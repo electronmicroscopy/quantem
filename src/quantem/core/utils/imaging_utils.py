@@ -179,6 +179,7 @@ def bilinear_kde(
     threshold: float = 1e-3,
     lowpass_filter: bool = False,
     max_batch_size: Optional[int] = None,
+    return_pix_count: bool = False,
 ) -> NDArray:
     """
     Compute a bilinear kernel density estimate (KDE) with smooth threshold masking.
@@ -258,7 +259,16 @@ def bilinear_kde(
         f_img /= np.sinc(fy)[None, :]  # type: ignore
         image = np.real(np.fft.ifft2(f_img))
 
-    return image
+        if return_pix_count:
+            f_img = np.fft.fft2(pix_count)
+            f_img /= np.sinc(fx)[:, None]  # type: ignore
+            f_img /= np.sinc(fy)[None, :]  # type: ignore
+            pix_count = np.real(np.fft.ifft2(f_img))
+
+    if return_pix_count:
+        return image, pix_count
+    else:
+        return image
 
 
 def bilinear_array_interpolation(
