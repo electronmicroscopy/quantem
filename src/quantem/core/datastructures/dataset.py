@@ -447,7 +447,9 @@ class Dataset(AutoSerialize):
         for axis, dim in enumerate(self.shape):
             if axis in crop_dict:
                 before, after = crop_dict[axis]
-                full_slices.append(slice(before, after))
+                start = before
+                stop = dim - after if after != 0 else None
+                full_slices.append(slice(start, stop))
             else:
                 full_slices.append(slice(None))
         if modify_in_place is False:

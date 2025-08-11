@@ -44,7 +44,6 @@ dependencies = [
   "scikit-image>=0.25.2",
   "torchvision>=0.22.1",
   "tensorboard>=2.19.0",
-  "cupy-cuda12x>=13.4.1",
   "torchmetrics>=1.7.3",
   "torchsummary>=1.5.1",
 ]
