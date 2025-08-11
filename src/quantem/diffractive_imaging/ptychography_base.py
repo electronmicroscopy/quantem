@@ -897,14 +897,15 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             else:
                 targets = self.dset.centered_amplitudes[batch_indices]
             preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
-            norm = self.dset.mean_diffraction_intensity  # sgd is more stable with amplitude norm
+            norm = self.dset.mean_diffraction_intensity
         else:
             if use_unshifted:
                 targets = self.dset.intensities[batch_indices]
             else:
                 targets = self.dset.centered_intensities[batch_indices]
             preds = pred_intensities
-            norm = self.dset.mean_diffraction_intensity**1.5  # otherwise sgd diverges??
+            norm = self.dset.mean_diffraction_intensity  # ??
+            # norm = self.dset.mean_diffraction_intensity**1.5  # otherwise sgd diverges??
 
         diff = preds - targets
         if loss_type == "l1":

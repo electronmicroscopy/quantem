@@ -271,17 +271,15 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # corner centering measured amplitudes
         measured_amplitudes = torch.fft.fftshift(measured_amplitudes, dim=(-2, -1))
         fourier_overlap = torch.fft.fft2(overlap_array, norm="ortho")
-        # from quantem.core.visualization.visualization import show_2d
-        # show_2d([fourier_overlap[0,0], torch.abs(fourier_overlap[0,0])])
         if self.num_probes == 1:  # faster
             fourier_modified_overlap = measured_amplitudes * torch.exp(
                 1.0j * torch.angle(fourier_overlap)
             )
-        else:  # necessary for mixed state # TODO check this with  normalization
+        else:  # necessary for mixed state # TODO check this with normalization
             farfield_amplitudes = self.estimate_amplitudes(overlap_array, corner_centered=True)
             farfield_amplitudes[farfield_amplitudes == 0] = torch.inf
             amplitude_modification = measured_amplitudes / farfield_amplitudes
-            fourier_modified_overlap = amplitude_modification * fourier_overlap
+            fourier_modified_overlap = amplitude_modification[None] * fourier_overlap
 
         return torch.fft.ifft2(fourier_modified_overlap, norm="ortho")
 

@@ -223,9 +223,7 @@ class ObjectBase(RNGMixin, OptimizerMixin, AutoSerialize):
     def _propagate_array(
         self, array: "torch.Tensor", propagator_array: "torch.Tensor"
     ) -> "torch.Tensor":
-        propagated = torch.fft.ifft2(
-            torch.fft.fft2(array, norm="ortho") * propagator_array, norm="ortho"
-        )
+        propagated = torch.fft.ifft2(torch.fft.fft2(array) * propagator_array)
         return propagated
 
     def _get_obj_patches(self, obj_array, patch_indices):

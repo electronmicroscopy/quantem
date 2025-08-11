@@ -582,7 +582,7 @@ class ProbePixelated(ProbeConstraints):
         return "ProbePixelized"
 
     def backward(self, propagated_gradient, obj_patches):
-        obj_normalization = torch.sum(torch.abs(obj_patches) ** 2, dim=(0, 1)).max()
+        obj_normalization = torch.sum(torch.abs(obj_patches) ** 2, dim=(-2, -1)).max()
         ortho_norm: float = np.prod(self.roi_shape) ** 0.5  # from ortho fft2 # type:ignore
         probe_grad = torch.sum(propagated_gradient, dim=1) / obj_normalization / ortho_norm
         self._probe.grad = -1 * probe_grad.clone().detach()

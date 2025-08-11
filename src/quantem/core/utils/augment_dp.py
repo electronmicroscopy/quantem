@@ -20,6 +20,10 @@ if config.get("has_torch"):
 
 ArrayLike = Union[np.ndarray, "torch.Tensor"]
 
+# TODO
+# add dark background
+# add gaussian noise
+
 
 class DPAugmentor(RNGMixin):
     def __init__(
