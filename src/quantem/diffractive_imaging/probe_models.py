@@ -334,11 +334,18 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         "tv_weight": 0.0,
     }
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
     def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
-        self._soft_constraint_loss = {}
+        self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
         if self.constraints["tv_weight"]:
-            loss += self._probe_tv_constraint(probe)
+            loss_tv = self._probe_tv_constraint(probe, self.constraints["tv_weight"])
+            self.add_soft_constraint_loss("tv_loss", loss_tv)
+            loss = loss + loss_tv
+
+        self.accumulate_constraint_losses()
         return loss
 
     def apply_hard_constraints(self, probe: torch.Tensor) -> torch.Tensor:
@@ -350,15 +357,13 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
             probe = self._probe_center_of_mass_constraint(probe)
         return probe
 
-    def _probe_tv_constraint(self, probe: torch.Tensor) -> torch.Tensor:
-        loss = self._get_zero_loss_tensor()
-        w = self.constraints["tv_weight"]
-        if w == 0:
-            return loss
-        for dim in [-1, -2]:
-            loss += w * torch.mean(torch.abs(torch.diff(probe, dim=dim)))
-        self._soft_constraint_loss["tv_loss"] = loss
-        return loss
+    def _probe_tv_constraint(self, probe: torch.Tensor, weight: float) -> torch.Tensor:
+        tv = self._get_zero_loss_tensor()
+        if weight == 0:
+            return tv
+        for dim in (-1, -2):
+            tv = tv + torch.mean(torch.abs(torch.diff(probe, dim=dim)))
+        return weight * tv
 
     def _probe_center_of_mass_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
         probe_int = torch.abs(start_probe) ** 2
@@ -440,9 +445,6 @@ class ProbePixelated(ProbeConstraints):
             # roi_shape was already set in parent __init__
             pass
         # If neither is provided, roi_shape will be set later in set_initial_probe
-
-    # TODO write classmethods for from_params and from_array
-    # from_params should accept vacuum probe as well
 
     @property
     def probe(self) -> torch.Tensor:

@@ -108,11 +108,7 @@ class LoggerBase(AutoSerialize):
 
     @log_images_every.setter
     def log_images_every(self, value: int) -> None:
-        if not isinstance(value, int):
-            raise TypeError("Log images every must be an integer")
-        if value < 1:
-            raise ValueError("Log images every must be at least 1")
-        self._log_images_every = value
+        self._log_images_every = int(value)
 
     # --- Helper Functions ---
 

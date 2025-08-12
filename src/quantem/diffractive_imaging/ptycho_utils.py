@@ -1,22 +1,13 @@
-from typing import TYPE_CHECKING, Literal, Union, overload
+from typing import Literal, Union, overload
 
 import numpy as np
+import torch
 from scipy.optimize import curve_fit
 
-from quantem.core import config
 from quantem.core.utils import array_funcs as arr
 
-ArrayLike = Union[np.ndarray, "cp.ndarray", "torch.Tensor"]
+ArrayLike = Union[np.ndarray, "torch.Tensor"]
 
-
-if TYPE_CHECKING:
-    import cupy as cp
-    import torch
-else:
-    if config.get("has_cupy"):
-        import cupy as cp
-    if config.get("has_torch"):
-        import torch
 
 # TODO: figure out what here should be put into ptycho base vs kept in a utilities file
 
@@ -53,6 +44,9 @@ class SimpleBatcher:
             self.indices = self.rng.permutation(self.indices)
         for i in range(0, len(self.indices), self.batch_size):
             yield self.indices[i : i + self.batch_size]
+
+    def __len__(self):
+        return len(self.indices) // self.batch_size
 
 
 @overload

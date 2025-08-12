@@ -70,7 +70,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.probe_model.reset_optimizer()
         self.dset.reset_optimizer()
 
-    def _record_lrs(self) -> None:
+    def _record_epoch(self, epoch_loss: float) -> None:
+        self._epoch_losses.append(epoch_loss)
         optimizers = self.optimizers
         all_keys = set(self._epoch_lrs.keys()) | set(optimizers.keys())
         for key in all_keys:
@@ -92,32 +93,22 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.probe_model.reset_epoch_constraint_losses()
         self.dset.reset_epoch_constraint_losses()
 
-    def _accumulate_constraints(self) -> None:
-        """Accumulate constraint losses from all models."""
-        self.obj_model.accumulate_constraint_losses(self.obj_model.soft_constraint_loss)
-        self.probe_model.accumulate_constraint_losses(self.probe_model.soft_constraint_loss)
-        self.dset.accumulate_constraint_losses(self.dset.soft_constraint_loss)
-
-    def _soft_constraints(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def _soft_constraints(self) -> torch.Tensor:
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
         total_loss = torch.tensor(0, device=self.device, dtype=self._dtype_real)
-        constraint_losses = {}
 
         obj_loss = self.obj_model.apply_soft_constraints(
             self.obj_model.obj, mask=self.obj_model.mask
         )
         total_loss += obj_loss
-        constraint_losses.update(self.obj_model.soft_constraint_loss)
 
         probe_loss = self.probe_model.apply_soft_constraints(self.probe_model.probe)
         total_loss += probe_loss
-        constraint_losses.update(self.probe_model.soft_constraint_loss)
 
         dataset_loss = self.dset.apply_soft_constraints(self.dset.descan_shifts)
         total_loss += dataset_loss
-        constraint_losses.update(self.dset.soft_constraint_loss)
 
-        return total_loss, constraint_losses
+        return total_loss
 
     # endregion --- methods ---
 
@@ -179,8 +170,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         pbar = tqdm(range(num_iter), disable=not self.verbose)
 
         for a0 in pbar:
-            epoch_loss = 0.0
-            batch_losses = []
+            consistency_loss = 0.0
+            total_loss = 0.0
             self._reset_epoch_constraints()
 
             for batch_indices in batcher:
@@ -195,7 +186,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 )
                 pred_intensities = self.detector_model.forward(overlap)
 
-                consistency_loss, targets = self.error_estimate(
+                batch_consistency_loss, targets = self.error_estimate(
                     pred_intensities,
                     batch_indices,
                     amplitude_error=True,
@@ -203,13 +194,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     loss_type=loss_type,
                 )
 
-                soft_constraint_loss, _constraint_losses = self._soft_constraints()
-                total_loss = consistency_loss + soft_constraint_loss
-
-                self._accumulate_constraints()
+                batch_soft_constraint_loss = self._soft_constraints()
+                batch_loss = batch_consistency_loss + batch_soft_constraint_loss
 
                 self.backward(
-                    total_loss,
+                    batch_loss,
                     autograd,
                     obj_patches,
                     propagated_probes,
@@ -218,35 +207,42 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     targets,
                 )
                 self.step_optimizers()
-                batch_losses.append(
-                    {
-                        "consistency_loss": consistency_loss.item(),
-                        "constraint_loss": soft_constraint_loss.item(),
-                        "total_loss": total_loss.item(),
-                    }
-                )
-            epoch_loss = float(np.mean([bl["total_loss"] for bl in batch_losses]))
-            self._epoch_losses.append(epoch_loss)
-            self._record_lrs()
+                consistency_loss += batch_consistency_loss.item()
+                total_loss += batch_loss.item()
+
+            num_batches = len(batcher)
+            total_loss = total_loss / num_batches
+            consistency_loss = consistency_loss / num_batches
+            self._record_epoch(total_loss)
 
             # Step schedulers with current loss
-            self.step_schedulers(epoch_loss)
+            self.step_schedulers(total_loss)
 
             if self.store_iterations and (a0 % self.store_iterations_every) == 0:
                 self.append_recon_iteration()
 
             if self.logger is not None:
-                current_lrs = {
-                    param_name: optimizer.param_groups[0]["lr"]
-                    for param_name, optimizer in self.optimizers.items()
-                    if optimizer is not None
-                }
-                self.logger.log_epoch(self, a0, epoch_loss, batch_losses, current_lrs)
+                self.logger.log_epoch(
+                    self.obj_model,
+                    self.probe_model,
+                    self.dset,
+                    a0,
+                    consistency_loss,
+                    num_batches,
+                    self._get_current_lrs(),
+                )
 
-            pbar.set_description(f"Epoch {a0 + 1}/{num_iter}, Loss: {epoch_loss:.3e}")
+            pbar.set_description(f"Epoch {a0 + 1}/{num_iter}, Loss: {total_loss:.3e}")
 
         torch.cuda.empty_cache()
         return self
+
+    def _get_current_lrs(self) -> dict[str, float]:
+        return {
+            param_name: optimizer.param_groups[0]["lr"]
+            for param_name, optimizer in self.optimizers.items()
+            if optimizer is not None
+        }
 
     def backward(
         self,

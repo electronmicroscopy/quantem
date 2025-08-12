@@ -610,14 +610,15 @@ class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
     }
 
     def apply_soft_constraints(self, descan_shifts: torch.Tensor) -> torch.Tensor:
-        self._soft_constraint_loss = {}
-        loss = torch.tensor(0, device=self.device, dtype=getattr(torch, config.get("dtype_real")))
+        self.reset_soft_constraint_losses()
+        loss = self._get_zero_loss_tensor()
 
-        if self.constraints.get("tv_descan", 0) > 0:
-            tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints["tv_descan"])
+        if self.constraints.get("descan_tv_weight", 0) > 0:
+            tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints["descan_tv_weight"])
             loss = loss + tv_loss
-            self._soft_constraint_loss["tv_descan"] = tv_loss
+            self.add_soft_constraint_loss("descan_tv_weight", tv_loss)
 
+        self.accumulate_constraint_losses()
         return loss
 
     def get_descan_tv_loss(self, descan_shifts: torch.Tensor, weight: float = 0.0) -> torch.Tensor:

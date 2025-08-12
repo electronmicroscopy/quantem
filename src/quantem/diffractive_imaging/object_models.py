@@ -61,7 +61,7 @@ class ObjectBase(RNGMixin, OptimizerMixin, AutoSerialize):
         rng: np.random.Generator | int | None = None,
         shape: tuple[int, int, int] | None = None,
     ):
-        super().__init__(rng=rng)
+        super().__init__(rng=rng, device=device)
         self.shape = shape
         self.mask = None
         self.device = device
@@ -301,7 +301,8 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
     def apply_soft_constraints(
         self, obj: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        self._soft_constraint_loss = {}
+        # reset recorded losses each call
+        self.reset_soft_constraint_losses()
 
         tv_loss = self.get_tv_loss(
             obj,
@@ -310,12 +311,15 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 self.constraints["tv_weight_yx"],
             ),
         )
+        self.add_soft_constraint_loss("tv_loss", tv_loss)
 
         surface_zero_loss = self.get_surface_zero_loss(
             obj,
             weight=self.constraints["surface_zero_weight"],
         )
+        self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
 
+        self.accumulate_constraint_losses()
         return tv_loss + surface_zero_loss
 
     def get_tv_loss(
@@ -343,14 +347,13 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
         if array.is_complex():
             ph = array.angle()
-            loss += self._calc_tv_loss(ph, w)
+            loss = loss + self._calc_tv_loss(ph, w)
             amp = array.abs()
             if self.obj_type == "complex":
-                loss += self._calc_tv_loss(amp, w)
+                loss = loss + self._calc_tv_loss(amp, w)
         else:
-            loss += self._calc_tv_loss(array, w)
+            loss = loss + self._calc_tv_loss(array, w)
 
-        self._soft_constraint_loss["tv_loss"] = loss
         return loss
 
     def _calc_tv_loss(self, array: torch.Tensor, weight: tuple[float, float]) -> torch.Tensor:
@@ -363,8 +366,9 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 w = weight[1]
             if w > 0:
                 calc_dim += 1
-                loss += w * torch.mean(torch.abs(array.diff(dim=dim)))
-        loss /= calc_dim
+                loss = loss + w * torch.mean(torch.abs(array.diff(dim=dim)))
+        if calc_dim > 0:
+            loss = loss / calc_dim
         return loss
 
     def get_surface_zero_loss(
@@ -378,11 +382,10 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if array.is_complex():
             amp = array.abs()
             ph = array.angle()
-            loss += weight * (torch.mean(amp[0]) + torch.mean(amp[-1]))
-            loss += weight * (torch.mean(torch.diff(ph[0])) + torch.mean(torch.diff(ph[-1])))
+            loss = loss + weight * (torch.mean(amp[0]) + torch.mean(amp[-1]))
+            loss = loss + weight * (torch.mean(torch.diff(ph[0])) + torch.mean(torch.diff(ph[-1])))
         else:
-            loss += weight * (torch.mean(array[0]) + torch.mean(array[-1]))
-        self._soft_constraint_loss["surface_zero_loss"] = loss
+            loss = loss + weight * (torch.mean(array[0]) + torch.mean(array[-1]))
         return loss
 
 
@@ -564,7 +567,6 @@ class ObjectDIP(ObjectConstraints):
         """get the model input"""
         if self._model_input is None:
             try:
-                print("Trying to generate model input")
                 self._generate_model_input("random")
             except ValueError:
                 raise ValueError(
@@ -591,14 +593,16 @@ class ObjectDIP(ObjectConstraints):
         input_shape = (1, *self.shape)
         # TODO -- support for 3D CNN models, single channel 2D with identical slices
         if mode == "random":
-            inp = torch.randn(input_shape, dtype=self.dtype, generator=self._rng_torch)
+            inp = torch.randn(
+                input_shape, device=self.device, dtype=self.dtype, generator=self._rng_torch
+            )
         elif mode == "zeros":
-            inp = torch.zeros(input_shape, dtype=self.dtype)
+            inp = torch.zeros(input_shape, device=self.device, dtype=self.dtype)
         elif mode == "ones":
-            inp = torch.ones(input_shape, dtype=self.dtype)
+            inp = torch.ones(input_shape, device=self.device, dtype=self.dtype)
         else:
             raise ValueError(f"Invalid mode: {mode} | must be one of: 'random', 'zeros', 'ones'")
-        self._model_input = inp.to(self.device)
+        self._model_input = inp
 
     @property
     def pretrain_target(self) -> torch.Tensor:

@@ -294,11 +294,12 @@ class PtychographyVisualizations(PtychographyBase):
         else:
             fig, ax = figax
 
+        lw = 2
         lines = []
         epochs = np.arange(len(self.epoch_losses))
         colors = plt.cm.Set1.colors  # type:ignore
         colors = config.get("viz.colors.set")[1:]
-        lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="loss"))
+        lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="loss", lw=lw))
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
         ax.spines["left"].set_color("k")
@@ -307,7 +308,6 @@ class PtychographyVisualizations(PtychographyBase):
         if plot_lrs and len(self.epoch_lrs) > 0:
             nx = ax.twinx()
             nx.spines["left"].set_visible(False)
-
             color_idx = 0
 
             # Sort optimizers: object first, then probe, then the rest
@@ -319,7 +319,8 @@ class PtychographyVisualizations(PtychographyBase):
                 if len(lr_values) > 0:
                     # Create epochs array that matches lr_values length
                     lr_epochs = np.arange(len(lr_values))
-                    linestyle = "--" if lr_type == "probe" else "-"
+                    linestyles = ["-", "--", ":", "-."]
+                    linestyle = linestyles[color_idx % len(linestyles)]
                     if lr_type == "probe":
                         zorder = 3
                     elif lr_type == "object":
@@ -334,6 +335,7 @@ class PtychographyVisualizations(PtychographyBase):
                             label=f"{lr_type} LR",
                             linestyle=linestyle,
                             zorder=zorder,
+                            lw=lw,
                         )
                     )
                     color_idx += 1

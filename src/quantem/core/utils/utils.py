@@ -473,7 +473,14 @@ class RNGMixin:
     - self._reset_rng(): reset the RNG to the current seed
     """
 
-    def __init__(self, rng: np.random.Generator | int | None = None, *args, **kwargs):
+    def __init__(
+        self,
+        rng: np.random.Generator | int | None = None,
+        device: str | int | torch.device = "cpu",
+        *args,
+        **kwargs,
+    ):
+        self._device = device
         self.rng = rng
 
     @property
@@ -481,7 +488,7 @@ class RNGMixin:
         return self._rng
 
     @rng.setter
-    def rng(self, rng: np.random.Generator | int | None):
+    def rng(self, rng: int | np.random.Generator | torch.Generator | None):
         if rng is None:
             self._rng_seed = None
             rng = np.random.default_rng()
@@ -490,6 +497,9 @@ class RNGMixin:
             rng = np.random.default_rng(rng)
         elif isinstance(rng, np.random.Generator):
             self._rng_seed = rng.bit_generator._seed_seq.entropy  # type:ignore ## get the seed
+        elif isinstance(rng, torch.Generator):
+            self._rng_seed = rng.initial_seed()
+            rng = np.random.default_rng(self._rng_seed)
         else:
             raise TypeError(f"rng should be a np.random.Generator or a seed, got {type(rng)}")
 
@@ -498,23 +508,24 @@ class RNGMixin:
 
     def _update_torch_rng(self):
         """Update the torch generator with current seed and device."""
-        if self._rng_seed is not None:
-            device = getattr(self, "device", "cpu")
-            if self._rng_seed is None:
-                self._rng_torch = torch.Generator(device=device)
-            else:
-                self._rng_torch = torch.Generator(device=device).manual_seed(
-                    self._rng_seed % 2**32
-                )
+        if self._rng_seed is None:
+            self._rng_torch = torch.Generator(device=self._device)
+        else:
+            self._rng_torch = torch.Generator(device=self._device).manual_seed(
+                self._rng_seed % 2**32
+            )
 
     def _reset_rng(self):
         """Reset RNG to current seed, useful for reproducible iterations."""
-        if self._rng is not None:
+        if self._rng_seed is not None:
             self.rng = self._rng_seed  # sets rng and _rng_torch
 
     def _rng_to_device(self, device: str | int | torch.device):
         ## Could consider renaming this as just to, allowing super calls
-        """Update torch RNG when device changes."""
-        if hasattr(self, "_rng_seed") and self._rng_seed is not None:
-            dev, _id = config.validate_device(device)
-            self._rng_torch = torch.Generator(device=dev).manual_seed(self._rng_seed % 2**32)
+        """Update torch RNG when device changes.
+        Currently resets the seed... not sure of a way around that."""
+        self._device = device
+        rng_torch = torch.Generator(device=self._device)
+        if self._rng_seed is not None:
+            rng_torch = rng_torch.manual_seed(self._rng_seed % 2**32)
+        self._rng_torch = rng_torch
