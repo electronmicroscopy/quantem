@@ -434,9 +434,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def obj_model(self) -> ObjectModelType:
         return self._obj_model
 
-    # @obj_model.setter
-    # def obj_model(self, *args):
-    #     raise AttributeError("Use tycho.set_obj_model to set the obj_model")
+    @obj_model.setter
+    def obj_model(self, model: ObjectModelType | type | None):
+        self.set_obj_model(model)  # redundant
 
     def set_obj_model(self, model: ObjectModelType | type | None):
         if model is None:
@@ -452,8 +452,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         # Set object shape and reset
         rotshape = self.dset._obj_shape_full_2d(self.obj_padding_px)
-        obj_shape_full = (self.num_slices, int(rotshape[0]), int(rotshape[1]))
-        self._obj_model.shape = obj_shape_full
+        self._obj_model.shape_2d = rotshape
         self._obj_model.reset()
 
     @property
@@ -527,8 +526,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def logger(self, logger: LoggerPtychography | None):
         if logger is None:
             self._logger = None
-        elif not isinstance(logger, LoggerPtychography):
-            raise TypeError("Logger must be a LoggerPtychography")
+        elif not isinstance(logger, LoggerPtychography) and "logger_pty" not in str(type(logger)):
+            raise TypeError(f"Logger must be a LoggerPtychography, got {type(logger)}")
 
         self._logger = logger
 

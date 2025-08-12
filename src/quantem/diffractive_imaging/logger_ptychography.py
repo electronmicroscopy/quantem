@@ -1,3 +1,6 @@
+import os
+from warnings import warn
+
 import numpy as np
 
 from quantem.core import config
@@ -18,10 +21,16 @@ class LoggerPtychography(LoggerBase):
     """
 
     def __init__(
-        self, log_dir: str, run_prefix: str, run_suffix: str = "", log_images_every: int = 10
+        self,
+        log_dir: os.PathLike | str,
+        run_prefix: str,
+        run_suffix: str = "",
+        log_images_every: int = 10,
+        log_probe_images: bool = True,
     ):
         super().__init__(log_dir, run_prefix, run_suffix, log_images_every)
         self._phase_cmap = config.get("viz.phase_cmap")
+        self._log_probe_images = log_probe_images
 
     def object_image(self, volume_obj: ObjectModelType, epoch: int, logger_cmap: str = "turbo"):
         """Log object images with object type-aware visualization (optimized)."""
@@ -138,24 +147,21 @@ class LoggerPtychography(LoggerBase):
 
             # Log detailed losses
             if batch_losses:
-                avg_data_loss = sum(bl["data_loss"] for bl in batch_losses) / len(batch_losses)
+                avg_consistency_loss = sum(bl["consistency_loss"] for bl in batch_losses) / len(
+                    batch_losses
+                )
                 avg_constraint_loss = sum(bl["constraint_loss"] for bl in batch_losses) / len(
                     batch_losses
                 )
-
-                self.log_scalar("loss/data", avg_data_loss, epoch)
+                self.log_scalar("loss/consistency", avg_consistency_loss, epoch)
                 self.log_scalar("loss/constraint", avg_constraint_loss, epoch)
 
-                # Log detailed constraint breakdown occasionally
-                if epoch % self.log_images_every == 0:
-                    organized_losses = self.organize_constraint_losses(
-                        ptychography_instance, len(batch_losses)
-                    )
-                    for category, constraint_losses in organized_losses.items():
-                        for constraint_name, value in constraint_losses.items():
-                            self.log_scalar(
-                                f"constraints/{category}/{constraint_name}", value, epoch
-                            )
+                organized_losses = self.organize_constraint_losses(
+                    ptychography_instance, len(batch_losses)
+                )
+                for category, constraint_losses in organized_losses.items():
+                    for constraint_name, value in constraint_losses.items():
+                        self.log_scalar(f"constraints/{category}/{constraint_name}", value, epoch)
 
             # Learning rates
             if learning_rates:
@@ -167,14 +173,16 @@ class LoggerPtychography(LoggerBase):
             # Images (only when needed)
             if epoch % self.log_images_every == 0:
                 self.object_image(ptychography_instance.obj_model, epoch, logger_cmap)
-                self.probe_image(ptychography_instance.probe_model, epoch, logger_cmap)
+                if self._log_probe_images:
+                    self.probe_image(ptychography_instance.probe_model, epoch, logger_cmap)
 
             # Flush occasionally
             if epoch % 20 == 0:
                 self.flush()
 
         except Exception as e:
-            print(f"Warning: Epoch logging failed at epoch {epoch}: {e}")
+            warn(f"Warning: Epoch logging failed at epoch {epoch}: {e}")
+            raise e
             if epoch % 100 == 0:
                 try:
                     self.flush()

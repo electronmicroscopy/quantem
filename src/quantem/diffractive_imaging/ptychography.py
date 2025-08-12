@@ -218,10 +218,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     targets,
                 )
                 self.step_optimizers()
-
-                batch_losses.append(total_loss.item())
-
-            epoch_loss = float(np.mean(batch_losses))
+                batch_losses.append(
+                    {
+                        "consistency_loss": consistency_loss.item(),
+                        "constraint_loss": soft_constraint_loss.item(),
+                        "total_loss": total_loss.item(),
+                    }
+                )
+            epoch_loss = float(np.mean([bl["total_loss"] for bl in batch_losses]))
             self._epoch_losses.append(epoch_loss)
             self._record_lrs()
 
@@ -230,6 +234,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
             if self.store_iterations and (a0 % self.store_iterations_every) == 0:
                 self.append_recon_iteration()
+
+            if self.logger is not None:
+                current_lrs = {
+                    param_name: optimizer.param_groups[0]["lr"]
+                    for param_name, optimizer in self.optimizers.items()
+                    if optimizer is not None
+                }
+                self.logger.log_epoch(self, a0, epoch_loss, batch_losses, current_lrs)
 
             pbar.set_description(f"Epoch {a0 + 1}/{num_iter}, Loss: {epoch_loss:.3e}")
 

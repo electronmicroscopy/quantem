@@ -474,7 +474,6 @@ class RNGMixin:
     """
 
     def __init__(self, rng: np.random.Generator | int | None = None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
         self.rng = rng
 
     @property
@@ -514,6 +513,7 @@ class RNGMixin:
             self.rng = self._rng_seed  # sets rng and _rng_torch
 
     def _rng_to_device(self, device: str | int | torch.device):
+        ## Could consider renaming this as just to, allowing super calls
         """Update torch RNG when device changes."""
         if hasattr(self, "_rng_seed") and self._rng_seed is not None:
             dev, _id = config.validate_device(device)

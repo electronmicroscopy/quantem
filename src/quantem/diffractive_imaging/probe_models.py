@@ -328,24 +328,37 @@ class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
 
 class ProbeConstraints(BaseConstraints, ProbeBase):
     DEFAULT_CONSTRAINTS = {
-        "fix_probe": False,
+        # "fix_probe": False,
         "orthogonalize_probe": True,
         "center_probe": False,
+        "tv_weight": 0.0,
     }
 
     def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
         self._soft_constraint_loss = {}
         loss = self._get_zero_loss_tensor()
+        if self.constraints["tv_weight"]:
+            loss += self._probe_tv_constraint(probe)
         return loss
 
     def apply_hard_constraints(self, probe: torch.Tensor) -> torch.Tensor:
-        if self.constraints["fix_probe"]:
-            return self.initial_probe
+        # if self.constraints["fix_probe"]:
+        #     return self.initial_probe
         if self.constraints["orthogonalize_probe"]:
             probe = self._probe_orthogonalization_constraint(probe)
         if self.constraints["center_probe"]:
             probe = self._probe_center_of_mass_constraint(probe)
         return probe
+
+    def _probe_tv_constraint(self, probe: torch.Tensor) -> torch.Tensor:
+        loss = self._get_zero_loss_tensor()
+        w = self.constraints["tv_weight"]
+        if w == 0:
+            return loss
+        for dim in [-1, -2]:
+            loss += w * torch.mean(torch.abs(torch.diff(probe, dim=dim)))
+        self._soft_constraint_loss["tv_loss"] = loss
+        return loss
 
     def _probe_center_of_mass_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
         probe_int = torch.abs(start_probe) ** 2

@@ -1,4 +1,5 @@
 import datetime
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -18,7 +19,7 @@ Tensorboard logger class for AD/ML reconstruction methods
 class LoggerBase(AutoSerialize):
     def __init__(
         self,
-        base_log_dir: Path | str,
+        base_log_dir: os.PathLike | str,
         run_prefix: str,
         run_suffix: str = "",
         log_images_every: int = 10,
@@ -65,8 +66,8 @@ class LoggerBase(AutoSerialize):
         return self._log_dir
 
     @log_dir.setter
-    def log_dir(self, dir: str | Path) -> None:
-        if not isinstance(dir, (str, Path)):
+    def log_dir(self, dir: str | os.PathLike) -> None:
+        if not isinstance(dir, str | os.PathLike):
             raise TypeError("Log directory must be a str or Path.")
 
         dir = Path(dir)
