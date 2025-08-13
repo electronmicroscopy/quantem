@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from typing import List, Optional, Union
 
+import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
@@ -235,9 +236,7 @@ class DriftCorrection(AutoSerialize):
             shape = self.images[a0].shape
 
             v_slow = np.linspace(-(shape[0] - 1) / 2, (shape[0] - 1) / 2, shape[0])
-            u_fast = np.linspace(
-                -(shape[1] - 1) / 2, (shape[1] - 1) / 2, self.number_knots
-            )
+            u_fast = np.linspace(-(shape[1] - 1) / 2, (shape[1] - 1) / 2, self.number_knots)
 
             xa = (
                 (self.shape[1] - 1) / 2
@@ -270,11 +269,11 @@ class DriftCorrection(AutoSerialize):
         self.images_warped = Dataset3d.from_shape(self.shape)
         self.weights_warped = Dataset3d.from_shape(self.shape)
         for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = (
-                self.interpolator[ind].warp_image(
-                    self.images[ind].array,
-                    self.knots[ind],
-                )
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
             )
 
         # Error tracking
@@ -283,9 +282,7 @@ class DriftCorrection(AutoSerialize):
         # Plots
         kwargs.pop("title", None)
         if show_merged:
-            self.plot_merged_images(
-                show_knots=show_knots, title="Merged: initial", **kwargs
-            )
+            self.plot_merged_images(show_knots=show_knots, title="Merged: initial", **kwargs)
         if show_images:
             self.plot_transformed_images(
                 show_knots=show_knots,
@@ -299,7 +296,8 @@ class DriftCorrection(AutoSerialize):
     def align_translation(
         self,
         upsample_factor: int = 8,
-        max_image_shift: int = 32,
+        min_image_shift: Optional[float] = None,
+        max_image_shift: float = 32,
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
@@ -310,9 +308,7 @@ class DriftCorrection(AutoSerialize):
         """
 
         if not hasattr(self, "knots"):
-            print(
-                "\033[91mNo knots found — running .preprocess() with default settings.\033[0m"
-            )
+            print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
             self.preprocess()
 
         # init
@@ -337,6 +333,11 @@ class DriftCorrection(AutoSerialize):
         # Normalize dxy
         dxy -= np.mean(dxy, axis=0)
 
+        # Minimum image shift
+        if min_image_shift is not None:
+            if np.linalg.norm(dxy[ind]) < min_image_shift:
+                dxy[ind] = 0.0
+
         # Apply shifts to knots
         for ind in range(self.shape[0]):
             self.knots[ind][0] += dxy[ind, 0]
@@ -344,19 +345,17 @@ class DriftCorrection(AutoSerialize):
 
         # Regenerate images
         for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = (
-                self.interpolator[ind].warp_image(
-                    self.images[ind].array,
-                    self.knots[ind],
-                )
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
             )
 
         # Plots
         kwargs.pop("title", None)
         if show_merged:
-            self.plot_merged_images(
-                show_knots=show_knots, title="Merged: translation", **kwargs
-            )
+            self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)
         if show_images:
             self.plot_transformed_images(
                 show_knots=show_knots,
@@ -384,9 +383,7 @@ class DriftCorrection(AutoSerialize):
         """
 
         if not hasattr(self, "knots"):
-            print(
-                "\033[91mNo knots found — running .preprocess() with default settings.\033[0m"
-            )
+            print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
             self.preprocess()
 
         if num_tests % 2 == 0:
@@ -449,11 +446,11 @@ class DriftCorrection(AutoSerialize):
 
         # Regenerate images
         for ind in range(self.shape[0]):
-            self.images_warped.array[a0], self.weights_warped.array[ind] = (
-                self.interpolator[ind].warp_image(
-                    self.images[ind].array,
-                    self.knots[ind],
-                )
+            self.images_warped.array[a0], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
             )
 
         # Translation alignment
@@ -510,20 +507,17 @@ class DriftCorrection(AutoSerialize):
             # update all knots
             ind = np.argmin(cost)
             for a0 in range(self.shape[0]):
-                u = (
-                    np.arange(self.knots[a0].shape[1])
-                    - (self.knots[a0].shape[1] - 1) / 2
-                )
+                u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
                 self.knots[a0][0] += dxy[ind, 0] * u[:, None]
                 self.knots[a0][1] += dxy[ind, 1] * u[:, None]
 
         # Regenerate images
         for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = (
-                self.interpolator[ind].warp_image(
-                    self.images[ind].array,
-                    self.knots[ind],
-                )
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                ind
+            ].warp_image(
+                self.images[ind].array,
+                self.knots[ind],
             )
 
         # Translation alignment
@@ -557,13 +551,15 @@ class DriftCorrection(AutoSerialize):
     # non-rigid alignment
     def align_nonrigid(
         self,
-        num_iterations: int = 4,
+        num_iterations: int = 8,
         max_optimize_iterations: int = 10,
-        regularization_sigma_px=1.0,
+        regularization_sigma_px: float = 16.0,
         regularization_poly_order: int = 1,
         regularization_max_image_shift_px: Optional[float] = None,
+        regularization_update_step_size: Optional[float] = 0.8,
         solve_individual_rows: bool = True,
-        max_image_shift: float | None = 32,
+        min_image_shift: Optional[float] = None,
+        max_image_shift: float | None = 32.0,
         show_merged: bool = True,
         show_images: bool = False,
         show_knots: bool = True,
@@ -574,9 +570,7 @@ class DriftCorrection(AutoSerialize):
         """
 
         if not hasattr(self, "knots"):
-            print(
-                "\033[91mNo knots found — running .preprocess() with default settings.\033[0m"
-            )
+            print("\033[91mNo knots found — running .preprocess() with default settings.\033[0m")
             self.preprocess()
 
         for iterations in tqdm(
@@ -584,9 +578,7 @@ class DriftCorrection(AutoSerialize):
             desc="Solving nonrigid drift",
         ):
             for ind in range(self.shape[0]):
-                image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(
-                    axis=0
-                )
+                image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
 
                 knots_init = self.knots[ind]
                 shape_knots = knots_init.shape
@@ -622,9 +614,7 @@ class DriftCorrection(AutoSerialize):
                             if max_optimize_iterations is not None
                             else {}
                         )
-                        result = minimize(
-                            cost_function, x0, method="L-BFGS-B", options=options
-                        )
+                        result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                         knots_updated[:, row_ind, :] = result.x.reshape((2, -1))
 
                 else:
@@ -655,9 +645,7 @@ class DriftCorrection(AutoSerialize):
                         if max_optimize_iterations is not None
                         else {}
                     )
-                    result = minimize(
-                        cost_function, x0, method="L-BFGS-B", options=options
-                    )
+                    result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
                     knots_updated = result.x.reshape(shape_knots)
 
                 # apply max shift regularization if needed
@@ -667,15 +655,11 @@ class DriftCorrection(AutoSerialize):
                     sub = knots_dist > regularization_max_image_shift_px
                     knots_updated[0][sub] = (
                         self.knots[ind][0][sub]
-                        + knots_shift[0][sub]
-                        * regularization_max_image_shift_px
-                        / knots_dist[sub]
+                        + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub]
                     )
                     knots_updated[1][sub] = (
                         self.knots[ind][1][sub]
-                        + knots_shift[1][sub]
-                        * regularization_max_image_shift_px
-                        / knots_dist[sub]
+                        + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub]
                     )
 
                 # apply smoothness regularization if needed
@@ -699,20 +683,28 @@ class DriftCorrection(AutoSerialize):
 
                     knots_updated = knots_smoothed
 
+                # Apply step size if needed
+                if regularization_update_step_size is not None:
+                    knots_updated = (
+                        self.knots[ind]
+                        + (knots_updated - self.knots[ind]) * regularization_update_step_size
+                    )
+
                 # Update knots with optimized values
                 self.knots[ind] = knots_updated
 
             # Update images
             for ind in range(self.shape[0]):
-                self.images_warped.array[ind], self.weights_warped.array[ind] = (
-                    self.interpolator[ind].warp_image(
-                        self.images[ind].array,
-                        self.knots[ind],
-                    )
+                self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
+                    ind
+                ].warp_image(
+                    self.images[ind].array,
+                    self.knots[ind],
                 )
 
             # Translation alignment
             self.align_translation(
+                min_image_shift=min_image_shift,
                 max_image_shift=max_image_shift,
                 show_images=False,
                 show_merged=False,
@@ -743,12 +735,47 @@ class DriftCorrection(AutoSerialize):
         upsample_factor: int = 2,
         output_original_shape: bool = True,
         fourier_filter: bool = True,
+        filter_midpoint: float = 0.5,
         kde_sigma: float = 0.5,
         show_image: bool = True,
         **kwargs,
     ):
         """
-        Generate the final output image, after drift correction.
+        Generate the final drift-corrected image after aligning a stack of input images.
+
+        Parameters
+        ----------
+        upsample_factor : int, default 2
+            Factor to upsample the output image for enhanced interpolation accuracy.
+        output_original_shape : bool, default True
+            If True, crop the output image back to the original input dimensions after processing.
+        fourier_filter : bool, default True
+            Whether to apply Fourier-based directional filtering to merge corrected images.
+        filter_midpoint : float, default 0.5
+            Midpoint for the sigmoid-based Fourier weighting filter, determining transition smoothness.
+            Setting this to a low value close to 0 will include more signal but also more slow scan artifacts.
+            If using 2 images at 0 and 90 degrees scan angles, any value >0.75 will be unstable.
+            Only use larger values (close to 1.0) if multiple images covering many scan angles are used.
+        kde_sigma : float, default 0.5
+            Standard deviation for kernel density estimation used during image interpolation. Defaults
+            to the object's stored kde_sigma if set to None.
+        show_image : bool, default True
+            Whether to display the final corrected image after processing.
+        **kwargs : dict
+            Additional keyword arguments passed to the plotting function when displaying the image.
+
+        Returns
+        -------
+        image_corr : Dataset2d
+            The final drift-corrected output image encapsulated in a Dataset2d object.
+
+        Notes
+        -----
+        - The function applies per-frame warping using knot-based interpolation and optionally
+          performs directional Fourier filtering to blend multiple warped images.
+        - The Fourier filter suppresses directional artifacts by weighting image contributions based
+          on their scan angles, utilizing a bounded sine sigmoid for smooth transition.
+        - Upsampling enhances interpolation precision but may increase computational cost.
         """
 
         # init
@@ -776,18 +803,26 @@ class DriftCorrection(AutoSerialize):
             # Apply fourier filtering
             kx = np.fft.fftfreq(stack_corr.shape[1])[:, None]
             ky = np.fft.fftfreq(stack_corr.shape[2])[None, :]
-            kr = np.sqrt(kx**2 + ky**2)
+            # kr = np.sqrt(kx**2 + ky**2)
+            kt = np.arctan2(ky, kx)
 
             stack_fft = np.fft.fft2(stack_corr)
             weights = np.zeros_like(stack_corr)
 
             for ind in range(stack_corr.shape[0]):
-                weights[ind] = np.divide(
-                    np.abs(self.scan_fast[ind, 0] * kx + self.scan_fast[ind, 1] * ky),
-                    kr,
-                    where=kr > 0.0,
-                )
+                # Calculate weights as a function of angle
+                weights[ind] = np.abs(
+                    np.mod((kt - self.scan_direction[ind]) / np.pi + 0.5, 1.0) - 0.5
+                ) / (1 / 2)
                 weights[ind][0, 0] = 1.0
+
+                # Apply sigmoid to weighting function
+                weights[ind] = bounded_sine_sigmoid(
+                    weights[ind],
+                    midpoint=filter_midpoint,
+                )
+
+                # Weight the fourier transformed images
                 stack_fft[ind] *= weights[ind]
 
             weights_sum = np.sum(weights, axis=0)
@@ -801,9 +836,7 @@ class DriftCorrection(AutoSerialize):
             image_corr_fft = np.fft.fft2(np.mean(stack_corr, axis=0))
 
         if output_original_shape:
-            image_corr_fft = (
-                fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
-            )
+            image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
 
         image_corr = Dataset2d.from_array(
             np.real(np.fft.ifft2(image_corr_fft)),
@@ -824,9 +857,7 @@ class DriftCorrection(AutoSerialize):
     ):
         # Estimate current error
         images_mean = np.mean(self.images_warped.array, axis=0)
-        sig_diff = np.mean(
-            np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2)
-        )
+        sig_diff = np.mean(np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2))
 
         # Error vector
         error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
@@ -851,6 +882,66 @@ class DriftCorrection(AutoSerialize):
                     x,
                     color="r",
                 )
+
+    def plot_convergence(
+        self,
+        figsize=(8, 3),
+        **kwargs,
+    ):
+        """
+        Plot the convergence of the drift correction.
+        """
+        sub = np.abs(self.error_track[:, 0] - 2) < 0.1
+        error = self.error_track[:, 1]
+        it = np.arange(error.shape[0])
+
+        from matplotlib.ticker import FormatStrFormatter, MaxNLocator
+
+        fig, ax = plt.subplots(1, 2, figsize=figsize)
+        color = (1, 0, 0)  # red
+
+        # Plot Affine
+        if np.any(~sub):
+            ax[0].plot(
+                it[~sub],
+                100 * error[~sub],
+                marker="o",
+                color=color,
+                linestyle="-",
+                label="Affine",
+                **kwargs,
+            )
+            ax[0].set_xlabel("Affine Iterations")
+            ax[0].set_ylabel("Mean Error [%]")
+            ax[0].xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax[0].yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
+        else:
+            ax[0].axis("off")
+
+        # Plot Non-Rigid
+        if np.any(sub):
+            first_true = np.argmax(sub)
+            if first_true > 0:
+                sub[first_true - 1] = True
+
+            ax[1].plot(
+                it[sub],
+                100 * error[sub],
+                marker="o",
+                color=color,
+                linestyle="-",
+                label="Non-Rigid",
+                **kwargs,
+            )
+            ax[1].set_xlabel("Non-Rigid Iterations")
+            ax[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax[1].yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
+        else:
+            ax[1].axis("off")
+
+        plt.tight_layout()
+
+        return self
 
     def plot_merged_images(self, show_knots: bool = True, **kwargs):
         """
@@ -899,19 +990,11 @@ class DriftInterpolator:
         basis = np.linspace(0, 1, num_knots)
 
         if num_knots == 1:
-            xa = knots_row[0] + self.u[None, :] * self.scan_fast[0] * (
-                self.input_shape[0] - 1
-            )
-            ya = knots_row[1] + self.u[None, :] * self.scan_fast[1] * (
-                self.input_shape[1] - 1
-            )
+            xa = knots_row[0] + self.u[None, :] * self.scan_fast[0] * (self.input_shape[0] - 1)
+            ya = knots_row[1] + self.u[None, :] * self.scan_fast[1] * (self.input_shape[1] - 1)
         elif num_knots == 2:
-            xa = interp1d(basis, knots_row[0], kind="linear", assume_sorted=True)(
-                self.u
-            )
-            ya = interp1d(basis, knots_row[1], kind="linear", assume_sorted=True)(
-                self.u
-            )
+            xa = interp1d(basis, knots_row[0], kind="linear", assume_sorted=True)(self.u)
+            ya = interp1d(basis, knots_row[1], kind="linear", assume_sorted=True)(self.u)
         else:
             kind = "quadratic" if num_knots == 3 else "cubic"
             xa = interp1d(
@@ -977,12 +1060,48 @@ class DriftInterpolator:
             xa=xa * upsample_factor,  # rows
             ya=ya * upsample_factor,  # cols
             values=image,
-            output_shape=np.round(np.array(output_shape) * upsample_factor).astype(
-                "int"
-            ),
+            output_shape=np.round(np.array(output_shape) * upsample_factor).astype("int"),
             kde_sigma=kde_sigma * upsample_factor,
             pad_value=pad_value,
             return_pix_count=True,
         )
 
         return image_interp, weight_interp
+
+
+def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
+    """
+    Piecewise bounded sigmoid: zero, raised sine squared, one.
+
+    Parameters
+    ----------
+    x : array-like, shape (...,)
+        Input values in [0, 1].
+    midpoint : float
+        Center of the sigmoid transition.
+    width : float
+        Width of the sigmoid (range over which it ramps from 0 to 1).
+    Returns
+    -------
+    y : array-like
+        Output in [0, 1], same shape as x.
+    """
+    x = np.asarray(x)
+    # Truncate width if midpoint too close to edge
+    left_max = midpoint - width / 2
+    right_min = midpoint + width / 2
+    if left_max < 0:
+        width = 2 * midpoint  # can't start below zero
+    if right_min > 1:
+        width = 2 * (1 - midpoint)  # can't extend above one
+    # Recalculate edges
+    left = midpoint - width / 2
+    right = midpoint + width / 2
+
+    y = np.zeros_like(x, dtype=float)
+    in_band = (x >= left) & (x <= right)
+    # Map [left, right] to [0, pi/2]
+    t = (x[in_band] - left) / width  # goes from 0 to 1
+    y[in_band] = np.sin(t * np.pi / 2) ** 2
+    y[x > right] = 1.0
+    return y

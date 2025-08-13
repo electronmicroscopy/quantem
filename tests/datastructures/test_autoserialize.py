@@ -64,9 +64,7 @@ def test_dummy_save_load_and_skip(tmp_path, store):
     assert loaded_skip_cd._private == "secret"
 
     # ——— (c) skip "_private" only ———
-    tgt3 = tmp_path / (
-        "dummy_skip_priv.zip" if store == "zip" else "dummy_skip_priv_dir"
-    )
+    tgt3 = tmp_path / ("dummy_skip_priv.zip" if store == "zip" else "dummy_skip_priv_dir")
     d.save(str(tgt3), mode="w", store=store, skip=["_private"])
     loaded_skip_priv = load(str(tgt3))
 

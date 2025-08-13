@@ -22,9 +22,7 @@ from quantem.core.visualization.visualization_utils import (
 
 @pytest.fixture
 def sample_array():
-    return np.array(
-        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], dtype=np.float64
-    )
+    return np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], dtype=np.float64)
 
 
 @pytest.fixture
@@ -254,9 +252,7 @@ class TestBilinearHistogram2D:
 
     def test_bilinear_histogram_2d(self, sample_array):
         # Create a grid of points that matches the sample array size
-        x = np.linspace(
-            0, 1, 3, dtype=np.float64
-        )  # 3 points to match sample_array shape
+        x = np.linspace(0, 1, 3, dtype=np.float64)  # 3 points to match sample_array shape
         y = np.linspace(0, 1, 3, dtype=np.float64)
         X, Y = np.meshgrid(x, y)
         Z = sample_array.flatten()

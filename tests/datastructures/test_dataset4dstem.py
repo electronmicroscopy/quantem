@@ -55,9 +55,7 @@ class TestDataset4dstemInitialization:
         assert dataset.name == "4D-STEM dataset"  # Default name
         assert dataset.ndim == 4
         assert np.array_equal(dataset.origin, np.array([0, 0, 0, 0]))  # Default origin
-        assert np.array_equal(
-            dataset.sampling, np.array([1, 1, 1, 1])
-        )  # Default sampling
+        assert np.array_equal(dataset.sampling, np.array([1, 1, 1, 1]))  # Default sampling
         assert dataset.units == [
             "pixels",
             "pixels",
@@ -197,9 +195,7 @@ class TestDataset4dstemDpMethods:
             mask=mask, name="test_virtual_image", attach=True
         )
         assert "test_virtual_image" in sample_dataset4dstem.virtual_images
-        assert (
-            virtual_image2 is sample_dataset4dstem.virtual_images["test_virtual_image"]
-        )
+        assert virtual_image2 is sample_dataset4dstem.virtual_images["test_virtual_image"]
 
 
 class TestDataset4dstemShow:
@@ -213,9 +209,7 @@ class TestDataset4dstemShow:
             return None
 
         # Apply the mock
-        monkeypatch.setattr(
-            "quantem.core.visualization.visualization.show_2d", mock_show_2d
-        )
+        monkeypatch.setattr("quantem.core.visualization.visualization.show_2d", mock_show_2d)
 
         # Call show method
         result = sample_dataset4dstem.show()

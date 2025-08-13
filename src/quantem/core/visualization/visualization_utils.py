@@ -50,9 +50,7 @@ def array_to_rgba(
     ValueError
         If scaled_angle is provided but has a different shape than scaled_amplitude.
     """
-    cmap_obj = (
-        cmap if isinstance(cmap, colors.Colormap) else mpl.colormaps.get_cmap(cmap)
-    )
+    cmap_obj = cmap if isinstance(cmap, colors.Colormap) else mpl.colormaps.get_cmap(cmap)
     if scaled_angle is None:
         rgba = cmap_obj(scaled_amplitude)
     else:
@@ -107,9 +105,7 @@ def list_of_arrays_to_rgba(
 
     # circular encoding
     hue_angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
-    hue_angles += np.linspace(0.0, 0.5, n) * (
-        2 * np.pi / n / 2
-    )  # jitter to avoid cancellation
+    hue_angles += np.linspace(0.0, 0.5, n) * (2 * np.pi / n / 2)  # jitter to avoid cancellation
     complex_weights = np.exp(1j * hue_angles)[:, None, None] * bins
 
     # weighted average direction (w/ normalization)
@@ -371,9 +367,7 @@ def add_arg_cbar_to_ax(
     return cb_angle
 
 
-def turbo_black(
-    num_colors: int = 256, fade_len: Optional[int] = None
-) -> colors.ListedColormap:
+def turbo_black(num_colors: int = 256, fade_len: Optional[int] = None) -> colors.ListedColormap:
     """Create a modified version of the 'turbo' colormap that fades to black.
 
     This function creates a colormap based on the 'turbo' colormap but with

@@ -6,7 +6,7 @@ from matplotlib.figure import Figure
 from quantem.core.visualization.custom_normalizations import NormalizationConfig
 from quantem.core.visualization.visualization import (
     _normalize_show_input_to_grid,
-    _show_2d,
+    _show_2d_array,
     _show_2d_combined,
     show_2d,
 )
@@ -20,9 +20,7 @@ def sample_array():
 
 @pytest.fixture
 def sample_complex_array():
-    return np.array(
-        [[1 + 1j, 2 + 2j, 3 + 3j], [4 + 4j, 5 + 5j, 6 + 6j], [7 + 7j, 8 + 8j, 9 + 9j]]
-    )
+    return np.array([[1 + 1j, 2 + 2j, 3 + 3j], [4 + 4j, 5 + 5j, 6 + 6j], [7 + 7j, 8 + 8j, 9 + 9j]])
 
 
 @pytest.fixture
@@ -43,46 +41,46 @@ def mock_fig_ax():
 
 class TestShow2DFunction:
     def test_show_2d_basic(self, sample_array, mock_fig_ax):
-        fig, ax = _show_2d(sample_array, figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_array, figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
 
     def test_show_2d_with_complex(self, sample_complex_array, mock_fig_ax):
-        fig, ax = _show_2d(sample_complex_array, figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_complex_array, figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
 
     def test_show_2d_with_norm(self, sample_array, mock_fig_ax):
         norm = NormalizationConfig(interval_type="manual", vmin=1, vmax=9)
-        fig, ax = _show_2d(sample_array, norm=norm, figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_array, norm=norm, figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
 
     def test_show_2d_with_scalebar(self, sample_array, mock_fig_ax):
         scalebar = ScalebarConfig(sampling=1.0, units="nm")
-        fig, ax = _show_2d(sample_array, scalebar=scalebar, figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_array, scalebar=scalebar, figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
         assert len(ax.artists) > 0  # scalebar should be added
 
     def test_show_2d_with_cbar(self, sample_array, mock_fig_ax):
-        fig, ax = _show_2d(sample_array, cbar=True, figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_array, cbar=True, figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
         assert len(fig.axes) > 1  # colorbar should be added
 
     def test_show_2d_with_custom_cmap(self, sample_array, mock_fig_ax):
-        fig, ax = _show_2d(sample_array, cmap="viridis", figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_array, cmap="viridis", figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
 
     def test_show_2d_with_chroma_boost(self, sample_complex_array, mock_fig_ax):
-        fig, ax = _show_2d(sample_complex_array, chroma_boost=2.0, figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_complex_array, chroma_boost=2.0, figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
 
     def test_show_2d_with_title(self, sample_array, mock_fig_ax):
-        fig, ax = _show_2d(sample_array, title="Test Title", figax=mock_fig_ax)
+        fig, ax = _show_2d_array(sample_array, title="Test Title", figax=mock_fig_ax)
         assert isinstance(fig, Figure)
         assert len(ax.images) == 1
         assert ax.get_title() == "Test Title"

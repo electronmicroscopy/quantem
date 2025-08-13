@@ -48,16 +48,12 @@ def validate_list_of_dataset2d(
     if isinstance(images, Dataset3d):
         image_list = images.to_dataset2d()
     elif isinstance(images, np.ndarray) and images.ndim == 3:
-        image_list = [
-            Dataset2d.from_array(ensure_valid_array(im, ndim=2)) for im in images
-        ]
+        image_list = [Dataset2d.from_array(ensure_valid_array(im, ndim=2)) for im in images]
     elif isinstance(images, list):
         if all(isinstance(im, Dataset2d) for im in images):
             image_list = images
         elif all(isinstance(im, np.ndarray) and im.ndim == 2 for im in images):
-            image_list = [
-                Dataset2d.from_array(ensure_valid_array(im, ndim=2)) for im in images
-            ]
+            image_list = [Dataset2d.from_array(ensure_valid_array(im, ndim=2)) for im in images]
         else:
             raise TypeError(
                 "If passing a list, all elements must be either 2D numpy arrays or Dataset2d instances."
@@ -70,9 +66,7 @@ def validate_list_of_dataset2d(
     return image_list
 
 
-def validate_pad_value(
-    pad_value: Union[float, str, List[float]], images: List[Dataset2d]
-):
+def validate_pad_value(pad_value: Union[float, str, List[float]], images: List[Dataset2d]):
     """ """
 
     if isinstance(pad_value, str):
@@ -90,9 +84,7 @@ def validate_pad_value(
         if float(pad_value) > 1.0:
             raise ValueError(f"pad_value of {pad_value} is > 1.0")
         pad_value = [np.quantile(im.array, pad_value) for im in images]
-    elif isinstance(pad_value, list) and all(
-        isinstance(v, (int, float)) for v in pad_value
-    ):
+    elif isinstance(pad_value, list) and all(isinstance(v, (int, float)) for v in pad_value):
         if len(pad_value) != len(images):
             raise ValueError("pad_value list length must match number of images.")
         pad_value = pad_value

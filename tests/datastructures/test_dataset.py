@@ -281,6 +281,4 @@ class TestDatasetRepresentation:
         str_str = str(sample_dataset_2d)
         assert "quantem Dataset" in str_str
         assert "shape: (10, 10)" in str_str
-        assert (
-            "name: 'test_2d_dataset'" in str_str or "named 'test_2d_dataset'" in str_str
-        )
+        assert "name: 'test_2d_dataset'" in str_str or "named 'test_2d_dataset'" in str_str

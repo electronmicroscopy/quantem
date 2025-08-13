@@ -181,3 +181,5 @@ cython_debug/
 
 # zip files
 *.zip
+*.h5
+*.npy

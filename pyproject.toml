@@ -10,11 +10,18 @@ testpaths = "tests"
 
 [tool.ruff.lint]
 select = ["E4","E7","E9","F","I"]
+
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["I001"]
 
 [tool.ruff.format]
 exclude = ["*.ipynb"]
+
+[tool.ruff]
+line-length = 99
+
+[tool.uv]
+config-settings = { editable_mode = "compat" }
 
 [project]
 name = "quantem"
@@ -36,6 +43,7 @@ dependencies = [
   "rosettasciio>=0.8.0",
   "h5py>=3.13.0",
   "torch>=2.7.0",
+  "cupy-cuda12x>=13.4.1",
 ]
 
 [tool.hatch.build.targets.sdist]

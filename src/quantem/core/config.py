@@ -30,6 +30,11 @@ try:
     _defaults["has_cupy"] = True
 except ModuleNotFoundError:
     _defaults["has_cupy"] = False
+except Exception as e:
+    if "cuda" in str(e):
+        NUM_DEVICES = 0
+    _defaults["has_cupy"] = False
+
 
 defaults: list[Mapping] = [_defaults]
 no_default = "__no_default__"
@@ -66,6 +71,8 @@ class set:
         self._record = []
 
         if arg is not None:
+            if not isinstance(arg, (Mapping)):
+                raise TypeError(f"arg must be a dictionary, got {type(arg).__name__}")
             for key, value in arg.items():
                 key, value = check_key_val(key, value)
                 self._assign(key.split("."), value, config)
@@ -110,9 +117,7 @@ class set:
             self._assign(keys[1:], value, d[key], path)
 
 
-def refresh(
-    config: dict = config, defaults: list[Mapping] = defaults, **kwargs
-) -> None:
+def refresh(config: dict = config, defaults: list[Mapping] = defaults, **kwargs) -> None:
     """
     Update configuration by re-reading yaml files and env variables
 
@@ -174,9 +179,7 @@ def get(
     return result
 
 
-def update_defaults(
-    new: dict, config: dict = config, defaults: list[Mapping] = defaults
-) -> None:
+def update_defaults(new: dict, config: dict = config, defaults: list[Mapping] = defaults) -> None:
     """Add a new set of defaults to the configuration
 
     It does two things:
@@ -424,9 +427,7 @@ def _load_config_file(path: str) -> dict | None:
     return config
 
 
-def check_key_val(
-    key: str, val: Any, deprecations: dict = deprecations
-) -> tuple[str, Any]:
+def check_key_val(key: str, val: Any, deprecations: dict = deprecations) -> tuple[str, Any]:
     """Check if the provided value has been renamed or removed
 
     Parameters
@@ -478,18 +479,7 @@ def check_key_val(
         if "cpu" in str(new_val):
             new_val = "cpu"
         else:
-            if isinstance(new_val, int):
-                gpu_id = new_val
-                new_val = f"cuda:{gpu_id}"
-            elif "cuda" in str(new_val).lower():
-                gpu_id = device_id_to_int(new_val)
-            else:
-                raise ValueError(f"Invalid device: {new_val}")
-            if gpu_id > NUM_DEVICES - 1:
-                raise ValueError(
-                    f"Trying to set device {new_val} but found {NUM_DEVICES} GPUs | "
-                    + f"has_cupy: {config['has_cupy']} | has_torch: {config['has_torch']}"
-                )
+            new_val, gpu_id = validate_device(new_val)
             if config["has_torch"]:
                 torch.cuda.set_device(f"cuda:{gpu_id}")
             if config["has_cupy"]:
@@ -497,15 +487,23 @@ def check_key_val(
     return key, new_val
 
 
-def device_id_to_int(dev: str | int) -> int:
-    """
-    utility for getting the device id integer from a string as used in torch and cupy
-    can/will be expanded to support torch.device and cupy.Device objects
-    """
+# TODO clean this up
+def validate_device(dev: "str | int | torch.device") -> tuple[str, int]:
+    """validate the input device given as a string or int, and return the torch formatted
+    string of the device id and the device id int. Checks to make sure cupy and or torch are available if a gpu
+    device is chosen, but does not actually set the device."""
     if isinstance(dev, str):
-        if dev.startswith("cuda:"):  # for torch
+        if dev.lower() == "cpu":
+            return "cpu", -1
+        elif dev.lower() in ["cuda", "gpu"]:
+            current_device = get_device()
+            if current_device.startswith("cuda:"):
+                id = int(current_device[5:])  # use currently set device
+            else:
+                id = 0  # default device is 0 if currently on cpu
+        elif dev.startswith("cuda:"):
             id = int(dev[5:])
-        elif dev.startswith("<CUDA"):  # for cupy
+        elif dev.startswith("<CUDA"):
             id = int(dev.split(" ")[-1][:-1])
         elif dev.isnumeric():
             id = int(dev)
@@ -513,9 +511,23 @@ def device_id_to_int(dev: str | int) -> int:
             raise NotImplementedError(f"new case for string device id: {dev}")
     elif isinstance(dev, int):
         id = dev
+    elif config["has_torch"]:
+        if isinstance(dev, torch.device):
+            id = dev.index
+            dev = dev.type
+            if dev == "cpu":
+                return "cpu", -1
+        else:
+            raise NotImplementedError(f"new case for device id: {dev} of type {type(dev)}")
     else:
         raise NotImplementedError(f"new case for device id: {dev} of type {type(dev)}")
-    return id
+
+    if id > NUM_DEVICES - 1:
+        raise ValueError(
+            f"Trying to set device {dev} but found {NUM_DEVICES} GPUs | "
+            + f"has_cupy: {config['has_cupy']} | has_torch: {config['has_torch']}"
+        )
+    return f"cuda:{id}", id
 
 
 def write(path: Path | str = PATH / "config.yaml") -> None:
@@ -532,6 +544,20 @@ def write(path: Path | str = PATH / "config.yaml") -> None:
     print("writing config to: ", path)
     with open(path, "w") as f:
         yaml.dump(config, f)
+
+
+def set_device(dev: str | int) -> None:
+    set({"device": dev})
+
+
+def get_device() -> str:
+    """Get the current device"""
+    return get("device")
+
+
+def device() -> str:
+    """Get the current device"""
+    return get("device")
 
 
 refresh()

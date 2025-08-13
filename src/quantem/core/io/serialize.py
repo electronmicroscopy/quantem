@@ -83,9 +83,7 @@ class AutoSerialize:
                 else:
                     os.remove(path)
             else:
-                raise FileExistsError(
-                    f"File '{path}' already exists. Use mode='o' to overwrite."
-                )
+                raise FileExistsError(f"File '{path}' already exists. Use mode='o' to overwrite.")
 
         # Normalize skip argument (split to names and types)
         if isinstance(skip, (str, type)):
@@ -219,9 +217,7 @@ class AutoSerialize:
             elif isinstance(attr_value, AutoSerialize):
                 # Nested AutoSerialize subtree
                 subgroup = group.require_group(attr_name)
-                self._recursive_save(
-                    attr_value, subgroup, skip_names, skip_types, compressors
-                )
+                self._recursive_save(attr_value, subgroup, skip_names, skip_types, compressors)
 
             elif isinstance(attr_value, (list, tuple, dict)):
                 # Save containers recursively (with nested AutoSerialize support)
@@ -382,9 +378,7 @@ class AutoSerialize:
         """
 
         # Special handling for torch.nn containers: flatten to list and record type
-        if isinstance(
-            value, (torch.nn.ModuleList, torch.nn.Sequential, torch.nn.ParameterList)
-        ):
+        if isinstance(value, (torch.nn.ModuleList, torch.nn.Sequential, torch.nn.ParameterList)):
             group.attrs["_torch_iterable_module_type"] = type(value).__name__
             value = list(value)
 
@@ -397,16 +391,12 @@ class AutoSerialize:
                 # --- If entry is an AutoSerialize object, use full recursive_save (preserves type!) ---
                 if isinstance(v, AutoSerialize):
                     subgroup = group.require_group(key)
-                    self._recursive_save(
-                        v, subgroup, skip_names, skip_types, compressors
-                    )
+                    self._recursive_save(v, subgroup, skip_names, skip_types, compressors)
 
                 # --- Recursively handle nested containers ---
                 elif isinstance(v, (list, tuple, dict)):
                     subgroup = group.require_group(key)
-                    self._serialize_container(
-                        v, subgroup, skip_names, skip_types, compressors
-                    )
+                    self._serialize_container(v, subgroup, skip_names, skip_types, compressors)
 
                 # --- Torch nn.Module: save as a whole-module byte array with a marker ---
                 elif isinstance(v, torch.nn.Module):
@@ -422,9 +412,7 @@ class AutoSerialize:
 
                 # --- Torch tensor: save as ndarray, with .torch_save flag ---
                 elif isinstance(v, torch.Tensor):
-                    arr_np = (
-                        v.detach().cpu().numpy() if v.requires_grad else v.cpu().numpy()
-                    )
+                    arr_np = v.detach().cpu().numpy() if v.requires_grad else v.cpu().numpy()
                     ds = group.create_dataset(
                         name=key,
                         data=arr_np,
@@ -469,16 +457,12 @@ class AutoSerialize:
                 # --- AutoSerialize instance as value ---
                 if isinstance(v, AutoSerialize):
                     subgroup = group.require_group(key)
-                    self._recursive_save(
-                        v, subgroup, skip_names, skip_types, compressors
-                    )
+                    self._recursive_save(v, subgroup, skip_names, skip_types, compressors)
 
                 # --- Nested container (list/tuple/dict) as value ---
                 elif isinstance(v, (list, tuple, dict)):
                     subgroup = group.require_group(key)
-                    self._serialize_container(
-                        v, subgroup, skip_names, skip_types, compressors
-                    )
+                    self._serialize_container(v, subgroup, skip_names, skip_types, compressors)
 
                 # --- Torch nn.Module as value ---
                 elif isinstance(v, torch.nn.Module):
@@ -494,9 +478,7 @@ class AutoSerialize:
 
                 # --- Torch tensor as value ---
                 elif isinstance(v, torch.Tensor):
-                    arr_np = (
-                        v.detach().cpu().numpy() if v.requires_grad else v.cpu().numpy()
-                    )
+                    arr_np = v.detach().cpu().numpy() if v.requires_grad else v.cpu().numpy()
                     ds = group.create_dataset(
                         name=key,
                         data=arr_np,
@@ -550,9 +532,7 @@ class AutoSerialize:
         # Helper to handle optional torch tensor restoration
         def maybe_tensor(group, key):
             arr = group[key][:]
-            return (
-                torch.from_numpy(arr) if group.attrs.get(f"{key}.torch_save") else arr
-            )
+            return torch.from_numpy(arr) if group.attrs.get(f"{key}.torch_save") else arr
 
         if ctype in ("list", "tuple"):
             # Determine maximum index to reconstruct order and size
@@ -584,9 +564,7 @@ class AutoSerialize:
                     # Restore nested AutoSerialize objects
                     elif "_autoserialize" in subgroup.attrs:
                         meta = subgroup.attrs["_autoserialize"]
-                        submod = __import__(
-                            meta["class_module"], fromlist=[meta["class_name"]]
-                        )
+                        submod = __import__(meta["class_module"], fromlist=[meta["class_name"]])
                         subcls = getattr(submod, meta["class_name"])
                         items.append(subcls._recursive_load(subgroup))
                     # Restore nested torch modules
@@ -596,9 +574,7 @@ class AutoSerialize:
                         mod = torch.load(buf, map_location="cpu", weights_only=False)
                         items.append(mod)
                     else:
-                        raise ValueError(
-                            f"Unknown group structure at key '{key}' in {group.path}"
-                        )
+                        raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
                 else:
                     raise KeyError(f"Missing expected key '{key}' in container")
             # Restore container type and special torch containers
@@ -629,9 +605,7 @@ class AutoSerialize:
                     result[key] = cls._deserialize_container(subgroup)
                 elif "_autoserialize" in subgroup.attrs:
                     meta = subgroup.attrs["_autoserialize"]
-                    submod = __import__(
-                        meta["class_module"], fromlist=[meta["class_name"]]
-                    )
+                    submod = __import__(meta["class_module"], fromlist=[meta["class_name"]])
                     subcls = getattr(submod, meta["class_name"])
                     result[key] = subcls._recursive_load(subgroup)
                 elif subgroup.attrs.get("_torch_whole_module"):
@@ -640,9 +614,7 @@ class AutoSerialize:
                     mod = torch.load(buf, map_location="cpu", weights_only=False)
                     result[key] = mod
                 else:
-                    raise ValueError(
-                        f"Unknown group structure at key '{key}' in {group.path}"
-                    )
+                    raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
             return result
 
         else:
@@ -713,21 +685,11 @@ class AutoSerialize:
                         )
                         print(prefix + branch + s)
                     elif isinstance(subval, torch.Tensor):
-                        print(
-                            prefix
-                            + branch
-                            + f"{key}: torch.Tensor shape={tuple(subval.shape)}"
-                        )
+                        print(prefix + branch + f"{key}: torch.Tensor shape={tuple(subval.shape)}")
                     elif isinstance(subval, np.ndarray):
-                        print(
-                            prefix
-                            + branch
-                            + f"{key}: ndarray shape={tuple(subval.shape)}"
-                        )
+                        print(prefix + branch + f"{key}: ndarray shape={tuple(subval.shape)}")
                     elif isinstance(subval, (list, tuple)) and show_autoserialize_types:
-                        print(
-                            prefix + branch + f"{key}: {type(subval).__name__}{suffix}"
-                        )
+                        print(prefix + branch + f"{key}: {type(subval).__name__}{suffix}")
                     else:
                         val_str = (
                             f" = {repr(subval)}"
@@ -735,9 +697,7 @@ class AutoSerialize:
                             and isinstance(subval, (int, float, str, bool, type(None)))
                             else ""
                         )
-                        print(
-                            prefix + branch + f"{key}: {type(subval).__name__}{val_str}"
-                        )
+                        print(prefix + branch + f"{key}: {type(subval).__name__}{val_str}")
                     # Recursively print children if within depth
                     if depth is None or current_depth < depth - 1:
                         _recurse(
@@ -752,17 +712,9 @@ class AutoSerialize:
                 for idx, item in enumerate(val):
                     branch, new_indent = make_branch(idx, len(val))
                     if isinstance(item, torch.Tensor):
-                        print(
-                            prefix
-                            + branch
-                            + f"[{idx}]: torch.Tensor shape={tuple(item.shape)}"
-                        )
+                        print(prefix + branch + f"[{idx}]: torch.Tensor shape={tuple(item.shape)}")
                     elif isinstance(item, np.ndarray):
-                        print(
-                            prefix
-                            + branch
-                            + f"[{idx}]: ndarray shape={tuple(item.shape)}"
-                        )
+                        print(prefix + branch + f"[{idx}]: ndarray shape={tuple(item.shape)}")
                     else:
                         val_str = (
                             f" = {repr(item)}"
@@ -770,9 +722,7 @@ class AutoSerialize:
                             and isinstance(item, (int, float, str, bool, type(None)))
                             else ""
                         )
-                        print(
-                            prefix + branch + f"[{idx}]: {type(item).__name__}{val_str}"
-                        )
+                        print(prefix + branch + f"[{idx}]: {type(item).__name__}{val_str}")
                     # Recurse for nested containers/objects
                     if depth is None or current_depth < depth - 1:
                         _recurse(
@@ -795,11 +745,7 @@ class AutoSerialize:
                             + f"{repr(key)}: torch.Tensor shape={tuple(item.shape)}"
                         )
                     elif isinstance(item, np.ndarray):
-                        print(
-                            prefix
-                            + branch
-                            + f"{repr(key)}: ndarray shape={tuple(item.shape)}"
-                        )
+                        print(prefix + branch + f"{repr(key)}: ndarray shape={tuple(item.shape)}")
                     else:
                         val_str = (
                             f" = {repr(item)}"
@@ -807,11 +753,7 @@ class AutoSerialize:
                             and isinstance(item, (int, float, str, bool, type(None)))
                             else ""
                         )
-                        print(
-                            prefix
-                            + branch
-                            + f"{repr(key)}: {type(item).__name__}{val_str}"
-                        )
+                        print(prefix + branch + f"{repr(key)}: {type(item).__name__}{val_str}")
                     # Recurse for nested dict/containers/objects
                     if depth is None or current_depth < depth - 1:
                         _recurse(
@@ -884,9 +826,7 @@ def load(
 
     # Merge user-specified and file-stored skip lists/types (avoid duplicates)
     skip_names = user_skip_names | file_skip_names
-    skip_types = user_skip_types + tuple(
-        t for t in file_skip_types if t not in user_skip_types
-    )
+    skip_types = user_skip_types + tuple(t for t in file_skip_types if t not in user_skip_types)
 
     # Dynamically import target class, then reconstruct from Zarr
     mod = __import__(meta["class_module"], fromlist=[meta["class_name"]])
@@ -927,14 +867,10 @@ def print_file(
         store = LocalStore(tempdir.name)
     root = zarr.group(store=store)
 
-    def _recurse(
-        obj: Any, prefix: str = "", current_depth: int = 0, is_last: bool = True
-    ) -> None:
+    def _recurse(obj: Any, prefix: str = "", current_depth: int = 0, is_last: bool = True) -> None:
         if isinstance(obj, zarr.Group):
             # Collect all keys: attrs, arrays, and subgroups, for sorting/printing
-            keys = sorted(
-                set(obj.attrs.keys()) | set(obj.array_keys()) | set(obj.group_keys())
-            )
+            keys = sorted(set(obj.attrs.keys()) | set(obj.array_keys()) | set(obj.group_keys()))
 
             # Print the root label (with class info) at the top level
             if current_depth == 0:
@@ -994,8 +930,7 @@ def print_file(
                     type_str = type(val).__name__
                     display_val = (
                         f" = {repr(val)}"
-                        if show_values
-                        and isinstance(val, (int, float, str, bool, type(None)))
+                        if show_values and isinstance(val, (int, float, str, bool, type(None)))
                         else ""
                     )
                     print(prefix + branch + f"{key}: {type_str}{display_val}")

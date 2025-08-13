@@ -1,18 +1,20 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 
 from quantem.core import config
+from quantem.diffractive_imaging.ptycho_utils import shift_array
 
-if config.get("has_cupy"):
+if TYPE_CHECKING:
     import cupy as cp
 else:
-    import numpy as cp
+    if config.get("has_cupy"):
+        import cupy as cp
 
 
-polar_symbols = (
+POLAR_SYMBOLS = (
     "C10",
     "C12",
     "phi12",
@@ -41,7 +43,7 @@ polar_symbols = (
 )
 
 #: Aliases for the most commonly used optical aberrations.
-polar_aliases = {
+POLAR_ALIASES = {
     "defocus": "C10",
     "astigmatism": "C12",
     "astigmatism_angle": "phi12",
@@ -135,7 +137,7 @@ class ComplexProbe:
             raise ValueError(f"device must be either 'cpu' or 'gpu', not {device}")
 
         for key in kwargs.keys():
-            if (key not in polar_symbols) and (key not in polar_aliases.keys()):
+            if (key not in POLAR_SYMBOLS) and (key not in POLAR_ALIASES.keys()):
                 raise ValueError("{} not a recognized parameter".format(key))
 
         self._vacuum_probe_intensity = vacuum_probe_intensity
@@ -152,9 +154,7 @@ class ComplexProbe:
         self._sampling = sampling
         self._device = device
 
-        self._parameters: dict[str, float] = dict(
-            zip(polar_symbols, [0.0] * len(polar_symbols))
-        )
+        self._parameters: dict[str, float] = dict(zip(POLAR_SYMBOLS, [0.0] * len(POLAR_SYMBOLS)))
 
         if parameters is None:
             parameters = {}
@@ -176,10 +176,10 @@ class ComplexProbe:
                 self._parameters[symbol] = value
 
             elif symbol == "defocus":
-                self._parameters[polar_aliases[symbol]] = -value
+                self._parameters[POLAR_ALIASES[symbol]] = -value
 
-            elif symbol in polar_aliases.keys():
-                self._parameters[polar_aliases[symbol]] = value
+            elif symbol in POLAR_ALIASES.keys():
+                self._parameters[POLAR_ALIASES[symbol]] = value
 
             else:
                 raise ValueError("{} not a recognized parameter".format(symbol))
@@ -194,17 +194,14 @@ class ComplexProbe:
 
         if self._vacuum_probe_intensity is not None:
             if self._force_spatial_frequencies is not None:
-                vacuum_probe_intensity = get_shifted_ar(
+                vacuum_probe_intensity = shift_array(
                     xp.asarray(self._vacuum_probe_intensity, dtype=xp.float32),
                     self._origin[0],
                     self._origin[1],
                     bilinear=False,
-                    device=self._device,
                 )
             else:
-                vacuum_probe_intensity = xp.asarray(
-                    self._vacuum_probe_intensity, dtype=xp.float32
-                )
+                vacuum_probe_intensity = xp.asarray(self._vacuum_probe_intensity, dtype=xp.float32)
             vacuum_probe_amplitude = xp.sqrt(xp.maximum(vacuum_probe_intensity, 0))
             return vacuum_probe_amplitude
 
@@ -213,9 +210,7 @@ class ComplexProbe:
 
         if self._rolloff > 0.0:
             rolloff = self._rolloff / 1000.0  # * semiangle_cutoff
-            array = 0.5 * (
-                1 + xp.cos(np.pi * (alpha - semiangle_cutoff + rolloff) / rolloff)
-            )
+            array = 0.5 * (1 + xp.cos(np.pi * (alpha - semiangle_cutoff + rolloff) / rolloff))
             array[alpha > semiangle_cutoff] = 0.0
             array = xp.where(
                 alpha > semiangle_cutoff - rolloff,
@@ -226,17 +221,13 @@ class ComplexProbe:
             array = xp.array(alpha < semiangle_cutoff).astype(xp.float32)
         return array
 
-    def evaluate_temporal_envelope(
-        self, alpha: float | np.ndarray
-    ) -> float | np.ndarray:
+    def evaluate_temporal_envelope(self, alpha: float | np.ndarray) -> float | np.ndarray:
         xp = self._xp
         return xp.exp(
             -((0.5 * xp.pi / self._wavelength * self._focal_spread * alpha**2) ** 2)
         ).astype(xp.float32)
 
-    def evaluate_gaussian_envelope(
-        self, alpha: float | np.ndarray
-    ) -> float | np.ndarray:
+    def evaluate_gaussian_envelope(self, alpha: float | np.ndarray) -> float | np.ndarray:
         xp = self._xp
         return xp.exp(-0.5 * self._gaussian_spread**2 * alpha**2 / self._wavelength**2)
 
@@ -334,9 +325,7 @@ class ComplexProbe:
 
         array = xp.zeros(alpha.shape, dtype=np.float32)
         if any([p[symbol] != 0.0 for symbol in ("C10", "C12", "phi12")]):
-            array += (
-                1 / 2 * alpha2 * (p["C10"] + p["C12"] * xp.cos(2 * (phi - p["phi12"])))
-            )
+            array += 1 / 2 * alpha2 * (p["C10"] + p["C12"] * xp.cos(2 * (phi - p["phi12"])))
 
         if any([p[symbol] != 0.0 for symbol in ("C21", "phi21", "C23", "phi23")]):
             array += (
@@ -344,15 +333,10 @@ class ComplexProbe:
                 / 3
                 * alpha2
                 * alpha
-                * (
-                    p["C21"] * xp.cos(phi - p["phi21"])
-                    + p["C23"] * xp.cos(3 * (phi - p["phi23"]))
-                )
+                * (p["C21"] * xp.cos(phi - p["phi21"]) + p["C23"] * xp.cos(3 * (phi - p["phi23"])))
             )
 
-        if any(
-            [p[symbol] != 0.0 for symbol in ("C30", "C32", "phi32", "C34", "phi34")]
-        ):
+        if any([p[symbol] != 0.0 for symbol in ("C30", "C32", "phi32", "C34", "phi34")]):
             array += (
                 1
                 / 4
@@ -364,12 +348,7 @@ class ComplexProbe:
                 )
             )
 
-        if any(
-            [
-                p[symbol] != 0.0
-                for symbol in ("C41", "phi41", "C43", "phi43", "C45", "phi41")
-            ]
-        ):
+        if any([p[symbol] != 0.0 for symbol in ("C41", "phi41", "C43", "phi43", "C45", "phi41")]):
             array += (
                 1
                 / 5
@@ -409,9 +388,7 @@ class ComplexProbe:
         xp = self._xp
         return xp.exp(-1.0j * self.evaluate_chi(alpha, phi))
 
-    def evaluate(
-        self, alpha: float | np.ndarray, phi: float | np.ndarray
-    ) -> float | np.ndarray:
+    def evaluate(self, alpha: float | np.ndarray, phi: float | np.ndarray) -> float | np.ndarray:
         array = self.evaluate_aberrations(alpha, phi)
 
         if self._semiangle_cutoff < np.inf or self._vacuum_probe_intensity is not None:
@@ -436,9 +413,7 @@ class ComplexProbe:
 
     def get_scattering_angles(self):
         kx, ky = self.get_spatial_frequencies()
-        alpha, phi = self.polar_coordinates(
-            kx * self._wavelength, ky * self._wavelength
-        )
+        alpha, phi = self.polar_coordinates(kx * self._wavelength, ky * self._wavelength)
         return alpha, phi
 
     def get_spatial_frequencies(self):
@@ -508,88 +483,4 @@ def spatial_frequencies(gpts: tuple[int, int], sampling: tuple[float, float], xp
     tuple of arrays
     """
 
-    return tuple(
-        xp.fft.fftfreq(n, d).astype(xp.float32) for n, d in zip(gpts, sampling)
-    )
-
-
-def get_shifted_ar(ar, xshift, yshift, periodic=True, bilinear=False, device="cpu"):
-    """
-        Shifts array ar by the shift vector (xshift,yshift), using the either
-    the Fourier shift theorem (i.e. with sinc interpolation), or bilinear
-    resampling. Boundary conditions can be periodic or not.
-
-    Args:
-            ar (float): input array
-            xshift (float): shift along axis 0 (x) in pixels
-            yshift (float): shift along axis 1 (y) in pixels
-            periodic (bool): flag for periodic boundary conditions
-            bilinear (bool): flag for bilinear image shifts
-            device(str): calculation device will be perfomed on. Must be 'cpu' or 'gpu'
-        Returns:
-            (array) the shifted array
-    """
-    if device == "gpu":
-        xp = cp
-    else:
-        xp = np
-
-    ar = xp.asarray(ar)
-
-    # Apply image shift
-    if bilinear is False:
-        nx, ny = xp.shape(ar)
-        qx, qy = make_Fourier_coords2D(nx, ny, 1)
-        qx = xp.asarray(qx)
-        qy = xp.asarray(qy)
-
-        w = xp.exp(-(2j * xp.pi) * ((yshift * qy) + (xshift * qx)))
-        shifted_ar = xp.real(xp.fft.ifft2((xp.fft.fft2(ar)) * w))
-
-    else:
-        xF = xp.floor(xshift).astype(int).item()
-        yF = xp.floor(yshift).astype(int).item()
-        wx = xshift - xF
-        wy = yshift - yF
-
-        shifted_ar = (
-            xp.roll(ar, (xF, yF), axis=(0, 1)) * ((1 - wx) * (1 - wy))
-            + xp.roll(ar, (xF + 1, yF), axis=(0, 1)) * ((wx) * (1 - wy))
-            + xp.roll(ar, (xF, yF + 1), axis=(0, 1)) * ((1 - wx) * (wy))
-            + xp.roll(ar, (xF + 1, yF + 1), axis=(0, 1)) * ((wx) * (wy))
-        )
-
-    if periodic is False:
-        # Rounded coordinates for boundaries
-        xR = (xp.round(xshift)).astype(int)
-        yR = (xp.round(yshift)).astype(int)
-
-        if xR > 0:
-            shifted_ar[0:xR, :] = 0
-        elif xR < 0:
-            shifted_ar[xR:, :] = 0
-        if yR > 0:
-            shifted_ar[:, 0:yR] = 0
-        elif yR < 0:
-            shifted_ar[:, yR:] = 0
-
-    return shifted_ar
-
-
-def make_Fourier_coords2D(Nx: int, Ny: int, pixelSize: float | tuple[float, float] = 1):
-    """
-    Generates Fourier coordinates for a (Nx,Ny)-shaped 2D array.
-        Specifying the pixelSize argument sets a unit size.
-    """
-    if isinstance(pixelSize, (tuple, list)):
-        assert len(pixelSize) == 2, "pixelSize must either be a scalar or have length 2"
-        pixelSize_x = pixelSize[0]
-        pixelSize_y = pixelSize[1]
-    else:
-        pixelSize_x = pixelSize
-        pixelSize_y = pixelSize
-
-    qx = np.fft.fftfreq(Nx, pixelSize_x)
-    qy = np.fft.fftfreq(Ny, pixelSize_y)
-    qy, qx = np.meshgrid(qy, qx)
-    return qx, qy
+    return tuple(xp.fft.fftfreq(n, d).astype(xp.float32) for n, d in zip(gpts, sampling))

@@ -147,9 +147,7 @@ class CenteredInterval(BaseInterval):
         vmin = np.min(values)
         vmax = np.max(values)
 
-        half_range = np.maximum(
-            np.abs(vmin - self.vcenter), np.abs(vmax - self.vcenter)
-        )
+        half_range = np.maximum(np.abs(vmin - self.vcenter), np.abs(vmax - self.vcenter))
 
         return self.vcenter - half_range, self.vcenter + half_range
 
@@ -522,9 +520,7 @@ class CustomNormalization(colors.Normalize):
         None
         """
         self.vmin, self.vmax = self.interval.get_limits(data)
-        self.interval = ManualInterval(
-            self.vmin, self.vmax
-        )  # set explicitly with ManualInterval
+        self.interval = ManualInterval(self.vmin, self.vmax)  # set explicitly with ManualInterval
         return None
 
     def __call__(self, value: NDArray, clip: bool | None = None) -> NDArray:  # type: ignore[override]
@@ -613,20 +609,17 @@ class NormalizationConfig:
 NORMALIZATION_PRESETS = {
     "linear_auto": lambda: NormalizationConfig(),
     "linear_minmax": lambda: NormalizationConfig(interval_type="manual"),
+    "minmax": lambda: NormalizationConfig(interval_type="manual"),
     "linear_centered": lambda: NormalizationConfig(interval_type="centered"),
     "log_auto": lambda: NormalizationConfig(stretch_type="logarithmic"),
-    "log_minmax": lambda: NormalizationConfig(
-        stretch_type="logarithmic", interval_type="manual"
-    ),
+    "log_minmax": lambda: NormalizationConfig(stretch_type="logarithmic", interval_type="manual"),
     "power_squared": lambda: NormalizationConfig(stretch_type="power", power=2.0),
     "power_sqrt": lambda: NormalizationConfig(stretch_type="power", power=0.5),
-    "asinh_centered": lambda: NormalizationConfig(
-        stretch_type="asinh", interval_type="centered"
-    ),
+    "asinh_centered": lambda: NormalizationConfig(stretch_type="asinh", interval_type="centered"),
 }
 
 
-def _resolve_normalization(norm) -> NormalizationConfig:
+def _resolve_normalization(norm, **kwargs) -> NormalizationConfig:
     """Resolve various input types to a NormalizationConfig object.
 
     This function takes different input types and converts them to a
@@ -650,7 +643,21 @@ def _resolve_normalization(norm) -> NormalizationConfig:
         If norm is not one of the supported types.
     """
     if norm is None:
-        return NormalizationConfig()
+        if "vmin" in kwargs or "vmax" in kwargs:
+            return NormalizationConfig(
+                interval_type="manual",
+                stretch_type=kwargs.get("stretch_type", "linear"),
+                vmin=kwargs.get("vmin"),
+                vmax=kwargs.get("vmax"),
+            )
+        elif "lower_quantile" in kwargs or "upper_quantile" in kwargs:
+            return NormalizationConfig(
+                interval_type="quantile",
+                lower_quantile=kwargs.get("lower_quantile", 0.02),
+                upper_quantile=kwargs.get("upper_quantile", 0.98),
+            )
+        else:
+            return NormalizationConfig()
     elif isinstance(norm, dict):
         return NormalizationConfig(**norm)
     elif isinstance(norm, str):
