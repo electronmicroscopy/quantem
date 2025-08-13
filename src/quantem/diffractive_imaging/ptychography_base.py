@@ -904,13 +904,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 targets = self.dset.centered_intensities[batch_indices]
             preds = pred_intensities
             norm = self.dset.mean_diffraction_intensity  # ??
-            # norm = self.dset.mean_diffraction_intensity**1.5  # otherwise sgd diverges??
 
         diff = preds - targets
         if loss_type == "l1":
-            error = arr.sum(arr.abs(diff))
+            error = arr.sum(arr.abs(diff), axis=(-2, -1)).mean()
         elif loss_type == "l2":
-            error = arr.sum(arr.abs(diff) ** 2)
+            error = arr.sum(arr.abs(diff) ** 2, axis=(-2, -1)).mean()
         else:
             raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
         loss = error / norm

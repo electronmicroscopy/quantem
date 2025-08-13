@@ -46,7 +46,7 @@ class SimpleBatcher:
             yield self.indices[i : i + self.batch_size]
 
     def __len__(self):
-        return len(self.indices) // self.batch_size
+        return int(np.ceil(len(self.indices) / self.batch_size))
 
 
 @overload
