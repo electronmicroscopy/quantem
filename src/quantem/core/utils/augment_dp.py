@@ -400,14 +400,14 @@ class DPAugmentor(RNGMixin):
 
         if self.add_flipshift:
             result = self._apply_flipshift(result)
-            if label is not None:
-                transformed_label = self._apply_flipshift(label)
+            if transformed_label is not None:
+                transformed_label = self._apply_flipshift(transformed_label)
         if self.add_bkg:
             result = self._apply_bkg(result, probe)
         if self.add_ellipticity or self.add_shift or self.add_scale:
             result = self._apply_elastic(result)
-            if label is not None:
-                transformed_label = self._apply_elastic_to_label(label)
+            if transformed_label is not None:
+                transformed_label = self._apply_elastic_to_label(transformed_label)
         if self.add_shot:
             result = self._apply_shot(result)
         if self.add_blur:
