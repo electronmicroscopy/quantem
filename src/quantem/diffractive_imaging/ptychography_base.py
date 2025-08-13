@@ -29,7 +29,7 @@ from quantem.diffractive_imaging.dataset_models import (
 from quantem.diffractive_imaging.detector_models import DetectorBase, DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType
-from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType
+from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
 from quantem.diffractive_imaging.ptycho_utils import (
     AffineTransform,
     center_crop_arr,
@@ -435,15 +435,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self._obj_model
 
     @obj_model.setter
-    def obj_model(self, model: ObjectModelType | type | None):
+    def obj_model(self, model: ObjectModelType | type):
         self.set_obj_model(model)  # redundant
 
-    def set_obj_model(self, model: ObjectModelType | type | None):
-        if model is None:
-            if not hasattr(self, "_obj_model"):
-                raise ValueError("obj_model must be a subclass of ObjectModelType")
-            return
-
+    def set_obj_model(self, model: ObjectModelType | type):
         # Type checking with autoreload bug workaround
         if not (isinstance(model, ObjectBase) or "object" in str(type(model))):
             raise TypeError(f"obj_model must be a ObjectModelType, got {type(model)}")
@@ -454,25 +449,33 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         rotshape = self.dset._obj_shape_full_2d(self.obj_padding_px)
         self._obj_model.shape_2d = rotshape
         self._obj_model.reset()
+        self._obj_model.to(self.device)
 
     @property
     def probe_model(self) -> ProbeModelType:
         return self._probe_model
 
-    def set_probe_model(self, probe_model: ProbeModelType | type | None):
-        if probe_model is None:
-            if not hasattr(self, "_probe_model"):
-                raise ValueError("probe_model must be a subclass of ProbeModelType")
-            return
+    @probe_model.setter
+    def probe_model(self, model: ProbeModelType | type):
+        self.set_probe_model(model)  # redundant
 
+    def set_probe_model(self, probe_model: ProbeModelType | type):
         # Type checking with autoreload bug workaround
         if not (isinstance(probe_model, ProbeBase) or "probe" in str(type(probe_model))):
             raise TypeError(f"probe_model must be a ProbeModelType, got {type(probe_model)}")
 
         self._probe_model = cast(ProbeModelType, probe_model)
-        self._probe_model.set_initial_probe(
-            self.roi_shape, self.reciprocal_sampling, self.dset.mean_diffraction_intensity
-        )
+        if isinstance(self._probe_model, ProbePixelated) or "pixelated" in str(
+            type(self._probe_model)
+        ):
+            self._probe_model = cast(ProbePixelated, self._probe_model)
+            if probe_model._initial_probe is None and probe_model.probe_params:
+                self._probe_model.set_initial_probe_from_params(
+                    self.roi_shape,
+                    self.reciprocal_sampling,
+                    self.dset.mean_diffraction_intensity,
+                    device=self.device,
+                )
         self._probe_model.to(self.device)
 
     @property
