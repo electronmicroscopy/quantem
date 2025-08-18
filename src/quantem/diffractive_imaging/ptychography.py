@@ -127,7 +127,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         store_iterations_every: int | None = None,
         device: Literal["cpu", "gpu"] | None = None,
         autograd: bool = True,
-        loss_type: Literal["l1", "l2"] = "l2",
+        loss_type: Literal[
+            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
+        ] = "l2_amplitude",
     ) -> Self:
         """
         reason for having a single reconstruct() is so that updating things like constraints
@@ -166,6 +168,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
         learn_descan = True if "dataset" in self.optimizer_params.keys() else False
+        self.dset._set_targets(loss_type, learn_descan)
         batcher = SimpleBatcher(self.dset.num_gpts, self.batch_size, rng=self.rng)
         pbar = tqdm(range(num_iter), disable=not self.verbose)
 
@@ -189,8 +192,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 batch_consistency_loss, targets = self.error_estimate(
                     pred_intensities,
                     batch_indices,
-                    amplitude_error=True,
-                    use_unshifted=learn_descan,
                     loss_type=loss_type,
                 )
 

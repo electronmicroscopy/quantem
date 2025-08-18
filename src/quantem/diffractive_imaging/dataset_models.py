@@ -80,10 +80,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._initial_descan_shifts = torch.zeros_like(self._descan_shifts)
 
         # Initialize other attributes # TODO allow for only the needed dset to be moved to gpu
-        # self.register_buffer("_intensities", torch.zeros(num_positions, *self.roi_shape))
-        # self.register_buffer("_centered_intensities", torch.zeros(num_positions, *self.roi_shape))
-        self.register_buffer("_amplitudes", torch.zeros(num_positions, *self.roi_shape))
-        self.register_buffer("_centered_amplitudes", torch.zeros(num_positions, *self.roi_shape))
+        self.register_buffer("_targets", torch.zeros(num_positions, *self.roi_shape))
         self.register_buffer(
             "_patch_indices", torch.zeros(num_positions, *self.roi_shape, dtype=torch.int64)
         )
@@ -242,6 +239,49 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._initial_scan_positions_px = positions
 
     @property
+    def targets(self) -> torch.Tensor:
+        if not self._preprocessed:
+            raise ValueError("dset must be preprocessed before targets can be accessed")
+        return self._targets
+
+    def _set_targets(
+        self,
+        loss_type: Literal[
+            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
+        ],
+        learn_descan: bool = False,
+    ):
+        if "amplitude" in loss_type:
+            if learn_descan:
+                self._targets = self.amplitudes.clone().to(self.device)
+            else:
+                self._targets = self.centered_amplitudes.clone().to(self.device)
+        elif "intensity" in loss_type or loss_type == "poisson":
+            if learn_descan:
+                self._targets = self.intensities.clone().to(self.device)
+            else:
+                self._targets = self.centered_intensities.clone().to(self.device)
+        else:
+            raise ValueError(f"Unknown loss type {loss_type}")
+
+    @property
+    def patch_indices(self) -> torch.Tensor:
+        return self._patch_indices
+
+    # endregion --- buffers ---
+
+    # region --- explicit properties (have setters) ---
+    @property
+    def dset(self) -> Dataset4dstem:
+        return self._dset
+
+    @dset.setter
+    def dset(self, new_dset: Dataset4dstem):
+        if not isinstance(new_dset, Dataset4dstem):
+            raise TypeError(f"dset should be a Dataset4dstem, got {type(new_dset)}")
+        self._dset = new_dset.copy()
+
+    @property
     def centered_amplitudes(self) -> torch.Tensor:
         """gives the amplitudes that have had descan corrected and which are centered in the fov
         shaped as (rr*rc, qx, qy)
@@ -314,29 +354,12 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._intensities = arr
 
     @property
-    def patch_indices(self) -> torch.Tensor:
-        return self._patch_indices
-
-    # endregion --- buffers ---
-
-    # region --- explicit properties (have setters) ---
-    @property
     def verbose(self) -> int:
         return self._verbose
 
     @verbose.setter
     def verbose(self, v: bool | int | float) -> None:
         self._verbose = validate_int(validate_gt(v, -1, "verbose"), "verbose")
-
-    @property
-    def dset(self) -> Dataset4dstem:
-        return self._dset
-
-    @dset.setter
-    def dset(self, new_dset: Dataset4dstem):
-        if not isinstance(new_dset, Dataset4dstem):
-            raise TypeError(f"dset should be a Dataset4dstem, got {type(new_dset)}")
-        self._dset = new_dset.copy()
 
     @property
     def mean_diffraction_intensity(self) -> float:
@@ -782,6 +805,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
         # self.obj_padding_px = obj_padding_px
         self._set_initial_scan_positions_px(obj_padding_px)
         self._set_patch_indices(obj_padding_px)
+
+        self._set_targets("l2_amplitude", learn_descan=False)
 
         self._preprocessed = True
         return

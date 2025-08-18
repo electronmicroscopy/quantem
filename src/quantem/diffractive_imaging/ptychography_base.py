@@ -884,33 +884,26 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self,
         pred_intensities: torch.Tensor,
         batch_indices: np.ndarray,
-        amplitude_error: bool = True,
-        use_unshifted: bool = True,
-        loss_type: Literal["l1", "l2"] = "l2",
+        loss_type: Literal[
+            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
+        ] = "l2_amplitude",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if amplitude_error:
-            if use_unshifted:
-                targets = self.dset.amplitudes[batch_indices]
-            else:
-                targets = self.dset.centered_amplitudes[batch_indices]
+        targets = self.dset.targets[batch_indices]
+        if "amplitude" in loss_type:
             preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
-            norm = self.dset.mean_diffraction_intensity
         else:
-            if use_unshifted:
-                targets = self.dset.intensities[batch_indices]
-            else:
-                targets = self.dset.centered_intensities[batch_indices]
             preds = pred_intensities
-            norm = self.dset.mean_diffraction_intensity  # ??
 
         diff = preds - targets
-        if loss_type == "l1":
+        if "l1" in loss_type:
             error = arr.sum(arr.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
-        elif loss_type == "l2":
+        elif "l2" in loss_type:
             error = arr.sum(arr.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
+        elif loss_type == "poisson":
+            error = arr.sum(preds - targets * torch.log(preds + 1e-6))
         else:
             raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
-        loss = error / norm
+        loss = error / self.dset.mean_diffraction_intensity
         return loss, targets
 
     def overlap_projection(self, obj_patches, input_probe):
