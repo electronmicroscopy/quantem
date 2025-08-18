@@ -29,7 +29,7 @@ from quantem.diffractive_imaging.dataset_models import (
 from quantem.diffractive_imaging.detector_models import DetectorBase, DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType
-from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
+from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType
 from quantem.diffractive_imaging.ptycho_utils import (
     AffineTransform,
     center_crop_arr,
@@ -465,17 +465,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise TypeError(f"probe_model must be a ProbeModelType, got {type(probe_model)}")
 
         self._probe_model = cast(ProbeModelType, probe_model)
-        if isinstance(self._probe_model, ProbePixelated) or "pixelated" in str(
-            type(self._probe_model)
-        ):
-            self._probe_model = cast(ProbePixelated, self._probe_model)
-            if probe_model._initial_probe is None and probe_model.probe_params:
-                self._probe_model.set_initial_probe_from_params(
-                    self.roi_shape,
-                    self.reciprocal_sampling,
-                    self.dset.mean_diffraction_intensity,
-                    device=self.device,
-                )
+        self._probe_model.set_initial_probe(
+            self.roi_shape,
+            self.reciprocal_sampling,
+            self.dset.mean_diffraction_intensity,
+            device=self.device,
+        )
         self._probe_model.to(self.device)
 
     @property
@@ -910,9 +905,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         diff = preds - targets
         if loss_type == "l1":
-            error = arr.sum(arr.abs(diff), axis=(-2, -1)).mean()
+            error = arr.sum(arr.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
         elif loss_type == "l2":
-            error = arr.sum(arr.abs(diff) ** 2, axis=(-2, -1)).mean()
+            error = arr.sum(arr.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
         else:
             raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
         loss = error / norm

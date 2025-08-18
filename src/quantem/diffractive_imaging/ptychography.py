@@ -255,7 +255,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         amplitudes: torch.Tensor,
     ):
         if autograd:
-            loss.backward()
+            # different normalization in AD vs analytic, so scale by upsample factor
+            scaled_loss = loss * self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
+            scaled_loss.backward()
         else:
             gradient = self.gradient_step(amplitudes, overlap)
             prop_gradient = self.obj_model.backward(

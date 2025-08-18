@@ -36,6 +36,9 @@ from quantem.diffractive_imaging.ptycho_utils import (
     shift_array,
 )
 
+# TODO
+# - prevent gpu overhead, make sure initial_probe and other stuff is on cpu
+
 
 class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
     DEFAULT_PROBE_PARAMS = {
@@ -174,7 +177,10 @@ class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
 
     @property
     def dtype(self) -> torch.dtype:
-        return config.get("dtype_complex")
+        dtype_str = config.get("dtype_complex")
+        if isinstance(dtype_str, str):
+            return getattr(torch, dtype_str)
+        return dtype_str
 
     @property
     def device(self) -> str:
@@ -249,9 +255,28 @@ class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
         """Reset the probe"""
         raise NotImplementedError()
 
-    # @abstractmethod
-    # def set_initial_probe(self, *args, **kwargs):
-    #     raise NotImplementedError()
+    def set_initial_probe(
+        self,
+        roi_shape: np.ndarray | tuple,
+        reciprocal_sampling: np.ndarray,
+        mean_diffraction_intensity: float,
+        device: str | None = None,
+    ):
+        if device is not None:
+            self._device = device
+
+        # Only update roi_shape if it wasn't already set during initialization
+        if not hasattr(self, "_roi_shape"):
+            self.roi_shape = np.array(roi_shape)
+        else:
+            # Verify that the provided roi_shape matches the initialized one
+            if not np.array_equal(self.roi_shape, np.array(roi_shape)):
+                raise ValueError(
+                    f"roi_shape {roi_shape} conflicts with initialized roi_shape {self.roi_shape}."
+                )
+
+        self.reciprocal_sampling = reciprocal_sampling
+        self.mean_diffraction_intensity = mean_diffraction_intensity
 
     def check_probe_params(self):
         for k in self.DEFAULT_PROBE_PARAMS.keys():
@@ -373,6 +398,7 @@ class ProbePixelated(ProbeConstraints):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         initial_probe_weights: list[float] | np.ndarray | None = None,
+        _from_params: bool = False,
         _token: object | None = None,
         *args,
     ):
@@ -386,6 +412,7 @@ class ProbePixelated(ProbeConstraints):
             _token=_token,
         )
         self.initial_probe_weights = initial_probe_weights
+        self._from_params = _from_params
 
     @classmethod
     def from_array(
@@ -400,7 +427,6 @@ class ProbePixelated(ProbeConstraints):
     ):
         if isinstance(probe_array, np.ndarray):
             probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
-        apply_phase_shifts = False
         if probe_array.ndim == 3:
             if num_probes is None:
                 num_probes = probe_array.shape[0]
@@ -411,7 +437,6 @@ class ProbePixelated(ProbeConstraints):
         else:
             num_probes = 1 if num_probes is None else num_probes
             probe_array = torch.tile(probe_array, (num_probes, 1, 1))
-            apply_phase_shifts = True
 
         probe_model = cls(
             num_probes=num_probes,
@@ -421,11 +446,10 @@ class ProbePixelated(ProbeConstraints):
             device=device,
             rng=rng,
             initial_probe_weights=initial_probe_weights,
+            _from_params=False,
             _token=cls._token,
         )
 
-        if apply_phase_shifts:
-            probe_array = probe_model._apply_random_phase_shifts(probe_array)
         probe_model.initial_probe = probe_array
         probe_model.probe = probe_array.clone()
         return probe_model
@@ -435,8 +459,7 @@ class ProbePixelated(ProbeConstraints):
         cls,
         probe_params: dict,
         num_probes: int = 1,
-        roi_shape: tuple[int, int]
-        | None = None,  # can be set later with set_initial_probe_from_params
+        roi_shape: tuple[int, int] | None = None,  # can be set later when set_initial_probe
         dtype: torch.dtype = torch.complex64,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -451,6 +474,7 @@ class ProbePixelated(ProbeConstraints):
             device=device,
             rng=rng,
             initial_probe_weights=initial_probe_weights,
+            _from_params=True,
             _token=cls._token,
         )
         probe_model.vacuum_probe_intensity = vacuum_probe_intensity
@@ -516,58 +540,41 @@ class ProbePixelated(ProbeConstraints):
         shifted_probes = fourier_shift_expand(self.probe, fract_positions).swapaxes(0, 1)
         return shifted_probes
 
-    def set_initial_probe_from_params(
+    def set_initial_probe(
         self,
         roi_shape: np.ndarray | tuple,
         reciprocal_sampling: np.ndarray,
         mean_diffraction_intensity: float,
         device: str | None = None,
     ):
-        if device is not None:
-            self._device = device
-
-        self.roi_shape = np.array(roi_shape)
-        self.reciprocal_sampling = reciprocal_sampling
-        self.mean_diffraction_intensity = mean_diffraction_intensity
-
-        self.check_probe_params()
-        prb = ComplexProbe(
-            gpts=tuple(self.roi_shape),
-            sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
-            energy=self.probe_params["energy"],
-            semiangle_cutoff=self.probe_params["semiangle_cutoff"],
-            defocus=self.probe_params["defocus"],
-            rolloff=self.probe_params["rolloff"],
-            vacuum_probe_intensity=self.vacuum_probe_intensity,
-            parameters=self.probe_params["polar_parameters"],
-            device="cpu",
+        super().set_initial_probe(
+            roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
-        probes: np.ndarray = prb.build()._array
+
+        if self._from_params:
+            self.check_probe_params()
+            prb = ComplexProbe(
+                gpts=tuple(self.roi_shape),
+                sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
+                energy=self.probe_params["energy"],
+                semiangle_cutoff=self.probe_params["semiangle_cutoff"],
+                defocus=self.probe_params["defocus"],
+                rolloff=self.probe_params["rolloff"],
+                vacuum_probe_intensity=self.vacuum_probe_intensity,
+                parameters=self.probe_params["polar_parameters"],
+                device="cpu",
+            )
+            probes = torch.tensor(prb.build()._array, dtype=self.dtype, device=self.device)
+        else:
+            probes = self.initial_probe.clone()
 
         if probes.ndim != 3:
             probes = probes[None]
         if probes.shape[0] != self.num_probes:
-            probes = np.tile(probes, (self.num_probes, 1, 1))
+            probes = torch.tile(probes, (self.num_probes, 1, 1))
 
-        # apply random phase shifts for initializing mixed state
-        for a0 in range(1, self.num_probes):
-            shift_y = np.exp(
-                -2j * np.pi * (self.rng.random() - 0.5) * np.fft.fftfreq(self.roi_shape[0])
-            ).astype(config.get("dtype_complex"))
-            shift_x = np.exp(
-                -2j * np.pi * (self.rng.random() - 0.5) * np.fft.fftfreq(self.roi_shape[1])
-            ).astype(config.get("dtype_complex"))
-            probes[a0] = probes[a0] * shift_y[:, None] * shift_x[None]
-
-        # apply weights
-        probe_intensity = np.sum(np.abs(np.fft.fft2(probes, norm="ortho")) ** 2)
-        intensity_norm = np.sqrt(mean_diffraction_intensity / probe_intensity)
-        probes *= intensity_norm
-
-        current_weights = np.sum(np.abs(probes) ** 2, axis=(1, 2))
-        current_weights = current_weights / np.sum(current_weights)
-        weight_scaling = np.sqrt(self.initial_probe_weights / current_weights)
-        probes = probes * weight_scaling[:, None, None]
+        probes = self._apply_random_phase_shifts(probes)
+        probes = self._apply_weights(probes)
 
         self._initial_probe = self._to_torch(probes)
         self._probe = self._initial_probe.clone()
@@ -634,18 +641,16 @@ class ProbePixelated(ProbeConstraints):
         self._vacuum_probe_intensity = vp2
 
     def _apply_random_phase_shifts(self, probe_array: torch.Tensor | np.ndarray) -> torch.Tensor:
-        probe_array = self._to_torch(probe_array)
+        probes = self._to_torch(probe_array)
         for a0 in range(1, self.num_probes):
-            shift_y = np.exp(
-                -2j * np.pi * (self.rng.random() - 0.5) * np.fft.fftfreq(probe_array.shape[1])
-            ).astype(config.get("dtype_complex"))
-            shift_x = np.exp(
-                -2j * np.pi * (self.rng.random() - 0.5) * np.fft.fftfreq(probe_array.shape[2])
-            ).astype(config.get("dtype_complex"))
-            shift_y = torch.tensor(shift_y, dtype=config.get("dtype_complex"), device=self.device)
-            shift_x = torch.tensor(shift_x, dtype=config.get("dtype_complex"), device=self.device)
-            probe_array[a0] = probe_array[a0] * shift_y[:, None] * shift_x[None]  # type: ignore
-        return probe_array
+            shift_y = torch.exp(
+                -2j * torch.pi * (self.rng.random() - 0.5) * torch.fft.fftfreq(self.roi_shape[0])
+            )
+            shift_x = torch.exp(
+                -2j * torch.pi * (self.rng.random() - 0.5) * torch.fft.fftfreq(self.roi_shape[1])
+            )
+            probes[a0] = probes[a0] * shift_y[:, None] * shift_x[None]
+        return probes
 
     def _apply_weights(self, probe_array: torch.Tensor | np.ndarray) -> torch.Tensor:
         probes = self._to_torch(probe_array)
@@ -856,41 +861,29 @@ class ProbeDIP(ProbeConstraints):
         shifted_probes = fourier_shift_expand(probe, fract_positions).swapaxes(0, 1)
         return shifted_probes
 
-    # def set_initial_probe(
-    #     self,
-    #     roi_shape: np.ndarray | tuple,
-    #     reciprocal_sampling: np.ndarray,
-    #     mean_diffraction_intensity: float,
-    #     device: str | None = None,
-    #     *args,
-    # ):
-    #     """Set initial probe and create appropriate model input"""
-    #     if device is not None:
-    #         self._device = device
+    def set_initial_probe(
+        self,
+        roi_shape: np.ndarray | tuple,
+        reciprocal_sampling: np.ndarray,
+        mean_diffraction_intensity: float,
+        device: str | None = None,
+        *args,
+    ):
+        """Set initial probe and create appropriate model input"""
+        super().set_initial_probe(
+            roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
+        )
 
-    #     # Only update roi_shape if it wasn't already set during initialization
-    #     if not hasattr(self, "_roi_shape"):
-    #         self.roi_shape = np.array(roi_shape)
-    #     else:
-    #         # Verify that the provided roi_shape matches the initialized one
-    #         if not np.array_equal(self.roi_shape, np.array(roi_shape)):
-    #             warn(
-    #                 f"roi_shape {roi_shape} conflicts with initialized roi_shape {self.roi_shape}. Using initialized value."
-    #             )
+        # could check if num_probes corresponds to out_channels of model
 
-    #     self.reciprocal_sampling = reciprocal_sampling
-    #     self.mean_diffraction_intensity = mean_diffraction_intensity
-
-    #     # could check if num_probes corresponds to out_channels of model
-
-    #     # Only create new model_input if it's still the placeholder (shape [1, num_probes, 1, 1])
-    #     if self.model_input.shape[-2:] == (1, 1):
-    #         self.model_input = torch.randn(
-    #             (1, self.num_probes, *self.roi_shape),
-    #             dtype=self.dtype,
-    #             device=self.device,
-    #             generator=self._rng_torch,
-    #         )
+        # Only create new model_input if it's still the placeholder (shape [1, num_probes, 1, 1])
+        if self.model_input.shape[-2:] == (1, 1):
+            self.model_input = torch.randn(
+                (1, self.num_probes, *self.roi_shape),
+                dtype=self.dtype,
+                device=self.device,
+                generator=self._rng_torch,
+            )
 
     def to(self, device: str | torch.device):
         """Move all relevant tensors to a different device."""

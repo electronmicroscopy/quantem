@@ -520,6 +520,10 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         rotshape += 2 * np.array(obj_padding_px)
         return rotshape.astype("int")
 
+    @property
+    def upsample_factor(self) -> float:
+        return (self._obj_shape_crop_2d / self.shape[:2]).mean()
+
     # endregion --- implicit properties (no setters) ---
 
     # region --- abstract class methods ---

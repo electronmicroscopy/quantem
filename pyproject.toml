@@ -46,6 +46,7 @@ dependencies = [
   "tensorboard>=2.19.0",
   "torchmetrics>=1.7.3",
   "torchsummary>=1.5.1",
+  "cupy-cuda12x>=13.5.1",
 ]
 
 [tool.hatch.build.targets.sdist]
