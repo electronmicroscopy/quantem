@@ -346,16 +346,16 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         return weight * tv
 
     def _probe_center_of_mass_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
-        probe_int = torch.abs(start_probe) ** 2
-        probe_int_com = self._to_torch(
-            np.array(
-                [
-                    center_of_mass(torch.fft.fftshift(probe_int[i]).detach().cpu().numpy())
-                    for i in range(self.num_probes)
-                ]
-            )
-        )
-        probe_int_com = probe_int_com - torch.tensor(
+        probe_int = torch.fft.fftshift(torch.abs(start_probe) ** 2, dim=(-2, -1))
+        # TODO -- move this to a util function
+        y_coords = torch.arange(probe_int.shape[-2], device=probe_int.device)
+        x_coords = torch.arange(probe_int.shape[-1], device=probe_int.device)
+        y_grid, x_grid = torch.meshgrid(y_coords, x_coords, indexing="ij")
+        total_intensity = torch.sum(probe_int, dim=(-2, -1))
+        com_y = torch.sum(probe_int * y_grid[None,], dim=(-2, -1)) / total_intensity
+        com_x = torch.sum(probe_int * x_grid[None,], dim=(-2, -1)) / total_intensity
+
+        probe_int_com = torch.stack([com_y, com_x], dim=-1) - torch.tensor(
             [s // 2 for s in self.roi_shape], device=self.device
         )
         return fourier_shift_expand(start_probe, -probe_int_com, expand_dim=False)
@@ -363,7 +363,8 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
     def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
         n_probes = start_probe.shape[0]
         orthogonal_probes = []
-        original_norms = torch.norm(start_probe.view(n_probes, -1), dim=1, keepdim=True)
+        original_norms = torch.norm(start_probe, dim=(-2, -1), keepdim=True)
+        # original_norms = torch.norm(start_probe.view(n_probes, -1), dim=1, keepdim=True)
 
         # Apply Gram-Schmidt process
         for i in range(n_probes):
@@ -593,7 +594,12 @@ class ProbePixelated(ProbeConstraints):
 
     def backward(self, propagated_gradient, obj_patches):
         obj_normalization = torch.sum(torch.abs(obj_patches) ** 2, dim=(-2, -1)).max()
-        ortho_norm: float = 2 * np.prod(self.roi_shape) ** 0.5  # from ortho fft2 # type:ignore
+        if self.num_probes == 1:
+            # this is wrong--but it fixes the issue with multiple probes sgd + analytical--TODO fix
+            # basically it screws up the amplitude grad but fixes the phase grad
+            ortho_norm: float = 2 * np.prod(self.roi_shape) ** 0.5  # from ortho fft2 # type:ignore
+        else:
+            ortho_norm: float = 1 / (2 * np.prod(self.roi_shape) ** 0.5)  # type:ignore
         probe_grad = torch.sum(propagated_gradient, dim=1) / obj_normalization / ortho_norm
         self._probe.grad = -1 * probe_grad.clone().detach()
 

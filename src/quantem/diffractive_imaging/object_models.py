@@ -294,7 +294,8 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
         if self.num_slices > 1:
             if self.constraints["identical_slices"]:
-                obj2[:] = torch.mean(obj2, dim=0, keepdim=True)
+                with torch.no_grad():
+                    obj2[:] = torch.mean(obj2, dim=0, keepdim=True)
 
         return obj2
 
