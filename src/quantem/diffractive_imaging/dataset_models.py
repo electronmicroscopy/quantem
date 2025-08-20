@@ -67,12 +67,14 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
         # scan_positions_px: [num_positions, 2] in pixels
         self._scan_positions_px = nn.Parameter(
-            torch.zeros((num_positions, 2), dtype=getattr(torch, config.get("dtype_real")))
+            torch.zeros((num_positions, 2), dtype=getattr(torch, config.get("dtype_real"))),
+            requires_grad=False,
         )
 
         # descan_shifts: [num_positions, 2] descan shifts in pixels
         self._descan_shifts = nn.Parameter(
-            torch.zeros((num_positions, 2), dtype=getattr(torch, config.get("dtype_real")))
+            torch.zeros((num_positions, 2), dtype=getattr(torch, config.get("dtype_real"))),
+            requires_grad=False,
         )
 
         # Store initial values for reset
@@ -91,13 +93,6 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     def get_optimization_parameters(self):
         """Get the combined descan and scan position parameters for optimization."""
         return [self._descan_shifts, self._scan_positions_px]
-
-    def zero_grad(self, set_to_none: bool = True) -> None:
-        """Override to use OptimizerMixin's zero_grad if optimizer exists, else torch.nn.Module's."""
-        if self.has_optimizer():
-            OptimizerMixin.zero_grad(self)
-        else:
-            torch.nn.Module.zero_grad(self, set_to_none=set_to_none)
 
     @classmethod
     def from_file(cls, file_path: str, file_type: str, verbose: int | bool = 1) -> Self:

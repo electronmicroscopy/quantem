@@ -833,14 +833,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if isinstance(skip, (str, type)):
             skip = [skip]
         skip = list(skip)
-        skips = skip + [
-            torch.optim.Optimizer,
-            torch.optim.lr_scheduler.LRScheduler,
-            DatasetModelType,
-            "_probe_model",
-            "_obj_model",
-            "_detector_model",
-        ]
+        skips = (
+            skip
+            + [
+                # torch.optim.Optimizer,
+                # torch.optim.lr_scheduler.LRScheduler,
+                # DatasetModelType,
+                # "_probe_model",
+                # "_obj_model",
+                # "_detector_model",
+            ]
+        )
         super().save(
             path,
             mode=mode,

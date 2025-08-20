@@ -192,11 +192,11 @@ class PtychographyOpt(PtychographyBase):
         """Zero gradients for all active optimizers."""
         for key in self._optimizer_params.keys():
             if key == "object" and self.obj_model.has_optimizer():
-                self.obj_model.zero_grad()
+                self.obj_model.zero_optimizer_grad()
             elif key == "probe" and self.probe_model.has_optimizer():
-                self.probe_model.zero_grad()
+                self.probe_model.zero_optimizer_grad()
             elif key == "dataset" and self.dset.has_optimizer():
-                self.dset.zero_grad()
+                self.dset.zero_optimizer_grad()
 
     def step_schedulers(self, loss: float | None = None):
         """Step all active schedulers."""

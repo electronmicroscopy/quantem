@@ -1,6 +1,6 @@
 import math
 from itertools import product
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,6 +10,8 @@ from scipy.optimize import least_squares
 from tqdm.auto import tqdm
 
 from quantem.core import config
+
+DeviceType = Union[str, "torch.device", int]
 
 if TYPE_CHECKING:
     import cupy as cp  # type: ignore
@@ -520,7 +522,7 @@ class RNGMixin:
         if self._rng_seed is not None:
             self.rng = self._rng_seed  # sets rng and _rng_torch
 
-    def _rng_to_device(self, device: str | int | torch.device):
+    def _rng_to_device(self, device: "DeviceType"):
         ## Could consider renaming this as just to, allowing super calls
         """Update torch RNG when device changes.
         Currently resets the seed... not sure of a way around that."""

@@ -6,6 +6,7 @@ from warnings import warn
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 from tqdm.auto import tqdm
 
 from quantem.core import config
@@ -35,13 +36,8 @@ which will not be used for implicit NNs, which leads to an inconsistency. Leavin
 sure if this would lead to other issues, so a bit of testing will be needed.
 """
 
-# TODO -- class method and protect object inits
-# - DIP from_model,
-# - pixelated doesn't make much sense, from_array isn't logical as the most common case is to not
-#   actually pass an array or anything besides the num_slices (and optionally slice thicknesses)
 
-
-class ObjectBase(RNGMixin, OptimizerMixin, AutoSerialize):
+class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     """
     Base class for all ObjectModels to inherit from.
     """
@@ -51,6 +47,7 @@ class ObjectBase(RNGMixin, OptimizerMixin, AutoSerialize):
         "tv_weight_z": 0,
         "tv_weight_yx": 0,
     }
+    _token = object()
 
     def __init__(
         self,
@@ -60,8 +57,16 @@ class ObjectBase(RNGMixin, OptimizerMixin, AutoSerialize):
         obj_type: object_type = "complex",
         rng: np.random.Generator | int | None = None,
         shape: tuple[int, int, int] | None = None,
+        _token: object | None = None,
     ):
-        super().__init__(rng=rng, device=device)
+        if _token is not self._token:
+            raise RuntimeError("Use a factory method to instantiate this class.")
+
+        # Initialize nn.Module first
+        nn.Module.__init__(self)
+        RNGMixin.__init__(self, rng=rng, device=device)
+        OptimizerMixin.__init__(self)
+
         self.shape = shape
         self.mask = None
         self.device = device
@@ -213,9 +218,17 @@ class ObjectBase(RNGMixin, OptimizerMixin, AutoSerialize):
     def reset(self):
         raise NotImplementedError()
 
-    def to(self, device: str | torch.device):
-        self.device = device
-        self._rng_to_device(device)
+    def to(self, *args, **kwargs):
+        """Move all relevant tensors to a different device. Overrides nn.Module.to()."""
+        # Call parent's to() method first to handle PyTorch's internal device management
+        super().to(*args, **kwargs)
+
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self.device = device
+            self._rng_to_device(device)
+
+        return self
 
     @property
     @abstractmethod
@@ -278,7 +291,6 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 obj2 = amp * torch.exp(1.0j * phase)
         else:
             if self.constraints["fix_potential_baseline"]:
-                print("fixing baseline")
                 if mask is not None:
                     offset = obj[mask < 0.5 * mask.max()].mean()
                 else:
@@ -403,6 +415,7 @@ class ObjectPixelated(ObjectConstraints):
         obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
         rng: np.random.Generator | int | None = None,
         shape: tuple[int, int, int] | None = None,
+        _token: object | None = None,
     ):
         super().__init__(
             num_slices=num_slices,
@@ -411,7 +424,37 @@ class ObjectPixelated(ObjectConstraints):
             obj_type=obj_type,
             rng=rng,
             shape=shape,
+            _token=_token,
         )
+        self._obj = nn.Parameter(torch.ones(1), requires_grad=True)
+
+    @classmethod
+    def from_uniform(
+        cls,
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | None = None,
+        device: str = "cpu",
+        obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
+        rng: np.random.Generator | int | None = None,
+        shape: tuple[int, int, int] | None = None,
+    ):
+        """
+        Create ObjectPixelated from an array or with uniform initialization.
+        If there's a reason, in the future could change this to from_array and add an
+        initial_obj parameter, though would have to make sure it works with shape being set later,
+        and then just modify reset to set the initial obj to the initial_obj parameter
+        """
+        obj_model = cls(
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            rng=rng,
+            shape=shape,
+            _token=cls._token,
+        )
+
+        return obj_model
 
     @property
     def obj(self):
@@ -428,11 +471,9 @@ class ObjectPixelated(ObjectConstraints):
 
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
-        self._obj = torch.ones(self.shape, dtype=self.dtype, device=self.device)
-
-    def to(self, device: str | torch.device):
-        super().to(device)
-        self._obj = self._obj.to(self.device)
+        self._obj = nn.Parameter(
+            torch.ones(self.shape, dtype=self.dtype, device=self.device), requires_grad=True
+        )
 
     @property
     def name(self) -> str:
@@ -491,6 +532,34 @@ class ObjectDIP(ObjectConstraints):
 
     def __init__(
         self,
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        input_noise_std: float = 0.025,
+        device: str = "cpu",
+        obj_type: object_type = "complex",
+        rng: np.random.Generator | int | None = None,
+        shape: tuple[int, int, int] | None = None,
+        _token: object | None = None,
+    ):
+        super().__init__(
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            rng=rng,
+            shape=shape,
+            _token=_token,
+        )
+        self.register_buffer("_model_input", torch.tensor([]))
+        self.register_buffer("_pretrain_target", torch.tensor([]))
+
+        self._pretrain_losses = []
+        self._pretrain_lrs = []
+        self._model_input_noise_std = input_noise_std
+
+    @classmethod
+    def from_model(
+        cls,
         model: "torch.nn.Module",
         model_input: torch.Tensor | None = None,
         num_slices: int = 1,
@@ -501,25 +570,26 @@ class ObjectDIP(ObjectConstraints):
         rng: np.random.Generator | int | None = None,
         shape: tuple[int, int, int] | None = None,
     ):
-        super().__init__(
+        """Create ObjectDIP from a model."""
+        obj_model = cls(
             num_slices=num_slices,
             slice_thicknesses=slice_thicknesses,
+            input_noise_std=input_noise_std,
             device=device,
             obj_type=obj_type,
             rng=rng,
             shape=shape,
+            _token=cls._token,
         )
-        self.model = model
+        obj_model.model = model.to(device)
+        obj_model.set_pretrained_weights(model)
 
-        if model_input is None:  # will be generated when first needed
-            self.model_input = None
+        if model_input is None:
+            obj_model.model_input = None
         else:
-            self.model_input = model_input.clone().detach()
+            obj_model.model_input = model_input.clone().detach()
 
-        self.pretrain_target = self.model_input.clone().detach()
-        self._pretrain_losses = []
-        self._pretrain_lrs = []
-        self._model_input_noise_std = input_noise_std
+        return obj_model
 
     @property
     def name(self) -> str:
@@ -542,7 +612,11 @@ class ObjectDIP(ObjectConstraints):
 
     @model.setter
     def model(self, dip: "torch.nn.Module"):
-        """set the DIP model"""
+        """
+        This actually doesn't work -- can't have setters for torch sub modules
+        https://github.com/pytorch/pytorch/issues/52664
+        """
+        print("\n\n\nsetting model, this is not reachable???\n\n\n")
         if not isinstance(dip, torch.nn.Module):
             raise TypeError(f"DIP must be a torch.nn.Module, got {type(dip)}")
         if hasattr(dip, "dtype"):
@@ -566,7 +640,7 @@ class ObjectDIP(ObjectConstraints):
     @property
     def model_input(self) -> torch.Tensor:
         """get the model input"""
-        if self._model_input is None:
+        if self._model_input.numel() == 0:  # Check for empty tensor instead of None
             try:
                 self._generate_model_input("random")
             except ValueError:
@@ -579,7 +653,7 @@ class ObjectDIP(ObjectConstraints):
     def model_input(self, input_tensor: torch.Tensor | None):
         """set the model input"""
         if input_tensor is None:
-            self._model_input = None
+            self._model_input = torch.tensor([])
         else:
             inp = validate_tensor(
                 input_tensor,
@@ -611,8 +685,12 @@ class ObjectDIP(ObjectConstraints):
         return self._pretrain_target
 
     @pretrain_target.setter
-    def pretrain_target(self, target: torch.Tensor):
+    def pretrain_target(self, target: torch.Tensor | None):
         """set the pretrain target"""
+        if target is None:
+            self._pretrain_target = torch.tensor([])
+            return
+
         if target.ndim == 4:
             target = target.squeeze(0)
         target = validate_tensor(
@@ -682,13 +760,19 @@ class ObjectDIP(ObjectConstraints):
             obj_array = obj_array * self.mask
         return self._get_obj_patches(obj_array, patch_indices)
 
-    def to(self, device: str | torch.device):
+    def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device."""
-        super().to(device)
-        self._model = self._model.to(self.device)
-        self.model_input = self.model_input.to(self.device)
-        if hasattr(self, "_pretrain_target"):
-            self._pretrain_target = self._pretrain_target.to(self.device)
+        # Call parent's to() method first to handle PyTorch's internal device management
+        # This will automatically move the registered module and buffers
+        super().to(*args, **kwargs)
+
+        # Update device property
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self.device = device
+            self._rng_to_device(device)
+
+        return self
 
     @property
     def params(self):
@@ -697,8 +781,9 @@ class ObjectDIP(ObjectConstraints):
 
     def get_optimization_parameters(self):
         """Get the parameters that should be optimized for this model."""
-        # Return a fresh list of parameters each time to avoid generator exhaustion
-        return list(self._model.parameters())
+        # Since model is registered as a submodule, we can use the parent's parameters() method
+        # which will automatically include all submodule parameters
+        return list(self.parameters())
 
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
@@ -723,7 +808,7 @@ class ObjectDIP(ObjectConstraints):
             self.set_scheduler(scheduler_params, num_epochs)
 
         if reset:
-            self._model.apply(reset_weights)
+            self.model.apply(reset_weights)
             self._pretrain_losses = []
             self._pretrain_lrs = []
 
@@ -757,10 +842,10 @@ class ObjectDIP(ObjectConstraints):
         show: bool = False,
     ):
         """Pretrain the DIP model."""
-        if not hasattr(self, "pretrain_target"):
+        if self.pretrain_target is None:
             raise ValueError("Pretrain target is not set. Use pretrain_target to set it.")
 
-        self._model.train()
+        self.model.train()
         optimizer = self.optimizer
         if optimizer is None:
             raise ValueError("Optimizer not set. Call set_optimizer() first.")
@@ -840,6 +925,8 @@ class ObjectDIP(ObjectConstraints):
         gs_bot = gridspec.GridSpecFromSubplotSpec(1, n_bot, subplot_spec=gs[1])
         axs_bot = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(n_bot)])
         target = self.pretrain_target
+        if target is None:
+            raise ValueError("Model has not been pre-trained")
         if n_bot == 4:
             show_2d(
                 [

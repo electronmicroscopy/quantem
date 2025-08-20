@@ -7,7 +7,7 @@ from quantem.core import config
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectModelType
+from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeModelType
 from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
@@ -257,9 +257,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
     ):
         if autograd:
             loss.backward()
-            # scaling ad gradients to closer match analytic
-            obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
-            self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
+            # scaling pixelated ad gradients to closer match analytic
+            if isinstance(self.obj_model, ObjectPixelated):
+                obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
+                self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
 
         else:
             gradient = self.gradient_step(amplitudes, overlap)

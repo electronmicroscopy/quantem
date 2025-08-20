@@ -1,11 +1,12 @@
 from abc import abstractmethod
 from copy import deepcopy
-from typing import Any, Callable, Self
+from typing import Any, Callable, Self, Union
 from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 from scipy.ndimage import center_of_mass
 from tqdm.auto import tqdm
 
@@ -39,8 +40,10 @@ from quantem.diffractive_imaging.ptycho_utils import (
 # TODO
 # - prevent gpu overhead, make sure initial_probe and other stuff is on cpu
 
+DeviceType = Union[str, torch.device, int]
 
-class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
+
+class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     DEFAULT_PROBE_PARAMS = {
         "energy": None,
         "defocus": None,
@@ -58,7 +61,7 @@ class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
         num_probes: int = 1,
         probe_params: dict = {},
         roi_shape: tuple[int, int] | np.ndarray | None = None,
-        device: str = "cpu",
+        device: DeviceType = "cpu",
         rng: np.random.Generator | int | None = None,
         _token: object | None = None,
         *args,
@@ -66,7 +69,12 @@ class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
     ):
         if _token is not self._token:
             raise RuntimeError("Use a factory method to instantiate this class.")
-        super().__init__(rng=rng, device=device, *args, **kwargs)
+
+        # Initialize nn.Module first
+        nn.Module.__init__(self)
+        RNGMixin.__init__(self, rng=rng, device=device)
+        OptimizerMixin.__init__(self)
+
         self.num_probes = num_probes
         self._device = device
         self._probe_params = self.DEFAULT_PROBE_PARAMS
@@ -183,11 +191,11 @@ class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
         return dtype_str
 
     @property
-    def device(self) -> str:
+    def device(self) -> DeviceType:
         return self._device
 
     @device.setter
-    def device(self, device: str | torch.device):
+    def device(self, device: DeviceType):
         dev, _id = config.validate_device(device)
         self._device = dev
 
@@ -289,10 +297,17 @@ class ProbeBase(RNGMixin, OptimizerMixin, AutoSerialize):
                 # raise ValueError(f"Missing probe parameter '{k}' in probe_params")
 
     @abstractmethod
-    def to(self, device: str | torch.device):
-        """Move all relevant tensors to a different device."""
-        self.device = device
-        self._rng_to_device(device)
+    def to(self, *args, **kwargs) -> Self:
+        """Move all relevant tensors to a different device. Overrides nn.Module.to()."""
+        # Call parent's to() method first to handle PyTorch's internal device management
+        super().to(*args, **kwargs)
+
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self.device = device
+            self._rng_to_device(device)
+
+        return self
 
     @property
     @abstractmethod
@@ -501,13 +516,13 @@ class ProbePixelated(ProbeConstraints):
         self._probe = self._to_torch(prb)
 
     @property
-    def initial_probe_weights(self) -> np.ndarray:
+    def initial_probe_weights(self) -> torch.Tensor:
         return self._initial_probe_weights
 
     @initial_probe_weights.setter
     def initial_probe_weights(self, weights: list[float] | np.ndarray | None):
         if weights is None:
-            self._initial_probe_weights = np.array(
+            self._initial_probe_weights = torch.tensor(
                 [1 - 0.02 * (self.num_probes - 1)] + [0.02] * (self.num_probes - 1)
             )
         else:
@@ -584,9 +599,13 @@ class ProbePixelated(ProbeConstraints):
     def reset(self):
         self.probe = self._initial_probe.clone()
 
-    def to(self, device: str | torch.device):
-        super().to(device)
-        self._probe = self._probe.to(self.device)
+    def to(self, *args, **kwargs) -> Self:
+        super().to(*args, **kwargs)
+        # Extract device from kwargs if present
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self._probe = self._probe.to(self.device)
+        return self
 
     @property
     def name(self) -> str:
@@ -666,7 +685,7 @@ class ProbePixelated(ProbeConstraints):
 
         current_weights = torch.sum(torch.abs(probes) ** 2, dim=(1, 2))
         current_weights = current_weights / torch.sum(current_weights)
-        weight_scaling = np.sqrt(self.initial_probe_weights / current_weights)
+        weight_scaling = torch.sqrt(self.initial_probe_weights.to(self.device) / current_weights)
         probes = probes * self._to_torch(weight_scaling)[:, None, None]
 
         # self._initial_probe = self._to_torch(probes)
@@ -722,7 +741,8 @@ class ProbeDIP(ProbeConstraints):
             rng=rng,
             _token=cls._token,
         )
-        probe_model.model = model
+        probe_model.model = model.to(device)
+        probe_model.set_pretrained_weights(model)
 
         if model_input is None:
             # Create default model input - use roi_shape if provided, otherwise placeholder
@@ -758,7 +778,11 @@ class ProbeDIP(ProbeConstraints):
 
     @model.setter
     def model(self, dip: "torch.nn.Module"):
-        """set the DIP model"""
+        """
+        This actually doesn't work -- can't have setters for torch sub modules
+        https://github.com/pytorch/pytorch/issues/52664
+        """
+        print("probe model setter hi")
         if not isinstance(dip, torch.nn.Module):
             raise TypeError(f"DIP must be a torch.nn.Module, got {type(dip)}")
         if hasattr(dip, "dtype"):
@@ -891,13 +915,17 @@ class ProbeDIP(ProbeConstraints):
                 generator=self._rng_torch,
             )
 
-    def to(self, device: str | torch.device):
+    def to(self, *args, **kwargs) -> Self:
         """Move all relevant tensors to a different device."""
-        super().to(device)
-        self._model = self._model.to(self.device)
-        self._model_input = self._model_input.to(self.device)
-        if hasattr(self, "_initial_probe"):
-            self._initial_probe = self._initial_probe.to(self.device)
+        super().to(*args, **kwargs)
+        # Extract device from kwargs if present
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self.model = self.model.to(self.device)
+            self._model_input = self._model_input.to(self.device)
+            if hasattr(self, "_initial_probe"):
+                self._initial_probe = self._initial_probe.to(self.device)
+        return self
 
     @property
     def params(self):
@@ -932,7 +960,7 @@ class ProbeDIP(ProbeConstraints):
             self.set_scheduler(scheduler_params, num_epochs)
 
         if reset:
-            self._model.apply(reset_weights)
+            self.model.apply(reset_weights)
             self._pretrain_losses = []
             self._pretrain_lrs = []
 
@@ -967,7 +995,7 @@ class ProbeDIP(ProbeConstraints):
         if not hasattr(self, "pretrain_target"):
             raise ValueError("Pretrain target is not set. Use pretrain_target to set it.")
 
-        self._model.train()
+        self.model.train()
         optimizer = self.optimizer
         if optimizer is None:
             raise ValueError("Optimizer not set. Call set_optimizer() first.")

@@ -18,7 +18,7 @@ class OptimizerMixin:
 
     DEFAULT_OPTIMIZER_TYPE = "adam"
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self):
         """Initialize the optimizer mixin."""
         self._optimizer = None
         self._scheduler = None
@@ -60,11 +60,19 @@ class OptimizerMixin:
     def get_optimization_parameters(
         self,
     ) -> "torch.Tensor | Sequence[torch.Tensor] | Iterator[torch.Tensor]":
-        """Get the parameters that should be optimized for this model."""
+        """
+        Get the parameters that should be optimized for this model.
+        This could be replaced with just module.parameters(), but this allows for flexibility
+        in the future to allow for per parameter LRs.
+        """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
     def set_optimizer(self, opt_params: dict | None = None) -> None:
-        """Set the optimizer for this model."""
+        """
+        Set the optimizer for this model.
+        Currently supports single LR for all parameters, TODO allow for per parameter LRs by
+        updating get_optimization_parameters to return a list of parameters and their LRs.
+        """
         if opt_params is not None:
             self.optimizer_params = opt_params
 
@@ -154,7 +162,7 @@ class OptimizerMixin:
         if self._optimizer is not None:
             self._optimizer.step()
 
-    def zero_grad(self) -> None:
+    def zero_optimizer_grad(self) -> None:
         """Zero gradients if optimizer exists."""
         if self._optimizer is not None:
             self._optimizer.zero_grad()
