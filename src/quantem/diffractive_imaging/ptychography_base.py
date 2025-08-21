@@ -865,15 +865,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._propagators = self._to_torch(self._propagators)
         self._rng_to_device(dev)
 
-        # Reconnect optimizers after all models have been moved
-        for model_name, model in [
-            ("obj_model", self.obj_model),
-            ("probe_model", self.probe_model),
-            ("dset", self.dset),
-        ]:
-            if hasattr(model, "reconnect_optimizer_to_parameters"):
-                model.reconnect_optimizer_to_parameters()
-
     # endregion
 
     # region --- ptychography foRcard model ---

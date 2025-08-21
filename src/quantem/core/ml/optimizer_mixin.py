@@ -132,6 +132,10 @@ class OptimizerMixin:
         optimizer = self._optimizer
         base_LR = optimizer.param_groups[0]["lr"]
 
+        # # Store the original base learning rate for future recreation
+        # if not hasattr(self, '_original_base_lr'):
+        #     self._original_base_lr = base_LR
+
         if sched_type == "none":
             self._scheduler = None
         elif sched_type == "cyclic":
@@ -250,6 +254,9 @@ class OptimizerMixin:
             # Store the old state before clearing param_groups
             old_state = self._optimizer.state.copy()
 
+            # Store the current learning rate and other param_group settings
+            current_param_group = self._optimizer.param_groups[0].copy()
+
             # Clear and recreate param_groups with new parameters
             self._optimizer.param_groups.clear()
             self._optimizer.add_param_group({"params": optimizable_params})
@@ -274,6 +281,16 @@ class OptimizerMixin:
             # Update the optimizer state properly
             self._optimizer.state.clear()
             self._optimizer.state.update(new_state)
+
+            # Restore the learning rate and other param_group settings
+            # but keep the new parameters
+            self._optimizer.param_groups[0].update(
+                {
+                    k: v
+                    for k, v in current_param_group.items()
+                    if k != "params"  # Don't overwrite the new parameters
+                }
+            )
 
             # Also reconnect scheduler if it exists
             if self._scheduler is not None:

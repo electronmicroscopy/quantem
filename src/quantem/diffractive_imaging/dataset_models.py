@@ -100,7 +100,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         super().to(*args, **kwargs)
 
         # Reconnect optimizer to parameters on the new device
-        if hasattr(self, "reconnect_optimizer_to_parameters"):
+        if self._optimizer is not None:
             self.reconnect_optimizer_to_parameters()
 
         return self

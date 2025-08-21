@@ -305,7 +305,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
-            if hasattr(self, "reconnect_optimizer_to_parameters"):
+            if self._optimizer is not None:
                 self.reconnect_optimizer_to_parameters()
 
         return self
@@ -606,10 +606,6 @@ class ProbePixelated(ProbeConstraints):
 
     def to(self, *args, **kwargs) -> Self:
         super().to(*args, **kwargs)
-        device = kwargs.get("device", args[0] if args else None)
-        if device is not None:
-            if hasattr(self, "reconnect_optimizer_to_parameters"):
-                self.reconnect_optimizer_to_parameters()
         return self
 
     @property
@@ -929,8 +925,6 @@ class ProbeDIP(ProbeConstraints):
             self._model_input = self._model_input.to(self.device)
             if hasattr(self, "_initial_probe"):
                 self._initial_probe = self._initial_probe.to(self.device)
-            if hasattr(self, "reconnect_optimizer_to_parameters"):
-                self.reconnect_optimizer_to_parameters()
         return self
 
     @property
