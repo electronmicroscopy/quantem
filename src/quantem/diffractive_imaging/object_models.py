@@ -235,8 +235,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
-            if self._optimizer is not None:
-                self.reconnect_optimizer_to_parameters()
+            self.reconnect_optimizer_to_parameters()
 
         return self
 
@@ -786,8 +785,7 @@ class ObjectDIP(ObjectConstraints):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
-            if hasattr(self, "reconnect_optimizer_to_parameters"):
-                self.reconnect_optimizer_to_parameters()
+            self.reconnect_optimizer_to_parameters()
 
         return self
 

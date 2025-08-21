@@ -305,8 +305,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
-            if self._optimizer is not None:
-                self.reconnect_optimizer_to_parameters()
+            self.reconnect_optimizer_to_parameters()
 
         return self
 
