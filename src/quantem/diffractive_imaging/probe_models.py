@@ -241,10 +241,6 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         raise NotImplementedError()
 
     @property
-    def initial_probe(self) -> torch.Tensor:
-        raise NotImplementedError()
-
-    @property
     def params(self):
         """optimization parameters"""
         raise NotImplementedError()
@@ -305,8 +301,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
-            if hasattr(self, "reconnect_optimizer_to_parameters"):
-                self.reconnect_optimizer_to_parameters()
+            self.reconnect_optimizer_to_parameters()
 
         return self
 
@@ -571,6 +566,11 @@ class ProbePixelated(ProbeConstraints):
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 
+        if (
+            self._initial_probe is not None
+        ):  # don't reinitilize probe cuz maybe reloading from file
+            return
+
         if self._from_params:
             self.check_probe_params()
             prb = ComplexProbe(
@@ -606,10 +606,6 @@ class ProbePixelated(ProbeConstraints):
 
     def to(self, *args, **kwargs) -> Self:
         super().to(*args, **kwargs)
-        device = kwargs.get("device", args[0] if args else None)
-        if device is not None:
-            if hasattr(self, "reconnect_optimizer_to_parameters"):
-                self.reconnect_optimizer_to_parameters()
         return self
 
     @property
@@ -929,8 +925,6 @@ class ProbeDIP(ProbeConstraints):
             self._model_input = self._model_input.to(self.device)
             if hasattr(self, "_initial_probe"):
                 self._initial_probe = self._initial_probe.to(self.device)
-            if hasattr(self, "reconnect_optimizer_to_parameters"):
-                self.reconnect_optimizer_to_parameters()
         return self
 
     @property

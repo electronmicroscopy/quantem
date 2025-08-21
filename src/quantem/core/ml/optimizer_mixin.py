@@ -212,91 +212,60 @@ class OptimizerMixin:
         Reconnect optimizer to parameters after device changes.
         This is needed because AutoSerialize loads to CPU, but optimizers
         need to reference tensors on the current device.
-
-        If the optimizer was loaded from serialization, we preserve its state
-        by reconnecting it to the new parameters. If no optimizer exists,
-        we create a new one.
         """
-        if not hasattr(self, "get_optimization_parameters"):
+        if self._optimizer is None:
             return
 
-        # Get current parameters on the current device
         current_params = self.get_optimization_parameters()
         if isinstance(current_params, torch.Tensor):
             current_params = [current_params]
         elif isinstance(current_params, Generator):
             current_params = list(current_params)
 
-        # Filter out non-leaf tensors that can't be optimized
         optimizable_params = [
             p for p in current_params if isinstance(p, torch.Tensor) and p.is_leaf
         ]
 
         if not optimizable_params:
             print(
-                f"Warning: No optimizable parameters found for {self.__class__.__name__}, removing optimizer"
+                f"souldn't be getting here! No optimizable parameters found for {self.__class__.__name__}, removing optimizer"
             )
             self.remove_optimizer()
             return
 
-        # Ensure parameters require gradients
         for p in optimizable_params:
             p.requires_grad_(True)
 
-        if self._optimizer is not None:
-            # Reconnect existing optimizer to new parameters
-            # This preserves optimizer state (momentum, learning rate, etc.)
+        # Preserve optimizer state and param_group settings
+        old_state = self._optimizer.state.copy()
+        current_param_group = self._optimizer.param_groups[0].copy()
 
-            # Store the old state before clearing param_groups
-            old_state = self._optimizer.state.copy()
+        # Reconnect to new parameters
+        self._optimizer.param_groups.clear()
+        self._optimizer.add_param_group({"params": optimizable_params})
 
-            # Clear and recreate param_groups with new parameters
-            self._optimizer.param_groups.clear()
-            self._optimizer.add_param_group({"params": optimizable_params})
+        # Update state mapping and move tensors to correct device
+        new_state = {}
+        device = optimizable_params[0].device
+        for i, old_param in enumerate(old_state.keys()):
+            if i < len(optimizable_params):
+                new_param = optimizable_params[i]
+                new_state[new_param] = {}
+                for key, value in old_state[old_param].items():
+                    if isinstance(value, torch.Tensor):
+                        new_state[new_param][key] = value.to(device)
+                    else:
+                        new_state[new_param][key] = value
 
-            # Update the optimizer's state to map old tensor keys to new tensor keys
-            # and move all state tensors to the correct device
-            new_state = {}
-            device = optimizable_params[0].device
+        self._optimizer.state.clear()
+        self._optimizer.state.update(new_state)
 
-            for i, old_param in enumerate(old_state.keys()):
-                if i < len(optimizable_params):
-                    new_param = optimizable_params[i]
-                    new_state[new_param] = {}
+        # Restore param_group settings (LR, betas, etc.) but keep new parameters
+        self._optimizer.param_groups[0].update(
+            {k: v for k, v in current_param_group.items() if k != "params"}
+        )
 
-                    # Move all state tensors to the new device
-                    for key, value in old_state[old_param].items():
-                        if isinstance(value, torch.Tensor):
-                            new_state[new_param][key] = value.to(device)
-                        else:
-                            new_state[new_param][key] = value
-
-            # Update the optimizer state properly
-            self._optimizer.state.clear()
-            self._optimizer.state.update(new_state)
-
-            # Also reconnect scheduler if it exists
-            if self._scheduler is not None:
-                self._scheduler.optimizer = self._optimizer
-        else:
-            # Create new optimizer if none exists
-            opt_params = self._optimizer_params.copy()
-            opt_type = opt_params.pop("type", self.DEFAULT_OPTIMIZER_TYPE)
-
-            if isinstance(opt_type, type):
-                self._optimizer = opt_type(optimizable_params, **opt_params)
-            elif isinstance(opt_type, str):
-                if opt_type.lower() == "adam":
-                    self._optimizer = torch.optim.Adam(optimizable_params, **opt_params)
-                elif opt_type.lower() == "adamw":
-                    self._optimizer = torch.optim.AdamW(optimizable_params, **opt_params)
-                elif opt_type.lower() == "sgd":
-                    self._optimizer = torch.optim.SGD(optimizable_params, **opt_params)
-                elif opt_type.lower() == "none":
-                    self.remove_optimizer()
-                else:
-                    raise NotImplementedError(f"Unknown optimizer type: {opt_type}")
-
-            # Recreate scheduler if it exists
-            if self._scheduler_params:
-                self.set_scheduler(self._scheduler_params)
+        # Reconnect scheduler
+        if self._scheduler is not None and self._optimizer is not None:
+            self._scheduler.optimizer = self._optimizer
+        return

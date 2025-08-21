@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Any, Literal, Sequence, cast
 from warnings import warn
 
@@ -835,38 +834,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             intensities = np.abs(probe) ** 2
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
 
-    def save(
-        self,
-        path: str | Path,
-        mode: Literal["w", "o"] = "w",
-        store: Literal["auto", "zip", "dir"] = "auto",
-        skip: str | type | Sequence[str | type] = (),
-        compression_level: int | None = 4,
-    ):
-        if isinstance(skip, (str, type)):
-            skip = [skip]
-        skip = list(skip)
-        skips = (
-            skip
-            + [
-                # torch.optim.Optimizer,
-                # torch.optim.lr_scheduler.LRScheduler,
-                # DatasetModelType,
-                # "_probe_model",
-                # "_obj_model",
-                # "_detector_model",
-            ]
-        )
-        super().save(
-            path,
-            mode=mode,
-            store=store,
-            compression_level=compression_level,
-            # skip=["optimizers", "_optimizers"],
-            # skip=torch.optim.Optimizer,'
-            skip=skips,
-        )
-
     def to(self, device: str | int | torch.device):
         dev, _id = config.validate_device(device)
         if dev != self.device:
@@ -877,15 +844,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._obj_fov_mask = self._to_torch(self._obj_fov_mask)
         self._propagators = self._to_torch(self._propagators)
         self._rng_to_device(dev)
-
-        # Reconnect optimizers after all models have been moved
-        for model_name, model in [
-            ("obj_model", self.obj_model),
-            ("probe_model", self.probe_model),
-            ("dset", self.dset),
-        ]:
-            if hasattr(model, "reconnect_optimizer_to_parameters"):
-                model.reconnect_optimizer_to_parameters()
 
     # endregion
 

@@ -61,6 +61,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self.dset = dset
         self.verbose = verbose
         self._preprocessed = False
+        self._preprocessing_params = {}  # for serialization and reloading
 
         # Initialize scan positions and descan shifts as parameters
         num_positions = self.dset.shape[0] * self.dset.shape[1]
@@ -100,8 +101,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         super().to(*args, **kwargs)
 
         # Reconnect optimizer to parameters on the new device
-        if hasattr(self, "reconnect_optimizer_to_parameters"):
-            self.reconnect_optimizer_to_parameters()
+        self.reconnect_optimizer_to_parameters()
 
         return self
 
@@ -760,9 +760,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
     def preprocess(
         self,
-        com_fit_function: Literal[
-            "none", "plane", "parabola", "constant", "no_shift"
-        ] = "constant",
+        com_fit_function: Literal["none", "plane", "parabola", "constant", "no_shift"] = "plane",
         force_com_rotation: float | None = None,
         force_com_transpose: bool | None = None,
         padded_diffraction_intensities_shape: tuple[int, int] | None = None,
@@ -772,6 +770,18 @@ class PtychographyDatasetRaster(DatasetConstraints):
         vectorized: bool = True,
         probe_energy: float | None = None,
     ):
+        # Store preprocessing parameters for serialization and reloading
+        self._preprocessing_params = {
+            "com_fit_function": com_fit_function,
+            "force_com_rotation": force_com_rotation,
+            "force_com_transpose": force_com_transpose,
+            "padded_diffraction_intensities_shape": padded_diffraction_intensities_shape,
+            "obj_padding_px": obj_padding_px,
+            "plot_rotation": False,
+            "plot_com": False,
+            "vectorized": vectorized,
+        }
+
         if probe_energy is not None:
             self.probe_energy = probe_energy
 

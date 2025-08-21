@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, Self, cast, overload
 
@@ -9,6 +11,7 @@ from quantem.core.utils.utils import get_array_module
 from quantem.core.utils.validators import (
     ensure_valid_array,
     validate_ndinfo,
+    validate_pathlike,
     validate_units,
 )
 
@@ -151,6 +154,14 @@ class Dataset(AutoSerialize):
     @signal_units.setter
     def signal_units(self, value: str) -> None:
         self._signal_units = str(value)
+
+    @property
+    def file_path(self) -> Path | None:
+        return self._file_path
+
+    @file_path.setter
+    def file_path(self, value: os.PathLike | str | None) -> None:
+        self._file_path = validate_pathlike(value)
 
     # --- Derived Properties ---
     @property

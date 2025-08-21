@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 from warnings import warn
 
@@ -161,6 +163,17 @@ def validate_units(value: Union[List[str], tuple, list, str], ndim: int) -> List
         raise ValueError(f"Length of units ({len(value)}) must match data ndim ({ndim})")
 
     return [str(unit) for unit in value]
+
+
+def validate_pathlike(value: os.PathLike | str | None) -> Path | None:
+    if value is None:
+        return
+    if isinstance(value, os.PathLike):
+        return Path(value)
+    elif isinstance(value, str):
+        return Path(value)
+    else:
+        raise TypeError(f"Path must be a pathlike or string, got {type(value)}")
 
 
 # --- Vector Validation Functions ---
