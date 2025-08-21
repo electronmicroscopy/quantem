@@ -448,7 +448,7 @@ class Dataset(AutoSerialize):
             if axis in crop_dict:
                 before, after = crop_dict[axis]
                 start = before
-                stop = dim - after if after != 0 else None
+                stop = after if after != 0 else None
                 full_slices.append(slice(start, stop))
             else:
                 full_slices.append(slice(None))
