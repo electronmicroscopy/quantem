@@ -94,8 +94,21 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
         self.batch_size = self.dset.num_gpts
 
-        # Remove centralized optimizer storage - now managed by individual models
+        if (
+            (hasattr(probe_model, "vacuum_probe_intensity"))
+            and (probe_model.vacuum_probe_intensity is not None)
+            and (dset.amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
+        ):
+            scale_output = (
+                dset.amplitudes.shape[1] / probe_model.vacuum_probe_intensity.shape[0],
+                dset.amplitudes.shape[2] / probe_model.vacuum_probe_intensity.shape[1],
+            )
+            probe_model.vacuum_probe_intensity = ndi.zoom(
+                probe_model.vacuum_probe_intensity,
+                scale_output,
+            )
 
+        # Remove centralized optimizer storage - now managed by individual models
         self.set_probe_model(probe_model)
         self.set_obj_model(obj_model)
         self.detector_model = detector_model
