@@ -4,7 +4,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Literal, Sequence, Union
+from typing import AbstractSet, Any, Literal, Sequence, Union, cast
 from zipfile import ZipFile
 
 import dill
@@ -16,6 +16,115 @@ from zarr.storage import LocalStore
 
 # Base class for automatic serialization of classes
 class AutoSerialize:
+    # ---- Helpers to reduce casting noise ----
+    @staticmethod
+    def _get_group(parent: zarr.Group, key: str) -> zarr.Group:
+        return cast(zarr.Group, parent[key])
+
+    @staticmethod
+    def _get_array(parent: zarr.Group, key: str) -> zarr.Array:
+        return cast(zarr.Array, parent[key])
+
+    @staticmethod
+    def _fix_torch_module_sets(mod):
+        """Fix PyTorch module set attributes that might have been corrupted during serialization."""
+        if isinstance(mod, torch.nn.Module):
+            # Fix _non_persistent_buffers_set if it's not a set
+            if hasattr(mod, "_non_persistent_buffers_set") and not isinstance(
+                mod._non_persistent_buffers_set, set
+            ):
+                mod._non_persistent_buffers_set = set(mod._non_persistent_buffers_set)
+        return mod
+
+    @staticmethod
+    def _load_torch_module_with_fix(data_bytes):
+        """Load a torch module and fix any corrupted set attributes."""
+        buf = io.BytesIO(data_bytes)
+        mod = torch.load(buf, map_location="cpu", weights_only=False)
+        AutoSerialize._fix_torch_module_sets(mod)
+        return mod
+
+    @staticmethod
+    def _array_to_np(arr: zarr.Array) -> np.ndarray:
+        # Handle empty arrays (any dimension of size 0) and 0-dimensional arrays
+        if arr.ndim == 0 or any(s == 0 for s in arr.shape):
+            # Check if this was originally an empty array with a specific shape
+            if "_original_shape" in arr.attrs:
+                original_shape = arr.attrs["_original_shape"]
+                # Convert to tuple of ints to ensure proper typing
+                if isinstance(original_shape, (list, tuple)):
+                    original_shape = tuple(int(cast(Any, x)) for x in original_shape)
+                return np.empty(cast(Any, original_shape), dtype=arr.dtype)
+            else:
+                # For empty or 0-dimensional arrays, return an empty numpy array with the same shape
+                return np.empty(arr.shape, dtype=arr.dtype)
+        else:
+            return cast(np.ndarray, arr[:])
+
+    @staticmethod
+    def _read_array_np(parent: zarr.Group, key: str) -> np.ndarray:
+        return AutoSerialize._array_to_np(AutoSerialize._get_array(parent, key))
+
+    @staticmethod
+    def _write_ndarray(
+        group: zarr.Group,
+        name: str,
+        array: np.ndarray,
+        compressors=None,
+    ) -> None:
+        # Ensure array is a numpy array
+        if not isinstance(array, np.ndarray):
+            array = np.asarray(array)
+
+        # Handle scalar arrays (0-dimensional) properly
+        if array.ndim == 0:
+            ds = group.create_array(
+                name=name, shape=(), dtype=array.dtype, compressors=compressors
+            )
+            ds[()] = array.item()  # Use () for scalar indexing
+        else:
+            # Handle empty arrays (any dimension of size 0)
+            if any(s == 0 for s in array.shape):
+                # For empty arrays, create a 0-dimensional array instead of (0,)
+                # This avoids indexing issues during loading
+                ds = group.create_array(
+                    name=name, shape=(), dtype=array.dtype, compressors=compressors
+                )
+                # Store the original shape as an attribute for reconstruction
+                ds.attrs["_original_shape"] = array.shape
+                # No need to assign data since it's empty
+                return
+            # Ensure the shape is valid (no negative dimensions)
+            if any(s < 0 for s in array.shape):
+                raise ValueError(f"Invalid array shape {array.shape} for array '{name}'")
+            ds = group.create_array(
+                name=name, shape=array.shape, dtype=array.dtype, compressors=compressors
+            )
+            ds[:] = array
+
+    @staticmethod
+    def _write_bytes(
+        group: zarr.Group,
+        name: str,
+        data: bytes,
+        compressors=None,
+    ) -> None:
+        # Handle empty bytes
+        if not data:
+            ds = group.create_array(name=name, shape=(0,), dtype="uint8", compressors=compressors)
+            return
+
+        buf_arr = np.frombuffer(data, dtype="uint8")
+        # Handle scalar arrays (0-dimensional) properly
+        if buf_arr.ndim == 0:
+            ds = group.create_array(name=name, shape=(), dtype="uint8", compressors=compressors)
+            ds[()] = buf_arr.item()
+        else:
+            ds = group.create_array(
+                name=name, shape=buf_arr.shape, dtype="uint8", compressors=compressors
+            )
+            ds[:] = buf_arr
+
     def save(
         self,
         path: str | Path,
@@ -127,6 +236,128 @@ class AutoSerialize:
         else:
             raise ValueError(f"Unknown store type: {store}")
 
+    def _serialize_value(
+        self,
+        value: Any,
+        group: zarr.Group,
+        name: str,
+        skip_names: set[str] = set(),
+        skip_types: tuple[type, ...] = (),
+        compressors=None,
+    ) -> None:
+        """
+        Unified method to serialize any value type to a Zarr group.
+        This eliminates duplication between _recursive_save and _serialize_container.
+        """
+        # --- Serialization handlers by type ---
+        if isinstance(value, torch.Tensor):
+            # Save entire tensor with torch.save to preserve requires_grad, grad_fn, etc.
+            # This is more robust than converting to numpy which loses gradient information
+            subgroup = group.require_group(name)
+            subgroup.attrs["_torch_tensor"] = True
+            subgroup.attrs["_tensor_shape"] = list(value.shape)
+            subgroup.attrs["_tensor_dtype"] = str(value.dtype)
+            subgroup.attrs["_tensor_device"] = str(value.device)
+            subgroup.attrs["_tensor_requires_grad"] = bool(value.requires_grad)
+
+            buffer = io.BytesIO()
+            torch.save(value, buffer)
+            buffer.seek(0)
+            byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
+            self._write_bytes(subgroup, "tensor", byte_arr.tobytes(), compressors=None)
+
+        elif isinstance(value, torch.optim.Optimizer):
+            # Save entire optimizer with torch.save for robustness
+            subgroup = group.require_group(name)
+            subgroup.attrs["_torch_optimizer"] = True
+            subgroup.attrs["class_name"] = value.__class__.__name__
+
+            buffer = io.BytesIO()
+            torch.save(value, buffer)
+            buffer.seek(0)
+            byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
+            self._write_bytes(subgroup, "optimizer", byte_arr.tobytes(), compressors=None)
+
+        elif hasattr(value, "step") and hasattr(value, "get_last_lr"):
+            # Handle LR schedulers with torch.save for robustness
+            subgroup = group.require_group(name)
+            subgroup.attrs["_torch_scheduler"] = True
+            subgroup.attrs["class_name"] = value.__class__.__name__
+
+            buffer = io.BytesIO()
+            torch.save(value, buffer)
+            buffer.seek(0)
+            byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
+            self._write_bytes(subgroup, "scheduler", byte_arr.tobytes(), compressors=None)
+
+        elif isinstance(value, torch.nn.Module):
+            # Save entire torch module with torch.save for robustness
+            subgroup = group.require_group(name)
+            subgroup.attrs["_torch_whole_module"] = True
+            buffer = io.BytesIO()
+            torch.save(value, buffer)
+            buffer.seek(0)
+            byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
+            self._write_bytes(subgroup, "module", byte_arr.tobytes(), compressors=None)
+
+        elif isinstance(value, np.ndarray):
+            # Save as native array
+            if name not in group:
+                self._write_ndarray(group, name, value, compressors)
+
+        elif isinstance(value, (int, float, str, bool, type(None))):
+            # Scalars saved as attributes
+            group.attrs[name] = value
+        elif hasattr(value, "dtype") and hasattr(value, "item"):
+            # Handle numpy scalar types (np.float32, np.int64, etc.)
+            group.attrs[name] = value.item()
+
+        elif isinstance(value, AutoSerialize):
+            # Nested AutoSerialize subtree
+            subgroup = group.require_group(name)
+            self._recursive_save(value, subgroup, skip_names, skip_types, compressors)
+
+        elif isinstance(value, (list, tuple, dict)):
+            # Save containers recursively (with nested AutoSerialize support)
+            subgroup = group.require_group(name)
+            self._serialize_container(value, subgroup, skip_names, skip_types, compressors)
+
+        elif isinstance(value, set):
+            # Convert set to list for serialization, store type info
+            subgroup = group.require_group(name)
+            subgroup.attrs["_container_type"] = "set"
+            # Convert set items to list and serialize
+            list_value = list(value)
+            self._serialize_container(list_value, subgroup, skip_names, skip_types, compressors)
+
+        elif hasattr(value, "bit_generator"):
+            # NumPy random generator - save state through bit_generator
+            subgroup = group.require_group(name)
+            subgroup.attrs["_numpy_rng"] = True
+            # Get state from the bit_generator
+            rng_state = value.bit_generator.state
+            if hasattr(rng_state, "tolist"):
+                subgroup.attrs["_rng_state"] = rng_state.tolist()
+            else:
+                subgroup.attrs["_rng_state"] = rng_state
+            subgroup.attrs["_rng_type"] = value.__class__.__name__
+            subgroup.attrs["_bit_generator_type"] = value.bit_generator.__class__.__name__
+
+        elif hasattr(value, "get_state") and hasattr(value, "set_state"):
+            # PyTorch generator - skip for now as state structure is complex
+            # Just store a marker that this was a generator
+            subgroup = group.require_group(name)
+            subgroup.attrs["_torch_rng_skipped"] = True
+            subgroup.attrs["_rng_type"] = "torch.Generator"
+            # Don't try to save the state - it's not essential for core functionality
+
+        else:
+            # Fallback: dill-serialize + gzip-compress
+            print(f"falling back in serialize for {name} of type {type(value)}")
+            serialized = dill.dumps(value)
+            compressed = gzip.compress(serialized)
+            self._write_bytes(group, name, compressed, compressors)
+
     def _recursive_save(
         self,
         obj,
@@ -155,95 +386,16 @@ class AutoSerialize:
             if attr_name in skip_names or isinstance(attr_value, skip_types):
                 continue
 
-            # --- Serialization handlers by type ---
-            if isinstance(attr_value, torch.Tensor):
-                # Save as ndarray, with flag for torch reloading
-                tensor_np = (
-                    attr_value.detach().cpu().numpy()
-                    if attr_value.requires_grad
-                    else attr_value.cpu().numpy()
-                )
-                if attr_name not in group:
-                    arr = group.create_dataset(
-                        name=attr_name,
-                        shape=tensor_np.shape,
-                        dtype=tensor_np.dtype,
-                        compressors=compressors,
-                    )
-                    arr[:] = tensor_np
-                    group.attrs[f"{attr_name}.torch_save"] = True
-
-            elif isinstance(attr_value, torch.optim.Optimizer):
-                # Save torch optimizer state_dict as compressed byte array
-                opt_group = group.require_group(attr_name)
-                opt_group.attrs["_torch_optimizer"] = True
-                opt_group.attrs["class_name"] = attr_value.__class__.__name__
-
-                buffer = io.BytesIO()
-                torch.save(attr_value.state_dict(), buffer)
-                buffer.seek(0)
-                byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
-                opt_group.create_dataset(
-                    "state_dict", data=byte_arr, shape=byte_arr.shape, dtype="uint8"
-                )
-
-            elif isinstance(attr_value, torch.nn.Module):
-                # Save entire torch module as compressed byte array
-                subgroup = group.require_group(attr_name)
-                subgroup.attrs["_torch_whole_module"] = True
-                buffer = io.BytesIO()
-                print("attr_value", attr_value)
-                torch.save(attr_value, buffer)
-                buffer.seek(0)
-                byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
-                subgroup.create_dataset(
-                    "module", data=byte_arr, shape=byte_arr.shape, dtype="uint8"
-                )
-
-            elif isinstance(attr_value, np.ndarray):
-                # Save as native array
-                if attr_name not in group:
-                    arr = group.create_dataset(
-                        name=attr_name,
-                        shape=attr_value.shape,
-                        dtype=attr_value.dtype,
-                        compressors=compressors,
-                    )
-                    arr[:] = attr_value
-
-            elif isinstance(attr_value, (int, float, str, bool, type(None))):
-                # Scalars saved as attributes
-                group.attrs[attr_name] = attr_value
-
-            elif isinstance(attr_value, AutoSerialize):
-                # Nested AutoSerialize subtree
-                subgroup = group.require_group(attr_name)
-                self._recursive_save(attr_value, subgroup, skip_names, skip_types, compressors)
-
-            elif isinstance(attr_value, (list, tuple, dict)):
-                # Save containers recursively (with nested AutoSerialize support)
-                subgroup = group.require_group(attr_name)
-                self._serialize_container(
-                    attr_value, subgroup, skip_names, skip_types, compressors
-                )
-
-            else:
-                # Fallback: dill-serialize + gzip-compress
-                serialized = dill.dumps(attr_value)
-                compressed = gzip.compress(serialized)
-                ds = group.create_dataset(
-                    name=attr_name,
-                    shape=(len(compressed),),
-                    dtype="uint8",
-                    compressors=compressors,
-                )
-                ds[:] = np.frombuffer(compressed, dtype="uint8")
+            # Use unified serialization method
+            self._serialize_value(
+                attr_value, group, attr_name, skip_names, skip_types, compressors
+            )
 
     @classmethod
     def _recursive_load(
         cls,
         group: zarr.Group,
-        skip_names: set[str] = frozenset(),
+        skip_names: AbstractSet[str] = frozenset(),
         skip_types: tuple[type, ...] = (),
     ) -> object:
         """
@@ -251,12 +403,14 @@ class AutoSerialize:
         honoring attribute/type skipping for selective deserialization.
         """
         # --- Load class identity and ensure version is compatible ---
-        meta = group.attrs["_autoserialize"]
-        version = meta.get("version", 1)
+        meta = cast(dict[str, Any], group.attrs["_autoserialize"])
+        version = int(meta.get("version", 1))
         if version != 1:
             raise ValueError(f"Unsupported AutoSerialize version: {version}")
-        module = __import__(meta["class_module"], fromlist=[meta["class_name"]])
-        cls_obj = getattr(module, meta["class_name"])
+        module_name = cast(str, meta["class_module"])
+        class_name = cast(str, meta["class_name"])
+        module = __import__(module_name, fromlist=[class_name])
+        cls_obj = getattr(module, class_name)
         obj = cls_obj.__new__(cls_obj)  # Avoid __init__ side effects
 
         # If attrs package is used, only allow whitelisted attribute names
@@ -283,12 +437,12 @@ class AutoSerialize:
         for ds in group.array_keys():
             if ds in skip_names:
                 continue
-            arr = group[ds][:]
+            arr_np = AutoSerialize._read_array_np(group, ds)
             try:
-                payload = gzip.decompress(arr.tobytes())
+                payload = gzip.decompress(arr_np.tobytes())
                 v = dill.loads(payload)
             except Exception:
-                v = arr
+                v = arr_np
                 if group.attrs.get(f"{ds}.torch_save", False):
                     v = torch.from_numpy(v)
             if type(v) in skip_types:
@@ -300,52 +454,112 @@ class AutoSerialize:
         for name in group.group_keys():
             if name in skip_names:
                 continue
-            subgrp = group[name]
+            subgrp = AutoSerialize._get_group(group, name)
+
+            # torch tensor group
+            if subgrp.attrs.get("_torch_tensor"):
+                data = AutoSerialize._read_array_np(subgrp, "tensor").tobytes()
+                buf = io.BytesIO(data)
+                tensor = torch.load(buf, map_location="cpu", weights_only=False)
+                if type(tensor) in skip_types:
+                    continue
+                setattr(obj, name, tensor)
+                set_attrs.add(name)
 
             # torch optimizer group
-            if subgrp.attrs.get("_torch_optimizer"):
-                clsname = subgrp.attrs["class_name"]
-                data = bytes(subgrp["state_dict"][:])
+            elif subgrp.attrs.get("_torch_optimizer"):
+                data = AutoSerialize._read_array_np(subgrp, "optimizer").tobytes()
                 buf = io.BytesIO(data)
-                state = torch.load(buf, map_location="cpu")
-                opt_cls = getattr(torch.optim, clsname)
-                dummy = torch.zeros(1, requires_grad=True)
-                opt = opt_cls([dummy])
-                opt.load_state_dict(state)
+                opt = torch.load(buf, map_location="cpu", weights_only=False)
                 if type(opt) in skip_types:
                     continue
+
                 setattr(obj, name, opt)
+                set_attrs.add(name)
+
+            # torch scheduler group
+            elif subgrp.attrs.get("_torch_scheduler"):
+                data = AutoSerialize._read_array_np(subgrp, "scheduler").tobytes()
+                buf = io.BytesIO(data)
+                scheduler = torch.load(buf, map_location="cpu", weights_only=False)
+                if type(scheduler) in skip_types:
+                    continue
+                setattr(obj, name, scheduler)
                 set_attrs.add(name)
 
             # torch module group
             elif subgrp.attrs.get("_torch_whole_module"):
-                data = bytes(subgrp["module"][:])
+                data = AutoSerialize._read_array_np(subgrp, "module").tobytes()
                 buf = io.BytesIO(data)
                 mod = torch.load(buf, map_location="cpu", weights_only=False)
                 if type(mod) in skip_types:
                     continue
+
+                # Fix PyTorch module set attributes that might be corrupted
+                if isinstance(mod, torch.nn.Module):
+                    cls._fix_torch_module_sets(mod)
+
                 setattr(obj, name, mod)
                 set_attrs.add(name)
 
             # nested AutoSerialize group
             elif "_autoserialize" in subgrp.attrs:
-                m = subgrp.attrs["_autoserialize"]
-                submod = __import__(m["class_module"], fromlist=[m["class_name"]])
-                subcls = getattr(submod, m["class_name"])
+                m = cast(dict[str, Any], subgrp.attrs["_autoserialize"])
+                submod_name = cast(str, m["class_module"])
+                subcls_name = cast(str, m["class_name"])
+                submod = __import__(submod_name, fromlist=[subcls_name])
+                subcls = getattr(submod, subcls_name)
                 if subcls in skip_types:
                     continue
                 val = subcls._recursive_load(subgrp, skip_names, skip_types)
                 if type(val) in skip_types:
                     continue
+
                 setattr(obj, name, val)
                 set_attrs.add(name)
 
             # containers (list, tuple, dict)
             elif subgrp.attrs.get("_container_type", None) is not None:
-                val = cls._deserialize_container(subgrp)
+                val = cls._deserialize_container(cast(zarr.Group, subgrp))
                 if type(val) in skip_types:
                     continue
                 setattr(obj, name, val)
+                set_attrs.add(name)
+
+            # NumPy random generator
+            elif subgrp.attrs.get("_numpy_rng"):
+                import numpy.random as npr
+
+                # rng_type = subgrp.attrs.get("_rng_type", "Generator")
+                bit_generator_type = subgrp.attrs.get("_bit_generator_type", "PCG64")
+                # rng_state = subgrp.attrs["_rng_state"]
+
+                # Create the appropriate bit generator
+                if bit_generator_type == "PCG64":
+                    bit_gen = npr.PCG64()
+                elif bit_generator_type == "MT19937":
+                    bit_gen = npr.MT19937()
+                elif bit_generator_type == "Philox":
+                    bit_gen = npr.Philox()
+                elif bit_generator_type == "SFC64":
+                    bit_gen = npr.SFC64()
+                else:
+                    # Fallback to default
+                    bit_gen = npr.PCG64()
+
+                # Create generator with fresh state
+                rng = npr.Generator(bit_gen)
+                # Note: We don't restore the exact state due to type compatibility issues
+                # The generator will work fine with fresh state and can be re-seeded if needed
+
+                setattr(obj, name, rng)
+                set_attrs.add(name)
+
+            # PyTorch generator (skipped during save)
+            elif subgrp.attrs.get("_torch_rng_skipped"):
+                # Create a new generator since we didn't save the state
+                rng = torch.Generator()
+                setattr(obj, name, rng)
                 set_attrs.add(name)
 
             else:
@@ -361,18 +575,43 @@ class AutoSerialize:
         if hasattr(obj, "__attrs_post_init__"):
             obj.__attrs_post_init__()
 
+        # Fix PyTorch module set attributes after all loading is complete
+        if isinstance(obj, torch.nn.Module):
+            cls._fix_torch_module_sets(obj)
+
+        # Also fix any nested PyTorch modules in the object's attributes
+        # Use a more defensive approach to avoid triggering property accessors
+        for attr_name in dir(obj):
+            if not attr_name.startswith("_"):  # Skip private attributes
+                try:
+                    # Check if it's a property first to avoid triggering accessors
+                    if hasattr(type(obj), attr_name):
+                        attr_descriptor = getattr(type(obj), attr_name)
+                        if hasattr(attr_descriptor, "__get__") and not hasattr(
+                            attr_descriptor, "__set__"
+                        ):
+                            # This is a read-only property, skip it to avoid triggering computation
+                            continue
+
+                    attr_value = getattr(obj, attr_name)
+                    if isinstance(attr_value, torch.nn.Module):
+                        cls._fix_torch_module_sets(attr_value)
+                except (AttributeError, RuntimeError, ValueError, KeyError):
+                    # Skip attributes that can't be accessed or cause other errors
+                    pass
+
         return obj
 
     def _serialize_container(
         self,
-        value,
+        value: Union[list, tuple, dict],
         group: zarr.Group,
-        skip_names: set[str],
-        skip_types: tuple[type, ...],
+        skip_names: set[str] = set(),
+        skip_types: tuple[type, ...] = (),
         compressors=None,
-    ):
+    ) -> None:
         """
-        Serialize a container (list, tuple, or dict) into a Zarr group.
+        Serialize Python containers (list, tuple, dict) to Zarr groups.
 
         Handles nested containers, AutoSerialize instances, PyTorch objects, and primitives,
         with recursive support for arbitrary depth and skipping.
@@ -388,132 +627,16 @@ class AutoSerialize:
             group.attrs["_container_type"] = type(value).__name__
             for i, v in enumerate(value):
                 key = str(i)
+                # Use unified serialization method
+                self._serialize_value(v, group, key, skip_names, skip_types, compressors)
 
-                # --- If entry is an AutoSerialize object, use full recursive_save (preserves type!) ---
-                if isinstance(v, AutoSerialize):
-                    subgroup = group.require_group(key)
-                    self._recursive_save(v, subgroup, skip_names, skip_types, compressors)
-
-                # --- Recursively handle nested containers ---
-                elif isinstance(v, (list, tuple, dict)):
-                    subgroup = group.require_group(key)
-                    self._serialize_container(v, subgroup, skip_names, skip_types, compressors)
-
-                # --- Torch nn.Module: save as a whole-module byte array with a marker ---
-                elif isinstance(v, torch.nn.Module):
-                    subgroup = group.require_group(key)
-                    subgroup.attrs["_torch_whole_module"] = True
-                    buffer = io.BytesIO()
-                    torch.save(v, buffer)
-                    buffer.seek(0)
-                    byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
-                    subgroup.create_dataset(
-                        "module", data=byte_arr, shape=byte_arr.shape, dtype="uint8"
-                    )
-
-                # --- Torch tensor: save as ndarray, with .torch_save flag ---
-                elif isinstance(v, torch.Tensor):
-                    arr_np = v.detach().cpu().numpy() if v.requires_grad else v.cpu().numpy()
-                    ds = group.create_dataset(
-                        name=key,
-                        data=arr_np,
-                        shape=arr_np.shape,
-                        dtype=arr_np.dtype,
-                        compressors=compressors,
-                    )
-                    group.attrs[f"{key}.torch_save"] = True
-
-                # --- Standard numpy arrays: save directly as dataset ---
-                elif isinstance(v, np.ndarray):
-                    group.create_dataset(
-                        name=key,
-                        data=v,
-                        shape=v.shape,
-                        dtype=v.dtype,
-                        compressors=compressors,
-                    )
-
-                # --- Primitive types: store as attribute ---
-                elif isinstance(v, (int, float, str, bool, type(None))):
-                    group.attrs[key] = v
-
-                # --- Fallback: dill/gzip serialize and store as byte array ---
-                else:
-                    payload = dill.dumps(v)
-                    comp = gzip.compress(payload)
-                    ds = group.create_dataset(
-                        name=key,
-                        shape=(len(comp),),
-                        dtype="uint8",
-                        compressors=compressors,
-                    )
-                    ds[:] = np.frombuffer(comp, dtype="uint8")
-
-        # Handle dict containers (very similar logic, using keys)
+        # Handle dict containers
         elif isinstance(value, dict):
             group.attrs["_container_type"] = "dict"
             for k, v in value.items():
                 key = str(k)
-
-                # --- AutoSerialize instance as value ---
-                if isinstance(v, AutoSerialize):
-                    subgroup = group.require_group(key)
-                    self._recursive_save(v, subgroup, skip_names, skip_types, compressors)
-
-                # --- Nested container (list/tuple/dict) as value ---
-                elif isinstance(v, (list, tuple, dict)):
-                    subgroup = group.require_group(key)
-                    self._serialize_container(v, subgroup, skip_names, skip_types, compressors)
-
-                # --- Torch nn.Module as value ---
-                elif isinstance(v, torch.nn.Module):
-                    subgroup = group.require_group(key)
-                    subgroup.attrs["_torch_whole_module"] = True
-                    buffer = io.BytesIO()
-                    torch.save(v, buffer)
-                    buffer.seek(0)
-                    byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
-                    subgroup.create_dataset(
-                        "module", data=byte_arr, shape=byte_arr.shape, dtype="uint8"
-                    )
-
-                # --- Torch tensor as value ---
-                elif isinstance(v, torch.Tensor):
-                    arr_np = v.detach().cpu().numpy() if v.requires_grad else v.cpu().numpy()
-                    ds = group.create_dataset(
-                        name=key,
-                        data=arr_np,
-                        shape=arr_np.shape,
-                        dtype=arr_np.dtype,
-                        compressors=compressors,
-                    )
-                    group.attrs[f"{key}.torch_save"] = True
-
-                # --- Standard numpy array as value ---
-                elif isinstance(v, np.ndarray):
-                    group.create_dataset(
-                        name=key,
-                        data=v,
-                        shape=v.shape,
-                        dtype=v.dtype,
-                        compressors=compressors,
-                    )
-
-                # --- Primitive type as value ---
-                elif isinstance(v, (int, float, str, bool, type(None))):
-                    group.attrs[key] = v
-
-                # --- Fallback: dill/gzip ---
-                else:
-                    payload = dill.dumps(v)
-                    comp = gzip.compress(payload)
-                    ds = group.create_dataset(
-                        name=key,
-                        shape=(len(comp),),
-                        dtype="uint8",
-                        compressors=compressors,
-                    )
-                    ds[:] = np.frombuffer(comp, dtype="uint8")
+                # Use unified serialization method
+                self._serialize_value(v, group, key, skip_names, skip_types, compressors)
 
     @classmethod
     def _deserialize_container(cls, group: zarr.Group):
@@ -532,7 +655,7 @@ class AutoSerialize:
 
         # Helper to handle optional torch tensor restoration
         def maybe_tensor(group, key):
-            arr = group[key][:]
+            arr = AutoSerialize._read_array_np(group, key)
             return torch.from_numpy(arr) if group.attrs.get(f"{key}.torch_save") else arr
 
         if ctype in ("list", "tuple"):
@@ -558,39 +681,105 @@ class AutoSerialize:
                 elif key in group.array_keys():
                     items.append(maybe_tensor(group, key))
                 elif key in group.group_keys():
-                    subgroup = group[key]
+                    subgroup = cast(zarr.Group, group[key])
                     # Handle recursive containers
                     if "_container_type" in subgroup.attrs:
                         items.append(cls._deserialize_container(subgroup))
                     # Restore nested AutoSerialize objects
                     elif "_autoserialize" in subgroup.attrs:
-                        meta = subgroup.attrs["_autoserialize"]
-                        submod = __import__(meta["class_module"], fromlist=[meta["class_name"]])
-                        subcls = getattr(submod, meta["class_name"])
+                        meta = cast(dict[str, Any], subgroup.attrs["_autoserialize"])
+                        submod = __import__(
+                            cast(str, meta["class_module"]),
+                            fromlist=[cast(str, meta["class_name"])],
+                        )
+                        subcls = getattr(submod, cast(str, meta["class_name"]))
                         items.append(subcls._recursive_load(subgroup))
                     # Restore nested torch modules
                     elif subgroup.attrs.get("_torch_whole_module"):
-                        data = bytes(subgroup["module"][:])
+                        module_arr = cast(zarr.Array, subgroup["module"])
+                        data = cast(np.ndarray, module_arr[:]).tobytes()
                         buf = io.BytesIO(data)
+                        # For containers, load to CPU - they'll be moved to the right device when attached to the main object
                         mod = torch.load(buf, map_location="cpu", weights_only=False)
                         items.append(mod)
+                    elif subgroup.attrs.get("_torch_tensor"):
+                        # Handle new tensor format in containers
+                        data = AutoSerialize._read_array_np(subgroup, "tensor").tobytes()
+                        buf = io.BytesIO(data)
+                        tensor = torch.load(buf, map_location="cpu", weights_only=False)
+                        items.append(tensor)
                     else:
                         raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
                 else:
                     raise KeyError(f"Missing expected key '{key}' in container")
             # Restore container type and special torch containers
-            result = items if ctype == "list" else tuple(items)
+            seq_result = items if ctype == "list" else tuple(items)
             if torch_iterable_type == "Sequential":
-                return torch.nn.Sequential(*result)
+                return torch.nn.Sequential(*seq_result)
             elif torch_iterable_type == "ModuleList":
-                return torch.nn.ModuleList(result)
+                return torch.nn.ModuleList(cast(Sequence[torch.nn.Module], list(seq_result)))
             elif torch_iterable_type == "ParameterList":
-                return torch.nn.ParameterList(result)
+                return torch.nn.ParameterList(cast(Sequence[torch.nn.Parameter], list(seq_result)))
             else:
-                return result
+                return seq_result
+
+        elif ctype == "set":
+            # Convert back from list to set
+            items = []
+            for i in range(
+                max(
+                    (
+                        int(k)
+                        for k in list(group.attrs)
+                        + list(group.array_keys())
+                        + list(group.group_keys())
+                        if k.isdigit()
+                    ),
+                    default=-1,
+                )
+                + 1
+            ):
+                key = str(i)
+                if key in group.attrs:
+                    items.append(group.attrs[key])
+                elif key in group.array_keys():
+                    items.append(maybe_tensor(group, key))
+                elif key in group.group_keys():
+                    subgroup = cast(zarr.Group, group[key])
+                    # Handle recursive containers
+                    if "_container_type" in subgroup.attrs:
+                        items.append(cls._deserialize_container(subgroup))
+                    # Restore nested AutoSerialize objects
+                    elif "_autoserialize" in subgroup.attrs:
+                        meta = cast(dict[str, Any], subgroup.attrs["_autoserialize"])
+                        submod = __import__(
+                            cast(str, meta["class_module"]),
+                            fromlist=[cast(str, meta["class_name"])],
+                        )
+                        subcls = getattr(submod, cast(str, meta["class_name"]))
+                        items.append(subcls._recursive_load(subgroup))
+                    # Restore nested torch modules
+                    elif subgroup.attrs.get("_torch_whole_module"):
+                        module_arr = cast(zarr.Array, subgroup["module"])
+                        data = cast(np.ndarray, module_arr[:]).tobytes()
+                        buf = io.BytesIO(data)
+                        # For containers, load to CPU - they'll be moved to the right device when attached to the main object
+                        mod = torch.load(buf, map_location="cpu", weights_only=False)
+                        items.append(mod)
+                    elif subgroup.attrs.get("_torch_tensor"):
+                        # Handle new tensor format in containers
+                        data = AutoSerialize._read_array_np(subgroup, "tensor").tobytes()
+                        buf = io.BytesIO(data)
+                        tensor = torch.load(buf, map_location="cpu", weights_only=False)
+                        items.append(tensor)
+                    else:
+                        raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
+                else:
+                    raise KeyError(f"Missing expected key '{key}' in container")
+            return set(items)
 
         elif ctype == "dict":
-            result = {}
+            result: dict[str, Any] = {}
             # Restore scalars and simple objects stored as attributes
             for key in group.attrs:
                 if key == "_container_type" or key.endswith(".torch_save"):
@@ -601,21 +790,32 @@ class AutoSerialize:
                 result[key] = maybe_tensor(group, key)
             # Restore subgroups
             for key in group.group_keys():
-                subgroup = group[key]
+                subgroup = cast(zarr.Group, group[key])
                 if "_container_type" in subgroup.attrs:
                     result[key] = cls._deserialize_container(subgroup)
                 elif "_autoserialize" in subgroup.attrs:
-                    meta = subgroup.attrs["_autoserialize"]
-                    submod = __import__(meta["class_module"], fromlist=[meta["class_name"]])
-                    subcls = getattr(submod, meta["class_name"])
+                    meta = cast(dict[str, Any], subgroup.attrs["_autoserialize"])
+                    submod = __import__(
+                        cast(str, meta["class_module"]), fromlist=[cast(str, meta["class_name"])]
+                    )
+                    subcls = getattr(submod, cast(str, meta["class_name"]))
                     result[key] = subcls._recursive_load(subgroup)
                 elif subgroup.attrs.get("_torch_whole_module"):
-                    data = bytes(subgroup["module"][:])
+                    module_arr = cast(zarr.Array, subgroup["module"])
+                    data = cast(np.ndarray, module_arr[:]).tobytes()
                     buf = io.BytesIO(data)
+                    # For containers, load to CPU - they'll be moved to the right device when attached to the main object
                     mod = torch.load(buf, map_location="cpu", weights_only=False)
                     result[key] = mod
+                elif subgroup.attrs.get("_torch_tensor"):
+                    # Handle new tensor format in containers
+                    data = AutoSerialize._read_array_np(subgroup, "tensor").tobytes()
+                    buf = io.BytesIO(data)
+                    tensor = torch.load(buf, map_location="cpu", weights_only=False)
+                    result[key] = tensor
                 else:
                     raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
+
             return result
 
         else:
@@ -805,18 +1005,20 @@ def load(
     root = zarr.group(store=store)
     if "_autoserialize" not in root.attrs:
         raise KeyError("Missing '_autoserialize' metadata in Zarr root attrs.")
-    meta = root.attrs["_autoserialize"]
-    version = meta.get("version", 1)
+    meta = cast(dict[str, Any], root.attrs["_autoserialize"])
+    version = int(meta.get("version", 1))
     if version != 1:
         raise ValueError(f"Unsupported AutoSerialize version: {version}")
 
     # Read skip metadata (names/types) stored with the file, if present
-    file_skip_names = set(root.attrs.get("_autoserialize_skip_names", []))
-    file_skip_types_raw = root.attrs.get("_autoserialize_skip_types", [])
+    file_skip_names = set(cast(Sequence[str], root.attrs.get("_autoserialize_skip_names", [])))
+    file_skip_types_raw = cast(
+        Sequence[str] | None, root.attrs.get("_autoserialize_skip_types", [])
+    )
     file_skip_types = (
         tuple(
             # Import each type by fully-qualified name from string
-            __import__(t.rpartition(".")[0], fromlist=[t.rpartition(".")[2]]).__dict__[
+            __import__(t.rpartition(".")[0], fromlist=[t.rpartition(".")[2]]).__dict__[  # type: ignore[index]
                 t.rpartition(".")[2]
             ]
             for t in file_skip_types_raw
@@ -830,8 +1032,8 @@ def load(
     skip_types = user_skip_types + tuple(t for t in file_skip_types if t not in user_skip_types)
 
     # Dynamically import target class, then reconstruct from Zarr
-    mod = __import__(meta["class_module"], fromlist=[meta["class_name"]])
-    cls = getattr(mod, meta["class_name"])
+    mod = __import__(cast(str, meta["class_module"]), fromlist=[cast(str, meta["class_name"])])
+    cls = getattr(mod, cast(str, meta["class_name"]))
     return cls._recursive_load(root, skip_names=skip_names, skip_types=skip_types)
 
 
@@ -875,13 +1077,13 @@ def print_file(
 
             # Print the root label (with class info) at the top level
             if current_depth == 0:
-                class_info = obj.attrs.get("_autoserialize")
+                class_info = cast(dict[str, Any] | None, obj.attrs.get("_autoserialize"))
                 label = Path(path).name
-                if class_info and "class_name" in class_info:
+                if class_info is not None and "class_name" in class_info:
                     mod_cls = (
-                        f"{class_info['class_module']}.{class_info['class_name']}"
+                        f"{cast(str, class_info['class_module'])}.{cast(str, class_info['class_name'])}"
                         if show_class_origin
-                        else class_info["class_name"]
+                        else cast(str, class_info["class_name"])
                     )
                     label += f": class {mod_cls}"
                 print(label)
@@ -907,7 +1109,7 @@ def print_file(
 
                 if key in obj.group_keys():
                     # Print nested groups (submodules, containers, etc)
-                    child_group = obj[key]
+                    child_group = cast(zarr.Group, obj[key])
                     group_type = child_group.attrs.get("_container_type")
                     suffix = (
                         f" (_container_type = '{group_type}')"
@@ -920,10 +1122,14 @@ def print_file(
 
                 elif key in obj.array_keys():
                     # Print info about arrays/tensors
-                    arr = obj[key]
+                    arr = cast(zarr.Array, obj[key])
                     is_torch = obj.attrs.get(f"{key}.torch_save", False)
-                    tensor_type = "torch.Tensor" if is_torch else "ndarray"
-                    print(prefix + branch + f"{key}: {tensor_type} shape={arr.shape}")
+                    tensor_type = "ndarray"  # Default to ndarray for array_keys
+                    print(
+                        prefix
+                        + branch
+                        + f"{key}: {tensor_type} shape={arr.shape} is_torch={is_torch}"
+                    )
 
                 else:
                     # Print scalar/group attribute values
@@ -935,5 +1141,20 @@ def print_file(
                         else ""
                     )
                     print(prefix + branch + f"{key}: {type_str}{display_val}")
+
+            # Check for tensors in new format that might not be in the main keys
+            for key in obj.group_keys():
+                if key not in printable_keys:  # Skip if already printed
+                    child_group = cast(zarr.Group, obj[key])
+                    if child_group.attrs.get("_torch_tensor"):
+                        # This is a tensor in the new format
+                        tensor_shape = child_group.attrs.get("_tensor_shape", "unknown")
+                        requires_grad = child_group.attrs.get("_tensor_requires_grad", False)
+                        grad_info = " (requires_grad=True)" if requires_grad else ""
+                        print(
+                            prefix
+                            + "└── "
+                            + f"{key}: torch.Tensor shape={tensor_shape}{grad_info}"
+                        )
 
     _recurse(root)

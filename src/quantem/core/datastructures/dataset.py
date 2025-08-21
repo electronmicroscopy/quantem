@@ -41,7 +41,7 @@ class Dataset(AutoSerialize):
     ):
         if _token is not self._token:
             raise RuntimeError("Use Dataset.from_array() to instantiate this class.")
-
+        super().__init__()
         self._array = ensure_valid_array(array)
         self.name = name
         self.origin = origin

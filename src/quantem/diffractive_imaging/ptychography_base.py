@@ -75,6 +75,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if not config.get("has_torch"):
             raise RuntimeError("the quantEM Ptychography module requires torch to be installed.")
 
+        super().__init__()
         self.verbose = verbose
         self.dset = dset
         self.device = device
@@ -145,7 +146,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
         self._preprocessed = True
-        self.reset_recon()  # force clear losses and everything
+        # self.reset_recon()  # force clear losses and everything
         return self
 
     def _compute_propagator_arrays(
@@ -448,7 +449,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # Set object shape and reset
         rotshape = self.dset._obj_shape_full_2d(self.obj_padding_px)
         self._obj_model.shape_2d = rotshape
-        self._obj_model.reset()
         self._obj_model.to(self.device)
 
     @property
@@ -864,6 +864,15 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._obj_fov_mask = self._to_torch(self._obj_fov_mask)
         self._propagators = self._to_torch(self._propagators)
         self._rng_to_device(dev)
+
+        # Reconnect optimizers after all models have been moved
+        for model_name, model in [
+            ("obj_model", self.obj_model),
+            ("probe_model", self.probe_model),
+            ("dset", self.dset),
+        ]:
+            if hasattr(model, "reconnect_optimizer_to_parameters"):
+                model.reconnect_optimizer_to_parameters()
 
     # endregion
 

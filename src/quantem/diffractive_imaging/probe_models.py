@@ -296,7 +296,6 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
                 print(f"Missing probe parameter '{k}' in probe_params")
                 # raise ValueError(f"Missing probe parameter '{k}' in probe_params")
 
-    @abstractmethod
     def to(self, *args, **kwargs) -> Self:
         """Move all relevant tensors to a different device. Overrides nn.Module.to()."""
         # Call parent's to() method first to handle PyTorch's internal device management
@@ -306,6 +305,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
+            if hasattr(self, "reconnect_optimizer_to_parameters"):
+                self.reconnect_optimizer_to_parameters()
 
         return self
 
@@ -513,7 +514,10 @@ class ProbePixelated(ProbeConstraints):
             shape=(self.num_probes, *self.roi_shape),
             expand_dims=True,
         )
-        self._probe = self._to_torch(prb)
+        probe_tensor = self._to_torch(prb)
+        # Update the probe parameter data
+        with torch.no_grad():
+            self._probe.data = probe_tensor
 
     @property
     def initial_probe_weights(self) -> torch.Tensor:
@@ -593,18 +597,19 @@ class ProbePixelated(ProbeConstraints):
         probes = self._apply_weights(probes)
 
         self._initial_probe = self._to_torch(probes)
-        self._probe = self._initial_probe.clone()
+        self._probe = nn.Parameter(self._initial_probe.clone().to(self.device), requires_grad=True)
         return
 
     def reset(self):
         self.probe = self._initial_probe.clone()
+        self._probe = nn.Parameter(self._initial_probe.clone().to(self.device), requires_grad=True)
 
     def to(self, *args, **kwargs) -> Self:
         super().to(*args, **kwargs)
-        # Extract device from kwargs if present
         device = kwargs.get("device", args[0] if args else None)
         if device is not None:
-            self._probe = self._probe.to(self.device)
+            if hasattr(self, "reconnect_optimizer_to_parameters"):
+                self.reconnect_optimizer_to_parameters()
         return self
 
     @property
@@ -918,13 +923,14 @@ class ProbeDIP(ProbeConstraints):
     def to(self, *args, **kwargs) -> Self:
         """Move all relevant tensors to a different device."""
         super().to(*args, **kwargs)
-        # Extract device from kwargs if present
         device = kwargs.get("device", args[0] if args else None)
         if device is not None:
             self.model = self.model.to(self.device)
             self._model_input = self._model_input.to(self.device)
             if hasattr(self, "_initial_probe"):
                 self._initial_probe = self._initial_probe.to(self.device)
+            if hasattr(self, "reconnect_optimizer_to_parameters"):
+                self.reconnect_optimizer_to_parameters()
         return self
 
     @property

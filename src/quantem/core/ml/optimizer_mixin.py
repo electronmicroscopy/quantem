@@ -54,7 +54,14 @@ class OptimizerMixin:
     @scheduler_params.setter
     def scheduler_params(self, params: dict):
         """Set the scheduler parameters."""
-        self._scheduler_params = params.copy() if params else {}
+        if params:
+            if params["type"] not in ["cyclic", "plateau", "exp", "gamma", "none"]:
+                raise ValueError(
+                    f"Unknown scheduler type: {params['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'none']"
+                )
+            self._scheduler_params = params.copy()
+        else:
+            self._scheduler_params = {}
 
     @abstractmethod
     def get_optimization_parameters(
@@ -102,6 +109,8 @@ class OptimizerMixin:
                 self._optimizer = torch.optim.AdamW(params, **opt_params)
             elif opt_type.lower() == "sgd":
                 self._optimizer = torch.optim.SGD(params, **opt_params)
+            elif opt_type.lower() == "none":
+                self.remove_optimizer()
             else:
                 raise NotImplementedError(f"Unknown optimizer type: {opt_type}")
         else:
@@ -186,7 +195,68 @@ class OptimizerMixin:
             return self._optimizer.param_groups[0]["lr"]
         return 0.0
 
+    def remove_optimizer(self) -> None:
+        """Remove the optimizer and scheduler."""
+        self._optimizer = None
+        self._optimizer_params = {}
+        self._scheduler = None
+        self._scheduler_params = {}
+
     def reset_optimizer(self) -> None:
         """Reset the optimizer and scheduler."""
-        self._optimizer = None
-        self._scheduler = None
+        self.set_optimizer(self._optimizer_params)
+        self.set_scheduler(self._scheduler_params)
+
+    def reconnect_optimizer_to_parameters(self) -> None:
+        """
+        Reconnect optimizer to parameters after device changes.
+        This is needed because AutoSerialize loads to CPU, but optimizers
+        need to reference tensors on the current device.
+        """
+        if self._optimizer is None or not hasattr(self, "get_optimization_parameters"):
+            return
+
+        # Get current parameters on the current device
+        current_params = self.get_optimization_parameters()
+        if isinstance(current_params, torch.Tensor):
+            current_params = [current_params]
+        elif isinstance(current_params, Generator):
+            current_params = list(current_params)
+
+        # Filter out non-leaf tensors that can't be optimized
+        optimizable_params = [
+            p for p in current_params if isinstance(p, torch.Tensor) and p.is_leaf
+        ]
+
+        if not optimizable_params:
+            print(
+                f"Warning: No optimizable parameters found for {self.__class__.__name__}, removing optimizer"
+            )
+            self.remove_optimizer()
+            return
+
+        # Ensure parameters require gradients
+        for p in optimizable_params:
+            p.requires_grad_(True)
+
+        # Recreate optimizer with current parameters
+        opt_params = self._optimizer_params.copy()
+        opt_type = opt_params.pop("type", self.DEFAULT_OPTIMIZER_TYPE)
+
+        if isinstance(opt_type, type):
+            self._optimizer = opt_type(optimizable_params, **opt_params)
+        elif isinstance(opt_type, str):
+            if opt_type.lower() == "adam":
+                self._optimizer = torch.optim.Adam(optimizable_params, **opt_params)
+            elif opt_type.lower() == "adamw":
+                self._optimizer = torch.optim.AdamW(optimizable_params, **opt_params)
+            elif opt_type.lower() == "sgd":
+                self._optimizer = torch.optim.SGD(optimizable_params, **opt_params)
+            elif opt_type.lower() == "none":
+                self.remove_optimizer()
+            else:
+                raise NotImplementedError(f"Unknown optimizer type: {opt_type}")
+
+        # Recreate scheduler if it exists
+        if self._scheduler_params:
+            self.set_scheduler(self._scheduler_params)

@@ -345,7 +345,7 @@ class PtychographyVisualizations(PtychographyBase):
             nx.tick_params(axis="y", which="both", colors=colors[0])
 
             labs = [lin.get_label() for lin in lines]
-            nx.legend(lines, labs, loc="upper center")
+            nx.legend(lines, labs, loc="upper right")
         else:
             # No learning rates to plot, just show loss
             pass

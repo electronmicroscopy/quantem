@@ -185,7 +185,6 @@ class Dataset4dstem(Dataset4d):
         if hasattr(self, "_dp_mean"):
             return self._dp_mean
         else:
-            print("Calculating dp_mean, attach with Dataset4dstem.get_dp_mean()")
             return self.get_dp_mean(attach=False)
 
     def get_dp_mean(self, attach: bool = True) -> Dataset2d:
@@ -231,7 +230,6 @@ class Dataset4dstem(Dataset4d):
         if hasattr(self, "_dp_max"):
             return self._dp_max
         else:
-            print("Calculating dp_max, attach with Dataset4dstem.get_dp_max()")
             return self.get_dp_max(attach=False)
 
     def get_dp_max(self, attach: bool = True) -> Dataset2d:
@@ -277,7 +275,6 @@ class Dataset4dstem(Dataset4d):
         if hasattr(self, "_dp_median"):
             return self._dp_median
         else:
-            print("Calculating dp_median, attach with Dataset4dstem.get_dp_median()")
             return self.get_dp_median(attach=False)
 
     def get_dp_median(self, attach: bool = True) -> Dataset2d:

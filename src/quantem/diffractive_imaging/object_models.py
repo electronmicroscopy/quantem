@@ -68,7 +68,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         OptimizerMixin.__init__(self)
 
         self.shape = shape
-        self.mask = None
+        self.register_buffer("_mask", torch.tensor([]))
         self.device = device
         self._obj_type = obj_type
         self.num_slices = num_slices
@@ -112,7 +112,14 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         s = tuple(int(x) for x in s)
         if len(s) != 2:
             raise ValueError(f"shape_2d must be a tuple of length 2 (row, col), got {len(s)}: {s}")
-        self.shape = (self.num_slices, *s)
+        if None not in self._shape:
+            self.shape = (self.num_slices, *s)
+            if self.shape_2d != s:
+                print(f"temp warning -- overrriding shape_2d {self.shape_2d} -> shape_2d")
+                self.initialize_obj()
+        else:
+            self.shape = (self.num_slices, *s)
+            self.initialize_obj()
 
     @property
     def dtype(self) -> "torch.dtype":
@@ -185,22 +192,19 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             self._slice_thicknesses = torch.tensor(arr, dtype=dt, device=self.device)
 
     @property
-    def mask(self) -> torch.Tensor | None:
+    def mask(self) -> torch.Tensor:
         return self._mask
 
     @mask.setter
-    def mask(self, mask: torch.Tensor | np.ndarray | None):
-        if mask is not None:
-            mask = validate_tensor(
-                mask,
-                name="mask",
-                dtype=self.dtype,
-                ndim=3,
-                expand_dims=True,
-            )
-            self._mask = mask.to(self.device).expand(self.num_slices, -1, -1)
-        else:
-            self._mask = None
+    def mask(self, mask: torch.Tensor | np.ndarray):
+        mask = validate_tensor(
+            mask,
+            name="mask",
+            dtype=self.dtype,
+            ndim=3,
+            expand_dims=True,
+        )
+        self._mask = mask.to(self.device).expand(self.num_slices, -1, -1)
 
     @property
     def obj(self):
@@ -218,6 +222,10 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     def reset(self):
         raise NotImplementedError()
 
+    @abstractmethod
+    def initialize_obj(self, *args, **kwargs):
+        raise NotImplementedError()
+
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device. Overrides nn.Module.to()."""
         # Call parent's to() method first to handle PyTorch's internal device management
@@ -227,6 +235,8 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
+            if hasattr(self, "reconnect_optimizer_to_parameters"):
+                self.reconnect_optimizer_to_parameters()
 
         return self
 
@@ -471,6 +481,11 @@ class ObjectPixelated(ObjectConstraints):
 
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
+        self._obj = nn.Parameter(
+            torch.ones(self.shape, dtype=self.dtype, device=self.device), requires_grad=True
+        )
+
+    def initialize_obj(self, *args, **kwargs):
         self._obj = nn.Parameter(
             torch.ones(self.shape, dtype=self.dtype, device=self.device), requires_grad=True
         )
@@ -756,8 +771,8 @@ class ObjectDIP(ObjectConstraints):
             model_input = self.model_input
 
         obj_array = self.model(model_input)[0]
-        if self.mask is not None:
-            obj_array = obj_array * self.mask
+        if self.mask.numel() > 0:
+            obj_array = obj_array * self._mask
         return self._get_obj_patches(obj_array, patch_indices)
 
     def to(self, *args, **kwargs):
@@ -771,6 +786,8 @@ class ObjectDIP(ObjectConstraints):
         if device is not None:
             self.device = device
             self._rng_to_device(device)
+            if hasattr(self, "reconnect_optimizer_to_parameters"):
+                self.reconnect_optimizer_to_parameters()
 
         return self
 
@@ -788,6 +805,9 @@ class ObjectDIP(ObjectConstraints):
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
         self.model.load_state_dict(self.pretrained_weights.copy())
+
+    def initialize_obj(self, *args, **kwargs):
+        pass
 
     def pretrain(
         self,

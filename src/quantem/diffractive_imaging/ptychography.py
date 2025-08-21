@@ -81,9 +81,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 else:
                     self._epoch_lrs[key].append(0.0)
             else:  # new optimizer
-                # For new optimizers, backfill with current LR for previous epochs
+                # For new optimizers, backfill with 0.0 LR for previous epochs
                 current_epoch = self.num_epochs - 1  # -1 because loss was just appended
-                prev_lrs = [optimizers[key].param_groups[0]["lr"]] * current_epoch
+                prev_lrs = [0.0] * current_epoch
                 prev_lrs.append(optimizers[key].param_groups[0]["lr"])
                 self._epoch_lrs[key] = prev_lrs
 
@@ -298,3 +298,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         return torch.fft.ifft2(fourier_modified_overlap, norm="ortho")
 
     # endregion --- reconstruction ---
+
+    def dummy(self):
+        print("Hi this is a test1")

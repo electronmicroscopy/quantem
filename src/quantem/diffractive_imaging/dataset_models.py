@@ -94,6 +94,17 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         """Get the combined descan and scan position parameters for optimization."""
         return [self._descan_shifts, self._scan_positions_px]
 
+    def to(self, *args, **kwargs):
+        """Move all relevant tensors to a different device."""
+        # Call parent's to() method to handle PyTorch's internal device management
+        super().to(*args, **kwargs)
+
+        # Reconnect optimizer to parameters on the new device
+        if hasattr(self, "reconnect_optimizer_to_parameters"):
+            self.reconnect_optimizer_to_parameters()
+
+        return self
+
     @classmethod
     def from_file(cls, file_path: str, file_type: str, verbose: int | bool = 1) -> Self:
         """
