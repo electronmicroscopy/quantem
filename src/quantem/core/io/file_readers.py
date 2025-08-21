@@ -11,7 +11,7 @@ from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
 
 def read_4dstem(
     file_path: str,
-    file_type: str,
+    file_type: str | None = None,
     **kwargs,
 ) -> Dataset4dstem:
     """
@@ -31,6 +31,9 @@ def read_4dstem(
     --------
     Dataset4dstem
     """
+    if file_type is None:
+        file_type = Path(file_path).suffix.lower().lstrip(".")
+
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
     imported_data = file_reader(file_path)[0]
     imported_axes = imported_data["axes"]
@@ -68,6 +71,7 @@ def read_4dstem(
         units=units,
         **kwargs,
     )
+    dataset.file_path = file_path
 
     return dataset
 
@@ -112,6 +116,7 @@ def read_2d(
             imported_data["axes"][1]["units"],
         ],
     )
+    dataset.file_path = file_path
 
     return dataset
 
@@ -164,5 +169,6 @@ def read_emdfile_to_4dstem(
             sampling=[r_pixel_size, r_pixel_size, q_pixel_size, q_pixel_size],
             units=[r_pixel_units, r_pixel_units, q_pixel_units, q_pixel_units],
         )
+    dataset.file_path = file_path
 
     return dataset

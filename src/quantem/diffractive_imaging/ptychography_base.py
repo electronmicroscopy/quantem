@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Any, Literal, Sequence, cast
 from warnings import warn
 
@@ -821,38 +820,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             probe = self._to_numpy(probe)
             intensities = np.abs(probe) ** 2
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
-
-    def save(
-        self,
-        path: str | Path,
-        mode: Literal["w", "o"] = "w",
-        store: Literal["auto", "zip", "dir"] = "auto",
-        skip: str | type | Sequence[str | type] = (),
-        compression_level: int | None = 4,
-    ):
-        if isinstance(skip, (str, type)):
-            skip = [skip]
-        skip = list(skip)
-        skips = (
-            skip
-            + [
-                # torch.optim.Optimizer,
-                # torch.optim.lr_scheduler.LRScheduler,
-                # DatasetModelType,
-                # "_probe_model",
-                # "_obj_model",
-                # "_detector_model",
-            ]
-        )
-        super().save(
-            path,
-            mode=mode,
-            store=store,
-            compression_level=compression_level,
-            # skip=["optimizers", "_optimizers"],
-            # skip=torch.optim.Optimizer,'
-            skip=skips,
-        )
 
     def to(self, device: str | int | torch.device):
         dev, _id = config.validate_device(device)

@@ -241,10 +241,6 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         raise NotImplementedError()
 
     @property
-    def initial_probe(self) -> torch.Tensor:
-        raise NotImplementedError()
-
-    @property
     def params(self):
         """optimization parameters"""
         raise NotImplementedError()
@@ -569,6 +565,11 @@ class ProbePixelated(ProbeConstraints):
         super().set_initial_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
+
+        if (
+            self._initial_probe is not None
+        ):  # don't reinitilize probe cuz maybe reloading from file
+            return
 
         if self._from_params:
             self.check_probe_params()

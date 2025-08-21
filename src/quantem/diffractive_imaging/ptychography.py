@@ -1,9 +1,11 @@
-from typing import TYPE_CHECKING, Literal, Self
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, Self, Sequence
 
 import numpy as np
 from tqdm.auto import tqdm
 
 from quantem.core import config
+from quantem.core.io.serialize import load as autoserialize_load
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
@@ -301,3 +303,233 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
     def dummy(self):
         print("Hi this is a test1")
+
+    def save(
+        self,
+        path: str | Path,
+        mode: Literal["w", "o"] = "w",
+        store: Literal["auto", "zip", "dir"] = "auto",
+        skip: str | type | Sequence[str | type] = (),
+        compression_level: int | None = 4,
+        save_raw_data: bool = False,
+    ):
+        """
+        Save the ptychography object, optionally excluding raw dataset data.
+
+        By default, this method saves the ptychography object without the raw dataset
+        to save space and allow for dataset reloading. Use save_raw_data=True if you
+        want to include the complete dataset.
+
+        When saving without raw data, the system automatically saves:
+        - Dataset file path and file type
+        - All preprocessing parameters (CoM fitting, rotation, padding, etc.)
+        - Reconstruction state (losses, constraints, etc.)
+
+        On load, if no dataset is provided, the system will automatically:
+        - Reload the dataset from the saved file path
+        - Reapply all preprocessing with the exact same parameters
+        - Restore the reconstruction state
+
+        Parameters
+        ----------
+        path : str | Path
+            Path to save the object
+        mode : Literal["w", "o"]
+            Write mode ('w' for write, 'o' for overwrite)
+        store : Literal["auto", "zip", "dir"]
+            Storage format
+        skip : str | type | Sequence[str | type]
+            Additional items to skip during serialization
+        compression_level : int | None
+            Compression level for zip storage
+        save_raw_data : bool
+            Whether to save the raw dataset data (default: False)
+
+        Examples
+        --------
+        # Save without raw data (default behavior) - includes dataset metadata
+        ptycho.save("my_reconstruction.zip")
+
+        # Save with raw data included
+        ptycho.save("my_reconstruction_with_data.zip", save_raw_data=True)
+
+        # Load a saved reconstruction - automatically reloads dataset
+        loaded_ptycho = Ptychography.from_file("my_reconstruction.zip")
+
+        # Load and move to GPU
+        loaded_ptycho = Ptychography.from_file("my_reconstruction.zip", device="gpu")
+
+        # Load with custom dataset (overrides automatic reloading)
+        loaded_ptycho = Ptychography.from_file("my_reconstruction.zip", dset=my_dataset)
+
+        """
+        if isinstance(skip, (str, type)):
+            skip = [skip]
+        skip = list(skip)
+
+        # Always skip raw dataset data unless explicitly requested
+        if not save_raw_data:
+            skip.extend(
+                [
+                    "_dset",  # Skip the dataset object itself
+                    "dset",  # Skip dataset references
+                ]
+            )
+
+            # Save dataset metadata for automatic reloading
+            self._dataset_metadata = {
+                "file_path": str(self.dset.dset.file_path) if self.dset.dset.file_path else None,
+                "preprocessing_params": self.dset._preprocessing_params,
+            }
+
+        # Add other common skips for ptychography objects
+        skips = skip
+
+        current_device = self.device
+        self.to("cpu")
+
+        super().save(
+            path,
+            mode=mode,
+            store=store,
+            skip=skips,
+            compression_level=compression_level,
+        )
+
+        self.to(current_device)
+
+        # Clean up temporary metadata
+        if not save_raw_data and hasattr(self, "_dataset_metadata"):
+            delattr(self, "_dataset_metadata")
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str | Path,
+        dset: DatasetModelType | None = None,
+        device: str | int | None = None,
+        verbose: int | bool | None = None,
+        rng: np.random.Generator | int | None = None,
+        auto_reload_dataset: bool = True,
+    ):
+        """
+        Load a ptychography object from a saved file.
+
+        Parameters
+        ----------
+        path : str | Path
+            Path to the saved ptychography object
+        dset : DatasetModelType | None
+            Dataset to use (if None and auto_reload_dataset=True, will try to reload from saved metadata)
+        device : str | int | None
+            Device to load the object on
+        verbose : int | bool | None
+            Verbosity level
+        rng : np.random.Generator | int | None
+            Random number generator
+        auto_reload_dataset : bool
+            Whether to automatically reload and preprocess the dataset from saved metadata
+
+        Returns
+        -------
+        Ptychography
+            Loaded ptychography object
+        """
+        # Load the base object without the dataset
+        loaded_obj = cls._recursive_load_from_path(path)
+
+        # If no dataset was provided, try to reload it from saved metadata
+        if dset is None and auto_reload_dataset:
+            if hasattr(loaded_obj, "_dataset_metadata") and loaded_obj._dataset_metadata:
+                metadata = loaded_obj._dataset_metadata
+                file_path = metadata.get("file_path")
+
+                if file_path:
+                    # Import here to avoid circular imports
+                    from quantem.core.io.file_readers import read_4dstem
+                    from quantem.diffractive_imaging.dataset_models import (
+                        PtychographyDatasetRaster,
+                    )
+
+                    # Reload the dataset
+                    print(f"reloading dataset from {file_path}", end="\r")
+                    try:
+                        raw_dset = read_4dstem(file_path)
+                    except (ValueError, ModuleNotFoundError) as _e:
+                        try:
+                            raw_dset = autoserialize_load(file_path)
+                            raw_dset.file_path = file_path  # legacy support
+                        except Exception as e:
+                            raise ValueError(
+                                f"Could not automatically reload dataset from {file_path}: {e}"
+                            )
+
+                    dset = PtychographyDatasetRaster.from_dataset(raw_dset, verbose=verbose or 1)
+                    # Apply preprocessing with saved parameters
+                    preprocessing_params = metadata.get("preprocessing_params", {})
+                    _v = dset.verbose
+                    dset.verbose = 0
+                    dset.preprocess(**preprocessing_params)
+                    dset.verbose = _v
+
+                    print(f"Successfully reloaded dataset from {file_path}")
+                else:
+                    print("Warning: No dataset file path found in saved metadata.")
+                    dset = None
+            else:
+                print("Warning: No dataset metadata found in saved object.")
+                dset = None
+
+        # If still no dataset, try to load it from the saved object
+        if dset is None:
+            if hasattr(loaded_obj, "_dset") and loaded_obj._dset is not None:
+                dset = loaded_obj._dset
+            else:
+                raise ValueError(
+                    "No dataset provided and could not automatically reload dataset. "
+                    "Please provide a dataset parameter or ensure the object was saved with dataset metadata."
+                )
+
+        # Ensure dset is not None at this point
+        if dset is None:
+            raise ValueError("Dataset is required but not provided")
+
+        # Create a new ptychography object with the loaded components
+        ptycho = cls.from_models(
+            dset=dset,
+            obj_model=loaded_obj._obj_model,
+            probe_model=loaded_obj._probe_model,
+            detector_model=loaded_obj._detector_model,
+            logger=loaded_obj._logger if hasattr(loaded_obj, "_logger") else None,
+            device=device if device is not None else loaded_obj.device,
+            verbose=verbose if verbose is not None else loaded_obj.verbose,
+            rng=rng if rng is not None else loaded_obj.rng,
+        )
+
+        # Copy over any additional attributes that were saved
+        for attr in [
+            "_preprocessed",
+            "_obj_padding_px",
+            "_batch_size",
+            "_store_iterations",
+            "_store_iterations_every",
+            "_epoch_losses",
+            "_epoch_recon_types",
+            "_epoch_lrs",
+            "_epoch_snapshots",
+            "_obj_fov_mask",
+            "_propagators",
+        ]:
+            if hasattr(loaded_obj, attr):
+                setattr(ptycho, attr, getattr(loaded_obj, attr))
+
+        # Move to the specified device
+        if device is not None:
+            ptycho.to(device)
+
+        return ptycho
+
+    @classmethod
+    def _recursive_load_from_path(cls, path: str | Path):
+        """Helper method to load an object from a path using AutoSerialize."""
+        return autoserialize_load(path)
