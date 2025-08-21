@@ -149,7 +149,7 @@ def ptycho_dataset(complex_obj, probe_array):
 @pytest.fixture
 def single_probe_ptycho_model(ptycho_dataset, probe_array):
     """Create ptychography model components for testing."""
-    obj_model = ObjectPixelated(num_slices=1, obj_type="complex", slice_thicknesses=1)
+    obj_model = ObjectPixelated.from_uniform(num_slices=1, obj_type="complex", slice_thicknesses=1)
 
     probe_params = {
         "energy": PROBE_ENERGY,
@@ -182,7 +182,7 @@ def single_probe_ptycho_model(ptycho_dataset, probe_array):
 @pytest.fixture
 def mixed_probe_ptycho_model(ptycho_dataset, probe_array):
     """Create ptychography model components for testing."""
-    obj_model = ObjectPixelated(num_slices=1, obj_type="complex", slice_thicknesses=1)
+    obj_model = ObjectPixelated.from_uniform(num_slices=1, obj_type="complex", slice_thicknesses=1)
 
     probe_params = {
         "energy": PROBE_ENERGY,

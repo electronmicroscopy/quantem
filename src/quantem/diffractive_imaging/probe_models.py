@@ -468,7 +468,7 @@ class ProbePixelated(ProbeConstraints):
         )
 
         probe_model.initial_probe = probe_array
-        probe_model.probe = probe_array.clone()
+        probe_model._probe = nn.Parameter(probe_array.clone(), requires_grad=True)
         return probe_model
 
     @classmethod
