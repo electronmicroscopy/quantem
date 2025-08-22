@@ -28,7 +28,7 @@ from quantem.diffractive_imaging.dataset_models import (
 from quantem.diffractive_imaging.detector_models import DetectorBase, DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType
-from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType
+from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
 from quantem.diffractive_imaging.ptycho_utils import (
     AffineTransform,
     center_crop_arr,
@@ -94,18 +94,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.batch_size = self.dset.num_gpts
 
         if (
-            (hasattr(probe_model, "vacuum_probe_intensity"))
+            isinstance(probe_model, ProbePixelated)
             and (probe_model.vacuum_probe_intensity is not None)
             and (dset.amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
         ):
-            scale_output = (
-                dset.amplitudes.shape[1] / probe_model.vacuum_probe_intensity.shape[0],
-                dset.amplitudes.shape[2] / probe_model.vacuum_probe_intensity.shape[1],
-            )
-            probe_model.vacuum_probe_intensity = ndi.zoom(
-                probe_model.vacuum_probe_intensity,
-                scale_output,
-            )
+            probe_model.rescale_vacuum_probe((dset.amplitudes.shape[1], dset.amplitudes.shape[2]))
 
         # Remove centralized optimizer storage - now managed by individual models
         self.set_probe_model(probe_model)

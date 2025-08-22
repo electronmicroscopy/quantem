@@ -5,9 +5,9 @@ from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.ndimage as ndi
 import torch
 import torch.nn as nn
-from scipy.ndimage import center_of_mass
 from tqdm.auto import tqdm
 
 from quantem.core import config
@@ -656,7 +656,7 @@ class ProbePixelated(ProbeConstraints):
             vp2 = np.fft.fftshift(vp2)
 
         # fix centering
-        com: list | tuple = center_of_mass(vp2)
+        com: list | tuple = ndi.center_of_mass(vp2)
         vp2 = shift_array(
             vp2,
             -com[0],
@@ -665,6 +665,18 @@ class ProbePixelated(ProbeConstraints):
         )
 
         self._vacuum_probe_intensity = vp2
+
+    def rescale_vacuum_probe(self, shape: tuple[int, int]):
+        if self.vacuum_probe_intensity is None:
+            return
+        scale_output = (
+            shape[0] / self.vacuum_probe_intensity.shape[0],
+            shape[1] / self.vacuum_probe_intensity.shape[1],
+        )
+        self._vacuum_probe_intensity = ndi.zoom(
+            self._vacuum_probe_intensity,
+            scale_output,
+        )
 
     def _apply_random_phase_shifts(self, probe_array: torch.Tensor | np.ndarray) -> torch.Tensor:
         probes = self._to_torch(probe_array)

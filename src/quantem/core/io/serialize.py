@@ -16,6 +16,28 @@ from zarr.storage import LocalStore
 
 # Base class for automatic serialization of classes
 class AutoSerialize:
+    """
+    Base class for automatic serialization of Python objects using Zarr storage.
+
+    This class provides comprehensive serialization support for:
+    - PyTorch objects (tensors, modules, optimizers, schedulers)
+    - PyTorch loggers (SummaryWriter, etc.) - metadata only
+    - Python loggers (logging.Logger) - metadata only
+    - NumPy arrays and scalars
+    - Python primitives (int, float, str, bool, None)
+    - pathlib.Path objects (converted to strings for storage)
+    - AutoSerialize instances (nested serialization)
+    - Python containers (list, tuple, dict, set)
+    - NumPy random generators
+    - Fallback to dill for other objects
+
+    Path objects are automatically converted to strings during serialization
+    and restored as Path objects during deserialization.
+
+    Logger objects (PyTorch and Python) are serialized as metadata only
+    and recreated as new instances during deserialization.
+    """
+
     # ---- Helpers to reduce casting noise ----
     @staticmethod
     def _get_group(parent: zarr.Group, key: str) -> zarr.Group:
@@ -124,6 +146,19 @@ class AutoSerialize:
                 name=name, shape=buf_arr.shape, dtype="uint8", compressors=compressors
             )
             ds[:] = buf_arr
+
+    @staticmethod
+    def _convert_string_to_path_if_needed(val: Any, group: zarr.Group, key: str) -> Any:
+        """Convert string back to pathlib.Path if it was originally a Path object."""
+        if isinstance(val, str) and group.attrs.get(f"{key}.is_path", False):
+            try:
+                from pathlib import Path
+
+                return Path(val)
+            except (ValueError, OSError):
+                # If Path creation fails, keep as string
+                return val
+        return val
 
     def save(
         self,
@@ -290,6 +325,37 @@ class AutoSerialize:
             byte_arr = np.frombuffer(buffer.read(), dtype="uint8")
             self._write_bytes(subgroup, "scheduler", byte_arr.tobytes(), compressors=None)
 
+        elif hasattr(value, "add_scalar") and hasattr(value, "add_image"):
+            # Handle PyTorch loggers (SummaryWriter, etc.) - save basic info only
+            subgroup = group.require_group(name)
+            subgroup.attrs["_torch_logger"] = True
+            subgroup.attrs["class_name"] = value.__class__.__name__
+
+            # Store basic logger information that can be reconstructed
+            if hasattr(value, "log_dir"):
+                subgroup.attrs["log_dir"] = str(value.log_dir)
+            if hasattr(value, "comment"):
+                subgroup.attrs["comment"] = str(value.comment) if value.comment else ""
+            if hasattr(value, "max_queue"):
+                subgroup.attrs["max_queue"] = int(value.max_queue)
+            if hasattr(value, "flush_secs"):
+                subgroup.attrs["flush_secs"] = int(value.flush_secs)
+            if hasattr(value, "filename_suffix"):
+                subgroup.attrs["filename_suffix"] = (
+                    str(value.filename_suffix) if value.filename_suffix else ""
+                )
+        elif hasattr(value, "log") and hasattr(value, "info"):
+            # Handle other logging objects (like Python's logging.Logger)
+            subgroup = group.require_group(name)
+            subgroup.attrs["_python_logger"] = True
+            subgroup.attrs["class_name"] = value.__class__.__name__
+
+            # Store logger name and level if available
+            if hasattr(value, "name"):
+                subgroup.attrs["logger_name"] = str(value.name)
+            if hasattr(value, "level"):
+                subgroup.attrs["logger_level"] = int(value.level)
+
         elif isinstance(value, torch.nn.Module):
             # Save entire torch module with torch.save for robustness
             subgroup = group.require_group(name)
@@ -311,6 +377,10 @@ class AutoSerialize:
         elif hasattr(value, "dtype") and hasattr(value, "item"):
             # Handle numpy scalar types (np.float32, np.int64, etc.)
             group.attrs[name] = value.item()
+        elif hasattr(value, "__fspath__") or str(type(value)).startswith("<class 'pathlib."):
+            # Handle pathlib.Path objects and other path-like objects
+            group.attrs[name] = str(value)
+            group.attrs[f"{name}.is_path"] = True
 
         elif isinstance(value, AutoSerialize):
             # Nested AutoSerialize subtree
@@ -424,12 +494,20 @@ class AutoSerialize:
 
         # --- Restore simple attributes ---
         for name, val in group.attrs.items():
-            if name == "_autoserialize" or name.endswith(".torch_save"):
+            if (
+                name == "_autoserialize"
+                or name.endswith(".torch_save")
+                or name.endswith(".is_path")
+            ):
                 continue  # Skip metadata/flags
             if name in skip_names:
                 continue
             if attrs_item_names and name not in attrs_item_names:
                 continue
+
+            # Convert string paths back to pathlib.Path objects if needed
+            val = cls._convert_string_to_path_if_needed(val, group, name)
+
             setattr(obj, name, val)
             set_attrs.add(name)
 
@@ -485,6 +563,69 @@ class AutoSerialize:
                 if type(scheduler) in skip_types:
                     continue
                 setattr(obj, name, scheduler)
+                set_attrs.add(name)
+
+            # torch logger group
+            elif subgrp.attrs.get("_torch_logger"):
+                # Recreate logger from saved metadata
+                logger_class_name = subgrp.attrs.get("class_name", "SummaryWriter")
+
+                if logger_class_name == "SummaryWriter":
+                    from torch.utils.tensorboard import SummaryWriter
+
+                    # Extract logger parameters with explicit type casting
+                    log_dir = subgrp.attrs.get("log_dir", None)
+
+                    comment = str(cast(Any, subgrp.attrs.get("comment", "")))
+                    max_queue = int(cast(Any, subgrp.attrs.get("max_queue", 10)))
+                    flush_secs = int(cast(Any, subgrp.attrs.get("flush_secs", 120)))
+                    filename_suffix = str(cast(Any, subgrp.attrs.get("filename_suffix", "")))
+
+                    # Create new logger instance
+                    logger = SummaryWriter(
+                        log_dir=log_dir,
+                        comment=comment,
+                        max_queue=max_queue,
+                        flush_secs=flush_secs,
+                        filename_suffix=filename_suffix,
+                    )
+                else:
+                    # For other logger types, create a basic instance or skip
+                    print(
+                        f"Warning: Unknown logger type '{logger_class_name}', skipping logger restoration"
+                    )
+                    continue
+
+                if type(logger) in skip_types:
+                    continue
+                setattr(obj, name, logger)
+                set_attrs.add(name)
+
+            # python logger group
+            elif subgrp.attrs.get("_python_logger"):
+                # Recreate Python logger from saved metadata
+                logger_class_name = subgrp.attrs.get("class_name", "Logger")
+
+                if logger_class_name == "Logger":
+                    import logging
+
+                    # Extract logger parameters
+                    logger_name = cast(str, subgrp.attrs.get("logger_name", "quantem"))
+                    logger_level = int(cast(Any, subgrp.attrs.get("logger_level", logging.INFO)))
+
+                    # Create new logger instance
+                    logger = logging.getLogger(logger_name)
+                    logger.setLevel(logger_level)
+                else:
+                    # For other logger types, create a basic instance or skip
+                    print(
+                        f"Warning: Unknown Python logger type '{logger_class_name}', skipping logger restoration"
+                    )
+                    continue
+
+                if type(logger) in skip_types:
+                    continue
+                setattr(obj, name, logger)
                 set_attrs.add(name)
 
             # torch module group
@@ -677,7 +818,10 @@ class AutoSerialize:
             for i in range(length):
                 key = str(i)
                 if key in group.attrs:
-                    items.append(group.attrs[key])
+                    val = group.attrs[key]
+                    # Convert string paths back to Path objects if needed
+                    val = cls._convert_string_to_path_if_needed(val, group, key)
+                    items.append(val)
                 elif key in group.array_keys():
                     items.append(maybe_tensor(group, key))
                 elif key in group.group_keys():
@@ -708,6 +852,50 @@ class AutoSerialize:
                         buf = io.BytesIO(data)
                         tensor = torch.load(buf, map_location="cpu", weights_only=False)
                         items.append(tensor)
+                    elif subgroup.attrs.get("_torch_logger"):
+                        # Handle torch logger in containers
+                        logger_class_name = subgroup.attrs.get("class_name", "SummaryWriter")
+
+                        if logger_class_name == "SummaryWriter":
+                            from torch.utils.tensorboard import SummaryWriter
+
+                            log_dir = subgroup.attrs.get("log_dir", None)
+                            comment = str(cast(Any, subgroup.attrs.get("comment", "")))
+                            max_queue = int(cast(Any, subgroup.attrs.get("max_queue", 10)))
+                            flush_secs = int(cast(Any, subgroup.attrs.get("flush_secs", 120)))
+                            filename_suffix = str(
+                                cast(Any, subgroup.attrs.get("filename_suffix", ""))
+                            )
+
+                            logger = SummaryWriter(
+                                log_dir=log_dir,
+                                comment=comment,
+                                max_queue=max_queue,
+                                flush_secs=flush_secs,
+                                filename_suffix=filename_suffix,
+                            )
+                            items.append(logger)
+                        else:
+                            # Skip unknown logger types in containers
+                            continue
+                    elif subgroup.attrs.get("_python_logger"):
+                        # Handle Python logger in containers
+                        logger_class_name = subgroup.attrs.get("class_name", "Logger")
+
+                        if logger_class_name == "Logger":
+                            import logging
+
+                            logger_name = cast(str, subgroup.attrs.get("logger_name", "quantem"))
+                            logger_level = int(
+                                cast(Any, subgroup.attrs.get("logger_level", logging.INFO))
+                            )
+
+                            logger = logging.getLogger(logger_name)
+                            logger.setLevel(logger_level)
+                            items.append(logger)
+                        else:
+                            # Skip unknown logger types in containers
+                            continue
                     else:
                         raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
                 else:
@@ -741,7 +929,10 @@ class AutoSerialize:
             ):
                 key = str(i)
                 if key in group.attrs:
-                    items.append(group.attrs[key])
+                    val = group.attrs[key]
+                    # Convert string paths back to Path objects if needed
+                    val = cls._convert_string_to_path_if_needed(val, group, key)
+                    items.append(val)
                 elif key in group.array_keys():
                     items.append(maybe_tensor(group, key))
                 elif key in group.group_keys():
@@ -772,6 +963,50 @@ class AutoSerialize:
                         buf = io.BytesIO(data)
                         tensor = torch.load(buf, map_location="cpu", weights_only=False)
                         items.append(tensor)
+                    elif subgroup.attrs.get("_torch_logger"):
+                        # Handle torch logger in containers
+                        logger_class_name = subgroup.attrs.get("class_name", "SummaryWriter")
+
+                        if logger_class_name == "SummaryWriter":
+                            from torch.utils.tensorboard import SummaryWriter
+
+                            log_dir = subgroup.attrs.get("log_dir", None)
+                            comment = str(cast(Any, subgroup.attrs.get("comment", "")))
+                            max_queue = int(cast(Any, subgroup.attrs.get("max_queue", 10)))
+                            flush_secs = int(cast(Any, subgroup.attrs.get("flush_secs", 120)))
+                            filename_suffix = str(
+                                cast(Any, subgroup.attrs.get("filename_suffix", ""))
+                            )
+
+                            logger = SummaryWriter(
+                                log_dir=log_dir,
+                                comment=comment,
+                                max_queue=max_queue,
+                                flush_secs=flush_secs,
+                                filename_suffix=filename_suffix,
+                            )
+                            items.append(logger)
+                        else:
+                            # Skip unknown logger types in containers
+                            continue
+                    elif subgroup.attrs.get("_python_logger"):
+                        # Handle Python logger in containers
+                        logger_class_name = subgroup.attrs.get("class_name", "Logger")
+
+                        if logger_class_name == "Logger":
+                            import logging
+
+                            logger_name = cast(str, subgroup.attrs.get("logger_name", "quantem"))
+                            logger_level = int(
+                                cast(Any, subgroup.attrs.get("logger_level", logging.INFO))
+                            )
+
+                            logger = logging.getLogger(logger_name)
+                            logger.setLevel(logger_level)
+                            items.append(logger)
+                        else:
+                            # Skip unknown logger types in containers
+                            continue
                     else:
                         raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
                 else:
@@ -782,9 +1017,16 @@ class AutoSerialize:
             result: dict[str, Any] = {}
             # Restore scalars and simple objects stored as attributes
             for key in group.attrs:
-                if key == "_container_type" or key.endswith(".torch_save"):
+                if (
+                    key == "_container_type"
+                    or key.endswith(".torch_save")
+                    or key.endswith(".is_path")
+                ):
                     continue
-                result[key] = group.attrs[key]
+                val = group.attrs[key]
+                # Convert string paths back to Path objects if needed
+                val = cls._convert_string_to_path_if_needed(val, group, key)
+                result[key] = val
             # Restore arrays (including torch tensors)
             for key in group.array_keys():
                 result[key] = maybe_tensor(group, key)
@@ -813,6 +1055,48 @@ class AutoSerialize:
                     buf = io.BytesIO(data)
                     tensor = torch.load(buf, map_location="cpu", weights_only=False)
                     result[key] = tensor
+                elif subgroup.attrs.get("_torch_logger"):
+                    # Handle torch logger in containers
+                    logger_class_name = subgroup.attrs.get("class_name", "SummaryWriter")
+
+                    if logger_class_name == "SummaryWriter":
+                        from torch.utils.tensorboard import SummaryWriter
+
+                        log_dir = subgroup.attrs.get("log_dir", None)
+                        comment = str(cast(Any, subgroup.attrs.get("comment", "")))
+                        max_queue = int(cast(Any, subgroup.attrs.get("max_queue", 10)))
+                        flush_secs = int(cast(Any, subgroup.attrs.get("flush_secs", 120)))
+                        filename_suffix = str(cast(Any, subgroup.attrs.get("filename_suffix", "")))
+
+                        logger = SummaryWriter(
+                            log_dir=log_dir,
+                            comment=comment,
+                            max_queue=max_queue,
+                            flush_secs=flush_secs,
+                            filename_suffix=filename_suffix,
+                        )
+                        result[key] = logger
+                    else:
+                        # Skip unknown logger types in containers
+                        continue
+                elif subgroup.attrs.get("_python_logger"):
+                    # Handle Python logger in containers
+                    logger_class_name = subgroup.attrs.get("class_name", "Logger")
+
+                    if logger_class_name == "Logger":
+                        import logging
+
+                        logger_name = cast(str, subgroup.attrs.get("logger_name", "quantem"))
+                        logger_level = int(
+                            cast(Any, subgroup.attrs.get("logger_level", logging.INFO))
+                        )
+
+                        logger = logging.getLogger(logger_name)
+                        logger.setLevel(logger_level)
+                        result[key] = logger
+                    else:
+                        # Skip unknown logger types in containers
+                        continue
                 else:
                     raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
 

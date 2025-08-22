@@ -439,7 +439,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loaded_obj = cls._recursive_load_from_path(path)
 
         # If no dataset was provided, try to reload it from saved metadata
-        if dset is None and auto_reload_dataset:
+        if dset is None and auto_reload_dataset and not hasattr(loaded_obj, "dset"):
             if hasattr(loaded_obj, "_dataset_metadata") and loaded_obj._dataset_metadata:
                 metadata = loaded_obj._dataset_metadata
                 file_path = metadata.get("file_path")
@@ -474,7 +474,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
                     print(f"Successfully reloaded dataset from {file_path}")
                 else:
-                    print("Warning: No dataset file path found in saved metadata.")
                     dset = None
             else:
                 print("Warning: No dataset metadata found in saved object.")
