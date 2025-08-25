@@ -410,6 +410,7 @@ class ProbePixelated(ProbeConstraints):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         initial_probe_weights: list[float] | np.ndarray | None = None,
+        vacuum_probe_intensity: Dataset4dstem | np.ndarray | None = None,
         _from_params: bool = False,
         _token: object | None = None,
         *args,
@@ -425,6 +426,7 @@ class ProbePixelated(ProbeConstraints):
         )
         self.initial_probe_weights = initial_probe_weights
         self._from_params = _from_params
+        self.vacuum_probe_intensity = vacuum_probe_intensity
 
     @classmethod
     def from_array(
@@ -486,10 +488,10 @@ class ProbePixelated(ProbeConstraints):
             device=device,
             rng=rng,
             initial_probe_weights=initial_probe_weights,
+            vacuum_probe_intensity=vacuum_probe_intensity,
             _from_params=True,
             _token=cls._token,
         )
-        probe_model.vacuum_probe_intensity = vacuum_probe_intensity
         probe_model._initial_probe = None
 
         return probe_model

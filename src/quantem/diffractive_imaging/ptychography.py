@@ -229,7 +229,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     self.obj_model,
                     self.probe_model,
                     self.dset,
-                    a0,
+                    self.num_epochs - 1,
                     consistency_loss,
                     num_batches,
                     self._get_current_lrs(),
@@ -464,7 +464,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                                 f"Could not automatically reload dataset from {file_path}: {e}"
                             )
 
-                    dset = PtychographyDatasetRaster.from_dataset(raw_dset, verbose=verbose or 1)
+                    dset = PtychographyDatasetRaster.from_dataset4dstem(
+                        raw_dset, verbose=verbose or 1
+                    )
                     # Apply preprocessing with saved parameters
                     preprocessing_params = metadata.get("preprocessing_params", {})
                     _v = dset.verbose
