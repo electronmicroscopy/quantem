@@ -580,6 +580,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             sampling=[0, *dset.sampling[2:]],
             units=["pix", *dset.units[2:]],
         )
+        dset3d.file_path = dset.file_path  # any other attributes to transfer?
 
         super().__init__(dset=dset3d, verbose=verbose, _token=_token)
 

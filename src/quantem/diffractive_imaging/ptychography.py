@@ -409,7 +409,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         dset: DatasetModelType | None = None,
         device: str | int | None = None,
         verbose: int | bool | None = None,
-        rng: np.random.Generator | int | None = None,
         auto_reload_dataset: bool = True,
     ):
         """
@@ -436,12 +435,15 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             Loaded ptychography object
         """
         # Load the base object without the dataset
-        loaded_obj = cls._recursive_load_from_path(path)
+        ptycho = cls._recursive_load_from_path(path)
+
+        if not isinstance(ptycho, Ptychography):
+            raise ValueError("Loaded object is not a Ptychography object")
 
         # If no dataset was provided, try to reload it from saved metadata
-        if dset is None and auto_reload_dataset and not hasattr(loaded_obj, "dset"):
-            if hasattr(loaded_obj, "_dataset_metadata") and loaded_obj._dataset_metadata:
-                metadata = loaded_obj._dataset_metadata
+        if dset is None and auto_reload_dataset and not hasattr(ptycho, "dset"):
+            if hasattr(ptycho, "_dataset_metadata") and ptycho._dataset_metadata:
+                metadata = ptycho._dataset_metadata
                 file_path = metadata.get("file_path")
 
                 if file_path:
@@ -481,50 +483,18 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 print("Warning: No dataset metadata found in saved object.")
                 dset = None
 
-        # If still no dataset, try to load it from the saved object
+        # check if dset was attached to ptycho object
         if dset is None:
-            if hasattr(loaded_obj, "_dset") and loaded_obj._dset is not None:
-                dset = loaded_obj._dset
+            if hasattr(ptycho, "_dset") and ptycho._dset is not None:
+                dset = ptycho._dset
             else:
                 raise ValueError(
                     "No dataset provided and could not automatically reload dataset. "
                     "Please provide a dataset parameter or ensure the object was saved with dataset metadata."
                 )
 
-        # Ensure dset is not None at this point
-        if dset is None:
-            raise ValueError("Dataset is required but not provided")
+        ptycho.dset = dset
 
-        # Create a new ptychography object with the loaded components
-        ptycho = cls.from_models(
-            dset=dset,
-            obj_model=loaded_obj._obj_model,
-            probe_model=loaded_obj._probe_model,
-            detector_model=loaded_obj._detector_model,
-            logger=loaded_obj._logger if hasattr(loaded_obj, "_logger") else None,
-            device=device if device is not None else loaded_obj.device,
-            verbose=verbose if verbose is not None else loaded_obj.verbose,
-            rng=rng if rng is not None else loaded_obj.rng,
-        )
-
-        # Copy over any additional attributes that were saved
-        for attr in [
-            "_preprocessed",
-            "_obj_padding_px",
-            "_batch_size",
-            "_store_iterations",
-            "_store_iterations_every",
-            "_epoch_losses",
-            "_epoch_recon_types",
-            "_epoch_lrs",
-            "_epoch_snapshots",
-            "_obj_fov_mask",
-            "_propagators",
-        ]:
-            if hasattr(loaded_obj, attr):
-                setattr(ptycho, attr, getattr(loaded_obj, attr))
-
-        # Move to the specified device
         if device is not None:
             ptycho.to(device)
 

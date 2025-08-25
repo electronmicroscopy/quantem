@@ -51,6 +51,7 @@ class Dataset(AutoSerialize):
         self.sampling = sampling
         self.units = units
         self.signal_units = signal_units
+        self._file_path = None
 
     @classmethod
     def from_array(

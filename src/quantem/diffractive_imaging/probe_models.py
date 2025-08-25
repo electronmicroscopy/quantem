@@ -568,11 +568,6 @@ class ProbePixelated(ProbeConstraints):
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 
-        if (
-            self._initial_probe is not None
-        ):  # don't reinitilize probe cuz maybe reloading from file
-            return
-
         if self._from_params:
             self.check_probe_params()
             prb = ComplexProbe(
