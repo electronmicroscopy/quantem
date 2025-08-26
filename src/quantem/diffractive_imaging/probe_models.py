@@ -372,6 +372,7 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         return fourier_shift_expand(start_probe, -probe_int_com, expand_dim=False)
 
     def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
+        ### this is not very efficient with Adam, should find a better way
         n_probes = start_probe.shape[0]
         orthogonal_probes = []
         original_norms = torch.norm(start_probe, dim=(-2, -1), keepdim=True)

@@ -38,12 +38,14 @@ class PtychographyOpt(PtychographyBase):
 
     @property
     def optimizer_params(self) -> dict[str, dict]:
-        """Returns the parameters used to set the optimizers."""
-        # return self._optimizer_params
         return {
-            "object": self.obj_model.optimizer_params,
-            "probe": self.probe_model.optimizer_params,
-            "dataset": self.dset.optimizer_params,
+            key: params
+            for key, params in [
+                ("object", self.obj_model.optimizer_params),
+                ("probe", self.probe_model.optimizer_params),
+                ("dataset", self.dset.optimizer_params),
+            ]
+            if params
         }
 
     @optimizer_params.setter
