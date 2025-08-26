@@ -133,7 +133,7 @@ def ptycho_dataset(complex_obj, probe_array):
         ),
         units=("A", "A", "A^-1", "A^-1"),
     )
-    pdset = PtychographyDatasetRaster.from_dataset(dset)
+    pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
 
     pdset.preprocess(
         com_fit_function="constant",
