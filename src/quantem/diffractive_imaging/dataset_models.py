@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from pathlib import Path
 from typing import Any, Literal, Self
 
 import matplotlib.pyplot as plt
@@ -576,7 +577,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
             sampling=[0, *dset.sampling[2:]],
             units=["pix", *dset.units[2:]],
         )
-        dset3d.file_path = dset.file_path  # any other attributes to transfer?
+        p = Path(dset.file_path).expanduser().resolve() if dset.file_path is not None else None
+        dset3d.file_path = p  # any other attributes to transfer?
 
         super().__init__(dset=dset3d, verbose=verbose, _token=_token)
 

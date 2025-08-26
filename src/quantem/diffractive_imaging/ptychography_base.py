@@ -357,6 +357,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.obj_model.shape = tuple(self.obj_shape_full)
         self.dset._set_initial_scan_positions_px(self.obj_padding_px)
         self.dset._set_patch_indices(self.obj_padding_px)
+        self.dset._preprocessing_params["obj_padding_px"] = self.obj_padding_px
 
     @property
     def obj_fov_mask(self) -> np.ndarray:
