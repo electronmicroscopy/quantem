@@ -297,8 +297,8 @@ class PtychographyVisualizations(PtychographyBase):
         lw = 2
         lines = []
         epochs = np.arange(len(self.epoch_losses))
-        colors = plt.cm.Set1.colors  # type:ignore
-        colors = config.get("viz.colors.set")[1:]
+        # colors = plt.cm.Set1.colors  # type:ignore
+        colors = config.get("viz.colors.set")  # [1:]
         lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="loss", lw=lw))
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")

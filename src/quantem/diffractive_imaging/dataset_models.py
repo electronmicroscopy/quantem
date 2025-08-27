@@ -413,7 +413,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         shp = shp.astype("int")
         return shp
 
-    def _obj_shape_full_2d(self, obj_padding_px: np.ndarray | tuple = (0, 0)) -> np.ndarray:
+    def _obj_shape_full_2d(self, obj_padding_px: np.ndarray | tuple) -> np.ndarray:
         cshape = self._obj_shape_crop_2d.copy()
         rotshape = np.floor(
             [

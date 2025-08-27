@@ -350,7 +350,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if self._obj_padding_force_power2_level > 0:
             p2 = adjust_padding_power2(
                 p2,
-                self.dset._obj_shape_full_2d(),
+                self.dset._obj_shape_full_2d((0, 0)),
                 self._obj_padding_force_power2_level,
             )
         self._obj_padding_px = p2
@@ -573,7 +573,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj_cropped(self) -> np.ndarray:
-        cropped = self._crop_rotate_obj_fov(self.obj)
+        cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "pure_phase":
             cropped = np.exp(1j * np.angle(cropped))
         cropped = center_crop_arr(cropped, tuple(self.obj_shape_crop))  # sometimes 1 pixel off
@@ -737,7 +737,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         positions_px: np.ndarray | None = None,
         com_rotation_rad: float | None = None,
         transpose: bool | None = None,
-        padding: int = 0,
+        padding: np.ndarray | tuple[int, int] = (0, 0),
     ) -> np.ndarray:
         """
         Crops and rotated object to FOV bounded by current pixel positions.
@@ -747,6 +747,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             self.dset.com_rotation_rad if com_rotation_rad is None else com_rotation_rad
         )
         transpose = self.dset.com_transpose if transpose is None else transpose
+        padding = np.array(padding)
 
         angle = com_rotation_rad if transpose else -1 * com_rotation_rad
 
@@ -759,14 +760,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         rotated_points = tf(positions, origin=positions.mean(0))
         rotated_points += 1e-9  # avoid pixel perfect errors
 
-        min_x, min_y = np.floor(np.amin(rotated_points, axis=0) - padding).astype("int")
-        min_x = min_x if min_x > 0 else 0
-        min_y = min_y if min_y > 0 else 0
-        max_x, max_y = np.ceil(np.amax(rotated_points, axis=0) + padding).astype("int")
+        min_r, min_c = np.floor(np.amin(rotated_points, axis=0) - padding).astype("int")
+        min_r = max(min_r, 0)
+        min_c = max(min_c, 0)
+        max_r, max_c = np.ceil(np.amax(rotated_points, axis=0) + padding).astype("int")
 
         rotated_array = ndi.rotate(
             array, np.rad2deg(-angle), order=1, reshape=False, axes=(-2, -1)
-        )[..., min_x:max_x, min_y:max_y]
+        )[..., min_r:max_r, min_c:max_c]
 
         if transpose:
             rotated_array = rotated_array.swapaxes(-2, -1)
