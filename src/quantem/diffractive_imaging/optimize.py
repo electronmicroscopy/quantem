@@ -149,9 +149,6 @@ def _OptimizeIterativePtychographyObjective(
 ) -> Callable[[optuna.trial.Trial], float]:
     """Build and return an Optuna objective for iterative ptychography.
 
-    NEW: Supports optimizing dataset parameters (e.g., rotation) by building the dataset
-    fresh each trial if dataset_constructor is provided.
-
     Args:
         constructors, base_kwargs, loss_getter: as before
         dataset_constructor: Optional callable to build dataset
