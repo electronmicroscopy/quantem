@@ -447,3 +447,125 @@ class Dataset(AutoSerialize):
             self.array = np.sum(
                 self.array[tuple(slices)].reshape(reshape_dims), axis=tuple(reduce_axes)
             )
+
+    def fourier_resample(
+        self,
+        out_shape: Optional[tuple[int, ...]] = None,
+        factors: Optional[Union[float, tuple[float, ...]]] = None,
+        axes: Optional[tuple[int, ...]] = None,
+        overwrite: bool = False,
+    ) -> Optional["Dataset"]:
+        """
+        Resample the dataset using Fourier cropping/zero-padding.
+
+        Parameters
+        ----------
+        out_shape : tuple of int, optional
+            Desired output shape along specified axes.
+        factors : float or tuple of float, optional
+            Downsample/upsample factors per axis (e.g., 0.5 halves size, 2 doubles size).
+            If scalar, same factor applied to all specified axes.
+        axes : tuple of int, optional
+            Axes to resample. If None, all axes are used.
+        overwrite : bool, default False
+            If True, modify this dataset in place. Otherwise return a new Dataset.
+
+        Returns
+        -------
+        Dataset or None
+            Resampled dataset if overwrite is False, otherwise None.
+        """
+        xp = self._xp
+        if axes is None:
+            axes = tuple(range(self.ndim))
+
+        # Determine output shape
+        if out_shape is not None and factors is not None:
+            raise ValueError("Specify either out_shape or factors, not both.")
+
+        if out_shape is None and factors is None:
+            raise ValueError("Must specify either out_shape or factors.")
+
+        if factors is not None:
+            if np.isscalar(factors):
+                factors = (float(factors),) * len(axes)
+            elif len(factors) != len(axes):
+                raise ValueError("factors length must match number of axes.")
+            out_shape = tuple(int(round(self.shape[ax] * fac)) for ax, fac in zip(axes, factors))
+        else:
+            if len(out_shape) != len(axes):
+                raise ValueError("out_shape length must match number of axes.")
+            factors = tuple(new_len / self.shape[ax] for ax, new_len in zip(axes, out_shape))
+
+        # Forward FFT
+        F = xp.fft.fftn(self.array, axes=axes, norm="ortho")
+        F = xp.fft.fftshift(F, axes=axes)
+
+        # Slice or pad Fourier domain
+        slices = []
+        pad_widths = []
+        for ax, new_len in zip(axes, out_shape):
+            old_len = self.shape[ax]
+            if new_len < old_len:  # crop
+                start = (old_len - new_len) // 2
+                end = start + new_len
+                slices.append(slice(start, end))
+                pad_widths.append(None)
+            elif new_len > old_len:  # pad
+                slices.append(slice(None))
+                before = (new_len - old_len) // 2
+                after = new_len - old_len - before
+                pad_widths.append((before, after))
+            else:  # unchanged
+                slices.append(slice(None))
+                pad_widths.append(None)
+
+        # Apply slices
+        full_slices = []
+        ax_map = dict(zip(axes, slices))
+        for a0 in range(self.ndim):
+            if a0 in ax_map:
+                full_slices.append(ax_map[a0])
+            else:
+                full_slices.append(slice(None))
+        F_resampled = F[tuple(full_slices)]
+
+        # Apply padding
+        for ax_index, pad in zip(axes, pad_widths):
+            if pad is not None:
+                pad_spec = [(0, 0)] * self.ndim
+                pad_spec[ax_index] = pad
+                F_resampled = xp.pad(F_resampled, pad_spec, mode="constant")
+
+        # Inverse FFT
+        F_resampled = xp.fft.ifftshift(F_resampled, axes=axes)
+        array_resampled = xp.fft.ifftn(F_resampled, axes=axes, norm="ortho")
+
+        # If input was real, discard small imaginary part
+        if xp.isrealobj(self.array):
+            array_resampled = array_resampled.real
+
+        # Scale to preserve mean intensity
+        in_size = np.prod([self.shape[ax] for ax in axes])
+        out_size = np.prod([out_shape[idx] for idx in range(len(axes))])
+        scale = in_size / out_size
+        array_resampled *= scale
+
+        # Update sampling (inverse of factor)
+        new_sampling = self.sampling.copy()
+        for ax, fac in zip(axes, factors):
+            new_sampling[ax] /= fac
+
+        # Prepare output
+        factors_str = " ".join(f"{fac:.3g}" for fac in factors)
+        if overwrite:
+            self._array = array_resampled
+            self._sampling = new_sampling
+            self.name = self.name + f" (resampled factors {factors_str})"
+            return None
+        else:
+            dataset = self.copy()
+            dataset.array = array_resampled
+            dataset.sampling = new_sampling
+            dataset.name = self.name + f" (resampled factors {factors_str})"
+            return dataset
