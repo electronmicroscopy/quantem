@@ -453,7 +453,7 @@ class Dataset(AutoSerialize):
         out_shape: Optional[tuple[int, ...]] = None,
         factors: Optional[Union[float, tuple[float, ...]]] = None,
         axes: Optional[tuple[int, ...]] = None,
-        overwrite: bool = False,
+        modify_in_place: bool = False,
     ) -> Optional["Dataset"]:
         """
         Resample the dataset using Fourier cropping/zero-padding.
@@ -467,13 +467,13 @@ class Dataset(AutoSerialize):
             If scalar, same factor applied to all specified axes.
         axes : tuple of int, optional
             Axes to resample. If None, all axes are used.
-        overwrite : bool, default False
+        modify_in_place : bool, default False
             If True, modify this dataset in place. Otherwise return a new Dataset.
 
         Returns
         -------
         Dataset or None
-            Resampled dataset if overwrite is False, otherwise None.
+            Resampled dataset if modify_in_place is False, otherwise None.
         """
         xp = self._xp
         if axes is None:
@@ -558,7 +558,7 @@ class Dataset(AutoSerialize):
 
         # Prepare output
         factors_str = " ".join(f"{fac:.3g}" for fac in factors)
-        if overwrite:
+        if modify_in_place:
             self._array = array_resampled
             self._sampling = new_sampling
             self.name = self.name + f" (resampled factors {factors_str})"
