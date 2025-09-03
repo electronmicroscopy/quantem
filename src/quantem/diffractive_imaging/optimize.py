@@ -237,7 +237,6 @@ def OptimizeIterativePtychography(
     study: Optional[optuna.study.Study] = None,
     study_kwargs: Optional[Dict[str, Any]] = None,
     unit: str = "trial",
-    verbose: bool = True,
 ) -> optuna.study.Study:
     """Run an Optuna study for iterative ptychography with embedded tqdm progress bar.
 
@@ -272,7 +271,7 @@ def OptimizeIterativePtychography(
             objective,
             n_trials=n_trials,
             callbacks=[_on_trial_end],
-            show_progress_bar=verbose,
+            show_progress_bar=False,
         )
 
     return study
