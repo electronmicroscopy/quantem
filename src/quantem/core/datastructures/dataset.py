@@ -380,73 +380,112 @@ class Dataset(AutoSerialize):
         modify_in_place=False,
     ):
         """
-        Bins Dataset
+        Bin the Dataset by integer factors along selected axes using block summation.
+
+        Notes
+        -----
+        - Sampling is multiplied by the bin factor on each binned axis.
+        - Origin is shifted to the center of the first block on each binned axis:
+          origin_new = origin_old + 0.5 * (factor - 1) * sampling_old
+        - Any trailing remainder (shape % factor) is dropped.
 
         Parameters
         ----------
-        bin_factors:tuple or int
-            bin factors for each axis
-        axes:
-            Axis over which to bin. If None is specified, all axes are binned.
-        modify_in_place: bool
-            If True, modifies dataset
+        bin_factors : int | tuple[int, ...]
+            Bin factors per specified axis (must be positive integers).
+        axes : int | tuple[int, ...] | None
+            Axes to bin. If None, all axes are binned.
+        modify_in_place : bool
+            If True, modifies this dataset; otherwise returns a new Dataset.
 
         Returns
-        --------
-        Dataset (binned) only if modify_in_place is False
+        -------
+        Dataset or None
         """
+        xp = self._xp
+
+        # Normalize axes
         if axes is None:
             axes = tuple(range(self.ndim))
         elif np.isscalar(axes):
-            axes = (axes,)
+            axes = (int(axes),)
+        else:
+            axes = tuple(int(ax) for ax in axes)
 
+        # Normalize factors to per-axis tuple
         if isinstance(bin_factors, int):
-            bin_factors = tuple([bin_factors] * len(axes))
+            bin_factors = tuple([int(bin_factors)] * len(axes))
         elif isinstance(bin_factors, (list, tuple)):
             if len(bin_factors) != len(axes):
                 raise ValueError("bin_factors and axes must have the same length.")
-            bin_factors = tuple(bin_factors)
+            bin_factors = tuple(int(fac) for fac in bin_factors)
         else:
             raise TypeError("bin_factors must be an int or tuple of ints.")
 
+        if any(fac <= 0 for fac in bin_factors):
+            raise ValueError("All bin factors must be positive integers.")
+
         axis_to_factor = dict(zip(axes, bin_factors))
 
+        # Compute effective slices that drop any remainder at the end
         slices = []
-        new_shape = []
-        for axis in range(self.ndim):
-            if axis in axis_to_factor:
-                factor = axis_to_factor[axis]
-                length = self.shape[axis] - (self.shape[axis] % factor)
-                slices.append(slice(0, length))
-                new_shape.extend([length // factor, factor])
+        effective_lengths = []
+        for a0 in range(self.ndim):
+            if a0 in axis_to_factor:
+                fac = axis_to_factor[a0]
+                length_eff = (self.shape[a0] // fac) * fac
+                slices.append(slice(0, length_eff))
+                effective_lengths.append(length_eff)
             else:
                 slices.append(slice(None))
-                new_shape.append(self.shape[axis])
+                effective_lengths.append(self.shape[a0])
 
+        # Build reshape dims and which axes to reduce (sum over block dimension)
         reshape_dims = []
         reduce_axes = []
-        current_axis = 0
-
-        for axis in range(self.ndim):
-            if axis in axis_to_factor:
-                reshape_dims.extend([new_shape[current_axis], axis_to_factor[axis]])
-                reduce_axes.append(len(reshape_dims) - 1)
-                current_axis += 2
+        running_axis = 0
+        for a1 in range(self.ndim):
+            if a1 in axis_to_factor:
+                fac = axis_to_factor[a1]
+                nblocks = effective_lengths[a1] // fac
+                reshape_dims.extend([nblocks, fac])
+                # The 'fac' dimension is immediately after the 'nblocks' dim
+                reduce_axes.append(running_axis + 1)
+                running_axis += 2
             else:
-                reshape_dims.append(new_shape[current_axis])
-                current_axis += 1
+                reshape_dims.append(effective_lengths[a1])
+                running_axis += 1
 
-        if modify_in_place is False:
-            dataset = self.copy()
-            dataset.array = np.sum(
-                dataset.array[tuple(slices)].reshape(reshape_dims),
-                axis=tuple(reduce_axes),
-            )
-            return dataset
-        else:
-            self.array = np.sum(
-                self.array[tuple(slices)].reshape(reshape_dims), axis=tuple(reduce_axes)
-            )
+        # Perform block summation
+        array_view = self.array[tuple(slices)]
+        array_binned = xp.sum(array_view.reshape(tuple(reshape_dims)), axis=tuple(reduce_axes))
+
+        # Update metadata
+        new_sampling = self.sampling.copy()
+        new_origin = self.origin.copy()
+        for ax_binned, fac_binned in axis_to_factor.items():
+            # sampling increases by factor
+            old_sampling = new_sampling[ax_binned]
+            new_sampling[ax_binned] = old_sampling * fac_binned
+            # shift origin to the center of the first block
+            new_origin[ax_binned] = new_origin[ax_binned] + 0.5 * (fac_binned - 1) * old_sampling
+
+        if modify_in_place:
+            self._array = array_binned
+            self._sampling = new_sampling
+            self._origin = new_origin
+            return None
+
+        dataset = self.copy()
+        dataset.array = array_binned
+        dataset.sampling = new_sampling
+        dataset.origin = new_origin
+        # Optional: annotate the name with factors (3 sig figs) for the binned axes
+        factors_str = " ".join(
+            f"{axis_to_factor[a2]:.3g}" if a2 in axis_to_factor else "1" for a2 in range(self.ndim)
+        )
+        dataset.name = f"{self.name} (binned factors {factors_str})"
+        return dataset
 
     def fourier_resample(
         self,
@@ -569,3 +608,94 @@ class Dataset(AutoSerialize):
             dataset.sampling = new_sampling
             dataset.name = self.name + f" (resampled factors {factors_str})"
             return dataset
+
+    def transpose(
+        self,
+        order: Optional[tuple[int, ...]] = None,
+        modify_in_place: bool = False,
+    ) -> Optional["Dataset"]:
+        """
+        Transpose (permute) axes of the dataset and reorder metadata accordingly.
+
+        Parameters
+        ----------
+        order : tuple[int, ...], optional
+            A permutation of range(self.ndim). If None, axes are reversed (NumPy's default).
+        modify_in_place : bool, default False
+            If True, modify this dataset in place. Otherwise return a new Dataset.
+
+        Returns
+        -------
+        Dataset or None
+            Transposed dataset if modify_in_place is False, otherwise None.
+        """
+        if order is None:
+            order = tuple(range(self.ndim - 1, -1, -1))
+
+        if len(order) != self.ndim or set(order) != set(range(self.ndim)):
+            raise ValueError(f"'order' must be a permutation of 0..{self.ndim - 1}; got {order!r}")
+
+        array_t = self.array.transpose(order)
+
+        # Reorder metadata to match new axis order
+        new_origin = self.origin[list(order)].copy()
+        new_sampling = self.sampling[list(order)].copy()
+        new_units = [self.units[ax] for ax in order]
+
+        if modify_in_place:
+            # Use private attrs to avoid dtype/ndim enforcement in the setter
+            self._array = array_t
+            self._origin = new_origin
+            self._sampling = new_sampling
+            self._units = new_units
+            return None
+
+        # Create a new Dataset without extra array copies
+        return type(self).from_array(
+            array=array_t,
+            name=self.name,  # keep name unchanged for now
+            origin=new_origin,
+            sampling=new_sampling,
+            units=new_units,
+            signal_units=self.signal_units,
+        )
+
+    def astype(
+        self,
+        dtype: DTypeLike,
+        copy: bool = True,
+        modify_in_place: bool = False,
+    ) -> Optional["Dataset"]:
+        """
+        Cast the array to a new dtype. Metadata is unchanged.
+
+        Parameters
+        ----------
+        dtype : DTypeLike
+            Target dtype (e.g., np.float32, "complex64", etc.).
+        copy : bool, default True
+            If False and no cast is needed, a view may be returned by the backend.
+        modify_in_place : bool, default False
+            If True, modify this dataset in place. Otherwise return a new Dataset.
+
+        Returns
+        -------
+        Dataset or None
+            Dtype-cast dataset if modify_in_place is False, otherwise None.
+        """
+        array_cast = self.array.astype(dtype, copy=copy)
+
+        if modify_in_place:
+            # Bypass the array setter so we can actually change dtype
+            self._array = array_cast
+            return None
+
+        # Build a new Dataset with identical metadata
+        return type(self).from_array(
+            array=array_cast,
+            name=self.name,
+            origin=self.origin.copy(),
+            sampling=self.sampling.copy(),
+            units=self.units[:],
+            signal_units=self.signal_units,
+        )
