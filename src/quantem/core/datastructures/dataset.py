@@ -378,14 +378,38 @@ class Dataset(AutoSerialize):
         bin_factors,
         axes=None,
         modify_in_place=False,
+        reducer: str = "sum",
     ):
         """
-        Bin the Dataset by integer factors along selected axes using block summation.
-        Updates sampling and origin (origin -> center of first block).
+        Bin the Dataset by integer factors along selected axes using block reduction.
+
+        Parameters
+        ----------
+        bin_factors : int | tuple[int, ...]
+            Bin factors per specified axis (positive integers).
+        axes : int | tuple[int, ...] | None
+            Axes to bin. If None, all axes are binned.
+        modify_in_place : bool
+            If True, modifies this dataset; otherwise returns a new Dataset.
+        reducer : {"sum","mean"}
+            Reduction applied within each block. "sum" (default) preserves counts;
+            "mean" averages over each block (block volume = product of factors).
+
+        Notes
+        -----
+        - Any remainder (shape % factor) is dropped on each binned axis.
+        - Sampling is multiplied by the factor on each binned axis.
+        - Origin is shifted to the center of the first block:
+            origin_new = origin_old + 0.5 * (factor - 1) * sampling_old
         """
         xp = self._xp
 
-        # Normalize axes
+        # --- Validate reducer ---
+        reducer_norm = reducer.lower()
+        if reducer_norm not in ("sum", "mean"):
+            raise ValueError("reducer must be 'sum' or 'mean'")
+
+        # --- Normalize axes ---
         if axes is None:
             axes = tuple(range(self.ndim))
         elif np.isscalar(axes):
@@ -393,7 +417,7 @@ class Dataset(AutoSerialize):
         else:
             axes = tuple(int(ax) for ax in axes)
 
-        # Normalize factors
+        # --- Normalize factors ---
         if isinstance(bin_factors, int):
             bin_factors = tuple([int(bin_factors)] * len(axes))
         elif isinstance(bin_factors, (list, tuple)):
@@ -407,7 +431,7 @@ class Dataset(AutoSerialize):
 
         axis_to_factor = dict(zip(axes, bin_factors))
 
-        # Drop remainders
+        # --- Compute effective slices (drop remainder) ---
         slices = []
         effective_lengths = []
         for a0 in range(self.ndim):
@@ -420,7 +444,7 @@ class Dataset(AutoSerialize):
                 slices.append(slice(None))
                 effective_lengths.append(self.shape[a0])
 
-        # Reshape to blocks and sum
+        # --- Build reshape dims & reduction axes ---
         reshape_dims = []
         reduce_axes = []
         running_axis = 0
@@ -429,22 +453,31 @@ class Dataset(AutoSerialize):
                 fac = axis_to_factor[a1]
                 nblocks = effective_lengths[a1] // fac
                 reshape_dims.extend([nblocks, fac])
-                reduce_axes.append(running_axis + 1)  # the 'fac' dim
+                reduce_axes.append(running_axis + 1)  # reduce over the 'fac' dim
                 running_axis += 2
             else:
                 reshape_dims.append(effective_lengths[a1])
                 running_axis += 1
 
-        array_view = self.array[tuple(slices)]
-        array_binned = xp.sum(array_view.reshape(tuple(reshape_dims)), axis=tuple(reduce_axes))
+        # --- Perform block reduction ---
+        array_view = self.array[tuple(slices)].reshape(tuple(reshape_dims))
+        if reducer_norm == "sum":
+            array_binned = xp.sum(array_view, axis=tuple(reduce_axes))
+        else:  # "mean"
+            array_binned = xp.sum(array_view, axis=tuple(reduce_axes))
+            # Divide by block volume (product of factors across selected axes)
+            block_volume = 1
+            for ax_b, fac_b in axis_to_factor.items():
+                block_volume *= fac_b
+            array_binned = array_binned / block_volume
 
-        # ---- Metadata (ensure float to avoid truncation) ----
+        # --- Metadata updates (ensure float to avoid truncation) ---
         new_sampling = self.sampling.astype(float).copy()
         new_origin = self.origin.astype(float).copy()
         for ax_binned, fac_binned in axis_to_factor.items():
             old_sampling = new_sampling[ax_binned]
             new_sampling[ax_binned] = old_sampling * fac_binned
-            # shift origin to center of the first block
+            # shift origin to the center of the first block
             new_origin[ax_binned] = new_origin[ax_binned] + 0.5 * (fac_binned - 1) * old_sampling
 
         if modify_in_place:
@@ -457,10 +490,13 @@ class Dataset(AutoSerialize):
         dataset.array = array_binned
         dataset.sampling = new_sampling
         dataset.origin = new_origin
+
+        # Annotate name
         factors_str = " ".join(
             f"{axis_to_factor[a2]:.3g}" if a2 in axis_to_factor else "1" for a2 in range(self.ndim)
         )
-        dataset.name = f"{self.name} (binned factors {factors_str})"
+        suffix = f"(binned factors {factors_str}" + (", mean)" if reducer_norm == "mean" else ")")
+        dataset.name = f"{self.name} {suffix}"
         return dataset
 
     def fourier_resample(
