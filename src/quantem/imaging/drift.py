@@ -283,9 +283,6 @@ class DriftCorrection(AutoSerialize):
         kwargs.pop("title", None)
         if show_merged:
             self.plot_merged_images(show_knots=show_knots, title="Merged: initial", **kwargs)
-
-            self.plot_merged_images(show_knots=show_knots, title="Merged: initial", **kwargs)
-
         if show_images:
             self.plot_transformed_images(
                 show_knots=show_knots,
@@ -359,9 +356,6 @@ class DriftCorrection(AutoSerialize):
         kwargs.pop("title", None)
         if show_merged:
             self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)
-
-            self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)
-
         if show_images:
             self.plot_transformed_images(
                 show_knots=show_knots,
@@ -861,15 +855,9 @@ class DriftCorrection(AutoSerialize):
         self,
         mode,
     ):
-        # Mask for error estimate
-        mask = np.prod(self.weights_warped.array, axis=0)
-
         # Estimate current error
         images_mean = np.mean(self.images_warped.array, axis=0)
-        sig_diff = np.mean(
-            mask[None, :, :] * np.abs(self.images_warped.array - images_mean[None, :, :]),
-            axis=(1, 2),
-        ) / np.sum(mask)
+        sig_diff = np.mean(np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2))
 
         # Error vector
         error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
