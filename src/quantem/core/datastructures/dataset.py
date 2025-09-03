@@ -381,26 +381,7 @@ class Dataset(AutoSerialize):
     ):
         """
         Bin the Dataset by integer factors along selected axes using block summation.
-
-        Notes
-        -----
-        - Sampling is multiplied by the bin factor on each binned axis.
-        - Origin is shifted to the center of the first block on each binned axis:
-          origin_new = origin_old + 0.5 * (factor - 1) * sampling_old
-        - Any trailing remainder (shape % factor) is dropped.
-
-        Parameters
-        ----------
-        bin_factors : int | tuple[int, ...]
-            Bin factors per specified axis (must be positive integers).
-        axes : int | tuple[int, ...] | None
-            Axes to bin. If None, all axes are binned.
-        modify_in_place : bool
-            If True, modifies this dataset; otherwise returns a new Dataset.
-
-        Returns
-        -------
-        Dataset or None
+        Updates sampling and origin (origin -> center of first block).
         """
         xp = self._xp
 
@@ -412,7 +393,7 @@ class Dataset(AutoSerialize):
         else:
             axes = tuple(int(ax) for ax in axes)
 
-        # Normalize factors to per-axis tuple
+        # Normalize factors
         if isinstance(bin_factors, int):
             bin_factors = tuple([int(bin_factors)] * len(axes))
         elif isinstance(bin_factors, (list, tuple)):
@@ -421,13 +402,12 @@ class Dataset(AutoSerialize):
             bin_factors = tuple(int(fac) for fac in bin_factors)
         else:
             raise TypeError("bin_factors must be an int or tuple of ints.")
-
         if any(fac <= 0 for fac in bin_factors):
             raise ValueError("All bin factors must be positive integers.")
 
         axis_to_factor = dict(zip(axes, bin_factors))
 
-        # Compute effective slices that drop any remainder at the end
+        # Drop remainders
         slices = []
         effective_lengths = []
         for a0 in range(self.ndim):
@@ -440,7 +420,7 @@ class Dataset(AutoSerialize):
                 slices.append(slice(None))
                 effective_lengths.append(self.shape[a0])
 
-        # Build reshape dims and which axes to reduce (sum over block dimension)
+        # Reshape to blocks and sum
         reshape_dims = []
         reduce_axes = []
         running_axis = 0
@@ -449,25 +429,22 @@ class Dataset(AutoSerialize):
                 fac = axis_to_factor[a1]
                 nblocks = effective_lengths[a1] // fac
                 reshape_dims.extend([nblocks, fac])
-                # The 'fac' dimension is immediately after the 'nblocks' dim
-                reduce_axes.append(running_axis + 1)
+                reduce_axes.append(running_axis + 1)  # the 'fac' dim
                 running_axis += 2
             else:
                 reshape_dims.append(effective_lengths[a1])
                 running_axis += 1
 
-        # Perform block summation
         array_view = self.array[tuple(slices)]
         array_binned = xp.sum(array_view.reshape(tuple(reshape_dims)), axis=tuple(reduce_axes))
 
-        # Update metadata
-        new_sampling = self.sampling.copy()
-        new_origin = self.origin.copy()
+        # ---- Metadata (ensure float to avoid truncation) ----
+        new_sampling = self.sampling.astype(float).copy()
+        new_origin = self.origin.astype(float).copy()
         for ax_binned, fac_binned in axis_to_factor.items():
-            # sampling increases by factor
             old_sampling = new_sampling[ax_binned]
             new_sampling[ax_binned] = old_sampling * fac_binned
-            # shift origin to the center of the first block
+            # shift origin to center of the first block
             new_origin[ax_binned] = new_origin[ax_binned] + 0.5 * (fac_binned - 1) * old_sampling
 
         if modify_in_place:
@@ -480,7 +457,6 @@ class Dataset(AutoSerialize):
         dataset.array = array_binned
         dataset.sampling = new_sampling
         dataset.origin = new_origin
-        # Optional: annotate the name with factors (3 sig figs) for the binned axes
         factors_str = " ".join(
             f"{axis_to_factor[a2]:.3g}" if a2 in axis_to_factor else "1" for a2 in range(self.ndim)
         )
@@ -495,136 +471,128 @@ class Dataset(AutoSerialize):
         modify_in_place: bool = False,
     ) -> Optional["Dataset"]:
         """
-        Resample the dataset using Fourier cropping/zero-padding.
-
-        Parameters
-        ----------
-        out_shape : tuple of int, optional
-            Desired output shape along specified axes.
-        factors : float or tuple of float, optional
-            Downsample/upsample factors per axis (e.g., 0.5 halves size, 2 doubles size).
-            If scalar, same factor applied to all specified axes.
-        axes : tuple of int, optional
-            Axes to resample. If None, all axes are used.
-        modify_in_place : bool, default False
-            If True, modify this dataset in place. Otherwise return a new Dataset.
-
-        Returns
-        -------
-        Dataset or None
-            Resampled dataset if modify_in_place is False, otherwise None.
+        Fourier resample via centered crop (down) / zero-pad (up), using default FFT norms.
+        Preserves mean and keeps the physical center fixed.
         """
         xp = self._xp
         if axes is None:
             axes = tuple(range(self.ndim))
+        elif np.isscalar(axes):
+            axes = (int(axes),)
+        else:
+            axes = tuple(int(a0) for a0 in axes)
 
-        # Determine output shape
-        if out_shape is not None and factors is not None:
-            raise ValueError("Specify either out_shape or factors, not both.")
+        if (out_shape is None) == (factors is None):
+            raise ValueError("Specify exactly one of out_shape or factors.")
 
-        if out_shape is None and factors is None:
-            raise ValueError("Must specify either out_shape or factors.")
-
+        # Resolve out_shape & factors
         if factors is not None:
             if np.isscalar(factors):
                 factors = (float(factors),) * len(axes)
-            elif len(factors) != len(axes):
-                raise ValueError("factors length must match number of axes.")
-            out_shape = tuple(int(round(self.shape[ax] * fac)) for ax, fac in zip(axes, factors))
+            else:
+                factors = tuple(float(f) for f in factors)
+                if len(factors) != len(axes):
+                    raise ValueError("factors length must match number of axes.")
+            out_shape = tuple(
+                max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors)
+            )
         else:
             if len(out_shape) != len(axes):
                 raise ValueError("out_shape length must match number of axes.")
-            factors = tuple(new_len / self.shape[ax] for ax, new_len in zip(axes, out_shape))
+            out_shape = tuple(int(nl) for nl in out_shape)
+            factors = tuple(out_len / self.shape[a2] for a2, out_len in zip(axes, out_shape))
 
-        # Forward FFT
-        F = xp.fft.fftn(self.array, axes=axes, norm="ortho")
+        if any(nl < 1 for nl in out_shape):
+            raise ValueError("All output lengths must be >= 1.")
+
+        def _shift_center_index(n: int) -> int:
+            # index of DC after fftshift: n//2 for even, (n-1)//2 for odd
+            return n // 2 if (n % 2 == 0) else (n - 1) // 2
+
+        # Forward FFT (default normalization: forward unscaled, inverse 1/N)
+        F = xp.fft.fftn(self.array, axes=axes)
         F = xp.fft.fftshift(F, axes=axes)
 
-        # Slice or pad Fourier domain
+        # Center-aligned crop/pad per axis (so DC stays centered)
+        axis_to_outlen = dict(zip(axes, out_shape))
         slices = []
-        pad_widths = []
-        for ax, new_len in zip(axes, out_shape):
-            old_len = self.shape[ax]
-            if new_len < old_len:  # crop
-                start = (old_len - new_len) // 2
-                end = start + new_len
-                slices.append(slice(start, end))
-                pad_widths.append(None)
-            elif new_len > old_len:  # pad
-                slices.append(slice(None))
-                before = (new_len - old_len) // 2
-                after = new_len - old_len - before
-                pad_widths.append((before, after))
-            else:  # unchanged
-                slices.append(slice(None))
-                pad_widths.append(None)
+        pad_specs = []
+        for a3 in range(self.ndim):
+            if a3 in axis_to_outlen:
+                old_len = self.shape[a3]
+                new_len = axis_to_outlen[a3]
+                oc = _shift_center_index(old_len)
+                nc = _shift_center_index(new_len)
 
-        # Apply slices
-        full_slices = []
-        ax_map = dict(zip(axes, slices))
-        for a0 in range(self.ndim):
-            if a0 in ax_map:
-                full_slices.append(ax_map[a0])
+                if new_len < old_len:
+                    start = oc - nc
+                    end = start + new_len
+                    slices.append(slice(start, end))
+                    pad_specs.append((0, 0))
+                elif new_len > old_len:
+                    slices.append(slice(None))
+                    before = nc - oc
+                    after = new_len - old_len - before
+                    pad_specs.append((before, after))
+                else:
+                    slices.append(slice(None))
+                    pad_specs.append((0, 0))
             else:
-                full_slices.append(slice(None))
-        F_resampled = F[tuple(full_slices)]
+                slices.append(slice(None))
+                pad_specs.append((0, 0))
 
-        # Apply padding
-        for ax_index, pad in zip(axes, pad_widths):
-            if pad is not None:
-                pad_spec = [(0, 0)] * self.ndim
-                pad_spec[ax_index] = pad
-                F_resampled = xp.pad(F_resampled, pad_spec, mode="constant")
+        F_rs = F[tuple(slices)]
+        if any(pw != (0, 0) for pw in pad_specs):
+            F_rs = xp.pad(F_rs, pad_specs, mode="constant")
 
         # Inverse FFT
-        F_resampled = xp.fft.ifftshift(F_resampled, axes=axes)
-        array_resampled = xp.fft.ifftn(F_resampled, axes=axes, norm="ortho")
+        F_rs = xp.fft.ifftshift(F_rs, axes=axes)
+        array_resampled = xp.fft.ifftn(F_rs, axes=axes)
 
-        # If input was real, discard small imaginary part
         if xp.isrealobj(self.array):
             array_resampled = array_resampled.real
 
-        # Scale to preserve mean intensity
-        in_size = np.prod([self.shape[ax] for ax in axes])
-        out_size = np.prod([out_shape[idx] for idx in range(len(axes))])
-        scale = in_size / out_size
-        array_resampled *= scale
+        # Mean preservation with default FFTs:
+        # ones -> F(0)=N_in, IFFT size N_out -> constant N_in/N_out; multiply by N_out/N_in.
+        N_in = int(np.prod([self.shape[a4] for a4 in axes]))
+        N_out = int(np.prod([axis_to_outlen[a5] for a5 in axes]))
+        if N_in > 0 and N_out > 0:
+            array_resampled *= N_out / N_in
 
-        # Update sampling (inverse of factor)
-        new_sampling = self.sampling.copy()
-        for ax_resampled, fac_resampled in zip(axes, factors):
-            new_sampling[ax_resampled] /= fac_resampled
+        # Metadata (ensure float arrays to avoid truncation)
+        new_sampling = self.sampling.astype(float).copy()
+        for a6, out_len in zip(axes, out_shape):
+            fac_actual = out_len / self.shape[a6]
+            new_sampling[a6] = new_sampling[a6] / fac_actual
 
-        # Update origin to keep the array CENTER fixed in world coordinates
-        new_origin = self.origin.copy()
-        for ax_resampled, fac_resampled in zip(axes, factors):
-            old_len = self.shape[ax_resampled]
-            new_len = out_shape[axes.index(ax_resampled)]
+        new_origin = self.origin.astype(float).copy()
+        for a7, out_len in zip(axes, out_shape):
+            old_len = self.shape[a7]
             old_center_idx = (old_len - 1) / 2.0
-            new_center_idx = (new_len - 1) / 2.0
-            old_sampling = self.sampling[ax_resampled]
-            # place new center at the same physical coordinate as old center
-            new_origin[ax_resampled] = (
-                self.origin[ax_resampled]
-                + old_center_idx * old_sampling
-                - new_center_idx * new_sampling[ax_resampled]
+            new_center_idx = (out_len - 1) / 2.0
+            old_sampling = self.sampling[a7]
+            new_origin[a7] = (
+                self.origin[a7] + old_center_idx * old_sampling - new_center_idx * new_sampling[a7]
             )
 
-        # Prepare output
-        factors_str = " ".join(f"{fac:.3g}" for fac in factors)
+        # Name suffix
+        factors_map = {axk: (axis_to_outlen[axk] / self.shape[axk]) for axk in axes}
+        factors_list = [f"{factors_map.get(a8, 1.0):.3g}" for a8 in range(self.ndim)]
+        suffix = " ".join(factors_list)
+
         if modify_in_place:
             self._array = array_resampled
             self._sampling = new_sampling
             self._origin = new_origin
-            self.name = self.name + f" (resampled factors {factors_str})"
+            self.name = self.name + f" (resampled factors {suffix})"
             return None
-        else:
-            dataset = self.copy()
-            dataset.array = array_resampled
-            dataset.sampling = new_sampling
-            dataset.origin = new_origin
-            dataset.name = self.name + f" (resampled factors {factors_str})"
-            return dataset
+
+        ds = self.copy()
+        ds.array = array_resampled
+        ds.sampling = new_sampling
+        ds.origin = new_origin
+        ds.name = self.name + f" (resampled factors {suffix})"
+        return ds
 
     def transpose(
         self,
