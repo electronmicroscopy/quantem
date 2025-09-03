@@ -592,20 +592,37 @@ class Dataset(AutoSerialize):
 
         # Update sampling (inverse of factor)
         new_sampling = self.sampling.copy()
-        for ax, fac in zip(axes, factors):
-            new_sampling[ax] /= fac
+        for ax_resampled, fac_resampled in zip(axes, factors):
+            new_sampling[ax_resampled] /= fac_resampled
+
+        # Update origin to keep the array CENTER fixed in world coordinates
+        new_origin = self.origin.copy()
+        for ax_resampled, fac_resampled in zip(axes, factors):
+            old_len = self.shape[ax_resampled]
+            new_len = out_shape[axes.index(ax_resampled)]
+            old_center_idx = (old_len - 1) / 2.0
+            new_center_idx = (new_len - 1) / 2.0
+            old_sampling = self.sampling[ax_resampled]
+            # place new center at the same physical coordinate as old center
+            new_origin[ax_resampled] = (
+                self.origin[ax_resampled]
+                + old_center_idx * old_sampling
+                - new_center_idx * new_sampling[ax_resampled]
+            )
 
         # Prepare output
         factors_str = " ".join(f"{fac:.3g}" for fac in factors)
         if modify_in_place:
             self._array = array_resampled
             self._sampling = new_sampling
+            self._origin = new_origin
             self.name = self.name + f" (resampled factors {factors_str})"
             return None
         else:
             dataset = self.copy()
             dataset.array = array_resampled
             dataset.sampling = new_sampling
+            dataset.origin = new_origin
             dataset.name = self.name + f" (resampled factors {factors_str})"
             return dataset
 
