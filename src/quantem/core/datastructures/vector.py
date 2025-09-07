@@ -462,16 +462,18 @@ class Vector(AutoSerialize):
             np.asarray(i) if isinstance(i, (list, np.ndarray)) else i for i in normalized
         )
 
-        # Check if we should return a numpy array (all indices are integers)
-        return_np = all(isinstance(i, (int, np.integer)) for i in idx_converted[: len(self.shape)])
+        # Check if we should return a single-cell view (all indices are integers)
+        return_cell = all(
+            isinstance(i, (int, np.integer)) for i in idx_converted[: len(self.shape)]
+        )
         if len(idx_converted) < len(self.shape):
-            return_np = False
+            return_cell = False
 
-        if return_np:
-            view = self._data
-            for i in idx_converted:
-                view = view[i]
-            return cast(NDArray[Any], view)
+        if return_cell:
+            # Return a CellView so atoms[0]['x'] works;
+            # still behaves like ndarray via __array__ when used numerically.
+            indices_tuple = tuple(int(i) for i in idx_converted[: len(self.shape)])
+            return _CellView(self, indices_tuple)
 
         # Handle fancy indexing and slicing
         def get_indices(dim_idx: Any, dim_size: int) -> np.ndarray:
@@ -1036,3 +1038,34 @@ class _FieldView:
     def __array__(self) -> np.ndarray:
         """Convert to numpy array when needed."""
         return self.flatten()
+
+
+class _CellView:
+    """
+    View over a single Vector cell (fixed indices over the indexed dims).
+    Supports item access by field name, e.g., v[0]['x'] -> 1D array for that cell.
+    Behaves like a numpy array via __array__ for backward compatibility.
+    """
+
+    def __init__(self, vector: "Vector", indices: Tuple[int, ...]) -> None:
+        self.vector = vector
+        self.indices = indices  # tuple of ints, one per indexed dimension
+
+    @property
+    def array(self) -> NDArray:
+        ref = self.vector._data
+        for i in self.indices:
+            ref = ref[i]
+        return ref  # shape: (rows, num_fields)
+
+    def __array__(self) -> np.ndarray:
+        # Allows numpy to transparently consume this as an ndarray
+        return self.array
+
+    def __getitem__(self, field_name: str) -> NDArray:
+        if not isinstance(field_name, str):
+            raise TypeError("Use a field name string, e.g. cell['x']")
+        if field_name not in self.vector._fields:
+            raise KeyError(f"Field '{field_name}' not found.")
+        j = self.vector._fields.index(field_name)
+        return self.array[:, j]
