@@ -789,7 +789,7 @@ class Lattice(AutoSerialize):
         tail_width: float = 1.0,
         headwidth: float = 4.0,
         headlength: float = 4.0,
-        outline: bool = False,
+        outline: bool = True,
         outline_width: float = 2.0,
         outline_color: str = "black",
         alpha: float = 1.0,
@@ -802,8 +802,8 @@ class Lattice(AutoSerialize):
         ref_face: str = "none",
         show_colorbar: bool = True,
         disp_color_max: float | None = None,
-        phase_offset_deg: float = 180.0,
-        phase_dir_flip: bool = False,
+        phase_offset_deg: float = 180.0,  # red = down
+        phase_dir_flip: bool = False,  # flip color direction if desired
         **kwargs,
     ):
         import matplotlib.patheffects as pe
@@ -812,7 +812,6 @@ class Lattice(AutoSerialize):
         from matplotlib.patches import ArrowStyle, Circle, FancyArrowPatch
         from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-        # JCh-based cyclic mapping (safe for 1D/2D)
         from quantem.core.visualization.visualization_utils import array_to_rgba
 
         data = pol_vec.get_data(0)
@@ -829,45 +828,32 @@ class Lattice(AutoSerialize):
             plt.tight_layout()
             return fig, ax
 
-        # fields (x=row, y=col)
+        # Fields
         xA = pol_vec[0]["x"]
         yA = pol_vec[0]["y"]
         xR = pol_vec[0]["x_ref"]
         yR = pol_vec[0]["y_ref"]
 
-        # displacements
-        dr = (xA - xR).astype(float)  # rows (down +)
-        dc = (yA - yR).astype(float)  # cols (right +)
+        # Displacements (rows, cols)
+        dr_raw = (xA - xR).astype(float)  # down +
+        dc_raw = (yA - yR).astype(float)  # right +
 
-        if subtract_median and dr.size > 0:
-            dr = dr - np.median(dr)
-            dc = dc - np.median(dc)
+        # --- Unified color mapping (identical across scripts) ---
+        dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
+            dr_raw,
+            dc_raw,
+            subtract_median=subtract_median,
+            use_magnitude_lightness=use_magnitude_lightness,
+            disp_color_max=disp_color_max,
+        )
 
-        # Angle mapping for desired hues:
-        #   down -> 0° (cyan after +180° in array_to_rgba)
-        #   right -> +90° (cyan-violet)
-        #   up    -> 180° (red)
-        #   left  -> -90° (orange-ish)
-        ang = np.arctan2(dc, dr)  # NOTE: swapped order (dc, dr)
+        # Angle mapping consistent with legend (down=0°, right=+90°, up=180°, left=-90°)
+        ang = np.arctan2(dc, dr)
         if phase_dir_flip:
             ang = -ang
-        ang = ang + np.deg2rad(phase_offset_deg)
+        ang += np.deg2rad(phase_offset_deg)
 
-        # Magnitude -> lightness amplitude
-        mag = np.hypot(dr, dc)
-        if use_magnitude_lightness:
-            if disp_color_max is None:
-                nz = mag[mag > 0]
-                ref = np.percentile(nz, 95) if nz.size else 1.0
-            else:
-                ref = max(float(disp_color_max), 1e-9)
-            amp = np.clip(mag / ref, 0.0, 1.0)
-            disp_cap_px = ref
-        else:
-            amp = np.full_like(ang, 0.85, dtype=float)
-            disp_cap_px = float(disp_color_max) if disp_color_max is not None else 1.0
-
-        # Colors via JCh
+        # Colors
         rgba = array_to_rgba(amp, ang, chroma_boost=chroma_boost)
         colors = rgba.reshape(-1, 4)[:, :3] if rgba.ndim != 2 else rgba[:, :3]
 
@@ -879,11 +865,10 @@ class Lattice(AutoSerialize):
         else:
             fig, ax = plt.subplots(1, 1, figsize=figsize)
 
-        # Arrow style (continuous shape; no seam)
+        # Draw arrows (colored patch with black stroke beneath via path effects)
         arrowstyle = ArrowStyle.Simple(
             head_length=headlength, head_width=headwidth, tail_width=tail_width
         )
-
         for i in range(xA.size):
             x0, y0 = float(xA[i]), float(yA[i])
             x1 = x0 + float(dr[i]) * float(length_scale)
@@ -891,12 +876,12 @@ class Lattice(AutoSerialize):
 
             arrow = FancyArrowPatch(
                 (y0, x0),
-                (y1, x1),  # (col,row)
+                (y1, x1),
                 arrowstyle=arrowstyle,
                 mutation_scale=1.0,
                 linewidth=linewidth,
                 facecolor=colors[i],
-                edgecolor=colors[i],  # colored edge to avoid seam
+                edgecolor=colors[i],
                 alpha=alpha,
                 zorder=11,
                 capstyle="round",
@@ -913,7 +898,6 @@ class Lattice(AutoSerialize):
                 )
             ax.add_patch(arrow)
 
-        # optional reference markers
         if show_ref_points:
             ax.scatter(
                 yR,
@@ -926,7 +910,6 @@ class Lattice(AutoSerialize):
                 zorder=12,
             )
 
-        # axes & title
         H, W = self._image.shape
         ax.set_xlim(-0.5, W - 0.5)
         ax.set_ylim(H - 0.5, -0.5)
@@ -934,7 +917,7 @@ class Lattice(AutoSerialize):
         ax.set_title("polarization" + (" (median subtracted)" if subtract_median else ""))
         plt.tight_layout()
 
-        # circular legend panel
+        # Circular legend (same mapping and label)
         if show_colorbar:
             divider = make_axes_locatable(ax)
             ax_c = divider.append_axes("right", size="28%", pad="6%")
@@ -946,37 +929,32 @@ class Lattice(AutoSerialize):
             rr = np.sqrt(XX**2 + YY**2)
             disk = rr <= 1.0
 
-            # Use the SAME angle mapping as for arrows:
-            #   dr_grid ~ down component -> -YY
-            #   dc_grid ~ right component -> XX
             ang_grid = np.arctan2(XX, -YY)
             if phase_dir_flip:
                 ang_grid = -ang_grid
-            ang_grid = ang_grid + np.deg2rad(phase_offset_deg)
+            ang_grid += np.deg2rad(phase_offset_deg)
 
             amp_grid = np.clip(rr, 0, 1)
             rgba_grid = array_to_rgba(amp_grid, ang_grid, chroma_boost=chroma_boost)
             rgba_grid[~disk] = 0.0
 
-            # Show disk; expand limits & disable clipping so rim isn't cut
             ax_c.imshow(
                 rgba_grid, origin="lower", extent=(-1, 1, -1, 1), interpolation="nearest", zorder=0
             )
             ax_c.set_aspect("equal")
             ax_c.axis("off")
 
-            # Slightly smaller ring to avoid edge crop; no clipping
             ring = Circle((0, 0), 0.98, facecolor="none", edgecolor="k", linewidth=1.2, zorder=3)
             ring.set_clip_on(False)
             ax_c.add_patch(ring)
 
-            # Degree labels at requested positions
+            # Cardinal labels (down/right/up/left)
             ax_c.text(0.00, -1.12, "0°", ha="center", va="top", fontsize=9, color="k")
             ax_c.text(1.12, 0.00, "90°", ha="left", va="center", fontsize=9, color="k")
             ax_c.text(0.00, 1.12, "180°", ha="center", va="bottom", fontsize=9, color="k")
             ax_c.text(-1.12, 0.00, "270°", ha="right", va="center", fontsize=9, color="k")
 
-            # Black scale arrow along +x (right), with label centered above its MIDPOINT
+            # Scale arrow along +x, label centered above midpoint (white)
             scale_len = 0.85
             arrow_scale = FancyArrowPatch(
                 (0.0, 0.0),
@@ -993,7 +971,6 @@ class Lattice(AutoSerialize):
             arrow_scale.set_clip_on(False)
             ax_c.add_patch(arrow_scale)
 
-            # Label centered above the arrow MIDPOINT (not overlapping the 90° label)
             mid_x, mid_y = scale_len / 2.0, 0.0
             ax_c.text(
                 mid_x,
@@ -1005,15 +982,261 @@ class Lattice(AutoSerialize):
                 color="w",
             )
 
-            # Subtle crosshairs
+            # Crosshairs & generous limits to avoid clipping
             ax_c.plot([0, 0], [-0.9, 0.9], color=(0, 0, 0, 0.15), lw=0.8, zorder=2)
             ax_c.plot([-0.9, 0.9], [0, 0], color=(0, 0, 0, 0.15), lw=0.8, zorder=2)
-
-            # Generous limits to prevent any clipping
             ax_c.set_xlim(-1.35, 1.35)
             ax_c.set_ylim(-1.25, 1.35)
 
         return fig, ax
+
+    def plot_polarization_image(
+        self,
+        pol_vec: "Vector",
+        *,
+        pixel_size: int = 16,
+        padding: int = 8,
+        spacing: int = 2,
+        subtract_median: bool = False,
+        chroma_boost: float = 2.0,
+        use_magnitude_lightness: bool = True,
+        disp_color_max: float | None = None,
+        phase_offset_deg: float = 180.0,  # red = down (your convention)
+        phase_dir_flip: bool = False,  # flip global hue mapping if desired
+        aggregator: str = "mean",  # 'mean' or 'maxmag'
+        plot: bool = False,  # if True, draw with show_2d and legend
+        returnfig: bool = False,  # if True (and plot=True) also return (fig, ax)
+        show_colorbar: bool = True,
+        figsize=(6, 6),
+        **kwargs,
+    ):
+        """
+        Build and return an RGB superpixel image indexed by integer (a,b), colored by
+        the same JCh cyclic mapping used for polarization vectors.
+
+        Returns
+        -------
+        img_rgb : (H,W,3) float in [0,1]
+        (fig, ax) : optional, only when plot=True and returnfig=True
+        """
+        import numpy as np
+        from matplotlib.patches import ArrowStyle, Circle, FancyArrowPatch
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+        from quantem.core.visualization.visualization_utils import array_to_rgba
+        # Requires the shared helper from the arrow script:
+        # _compute_polar_color_mapping(dr, dc, subtract_median=..., use_magnitude_lightness=..., disp_color_max=...)
+
+        # --- Extract data ---
+        data = pol_vec.get_data(0)
+        if isinstance(data, list) or data is None or data.size == 0:
+            H = padding * 2 + pixel_size
+            W = padding * 2 + pixel_size
+            img_rgb = np.zeros((H, W, 3), dtype=float)
+            if plot:
+                fig, ax = show_2d(img_rgb, returnfig=True, figsize=figsize, **kwargs)
+                ax.set_title(
+                    "polarization image" + (" (median subtracted)" if subtract_median else "")
+                )
+                if returnfig:
+                    return img_rgb, (fig, ax)
+            return img_rgb
+
+        # fields
+        xA = pol_vec[0]["x"]
+        yA = pol_vec[0]["y"]
+        xR = pol_vec[0]["x_ref"]
+        yR = pol_vec[0]["y_ref"]
+        a_raw = pol_vec[0]["a"]
+        b_raw = pol_vec[0]["b"]
+
+        # displacements (rows/cols)
+        dr_raw = (xA - xR).astype(float)  # down +
+        dc_raw = (yA - yR).astype(float)  # right +
+
+        # --- Unified color mapping (identical to arrow plot) ---
+        dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
+            dr_raw,
+            dc_raw,
+            subtract_median=subtract_median,
+            use_magnitude_lightness=use_magnitude_lightness,
+            disp_color_max=disp_color_max,
+        )
+
+        # Hue angles with your convention (down=0°, right=+90°, up=180°, left=-90°)
+        ang = np.arctan2(dc, dr)
+        if phase_dir_flip:
+            ang = -ang
+        ang += np.deg2rad(phase_offset_deg)
+
+        # Per-sample RGB from JCh mapping
+        rgba = array_to_rgba(amp, ang, chroma_boost=chroma_boost)
+        colors = rgba.reshape(-1, 4)[:, :3] if rgba.ndim != 2 else rgba[:, :3]
+
+        # Quantize to integer (a,b) tiles
+        ai = np.rint(a_raw).astype(int)
+        bi = np.rint(b_raw).astype(int)
+
+        a_min, a_max = int(ai.min()), int(ai.max())
+        b_min, b_max = int(bi.min()), int(bi.max())
+        nrows = a_max - a_min + 1
+        ncols = b_max - b_min + 1
+
+        # Output canvas
+        H = padding * 2 + nrows * pixel_size + (nrows - 1) * spacing
+        W = padding * 2 + ncols * pixel_size + (ncols - 1) * spacing
+        img_rgb = np.zeros((H, W, 3), dtype=float)
+
+        # Group indices by (a,b)
+        from collections import defaultdict
+
+        groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for idx, (aa, bb) in enumerate(zip(ai, bi)):
+            groups[(aa, bb)].append(idx)
+
+        # Optional magnitude (after median subtraction) for 'maxmag' selection
+        mag = np.hypot(dr, dc)
+
+        # Fill tiles
+        for (aa, bb), idx_list in groups.items():
+            rr, cc = aa - a_min, bb - b_min
+            r0 = padding + rr * (pixel_size + spacing)
+            c0 = padding + cc * (pixel_size + spacing)
+
+            if aggregator == "maxmag":
+                j = idx_list[int(np.argmax(mag[idx_list]))]
+                color = colors[j]
+            else:  # 'mean'
+                color = colors[idx_list].mean(axis=0)
+
+            img_rgb[r0 : r0 + pixel_size, c0 : c0 + pixel_size, :] = color
+
+        # --- Optional rendering with legend ---
+        if plot:
+            fig, ax = show_2d(img_rgb, returnfig=True, figsize=figsize, **kwargs)
+            ax.set_title(
+                "polarization image" + (" (median subtracted)" if subtract_median else "")
+            )
+
+            if show_colorbar:
+                divider = make_axes_locatable(ax)
+                ax_c = divider.append_axes("right", size="28%", pad="6%")
+
+                N = 256
+                yy = np.linspace(-1, 1, N)
+                xx = np.linspace(-1, 1, N)
+                YY, XX = np.meshgrid(yy, xx, indexing="ij")
+                rr = np.sqrt(XX**2 + YY**2)
+                disk = rr <= 1.0
+
+                # Legend angle mapping identical to main mapping
+                ang_grid = np.arctan2(XX, -YY)  # down=0 at bottom, right=+90° on +x
+                if phase_dir_flip:
+                    ang_grid = -ang_grid
+                ang_grid += np.deg2rad(phase_offset_deg)
+
+                amp_grid = np.clip(rr, 0, 1)
+                rgba_grid = array_to_rgba(amp_grid, ang_grid, chroma_boost=chroma_boost)
+                rgba_grid[~disk] = 0.0
+
+                ax_c.imshow(
+                    rgba_grid,
+                    origin="lower",
+                    extent=(-1, 1, -1, 1),
+                    interpolation="nearest",
+                    zorder=0,
+                )
+                ax_c.set_aspect("equal")
+                ax_c.axis("off")
+
+                # ring outline (no clipping so it isn't cut off)
+                ring = Circle(
+                    (0, 0), 0.98, facecolor="none", edgecolor="k", linewidth=1.2, zorder=3
+                )
+                ring.set_clip_on(False)
+                ax_c.add_patch(ring)
+
+                # angle labels (down/right/up/left)
+                ax_c.text(0.00, -1.12, "0°", ha="center", va="top", fontsize=9, color="k")
+                ax_c.text(1.12, 0.00, "90°", ha="left", va="center", fontsize=9, color="k")
+                ax_c.text(0.00, 1.12, "180°", ha="center", va="bottom", fontsize=9, color="k")
+                ax_c.text(-1.12, 0.00, "270°", ha="right", va="center", fontsize=9, color="k")
+
+                # black arrow (scale) and white label centered above it
+                scale_len = 0.85
+                arrow = FancyArrowPatch(
+                    (0.0, 0.0),
+                    (scale_len, 0.0),
+                    arrowstyle=ArrowStyle.Simple(head_length=10.0, head_width=6.0, tail_width=2.0),
+                    mutation_scale=1.0,
+                    linewidth=1.2,
+                    facecolor="k",
+                    edgecolor="k",
+                    zorder=4,
+                    shrinkA=0.0,
+                    shrinkB=0.0,
+                )
+                arrow.set_clip_on(False)
+                ax_c.add_patch(arrow)
+                mid_x, mid_y = scale_len / 2.0, 0.0
+                ax_c.text(
+                    mid_x,
+                    mid_y + 0.14,
+                    f"{disp_cap_px:.2g} px",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    color="w",
+                )
+
+                # subtle crosshairs & generous limits to avoid clipping
+                ax_c.plot([0, 0], [-0.9, 0.9], color=(0, 0, 0, 0.15), lw=0.8, zorder=2)
+                ax_c.plot([-0.9, 0.9], [0, 0], color=(0, 0, 0, 0.15), lw=0.8, zorder=2)
+                ax_c.set_xlim(-1.35, 1.35)
+                ax_c.set_ylim(-1.25, 1.35)
+
+            if returnfig:
+                return img_rgb, (fig, ax)
+
+        return img_rgb
+
+
+# helper function for polar color mapping
+def _compute_polar_color_mapping(
+    dr: np.ndarray,
+    dc: np.ndarray,
+    *,
+    subtract_median: bool,
+    use_magnitude_lightness: bool,
+    disp_color_max: float | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Returns (dr_adj, dc_adj, amp, disp_cap_px):
+      dr_adj, dc_adj  -> components after optional median subtraction
+      amp             -> [0,1] lightness (or constant if not using magnitude lightness)
+      disp_cap_px     -> saturation cap (px): user value or 95th percentile
+    """
+    dr = np.asarray(dr, float).copy()
+    dc = np.asarray(dc, float).copy()
+
+    if subtract_median and dr.size:
+        dr -= np.median(dr)
+        dc -= np.median(dc)
+
+    mag = np.hypot(dr, dc)
+
+    if use_magnitude_lightness:
+        if disp_color_max is None:
+            nz = mag[mag > 0]
+            disp_cap_px = float(np.percentile(nz, 95)) if nz.size else 1.0
+        else:
+            disp_cap_px = max(float(disp_color_max), 1e-9)
+        amp = np.clip(mag / disp_cap_px, 0.0, 1.0)
+    else:
+        disp_cap_px = float(disp_color_max) if disp_color_max is not None else 1.0
+        amp = np.full_like(mag, 0.85, dtype=float)
+
+    return dr, dc, amp, disp_cap_px
 
 
 def site_colors(number: int) -> tuple[float, float, float]:

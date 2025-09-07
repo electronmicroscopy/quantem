@@ -78,6 +78,38 @@ def _show_2d_array(
     ax : Axes
         The matplotlib axes object.
     """
+    # Special-case: already an RGB(A) image (H,W,3/4) → plot directly, skip normalization/cbar
+    if array.ndim == 3 and array.shape[2] in (3, 4):
+        disp = array
+        # Ensure valid dtype range for imshow
+        if disp.dtype.kind in "fc":  # float: clip to [0,1]
+            disp = np.clip(disp, 0.0, 1.0)
+        elif disp.dtype.kind in "ui":  # integer: mpl handles uint8 well; clip if needed
+            if disp.dtype != np.uint8:
+                disp = np.clip(disp, 0, 255).astype(np.uint8)
+        if figax is None:
+            fig, ax = plt.subplots(figsize=figsize)
+        else:
+            fig, ax = figax
+        ax.imshow(disp)
+        ax.set(xticks=[], yticks=[], title=title)
+        # scalebar still supported
+        scalebar_config = _resolve_scalebar(scalebar)
+        if scalebar_config is not None:
+            add_scalebar_to_ax(
+                ax,
+                disp.shape[1],
+                scalebar_config.sampling,
+                scalebar_config.length,
+                scalebar_config.units,
+                scalebar_config.width_px,
+                scalebar_config.pad_px,
+                scalebar_config.color,
+                scalebar_config.loc,
+            )
+        return fig, ax
+
+    # 2D / complex path
     is_complex = np.iscomplexobj(array)
     if is_complex:
         amplitude = np.abs(array)
@@ -269,14 +301,15 @@ def _normalize_show_input_to_grid(
         Normalized grid format where each inner list represents a row of arrays.
     """
     if isinstance(arrays, np.ndarray):
+        # Single panel: 2D, or 3D with channel-last (RGB/RGBA or grayscale as [:,:,1])
         if arrays.ndim == 2:
             return [[arrays]]
-        elif arrays.ndim == 3:
-            if arrays.shape[0] == 1:
-                return [[arrays[0]]]
-            elif arrays.shape[2] == 1:
+        if arrays.ndim == 3:
+            if arrays.shape[2] in (3, 4):  # RGB or RGBA
+                return [[arrays]]
+            if arrays.shape[2] == 1:  # squeeze single-channel
                 return [[arrays[:, :, 0]]]
-        raise ValueError(f"Input array must be 2D, got shape {arrays.shape}")
+        raise ValueError(f"Input array must be 2D or RGB(A), got shape {arrays.shape}")
     if isinstance(arrays, Sequence) and not isinstance(arrays[0], Sequence):
         # Convert sequence to list and ensure each element is an NDArray
         return [[cast(NDArray, arr) for arr in arrays]]
