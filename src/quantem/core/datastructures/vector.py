@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import (
     Any,
     List,
@@ -159,7 +160,7 @@ class Vector(AutoSerialize):
     @classmethod
     def from_shape(
         cls,
-        shape: Tuple[int, ...],
+        shape: Union[int, np.integer, Tuple[int, ...], Sequence[int]],
         num_fields: Optional[int] = None,
         fields: Optional[List[str]] = None,
         units: Optional[List[str]] = None,
@@ -170,25 +171,42 @@ class Vector(AutoSerialize):
 
         Parameters
         ----------
-        shape : Tuple[int, ...]
-            The shape of the vector (dimensions)
-        num_fields : Optional[int]
-            Number of fields in the vector
-        name : Optional[str]
-            Name of the vector
-        fields : Optional[List[str]]
-            List of field names
-        units : Optional[List[str]]
-            List of units for each field
+        shape
+            The fixed indexed dimensions of the ragged vector.
+            Accepts:
+              - int / np.integer  -> treated as (int,)
+              - tuple[int, ...]   -> used as-is
+              - sequence[int]     -> converted to tuple[int, ...]
+              - ()                 -> 0-D (no indexed dims)
+        num_fields
+            Number of fields in the vector (ignored if `fields` is provided).
+        fields
+            List of field names (mutually exclusive with `num_fields`).
+        units
+            Unit strings per field. If None, defaults are used.
+        name
+            Optional name.
 
         Returns
         -------
         Vector
-            A new Vector instance
+            A new Vector instance.
         """
-        validated_shape = validate_shape(shape)
+        # --- Normalize 'shape' to a tuple[int, ...] to satisfy validate_shape ---
+        if isinstance(shape, (int, np.integer)):
+            shape_tuple: Tuple[int, ...] = (int(shape),)
+        elif isinstance(shape, tuple):
+            shape_tuple = tuple(int(s) for s in shape)
+        elif isinstance(shape, Sequence):
+            shape_tuple = tuple(int(s) for s in shape)
+        else:
+            raise TypeError(f"Unsupported type for shape: {type(shape)}")
+
+        # validate_shape expects a tuple and applies your project-specific checks
+        validated_shape = validate_shape(shape_tuple)
         ndim = len(validated_shape)
 
+        # --- Fields / num_fields handling (unchanged) ---
         if fields is not None:
             validated_fields = validate_fields(fields)
             validated_num_fields = len(validated_fields)
