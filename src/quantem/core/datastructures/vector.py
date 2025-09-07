@@ -1069,3 +1069,93 @@ class _CellView:
             raise KeyError(f"Field '{field_name}' not found.")
         j = self.vector._fields.index(field_name)
         return self.array[:, j]
+
+    def save_csv(
+        self,
+        filename: str,
+        *,
+        # Jupyter-friendly defaults:
+        jupyter_friendly: bool = True,
+        include_units: bool = True,
+        delimiter: str = ",",
+        float_fmt: str = "%.6g",
+        append_csv_ext: bool = True,
+        create_dirs: bool = True,
+        # Legacy/optional extras (ignored when jupyter_friendly=True):
+        add_comment_header: bool = False,  # writes a leading "# ..." line
+        add_units_row: bool = False,  # writes a separate units row
+    ) -> str:
+        """
+        Save this cell's rows to a CSV file.
+
+        If jupyter_friendly=True (default), writes a single header row suitable
+        for JupyterLab's CSV viewer. Units are merged into the column names
+        as 'field (unit)'. No extra header lines.
+
+        If jupyter_friendly=False, you can enable:
+          - add_comment_header=True   -> a commented first line
+          - add_units_row=True        -> a second line with units only
+        """
+        import csv
+        import os
+
+        import numpy as np
+
+        path = os.fspath(filename)
+        if append_csv_ext and not path.lower().endswith(".csv"):
+            path += ".csv"
+
+        parent = os.path.dirname(path)
+        if parent and create_dirs:
+            os.makedirs(parent, exist_ok=True)
+
+        arr = self.array
+        fields = list(self.vector.fields)
+        units = list(self.vector.units)
+
+        # Build header row
+        if jupyter_friendly:
+            if include_units:
+                header = [f"{n} ({u})" for n, u in zip(fields, units)]
+            else:
+                header = fields
+            write_comment = False
+            write_units_row = False
+        else:
+            header = fields
+            write_comment = bool(add_comment_header)
+            write_units_row = bool(add_units_row and include_units)
+
+        # Prepare a small formatter to apply float_fmt to numeric values
+        def fmt_row(row: np.ndarray) -> list[str]:
+            out = []
+            for v in row:
+                try:
+                    out.append(float_fmt % float(v))
+                except Exception:
+                    out.append(str(v))
+            return out
+
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
+
+            # Optional legacy comment header
+            if write_comment:
+                vec_name = getattr(self.vector, "name", "Vector")
+                idx_str = ", ".join(str(i) for i in self.indices)
+                nrows = 0 if (not isinstance(arr, np.ndarray)) else int(arr.shape[0])
+                f.write(f"# {vec_name} — cell indices ({idx_str}), rows={nrows}\n")
+
+            # Header row (always)
+            w.writerow(header)
+
+            # Optional legacy separate units row
+            if write_units_row:
+                w.writerow(units)
+
+            # Data rows
+            if isinstance(arr, np.ndarray) and arr.size:
+                for r in range(arr.shape[0]):
+                    w.writerow(fmt_row(arr[r, :]))
+
+        return path
