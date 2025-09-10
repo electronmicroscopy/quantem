@@ -71,6 +71,7 @@ class Lattice(AutoSerialize):
         origin,
         u,
         v,
+        block_size: int = -1,
         plot_lattice=True,
         bound_num_vectors=None,
         mask=None,
@@ -110,31 +111,88 @@ class Lattice(AutoSerialize):
             A = np.column_stack((u, v))  # (2,2)
             ab = np.linalg.lstsq(A, (corners - r0[None, :]).T, rcond=None)[0]  # (2,4)
 
-            a_min, a_max = int(np.floor(np.min(ab[0]))), int(np.ceil(np.max(ab[0])))
-            b_min, b_max = int(np.floor(np.min(ab[1]))), int(np.ceil(np.max(ab[1])))
+            a_min, a_max = int(np.floor(ab[0].min())), int(np.ceil(ab[0].max()))
+            b_min, b_max = int(np.floor(ab[1].min())), int(np.ceil(ab[1].max()))
 
-            aa, bb = np.meshgrid(
-                np.arange(a_min, a_max + 1),  # inclusive
-                np.arange(b_min, b_max + 1),
-                indexing="ij",
+            max_ind = max(abs(a_min), a_max, abs(b_min), b_max)
+            steps = (
+                [*np.arange(0, max_ind + 1, block_size)[1:], max_ind] if max_ind > 0 else [max_ind]
             )
-            basis = np.vstack(
-                (
-                    np.ones(aa.size),
-                    aa.ravel(),
-                    bb.ravel(),
+
+            PENALTY = 1e10
+            H_CLIP = H - 2
+            W_CLIP = W - 2
+
+            a_range = np.arange(max(a_min, -max_ind), min(a_max, max_ind) + 1, dtype=np.int32)
+            b_range = np.arange(max(b_min, -max_ind), min(b_max, max_ind) + 1, dtype=np.int32)
+            aa, bb = np.meshgrid(a_range, b_range, indexing="ij")
+
+            # Pre-compute all masks and bases
+            all_masks = {}
+            all_bases = {}
+            for curr_block_size in steps:
+                a_min_blk = max(a_min, -curr_block_size)
+                a_max_blk = min(a_max, curr_block_size)
+                b_min_blk = max(b_min, -curr_block_size)
+                b_max_blk = min(b_max, curr_block_size)
+
+                mask = (
+                    (aa >= a_min_blk) & (aa <= a_max_blk) & (bb >= b_min_blk) & (bb <= b_max_blk)
                 )
-            ).T  # (N,3)
+
+                aa_masked = aa[mask]
+                bb_masked = bb[mask]
+
+                all_masks[curr_block_size] = mask
+                all_bases[curr_block_size] = np.column_stack(
+                    [np.ones(aa_masked.size), aa_masked.ravel(), bb_masked.ravel()]
+                )
+
+            # Pre-allocate cache
+            max_points = max(basis.shape[0] for basis in all_bases.values())
+            x0_cache = np.empty(max_points, dtype=np.int32)
+            y0_cache = np.empty(max_points, dtype=np.int32)
+            dx_cache = np.empty(max_points, dtype=np.float64)
+            dy_cache = np.empty(max_points, dtype=np.float64)
 
             def bilinear_sum(im_: np.ndarray, xy: np.ndarray) -> float:
                 """Sum of bilinearly interpolated intensities at (x,y) points."""
-                x = xy[:, 0]
-                y = xy[:, 1]
-                # clamp so x0+1 <= H-1, y0+1 <= W-1
-                x0 = np.clip(np.floor(x).astype(int), 0, im_.shape[0] - 2)
-                y0 = np.clip(np.floor(y).astype(int), 0, im_.shape[1] - 2)
-                dx = x - x0
-                dy = y - y0
+
+                n_points = xy.shape[0]
+                if n_points == 0:
+                    return 0.0
+
+                x, y = xy[:, 0], xy[:, 1]
+
+                # Filter points that are within valid bounds for bilinear interpolation
+                # Need x in [0, H-2] and y in [0, W-2] so that x+1 and y+1 are valid
+                valid_mask = (
+                    (x >= 0)
+                    & (x <= H_CLIP)
+                    & (y >= 0)
+                    & (y <= W_CLIP)
+                    & np.isfinite(x)
+                    & np.isfinite(y)
+                )
+
+                n_valid = np.sum(valid_mask)
+                if n_valid == 0:
+                    return -PENALTY
+
+                x_valid = x[valid_mask]
+                y_valid = y[valid_mask]
+
+                # Use pre-allocated arrays
+                x0, y0 = x0_cache[:n_valid], y0_cache[:n_valid]
+                dx, dy = dx_cache[:n_valid], dy_cache[:n_valid]
+
+                np.floor(x_valid, out=dx)
+                x0[:] = dx.astype(np.int32)
+                np.floor(y_valid, out=dy)
+                y0[:] = dy.astype(np.int32)
+
+                np.subtract(x_valid, x0, out=dx)
+                np.subtract(y_valid, y0, out=dy)
 
                 Ia = im_[x0, y0]
                 Ib = im_[x0 + 1, y0]
@@ -148,28 +206,75 @@ class Lattice(AutoSerialize):
                     + Id * dx * dy
                 )
 
+            current_basis = None
+
             def objective(theta: np.ndarray) -> float:
                 # theta is 6-vector -> (3,2) matrix [[r0],[u],[v]]
+                r0_x, r0_y, u_x, u_y, v_x, v_y = theta
+
+                if (  # Bound: r0, u, and v should be within image margins
+                    r0_x < 0
+                    or r0_x > H
+                    or r0_y < 0
+                    or r0_y > W
+                    or u_x < -H / 2
+                    or u_x > H / 2
+                    or u_y < -W / 2
+                    or u_y > W / 2
+                    or v_x < -H / 2
+                    or v_x > H / 2
+                    or v_y < -W / 2
+                    or v_y > W / 2
+                    or
+                    # Bound: r0 + u and r0 + v must be within image
+                    r0_x + u_x < 0
+                    or r0_x + u_x > H
+                    or r0_y + u_y < 0
+                    or r0_y + u_y > W
+                    or r0_x + v_x < 0
+                    or r0_x + v_x > H
+                    or r0_y + v_y < 0
+                    or r0_y + v_y > W
+                    or
+                    # Finite check
+                    not (
+                        np.isfinite(r0_x)
+                        and np.isfinite(r0_y)
+                        and np.isfinite(u_x)
+                        and np.isfinite(u_y)
+                        and np.isfinite(v_x)
+                        and np.isfinite(v_y)
+                    )
+                ):
+                    return PENALTY
+
                 lat = theta.reshape(3, 2)
-                xy = basis @ lat  # (N,2) with columns (x,y)
+                xy = current_basis @ lat  # (N,2) with columns (x,y)
                 # Negative: maximize intensity sum by minimizing its negative
                 return -bilinear_sum(im, xy)
 
-            theta0 = self._lat.astype(float).reshape(-1)
-            res = minimize(
-                objective,
-                theta0,
-                method="Powell",  # robust, derivative-free
-                options={
-                    "maxiter": int(refine_maxiter),
-                    "xtol": 1e-3,
-                    "ftol": 1e-3,
-                    "disp": False,
-                },
-            )
+            minimize_options = {
+                "maxiter": int(refine_maxiter),
+                "xtol": 1e-3,
+                "ftol": 1e-3,
+                "disp": False,
+            }
 
-            # Update lattice (even if not fully converged)
-            self._lat = res.x.reshape(3, 2)
+            lat_flat = self._lat.astype(np.float32).reshape(-1)
+
+            for curr_block_size in steps:
+                current_basis = all_bases[curr_block_size]
+
+                res = minimize(
+                    objective,
+                    lat_flat,
+                    method="Powell",
+                    options=minimize_options,
+                )
+
+                # Update for next iteration
+                lat_flat = res.x
+                self._lat = res.x.reshape(3, 2)
 
         # plotting
         if plot_lattice:
