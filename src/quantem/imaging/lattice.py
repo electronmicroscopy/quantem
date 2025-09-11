@@ -210,44 +210,6 @@ class Lattice(AutoSerialize):
 
             def objective(theta: np.ndarray) -> float:
                 # theta is 6-vector -> (3,2) matrix [[r0],[u],[v]]
-                r0_x, r0_y, u_x, u_y, v_x, v_y = theta
-
-                if (  # Bound: r0, u, and v should be within image margins
-                    r0_x < 0
-                    or r0_x > H
-                    or r0_y < 0
-                    or r0_y > W
-                    or u_x < -H / 2
-                    or u_x > H / 2
-                    or u_y < -W / 2
-                    or u_y > W / 2
-                    or v_x < -H / 2
-                    or v_x > H / 2
-                    or v_y < -W / 2
-                    or v_y > W / 2
-                    or
-                    # Bound: r0 + u and r0 + v must be within image
-                    r0_x + u_x < 0
-                    or r0_x + u_x > H
-                    or r0_y + u_y < 0
-                    or r0_y + u_y > W
-                    or r0_x + v_x < 0
-                    or r0_x + v_x > H
-                    or r0_y + v_y < 0
-                    or r0_y + v_y > W
-                    or
-                    # Finite check
-                    not (
-                        np.isfinite(r0_x)
-                        and np.isfinite(r0_y)
-                        and np.isfinite(u_x)
-                        and np.isfinite(u_y)
-                        and np.isfinite(v_x)
-                        and np.isfinite(v_y)
-                    )
-                ):
-                    return PENALTY
-
                 lat = theta.reshape(3, 2)
                 xy = current_basis @ lat  # (N,2) with columns (x,y)
                 # Negative: maximize intensity sum by minimizing its negative
