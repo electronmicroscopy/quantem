@@ -371,14 +371,6 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         return 1 / (self.roi_shape * self.reciprocal_sampling)
 
     @property
-    def fov(self) -> np.ndarray:
-        """Field of view in real space. Units of A matching self.obj_sampling"""
-        min_pos = torch.min(self.scan_positions_px, dim=0)[0]
-        max_pos = torch.max(self.scan_positions_px, dim=0)[0]
-        extent_px = max_pos - min_pos
-        return extent_px.cpu().detach().numpy() * self.obj_sampling
-
-    @property
     def reciprocal_sampling(self) -> np.ndarray:
         """
         Units A^-1 or raises error
@@ -543,6 +535,7 @@ class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
         return descan
 
     def apply_position_constraints(self, positions: torch.Tensor) -> torch.Tensor:
+        # could clip positions here if needed
         return positions
 
 
@@ -751,6 +744,19 @@ class PtychographyDatasetRaster(DatasetConstraints):
     def gpts(self, gpts: np.ndarray | tuple | list) -> None:
         gpts = validate_array(gpts, name="gpts", shape=(2,), dtype=int)
         self._gpts = gpts
+
+    @property
+    def fov(self) -> np.ndarray:
+        """
+        Field of view in real space. Units of A matching self.obj_sampling
+        untying this from gpts is actually a little tricky, as the fov needs to be fixed as
+        it is used for calculating the object shape, which shouldn't change during the recon
+        """
+        # min_pos = torch.min(self.initial_scan_positions_px, dim=0)[0]
+        # max_pos = torch.max(self.initial_scan_positions_px, dim=0)[0]
+        # extent_px = max_pos - min_pos
+        # return extent_px.cpu().detach().numpy() * self.obj_sampling
+        return self.scan_sampling * (self.gpts - 1)
 
     @property
     def upsample_factor(self) -> float:

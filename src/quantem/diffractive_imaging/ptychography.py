@@ -121,7 +121,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         num_iter: int = 0,
         reset: bool = False,
         optimizer_params: dict | None = None,
-        obj_type: Literal["complex", "pure_phase", "potential"] | None = None,
         scheduler_params: dict | None = None,
         constraints: dict = {},
         batch_size: int | None = None,
@@ -142,7 +141,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # TODO maybe make an "process args" method that handles things like:
         # mode, store_iterations, device,
         self._check_preprocessed()
-        self.set_obj_type(obj_type, force=reset)  # TODO update this or remove, DIPs...
         if device is not None:
             self.to(device)
         self.batch_size = batch_size
@@ -301,9 +299,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
     # endregion --- reconstruction ---
 
-    def dummy(self):
-        print("Hi this is a test1")
-
     def save(
         self,
         path: str | Path,
@@ -387,6 +382,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         current_device = self.device
         self.to("cpu")
+
+        if self.verbose:
+            print(f"Saving ptychography object to {path}")
 
         super().save(
             path,
@@ -482,6 +480,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             else:
                 print("Warning: No dataset metadata found in saved object.")
                 dset = None
+        elif dset is not None:
+            # this overwrites learned/modified scan positions, but fixing will involve
+            # rewriting the skip on save and dset.preprocess on re-load
+            dset._set_initial_scan_positions_px(ptycho.obj_padding_px)
+            dset._set_patch_indices(ptycho.obj_padding_px)
 
         # check if dset was attached to ptycho object
         if dset is None:

@@ -151,7 +151,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
         self._preprocessed = True
-        # self.reset_recon()  # force clear losses and everything
+        if self.num_epochs == 0:
+            self.reset_recon()  # if new models, reset to ensure shapes are correct
         return self
 
     def _compute_propagator_arrays(
@@ -331,7 +332,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
-        return self._to_numpy(self.obj_model.obj)
+        obj = self._to_numpy(self.obj_model.obj)
+        if self.obj_type in ["pure_phase", "complex"]:
+            ph = np.angle(obj)
+            obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
+        return obj
 
     @property
     def obj_padding_px(self) -> np.ndarray:
@@ -408,7 +413,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self._to_numpy(self.probe_model.probe)
 
     @property
-    def store_iterations(self) -> bool:
+    def store_iterations(self) -> bool:  # TODO rename to store_epochs or store_snapshots
         return self._store_iterations
 
     @store_iterations.setter
@@ -429,14 +434,22 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def epoch_snapshots(self) -> list[dict[str, int | np.ndarray]]:
         return self._epoch_snapshots
 
-    def get_snapshot_by_iter(self, iteration: int):
+    def get_snapshot_by_epoch(self, iteration: int, closest: bool = False):
         iteration = int(iteration)
         for snapshot in self.epoch_snapshots:
             if snapshot["iteration"] == iteration:
                 return snapshot
-        raise ValueError(f"No snapshot found at iteration: {iteration}")
+        if closest:
+            closest_snapshot = min(
+                self.epoch_snapshots, key=lambda s: abs(int(s["iteration"]) - iteration)
+            )
+            return closest_snapshot
+        raise ValueError(
+            f"No snapshot found at iteration: {iteration}, "
+            + "to return the closest snapshot, set closest=True"
+        )
 
-    # TODO overload this to type hint proper object model type
+    # TODO is there a way to type hint proper object model type?
     @property
     def obj_model(self) -> ObjectModelType:
         return self._obj_model
@@ -576,12 +589,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "pure_phase":
             cropped = np.exp(1j * np.angle(cropped))
-        cropped = center_crop_arr(cropped, tuple(self.obj_shape_crop))  # sometimes 1 pixel off
         # TEMP testing for bugs
         if cropped.shape != tuple(self.obj_shape_crop):
             raise ValueError(
                 f"Object shape {cropped.shape} does not match expected shape {self.obj_shape_crop}"
             )
+        if self.obj_type in ["pure_phase", "complex"]:
+            ph = np.angle(cropped)
+            cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
         return cropped
 
     @property  # FIXME depend on ptychodataset
@@ -737,7 +752,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         positions_px: np.ndarray | None = None,
         com_rotation_rad: float | None = None,
         transpose: bool | None = None,
-        padding: np.ndarray | tuple[int, int] = (0, 0),
+        padding: np.ndarray | tuple[int, int] | None = None,
     ) -> np.ndarray:
         """
         Crops and rotated object to FOV bounded by current pixel positions.
@@ -747,7 +762,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             self.dset.com_rotation_rad if com_rotation_rad is None else com_rotation_rad
         )
         transpose = self.dset.com_transpose if transpose is None else transpose
-        padding = np.array(padding)
+        padding = np.array(padding) if padding is not None else self.obj_padding_px
 
         angle = com_rotation_rad if transpose else -1 * com_rotation_rad
 
@@ -760,10 +775,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         rotated_points = tf(positions, origin=positions.mean(0))
         rotated_points += 1e-9  # avoid pixel perfect errors
 
-        min_r, min_c = np.floor(np.amin(rotated_points, axis=0) - padding).astype("int")
+        min_r, min_c = np.floor(np.min(rotated_points, axis=0)).astype("int")
         min_r = max(min_r, 0)
         min_c = max(min_c, 0)
-        max_r, max_c = np.ceil(np.amax(rotated_points, axis=0) + padding).astype("int")
+        max_r, max_c = np.ceil(np.max(rotated_points, axis=0)).astype("int")
+        max_r = min(max_r, array.shape[-2])
+        max_c = min(max_c, array.shape[-1])
+        # print(f"{min_r = }, {min_c = }, {max_r = }, {max_c = }")
 
         rotated_array = ndi.rotate(
             array, np.rad2deg(-angle), order=1, reshape=False, axes=(-2, -1)
@@ -772,7 +790,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if transpose:
             rotated_array = rotated_array.swapaxes(-2, -1)
 
-        return rotated_array
+        # fixing that is sometimes 1 pixel off
+        cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop))
+
+        return cropped
 
     def _repeat_arr(
         self, arr: "np.ndarray|torch.Tensor", repeats: int, axis: int

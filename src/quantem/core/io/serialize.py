@@ -48,6 +48,15 @@ class AutoSerialize:
         return cast(zarr.Array, parent[key])
 
     @staticmethod
+    def _is_numeric_scalar(value: Any) -> bool:
+        """Return True if value is a plain numeric scalar (int/float/bool or numpy scalar)."""
+        # Avoid treating numpy arrays/tensors/containers as scalars
+        if isinstance(value, (np.ndarray, torch.Tensor, list, tuple, dict, set)):
+            return False
+        # Python numeric types and numpy scalar types
+        return isinstance(value, (int, float, bool, np.integer, np.floating, np.bool_))
+
+    @staticmethod
     def _fix_torch_module_sets(mod):
         """Fix PyTorch module set attributes that might have been corrupted during serialization."""
         if isinstance(mod, torch.nn.Module):
@@ -766,10 +775,25 @@ class AutoSerialize:
         # Handle list/tuple containers
         if isinstance(value, (list, tuple)):
             group.attrs["_container_type"] = type(value).__name__
-            for i, v in enumerate(value):
-                key = str(i)
-                # Use unified serialization method
-                self._serialize_value(v, group, key, skip_names, skip_types, compressors)
+            # Fast-path: homogeneous numeric scalars → single ndarray
+            try:
+                is_all_numeric = len(value) > 0 and all(
+                    AutoSerialize._is_numeric_scalar(v) for v in value
+                )
+            except TypeError:
+                # If value isn't sized/iterable like expected, fall back
+                is_all_numeric = False
+
+            if is_all_numeric:
+                group.attrs["_sequence_encoding"] = "ndarray"
+                arr = np.asarray(value)
+                # Store in a single dataset named 'values'
+                self._write_ndarray(group, "values", arr, compressors)
+            else:
+                for i, v in enumerate(value):
+                    key = str(i)
+                    # Use unified serialization method
+                    self._serialize_value(v, group, key, skip_names, skip_types, compressors)
 
         # Handle dict containers
         elif isinstance(value, dict):
@@ -801,105 +825,118 @@ class AutoSerialize:
 
         if ctype in ("list", "tuple"):
             # Determine maximum index to reconstruct order and size
-            length = (
-                max(
-                    (
-                        int(k)
-                        for k in list(group.attrs)
-                        + list(group.array_keys())
-                        + list(group.group_keys())
-                        if k.isdigit()
-                    ),
-                    default=-1,
+            # Fast-path: ndarray-encoded homogeneous sequence
+            if (
+                group.attrs.get("_sequence_encoding") == "ndarray"
+                and "values" in group.array_keys()
+            ):
+                arr = AutoSerialize._read_array_np(group, "values")
+                seq = arr.tolist()
+                items = seq
+            else:
+                length = (
+                    max(
+                        (
+                            int(k)
+                            for k in list(group.attrs)
+                            + list(group.array_keys())
+                            + list(group.group_keys())
+                            if k.isdigit()
+                        ),
+                        default=-1,
+                    )
+                    + 1
                 )
-                + 1
-            )
-            items = []
-            for i in range(length):
-                key = str(i)
-                if key in group.attrs:
-                    val = group.attrs[key]
-                    # Convert string paths back to Path objects if needed
-                    val = cls._convert_string_to_path_if_needed(val, group, key)
-                    items.append(val)
-                elif key in group.array_keys():
-                    items.append(maybe_tensor(group, key))
-                elif key in group.group_keys():
-                    subgroup = cast(zarr.Group, group[key])
-                    # Handle recursive containers
-                    if "_container_type" in subgroup.attrs:
-                        items.append(cls._deserialize_container(subgroup))
-                    # Restore nested AutoSerialize objects
-                    elif "_autoserialize" in subgroup.attrs:
-                        meta = cast(dict[str, Any], subgroup.attrs["_autoserialize"])
-                        submod = __import__(
-                            cast(str, meta["class_module"]),
-                            fromlist=[cast(str, meta["class_name"])],
-                        )
-                        subcls = getattr(submod, cast(str, meta["class_name"]))
-                        items.append(subcls._recursive_load(subgroup))
-                    # Restore nested torch modules
-                    elif subgroup.attrs.get("_torch_whole_module"):
-                        module_arr = cast(zarr.Array, subgroup["module"])
-                        data = cast(np.ndarray, module_arr[:]).tobytes()
-                        buf = io.BytesIO(data)
-                        # For containers, load to CPU - they'll be moved to the right device when attached to the main object
-                        mod = torch.load(buf, map_location="cpu", weights_only=False)
-                        items.append(mod)
-                    elif subgroup.attrs.get("_torch_tensor"):
-                        # Handle new tensor format in containers
-                        data = AutoSerialize._read_array_np(subgroup, "tensor").tobytes()
-                        buf = io.BytesIO(data)
-                        tensor = torch.load(buf, map_location="cpu", weights_only=False)
-                        items.append(tensor)
-                    elif subgroup.attrs.get("_torch_logger"):
-                        # Handle torch logger in containers
-                        logger_class_name = subgroup.attrs.get("class_name", "SummaryWriter")
-
-                        if logger_class_name == "SummaryWriter":
-                            from torch.utils.tensorboard import SummaryWriter
-
-                            log_dir = subgroup.attrs.get("log_dir", None)
-                            comment = str(cast(Any, subgroup.attrs.get("comment", "")))
-                            max_queue = int(cast(Any, subgroup.attrs.get("max_queue", 10)))
-                            flush_secs = int(cast(Any, subgroup.attrs.get("flush_secs", 120)))
-                            filename_suffix = str(
-                                cast(Any, subgroup.attrs.get("filename_suffix", ""))
+                items = []
+                for i in range(length):
+                    key = str(i)
+                    if key in group.attrs:
+                        val = group.attrs[key]
+                        # Convert string paths back to Path objects if needed
+                        val = cls._convert_string_to_path_if_needed(val, group, key)
+                        items.append(val)
+                    elif key in group.array_keys():
+                        items.append(maybe_tensor(group, key))
+                    elif key in group.group_keys():
+                        subgroup = cast(zarr.Group, group[key])
+                        # Handle recursive containers
+                        if "_container_type" in subgroup.attrs:
+                            items.append(cls._deserialize_container(subgroup))
+                        # Restore nested AutoSerialize objects
+                        elif "_autoserialize" in subgroup.attrs:
+                            meta = cast(dict[str, Any], subgroup.attrs["_autoserialize"])
+                            submod = __import__(
+                                cast(str, meta["class_module"]),
+                                fromlist=[cast(str, meta["class_name"])],
                             )
+                            subcls = getattr(submod, cast(str, meta["class_name"]))
+                            items.append(subcls._recursive_load(subgroup))
+                        # Restore nested torch modules
+                        elif subgroup.attrs.get("_torch_whole_module"):
+                            module_arr = cast(zarr.Array, subgroup["module"])
+                            data = cast(np.ndarray, module_arr[:]).tobytes()
+                            buf = io.BytesIO(data)
+                            # For containers, load to CPU - they'll be moved to the right device when attached to the main object
+                            mod = torch.load(buf, map_location="cpu", weights_only=False)
+                            items.append(mod)
+                        elif subgroup.attrs.get("_torch_tensor"):
+                            # Handle new tensor format in containers
+                            data = AutoSerialize._read_array_np(subgroup, "tensor").tobytes()
+                            buf = io.BytesIO(data)
+                            tensor = torch.load(buf, map_location="cpu", weights_only=False)
+                            items.append(tensor)
+                        elif subgroup.attrs.get("_torch_logger"):
+                            # Handle torch logger in containers
+                            logger_class_name = subgroup.attrs.get("class_name", "SummaryWriter")
 
-                            logger = SummaryWriter(
-                                log_dir=log_dir,
-                                comment=comment,
-                                max_queue=max_queue,
-                                flush_secs=flush_secs,
-                                filename_suffix=filename_suffix,
-                            )
-                            items.append(logger)
+                            if logger_class_name == "SummaryWriter":
+                                from torch.utils.tensorboard import SummaryWriter
+
+                                log_dir = subgroup.attrs.get("log_dir", None)
+                                comment = str(cast(Any, subgroup.attrs.get("comment", "")))
+                                max_queue = int(cast(Any, subgroup.attrs.get("max_queue", 10)))
+                                flush_secs = int(cast(Any, subgroup.attrs.get("flush_secs", 120)))
+                                filename_suffix = str(
+                                    cast(Any, subgroup.attrs.get("filename_suffix", ""))
+                                )
+
+                                logger = SummaryWriter(
+                                    log_dir=log_dir,
+                                    comment=comment,
+                                    max_queue=max_queue,
+                                    flush_secs=flush_secs,
+                                    filename_suffix=filename_suffix,
+                                )
+                                items.append(logger)
+                            else:
+                                # Skip unknown logger types in containers
+                                continue
+                        elif subgroup.attrs.get("_python_logger"):
+                            # Handle Python logger in containers
+                            logger_class_name = subgroup.attrs.get("class_name", "Logger")
+
+                            if logger_class_name == "Logger":
+                                import logging
+
+                                logger_name = cast(
+                                    str, subgroup.attrs.get("logger_name", "quantem")
+                                )
+                                logger_level = int(
+                                    cast(Any, subgroup.attrs.get("logger_level", logging.INFO))
+                                )
+
+                                logger = logging.getLogger(logger_name)
+                                logger.setLevel(logger_level)
+                                items.append(logger)
+                            else:
+                                # Skip unknown logger types in containers
+                                continue
                         else:
-                            # Skip unknown logger types in containers
-                            continue
-                    elif subgroup.attrs.get("_python_logger"):
-                        # Handle Python logger in containers
-                        logger_class_name = subgroup.attrs.get("class_name", "Logger")
-
-                        if logger_class_name == "Logger":
-                            import logging
-
-                            logger_name = cast(str, subgroup.attrs.get("logger_name", "quantem"))
-                            logger_level = int(
-                                cast(Any, subgroup.attrs.get("logger_level", logging.INFO))
+                            raise ValueError(
+                                f"Unknown group structure at key '{key}' in {group.path}"
                             )
-
-                            logger = logging.getLogger(logger_name)
-                            logger.setLevel(logger_level)
-                            items.append(logger)
-                        else:
-                            # Skip unknown logger types in containers
-                            continue
                     else:
-                        raise ValueError(f"Unknown group structure at key '{key}' in {group.path}")
-                else:
-                    raise KeyError(f"Missing expected key '{key}' in container")
+                        raise KeyError(f"Missing expected key '{key}' in container")
             # Restore container type and special torch containers
             seq_result = items if ctype == "list" else tuple(items)
             if torch_iterable_type == "Sequential":

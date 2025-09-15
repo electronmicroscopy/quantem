@@ -55,7 +55,7 @@ class OptimizerMixin:
     def scheduler_params(self, params: dict):
         """Set the scheduler parameters."""
         if params:
-            if params["type"] not in ["cyclic", "plateau", "exp", "gamma", "none"]:
+            if params["type"] not in ["cyclic", "plateau", "exp", "gamma", "linear", "none"]:
                 raise ValueError(
                     f"Unknown scheduler type: {params['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'none']"
                 )
@@ -163,6 +163,13 @@ class OptimizerMixin:
             else:
                 gamma = 0.999
             self._scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+        elif sched_type == "linear":
+            self._scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=params.get("start_factor", 0.1),
+                end_factor=params.get("end_factor", 1.0),
+                total_iters=params.get("total_iters", num_iter),
+            )
         else:
             raise ValueError(f"Unknown scheduler type: {sched_type}")
 

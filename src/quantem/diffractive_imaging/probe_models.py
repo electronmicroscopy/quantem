@@ -532,7 +532,8 @@ class ProbePixelated(ProbeConstraints):
                 raise ValueError(
                     f"initial_probe_weights must be a list of length {self.num_probes}"
                 )
-            self._initial_probe_weights = np.array(weights) / np.sum(weights)
+            w2 = validate_tensor(weights, name="initial_probe_weights", dtype=torch.float32)
+            self._initial_probe_weights = w2 / torch.sum(w2)
 
     @property
     def params(self):
@@ -685,6 +686,8 @@ class ProbePixelated(ProbeConstraints):
             shift_x = torch.exp(
                 -2j * torch.pi * (self.rng.random() - 0.5) * torch.fft.fftfreq(self.roi_shape[1])
             )
+            shift_y = shift_y.to(self.device)
+            shift_x = shift_x.to(self.device)
             probes[a0] = probes[a0] * shift_y[:, None] * shift_x[None]
         return probes
 

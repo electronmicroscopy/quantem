@@ -73,11 +73,18 @@ class PtychographyVisualizations(PtychographyBase):
         tukey_alpha: float = 0.5,
         pad: int = 0,
         show_obj: bool = False,
+        snapshot_idx: int | None = None,
         return_fft: bool = False,
         **kwargs,
     ):
         if obj is None:
-            obj_np = self.obj_cropped.sum(0)
+            if snapshot_idx is not None:
+                obj_np = self.epoch_snapshots[snapshot_idx]["obj"]
+                obj_np = self._crop_rotate_obj_fov(obj_np).sum(0)  # type:ignore # FIXME
+                if self.obj_type == "pure_phase":
+                    obj_np = np.exp(1j * np.angle(obj_np))
+            else:
+                obj_np = self.obj_cropped.sum(0)
         else:
             obj_np = self._to_numpy(obj)
             if obj_np.ndim == 3:
@@ -108,6 +115,8 @@ class PtychographyVisualizations(PtychographyBase):
             else:  # self.obj_type == "pure_phase":
                 obj_show = np.angle(obj_pad)
             stitle = kwargs.pop("title", "")
+            if snapshot_idx is not None:
+                stitle += f" epoch {self.epoch_snapshots[snapshot_idx]['iteration']}"
             if len(stitle) > 0:
                 stitle = stitle + " "
             show_2d(

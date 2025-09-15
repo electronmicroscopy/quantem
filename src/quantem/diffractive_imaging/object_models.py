@@ -262,9 +262,11 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return propagated
 
     def _get_obj_patches(self, obj_array, patch_indices):
-        if not obj_array.is_complex():
-            obj_array = torch.exp(1.0j * obj_array)
-        obj_flat = obj_array.reshape(obj_array.shape[0], -1)
+        if not obj_array.is_complex():  # potential or pure_phase DIP -> float
+            obj_array2 = torch.exp(1.0j * obj_array)
+        else:
+            obj_array2 = obj_array
+        obj_flat = obj_array2.reshape(obj_array.shape[0], -1)
         patches = obj_flat[:, patch_indices]
         return patches
 
@@ -838,7 +840,8 @@ class ObjectDIP(ObjectConstraints):
                     f"Model target shape {pretrain_target.shape} does not match model input shape {self.model_input.shape}"
                 )
             self.pretrain_target = pretrain_target.clone().detach().to(self.device)
-        elif self.pretrain_target is None:
+        elif self.pretrain_target.numel() == 0:
+            # self.pretrain_target = self.model_input.clone().detach().to(self.device)
             raise ValueError(
                 "No pretrain target set. Provide pretrain_target or set it beforehand."
             )
