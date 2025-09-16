@@ -1,3 +1,5 @@
+import os
+import warnings
 from collections.abc import Sequence
 from typing import Any, Optional, Union, cast
 
@@ -34,9 +36,9 @@ def _show_2d_array(
     cmap: Union[str, colors.Colormap] = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
+    title: Optional[str] = None,
     figax: Optional[tuple[Any, Any]] = None,
     figsize: tuple[int, int] = (8, 8),
-    title: Optional[str] = None,
     show_ticks: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
@@ -60,12 +62,12 @@ def _show_2d_array(
         Factor to boost color saturation when displaying complex data.
     cbar : bool, default=False
         Whether to add a colorbar to the plot.
+    title : str, optional
+        Title for the plot.
     figax : tuple, optional
         (fig, ax) tuple to use for plotting. If None, a new figure and axes are created.
     figsize : tuple, default=(8, 8)
         Figure size in inches, used only if figax is None.
-    title : str, optional
-        Title for the plot.
     show_ticks : bool, default=False
         Whether to show axis ticks and labels.
 
@@ -147,6 +149,9 @@ def _show_2d_array(
             scalebar_config.color,
             scalebar_config.loc,
         )
+
+    for spine in ax.spines.values():  # fixes asymmetry of bbox for some reason
+        spine.set_linewidth(kwargs.get("spine_linewidth", 1))
 
     return fig, ax
 
@@ -426,7 +431,7 @@ def show_2d(
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     figax: tuple[Any, Any] | None = None,
     axsize: tuple[int, int] = (4, 4),
-    show_ticks: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
+    save: os.PathLike | str | None = None,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
     """Display one or more 2D arrays in a grid layout.
@@ -460,13 +465,8 @@ def show_2d(
         (fig, axs) tuple to use for plotting. If None, a new figure and axes are created.
     axsize : tuple, default=(4, 4)
         Size of each subplot in inches.
-    show_ticks : bool, default=False
-        Whether to show axis ticks and labels.
-    tight_layout : bool, default=True
-        Whether to apply tight_layout to the figure.
-    combine_images : bool, default=False
-        If True and arrays is a sequence, combine all arrays into a single visualization
-        using color encoding. Only works for a single row of arrays.
+    save : os.PathLike or str, optional
+        Path to save the figure to.
 
     **kwargs : dict
         Additional keyword arguments passed to _show_2d_array or _show_2d_combined:
@@ -479,7 +479,8 @@ def show_2d(
             Only works for a single row of arrays.
         figsize: tuple, default None
             Size of the figure in inches. If None, calculated based on axsize and grid shape.
-
+        show_ticks : bool, default=False
+            Whether to show axis ticks and labels.
 
     Returns
     -------
@@ -513,7 +514,7 @@ def show_2d(
         cbar=cbar,
         title=kwargs.pop("titles", None) if title is None else title,
         chroma_boost=kwargs.pop("chroma_boost", 1.0),
-        show_ticks=show_ticks,
+        show_ticks=kwargs.pop("show_ticks", False),
     )
 
     if figax is not None:
@@ -544,7 +545,9 @@ def show_2d(
             axs[i][j].axis("off")  # type: ignore
 
     if kwargs.get("tight_layout", True):
-        fig.tight_layout()
+        with warnings.catch_warnings():  # suppress warning about tight_layout
+            warnings.simplefilter("ignore")
+            fig.tight_layout()
 
     # Squeeze the axes to the expected shape
     if axs.shape == (1, 1):
@@ -556,5 +559,14 @@ def show_2d(
 
     if kwargs.get("force_show", False):
         plt.show()
+
+    if save is not None:
+        print(f"Saving figure to {save}")
+        fig.savefig(
+            save,
+            bbox_inches="tight",
+            pad_inches=kwargs.get("pad_inches", 0),
+            dpi=kwargs.get("dpi", 300),
+        )
 
     return fig, axs
