@@ -881,8 +881,8 @@ class Lattice(AutoSerialize):
                     xr_arr[i] = np.mean(Bx[nbr_idx])
                     yr_arr[i] = np.mean(By[nbr_idx])
 
-        else:  # method == "ab"
-            # Vectorized calculation for ab method
+        else:  # coordinates == "fractional"
+            # Vectorized calculation for fractional coordinates method
             for i, atom_idx in enumerate(valid_atom_indices):
                 valid_neighbors = valid_mask[atom_idx]
                 if np.sum(valid_neighbors) >= reference_num:
