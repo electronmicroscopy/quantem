@@ -1253,6 +1253,36 @@ class Lattice(AutoSerialize):
 
             img_rgb[r0 : r0 + pixel_size, c0 : c0 + pixel_size, :] = color
 
+        r_0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        theta_u = -np.arctan2(u[1], u[0])
+        handedness = u[0] * v[1] - u[1] * v[0] > 0
+
+        if theta_u > np.pi / 36 or theta_u < -np.pi / 36:
+            from scipy.ndimage import rotate
+
+            if not handedness:
+                img_rgb = np.fliplr(img_rgb)
+
+            img_rgb = rotate(
+                img_rgb,
+                -np.degrees(theta_u),
+                axes=(1, 0),
+                reshape=True,
+                order=1,
+                mode="constant",
+                cval=0.0,
+            )
+
+            # Crop the image to deal with artifacts due to rotation
+            mask = np.linalg.norm(img_rgb, axis=2) > 0
+            rows, cols = np.where(mask)
+
+            if len(rows) > 0 and len(cols) > 0:
+                r_min, r_max = rows.min(), rows.max()
+                c_min, c_max = cols.min(), cols.max()
+
+                img_rgb = img_rgb[r_min : r_max + 1, c_min : c_max + 1, :]
+
         # --- Optional rendering with legend ---
         if plot:
             fig, ax = show_2d(img_rgb, returnfig=True, figsize=figsize, **kwargs)
