@@ -759,6 +759,7 @@ class Lattice(AutoSerialize):
         reference_ind,
         reference_radius=None,
         reference_num=4,
+        coordinates: str = "cartesian",
         plot_polarization_vectors: bool = False,
         **plot_kwargs,
     ):
@@ -766,20 +767,23 @@ class Lattice(AutoSerialize):
 
         # lattice vectors in pixels
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-        if reference_radius is None:
-            reference_radius = float(min(np.linalg.norm(u), np.linalg.norm(v)))
 
-        # grab cells (skip if empty)
-        A_cell = self.atoms.get_data(int(measure_ind))
-        B_cell = self.atoms.get_data(int(reference_ind))
-        if (
-            isinstance(A_cell, list)
-            or A_cell is None
-            or A_cell.size == 0
-            or isinstance(B_cell, list)
-            or B_cell is None
-            or B_cell.size == 0
-        ):
+        if coordinates not in ("cartesian", "fractional"):
+            raise ValueError(
+                f"coordinates must be 'cartesian'(default) or 'fractional'. {coordinates} is not valid."
+            )
+
+        measure_ind = int(measure_ind)
+        reference_ind = int(reference_ind)
+
+        # Check for empty cells
+        A_cell = self.atoms.get_data(measure_ind)
+        B_cell = self.atoms.get_data(reference_ind)
+
+        def is_empty(cell):
+            return isinstance(cell, list) or cell is None or cell.size == 0
+
+        if is_empty(A_cell) or is_empty(B_cell):
             out = Vector.from_shape(
                 shape=(1,),
                 fields=("x", "y", "a", "b", "x_ref", "y_ref"),
@@ -789,43 +793,117 @@ class Lattice(AutoSerialize):
             out.set_data(np.zeros((0, 6), float), 0)
             return out
 
-        # field access via _CellView
-        Ax = self.atoms[int(measure_ind)]["x"]
-        Ay = self.atoms[int(measure_ind)]["y"]
-        Aa = self.atoms[int(measure_ind)]["a"]
-        Ab = self.atoms[int(measure_ind)]["b"]
-        Bx = self.atoms[int(reference_ind)]["x"]
-        By = self.atoms[int(reference_ind)]["y"]
+        # Extract common atom data
+        Ax = self.atoms[measure_ind]["x"]
+        Ay = self.atoms[measure_ind]["y"]
+        Aa = self.atoms[measure_ind]["a"]
+        Ab = self.atoms[measure_ind]["b"]
+        Bx = self.atoms[reference_ind]["x"]
+        By = self.atoms[reference_ind]["y"]
 
-        # KD-tree on reference coordinates
-        tree = cKDTree(np.column_stack([Bx, By]))
+        # Method-specific processing
+        if coordinates == "cartesian":
+            if reference_radius is None:
+                reference_radius = float(min(np.linalg.norm(u), np.linalg.norm(v)))
+
+            query_coords = np.column_stack([Ax, Ay])
+            ref_coords = np.column_stack([Bx, By])
+
+        elif coordinates == "fractional":
+            reference_radius = 3
+            L = np.column_stack((u, v))
+            # try:
+            #     # Not sure if we need this or not, but keeping it for now.
+            #     # Also depends on whether we would be caclulating polarization
+            #     # based on fractional or cartesian coordinates
+            #     L_inv = np.linalg.inv(L)
+            # except np.linalg.LinAlgError:
+            #     raise ValueError("Lattice vectors are singular and cannot be inverted.")
+
+            Ba = self.atoms[reference_ind]["a"]
+            Bb = self.atoms[reference_ind]["b"]
+            query_coords = np.column_stack([Aa, Ab])
+            ref_coords = np.column_stack([Ba, Bb])
+
+        # KD-tree query
+        tree = cKDTree(ref_coords)
         k = int(max(1, reference_num))
         dists, idxs = tree.query(
-            np.column_stack([Ax, Ay]),
+            query_coords,
             k=k,
             distance_upper_bound=float(reference_radius),
             workers=-1,
         )
-        if k == 1:  # normalize shapes
+
+        # Normalize shapes for k=1 case
+        if k == 1:
             dists = dists[:, None]
             idxs = idxs[:, None]
 
-        x_list, y_list, a_list, b_list, xr_list, yr_list = [], [], [], [], [], []
-        for i in range(Ax.shape[0]):
-            valid = np.isfinite(dists[i]) & (idxs[i] < Bx.shape[0])
-            if np.count_nonzero(valid) < reference_num:
-                continue
-            order = np.argsort(dists[i][valid])[:reference_num]
-            nbr_idx = idxs[i][valid][order].astype(int)
-            x_ref = float(np.mean(Bx[nbr_idx]))
-            y_ref = float(np.mean(By[nbr_idx]))
+        # Vectorized neighbor validation
+        valid_mask = np.isfinite(dists) & (idxs < len(Bx))
+        valid_counts = np.sum(valid_mask, axis=1)
+        atoms_with_enough_neighbors = valid_counts >= reference_num
 
-            x_list.append(float(Ax[i]))
-            y_list.append(float(Ay[i]))
-            a_list.append(float(Aa[i]))
-            b_list.append(float(Ab[i]))
-            xr_list.append(x_ref)
-            yr_list.append(y_ref)
+        if not np.any(atoms_with_enough_neighbors):
+            out = Vector.from_shape(
+                shape=(1,),
+                fields=("x", "y", "a", "b", "x_ref", "y_ref"),
+                units=("px", "px", "ind", "ind", "px", "px"),
+                name="polarization",
+            )
+            out.set_data(np.zeros((0, 6), float), 0)
+            return out
+
+        # Filter to atoms with enough neighbors
+        valid_atom_indices = np.where(atoms_with_enough_neighbors)[0]
+        n_valid = len(valid_atom_indices)
+
+        # Pre-allocate result array memory
+        x_arr = Ax[valid_atom_indices].astype(float)
+        y_arr = Ay[valid_atom_indices].astype(float)
+        a_arr = Aa[valid_atom_indices].astype(float)
+        b_arr = Ab[valid_atom_indices].astype(float)
+        xr_arr = np.zeros(n_valid, dtype=float)
+        yr_arr = np.zeros(n_valid, dtype=float)
+
+        if coordinates == "cartesian":
+            # Vectorized reference position calculation for xy method
+            for i, atom_idx in enumerate(valid_atom_indices):
+                valid_neighbors = valid_mask[atom_idx]
+                if np.sum(valid_neighbors) >= reference_num:
+                    # Get closest reference_num neighbors
+                    valid_dists = dists[atom_idx][valid_neighbors]
+                    valid_idxs = idxs[atom_idx][valid_neighbors]
+                    closest_order = np.argsort(valid_dists)[:reference_num]
+                    nbr_idx = valid_idxs[closest_order].astype(int)
+
+                    xr_arr[i] = np.mean(Bx[nbr_idx])
+                    yr_arr[i] = np.mean(By[nbr_idx])
+
+        else:  # method == "ab"
+            # Vectorized calculation for ab method
+            for i, atom_idx in enumerate(valid_atom_indices):
+                valid_neighbors = valid_mask[atom_idx]
+                if np.sum(valid_neighbors) >= reference_num:
+                    # Get closest reference_num neighbors
+                    valid_dists = dists[atom_idx][valid_neighbors]
+                    valid_idxs = idxs[atom_idx][valid_neighbors]
+                    closest_order = np.argsort(valid_dists)[:reference_num]
+                    nbr_idx = valid_idxs[closest_order].astype(int)
+
+                    # Vectorized matrix operations
+                    a, b = a_arr[i], b_arr[i]
+                    xi, yi = Bx[nbr_idx], By[nbr_idx]
+                    ai, bi = Ba[nbr_idx], Bb[nbr_idx]
+
+                    diff_ind = np.array([a - ai, b - bi])  # (2, n_neighbors)
+                    neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
+                    transformed = L @ diff_ind + neighbor_positions
+                    exp_pos = np.mean(transformed, axis=1)  # (2,)
+
+                    xr_arr[i] = exp_pos[0]
+                    yr_arr[i] = exp_pos[1]
 
         out = Vector.from_shape(
             shape=(1,),
@@ -833,11 +911,8 @@ class Lattice(AutoSerialize):
             units=("px", "px", "ind", "ind", "px", "px"),
             name="polarization",
         )
-        if len(x_list) == 0:
-            out.set_data(np.zeros((0, 6), float), 0)
-            return out
 
-        arr = np.column_stack([x_list, y_list, a_list, b_list, xr_list, yr_list]).astype(float)
+        arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, xr_arr, yr_arr])
         out.set_data(arr, 0)
 
         if plot_polarization_vectors:
