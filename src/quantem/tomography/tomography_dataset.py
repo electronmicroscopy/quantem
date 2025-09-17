@@ -12,7 +12,7 @@ from quantem.core.utils.validators import (
 from torch.utils.data import Dataset
 
 
-class TomographyDataset(AutoSerialize, Dataset):
+class TomographyDataset(Autoserialize, Dataset):
     _token = object()
 
     """

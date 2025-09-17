@@ -365,7 +365,7 @@ class TomographyNerf():
 
             print(f"Dataloader setup complete:")
             print(f"  Total projections: {len(self.tomo_dataset.tilt_angles)}")
-            print(f"  Grid size: {self.tomo_dataset.dims[1]}×{self.tomo_dataset.dims[2]}")
+            print(f"  Grid size: {self.tomo_dataset.dims[1]}{self.tomo_dataset.dims[2]}")
             print(f"  Total pixels: {train_pixels:,}")
 
             print(f"  Local batch size (train): {batch_size}")
@@ -382,8 +382,8 @@ class TomographyNerf():
             out_features = 1,
             hidden_features = 512,
             hidden_layers = 4,
-            first_omega_0 = omega_0,
-            hidden_omega_0 = omega_0, # Remove hidden_omega_0.
+            first_omega_0 = 30,
+            hidden_omega_0 = 30, # Remove hidden_omega_0.
         ).to(self.device)
         
         if self.world_size > 1:
@@ -442,17 +442,18 @@ class TomographyNerf():
         optimizer = torch.optim.Adam(self.model.parameters(), lr=scaled_train_lr, fused = True)
         aux_optimizer = torch.optim.Adam(self.aux_params.parameters(), lr=scaled_aux_lr)
         
+        aux_norm = torch.tensor(0.0, device=self.device)
+        model_norm = torch.tensor(0.0, device=self.device)
+        
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
         
-        warmup_scheduler_model = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.001, total_iters=warmup_epochs) # TODO: Start factor play around with this.
+        warmup_scheduler_model = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs) # TODO: Start factor play around with this.
         cosine_scheduler_model = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=scaled_train_lr/100)
         scheduler_model = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler_model, cosine_scheduler_model], milestones=[warmup_epochs])
 
         scheduler_aux = torch.optim.lr_scheduler.CosineAnnealingLR(aux_optimizer, T_max=epochs, eta_min=scaled_aux_lr/100)
         
-        
-        accumulated_batches = 0 # TODO: Do this? Gradient accumulation
         device_type = self.device.type        
         autocast_dtype = torch.bfloat16 if use_amp else None
         
@@ -593,58 +594,51 @@ class TomographyNerf():
                 
                 
             if epoch % viz_freq == 0 or epoch == epochs - 1 or epoch % checkpoint_freq == 0 :
-            
                 with torch.no_grad():
-                    
                     pred_full = self.create_volume().cpu()
                     avg_loss = epoch_loss.item() / num_batches
                     avg_mse_loss = epoch_mse_loss.item() / num_batches
                     avg_tv_loss = epoch_tv_loss.item() / num_batches
                     avg_z1_loss = epoch_z1_loss.item() / num_batches
-                    
+
+
                     metrics = torch.tensor([avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss], device=self.device)
                     if self.world_size > 1:
                         torch.distributed.all_reduce(metrics, op=torch.distributed.ReduceOp.AVG)
                     avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss = metrics.tolist()
+                    
+
             if self.global_rank == 0 and (epoch % viz_freq == 0 or epoch == epochs - 1):
                 with torch.no_grad():
                     current_lr = scheduler_model.get_last_lr()[0]
-                    
+
                     # Log metrics
-                    if self.writer is not None:
-                        self.writer.add_scalar("train/mse_loss", avg_mse_loss, epoch)
-                        self.writer.add_scalar("train/z1_loss", avg_z1_loss, epoch)
+                    self.writer.add_scalar("train/mse_loss", avg_mse_loss, epoch)
+
+
+                    self.writer.add_scalar("train/z1_loss", avg_z1_loss, epoch)
                     if tv_weight > 0:
                         self.writer.add_scalar("train/tv_loss", avg_tv_loss, epoch)
-                    if self.writer is not None:
                         self.writer.add_scalar("train/total_loss", avg_loss, epoch)
-                    if self.writer is not None:
-                        self.writer.add_scalar("train/model_grad_norm", model_norm.item(), epoch)
-                    
-                    if hasattr(self, "aux_norm"):
-                        if self.writer is not None:
-                            self.writer.add_scalar("train/aux_grad_norm", aux_norm.item(), epoch)
-                    else:
-                        self.writer.add_scalar("train/aux_grad_norm", 0, epoch)
-                    if self.writer is not None:
-                        self.writer.add_scalar("train/lr", current_lr, epoch)
+                    self.writer.add_scalar("train/model_grad_norm", model_norm.item(), epoch)
+                    self.writer.add_scalar("train/aux_grad_norm", aux_norm.item(), epoch)
+                    self.writer.add_scalar("train/lr", current_lr, epoch)
                     self.writer.add_scalar("train/num_samples_per_ray", num_samples_per_ray, epoch)
-                    
+
                     fig, axes = plt.subplots(1, 3, figsize=(36, 12))
                     axes[0].matshow(pred_full.sum(dim=0).cpu().numpy(), cmap='turbo', vmin=0)
                     axes[0].set_title('Sum over Z-axis')
 
                     axes[1].matshow(pred_full[self.tomo_dataset.dims[1]//2].cpu().numpy(), cmap='turbo', vmin=0)
                     axes[1].set_title(f'Slice at Z={self.tomo_dataset.dims[1]//2}')
-                    
+
                     slice_start = max(0, self.tomo_dataset.dims[1]//2 - 5)
                     slice_end = min(self.tomo_dataset.dims[1], self.tomo_dataset.dims[1]//2 + 6)
                     thick_slice = pred_full[slice_start:slice_end].sum(dim=0).cpu().numpy()
                     axes[2].matshow(thick_slice, cmap='turbo', vmin=0)
                     axes[2].set_title(f'Thick slice sum (Z={slice_start}:{slice_end-1})')
-                    
-                    if self.writer is not None:
-                        self.writer.add_figure("train/viz", fig, epoch, close=True)
+
+                    self.writer.add_figure("train/viz", fig, epoch, close=True)
                     plt.close(fig)
                     
             if epoch % checkpoint_freq == 0 or epoch == epochs - 1:
