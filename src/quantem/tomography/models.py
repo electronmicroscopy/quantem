@@ -37,12 +37,12 @@ class HSiren(nn.Module):
     def __init__(self, in_features=2, out_features=3, hidden_layers=3, hidden_features=256,
                  first_omega_0=30, hidden_omega_0=30, alpha=1.0):
         super().__init__()
-        self.net = []
-        self.net.append(SineLayer(in_features, hidden_features, is_first=True,
+        self.net_list = []
+        self.net_list.append(SineLayer(in_features, hidden_features, is_first=True,
                                   omega_0=first_omega_0, hsiren=True, alpha=alpha))
 
         for i in range(hidden_layers):
-            self.net.append(SineLayer(hidden_features, hidden_features, is_first=False,
+            self.net_list.append(SineLayer(hidden_features, hidden_features, is_first=False,
                                      omega_0=hidden_omega_0, alpha=alpha))
 
         final_linear = nn.Linear(hidden_features, out_features)
@@ -50,9 +50,9 @@ class HSiren(nn.Module):
             # Final layer keeps original initialization (no alpha scaling)
             final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0,
                                           np.sqrt(6 / hidden_features) / hidden_omega_0)
-        self.net.append(final_linear)
-        self.net.append(nn.Softplus())
-        self.net = nn.Sequential(*self.net)
+        self.net_list.append(final_linear)
+        self.net_list.append(nn.Softplus())
+        self.net = nn.Sequential(*self.net_list)
 
     def forward(self, coords):
         output = self.net(coords)

@@ -12,7 +12,7 @@ from quantem.core.utils.validators import (
 from torch.utils.data import Dataset
 
 
-class TomographyDataset(Autoserialize, Dataset):
+class TomographyDataset(AutoSerialize, Dataset):
     _token = object()
 
     """
@@ -32,6 +32,9 @@ class TomographyDataset(Autoserialize, Dataset):
         shifts: Tensor,
     ):
         self._tilt_series = tilt_series
+        # Enforce Positivity
+        self._tilt_series = torch.clamp(self._tilt_series, min=0)
+        
         self._tilt_angles = tilt_angles
         self._z1_angles = z1_angles
         self._z3_angles = z3_angles
