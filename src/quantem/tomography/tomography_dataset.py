@@ -9,8 +9,10 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 
+from torch.utils.data import Dataset
 
-class TomographyDataset(AutoSerialize):
+
+class TomographyDataset(AutoSerialize, Dataset):
     _token = object()
 
     """
@@ -39,6 +41,16 @@ class TomographyDataset(AutoSerialize):
         self._initial_z1_angles = z1_angles.clone()
         self._initial_z3_angles = z3_angles.clone()
         self._initial_shifts = shifts.clone()
+        
+        # Move everything to CPU
+        self.to("cpu")
+        
+        # Number of indices (?)
+        
+        
+        # Enforce normalization of tilt series
+        tilt_percentile = torch.quantile(self._tilt_series, .95)
+        self._tilt_series = self._tilt_series / tilt_percentile
 
     # --- Class Methods ---
     @classmethod
@@ -49,12 +61,6 @@ class TomographyDataset(AutoSerialize):
         z1_angles: NDArray | Tensor | None = None,
         z3_angles: NDArray | Tensor | None = None,
         shifts: NDArray | Tensor | None = None,
-        # name: str | None = None,
-        # origin: NDArray | tuple | list | float | int | None = None,
-        # sampling: NDArray | tuple | list | float | int | None = None,
-        # units: list[str] | tuple | list | None = None,
-        # signal_units: str = "arb. units",
-        # _token: object | None = None,
     ):
         """
         tilt_series: (N, H, W)
@@ -145,6 +151,50 @@ class TomographyDataset(AutoSerialize):
     @property
     def initial_shifts(self) -> Tensor:
         return self._initial_shifts
+    
+    @property
+    def num_projections(self) -> int:
+        
+        return self._tilt_series.shape[0]
+    
+    @property
+    def num_pixels(self) -> int:
+        
+        return self._tilt_series.shape[0] * self._tilt_series.shape[1] * self._tilt_series.shape[2]
+    
+    @property
+    def dims(self) -> tuple[int, int, int]:
+        
+        return self._tilt_series.shape[0], self._tilt_series.shape[1], self._tilt_series.shape[2]
+    
+    def __len__(self) -> int:
+        
+        return self.num_pixels
+    
+    def __getitem__(self, idx):
+        
+        actual_idx = idx
+        
+        projection_idx = actual_idx // (self.dims[1] * self.dims[2])
+        remaining = actual_idx % (self.dims[1] * self.dims[2])
+        
+        # TODO: What if non-square tilt images?
+        if self.dims[1] != self.dims[2]:
+            raise NotImplementedError("Non-square tilt images are not supported yet.")
+        
+        pixel_i = remaining // self.dims[1]
+        pixel_j = remaining % self.dims[1]
+        
+        target_value = self._tilt_series[projection_idx, pixel_i, pixel_j]
+        phi = self._tilt_angles[projection_idx]
+        
+        return {
+            'projection_idx': projection_idx,
+            'pixel_i': pixel_i,
+            'pixel_j': pixel_j,
+            'target_value': target_value,
+            'phi': phi
+        }
 
     # --- Setters ---
 
