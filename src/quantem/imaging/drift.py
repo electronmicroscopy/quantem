@@ -739,6 +739,7 @@ class DriftCorrection(AutoSerialize):
         fourier_filter: bool = True,
         filter_midpoint: float = 0.5,
         kde_sigma: float = 0.5,
+        weight_thresh=0.1,
         show_image: bool = True,
         **kwargs,
     ):
@@ -765,6 +766,9 @@ class DriftCorrection(AutoSerialize):
         kde_sigma : float, default 0.5
             Standard deviation for kernel density estimation used during image interpolation. Defaults
             to the object's stored kde_sigma if set to None.
+        weight_thresh: float, default 0.1
+            This value sets the threshold for masking the outputs.
+            For very large jitter artifacts this value can be lowered.
         show_image : bool, default True
             Whether to display the final corrected image after processing.
         **kwargs : dict
@@ -852,7 +856,7 @@ class DriftCorrection(AutoSerialize):
 
             # calculate mask from product of individual image masks
             # scale weights by upsample factor to normalize to mean value of 1.0
-            mask_edge = np.prod(weight_corr >= (0.5 / upsample_factor**2), axis=0)
+            mask_edge = np.prod(weight_corr >= (weight_thresh / upsample_factor**2), axis=0)
 
             # ensure edges of mask are true for edge blending
             mask_edge[:, 0] = False
