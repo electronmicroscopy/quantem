@@ -33,7 +33,6 @@ class TomographyDataset(AutoSerialize, Dataset):
     ):
         self._tilt_series = tilt_series
         # Enforce Positivity
-        self._tilt_series = torch.clamp(self._tilt_series, min=0)
         
         self._tilt_angles = tilt_angles
         self._z1_angles = z1_angles
@@ -54,6 +53,8 @@ class TomographyDataset(AutoSerialize, Dataset):
         # Enforce normalization of tilt series
         tilt_percentile = torch.quantile(self._tilt_series, .95)
         self._tilt_series = self._tilt_series / tilt_percentile
+        self._tilt_series = torch.clamp(self._tilt_series, min=0)
+        
 
     # --- Class Methods ---
     @classmethod

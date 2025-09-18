@@ -51,7 +51,7 @@ class HSiren(nn.Module):
             final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0,
                                           np.sqrt(6 / hidden_features) / hidden_omega_0)
         self.net_list.append(final_linear)
-        self.net_list.append(nn.Softplus())
+        self.net_list.append(nn.Softplus())   
         self.net = nn.Sequential(*self.net_list)
 
     def forward(self, coords):
