@@ -36,6 +36,7 @@ class Dataset(AutoSerialize):
         sampling: Union[NDArray, tuple, list, float, int],
         units: Union[list[str], tuple, list],
         signal_units: str = "arb. units",
+        metadata: dict = {},
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -47,6 +48,7 @@ class Dataset(AutoSerialize):
         self.sampling = sampling
         self.units = units
         self.signal_units = signal_units
+        self._metadata = metadata
 
     @classmethod
     def from_array(
@@ -109,6 +111,10 @@ class Dataset(AutoSerialize):
     @array.setter
     def array(self, value: NDArray) -> None:
         self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
+
+    @property
+    def metadata(self) -> dict:
+        return self._metadata
 
     @property
     def name(self) -> str:

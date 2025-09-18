@@ -31,6 +31,7 @@ class Dataset4dstem(Dataset4d):
         sampling: NDArray | tuple | list | float | int,
         units: list[str] | tuple | list,
         signal_units: str = "arb. units",
+        metadata: dict = {},
         _token: object | None = None,
     ):
         """Initialize a 4D-STEM dataset.
@@ -49,9 +50,17 @@ class Dataset4dstem(Dataset4d):
             Units for each dimension
         signal_units : str, optional
             Units for the array values, by default "arb. units"
+        metadata : dict
+            "r_to_q_rotation_cw_deg":  rotation r to q clockwise in degrees
+            "ellipticity": 3 parameters (a, b, theta (degrees))
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
+        mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
+        for k in mdata_keys_4dstem:
+            if k not in metadata.keys():
+                metadata[k] = None
+
         super().__init__(
             array=array,
             name=name,
@@ -59,6 +68,7 @@ class Dataset4dstem(Dataset4d):
             sampling=sampling,
             units=units,
             signal_units=signal_units,
+            metadata=metadata,
             _token=_token,
         )
         self._virtual_images = {}
