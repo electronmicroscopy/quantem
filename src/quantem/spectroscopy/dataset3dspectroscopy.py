@@ -75,7 +75,7 @@ class Dataset3dspectroscopy(Dataset3d):
         array : NDArray | Any
             The underlying 3D array data
         name : str | None, optional
-            A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
+            A descriptive name for the dataset. If None, defaults to "3D-STEM dataset"
         origin : NDArray | tuple | list | float | int | None, optional
             The origin coordinates for each dimension. If None, defaults to zeros
         sampling : NDArray | tuple | list | float | int | None, optional

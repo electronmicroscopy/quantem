@@ -7,9 +7,13 @@ from quantem.core.datastructures import Dataset as Dataset
 from quantem.core.datastructures import Dataset2d as Dataset2d
 from quantem.core.datastructures import Dataset3d as Dataset3d
 from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
-from quantem.spectroscopy.dataset3dspectroscopy import (
-    Dataset3dspectroscopy as Dataset3dspectroscopy,
+from quantem.spectroscopy import (
+    Dataset3deds as Dataset3deds,
 )
+from quantem.spectroscopy import (
+    Dataset3deels as Dataset3deels,
+)
+from quantem.spectroscopy import Dataset3dspectroscopy as Dataset3dspectroscopy
 
 
 def read_4dstem(
@@ -58,10 +62,7 @@ def read_4dstem(
     return dataset
 
 
-def read_3d_spectroscopy(
-    file_path: str,
-    file_type: str,
-) -> Dataset3dspectroscopy:
+def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str) -> Dataset3dspectroscopy:
     """
     File reader for 3D spectroscopy data data
 
@@ -72,31 +73,54 @@ def read_3d_spectroscopy(
     file_type: str
         The type of file reader needed. See rosettasciio for supported formats
         https://hyperspy.org/rosettasciio/supported_formats/index.html
-
+    data_type: str
+        type of spectroscopy data 'EELS' or 'EDS'
     Returns
     --------
     Dataset3dspectroscopy
     """
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
     imported_data = file_reader(file_path)[0]
-    dataset = Dataset3dspectroscopy.from_array(
-        array=imported_data["data"].transpose((2, 0, 1)),
-        sampling=[
-            imported_data["axes"][2]["scale"],
-            imported_data["axes"][0]["scale"],
-            imported_data["axes"][1]["scale"],
-        ],
-        origin=[
-            imported_data["axes"][2]["offset"],
-            imported_data["axes"][0]["offset"],
-            imported_data["axes"][1]["offset"],
-        ],
-        units=[
-            imported_data["axes"][2]["units"],
-            imported_data["axes"][0]["units"],
-            imported_data["axes"][1]["units"],
-        ],
-    )
+    if data_type == "EELS":
+        dataset = Dataset3deels.from_array(
+            array=imported_data["data"].transpose((2, 0, 1)),
+            sampling=[
+                imported_data["axes"][2]["scale"],
+                imported_data["axes"][0]["scale"],
+                imported_data["axes"][1]["scale"],
+            ],
+            origin=[
+                imported_data["axes"][2]["offset"],
+                imported_data["axes"][0]["offset"],
+                imported_data["axes"][1]["offset"],
+            ],
+            units=[
+                imported_data["axes"][2]["units"],
+                imported_data["axes"][0]["units"],
+                imported_data["axes"][1]["units"],
+            ],
+        )
+    elif data_type == "EDS":
+        dataset = Dataset3deds.from_array(
+            array=imported_data["data"].transpose((2, 0, 1)),
+            sampling=[
+                imported_data["axes"][2]["scale"],
+                imported_data["axes"][0]["scale"],
+                imported_data["axes"][1]["scale"],
+            ],
+            origin=[
+                imported_data["axes"][2]["offset"],
+                imported_data["axes"][0]["offset"],
+                imported_data["axes"][1]["offset"],
+            ],
+            units=[
+                imported_data["axes"][2]["units"],
+                imported_data["axes"][0]["units"],
+                imported_data["axes"][1]["units"],
+            ],
+        )
+    else:
+        raise ValueError(f"`data_type` must be `EDS` or `EELS` not `{data_type}`")
 
     return dataset
 
