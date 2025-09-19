@@ -90,7 +90,7 @@ class Dataset3dspectroscopy(Dataset3d):
         Dataset3dspectroscopy
             A new Dataset3dspectroscopy instance
         """
-        array = ensure_valid_array(array, ndim=4)
+        array = ensure_valid_array(array, ndim=3)
         return cls(
             array=array,
             name=name if name is not None else "3D-STEM dataset",
@@ -100,3 +100,7 @@ class Dataset3dspectroscopy(Dataset3d):
             signal_units=signal_units,
             _token=cls._token,
         )
+
+    ## PCA
+    ## imaging
+    ## specturm picking
