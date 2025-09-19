@@ -80,21 +80,21 @@ def read_3d_spectroscopy(
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
     imported_data = file_reader(file_path)[0]
     dataset = Dataset3dspectroscopy.from_array(
-        array=imported_data["data"],
+        array=imported_data["data"].transpose((2, 0, 1)),
         sampling=[
+            imported_data["axes"][2]["scale"],
             imported_data["axes"][0]["scale"],
             imported_data["axes"][1]["scale"],
-            imported_data["axes"][2]["scale"],
         ],
         origin=[
+            imported_data["axes"][2]["offset"],
             imported_data["axes"][0]["offset"],
             imported_data["axes"][1]["offset"],
-            imported_data["axes"][2]["offset"],
         ],
         units=[
+            imported_data["axes"][2]["units"],
             imported_data["axes"][0]["units"],
             imported_data["axes"][1]["units"],
-            imported_data["axes"][2]["units"],
         ],
     )
 
