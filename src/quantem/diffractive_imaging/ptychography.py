@@ -167,8 +167,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if new_scheduler:
             self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
-        learn_descan = True if "dataset" in self.optimizer_params.keys() else False
-        self.dset._set_targets(loss_type, learn_descan)
+        self.dset._set_targets(loss_type)
         batcher = SimpleBatcher(self.dset.num_gpts, self.batch_size, rng=self.rng)
         pbar = tqdm(range(num_iter), disable=not self.verbose)
 
@@ -180,7 +179,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             for batch_indices in batcher:
                 self.zero_grad_all()
                 patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
-                    self.dset.forward(batch_indices, self.obj_padding_px, learn_descan)
+                    self.dset.forward(batch_indices, self.obj_padding_px)
                 )
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
                 obj_patches = self.obj_model.forward(patch_indices)

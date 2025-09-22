@@ -481,6 +481,14 @@ def show_2d(
             Size of the figure in inches. If None, calculated based on axsize and grid shape.
         show_ticks : bool, default=False
             Whether to show axis ticks and labels.
+        vmin: float, optional
+            Minimum value for the color scale.
+        vmax: float, optional
+            Maximum value for the color scale.
+        lower_quantile: float, optional
+            Lower quantile for the color scale.
+        upper_quantile: float, optional
+            Upper quantile for the color scale.
 
     Returns
     -------

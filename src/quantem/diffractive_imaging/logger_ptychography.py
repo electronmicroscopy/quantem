@@ -24,7 +24,7 @@ class LoggerPtychography(LoggerBase):
     def __init__(
         self,
         log_dir: os.PathLike | str,
-        run_prefix: str,
+        run_prefix: str = "",
         run_suffix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = True,

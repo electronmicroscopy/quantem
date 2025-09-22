@@ -42,6 +42,8 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self,
         dset: Dataset3d,
         verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
         _token: object | None = None,
     ):
         AutoSerialize.__init__(self)
@@ -65,14 +67,16 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         # scan_positions_px: [num_positions, 2] in pixels
         self._scan_positions_px = nn.Parameter(
             torch.zeros((self.num_gpts, 2), dtype=getattr(torch, config.get("dtype_real"))),
-            requires_grad=False,
+            requires_grad=learn_scan_positions,
         )
+        self.learn_scan_positions = learn_scan_positions
 
         # descan_shifts: [self.num_gpts, 2] descan shifts in pixels
         self._descan_shifts = nn.Parameter(
             torch.zeros((self.num_gpts, 2), dtype=getattr(torch, config.get("dtype_real"))),
-            requires_grad=False,
+            requires_grad=learn_descan,
         )
+        self.learn_descan = learn_descan
 
         # Store initial values for reset
         self._initial_scan_positions_px = torch.zeros_like(self._scan_positions_px)
@@ -88,7 +92,16 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
     def get_optimization_parameters(self):
         """Get the combined descan and scan position parameters for optimization."""
-        return [self._descan_shifts, self._scan_positions_px]
+        params = []
+        if self.learn_descan:
+            params.append(self._descan_shifts)
+        if self.learn_scan_positions:
+            params.append(self._scan_positions_px)
+        if len(params) == 0:
+            raise RuntimeError(
+                "No parameters to optimize for dataset: learn_descan and learn_scan_positions are both False"
+            )
+        return params
 
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device."""
@@ -114,6 +127,14 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._descan_shifts.data = shifts.to(self.device)
 
     @property
+    def learn_descan(self) -> bool:
+        return self._learn_descan
+
+    @learn_descan.setter
+    def learn_descan(self, learn_descan: bool) -> None:
+        self._learn_descan = bool(learn_descan)
+
+    @property
     def scan_positions_px(self) -> nn.Parameter:
         return self._scan_positions_px
 
@@ -126,6 +147,14 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             shape=(self.num_gpts, 2),
         )
         self._scan_positions_px.data = positions.to(self.device)
+
+    @property
+    def learn_scan_positions(self) -> bool:
+        return self._learn_scan_positions
+
+    @learn_scan_positions.setter
+    def learn_scan_positions(self, learn_scan_positions: bool) -> None:
+        self._learn_scan_positions = bool(learn_scan_positions)
 
     @property
     def positions_px_fractional(self) -> torch.Tensor:
@@ -176,15 +205,14 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ],
-        learn_descan: bool = False,
     ):
         if "amplitude" in loss_type:
-            if learn_descan:
+            if self.learn_descan and self.has_optimizer():
                 self._targets = self.amplitudes.clone().to(self.device)
             else:
                 self._targets = self.centered_amplitudes.clone().to(self.device)
         elif "intensity" in loss_type or loss_type == "poisson":
-            if learn_descan:
+            if self.learn_descan and self.has_optimizer():
                 self._targets = self.intensities.clone().to(self.device)
             else:
                 self._targets = self.centered_intensities.clone().to(self.device)
@@ -427,7 +455,6 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self,
         batch_indices: np.ndarray | torch.Tensor,
         obj_padding_px: np.ndarray | tuple,
-        return_descan: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Forward pass to compute the diffraction intensities from the object and scan positions."""
         # return patch_indices, positions_px, positions_px_fractional
@@ -554,6 +581,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self,
         dset: Dataset4dstem,
         verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
         _token: object | None = None,
     ):
         self.scan_sampling = dset.sampling[:2]
@@ -573,15 +602,22 @@ class PtychographyDatasetRaster(DatasetConstraints):
         p = Path(dset.file_path).expanduser().resolve() if dset.file_path is not None else None
         dset3d.file_path = p  # any other attributes to transfer?
 
-        super().__init__(dset=dset3d, verbose=verbose, _token=_token)
+        super().__init__(
+            dset=dset3d,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+            _token=_token,
+        )
 
     # region --- classmethods ---
-
     @classmethod
     def from_dataset4dstem(
         cls,
         dset: Dataset4dstem,
         verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
     ) -> Self:
         """
         Create a new Dataset4dstem from a Dataset4dstem.
@@ -596,10 +632,23 @@ class PtychographyDatasetRaster(DatasetConstraints):
         Dataset4dstem
             A new Dataset4dstem instance
         """
-        return cls(dset=dset, verbose=verbose, _token=cls._token)
+        return cls(
+            dset=dset,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+            _token=cls._token,
+        )
 
     @classmethod
-    def from_file(cls, file_path: str, file_type: str, verbose: int | bool = 1) -> Self:
+    def from_file(
+        cls,
+        file_path: str,
+        file_type: str,
+        verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
+    ) -> Self:
         """
         Create a new Dataset4dstem from a file.
 
@@ -620,7 +669,13 @@ class PtychographyDatasetRaster(DatasetConstraints):
         from quantem.core.io.file_readers import read_4dstem
 
         dset = read_4dstem(file_path, file_type)
-        return cls(dset=dset, verbose=verbose, _token=cls._token)
+        return cls(
+            dset=dset,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+            _token=cls._token,
+        )
 
     @classmethod
     def from_array(
@@ -632,6 +687,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
         units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
         verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
     ) -> Self:
         """
         Create a new Dataset4dstem from an array.
@@ -664,7 +721,12 @@ class PtychographyDatasetRaster(DatasetConstraints):
             units=units if units is not None else ["pixels"] * 4,
             signal_units=signal_units,
         )
-        return cls.from_dataset4dstem(dset=dset, verbose=verbose)
+        return cls.from_dataset4dstem(
+            dset=dset,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+        )
 
     # endregion --- classmethods ---
 
@@ -889,7 +951,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self._set_initial_scan_positions_px(obj_padding_px)
         self._set_patch_indices(obj_padding_px)
 
-        self._set_targets("l2_amplitude", learn_descan=False)
+        self._set_targets("l2_amplitude")
 
         self._preprocessed = True
         return
@@ -1349,7 +1411,6 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self,
         batch_indices: np.ndarray | torch.Tensor,
         obj_padding_px: np.ndarray | tuple,
-        return_descan: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Forward pass to compute the diffraction intensities from the object and scan positions."""
         positions_px = self.apply_position_constraints(self.scan_positions_px)[batch_indices]
@@ -1358,7 +1419,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             if self.patch_indices_need_update():
                 self._set_patch_indices(obj_padding_px)
         patch_indices = self.patch_indices[batch_indices]
-        if return_descan:
+        if self.learn_descan and self.has_optimizer():
             descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
         else:
             descan_shifts = None
