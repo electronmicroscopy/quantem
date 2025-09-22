@@ -11,6 +11,7 @@ from quantem.core.utils.validators import (
 
 from torch.utils.data import Dataset
 
+import numpy as np
 
 class TomographyDataset(AutoSerialize, Dataset):
     _token = object()
@@ -51,7 +52,10 @@ class TomographyDataset(AutoSerialize, Dataset):
         
         
         # Enforce normalization of tilt series
-        tilt_percentile = torch.quantile(self._tilt_series, .95)
+        try:
+            tilt_percentile = torch.quantile(self._tilt_series, .95)
+        except:
+            tilt_percentile = np.quantile(self._tilt_series, .95)
         self._tilt_series = self._tilt_series / tilt_percentile
         self._tilt_series = torch.clamp(self._tilt_series, min=0)
         
@@ -186,6 +190,7 @@ class TomographyDataset(AutoSerialize, Dataset):
         if self.dims[1] != self.dims[2]:
             raise NotImplementedError("Non-square tilt images are not supported yet.")
         
+        #TODO: row, column
         pixel_i = remaining // self.dims[1]
         pixel_j = remaining % self.dims[1]
         

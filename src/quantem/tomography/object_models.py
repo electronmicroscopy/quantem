@@ -536,5 +536,16 @@ class ObjectDIP(ObjectConstraints):
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
             pbar.set_description(f"Epoch {a0 + 1}/{num_epochs}, Loss: {loss.item():.4f}, ")
 
+class ObjectINN(ObjectConstraints):
+    """
+    Object model for INN objects.
+    
+    - VolumeDataset (?) dependent on the object
+    """
+    
+    def __init__(
+        self
+    ):
+        pass
 
 ObjectModelType = Union[ObjectVoxelwise]  # | ObjectDIP | ObjectImplicit (ObjectFFN?)

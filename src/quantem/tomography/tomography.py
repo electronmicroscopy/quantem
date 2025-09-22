@@ -90,7 +90,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase):
 
         if plot_loss:
             self.plot_loss()
-
+    
+    # TODO: ML Recon which has NeRF and AD depending on the object type.
+    
     def ad_recon(
         self,
         optimizer_params: dict,
