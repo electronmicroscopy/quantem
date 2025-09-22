@@ -422,12 +422,12 @@ class Lattice(AutoSerialize):
         annulus_radii=None,
         **kwargs,
     ):
-        self._positions_frac = np.array(positions_frac, dtype=float)
+        self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
         self._num_sites = self._positions_frac.shape[0]
         self._numbers = (
             np.arange(1, self._num_sites + 1, dtype=int)
             if numbers is None
-            else np.array(numbers, dtype=int)
+            else np.atleast_1d(np.array(numbers, dtype=int))
         )
 
         im = np.asarray(self._image.array, dtype=float)
