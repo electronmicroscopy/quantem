@@ -1254,7 +1254,7 @@ class Lattice(AutoSerialize):
             img_rgb[r0 : r0 + pixel_size, c0 : c0 + pixel_size, :] = color
 
         r_0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-        theta_u = -np.arctan2(u[1], u[0])
+        theta_u = np.arctan2(u[1], u[0])
         handedness = u[0] * v[1] - u[1] * v[0] > 0
 
         if theta_u > np.pi / 36 or theta_u < -np.pi / 36:
@@ -1265,7 +1265,7 @@ class Lattice(AutoSerialize):
 
             img_rgb = rotate(
                 img_rgb,
-                -np.degrees(theta_u),
+                np.degrees(theta_u),
                 axes=(1, 0),
                 reshape=True,
                 order=1,
