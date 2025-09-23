@@ -368,32 +368,33 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     #     coords = all_coords,
                     #     tv_weight = 1e-5,
                     # )
-                    if tv_weight > 0:
-                        num_tv_samples = min(10000, all_coords.shape[0])
-                        tv_indices = torch.randperm(all_coords.shape[0], device=all_coords.device)[:num_tv_samples]
+                    # if tv_weight > 0:
+                    #     num_tv_samples = min(10000, all_coords.shape[0])
+                    #     tv_indices = torch.randperm(all_coords.shape[0], device=all_coords.device)[:num_tv_samples]
 
-                        # Rerun forward for gradient tracking
-                        tv_coords = all_coords[tv_indices].detach().requires_grad_(True)
+                    #     # Rerun forward for gradient tracking
+                    #     tv_coords = all_coords[tv_indices].detach().requires_grad_(True)
                         
-                        # TODO: torch.nn.functional.softplus here
-                        # tv_densities_recomputed = torch.nn.functional.softplus(self.model(tv_coords)) # Get rid of this
-                        tv_densities_recomputed = self.model(tv_coords)
-                        if tv_densities_recomputed.dim() > 1:
-                            tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+                    #     # TODO: torch.nn.functional.softplus here
+                    #     # tv_densities_recomputed = torch.nn.functional.softplus(self.model(tv_coords)) # Get rid of this
+                    #     tv_densities_recomputed = self.model(tv_coords)
+                    #     if tv_densities_recomputed.dim() > 1:
+                    #         tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
 
-                        # Compute gradients
-                        grad_outputs = torch.autograd.grad(
-                            outputs=tv_densities_recomputed,
-                            inputs=tv_coords,
-                            grad_outputs=torch.ones_like(tv_densities_recomputed),
-                            create_graph=True
-                        )[0]
+                    #     # Compute gradients
+                    #     grad_outputs = torch.autograd.grad(
+                    #         outputs=tv_densities_recomputed,
+                    #         inputs=tv_coords,
+                    #         grad_outputs=torch.ones_like(tv_densities_recomputed),
+                    #         create_graph=True
+                    #     )[0]
                         
-                        grad_norm = torch.norm(grad_outputs, dim=1)
-                        tv_loss = tv_weight * grad_norm.mean()
-                    else:
-                        tv_loss = torch.tensor(0.0, device=self.device)
-                        
+                    #     grad_norm = torch.norm(grad_outputs, dim=1)
+                    #     tv_loss = tv_weight * grad_norm.mean()
+                    # else:
+                    #     tv_loss = torch.tensor(0.0, device=self.device)
+                
+                    tv_loss = self.obj.apply_soft_constraints(all_coords, tv_weight = 1e-5)
                     ray_densities = all_densities.view(len(target_values), num_samples_per_ray) # Reshape rays and integarte
                     step_size = 2.0 / (num_samples_per_ray - 1)
 
@@ -446,9 +447,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     self.temp_logger.add_scalar("train/mse_loss", avg_mse_loss, epoch)
 
                     self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, epoch)
-                    if tv_weight > 0:
-                        self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, epoch)
-                        self.temp_logger.add_scalar("train/total_loss", avg_loss, epoch)
+                    # if tv_weight > 0:
+                    self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, epoch)
+                    self.temp_logger.add_scalar("train/total_loss", avg_loss, epoch)
                     self.temp_logger.add_scalar("train/model_grad_norm", model_norm.item(), epoch)
                     self.temp_logger.add_scalar("train/aux_grad_norm", aux_norm.item(), epoch)
                     self.temp_logger.add_scalar("train/lr", current_lr, epoch)
