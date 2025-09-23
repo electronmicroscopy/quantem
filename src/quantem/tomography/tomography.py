@@ -7,10 +7,38 @@ from quantem.tomography.object_models import ObjectVoxelwise
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_conv import TomographyConv
 from quantem.tomography.tomography_ml import TomographyML
+from quantem.tomography.tomography_ddp import TomographyDDP
 from quantem.tomography.utils import differentiable_shift_2d, gaussian_kernel_1d, rot_ZXZ
 
+# Temporary imports for TomographyNERF
+from quantem.tomography.models import HSiren
+from quantem.tomography.object_models import ObjectINN
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+import matplotlib.pyplot as plt
+import torch.distributed as dist
 
-class Tomography(TomographyConv, TomographyML, TomographyBase):
+# Temporary aux class for TomographyNERF
+# TODO: Maybe put this in INN?
+def get_num_samples_per_ray(epoch):
+    """Increase number of samples per ray at specific epochs."""
+    schedule = {
+        0: 25,
+        2: 50,
+        4: 100,
+        6: 200,
+    }
+
+    num_samples = 64
+    for epoch_threshold, samples in sorted(schedule.items()):
+        if epoch >= epoch_threshold:
+            num_samples = samples
+
+    return num_samples
+
+
+
+class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
     """
     Top level class for either using conventional or ML-based reconstruction methods
     for tomography.
@@ -24,7 +52,11 @@ class Tomography(TomographyConv, TomographyML, TomographyBase):
         _token,
     ):
         super().__init__(dataset, volume_obj, device, _token)
-
+        
+        # TODO: More elegant way of doing this.
+        self.global_epochs = 0
+        self.ddp_instantiated = False
+        
     # --- Reconstruction Method ---
 
     def sirt_recon(
@@ -90,7 +122,285 @@ class Tomography(TomographyConv, TomographyML, TomographyBase):
 
         if plot_loss:
             self.plot_loss()
+    
+    # TODO: ML Recon which has NeRF and AD depending on the object type.
+    # TODO: Temporary 
+    
+    def create_batch_projection_rays(self, pixel_i, pixel_j, N, num_samples_per_ray):
+        """Create projection rays for entire batch simultaneously."""
+        batch_size = len(pixel_i)
 
+        # Convert all pixels to normalized coordinates
+        x_coords = (pixel_j / (N - 1)) * 2 - 1
+        y_coords = (pixel_i / (N - 1)) * 2 - 1
+        # TODO: maybe pixel_j.device?
+        # Create z coordinates
+        z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=self.device)
+
+        # Create rays for all pixels: [batch_size, num_samples_per_ray, 3]
+        rays = torch.zeros(batch_size, num_samples_per_ray, 3, device=self.device)
+
+        # Fill coordinates efficiently
+        rays[:, :, 0] = x_coords.unsqueeze(1)  # x constant per ray
+        rays[:, :, 1] = y_coords.unsqueeze(1)  # y constant per ray
+        rays[:, :, 2] = z_coords.unsqueeze(0)  # z varies along ray
+
+        return rays
+    
+    @torch.compile(mode="reduce-overhead")    
+    def transform_batch_ray_coordinates(self, rays, z1, x, z3, shifts, N, sampling_rate):
+
+        # Step 1: Apply shifts
+        shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
+        shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
+
+        rays_x = rays[:, :, 0] - shift_x_norm
+        rays_y = rays[:, :, 1] - shift_y_norm
+        rays_z = rays[:, :, 2]
+
+        # Rotation 1: Z(-z3)
+        theta = torch.deg2rad(-z3).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_rot1 = cos_t * rays_x - sin_t * rays_y
+        rays_y_rot1 = sin_t * rays_x + cos_t * rays_y
+        rays_z_rot1 = rays_z
+
+        # Rotation 2: X(x)
+        theta = torch.deg2rad(x).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_rot2 = rays_x_rot1
+        rays_y_rot2 = cos_t * rays_y_rot1 - sin_t * rays_z_rot1
+        rays_z_rot2 = sin_t * rays_y_rot1 + cos_t * rays_z_rot1
+
+        # Rotation 3: Z(-z1)
+        theta = torch.deg2rad(-z1).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_final = cos_t * rays_x_rot2 - sin_t * rays_y_rot2
+        rays_y_final = sin_t * rays_x_rot2 + cos_t * rays_y_rot2
+        rays_z_final = rays_z_rot2
+
+        # Stack the final result
+        transformed_rays = torch.stack([rays_x_final, rays_y_final, rays_z_final], dim=2)
+
+        return transformed_rays
+
+    # TODO: Temp logger
+    def setup_logger(self):
+        if self.global_rank == 0:
+            self.temp_logger = SummaryWriter()
+        else:
+            self.temp_logger = None
+    
+    def recon(
+        self,
+        obj: ObjectINN,
+        batch_size: int,
+        num_workers: int = 0,
+        epochs = 20,
+        use_amp = True,
+        viz_freq = 1,
+        checkpoint_freq = 5,
+        optimizer_params: dict = None,
+        scheduler_params: dict = None,
+        soft_constraints: dict = None,
+    ):      
+
+        if not self.ddp_instantiated:
+            self.setup_distributed()
+            self.setup_dataloader(self.dataset, batch_size, num_workers)
+            self.ddp_instantiated = True
+            obj.model = self.build_model(obj._model)
+            self.obj = obj
+        
+        
+        if soft_constraints is not None:
+            self.obj.soft_constraints = soft_constraints
+        
+        if not hasattr(self, "temp_logger"):
+            self.setup_logger()
+
+        zero_tilt_idx = torch.argmin(torch.abs(self.dataset.tilt_angles)).item()
+        
+        if self.global_rank == 0:
+            print(f"Using projection {zero_tilt_idx} (angle={self.dataset.tilt_angles[zero_tilt_idx]:.2f}°) as reference")
+        
+        # Auxiliary params setup
+        self.dataset.setup_auxiliary_params(zero_tilt_idx, self.device)
+        aux_params = self.dataset.auxiliary_params
+        
+        # Scaling learning rates to account for distributed training
+        if optimizer_params is not None:
+            optimizer_params = self.scale_lr(optimizer_params)
+            self.optimizer_params = optimizer_params  
+            self.set_optimizers()
+
+        if scheduler_params is not None:
+            self.scheduler_params = scheduler_params
+            self.set_schedulers(self.scheduler_params, num_iter = epochs)
+        
+        
+        aux_norm = torch.tensor(0.0, device=self.device)
+        model_norm = torch.tensor(0.0, device=self.device)
+        
+        for _, opt in self.optimizers.items():
+            opt.zero_grad()
+        
+        N = max(self.dataset.dims)
+        
+        device_type = self.device.type
+        autocast_dtype = torch.bfloat16 if use_amp else None
+        
+        
+        for epoch in range(epochs):
+            num_samples_per_ray = get_num_samples_per_ray(self.global_epochs)
+            
+            # Log the change if it happens
+            if self.global_epochs >= 0:
+                prev_samples = get_num_samples_per_ray(self.global_epochs)
+                
+                if num_samples_per_ray != prev_samples and self.global_rank == 0:
+                    print(f"Epoch {epoch}: Changing num_samples_per_ray from {prev_samples} to {num_samples_per_ray}")
+                    
+                
+            if self.sampler is not None:
+                self.sampler.set_epoch(epoch)
+
+            epoch_loss = 0.0
+            epoch_mse_loss = 0.0
+            epoch_tv_loss = 0.0
+            epoch_z1_loss = 0.0
+
+            num_batches = 0
+            
+            for batch_idx, batch in enumerate(self.dataloader):
+
+                projection_indices = batch['projection_idx']
+
+                pixel_i = batch['pixel_i'].float().to(self.device, non_blocking=True)
+                pixel_j = batch['pixel_j'].float().to(self.device, non_blocking=True)
+                target_values = batch['target_value'].to(self.device, non_blocking=True)
+                phis = batch['phi'].to(self.device, non_blocking=True)
+                projection_indices = batch['projection_idx'].to(self.device, non_blocking=True)
+
+                shifts, z1_params, z3_params = aux_params(None)
+                batch_shifts = torch.index_select(shifts, 0, projection_indices)
+                batch_z1 = torch.index_select(z1_params, 0, projection_indices)
+                batch_z3 = torch.index_select(z3_params, 0, projection_indices)
+                
+                with torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=use_amp):
+
+                    with torch.no_grad():
+                        batch_ray_coords = self.create_batch_projection_rays(
+                            pixel_i, pixel_j, N, num_samples_per_ray
+                        )
+                    
+                    # TODO: .forward passing z1, x, z3, shifts, N, sampling_rate
+                    transformed_rays = self.transform_batch_ray_coordinates(
+                        batch_ray_coords,
+                        z1=batch_z1,
+                        x=phis,
+                        z3=batch_z3,
+                        shifts=batch_shifts,
+                        N=N,
+                        sampling_rate=1.0,
+                    )
+
+                    all_coords = transformed_rays.view(-1, 3)
+
+                    all_densities = self.obj.forward(all_coords)
+
+                    tv_loss = self.obj.apply_soft_constraints(all_coords)
+                    ray_densities = all_densities.view(len(target_values), num_samples_per_ray) # Reshape rays and integarte
+                    step_size = 2.0 / (num_samples_per_ray - 1)
+
+                    predicted_values = ray_densities.sum(dim=1) * step_size
+
+                    mse_loss = torch.nn.functional.mse_loss(predicted_values, target_values)
+                    tv_loss_z1 = torch.tensor(0.0, device=self.device)
+
+                    loss = mse_loss + tv_loss + tv_loss_z1
+                    
+                loss.backward()
+
+                epoch_loss += loss.detach()
+                epoch_mse_loss += mse_loss.detach()
+                epoch_tv_loss += tv_loss.detach()
+                epoch_z1_loss += tv_loss_z1.detach()
+                num_batches += 1
+                
+
+                for key, opt in self.optimizers.items():
+                    
+                    if key == "model":
+                        model_norm = torch.nn.utils.clip_grad_norm_(self.obj.model.parameters(), max_norm = 1)
+                    elif key == "aux_params":
+                        aux_norm = torch.nn.utils.clip_grad_norm_(self.dataset.auxiliary_params.parameters(), max_norm = 1)
+                    opt.step()
+                    opt.zero_grad()
+                    
+            for key, sched in self.schedulers.items():
+                sched.step()
+
+                    
+            if epoch % viz_freq == 0 or epoch == epochs - 1 or epoch % checkpoint_freq == 0 :
+                with torch.no_grad():
+                    
+                    self.obj.create_volume(world_size = self.world_size, global_rank = self.global_rank, ray_size = num_samples_per_ray)
+                    pred_full = self.obj.obj
+                    avg_loss = epoch_loss.item() / num_batches
+                    avg_mse_loss = epoch_mse_loss.item() / num_batches
+                    avg_tv_loss = epoch_tv_loss.item() / num_batches
+                    avg_z1_loss = epoch_z1_loss.item() / num_batches
+                    
+                    metrics = torch.tensor([avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss], device=self.device)
+                    if self.world_size > 1:
+                        dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
+                    avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss = metrics.tolist()
+
+            if self.global_rank == 0 and (epoch % viz_freq == 0 or epoch == epochs - 1):
+                with torch.no_grad():
+                    current_lr = self.schedulers["model"].get_last_lr()[0]
+
+                    # Log metrics
+                    self.temp_logger.add_scalar("train/mse_loss", avg_mse_loss, self.global_epochs)
+
+                    self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, self.global_epochs)
+                    # if tv_weight > 0:
+                    self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, self.global_epochs)
+                    self.temp_logger.add_scalar("train/total_loss", avg_loss, self.global_epochs)
+                    self.temp_logger.add_scalar("train/model_grad_norm", model_norm.item(), self.global_epochs)
+                    self.temp_logger.add_scalar("train/aux_grad_norm", aux_norm.item(), self.global_epochs)
+                    self.temp_logger.add_scalar("train/lr", current_lr, self.global_epochs)
+                    self.temp_logger.add_scalar("train/num_samples_per_ray", num_samples_per_ray, self.global_epochs)
+
+                    fig, axes = plt.subplots(1, 3, figsize=(36, 12))
+                    axes[0].matshow(pred_full.sum(dim=0).cpu().numpy(), cmap='turbo', vmin=0)
+                    axes[0].set_title('Sum over Z-axis')
+
+                    axes[1].matshow(pred_full[N//2].cpu().numpy(), cmap='turbo', vmin=0)
+                    axes[1].set_title(f'Slice at Z={N//2}')
+
+                    slice_start = max(0, N//2 - 5)
+                    slice_end = min(N, N//2 + 6)
+                    thick_slice = pred_full[slice_start:slice_end].sum(dim=0).cpu().numpy()
+                    axes[2].matshow(thick_slice, cmap='turbo', vmin=0)
+                    axes[2].set_title(f'Thick slice sum (Z={slice_start}:{slice_end-1})')
+
+                    self.temp_logger.add_figure("train/viz", fig, self.global_epochs, close=True)
+                    plt.close(fig)
+            self.global_epochs += 1
+
+        if self.global_rank == 0:
+            print("Training complete.")
+
+        # print("Successfully setup DDP and dataloader")
+        
     def ad_recon(
         self,
         optimizer_params: dict,
