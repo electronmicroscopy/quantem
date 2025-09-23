@@ -774,6 +774,34 @@ class ProbeDIP(ProbeConstraints):
         probe_model._model_input_noise_std = input_noise_std
         return probe_model
 
+    @classmethod
+    def from_pixelated(
+        cls,
+        model: "torch.nn.Module",
+        pixelated: "ProbeModelType",  # ProbePixelated upsets linter when ptycho.probe_model is used
+        input_noise_std: float = 0.025,
+        device: str = "cpu",
+    ) -> "ProbeDIP":
+        if not isinstance(pixelated, ProbePixelated):
+            raise ValueError(f"Pixelated must be an ObjectPixelated, got {type(pixelated)}")
+
+        probe_model = cls(
+            num_probes=pixelated.num_probes,
+            probe_params=pixelated.probe_params,
+            roi_shape=pixelated.roi_shape,
+            device=device,
+            rng=pixelated.rng,
+            _token=cls._token,
+        )
+
+        probe_model.model = model.to(device)
+        probe_model.set_pretrained_weights(model)
+
+        probe_model.model_input = pixelated.probe.clone().detach()
+        probe_model.pretrain_target = probe_model.model_input.clone().detach()
+        probe_model._model_input_noise_std = input_noise_std
+        return probe_model
+
     @property
     def name(self) -> str:
         return "ProbeDIP"

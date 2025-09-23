@@ -24,7 +24,7 @@ class CNN2d(nn.Module):
         start_filters: int = 16,
         num_layers: int = 3,  # num_layers
         num_per_layer: int = 2,  # number conv per layer
-        use_skip_connections: bool = False,
+        use_skip_connections: bool = True,
         dtype: torch.dtype = torch.float32,
         dropout: float = 0,
         activation: str | Callable = "relu",

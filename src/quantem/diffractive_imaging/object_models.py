@@ -17,9 +17,7 @@ from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.utils import RNGMixin
 from quantem.core.utils.validators import (
     validate_arr_gt,
-    validate_array,
     validate_gt,
-    validate_np_len,
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
@@ -167,29 +165,35 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     @slice_thicknesses.setter
     def slice_thicknesses(self, val: float | Sequence | torch.Tensor | None) -> None:
         if val is None:
+            thicknesses = []
+        elif isinstance(val, (float, int)):
+            thicknesses = [val]
+        else:
+            thicknesses = val
+
+        if len(thicknesses) == 0:
             if self.num_slices > 1:
                 raise ValueError(
                     f"num slices = {self.num_slices}, so slice_thicknesses cannot be None"
                 )
-            else:
-                self._slice_thicknesses = torch.tensor([-1])
-        elif isinstance(val, (float, int)):
-            val = validate_gt(float(val), 0, "slice_thicknesses")
-            self._slice_thicknesses = val * torch.ones(self.num_slices - 1)
+            thicknesses = torch.tensor([])
+        elif len(thicknesses) == 1:
+            thk = validate_gt(float(thicknesses[0]), 0, "slice_thicknesses")
+            thicknesses = thk * torch.ones(self.num_slices - 1)
         else:
             if self.num_slices == 1:
                 warn("Single slice reconstruction so not setting slice_thicknesses")
-            arr = validate_array(
-                val,
+            thicknesses = validate_tensor(
+                thicknesses,
                 name="slice_thicknesses",
                 dtype=config.get("dtype_real"),
                 ndim=1,
                 shape=(self.num_slices - 1,),
             )
-            arr = validate_arr_gt(arr, 0, "slice_thicknesses")
-            arr = validate_np_len(arr, self.num_slices - 1, name="slice_thicknesses")
-            dt = getattr(torch, config.get("dtype_real"))
-            self._slice_thicknesses = torch.tensor(arr, dtype=dt, device=self.device)
+            thicknesses = validate_arr_gt(thicknesses, 0, "slice_thicknesses")
+
+        dt = getattr(torch, config.get("dtype_real"))
+        self._slice_thicknesses = thicknesses.type(dt).to(self.device)
 
     @property
     def mask(self) -> torch.Tensor:
@@ -607,6 +611,47 @@ class ObjectDIP(ObjectConstraints):
 
         return obj_model
 
+    @classmethod
+    def from_pixelated(
+        cls,
+        model: "torch.nn.Module",
+        pixelated: "ObjectModelType",  # ObjectPixelated upsets linter when ptycho.obj_model is used
+        input_noise_std: float = 0.025,
+        device: str = "cpu",
+    ) -> "ObjectDIP":
+        if not isinstance(pixelated, ObjectPixelated):
+            raise ValueError(f"Pixelated must be an ObjectPixelated, got {type(pixelated)}")
+
+        obj_model = cls(
+            num_slices=pixelated.num_slices,
+            slice_thicknesses=pixelated.slice_thicknesses,
+            input_noise_std=input_noise_std,
+            device=pixelated.device,
+            obj_type=pixelated.obj_type,
+            rng=pixelated.rng,
+            shape=pixelated.shape,
+            _token=cls._token,
+        )
+
+        obj_model.model = model.to(device)
+        obj_model.set_pretrained_weights(model)
+
+        model_dtype = "complex" if obj_model.obj_type == "complex" else "real"
+        if hasattr(model, "dtype"):  # allow overwriting of dtype based on model
+            if "complex" in str(model.dtype):
+                model_dtype = "complex"
+            else:
+                model_dtype = "real"
+
+        if obj_model.obj_type == "pure_phase" and model_dtype == "real":
+            obj = pixelated.obj.angle().clone().detach()
+        else:
+            obj = pixelated.obj.clone().detach()
+        obj_model.model_input = obj
+        obj_model.pretrain_target = obj
+
+        return obj_model
+
     @property
     def name(self) -> str:
         return "ObjectDIP"
@@ -781,6 +826,7 @@ class ObjectDIP(ObjectConstraints):
         # Call parent's to() method first to handle PyTorch's internal device management
         # This will automatically move the registered module and buffers
         super().to(*args, **kwargs)
+        self.model = self.model.to(*args, **kwargs)
 
         # Update device property
         device = kwargs.get("device", args[0] if args else None)
@@ -820,7 +866,11 @@ class ObjectDIP(ObjectConstraints):
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,
+        device: str | None = None,  # allow overwriting of device
     ):
+        if device is not None:
+            self.to(device)
+
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)
 

@@ -161,7 +161,7 @@ class OptimizerMixin:
                 fac = params.get("factor", 0.01)
                 gamma = fac ** (1.0 / num_iter)
             else:
-                gamma = 0.999
+                gamma = 0.9
             self._scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
         elif sched_type == "linear":
             self._scheduler = torch.optim.lr_scheduler.LinearLR(

@@ -1,5 +1,8 @@
+import contextlib
+import copy
+import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Self, Sequence
+from typing import TYPE_CHECKING, Literal, Self, Sequence, cast
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -39,7 +42,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         device: str | int = "cpu",  # "gpu" | "cpu" | "cuda:X"
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
-    ):
+    ) -> Self:
         return cls(
             dset=dset,
             obj_model=obj_model,
@@ -51,6 +54,28 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             rng=rng,
             _token=cls._token,
         )
+
+    @classmethod
+    def from_ptychography(
+        cls,
+        ptycho: "Ptychography",
+        obj_model: ObjectModelType | None = None,
+        probe_model: ProbeModelType | None = None,
+        logger: LoggerPtychography | None = None,
+    ) -> "Ptychography":
+        _tmp_logger = ptycho.logger
+        ptycho.logger = None
+        cloned = ptycho.clone()
+        ptycho.logger = _tmp_logger
+        if obj_model is not None:
+            cloned.obj_model = obj_model
+        if probe_model is not None:
+            cloned.probe_model = probe_model
+        if logger is not None:
+            cloned.logger = logger
+
+        cloned.reset_recon()
+        return cloned
 
     # region --- explicit properties and setters ---
 
@@ -306,6 +331,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         skip: str | type | Sequence[str | type] = (),
         compression_level: int | None = 4,
         save_raw_data: bool = False,
+        verbose: int | bool = True,
     ):
         """
         Save the ptychography object, optionally excluding raw dataset data.
@@ -382,7 +408,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         current_device = self.device
         self.to("cpu")
 
-        if self.verbose:
+        if self.verbose and verbose:
             print(f"Saving ptychography object to {path}")
 
         super().save(
@@ -506,3 +532,38 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
     def _recursive_load_from_path(cls, path: str | Path):
         """Helper method to load an object from a path using AutoSerialize."""
         return autoserialize_load(path)
+
+    def clone(self, device: str | int = "cpu") -> Self:
+        """
+        Create a deep-copy clone of this Ptychography instance.
+
+        The clone is placed on CPU by default (device="cpu"). You can override
+        the output device by passing a different device string.
+
+        This method first attempts a Python deepcopy for speed. If that fails
+        (e.g., due to non-copyable objects), it falls back to serializing the
+        object to a temporary file and reloading it, which is robust and includes
+        the dataset by default.
+        """
+        try:
+            cloned: Self = copy.deepcopy(self)
+        except Exception:
+            # Robust fallback: save then reload including raw dataset data so that
+            # the in-memory state is fully preserved without relying on external files.
+            tmp_path = (
+                Path(tempfile.gettempdir()) / f"ptycho_clone_{self.rng.integers(int(1e7))}.zip"
+            )
+            try:
+                self.save(tmp_path, mode="o", store="zip", save_raw_data=True, verbose=0)
+                cloned = cast(
+                    Self, Ptychography.from_file(tmp_path, device=None, auto_reload_dataset=False)
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    tmp_path.unlink()
+
+        if self.logger is not None:
+            cloned.logger = self.logger.clone()
+
+        cloned.to(device)
+        return cloned

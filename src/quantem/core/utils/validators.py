@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, TypeAlias, Union, overload
 from warnings import warn
 
 import numpy as np
@@ -17,6 +17,8 @@ else:
         import torch
     if config.get("has_cupy"):
         import cupy as cp
+
+TensorLike: TypeAlias = ArrayLike | "torch.Tensor"
 
 
 # --- Dataset Validation Functions ---
@@ -132,20 +134,20 @@ def validate_ndinfo(
     return arr
 
 
-def validate_units(value: Union[List[str], tuple, list, str], ndim: int) -> List[str]:
+def validate_units(value: Union[list[str], tuple, list, str], ndim: int) -> list[str]:
     """
     Validate and convert units to a list of strings of correct length.
 
     Parameters
     ----------
-    value : Union[List[str], tuple, list, str]
+    value : Union[list[str], tuple, list, str]
         The units to validate and convert
     ndim : int
         The expected number of dimensions
 
     Returns
     -------
-    List[str]
+    list[str]
         A list of strings representing the units
 
     Raises
@@ -177,18 +179,18 @@ def validate_pathlike(value: os.PathLike | str | None) -> Path | None:
 
 
 # --- Vector Validation Functions ---
-def validate_shape(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+def validate_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     """
     Validate and convert shape to a tuple of integers.
 
     Parameters
     ----------
-    shape : Tuple[int, ...]
+    shape : tuple[int, ...]
         The shape to validate
 
     Returns
     -------
-    Tuple[int, ...]
+    tuple[int, ...]
         The validated shape
 
     Raises
@@ -212,7 +214,7 @@ def validate_shape(shape: Tuple[int, ...]) -> Tuple[int, ...]:
     return tuple(validated)
 
 
-def validate_fields(fields: List[str]) -> List[str]:
+def validate_fields(fields: list[str]) -> list[str]:
     if not isinstance(fields, (list, tuple)):
         raise TypeError(f"fields must be a list or tuple, got {type(fields)}")
     if len(set(fields)) != len(fields):
@@ -220,7 +222,7 @@ def validate_fields(fields: List[str]) -> List[str]:
     return [str(field) for field in fields]
 
 
-def validate_num_fields(num_fields: int, fields: Optional[List[str]] = None) -> int:
+def validate_num_fields(num_fields: int, fields: Optional[list[str]] = None) -> int:
     """
     Validate number of fields.
 
@@ -228,8 +230,8 @@ def validate_num_fields(num_fields: int, fields: Optional[List[str]] = None) -> 
     ----------
     num_fields : int
         The number of fields
-    fields : Optional[List[str]]
-        List of field names
+    fields : Optional[list[str]]
+        list of field names
 
     Returns
     -------
@@ -252,7 +254,7 @@ def validate_num_fields(num_fields: int, fields: Optional[List[str]] = None) -> 
     return num_fields
 
 
-def validate_vector_units(units: Optional[List[str]], num_fields: int) -> List[str]:
+def validate_vector_units(units: Optional[list[str]], num_fields: int) -> list[str]:
     if units is None:
         return ["none"] * num_fields
     if not isinstance(units, (list, tuple)):
@@ -262,7 +264,7 @@ def validate_vector_units(units: Optional[List[str]], num_fields: int) -> List[s
     return [str(unit) for unit in units]
 
 
-def validate_vector_data_for_inference(data: List[Any]) -> Tuple[Tuple[int, ...], int]:
+def validate_vector_data_for_inference(data: list[Any]) -> tuple[tuple[int, ...], int]:
     if not isinstance(data, list):
         raise TypeError("Data must be a list.")
     if len(data) == 0:
@@ -286,22 +288,22 @@ def validate_vector_data_for_inference(data: List[Any]) -> Tuple[Tuple[int, ...]
     return shape, inferred_num_fields
 
 
-def validate_vector_data(data: List[Any], shape: Tuple[int, ...], num_fields: int) -> List[Any]:
+def validate_vector_data(data: list[Any], shape: tuple[int, ...], num_fields: int) -> list[Any]:
     """
     Validate that the data structure matches the expected shape and number of fields.
 
     Parameters
     ----------
-    data : List[Any]
+    data : list[Any]
         The nested list structure containing the vector's data
-    shape : Tuple[int, ...]
+    shape : tuple[int, ...]
         The expected shape of the vector
     num_fields : int
         The expected number of fields
 
     Returns
     -------
-    List[Any]
+    list[Any]
         The validated data structure
 
     Raises
@@ -507,8 +509,18 @@ def validate_np_len(value: ArrayLike, length: int, name: str = "") -> np.ndarray
     return value
 
 
-def validate_arr_gt(value: "np.ndarray", cutoff: float | int, name: str) -> "np.ndarray":
-    if np.any(value <= cutoff):
+@overload
+def validate_arr_gt(value: np.ndarray, cutoff: float | int, name: str) -> np.ndarray: ...
+@overload
+def validate_arr_gt(value: "torch.Tensor", cutoff: float | int, name: str) -> "torch.Tensor": ...
+def validate_arr_gt(value: TensorLike, cutoff: float | int, name: str) -> TensorLike:
+    fail = False
+    if config.get("has_torch"):
+        if isinstance(value, torch.Tensor):
+            fail = torch.any(value <= cutoff)
+    if isinstance(value, np.ndarray):
+        fail = np.any(value <= cutoff)
+    if fail:
         raise ValueError(f"All elements of {name} must be greater than {cutoff}")
     return value
 

@@ -33,7 +33,7 @@ class PtychographyVisualizations(PtychographyBase):
         # else:
         #     raise ValueError(f"Unknown norm type: {norm}")
 
-        ph_cmap = config.get("viz.phase_cmap")
+        ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
         if obj.shape[0] > 1:
             t = "Summed "
         else:

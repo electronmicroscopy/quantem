@@ -1,6 +1,11 @@
+import contextlib
+import copy
 import datetime
 import os
+import shutil
+import tempfile
 from pathlib import Path
+from typing import Self, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,7 +14,7 @@ from numpy.typing import NDArray
 from torch._tensor import Tensor
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from quantem.core.io.serialize import AutoSerialize
+from quantem.core.io.serialize import AutoSerialize, load
 
 """
 Tensorboard logger class for AD/ML reconstruction methods
@@ -57,7 +62,43 @@ class LoggerBase(AutoSerialize):
         self.writer.flush()
 
     def close(self) -> None:
+        self.writer.flush()
         self.writer.close()
+
+    def new_timestamp(self) -> None:
+        self.close()
+        self._timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = self.run_prefix + "_" + self._timestamp
+        if self.run_suffix:
+            name += f"_{self.run_suffix}"
+        new_log_dir = self.log_dir.parent / name
+        new_log_dir.mkdir(exist_ok=True)
+        self._log_dir = new_log_dir
+        self.writer = SummaryWriter(str(self.log_dir))
+
+    def clone(self) -> Self:
+        try:
+            cloned: Self = copy.deepcopy(self)
+        except Exception:
+            # using tempfile saving as fallback
+            tmp_path = Path(tempfile.gettempdir()) / f"logger_clone_{self.run_prefix}.zip"
+            try:
+                self.save(
+                    tmp_path,
+                    mode="o",
+                    store="zip",
+                )
+                cloned = cast(Self, load(tmp_path))
+            finally:
+                with contextlib.suppress(Exception):
+                    tmp_path.unlink()
+        cloned.new_timestamp()
+
+        # copy old log file to new log dir
+        files = list(self.log_dir.glob("events.out.tfevents.*"))
+        for file in files:
+            shutil.copy(file, cloned.log_dir)
+        return cloned
 
     # --- Properties ---
 
