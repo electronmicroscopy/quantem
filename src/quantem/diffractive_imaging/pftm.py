@@ -163,7 +163,6 @@ class PFTM(Ptychography):
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
-        print("hi pftm")
 
         if new_optimizers or reset or self.num_epochs == 0:
             opt_params = {
