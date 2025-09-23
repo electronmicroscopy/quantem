@@ -58,11 +58,11 @@ class TomographyDDP:
     ):
         
         # TODO: Generalized model --> Should be instantiated in the object? Where does `HSIREN` get instantiated?
-        self.model = model.to(self.device)
+        model = model.to(self.device)
         
         if self.world_size > 1:
-            self.model = torch.nn.parallel.DistributedDataParallel(
-                self.model,
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
                 device_ids = [self.local_rank],
                 output_device = self.local_rank,
                 find_unused_parameters = False,
@@ -81,6 +81,8 @@ class TomographyDDP:
                 
         else:
             print("Model built, compiled successfully")
+            
+        return model
 
     
     def setup_dataloader(

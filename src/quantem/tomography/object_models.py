@@ -11,6 +11,8 @@ from quantem.core.ml.blocks import reset_weights
 from quantem.core.utils.validators import validate_gt, validate_tensor
 from quantem.tomography.utils import get_TV_loss
 
+import torch.nn as nn
+
 
 class ObjectBase(AutoSerialize):
     """
@@ -78,7 +80,7 @@ class ObjectBase(AutoSerialize):
         pass
 
     @abstractmethod
-    def to(self, device: str):z
+    def to(self, device: str):
         pass
 
     @abstractmethod
@@ -545,14 +547,88 @@ class ObjectINN(ObjectConstraints):
     
     def __init__(
         self,
-        model: torch.nn.Module,
+        model: nn.Module,
+        volume_shape = tuple[int, int, int],
+        device: str = "cuda",
     ):
-        pass
+        
+        super().__init__(
+            volume_shape = volume_shape,
+            device = device,
+            offset_obj = 0,
+        )
+        
+        self._model = model
+        
+
+    # --- Properties ---
+    @property
+    def obj(self):
+        
+        raise NotImplementedError
+    
+    @property
+    def model(self):
+        
+        return self._model
+    
+    @model.setter
+    def model(self, model):
+        
+        self._model = model
+    
+    def apply_soft_constraints(
+        self,
+        coords: torch.Tensor,
+        tv_weight: float = 0.0,
+    ):
+        if tv_weight > 0:
+            
+            num_tv_samples = min(10000, coords.shape[0])
+            tv_indices = torch.randperm(coords.shape[0], device = coords.device)[:num_tv_samples]
+            
+            # Rerun forward for gradient tracking
+            tv_coords = coords[tv_indices].detach().requires_grad_(True)
+            
+            tv_densities_recomputed = self.model(tv_coords)
+            if tv_densities_recomputed.dim() > 1:
+                tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+                
+            # Compute gradients
+            grad_outputs = torch.autograd.grad(
+                outputs=tv_densities_recomputed,
+                inputs=tv_coords,
+                grad_outputs=torch.ones_like(tv_densities_recomputed),
+                create_graph=True
+            )[0]
+            
+            grad_norm = torch.norm(grad_outputs, dim = 1)
+            tv_loss = tv_weight * grad_norm.mean()
+        else:
+            tv_loss = torch.tensor(0.0, device = self.device)
+        
+        return tv_loss
     
     def forward(
         self,
-        rays,
-        
+        all_coords: torch.Tensor,     
     ):
+        
+        all_densities = self.model(all_coords)
+        
+        if all_densities.dim() > 1:
+            all_densities = all_densities.squeeze(-1)
+            
+        valid_mask = (
+            (all_coords[:, 0] >= -1) & (all_coords[:, 0] <= 1) &
+            (all_coords[:, 1] >= -1) & (all_coords[:, 1] <= 1) &
+            (all_coords[:, 2] >= -1) & (all_coords[:, 2] <= 1)
+        ).float()
+        
+        all_densities = all_densities * valid_mask
+        
+        return all_densities
+        
+        
 
 ObjectModelType = ObjectVoxelwise | ObjectINN # | ObjectDIP | ObjectImplicit (ObjectFFN?)

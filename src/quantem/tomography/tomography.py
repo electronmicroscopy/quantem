@@ -12,6 +12,7 @@ from quantem.tomography.utils import differentiable_shift_2d, gaussian_kernel_1d
 
 # Temporary imports for TomographyNERF
 from quantem.tomography.models import HSiren
+from quantem.tomography.object_models import ObjectINN
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import matplotlib.pyplot as plt
@@ -193,7 +194,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         return transformed_rays
     
     # --- Creating Volume ---
-    def create_volume(self):
+    def create_volume(self, model):
         
         N = max(self.dataset.dims)
         
@@ -202,7 +203,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
             x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing='ij')
             inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
             
-            model = self.model.module if hasattr(self.model, 'module') else self.model
+            model = model.module if hasattr(model, 'module') else model
             
             samples_per_gpu = N**3 // self.world_size
             start_idx = self.global_rank * samples_per_gpu
@@ -237,7 +238,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
     
     def recon(
         self,
-        model: HSiren,
+        obj: ObjectINN,
         batch_size: int,
         num_workers: int = 0,
         epochs = 20,
@@ -247,13 +248,14 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         checkpoint_freq = 5,
         optimizer_params: dict = None,
         scheduler_params: dict = None,
-    ):
-        
+    ):      
 
         self.setup_distributed()
         self.setup_dataloader(self.dataset, batch_size, num_workers)
-        self.build_model(model)
         
+        obj.model = self.build_model(obj._model)
+        
+        self.obj = obj
         
         if not hasattr(self, "temp_logger"):
             self.setup_logger()
@@ -346,20 +348,26 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     all_coords = transformed_rays.view(-1, 3)
                     # TODO: torch.nn.functional.softplus here
                     # all_densities = torch.nn.functional.softplus(self.model(all_coords))
-                    all_densities = self.model(all_coords)
-
-                    if all_densities.dim() > 1:
-                        all_densities = all_densities.squeeze(-1)  # [N, 1] → [N]
-
-                    # Create mask for valid coordinates (within [-1, 1]^3)
-                    valid_mask = (
-                        (all_coords[:, 0] >= -1) & (all_coords[:, 0] <= 1) &
-                        (all_coords[:, 1] >= -1) & (all_coords[:, 1] <= 1) &
-                        (all_coords[:, 2] >= -1) & (all_coords[:, 2] <= 1)
-                    ).float()
                     
-                    all_densities = all_densities * valid_mask
+                    # TODO: I don't think this work, object needs to be distributed to all devices?
+                    all_densities = self.obj.forward(all_coords)
+                    # all_densities = self.model(all_coords)
+
+                    # if all_densities.dim() > 1:
+                    #     all_densities = all_densities.squeeze(-1)  # [N, 1] → [N]
+
+                    # # Create mask for valid coordinates (within [-1, 1]^3)
+                    # valid_mask = (
+                    #     (all_coords[:, 0] >= -1) & (all_coords[:, 0] <= 1) &
+                    #     (all_coords[:, 1] >= -1) & (all_coords[:, 1] <= 1) &
+                    #     (all_coords[:, 2] >= -1) & (all_coords[:, 2] <= 1)
+                    # ).float()
                     
+                    # all_densities = all_densities * valid_mask
+                    # tv_loss = obj.apply_soft_constraints(
+                    #     coords = all_coords,
+                    #     tv_weight = 1e-5,
+                    # )
                     if tv_weight > 0:
                         num_tv_samples = min(10000, all_coords.shape[0])
                         tv_indices = torch.randperm(all_coords.shape[0], device=all_coords.device)[:num_tv_samples]
@@ -393,7 +401,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
                     mse_loss = torch.nn.functional.mse_loss(predicted_values, target_values)
                     tv_loss_z1 = torch.tensor(0.0, device=self.device)
-                    
+
                     loss = mse_loss + tv_loss + tv_loss_z1
                     
                 loss.backward()
@@ -407,7 +415,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                 for key, opt in self.optimizers.items():
                     
                     if key == "model":
-                        model_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm = 1)
+                        model_norm = torch.nn.utils.clip_grad_norm_(self.obj.model.parameters(), max_norm = 1)
                     elif key == "aux_params":
                         aux_norm = torch.nn.utils.clip_grad_norm_(self.dataset.auxiliary_params.parameters(), max_norm = 1)
                     opt.step()
@@ -419,7 +427,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     
             if epoch % viz_freq == 0 or epoch == epochs - 1 or epoch % checkpoint_freq == 0 :
                 with torch.no_grad():
-                    pred_full = self.create_volume().cpu()
+                    pred_full = self.create_volume(self.obj.model).cpu()
                     avg_loss = epoch_loss.item() / num_batches
                     avg_mse_loss = epoch_mse_loss.item() / num_batches
                     avg_tv_loss = epoch_tv_loss.item() / num_batches

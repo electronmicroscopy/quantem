@@ -86,7 +86,7 @@ class TomographyML(TomographyBase):
                 if self._optimizer_params[key]["original_lr"] is not None:
                     optimizer_params = self._optimizer_params[key].copy()
                     optimizer_params.pop("original_lr", None)
-                self._add_optimizer(key, self.model.parameters(), optimizer_params)
+                self._add_optimizer(key, self.obj.model.parameters(), optimizer_params)
             elif key == "aux_params":
                 
                 if self._optimizer_params[key]["original_lr"] is not None:
