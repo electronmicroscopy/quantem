@@ -124,15 +124,6 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
     
     # TODO: ML Recon which has NeRF and AD depending on the object type.
     # TODO: Temporary 
-
-    
-    def create_optimizer(self, params, lr, fused = True):
-
-        return torch.optim.Adam(
-            params,
-            lr = lr,
-            fused = fused,
-        )
     
     def create_batch_projection_rays(self, pixel_i, pixel_j, N, num_samples_per_ray):
         """Create projection rays for entire batch simultaneously."""
@@ -197,43 +188,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         transformed_rays = torch.stack([rays_x_final, rays_y_final, rays_z_final], dim=2)
 
         return transformed_rays
-    
-    # --- Creating Volume ---
-    def create_volume(self, model):
-        
-        N = max(self.dataset.dims)
-        
-        with torch.no_grad():
-            coords_1d = torch.linspace(-1, 1, N)
-            x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing='ij')
-            inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-            
-            model = model.module if hasattr(model, 'module') else model
-            
-            samples_per_gpu = N**3 // self.world_size
-            start_idx = self.global_rank * samples_per_gpu
-            end_idx = start_idx + samples_per_gpu
-            
-            inputs_subset = inputs[start_idx:end_idx].to(self.device)
-            
-            # TODO: torch.nn.functional.softplus here
-            # outputs = torch.nn.functional.softplus(model(inputs_subset))
-            outputs = model(inputs_subset)
-            
-            if outputs.dim() > 1:
-                outputs = outputs.squeeze(-1)
-                
-            if self.world_size > 1:
-                gathered_outputs = [torch.empty_like(outputs) for _ in range(self.world_size)]
-                dist.all_gather(gathered_outputs, outputs.contiguous())
-                
-                pred_full = torch.cat(gathered_outputs, dim=0).reshape(N, N, N).float()
-            else:
-                pred_full = outputs.reshape(N, N, N).float()
-                
-            return pred_full
-    
-    
+
     # TODO: Temp logger
     def setup_logger(self):
         if self.global_rank == 0:
@@ -248,20 +203,24 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         num_workers: int = 0,
         epochs = 20,
         use_amp = True,
-        tv_weight = 0.0,
         viz_freq = 1,
         checkpoint_freq = 5,
         optimizer_params: dict = None,
         scheduler_params: dict = None,
+        soft_constraints: dict = None,
     ):      
 
         if not self.ddp_instantiated:
             self.setup_distributed()
             self.setup_dataloader(self.dataset, batch_size, num_workers)
+            self.ddp_instantiated = True
         
         if not hasattr(self, "obj"):
             obj.model = self.build_model(obj._model)
             self.obj = obj
+        
+        if soft_constraints is not None:
+            self.obj.soft_constraints = soft_constraints
         
         if not hasattr(self, "temp_logger"):
             self.setup_logger()
@@ -356,7 +315,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
                     all_densities = self.obj.forward(all_coords)
 
-                    tv_loss = self.obj.apply_soft_constraints(all_coords, tv_weight = 1e-5)
+                    tv_loss = self.obj.apply_soft_constraints(all_coords)
                     ray_densities = all_densities.view(len(target_values), num_samples_per_ray) # Reshape rays and integarte
                     step_size = 2.0 / (num_samples_per_ray - 1)
 
@@ -391,7 +350,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     
             if epoch % viz_freq == 0 or epoch == epochs - 1 or epoch % checkpoint_freq == 0 :
                 with torch.no_grad():
-                    pred_full = self.create_volume(self.obj.model).cpu()
+                    
+                    self.obj.create_volume(world_size = self.world_size, global_rank = self.global_rank, ray_size = num_samples_per_ray)
+                    pred_full = self.obj.obj
                     avg_loss = epoch_loss.item() / num_batches
                     avg_mse_loss = epoch_mse_loss.item() / num_batches
                     avg_tv_loss = epoch_tv_loss.item() / num_batches
