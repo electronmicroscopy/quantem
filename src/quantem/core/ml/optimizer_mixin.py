@@ -87,6 +87,13 @@ class OptimizerMixin:
             self._optimizer = None
             return
 
+        opt_params = self._optimizer_params.copy()
+        opt_type = opt_params.pop("type", self.DEFAULT_OPTIMIZER_TYPE)
+
+        if opt_type == "none":
+            self.remove_optimizer()
+            return
+
         params = self.get_optimization_parameters()
         if isinstance(params, torch.Tensor):
             params = [params]
@@ -97,9 +104,6 @@ class OptimizerMixin:
         for p in params:
             p.requires_grad_(True)
 
-        opt_params = self._optimizer_params.copy()
-        opt_type = opt_params.pop("type", self.DEFAULT_OPTIMIZER_TYPE)
-
         if isinstance(opt_type, type):
             self._optimizer = opt_type(params, **opt_params)
         elif isinstance(opt_type, str):
@@ -109,8 +113,6 @@ class OptimizerMixin:
                 self._optimizer = torch.optim.AdamW(params, **opt_params)
             elif opt_type.lower() == "sgd":
                 self._optimizer = torch.optim.SGD(params, **opt_params)
-            elif opt_type.lower() == "none":
-                self.remove_optimizer()
             else:
                 raise NotImplementedError(f"Unknown optimizer type: {opt_type}")
         else:
