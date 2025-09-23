@@ -51,6 +51,11 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         _token,
     ):
         super().__init__(dataset, volume_obj, device, _token)
+        
+        # TODO: More elegant way of doing this.
+        self.global_epochs = 0
+        self.ddp_instantiated = False
+        
     # --- Reconstruction Method ---
 
     def sirt_recon(
@@ -250,12 +255,13 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         scheduler_params: dict = None,
     ):      
 
-        self.setup_distributed()
-        self.setup_dataloader(self.dataset, batch_size, num_workers)
+        if not self.ddp_instantiated:
+            self.setup_distributed()
+            self.setup_dataloader(self.dataset, batch_size, num_workers)
         
-        obj.model = self.build_model(obj._model)
-        
-        self.obj = obj
+        if not hasattr(self, "obj"):
+            obj.model = self.build_model(obj._model)
+            self.obj = obj
         
         if not hasattr(self, "temp_logger"):
             self.setup_logger()
@@ -294,15 +300,16 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         
         
         for epoch in range(epochs):
-            num_samples_per_ray = get_num_samples_per_ray(epoch)
+            num_samples_per_ray = get_num_samples_per_ray(self.global_epochs)
             
             # Log the change if it happens
-            if epoch > 0:
-                prev_samples = get_num_samples_per_ray(epoch - 1)
+            if self.global_epochs >= 0:
+                prev_samples = get_num_samples_per_ray(self.global_epochs)
                 
                 if num_samples_per_ray != prev_samples and self.global_rank == 0:
                     print(f"Epoch {epoch}: Changing num_samples_per_ray from {prev_samples} to {num_samples_per_ray}")
-
+                    
+                
             if self.sampler is not None:
                 self.sampler.set_epoch(epoch)
 
@@ -346,54 +353,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     )
 
                     all_coords = transformed_rays.view(-1, 3)
-                    # TODO: torch.nn.functional.softplus here
-                    # all_densities = torch.nn.functional.softplus(self.model(all_coords))
-                    
-                    # TODO: I don't think this work, object needs to be distributed to all devices?
+
                     all_densities = self.obj.forward(all_coords)
-                    # all_densities = self.model(all_coords)
 
-                    # if all_densities.dim() > 1:
-                    #     all_densities = all_densities.squeeze(-1)  # [N, 1] → [N]
-
-                    # # Create mask for valid coordinates (within [-1, 1]^3)
-                    # valid_mask = (
-                    #     (all_coords[:, 0] >= -1) & (all_coords[:, 0] <= 1) &
-                    #     (all_coords[:, 1] >= -1) & (all_coords[:, 1] <= 1) &
-                    #     (all_coords[:, 2] >= -1) & (all_coords[:, 2] <= 1)
-                    # ).float()
-                    
-                    # all_densities = all_densities * valid_mask
-                    # tv_loss = obj.apply_soft_constraints(
-                    #     coords = all_coords,
-                    #     tv_weight = 1e-5,
-                    # )
-                    # if tv_weight > 0:
-                    #     num_tv_samples = min(10000, all_coords.shape[0])
-                    #     tv_indices = torch.randperm(all_coords.shape[0], device=all_coords.device)[:num_tv_samples]
-
-                    #     # Rerun forward for gradient tracking
-                    #     tv_coords = all_coords[tv_indices].detach().requires_grad_(True)
-                        
-                    #     # TODO: torch.nn.functional.softplus here
-                    #     # tv_densities_recomputed = torch.nn.functional.softplus(self.model(tv_coords)) # Get rid of this
-                    #     tv_densities_recomputed = self.model(tv_coords)
-                    #     if tv_densities_recomputed.dim() > 1:
-                    #         tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
-
-                    #     # Compute gradients
-                    #     grad_outputs = torch.autograd.grad(
-                    #         outputs=tv_densities_recomputed,
-                    #         inputs=tv_coords,
-                    #         grad_outputs=torch.ones_like(tv_densities_recomputed),
-                    #         create_graph=True
-                    #     )[0]
-                        
-                    #     grad_norm = torch.norm(grad_outputs, dim=1)
-                    #     tv_loss = tv_weight * grad_norm.mean()
-                    # else:
-                    #     tv_loss = torch.tensor(0.0, device=self.device)
-                
                     tv_loss = self.obj.apply_soft_constraints(all_coords, tv_weight = 1e-5)
                     ray_densities = all_densities.view(len(target_values), num_samples_per_ray) # Reshape rays and integarte
                     step_size = 2.0 / (num_samples_per_ray - 1)
@@ -412,6 +374,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                 epoch_tv_loss += tv_loss.detach()
                 epoch_z1_loss += tv_loss_z1.detach()
                 num_batches += 1
+                
 
                 for key, opt in self.optimizers.items():
                     
@@ -421,7 +384,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                         aux_norm = torch.nn.utils.clip_grad_norm_(self.dataset.auxiliary_params.parameters(), max_norm = 1)
                     opt.step()
                     opt.zero_grad()
-                
+                    
             for key, sched in self.schedulers.items():
                 sched.step()
 
@@ -444,16 +407,16 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     current_lr = self.schedulers["model"].get_last_lr()[0]
 
                     # Log metrics
-                    self.temp_logger.add_scalar("train/mse_loss", avg_mse_loss, epoch)
+                    self.temp_logger.add_scalar("train/mse_loss", avg_mse_loss, self.global_epochs)
 
-                    self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, epoch)
+                    self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, self.global_epochs)
                     # if tv_weight > 0:
-                    self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, epoch)
-                    self.temp_logger.add_scalar("train/total_loss", avg_loss, epoch)
-                    self.temp_logger.add_scalar("train/model_grad_norm", model_norm.item(), epoch)
-                    self.temp_logger.add_scalar("train/aux_grad_norm", aux_norm.item(), epoch)
-                    self.temp_logger.add_scalar("train/lr", current_lr, epoch)
-                    self.temp_logger.add_scalar("train/num_samples_per_ray", num_samples_per_ray, epoch)
+                    self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, self.global_epochs)
+                    self.temp_logger.add_scalar("train/total_loss", avg_loss, self.global_epochs)
+                    self.temp_logger.add_scalar("train/model_grad_norm", model_norm.item(), self.global_epochs)
+                    self.temp_logger.add_scalar("train/aux_grad_norm", aux_norm.item(), self.global_epochs)
+                    self.temp_logger.add_scalar("train/lr", current_lr, self.global_epochs)
+                    self.temp_logger.add_scalar("train/num_samples_per_ray", num_samples_per_ray, self.global_epochs)
 
                     fig, axes = plt.subplots(1, 3, figsize=(36, 12))
                     axes[0].matshow(pred_full.sum(dim=0).cpu().numpy(), cmap='turbo', vmin=0)
@@ -468,9 +431,10 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     axes[2].matshow(thick_slice, cmap='turbo', vmin=0)
                     axes[2].set_title(f'Thick slice sum (Z={slice_start}:{slice_end-1})')
 
-                    self.temp_logger.add_figure("train/viz", fig, epoch, close=True)
+                    self.temp_logger.add_figure("train/viz", fig, self.global_epochs, close=True)
                     plt.close(fig)
-                    
+            self.global_epochs += 1
+
         if self.global_rank == 0:
             print("Training complete.")
 
