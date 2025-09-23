@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import torch.distributed as dist
 
 # Temporary aux class for TomographyNERF
+# TODO: Maybe put this in INN?
 def get_num_samples_per_ray(epoch):
     """Increase number of samples per ray at specific epochs."""
     schedule = {
@@ -132,7 +133,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         # Convert all pixels to normalized coordinates
         x_coords = (pixel_j / (N - 1)) * 2 - 1
         y_coords = (pixel_i / (N - 1)) * 2 - 1
-
+        # TODO: maybe pixel_j.device?
         # Create z coordinates
         z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=self.device)
 
@@ -214,10 +215,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
             self.setup_distributed()
             self.setup_dataloader(self.dataset, batch_size, num_workers)
             self.ddp_instantiated = True
-        
-        if not hasattr(self, "obj"):
             obj.model = self.build_model(obj._model)
             self.obj = obj
+        
         
         if soft_constraints is not None:
             self.obj.soft_constraints = soft_constraints
@@ -247,7 +247,6 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         
         aux_norm = torch.tensor(0.0, device=self.device)
         model_norm = torch.tensor(0.0, device=self.device)
-        
         
         for _, opt in self.optimizers.items():
             opt.zero_grad()
@@ -300,7 +299,8 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                         batch_ray_coords = self.create_batch_projection_rays(
                             pixel_i, pixel_j, N, num_samples_per_ray
                         )
-
+                    
+                    # TODO: .forward passing z1, x, z3, shifts, N, sampling_rate
                     transformed_rays = self.transform_batch_ray_coordinates(
                         batch_ray_coords,
                         z1=batch_z1,
