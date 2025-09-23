@@ -34,47 +34,7 @@ def get_num_samples_per_ray(epoch):
 
     return num_samples
 
-class AuxiliaryParams(torch.nn.Module):
-    def __init__(self, num_tilts, device, zero_tilt_idx=None):
-        super().__init__()
 
-        if zero_tilt_idx is None:
-            # If not provided, assume first projection is reference
-            zero_tilt_idx = 0
-
-        self.zero_tilt_idx = zero_tilt_idx
-        self.num_tilts = num_tilts
-
-        # Shifts: only parameterize non-reference tilts
-        num_param_tilts = num_tilts - 1
-        self.shifts_param = torch.nn.Parameter(torch.zeros(num_param_tilts, 2, device=device))
-
-        # Fixed zero shifts for reference
-        self.shifts_ref = torch.zeros(1, 2, device=device)
-
-        # Z1 and Z3: parameterize all tilts EXCEPT the reference
-        self.z1_param = torch.nn.Parameter(torch.zeros(num_param_tilts, device=device))
-        # self.z3_param = torch.nn.Parameter(torch.zeros(num_param_tilts, device=device))
-
-        # Fixed zeros for reference tilt
-        self.z1_ref = torch.zeros(1, device=device)
-        # self.z3_ref = torch.zeros(1, device=device)
-
-    def forward(self, dummy_input=None):
-        # Reconstruct full arrays with zeros at reference position
-        before_shifts = self.shifts_param[:self.zero_tilt_idx]
-        after_shifts = self.shifts_param[self.zero_tilt_idx:]
-        shifts = torch.cat([before_shifts, self.shifts_ref, after_shifts], dim=0)
-
-        before_z1 = self.z1_param[:self.zero_tilt_idx]
-        after_z1 = self.z1_param[self.zero_tilt_idx:]
-        z1 = torch.cat([before_z1, self.z1_ref, after_z1], dim=0)
-
-        # before_z3 = self.z3_param[:self.zero_tilt_idx]
-        # after_z3 = self.z3_param[self.zero_tilt_idx:]
-        # z3 = torch.cat([before_z3, self.z3_ref, after_z3], dim=0)
-
-        return shifts, z1, -z1
 
 class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
     """
@@ -90,7 +50,6 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         _token,
     ):
         super().__init__(dataset, volume_obj, device, _token)
-
     # --- Reconstruction Method ---
 
     def sirt_recon(
@@ -159,13 +118,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
     
     # TODO: ML Recon which has NeRF and AD depending on the object type.
     # TODO: Temporary 
-    def get_scaled_lr(self, base_lr, scaling_rule="sqrt"):
-        if scaling_rule == "sqrt":
-            return base_lr * np.sqrt(self.world_size)
-        elif scaling_rule == "linear":
-            return base_lr * self.world_size
-        else:
-            raise ValueError(f"Invalid scaling rule: {scaling_rule}")
+
     
     def create_optimizer(self, params, lr, fused = True):
 
@@ -274,90 +227,63 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                 
             return pred_full
     
+    
+    # TODO: Temp logger
+    def setup_logger(self):
+        if self.global_rank == 0:
+            self.temp_logger = SummaryWriter()
+        else:
+            self.temp_logger = None
+    
     def recon(
         self,
         model: HSiren,
         batch_size: int,
         num_workers: int = 0,
-        train_lr = 1e-5,
-        aux_lr = 1e-5,
         epochs = 20,
-        warmup_epochs = 10,
         use_amp = True,
         tv_weight = 0.0,
         viz_freq = 1,
         checkpoint_freq = 5,
+        optimizer_params: dict = None,
+        scheduler_params: dict = None,
     ):
         
 
-        
         self.setup_distributed()
         self.setup_dataloader(self.dataset, batch_size, num_workers)
         self.build_model(model)
-        # TODO: Temp-logger
-        if self.global_rank == 0:
-            logger = SummaryWriter()
-        else:
-            logger = None
+        
+        
+        if not hasattr(self, "temp_logger"):
+            self.setup_logger()
+
         zero_tilt_idx = torch.argmin(torch.abs(self.dataset.tilt_angles)).item()
         
         if self.global_rank == 0:
             print(f"Using projection {zero_tilt_idx} (angle={self.dataset.tilt_angles[zero_tilt_idx]:.2f}°) as reference")
-            
-        aux_params = AuxiliaryParams(
-            num_tilts = len(self.dataset.tilt_angles),
-            device = self.device,
-            zero_tilt_idx = zero_tilt_idx,
-        )
         
-        scaled_train_lr = self.get_scaled_lr(train_lr, scaling_rule="sqrt")
-        scaled_aux_lr = self.get_scaled_lr(aux_lr, scaling_rule="sqrt")
+        # Auxiliary params setup
+        self.dataset.setup_auxiliary_params(zero_tilt_idx, self.device)
+        aux_params = self.dataset.auxiliary_params
         
-        optimizer = self.create_optimizer(
-            self.model.parameters(),
-            scaled_train_lr,
-            fused = True,
-        )
+        # Scaling learning rates to account for distributed training
+        if optimizer_params is not None:
+            optimizer_params = self.scale_lr(optimizer_params)
+            self.optimizer_params = optimizer_params  
+            self.set_optimizers()
+
+        if scheduler_params is not None:
+            self.scheduler_params = scheduler_params
+            self.set_schedulers(self.scheduler_params, num_iter = epochs)
         
-        aux_optimizer = self.create_optimizer(
-            aux_params.parameters(),
-            scaled_aux_lr,
-            fused = True,
-        )
         
         aux_norm = torch.tensor(0.0, device=self.device)
         model_norm = torch.tensor(0.0, device=self.device)
         
-        optimizer.zero_grad()
-        aux_optimizer.zero_grad()
         
-        
-        warmup_scheduler_model = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor = 0.001,
-            total_iters = warmup_epochs,
-        )
-        
-        
-        cosine_scheduler_model = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max = epochs - warmup_epochs,
-            eta_min = scaled_train_lr / 100,
-        )
-        
-        
-        scheduler_model = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers = [warmup_scheduler_model, cosine_scheduler_model],
-            milestones = [warmup_epochs],
-        )
-        
-        
-        scheduler_aux = torch.optim.lr_scheduler.CosineAnnealingLR(
-            aux_optimizer,
-            T_max = epochs,
-            eta_min = scaled_aux_lr / 100,
-        )
+        for _, opt in self.optimizers.items():
+            opt.zero_grad()
         
         N = max(self.dataset.dims)
         
@@ -477,28 +403,20 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                 epoch_tv_loss += tv_loss.detach()
                 epoch_z1_loss += tv_loss_z1.detach()
                 num_batches += 1
-                
-                if epoch >= warmup_epochs:
-                    
-                    model_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm = 1)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    
-                    aux_norm = torch.nn.utils.clip_grad_norm_(aux_params.parameters(), max_norm = 1)
-                    aux_optimizer.step()
-                    aux_optimizer.zero_grad()
-                else:
-                    model_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm = 1)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    
-                    aux_optimizer.zero_grad()
-                
-            scheduler_model.step()
-            
-            if epoch >= warmup_epochs:
-                scheduler_aux.step()
 
+                for key, opt in self.optimizers.items():
+                    
+                    if key == "model":
+                        model_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm = 1)
+                    elif key == "aux_params":
+                        aux_norm = torch.nn.utils.clip_grad_norm_(self.dataset.auxiliary_params.parameters(), max_norm = 1)
+                    opt.step()
+                    opt.zero_grad()
+                
+            for key, sched in self.schedulers.items():
+                sched.step()
+
+                    
             if epoch % viz_freq == 0 or epoch == epochs - 1 or epoch % checkpoint_freq == 0 :
                 with torch.no_grad():
                     pred_full = self.create_volume().cpu()
@@ -514,19 +432,19 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
             if self.global_rank == 0 and (epoch % viz_freq == 0 or epoch == epochs - 1):
                 with torch.no_grad():
-                    current_lr = scheduler_model.get_last_lr()[0]
+                    current_lr = self.schedulers["model"].get_last_lr()[0]
 
                     # Log metrics
-                    logger.add_scalar("train/mse_loss", avg_mse_loss, epoch)
+                    self.temp_logger.add_scalar("train/mse_loss", avg_mse_loss, epoch)
 
-                    logger.add_scalar("train/z1_loss", avg_z1_loss, epoch)
+                    self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, epoch)
                     if tv_weight > 0:
-                        logger.add_scalar("train/tv_loss", avg_tv_loss, epoch)
-                        logger.add_scalar("train/total_loss", avg_loss, epoch)
-                    logger.add_scalar("train/model_grad_norm", model_norm.item(), epoch)
-                    logger.add_scalar("train/aux_grad_norm", aux_norm.item(), epoch)
-                    logger.add_scalar("train/lr", current_lr, epoch)
-                    logger.add_scalar("train/num_samples_per_ray", num_samples_per_ray, epoch)
+                        self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, epoch)
+                        self.temp_logger.add_scalar("train/total_loss", avg_loss, epoch)
+                    self.temp_logger.add_scalar("train/model_grad_norm", model_norm.item(), epoch)
+                    self.temp_logger.add_scalar("train/aux_grad_norm", aux_norm.item(), epoch)
+                    self.temp_logger.add_scalar("train/lr", current_lr, epoch)
+                    self.temp_logger.add_scalar("train/num_samples_per_ray", num_samples_per_ray, epoch)
 
                     fig, axes = plt.subplots(1, 3, figsize=(36, 12))
                     axes[0].matshow(pred_full.sum(dim=0).cpu().numpy(), cmap='turbo', vmin=0)
@@ -541,7 +459,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     axes[2].matshow(thick_slice, cmap='turbo', vmin=0)
                     axes[2].set_title(f'Thick slice sum (Z={slice_start}:{slice_end-1})')
 
-                    logger.add_figure("train/viz", fig, epoch, close=True)
+                    self.temp_logger.add_figure("train/viz", fig, epoch, close=True)
                     plt.close(fig)
                     
         if self.global_rank == 0:

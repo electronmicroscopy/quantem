@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import torch.nn as nn
 import os
-
+import numpy as np
 from quantem.tomography.tomography_dataset import TomographyDataset
 
 class TomographyDDP:
@@ -81,7 +81,8 @@ class TomographyDDP:
                 
         else:
             print("Model built, compiled successfully")
-            
+
+    
     def setup_dataloader(
         self,
         tomo_dataset: TomographyDataset,
@@ -124,5 +125,36 @@ class TomographyDDP:
             print(f"  Local batch size (train): {batch_size}")
             print(f"  Global batch size: {batch_size*self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(self.dataloader)}")
+            
+    def get_scaled_lr(self, base_lr, scaling_rule="sqrt"):
+        if scaling_rule == "sqrt":
+            return base_lr * np.sqrt(self.world_size)
+        elif scaling_rule == "linear":
+            return base_lr * self.world_size
+        else:
+            raise ValueError(f"Invalid scaling rule: {scaling_rule}")
         
+    def scale_lr(
+        self,
+        optimizer_params: dict,
+    ):
+        
+        new_optimizer_params = {}
+        for key, value in optimizer_params.items():
+        
+            if "original_lr" in value:
+                new_optimizer_params[key] = {
+                    "type": value["type"],
+                    "lr": self.get_scaled_lr(value["original_lr"]),
+                    "original_lr": value["original_lr"],
+                }
+            else:
+                new_optimizer_params[key] = {
+                    "type": value["type"],
+                    "lr": self.get_scaled_lr(value["lr"]),
+                    "original_lr": value["lr"],
+                }
+            
+        return new_optimizer_params
+            
     

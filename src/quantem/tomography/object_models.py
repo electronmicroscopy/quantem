@@ -78,7 +78,7 @@ class ObjectBase(AutoSerialize):
         pass
 
     @abstractmethod
-    def to(self, device: str):
+    def to(self, device: str):z
         pass
 
     @abstractmethod
@@ -544,8 +544,15 @@ class ObjectINN(ObjectConstraints):
     """
     
     def __init__(
-        self
+        self,
+        model: torch.nn.Module,
     ):
         pass
+    
+    def forward(
+        self,
+        rays,
+        
+    ):
 
-ObjectModelType = Union[ObjectVoxelwise]  # | ObjectDIP | ObjectImplicit (ObjectFFN?)
+ObjectModelType = ObjectVoxelwise | ObjectINN # | ObjectDIP | ObjectImplicit (ObjectFFN?)

@@ -13,6 +13,49 @@ from torch.utils.data import Dataset
 
 import numpy as np
 
+class AuxiliaryParams(torch.nn.Module):
+    def __init__(self, num_tilts, device, zero_tilt_idx=None):
+        super().__init__()
+
+        if zero_tilt_idx is None:
+            # If not provided, assume first projection is reference
+            zero_tilt_idx = 0
+
+        self.zero_tilt_idx = zero_tilt_idx
+        self.num_tilts = num_tilts
+
+        # Shifts: only parameterize non-reference tilts
+        num_param_tilts = num_tilts - 1
+        self.shifts_param = torch.nn.Parameter(torch.zeros(num_param_tilts, 2, device=device))
+
+        # Fixed zero shifts for reference
+        self.shifts_ref = torch.zeros(1, 2, device=device)
+
+        # Z1 and Z3: parameterize all tilts EXCEPT the reference
+        self.z1_param = torch.nn.Parameter(torch.zeros(num_param_tilts, device=device))
+        # self.z3_param = torch.nn.Parameter(torch.zeros(num_param_tilts, device=device))
+
+        # Fixed zeros for reference tilt
+        self.z1_ref = torch.zeros(1, device=device)
+        # self.z3_ref = torch.zeros(1, device=device)
+
+    def forward(self, dummy_input=None):
+        # Reconstruct full arrays with zeros at reference position
+        before_shifts = self.shifts_param[:self.zero_tilt_idx]
+        after_shifts = self.shifts_param[self.zero_tilt_idx:]
+        shifts = torch.cat([before_shifts, self.shifts_ref, after_shifts], dim=0)
+
+        before_z1 = self.z1_param[:self.zero_tilt_idx]
+        after_z1 = self.z1_param[self.zero_tilt_idx:]
+        z1 = torch.cat([before_z1, self.z1_ref, after_z1], dim=0)
+
+        # before_z3 = self.z3_param[:self.zero_tilt_idx]
+        # after_z3 = self.z3_param[self.zero_tilt_idx:]
+        # z3 = torch.cat([before_z3, self.z3_ref, after_z3], dim=0)
+
+        return shifts, z1, -z1
+    
+    
 class TomographyDataset(AutoSerialize, Dataset):
     _token = object()
 
@@ -276,6 +319,24 @@ class TomographyDataset(AutoSerialize, Dataset):
     def initial_shifts(self, shifts: NDArray | Tensor) -> None:
         self._initial_shifts = shifts
 
+    # TODO: Temp auxiliary params
+    
+    def setup_auxiliary_params(self, zero_tilt_idx: int = None, device: str = "cpu") -> None:
+        
+        if not hasattr(self, "_auxiliary_params"):
+            self._auxiliary_params = AuxiliaryParams(
+                num_tilts = len(self.tilt_angles),
+                device = device,
+                zero_tilt_idx = zero_tilt_idx,
+            )
+            
+        else:
+            print("Auxiliary params already set")
+        
+    @property
+    def auxiliary_params(self) -> AuxiliaryParams:
+        return self._auxiliary_params
+    
     # --- RESET ---
 
     def reset(self) -> None:

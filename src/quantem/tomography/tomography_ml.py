@@ -10,7 +10,7 @@ class TomographyML(TomographyBase):
     Class for handling conventional reconstruction methods of tomography data.
     """
 
-    OPTIMIZABLE_VALS = ["volume", "z1", "x", "z3", "shifts"]
+    OPTIMIZABLE_VALS = ["volume", "z1", "x", "z3", "shifts", "model", "aux_params"]
     DEFAULT_LRS = {
         "volume": 1e-2,
         "z1": 1e-1,
@@ -81,6 +81,18 @@ class TomographyML(TomographyBase):
                 self._add_optimizer(key, self.dataset.tilt_angles, self._optimizer_params[key])
             elif key == "z3":
                 self._add_optimizer(key, self.dataset.z3_angles, self._optimizer_params[key])
+            elif key == "model":
+                
+                if self._optimizer_params[key]["original_lr"] is not None:
+                    optimizer_params = self._optimizer_params[key].copy()
+                    optimizer_params.pop("original_lr", None)
+                self._add_optimizer(key, self.model.parameters(), optimizer_params)
+            elif key == "aux_params":
+                
+                if self._optimizer_params[key]["original_lr"] is not None:
+                    optimizer_params = self._optimizer_params[key].copy()
+                    optimizer_params.pop("original_lr", None)
+                self._add_optimizer(key, self.dataset.auxiliary_params.parameters(), optimizer_params)
             else:
                 raise ValueError(
                     f"key to be optimized, {key}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
@@ -151,7 +163,7 @@ class TomographyML(TomographyBase):
                 raise ValueError(
                     f"key to be optimized, {k}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
                 )
-            if v["type"] not in ["cyclic", "plateau", "exp", "gamma", "none"]:
+            if v["type"] not in ["cyclic", "plateau", "exp", "gamma", "linear", "cosine_annealing", "none"]:
                 raise ValueError(
                     f"Unknown scheduler type: {v['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'none']"
                 )
@@ -166,6 +178,8 @@ class TomographyML(TomographyBase):
             torch.optim.lr_scheduler.CyclicLR
             | torch.optim.lr_scheduler.ReduceLROnPlateau
             | torch.optim.lr_scheduler.ExponentialLR
+            | torch.optim.lr_scheduler.LinearLR
+            | torch.optim.lr_scheduler.CosineAnnealingLR
             | None
         ),
     ]:
@@ -271,6 +285,18 @@ class TomographyML(TomographyBase):
         base_LR = optimizer.param_groups[0]["lr"]
         if sched_type == "none":
             scheduler = None
+        elif sched_type == "linear":
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=params.get("start_factor", 0.1),
+                total_iters=params.get("total_iters", num_iter),
+            )
+        elif sched_type == "cosine_annealing":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=params.get("T_max", num_iter),
+                eta_min=params.get("eta_min", base_LR / 100),
+            )
         elif sched_type == "cyclic":
             scheduler = torch.optim.lr_scheduler.CyclicLR(
                 optimizer,
