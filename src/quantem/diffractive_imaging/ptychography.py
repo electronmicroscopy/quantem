@@ -58,11 +58,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
     @classmethod
     def from_ptychography(
         cls,
-        ptycho: "Ptychography",
+        ptycho: Self,
         obj_model: ObjectModelType | None = None,
         probe_model: ProbeModelType | None = None,
         logger: LoggerPtychography | None = None,
-    ) -> "Ptychography":
+    ) -> Self:
         _tmp_logger = ptycho.logger
         ptycho.logger = None
         cloned = ptycho.clone()

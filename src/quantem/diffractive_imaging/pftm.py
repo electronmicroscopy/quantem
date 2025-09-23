@@ -2,13 +2,16 @@ import os
 from typing import Any, Literal, Self, Sequence
 
 import numpy as np
+import torch
 
+from quantem.core import config
 from quantem.core.datastructures import Dataset4dstem
+from quantem.core.ml.cnn2d import CNN2d
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbePixelated
+from quantem.diffractive_imaging.object_models import ObjectDIP, ObjectPixelated
+from quantem.diffractive_imaging.probe_models import ProbeDIP, ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 
 
@@ -44,7 +47,7 @@ class PFTM(Ptychography):
         log_prefix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = False,
-        device: str | int = "cpu",
+        device: Literal["cpu", "gpu"] = "cpu",
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
@@ -150,6 +153,179 @@ class PFTM(Ptychography):
         lr_obj: float = 1e-1,
         learn_probe: bool = True,
         lr_probe: float = 1e-1,
+        batch_size: int | None = None,
+        scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
+        scheduler_factor: float = 0.5,
+        new_optimizers: bool = False,  # not sure what the default should be
+        constraints: dict = {},  # TODO add constraints flags
+        store_iterations_every: int | None = None,
+        device: Literal["cpu", "gpu"] | None = None,
+        verbose: int | bool = True,
+    ) -> Self:
+        self.verbose = verbose
+        print("hi pftm")
+
+        if new_optimizers or reset or self.num_epochs == 0:
+            opt_params = {
+                "object": {
+                    "type": "adam",
+                    "lr": lr_obj,
+                },
+            }
+            scheduler_params = {
+                "object": {
+                    "type": scheduler_type,
+                    "factor": scheduler_factor,
+                }
+            }
+            if learn_probe:
+                opt_params["probe"] = {
+                    "type": "adam",
+                    "lr": lr_probe,
+                }
+                scheduler_params["probe"] = {
+                    "type": scheduler_type,
+                    "factor": scheduler_factor,
+                }
+        else:
+            opt_params = None
+            scheduler_params = None
+
+        constraints = constraints  # placeholder for constraints flags
+
+        return super().reconstruct(
+            num_iter=num_iter,
+            reset=reset,
+            optimizer_params=opt_params,
+            scheduler_params=scheduler_params,
+            constraints=constraints,
+            batch_size=batch_size,
+            store_iterations_every=store_iterations_every,
+            device=device,
+        )
+
+
+class PFTM_DIP(Ptychography):
+    """
+    High-level convenience wrapper around Ptychography.
+
+    Provides a from_dataset() constructor that builds pixelated object and probe
+    models from simple flags, then initializes a full Ptychography instance.
+    """
+
+    @classmethod
+    def from_pftm(
+        cls,
+        pftm: PFTM,
+        pretrain_iters: int | None = None,
+        pretrain_lr: float = 1e-3,
+        # model settings
+        cnn_num_layers: int = 3,
+        # logging/device
+        log_dir: os.PathLike | str | None = None,
+        log_prefix: str = "",
+        log_images_every: int = 10,
+        log_probe_images: bool = False,
+        device: Literal["cpu", "gpu", "cuda"] = "cpu",
+        verbose: int | bool = True,
+    ) -> Self:
+        if device == "gpu":
+            device = "cuda"
+        # Object model
+        obj_dip = CNN2d(
+            in_channels=pftm.obj_model.num_slices,
+            out_channels=pftm.obj_model.num_slices,
+            num_layers=cnn_num_layers,
+            dtype=torch.float32 if pftm.obj_model.obj_type == "complex" else torch.float32,
+        )
+
+        obj_model = ObjectDIP.from_pixelated(
+            model=obj_dip,
+            pixelated=pftm.obj_model,
+            device=device,
+        )
+
+        # Probe model
+        probe_dip = CNN2d(
+            in_channels=pftm.probe_model.num_probes,
+            out_channels=pftm.probe_model.num_probes,
+            num_layers=cnn_num_layers,
+            dtype=torch.complex64,
+        )
+
+        probe_model = ProbeDIP.from_pixelated(
+            model=probe_dip,
+            pixelated=pftm.probe_model,
+            device=device,
+        )
+
+        if pretrain_iters is not None:
+            obj_model.pretrain(
+                reset=True,
+                num_epochs=pretrain_iters,
+                optimizer_params={
+                    "type": "adam",
+                    "lr": pretrain_lr,
+                },
+                scheduler_params={
+                    "type": "plateau",
+                    "factor": 0.5,
+                },
+                apply_constraints=False,
+                device=config.get("device"),
+            )
+
+            probe_model.pretrain(
+                reset=True,
+                num_epochs=pretrain_iters,
+                optimizer_params={
+                    "type": "adam",
+                    "lr": 1e-3,
+                },
+                scheduler_params={
+                    "type": "plateau",
+                    "factor": 0.5,
+                },
+                apply_constraints=False,
+            )
+
+        if log_dir is not None:
+            logger = LoggerPtychography(
+                log_dir=log_dir,
+                run_prefix=log_prefix,
+                run_suffix="pix",
+                log_images_every=log_images_every,
+                log_probe_images=log_probe_images,
+            )
+            if verbose:
+                print(f"Logging to {logger.log_dir}")
+        else:
+            logger = None
+
+        # Build a fresh instance of this subclass using the original components
+        ptycho = cls.from_models(
+            dset=pftm.dset,
+            obj_model=obj_model,
+            probe_model=probe_model,
+            detector_model=pftm.detector_model,
+            logger=logger if logger is not None else pftm.logger,
+            device=device,
+            verbose=pftm.verbose,
+            rng=pftm.rng,
+        )
+
+        ptycho.preprocess(
+            obj_padding_px=(int(pftm.obj_padding_px[0]), int(pftm.obj_padding_px[1]))
+        )
+        return ptycho
+
+    def reconstruct(  # type:ignore could do overloads but this is simpler...
+        self,
+        num_iter: int = 0,
+        reset: bool = False,
+        lr_obj: float = 5e-4,
+        learn_probe: bool = True,
+        lr_probe: float = 5e-4,
         batch_size: int | None = None,
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
