@@ -78,7 +78,6 @@ def _show_2d_array(
     ax : Axes
         The matplotlib axes object.
     """
-    print("hello")
     is_complex = np.iscomplexobj(array)
     if is_complex:
         amplitude = np.abs(array)
