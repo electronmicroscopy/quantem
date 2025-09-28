@@ -271,7 +271,6 @@ class OptimizeIterativePtychography:
         self,
         n_trials: int = 50,
         direction: str = "minimize",
-        study: Optional[optuna.study.Study] = None,
         study_kwargs: Optional[Dict[str, Any]] = None,
         unit: str = "trial",
         verbose: bool = True,
@@ -284,11 +283,7 @@ class OptimizeIterativePtychography:
         self.unit = unit
         self.verbose = verbose
 
-        # Create or use provided study
-        if study is None:
-            self.study = optuna.create_study(direction=direction, **self.study_kwargs)
-        else:
-            self.study = study
+        self.study = optuna.create_study(direction=direction, **self.study_kwargs)
 
     @classmethod
     def from_constructors(
@@ -302,7 +297,6 @@ class OptimizeIterativePtychography:
         reconstruction_class: str = "auto",  # NEW: "ptychography", "pftm", or "auto"
         n_trials: int = 50,
         direction: str = "minimize",
-        study: Optional[optuna.study.Study] = None,
         study_kwargs: Optional[Dict[str, Any]] = None,
         unit: str = "trial",
         verbose: bool = True,
@@ -330,7 +324,6 @@ class OptimizeIterativePtychography:
         instance = cls(
             n_trials=n_trials,
             direction=direction,
-            study=study,
             study_kwargs=study_kwargs,
             unit=unit,
             verbose=verbose,
@@ -378,4 +371,4 @@ class OptimizeIterativePtychography:
         if not self.verbose:
             optuna.logging.set_verbosity(optuna.logging.INFO)
 
-        return self.study
+        return self
