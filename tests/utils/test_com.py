@@ -8,7 +8,7 @@ import pytest
 import scipy.ndimage as ndi
 import torch
 
-from quantem.core.utils.optimized_center_of_mass import (
+from quantem.core.utils.com import (
     center_of_mass_optimized,
     warmup_compiled_functions,
 )
