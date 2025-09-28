@@ -179,9 +179,10 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
         recon_obj.preprocess(**preprocess_kwargs)
 
     # Reconstruct step
-    reconstruct_kwargs = resolved_kwargs.get("reconstruct")
-    if reconstruct_kwargs:
-        recon_obj.reconstruct(**reconstruct_kwargs)
+    reconstruct_kwargs = resolved_kwargs.get("reconstruct", {})
+    reconstruct_kwargs = dict(reconstruct_kwargs)  # Make a copy to avoid modifying original
+    reconstruct_kwargs["verbose"] = False
+    recon_obj.reconstruct(**reconstruct_kwargs)
 
 
 def _extract_default_loss(recon_obj, class_type):
