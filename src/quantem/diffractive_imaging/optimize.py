@@ -139,6 +139,65 @@ def _resolve_params_with_trial(
     return obj
 
 
+def _build_ptychography_instance(constructors, resolved_kwargs):
+    """Build Ptychography instance (existing logic)."""
+    obj_kwargs = resolved_kwargs.get("object", {})
+    obj_model = constructors["object"](**obj_kwargs)
+
+    probe_kwargs = resolved_kwargs.get("probe", {})
+    probe_model = constructors["probe"](**probe_kwargs)
+
+    detector_kwargs = resolved_kwargs.get("detector", {})
+    detector_model = constructors["detector"](**detector_kwargs)
+
+    ptycho_kwargs = resolved_kwargs.get("ptycho", {})
+    return constructors["ptycho"](
+        obj_model=obj_model,
+        probe_model=probe_model,
+        detector_model=detector_model,
+        **ptycho_kwargs,
+    )
+
+
+def _build_pftm_instance(constructors, resolved_kwargs):
+    """Build PFTM instance."""
+    # Assuming PFTM has a simpler constructor - adjust based on your PFTM API
+    pftm_kwargs = resolved_kwargs.get("pftm", {})
+    return constructors["pftm"](**pftm_kwargs)
+
+
+def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
+    """Run the reconstruction pipeline for either class."""
+    # Initialize step (if applicable)
+    init_kwargs = resolved_kwargs.get("initialize")
+    if init_kwargs and hasattr(recon_obj, "initialize"):
+        recon_obj.initialize(**init_kwargs)
+
+    # Preprocess step
+    preprocess_kwargs = resolved_kwargs.get("preprocess")
+    if preprocess_kwargs:
+        recon_obj.preprocess(**preprocess_kwargs)
+
+    # Reconstruct step
+    reconstruct_kwargs = resolved_kwargs.get("reconstruct")
+    if reconstruct_kwargs:
+        recon_obj.reconstruct(**reconstruct_kwargs)
+
+
+def _extract_default_loss(recon_obj, class_type):
+    """Extract loss from reconstruction object."""
+    if class_type == "pftm":
+        # Adjust based on how PFTM stores losses
+        losses = getattr(recon_obj, "_losses", None) or getattr(recon_obj, "_epoch_losses", None)
+    else:
+        losses = getattr(recon_obj, "_epoch_losses", None)
+
+    if not losses:
+        msg = f"No losses available on {class_type} object. Provide a loss_getter."
+        raise RuntimeError(msg)
+    return float(losses[-1])
+
+
 def _OptimizeIterativePtychographyObjective(
     constructors: Mapping[str, Callable[..., Any]],
     base_kwargs: Mapping[str, Any],
@@ -146,14 +205,12 @@ def _OptimizeIterativePtychographyObjective(
     dataset_constructor: Optional[Callable[..., Any]] = None,
     dataset_kwargs: Optional[Mapping[str, Any]] = None,
     dataset_preprocess_kwargs: Optional[Mapping[str, Any]] = None,
+    reconstruction_class: str = "auto",  # "ptychography", "pftm", or "auto"
 ) -> Callable[[optuna.trial.Trial], float]:
-    """Build and return an Optuna objective for iterative ptychography.
+    """Build and return an Optuna objective for iterative ptychography or PFTM.
 
     Args:
-        constructors, base_kwargs, loss_getter: as before
-        dataset_constructor: Optional callable to build dataset
-        dataset_kwargs: kwargs for dataset_constructor, can contain OptimizationParameter
-        dataset_preprocess_kwargs: kwargs for dataset.preprocess(), can contain OptimizationParameter
+        reconstruction_class: Which class to use - "ptychography", "pftm", or "auto" to detect
     """
 
     def objective(trial: optuna.trial.Trial) -> float:
@@ -162,116 +219,163 @@ def _OptimizeIterativePtychographyObjective(
 
         # 2) Handle dataset construction/preprocessing if optimizing dataset params
         if dataset_constructor is not None:
-            # Build dataset fresh with potentially optimized parameters
             resolved_dataset_kwargs = _resolve_params_with_trial(trial, dataset_kwargs or {})
             pdset = dataset_constructor(**resolved_dataset_kwargs)
 
-            # Preprocess dataset with potentially optimized parameters
             if dataset_preprocess_kwargs is not None:
                 resolved_preprocess_kwargs = _resolve_params_with_trial(
                     trial, dataset_preprocess_kwargs
                 )
                 pdset.preprocess(**resolved_preprocess_kwargs)
 
-            # Override the dataset in ptycho_kwargs
             resolved_kwargs.setdefault("ptycho", {})["dset"] = pdset
 
-        # 3) Build object model fresh
-        obj_kwargs = resolved_kwargs.get("object", {})
-        obj_model = constructors["object"](**obj_kwargs)
+        # 3) Determine which class to use
+        if reconstruction_class == "auto":
+            # Auto-detect based on constructor name or other heuristic
+            ptycho_constructor = constructors.get("ptycho")
+            pftm_constructor = constructors.get("pftm")
 
-        # 4) Build probe model fresh
-        probe_kwargs = resolved_kwargs.get("probe", {})
-        probe_model = constructors["probe"](**probe_kwargs)
+            if pftm_constructor is not None:
+                class_type = "pftm"
+            elif ptycho_constructor is not None:
+                class_type = "ptychography"
+            else:
+                msg = "Could not auto-detect reconstruction class. Provide 'ptycho' or 'pftm' constructor."
+                raise ValueError(msg)
+        else:
+            class_type = reconstruction_class
 
-        # 5) Build detector model fresh
-        detector_kwargs = resolved_kwargs.get("detector", {})
-        detector_model = constructors["detector"](**detector_kwargs)
+        # 4) Build reconstruction object based on class type
+        if class_type == "pftm":
+            recon_obj = _build_pftm_instance(constructors, resolved_kwargs)
+        else:
+            recon_obj = _build_ptychography_instance(constructors, resolved_kwargs)
 
-        # 6) Build ptycho fresh
-        ptycho_kwargs = resolved_kwargs.get("ptycho", {})
-        ptycho = constructors["ptycho"](
-            obj_model=obj_model,
-            probe_model=probe_model,
-            detector_model=detector_model,
-            **ptycho_kwargs,
-        )
+        # 5) Run the reconstruction pipeline
+        _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type)
 
-        # 7) Optional initialize step
-        init_kwargs = resolved_kwargs.get("initialize")
-        if init_kwargs and hasattr(ptycho, "initialize"):
-            ptycho.initialize(**init_kwargs)
-
-        # 8) Preprocess (ptycho-level, not dataset-level)
-        preprocess_kwargs = resolved_kwargs.get("preprocess")
-        if preprocess_kwargs:
-            ptycho.preprocess(**preprocess_kwargs)
-
-        # 9) Reconstruct
-        reconstruct_kwargs = resolved_kwargs.get("reconstruct")
-        if reconstruct_kwargs:
-            ptycho.reconstruct(**reconstruct_kwargs)
-
-        # 10) Extract loss
+        # 6) Extract loss
         if loss_getter is not None:
-            return float(loss_getter(ptycho))
+            return float(loss_getter(recon_obj))
 
-        losses = getattr(ptycho, "_epoch_losses", None)
-        if not losses:
-            msg = "No losses available on ptycho. Provide a loss_getter."
-            raise RuntimeError(msg)
-        return float(losses[-1])
+        return _extract_default_loss(recon_obj, class_type)
 
     return objective
 
 
-def OptimizeIterativePtychography(
-    constructors: Mapping[str, Callable[..., Any]],
-    base_kwargs: Mapping[str, Any],
-    dataset_constructor: Optional[Callable[..., Any]] = None,
-    dataset_kwargs: Optional[Mapping[str, Any]] = None,
-    dataset_preprocess_kwargs: Optional[Mapping[str, Any]] = None,
-    loss_getter: Optional[Callable[[Any], float]] = None,
-    n_trials: int = 50,
-    direction: str = "minimize",
-    study: Optional[optuna.study.Study] = None,
-    study_kwargs: Optional[Dict[str, Any]] = None,
-    unit: str = "trial",
-) -> optuna.study.Study:
-    """Run an Optuna study for iterative ptychography with embedded tqdm progress bar.
+class OptimizeIterativePtychography:
+    """Bayesian optimization for ptychography and PFTM reconstruction pipelines."""
 
-    Args:
-        constructors, base_kwargs, loss_getter, n_trials, direction, study, study_kwargs,
-        unit, verbose: as before
-        dataset_constructor: Optional callable to build dataset fresh each trial
-        dataset_kwargs: kwargs for dataset_constructor, can contain OptimizationParameter
-        dataset_preprocess_kwargs: kwargs for dataset.preprocess(), can contain OptimizationParameter
-    """
-    # Create objective that builds models fresh each trial
-    objective = _OptimizeIterativePtychographyObjective(
-        constructors=constructors,
-        base_kwargs=base_kwargs,
-        loss_getter=loss_getter,
-        dataset_constructor=dataset_constructor,
-        dataset_kwargs=dataset_kwargs,
-        dataset_preprocess_kwargs=dataset_preprocess_kwargs,
-    )
+    def __init__(
+        self,
+        n_trials: int = 50,
+        direction: str = "minimize",
+        study: Optional[optuna.study.Study] = None,
+        study_kwargs: Optional[Dict[str, Any]] = None,
+        unit: str = "trial",
+        verbose: bool = True,
+    ):
+        """Initialize optimizer settings."""
+        self.objective_func = None  # Will be set by factory methods
+        self.n_trials = n_trials
+        self.direction = direction
+        self.study_kwargs = study_kwargs or {}
+        self.unit = unit
+        self.verbose = verbose
 
-    # Create or reuse study
-    if study is None:
-        study = optuna.create_study(direction=direction, **(study_kwargs or {}))
+        # Create or use provided study
+        if study is None:
+            self.study = optuna.create_study(direction=direction, **self.study_kwargs)
+        else:
+            self.study = study
 
-    # Run with embedded tqdm progress bar (like show_progress_bar=True)
-    with tqdm(total=n_trials, desc="optimizing", unit=unit) as pbar:
+    @classmethod
+    def from_constructors(
+        cls,
+        constructors: Mapping[str, Callable[..., Any]],
+        base_kwargs: Mapping[str, Any],
+        dataset_constructor: Optional[Callable[..., Any]] = None,
+        dataset_kwargs: Optional[Mapping[str, Any]] = None,
+        dataset_preprocess_kwargs: Optional[Mapping[str, Any]] = None,
+        loss_getter: Optional[Callable[[Any], float]] = None,
+        reconstruction_class: str = "auto",  # NEW: "ptychography", "pftm", or "auto"
+        n_trials: int = 50,
+        direction: str = "minimize",
+        study: Optional[optuna.study.Study] = None,
+        study_kwargs: Optional[Dict[str, Any]] = None,
+        unit: str = "trial",
+        verbose: bool = True,
+    ):
+        """Create optimizer from constructor functions and parameter specifications.
 
-        def _on_trial_end(study_: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
-            pbar.update(1)
+        Args:
+            reconstruction_class: Which class to use - "ptychography", "pftm", or "auto"
 
-        study.optimize(
-            objective,
+        Examples:
+            # For Ptychography
+            constructors = {
+                "object": ObjectPixelated.from_uniform,
+                "probe": ProbePixelated.from_params,
+                "detector": DetectorPixelated,
+                "ptycho": Ptychography.from_models,
+            }
+
+            # For PFTM
+            constructors = {
+                "pftm": PFTM.from_dataset,
+            }
+        """
+        # Create instance with basic settings
+        instance = cls(
             n_trials=n_trials,
-            callbacks=[_on_trial_end],
-            show_progress_bar=False,
+            direction=direction,
+            study=study,
+            study_kwargs=study_kwargs,
+            unit=unit,
+            verbose=verbose,
         )
 
-    return study
+        # Set the objective function with PFTM support
+        instance.objective_func = _OptimizeIterativePtychographyObjective(
+            constructors=constructors,
+            base_kwargs=base_kwargs,
+            loss_getter=loss_getter,
+            dataset_constructor=dataset_constructor,
+            dataset_kwargs=dataset_kwargs,
+            dataset_preprocess_kwargs=dataset_preprocess_kwargs,
+            reconstruction_class=reconstruction_class,  # PFTM support restored
+        )
+
+        return instance
+
+    def optimize(self) -> optuna.study.Study:
+        """Run the optimization study with progress bar."""
+        if self.objective_func is None:
+            msg = "No objective function set. Use a factory method like from_constructors()."
+            raise RuntimeError(msg)
+
+        # Control Optuna logging verbosity
+        if not self.verbose:
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        else:
+            optuna.logging.set_verbosity(optuna.logging.INFO)
+
+        # Run with embedded tqdm progress bar
+        with tqdm(total=self.n_trials, desc="optimizing", unit=self.unit) as pbar:
+
+            def _on_trial_end(study_: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
+                pbar.update(1)
+
+            self.study.optimize(
+                self.objective_func,
+                n_trials=self.n_trials,
+                callbacks=[_on_trial_end],
+                show_progress_bar=self.verbose,
+            )
+
+        # Restore original logging level
+        if not self.verbose:
+            optuna.logging.set_verbosity(optuna.logging.INFO)
+
+        return self.study

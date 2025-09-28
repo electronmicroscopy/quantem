@@ -91,6 +91,9 @@ def _show_2d_array(
         amplitude = array
         angle = None
 
+    if array.dtype == "bool":
+        array = np.array(array, dtype="float")
+
     norm_config = _resolve_normalization(norm, **kwargs)
     scalebar_config = _resolve_scalebar(scalebar, **kwargs)
 
