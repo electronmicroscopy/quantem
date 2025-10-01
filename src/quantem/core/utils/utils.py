@@ -68,6 +68,8 @@ def to_numpy(array: "np.ndarray | cp.ndarray | torch.Tensor") -> np.ndarray:
 
 
 def to_cpu(arrs: Any) -> np.ndarray | Sequence:
+    from quantem.core.datastructures.dataset2d import Dataset2d
+
     if config.get("has_cupy"):
         if isinstance(arrs, cp.ndarray):
             return cp.asnumpy(arrs)
@@ -76,12 +78,14 @@ def to_cpu(arrs: Any) -> np.ndarray | Sequence:
             return arrs.cpu().detach().numpy()
     if isinstance(arrs, np.ndarray):
         return np.array(arrs)
+    elif isinstance(arrs, Dataset2d):
+        return arrs.array       
     elif isinstance(arrs, list):
         return [to_cpu(i) for i in arrs]
     elif isinstance(arrs, tuple):
         return tuple([to_cpu(i) for i in arrs])
     else:
-        raise NotImplementedError(f"Unkown type: {type(arrs)}")
+        raise NotImplementedError(f"Unknown type: {type(arrs)}")
 
 
 # endregion
