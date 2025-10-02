@@ -2,6 +2,9 @@ from typing import Any, Self
 
 import numpy as np
 from numpy.typing import NDArray
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.utils.validators import ensure_valid_array
@@ -104,3 +107,60 @@ class Dataset3dspectroscopy(Dataset3d):
     ## PCA
     ## imaging
     ## specturm picking
+
+
+class DataSpectroscopy:
+    """
+    Class for handling 3D spectroscopy data and extracting spectra from ROIs.
+    """
+    def __init__(self, array):
+        # Use the underlying array attribute, do not sum over axis 0
+        self.array = np.asarray(array.array, dtype=float)
+        self.sampling = array.sampling
+        self.origin = array.origin
+        self.shape = self.array.shape
+
+    def image_to_spec(self, y, x, dy=None, dx=None, title=None):
+        """
+        Make and show a spectrum plot from a spatial ROI in a 3D EDS cube (E, Y, X).
+
+        Parameters
+        ----------
+        y, x : int
+            Top-left pixel of the ROI.
+        dy, dx : int, optional
+            ROI size (height, width). Defaults to full image if None.
+        title : str, optional
+            Plot title (auto-filled if None).
+
+        Returns
+        -------
+        (fig, ax) : tuple
+            The Matplotlib Figure and Axes of the spectrum plot.
+        """
+        if dy is None:
+            dy = self.shape[1]
+        if dx is None:
+            dx = self.shape[2]
+
+        dE = float(self.sampling[0])
+        E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
+        E  = E0 + dE * np.arange(self.shape[0])
+
+        spec = np.empty(self.shape[0], dtype=float)
+        for k in range(self.shape[0]):
+            img = np.asarray(self.array[k], dtype=float)
+            roi = img[y:y+dy, x:x+dx]
+            if roi.size == 0:
+                raise ValueError("ROI is empty; check y/x/dy/dx.")
+            spec[k] = roi.mean()
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(E, spec)
+        ax.set_xlabel("Energy (keV)")
+        ax.set_ylabel("Intensity")
+        ax.set_title(title or f"Spectrum ROI y={y}:{y+dy}, x={x}:{x+dx}")
+        fig.tight_layout()
+        plt.show()
+
+        return fig, ax

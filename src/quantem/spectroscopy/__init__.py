@@ -8,3 +8,6 @@ from quantem.spectroscopy.dataset3deels import (
 from quantem.spectroscopy.dataset3deds import (
     Dataset3deds as Dataset3deds,
 )
+
+
+from quantem.spectroscopy.dataset3dspectroscopy import DataSpectroscopy
