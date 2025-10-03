@@ -767,7 +767,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         angle = com_rotation_rad if transpose else -1 * com_rotation_rad
 
         if positions_px is None:
-            positions = self.dset.scan_positions_px.cpu().detach().numpy()
+            positions = self.dset.initial_scan_positions_px.cpu().detach().numpy()
+            # if using learned positions potentially need to pad the object in center_crop_arr
+            # positions = self.dset.scan_positions_px.cpu().detach().numpy()
         else:
             positions = positions_px
 
@@ -791,7 +793,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             rotated_array = rotated_array.swapaxes(-2, -1)
 
         # fixing that is sometimes 1 pixel off
-        cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop))
+        cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop), pad_if_needed=False)
 
         return cropped
 

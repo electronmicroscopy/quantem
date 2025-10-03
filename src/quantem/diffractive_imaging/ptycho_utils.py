@@ -1,10 +1,11 @@
+from math import ceil, floor
 from typing import Literal, Union, overload
 
 import numpy as np
 import torch
 from scipy.optimize import curve_fit
 
-from quantem.core.utils import array_funcs as arr
+from quantem.core.utils import array_funcs as arrf
 
 ArrayLike = Union[np.ndarray, "torch.Tensor"]
 
@@ -46,7 +47,7 @@ class SimpleBatcher:
             yield self.indices[i : i + self.batch_size]
 
     def __len__(self):
-        return int(np.ceil(len(self.indices) / self.batch_size))
+        return int(ceil(len(self.indices) / self.batch_size))
 
 
 @overload
@@ -62,10 +63,10 @@ def fourier_shift_expand(
 ) -> ArrayLike:
     """Fourier-shift array by flat array of positions."""
     phase = fourier_translation_operator(positions, array.shape, expand_dim, dtype=array.dtype)
-    fourier_array = arr.fft2(array)
+    fourier_array = arrf.fft2(array)
     shifted_fourier_array = fourier_array * phase
-    shifted_array = arr.ifft2(shifted_fourier_array)
-    if arr.is_complex(array):
+    shifted_array = arrf.ifft2(shifted_fourier_array)
+    if arrf.is_complex(array):
         return shifted_array
     else:
         return shifted_array.real
@@ -95,16 +96,16 @@ def fourier_translation_operator(
     nr, nc = shape[-2:]
     r = positions[..., 0][:, None, None]
     c = positions[..., 1][:, None, None]
-    kr = arr.match_device(np.fft.fftfreq(nr, d=1.0), positions)
-    kc = arr.match_device(np.fft.fftfreq(nc, d=1.0), positions)
-    ramp_r = arr.exp(-2.0j * np.pi * kr[None, :, None] * r)
-    ramp_c = arr.exp(-2.0j * np.pi * kc[None, None, :] * c)
+    kr = arrf.match_device(np.fft.fftfreq(nr, d=1.0), positions)
+    kc = arrf.match_device(np.fft.fftfreq(nc, d=1.0), positions)
+    ramp_r = arrf.exp(-2.0j * np.pi * kr[None, :, None] * r)
+    ramp_c = arrf.exp(-2.0j * np.pi * kc[None, None, :] * c)
     ramp = ramp_r * ramp_c
     if expand_dim:
         for _ in range(len(shape) - 2):
             ramp = ramp[:, None, ...]
     if dtype is not None:
-        ramp = arr.as_type(ramp, dtype)
+        ramp = arrf.as_type(ramp, dtype)
     return ramp
 
 
@@ -124,16 +125,16 @@ def get_com_2d(ar: ArrayLike, corner_centered: bool = False) -> ArrayLike:
     else:
         c, r = np.meshgrid(np.arange(nc), np.arange(nr))
 
-    rc = arr.match_device(np.stack([r, c]), ar)
+    rc = arrf.match_device(np.stack([r, c]), ar)
     com = (
-        arr.sum(
+        arrf.sum(
             rc * ar[..., None, :, :],
             axis=(
                 -1,
                 -2,
             ),
         )
-        / arr.sum(
+        / arrf.sum(
             ar,
             axis=(
                 -1,
@@ -149,7 +150,7 @@ def sum_patches_base(
 ) -> torch.Tensor:
     flat_weights = patches.reshape(-1)
     flat_indices = indices.reshape(-1)
-    out = arr.match_device(
+    out = arrf.match_device(
         torch.zeros(
             int(torch.prod(torch.tensor(obj_shape))), dtype=patches.dtype, device=patches.device
         ),
@@ -190,7 +191,7 @@ def shift_array(
         Returns:
             (array) the shifted array
     """
-    xp = arr.get_xp_module(ar)
+    xp = arrf.get_xp_module(ar)
 
     # Apply image shift
     if bilinear is False:
@@ -517,7 +518,9 @@ class AffineTransform:
         )
 
 
-def center_crop_arr(arr: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+def center_crop_arr(
+    arr: np.ndarray, shape: tuple[int, ...], pad_if_needed: bool = False
+) -> np.ndarray:
     """
     Crop an array to a given shape, centered along all axes.
 
@@ -535,11 +538,17 @@ def center_crop_arr(arr: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
             f"Got shape with {len(shape)} dimensions and arr with {arr.ndim} dimensions."
         )
 
+    pad = [[0, 0]] * len(shape)
     for i, (s, a) in enumerate(zip(shape, arr.shape)):
         if s > a:
-            raise ValueError(
-                f"Dimension {i} of shape ({s}) is larger than dimension {i} of arr ({a})."
-            )
+            if not pad_if_needed:
+                raise ValueError(
+                    f"Dimension {i} of shape ({s}) is larger than dimension {i} of arr ({a})."
+                )
+            pad[i] = [int(floor(s - a) / 2), int(ceil(s - a) / 2)]
+
+    if any(pad):
+        arr = np.pad(arr, pad_width=pad, mode="constant")
 
     slices = []
     for i, (s, a) in enumerate(zip(shape, arr.shape)):

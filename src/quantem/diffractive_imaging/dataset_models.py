@@ -530,13 +530,19 @@ class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
     DEFAULT_CONSTRAINTS = {
         "descan_tv_weight": 0.0,
         "descan_shifts_constant": False,
+        "center_scan_positions": False,
+        "clip_scan_positions": True,
     }
 
     def apply_soft_constraints(self, descan_shifts: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
 
-        if self.constraints.get("descan_tv_weight", 0) > 0:
+        if (
+            self.constraints.get("descan_tv_weight", 0) > 0
+            and self.learn_descan
+            and self.has_optimizer()
+        ):
             tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints["descan_tv_weight"])
             loss = loss + tv_loss
             self.add_soft_constraint_loss("descan_tv_weight", tv_loss)
@@ -561,9 +567,23 @@ class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
             descan = torch.zeros_like(descan)
         return descan
 
-    def apply_position_constraints(self, positions: torch.Tensor) -> torch.Tensor:
+    def apply_hard_constraints(self, obj_padding_px: np.ndarray | tuple) -> None:
         # could clip positions here if needed
-        return positions
+        positions = self.scan_positions_px
+        obj_shape = torch.tensor(self._obj_shape_full_2d(obj_padding_px), device=positions.device)
+        if self.constraints.get(
+            "clip_scan_positions", self.DEFAULT_CONSTRAINTS["clip_scan_positions"]
+        ):
+            positions = torch.clamp(positions, min=torch.zeros_like(obj_shape), max=obj_shape - 1)
+
+        if self.constraints.get(
+            "center_scan_positions", self.DEFAULT_CONSTRAINTS["center_scan_positions"]
+        ):
+            # shift all positions uniformly so that the mean position is at the center of the object
+            positions = positions - positions.mean(dim=0, keepdim=True)
+            positions = positions + obj_shape / 2
+
+        self.scan_positions_px = positions
 
 
 class PtychographyDatasetRaster(DatasetConstraints):
@@ -731,7 +751,6 @@ class PtychographyDatasetRaster(DatasetConstraints):
     # endregion --- classmethods ---
 
     # region --- properties ---
-
     @property
     def intensities_4d(self) -> np.ndarray:
         """4D diffraction intensities"""
@@ -1413,7 +1432,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
         obj_padding_px: np.ndarray | tuple,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Forward pass to compute the diffraction intensities from the object and scan positions."""
-        positions_px = self.apply_position_constraints(self.scan_positions_px)[batch_indices]
+        self.apply_hard_constraints(obj_padding_px)
+        positions_px = self.scan_positions_px[batch_indices]
         positions_px_fractional = positions_px - torch.round(positions_px)
         with torch.no_grad():
             if self.patch_indices_need_update():

@@ -689,7 +689,38 @@ class PtychographyVisualizations(PtychographyBase):
             **kwargs,
         )
 
-    # def show_epochs(self):
-    #     ## show the object at each .epoch_snapshots
-    #     ## options to show probe as well, defaults to just object
-    #     ## also option to not show every saved epoch, but only select ones or every nth
+    def show_scan_positions(self, plot_radii: bool = True):
+        # for each scan position, sum the intensity of self.probe at that position
+        scan_positions = self.dset.scan_positions_px.cpu().detach().numpy()
+
+        probe_params = self.probe_model.probe_params
+        probe_radius_px = None
+
+        conv_angle = probe_params.get("semiangle_cutoff")
+        defocus = probe_params.get("defocus", 0)
+        energy = probe_params.get("energy")
+
+        if conv_angle is not None and energy is not None:
+            from quantem.diffractive_imaging.complexprobe import electron_wavelength_angstrom
+
+            wavelength = electron_wavelength_angstrom(energy)
+            conv_angle_rad = conv_angle * 1e-3
+
+            # For defocused probe: radius ≈ |defocus| * convergence_angle + diffraction_limit
+            diffraction_limit_angstrom = 0.61 * wavelength / conv_angle_rad
+            defocus_blur_angstrom = abs(defocus) * conv_angle_rad
+            probe_radius_angstrom = diffraction_limit_angstrom + defocus_blur_angstrom
+            probe_radius_px = probe_radius_angstrom / self.sampling[0]
+
+        _fig, ax = show_2d(self._get_probe_overlap(), title="probe overlap")
+        if probe_radius_px is not None and plot_radii:
+            # plot a circle with the probe radius for each probe position
+            ax.scatter(
+                scan_positions[:, 1],
+                scan_positions[:, 0],
+                s=probe_radius_px**2,
+                edgecolors="red",
+                c="none",
+                linestyle="--",
+            )
+        plt.show()

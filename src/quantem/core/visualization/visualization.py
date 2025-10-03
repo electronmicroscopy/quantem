@@ -511,59 +511,59 @@ def show_2d(
     if kwargs.pop("combine_images", False):
         if nrows > 1:
             raise ValueError()
-        return _show_2d_combined(grid[0], figax=figax, **kwargs)  # TODO pass args here
-
-    # Normalize all arguments to grid format
-    normalized_args = _normalize_show_args_to_grid(
-        shape=(nrows, ncols),
-        norm=norm,
-        scalebar=scalebar,
-        cmap=cmap,
-        cbar=cbar,
-        title=kwargs.pop("titles", None) if title is None else title,
-        chroma_boost=kwargs.pop("chroma_boost", 1.0),
-        show_ticks=kwargs.pop("show_ticks", False),
-    )
-
-    if figax is not None:
-        fig, axs = figax
-        if not isinstance(axs, np.ndarray):
-            axs = np.array([[axs]])
-        elif axs.ndim == 1:
-            axs = axs.reshape(1, -1)
-        if axs.shape != (nrows, ncols):
-            raise ValueError()
+        fig, axs = _show_2d_combined(grid[0], figax=figax, **kwargs)  # TODO pass args here
     else:
-        figsize = kwargs.pop("figsize", (axsize[0] * ncols, axsize[1] * nrows))
-        fig, axs = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+        # Normalize all arguments to grid format
+        normalized_args = _normalize_show_args_to_grid(
+            shape=(nrows, ncols),
+            norm=norm,
+            scalebar=scalebar,
+            cmap=cmap,
+            cbar=cbar,
+            title=kwargs.pop("titles", None) if title is None else title,
+            chroma_boost=kwargs.pop("chroma_boost", 1.0),
+            show_ticks=kwargs.pop("show_ticks", False),
+        )
 
-    for i, row in enumerate(grid):
-        for j, array in enumerate(row):
-            figax = (fig, axs[i][j])
-            _show_2d_array(
-                array,
-                figax=figax,
-                **normalized_args[i][j],  # Unpack the arguments for this subplot
-                **kwargs,
-            )
+        if figax is not None:
+            fig, axs = figax
+            if not isinstance(axs, np.ndarray):
+                axs = np.array([[axs]])
+            elif axs.ndim == 1:
+                axs = axs.reshape(1, -1)
+            if axs.shape != (nrows, ncols):
+                raise ValueError()
+        else:
+            figsize = kwargs.pop("figsize", (axsize[0] * ncols, axsize[1] * nrows))
+            fig, axs = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
 
-    # Hide unused axes in incomplete rows
-    for i, row in enumerate(grid):
-        for j in range(len(row), ncols):
-            axs[i][j].axis("off")  # type: ignore
+        for i, row in enumerate(grid):
+            for j, array in enumerate(row):
+                figax = (fig, axs[i][j])
+                _show_2d_array(
+                    array,
+                    figax=figax,
+                    **normalized_args[i][j],  # Unpack the arguments for this subplot
+                    **kwargs,
+                )
 
-    if kwargs.get("tight_layout", True):
-        with warnings.catch_warnings():  # suppress warning about tight_layout
-            warnings.simplefilter("ignore")
-            fig.tight_layout()
+        # Hide unused axes in incomplete rows
+        for i, row in enumerate(grid):
+            for j in range(len(row), ncols):
+                axs[i][j].axis("off")  # type: ignore
 
-    # Squeeze the axes to the expected shape
-    if axs.shape == (1, 1):
-        axs = axs[0, 0]
-    elif axs.shape[0] == 1:
-        axs = axs[0]
-    elif axs.shape[1] == 1:
-        axs = axs[:, 0]
+        if kwargs.get("tight_layout", True):
+            with warnings.catch_warnings():  # suppress warning about tight_layout
+                warnings.simplefilter("ignore")
+                fig.tight_layout()
+
+        # Squeeze the axes to the expected shape
+        if axs.shape == (1, 1):
+            axs = axs[0, 0]
+        elif axs.shape[0] == 1:
+            axs = axs[0]
+        elif axs.shape[1] == 1:
+            axs = axs[:, 0]
 
     if kwargs.get("force_show", False):
         plt.show()

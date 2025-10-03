@@ -3,6 +3,7 @@ import copy
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self, Sequence, cast
+from warnings import warn
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -400,6 +401,8 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self._dataset_metadata = {
                 "file_path": str(self.dset.dset.file_path) if self.dset.dset.file_path else None,
                 "preprocessing_params": self.dset._preprocessing_params,
+                "learned_scan_positions_px": self.dset.scan_positions_px.data.cpu(),
+                "learned_descan_shifts": self.dset.descan_shifts.data.cpu(),
             }
 
         # Add other common skips for ptychography objects
@@ -419,7 +422,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             compression_level=compression_level,
         )
 
-        self.to(current_device)
+        self.to(current_device)  # TODO figure out why this isn't working for DDIP sometimes?
 
         # Clean up temporary metadata
         if not save_raw_data and hasattr(self, "_dataset_metadata"):
@@ -506,22 +509,29 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 print("Warning: No dataset metadata found in saved object.")
                 dset = None
         elif dset is not None:
-            # this overwrites learned/modified scan positions, but fixing will involve
-            # rewriting the skip on save and dset.preprocess on re-load
             dset._set_initial_scan_positions_px(ptycho.obj_padding_px)
             dset._set_patch_indices(ptycho.obj_padding_px)
+            if hasattr(ptycho, "_dataset_metadata") and ptycho._dataset_metadata:
+                metadata = ptycho._dataset_metadata
+                # preserve learned scan positions and descan shifts
+                if "learned_scan_positions_px" in metadata:
+                    dset.scan_positions_px.data = metadata["learned_scan_positions_px"]
+                if "learned_descan_shifts" in metadata:
+                    dset.descan_shifts.data = metadata["learned_descan_shifts"]
 
         # check if dset was attached to ptycho object
-        if dset is None:
-            if hasattr(ptycho, "_dset") and ptycho._dset is not None:
-                dset = ptycho._dset
-            else:
-                raise ValueError(
-                    "No dataset provided and could not automatically reload dataset. "
-                    "Please provide a dataset parameter or ensure the object was saved with dataset metadata."
-                )
-
-        ptycho.dset = dset
+        if dset is not None:
+            ptycho.dset = dset
+        elif not (hasattr(ptycho, "_dset") and ptycho._dset is not None):
+            warn(
+                "No dataset provided and could not automatically reload dataset.\n"
+                "Please provide a dataset parameter or ensure the object was saved with dataset metadata.\n"
+                "Many functionalities will not work without the dataset attached."
+            )
+            # raise ValueError(
+            #     "No dataset provided and could not automatically reload dataset. "
+            #     "Please provide a dataset parameter or ensure the object was saved with dataset metadata."
+            # )
 
         if device is not None:
             ptycho.to(device)

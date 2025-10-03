@@ -409,11 +409,13 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             return loss
         if array.is_complex():
             amp = array.abs()
-            ph = array.angle()
+            ph = array.angle().abs()
             loss = loss + weight * (torch.mean(amp[0]) + torch.mean(amp[-1]))
             loss = loss + weight * (torch.mean(torch.diff(ph[0])) + torch.mean(torch.diff(ph[-1])))
         else:
-            loss = loss + weight * (torch.mean(array[0]) + torch.mean(array[-1]))
+            loss = loss + weight * (
+                torch.mean(torch.abs(array[0])) + torch.mean(torch.abs(array[-1]))
+            )
         return loss
 
 

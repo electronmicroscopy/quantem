@@ -1,3 +1,5 @@
+from typing import Any
+
 import matplotlib.pyplot as plt
 import numpy as np
 import skimage.measure
@@ -6,6 +8,7 @@ from matplotlib.patches import Polygon
 from quantem.core.visualization import show_2d
 
 
+# TODO update sampling to allow for 3D and to plot with appropriate units along xy/z
 def linescan(
     image: np.ndarray,
     center: tuple[int, int] | None = None,
@@ -16,7 +19,7 @@ def linescan(
     sampling: tuple[float, float] | np.ndarray | None = None,
     sampling_units: str | None = None,
     **kwargs,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, tuple[Any, Any]]:
     """
     Generate a line scan through an image.
 
@@ -108,7 +111,7 @@ def linescan(
         sampling_units = "pixels"
 
     if show:
-        _show_linescan(
+        fig, axs = _show_linescan(
             scan_image,
             profile,
             positions,
@@ -118,8 +121,13 @@ def linescan(
             sampling_units,
             **kwargs,
         )
+    else:
+        fig, axs = None, None
 
-    return positions, profile
+    if kwargs.get("return_fig", False) and show:
+        return positions, profile, (fig, axs)
+    else:
+        return positions, profile
 
 
 def _calculate_line_endpoints(
@@ -153,6 +161,8 @@ def _calculate_line_endpoints(
         # Extend to image boundaries
         start_point, end_point = _find_boundary_intersections(image_shape, center, phi_rad)
 
+    start_point = tuple(np.clip(start_point, 0, np.array(image_shape) - 1))
+    end_point = tuple(np.clip(end_point, 0, np.array(image_shape) - 1))
     return start_point, end_point
 
 
@@ -223,32 +233,26 @@ def _show_linescan(
     linewidth: int,
     sampling_units: str,
     **kwargs,
-) -> None:
+) -> tuple[Any, tuple[Any, Any]]:
     """Display the linescan results."""
-    fig, (ax0, ax1) = plt.subplots(nrows=1, ncols=2, figsize=(12, 8))
+    fig, (ax0, ax1) = plt.subplots(nrows=1, ncols=2, figsize=(12, 6))
 
     if profile.ndim == 1:
         ax0.plot(positions, profile, linewidth=2)
     else:
         # For 3D input, show as image
+        # im = ax0.imshow(profile, aspect="equal", origin="upper")
         im = ax0.imshow(profile, aspect="auto", origin="upper")
-        ax0.set_xlabel("Position along line (pixels)")
-        ax0.set_ylabel("Depth")
         plt.colorbar(im, ax=ax0)
 
     ax0.set_xlabel(f"Position ({sampling_units})")
-    ax0.set_ylabel("Intensity" if profile.ndim == 1 else "Depth")
+    ax0.set_ylabel("Intensity" if profile.ndim == 1 else "Depth (pixels)")
     ax0.set_title("Line Profile")
 
-    # Show the image with line overlay
-
     show_2d(image, figax=(fig, ax1), **kwargs)
-
-    # Draw the line
     color = kwargs.get("color", "red")
 
     if linewidth > 1:
-        # Draw line with width
         _draw_line_with_width(ax1, start_point, end_point, linewidth, color)
     else:
         ax1.plot(
@@ -263,7 +267,7 @@ def _show_linescan(
     ax1.set_title("Image with Line Scan")
 
     plt.tight_layout()
-    plt.show()
+    return fig, (ax0, ax1)
 
 
 def _draw_line_with_width(
