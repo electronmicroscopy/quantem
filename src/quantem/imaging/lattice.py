@@ -77,6 +77,7 @@ class Lattice(AutoSerialize):
         mask=None,
         refine_lattice=True,
         refine_maxiter: int = 200,
+        debugging=False,
         **kwargs,
     ):
         # Lattice
@@ -237,6 +238,10 @@ class Lattice(AutoSerialize):
                 # Update for next iteration
                 lat_flat = res.x
                 self._lat = res.x.reshape(3, 2)
+
+                if debugging:
+                    print(f"Current Block Size: {curr_block_size}")
+                    print(f"Current params : {self._lat}")
 
         # plotting
         if plot_lattice:
@@ -768,11 +773,6 @@ class Lattice(AutoSerialize):
         # lattice vectors in pixels
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
 
-        if coordinates not in ("cartesian", "fractional"):
-            raise ValueError(
-                f"coordinates must be 'cartesian'(default) or 'fractional'. {coordinates} is not valid."
-            )
-
         measure_ind = int(measure_ind)
         reference_ind = int(reference_ind)
 
@@ -786,8 +786,8 @@ class Lattice(AutoSerialize):
         if is_empty(A_cell) or is_empty(B_cell):
             out = Vector.from_shape(
                 shape=(1,),
-                fields=("x", "y", "a", "b", "x_ref", "y_ref"),
-                units=("px", "px", "ind", "ind", "px", "px"),
+                fields=("x", "y", "a", "b", "da", "db"),
+                units=("px", "px", "ind", "ind", "ind", "ind"),
                 name="polarization",
             )
             out.set_data(np.zeros((0, 6), float), 0)
@@ -800,30 +800,17 @@ class Lattice(AutoSerialize):
         Ab = self.atoms[measure_ind]["b"]
         Bx = self.atoms[reference_ind]["x"]
         By = self.atoms[reference_ind]["y"]
+        Ba = self.atoms[reference_ind]["a"]
+        Bb = self.atoms[reference_ind]["b"]
 
-        # Method-specific processing
-        if coordinates == "cartesian":
-            if reference_radius is None:
-                reference_radius = float(min(np.linalg.norm(u), np.linalg.norm(v)))
-
-            query_coords = np.column_stack([Ax, Ay])
-            ref_coords = np.column_stack([Bx, By])
-
-        elif coordinates == "fractional":
-            reference_radius = 3
-            L = np.column_stack((u, v))
-            # try:
-            #     # Not sure if we need this or not, but keeping it for now.
-            #     # Also depends on whether we would be caclulating polarization
-            #     # based on fractional or cartesian coordinates
-            #     L_inv = np.linalg.inv(L)
-            # except np.linalg.LinAlgError:
-            #     raise ValueError("Lattice vectors are singular and cannot be inverted.")
-
-            Ba = self.atoms[reference_ind]["a"]
-            Bb = self.atoms[reference_ind]["b"]
-            query_coords = np.column_stack([Aa, Ab])
-            ref_coords = np.column_stack([Ba, Bb])
+        reference_radius = 3
+        L = np.column_stack((u, v))
+        try:
+            L_inv = np.linalg.inv(L)
+        except np.linalg.LinAlgError:
+            raise ValueError("Lattice vectors are singular and cannot be inverted.")
+        query_coords = np.column_stack([Aa, Ab])
+        ref_coords = np.column_stack([Ba, Bb])
 
         # KD-tree query
         tree = cKDTree(ref_coords)
@@ -848,8 +835,8 @@ class Lattice(AutoSerialize):
         if not np.any(atoms_with_enough_neighbors):
             out = Vector.from_shape(
                 shape=(1,),
-                fields=("x", "y", "a", "b", "x_ref", "y_ref"),
-                units=("px", "px", "ind", "ind", "px", "px"),
+                fields=("x", "y", "a", "b", "da", "db"),
+                units=("px", "px", "ind", "ind", "ind", "ind"),
                 name="polarization",
             )
             out.set_data(np.zeros((0, 6), float), 0)
@@ -864,56 +851,61 @@ class Lattice(AutoSerialize):
         y_arr = Ay[valid_atom_indices].astype(float)
         a_arr = Aa[valid_atom_indices].astype(float)
         b_arr = Ab[valid_atom_indices].astype(float)
-        xr_arr = np.zeros(n_valid, dtype=float)
-        yr_arr = np.zeros(n_valid, dtype=float)
+        da_arr = np.zeros(n_valid, dtype=float)
+        db_arr = np.zeros(n_valid, dtype=float)
 
-        if coordinates == "cartesian":
-            # Vectorized reference position calculation for xy method
-            for i, atom_idx in enumerate(valid_atom_indices):
-                valid_neighbors = valid_mask[atom_idx]
-                if np.sum(valid_neighbors) >= reference_num:
-                    # Get closest reference_num neighbors
-                    valid_dists = dists[atom_idx][valid_neighbors]
-                    valid_idxs = idxs[atom_idx][valid_neighbors]
-                    closest_order = np.argsort(valid_dists)[:reference_num]
-                    nbr_idx = valid_idxs[closest_order].astype(int)
+        for i, atom_idx in enumerate(valid_atom_indices):
+            valid_neighbors = valid_mask[atom_idx]
+            if np.sum(valid_neighbors) >= reference_num:
+                valid_dists = dists[atom_idx][valid_neighbors]
+                valid_idxs = idxs[atom_idx][valid_neighbors]
+                closest_order = np.argsort(valid_dists)[:reference_num]
+                nbr_idx = valid_idxs[closest_order].astype(int)
 
-                    xr_arr[i] = np.mean(Bx[nbr_idx])
-                    yr_arr[i] = np.mean(By[nbr_idx])
+                # Actual Cartesian position of the atom
+                actual_pos = np.array([x_arr[i], y_arr[i]])
 
-        else:  # coordinates == "fractional"
-            # Vectorized calculation for fractional coordinates method
-            for i, atom_idx in enumerate(valid_atom_indices):
-                valid_neighbors = valid_mask[atom_idx]
-                if np.sum(valid_neighbors) >= reference_num:
-                    # Get closest reference_num neighbors
-                    valid_dists = dists[atom_idx][valid_neighbors]
-                    valid_idxs = idxs[atom_idx][valid_neighbors]
-                    closest_order = np.argsort(valid_dists)[:reference_num]
-                    nbr_idx = valid_idxs[closest_order].astype(int)
+                # Fractional indices
+                a, b = a_arr[i], b_arr[i]
+                ai, bi = Ba[nbr_idx], Bb[nbr_idx]
 
-                    # Vectorized matrix operations
-                    a, b = a_arr[i], b_arr[i]
-                    xi, yi = Bx[nbr_idx], By[nbr_idx]
-                    ai, bi = Ba[nbr_idx], Bb[nbr_idx]
+                # Cartesian positions of neighbors
+                xi, yi = Bx[nbr_idx], By[nbr_idx]
 
-                    diff_ind = np.array([a - ai, b - bi])  # (2, n_neighbors)
-                    neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
-                    transformed = L @ diff_ind + neighbor_positions
-                    exp_pos = np.mean(transformed, axis=1)  # (2,)
+                # For each neighbor, calculate where the atom should be
+                # based on fractional index difference
+                fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
+                neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
 
-                    xr_arr[i] = exp_pos[0]
-                    yr_arr[i] = exp_pos[1]
+                # Expected position = neighbor_position + L @ fractional_difference
+                expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
+
+                # Average the expected positions from all neighbors
+                expected_position = np.mean(expected_positions, axis=1)  # (2,)
+
+                # Calculate displacement in Cartesian coordinates
+                displacement_cartesian = actual_pos - expected_position
+
+                # Convert displacement back to fractional coordinates
+                displacement_fractional = L_inv @ displacement_cartesian
+
+                # Store with consistent sign convention
+                da_arr[i] = displacement_fractional[0]
+                db_arr[i] = displacement_fractional[1]
 
         out = Vector.from_shape(
             shape=(1,),
-            fields=("x", "y", "a", "b", "x_ref", "y_ref"),
-            units=("px", "px", "ind", "ind", "px", "px"),
+            fields=("x", "y", "a", "b", "da", "db"),
+            units=("px", "px", "ind", "ind", "ind", "ind"),
             name="polarization",
         )
 
-        arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, xr_arr, yr_arr])
-        out.set_data(arr, 0)
+        arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
+
+        filtered_arr = arr[(np.abs(arr[:, -2]) < 0.1) & (np.abs(arr[:, -1]) < 0.1)]
+        out.set_data(filtered_arr, 0)
+
+        # out.set_data(arr, 0)
 
         if plot_polarization_vectors:
             self.plot_polarization_vectors(out, **plot_kwargs)
@@ -973,12 +965,23 @@ class Lattice(AutoSerialize):
         # Fields
         xA = pol_vec[0]["x"]
         yA = pol_vec[0]["y"]
-        xR = pol_vec[0]["x_ref"]
-        yR = pol_vec[0]["y_ref"]
+        # xR = pol_vec[0]["x_ref"]
+        # yR = pol_vec[0]["y_ref"]
+        da = pol_vec[0]["da"]
+        db = pol_vec[0]["db"]
+
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        L = np.column_stack((u, v))
+        dr = L @ np.vstack((da, db))
+        dr_raw = dr[0].astype(float)
+        dc_raw = dr[1].astype(float)
+
+        xR = xA - dr_raw
+        yR = yA - dc_raw
 
         # Displacements (rows, cols)
-        dr_raw = (xA - xR).astype(float)  # down +
-        dc_raw = (yA - yR).astype(float)  # right +
+        # dr_raw = (xA - xR).astype(float)  # down +
+        # dc_raw = (yA - yR).astype(float)  # right +
 
         # --- Unified color mapping (identical across scripts) ---
         dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
@@ -1185,16 +1188,20 @@ class Lattice(AutoSerialize):
             return img_rgb
 
         # fields
-        xA = pol_vec[0]["x"]
-        yA = pol_vec[0]["y"]
-        xR = pol_vec[0]["x_ref"]
-        yR = pol_vec[0]["y_ref"]
         a_raw = pol_vec[0]["a"]
         b_raw = pol_vec[0]["b"]
+        da = pol_vec[0]["da"]  # fractional displacement in a direction
+        db = pol_vec[0]["db"]  # fractional displacement in b direction
 
-        # displacements (rows/cols)
-        dr_raw = (xA - xR).astype(float)  # down +
-        dc_raw = (yA - yR).astype(float)  # right +
+        # Convert fractional displacements to Cartesian displacements
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        L = np.column_stack((u, v))
+        displacement_fractional = np.vstack((da, db))
+        displacement_cartesian = L @ displacement_fractional
+
+        # Extract Cartesian displacements
+        dr_raw = displacement_cartesian[0].astype(float)  # down +
+        dc_raw = displacement_cartesian[1].astype(float)  # right +
 
         # --- Unified color mapping (identical to arrow plot) ---
         dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
@@ -1253,35 +1260,35 @@ class Lattice(AutoSerialize):
 
             img_rgb[r0 : r0 + pixel_size, c0 : c0 + pixel_size, :] = color
 
-        r_0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-        theta_u = np.arctan2(u[1], u[0])
-        handedness = u[0] * v[1] - u[1] * v[0] > 0
+        # r_0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        # theta_u = np.arctan2(u[1], u[0])
+        # handedness = u[0] * v[1] - u[1] * v[0] > 0
 
-        if theta_u > np.pi / 36 or theta_u < -np.pi / 36:
-            from scipy.ndimage import rotate
+        # if theta_u > np.pi / 36 or theta_u < -np.pi / 36:
+        #     from scipy.ndimage import rotate
 
-            if not handedness:
-                img_rgb = np.fliplr(img_rgb)
+        #     if not handedness:
+        #         img_rgb = np.fliplr(img_rgb)
 
-            img_rgb = rotate(
-                img_rgb,
-                np.degrees(theta_u),
-                axes=(1, 0),
-                reshape=True,
-                order=1,
-                mode="constant",
-                cval=0.0,
-            )
+        #     img_rgb = rotate(
+        #         img_rgb,
+        #         np.degrees(theta_u),
+        #         axes=(1, 0),
+        #         reshape=True,
+        #         order=1,
+        #         mode="constant",
+        #         cval=0.0,
+        #     )
 
-            # Crop the image to deal with artifacts due to rotation
-            mask = np.linalg.norm(img_rgb, axis=2) > 0
-            rows, cols = np.where(mask)
+        #     # Crop the image to deal with artifacts due to rotation
+        #     mask = np.linalg.norm(img_rgb, axis=2) > 0
+        #     rows, cols = np.where(mask)
 
-            if len(rows) > 0 and len(cols) > 0:
-                r_min, r_max = rows.min(), rows.max()
-                c_min, c_max = cols.min(), cols.max()
+        #     if len(rows) > 0 and len(cols) > 0:
+        #         r_min, r_max = rows.min(), rows.max()
+        #         c_min, c_max = cols.min(), cols.max()
 
-                img_rgb = img_rgb[r_min : r_max + 1, c_min : c_max + 1, :]
+        #         img_rgb = img_rgb[r_min : r_max + 1, c_min : c_max + 1, :]
 
         # --- Optional rendering with legend ---
         if plot:
