@@ -15,7 +15,7 @@ from quantem.diffractive_imaging.probe_models import ProbeDIP, ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 
 
-class PFTM(Ptychography):
+class PtychoLite(Ptychography):
     """
     High-level convenience wrapper around Ptychography.
 
@@ -204,7 +204,7 @@ class PFTM(Ptychography):
         )
 
 
-class PFTM_DIP(Ptychography):
+class PtychoLiteDIP(Ptychography):
     """
     High-level convenience wrapper around Ptychography.
 
@@ -213,9 +213,9 @@ class PFTM_DIP(Ptychography):
     """
 
     @classmethod
-    def from_pftm(
+    def from_ptycholite(
         cls,
-        pftm: PFTM,
+        ptycholite: PtychoLite,
         pretrain_iters: int | None = None,
         pretrain_lr: float = 1e-3,
         # model settings
@@ -232,29 +232,29 @@ class PFTM_DIP(Ptychography):
             device = "cuda"
         # Object model
         obj_dip = CNN2d(
-            in_channels=pftm.obj_model.num_slices,
-            out_channels=pftm.obj_model.num_slices,
+            in_channels=ptycholite.obj_model.num_slices,
+            out_channels=ptycholite.obj_model.num_slices,
             num_layers=cnn_num_layers,
-            dtype=torch.float32 if pftm.obj_model.obj_type == "complex" else torch.float32,
+            dtype=torch.float32 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
         )
 
         obj_model = ObjectDIP.from_pixelated(
             model=obj_dip,
-            pixelated=pftm.obj_model,
+            pixelated=ptycholite.obj_model,
             device=device,
         )
 
         # Probe model
         probe_dip = CNN2d(
-            in_channels=pftm.probe_model.num_probes,
-            out_channels=pftm.probe_model.num_probes,
+            in_channels=ptycholite.probe_model.num_probes,
+            out_channels=ptycholite.probe_model.num_probes,
             num_layers=cnn_num_layers,
             dtype=torch.complex64,
         )
 
         probe_model = ProbeDIP.from_pixelated(
             model=probe_dip,
-            pixelated=pftm.probe_model,
+            pixelated=ptycholite.probe_model,
             device=device,
         )
 
@@ -303,18 +303,18 @@ class PFTM_DIP(Ptychography):
 
         # Build a fresh instance of this subclass using the original components
         ptycho = cls.from_models(
-            dset=pftm.dset,
+            dset=ptycholite.dset,
             obj_model=obj_model,
             probe_model=probe_model,
-            detector_model=pftm.detector_model,
-            logger=logger if logger is not None else pftm.logger,
+            detector_model=ptycholite.detector_model,
+            logger=logger if logger is not None else ptycholite.logger,
             device=device,
-            verbose=pftm.verbose,
-            rng=pftm.rng,
+            verbose=ptycholite.verbose,
+            rng=ptycholite.rng,
         )
 
         ptycho.preprocess(
-            obj_padding_px=(int(pftm.obj_padding_px[0]), int(pftm.obj_padding_px[1]))
+            obj_padding_px=(int(ptycholite.obj_padding_px[0]), int(ptycholite.obj_padding_px[1]))
         )
         return ptycho
 

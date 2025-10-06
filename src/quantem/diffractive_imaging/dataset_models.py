@@ -1160,6 +1160,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             ax.set_aspect(np.ptp(angles_deg) / aspect_ratio / 4)
 
             fig.tight_layout()
+            plt.show()
 
         def plot_com_images(
             com_arrays: list[np.ndarray],
@@ -1180,6 +1181,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 figsize=figsize,
                 scalebar={"sampling": self.obj_sampling[0], "units": "A"},
                 norm={"interval_type": "manual"},
+                force_show=True,
                 **plot_kwargs,
             )
 
