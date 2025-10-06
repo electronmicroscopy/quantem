@@ -1,27 +1,23 @@
-"""Optimized center of mass calculations for diffraction patterns."""
+"""optimized center of mass calculations for dpc diffraction patterns"""
 
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 
-try:
-    import scipy.ndimage as ndi
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+_coordinate_cache: dict[tuple[int, int, torch.device, torch.dtype, float, float], tuple[torch.Tensor, torch.Tensor]] = {}
+_MAX_CACHE_ENTRIES = 8
 
-_coordinate_cache = {}
-
+# Define a clear coordinate cache helper for CPU if needed.
+def clear_coordinate_cache() -> None:
+    _coordinate_cache.clear()
 
 def _get_dtype(tensor: torch.Tensor) -> torch.dtype:
-    """Get appropriate dtype for calculations."""
     return (
         tensor.dtype
         if tensor.dtype in (torch.float32, torch.float64)
         else torch.float32
     )
-
 
 def _create_coordinates(
     H: int,
@@ -31,24 +27,25 @@ def _create_coordinates(
     center: Optional[Tuple[float, float]] = None,
     use_cache: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Create coordinate tensors with optional caching."""
-    # Set coordinate origin
+    # set coordinate origin
     if center is None:
         x0, y0 = (W - 1) * 0.5, (H - 1) * 0.5
     else:
         x0, y0 = float(center[0]), float(center[1])
 
-    # Skip caching for MPS or when disabled
-    if not use_cache or device.type == 'mps':
+    # skip caching for gpu/mps or when disabled
+    if not use_cache or device.type in ("mps", "cuda"):
         x_coords = torch.arange(W, device=device, dtype=dtype) - x0
         y_coords = torch.arange(H, device=device, dtype=dtype) - y0
         return x_coords, y_coords
 
-    # Use caching for other devices
+    # use caching for CPU tensors
     cache_key = (H, W, device, dtype, x0, y0)
     if cache_key not in _coordinate_cache:
         x_coords = torch.arange(W, device=device, dtype=dtype) - x0
         y_coords = torch.arange(H, device=device, dtype=dtype) - y0
+        if len(_coordinate_cache) >= _MAX_CACHE_ENTRIES:
+            _coordinate_cache.pop(next(iter(_coordinate_cache)))
         _coordinate_cache[cache_key] = (x_coords, y_coords)
     else:
         x_coords, y_coords = _coordinate_cache[cache_key]
@@ -65,35 +62,28 @@ def center_of_mass_optimized(
     eps: float = 1e-12,
 ) -> torch.Tensor:
     if diffraction_patterns.ndim < 2:
-        raise ValueError("Input must have at least 2 dimensions (height, width)")
+        raise ValueError("Input must have at least 2 dimensions, height and width")
 
     is_single_pattern = diffraction_patterns.ndim == 2
     device = diffraction_patterns.device
     dtype = _get_dtype(diffraction_patterns)
 
-    # Use scipy for simple single-pattern CPU calculations
-    if (is_single_pattern and SCIPY_AVAILABLE and device.type == 'cpu'
-        and mask is None and not subtract_background and pixel_size is None and center is None):
+    if mask is None and not subtract_background and pixel_size is None and center is None:
+        if is_single_pattern:
+            batched = diffraction_patterns.unsqueeze(0)
+            return _vectorized_batch_center_of_mass(batched, eps).squeeze(0)
+        return _vectorized_batch_center_of_mass(diffraction_patterns, eps)
 
-        H, W = diffraction_patterns.shape
-        com = ndi.center_of_mass(diffraction_patterns.detach().numpy())
-        x_center = com[1] - (W - 1) * 0.5
-        y_center = com[0] - (H - 1) * 0.5
+    return _full_featured_center_of_mass(
+        diffraction_patterns,
+        pixel_size,
+        mask,
+        subtract_background,
+        center,
+        eps,
+    )
 
-        result_np = np.array([x_center, y_center], dtype=np.float32 if dtype == torch.float32 else np.float64)
-        return torch.from_numpy(result_np).to(device=device)
-
-    # Use optimized batch processing for simple cases
-    elif (not is_single_pattern and mask is None and not subtract_background
-          and pixel_size is None and center is None):
-        return _ultra_fast_batch_center_of_mass(diffraction_patterns, eps)
-
-    # Handle complex cases with full feature set
-    else:
-        return _full_featured_center_of_mass(diffraction_patterns, pixel_size, mask, subtract_background, center, eps)
-
-
-def _ultra_fast_batch_center_of_mass(
+def _vectorized_batch_center_of_mass(
     diffraction_patterns: torch.Tensor,
     eps: float = 1e-12
 ) -> torch.Tensor:
@@ -126,13 +116,12 @@ def _ultra_fast_batch_center_of_mass(
 
     return torch.stack((com_x, com_y), dim=-1)
 
+# Fallback to original implementation on devices that don't handle torch.compile well
 def _compile_if_supported(func):
-    """Apply torch.compile with MPS safety check."""
     try:
         compiled = torch.compile(func)
 
         def safe_compiled_func(*args, **kwargs):
-            # Skip compilation for MPS due to symbolic expression issues
             for arg in args:
                 if isinstance(arg, torch.Tensor) and arg.device.type == 'mps':
                     return func(*args, **kwargs)
@@ -141,10 +130,9 @@ def _compile_if_supported(func):
         return safe_compiled_func
     except (AttributeError, ImportError):
         return func
+    
 
-
-_ultra_fast_batch_center_of_mass = _compile_if_supported(_ultra_fast_batch_center_of_mass)
-
+_vectorized_batch_center_of_mass = _compile_if_supported(_vectorized_batch_center_of_mass)
 
 def _full_featured_center_of_mass(
     diffraction_patterns: torch.Tensor,
@@ -155,7 +143,7 @@ def _full_featured_center_of_mass(
     eps: float = 1e-12,
 ) -> torch.Tensor:
     if diffraction_patterns.ndim < 2:
-        raise ValueError("Input must have (at least) 2 dimensions (height, width)")
+        raise ValueError("Input must have at least 2 dimensions -(height, width)")
 
     H, W = diffraction_patterns.shape[-2:]
     device = diffraction_patterns.device
@@ -213,17 +201,23 @@ def _full_featured_center_of_mass(
 
 _full_featured_center_of_mass = _compile_if_supported(_full_featured_center_of_mass)
 
+# Warmup on sample data a couple times
 def warmup_compiled_functions(
     batch_size: int = 100,
-    pattern_size: Tuple[int, int] = (256, 256)
+    pattern_size: Tuple[int, int] = (256, 256),
+    device: Optional[torch.device | str] = None,
 ) -> None:
-    """Pre-compile torch.compile functions to eliminate JIT overhead."""
-    test_data = torch.randn(batch_size, *pattern_size, dtype=torch.float32)
+    if device is None:
+        device = torch.device("cpu")
+    else:
+        device = torch.device(device)
 
-    # Warmup batch function
+    test_data = torch.randn(batch_size, *pattern_size, dtype=torch.float32, device=device)
+
+    # warmup batch 
     for _ in range(5):
-        _ultra_fast_batch_center_of_mass(test_data)
+        _vectorized_batch_center_of_mass(test_data)
 
-    # Warmup full-featured function
+    # warmup full-featured 
     for _ in range(5):
         _full_featured_center_of_mass(test_data, None, None, False, None, 1e-12)

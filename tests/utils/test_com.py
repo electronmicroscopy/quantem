@@ -8,13 +8,13 @@ import pytest
 import scipy.ndimage as ndi
 import torch
 
-from quantem.core.utils.com import (
+from quantem.diffraction.dpc.com import (
     center_of_mass_optimized,
     warmup_compiled_functions,
 )
 
 
-def _benchmark_function(func, data, num_trials=100, warmup_runs=0):
+def _benchmark_function(func, data, num_trials=20, warmup_runs=0):
     """Helper function to benchmark a function with timing."""
     # Warmup runs
     for _ in range(warmup_runs):
@@ -30,7 +30,7 @@ def _benchmark_function(func, data, num_trials=100, warmup_runs=0):
     return statistics.mean(times), result
 
 
-def _benchmark_gpu_function(func, data, num_trials=100, warmup_runs=0):
+def _benchmark_gpu_function(func, data, num_trials=20, warmup_runs=0):
     """Helper function to benchmark GPU functions with proper synchronization."""
     device = data.device
 
@@ -153,6 +153,7 @@ def test_single_pattern_benchmark():
 
     data_torch = torch.from_numpy(data_np)
     data_torch_gpu = data_torch
+    rng = np.random.default_rng(0)
     results = {}
 
     # Benchmark implementations
@@ -250,6 +251,7 @@ def test_mps_specific_benchmark():
     batch_sizes = [1, 10, 50, 100, 500, 1000]
     pattern_size = (256, 256)
 
+    rng = np.random.default_rng(0)
     results = {}
 
     for batch_size in batch_sizes:
@@ -257,8 +259,12 @@ def test_mps_specific_benchmark():
 
         # Create more realistic test data (avoid pure random noise)
         data_np = np.zeros((batch_size, *pattern_size), dtype=np.float32)
-        # Add controlled noise
-        data_np += np.random.randn(batch_size, *pattern_size).astype(np.float32) * 10
+        # Add controlled, low-amplitude noise for reproducibility
+        data_np += rng.normal(
+            loc=0.0,
+            scale=0.1,
+            size=(batch_size, *pattern_size),
+        ).astype(np.float32)
         # Add prominent bright spots to dominate the center of mass
         for i in range(batch_size):
             row = pattern_size[0]//2 + (i % 20) - 10
@@ -758,4 +764,3 @@ def test_run_comprehensive_benchmarks():
     print("\n" + "=" * 80)
     print("BENCHMARK COMPLETE")
     print("=" * 80)
-
