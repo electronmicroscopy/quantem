@@ -1,12 +1,17 @@
 # Utilities for processing images
-
-from typing import Optional, Tuple
+from __future__ import annotations
+from typing import Optional, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
+from scipy.special import comb
 
 from quantem.core.utils.utils import generate_batches
+from quantem.core.datastructures.dataset2d import Dataset2d
+from quantem.core.visualization import show_2d
+
+ArrayOrDS = Union[NDArray, Dataset2d]
 
 
 def dft_upsample(
@@ -360,3 +365,189 @@ def fourier_cropping(
     result[-h2:, -w2:] = corner_centered_array[-h2:, -w2:]
 
     return result
+
+
+def _as_array(x: ArrayOrDS) -> NDArray:
+    return x.array if isinstance(x, Dataset2d) else np.asarray(x)
+
+
+def _like_dataset2d(arr: NDArray, template: Dataset2d, name: str) -> Dataset2d:
+    return Dataset2d.from_array(
+        arr,
+        name=name,
+        origin=getattr(template, "origin", None),
+        sampling=getattr(template, "sampling", None),
+        units=getattr(template, "units", None),
+    )
+
+
+def _bernstein_basis_1d(n: int, t: NDArray) -> NDArray:
+    """
+    Bernstein basis B_k^n(t) for k=0..n, evaluated at t in [0,1].
+    Returns shape (t.size, n+1).
+    """
+    k = np.arange(n + 1, dtype=int)
+    return comb(n, k)[None, :] * (t[:, None] ** k[None, :]) * ((1.0 - t)[:, None] ** (n - k)[None, :])
+
+
+def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> NDArray:
+    """
+    Builds A with shape (H*W, (ou+1)*(ov+1)) via a Kronecker product of 1D Bernstein bases.
+    """
+    H, W = im_shape
+    ou, ov = int(order[0]), int(order[1])
+    u = np.linspace(0.0, 1.0, H)
+    v = np.linspace(0.0, 1.0, W)
+    Bu = _bernstein_basis_1d(ou, u)   # (H, ou+1)
+    Bv = _bernstein_basis_1d(ov, v)   # (W, ov+1)
+    basis_cube = np.einsum("ik,jl->ijkl", Bu, Bv)  # (H, W, ou+1, ov+1)
+    A = basis_cube.reshape(H * W, (ou + 1) * (ov + 1))
+    return A
+
+
+def background_subtract(
+    image: ArrayOrDS,
+    mask: Optional[ArrayOrDS] = None,
+    thresh_bg: Optional[float] = None,
+    order: Tuple[int, int] = (2, 2),
+    sigma: Optional[float] = None,
+    num_iter: int = 10,
+    plot_result: bool = True,
+    cmap: str = "turbo",
+    return_background: bool = False,
+    return_mask: bool = False,
+    **show_kwargs,
+):
+    """
+    Background subtraction using bi-variate Bernstein (Bezier) polynomial fitting
+    with iterative background pixel selection.
+
+    Parameters
+    ----------
+    image : np.ndarray or Dataset2d
+        Input 2D image.
+    mask : np.ndarray or Dataset2d, optional
+        Boolean mask selecting valid pixels (True = valid). If None, all pixels valid.
+    thresh_bg : float, optional
+        Threshold on residual (image - background) to classify background pixels.
+        If None, initialized to median(image[mask]) and reused each iteration.
+    order : (int, int), default (2,2)
+        Polynomial orders (row_order, col_order) for the Bernstein basis.
+    sigma : float, optional
+        Gaussian sigma (in pixels) for smoothing residuals before thresholding.
+    num_iter : int, default 10
+        Number of fit/update iterations.
+    plot_result : bool, default True
+        If True, displays input, background, and background-subtracted images using show_2d.
+    cmap : str, default "turbo"
+        Colormap for plotting.
+    return_background : bool, default False
+        If True, also return the background image.
+    return_mask : bool, default False
+        If True, also return the final background mask (numpy bool array).
+    **show_kwargs
+        Passed through to `show_2d` (e.g., to enable scalebars if supported).
+
+    Returns
+    -------
+    image_sub : same type as `image` (np.ndarray or Dataset2d)
+        Background-subtracted image.
+    image_bg : same type as `image` (optional)
+        Estimated background image (returned if `return_background=True`).
+    mask_bg : np.ndarray of bool (optional)
+        Final background mask (returned if `return_mask=True`).
+    """
+    # --- normalize inputs ---
+    is_dataset = isinstance(image, Dataset2d)
+    im = _as_array(image).astype(float, copy=True)
+
+    if im.ndim != 2:
+        raise ValueError("`image` must be a 2D numpy array or Dataset2d")
+
+    if mask is None:
+        mask_arr = np.ones_like(im, dtype=bool)
+    else:
+        mask_arr = _as_array(mask).astype(bool, copy=False)
+        if mask_arr.shape != im.shape:
+            raise ValueError("`mask` must have the same shape as `image`.")
+
+    # --- build basis once ---
+    order = (int(order[0]), int(order[1]))
+    A_full = _build_basis_matrix(im.shape, order)  # (H*W, K)
+    H, W = im.shape
+    im_flat = im.ravel()
+
+    # --- initialize background & thresholds ---
+    im_bg = np.zeros_like(im)
+    if thresh_bg is None:
+        thresh_val = np.median(im[mask_arr])
+    else:
+        thresh_val = float(thresh_bg)
+
+    resid = im - im_bg
+    if sigma is not None and sigma > 0:
+        resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
+    mask_bg = resid < thresh_val
+    mask_bg &= mask_arr
+
+    # --- iterate fit/update ---
+    for _ in range(int(num_iter)):
+        idx = mask_bg.ravel()
+        if not np.any(idx):
+            idx = mask_arr.ravel()  # ensure solvable if mask collapses
+
+        coefs, *_ = np.linalg.lstsq(A_full[idx, :], im_flat[idx], rcond=None)
+        im_bg = (A_full @ coefs).reshape(H, W)
+
+        resid = im - im_bg
+        if sigma is not None and sigma > 0:
+            resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
+
+        thr = thresh_val if thresh_bg is None else float(thresh_bg)
+        mask_bg = (resid < thr)
+        mask_bg &= mask_arr
+
+    # --- final subtraction ---
+    im_sub = im - im_bg
+
+    # --- plotting with quantem.show_2d (for scalebar support when available) ---
+    if plot_result:
+        vmin = float(np.min(im_sub[mask_arr]))
+        vmax = float(np.max(im_sub[mask_arr]))
+        disp = [
+            im - np.mean(im_bg),
+            (im_bg - np.mean(im_bg)) * mask_bg,
+            im_sub,
+        ]
+        # Add default titles only if the caller didn't specify titles
+        local_kwargs = dict(vmin=vmin, vmax=vmax, cmap=cmap)
+        local_kwargs.update(show_kwargs)
+        if "title" not in local_kwargs:
+            local_kwargs["title"] = [
+                "Input Image",
+                "Background Image (masked)",
+                "Background Subtracted",
+            ]
+        show_2d(disp, **local_kwargs)
+
+    # --- package outputs in the same type as input ---
+    if is_dataset:
+        sub_ds = _like_dataset2d(im_sub, image, name=getattr(image, "name", "image") + " (background subtracted)")
+        bg_ds = _like_dataset2d(im_bg, image, name=getattr(image, "name", "image") + " (background)")
+        if return_background and return_mask:
+            return sub_ds, bg_ds, mask_bg
+        elif return_background:
+            return sub_ds, bg_ds
+        elif return_mask:
+            return sub_ds, mask_bg
+        else:
+            return sub_ds
+    else:
+        if return_background and return_mask:
+            return im_sub, im_bg, mask_bg
+        elif return_background:
+            return im_sub, im_bg
+        elif return_mask:
+            return im_sub, mask_bg
+        else:
+            return im_sub
