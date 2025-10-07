@@ -452,7 +452,7 @@ def background_subtract(
     image: NDArray | Dataset2d,
     mask: Optional[NDArray] = None,        # boolean numpy array or None
     thresh_bg: Optional[float] = None,
-    order: Tuple[int, int] = (2, 2),
+    order: Tuple[int, int] = (1, 1),
     sigma: Optional[float] = None,
     num_iter: int = 10,
     plot_result: bool = True,
