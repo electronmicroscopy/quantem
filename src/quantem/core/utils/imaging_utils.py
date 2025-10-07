@@ -1,6 +1,6 @@
 # Utilities for processing images
 from __future__ import annotations
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Literal, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -388,6 +388,66 @@ def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> ND
     return basis_cube.reshape(H * W, (ou + 1) * (ov + 1))
 
 
+# --- Overloads: NDArray input ---
+@overload
+def background_subtract(
+    image: NDArray,
+    mask: Optional[NDArray] = ...,
+    thresh_bg: Optional[float] = ...,
+    order: Tuple[int, int] = ...,
+    sigma: Optional[float] = ...,
+    num_iter: int = ...,
+    plot_result: bool = ...,
+    axsize: Tuple[int, int] = ...,
+    cmap: str = ...,
+    return_background_and_mask: Literal[False] = ...,
+    **show_kwargs,
+) -> NDArray: ...
+@overload
+def background_subtract(
+    image: NDArray,
+    mask: Optional[NDArray] = ...,
+    thresh_bg: Optional[float] = ...,
+    order: Tuple[int, int] = ...,
+    sigma: Optional[float] = ...,
+    num_iter: int = ...,
+    plot_result: bool = ...,
+    axsize: Tuple[int, int] = ...,
+    cmap: str = ...,
+    return_background_and_mask: Literal[True] = ...,
+    **show_kwargs,
+) -> Tuple[NDArray, NDArray, NDArray]: ...
+
+# --- Overloads: Dataset2d input (mask stays NDArray) ---
+@overload
+def background_subtract(
+    image: Dataset2d,
+    mask: Optional[NDArray] = ...,
+    thresh_bg: Optional[float] = ...,
+    order: Tuple[int, int] = ...,
+    sigma: Optional[float] = ...,
+    num_iter: int = ...,
+    plot_result: bool = ...,
+    axsize: Tuple[int, int] = ...,
+    cmap: str = ...,
+    return_background_and_mask: Literal[False] = ...,
+    **show_kwargs,
+) -> Dataset2d: ...
+@overload
+def background_subtract(
+    image: Dataset2d,
+    mask: Optional[NDArray] = ...,
+    thresh_bg: Optional[float] = ...,
+    order: Tuple[int, int] = ...,
+    sigma: Optional[float] = ...,
+    num_iter: int = ...,
+    plot_result: bool = ...,
+    axsize: Tuple[int, int] = ...,
+    cmap: str = ...,
+    return_background_and_mask: Literal[True] = ...,
+    **show_kwargs,
+) -> Tuple[Dataset2d, Dataset2d, NDArray]: ...
+
 def background_subtract(
     image: NDArray | Dataset2d,
     mask: Optional[NDArray] = None,        # boolean numpy array or None
@@ -396,20 +456,62 @@ def background_subtract(
     sigma: Optional[float] = None,
     num_iter: int = 10,
     plot_result: bool = True,
-    axsize: Tuple[int, int] = (3.1,3),
+    axsize: Tuple[int, int] = (3.1, 3),
     cmap: str = "turbo",
-    return_background: bool = False,
-    return_mask: bool = False,
+    return_background_and_mask: bool = False,
     **show_kwargs,
 ):
     """
-    Background subtraction via bi-variate Bernstein (Bezier) polynomial fitting.
+    Background subtraction via bi-variate Bernstein (Bézier) polynomial fitting.
+
+    Parameters
+    ----------
+    image : numpy.ndarray or Dataset2d
+        2D input image. If a Dataset2d is provided, only its array is used for the fit;
+        outputs are returned as Dataset2d (same metadata preserved).
+    mask : numpy.ndarray of bool, optional
+        Boolean mask (same shape as `image`) indicating valid pixels for fitting and for
+        range calculations in the diagnostic plot. If None, all pixels are valid.
+    thresh_bg : float, optional
+        Background threshold to classify pixels as background during robust iterations.
+        If None, initialized from the median of `image[mask]`.
+    order : tuple[int, int], default (2, 2)
+        Polynomial order (u, v) for the Bernstein basis along the two axes.
+        Number of basis terms = (order[0] + 1) * (order[1] + 1).
+    sigma : float, optional
+        Gaussian sigma (pixels) to smooth residuals before thresholding at each iteration.
+        If None or 0, no smoothing is applied.
+    num_iter : int, default 10
+        Number of robust fitting iterations (refit background, update mask).
+    plot_result : bool, default True
+        If True, displays a 3-panel diagnostic:
+          (1) Input (mean-centered by background mean),
+          (2) Fitted background shown only where `mask_bg` is True (else black),
+          (3) Background-subtracted image with `RdBu_r`, zero-centered, symmetric ±min(|min|,|max|)
+              computed from `im_sub[mask]`. Colorbar is shown on panel (3).
+    axsize : tuple[int, int], default (3.1, 3)
+        Panel size in inches, forwarded to `show_2d`.
+    cmap : str, default "turbo"
+        Colormap for panels (1) and (2). Panel (3) always uses "RdBu_r".
+    return_background_and_mask : bool, default False
+        If True, also return the fitted background and the final background mask.
+
+    **show_kwargs
+        Additional arguments passed to `quantem.core.visualization.show_2d`.
 
     Returns
     -------
-    im_sub : np.ndarray
-    im_bg  : np.ndarray (optional, if return_background=True)
-    mask_bg: np.ndarray bool (optional, if return_mask=True)
+    im_sub : numpy.ndarray or Dataset2d
+        Background-subtracted image (same type as `image`).
+    im_bg : numpy.ndarray or Dataset2d, optional
+        Fitted background (same type as `image`). Returned if `return_background_and_mask=True`.
+    mask_bg : numpy.ndarray of bool, optional
+        Final background mask (always NumPy). Returned if `return_background_and_mask=True`.
+
+    Notes
+    -----
+    - The right-panel plot uses `im_sub[mask]` to compute a symmetric, zero-centered range
+      so white corresponds to 0.0 in RdBu_r.
     """
     # --- inputs ---
     im = _as_array(image).astype(float, copy=True)
@@ -459,9 +561,9 @@ def background_subtract(
     # --- final subtraction ---
     im_sub = im - im_bg
 
-    # --- plotting (right panel: zero-centered RdBu_r with symmetric ±min(|min|,|max|) from im_sub[mask]) ---
+    # --- plotting (right panel: zero-centered RdBu_r; limits from im_sub[mask]) ---
     if plot_result:
-        # Use only the masked region to set the range
+        # Range from masked region
         vals = im_sub[mask_arr]
         vals = vals[np.isfinite(vals)]
         if vals.size == 0:
@@ -469,10 +571,9 @@ def background_subtract(
 
         vmin_sub = float(np.min(vals))
         vmax_sub = float(np.max(vals))
-        # vrange   = float(np.minimum(abs(vmin_sub), abs(vmax_sub)))
-        vrange   = float(np.maximum(abs(vmin_sub), abs(vmax_sub)))
+        vrange   = float(np.maximum(abs(vmin_sub), abs(vmax_sub)))  # ±min(|min|,|max|)
         if vrange <= 0:
-            vrange = 1e-12  # avoid zero-width range
+            vrange = 1e-12
 
         # Background panel: show only fitted region; black elsewhere
         bg_disp = (im_bg - np.mean(im_bg)).copy()
@@ -480,7 +581,7 @@ def background_subtract(
 
         # Colormaps
         cmap_base = cm.get_cmap(cmap).with_extremes(bad="black")  # NaNs -> black
-        cmap_div  = "RdBu_r"  # diverging; center (white) at 0 via centered interval
+        cmap_div  = "RdBu_r"
 
         # Panels: input, background(masked), background-subtracted
         disp = [
@@ -490,8 +591,6 @@ def background_subtract(
         ]
 
         # Per-panel normalization:
-        #  - Panels 1 & 2: manual min/max from masked im_sub
-        #  - Panel 3    : centered at 0.0 with half_range = vrange (white == 0.0)
         norm = [
             {"interval_type": "manual",   "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},   # input
             {"interval_type": "manual",   "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},   # background
@@ -508,12 +607,18 @@ def background_subtract(
             **show_kwargs,
         )
 
-    # --- outputs (numpy arrays) ---
-    if return_background and return_mask:
-        return im_sub, im_bg, mask_bg
-    elif return_background:
-        return im_sub, im_bg
-    elif return_mask:
-        return im_sub, mask_bg
+    # --- outputs (match image type for images; mask always ndarray) ---
+    if isinstance(image, Dataset2d):
+        meta = dict(origin=image.origin, sampling=image.sampling, units=image.units)
+        name_base = getattr(image, "name", "image")
+        im_sub_ds = Dataset2d.from_array(im_sub, name=f"{name_base} (bg-sub)", **meta)
+        im_bg_ds  = Dataset2d.from_array(im_bg,  name=f"{name_base} (bg-fit)", **meta)
+        if return_background_and_mask:
+            return im_sub_ds, im_bg_ds, mask_bg
+        else:
+            return im_sub_ds
     else:
-        return im_sub
+        if return_background_and_mask:
+            return im_sub, im_bg, mask_bg
+        else:
+            return im_sub
