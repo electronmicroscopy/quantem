@@ -400,6 +400,28 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
 
         return orthogonal_probes[intensities_order]
 
+#    def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
+#        """
+#        """
+#        n_probes = start_probe.shape[0]
+#
+#        # Gram matrix, G = P @ P.H
+#        P = start_probe.view(n_probes,-1)
+#        G = P @ P.conj().T
+#
+#        # eigen-decomposition of G
+#        _, eigenvecs = torch.linalg.eigh(G)
+#
+#        # rotate probes into orthogonal basis
+#        orthogonal_probes = torch.tensordot(eigenvecs.T, start_probe, dims=1)
+#
+#        # sort by intensity
+#        intensities = torch.sum(torch.abs(orthogonal_probes) ** 2, dim=(-2,-1))
+#        order = torch.argsort(intensities, descending=True)
+#
+#        return orthogonal_probes[order]
+
+
 
 class ProbePixelated(ProbeConstraints):
     def __init__(
