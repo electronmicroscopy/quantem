@@ -16,7 +16,8 @@ from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.loss_functions import get_loss_function
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
-from quantem.core.utils.utils import RNGMixin, to_numpy
+from quantem.core.utils.rng import RNGMixin
+from quantem.core.utils.utils import to_numpy
 from quantem.core.utils.validators import (
     validate_arr_gt,
     validate_array,
@@ -400,6 +401,7 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
 
         return orthogonal_probes[intensities_order]
 
+
 #    def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
 #        """
 #        """
@@ -420,7 +422,6 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
 #        order = torch.argsort(intensities, descending=True)
 #
 #        return orthogonal_probes[order]
-
 
 
 class ProbePixelated(ProbeConstraints):

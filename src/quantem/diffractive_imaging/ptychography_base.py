@@ -8,8 +8,8 @@ import torch
 import quantem.core.utils.array_funcs as arr
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
-    RNGMixin,
     electron_wavelength_angstrom,
     generate_batches,
     to_numpy,
