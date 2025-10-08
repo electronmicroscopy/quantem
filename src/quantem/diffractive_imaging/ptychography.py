@@ -14,7 +14,7 @@ from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeModelType
+from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
 from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
@@ -286,6 +286,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             if isinstance(self.obj_model, ObjectPixelated):
                 obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
                 self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
+
+            if isinstance(self.probe_model, ProbeParametric):
+                probe_grad_scale = np.sqrt(self.probe_model._mean_diffraction_intensity)
+                for par in self.probe_model.params:
+                    par.grad.mul_(probe_grad_scale)  # type:ignore
 
         else:
             gradient = self.gradient_step(amplitudes, overlap)

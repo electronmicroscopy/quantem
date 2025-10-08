@@ -133,9 +133,6 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         ) -> dict[str, float]:
             """Standardize aberration coefficients with optional max order filling."""
 
-            # Start only with explicitly passed aberrations
-            polar_parameters = {}
-
             def process_polar_params(p: dict):
                 bads = []
                 for symbol, value in p.items():
@@ -154,6 +151,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
                         bads.append(symbol)
                 [p.pop(bad, None) for bad in bads]
 
+            # Start only with explicitly passed aberrations
+            polar_parameters = {}
             process_polar_params(params)
 
             # Optionally fill all up to a given order with zeros
@@ -170,7 +169,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
             return polar_parameters
 
-        polar_parameters = set_aberrations(params, self._max_aberrations_order)
+        polar_parameters = set_aberrations(params.copy(), self._max_aberrations_order)
         params["aberration_coefs"] = polar_parameters
         self._probe_params = self.DEFAULT_PROBE_PARAMS | self._probe_params | params
 
@@ -466,7 +465,7 @@ class ProbePixelated(ProbeConstraints):
     ):
         super().__init__(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
@@ -503,7 +502,7 @@ class ProbePixelated(ProbeConstraints):
 
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=(int(probe_array.shape[-2]), int(probe_array.shape[-1])),
             dtype=dtype,
             device=device,
@@ -531,7 +530,7 @@ class ProbePixelated(ProbeConstraints):
     ):
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
@@ -761,6 +760,7 @@ class ProbeParametric(ProbeConstraints):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
+        max_aberrations_order: int | None = None,
         learn_aberrations: bool = True,
         learn_cutoff: bool = False,
         _token: object | None = None,
@@ -770,8 +770,8 @@ class ProbeParametric(ProbeConstraints):
 
         super().__init__(
             num_probes=num_probes,
-            probe_params=probe_params,
-            max_aberrations_order=None,
+            probe_params=probe_params.copy(),
+            max_aberrations_order=max_aberrations_order,
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
@@ -829,17 +829,19 @@ class ProbeParametric(ProbeConstraints):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
+        max_aberrations_order: int | None = None,
         learn_aberrations: bool = True,
-        learn_cutoff: bool = True,
+        learn_cutoff: bool = False,
     ):
         return cls(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
             rng=rng,
             vacuum_probe_intensity=vacuum_probe_intensity,
+            max_aberrations_order=max_aberrations_order,
             learn_aberrations=learn_aberrations,
             learn_cutoff=learn_cutoff,
             _token=cls._token,
@@ -894,9 +896,9 @@ class ProbeParametric(ProbeConstraints):
         coefs = {}
         for k in self.aberration_names:
             if hasattr(self.aberration_coefs, k):
-                coefs[k] = getattr(self.aberration_coefs, k).to(device="cpu")
+                coefs[k] = getattr(self.aberration_coefs, k)
             elif hasattr(self, k):
-                coefs[k] = getattr(self, k).to(device="cpu")
+                coefs[k] = getattr(self, k)
             else:
                 raise KeyError(f"Unknown aberration key {k}")
 
@@ -904,13 +906,15 @@ class ProbeParametric(ProbeConstraints):
             gpts=tuple(self.roi_shape),
             sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
             energy=self.probe_params["energy"],
-            semiangle_cutoff=self.semiangle_cutoff.to(device="cpu"),
+            semiangle_cutoff=self.semiangle_cutoff,
             vacuum_probe_intensity=self.vacuum_probe_intensity,
             aberration_coefs=coefs,
             soft_edges=self.probe_params["soft_edges"],
+            device=self.device,
         )
         probe = probe.to(dtype=self.dtype, device=self.device)
-        return probe[None]
+        mean_diffraction_intensity = getattr(self, "_mean_diffraction_intensity", 1.0)
+        return probe[None] * np.sqrt(mean_diffraction_intensity)
 
     def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
         """Generate probe on the fly and apply subpixel shifts."""
@@ -944,7 +948,7 @@ class ProbeDIP(ProbeConstraints):
     ):
         super().__init__(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             device=device,
             rng=rng,
@@ -970,7 +974,7 @@ class ProbeDIP(ProbeConstraints):
     ):
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             device=device,
             rng=rng,
@@ -1008,7 +1012,7 @@ class ProbeDIP(ProbeConstraints):
 
         probe_model = cls(
             num_probes=pixelated.num_probes,
-            probe_params=pixelated.probe_params,
+            probe_params=pixelated.probe_params.copy(),
             roi_shape=pixelated.roi_shape,
             device=device,
             rng=pixelated.rng,

@@ -171,7 +171,8 @@ def aberration_surface(
     alpha2 = alpha**2
     chi = torch.zeros_like(alpha)
 
-    coefs = standardize_aberration_coefs(aberration_coefs)
+    # coefs = standardize_aberration_coefs(aberration_coefs)
+    coefs = aberration_coefs
 
     def get(name, default=0.0):
         val = coefs.get(name, default)
@@ -234,19 +235,19 @@ def evaluate_probe(
 
 
 def spatial_frequencies(
-    gpts: Tuple[int, int], sampling: Tuple[float, float]
+    gpts: Tuple[int, int], sampling: Tuple[float, float], device: str | torch.device = "cpu"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """ """
-    kx = torch.fft.fftfreq(gpts[0], sampling[0])
-    ky = torch.fft.fftfreq(gpts[1], sampling[1])
+    kx = torch.fft.fftfreq(gpts[0], sampling[0], device=device, dtype=torch.float32)
+    ky = torch.fft.fftfreq(gpts[1], sampling[1], device=device, dtype=torch.float32)
     return kx, ky
 
 
 def polar_spatial_frequencies(
-    gpts: Tuple[int, int], sampling: Tuple[float, float]
+    gpts: Tuple[int, int], sampling: Tuple[float, float], device: str | torch.device = "cpu"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """ """
-    kx, ky = spatial_frequencies(gpts, sampling)
+    kx, ky = spatial_frequencies(gpts, sampling, device=device)
     k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2)
     phi = torch.arctan2(ky[None, :], kx[:, None])
     return k, phi
@@ -261,12 +262,17 @@ def fourier_space_probe(
     vacuum_probe_intensity: torch.Tensor | None = None,
     aberration_coefs: dict[str, float | torch.Tensor] = {},
     normalized: bool = True,
+    device: str | torch.device = "cpu",
 ) -> torch.Tensor:
     """ """
     wavelength = electron_wavelength_angstrom(energy)
-    k, phi = polar_spatial_frequencies(gpts, sampling)
+    k, phi = polar_spatial_frequencies(gpts, sampling, device=device)
     alpha = k * wavelength
     angular_sampling = (alpha[1, 0] * 1e3, alpha[0, 1] * 1e3)
+
+    vacuum = (
+        vacuum_probe_intensity.to(device=device) if vacuum_probe_intensity is not None else None
+    )
 
     fourier_probe = evaluate_probe(
         alpha,
@@ -275,7 +281,7 @@ def fourier_space_probe(
         angular_sampling,
         wavelength,
         soft_edges=soft_edges,
-        vacuum_probe_intensity=vacuum_probe_intensity,
+        vacuum_probe_intensity=vacuum,
         aberration_coefs=aberration_coefs,
     )
 
@@ -294,6 +300,7 @@ def real_space_probe(
     vacuum_probe_intensity: torch.Tensor | None = None,
     aberration_coefs: dict[str, float | torch.Tensor] = {},
     normalized: bool = True,
+    device: str | torch.device = "cpu",
 ) -> torch.Tensor:
     """ """
 
@@ -306,6 +313,7 @@ def real_space_probe(
         vacuum_probe_intensity=vacuum_probe_intensity,
         aberration_coefs=aberration_coefs,
         normalized=True,
+        device=device,
     )
 
     probe = torch.fft.ifft2(fourier_probe)
