@@ -26,10 +26,10 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
-from quantem.diffractive_imaging.complexprobe import (
+from quantem.diffractive_imaging.complex_probe import (
     POLAR_ALIASES,
     POLAR_SYMBOLS,
-    ComplexProbe,
+    real_space_probe,
 )
 from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import (
@@ -48,8 +48,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         "energy": None,
         "defocus": None,
         "semiangle_cutoff": None,
-        "rolloff": 2,
-        "polar_parameters": {},
+        "soft_edges": True,
+        "aberration_coefs": {},
     }
     DEFAULT_LRS = {
         "probe": 1e-3,
@@ -145,7 +145,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             # Ignore other parameters (energy, semiangle_cutoff, etc.)
 
         process_polar_params(params)
-        params["polar_parameters"] = polar_parameters
+        params["aberration_coefs"] = polar_parameters
         self._probe_params = self.DEFAULT_PROBE_PARAMS | self._probe_params | params
 
     @property
@@ -286,8 +286,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         for k in self.DEFAULT_PROBE_PARAMS.keys():
             if self.probe_params[k] is None:
                 if k == "defocus":
-                    if self.probe_params["polar_parameters"]["C10"] != 0:
-                        self.probe_params[k] = -1 * self.probe_params["polar_parameters"]["C10"]
+                    if self.probe_params["aberration_coefs"]["C10"] != 0:
+                        self.probe_params[k] = -1 * self.probe_params["aberration_coefs"]["C10"]
                         continue
                 print(f"Missing probe parameter '{k}' in probe_params")
                 # raise ValueError(f"Missing probe parameter '{k}' in probe_params")
@@ -400,6 +400,7 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
 
         return orthogonal_probes[intensities_order]
 
+
 #    def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
 #        """
 #        """
@@ -420,7 +421,6 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
 #        order = torch.argsort(intensities, descending=True)
 #
 #        return orthogonal_probes[order]
-
 
 
 class ProbePixelated(ProbeConstraints):
@@ -567,9 +567,7 @@ class ProbePixelated(ProbeConstraints):
         return self._initial_probe
 
     @initial_probe.setter
-    def initial_probe(self, initial_probe: np.ndarray | ComplexProbe | torch.Tensor):
-        if isinstance(initial_probe, ComplexProbe):
-            raise NotImplementedError
+    def initial_probe(self, initial_probe: np.ndarray | torch.Tensor):
         probe = validate_tensor(
             initial_probe,
             name="initial_probe",
@@ -594,18 +592,16 @@ class ProbePixelated(ProbeConstraints):
 
         if self._from_params:
             self.check_probe_params()
-            prb = ComplexProbe(
+            prb = real_space_probe(
                 gpts=tuple(self.roi_shape),
                 sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
                 energy=self.probe_params["energy"],
                 semiangle_cutoff=self.probe_params["semiangle_cutoff"],
-                defocus=self.probe_params["defocus"],
-                rolloff=self.probe_params["rolloff"],
                 vacuum_probe_intensity=self.vacuum_probe_intensity,
-                parameters=self.probe_params["polar_parameters"],
-                device="cpu",
+                aberration_coefs=self.probe_params["aberration_coefs"],
+                soft_edges=self.probe_params["soft_edges"],
             )
-            probes = torch.tensor(prb.build()._array, dtype=self.dtype, device=self.device)
+            probes = prb.to(dtype=self.dtype, device=self.device)
         else:
             probes = self.initial_probe.clone()
 
