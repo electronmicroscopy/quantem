@@ -194,12 +194,12 @@ def _build_ptychography_instance(constructors, resolved_kwargs):
     )
 
 
-def _build_pftm_instance(constructors, resolved_kwargs):
-    """Build PFTM instance."""
-    pftm_kwargs = resolved_kwargs.get("pftm", {}).copy()
-    pftm_kwargs["verbose"] = False  # Force verbose=False during optimization
+def _build_ptycholite_instance(constructors, resolved_kwargs):
+    """Build PtychoLite instance."""
+    ptycholite_kwargs = resolved_kwargs.get("ptycholite", {}).copy()
+    ptycholite_kwargs["verbose"] = False  # Force verbose=False during optimization
 
-    return constructors["ptychography_class"](**pftm_kwargs)
+    return constructors["ptychography_class"](**ptycholite_kwargs)
 
 
 def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
@@ -218,8 +218,8 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
 
 def _extract_default_loss(recon_obj, class_type):
     """Extract loss from reconstruction object."""
-    if class_type == "pftm":
-        # Adjust based on how PFTM stores losses
+    if class_type == "ptycholite":
+        # Adjust based on how Ptychography stores losses
         losses = getattr(recon_obj, "_losses", None) or getattr(recon_obj, "_epoch_losses", None)
     else:
         losses = getattr(recon_obj, "_epoch_losses", None)
@@ -230,19 +230,19 @@ def _extract_default_loss(recon_obj, class_type):
     return float(losses[-1])
 
 
-def _OptimizeIterativePtychographyObjective(
+def _OptimizePtychographyObjective(
     constructors: Mapping[str, Callable[..., Any]],
     base_kwargs: Mapping[str, Any],
     loss_getter: Optional[Callable[[Any], float]] = None,
     dataset_constructor: Optional[Callable[..., Any]] = None,
     dataset_kwargs: Optional[Mapping[str, Any]] = None,
     dataset_preprocess_kwargs: Optional[Mapping[str, Any]] = None,
-    reconstruction_class: str = "auto",  # "ptychography", "pftm", or "auto"
+    reconstruction_class: str = "auto",  # "ptychography", "ptycholite", or "auto"
 ) -> Callable[[optuna.trial.Trial], float]:
-    """Build and return an Optuna objective for iterative ptychography or PFTM.
+    """Build and return an Optuna objective for iterative ptychography or Ptycholite.
 
     Args:
-        reconstruction_class: Which class to use - "ptychography", "pftm", or "auto" to detect
+        reconstruction_class: Which class to use - "ptychography", "ptycholite", or "auto" to detect
     """
 
     def objective(trial: optuna.trial.Trial) -> float:
@@ -270,8 +270,8 @@ def _OptimizeIterativePtychographyObjective(
                 raise ValueError("No ptychography_class constructor found.")
 
             constructor_name = str(main_constructor)
-            if "PFTM" in constructor_name:
-                class_type = "pftm"
+            if "Ptycholite" in constructor_name:
+                class_type = "ptycholite"
             elif "Ptychography" in constructor_name:
                 class_type = "ptychography"
             else:
@@ -282,8 +282,8 @@ def _OptimizeIterativePtychographyObjective(
             class_type = reconstruction_class
 
         # 4) Build reconstruction object based on class type
-        if class_type == "pftm":
-            recon_obj = _build_pftm_instance(constructors, resolved_kwargs)
+        if class_type == "ptycholite":
+            recon_obj = _build_ptycholite_instance(constructors, resolved_kwargs)
         else:
             recon_obj = _build_ptychography_instance(constructors, resolved_kwargs)
 
@@ -299,8 +299,10 @@ def _OptimizeIterativePtychographyObjective(
     return objective
 
 
-class OptimizeIterativePtychography:
-    """Bayesian optimization for ptychography and PFTM reconstruction pipelines."""
+class OptimizePtychography:
+    """Bayesian optimization for ptychography and Ptycholite reconstruction pipelines."""
+
+    _token = object()
 
     def __init__(
         self,
@@ -309,14 +311,19 @@ class OptimizeIterativePtychography:
         study_kwargs: Optional[Dict[str, Any]] = None,
         unit: str = "trial",
         verbose: bool = True,
+        _token: object | None = None,
     ):
         """Initialize optimizer settings."""
+        if _token is not self._token:
+            raise RuntimeError("Use a factory method to instantiate this class.")
+
         self.objective_func = None  # Will be set by factory methods
         self.n_trials = n_trials
         self.direction = direction
         self.study_kwargs = study_kwargs or {}
         self.unit = unit
         self.verbose = verbose
+        self._config = None
 
         self.study = optuna.create_study(direction=direction, **self.study_kwargs)
 
@@ -329,7 +336,7 @@ class OptimizeIterativePtychography:
         dataset_kwargs: Optional[Mapping[str, Any]] = None,
         dataset_preprocess_kwargs: Optional[Mapping[str, Any]] = None,
         loss_getter: Optional[Callable[[Any], float]] = None,
-        reconstruction_class: str = "auto",  # NEW: "ptychography", "pftm", or "auto"
+        reconstruction_class: str = "auto",  # NEW: "ptychography", "ptycholite", or "auto"
         n_trials: int = 50,
         direction: str = "minimize",
         study_kwargs: Optional[Dict[str, Any]] = None,
@@ -339,7 +346,7 @@ class OptimizeIterativePtychography:
         """Create optimizer from constructor functions and parameter specifications.
 
         Args:
-            reconstruction_class: Which class to use - "ptychography", "pftm", or "auto"
+            reconstruction_class: Which class to use - "ptychography", "ptycholite", or "auto"
 
         Examples:
             # For Ptychography
@@ -350,9 +357,9 @@ class OptimizeIterativePtychography:
                 "ptycho": Ptychography.from_models,
             }
 
-            # For PFTM
+            # For Ptycholite
             constructors = {
-                "pftm": PFTM.from_dataset,
+                "ptycholite": PtychoLite.from_dataset,
             }
         """
         # Create instance with basic settings
@@ -362,17 +369,18 @@ class OptimizeIterativePtychography:
             study_kwargs=study_kwargs,
             unit=unit,
             verbose=verbose,
+            _token=cls._token,
         )
 
-        # Set the objective function with PFTM support
-        instance.objective_func = _OptimizeIterativePtychographyObjective(
+        # Set the objective function with Ptycholite support
+        instance.objective_func = _OptimizePtychographyObjective(
             constructors=constructors,
             base_kwargs=base_kwargs,
             loss_getter=loss_getter,
             dataset_constructor=dataset_constructor,
             dataset_kwargs=dataset_kwargs,
             dataset_preprocess_kwargs=dataset_preprocess_kwargs,
-            reconstruction_class=reconstruction_class,  # PFTM support restored
+            reconstruction_class=reconstruction_class,  # Ptycholite support restored
         )
 
         return instance
@@ -426,10 +434,10 @@ class OptimizeIterativePtychography:
 
         instance = cls(n_trials, direction, study_kwargs, unit, verbose)
         instance._config = updated_config
-        instance.objective_func = _OptimizeIterativePtychographyObjective(**updated_config)
+        instance.objective_func = _OptimizePtychographyObjective(**updated_config)  # type: ignore
         return instance
 
-    def optimize(self) -> optuna.study.Study:
+    def optimize(self) -> OptimizePtychography:
         """Run the optimization study with progress bar."""
         if self.objective_func is None:
             msg = "No objective function set. Use a factory method like from_constructors()."

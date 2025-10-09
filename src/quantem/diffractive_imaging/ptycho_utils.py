@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from scipy.optimize import curve_fit
 
-from quantem.core.utils import array_funcs as arrf
+from quantem.core.utils import array_funcs as af
 
 ArrayLike = Union[np.ndarray, "torch.Tensor"]
 
@@ -63,10 +63,10 @@ def fourier_shift_expand(
 ) -> ArrayLike:
     """Fourier-shift array by flat array of positions."""
     phase = fourier_translation_operator(positions, array.shape, expand_dim, dtype=array.dtype)
-    fourier_array = arrf.fft2(array)
+    fourier_array = af.fft2(array)
     shifted_fourier_array = fourier_array * phase
-    shifted_array = arrf.ifft2(shifted_fourier_array)
-    if arrf.is_complex(array):
+    shifted_array = af.ifft2(shifted_fourier_array)
+    if af.is_complex(array):
         return shifted_array
     else:
         return shifted_array.real
@@ -96,16 +96,16 @@ def fourier_translation_operator(
     nr, nc = shape[-2:]
     r = positions[..., 0][:, None, None]
     c = positions[..., 1][:, None, None]
-    kr = arrf.match_device(np.fft.fftfreq(nr, d=1.0), positions)
-    kc = arrf.match_device(np.fft.fftfreq(nc, d=1.0), positions)
-    ramp_r = arrf.exp(-2.0j * np.pi * kr[None, :, None] * r)
-    ramp_c = arrf.exp(-2.0j * np.pi * kc[None, None, :] * c)
+    kr = af.match_device(np.fft.fftfreq(nr, d=1.0), positions)
+    kc = af.match_device(np.fft.fftfreq(nc, d=1.0), positions)
+    ramp_r = af.exp(-2.0j * np.pi * kr[None, :, None] * r)
+    ramp_c = af.exp(-2.0j * np.pi * kc[None, None, :] * c)
     ramp = ramp_r * ramp_c
     if expand_dim:
         for _ in range(len(shape) - 2):
             ramp = ramp[:, None, ...]
     if dtype is not None:
-        ramp = arrf.as_type(ramp, dtype)
+        ramp = af.as_type(ramp, dtype)
     return ramp
 
 
@@ -125,16 +125,16 @@ def get_com_2d(ar: ArrayLike, corner_centered: bool = False) -> ArrayLike:
     else:
         c, r = np.meshgrid(np.arange(nc), np.arange(nr))
 
-    rc = arrf.match_device(np.stack([r, c]), ar)
+    rc = af.match_device(np.stack([r, c]), ar)
     com = (
-        arrf.sum(
+        af.sum(
             rc * ar[..., None, :, :],
             axis=(
                 -1,
                 -2,
             ),
         )
-        / arrf.sum(
+        / af.sum(
             ar,
             axis=(
                 -1,
@@ -150,7 +150,7 @@ def sum_patches_base(
 ) -> torch.Tensor:
     flat_weights = patches.reshape(-1)
     flat_indices = indices.reshape(-1)
-    out = arrf.match_device(
+    out = af.match_device(
         torch.zeros(
             int(torch.prod(torch.tensor(obj_shape))), dtype=patches.dtype, device=patches.device
         ),
@@ -191,7 +191,7 @@ def shift_array(
         Returns:
             (array) the shifted array
     """
-    xp = arrf.get_xp_module(ar)
+    xp = af.get_xp_module(ar)
 
     # Apply image shift
     if bilinear is False:

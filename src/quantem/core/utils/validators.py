@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
 from quantem.core import config
-from quantem.core.utils import array_funcs as arrf
+from quantem.core.utils import array_funcs as af
 
 if TYPE_CHECKING:
     import cupy as cp
@@ -417,11 +417,11 @@ def validate_array_or_tensor(
                 + f"{val_dtype_str}. Will not cast complex to real"
             )
         elif val_dtype_str != req_dtype_str:
-            value = arrf.as_type(value, req_dtype_str)
+            value = af.as_type(value, req_dtype_str)
     if ndim is not None and value.ndim != ndim:
         if expand_dims and ndim > value.ndim:
             for _ in range(ndim - value.ndim):
-                value = arrf.expand_dims(value, axis=0)
+                value = af.expand_dims(value, axis=0)
         else:
             raise ValueError(f"{name} must have {ndim} dimensions, got {value.ndim}")
     if shape is not None and not np.array_equal(value.shape, shape):
