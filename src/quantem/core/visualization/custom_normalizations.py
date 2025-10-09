@@ -664,7 +664,7 @@ def _resolve_normalization(norm, **kwargs) -> NormalizationConfig:
         return NormalizationConfig(**norm)
     elif isinstance(norm, str):
         if norm not in NORMALIZATION_PRESETS:
-            raise ValueError(f"Unknown normalization preset: {norm}")
+            raise ValueError(f"Unknown normalization preset: {norm} | {NORMALIZATION_PRESETS}")
         return NORMALIZATION_PRESETS[norm]()
     elif isinstance(norm, NormalizationConfig):
         return norm

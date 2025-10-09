@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Callable
 
 from quantem.core import config
+from math import floor
 
 from .activation_functions import get_activation_function
 from .blocks import Conv2dBlock, Upsample2dBlock, complex_pool, passfunc
@@ -30,6 +31,7 @@ class CNN2d(nn.Module):
         activation: str | Callable = "relu",
         final_activation: str | Callable = nn.Identity(),
         use_batchnorm: bool = True,
+        conv_kernel_size: int = 3,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -56,8 +58,19 @@ class CNN2d(nn.Module):
         self.concat = torch.cat
         self.flatten = nn.Flatten()
 
-        self.activation = activation
-        self.final_activation = final_activation
+        if callable(activation):
+            self._activation = activation
+        else:
+            self._activation = get_activation_function(activation, self.dtype)
+        if callable(final_activation):
+            self._final_activation = final_activation
+        else:
+            self._final_activation = get_activation_function(final_activation, self.dtype)
+        if conv_kernel_size <=0:
+            raise ValueError(f"Convolutional kernel size must be greater than 0. Got value {conv_kernel_size}")
+        if conv_kernel_size % 2 == 0:
+            raise ValueError(f"Convolutional kernel size must be an odd number. Got value {conv_kernel_size}")
+        self._conv_kernel_size = int(conv_kernel_size)
 
         self._build()
 
@@ -65,23 +78,13 @@ class CNN2d(nn.Module):
     def activation(self) -> Callable:
         return self._activation
 
-    @activation.setter
-    def activation(self, act: str | Callable):
-        if callable(act):
-            self._activation = act
-        else:
-            self._activation = get_activation_function(act, self.dtype)
-
     @property
     def final_activation(self) -> Callable:
         return self._final_activation
 
-    @final_activation.setter
-    def final_activation(self, act: str | Callable):
-        if callable(act):
-            self._final_activation = act
-        else:
-            self._final_activation = get_activation_function(act, self.dtype)
+    @property
+    def conv_kernel_size(self) -> int:
+        return self._conv_kernel_size
 
     def _build(self):
         self.down_conv_blocks = nn.ModuleList()
@@ -102,6 +105,8 @@ class CNN2d(nn.Module):
                     dropout=self.dropout,
                     dtype=self.dtype,
                     activation=self.activation,
+                    kernel_size=self.conv_kernel_size,
+                    padding=int(floor(self.conv_kernel_size/2)),
                 )
             )
             in_channels = out_channels
@@ -115,6 +120,8 @@ class CNN2d(nn.Module):
             dropout=self.dropout,
             dtype=self.dtype,
             activation=self.activation,
+            kernel_size=self.conv_kernel_size,
+            padding=int(floor(self.conv_kernel_size/2)),
         )
         in_channels = out_channels
 
@@ -138,6 +145,8 @@ class CNN2d(nn.Module):
                     dropout=self.dropout,
                     dtype=self.dtype,
                     activation=self.activation,
+                    kernel_size=self.conv_kernel_size,
+                    padding=int(floor(self.conv_kernel_size/2)),
                 )
             )
 
