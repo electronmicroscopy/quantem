@@ -283,7 +283,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         """Reset the probe"""
         raise NotImplementedError()
 
-    def set_initial_probe(
+    def _initialize_probe(
         self,
         roi_shape: np.ndarray | tuple,
         reciprocal_sampling: np.ndarray,
@@ -610,7 +610,7 @@ class ProbePixelated(ProbeConstraints):
         mean_diffraction_intensity: float,
         device: str | None = None,
     ):
-        super().set_initial_probe(
+        super()._initialize_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 
@@ -1176,7 +1176,7 @@ class ProbeDIP(ProbeConstraints):
         *args,
     ):
         """Set initial probe and create appropriate model input"""
-        super().set_initial_probe(
+        super()._initialize_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 

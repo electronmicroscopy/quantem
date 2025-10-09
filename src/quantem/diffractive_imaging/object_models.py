@@ -283,6 +283,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
 class ObjectConstraints(BaseConstraints, ObjectBase):
     DEFAULT_CONSTRAINTS = {
+        "positivity": True,
         "fix_potential_baseline": False,
         "fix_potential_baseline_factor": 1.0,
         "identical_slices": False,
@@ -305,7 +306,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 obj2 = amp * mask * torch.exp(1.0j * phase * mask)
             else:
                 obj2 = amp * torch.exp(1.0j * phase)
-        else:
+        else:  # potential
             if self.constraints["fix_potential_baseline"]:
                 if mask is not None:
                     offset = obj[mask < 0.5 * mask.max()].mean()
@@ -315,7 +316,10 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             else:
                 offset = 0
 
-            obj2 = torch.clamp(obj - offset, min=0.0)
+            if self.constraints["positivity"]:
+                obj2 = torch.clamp(obj - offset, min=0.0)
+            else:
+                obj2 = obj - offset
 
         if self.constraints["apply_fov_mask"] and mask is not None:
             obj2 *= mask
@@ -409,9 +413,10 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if array.shape[0] < 3:
             return loss
         if array.is_complex():
-            amp = array.abs()
             ph = array.angle().abs()
-            loss = loss + weight * (torch.mean(1.0 - amp[0]) + torch.mean(1.0 - amp[-1]))
+            if self.obj_type == "complex":
+                amp = array.abs()
+                loss = loss + weight * (torch.mean(1.0 - amp[0]) + torch.mean(1.0 - amp[-1]))
             loss = loss + weight * (torch.mean(torch.diff(ph[0])) + torch.mean(torch.diff(ph[-1])))
         else:
             loss = loss + weight * (
@@ -493,35 +498,35 @@ class ObjectPixelated(ObjectConstraints):
 
         return obj_model
 
-    # TODO from_array classmethod
-    # @classmethod
-    # def from_array(
-    #     cls,
-    #     initial_obj: torch.Tensor | np.ndarray,
-    #     slice_thicknesses: float | Sequence | None = None,
-    #     device: str = "cpu",
-    #     obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
-    #     rng: np.random.Generator | int | None = None,
-    # ):
-    #     """
-    #     Create ObjectPixelated from an array. Shape must match the correct recon shape,
-    #     and so for a demo of this use the pdset.obj_shape_full + padding to confirm is correct.
-    #     """
-    #     shape = initial_obj.shape
-    #     num_slices = initial_obj.shape[0]
+    @classmethod
+    def from_array(
+        cls,
+        initial_obj: torch.Tensor | np.ndarray,
+        slice_thicknesses: float | Sequence | None = None,
+        device: str = "cpu",
+        obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
+        rng: np.random.Generator | int | None = None,
+    ):
+        """
+        Create ObjectPixelated from an array. Shape must match the correct recon shape,
+        and so for a demo of this use the pdset.obj_shape_full + padding to confirm is correct.
+        """
+        num_slices = initial_obj.shape[0]
 
-    #     obj_model = cls(
-    #         num_slices=num_slices,
-    #         slice_thicknesses=slice_thicknesses,
-    #         device=device,
-    #         obj_type=obj_type,
-    #         initialize_mode="array",
-    #         rng=rng,
-    #         shape=shape,
-    #         _token=cls._token,
-    #     )
+        obj_model = cls(
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            initialize_mode="array",
+            rng=rng,
+            _token=cls._token,
+        )
+        obj_model._initial_obj = torch.tensor(
+            initial_obj, dtype=obj_model.dtype, device=obj_model.device
+        )
 
-    #     return obj_model
+        return obj_model
 
     @property
     def obj(self):
@@ -554,7 +559,7 @@ class ObjectPixelated(ObjectConstraints):
                 else:
                     amp = torch.randn(init_shape, dtype=self.dtype, generator=self._rng_torch)
                 ph = (
-                    torch.randn(init_shape, dtype=self.dtype, generator=self._rng_torch)
+                    torch.randn(init_shape, dtype=torch.float32, generator=self._rng_torch)
                     * 2
                     * np.pi
                 )
@@ -562,9 +567,7 @@ class ObjectPixelated(ObjectConstraints):
             else:
                 arr = torch.randn(init_shape, dtype=self.dtype, generator=self._rng_torch)
         elif self._initialize_mode == "array":
-            raise NotImplementedError("Initializing from array is not implemented yet")
-            # can set _initial_obj in classmethod, issue is shape maybe not set, could conflict
-            # arr = self._initial_obj
+            arr = self._initial_obj
         else:
             raise ValueError(f"Invalid initialize mode: {self._initialize_mode}")
 
@@ -688,6 +691,7 @@ class ObjectDIP(ObjectConstraints):
         )
         obj_model.model = model.to(device)
         obj_model.model_input = model_input
+        obj_model._set_pretrained_weights(model)
 
         return obj_model
 
@@ -707,29 +711,28 @@ class ObjectDIP(ObjectConstraints):
         ):
             raise ValueError(f"Pixelated must be an ObjectPixelated, got {type(pixelated)}")
 
-        obj_model = cls(
-            num_slices=pixelated.num_slices,
-            slice_thicknesses=pixelated.slice_thicknesses,
-            input_noise_std=input_noise_std,
-            device=pixelated.device,
-            obj_type=pixelated.obj_type,
-            rng=pixelated._rng_seed,
-            _token=cls._token,
-        )
-
-        obj_model.model = model.to(device)
-        model_dtype = "complex" if obj_model.obj_type == "complex" else "real"
+        model_dtype = "complex" if pixelated.obj_type == "complex" else "real"
         if hasattr(model, "dtype"):  # allow overwriting of dtype based on model
             if "complex" in str(model.dtype):
                 model_dtype = "complex"
             else:
                 model_dtype = "real"
 
-        if obj_model.obj_type == "pure_phase" and model_dtype == "real":
+        if pixelated.obj_type == "pure_phase" and model_dtype == "real":
             obj = pixelated.obj.angle().clone().detach()
         else:
             obj = pixelated.obj.clone().detach()
-        obj_model.model_input = obj
+
+        obj_model = cls.from_model(
+            model=model,
+            model_input=obj,
+            num_slices=pixelated.num_slices,
+            slice_thicknesses=pixelated.slice_thicknesses,
+            input_noise_std=input_noise_std,
+            device=pixelated.device,
+            obj_type=pixelated.obj_type,
+            rng=pixelated._rng_seed,
+        )
         obj_model.pretrain_target = obj
 
         return obj_model
@@ -764,14 +767,14 @@ class ObjectDIP(ObjectConstraints):
         https://github.com/pytorch/pytorch/issues/52664
         """
         print("\n\n\nsetting model, this is not reachable???\n\n\n")
-        if not isinstance(dip, torch.nn.Module):
-            raise TypeError(f"DIP must be a torch.nn.Module, got {type(dip)}")
-        if hasattr(dip, "dtype"):
-            dt = getattr(dip, "dtype")
-            if self.obj_type in ["complex"] and not dt.is_complex:
-                raise ValueError("DIP model must be a complex-valued model for complex objects")
-        self._model = dip.to(self.device)
-        self._set_pretrained_weights(self._model)
+        # if not isinstance(dip, torch.nn.Module):
+        #     raise TypeError(f"DIP must be a torch.nn.Module, got {type(dip)}")
+        # if hasattr(dip, "dtype"):
+        #     dt = getattr(dip, "dtype")
+        #     if self.obj_type in ["complex"] and not dt.is_complex:
+        #         raise ValueError("DIP model must be a complex-valued model for complex objects")
+        # self._model = dip.to(self.device)
+        # self._set_pretrained_weights(self._model)
 
     @property
     def pretrained_weights(self) -> dict[str, torch.Tensor]:
