@@ -27,10 +27,10 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
-from quantem.diffractive_imaging.complexprobe import (
+from quantem.diffractive_imaging.complex_probe import (
     POLAR_ALIASES,
     POLAR_SYMBOLS,
-    ComplexProbe,
+    real_space_probe,
 )
 from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import (
@@ -49,8 +49,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         "energy": None,
         "defocus": None,
         "semiangle_cutoff": None,
-        "rolloff": 2,
-        "polar_parameters": {},
+        "soft_edges": True,
+        "aberration_coefs": {},
     }
     DEFAULT_LRS = {
         "probe": 1e-3,
@@ -64,6 +64,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         roi_shape: tuple[int, int] | np.ndarray | None = None,
         device: DeviceType = "cpu",
         rng: np.random.Generator | int | None = None,
+        max_aberrations_order=5,
         _token: object | None = None,
         *args,
         **kwargs,
@@ -79,6 +80,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self.num_probes = num_probes
         self._device = device
         self._probe_params = self.DEFAULT_PROBE_PARAMS
+        self._max_aberrations_order = max_aberrations_order
         self.probe_params = probe_params
         self._constraints = {}
         self.rng = rng
@@ -125,28 +127,50 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             params,
             [*self.DEFAULT_PROBE_PARAMS.keys(), *POLAR_SYMBOLS, *POLAR_ALIASES.keys()],
         )
-        polar_parameters: dict[str, float] = dict(zip(POLAR_SYMBOLS, [0.0] * len(POLAR_SYMBOLS)))
 
-        def process_polar_params(p: dict):
-            bads = []
-            for symbol, value in p.items():
-                if isinstance(value, dict):
-                    process_polar_params(value)  # Recursively process nested dictionaries
-                elif value is None:
-                    continue
-                elif symbol in polar_parameters.keys():
-                    polar_parameters[symbol] = float(value)
-                    bads.append(symbol)
-                elif symbol == "defocus":
-                    polar_parameters[POLAR_ALIASES[symbol]] = -1 * float(value)
-                elif symbol in POLAR_ALIASES:
-                    polar_parameters[POLAR_ALIASES[symbol]] = float(value)
-                    bads.append(symbol)
-            [p.pop(bad) for bad in bads]
-            # Ignore other parameters (energy, semiangle_cutoff, etc.)
+        def set_aberrations(
+            params: dict[str, Any], max_order: int | None = None
+        ) -> dict[str, float]:
+            """Standardize aberration coefficients with optional max order filling."""
 
-        process_polar_params(params)
-        params["polar_parameters"] = polar_parameters
+            def process_polar_params(p: dict):
+                bads = []
+                for symbol, value in p.items():
+                    if isinstance(value, dict):
+                        process_polar_params(value)
+                    elif value is None:
+                        continue
+                    elif symbol in POLAR_SYMBOLS:
+                        polar_parameters[symbol] = float(value)
+                        bads.append(symbol)
+                    elif symbol == "defocus":
+                        polar_parameters["C10"] = -float(value)
+                        bads.append(symbol)
+                    elif symbol in POLAR_ALIASES:
+                        polar_parameters[POLAR_ALIASES[symbol]] = float(value)
+                        bads.append(symbol)
+                [p.pop(bad, None) for bad in bads]
+
+            # Start only with explicitly passed aberrations
+            polar_parameters = {}
+            process_polar_params(params)
+
+            # Optionally fill all up to a given order with zeros
+            if max_order is not None:
+                for sym in POLAR_SYMBOLS:
+                    if sym.startswith("C"):
+                        order = int(sym[1])
+                    elif sym.startswith("phi"):
+                        order = int(sym[3])
+                    else:
+                        continue
+                    if order <= max_order and sym not in polar_parameters:
+                        polar_parameters[sym] = 0.0
+
+            return polar_parameters
+
+        polar_parameters = set_aberrations(params.copy(), self._max_aberrations_order)
+        params["aberration_coefs"] = polar_parameters
         self._probe_params = self.DEFAULT_PROBE_PARAMS | self._probe_params | params
 
     @property
@@ -287,8 +311,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         for k in self.DEFAULT_PROBE_PARAMS.keys():
             if self.probe_params[k] is None:
                 if k == "defocus":
-                    if self.probe_params["polar_parameters"]["C10"] != 0:
-                        self.probe_params[k] = -1 * self.probe_params["polar_parameters"]["C10"]
+                    if self.probe_params["aberration_coefs"]["C10"] != 0:
+                        self.probe_params[k] = -1 * self.probe_params["aberration_coefs"]["C10"]
                         continue
                 print(f"Missing probe parameter '{k}' in probe_params")
                 # raise ValueError(f"Missing probe parameter '{k}' in probe_params")
@@ -441,7 +465,7 @@ class ProbePixelated(ProbeConstraints):
     ):
         super().__init__(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
@@ -478,7 +502,7 @@ class ProbePixelated(ProbeConstraints):
 
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=(int(probe_array.shape[-2]), int(probe_array.shape[-1])),
             dtype=dtype,
             device=device,
@@ -506,7 +530,7 @@ class ProbePixelated(ProbeConstraints):
     ):
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
@@ -568,9 +592,7 @@ class ProbePixelated(ProbeConstraints):
         return self._initial_probe
 
     @initial_probe.setter
-    def initial_probe(self, initial_probe: np.ndarray | ComplexProbe | torch.Tensor):
-        if isinstance(initial_probe, ComplexProbe):
-            raise NotImplementedError
+    def initial_probe(self, initial_probe: np.ndarray | torch.Tensor):
         probe = validate_tensor(
             initial_probe,
             name="initial_probe",
@@ -595,18 +617,16 @@ class ProbePixelated(ProbeConstraints):
 
         if self._from_params:
             self.check_probe_params()
-            prb = ComplexProbe(
+            prb = real_space_probe(
                 gpts=tuple(self.roi_shape),
                 sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
                 energy=self.probe_params["energy"],
                 semiangle_cutoff=self.probe_params["semiangle_cutoff"],
-                defocus=self.probe_params["defocus"],
-                rolloff=self.probe_params["rolloff"],
                 vacuum_probe_intensity=self.vacuum_probe_intensity,
-                parameters=self.probe_params["polar_parameters"],
-                device="cpu",
+                aberration_coefs=self.probe_params["aberration_coefs"],
+                soft_edges=self.probe_params["soft_edges"],
             )
-            probes = torch.tensor(prb.build()._array, dtype=self.dtype, device=self.device)
+            probes = prb.to(dtype=self.dtype, device=self.device)
         else:
             probes = self.initial_probe.clone()
 
@@ -730,6 +750,188 @@ class ProbePixelated(ProbeConstraints):
         return probes
 
 
+class ProbeParametric(ProbeConstraints):
+    def __init__(
+        self,
+        num_probes: int = 1,
+        probe_params: dict = {},
+        roi_shape: tuple[int, int] | np.ndarray | None = None,
+        dtype: torch.dtype = torch.complex64,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
+        max_aberrations_order: int | None = None,
+        learn_aberrations: bool = True,
+        learn_cutoff: bool = False,
+        _token: object | None = None,
+    ):
+        if num_probes > 1:
+            raise NotImplementedError()
+
+        super().__init__(
+            num_probes=num_probes,
+            probe_params=probe_params.copy(),
+            max_aberrations_order=max_aberrations_order,
+            roi_shape=roi_shape,
+            dtype=dtype,
+            device=device,
+            rng=rng,
+            _token=_token,
+        )
+
+        self.learn_aberrations = learn_aberrations
+        self.learn_cutoff = learn_cutoff
+        self._vacuum_probe_intensity = None
+
+        self.vacuum_probe_intensity = vacuum_probe_intensity
+
+        if learn_cutoff and self.vacuum_probe_intensity is None:
+            self.semiangle_cutoff = nn.Parameter(
+                torch.tensor(float(self.probe_params["semiangle_cutoff"]), dtype=torch.float32)
+            )
+        else:
+            self.register_buffer(
+                "semiangle_cutoff",
+                torch.tensor(float(self.probe_params["semiangle_cutoff"]), dtype=torch.float32),
+            )
+
+        aberration_coefs = self.probe_params.get("aberration_coefs", {})
+        self.aberration_names = list(aberration_coefs.keys())
+        self.aberration_coefs = nn.ParameterDict()
+
+        for k, v in aberration_coefs.items():
+            if learn_aberrations:
+                self.aberration_coefs[k] = nn.Parameter(
+                    torch.tensor(float(v), dtype=torch.float32)
+                )
+            else:
+                self.register_buffer(k, torch.tensor(float(v), dtype=torch.float32))
+
+        self._store_initial_params()
+
+    def _store_initial_params(self):
+        """Store initial learnable parameter values for later reset."""
+        if hasattr(self, "semiangle_cutoff"):
+            self.register_buffer(
+                "_initial_semiangle_cutoff", self.semiangle_cutoff.detach().clone()
+            )
+        if hasattr(self, "aberration_coefs"):
+            for name, tensor in self.aberration_coefs.items():
+                self.register_buffer(f"_initial_aberration_coefs_{name}", tensor.detach().clone())
+
+    @classmethod
+    def from_params(
+        cls,
+        probe_params: dict,
+        num_probes: int = 1,
+        roi_shape: tuple[int, int] | None = None,
+        dtype: torch.dtype = torch.complex64,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
+        max_aberrations_order: int | None = None,
+        learn_aberrations: bool = True,
+        learn_cutoff: bool = False,
+    ):
+        return cls(
+            num_probes=num_probes,
+            probe_params=probe_params.copy(),
+            roi_shape=roi_shape,
+            dtype=dtype,
+            device=device,
+            rng=rng,
+            vacuum_probe_intensity=vacuum_probe_intensity,
+            max_aberrations_order=max_aberrations_order,
+            learn_aberrations=learn_aberrations,
+            learn_cutoff=learn_cutoff,
+            _token=cls._token,
+        )
+
+    @property
+    def vacuum_probe_intensity(self) -> np.ndarray | None:
+        if self._vacuum_probe_intensity is None:
+            return None
+        return self._vacuum_probe_intensity
+
+    @vacuum_probe_intensity.setter
+    def vacuum_probe_intensity(self, vp: np.ndarray | Dataset4dstem | None):
+        if vp is None:
+            self._vacuum_probe_intensity = None
+            return
+        elif isinstance(vp, np.ndarray):
+            vp2 = vp.astype(config.get("dtype_real"))
+        elif isinstance(vp, (Dataset4dstem, Dataset2d)):
+            vp2 = vp.array
+        else:
+            raise NotImplementedError(f"Unknown vacuum probe type: {type(vp)}")
+
+        if vp2.ndim == 4:
+            vp2 = np.mean(vp2, axis=(0, 1))
+        elif vp2.ndim != 2:
+            raise ValueError(f"Unexpected shape for vacuum probe: {vp2.shape}")
+
+        self._vacuum_probe_intensity = vp2
+
+    @property
+    def params(self):
+        """Optimization parameters."""
+        params = []
+        if isinstance(self.semiangle_cutoff, nn.Parameter):
+            params.append(self.semiangle_cutoff)
+        params += list(self.aberration_coefs.values())
+        return params
+
+    @property
+    def probe(self) -> torch.Tensor:
+        """get the full probe"""
+        return self.apply_hard_constraints(self._build_probe())
+
+    @property
+    def name(self) -> str:
+        return "ProbeParametric"
+
+    def _build_probe(self) -> torch.Tensor:
+        """Build the probe array on the fly from current parameters."""
+        # collect aberration coefficients
+        coefs = {}
+        for k in self.aberration_names:
+            if hasattr(self.aberration_coefs, k):
+                coefs[k] = getattr(self.aberration_coefs, k)
+            elif hasattr(self, k):
+                coefs[k] = getattr(self, k)
+            else:
+                raise KeyError(f"Unknown aberration key {k}")
+
+        probe = real_space_probe(
+            gpts=tuple(self.roi_shape),
+            sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
+            energy=self.probe_params["energy"],
+            semiangle_cutoff=self.semiangle_cutoff,
+            vacuum_probe_intensity=self.vacuum_probe_intensity,
+            aberration_coefs=coefs,
+            soft_edges=self.probe_params["soft_edges"],
+            device=self.device,
+        )
+        probe = probe.to(dtype=self.dtype, device=self.device)
+        mean_diffraction_intensity = getattr(self, "_mean_diffraction_intensity", 1.0)
+        return probe[None] * np.sqrt(mean_diffraction_intensity)
+
+    def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
+        """Generate probe on the fly and apply subpixel shifts."""
+        shifted_probes = fourier_shift_expand(self.probe, fract_positions).swapaxes(0, 1)
+        return shifted_probes
+
+    def reset(self):
+        """Reset learnable parameters to their initial values."""
+        with torch.no_grad():
+            if hasattr(self, "semiangle_cutoff"):
+                self.semiangle_cutoff.copy_(self._initial_semiangle_cutoff.to(self.device))
+            if hasattr(self, "aberration_coefs"):
+                for name, param in self.aberration_coefs.items():
+                    initial = getattr(self, f"_initial_aberration_coefs_{name}")
+                    param.data.copy_(initial)
+
+
 class ProbeDIP(ProbeConstraints):
     """
     DIP/model based probe model.
@@ -746,7 +948,7 @@ class ProbeDIP(ProbeConstraints):
     ):
         super().__init__(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             device=device,
             rng=rng,
@@ -772,7 +974,7 @@ class ProbeDIP(ProbeConstraints):
     ):
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=probe_params.copy(),
             roi_shape=roi_shape,
             device=device,
             rng=rng,
@@ -810,7 +1012,7 @@ class ProbeDIP(ProbeConstraints):
 
         probe_model = cls(
             num_probes=pixelated.num_probes,
-            probe_params=pixelated.probe_params,
+            probe_params=pixelated.probe_params.copy(),
             roi_shape=pixelated.roi_shape,
             device=device,
             rng=pixelated.rng,
