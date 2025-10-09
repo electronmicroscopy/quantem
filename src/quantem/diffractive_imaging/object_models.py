@@ -147,11 +147,11 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if obj_type is None:
             return self.obj_type
         t_str = str(obj_type).lower()
-        if t_str in ["potential", "pot", "potentials"]:
+        if t_str in ["potential", "potentials"]:
             return "potential"
-        elif t_str in ["pure_phase", "purephase", "pure phase", "pure"]:
+        elif t_str in ["pure_phase", "purephase", "pure phase"]:
             return "pure_phase"
-        elif t_str in ["complex", "c"]:
+        elif t_str in ["complex"]:
             return "complex"
         else:
             raise ValueError(
@@ -410,7 +410,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if array.is_complex():
             amp = array.abs()
             ph = array.angle().abs()
-            loss = loss + weight * (torch.mean(amp[0]) + torch.mean(amp[-1]))
+            loss = loss + weight * (torch.mean(1.0 - amp[0]) + torch.mean(1.0 - amp[-1]))
             loss = loss + weight * (torch.mean(torch.diff(ph[0])) + torch.mean(torch.diff(ph[-1])))
         else:
             loss = loss + weight * (

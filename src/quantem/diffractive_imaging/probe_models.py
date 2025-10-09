@@ -1,7 +1,6 @@
 from abc import abstractmethod
 from copy import deepcopy
 from typing import Any, Callable, Self, Union
-from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -652,7 +651,7 @@ class ProbePixelated(ProbeConstraints):
 
     @property
     def name(self) -> str:
-        return "ProbePixelized"
+        return "ProbePixelated"
 
     def backward(self, propagated_gradient, obj_patches):
         obj_normalization = torch.sum(torch.abs(obj_patches) ** 2, dim=(-2, -1)).max()
@@ -666,14 +665,14 @@ class ProbePixelated(ProbeConstraints):
         self._probe.grad = -1 * probe_grad.clone().detach()
 
     @property
-    def vacuum_probe_intensity(self) -> np.ndarray | None:
+    def vacuum_probe_intensity(self) -> torch.Tensor | None:
         """corner centered vacuum probe"""
         if self._vacuum_probe_intensity is None:
             return None
         return self._vacuum_probe_intensity
 
     @vacuum_probe_intensity.setter
-    def vacuum_probe_intensity(self, vp: np.ndarray | Dataset4dstem | None):
+    def vacuum_probe_intensity(self, vp: np.ndarray | torch.Tensor | Dataset4dstem | None):
         """overwritten, clean up"""
         if vp is None:
             self._vacuum_probe_intensity = None
@@ -682,6 +681,8 @@ class ProbePixelated(ProbeConstraints):
             vp2 = vp.astype(config.get("dtype_real"))
         elif isinstance(vp, (Dataset4dstem, Dataset2d)):
             vp2 = vp.array
+        elif isinstance(vp, torch.Tensor):
+            vp2 = vp.cpu().detach().numpy()
         else:
             raise NotImplementedError(f"Unknown vacuum probe type: {type(vp)}")
 
@@ -690,11 +691,10 @@ class ProbePixelated(ProbeConstraints):
         elif vp2.ndim != 2:
             raise ValueError(f"Weird number of dimensions for vacuum probe, shape: {vp.shape}")
 
-        # vacuum probe should be corner centered
+        # vacuum probe will end up corner centered, but if it starts corner centered then
+        # we want to fftshift it be centered, so that we can use com to corner center it properly
         corner_vals = vp2[:10, :10].mean()
-        if corner_vals < 0.01 * vp2.max():
-            warn("Looks like vacuum probe is not corner centered, fft shifting now)")
-        else:
+        if corner_vals > 0.01 * vp2.max():
             vp2 = np.fft.fftshift(vp2)
 
         # fix centering
@@ -706,18 +706,25 @@ class ProbePixelated(ProbeConstraints):
             bilinear=True,
         )
 
-        self._vacuum_probe_intensity = vp2
+        self._vacuum_probe_intensity = torch.tensor(
+            vp2, dtype=config.get("dtype_real"), device=self.device
+        )
 
     def rescale_vacuum_probe(self, shape: tuple[int, int]):
+        """hack, should be fixed"""
         if self.vacuum_probe_intensity is None:
             return
         scale_output = (
             shape[0] / self.vacuum_probe_intensity.shape[0],
             shape[1] / self.vacuum_probe_intensity.shape[1],
         )
-        self._vacuum_probe_intensity = ndi.zoom(
-            self._vacuum_probe_intensity,
-            scale_output,
+        self._vacuum_probe_intensity = torch.tensor(
+            ndi.zoom(
+                self.vacuum_probe_intensity.cpu().detach().numpy(),
+                scale_output,
+            ),
+            dtype=config.get("dtype_real"),
+            device=self.device,
         )
 
     def _apply_random_phase_shifts(self, probe_array: torch.Tensor | np.ndarray) -> torch.Tensor:
@@ -906,11 +913,11 @@ class ProbeParametric(ProbeConstraints):
             gpts=tuple(self.roi_shape),
             sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
             energy=self.probe_params["energy"],
-            semiangle_cutoff=self.semiangle_cutoff,
-            vacuum_probe_intensity=self.vacuum_probe_intensity,
+            semiangle_cutoff=self.semiangle_cutoff,  # type:ignore
+            vacuum_probe_intensity=self.vacuum_probe_intensity,  # type:ignore
             aberration_coefs=coefs,
             soft_edges=self.probe_params["soft_edges"],
-            device=self.device,
+            device=self.device,  # type:ignore
         )
         probe = probe.to(dtype=self.dtype, device=self.device)
         mean_diffraction_intensity = getattr(self, "_mean_diffraction_intensity", 1.0)
@@ -925,7 +932,7 @@ class ProbeParametric(ProbeConstraints):
         """Reset learnable parameters to their initial values."""
         with torch.no_grad():
             if hasattr(self, "semiangle_cutoff"):
-                self.semiangle_cutoff.copy_(self._initial_semiangle_cutoff.to(self.device))
+                self.semiangle_cutoff.copy_(self._initial_semiangle_cutoff.to(self.device))  # type:ignore
             if hasattr(self, "aberration_coefs"):
                 for name, param in self.aberration_coefs.items():
                     initial = getattr(self, f"_initial_aberration_coefs_{name}")

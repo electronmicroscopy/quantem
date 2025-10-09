@@ -314,6 +314,10 @@ class PtychographyVisualizations(PtychographyBase):
         ax.spines["left"].set_color("k")
         ax.set_xlabel("Epochs")
 
+        # check if all lrs are constant and if so, don't plot lr
+        if all(np.all(lr == self.epoch_lrs["object"][0]) for lr in self.epoch_lrs.values()):
+            plot_lrs = False
+
         if plot_lrs and len(self.epoch_lrs) > 0:
             nx = ax.twinx()
             nx.spines["left"].set_visible(False)
@@ -356,8 +360,12 @@ class PtychographyVisualizations(PtychographyBase):
             labs = [lin.get_label() for lin in lines]
             nx.legend(lines, labs, loc="upper right")
         else:
-            # No learning rates to plot, just show loss
-            pass
+            # No learning rates to plot, add to title
+            # set title to each lr type
+            title = ""
+            for lr_type, lr_values in self.epoch_lrs.items():
+                title += f"{lr_type} LR: {lr_values[0]:.1e} | "
+            ax.set_title(title[:-3], fontsize=10)
 
         ax.set_xbound(-2, np.max(epochs if np.any(epochs) else [1]) + 2)
         if figax is None:
@@ -377,7 +385,7 @@ class PtychographyVisualizations(PtychographyBase):
         plt.suptitle(
             f"Final loss: {self.epoch_losses[-1]:.3e} | Epochs: {len(self.epoch_losses)}",
             fontsize=14,
-            y=0.94,
+            y=0.95,
         )
         plt.show()
 
@@ -701,7 +709,7 @@ class PtychographyVisualizations(PtychographyBase):
         energy = probe_params.get("energy")
 
         if conv_angle is not None and energy is not None:
-            from quantem.diffractive_imaging.complexprobe import electron_wavelength_angstrom
+            from quantem.core.utils.utils import electron_wavelength_angstrom
 
             wavelength = electron_wavelength_angstrom(energy)
             conv_angle_rad = conv_angle * 1e-3

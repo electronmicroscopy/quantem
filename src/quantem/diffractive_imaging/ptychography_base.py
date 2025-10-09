@@ -5,7 +5,6 @@ import numpy as np
 import scipy.ndimage as ndi
 import torch
 
-import quantem.core.utils.array_funcs as arr
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.rng import RNGMixin
@@ -897,11 +896,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         diff = preds - targets
         if "l1" in loss_type:
-            error = arr.sum(arr.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
         elif "l2" in loss_type:
-            error = arr.sum(arr.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
+            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
         elif loss_type == "poisson":
-            error = arr.sum(preds - targets * torch.log(preds + 1e-6))
+            error = torch.sum(preds - targets * torch.log(preds + 1e-6))
         else:
             raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
         loss = error / self.dset.mean_diffraction_intensity
@@ -919,7 +918,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             overlap = obj_patches[s] * propagated_probe
             propagated_probes.append(propagated_probe)
 
-        return arr.match_device(propagated_probes, overlap), overlap  # type:ignore
+        propagated_probes = torch.stack(propagated_probes, dim=0).to(overlap.device)
+        return propagated_probes, overlap  # type:ignore
 
     def estimate_amplitudes(
         self, overlap_array: "torch.Tensor", corner_centered: bool = False
