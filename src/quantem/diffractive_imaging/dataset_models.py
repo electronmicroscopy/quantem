@@ -433,7 +433,8 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         shp = shp.astype("int")
         return shp
 
-    def _obj_shape_full_2d(self, obj_padding_px: np.ndarray | tuple) -> np.ndarray:
+    @property
+    def _obj_shape_rot_2d(self) -> np.ndarray:
         cshape = self._obj_shape_crop_2d.copy()
         rotshape = np.floor(
             [
@@ -444,8 +445,12 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             ]
         )
         rotshape += rotshape % 2
-        rotshape += 2 * np.array(obj_padding_px)
         return rotshape.astype("int")
+
+    def _obj_shape_full_2d(self, obj_padding_px: np.ndarray | tuple) -> np.ndarray:
+        rshape = self._obj_shape_rot_2d.copy()
+        p = 2 * np.array(obj_padding_px)
+        return (rshape + p).astype("int")
 
     # endregion --- implicit properties (no setters) ---
 
@@ -966,7 +971,6 @@ class PtychographyDatasetRaster(DatasetConstraints):
         # set the various amplitudese and intensities (can be stripped down later)
         self._normalize_diffraction_intensities()
 
-        # self.obj_padding_px = obj_padding_px
         self._set_initial_scan_positions_px(obj_padding_px)
         self._set_patch_indices(obj_padding_px)
 

@@ -100,8 +100,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             probe_model.rescale_vacuum_probe((dset.amplitudes.shape[1], dset.amplitudes.shape[2]))
 
         # Remove centralized optimizer storage - now managed by individual models
-        self.set_probe_model(probe_model)
-        self.set_obj_model(obj_model)
+        self.probe_model = probe_model
+        self.obj_model = obj_model
         self.detector_model = detector_model
         self._compute_propagator_arrays()
         self.logger = logger
@@ -150,8 +150,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
         self._preprocessed = True
-        if self.num_epochs == 0:
-            self.reset_recon()  # if new models, reset to ensure shapes are correct
+        # if self.num_epochs == 0:
+        #     self.reset_recon()  # if new models, reset to ensure shapes are correct
         return self
 
     def _compute_propagator_arrays(
@@ -358,7 +358,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self._obj_padding_force_power2_level,
             )
         self._obj_padding_px = p2
-        self.obj_model.shape = tuple(self.obj_shape_full)
+        self.obj_model._initialize_obj(shape=self.obj_shape_full)
         self.dset._set_initial_scan_positions_px(self.obj_padding_px)
         self.dset._set_patch_indices(self.obj_padding_px)
         self.dset._preprocessing_params["obj_padding_px"] = self.obj_padding_px
@@ -448,26 +448,20 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             + "to return the closest snapshot, set closest=True"
         )
 
-    # TODO is there a way to type hint proper object model type?
+    # TODO is there a way to type hint proper object model type? probably not...
     @property
     def obj_model(self) -> ObjectModelType:
         return self._obj_model
 
     @obj_model.setter
     def obj_model(self, model: ObjectModelType | type):
-        self.set_obj_model(model)  # redundant
-
-    def set_obj_model(self, model: ObjectModelType | type):
         # Type checking with autoreload bug workaround
         if not (isinstance(model, ObjectBase) or "object" in str(type(model))):
             raise TypeError(f"obj_model must be a ObjectModelType, got {type(model)}")
 
+        # Set object shape
+        model.to(self.device)
         self._obj_model = cast(ObjectModelType, model)
-
-        # Set object shape and reset
-        rotshape = self.dset._obj_shape_full_2d(self.obj_padding_px)
-        self._obj_model.shape_2d = rotshape
-        self._obj_model.to(self.device)
 
     @property
     def probe_model(self) -> ProbeModelType:
@@ -475,14 +469,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @probe_model.setter
     def probe_model(self, model: ProbeModelType | type):
-        self.set_probe_model(model)  # redundant
-
-    def set_probe_model(self, probe_model: ProbeModelType | type):
         # Type checking with autoreload bug workaround
-        if not (isinstance(probe_model, ProbeBase) or "probe" in str(type(probe_model))):
-            raise TypeError(f"probe_model must be a ProbeModelType, got {type(probe_model)}")
+        if not (isinstance(model, ProbeBase) or "probe" in str(type(model))):
+            raise TypeError(f"probe_model must be a ProbeModelType, got {type(model)}")
 
-        self._probe_model = cast(ProbeModelType, probe_model)
+        self._probe_model = cast(
+            ProbeModelType, model
+        )  # have before so that energy available to set initial probe
         self._probe_model.set_initial_probe(
             self.roi_shape,
             self.reciprocal_sampling,

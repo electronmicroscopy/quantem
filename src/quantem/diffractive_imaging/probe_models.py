@@ -961,6 +961,8 @@ class ProbeDIP(ProbeConstraints):
             rng=rng,
             _token=_token,
         )
+        self.register_buffer("_model_input", torch.tensor([]))
+        self.register_buffer("_pretrain_target", torch.tensor([]))
 
         self._optimizer = None
         self._scheduler = None
@@ -987,7 +989,7 @@ class ProbeDIP(ProbeConstraints):
             rng=rng,
             _token=cls._token,
         )
-        probe_model.model = model.to(device)
+        probe_model._model = model.to(device)
         probe_model.set_pretrained_weights(model)
 
         if model_input is None:
@@ -1022,11 +1024,11 @@ class ProbeDIP(ProbeConstraints):
             probe_params=pixelated.probe_params.copy(),
             roi_shape=pixelated.roi_shape,
             device=device,
-            rng=pixelated.rng,
+            rng=pixelated._rng_seed,
             _token=cls._token,
         )
 
-        probe_model.model = model.to(device)
+        probe_model._model = model.to(device)
         probe_model.set_pretrained_weights(model)
 
         probe_model.model_input = pixelated.probe.clone().detach()
@@ -1194,7 +1196,7 @@ class ProbeDIP(ProbeConstraints):
         super().to(*args, **kwargs)
         device = kwargs.get("device", args[0] if args else None)
         if device is not None:
-            self.model = self.model.to(self.device)
+            self._model = self.model.to(self.device)
             self._model_input = self._model_input.to(self.device)
             if hasattr(self, "_initial_probe"):
                 self._initial_probe = self._initial_probe.to(self.device)
@@ -1225,7 +1227,11 @@ class ProbeDIP(ProbeConstraints):
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,
+        device: str | None = None,  # allow overwriting of device
     ):
+        if device is not None:
+            self.to(device)
+
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)
 

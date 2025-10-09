@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from typing import Any, Literal, Self, Sequence
 
 import numpy as np
@@ -96,7 +97,6 @@ class PtychoLite(Ptychography):
             obj_type=obj_type,
             device="cpu",
             rng=rng,
-            shape=None,
         )
 
         # Probe model
@@ -202,6 +202,41 @@ class PtychoLite(Ptychography):
             store_iterations_every=store_iterations_every,
             device=device,
         )
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str | Path,
+        dset: Any | None = None,
+        device: str | int | None = None,
+        verbose: int | bool | None = None,
+        auto_reload_dataset: bool = True,
+    ) -> Self:
+        """
+        Load a saved reconstruction and ensure the returned instance is PtychoLite.
+
+        This is a thin wrapper over the base loader that preserves the full
+        saved state while upgrading the loaded instance to this subclass when
+        necessary, without mutating the underlying data.
+        """
+        base = Ptychography.from_file(
+            path=path,
+            dset=dset,
+            device=device,
+            verbose=verbose,
+            auto_reload_dataset=auto_reload_dataset,
+        )
+
+        if not isinstance(base, cls):
+            # Safely upgrade the loaded instance to this subclass without altering state
+            try:
+                base.__class__ = cls  # type: ignore[assignment]
+            except Exception:
+                # Fallback: rely on the serialized class if available
+                upgraded = cls._recursive_load_from_path(path)
+                return upgraded  # type: ignore[return-value]
+
+        return base  # type: ignore[return-value]
 
 
 class PtychoLiteDIP(Ptychography):
