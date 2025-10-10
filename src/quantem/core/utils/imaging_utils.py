@@ -1,6 +1,6 @@
 # Utilities for processing images
 from __future__ import annotations
-from typing import Optional, Tuple, Union, Literal, overload
+from typing import Any, Optional, Tuple, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -8,11 +8,12 @@ from scipy.ndimage import gaussian_filter
 from scipy.special import comb
 from matplotlib import cm
 
-from quantem.core.utils.utils import generate_batches
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.visualization import show_2d
 
-ArrayOrDS = Union[NDArray, Dataset2d]
+# single TypeVar: works for both numpy and Dataset2d
+ImageType = TypeVar("ImageType", NDArray[Any], Dataset2d)
+BoolArray = NDArray[np.bool_]
 
 
 def dft_upsample(
@@ -368,89 +369,27 @@ def fourier_cropping(
     return result
 
 
-def _as_array(x: NDArray | Dataset2d) -> NDArray:
+def _as_array(x: ImageType) -> NDArray[Any]:
     return x.array if isinstance(x, Dataset2d) else np.asarray(x)
 
-
-def _bernstein_basis_1d(n: int, t: NDArray) -> NDArray:
+def _bernstein_basis_1d(n: int, t: NDArray[Any]) -> NDArray[Any]:
     k = np.arange(n + 1, dtype=int)
     return comb(n, k)[None, :] * (t[:, None] ** k[None, :]) * ((1.0 - t)[:, None] ** (n - k)[None, :])
 
-
-def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> NDArray:
+def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> NDArray[Any]:
     H, W = im_shape
     ou, ov = int(order[0]), int(order[1])
     u = np.linspace(0.0, 1.0, H)
     v = np.linspace(0.0, 1.0, W)
-    Bu = _bernstein_basis_1d(ou, u)   # (H, ou+1)
-    Bv = _bernstein_basis_1d(ov, v)   # (W, ov+1)
-    basis_cube = np.einsum("ik,jl->ijkl", Bu, Bv)  # (H, W, ou+1, ov+1)
+    Bu = _bernstein_basis_1d(ou, u)
+    Bv = _bernstein_basis_1d(ov, v)
+    basis_cube = np.einsum("ik,jl->ijkl", Bu, Bv)
     return basis_cube.reshape(H * W, (ou + 1) * (ov + 1))
 
 
-# --- Overloads: NDArray input ---
-@overload
 def background_subtract(
-    image: NDArray,
-    mask: Optional[NDArray] = ...,
-    thresh_bg: Optional[float] = ...,
-    order: Tuple[int, int] = ...,
-    sigma: Optional[float] = ...,
-    num_iter: int = ...,
-    plot_result: bool = ...,
-    axsize: Tuple[int, int] = ...,
-    cmap: str = ...,
-    return_background_and_mask: Literal[False] = ...,
-    **show_kwargs,
-) -> NDArray: ...
-@overload
-def background_subtract(
-    image: NDArray,
-    mask: Optional[NDArray] = ...,
-    thresh_bg: Optional[float] = ...,
-    order: Tuple[int, int] = ...,
-    sigma: Optional[float] = ...,
-    num_iter: int = ...,
-    plot_result: bool = ...,
-    axsize: Tuple[int, int] = ...,
-    cmap: str = ...,
-    return_background_and_mask: Literal[True] = ...,
-    **show_kwargs,
-) -> Tuple[NDArray, NDArray, NDArray]: ...
-
-# --- Overloads: Dataset2d input (mask stays NDArray) ---
-@overload
-def background_subtract(
-    image: Dataset2d,
-    mask: Optional[NDArray] = ...,
-    thresh_bg: Optional[float] = ...,
-    order: Tuple[int, int] = ...,
-    sigma: Optional[float] = ...,
-    num_iter: int = ...,
-    plot_result: bool = ...,
-    axsize: Tuple[int, int] = ...,
-    cmap: str = ...,
-    return_background_and_mask: Literal[False] = ...,
-    **show_kwargs,
-) -> Dataset2d: ...
-@overload
-def background_subtract(
-    image: Dataset2d,
-    mask: Optional[NDArray] = ...,
-    thresh_bg: Optional[float] = ...,
-    order: Tuple[int, int] = ...,
-    sigma: Optional[float] = ...,
-    num_iter: int = ...,
-    plot_result: bool = ...,
-    axsize: Tuple[int, int] = ...,
-    cmap: str = ...,
-    return_background_and_mask: Literal[True] = ...,
-    **show_kwargs,
-) -> Tuple[Dataset2d, Dataset2d, NDArray]: ...
-
-def background_subtract(
-    image: NDArray | Dataset2d,
-    mask: Optional[NDArray] = None,        # boolean numpy array or None
+    image: ImageType,
+    mask: Optional[BoolArray] = None,
     thresh_bg: Optional[float] = None,
     order: Tuple[int, int] = (1, 1),
     sigma: Optional[float] = None,
@@ -460,165 +399,93 @@ def background_subtract(
     cmap: str = "turbo",
     return_background_and_mask: bool = False,
     **show_kwargs,
-):
+) -> ImageType | Tuple[ImageType, NDArray[Any], BoolArray]:
     """
-    Background subtraction via bi-variate Bernstein (Bézier) polynomial fitting.
-
-    Parameters
-    ----------
-    image : numpy.ndarray or Dataset2d
-        2D input image. If a Dataset2d is provided, only its array is used for the fit;
-        outputs are returned as Dataset2d (same metadata preserved).
-    mask : numpy.ndarray of bool, optional
-        Boolean mask (same shape as `image`) indicating valid pixels for fitting and for
-        range calculations in the diagnostic plot. If None, all pixels are valid.
-    thresh_bg : float, optional
-        Background threshold to classify pixels as background during robust iterations.
-        If None, initialized from the median of `image[mask]`.
-    order : tuple[int, int], default (2, 2)
-        Polynomial order (u, v) for the Bernstein basis along the two axes.
-        Number of basis terms = (order[0] + 1) * (order[1] + 1).
-    sigma : float, optional
-        Gaussian sigma (pixels) to smooth residuals before thresholding at each iteration.
-        If None or 0, no smoothing is applied.
-    num_iter : int, default 10
-        Number of robust fitting iterations (refit background, update mask).
-    plot_result : bool, default True
-        If True, displays a 3-panel diagnostic:
-          (1) Input (mean-centered by background mean),
-          (2) Fitted background shown only where `mask_bg` is True (else black),
-          (3) Background-subtracted image with `RdBu_r`, zero-centered, symmetric ±min(|min|,|max|)
-              computed from `im_sub[mask]`. Colorbar is shown on panel (3).
-    axsize : tuple[int, int], default (3.1, 3)
-        Panel size in inches, forwarded to `show_2d`.
-    cmap : str, default "turbo"
-        Colormap for panels (1) and (2). Panel (3) always uses "RdBu_r".
-    return_background_and_mask : bool, default False
-        If True, also return the fitted background and the final background mask.
-
-    **show_kwargs
-        Additional arguments passed to `quantem.core.visualization.show_2d`.
+    Background subtraction via bivariate Bernstein polynomial fitting.
 
     Returns
     -------
-    im_sub : numpy.ndarray or Dataset2d
-        Background-subtracted image (same type as `image`).
-    im_bg : numpy.ndarray or Dataset2d, optional
-        Fitted background (same type as `image`). Returned if `return_background_and_mask=True`.
-    mask_bg : numpy.ndarray of bool, optional
-        Final background mask (always NumPy). Returned if `return_background_and_mask=True`.
-
-    Notes
-    -----
-    - The right-panel plot uses `im_sub[mask]` to compute a symmetric, zero-centered range
-      so white corresponds to 0.0 in RdBu_r.
+    - If `return_background_and_mask=False`: ImageType (same as input)
+    - If `True`: (ImageType, numpy.ndarray, numpy.ndarray[bool])
+      where background and mask are always NumPy.
     """
-    # --- inputs ---
     im = _as_array(image).astype(float, copy=True)
     if im.ndim != 2:
-        raise ValueError("`image` must be a 2D numpy array or Dataset2d")
+        raise ValueError("`image` must be 2D")
 
-    if mask is None:
-        mask_arr = np.ones_like(im, dtype=bool)
-    else:
-        mask_arr = np.asarray(mask, dtype=bool)
-        if mask_arr.shape != im.shape:
-            raise ValueError("`mask` must have the same shape as `image`.")
+    mask_arr: BoolArray = np.ones_like(im, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    if mask_arr.shape != im.shape:
+        raise ValueError("`mask` must match `image` shape")
 
-    # --- basis ---
     order = (int(order[0]), int(order[1]))
-    A_full = _build_basis_matrix(im.shape, order)  # (H*W, K)
+    A_full = _build_basis_matrix(im.shape, order)
     H, W = im.shape
     im_flat = im.ravel()
 
-    # --- init background & mask ---
     im_bg = np.zeros_like(im)
     thresh_val = np.median(im[mask_arr]) if thresh_bg is None else float(thresh_bg)
 
     resid = im - im_bg
-    if sigma is not None and sigma > 0:
+    if sigma and sigma > 0:
         resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
-    mask_bg = resid < thresh_val
-    mask_bg &= mask_arr
+    mask_bg: BoolArray = (resid < thresh_val) & mask_arr
 
-    # --- iterations ---
     for _ in range(int(num_iter)):
         idx = mask_bg.ravel()
         if not np.any(idx):
-            idx = mask_arr.ravel()  # ensure solvable if mask collapses
-
+            idx = mask_arr.ravel()
         coefs, *_ = np.linalg.lstsq(A_full[idx, :], im_flat[idx], rcond=None)
         im_bg = (A_full @ coefs).reshape(H, W)
 
         resid = im - im_bg
-        if sigma is not None and sigma > 0:
+        if sigma and sigma > 0:
             resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
 
         thr = thresh_val if thresh_bg is None else float(thresh_bg)
-        mask_bg = (resid < thr)
-        mask_bg &= mask_arr
+        mask_bg = (resid < thr) & mask_arr
 
-    # --- final subtraction ---
-    im_sub = im - im_bg
+    im_sub_np = im - im_bg
 
-    # --- plotting (right panel: zero-centered RdBu_r; limits from im_sub[mask]) ---
     if plot_result:
-        # Range from masked region
-        vals = im_sub[mask_arr]
+        vals = im_sub_np[mask_arr]
         vals = vals[np.isfinite(vals)]
         if vals.size == 0:
             vals = np.array([0.0])
-
         vmin_sub = float(np.min(vals))
         vmax_sub = float(np.max(vals))
-        vrange   = float(np.maximum(abs(vmin_sub), abs(vmax_sub)))  # ±min(|min|,|max|)
-        if vrange <= 0:
-            vrange = 1e-12
+        vrange = float(max(abs(vmin_sub), abs(vmax_sub))) or 1e-12
 
-        # Background panel: show only fitted region; black elsewhere
         bg_disp = (im_bg - np.mean(im_bg)).copy()
         bg_disp[~mask_bg] = np.nan
 
-        # Colormaps
-        cmap_base = cm.get_cmap(cmap).with_extremes(bad="black")  # NaNs -> black
-        cmap_div  = "RdBu_r"
+        cmap_base = cm.get_cmap(cmap).with_extremes(bad="black")
+        cmap_div = "RdBu_r"
 
-        # Panels: input, background(masked), background-subtracted
-        disp = [
-            im - np.mean(im_bg),
-            bg_disp,
-            im_sub,
-        ]
-
-        # Per-panel normalization:
+        disp = [im - np.mean(im_bg), bg_disp, im_sub_np]
         norm = [
-            {"interval_type": "manual",   "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},   # input
-            {"interval_type": "manual",   "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},   # background
-            {"interval_type": "centered", "stretch_type": "linear", "vcenter": 0.0,   "half_range": vrange},  # zero-centered
+            {"interval_type": "manual", "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},
+            {"interval_type": "manual", "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},
+            {"interval_type": "centered", "stretch_type": "linear", "vcenter": 0.0, "half_range": vrange},
         ]
 
         show_2d(
             disp,
             cmap=[cmap_base, cmap_base, cmap_div],
             norm=norm,
-            cbar=[False, False, True],  # colorbar only on right panel
+            cbar=[False, False, True],
             title=["Input Image", "Background (fit region)", "Background Subtracted"],
             axsize=axsize,
             **show_kwargs,
         )
 
-    # --- outputs (match image type for images; mask always ndarray) ---
+    # preserve Dataset2d if needed
     if isinstance(image, Dataset2d):
         meta = dict(origin=image.origin, sampling=image.sampling, units=image.units)
         name_base = getattr(image, "name", "image")
-        im_sub_ds = Dataset2d.from_array(im_sub, name=f"{name_base} (bg-sub)", **meta)
-        im_bg_ds  = Dataset2d.from_array(im_bg,  name=f"{name_base} (bg-fit)", **meta)
-        if return_background_and_mask:
-            return im_sub_ds, im_bg_ds, mask_bg
-        else:
-            return im_sub_ds
+        im_sub: ImageType = Dataset2d.from_array(im_sub_np, name=f"{name_base} (bg-sub)", **meta)  # type: ignore[assignment]
     else:
-        if return_background_and_mask:
-            return im_sub, im_bg, mask_bg
-        else:
-            return im_sub
+        im_sub = im_sub_np  # type: ignore[assignment]
+
+    if return_background_and_mask:
+        return im_sub, im_bg, mask_bg
+    return im_sub
