@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, Self, overload
+from typing import Any, Literal, Self, Union, overload
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
@@ -620,7 +620,7 @@ class Dataset(AutoSerialize):
         factors: float | tuple[float, ...] | None = None,
         axes: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
-    ) -> "Dataset" | None:
+    ) -> Union["Dataset", None]:
         """
         Fourier resample via centered crop (down) / zero-pad (up), using default FFT norms.
         Preserves mean and keeps the physical center fixed.
@@ -749,7 +749,7 @@ class Dataset(AutoSerialize):
         self,
         order: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
-    ) -> "Dataset" | None:
+    ) -> Union["Dataset", None]:
         """
         Transpose (permute) axes of the dataset and reorder metadata accordingly.
 
@@ -801,7 +801,7 @@ class Dataset(AutoSerialize):
         dtype: DTypeLike,
         copy: bool = True,
         modify_in_place: bool = False,
-    ) -> "Dataset" | None:
+    ) -> Union["Dataset", None]:
         """
         Cast the array to a new dtype. Metadata is unchanged.
 
