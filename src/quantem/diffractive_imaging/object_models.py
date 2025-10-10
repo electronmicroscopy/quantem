@@ -553,19 +553,13 @@ class ObjectPixelated(ObjectConstraints):
             else:
                 arr = torch.zeros(init_shape)
         elif self._initialize_mode == "random":
-            if self.obj_type in ["complex", "pure_phase"]:
-                if self.obj_type == "pure_phase":
-                    amp = torch.ones(init_shape)
-                else:
-                    amp = torch.randn(init_shape, dtype=self.dtype, generator=self._rng_torch)
-                ph = (
-                    torch.randn(init_shape, dtype=torch.float32, generator=self._rng_torch)
-                    * 2
-                    * np.pi
-                )
-                arr = amp * torch.exp(1.0j * ph)
+            ph = (
+                torch.randn(init_shape, dtype=torch.float32, generator=self._rng_torch) - 0.5
+            ) * 1e-6
+            if self.obj_type == "potential":
+                arr = ph
             else:
-                arr = torch.randn(init_shape, dtype=self.dtype, generator=self._rng_torch)
+                arr = torch.exp(1.0j * ph)
         elif self._initialize_mode == "array":
             arr = self._initial_obj
         else:
