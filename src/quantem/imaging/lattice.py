@@ -1,4 +1,4 @@
-from typing import Union
+from typing import List
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,7 +31,7 @@ class Lattice(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        image: Union[Dataset2d, NDArray],
+        image: Dataset2d | NDArray,
         normalize_min: bool = True,
         normalize_max: bool = True,
     ) -> "Lattice":
@@ -55,7 +55,7 @@ class Lattice(AutoSerialize):
         return self._image
 
     @image.setter
-    def image(self, value: Union[Dataset2d, NDArray]):
+    def image(self, value: Dataset2d | NDArray):
         if isinstance(value, Dataset2d):
             self._image = value
         else:
@@ -68,18 +68,56 @@ class Lattice(AutoSerialize):
     # --- Functions ---
     def define_lattice(
         self,
-        origin,
-        u,
-        v,
+        origin: NDArray[2] | List[float, float] | tuple[float, float],
+        u: NDArray[2] | List[float, float] | tuple[float, float],
+        v: NDArray[2] | List[float, float] | tuple[float, float],
+        refine_lattice: bool = True,
         block_size: int = -1,
-        plot_lattice=True,
-        bound_num_vectors=None,
-        mask=None,
-        refine_lattice=True,
+        plot_lattice: bool = True,
+        bound_num_vectors: int | None = None,
         refine_maxiter: int = 200,
-        debugging=False,
         **kwargs,
     ):
+        """
+        Define the lattice for the image using the origin and the u and v vectors starting from the origin.
+        The lattice is defined as r = r0 + nu + mv.
+
+        Parameters
+        ----------
+        origin : NDArray[2] | Sequence[float]
+            Start point (r0) to define the lattice.
+            Enter as (row, col) as a numpy array, list, or tuple.
+            Ideally a lattice point.
+        u : NDArray[2] | Sequence[float]
+            Basis vector u to define the lattice.
+            Enter as (row, col) as a numpy array, list, or tuple.
+        v : NDArray[2] | Sequence[float]
+            Basis vector v to define the lattice.
+            Enter as (row, col) as a numpy array, list, or tuple.
+        refine_lattice : bool, default=True
+            If True, refines the values of r0, u, and v by maximizing the bilinear intensity sum.
+        block_size : int, default=-1
+            Fit the lattice points in steps of block_size * lattice_vectors(u, v).
+            For example, if block_size = 5, then the lattice points will be fit in steps of
+            (-5, 5)u * (-5, 5)v -> (-10, 10)u * (-10, 10)v -> ...
+            block_size = -1 means the entire image will be fit at once.
+        plot_lattice : bool, default=True
+            If True, the lattice vectors and lines will be plotted overlaid on the image.
+        bound_num_vectors : int | None, default=None
+            The maximum number of lattice vectors to plot in each direction.
+            For example, if bound_num_vectors = 5, lattice lines between (-5, 5)u * (-5, 5)v will be plotted.
+            If None, the plotting bounds are set to the image edges.
+        refine_maxiter : int, default=200
+            Maximum number of iterations for the lattice refinement optimizer (Powell method).
+        **kwargs
+            Additional keyword arguments forwarded to the plotting function (show_2d), e.g., cmap, title, etc.
+
+        Returns
+        -------
+        self : Lattice
+            Returns the same object, modified in-place.
+            The final values of r0, u, v are stored in self._lat.
+        """
         # Lattice
         self._lat = np.vstack(
             (
@@ -238,10 +276,6 @@ class Lattice(AutoSerialize):
                 # Update for next iteration
                 lat_flat = res.x
                 self._lat = res.x.reshape(3, 2)
-
-                if debugging:
-                    print(f"Current Block Size: {curr_block_size}")
-                    print(f"Current params : {self._lat}")
 
         # plotting
         if plot_lattice:
@@ -427,6 +461,100 @@ class Lattice(AutoSerialize):
         annulus_radii=None,
         **kwargs,
     ):
+        """
+        Add atoms for each lattice site by sampling all integer lattice translations that fall inside
+        the image, measuring local intensity, and filtering candidates by bounds, edge distance,
+        mask, and optional intensity/contrast thresholds. Optionally plots the detected atoms.
+
+        Parameters
+        ----------
+        positions_frac : array-like, shape (S, 2)
+            Fractional positions (a, b) of S lattice sites within the unit cell. These are offsets
+            relative to the lattice origin r0 and basis vectors (u, v), and are used to tile the
+            image with candidate atom centers at all visible integer translations.
+        numbers : array-like of int, shape (S,), optional
+            Identifier per site (e.g., species or label). If None, uses 1..S. Used only for plotting
+            color coding; not used in detection logic.
+        intensity_min : float, optional
+            Minimum mean intensity inside the detection disk required to keep a candidate atom.
+            If None, no intensity thresholding is applied.
+        intensity_radius : float, optional
+            Radius (in pixels) of the detection disk used to compute the mean intensity at each
+            candidate center. If None, an automatic radius is estimated as half of the nearest-neighbor
+            spacing in pixels (see Notes).
+        plot_atoms : bool, default True
+            If True, displays the image and overlays the detected atoms for each site.
+        edge_min_dist_px : float, optional
+            Minimum distance (in pixels) that candidate centers must maintain from the image borders.
+            If a mask is provided and a distance transform can be computed, this same threshold is also
+            used to enforce a minimum distance from masked boundaries.
+        mask : array-like of bool, shape (H, W), optional
+            Binary mask defining valid regions. If provided:
+            - When a distance transform is available, candidates must be at least edge_min_dist_px away
+            from masked boundaries.
+            - Otherwise, candidates are kept only if the nearest integer-pixel location is True in the mask.
+        contrast_min : float, optional
+            Minimum contrast required to keep a candidate, defined as (disk mean) - (annulus mean).
+            If None, no contrast thresholding is applied.
+        annulus_radii : tuple of float, optional
+            Inner and outer radii (in pixels) of the background annulus used for contrast estimation.
+            If None, defaults to (1.5 * intensity_radius, 3.0 * intensity_radius).
+        **kwargs
+            Additional keyword arguments forwarded to the plotting helper (show_2d) when plot_atoms is True.
+
+        Returns
+        -------
+        self
+            The current object, with the following side effects:
+            - self._positions_frac set from positions_frac
+            - self._num_sites set to S
+            - self._numbers set from numbers or default sequence
+            - self.atoms populated with detected atom data per site
+
+        Raises
+        ------
+        ValueError
+            If a provided mask does not match the image shape (H, W).
+
+        Side Effects
+        ------------
+        self.atoms : Vector
+            shape=(S,), fields=("x", "y", "a", "b", "int_peak"), units=("px", "px", "ind", "ind", "counts").
+            For each site index s, self.atoms[s] holds a table with one row per detected atom:
+            - x, y: pixel coordinates of the atom center (x is row, y is column; origin at top-left)
+            - a, b: fractional lattice indices for that atom (including the site's fractional offset plus integer translations)
+            - int_peak: mean intensity inside the detection disk at (x, y)
+
+        Notes
+        -----
+        Lattice and image geometry
+            - The image array is of shape (H, W), where x indexes rows and y indexes columns.
+            - Lattice parameters are taken from self._lat = [r0, u, v], with r0 the origin (in pixels)
+            and u, v the lattice basis vectors (in pixels). Candidate centers are generated by tiling
+            each site's fractional offset across all integer translations that map into the image bounds.
+            - The visible range of integer translations (a, b) is determined by projecting the image corners
+            through the inverse lattice transform.
+
+        Automatic detection radius (when intensity_radius is None)
+            - If there are at least two sites, the nearest-neighbor spacing is computed from fractional
+            differences between site positions, accounting for periodic wrapping, and converted to pixels
+            via the lattice matrix [u v]. The radius is set to half of this spacing.
+            - If there is only one site, the spacing fallback is min(||u||, ||v||, ||u+v||, ||u-v||), and the
+            radius is half of this value.
+            - If the estimate is invalid or non-positive, a robust fallback of 0.5 * (0.5 * (||u|| + ||v||)) is used.
+
+        Filtering
+            - Candidates must lie fully within image bounds and satisfy the edge_min_dist_px constraint.
+            - If mask is provided and a distance transform can be computed, candidates must also be at least
+            edge_min_dist_px inside the masked region; otherwise, the mask must be True at the nearest integer pixel.
+            - intensity_min filters by the disk mean; contrast_min filters by the difference between the disk mean
+            and the annulus mean, where the annulus default is (1.5 * r, 3.0 * r).
+
+        Plotting
+            - When plot_atoms is True, the image is shown and detected atoms are rendered as semi-transparent
+            colored markers per site. Colors are determined by site numbers. Axes are set to match image
+            coordinates (x increasing downward).
+        """
         self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
         self._num_sites = self._positions_frac.shape[0]
         self._numbers = (
@@ -605,6 +733,82 @@ class Lattice(AutoSerialize):
         plot_atoms: bool = False,
         **kwargs,
     ):
+        """
+        Refine atom centers by local 2D Gaussian fitting around each previously detected atom.
+        Updates atom positions and peak intensity and adds per-atom sigma and background fields.
+        Optionally plots the refined atoms.
+        Parameters
+        ----------
+        fit_radius : float, optional
+            Radius (in pixels) of the circular fitting region around each atom's current center.
+            If None, an automatic radius is estimated as half of the nearest-neighbor spacing
+            between lattice sites in pixels. When there is only one site, the spacing fallback
+            is min(||u||, ||v||, ||u+v||, ||u-v||) where u and v are lattice vectors. If this
+            estimate is invalid or non-positive, a robust fallback is used.
+        max_nfev : int, default 200
+            Maximum number of function evaluations for the non-linear least-squares solver.
+        max_move_px : float, optional
+            Maximum allowed movement (in pixels) of the refined center from its initial position.
+            If None, defaults to the fitting radius. Bounds also enforce staying within image limits.
+        plot_atoms : bool, default False
+            If True, displays the image and overlays the refined atom positions.
+        **kwargs
+            Additional keyword arguments forwarded to the plotting helper when plot_atoms is True.
+
+        Returns
+        -------
+        self
+            The current object, with self.atoms updated per site to refined values.
+
+        Raises
+        ------
+        ValueError
+            If no atoms are present to refine (call add_atoms() first).
+
+        Side Effects
+        ------------
+        self.atoms : Vector
+            For each site index s, the per-atom rows are updated:
+            - x, y: pixel coordinates refined by local Gaussian fitting (x is row, y is column).
+            - int_peak: updated to the fitted Gaussian amplitude at the center.
+            - sigma: added or updated; the fitted Gaussian width (pixels).
+            - int_bg: added or updated; the fitted local constant background level.
+            If "sigma" and "int_bg" fields do not exist, they are added automatically.
+
+        Notes
+        -----
+        Model and fitting
+            - A circular patch of radius fit_radius is extracted around each atom's current center.
+            - Within that patch, a 2D isotropic Gaussian plus constant background is fit:
+            I(x, y) = amp * exp(-0.5 * r^2 / sigma^2) + bg, where r^2 is the squared distance
+            to the fitted center (x_c, y_c).
+            - Initial guesses:
+            - Center starts at the current atom position.
+            - amp starts from the central pixel value minus the local median background.
+            - sigma starts at max(0.5 * fit_radius, 0.5).
+            - bg starts at the median of the patch outside the circular mask (or full patch median).
+            - Parameter bounds:
+            - Center (x_c, y_c) limited to within max_move_px of the initial center and within
+                image bounds.
+            - amp in [0, max(pmax - pmin, 4 * amp0)], using local patch extrema and initial amp0.
+            - sigma in [0.25, max(2 x fit_radius, 1.0)].
+            - bg in [pmin * (pmax - pmin), pmax + (pmax - pmin)].
+            - Optimization uses scipy.optimize.least_squares with "trf" method and "soft_l1" loss.
+
+        Automatic fitting radius (when fit_radius is None)
+            - If there are at least two sites, the nearest-neighbor spacing is computed from fractional
+            differences between site positions (wrapped to [-0.5, 0.5]) and converted to pixels using
+            the lattice matrix [u v]; the radius is set to half of this spacing.
+            - If there is only one site, the spacing fallback is min(||u||, ||v||, ||u+v||, ||u-v||),
+            and the radius is half of this value.
+            - If the estimate is invalid or non-positive, a robust fallback is used based on the lattice
+            vector norms to ensure a reasonable, non-zero radius.
+
+        Plotting
+            - When plot_atoms is True, the image is shown and refined atom centers are rendered as
+            semi-transparent colored markers per site. Colors are determined by site numbers.
+            - Axes are set to match image coordinates (x increasing downward).
+        """
         import numpy as np
 
         if not hasattr(self, "atoms"):
@@ -760,15 +964,93 @@ class Lattice(AutoSerialize):
 
     def measure_polarization(
         self,
-        measure_ind,
-        reference_ind,
-        reference_radius=None,
-        reference_num=4,
-        coordinates: str = "cartesian",
+        measure_ind: int,
+        reference_ind: int,
+        reference_radius: float | None = None,
+        min_neighbours: int | None = 2,
+        max_neighbours: int | None = None,
         plot_polarization_vectors: bool = False,
         **plot_kwargs,
     ):
+        """
+        Measure the polarization of atoms at one site with respect to atoms at another site.
+        Polarization is computed as a fractional displacement (da, db) of each atom in the
+        'measure' site relative to the expected position inferred from the nearest atoms
+        in the 'reference' site and the current lattice vectors. The expected position is
+        the mean of neighbor positions shifted by the lattice vector transform of the
+        fractional index difference.
+
+        Parameters
+        ----------
+        measure_ind : int
+            Index of the site whose polarization is to be measured.
+            This corresponds to the index in `positions_frac` used in `add_atoms()`.
+        reference_ind : int
+            Index of the reference site used to calculate polarization.
+            This corresponds to the index in `positions_frac` used in `add_atoms()`.
+        reference_radius : float | None, default=None
+            If provided, neighbors are selected by radius search (in pixels) using a KD-tree.
+            Must be at least 1 pixel. If None, neighbors are selected by k-nearest search.
+        min_neighbours : int | None, default=2
+            Minimum number of nearest neighbors used to calculate polarization. Must be >= 2
+            when using k-nearest search (i.e., when `reference_radius` is None).
+        max_neighbours : int | None, default=None
+            Maximum number of nearest neighbors to use. Required when `reference_radius` is None.
+        plot_polarization_vectors : bool, default=False
+            If True, plots the polarization vectors using `self.plot_polarization_vectors(...)`.
+        **plot_kwargs
+            Additional keyword arguments forwarded to the plotting function.
+
+        Returns
+        -------
+        out : quantem.core.datastructures.vector.Vector
+            A Vector object containing the polarizations with:
+            - shape=(1,)
+            - fields=("x", "y", "a", "b", "da", "db")
+            - units=("px", "px", "ind", "ind", "ind", "ind")
+            Here, (x, y) are positions in pixels, (a, b) are fractional indices,
+            and (da, db) are fractional displacements (polarization).
+
+        Raises
+        ------
+        ValueError
+            - If the lattice vectors are singular (cannot invert).
+            - If neither `reference_radius` nor both `min_neighbours` and `max_neighbours` are specified.
+            - If `reference_radius` < 1.
+            - If radius-based search fails to find at least `min_neighbours` for any atom.
+            - If k-nearest search is used and `min_neighbours` or `max_neighbours` is missing.
+            - If k-nearest search is used with `min_neighbours` < 2 or `max_neighbours` < 2.
+            - If `min_neighbours` > `max_neighbours`.
+            - If no atoms have any neighbors identified (increase `reference_radius`).
+        DeprecationWarning
+            If `reference_num` is provided.
+            Use `max_neighbours` and `min_neighbours` instead.
+        Warning
+            If some atoms do not have any neighbors identified (suggests increasing `reference_radius`).
+
+        Notes
+        -----
+        - Lattice vectors are taken from `self._lat` and are in pixel units.
+        - Neighbor selection:
+            - If `reference_radius` is provided, a radius search (KD-tree) is used and optionally
+                truncated by `max_neighbours`.
+            - If `reference_radius` is None, k-nearest neighbors are used with `k=max_neighbours`.
+        - The expected position for each measured atom is computed as the mean over selected
+        neighbors of: neighbor_position + L @ ([a - a_i, b - b_i]), where L = [u v], and
+        (a, b) and (a_i, b_i) are the fractional indices of the measured atom and the neighbor,
+        respectively. The polarization (da, db) is then obtained by transforming the
+        Cartesian displacement back to fractional coordinates using L^{-1}.
+        - If either the measure or reference site is empty, an empty Vector (with zero rows) is returned.
+        """
         from scipy.spatial import cKDTree
+
+        # This is temporary. In case any old notebooks are still using "reference_num"
+        if "reference_num" in plot_kwargs:
+            if max_neighbours is None:
+                max_neighbours = plot_kwargs["reference_num"]
+                raise DeprecationWarning(
+                    "'reference_num' is deprecated. Use 'max_neighbours' and 'min_neighbours'."
+                )
 
         # lattice vectors in pixels
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
@@ -803,95 +1085,179 @@ class Lattice(AutoSerialize):
         Ba = self.atoms[reference_ind]["a"]
         Bb = self.atoms[reference_ind]["b"]
 
-        reference_radius = 3
         L = np.column_stack((u, v))
         try:
             L_inv = np.linalg.inv(L)
         except np.linalg.LinAlgError:
             raise ValueError("Lattice vectors are singular and cannot be inverted.")
-        query_coords = np.column_stack([Aa, Ab])
-        ref_coords = np.column_stack([Ba, Bb])
+        query_coords = np.column_stack([Ax, Ay])
+        ref_coords = np.column_stack([Bx, By])
+
+        # Pre-allocate result array memory
+        x_arr = Ax.copy().astype(float)
+        y_arr = Ay.copy().astype(float)
+        a_arr = Aa.copy().astype(float)
+        b_arr = Ab.copy().astype(float)
+        da_arr = np.zeros_like(x_arr, dtype=float)
+        db_arr = np.zeros_like(x_arr, dtype=float)
 
         # KD-tree query
         tree = cKDTree(ref_coords)
-        k = int(max(1, reference_num))
-        dists, idxs = tree.query(
-            query_coords,
-            k=k,
-            distance_upper_bound=float(reference_radius),
-            workers=-1,
-        )
 
-        # Normalize shapes for k=1 case
-        if k == 1:
-            dists = dists[:, None]
-            idxs = idxs[:, None]
-
-        # Vectorized neighbor validation
-        valid_mask = np.isfinite(dists) & (idxs < len(Bx))
-        valid_counts = np.sum(valid_mask, axis=1)
-        atoms_with_enough_neighbors = valid_counts >= reference_num
-
-        if not np.any(atoms_with_enough_neighbors):
-            out = Vector.from_shape(
-                shape=(1,),
-                fields=("x", "y", "a", "b", "da", "db"),
-                units=("px", "px", "ind", "ind", "ind", "ind"),
-                name="polarization",
+        if max_neighbours is None and reference_radius is None:
+            raise ValueError(
+                "Either min_neighbours or max_neighbours or reference_radius must be passed."
             )
-            out.set_data(np.zeros((0, 6), float), 0)
-            return out
 
-        # Filter to atoms with enough neighbors
-        valid_atom_indices = np.where(atoms_with_enough_neighbors)[0]
-        n_valid = len(valid_atom_indices)
+        # Initialize arrays for results
+        dists = []
+        idxs = []
 
-        # Pre-allocate result array memory
-        x_arr = Ax[valid_atom_indices].astype(float)
-        y_arr = Ay[valid_atom_indices].astype(float)
-        a_arr = Aa[valid_atom_indices].astype(float)
-        b_arr = Ab[valid_atom_indices].astype(float)
-        da_arr = np.zeros(n_valid, dtype=float)
-        db_arr = np.zeros(n_valid, dtype=float)
+        if reference_radius is not None:
+            # Radius-based query
+            if reference_radius < 1:
+                raise ValueError(
+                    f"reference_radius must be atleast 1 pixel. You have passed : {reference_radius}"
+                )
 
-        for i, atom_idx in enumerate(valid_atom_indices):
-            valid_neighbors = valid_mask[atom_idx]
-            if np.sum(valid_neighbors) >= reference_num:
-                valid_dists = dists[atom_idx][valid_neighbors]
-                valid_idxs = idxs[atom_idx][valid_neighbors]
-                closest_order = np.argsort(valid_dists)[:reference_num]
-                nbr_idx = valid_idxs[closest_order].astype(int)
+            neighbor_lists = tree.query_ball_point(
+                query_coords,
+                r=reference_radius,
+                workers=-1,
+            )
 
-                # Actual Cartesian position of the atom
-                actual_pos = np.array([x_arr[i], y_arr[i]])
+            # Vectorized distance calculations where possible
+            for i, neighbors in enumerate(neighbor_lists):
+                if len(neighbors) == 0:
+                    dists.append(np.array([]))
+                    idxs.append(np.array([]))
+                    continue
 
-                # Fractional indices
-                a, b = a_arr[i], b_arr[i]
-                ai, bi = Ba[nbr_idx], Bb[nbr_idx]
+                # Vectorized distance calculation
+                neighbor_coords = ref_coords[neighbors]
+                query_point = query_coords[i]
+                distances = np.linalg.norm(neighbor_coords - query_point, axis=1)
 
-                # Cartesian positions of neighbors
-                xi, yi = Bx[nbr_idx], By[nbr_idx]
+                # Vectorized sorting
+                sort_idx = np.argsort(distances)
+                sorted_distances = distances[sort_idx]
+                sorted_indices = np.array(neighbors)[sort_idx]
 
-                # For each neighbor, calculate where the atom should be
-                # based on fractional index difference
-                fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
-                neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
+                # Apply max_neighbours limit if specified
+                if max_neighbours is not None and len(sorted_distances) > max_neighbours:
+                    sorted_distances = sorted_distances[:max_neighbours]
+                    sorted_indices = sorted_indices[:max_neighbours]
 
-                # Expected position = neighbor_position + L @ fractional_difference
-                expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
+                dists.append(sorted_distances)
+                idxs.append(sorted_indices)
 
-                # Average the expected positions from all neighbors
-                expected_position = np.mean(expected_positions, axis=1)  # (2,)
+            # Vectorized length checking
+            lengths = np.array([len(row) for row in dists])
+            if min_neighbours is not None and np.any(lengths < min_neighbours):
+                raise ValueError(
+                    "Failed to calculate enough nearest neighbours. Increase the reference_radius"
+                )
 
-                # Calculate displacement in Cartesian coordinates
-                displacement_cartesian = actual_pos - expected_position
+        elif reference_radius is None:
+            # K-nearest neighbors query
+            if min_neighbours is None or max_neighbours is None:
+                raise ValueError(
+                    "min_neighbours and max_neighbours should be specified if reference_radius is None"
+                )
+            if min_neighbours < 2 or max_neighbours < 2:
+                raise ValueError(
+                    "Must use atleast 2 nearest neighbours to calculate the Polarization"
+                )
+            if min_neighbours > max_neighbours:
+                raise ValueError("'min_neighbours' cannot be larger than 'max_neighbours'")
 
-                # Convert displacement back to fractional coordinates
-                displacement_fractional = L_inv @ displacement_cartesian
+            dist_array, idx_array = tree.query(
+                query_coords,
+                k=max_neighbours,
+                workers=-1,
+            )
 
-                # Store with consistent sign convention
-                da_arr[i] = displacement_fractional[0]
-                db_arr[i] = displacement_fractional[1]
+            # Vectorized processing of results
+            finite_mask = np.isfinite(dist_array)
+            for i in range(len(query_coords)):
+                mask = finite_mask[i]
+                dists.append(dist_array[i][mask])
+                idxs.append(idx_array[i][mask])
+
+        # Vectorized neighbor checking
+        lengths = np.array([len(row) for row in dists])
+        atoms_with_atleast_one_neighbour = lengths > 0
+
+        if not np.any(atoms_with_atleast_one_neighbour):
+            raise ValueError(
+                "Failed to calculate nearest neighbours for all atoms. Increase reference_radius."
+            )
+
+        if not np.all(atoms_with_atleast_one_neighbour):
+            missing_count = len(atoms_with_atleast_one_neighbour) - np.sum(
+                atoms_with_atleast_one_neighbour
+            )
+            raise Warning(
+                f"{missing_count} atoms do not have any neighbours identified. Try increasing reference_radius."
+            )
+
+        # Pre-allocate arrays for better performance
+        da_arr = np.zeros(len(query_coords))
+        db_arr = np.zeros(len(query_coords))
+
+        # Calculate displacements with optimizations
+        for i, (atom_dists, atom_idxs) in enumerate(zip(dists, idxs)):
+            if len(atom_idxs) == 0:
+                continue  # Arrays already initialized to 0
+
+            # Check if we have enough neighbors
+            if min_neighbours is not None and len(atom_idxs) < min_neighbours:
+                continue  # Arrays already initialized to 0
+
+            # Determine how many neighbors to use
+            num_neighbors_to_use = len(atom_idxs)
+            if max_neighbours is not None:
+                num_neighbors_to_use = min(num_neighbors_to_use, max_neighbours)
+            if min_neighbours is not None:
+                num_neighbors_to_use = max(
+                    num_neighbors_to_use, min(min_neighbours, len(atom_idxs))
+                )
+
+            # Select the neighbors to use (closest ones) - optimized
+            if num_neighbors_to_use < len(atom_idxs):
+                # Use argpartition for better performance when we don't need full sort
+                closest_order = np.argpartition(atom_dists, num_neighbors_to_use)[
+                    :num_neighbors_to_use
+                ]
+                nbr_idx = atom_idxs[closest_order].astype(int)
+            else:
+                nbr_idx = atom_idxs.astype(int)
+
+            # Vectorized position calculations
+            actual_pos = np.array([x_arr[i], y_arr[i]])
+
+            # Vectorized fractional calculations
+            a, b = a_arr[i], b_arr[i]
+            ai, bi = Ba[nbr_idx], Bb[nbr_idx]
+            xi, yi = Bx[nbr_idx], By[nbr_idx]
+
+            # Vectorized matrix operations
+            fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
+            neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
+
+            # Single matrix multiplication for all neighbors
+            expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
+
+            # Vectorized mean calculation
+            expected_position = np.mean(expected_positions, axis=1)  # (2,)
+
+            # Vectorized displacement calculations
+            displacement_cartesian = actual_pos - expected_position
+            displacement_fractional = L_inv @ displacement_cartesian
+
+            # Direct assignment
+            da_arr[i] = displacement_fractional[0]
+            db_arr[i] = displacement_fractional[1]
 
         out = Vector.from_shape(
             shape=(1,),
@@ -901,9 +1267,7 @@ class Lattice(AutoSerialize):
         )
 
         arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
-
-        filtered_arr = arr[(np.abs(arr[:, -2]) < 0.1) & (np.abs(arr[:, -1]) < 0.1)]
-        out.set_data(filtered_arr, 0)
+        out.set_data(arr, 0)
 
         # out.set_data(arr, 0)
 
