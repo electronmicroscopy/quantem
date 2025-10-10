@@ -178,8 +178,12 @@ cython_debug/
 
 # jupyter notebooks
 *.ipynb
+ipynb-playground/
 
 # zip files
 *.zip
 *.h5
 *.npy
+
+# cursor
+.cursor

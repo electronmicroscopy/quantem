@@ -489,3 +489,130 @@ def is_complex(a: ArrayLike) -> bool:
         if isinstance(a, torch.Tensor):
             return a.is_complex()
     return np.iscomplexobj(a)
+
+
+@overload
+def fftfreq(n: int, d: float = 1.0, *, like: np.ndarray) -> "np.ndarray": ...
+@overload
+def fftfreq(n: int, d: float = 1.0, *, like: "torch.Tensor") -> "torch.Tensor": ...
+@overload
+def fftfreq(n: int, d: float = 1.0, *, like: "cp.ndarray") -> "cp.ndarray": ...
+def fftfreq(n: int, d: float = 1.0, like: ArrayLike = np.empty(0)) -> ArrayLike:
+    """Return the Discrete Fourier Transform sample frequencies."""
+    if config.get("has_torch"):
+        if isinstance(like, torch.Tensor):
+            return torch.fft.fftfreq(n, d, device=like.device)
+    if config.get("has_cupy"):
+        if isinstance(like, cp.ndarray):
+            return cp.fft.fftfreq(n, d)
+    return np.fft.fftfreq(n, d)
+
+
+@overload
+def meshgrid(
+    x: np.ndarray, y: np.ndarray, indexing: Literal["xy", "ij"] = "xy"
+) -> tuple[np.ndarray, np.ndarray]: ...
+@overload
+def meshgrid(
+    x: "torch.Tensor", y: "torch.Tensor", indexing: Literal["xy", "ij"] = "xy"
+) -> tuple["torch.Tensor", "torch.Tensor"]: ...
+def meshgrid(
+    x: ArrayLike, y: ArrayLike, indexing: Literal["xy", "ij"] = "xy"
+) -> tuple[ArrayLike, ArrayLike]:
+    """Return coordinate matrices from coordinate vectors."""
+    validate_arraylike(x)
+    validate_arraylike(y)
+    if config.get("has_torch") and isinstance(x, torch.Tensor):
+        if not isinstance(y, torch.Tensor):
+            raise TypeError(f"y and x must be same types, got {type(y)} and {type(x)}")
+        a0, a1 = torch.meshgrid(x, y, indexing=indexing)
+        return (a0, a1)
+    a0, a1 = np.meshgrid(x, y, indexing=indexing)
+    return (a0, a1)
+
+
+@overload
+def sort(a: np.ndarray, axis: int = -1) -> np.ndarray: ...
+@overload
+def sort(a: "torch.Tensor", axis: int = -1) -> "torch.Tensor": ...
+def sort(a: ArrayLike, axis: int = -1) -> ArrayLike:
+    """Return a sorted copy of an array."""
+    validate_arraylike(a)
+    if config.get("has_torch") and isinstance(a, torch.Tensor):
+        return torch.sort(a, dim=axis).values
+    return np.sort(a, axis=axis)
+
+
+@overload
+def arange(
+    start: int | float,
+    stop: int | float | None = None,
+    step: int = 1,
+    *,
+    like: np.ndarray,
+    **kwargs,
+) -> np.ndarray: ...
+@overload
+def arange(
+    start: int | float,
+    stop: int | float | None = None,
+    step: int = 1,
+    *,
+    like: "torch.Tensor",
+    **kwargs,
+) -> "torch.Tensor": ...
+@overload
+def arange(
+    start: int | float,
+    stop: int | float | None = None,
+    step: int = 1,
+    *,
+    like: "cp.ndarray",
+    **kwargs,
+) -> "cp.ndarray": ...
+def arange(
+    start: int | float = 0,
+    stop: int | float | None = None,
+    step: int = 1,
+    *,
+    like: ArrayLike = np.empty(0),
+    **kwargs,
+) -> ArrayLike:
+    """Return evenly spaced values within a given interval."""
+    # Handle numpy-style single argument case
+    if stop is None:
+        stop = start
+        start = 0
+
+    print("start stop step: ", start, stop, step)
+    if config.get("has_torch"):
+        if isinstance(like, torch.Tensor):
+            return torch.arange(start, stop, step, device=like.device, **kwargs)
+    if config.get("has_cupy"):
+        if isinstance(like, cp.ndarray):
+            return cp.arange(start, stop, step, **kwargs)
+    return np.arange(start, stop, step, **kwargs)
+
+
+@overload
+def view(a: np.ndarray, shape: tuple[int, ...]) -> np.ndarray: ...
+@overload
+def view(a: "torch.Tensor", shape: tuple[int, ...]) -> "torch.Tensor": ...
+def view(a: ArrayLike, shape: tuple[int, ...]) -> ArrayLike:
+    """Return a view of array with new shape."""
+    validate_arraylike(a)
+    if config.get("has_torch") and isinstance(a, torch.Tensor):
+        return a.view(*shape)
+    return a.reshape(shape)
+
+
+# @overload
+# def device_of(a: np.ndarray) -> str: ...
+# @overload
+# def device_of(a: "torch.Tensor") -> str: ...
+# def device_of(a: ArrayLike) -> str:
+#     """Get the device of an array."""
+#     validate_arraylike(a)
+#     if config.get("has_torch") and isinstance(a, torch.Tensor):
+#         return str(a.device)
+#     return "cpu"

@@ -1,4 +1,7 @@
-from typing import Any, Optional, Self, Union
+import os
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Literal, Self, overload
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
@@ -8,6 +11,7 @@ from quantem.core.utils.utils import get_array_module
 from quantem.core.utils.validators import (
     ensure_valid_array,
     validate_ndinfo,
+    validate_pathlike,
     validate_units,
 )
 
@@ -32,30 +36,31 @@ class Dataset(AutoSerialize):
         self,
         array: Any,  # Input can be array-like
         name: str,
-        origin: Union[NDArray, tuple, list, float, int],
-        sampling: Union[NDArray, tuple, list, float, int],
-        units: Union[list[str], tuple, list],
+        origin: NDArray | tuple | list | float | int,
+        sampling: NDArray | tuple | list | float | int,
+        units: list[str] | tuple | list,
         signal_units: str = "arb. units",
         _token: object | None = None,
     ):
         if _token is not self._token:
             raise RuntimeError("Use Dataset.from_array() to instantiate this class.")
-
+        super().__init__()
         self._array = ensure_valid_array(array)
         self.name = name
         self.origin = origin
         self.sampling = sampling
         self.units = units
         self.signal_units = signal_units
+        self._file_path = None
 
     @classmethod
     def from_array(
         cls,
         array: Any,  # Input can be array-like
         name: str | None = None,
-        origin: Union[NDArray, tuple, list, float, int] | None = None,
-        sampling: Union[NDArray, tuple, list, float, int] | None = None,
-        units: Union[list[str], tuple, list] | None = None,
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
     ) -> Self:
         """
@@ -67,11 +72,11 @@ class Dataset(AutoSerialize):
             The array to validate and create a Dataset from.
         name: str | None
             The name of the Dataset.
-        origin: Union[NDArray, tuple, list, float, int] | None
+        origin: NDArray | tuple | list | float | int | None
             The origin of the Dataset.
-        sampling: Union[NDArray, tuple, list, float, int] | None
+        sampling: NDArray | tuple | list | float | int | None
             The sampling of the Dataset.
-        units: Union[list[str], tuple, list] | None
+        units: list[str] | tuple | list | None
             The units of the Dataset.
         signal_units: str
             The units of the signal.
@@ -108,7 +113,8 @@ class Dataset(AutoSerialize):
 
     @array.setter
     def array(self, value: NDArray) -> None:
-        self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
+        self._array = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
+        # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
 
     @property
     def name(self) -> str:
@@ -123,7 +129,7 @@ class Dataset(AutoSerialize):
         return self._origin
 
     @origin.setter
-    def origin(self, value: Union[NDArray, tuple, list, float, int]) -> None:
+    def origin(self, value: NDArray | tuple | list | float | int) -> None:
         self._origin = validate_ndinfo(value, self.ndim, "origin")
 
     @property
@@ -131,7 +137,7 @@ class Dataset(AutoSerialize):
         return self._sampling
 
     @sampling.setter
-    def sampling(self, value: Union[NDArray, tuple, list, float, int]) -> None:
+    def sampling(self, value: NDArray | tuple | list | float | int) -> None:
         self._sampling = validate_ndinfo(value, self.ndim, "sampling")
 
     @property
@@ -139,7 +145,7 @@ class Dataset(AutoSerialize):
         return self._units
 
     @units.setter
-    def units(self, value: Union[list[str], tuple, list]) -> None:
+    def units(self, value: list[str] | tuple[str, ...] | list) -> None:
         self._units = validate_units(value, self.ndim)
 
     @property
@@ -149,6 +155,14 @@ class Dataset(AutoSerialize):
     @signal_units.setter
     def signal_units(self, value: str) -> None:
         self._signal_units = str(value)
+
+    @property
+    def file_path(self) -> Path | None:
+        return self._file_path
+
+    @file_path.setter
+    def file_path(self, value: os.PathLike | str | None) -> None:
+        self._file_path = validate_pathlike(value)
 
     # --- Derived Properties ---
     @property
@@ -164,7 +178,7 @@ class Dataset(AutoSerialize):
         return self.array.dtype
 
     @property
-    def _xp(self):
+    def _xp(self) -> ModuleType:
         return get_array_module(self.array)
 
     @property
@@ -174,7 +188,7 @@ class Dataset(AutoSerialize):
         figure out a more permanent device solution that enables easier translation between
         numpy <-> cupy <-> torch <-> numpy
         """
-        return str(self.array.device)
+        return str(self.array.device)  # type:ignore
 
     # --- Summaries ---
     def __repr__(self) -> str:
@@ -200,15 +214,15 @@ class Dataset(AutoSerialize):
         return "\n".join(description)
 
     # --- Methods ---
-    def copy(self) -> Self:
+    def copy(self, copy_custom_attributes: bool = True) -> Self:
         """
         Copies Dataset.
 
         Parameters
         ----------
-        copy_attributes: bool
+        copy_custom_attributes: bool, optional
             If True, copies non-standard attributes. Standard attributes (array, metadata)
-            are always deep-copied.
+            are always deep-copied. Default is True.
         """
         # Metadata arrays (origin, sampling) are numpy, use copy()
         # Units list is copied by slicing
@@ -221,15 +235,60 @@ class Dataset(AutoSerialize):
             signal_units=self.signal_units,
         )
 
+        # Copy custom attributes if requested
+        if copy_custom_attributes:
+            self._copy_custom_attributes(new_dataset)
+
         return new_dataset
 
-    def mean(self, axes: Optional[tuple[int, ...]] = None) -> Any:
+    def _copy_custom_attributes(self, new_dataset: Self) -> None:
+        """
+        Copy custom attributes from self to new_dataset.
+        This method can be overridden by subclasses to handle specific custom attributes.
+
+        Parameters
+        ----------
+        new_dataset : Self
+            The new dataset instance to copy attributes to
+        """
+        # Standard attributes that should not be copied
+        standard_attrs = {
+            "_array",
+            "_name",
+            "_origin",
+            "_sampling",
+            "_units",
+            "_signal_units",
+            "_token",
+            "__dict__",
+            "__class__",
+            "__weakref__",
+        }
+
+        # Copy all non-standard attributes (but not properties)
+        for attr_name in dir(self):
+            if not attr_name.startswith("__") and attr_name not in standard_attrs:
+                # Skip properties first - check the class, not the instance
+                if not isinstance(getattr(type(self), attr_name, None), property):
+                    if hasattr(self, attr_name) and not callable(getattr(self, attr_name)):
+                        try:
+                            attr_value = getattr(self, attr_name)
+                            # Try to copy the attribute if it has a copy method
+                            if hasattr(attr_value, "copy"):
+                                setattr(new_dataset, attr_name, attr_value.copy())
+                            else:
+                                setattr(new_dataset, attr_name, attr_value)
+                        except (AttributeError, TypeError):
+                            # Skip attributes that can't be copied
+                            pass
+
+    def mean(self, axes: int | tuple[int, ...] | None = None) -> Any:
         """
         Computes and returns mean of the data array.
 
         Parameters
         ----------
-        axes: tuple, optional
+        axes: int or tuple of ints, optional
             Axes over which to compute mean. If None specified, mean of all elements is computed.
 
         Returns
@@ -239,13 +298,13 @@ class Dataset(AutoSerialize):
         """
         return self.array.mean(axis=axes)
 
-    def max(self, axes: Optional[tuple[int, ...]] = None) -> Any:
+    def max(self, axes: int | tuple[int, ...] | None = None) -> Any:
         """
         Computes and returns max of the data array.
 
         Parameters
         ----------
-        axes: tuple, optional
+        axes: int or tuple of ints, optional
             Axes over which to compute max. If None specified, max of all elements is computed.
 
         Returns
@@ -255,13 +314,13 @@ class Dataset(AutoSerialize):
         """
         return self.array.max(axis=axes)
 
-    def min(self, axes: Optional[tuple[int, ...]] = None) -> Any:
+    def min(self, axes: int | tuple[int, ...] | None = None) -> Any:
         """
         Computes and returns min of the data array.
 
         Parameters
         ----------
-        axes: tuple, optional
+        axes: int or tuple of ints, optional
             Axes over which to compute min. If None specified, min of all elements is computed.
 
         Returns
@@ -271,13 +330,31 @@ class Dataset(AutoSerialize):
         """
         return self.array.min(axis=axes)
 
+    @overload
     def pad(
         self,
-        pad_width: Union[int, tuple[int, int], tuple[tuple[int, int], ...]] | None = None,
+        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None,
+        output_shape: tuple[int, ...] | None,
+        modify_in_place: Literal[True],
+        **kwargs: Any,
+    ) -> None: ...
+
+    @overload
+    def pad(
+        self,
+        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None = None,
+        output_shape: tuple[int, ...] | None = None,
+        modify_in_place: Literal[False] = False,
+        **kwargs: Any,
+    ) -> "Dataset": ...
+
+    def pad(
+        self,
+        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None = None,
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
         **kwargs: Any,
-    ) -> Optional["Dataset"]:
+    ) -> "Dataset | None":
         """
         Pads Dataset data array using numpy.pad or cupy.pad.
         Metadata (origin, sampling) is not modified.
@@ -326,7 +403,28 @@ class Dataset(AutoSerialize):
             new_dataset.name = self.name + " (padded)"
             return new_dataset
 
-    def crop(self, crop_widths, axes=None, modify_in_place=False):
+    @overload
+    def crop(
+        self,
+        crop_widths: tuple[tuple[int, int], ...],
+        axes: tuple | None,
+        modify_in_place: Literal[True],
+    ) -> None: ...
+
+    @overload
+    def crop(
+        self,
+        crop_widths: tuple[tuple[int, int], ...],
+        axes: tuple | None = None,
+        modify_in_place: Literal[False] = False,
+    ) -> Self: ...
+
+    def crop(
+        self,
+        crop_widths: tuple[tuple[int, int], ...],
+        axes: tuple | None = None,
+        modify_in_place: bool = False,
+    ) -> Self | None:
         """
         Crops Dataset
 
@@ -349,7 +447,7 @@ class Dataset(AutoSerialize):
             axes = tuple(range(self.ndim))
         elif np.isscalar(axes):
             axes = (axes,)
-            crop_widths = (crop_widths,)
+            crop_widths = (crop_widths[0],)  # Take first crop_width for single axis
         else:
             axes = tuple(axes)
 
@@ -362,7 +460,7 @@ class Dataset(AutoSerialize):
             if axis in crop_dict:
                 before, after = crop_dict[axis]
                 start = before
-                stop = dim - after if after != 0 else None
+                stop = after if after != 0 else None
                 full_slices.append(slice(start, stop))
             else:
                 full_slices.append(slice(None))
@@ -372,14 +470,31 @@ class Dataset(AutoSerialize):
             return dataset
         else:
             self.array = self.array[tuple(full_slices)]
+            return None
+
+    @overload
+    def bin(
+        self,
+        bin_factors,
+        axes,
+        modify_in_place: Literal[True],
+    ) -> None: ...
+
+    @overload
+    def bin(
+        self,
+        bin_factors,
+        axes=None,
+        modify_in_place: Literal[False] = False,
+    ) -> Self: ...
 
     def bin(
         self,
         bin_factors,
         axes=None,
-        modify_in_place=False,
+        modify_in_place: bool = False,
         reducer: str = "sum",
-    ):
+    ) -> Self | None:
         """
         Bin the Dataset by integer factors along selected axes using block reduction.
 
@@ -501,11 +616,11 @@ class Dataset(AutoSerialize):
 
     def fourier_resample(
         self,
-        out_shape: Optional[tuple[int, ...]] = None,
-        factors: Optional[Union[float, tuple[float, ...]]] = None,
-        axes: Optional[tuple[int, ...]] = None,
+        out_shape: tuple[int, ...] | None = None,
+        factors: float | tuple[float, ...] | None = None,
+        axes: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
-    ) -> Optional["Dataset"]:
+    ) -> "Dataset" | None:
         """
         Fourier resample via centered crop (down) / zero-pad (up), using default FFT norms.
         Preserves mean and keeps the physical center fixed.
@@ -632,9 +747,9 @@ class Dataset(AutoSerialize):
 
     def transpose(
         self,
-        order: Optional[tuple[int, ...]] = None,
+        order: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
-    ) -> Optional["Dataset"]:
+    ) -> "Dataset" | None:
         """
         Transpose (permute) axes of the dataset and reorder metadata accordingly.
 
@@ -686,7 +801,7 @@ class Dataset(AutoSerialize):
         dtype: DTypeLike,
         copy: bool = True,
         modify_in_place: bool = False,
-    ) -> Optional["Dataset"]:
+    ) -> "Dataset" | None:
         """
         Cast the array to a new dtype. Metadata is unchanged.
 
