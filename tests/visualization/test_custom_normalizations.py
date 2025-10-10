@@ -20,9 +20,7 @@ from quantem.core.visualization.custom_normalizations import (
 
 @pytest.fixture
 def sample_data():
-    return np.array(
-        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], dtype=np.float64
-    )
+    return np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], dtype=np.float64)
 
 
 @pytest.fixture
@@ -251,9 +249,7 @@ class TestResolveNormalization:
         assert config.interval_type == "quantile"
 
     def test_resolve_normalization_dict(self):
-        config = _resolve_normalization(
-            {"interval_type": "manual", "vmin": 1, "vmax": 10}
-        )
+        config = _resolve_normalization({"interval_type": "manual", "vmin": 1, "vmax": 10})
         assert isinstance(config, NormalizationConfig)
         assert config.interval_type == "manual"
         assert config.vmin == 1

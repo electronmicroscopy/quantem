@@ -75,9 +75,7 @@ class Dataset4d(Dataset):
             name=name if name is not None else "4D dataset",
             origin=origin if origin is not None else np.zeros(4),
             sampling=sampling if sampling is not None else np.ones(4),
-            units=units
-            if units is not None
-            else ["index", "index", "pixels", "pixels"],
+            units=units if units is not None else ["index", "index", "pixels", "pixels"],
             signal_units=signal_units,
             _token=cls._token,
         )

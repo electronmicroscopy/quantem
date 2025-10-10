@@ -37,16 +37,10 @@ def dft_upsample(
     c_shift = shift[1] - N // 2
 
     kern_row = np.exp(
-        -2j
-        * np.pi
-        / (M * up)
-        * np.outer(row, xp.fft.ifftshift(xp.arange(M)) - M // 2 + r_shift)
+        -2j * np.pi / (M * up) * np.outer(row, xp.fft.ifftshift(xp.arange(M)) - M // 2 + r_shift)
     )
     kern_col = np.exp(
-        -2j
-        * np.pi
-        / (N * up)
-        * np.outer(xp.fft.ifftshift(xp.arange(N)) - N // 2 + c_shift, col)
+        -2j * np.pi / (N * up) * np.outer(xp.fft.ifftshift(xp.arange(N)) - N // 2 + c_shift, col)
     )
     return xp.real(kern_row @ F @ kern_col)
 
@@ -146,9 +140,7 @@ def cross_correlation_shift(
         except (IndexError, ValueError):
             dxf = dyf = 0.0
 
-        shifts = (
-            np.array([x0, y0]) + (np.array(peak) - upsample_factor) / upsample_factor
-        )
+        shifts = np.array([x0, y0]) + (np.array(peak) - upsample_factor) / upsample_factor
         shifts += np.array([dxf, dyf]) / upsample_factor
 
     shifts = (shifts + 0.5 * np.array(cc.shape)) % cc.shape - 0.5 * np.array(cc.shape)
@@ -179,6 +171,7 @@ def bilinear_kde(
     threshold: float = 1e-3,
     lowpass_filter: bool = False,
     max_batch_size: Optional[int] = None,
+    return_pix_count: bool = False,
 ) -> NDArray:
     """
     Compute a bilinear kernel density estimate (KDE) with smooth threshold masking.
@@ -246,9 +239,7 @@ def bilinear_kde(
 
     # Final image
     weight = np.minimum(pix_count / threshold, 1.0)
-    image = pad_value * (1.0 - weight) + weight * (
-        pix_output / np.maximum(pix_count, 1e-8)
-    )
+    image = pad_value * (1.0 - weight) + weight * (pix_output / np.maximum(pix_count, 1e-8))
 
     if lowpass_filter:
         f_img = np.fft.fft2(image)
@@ -258,7 +249,16 @@ def bilinear_kde(
         f_img /= np.sinc(fy)[None, :]  # type: ignore
         image = np.real(np.fft.ifft2(f_img))
 
-    return image
+        if return_pix_count:
+            f_img = np.fft.fft2(pix_count)
+            f_img /= np.sinc(fx)[:, None]  # type: ignore
+            f_img /= np.sinc(fy)[None, :]  # type: ignore
+            pix_count = np.real(np.fft.ifft2(f_img))
+
+    if return_pix_count:
+        return image, pix_count
+    else:
+        return image
 
 
 def bilinear_array_interpolation(

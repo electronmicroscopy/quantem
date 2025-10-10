@@ -1,14 +1,19 @@
-"""
-pytest config file -- e.g. for making data or fixtures that are used by multiple tests
-"""
-
-import numpy as np
 import pytest
 
 
-@pytest.fixture(scope="session")
-def image_file(tmp_path_factory: pytest.TempdirFactory):
-    img = np.arange(16**2).reshape((16, 16))
-    fn = tmp_path_factory.mktemp("data") / "img.npy"
-    np.save(fn, img)
-    return fn
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", default=False, help="run slow tests")
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: mark test as slow to run")
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--runslow"):
+        # --runslow given in cli: do not skip slow tests
+        return
+    skip_slow = pytest.mark.skip(reason="need --runslow option to run")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)

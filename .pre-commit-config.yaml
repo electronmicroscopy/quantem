@@ -1,20 +1,15 @@
+ci:
+  autofix_commit_msg: |
+    [pre-commit.ci] auto fixes from pre-commit hooks
+  autofix_prs: true
+  autoupdate_branch: "pre-commit-autoupdate"
+  autoupdate_commit_msg: "[pre-commit.ci] pre-commit autoupdate"
+  autoupdate_schedule: monthly
+  submodules: false
 repos:
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  # Ruff version.
-  rev: v0.11.5
-  hooks:
-    # Run the linter.
-    - id: ruff
-      args: [ --select, "I,E4,E7,E9,F", --exclude, __init__.py, --fix ]
-    # Run the formatter.
-    - id: ruff-format
-# - repo: local 
-#   hooks: 
-#     # Run tests
-#     - id: pytest
-#       name: pytest
-#       entry: pytest tests
-#       language: system
-#       types: [python]
-#       pass_filenames: false
-#       always_run: true 
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.12
+    hooks:
+      - id: ruff-check
+        args: [ --fix ]
+      - id: ruff-format

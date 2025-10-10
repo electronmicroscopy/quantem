@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
-from quantem.core.utils.utils import as_numpy
+from quantem.core.utils.utils import to_numpy
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -175,4 +175,4 @@ class Dataset2d(Dataset):
         if title is None:
             title = self.name
 
-        return show_2d(as_numpy(self.array), scalebar=scalebar, title=title, **kwargs)
+        return show_2d(to_numpy(self.array), scalebar=scalebar, title=title, **kwargs)

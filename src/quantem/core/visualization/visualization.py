@@ -1,6 +1,7 @@
+import os
+import warnings
 from collections.abc import Sequence
-from functools import update_wrapper
-from typing import Any, List, Optional, Tuple, Union, cast
+from typing import Any, Optional, Union, cast
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -9,6 +10,8 @@ from matplotlib import colors
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from numpy.typing import NDArray
 
+from quantem.core import config
+from quantem.core.utils.utils import to_cpu
 from quantem.core.visualization.custom_normalizations import (
     CustomNormalization,
     NormalizationConfig,
@@ -25,7 +28,7 @@ from quantem.core.visualization.visualization_utils import (
 )
 
 
-def _show_2d(
+def _show_2d_array(
     array: NDArray,
     *,
     norm: Optional[Union[NormalizationConfig, dict, str]] = None,
@@ -33,10 +36,12 @@ def _show_2d(
     cmap: Union[str, colors.Colormap] = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
-    figax: Optional[Tuple[Any, Any]] = None,
-    figsize: Tuple[int, int] = (8, 8),
     title: Optional[str] = None,
-) -> Tuple[Any, Any]:
+    figax: Optional[tuple[Any, Any]] = None,
+    figsize: tuple[int, int] = (8, 8),
+    show_ticks: bool = False,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
     """Display a 2D array as an image with optional colorbar and scalebar.
 
     This function visualizes a 2D array, handling both real and complex data.
@@ -57,12 +62,19 @@ def _show_2d(
         Factor to boost color saturation when displaying complex data.
     cbar : bool, default=False
         Whether to add a colorbar to the plot.
+    title : str, optional
+        Title for the plot.
     figax : tuple, optional
         (fig, ax) tuple to use for plotting. If None, a new figure and axes are created.
     figsize : tuple, default=(8, 8)
         Figure size in inches, used only if figax is None.
-    title : str, optional
-        Title for the plot.
+    show_ticks : bool, default=False
+        Whether to show axis ticks and labels.
+
+    **kwargs : dict
+        Additional keyword arguments passed to the plotting functions.
+        vmin, vmax,
+
 
     Returns
     -------
@@ -79,8 +91,11 @@ def _show_2d(
         amplitude = array
         angle = None
 
-    norm_config = _resolve_normalization(norm)
-    scalebar_config = _resolve_scalebar(scalebar)
+    if array.dtype == "bool":
+        array = np.array(array, dtype="float")
+
+    norm_config = _resolve_normalization(norm, **kwargs)
+    scalebar_config = _resolve_scalebar(scalebar, **kwargs)
 
     norm_obj = CustomNormalization(
         interval_type=norm_config.interval_type,
@@ -105,8 +120,12 @@ def _show_2d(
     else:
         fig, ax = figax
 
-    ax.imshow(rgba)
-    ax.set(xticks=[], yticks=[], title=title)
+    ax.imshow(rgba, interpolation=config.get("viz.interpolation"))
+
+    if show_ticks:
+        ax.set(title=title)
+    else:
+        ax.set(xticks=[], yticks=[], title=title)
 
     if cbar:
         divider = make_axes_locatable(ax)
@@ -134,9 +153,13 @@ def _show_2d(
             scalebar_config.loc,
         )
 
+    for spine in ax.spines.values():  # fixes asymmetry of bbox for some reason
+        spine.set_linewidth(kwargs.get("spine_linewidth", 1))
+
     return fig, ax
 
 
+# TODO this should call _show_2d_array
 def _show_2d_combined(
     list_of_arrays: Sequence[NDArray],
     *,
@@ -145,9 +168,12 @@ def _show_2d_combined(
     cmap: Union[str, colors.Colormap] = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
-    figax: Optional[Tuple[Any, Any]] = None,
-    figsize: Tuple[int, int] = (8, 8),
-) -> Tuple[Any, Any]:
+    figax: Optional[tuple[Any, Any]] = None,
+    figsize: tuple[int, int] = (8, 8),
+    title: Optional[str] = None,
+    show_ticks: bool = False,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
     """Display multiple 2D arrays as a single combined image.
 
     This function takes a list of 2D arrays and creates a single visualization
@@ -173,6 +199,10 @@ def _show_2d_combined(
         (fig, ax) tuple to use for plotting. If None, a new figure and axes are created.
     figsize : tuple, default=(8, 8)
         Figure size in inches, used only if figax is None.
+    title : str, optional
+        Title for the plot.
+    show_ticks : bool, default=False
+        Whether to show axis ticks and labels.
 
     Returns
     -------
@@ -186,7 +216,7 @@ def _show_2d_combined(
     NotImplementedError
         If cbar is True (colorbar for combined visualization not yet implemented).
     """
-    norm_config = _resolve_normalization(norm)
+    norm_config = _resolve_normalization(norm, **kwargs)
     scalebar_config = _resolve_scalebar(scalebar)
 
     norm_obj = CustomNormalization(
@@ -203,7 +233,7 @@ def _show_2d_combined(
         asinh_linear_range=norm_config.asinh_linear_range,
     )
 
-    # Convert Sequence to List for list_of_arrays_to_rgba
+    # Convert Sequence to list for list_of_arrays_to_rgba
     list_of_arrays_list = list(list_of_arrays)
     rgba = list_of_arrays_to_rgba(
         list_of_arrays_list,
@@ -216,8 +246,12 @@ def _show_2d_combined(
     else:
         fig, ax = figax
 
-    ax.imshow(rgba)
-    ax.set(xticks=[], yticks=[])
+    ax.imshow(rgba, interpolation=config.get("viz.interpolation"))
+
+    if show_ticks:
+        ax.set(title=title)
+    else:
+        ax.set(xticks=[], yticks=[], title=title)
 
     if cbar:
         raise NotImplementedError()
@@ -239,8 +273,8 @@ def _show_2d_combined(
 
 
 def _normalize_show_input_to_grid(
-    arrays: Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
-) -> List[List[NDArray]]:
+    arrays: Any,  # Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
+) -> list[list[NDArray]]:
     """Convert various input formats to a consistent grid format for visualization.
 
     This helper function normalizes different input formats to a consistent
@@ -257,7 +291,16 @@ def _normalize_show_input_to_grid(
         Normalized grid format where each inner list represents a row of arrays.
     """
     if isinstance(arrays, np.ndarray):
-        return [[arrays]]
+        if not np.iscomplexobj(arrays):
+            arrays = arrays.astype(np.float32)  # int/bool arrays can cause issues with norm
+        if arrays.ndim == 2:
+            return [[arrays]]
+        elif arrays.ndim == 3:
+            if arrays.shape[0] == 1:
+                return [[arrays[0]]]
+            elif arrays.shape[2] == 1:
+                return [[arrays[:, :, 0]]]
+        raise ValueError(f"Input array must be 2D, got shape {arrays.shape}")
     if isinstance(arrays, Sequence) and not isinstance(arrays[0], Sequence):
         # Convert sequence to list and ensure each element is an NDArray
         return [[cast(NDArray, arr) for arr in arrays]]
@@ -265,37 +308,190 @@ def _normalize_show_input_to_grid(
     return [[cast(NDArray, arr) for arr in row] for row in arrays]
 
 
+def _norm_show_args(
+    args: Any,
+    shape: tuple[int, int],
+) -> list[list[Any]]:
+    """Normalize the arguments for visualization to a grid format.
+
+    This helper function ensures that the arguments passed to the visualization
+    functions are in a consistent grid format.
+
+    Parameters
+    ----------
+    args : Any
+        The arguments to normalize. Can be a single value, a list of values,
+        or a list of lists of values.
+    shape : tuple of int, default=(1, 1)
+        The desired grid shape (nrows, ncols).
+
+    Returns
+    -------
+    list of lists of (str | bool)
+        Normalized grid format where each inner list represents a row of arguments.
+
+    Raises
+    ------
+    ValueError
+        If args cannot be broadcast to the given shape.
+    """
+    nrows, ncols = shape
+
+    if not args:
+        return [[None for _ in range(ncols)] for _ in range(nrows)]
+
+    if not isinstance(args, (list, tuple)):
+        return [[args for _ in range(ncols)] for _ in range(nrows)]
+
+    if not isinstance(args[0], (list, tuple)):
+        # 1D sequence
+        args_list = list(args)
+        if len(args_list) == ncols and nrows == 1:
+            return [[cast(str | bool | float, arg) for arg in args_list]]
+        elif len(args_list) == nrows and ncols == 1:
+            return [[cast(str | bool | float, arg)] for arg in args_list]
+        elif len(args_list) == 1:
+            return [
+                [cast(str | bool | float, args_list[0]) for _ in range(ncols)]
+                for _ in range(nrows)
+            ]
+        elif len(args_list) == ncols and nrows > 1:
+            return [[cast(str | bool | float, arg) for arg in args_list] for _ in range(nrows)]
+        elif len(args_list) == nrows and ncols > 1:
+            return [[cast(str | bool | float, arg)] * ncols for arg in args_list]
+        else:
+            raise ValueError(
+                f"Cannot broadcast 1D args of length {len(args_list)} to shape {shape}"
+            )
+
+    # 2D sequence
+    args_grid = [list(row) for row in args]
+    if len(args_grid) == nrows and all(len(row) == ncols for row in args_grid):
+        return [[cast(str | bool | float, arg) for arg in row] for row in args_grid]
+    elif len(args_grid) == 1 and len(args_grid[0]) == 1:
+        return [
+            [cast(str | bool | float, args_grid[0][0]) for _ in range(ncols)] for _ in range(nrows)
+        ]
+    elif len(args_grid) == 1 and len(args_grid[0]) == ncols:
+        return [[cast(str | bool | float, arg) for arg in args_grid[0]] for _ in range(nrows)]
+    elif len(args_grid) == nrows and all(len(row) == 1 for row in args_grid):
+        return [[cast(str | bool | float, row[0]) for _ in range(ncols)] for row in args_grid]
+    else:
+        # Fill out the last row with None values if needed
+        result = []
+        for row in args_grid:
+            row_casted = [cast(str | bool | float, arg) for arg in row]
+            if len(row_casted) < ncols:
+                row_casted += [None] * (ncols - len(row_casted))
+            result.append(row_casted)
+        return result
+
+
+def _normalize_show_args_to_grid(
+    shape: tuple[int, int],
+    norm: NormalizationConfig | dict | str | Sequence[dict | str] | None = None,
+    scalebar: ScalebarConfig | dict | bool | Sequence[bool | dict | None] | None = None,
+    cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
+    cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
+    title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
+    chroma_boost: float | Sequence[float] = 1.0,
+    show_ticks: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
+) -> list[list[dict]]:
+    """Normalize all show arguments to grid format and return as list of dicts."""
+    norms = _norm_show_args(norm, shape)
+    scalebars = _norm_show_args(scalebar, shape)
+    cmaps = _norm_show_args(cmap, shape)
+    chroma_boosts = _norm_show_args(chroma_boost, shape)
+    cbars = _norm_show_args(cbar, shape)
+    titles = _norm_show_args(title, shape)
+    show_ticks_list = _norm_show_args(show_ticks, shape)
+
+    args = [
+        [
+            {
+                "norm": norms[i][j],
+                "scalebar": scalebars[i][j],
+                "cmap": cmaps[i][j],
+                "chroma_boost": chroma_boosts[i][j],
+                "cbar": cbars[i][j],
+                "title": titles[i][j],
+                "show_ticks": show_ticks_list[i][j],
+            }
+            for j in range(shape[1])
+        ]
+        for i in range(shape[0])
+    ]
+    return args
+
+
 def show_2d(
     arrays: Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
     *,
-    figax: Optional[Tuple[Any, Any]] = None,
-    axsize: Tuple[int, int] = (4, 4),
-    tight_layout: bool = True,
-    combine_images: bool = False,
+    norm: NormalizationConfig | dict | str | Sequence[dict | str] | None = None,
+    scalebar: ScalebarConfig | dict | bool | Sequence[bool | dict | None] | None = None,
+    cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
+    cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
+    title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
+    figax: tuple[Any, Any] | None = None,
+    axsize: tuple[int, int] = (4, 4),
+    save: os.PathLike | str | None = None,
     **kwargs: Any,
-) -> Tuple[Any, Any]:
+) -> tuple[Any, Any]:
     """Display one or more 2D arrays in a grid layout.
 
     This is the main visualization function that can display a single array,
     a list of arrays, or a grid of arrays. It supports both individual and
     combined visualization modes.
 
+    The display arguments, i.e. everything except figax and axsize, can be given as single values
+    or as sequences that will be broadcasted to the grid shape defined by the input arrays.
+
     Parameters
     ----------
     arrays : ndarray or sequence of ndarray or sequence of sequences of ndarray
         The arrays to visualize. Can be a single array, a sequence of arrays,
         or a nested sequence representing a grid of arrays.
+    norm : NormalizationConfig or dict or str, optional
+        Configuration for normalizing the data before visualization. This can be a string,
+        dictionary, or a NormalizationConfig object. Strings for preset normalization types
+        include: "linear_auto" (quantile), "linear_minmax", "linear_centered", "log_auto",
+        "log_minmax", "power_squared", "power_sqrt", "asinh_centered"
+    scalebar : ScalebarConfig or dict or bool, optional
+        Configuration for adding a scale bar to the plot.
+    cmap : str or Colormap, default="gray"
+        Colormap to use for real data or amplitude of complex data.
+    cbar : bool, default=False
+        Whether to add a colorbar to the plot.
+    title : str, optional
+        Title for the plot.
     figax : tuple, optional
         (fig, axs) tuple to use for plotting. If None, a new figure and axes are created.
     axsize : tuple, default=(4, 4)
         Size of each subplot in inches.
-    tight_layout : bool, default=True
-        Whether to apply tight_layout to the figure.
-    combine_images : bool, default=False
-        If True and arrays is a sequence, combine all arrays into a single visualization
-        using color encoding. Only works for a single row of arrays.
+    save : os.PathLike or str, optional
+        Path to save the figure to.
+
     **kwargs : dict
-        Additional keyword arguments passed to _show_2d or _show_2d_combined.
+        Additional keyword arguments passed to _show_2d_array or _show_2d_combined:
+        chroma_boost: float or sequence of float, default=1.0
+            Factor to boost color saturation when displaying complex data.
+        tight_layout: bool, default=True
+            Whether to apply tight_layout to the figure.
+        combine_images: bool, default=False
+            If True, combine all arrays into a single visualization using color encoding.
+            Only works for a single row of arrays.
+        figsize: tuple, default None
+            Size of the figure in inches. If None, calculated based on axsize and grid shape.
+        show_ticks : bool, default=False
+            Whether to show axis ticks and labels.
+        vmin: float, optional
+            Minimum value for the color scale.
+        vmax: float, optional
+            Maximum value for the color scale.
+        lower_quantile: float, optional
+            Lower quantile for the color scale.
+        upper_quantile: float, optional
+            Upper quantile for the color scale.
 
     Returns
     -------
@@ -310,76 +506,78 @@ def show_2d(
         If combine_images is True but arrays contains multiple rows, or if
         figax is provided but the axes shape doesn't match the grid shape.
     """
+    arrays = to_cpu(arrays)
     grid = _normalize_show_input_to_grid(arrays)
     nrows = len(grid)
     ncols = max(len(row) for row in grid)
 
-    title = kwargs.pop("title", None)
-
-    if combine_images:
+    if kwargs.pop("combine_images", False):
         if nrows > 1:
             raise ValueError()
-
-        return _show_2d_combined(grid[0], figax=figax, **kwargs)
-
-    if figax is not None:
-        fig, axs = figax
-        if not isinstance(axs, np.ndarray):
-            axs = np.array([[axs]])
-        elif axs.ndim == 1:
-            axs = axs.reshape(1, -1)
-        if axs.shape != (nrows, ncols):
-            raise ValueError()
+        fig, axs = _show_2d_combined(grid[0], figax=figax, **kwargs)  # TODO pass args here
     else:
-        fig, axs = plt.subplots(
-            nrows, ncols, figsize=(axsize[0] * ncols, axsize[1] * nrows), squeeze=False
+        # Normalize all arguments to grid format
+        normalized_args = _normalize_show_args_to_grid(
+            shape=(nrows, ncols),
+            norm=norm,
+            scalebar=scalebar,
+            cmap=cmap,
+            cbar=cbar,
+            title=kwargs.pop("titles", None) if title is None else title,
+            chroma_boost=kwargs.pop("chroma_boost", 1.0),
+            show_ticks=kwargs.pop("show_ticks", False),
         )
 
-    for i, row in enumerate(grid):
-        for j, array in enumerate(row):
-            figax = (fig, axs[i][j])
-            if title is None:
-                t = None
-            elif isinstance(title, str):
-                t = title
-            elif isinstance(title[0], str):
-                # Flat list of titles
-                t = title[i * ncols + j] if i * ncols + j < len(title) else None
-            else:
-                # Grid of titles
-                t = title[i][j] if i < len(title) and j < len(title[i]) else None
+        if figax is not None:
+            fig, axs = figax
+            if not isinstance(axs, np.ndarray):
+                axs = np.array([[axs]])
+            elif axs.ndim == 1:
+                axs = axs.reshape(1, -1)
+            if axs.shape != (nrows, ncols):
+                raise ValueError()
+        else:
+            figsize = kwargs.pop("figsize", (axsize[0] * ncols, axsize[1] * nrows))
+            fig, axs = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
 
-            _show_2d(
-                array,
-                figax=figax,
-                title=t,
-                **kwargs,
-            )
+        for i, row in enumerate(grid):
+            for j, array in enumerate(row):
+                figax = (fig, axs[i][j])
+                _show_2d_array(
+                    array,
+                    figax=figax,
+                    **normalized_args[i][j],  # Unpack the arguments for this subplot
+                    **kwargs,
+                )
 
-            # figax = (fig, axs[i][j])
-            # _show_2d(
-            #     array,
-            #     figax=figax,
-            #     **kwargs,
-            # )
+        # Hide unused axes in incomplete rows
+        for i, row in enumerate(grid):
+            for j in range(len(row), ncols):
+                axs[i][j].axis("off")  # type: ignore
 
-    # Hide unused axes in incomplete rows
-    for i, row in enumerate(grid):
-        for j in range(len(row), ncols):
-            axs[i][j].axis("off")  # type: ignore
+        if kwargs.get("tight_layout", True):
+            with warnings.catch_warnings():  # suppress warning about tight_layout
+                warnings.simplefilter("ignore")
+                fig.tight_layout()
 
-    if tight_layout:
-        fig.tight_layout()
+        # Squeeze the axes to the expected shape
+        if axs.shape == (1, 1):
+            axs = axs[0, 0]
+        elif axs.shape[0] == 1:
+            axs = axs[0]
+        elif axs.shape[1] == 1:
+            axs = axs[:, 0]
 
-    # Squeeze the axes to the expected shape
-    if axs.shape == (1, 1):
-        axs = axs[0, 0]
-    elif axs.shape[0] == 1:
-        axs = axs[0]
-    elif axs.shape[1] == 1:
-        axs = axs[:, 0]
+    if kwargs.get("force_show", False):
+        plt.show()
+
+    if save is not None:
+        print(f"Saving figure to {save}")
+        fig.savefig(
+            save,
+            bbox_inches="tight",
+            pad_inches=kwargs.get("pad_inches", 0),
+            dpi=kwargs.get("dpi", 300),
+        )
 
     return fig, axs
-
-
-update_wrapper(show_2d, _show_2d)

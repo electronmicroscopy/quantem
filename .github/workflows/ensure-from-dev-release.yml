@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Check branch
         run: |
-          if [[ ${GITHUB_HEAD_REF} != dev ]] && ! [[ ${GITHUB_HEAD_REF} =~ ^release/ ]]; 
+          if [[ ${GITHUB_HEAD_REF} != dev ]] && ! [[ ${GITHUB_HEAD_REF} =~ ^release/ ]];
           then
             echo "Error: Pull request must come from 'dev' or 'release/' branch"
             exit 1

@@ -148,9 +148,7 @@ class Vector(AutoSerialize):
         _token: object | None = None,
     ) -> None:
         if _token is not self._token:
-            raise RuntimeError(
-                "Use Vector.from_shape() or Vector.from_data() to instantiate."
-            )
+            raise RuntimeError("Use Vector.from_shape() or Vector.from_data() to instantiate.")
 
         self.shape = shape
         self.fields = fields
@@ -309,9 +307,7 @@ class Vector(AutoSerialize):
             elif isinstance(dim_idx, (np.ndarray, list)):
                 idx = np.asarray(dim_idx)
                 if np.any((idx < 0) | (idx >= dim_size)):
-                    raise IndexError(
-                        f"Index out of bounds for axis with size {dim_size}"
-                    )
+                    raise IndexError(f"Index out of bounds for axis with size {dim_size}")
                 return idx
             elif isinstance(dim_idx, (int, np.integer)):
                 if dim_idx < 0 or dim_idx >= dim_size:
@@ -377,9 +373,7 @@ class Vector(AutoSerialize):
             elif isinstance(dim_idx, (np.ndarray, list)):
                 idx = np.asarray(dim_idx)
                 if np.any((idx < 0) | (idx >= dim_size)):
-                    raise IndexError(
-                        f"Index out of bounds for axis with size {dim_size}"
-                    )
+                    raise IndexError(f"Index out of bounds for axis with size {dim_size}")
                 return idx
             elif isinstance(dim_idx, (int, np.integer)):
                 if dim_idx < 0 or dim_idx >= dim_size:
@@ -395,9 +389,7 @@ class Vector(AutoSerialize):
         # If all indices are single integers, handle as single value
         if all(len(i) == 1 for i in indices_arrays):
             if not isinstance(value, np.ndarray):
-                raise TypeError(
-                    f"Value must be a numpy array, got {type(value).__name__}"
-                )
+                raise TypeError(f"Value must be a numpy array, got {type(value).__name__}")
             if value.ndim != 2 or value.shape[1] != self.num_fields:
                 raise ValueError(
                     f"Expected a numpy array with shape (_, {self.num_fields}), got {value.shape}"
@@ -416,9 +408,7 @@ class Vector(AutoSerialize):
         for idx in np.ndindex(*[len(i) for i in indices_arrays]):
             src_idx = tuple(ind[i] for ind, i in zip(indices_arrays, idx))
             if not isinstance(value[idx[0]], np.ndarray):
-                raise TypeError(
-                    f"Expected numpy array, got {type(value[idx[0]]).__name__}"
-                )
+                raise TypeError(f"Expected numpy array, got {type(value[idx[0]]).__name__}")
             if value[idx[0]].ndim != 2 or value[idx[0]].shape[1] != self.num_fields:
                 raise ValueError(
                     f"Expected array with shape (_, {self.num_fields}), got {value[idx[0]].shape}"
@@ -438,9 +428,7 @@ class Vector(AutoSerialize):
 
     def __getitem__(
         self,
-        idx: Union[
-            str, Tuple[Union[int, slice, List[int]], ...], int, slice, List[int]
-        ],
+        idx: Union[str, Tuple[Union[int, slice, List[int]], ...], int, slice, List[int]],
     ) -> Union["_FieldView", NDArray, "Vector"]:
         """Get data or a view of the vector at specified indices."""
         if isinstance(idx, str):
@@ -452,17 +440,12 @@ class Vector(AutoSerialize):
         normalized: Tuple[Any, ...] = (idx,) if not isinstance(idx, tuple) else idx
 
         # Convert lists/arrays to ndarray
-        idx_converted: Tuple[Union[int, slice, np.ndarray[Any, np.dtype[Any]]], ...] = (
-            tuple(
-                np.asarray(i) if isinstance(i, (list, np.ndarray)) else i
-                for i in normalized
-            )
+        idx_converted: Tuple[Union[int, slice, np.ndarray[Any, np.dtype[Any]]], ...] = tuple(
+            np.asarray(i) if isinstance(i, (list, np.ndarray)) else i for i in normalized
         )
 
         # Check if we should return a numpy array (all indices are integers)
-        return_np = all(
-            isinstance(i, (int, np.integer)) for i in idx_converted[: len(self.shape)]
-        )
+        return_np = all(isinstance(i, (int, np.integer)) for i in idx_converted[: len(self.shape)])
         if len(idx_converted) < len(self.shape):
             return_np = False
 
@@ -484,9 +467,7 @@ class Vector(AutoSerialize):
             return np.arange(dim_size)
 
         # Get indices for each dimension
-        full_idx = list(idx_converted) + [slice(None)] * (
-            len(self.shape) - len(idx_converted)
-        )
+        full_idx = list(idx_converted) + [slice(None)] * (len(self.shape) - len(idx_converted))
         indices = [get_indices(i, s) for i, s in zip(full_idx, self.shape)]
 
         # Create new shape and data
@@ -511,9 +492,7 @@ class Vector(AutoSerialize):
 
     def __setitem__(
         self,
-        idx: Union[
-            Tuple[Union[int, slice, List[int]], ...], int, slice, List[int], str
-        ],
+        idx: Union[Tuple[Union[int, slice, List[int]], ...], int, slice, List[int], str],
         value: Union[NDArray, List[NDArray]],
     ) -> None:
         """Set data at specified indices."""
@@ -528,11 +507,8 @@ class Vector(AutoSerialize):
         normalized: Tuple[Any, ...] = (idx,) if not isinstance(idx, tuple) else idx
 
         # Convert lists/arrays to ndarray
-        idx_converted: Tuple[Union[int, slice, np.ndarray[Any, np.dtype[Any]]], ...] = (
-            tuple(
-                np.asarray(i) if isinstance(i, (list, np.ndarray)) else i
-                for i in normalized
-            )
+        idx_converted: Tuple[Union[int, slice, np.ndarray[Any, np.dtype[Any]]], ...] = tuple(
+            np.asarray(i) if isinstance(i, (list, np.ndarray)) else i for i in normalized
         )
 
         # Check if we're doing slice‐ or array‐based (multi‐cell) indexing
@@ -569,39 +545,26 @@ class Vector(AutoSerialize):
                 elif isinstance(dim_idx, (np.ndarray, list)):
                     idx = np.asarray(dim_idx)
                     if np.any((idx < 0) | (idx >= dim_size)):
-                        raise IndexError(
-                            f"Index out of bounds for axis with size {dim_size}"
-                        )
+                        raise IndexError(f"Index out of bounds for axis with size {dim_size}")
                     return idx
                 elif isinstance(dim_idx, (int, np.integer)):
                     if dim_idx < 0 or dim_idx >= dim_size:
-                        raise IndexError(
-                            f"Index out of bounds for axis with size {dim_size}"
-                        )
+                        raise IndexError(f"Index out of bounds for axis with size {dim_size}")
                     return np.array([dim_idx])
                 return np.arange(dim_size)
 
-            indices_arrays = [
-                get_indices(i, s) for i, s in zip(idx_converted, self._shape)
-            ]
+            indices_arrays = [get_indices(i, s) for i, s in zip(idx_converted, self._shape)]
             total_indices = np.prod([len(i) for i in indices_arrays])
 
             if len(value) != total_indices:
                 raise ValueError(f"Expected {total_indices} arrays, got {len(value)}")
 
             # Validate and set values
-            for array_idx, idx in enumerate(
-                np.ndindex(*[len(i) for i in indices_arrays])
-            ):
+            for array_idx, idx in enumerate(np.ndindex(*[len(i) for i in indices_arrays])):
                 src_idx = tuple(ind[i] for ind, i in zip(indices_arrays, idx))
                 if not isinstance(value[array_idx], np.ndarray):
-                    raise TypeError(
-                        f"Expected numpy array, got {type(value[array_idx]).__name__}"
-                    )
-                if (
-                    value[array_idx].ndim != 2
-                    or value[array_idx].shape[1] != self.num_fields
-                ):
+                    raise TypeError(f"Expected numpy array, got {type(value[array_idx]).__name__}")
+                if value[array_idx].ndim != 2 or value[array_idx].shape[1] != self.num_fields:
                     raise ValueError(
                         f"Expected array with shape (_, {self.num_fields}), got {value[array_idx].shape}"
                     )
@@ -612,9 +575,7 @@ class Vector(AutoSerialize):
         else:
             # For single value assignment
             if not isinstance(value, np.ndarray):
-                raise TypeError(
-                    f"Value must be a numpy array, got {type(value).__name__}"
-                )
+                raise TypeError(f"Value must be a numpy array, got {type(value).__name__}")
             if value.ndim != 2 or value.shape[1] != self.num_fields:
                 raise ValueError(
                     f"Expected a numpy array with shape (_, {self.num_fields}), got {value.shape}"

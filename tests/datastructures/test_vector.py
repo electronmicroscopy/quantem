@@ -35,9 +35,7 @@ class TestVector:
         assert v3.units == ["unit0", "unit1", "unit2"]
 
         # Test error cases
-        with pytest.raises(
-            ValueError, match="Must specify either 'fields' or 'num_fields'."
-        ):
+        with pytest.raises(ValueError, match="Must specify either 'fields' or 'num_fields'."):
             Vector.from_shape(shape=(2, 3))
 
         with pytest.raises(ValueError, match="does not match length of fields"):
@@ -303,23 +301,15 @@ class TestVector:
         result = v[[0, 1], 0]
         assert isinstance(result, Vector)
         assert result.shape == (2, 1)
-        np.testing.assert_array_equal(
-            result.get_data(0, 0), np.array([[1.0, 2.0, 3.0]])
-        )
-        np.testing.assert_array_equal(
-            result.get_data(1, 0), np.array([[7.0, 8.0, 9.0]])
-        )
+        np.testing.assert_array_equal(result.get_data(0, 0), np.array([[1.0, 2.0, 3.0]]))
+        np.testing.assert_array_equal(result.get_data(1, 0), np.array([[7.0, 8.0, 9.0]]))
 
         # Test numpy array indexing with __getitem__
         result = v[np.array([1, 2]), 1]  # type: ignore
         assert isinstance(result, Vector)
         assert result.shape == (2, 1)
-        np.testing.assert_array_equal(
-            result.get_data(0, 0), np.array([[10.0, 11.0, 12.0]])
-        )
-        np.testing.assert_array_equal(
-            result.get_data(1, 0), np.array([[16.0, 17.0, 18.0]])
-        )
+        np.testing.assert_array_equal(result.get_data(0, 0), np.array([[10.0, 11.0, 12.0]]))
+        np.testing.assert_array_equal(result.get_data(1, 0), np.array([[16.0, 17.0, 18.0]]))
 
         # Test fancy indexing with __setitem__
         new_data = [np.array([[20.0, 21.0, 22.0]]), np.array([[23.0, 24.0, 25.0]])]
