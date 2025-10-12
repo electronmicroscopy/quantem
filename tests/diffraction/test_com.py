@@ -4,7 +4,11 @@ import numpy as np
 import pytest
 import torch
 
-from quantem.diffraction.dpc import center_of_mass_optimized, warmup_compiled_functions
+from quantem.diffraction.dpc import (
+    center_of_mass_optimized,
+    center_of_mass_with_coordinates,
+    prepare_center_of_mass_coordinates,
+)
 
 
 def test_single_pattern_center_at_origin():
@@ -90,7 +94,27 @@ def test_mask_and_background_subtraction():
     assert torch.isfinite(com_bg).all()
 
 
-@pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
-def test_warmup_runs(device: str):
-    """Warmup helper should execute without raising on supported devices."""
-    warmup_compiled_functions(batch_size=8, pattern_size=(16, 16), device=device)
+def test_precomputed_coordinates_match_default():
+    batch = torch.randn(3, 11, 13, dtype=torch.float32)
+    coords = prepare_center_of_mass_coordinates(
+        height=batch.shape[-2],
+        width=batch.shape[-1],
+        device=batch.device,
+        dtype=torch.float32,
+    )
+    from_precomputed = center_of_mass_with_coordinates(batch, *coords)
+    default = center_of_mass_optimized(batch)
+    torch.testing.assert_close(from_precomputed, default, atol=1e-6, rtol=0.0)
+
+
+def test_center_of_mass_with_coordinates_validates_inputs():
+    pattern = torch.ones(5, 5)
+    x_coords = torch.arange(5)
+    y_coords = torch.arange(4)  # wrong length
+
+    with pytest.raises(ValueError):
+        center_of_mass_with_coordinates(pattern, x_coords, y_coords)
+
+    coords = prepare_center_of_mass_coordinates(5, 5)
+    with pytest.raises(ValueError):
+        center_of_mass_optimized(pattern, mask=torch.ones_like(pattern), coords=coords)
