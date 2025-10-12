@@ -12,6 +12,7 @@ from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 from numpy.typing import NDArray
 from scipy.stats import binned_statistic_2d
 
+from quantem.core import config
 from quantem.core.visualization.custom_normalizations import CustomNormalization
 
 
@@ -149,7 +150,13 @@ class ScalebarConfig:
     loc: Union[str, int] = "lower right"
 
 
-def _resolve_scalebar(cfg: Any) -> Optional[ScalebarConfig]:
+SCALEBAR_KWARGS = [
+    "sampling",
+    "units",
+]
+
+
+def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
     """Resolve various input types to a ScalebarConfig object.
 
     Parameters
@@ -167,7 +174,15 @@ def _resolve_scalebar(cfg: Any) -> Optional[ScalebarConfig]:
     TypeError
         If cfg is not one of the supported types.
     """
-    if cfg is None or cfg is False:
+    if cfg is None:
+        scalebar_kwargs = {k: kwargs[k] for k in SCALEBAR_KWARGS if k in kwargs}
+        if scalebar_kwargs:
+            if "sampling" in scalebar_kwargs and "units" not in scalebar_kwargs:
+                scalebar_kwargs["units"] = config.get("viz.real_space_units")
+            return ScalebarConfig(**scalebar_kwargs)
+        else:
+            return None
+    elif cfg is False:
         return None
     elif cfg is True:
         return ScalebarConfig()
@@ -199,6 +214,11 @@ def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, flo
         scale bar length in physical units and length_pixels is the equivalent
         in pixels.
     """
+    if isinstance(sampling, (tuple, list, np.ndarray)):
+        if not np.allclose(sampling, sampling[0], atol=1e-2):
+            raise ValueError("Sampling must be a single value or uniform across dimensions.")
+        sampling = sampling[0]
+
     d = length * sampling / 2
     exp = np.floor(np.log10(d))
     base = d / (10**exp)
@@ -212,6 +232,35 @@ def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, flo
         spacing = 1.0  # default case
     spacing = spacing * 10**exp
     return spacing, spacing / sampling
+
+
+def _normalize_length_units(length_units: float, units: str) -> tuple[float, str]:
+    """
+    pick intelligent units for the scalebar length
+    """
+    if units in ["A", "Å", "angstrom", "Angstrom"]:
+        length_A = length_units
+    elif units in ["nm", "nanometer", "nanometre"]:
+        length_A = length_units * 10
+    elif units in ["um", "μm", "micrometer", "micrometre"]:
+        length_A = length_units * 1e4
+    elif units in ["mm", "millimeter", "millimetre"]:
+        length_A = length_units * 1e7
+    elif units in ["cm", "centimeter", "centimetre"]:
+        length_A = length_units * 1e8
+    else:
+        return length_units, units
+
+    if length_A < 0.1:
+        return length_A * 100, "pm"
+    elif length_A < 10:
+        return length_A, "Å"
+    elif length_A < 3e4:
+        return length_A / 10, "nm"
+    elif length_A < 1e7:
+        return length_A / 1e4, "μm"
+    else:
+        return length_A / 1e7, "mm"
 
 
 def add_scalebar_to_ax(
@@ -253,6 +302,8 @@ def add_scalebar_to_ax(
         length_units, length_px = estimate_scalebar_length(array_size, sampling)
     else:
         length_px = length_units / sampling
+
+    length_units, units = _normalize_length_units(length_units, units)
 
     if length_units % 1 == 0.0:
         label = f"{length_units:.0f} {units}"
@@ -320,6 +371,11 @@ def add_cbar_to_ax(
 
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     cb = fig.colorbar(sm, cax=cax, ticks=ticks, format=formatter)
+    # set tick positions, fixes bug of gap between image and bbox
+    for label in cb.ax.get_yticklabels():
+        label.set_verticalalignment("center")
+        label.set_horizontalalignment("left")
+
     return cb
 
 
@@ -397,8 +453,12 @@ def turbo_black(num_colors: int = 256, fade_len: Optional[int] = None) -> colors
 
 
 _turbo_black = turbo_black()
-mpl.colormaps.register(_turbo_black, name="turbo_black")
-mpl.colormaps.register(_turbo_black.reversed(), name="turbo_black_r")
+try:
+    mpl.colormaps.register(_turbo_black, name="turbo_black")
+    mpl.colormaps.register(_turbo_black.reversed(), name="turbo_black_r")
+except ValueError:
+    # If the colormap is already registered, we can ignore the error.
+    pass
 
 
 def bilinear_histogram_2d(

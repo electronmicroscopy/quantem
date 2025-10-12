@@ -3,7 +3,7 @@ from itertools import product
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from quantem.core import config
 
@@ -18,8 +18,6 @@ else:
 
 
 # region --- array module stuff ---
-
-
 def get_array_module(array: "np.ndarray | cp.ndarray"):
     """Returns np or cp depending on the array type."""
     if config.get("has_cupy"):
@@ -68,6 +66,12 @@ def to_numpy(array: "np.ndarray | cp.ndarray | torch.Tensor") -> np.ndarray:
 
 
 def to_cpu(arrs: Any) -> np.ndarray | Sequence:
+    """
+    Similar to to_numpy but also allows lists and handles Datasets, only called in show_2d
+    so could likely be replaced with a more specific function.
+    """
+    from quantem.core.datastructures import Dataset2d
+
     if config.get("has_cupy"):
         if isinstance(arrs, cp.ndarray):
             return cp.asnumpy(arrs)
@@ -80,6 +84,8 @@ def to_cpu(arrs: Any) -> np.ndarray | Sequence:
         return [to_cpu(i) for i in arrs]
     elif isinstance(arrs, tuple):
         return tuple([to_cpu(i) for i in arrs])
+    elif isinstance(arrs, Dataset2d):
+        return to_cpu(arrs.array)
     else:
         raise NotImplementedError(f"Unkown type: {type(arrs)}")
 
@@ -88,8 +94,6 @@ def to_cpu(arrs: Any) -> np.ndarray | Sequence:
 
 
 # region --- TEM ---
-
-
 def electron_wavelength_angstrom(E_eV: float):
     m = 9.109383 * 10**-31
     e = 1.602177 * 10**-19
@@ -103,9 +107,7 @@ def electron_wavelength_angstrom(E_eV: float):
 # endregion
 
 
-# region --- generally useful bits ---
-
-
+# region --- misc ---
 def tqdmnd(*iterables, **kwargs):
     return tqdm(list(product(*iterables)), **kwargs)
 
@@ -179,3 +181,37 @@ def generate_batches(
     for size in batch_sizes:
         yield idx, idx + size
         idx += size
+
+
+def extract_patches(
+    array: np.ndarray | np.ma.MaskedArray, indices: np.ndarray | tuple, patch_size: int = 3
+) -> np.ndarray | np.ma.MaskedArray:
+    """
+    Extract patches from an array around the given indices.
+
+    Args:
+        array (np.ndarray): The input array.
+        indices (np.ndarray): The indices around which to extract patches.
+        patch_size (int): The size of the patches to extract. Default is 3.
+
+    Returns:
+        np.ndarray: The extracted patches.
+    """
+    if patch_size % 2 == 0:
+        patch_size += 1
+    ys, xs = np.array(indices)
+    patch2 = patch_size // 2
+
+    y_offsets = np.arange(-patch2, patch2 + 1)
+    x_offsets = np.arange(-patch2, patch2 + 1)
+    y_grid, x_grid = np.meshgrid(y_offsets, x_offsets, indexing="ij")
+
+    y_indices = ys[:, None, None] + y_grid
+    x_indices = xs[:, None, None] + x_grid
+
+    y_indices = np.clip(y_indices, 0, array.shape[0] - 1)
+    x_indices = np.clip(x_indices, 0, array.shape[1] - 1)
+
+    patches = array[y_indices, x_indices]
+
+    return patches
