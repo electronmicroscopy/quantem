@@ -1,9 +1,10 @@
 import numpy as np
 import torch
-from scipy.ndimage import center_of_mass, gaussian_filter, shift
+from scipy.ndimage import gaussian_filter, shift
 from scipy.stats import norm
 from tqdm.auto import tqdm
 
+from quantem.core.utils.center_of_mass import com
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 
 
@@ -154,10 +155,15 @@ def centering_com_alignment(image_stack):
     h, w = image_stack.shape[1:]
     image_center = np.array([h // 2, w // 2])
 
-    com_reference = np.array(center_of_mass(image_stack.mean(axis=0)))
+    def _com_absolute(array: np.ndarray) -> np.ndarray:
+        tensor = torch.as_tensor(array, dtype=torch.float32)
+        com_xy = com(tensor)
+        return np.array([float(com_xy[..., 1].item()), float(com_xy[..., 0].item())])
+
+    com_reference = _com_absolute(image_stack.mean(axis=0))
 
     for i, img in enumerate(image_stack):
-        com_img = np.array(center_of_mass(img))
+        com_img = _com_absolute(img)
         shift_vec = com_reference - com_img
         aligned_stack[i] = shift(img, shift=shift_vec, mode="constant", cval=0.0)
 

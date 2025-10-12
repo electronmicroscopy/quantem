@@ -3,11 +3,11 @@ from typing import TYPE_CHECKING, Any, Self
 from warnings import warn
 
 import numpy as np
-import scipy.ndimage as ndi
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.center_of_mass import com
 from quantem.core.utils.utils import to_numpy
 from quantem.core.utils.validators import (
     validate_arr_gt,
@@ -147,11 +147,19 @@ class ProbeBase(AutoSerialize):
             vp2 = np.fft.fftshift(vp2)
 
         # fix centering
-        com: list | tuple = ndi.center_of_mass(vp2)
+        if not config.get("has_torch"):
+            raise RuntimeError("Torch is required.")
+
+        import torch
+
+        vp_tensor = torch.as_tensor(vp2, dtype=torch.float32)
+        com_xy = com(vp_tensor)
+        com_y = float(com_xy[..., 1].item())
+        com_x = float(com_xy[..., 0].item())
         vp2 = shift_array(
             vp2,
-            -com[0],
-            -com[1],
+            -com_y,
+            -com_x,
             bilinear=True,
         )
 
