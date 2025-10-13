@@ -1,5 +1,3 @@
-from typing import List
-
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import least_squares
@@ -68,9 +66,9 @@ class Lattice(AutoSerialize):
     # --- Functions ---
     def define_lattice(
         self,
-        origin: NDArray[2] | List[float, float] | tuple[float, float],
-        u: NDArray[2] | List[float, float] | tuple[float, float],
-        v: NDArray[2] | List[float, float] | tuple[float, float],
+        origin,
+        u,
+        v,
         refine_lattice: bool = True,
         block_size: int = -1,
         plot_lattice: bool = True,
@@ -126,6 +124,8 @@ class Lattice(AutoSerialize):
                 np.array(v),
             )
         )
+        if not self._lat.shape == (3, 2):
+            raise ValueError("origin, u, v must be in (row, col) format only.")
 
         # Refine lattice coordinates
         # Note that we currently assume corners are local maxima
