@@ -37,9 +37,6 @@ from quantem.diffractive_imaging.ptycho_utils import (
     shift_array,
 )
 
-# TODO
-# - prevent gpu overhead, make sure initial_probe and other stuff is on cpu
-
 DeviceType = Union[str, torch.device, int]
 
 
@@ -381,7 +378,7 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         return weight * tv
 
     def _probe_center_of_mass_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
-        probe_int = torch.fft.fftshift(torch.abs(start_probe) ** 2, dim=(-2, -1))
+        probe_int = torch.fft.fftshift(torch.abs(start_probe).square(), dim=(-2, -1))
         # TODO -- move this to a util function
         y_coords = torch.arange(probe_int.shape[-2], device=probe_int.device)
         x_coords = torch.arange(probe_int.shape[-1], device=probe_int.device)
@@ -419,7 +416,7 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         orthogonal_probes = orthogonal_probes * original_norms.view(-1, 1, 1)
 
         # Sort probes by real-space intensity
-        intensities = torch.sum(torch.abs(orthogonal_probes) ** 2, dim=(-2, -1))
+        intensities = torch.sum(torch.abs(orthogonal_probes).square(), dim=(-2, -1))
         intensities_order = torch.argsort(intensities, descending=True)
 
         return orthogonal_probes[intensities_order]
@@ -497,6 +494,7 @@ class ProbePixelated(ProbeConstraints):
                 )
         else:
             num_probes = 1 if num_probes is None else num_probes
+            probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
             probe_array = torch.tile(probe_array, (num_probes, 1, 1))
 
         probe_model = cls(
@@ -617,8 +615,8 @@ class ProbePixelated(ProbeConstraints):
         if self._from_params:
             self.check_probe_params()
             prb = real_space_probe(
-                gpts=tuple(self.roi_shape),
-                sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
+                gpts=self.roi_shape.astype("int"),
+                sampling=1 / (self.roi_shape * self.reciprocal_sampling).astype(np.float64),
                 energy=self.probe_params["energy"],
                 semiangle_cutoff=self.probe_params["semiangle_cutoff"],
                 vacuum_probe_intensity=self.vacuum_probe_intensity,
@@ -654,7 +652,7 @@ class ProbePixelated(ProbeConstraints):
         return "ProbePixelated"
 
     def backward(self, propagated_gradient, obj_patches):
-        obj_normalization = torch.sum(torch.abs(obj_patches) ** 2, dim=(-2, -1)).max()
+        obj_normalization = torch.sum(torch.abs(obj_patches).square(), dim=(-2, -1)).max()
         if self.num_probes == 1:
             # this is wrong--but it fixes the issue with multiple probes sgd + analytical--TODO fix
             # basically it screws up the amplitude grad but fixes the phase grad
@@ -743,11 +741,11 @@ class ProbePixelated(ProbeConstraints):
 
     def _apply_weights(self, probe_array: torch.Tensor | np.ndarray) -> torch.Tensor:
         probes = self._to_torch(probe_array)
-        probe_intensity = torch.sum(torch.abs(torch.fft.fft2(probes, norm="ortho")) ** 2)
+        probe_intensity = torch.sum(torch.abs(torch.fft.fft2(probes, norm="ortho")).square())
         intensity_norm = torch.sqrt(self.mean_diffraction_intensity / probe_intensity)
         probes *= intensity_norm
 
-        current_weights = torch.sum(torch.abs(probes) ** 2, dim=(1, 2))
+        current_weights = torch.sum(torch.abs(probes).square(), dim=(1, 2))
         current_weights = current_weights / torch.sum(current_weights)
         weight_scaling = torch.sqrt(self.initial_probe_weights.to(self.device) / current_weights)
         probes = probes * self._to_torch(weight_scaling)[:, None, None]
@@ -910,8 +908,8 @@ class ProbeParametric(ProbeConstraints):
                 raise KeyError(f"Unknown aberration key {k}")
 
         probe = real_space_probe(
-            gpts=tuple(self.roi_shape),
-            sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling)),
+            gpts=self.roi_shape.astype("int"),
+            sampling=1 / (self.roi_shape * self.reciprocal_sampling).astype(np.float64),
             energy=self.probe_params["energy"],
             semiangle_cutoff=self.semiangle_cutoff,  # type:ignore
             vacuum_probe_intensity=self.vacuum_probe_intensity,  # type:ignore
