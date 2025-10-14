@@ -85,7 +85,7 @@ class TomographyBase(AutoSerialize):
             shifts=shifts,
         )
 
-        # dataset.to(device)
+        dataset.to(device)
 
         if volume_obj is None:
             max_shape = max(dataset.tilt_series.shape)

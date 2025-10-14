@@ -27,6 +27,7 @@ def get_num_samples_per_ray(epoch):
         2: 50,
         4: 100,
         6: 200,
+        8: 350,
     }
 
     num_samples = 64
@@ -100,6 +101,8 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         else:
             gaussian_kernel = None
 
+        print("Devices", sirt_tilt_series.device, proj_forward.device, self.dataset.tilt_angles.device)
+        
         for iter in pbar:
             proj_forward, loss = self._sirt_run_epoch(
                 tilt_series=sirt_tilt_series,
@@ -196,7 +199,8 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
             self.temp_logger = SummaryWriter()
         else:
             self.temp_logger = None
-    
+            
+            
     def recon(
         self,
         obj: ObjectINN,
@@ -260,13 +264,19 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         for epoch in range(epochs):
             num_samples_per_ray = get_num_samples_per_ray(self.global_epochs)
             
+            # num_samples_per_ray = get_num_samples_per_ray(epoch)
             # Log the change if it happens
-            if self.global_epochs >= 0:
-                prev_samples = get_num_samples_per_ray(self.global_epochs)
+            if self.global_rank == 0:
+                print(f"Epoch {epoch}: num_samples_per_ray = {num_samples_per_ray}")
                 
-                if num_samples_per_ray != prev_samples and self.global_rank == 0:
+            
+            if self.global_rank == 0 and self.global_epochs > 0:
+                prev_samples = get_num_samples_per_ray(self.global_epochs - 1)
+                
+                if num_samples_per_ray != prev_samples:
                     print(f"Epoch {epoch}: Changing num_samples_per_ray from {prev_samples} to {num_samples_per_ray}")
-                    
+                
+                
                 
             if self.sampler is not None:
                 self.sampler.set_epoch(epoch)
@@ -379,7 +389,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     self.temp_logger.add_scalar("train/lr", current_lr, self.global_epochs)
                     self.temp_logger.add_scalar("train/num_samples_per_ray", num_samples_per_ray, self.global_epochs)
 
-                    fig, axes = plt.subplots(1, 3, figsize=(36, 12))
+                    fig, axes = plt.subplots(1, 5, figsize=(36, 12))
                     axes[0].matshow(pred_full.sum(dim=0).cpu().numpy(), cmap='turbo', vmin=0)
                     axes[0].set_title('Sum over Z-axis')
 
@@ -391,9 +401,22 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     thick_slice = pred_full[slice_start:slice_end].sum(dim=0).cpu().numpy()
                     axes[2].matshow(thick_slice, cmap='turbo', vmin=0)
                     axes[2].set_title(f'Thick slice sum (Z={slice_start}:{slice_end-1})')
+                    
+                    axes[3].matshow(pred_full.sum(dim = 1).cpu().numpy(), cmap='turbo', vmin=0)
+                    axes[3].set_title('Sum over Y-axis')
+                    
+                    axes[4].matshow(pred_full.sum(dim = 2).cpu().numpy(), cmap='turbo', vmin=0)
+                    axes[4].set_title('Sum over X-axis')
 
                     self.temp_logger.add_figure("train/viz", fig, self.global_epochs, close=True)
                     plt.close(fig)
+                    
+            if epoch % checkpoint_freq == 0 or self.global_epochs == epochs - 1:
+                with torch.no_grad():
+                    if self.global_rank == 0:
+                        save_path = f"new_dataset_logs/volume_epoch_{self.global_epochs:04d}.pt"
+                        torch.save(pred_full.cpu(), save_path)
+                        
             self.global_epochs += 1
 
         if self.global_rank == 0:
