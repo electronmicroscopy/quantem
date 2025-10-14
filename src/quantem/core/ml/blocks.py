@@ -2,9 +2,12 @@ from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 
+import math
+
+
 from quantem.core import config
 
-from .activation_functions import Complex_ReLU
+from .activation_functions import Complex_ReLU, FinerActivation
 
 if TYPE_CHECKING:
     import torch
@@ -16,6 +19,9 @@ else:
         import torch.nn as nn
         import torch.nn.functional as F
 
+
+
+# ---- Convolutional Layers ----
 
 def complex_pool(z, m, **kwargs):
     return m(z.real) + 1.0j * m(z.imag)
@@ -110,18 +116,6 @@ class Conv2dBlock(nn.Module):
         output = self.block(x)
         return output
 
-
-class ComplexLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__()
-        linear = nn.Linear(in_features, out_features, dtype=torch.cfloat)
-        self.weight = nn.Parameter(torch.view_as_real(linear.weight))
-        self.bias = nn.Parameter(torch.view_as_real(linear.bias))
-
-    def forward(self, x):
-        weight = torch.view_as_complex(self.weight)
-        bias = torch.view_as_complex(self.bias)
-        return F.linear(x, weight, bias)
 
 
 class Upsample2dBlock(nn.Module):
@@ -337,3 +331,112 @@ class ComplexBatchNorm3D(nn.Module):
 
     def forward(self, x):
         return torch.complex(self.real_bn(x.real), self.imag_bn(x.imag))
+
+# ---- Linear Layers ----
+
+class ComplexLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        linear = nn.Linear(in_features, out_features, dtype=torch.cfloat)
+        self.weight = nn.Parameter(torch.view_as_real(linear.weight))
+        self.bias = nn.Parameter(torch.view_as_real(linear.bias))
+
+    def forward(self, x):
+        weight = torch.view_as_complex(self.weight)
+        bias = torch.view_as_complex(self.bias)
+        return F.linear(x, weight, bias)
+    
+## ---- Siren Family of Layers ----
+
+def init_weights(m: nn.Module, omega: float = 1., c: float = 1., is_first: bool = False):
+    if hasattr(m, 'weight'):
+        fan_in = m.weight.size(-1)
+        if is_first:
+            bound = 1 / fan_in # SIREN
+        else:
+            bound = math.sqrt(c / fan_in) / omega
+        nn.init.uniform_(m.weight, -bound, bound)
+
+def init_bias(m: nn.Module, k: float):
+    if hasattr(m, 'bias'):
+        nn.init.uniform_(m.bias, -k, k)
+
+class SineLayer(nn.Module):
+    """
+    
+    Sine layer for H-Siren, and SIREN implementations.
+    
+    Note: H-Siren uses the hyperbolic sine function only for the first layer.
+    """
+    def __init__(
+        self, 
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        is_first: bool = False,
+        omega_0: float = 30,
+        hsiren: bool = False,
+        alpha: float = 1.0,
+    ):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        self.hsiren = hsiren
+        self.in_features = in_features
+        self.alpha = alpha
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.init_weights()
+
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                # Scale the first layer initialization by alpha
+                self.linear.weight.uniform_(-self.alpha / self.in_features,
+                                             self.alpha / self.in_features)
+            else:
+                # Scale the hidden layer initialization by alpha
+                self.linear.weight.uniform_(-self.alpha * np.sqrt(6 / self.in_features) / self.omega_0,
+                                             self.alpha * np.sqrt(6 / self.in_features) / self.omega_0)
+
+    def forward(self, input):
+        if self.is_first and self.hsiren:
+            out = torch.sin(self.omega_0 * torch.sinh(2*self.linear(input)))
+        else:
+            out = torch.sin(self.omega_0 * self.linear(input))
+        return out
+
+class FinerLayer(nn.Module):
+    
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        omega: float = 30,
+        is_first: bool = False,
+        is_last: bool = False,
+        init_method: str = 'sine',
+        init_gain: float = 1,
+        fbs: bool = None,
+        hbs = None,
+        alphaType = None,
+        alphaReqGrad = False,
+    ):
+        
+        super().__init__()
+        self.omega = omega
+        self.is_last = is_last
+        self.alphaType = alphaType
+        self.alphaReqGrad = alphaReqGrad
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        # init weights
+        init_weights(self.linear, omega, init_gain, is_first)
+        # init bias
+        init_bias(self.linear, fbs, is_first)
+        
+    def forward(self, input):
+        wx_b = self.linear(input)
+        if not self.is_last:
+            return FinerActivation(wx_b, self.omega)
+        return wx_b # is_last==True
