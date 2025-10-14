@@ -183,6 +183,7 @@ def get_activation_function(
         elif activation_type in ["softplus"]:
             activation = nn.Softplus()
         elif activation_type in ["finer"]:
+            activation = FinerActivation()
         else:
             raise ValueError(f"Unknown activation type {activation_type}")
 

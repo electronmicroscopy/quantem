@@ -4,7 +4,6 @@ import numpy as np
 
 import math
 
-
 from quantem.core import config
 
 from .activation_functions import Complex_ReLU, FinerActivation
