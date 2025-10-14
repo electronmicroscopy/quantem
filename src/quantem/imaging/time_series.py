@@ -18,48 +18,61 @@ class TimeSeries(Dataset3d):
 
     def pad_images(
         self,
-        pad_width: Union[int, tuple[int, int]],
+        pad_width: Union[int, tuple[int, int], None],
         pad_val = None,
-        edge_blend: Union[int, tuple[int, int], None] = None,
-        # modify_in_place: bool = True,
+        edge_blend: Union[int, tuple[int, int], None] = (8,8),
+        modify_in_place: bool = False,
     ):
         # padding values
-        pad_x = 2*pad_width[0]
-        if len(pad_width) == 1:
-            pad_y = pad_x
+        if pad_width is None:
+            pad_width = np.zeros(2,dtype = 'int')
         else:
-            pad_y = 2*pad_width[1]
+            pad_width = np.array(pad_width)
+            if pad_width.size == 1:
+                pad_width = np.array(
+                    [pad_width,pad_width],
+                )
 
         # apply padding
         padded = self.pad(
-            pad_width = ((0,0),(0,pad_x),(0,pad_y)),
-            # modify_in_place = modify_in_place
+            pad_width = ((0,0),(0,2 * pad_width[0]),(0,2 * pad_width[1])),
+            modify_in_place = modify_in_place
         )
 
-        #blend edge
-        wx = tukey(self.shape[1],alpha=2*edge_blend[0]/self.shape[1])[None,:,None]
-        wy = tukey(self.shape[2],alpha=2*edge_blend[1]/self.shape[2])[None,None,:]
-        window = wx * wy
-
+        # initialize empty array
         stack_pad = pad_val * np.ones(padded.shape)
-        # print(pad_val)
 
-        
-        # print(stack_pad[:, pad_width[0]:-pad_width[0], pad_width[1]:-pad_width[1]])
-        print(stack_pad.shape, self.shape, window.shape)
-        
-        r = stack_pad[:, pad_width[0]:-1*pad_width[0], pad_width[1]:-1*pad_width[1]]
-        s = self.array * window
+        # edge blend values
+        if edge_blend is not None:
+            edge_blend = np.array(edge_blend)
+            
+            if edge_blend.size == 1:
+                edge_blend = np.array(
+                    [edge_blend,edge_blend],
+                )
+            
+            # create tukey window function for blending
+            wx = tukey(self.shape[1],alpha=2*edge_blend[0]/self.shape[1])[None,:,None]
+            wy = tukey(self.shape[2],alpha=2*edge_blend[1]/self.shape[2])[None,None,:]
+            window = wx * wy
 
-        print(r.shape, s.shape)
-
-        stack_pad[:, pad_width[0]:-pad_width[0], pad_width[1]:-pad_width[1]] = \
-            self.array * window + pad_val * (1 - window)
-
+            # combine tukey window and images
+            stack_pad[
+                :, 
+                pad_width[0]:stack_pad.shape[1]-pad_width[0], 
+                pad_width[1]:stack_pad.shape[2]-pad_width[1]] = \
+                self.array * window + pad_val * (1 - window)
+        else:
+            # add image to stack
+            stack_pad[
+                :, 
+                pad_width[0]:stack_pad.shape[1]-pad_width[0], 
+                pad_width[1]:stack_pad.shape[2]-pad_width[1]] = \
+                self.array 
 
         return stack_pad
 
-
+# cap edge blending to 0-half-width (stack_pad.shape)
 
 
 
