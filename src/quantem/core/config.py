@@ -159,7 +159,6 @@ def get(
     Get elements from global config
 
     If ``override_with`` is not None this value will be passed straight back.
-    Useful for getting kwarg defaults from abtem config.
 
     Use '.' for nested access
     """
@@ -417,11 +416,11 @@ def _load_config_file(path: str) -> dict | None:
         return None
     except Exception as exc:
         raise ValueError(
-            f"A dask config file at {path!r} is malformed, original error message:\n\n{exc}"
+            f"A quantEM config file at {path!r} is malformed, original error message:\n\n{exc}"
         ) from None
     if config is not None and not isinstance(config, dict):
         raise ValueError(
-            f"A dask config file at {path!r} is malformed - config files must have "
+            f"A quantEM config file at {path!r} is malformed - config files must have "
             f"a dict as the top level object, got a {type(config).__name__} instead"
         )
     return config

@@ -16,7 +16,7 @@ class CNN3d(nn.Module):
         start_filters: int = 16,
         num_layers: int = 3,
         num_per_layer: int = 2,
-        use_skip_connections: bool = False,
+        use_skip_connections: bool = True,
         dtype: torch.dtype = torch.complex64,
         dropout: float = 0,
         activation: str | Callable = "relu",

@@ -85,15 +85,41 @@ class Complex_Phase_ReLU(nn.Module):
 
 
 def get_activation_function(
-    activation_type: str,
+    activation_type: str | Callable,
     dtype: "torch.dtype",
     activation_phase_frac: float = 0.5,
     activation_sigmoid: bool = True,
-) -> Callable:
+) -> nn.Module:
     """
-    Allowed activation_types: relu, phase_relu
+    Get an activation function module.
 
+    Args:
+        activation_type: String name of activation or a callable activation function
+        dtype: Data type (used for complex vs real activations)
+        activation_phase_frac: Fraction for phase relu (complex only)
+        activation_sigmoid: Whether to use sigmoid for phase relu (complex only)
+
+    Returns:
+        Activation function module
+
+    Allowed activation_types: relu, phase_relu, identity, etc.
     """
+    # If it's already a callable/module, check if it's a module
+    if callable(activation_type):
+        if isinstance(activation_type, nn.Module):
+            return activation_type
+        else:
+            # Wrap callable in a lambda module
+            class CallableWrapper(nn.Module):
+                def __init__(self, func):
+                    super().__init__()
+                    self.func = func
+
+                def forward(self, x):
+                    return self.func(x)
+
+            return CallableWrapper(activation_type)
+
     activation_type = activation_type.lower()
 
     if activation_type in ["identity", "eye", "ident"]:

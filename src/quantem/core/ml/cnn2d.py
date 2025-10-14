@@ -19,25 +19,28 @@ class CNN2d(nn.Module):
 
     def __init__(
         self,
-        num_channels: int,  # (C, H, W) input shape same as output shape
+        in_channels: int,  # input channels (C_in, H, W)
+        out_channels: int | None = None,  # output channels (C_out, H, W)
         start_filters: int = 16,
         num_layers: int = 3,  # num_layers
         num_per_layer: int = 2,  # number conv per layer
-        use_skip_connections: bool = False,
-        dtype: torch.dtype = torch.complex64,
+        use_skip_connections: bool = True,
+        dtype: torch.dtype = torch.float32,
         dropout: float = 0,
         activation: str | Callable = "relu",
         final_activation: str | Callable = nn.Identity(),
         use_batchnorm: bool = True,
     ):
         super().__init__()
-        self.in_channels = self.out_channels = int(num_channels)
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels) if out_channels is not None else int(in_channels)
         self.start_filters = start_filters
         self.num_layers = num_layers
         self._num_per_layer = num_per_layer
         if use_skip_connections and num_per_layer < 2:
             raise ValueError(
-                "If using skip connections, num_per_layer must be at least 2 to allow for channel concatenation."
+                "If using skip connections, num_per_layer must be at least 2 to allow for "
+                + "channel concatenation."
             )
         self.use_skip_connections = use_skip_connections
         self.dtype = dtype
@@ -116,15 +119,9 @@ class CNN2d(nn.Module):
         in_channels = out_channels
 
         for a0 in range(self.num_layers):
-            if a0 == self.num_layers - 1:
-                out_channels = self.start_filters
-            else:
-                out_channels = in_channels // 2
+            out_channels = self.start_filters if a0 == self.num_layers - 1 else in_channels // 2
 
-            if self.use_skip_connections:
-                in_channels2 = in_channels
-            else:
-                in_channels2 = out_channels
+            in_channels2 = in_channels if self.use_skip_connections else out_channels
 
             self.upsample_blocks.append(
                 Upsample2dBlock(

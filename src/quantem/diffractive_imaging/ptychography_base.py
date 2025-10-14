@@ -1,13 +1,13 @@
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import Any, Literal, Sequence, cast
+from warnings import warn
 
 import numpy as np
 import scipy.ndimage as ndi
+import torch
 
-import quantem.core.utils.array_funcs as arr
 from quantem.core import config
-from quantem.core.datastructures import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
     electron_wavelength_angstrom,
     generate_batches,
@@ -25,21 +25,15 @@ from quantem.diffractive_imaging.dataset_models import (
     PtychographyDatasetBase,
 )
 from quantem.diffractive_imaging.detector_models import DetectorBase, DetectorModelType
-from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType, ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType
+from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
+from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType
+from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
 from quantem.diffractive_imaging.ptycho_utils import (
     AffineTransform,
     center_crop_arr,
     fourier_translation_operator,
     sum_patches,
 )
-
-if TYPE_CHECKING:
-    import torch
-else:
-    if config.get("has_torch"):
-        import torch
-
 
 """
 design patterns:
@@ -51,35 +45,13 @@ design patterns:
 """
 
 
-class PtychographyBase(AutoSerialize):
+class PtychographyBase(RNGMixin, AutoSerialize):
     """
     A base class for performing phase retrieval using the Ptychography algorithm.
 
     This class provides a basic framework for performing phase retrieval using the Ptychography algorithm.
     It is designed to be subclassed by specific Ptychography algorithms.
     """
-
-    DEFAULT_CONSTRAINTS = {
-        "object": {
-            "fix_potential_baseline": False,
-            "identical_slices": False,
-            "apply_fov_mask": False,
-            "tv_weight_yx": 0.0,
-            "tv_weight_z": 0.0,
-            "surface_zero_weight": 0.0,
-        },
-        "probe": {
-            "fix_probe": False,
-            "fix_probe_com": False,
-        },
-        "dataset": {
-            "descan_tv_weight": 0.0,
-            "descan_shifts_constant": False,
-        },
-        "detector": {
-            "detector_mask": None,
-        },
-    }
 
     _token = object()
 
@@ -89,6 +61,7 @@ class PtychographyBase(AutoSerialize):
         obj_model: ObjectModelType,
         probe_model: ProbeModelType,
         detector_model: DetectorModelType,
+        logger: LoggerPtychography | None = None,
         device: str | int = "cpu",  # "gpu" | "cpu" | "cuda:X"
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
@@ -100,6 +73,7 @@ class PtychographyBase(AutoSerialize):
         if not config.get("has_torch"):
             raise RuntimeError("the quantEM Ptychography module requires torch to be installed.")
 
+        super().__init__()
         self.verbose = verbose
         self.dset = dset
         self.device = device
@@ -114,33 +88,33 @@ class PtychographyBase(AutoSerialize):
         self._epoch_recon_types: list[str] = []
         self._epoch_lrs: dict[str, list] = {}  # LRs/step_sizes across epochs
         self._epoch_snapshots: list[dict[str, int | np.ndarray]] = []
-        self._constraints = self.DEFAULT_CONSTRAINTS.copy()
         self._obj_padding_px = np.array([0, 0])
         self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
+        self.batch_size = self.dset.num_gpts
 
-        self._schedulers = {}
-        self._optimizers = {}
-        self._scheduler_params = {}
-        self._optimizer_params = {}
+        if (
+            isinstance(probe_model, ProbePixelated)
+            and (probe_model.vacuum_probe_intensity is not None)
+            and (dset.amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
+        ):
+            probe_model.rescale_vacuum_probe((dset.amplitudes.shape[1], dset.amplitudes.shape[2]))
 
-        self.set_probe_model(probe_model)
-        self.set_obj_model(obj_model)
+        # Remove centralized optimizer storage - now managed by individual models
+        self.probe_model = probe_model
+        self.obj_model = obj_model
         self.detector_model = detector_model
         self._compute_propagator_arrays()
+        self.logger = logger
         self.to(self.device)
 
     # region --- preprocessing ---
     ## hopefully will be able to remove some of thes preprocessing flags,
     ## convert plotting and vectorized to kwargs
-    ## could also force users to initialize object and probe models externally, but I prefer
-    ## having the flexibility of passing the types in here and initializing them internally
     def preprocess(
         self,
-        obj_model: ObjectModelType | type | None = None,
-        probe_model: ProbeModelType | type | None = None,
         obj_padding_px: tuple[int, int] = (0, 0),
         com_fit_function: Literal[
-            "none", "plane", "parabola", "bezier_two", "constant"
+            "none", "plane", "parabola", "constant", "no_shift"
         ] = "constant",
         force_com_rotation: float | None = None,
         force_com_transpose: bool | None = None,
@@ -149,11 +123,13 @@ class PtychographyBase(AutoSerialize):
         plot_com: str | bool = True,
         plot_probe_overlap: bool = False,
         vectorized: bool = True,
+        batch_size: int | None = None,
     ):
         """
         Rather than passing 100 flags here, I'm going to suggest that if users want to run very
         customized pre-processing, they just call the functions themselves directly.
         """
+        # self.to(self.device)
         self.obj_padding_px = obj_padding_px
         if not self.dset.preprocessed:
             self.dset.preprocess(
@@ -171,19 +147,11 @@ class PtychographyBase(AutoSerialize):
             self.dset._set_initial_scan_positions_px(self.obj_padding_px)
             self.dset._set_patch_indices(self.obj_padding_px)
 
-        if probe_model is not None:
-            self.set_probe_model(probe_model)
-
-        if obj_model is not None:
-            self.set_obj_model(obj_model)
-        # else:
-        #     self._obj_model.shape = tuple(self.obj_shape_full)
-        #     self._obj_model.reset()
-
         self._compute_propagator_arrays()
-        self._set_obj_fov_mask()
+        self._set_obj_fov_mask(batch_size=batch_size)
         self._preprocessed = True
-        self.reset_recon()  # force clear losses and everything
+        # if self.num_epochs == 0:
+        #     self.reset_recon()  # if new models, reset to ensure shapes are correct
         return self
 
     def _compute_propagator_arrays(
@@ -214,7 +182,10 @@ class PtychographyBase(AutoSerialize):
 
         kr, kc = tuple(torch.fft.fftfreq(n, d) for n, d in zip(self.roi_shape, self.sampling))
         k2 = (kr[:, None] ** 2 + kc[None] ** 2).to(torch.complex64)  # broadcasting to match shape
-        wavelength = electron_wavelength_angstrom(self.probe_model.probe_params["energy"])
+        probe_energy = self.probe_model.probe_params["energy"]
+        if probe_energy is None:
+            raise ValueError("probe_model energy must be set to compute propagators.")
+        wavelength = electron_wavelength_angstrom(probe_energy)
         propagators = torch.empty(
             (self.num_slices - 1, kr.shape[0], kc.shape[0]), dtype=torch.complex64
         )
@@ -339,8 +310,10 @@ class PtychographyBase(AutoSerialize):
 
     @property
     def slice_thicknesses(self) -> np.ndarray:
-        return self._to_numpy(self._obj_model.slice_thicknesses)
-        # return self._to_numpy(self._slice_thicknesses)
+        slice_thick = self._obj_model.slice_thicknesses
+        if slice_thick is None:
+            return np.array([])
+        return self._to_numpy(slice_thick)
 
     @slice_thicknesses.setter
     def slice_thicknesses(self, val: float | Sequence | None) -> None:
@@ -358,7 +331,11 @@ class PtychographyBase(AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
-        return self._to_numpy(self.obj_model.obj)
+        obj = self._to_numpy(self.obj_model.obj)
+        if self.obj_type in ["pure_phase", "complex"]:
+            ph = np.angle(obj)
+            obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
+        return obj
 
     @property
     def obj_padding_px(self) -> np.ndarray:
@@ -377,13 +354,14 @@ class PtychographyBase(AutoSerialize):
         if self._obj_padding_force_power2_level > 0:
             p2 = adjust_padding_power2(
                 p2,
-                self.dset._obj_shape_full_2d(),
+                self.dset._obj_shape_full_2d((0, 0)),
                 self._obj_padding_force_power2_level,
             )
         self._obj_padding_px = p2
-        self.obj_model.shape = tuple(self.obj_shape_full)
+        self.obj_model._initialize_obj(shape=self.obj_shape_full)
         self.dset._set_initial_scan_positions_px(self.obj_padding_px)
         self.dset._set_patch_indices(self.obj_padding_px)
+        self.dset._preprocessing_params["obj_padding_px"] = self.obj_padding_px
 
     @property
     def obj_fov_mask(self) -> np.ndarray:
@@ -434,23 +412,7 @@ class PtychographyBase(AutoSerialize):
         return self._to_numpy(self.probe_model.probe)
 
     @property
-    def rng(self) -> np.random.Generator:
-        return self._rng
-
-    @rng.setter
-    def rng(self, rng: np.random.Generator | int | None):
-        if rng is None:
-            rng = np.random.default_rng()
-        elif isinstance(rng, (int, float)):
-            rng = np.random.default_rng(rng)
-        elif not isinstance(rng, np.random.Generator):
-            raise TypeError(f"rng should be a np.random.Generator or a seed, got {type(rng)}")
-        self._rng = rng
-        seed = rng.bit_generator._seed_seq.entropy  # type:ignore ## get the seed from the generator
-        self._rng_torch = torch.Generator(device=self.device).manual_seed(seed % 2**32)
-
-    @property
-    def store_iterations(self) -> bool:
+    def store_iterations(self) -> bool:  # TODO rename to store_epochs or store_snapshots
         return self._store_iterations
 
     @store_iterations.setter
@@ -471,142 +433,112 @@ class PtychographyBase(AutoSerialize):
     def epoch_snapshots(self) -> list[dict[str, int | np.ndarray]]:
         return self._epoch_snapshots
 
-    def get_snapshot_by_iter(self, iteration: int):
+    def get_snapshot_by_epoch(self, iteration: int, closest: bool = False):
         iteration = int(iteration)
         for snapshot in self.epoch_snapshots:
             if snapshot["iteration"] == iteration:
                 return snapshot
-        raise ValueError(f"No snapshot found at iteration: {iteration}")
+        if closest:
+            closest_snapshot = min(
+                self.epoch_snapshots, key=lambda s: abs(int(s["iteration"]) - iteration)
+            )
+            return closest_snapshot
+        raise ValueError(
+            f"No snapshot found at iteration: {iteration}, "
+            + "to return the closest snapshot, set closest=True"
+        )
 
+    # TODO is there a way to type hint proper object model type? probably not...
     @property
     def obj_model(self) -> ObjectModelType:
         return self._obj_model
 
-    # @obj_model.setter
-    # def obj_model(self, *args):
-    #     raise AttributeError("Use tycho.set_obj_model to set the obj_model")
+    @obj_model.setter
+    def obj_model(self, model: ObjectModelType | type):
+        # Type checking with autoreload bug workaround
+        if not (isinstance(model, ObjectBase) or "object" in str(type(model))):
+            raise TypeError(f"obj_model must be a ObjectModelType, got {type(model)}")
 
-    def set_obj_model(
-        self,
-        model: ObjectModelType | type | None,
-        num_slices: int | None = None,
-        slice_thicknesses: float | Sequence | None = None,
-        obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
-    ):
-        # TODO test with calling before preprocess, pass in "pixelized" or similar
-        # TODO -- here can transfer obj from existing to new model if applicable?
-        if model is None:
-            if hasattr(self, "_obj_model"):
-                return
-            else:
-                raise ValueError("obj_model must be a subclass of ObjectModelType")
-
-        if isinstance(model, type):
-            if not issubclass(model, ObjectModelType):
-                raise TypeError(
-                    f"obj_model must be a subclass of ObjectModelType, got {type(model)}"
-                )
-            if issubclass(model, ObjectPixelated):
-                print("initializing new model obj")
-                num_slices = self.num_slices if num_slices is None else int(num_slices)
-                self._obj_model = model(
-                    num_slices=num_slices,
-                    slice_thicknesses=slice_thicknesses,
-                    device=self.device,
-                    obj_type=obj_type,
-                )
-            else:
-                raise TypeError("please pre-intialize the object model")
-        # autoreload bug leads to type issues, so checking str also
-        elif isinstance(model, ObjectBase) or "object" in str(type(model)):
-            self._obj_model = model
-        else:
-            raise TypeError(f"obj_modelect must be a ObjectModelType, got {type(model)}")
-
-        # setting object shape manually here as haven't yet set slices
-        rotshape = self.dset._obj_shape_full_2d(self.obj_padding_px)
-        obj_shape_full = (self.num_slices, int(rotshape[0]), int(rotshape[1]))
-        self._obj_model.shape = obj_shape_full
-        self._obj_model.reset()
+        # Set object shape
+        model.to(self.device)
+        self._obj_model = cast(ObjectModelType, model)
 
     @property
     def probe_model(self) -> ProbeModelType:
         return self._probe_model
 
-    def set_probe_model(
-        self,
-        probe_model: ProbeModelType | type | None,
-        num_probes: int = 1,
-        probe_params: dict[str, float] = {},
-        vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
-        initial_probe: np.ndarray | None = None,
-    ):
-        if probe_model is None:
-            if hasattr(self, "_probe_model"):
-                return
-            else:
-                raise ValueError("probe_model must be a subclass of ProbeModelType")
+    @probe_model.setter
+    def probe_model(self, model: ProbeModelType | type):
+        # Type checking with autoreload bug workaround
+        if not (isinstance(model, ProbeBase) or "probe" in str(type(model))):
+            raise TypeError(f"probe_model must be a ProbeModelType, got {type(model)}")
 
-        if isinstance(probe_model, type):
-            if not issubclass(probe_model, ProbeModelType):
-                raise TypeError(
-                    f"probe_model must be a subclass of ProbeModelType, got {type(probe_model)}"
-                )
-
-            self._probe_model = probe_model(
-                num_probes=num_probes,
-                probe_params=probe_params,
-                vacuum_probe_intensity=vacuum_probe_intensity,
-                initial_probe_array=initial_probe,
-                device=self.device,
-                rng=self.rng,
-            )
-        # autoreload bug leads to type issues
-        elif isinstance(probe_model, ProbeBase) or "probe" in str(type(probe_model)):
-            # add protections for changing num_probes and such
-            self._probe_model = probe_model
-        else:
-            raise TypeError(f"probe_model must be a ProbeModelType, got {type(probe_model)}")
-
+        self._probe_model = cast(
+            ProbeModelType, model
+        )  # have before so that energy available to set initial probe
         self._probe_model.set_initial_probe(
-            self.roi_shape, self.reciprocal_sampling, self.dset.mean_diffraction_intensity
+            self.roi_shape,
+            self.reciprocal_sampling,
+            self.dset.mean_diffraction_intensity,
+            device=self.device,
         )
         self._probe_model.to(self.device)
-        self._probe_model.constraints = self._constraints["probe"]
 
     @property
     def constraints(self) -> dict[str, Any]:
-        return self._constraints
+        """Get current constraints from all models as a nested dictionary."""
+        return {
+            "object": self.obj_model.constraints,
+            "probe": self.probe_model.constraints,
+            "dataset": self.dset.constraints,
+            "detector": {
+                "detector_mask": getattr(self.detector_model, "detector_mask", None),
+            },
+        }
 
     @constraints.setter
     def constraints(self, c: dict[str, Any]):
-        """Sets both self._constraints as well as the constraints in the object and probe models"""
+        """Set constraints by forwarding to individual models."""
+        constraint_handlers = {
+            "object": self.obj_model,
+            "probe": self.probe_model,
+            "dataset": self.dset,
+        }
+
         for key, value in c.items():
-            if key not in self.DEFAULT_CONSTRAINTS:
+            if key in constraint_handlers and isinstance(value, dict):
+                for subkey, subvalue in value.items():
+                    constraint_handlers[key].add_constraint(subkey, subvalue)
+            elif key == "detector" and isinstance(value, dict):
+                warn("Detector constraints not implemented, skipping")
+            else:
+                valid_keys = list(constraint_handlers.keys()) + ["detector"]
                 raise KeyError(
-                    f"Invalid constraint key '{key}', allowed keys are {list(self.DEFAULT_CONSTRAINTS.keys())}"
+                    f"Invalid constraint category '{key}'. Valid categories are: {valid_keys}"
                 )
 
-            if not isinstance(value, dict):
-                raise ValueError(f"Constraint '{key}' must be a dictionary.")
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
 
-            allowed_subkeys = self.DEFAULT_CONSTRAINTS[key].keys()
-            for subkey, subvalue in value.items():
-                if subkey not in allowed_subkeys:
-                    raise KeyError(
-                        f"Invalid subkey '{subkey}' for constraint '{key}', allowed subkeys are {list(allowed_subkeys)}"
-                    )
+    @batch_size.setter
+    def batch_size(self, val: int | None) -> None:
+        if val is not None:
+            v = validate_gt(validate_int(val, "batch_size"), 0, "batch_size")
+            self._batch_size = int(v)
 
-                self._constraints[key][subkey] = subvalue
-        for k, v in self._constraints["object"].items():
-            if k in self.obj_model.DEFAULT_CONSTRAINTS.keys():
-                self.obj_model.add_constraint(k, v)
-        for k, v in self._constraints["probe"].items():
-            if k in self.probe_model.DEFAULT_CONSTRAINTS.keys():
-                self.probe_model.add_constraint(k, v)
-        for k, v in self._constraints["dataset"].items():
-            if k in self.dset.DEFAULT_CONSTRAINTS.keys():
-                self.dset.add_constraint(k, v)
+    @property
+    def logger(self) -> LoggerPtychography | None:
+        return self._logger
+
+    @logger.setter
+    def logger(self, logger: LoggerPtychography | None):
+        if logger is None:
+            self._logger = None
+        elif not isinstance(logger, LoggerPtychography) and "logger_pty" not in str(type(logger)):
+            raise TypeError(f"Logger must be a LoggerPtychography, got {type(logger)}")
+
+        self._logger = logger
 
     # endregion --- explicit class properties ---
 
@@ -646,15 +578,17 @@ class PtychographyBase(AutoSerialize):
 
     @property
     def obj_cropped(self) -> np.ndarray:
-        cropped = self._crop_rotate_obj_fov(self.obj)
+        cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "pure_phase":
             cropped = np.exp(1j * np.angle(cropped))
-        cropped = center_crop_arr(cropped, tuple(self.obj_shape_crop))  # sometimes 1 pixel off
         # TEMP testing for bugs
         if cropped.shape != tuple(self.obj_shape_crop):
             raise ValueError(
                 f"Object shape {cropped.shape} does not match expected shape {self.obj_shape_crop}"
             )
+        if self.obj_type in ["pure_phase", "complex"]:
+            ph = np.angle(cropped)
+            cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
         return cropped
 
     @property  # FIXME depend on ptychodataset
@@ -810,7 +744,7 @@ class PtychographyBase(AutoSerialize):
         positions_px: np.ndarray | None = None,
         com_rotation_rad: float | None = None,
         transpose: bool | None = None,
-        padding: int = 0,
+        padding: np.ndarray | tuple[int, int] | None = None,
     ) -> np.ndarray:
         """
         Crops and rotated object to FOV bounded by current pixel positions.
@@ -820,30 +754,40 @@ class PtychographyBase(AutoSerialize):
             self.dset.com_rotation_rad if com_rotation_rad is None else com_rotation_rad
         )
         transpose = self.dset.com_transpose if transpose is None else transpose
+        padding = np.array(padding) if padding is not None else self.obj_padding_px
 
         angle = com_rotation_rad if transpose else -1 * com_rotation_rad
 
         if positions_px is None:
-            positions = self.dset.scan_positions_px.cpu().detach().numpy()
+            positions = self.dset.initial_scan_positions_px.cpu().detach().numpy()
+            # if using learned positions potentially need to pad the object in center_crop_arr
+            # positions = self.dset.scan_positions_px.cpu().detach().numpy()
         else:
             positions = positions_px
 
         tf = AffineTransform(angle=angle)
         rotated_points = tf(positions, origin=positions.mean(0))
+        rotated_points += 1e-9  # avoid pixel perfect errors
 
-        min_x, min_y = np.floor(np.amin(rotated_points, axis=0) - padding).astype("int")
-        min_x = min_x if min_x > 0 else 0
-        min_y = min_y if min_y > 0 else 0
-        max_x, max_y = np.ceil(np.amax(rotated_points, axis=0) + padding).astype("int")
+        min_r, min_c = np.floor(np.min(rotated_points, axis=0)).astype("int")
+        min_r = max(min_r, 0)
+        min_c = max(min_c, 0)
+        max_r, max_c = np.ceil(np.max(rotated_points, axis=0)).astype("int")
+        max_r = min(max_r, array.shape[-2])
+        max_c = min(max_c, array.shape[-1])
+        # print(f"{min_r = }, {min_c = }, {max_r = }, {max_c = }")
 
         rotated_array = ndi.rotate(
             array, np.rad2deg(-angle), order=1, reshape=False, axes=(-2, -1)
-        )[..., min_x:max_x, min_y:max_y]
+        )[..., min_r:max_r, min_c:max_c]
 
         if transpose:
             rotated_array = rotated_array.swapaxes(-2, -1)
 
-        return rotated_array
+        # fixing that is sometimes 1 pixel off
+        cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop), pad_if_needed=False)
+
+        return cropped
 
     def _repeat_arr(
         self, arr: "np.ndarray|torch.Tensor", repeats: int, axis: int
@@ -855,14 +799,15 @@ class PtychographyBase(AutoSerialize):
         return np.repeat(arr, repeats, axis=axis)
 
     def reset_recon(self) -> None:
+        self._reset_rng()
         self.obj_model.reset()
         self.probe_model.reset()
         self.dset.reset()
+        # detector reset if necessary
         self._epoch_losses = []
         self._epoch_recon_types = []
         self._epoch_snapshots = []
         self._epoch_lrs = {}
-        self.constraints = self.DEFAULT_CONSTRAINTS.copy()
 
     def append_recon_iteration(
         self,
@@ -899,28 +844,6 @@ class PtychographyBase(AutoSerialize):
             intensities = np.abs(probe) ** 2
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
 
-    def save(
-        self,
-        path: str | Path,
-        mode: Literal["w", "o"] = "w",
-        store: Literal["auto", "zip", "dir"] = "auto",
-        skip: str | type | Sequence[str | type] = (),
-        compression_level: int | None = 4,
-    ):
-        if isinstance(skip, (str, type)):
-            skip = [skip]
-        skip = list(skip)
-        skips = skip + [torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]
-        super().save(
-            path,
-            mode=mode,
-            store=store,
-            compression_level=compression_level,
-            # skip=["optimizers", "_optimizers"],
-            # skip=torch.optim.Optimizer,
-            skip=skips,
-        )
-
     def to(self, device: str | int | torch.device):
         dev, _id = config.validate_device(device)
         if dev != self.device:
@@ -930,6 +853,7 @@ class PtychographyBase(AutoSerialize):
         self.dset.to(dev)
         self._obj_fov_mask = self._to_torch(self._obj_fov_mask)
         self._propagators = self._to_torch(self._propagators)
+        self._rng_to_device(dev)
 
     # endregion
 
@@ -953,50 +877,27 @@ class PtychographyBase(AutoSerialize):
         self,
         pred_intensities: torch.Tensor,
         batch_indices: np.ndarray,
-        amplitude_error: bool = True,
-        use_unshifted: bool = True,
-        loss_type: Literal["l1", "l2"] = "l2",
+        loss_type: Literal[
+            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
+        ] = "l2_amplitude",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if amplitude_error:
-            if use_unshifted:
-                targets = self.dset.amplitudes[batch_indices]
-            else:
-                targets = self.dset.centered_amplitudes[batch_indices]
+        targets = self.dset.targets[batch_indices]
+        if "amplitude" in loss_type:
             preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
         else:
-            if use_unshifted:
-                targets = self.dset.intensities[batch_indices]
-            else:
-                targets = self.dset.centered_intensities[batch_indices]
             preds = pred_intensities
-        if loss_type == "l1":
-            error = arr.sum(arr.abs(preds - targets))
-        elif loss_type == "l2":
-            error = arr.sum(arr.abs(preds - targets) ** 2)
+
+        diff = preds - targets
+        if "l1" in loss_type:
+            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
+        elif "l2" in loss_type:
+            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
+        elif loss_type == "poisson":
+            error = torch.sum(preds - targets * torch.log(preds + 1e-6))
         else:
             raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
-        loss = error / self.dset.mean_diffraction_intensity / targets.shape[0]
+        loss = error / self.dset.mean_diffraction_intensity
         return loss, targets
-
-    # def error_estimate(
-    #     self,
-    #     overlap: torch.Tensor,
-    #     true_amplitudes: torch.Tensor,
-    # ) -> torch.Tensor:
-    #     farfield_amplitudes = self.estimate_amplitudes(overlap)
-    #     raw_error = arr.sum(arr.abs(farfield_amplitudes - true_amplitudes) ** 2)
-    #     ave_error = raw_error / farfield_amplitudes.shape[0]  # normalize by # patterns
-    #     return ave_error
-
-    def error_estimate_intensities(
-        self,
-        overlap: torch.Tensor,
-        true_intensities: torch.Tensor,
-    ) -> torch.Tensor:
-        farfield_intensities = self.estimate_intensities(overlap)
-        raw_error = arr.sum(arr.abs(farfield_intensities - true_intensities) ** 2)
-        ave_error = raw_error / farfield_intensities.shape[0]  # normalize by # patterns
-        return ave_error
 
     def overlap_projection(self, obj_patches, input_probe):
         """Multiplies `input_probes` with roi-shaped patches from `obj_array`.
@@ -1010,7 +911,8 @@ class PtychographyBase(AutoSerialize):
             overlap = obj_patches[s] * propagated_probe
             propagated_probes.append(propagated_probe)
 
-        return arr.match_device(propagated_probes, overlap), overlap  # type:ignore
+        propagated_probes = torch.stack(propagated_probes, dim=0).to(overlap.device)
+        return propagated_probes, overlap  # type:ignore
 
     def estimate_amplitudes(
         self, overlap_array: "torch.Tensor", corner_centered: bool = False
@@ -1019,7 +921,7 @@ class PtychographyBase(AutoSerialize):
         # overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         # incoherent sum of all probe components
         eps = 1e-9  # this is to avoid diverging gradients at sqrt(0)
-        overlap_fft = torch.fft.fft2(overlap_array)
+        overlap_fft = torch.fft.fft2(overlap_array, norm="ortho")
         amps = torch.sqrt(torch.sum(torch.abs(overlap_fft + eps) ** 2, dim=0))
         if not corner_centered:  # default is shifted amplitudes matching exp data
             return torch.fft.fftshift(amps, dim=(-2, -1))
@@ -1030,7 +932,7 @@ class PtychographyBase(AutoSerialize):
         """Returns the estimated fourier amplitudes from real-valued `overlap_array`."""
         # overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         # incoherent sum of all probe components
-        overlap_fft = torch.fft.fft2(overlap_array)
+        overlap_fft = torch.fft.fft2(overlap_array, norm="ortho")
         return torch.sum(torch.abs(overlap_fft) ** 2, dim=0)
 
     def _propagate_array(
