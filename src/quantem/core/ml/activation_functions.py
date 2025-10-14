@@ -83,6 +83,37 @@ class Complex_Phase_ReLU(nn.Module):
 
         return f.type(torch.complex64)
 
+class FinerActivation(nn.Module):
+    """
+    Finer Activation function for complex and real inputs. 
+    
+    - Similar to sine activation function.  
+    """
+    def __init__(
+        self,
+        omega: float = 1,
+    ):
+        super().__init__()
+        self.omega = omega
+
+    def generate_alpha(self, x):
+        
+        with torch.no_grad():
+            return torch.abs(x) + 1
+    
+    def forward(self, x):
+        if x.is_complex(): # Complex Input Check
+            with torch.no_grad():
+                alpha_real = torch.abs(x.real) + 1
+                alpha_imag = torch.abs(x.imag) + 1
+            x.real = x.real * alpha_real
+            x.imag = x.imag * alpha_imag
+            return torch.sin(self.omega * self.generate_alpha(x) * x)
+        else:
+            return torch.sin(self.omega * self.generate_alpha(x) * x)
+
+    
+    
 
 def get_activation_function(
     activation_type: str | Callable,
@@ -151,6 +182,7 @@ def get_activation_function(
             activation = nn.Sigmoid()
         elif activation_type in ["softplus"]:
             activation = nn.Softplus()
+        elif activation_type in ["finer"]:
         else:
             raise ValueError(f"Unknown activation type {activation_type}")
 
