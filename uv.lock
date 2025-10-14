@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -2163,7 +2163,7 @@ wheels = [
 
 [[package]]
 name = "quantem"
-version = "0.1.5.post2"
+version = "0.1.6"
 source = { editable = "." }
 dependencies = [
     { name = "cmasher" },
