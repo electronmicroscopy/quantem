@@ -1,12 +1,19 @@
 # Utilities for processing images
-
-from typing import Optional, Tuple
+from __future__ import annotations
+from typing import Any, Optional, Tuple, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
+from scipy.special import comb
+from matplotlib import cm
 
-from quantem.core.utils.utils import generate_batches
+from quantem.core.datastructures.dataset2d import Dataset2d
+from quantem.core.visualization import show_2d
+
+# single TypeVar: works for both numpy and Dataset2d
+ImageType = TypeVar("ImageType", NDArray[Any], Dataset2d)
+BoolArray = NDArray[np.bool_]
 
 
 def dft_upsample(
@@ -360,3 +367,125 @@ def fourier_cropping(
     result[-h2:, -w2:] = corner_centered_array[-h2:, -w2:]
 
     return result
+
+
+def _as_array(x: ImageType) -> NDArray[Any]:
+    return x.array if isinstance(x, Dataset2d) else np.asarray(x)
+
+def _bernstein_basis_1d(n: int, t: NDArray[Any]) -> NDArray[Any]:
+    k = np.arange(n + 1, dtype=int)
+    return comb(n, k)[None, :] * (t[:, None] ** k[None, :]) * ((1.0 - t)[:, None] ** (n - k)[None, :])
+
+def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> NDArray[Any]:
+    H, W = im_shape
+    ou, ov = int(order[0]), int(order[1])
+    u = np.linspace(0.0, 1.0, H)
+    v = np.linspace(0.0, 1.0, W)
+    Bu = _bernstein_basis_1d(ou, u)
+    Bv = _bernstein_basis_1d(ov, v)
+    basis_cube = np.einsum("ik,jl->ijkl", Bu, Bv)
+    return basis_cube.reshape(H * W, (ou + 1) * (ov + 1))
+
+
+def background_subtract(
+    image: ImageType,
+    mask: Optional[BoolArray] = None,
+    thresh_bg: Optional[float] = None,
+    order: Tuple[int, int] = (1, 1),
+    sigma: Optional[float] = None,
+    num_iter: int = 10,
+    plot_result: bool = True,
+    axsize: Tuple[int, int] = (3.1, 3),
+    cmap: str = "turbo",
+    return_background_and_mask: bool = False,
+    **show_kwargs,
+) -> ImageType | Tuple[ImageType, NDArray[Any], BoolArray]:
+    """
+    Background subtraction via bivariate Bernstein polynomial fitting.
+
+    Returns
+    -------
+    - If `return_background_and_mask=False`: ImageType (same as input)
+    - If `True`: (ImageType, numpy.ndarray, numpy.ndarray[bool])
+      where background and mask are always NumPy.
+    """
+    im = _as_array(image).astype(float, copy=True)
+    if im.ndim != 2:
+        raise ValueError("`image` must be 2D")
+
+    mask_arr: BoolArray = np.ones_like(im, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    if mask_arr.shape != im.shape:
+        raise ValueError("`mask` must match `image` shape")
+
+    order = (int(order[0]), int(order[1]))
+    A_full = _build_basis_matrix(im.shape, order)
+    H, W = im.shape
+    im_flat = im.ravel()
+
+    im_bg = np.zeros_like(im)
+    thresh_val = np.median(im[mask_arr]) if thresh_bg is None else float(thresh_bg)
+
+    resid = im - im_bg
+    if sigma and sigma > 0:
+        resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
+    mask_bg: BoolArray = (resid < thresh_val) & mask_arr
+
+    for _ in range(int(num_iter)):
+        idx = mask_bg.ravel()
+        if not np.any(idx):
+            idx = mask_arr.ravel()
+        coefs, *_ = np.linalg.lstsq(A_full[idx, :], im_flat[idx], rcond=None)
+        im_bg = (A_full @ coefs).reshape(H, W)
+
+        resid = im - im_bg
+        if sigma and sigma > 0:
+            resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
+
+        thr = thresh_val if thresh_bg is None else float(thresh_bg)
+        mask_bg = (resid < thr) & mask_arr
+
+    im_sub_np = im - im_bg
+
+    if plot_result:
+        vals = im_sub_np[mask_arr]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            vals = np.array([0.0])
+        vmin_sub = float(np.min(vals))
+        vmax_sub = float(np.max(vals))
+        vrange = float(max(abs(vmin_sub), abs(vmax_sub))) or 1e-12
+
+        bg_disp = (im_bg - np.mean(im_bg)).copy()
+        bg_disp[~mask_bg] = np.nan
+
+        cmap_base = cm.get_cmap(cmap).with_extremes(bad="black")
+        cmap_div = "RdBu_r"
+
+        disp = [im - np.mean(im_bg), bg_disp, im_sub_np]
+        norm = [
+            {"interval_type": "manual", "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},
+            {"interval_type": "manual", "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},
+            {"interval_type": "centered", "stretch_type": "linear", "vcenter": 0.0, "half_range": vrange},
+        ]
+
+        show_2d(
+            disp,
+            cmap=[cmap_base, cmap_base, cmap_div],
+            norm=norm,
+            cbar=[False, False, True],
+            title=["Input Image", "Background (fit region)", "Background Subtracted"],
+            axsize=axsize,
+            **show_kwargs,
+        )
+
+    # preserve Dataset2d if needed
+    if isinstance(image, Dataset2d):
+        meta = dict(origin=image.origin, sampling=image.sampling, units=image.units)
+        name_base = getattr(image, "name", "image")
+        im_sub: ImageType = Dataset2d.from_array(im_sub_np, name=f"{name_base} (bg-sub)", **meta)  # type: ignore[assignment]
+    else:
+        im_sub = im_sub_np  # type: ignore[assignment]
+
+    if return_background_and_mask:
+        return im_sub, im_bg, mask_bg
+    return im_sub
