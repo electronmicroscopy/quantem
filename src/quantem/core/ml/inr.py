@@ -1,6 +1,7 @@
 from .blocks import SineLayer, FinerLayer
 from torch import nn
 import torch
+import numpy as np
 
 class Siren(nn.Module):
     def __init__(
@@ -25,8 +26,8 @@ class Siren(nn.Module):
         final_linear = nn.Linear(hidden_features, out_features)
         with torch.no_grad():
             # Final layer keeps original initialization (no alpha scaling)
-            final_linear.weight.uniform_(-torch.sqrt(6 / hidden_features) / hidden_omega_0,
-                                          torch.sqrt(6 / hidden_features) / hidden_omega_0)
+            final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0,
+                                          np.sqrt(6 / hidden_features) / hidden_omega_0)
         self.net.append(final_linear)
 
         self.net = nn.Sequential(*self.net)
@@ -50,8 +51,8 @@ class HSiren(nn.Module):
         final_linear = nn.Linear(hidden_features, out_features)
         with torch.no_grad():
             # Final layer keeps original initialization (no alpha scaling)
-            final_linear.weight.uniform_(-torch.sqrt(6 / hidden_features) / hidden_omega_0,
-                                          torch.sqrt(6 / hidden_features) / hidden_omega_0)
+            final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0,
+                                          np.sqrt(6 / hidden_features) / hidden_omega_0)
         self.net.append(final_linear)
 
         self.net = nn.Sequential(*self.net)
