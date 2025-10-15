@@ -1,7 +1,9 @@
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
+import optuna
 from numpy.typing import NDArray
 
 from quantem.core import config
@@ -31,6 +33,16 @@ if TYPE_CHECKING:
 else:
     if config.get("has_torch"):
         import torch
+
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
+@dataclass
+class OptimizationParameter:
+    low: float
+    high: float
+    log: bool = False
 
 
 class DirectPtychography(RNGMixin, AutoSerialize):
@@ -505,3 +517,88 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def obj(self) -> np.ndarray:
         obj = to_numpy(self.mean_corrected_bf)
         return obj
+
+    def optimize_hyperparameters(
+        self,
+        aberration_coefs: dict[str, float | OptimizationParameter] = None,
+        rotation_angle: float | OptimizationParameter = None,
+        n_trials=50,
+        sampler=None,
+        show_progress_bar=True,
+        **reconstruct_kwargs,
+    ):
+        """
+        Optimize hyperparameters (aberrations and/or rotation) using Optuna.
+
+        Parameters
+        ----------
+        aberration_coefs : dict[str, float|OptimizationParameter]
+            Dict of aberration names to either fixed values or optimization ranges.
+        rotation_angle : float|OptimizationParameter
+            Fixed rotation or optimization range.
+        n_trials : int
+            Number of Optuna trials.
+        sampler : optuna.samplers.BaseSampler, optional
+            Custom Optuna sampler.
+        direction : str
+            "minimize" or "maximize" (default: "minimize").
+        show_progress_bar : bool
+            Show progress bar during optimization.
+        **reconstruct_kwargs :
+            Extra arguments passed to reconstruct().
+        """
+
+        aberration_coefs = aberration_coefs or {}
+        sampler = sampler or optuna.samplers.TPESampler()
+
+        def objective(trial):
+            trial_aberrations = {}
+            for name, val in aberration_coefs.items():
+                if isinstance(val, OptimizationParameter):
+                    trial_aberrations[name] = trial.suggest_float(
+                        name, val.low, val.high, log=val.log
+                    )
+                else:
+                    trial_aberrations[name] = val
+
+            if isinstance(rotation_angle, OptimizationParameter):
+                rot = trial.suggest_float(
+                    "rotation_angle",
+                    rotation_angle.low,
+                    rotation_angle.high,
+                    log=rotation_angle.log,
+                )
+            else:
+                rot = rotation_angle
+
+            self.reconstruct(
+                aberration_coefs=trial_aberrations,
+                rotation_angle=rot,
+                **reconstruct_kwargs,
+            )
+            loss = self.variance_loss()
+            return float(loss)
+
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
+
+        self._hyperparameters_study = study
+        self._best_hyperparameters = study.best_params
+        self._reconstruct_optimized(**reconstruct_kwargs)
+        return self
+
+    def _reconstruct_optimized(
+        self,
+        **reconstruct_kwargs,
+    ):
+        """ """
+        if not hasattr(self, "_best_hyperparameters"):
+            raise ValueError("run self.optimize_hyperparameters first.")
+
+        aberration_coefs = self._best_hyperparameters.copy()
+        rotation_angle = aberration_coefs.pop("rotation_angle", None)
+        self.reconstruct(
+            aberration_coefs=aberration_coefs,
+            rotation_angle=rotation_angle,
+            **reconstruct_kwargs,
+        )
