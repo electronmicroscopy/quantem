@@ -597,7 +597,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         aberration_coefs = self._best_hyperparameters.copy()
         rotation_angle = aberration_coefs.pop("rotation_angle", None)
-        self.reconstruct(
+        return self.reconstruct(
             aberration_coefs=aberration_coefs,
             rotation_angle=rotation_angle,
             **reconstruct_kwargs,
