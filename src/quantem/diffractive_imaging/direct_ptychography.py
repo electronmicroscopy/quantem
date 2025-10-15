@@ -59,6 +59,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 "Use DirectPtychography.from_dataset4dstem() or DirectPtychography.from_virtual_bfs() to instantiate this class."
             )
 
+        self.device = device
         self.vbf_stack = vbf_dataset.array
         self.bf_mask = bf_mask_dataset.array
 
@@ -76,7 +77,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.semiangle_cutoff = semiangle_cutoff
         self.vacuum_probe_intensity = vacuum_probe_intensity
         self.soft_edges = soft_edges
-        self.device = device
         self.rng = rng
 
         self.gpts = bf_mask_dataset.shape
@@ -140,7 +140,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         """ """
 
-        origin = CenterOfMassOriginModel.from_dataset(dataset)
+        origin = CenterOfMassOriginModel.from_dataset(dataset, device=device)
 
         # measure and fit origin
         if force_fitted_origin is None:
@@ -168,7 +168,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         bf_mask = mean_dp > mean_dp.max() * intensity_threshold
 
         bf_mask_dataset = Dataset2d.from_array(
-            bf_mask.numpy(),
+            bf_mask.cpu().numpy(),
             name="BF mask",
             units=("A^-1", "A^-1"),
             sampling=dataset.sampling[-2:],
@@ -180,7 +180,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         vbf_stack = torch.moveaxis(vbf_stack, (0, 1, 2), (1, 2, 0))
 
         vbf_dataset = Dataset3d.from_array(
-            vbf_stack.numpy(),
+            vbf_stack.cpu().numpy(),
             name="vBF stack",
             units=("index", "A", "A"),
             sampling=(1,) + tuple(dataset.sampling[:2]),
@@ -236,7 +236,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @vbf_stack.setter
     def vbf_stack(self, value: torch.Tensor):
-        self._vbf_stack = validate_tensor(value, "vbf_stack", dtype=torch.float).to(self.device)
+        self._vbf_stack = validate_tensor(value, "vbf_stack", dtype=torch.float).to(
+            device=self.device
+        )
 
     @property
     def bf_mask(self) -> torch.Tensor:
@@ -244,7 +246,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @bf_mask.setter
     def bf_mask(self, value: torch.Tensor):
-        self._bf_mask = validate_tensor(value, "bf_mask", dtype=torch.bool).to(self.device)
+        self._bf_mask = validate_tensor(value, "bf_mask", dtype=torch.bool).to(device=self.device)
 
     @property
     def rotation_angle(self) -> float:
@@ -472,7 +474,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     @corrected_stack.setter
     def corrected_stack(self, value: torch.Tensor):
         self._corrected_stack = validate_tensor(value, "corrected_stack", dtype=torch.float).to(
-            self.device
+            device=self.device
         )
 
     @property

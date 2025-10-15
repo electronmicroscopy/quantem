@@ -190,8 +190,12 @@ class CenterOfMassOriginModel(AutoSerialize):
             ax, bx, cx, dx = fit_linear_plane(com_x_pts)
             ay, by, cy, dy = fit_linear_plane(com_y_pts)
 
-            com_fitted_x = (probe_positions @ torch.tensor([-ax, -bx]) - dx) / cx
-            com_fitted_y = (probe_positions @ torch.tensor([-ay, -by]) - dy) / cy
+            com_fitted_x = (
+                probe_positions @ torch.tensor([-ax, -bx], device=self.device) - dx
+            ) / cx
+            com_fitted_y = (
+                probe_positions @ torch.tensor([-ay, -by], device=self.device) - dy
+            ) / cy
             com_fitted = torch.stack([com_fitted_x, com_fitted_y], -1)
 
         elif fit_method == "constant":
