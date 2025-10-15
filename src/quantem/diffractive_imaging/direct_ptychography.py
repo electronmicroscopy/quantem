@@ -15,7 +15,6 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.diffractive_imaging.complex_probe import (
-    _passively_rotate_grid,
     _polar_coordinates,
     aberration_surface,
     aberration_surface_cartesian_gradients,
@@ -375,6 +374,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs=None,
         upsampling_factor=None,
         rotation_angle=None,
+        max_batch_size=None,
     ):
         """ """
         if aberration_coefs is None:
@@ -409,21 +409,29 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             aberration_coefs=aberration_coefs,
         )
 
+        if max_batch_size is None:
+            max_batch_size = self.num_bf
+
+        batcher = SimpleBatcher(
+            self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
+        )
+
         corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
+        for batch_idx in batcher:
+            ind_i = self._bf_inds_i[batch_idx]
+            ind_j = self._bf_inds_j[batch_idx]
 
-        for n, (ind_i, ind_j) in enumerate(zip(self._bf_inds_i, self._bf_inds_j)):
-            qmks = _passively_rotate_grid(
-                qxa - kxa[ind_i, ind_j], qya - kya[ind_i, ind_j], rotation_angle=rotation_angle
-            )
-            qpks = _passively_rotate_grid(
-                qxa + kxa[ind_i, ind_j], qya + kya[ind_i, ind_j], rotation_angle=rotation_angle
-            )
+            qmkxa = qxa.unsqueeze(0) - kxa[ind_i, ind_j].view(-1, 1, 1)
+            qmkya = qya.unsqueeze(0) - kya[ind_i, ind_j].view(-1, 1, 1)
 
-            cmplx_probe_at_k = cmplx_probe[ind_i, ind_j]
+            qpkxa = qxa.unsqueeze(0) + kxa[ind_i, ind_j].view(-1, 1, 1)
+            qpkya = qya.unsqueeze(0) + kya[ind_i, ind_j].view(-1, 1, 1)
+
+            cmplx_probe_at_k = cmplx_probe[ind_i, ind_j].view(-1, 1, 1)
 
             gamma = gamma_factor(
-                qmks,
-                qpks,
+                (qmkxa, qmkya),
+                (qpkxa, qpkya),
                 cmplx_probe_at_k,
                 self.wavelength,
                 self.semiangle_cutoff,
@@ -433,9 +441,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 aberration_coefs=aberration_coefs,
             )
 
-            vbf_fourier = torch.tile(self._vbf_fourier[n], (upsampling_factor, upsampling_factor))
-
-            corrected_stack[n] = torch.fft.ifft2(vbf_fourier * gamma).imag * upsampling_factor
+            vbf_fourier = torch.tile(
+                self._vbf_fourier[batch_idx],
+                (1, upsampling_factor, upsampling_factor),
+            )
+            corrected_stack[batch_idx] = (
+                torch.fft.ifft2(vbf_fourier * gamma).imag * upsampling_factor
+            )
 
         self.corrected_stack = corrected_stack
         return self
