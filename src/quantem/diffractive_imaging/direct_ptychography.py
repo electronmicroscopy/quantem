@@ -14,8 +14,12 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.diffractive_imaging.complex_probe import (
+    _passively_rotate_grid,
+    _polar_coordinates,
     aberration_surface,
     aberration_surface_cartesian_gradients,
+    evaluate_probe,
+    gamma_factor,
     polar_spatial_frequencies,
     spatial_frequencies,
 )
@@ -41,6 +45,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float,
         aberration_coefs: dict,
         semiangle_cutoff: float | None,
+        soft_edges: bool,
         vacuum_probe_intensity: torch.Tensor | None,
         rng: np.random.Generator | int | None,
         device: str | int,
@@ -68,12 +73,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self.semiangle_cutoff = semiangle_cutoff
         self.vacuum_probe_intensity = vacuum_probe_intensity
+        self.soft_edges = soft_edges
         self.device = device
         self.rng = rng
 
         self.gpts = bf_mask_dataset.shape
         self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
         self.wavelength = electron_wavelength_angstrom(energy)
+        self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
 
         self.rotation_angle = rotation_angle
         self.aberration_coefs = aberration_coefs
@@ -90,6 +97,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs: dict,
         semiangle_cutoff: float | None = None,
         vacuum_probe_intensity: torch.Tensor | None = None,
+        soft_edges: bool = True,
         rng: np.random.Generator | int | None = None,
         device: str | int = "cpu",
     ):
@@ -103,6 +111,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
             vacuum_probe_intensity=vacuum_probe_intensity,
+            soft_edges=soft_edges,
             rng=rng,
             device=device,
             _token=cls._token,
@@ -275,3 +284,122 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.corrected_stack = corrected_stack
 
         return self
+
+    def _kernel_deconvolution(
+        self,
+        aberration_coefs=None,
+        upsampling_factor=None,
+        rotation_angle=None,
+    ):
+        """ """
+        if aberration_coefs is None:
+            aberration_coefs = self.aberration_coefs
+        else:
+            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
+
+        if rotation_angle is None:
+            rotation_angle = self.rotation_angle
+        else:
+            rotation_angle = float(rotation_angle)
+
+        if upsampling_factor is None:
+            upsampling_factor = 1
+        upsampling_factor = math.ceil(upsampling_factor)
+
+        kxa, kya = spatial_frequencies(
+            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+        )
+        qxa, qya = self._return_upsampled_qgrid(
+            upsampling_factor=upsampling_factor,
+        )
+
+        k, phi = _polar_coordinates(kxa, kya)
+        alpha = k * self.wavelength
+        cmplx_probe = evaluate_probe(
+            alpha,
+            phi,
+            self.semiangle_cutoff,
+            self.angular_sampling,
+            self.wavelength,
+            aberration_coefs=aberration_coefs,
+        )
+
+        corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
+
+        for n, (ind_i, ind_j) in enumerate(zip(self._bf_inds_i, self._bf_inds_j)):
+            qmks = _passively_rotate_grid(
+                qxa - kxa[ind_i, ind_j], qya - kya[ind_i, ind_j], rotation_angle=rotation_angle
+            )
+            qpks = _passively_rotate_grid(
+                qxa + kxa[ind_i, ind_j], qya + kya[ind_i, ind_j], rotation_angle=rotation_angle
+            )
+
+            cmplx_probe_at_k = cmplx_probe[ind_i, ind_j]
+
+            gamma = gamma_factor(
+                qmks,
+                qpks,
+                cmplx_probe_at_k,
+                self.wavelength,
+                self.semiangle_cutoff,
+                self.vacuum_probe_intensity,
+                self.soft_edges,
+                angular_sampling=self.angular_sampling,
+                aberration_coefs=aberration_coefs,
+            )
+
+            vbf_fourier = torch.tile(self._vbf_fourier[n], (upsampling_factor, upsampling_factor))
+
+            corrected_stack[n] = torch.fft.ifft2(vbf_fourier * gamma).imag * upsampling_factor
+
+        self.corrected_stack = corrected_stack
+        return self
+
+    def reconstruct(
+        self,
+        use_parallax_approximation=False,
+        aberration_coefs=None,
+        upsampling_factor=None,
+        rotation_angle=None,
+        max_batch_size=None,
+        flip_phase=True,
+    ):
+        """ """
+        if use_parallax_approximation:
+            self._parallax_approximation(
+                aberration_coefs=aberration_coefs,
+                rotation_angle=rotation_angle,
+                upsampling_factor=upsampling_factor,
+                max_batch_size=max_batch_size,
+                flip_phase=flip_phase,
+            )
+        else:
+            self._kernel_deconvolution(
+                aberration_coefs=aberration_coefs,
+                rotation_angle=rotation_angle,
+                upsampling_factor=upsampling_factor,
+            )
+
+        return self
+
+    @property
+    def corrected_stack(self) -> torch.Tensor:
+        return self._corrected_stack
+
+    @corrected_stack.setter
+    def corrected_stack(self, value: torch.Tensor):
+        self._corrected_stack = validate_tensor(value, "corrected_stack", dtype=torch.float).to(
+            self.device
+        )
+
+    @property
+    def mean_corrected_bf(self):
+        if self.corrected_stack is None:
+            return None
+        return self.corrected_stack.mean(dim=0)
+
+    def variance_loss(self):
+        """ """
+        if self.corrected_stack is None:
+            return None
+        return ((self.corrected_stack - self.mean_corrected_bf).abs().square()).mean()

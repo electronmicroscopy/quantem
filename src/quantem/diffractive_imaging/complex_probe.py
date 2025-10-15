@@ -306,6 +306,49 @@ def aberration_surface_cartesian_gradients(
     return dchi_dx, dchi_dy
 
 
+def gamma_factor(
+    qmks: torch.Tensor,
+    qpks: torch.Tensor,
+    cmplx_probe_at_k: torch.complex,
+    wavelength: float,
+    semiangle_cutoff: float | None,
+    vacuum_probe_intensity: torch.Tensor | None,
+    soft_edges: bool,
+    aberration_coefs: Mapping[str, float | torch.Tensor],
+    angular_sampling: Tuple[float, float],
+):
+    """ """
+
+    q_m, phi_m = _polar_coordinates(*qmks)
+    q_p, phi_p = _polar_coordinates(*qpks)
+
+    probe_m = evaluate_probe(
+        q_m * wavelength,
+        phi_m,
+        semiangle_cutoff,
+        angular_sampling,
+        wavelength,
+        soft_edges,
+        vacuum_probe_intensity,
+        aberration_coefs,
+    )
+
+    probe_p = evaluate_probe(
+        q_p * wavelength,
+        phi_p,
+        semiangle_cutoff,
+        angular_sampling,
+        wavelength,
+        soft_edges,
+        vacuum_probe_intensity,
+        aberration_coefs,
+    )
+
+    gamma = probe_m * cmplx_probe_at_k.conj() - probe_p.conj() * cmplx_probe_at_k
+    gamma /= gamma.abs().clamp(min=1e-8)
+    return gamma.conj()
+
+
 def evaluate_probe(
     alpha: torch.Tensor,
     phi: torch.Tensor,
@@ -327,6 +370,18 @@ def evaluate_probe(
     return probe_aperture * torch.exp(-1j * probe_aberrations)
 
 
+def _passively_rotate_grid(
+    kxa: torch.Tensor,
+    kya: torch.Tensor,
+    rotation_angle: float,
+):
+    """ """
+    cos_a = math.cos(-rotation_angle)
+    sin_a = math.sin(-rotation_angle)
+    kxa, kya = kxa * cos_a + kya * sin_a, -kxa * sin_a + kya * cos_a
+    return kxa, kya
+
+
 def spatial_frequencies(
     gpts: Tuple[int, int],
     sampling: Tuple[float, float],
@@ -341,11 +396,16 @@ def spatial_frequencies(
 
     # passive grid rotation
     if rotation_angle is not None:
-        cos_a = math.cos(-rotation_angle)
-        sin_a = math.sin(-rotation_angle)
-        kxa, kya = kxa * cos_a + kya * sin_a, -kxa * sin_a + kya * cos_a
+        kxa, kya = _passively_rotate_grid(kxa, kya, rotation_angle)
 
     return kxa, kya
+
+
+def _polar_coordinates(kx: torch.Tensor, ky: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """ """
+    k = torch.sqrt(kx.square() + ky.square())
+    phi = torch.arctan2(ky, kx)
+    return k, phi
 
 
 def polar_spatial_frequencies(
@@ -356,9 +416,7 @@ def polar_spatial_frequencies(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """ """
     kx, ky = spatial_frequencies(gpts, sampling, rotation_angle=rotation_angle, device=device)
-    k = torch.sqrt(kx.square() + ky.square())
-    phi = torch.arctan2(ky, kx)
-    return k, phi
+    return _polar_coordinates(kx, ky)
 
 
 def fourier_space_probe(
