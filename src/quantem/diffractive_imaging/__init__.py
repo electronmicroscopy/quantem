@@ -24,3 +24,7 @@ from quantem.diffractive_imaging.complex_probe import (
 from quantem.diffractive_imaging.direct_ptychography import (
     DirectPtychography as DirectPtychography,
 )
+
+from quantem.diffractive_imaging.origin_models import (
+    CenterOfMassOriginModel as CenterOfMassOriginModel,
+)

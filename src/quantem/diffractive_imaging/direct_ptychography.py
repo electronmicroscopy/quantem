@@ -7,7 +7,7 @@ from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset3d
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.rng import RNGMixin
-from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.core.utils.validators import (
     validate_aberration_coefficients,
     validate_gt,
@@ -403,3 +403,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if self.corrected_stack is None:
             return None
         return ((self.corrected_stack - self.mean_corrected_bf).abs().square()).mean()
+
+    @property
+    def obj(self) -> np.ndarray:
+        obj = to_numpy(self.mean_corrected_bf)
+        return obj
