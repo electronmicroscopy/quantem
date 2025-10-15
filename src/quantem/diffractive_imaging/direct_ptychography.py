@@ -1,10 +1,11 @@
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
+from numpy.typing import NDArray
 
 from quantem.core import config
-from quantem.core.datastructures import Dataset2d, Dataset3d
+from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
@@ -23,6 +24,7 @@ from quantem.diffractive_imaging.complex_probe import (
     polar_spatial_frequencies,
     spatial_frequencies,
 )
+from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
 from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
 
 if TYPE_CHECKING:
@@ -102,6 +104,87 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         device: str | int = "cpu",
     ):
         """ """
+
+        return cls(
+            vbf_dataset=vbf_dataset,
+            bf_mask_dataset=bf_mask_dataset,
+            energy=energy,
+            rotation_angle=rotation_angle,
+            aberration_coefs=aberration_coefs,
+            semiangle_cutoff=semiangle_cutoff,
+            vacuum_probe_intensity=vacuum_probe_intensity,
+            soft_edges=soft_edges,
+            rng=rng,
+            device=device,
+            _token=cls._token,
+        )
+
+    @classmethod
+    def from_dataset4d(
+        cls,
+        dataset: Dataset4d,
+        energy: float,
+        aberration_coefs: dict,
+        semiangle_cutoff: float,
+        rotation_angle: float | None = None,
+        max_batch_size: int | None = None,
+        fit_method: str = "plane",
+        mode: str = "bicubic",
+        force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
+        force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
+        intensity_threshold: float = 0.5,
+        vacuum_probe_intensity: torch.Tensor | None = None,
+        soft_edges: bool = True,
+        rng: np.random.Generator | int | None = None,
+        device: str | int = "cpu",
+    ):
+        """ """
+
+        origin = CenterOfMassOriginModel.from_dataset(dataset)
+
+        # measure and fit origin
+        if force_fitted_origin is None:
+            if force_measured_origin is None:
+                origin.calculate_origin(max_batch_size)
+            else:
+                origin.origin_measured = force_measured_origin
+            origin.fit_origin_background(fit_method=fit_method)
+        else:
+            origin.origin_fitted = force_fitted_origin
+
+        if rotation_angle is None:
+            origin.estimate_detector_rotation()
+            rotation_angle = origin.detector_rotation_deg / 180 * math.pi
+
+        # shift to origin
+        origin.shift_origin_to(
+            max_batch_size=max_batch_size,
+            mode=mode,
+        )
+        shifted_tensor = origin.shifted_tensor
+
+        # bf_mask
+        mean_dp = shifted_tensor.mean(dim=(0, 1))
+        bf_mask = mean_dp > mean_dp.max() * intensity_threshold
+
+        bf_mask_dataset = Dataset2d.from_array(
+            bf_mask.numpy(),
+            name="BF mask",
+            units=("A^-1", "A^-1"),
+            sampling=dataset.sampling[-2:],
+        )
+
+        # vbf_stack
+        vbf_stack = shifted_tensor[..., bf_mask]
+        vbf_stack = vbf_stack / vbf_stack.mean((0, 1)) - 1
+        vbf_stack = torch.moveaxis(vbf_stack, (0, 1, 2), (1, 2, 0))
+
+        vbf_dataset = Dataset3d.from_array(
+            vbf_stack.numpy(),
+            name="vBF stack",
+            units=("index", "A", "A"),
+            sampling=(1,) + tuple(dataset.sampling[:2]),
+        )
 
         return cls(
             vbf_dataset=vbf_dataset,
