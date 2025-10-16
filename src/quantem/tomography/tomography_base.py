@@ -1,10 +1,11 @@
+from typing import Tuple
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from numpy.typing import NDArray
 from torch._tensor import Tensor
 from tqdm.auto import tqdm
-from typing import Tuple
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.io.serialize import AutoSerialize
@@ -74,6 +75,7 @@ class TomographyBase(AutoSerialize):
         shifts: NDArray | Tensor | None = None,
         volume_obj: NDArray | Dataset3d | ObjectModelType | None = None,
         device: str = "cpu",
+        clamp: bool = True,
     ):
         device = device.lower()
 
@@ -83,6 +85,7 @@ class TomographyBase(AutoSerialize):
             z1_angles=z1_angles,
             z3_angles=z3_angles,
             shifts=shifts,
+            clamp=clamp,
         )
 
         dataset.to(device)
@@ -436,8 +439,8 @@ class TomographyBase(AutoSerialize):
                 cmap=cmap,
                 title="Y-X Projection FFT",
                 # norm=norm,
-                vmin = fft_vmax[0],
-                vmax = fft_vmax[1],
+                vmin=fft_vmax[0],
+                vmax=fft_vmax[1],
             )
 
             show_2d(
@@ -445,8 +448,8 @@ class TomographyBase(AutoSerialize):
                 figax=(fig, ax[1]),
                 cmap=cmap,
                 title="Z-X Projection FFT",
-                vmin = fft_vmax[0],
-                vmax = fft_vmax[1],
+                vmin=fft_vmax[0],
+                vmax=fft_vmax[1],
                 # norm=norm,
             )
             show_2d(
@@ -454,8 +457,8 @@ class TomographyBase(AutoSerialize):
                 figax=(fig, ax[2]),
                 cmap=cmap,
                 title="Z-Y Projection FFT",
-                vmin = fft_vmax[0],
-                vmax = fft_vmax[1],
+                vmin=fft_vmax[0],
+                vmax=fft_vmax[1],
                 # norm=norm,
             )
 

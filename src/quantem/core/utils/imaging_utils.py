@@ -1,14 +1,16 @@
 # Utilities for processing images
 from __future__ import annotations
+
 from typing import Any, Optional, Tuple, TypeVar
 
 import numpy as np
+from matplotlib import cm
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
 from scipy.special import comb
-from matplotlib import cm
 
 from quantem.core.datastructures.dataset2d import Dataset2d
+from quantem.core.utils.utils import generate_batches
 from quantem.core.visualization import show_2d
 
 # single TypeVar: works for both numpy and Dataset2d
@@ -372,9 +374,13 @@ def fourier_cropping(
 def _as_array(x: ImageType) -> NDArray[Any]:
     return x.array if isinstance(x, Dataset2d) else np.asarray(x)
 
+
 def _bernstein_basis_1d(n: int, t: NDArray[Any]) -> NDArray[Any]:
     k = np.arange(n + 1, dtype=int)
-    return comb(n, k)[None, :] * (t[:, None] ** k[None, :]) * ((1.0 - t)[:, None] ** (n - k)[None, :])
+    return (
+        comb(n, k)[None, :] * (t[:, None] ** k[None, :]) * ((1.0 - t)[:, None] ** (n - k)[None, :])
+    )
+
 
 def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> NDArray[Any]:
     H, W = im_shape
@@ -413,7 +419,9 @@ def background_subtract(
     if im.ndim != 2:
         raise ValueError("`image` must be 2D")
 
-    mask_arr: BoolArray = np.ones_like(im, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    mask_arr: BoolArray = (
+        np.ones_like(im, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    )
     if mask_arr.shape != im.shape:
         raise ValueError("`mask` must match `image` shape")
 
@@ -463,9 +471,24 @@ def background_subtract(
 
         disp = [im - np.mean(im_bg), bg_disp, im_sub_np]
         norm = [
-            {"interval_type": "manual", "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},
-            {"interval_type": "manual", "stretch_type": "linear", "vmin": vmin_sub, "vmax": vmax_sub},
-            {"interval_type": "centered", "stretch_type": "linear", "vcenter": 0.0, "half_range": vrange},
+            {
+                "interval_type": "manual",
+                "stretch_type": "linear",
+                "vmin": vmin_sub,
+                "vmax": vmax_sub,
+            },
+            {
+                "interval_type": "manual",
+                "stretch_type": "linear",
+                "vmin": vmin_sub,
+                "vmax": vmax_sub,
+            },
+            {
+                "interval_type": "centered",
+                "stretch_type": "linear",
+                "vcenter": 0.0,
+                "half_range": vrange,
+            },
         ]
 
         show_2d(
