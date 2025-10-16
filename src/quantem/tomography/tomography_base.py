@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -73,6 +75,7 @@ class TomographyBase(AutoSerialize):
         shifts: NDArray | Tensor | None = None,
         volume_obj: NDArray | Dataset3d | ObjectModelType | None = None,
         device: str = "cpu",
+        clamp: bool = True,
     ):
         device = device.lower()
 
@@ -82,6 +85,7 @@ class TomographyBase(AutoSerialize):
             z1_angles=z1_angles,
             z3_angles=z3_angles,
             shifts=shifts,
+            clamp=clamp,
         )
 
         dataset.to(device)
@@ -387,6 +391,7 @@ class TomographyBase(AutoSerialize):
         fft: bool = False,
         norm: str = "log_auto",
         figax: tuple[plt.Figure, plt.Axes] | None = None,
+        fft_vmax: Tuple[float, float] = (0, 40),
         **kwargs,
     ):
         """
@@ -427,13 +432,15 @@ class TomographyBase(AutoSerialize):
 
         if fft:
             fig, ax = plt.subplots(ncols=3, figsize=(25, 8))
-
+            print(fft_vmax)
             show_2d(
                 np.abs(np.fft.fftshift(np.fft.fftn(volume_obj_np.sum(axis=0)))),
                 figax=(fig, ax[0]),
                 cmap=cmap,
                 title="Y-X Projection FFT",
-                norm=norm,
+                # norm=norm,
+                vmin=fft_vmax[0],
+                vmax=fft_vmax[1],
             )
 
             show_2d(
@@ -441,14 +448,18 @@ class TomographyBase(AutoSerialize):
                 figax=(fig, ax[1]),
                 cmap=cmap,
                 title="Z-X Projection FFT",
-                norm=norm,
+                vmin=fft_vmax[0],
+                vmax=fft_vmax[1],
+                # norm=norm,
             )
             show_2d(
                 np.abs(np.fft.fftshift(np.fft.fftn(volume_obj_np.sum(axis=2)))),
                 figax=(fig, ax[2]),
                 cmap=cmap,
                 title="Z-Y Projection FFT",
-                norm=norm,
+                vmin=fft_vmax[0],
+                vmax=fft_vmax[1],
+                # norm=norm,
             )
 
     def plot_slice(

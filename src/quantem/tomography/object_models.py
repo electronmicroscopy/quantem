@@ -11,6 +11,9 @@ from quantem.core.ml.blocks import reset_weights
 from quantem.core.utils.validators import validate_gt, validate_tensor
 from quantem.tomography.utils import get_TV_loss
 
+import torch.nn as nn
+import torch.distributed as dist
+
 
 class ObjectBase(AutoSerialize):
     """
@@ -536,5 +539,181 @@ class ObjectDIP(ObjectConstraints):
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
             pbar.set_description(f"Epoch {a0 + 1}/{num_epochs}, Loss: {loss.item():.4f}, ")
 
+class ObjectINN(ObjectConstraints):
+    """
+    Object model for INN objects.
+    
+    - VolumeDataset (?) dependent on the object
+    """
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        volume_shape = tuple[int, int, int],
+        device: str = "cuda",
+    ):
+        
+        super().__init__(
+            volume_shape = volume_shape,
+            device = device,
+            offset_obj = 0,
+        )
+        
+        self._model = model
+        
+        
 
-ObjectModelType = Union[ObjectVoxelwise]  # | ObjectDIP | ObjectImplicit (ObjectFFN?)
+    # --- Properties ---
+    @property
+    def obj(self):
+        
+        return self._obj
+    
+    def create_volume(
+        self,
+        world_size: int,
+        global_rank: int,
+        ray_size: int,
+    ):
+        N = max(self._shape)
+        with torch.no_grad():
+            coords_1d = torch.linspace(-1, 1, N)
+            x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing='ij')
+            inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+            
+            # Underlying model if using DDP
+            model = self.model.module if hasattr(self.model, 'module') else self.model
+            
+            # Batch size for inference
+            # 5x larger batches no gradients needed
+            
+            inference_batch_size = 5 * N * ray_size
+            
+            # Distribute work across GPUs
+            total_samples = N**3
+            samples_per_gpu = total_samples // world_size
+            remainder = total_samples % world_size
+            
+            # Handle uneven distribution
+            if global_rank < remainder:
+                start_idx = global_rank * (samples_per_gpu + 1)
+                end_idx = start_idx + samples_per_gpu + 1
+            else:
+                start_idx = global_rank * samples_per_gpu + remainder
+                end_idx = start_idx + samples_per_gpu
+            
+            inputs_subset = inputs[start_idx:end_idx]
+            num_samples = inputs_subset.shape[0]
+            outputs_list = []
+            
+            for batch_start in range(0, num_samples, inference_batch_size):
+                batch_end = min(batch_start + inference_batch_size, num_samples)
+                batch_coords = inputs_subset[batch_start:batch_end].to(self.device, non_blocking=True)
+
+                batch_outputs = model(batch_coords)
+                if batch_outputs.dim() > 1:
+                    batch_outputs = batch_outputs.squeeze(-1)
+
+                outputs_list.append(batch_outputs.cpu())
+
+            outputs = torch.cat(outputs_list, dim=0)
+
+            if world_size > 1:
+                # Gather from all ranks
+                # handle potentially different sizes
+                output_size = torch.tensor(outputs.shape[0], device=self.device, dtype=torch.long)
+                all_sizes = [torch.zeros(1, device=self.device, dtype=torch.long) for _ in range(world_size)]
+                dist.all_gather(all_sizes, output_size)
+
+                # Create gather list with correct sizes
+                max_size = max(size.item() for size in all_sizes)
+
+                # Pad if necessary for gathering
+                if outputs.shape[0] < max_size:
+                    padding = torch.zeros(max_size - outputs.shape[0], device=outputs.device, dtype=outputs.dtype)
+                    outputs_padded = torch.cat([outputs, padding], dim=0).to(self.device)
+                else:
+                    outputs_padded = outputs.to(self.device)
+
+                gathered_outputs = [torch.empty(max_size, device=self.device, dtype=outputs.dtype)
+                                for _ in range(world_size)]
+                dist.all_gather(gathered_outputs, outputs_padded.contiguous())
+
+                # Trim padding and concatenate
+                trimmed_outputs = []
+                for rank, size in enumerate(all_sizes):
+                    trimmed_outputs.append(gathered_outputs[rank][:size.item()])
+
+                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(N, N, N).float()
+            else:
+                pred_full = outputs.reshape(N, N, N).float()
+                
+                
+        self._obj = pred_full.detach().cpu()
+            
+    
+    @property
+    def model(self):
+        
+        return self._model
+    
+    @model.setter
+    def model(self, model):
+        
+        self._model = model
+    
+    
+    def apply_soft_constraints(
+        self,
+        coords: torch.Tensor,
+    ):
+        
+        soft_loss = torch.tensor(0.0, device = coords.device)
+        if self.soft_constraints["tv_vol"] > 0:
+            
+            num_tv_samples = min(10000, coords.shape[0])
+            tv_indices = torch.randperm(coords.shape[0], device = coords.device)[:num_tv_samples]
+            
+            # Rerun forward for gradient tracking
+            tv_coords = coords[tv_indices].detach().requires_grad_(True)
+            
+            tv_densities_recomputed = self.model(tv_coords)
+            if tv_densities_recomputed.dim() > 1:
+                tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+                
+            # Compute gradients
+            grad_outputs = torch.autograd.grad(
+                outputs=tv_densities_recomputed,
+                inputs=tv_coords,
+                grad_outputs=torch.ones_like(tv_densities_recomputed),
+                create_graph=True
+            )[0]
+            
+            grad_norm = torch.norm(grad_outputs, dim = 1)
+            soft_loss += self.soft_constraints["tv_vol"] * grad_norm.mean()
+        
+        return soft_loss
+    
+    def forward(
+        self,
+        all_coords: torch.Tensor,     
+    ):
+        
+        all_densities = self.model(all_coords)
+        
+        if all_densities.dim() > 1:
+            all_densities = all_densities.squeeze(-1)
+            
+        valid_mask = (
+            (all_coords[:, 0] >= -1) & (all_coords[:, 0] <= 1) &
+            (all_coords[:, 1] >= -1) & (all_coords[:, 1] <= 1) &
+            (all_coords[:, 2] >= -1) & (all_coords[:, 2] <= 1)
+        ).float()
+        
+        all_densities = all_densities * valid_mask
+        
+        return all_densities
+        
+        
+
+ObjectModelType = ObjectVoxelwise | ObjectINN # | ObjectDIP | ObjectImplicit (ObjectFFN?)
