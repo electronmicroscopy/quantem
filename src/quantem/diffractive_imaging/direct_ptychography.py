@@ -35,6 +35,15 @@ else:
         import torch
 
 
+from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
+from quantem.diffractive_imaging.direct_ptycho_utils import (
+    _bin_mask_and_stack_centered,
+    _fourier_shift_stack,
+    _make_periodic_pairs,
+    _synchronize_shifts,
+    _torch_polar,
+)
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
@@ -602,3 +611,74 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             rotation_angle=rotation_angle,
             **reconstruct_kwargs,
         )
+
+    def fit_low_order_aberrations(
+        self, bin_factors: tuple[int] = (7, 6, 5, 4, 3, 2, 1), pair_connectivity: int = 4
+    ):
+        """ """
+        bf_mask = self.bf_mask
+        inds_i, inds_j = self._bf_inds_i, self._bf_inds_j
+
+        vbf_stack = self.vbf_stack.clone()
+        global_shifts = torch.zeros((self.num_bf, 2), device=self.device)
+
+        for bin_factor in bin_factors:
+            bf_mask_binned, inds_ib, inds_jb, vbf_binned, mapping = _bin_mask_and_stack_centered(
+                bf_mask, inds_i, inds_j, vbf_stack, bin_factor=bin_factor
+            )
+
+            pairs = _make_periodic_pairs(bf_mask_binned, connectivity=pair_connectivity)
+
+            rel_shifts = []
+            for i, j in pairs:
+                s_ij, _ = cross_correlation_shift_torch(
+                    vbf_binned[i],
+                    vbf_binned[j],
+                    upsample_factor=1,
+                )
+                rel_shifts.append((i.item(), j.item(), s_ij))
+
+            shifts = _synchronize_shifts(len(vbf_binned), rel_shifts, self.device)
+
+            global_shifts += shifts[mapping]
+            vbf_stack = _fourier_shift_stack(self.vbf_stack, global_shifts)
+
+        self.corrected_stack = vbf_stack
+
+        kxa, kya = spatial_frequencies(
+            self.gpts,
+            self.sampling,
+            device=self.device,
+        )
+        kvec = torch.dstack((kxa[bf_mask], kya[bf_mask])).view((-1, 2))
+        basis = kvec * self.wavelength
+
+        shifts_ang = (global_shifts * torch.as_tensor(self.scan_sampling)).to(
+            dtype=basis.dtype, device=basis.device
+        )
+
+        # least-squares fit
+        m = torch.linalg.lstsq(basis, shifts_ang, rcond=None)[0]
+
+        m_rotation, m_aberration = _torch_polar(m)
+        rotation_rad = -1 * torch.arctan2(m_rotation[1, 0], m_rotation[0, 0])
+
+        if 2 * torch.abs(torch.remainder(rotation_rad + math.pi, 2 * math.pi) - math.pi) > math.pi:
+            rotation_rad = torch.remainder(rotation_rad, 2 * math.pi) - math.pi
+            m_aberration = -m_aberration
+
+        aberrations_C1 = (m_aberration[0, 0] + m_aberration[1, 1]) / 2
+        aberrations_C12a = (m_aberration[0, 0] - m_aberration[1, 1]) / 2
+        aberrations_C12b = (m_aberration[1, 0] + m_aberration[0, 1]) / 2
+
+        aberrations_C12 = torch.sqrt(aberrations_C12a.square() + aberrations_C12b.square())
+        aberrations_phi12 = torch.arctan2(aberrations_C12b, aberrations_C12a) / 2
+
+        self._fitted_aberrations = {
+            "C10": aberrations_C1.item(),
+            "C12": aberrations_C12.item(),
+            "phi12": aberrations_phi12.item(),
+        }
+        self._fitted_rotation_angle = rotation_rad.item()
+
+        return self

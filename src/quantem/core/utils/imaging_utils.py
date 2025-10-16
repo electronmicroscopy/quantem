@@ -1,8 +1,10 @@
 # Utilities for processing images
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
 
@@ -159,6 +161,145 @@ def cross_correlation_shift(
         image_shifted = xp.real(xp.fft.ifft2(F_im_shifted))
 
     return shifts, image_shifted
+
+
+def dft_upsample_torch(
+    F: torch.Tensor,
+    up: int,
+    shift: tuple[float, float],
+) -> torch.Tensor:
+    """
+    Matrix multiplication DFT upsampling (Guizar-Sicairos et al., Opt. Lett. 33, 156–158, 2008)
+    Torch-native version with complex arithmetic.
+
+    Parameters
+    ----------
+    F : (M, N) complex tensor
+        Fourier-space correlation matrix.
+    up : int
+        Upsampling factor (integer).
+    shift : (float, float)
+        Subpixel shift (row, col) for region center.
+
+    Returns
+    -------
+    local_cc : (2*ceil(1.5*up)+1, 2*ceil(1.5*up)+1) real tensor
+        Local upsampled cross-correlation.
+    """
+    device = F.device
+    M, N = F.shape
+    du = int(math.ceil(1.5 * up))
+    rows = torch.arange(-du, du + 1, device=device)
+    cols = torch.arange(-du, du + 1, device=device)
+
+    r_shift = shift[0] - M // 2
+    c_shift = shift[1] - N // 2
+
+    # Frequency indices (centered)
+    m = torch.fft.ifftshift(torch.arange(M, device=device)) - M // 2 + r_shift
+    n = torch.fft.ifftshift(torch.arange(N, device=device)) - N // 2 + c_shift
+
+    # Outer-product exponentials
+    kern_row = torch.exp(-2j * math.pi / (M * up) * rows[:, None] * m[None, :])
+    kern_col = torch.exp(-2j * math.pi / (N * up) * n[:, None] * cols[None, :])
+
+    local_cc = torch.real(kern_row @ F @ kern_col)
+    return local_cc
+
+
+def cross_correlation_shift_torch(
+    im_ref: torch.Tensor,
+    im: torch.Tensor,
+    upsample_factor: int = 1,
+    max_shift: float | None = None,
+    return_shifted_image: bool = False,
+    fft_input: bool = False,
+    fft_output: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Estimate subpixel shift between two 2D images using Fourier cross-correlation.
+    Torch-native version.
+
+    Returns
+    -------
+    shifts : (2,) tensor of floats (row_shift, col_shift)
+    shifted_image : optional, only if return_shifted_image=True
+    """
+    device = im_ref.device
+
+    # --- Fourier transforms
+    F_ref = im_ref if fft_input else torch.fft.fft2(im_ref)
+    F_im = im if fft_input else torch.fft.fft2(im)
+
+    # --- Cross-correlation
+    cc = F_ref * torch.conj(F_im)
+    cc /= torch.clamp(cc.abs(), min=1e-8)
+    cc_real = torch.real(torch.fft.ifft2(cc))
+
+    # --- Optional shift constraint mask
+    if max_shift is not None:
+        M, N = cc_real.shape
+        x = torch.fft.fftfreq(M, device=device) * M
+        y = torch.fft.fftfreq(N, device=device) * N
+        mask = (x[:, None] ** 2 + y[None, :] ** 2) >= max_shift**2
+        cc_real[mask] = 0.0
+
+    # --- Coarse peak
+    peak = torch.argmax(cc_real)
+    x0, y0 = torch.unravel_index(peak, cc_real.shape)
+
+    # --- Parabolic subpixel refinement
+    def parabolic_peak(v):
+        # v is 3-sample vector
+        return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0] + 1e-12)
+
+    M, N = cc_real.shape
+    x_inds = torch.remainder(x0 + torch.arange(-1, 2, device=device), M).long()
+    y_inds = torch.remainder(y0 + torch.arange(-1, 2, device=device), N).long()
+
+    vx = cc_real[x_inds, y0]
+    vy = cc_real[x0, y_inds]
+    dx = parabolic_peak(vx)
+    dy = parabolic_peak(vy)
+    x0 = (x0 + dx) % M
+    y0 = (y0 + dy) % N
+
+    # --- Fine subpixel DFT upsampling
+    if upsample_factor > 1:
+        local = dft_upsample_torch(cc, upsample_factor, (x0.item(), y0.item()))
+        peak = torch.argmax(local)
+        lx, ly = torch.unravel_index(peak, local.shape)
+        # secondary refinement
+        if 1 <= lx < local.shape[0] - 1 and 1 <= ly < local.shape[1] - 1:
+            icc = local[lx - 1 : lx + 2, ly - 1 : ly + 2]
+            dxf = parabolic_peak(icc[:, 1])
+            dyf = parabolic_peak(icc[1, :])
+        else:
+            dxf = dyf = 0.0
+        shift_sub = (
+            torch.tensor([x0, y0], device=device)
+            + (torch.tensor([lx, ly], device=device) - upsample_factor) / upsample_factor
+            + torch.tensor([dxf, dyf], device=device) / upsample_factor
+        )
+    else:
+        shift_sub = torch.tensor([x0, y0], device=device)
+
+    # --- Wrap to centered coordinates
+    shift_sub = (shift_sub + 0.5 * torch.tensor(cc_real.shape, device=device)) % torch.tensor(
+        cc_real.shape, device=device
+    ) - 0.5 * torch.tensor(cc_real.shape, device=device)
+
+    if not return_shifted_image:
+        return shift_sub, None
+
+    # --- Apply subpixel Fourier shift to im
+    kx = torch.fft.fftfreq(F_im.shape[0], device=device)[:, None]
+    ky = torch.fft.fftfreq(F_im.shape[1], device=device)[None, :]
+    phase_ramp = torch.exp(-2j * math.pi * (kx * shift_sub[0] + ky * shift_sub[1]))
+    F_im_shifted = F_im * phase_ramp
+    image_shifted = F_im_shifted if fft_output else torch.real(torch.fft.ifft2(F_im_shifted))
+
+    return shift_sub, image_shifted
 
 
 def bilinear_kde(
