@@ -653,7 +653,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         kvec = torch.dstack((kxa[bf_mask], kya[bf_mask])).view((-1, 2))
         basis = kvec * self.wavelength
 
-        shifts_ang = (global_shifts * torch.as_tensor(self.scan_sampling)).to(
+        shifts_ang = (global_shifts * torch.as_tensor(self.scan_sampling, device=self.device)).to(
             dtype=basis.dtype, device=basis.device
         )
 
