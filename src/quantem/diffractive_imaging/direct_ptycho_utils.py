@@ -10,6 +10,11 @@ else:
 
 import math
 
+from tqdm.auto import tqdm
+
+from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
+from quantem.diffractive_imaging.complex_probe import spatial_frequencies
+
 
 def _synchronize_shifts(num_nodes, rel_shifts, device):
     """
@@ -93,6 +98,39 @@ def _make_periodic_pairs(
         pairs = pairs[torch.randperm(len(pairs))[:max_pairs]]
 
     return pairs
+
+
+def _compute_pairwise_shifts(
+    vbf_stack: torch.Tensor,
+    pairs: torch.Tensor,
+    upsample_factor: int = 1,
+) -> list[tuple[int, int, torch.Tensor]]:
+    """
+    Compute relative shifts between pairs of virtual BF images.
+
+    Parameters
+    ----------
+    vbf_stack : torch.Tensor
+        (N, H, W) stack of virtual BF images
+    pairs : torch.Tensor
+        (M, 2) pairs of indices to correlate
+    upsample_factor : int
+        Upsampling factor for subpixel accuracy
+
+    Returns
+    -------
+    rel_shifts : list of (i, j, shift_ij)
+        Relative shifts between each pair
+    """
+    rel_shifts = []
+    for i, j in pairs:
+        s_ij, _ = cross_correlation_shift_torch(
+            vbf_stack[i],
+            vbf_stack[j],
+            upsample_factor=upsample_factor,
+        )
+        rel_shifts.append((i.item(), j.item(), s_ij))
+    return rel_shifts
 
 
 def _bin_mask_and_stack_centered(
@@ -223,6 +261,127 @@ def _fourier_shift_stack(images: torch.Tensor, shifts: torch.Tensor):
     shifted = torch.fft.ifft2(shifted_fft, dim=(-2, -1)).real
 
     return shifted.to(dtype)
+
+
+def _align_vbf_stack_multiscale(
+    vbf_stack: torch.Tensor,
+    bf_mask: torch.Tensor,
+    inds_i: torch.Tensor,
+    inds_j: torch.Tensor,
+    bin_factors: tuple[int, ...],
+    pair_connectivity: int = 4,
+    upsample_factor: int = 1,
+    verbose: int | bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Align virtual BF stack using multi-scale coarse-to-fine approach.
+
+    Parameters
+    ----------
+    vbf_stack : torch.Tensor
+        (N, H, W) stack of virtual BF images to align
+    bf_mask : torch.BoolTensor
+        (Q, R) corner-centered mask of valid BF positions
+    inds_i, inds_j : torch.Tensor
+        Corner-centered coordinates for each vBF
+    bin_factors : tuple of int
+        Sequence of binning factors from coarse to fine (e.g., (7, 6, 5, 4, 3, 2, 1))
+    pair_connectivity : int
+        Number of neighbors for pairwise alignment (4 or 8)
+    device : torch.device
+        Device to use for computation
+
+    Returns
+    -------
+    global_shifts : torch.Tensor
+        (N, 2) computed shifts in pixels for each vBF
+    aligned_stack : torch.Tensor
+        (N, H, W) aligned virtual BF stack
+    """
+
+    device = vbf_stack.device
+    N = len(vbf_stack)
+    global_shifts = torch.zeros((N, 2), device=device)
+
+    pbar = tqdm(range(len(bin_factors)), disable=not verbose)
+    for bin_factor in bin_factors:
+        # Bin the mask and stack
+        bf_mask_binned, inds_ib, inds_jb, vbf_binned, mapping = _bin_mask_and_stack_centered(
+            bf_mask, inds_i, inds_j, vbf_stack, bin_factor=bin_factor
+        )
+
+        # Create neighbor pairs for correlation
+        pairs = _make_periodic_pairs(bf_mask_binned, connectivity=pair_connectivity)
+
+        # Compute pairwise shifts
+        rel_shifts = _compute_pairwise_shifts(vbf_binned, pairs, upsample_factor=upsample_factor)
+
+        # Solve for global shifts via synchronization
+        shifts = _synchronize_shifts(len(vbf_binned), rel_shifts, device)
+
+        # Accumulate shifts and apply to full-resolution stack
+        global_shifts += shifts[mapping]
+        vbf_stack = _fourier_shift_stack(vbf_stack, shifts[mapping])
+        pbar.update(n=1)
+    pbar.close()
+
+    return global_shifts, vbf_stack
+
+
+def _fit_aberrations_from_shifts(
+    shifts_px: torch.Tensor,
+    bf_mask: torch.BoolTensor,
+    wavelength: float,
+    gpts: tuple[int, int],
+    sampling: tuple[float, float],
+    scan_sampling: tuple[float, float],
+) -> dict[str, float]:
+    """ """
+    device = shifts_px.device
+
+    # Get spatial frequencies at BF positions
+    kxa, kya = spatial_frequencies(gpts, sampling, device=device)
+    kvec = torch.dstack((kxa[bf_mask], kya[bf_mask])).view((-1, 2))
+    basis = kvec * wavelength
+    scan_s = torch.as_tensor(scan_sampling, device=device)
+
+    # Convert shifts to physical units (Angstroms)
+    shifts_ang = (shifts_px * scan_s).to(dtype=basis.dtype, device=device)
+
+    # Least-squares fit: shifts = basis @ M
+    M = torch.linalg.lstsq(basis, shifts_ang, rcond=None)[0]
+
+    # Decompose M = R @ A (rotation × aberration)
+    M_rotation, M_aberration = _torch_polar(M)
+
+    # Extract rotation angle
+    rotation_rad = -torch.arctan2(M_rotation[1, 0], M_rotation[0, 0])
+
+    # Handle angle wrapping and sign conventions
+    if 2 * torch.abs(torch.remainder(rotation_rad + math.pi, 2 * math.pi) - math.pi) > math.pi:
+        rotation_rad = torch.remainder(rotation_rad, 2 * math.pi) - math.pi
+        M_aberration = -M_aberration
+
+    # Extract aberration coefficients from symmetric matrix
+    a = M_aberration[0, 0]
+    b = (M_aberration[1, 0] + M_aberration[0, 1]) / 2  # Symmetrize
+    c = M_aberration[1, 1]
+
+    # Defocus (isotropic component)
+    C10 = (a + c) / 2
+
+    # 2-fold astigmatism (anisotropic component)
+    C12a = (a - c) / 2
+    C12b = b
+    C12 = torch.sqrt(C12a**2 + C12b**2)
+    phi12 = torch.arctan2(C12b, C12a) / 2
+
+    return {
+        "C10": C10.item(),
+        "C12": C12.item(),
+        "phi12": phi12.item(),
+        "rotation_angle": rotation_rad.item(),
+    }
 
 
 def _torch_polar(m: torch.Tensor):
