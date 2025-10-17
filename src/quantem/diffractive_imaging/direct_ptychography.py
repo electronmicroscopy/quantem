@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Tuple
 import numpy as np
 import optuna
 from numpy.typing import NDArray
+from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d
@@ -14,6 +15,7 @@ from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.core.utils.validators import (
     validate_aberration_coefficients,
     validate_gt,
+    validate_int,
     validate_tensor,
 )
 from quantem.diffractive_imaging.complex_probe import (
@@ -33,7 +35,6 @@ if TYPE_CHECKING:
 else:
     if config.get("has_torch"):
         import torch
-
 
 from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
 from quantem.diffractive_imaging.direct_ptycho_utils import (
@@ -68,9 +69,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs: dict,
         semiangle_cutoff: float | None,
         soft_edges: bool,
-        vacuum_probe_intensity: torch.Tensor | None,
         rng: np.random.Generator | int | None,
         device: str | int,
+        verbose: int | bool,
         _token: object | None = None,
     ):
         """ """
@@ -80,6 +81,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             )
 
         self.device = device
+        self.verbose = verbose
         self.vbf_stack = vbf_dataset.array
         self.bf_mask = bf_mask_dataset.array
 
@@ -88,14 +90,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.scan_sampling = vbf_dataset.sampling[-2:]
         self.scan_gpts = vbf_dataset.shape[-2:]
         self.num_bf = vbf_dataset.shape[0]
-
-        if semiangle_cutoff is None and vacuum_probe_intensity is None:
-            raise ValueError(
-                "one of semiangle_cutoff or vacuum_probe_intensity needs to be specified"
-            )
-
         self.semiangle_cutoff = semiangle_cutoff
-        self.vacuum_probe_intensity = vacuum_probe_intensity
         self.soft_edges = soft_edges
         self.rng = rng
 
@@ -118,10 +113,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float,
         aberration_coefs: dict,
         semiangle_cutoff: float | None = None,
-        vacuum_probe_intensity: torch.Tensor | None = None,
         soft_edges: bool = True,
         rng: np.random.Generator | int | None = None,
         device: str | int = "cpu",
+        verbose: int | bool = True,
     ):
         """ """
 
@@ -132,10 +127,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
-            vacuum_probe_intensity=vacuum_probe_intensity,
             soft_edges=soft_edges,
             rng=rng,
             device=device,
+            verbose=verbose,
             _token=cls._token,
         )
 
@@ -153,10 +148,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         intensity_threshold: float = 0.5,
-        vacuum_probe_intensity: torch.Tensor | None = None,
         soft_edges: bool = True,
         rng: np.random.Generator | int | None = None,
         device: str | int = "cpu",
+        verbose: int | bool = True,
     ):
         """ """
 
@@ -213,10 +208,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
-            vacuum_probe_intensity=vacuum_probe_intensity,
             soft_edges=soft_edges,
             rng=rng,
             device=device,
+            verbose=verbose,
             _token=cls._token,
         )
 
@@ -249,6 +244,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         qxa, qya = spatial_frequencies(scan_gpts, scan_sampling, device=self.device)
 
         return qxa, qya
+
+    @property
+    def verbose(self) -> int:
+        return self._verbose
+
+    @verbose.setter
+    def verbose(self, v: bool | int | float) -> None:
+        self._verbose = validate_int(validate_gt(v, -1, "verbose"), "verbose")
 
     @property
     def vbf_stack(self) -> torch.Tensor:
@@ -320,6 +323,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle=None,
         max_batch_size=None,
         flip_phase=True,
+        verbose=None,
     ):
         """ """
         if aberration_coefs is None:
@@ -331,6 +335,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             rotation_angle = self.rotation_angle
         else:
             rotation_angle = float(rotation_angle)
+
+        if verbose is None:
+            verbose = self.verbose
 
         if upsampling_factor is None:
             upsampling_factor = 1
@@ -372,6 +379,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             if max_batch_size is None:
                 max_batch_size = self.num_bf
 
+            pbar = tqdm(range(self.num_bf), disable=not verbose)
             batcher = SimpleBatcher(
                 self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
             )
@@ -385,7 +393,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 corrected_stack[batch_idx] = (
                     torch.fft.ifft2(vbf_fourier * operator[batch_idx]).real * upsampling_factor
                 )
+                pbar.update(len(batch_idx))
 
+            pbar.close()
             self.corrected_stack = corrected_stack
 
         return self
@@ -396,6 +406,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         upsampling_factor=None,
         rotation_angle=None,
         max_batch_size=None,
+        verbose=None,
     ):
         """ """
         if aberration_coefs is None:
@@ -407,6 +418,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             rotation_angle = self.rotation_angle
         else:
             rotation_angle = float(rotation_angle)
+
+        if verbose is None:
+            verbose = self.verbose
 
         if upsampling_factor is None:
             upsampling_factor = 1
@@ -433,6 +447,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if max_batch_size is None:
             max_batch_size = self.num_bf
 
+        pbar = tqdm(range(self.num_bf), disable=not verbose)
         batcher = SimpleBatcher(
             self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
         )
@@ -456,7 +471,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 cmplx_probe_at_k,
                 self.wavelength,
                 self.semiangle_cutoff,
-                self.vacuum_probe_intensity,
                 self.soft_edges,
                 angular_sampling=self.angular_sampling,
                 aberration_coefs=aberration_coefs,
@@ -469,18 +483,21 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             corrected_stack[batch_idx] = (
                 torch.fft.ifft2(vbf_fourier * gamma).imag * upsampling_factor
             )
+            pbar.update(len(batch_idx))
 
+        pbar.close()
         self.corrected_stack = corrected_stack
         return self
 
     def reconstruct(
         self,
-        use_parallax_approximation=False,
+        use_parallax_approximation=True,
         aberration_coefs=None,
         upsampling_factor=None,
         rotation_angle=None,
         max_batch_size=None,
         flip_phase=True,
+        verbose=None,
     ):
         """ """
         if use_parallax_approximation:
@@ -490,12 +507,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 upsampling_factor=upsampling_factor,
                 max_batch_size=max_batch_size,
                 flip_phase=flip_phase,
+                verbose=verbose,
             )
         else:
             self._kernel_deconvolution(
                 aberration_coefs=aberration_coefs,
                 rotation_angle=rotation_angle,
                 upsampling_factor=upsampling_factor,
+                verbose=verbose,
             )
 
         return self
@@ -529,8 +548,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def optimize_hyperparameters(
         self,
-        aberration_coefs: dict[str, float | OptimizationParameter] = None,
-        rotation_angle: float | OptimizationParameter = None,
+        aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
+        rotation_angle: float | OptimizationParameter | None = None,
         n_trials=50,
         sampler=None,
         show_progress_bar=True,
@@ -583,6 +602,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.reconstruct(
                 aberration_coefs=trial_aberrations,
                 rotation_angle=rot,
+                verbose=False,
                 **reconstruct_kwargs,
             )
             loss = self.variance_loss()
@@ -591,9 +611,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         study = optuna.create_study(direction="minimize", sampler=sampler)
         study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
 
-        self._hyperparameters_study = study
-        self._best_hyperparameters = study.best_params
-        self._reconstruct_optimized(**reconstruct_kwargs)
+        self._optimization_study = study
+        self._optimized_parameters = study.best_params
+        self._reconstruct_optimized(verbose=False, **reconstruct_kwargs)
         return self
 
     def _reconstruct_optimized(
@@ -601,10 +621,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         **reconstruct_kwargs,
     ):
         """ """
-        if not hasattr(self, "_best_hyperparameters"):
+        if not hasattr(self, "_optimized_parameters"):
             raise ValueError("run self.optimize_hyperparameters first.")
 
-        aberration_coefs = self._best_hyperparameters.copy()
+        aberration_coefs = self._optimized_parameters.copy()
         rotation_angle = aberration_coefs.pop("rotation_angle", None)
         return self.reconstruct(
             aberration_coefs=aberration_coefs,
@@ -613,7 +633,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         )
 
     def fit_low_order_aberrations(
-        self, bin_factors: tuple[int] = (7, 6, 5, 4, 3, 2, 1), pair_connectivity: int = 4
+        self,
+        bin_factors: tuple[int, ...] = (7, 6, 5, 4, 3, 2, 1),
+        pair_connectivity: int = 4,
+        **reconstruct_kwargs,
     ):
         """ """
         bf_mask = self.bf_mask
@@ -622,6 +645,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         vbf_stack = self.vbf_stack.clone()
         global_shifts = torch.zeros((self.num_bf, 2), device=self.device)
 
+        pbar = tqdm(range(len(bin_factors)), disable=not self.verbose)
         for bin_factor in bin_factors:
             bf_mask_binned, inds_ib, inds_jb, vbf_binned, mapping = _bin_mask_and_stack_centered(
                 bf_mask, inds_i, inds_j, vbf_stack, bin_factor=bin_factor
@@ -642,7 +666,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
             global_shifts += shifts[mapping]
             vbf_stack = _fourier_shift_stack(self.vbf_stack, global_shifts)
+            pbar.update(1)
 
+        pbar.close()
         self.corrected_stack = vbf_stack
 
         kxa, kya = spatial_frequencies(
@@ -674,11 +700,28 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberrations_C12 = torch.sqrt(aberrations_C12a.square() + aberrations_C12b.square())
         aberrations_phi12 = torch.arctan2(aberrations_C12b, aberrations_C12a) / 2
 
-        self._fitted_aberrations = {
+        self._fitted_parameters = {
             "C10": aberrations_C1.item(),
             "C12": aberrations_C12.item(),
             "phi12": aberrations_phi12.item(),
+            "rotation_angle": rotation_rad.item(),
         }
-        self._fitted_rotation_angle = rotation_rad.item()
 
+        self._reconstruct_fitted(verbose=False, **reconstruct_kwargs)
         return self
+
+    def _reconstruct_fitted(
+        self,
+        **reconstruct_kwargs,
+    ):
+        """ """
+        if not hasattr(self, "_fitted_parameters"):
+            raise ValueError("run self.fit_low_order_aberrations first.")
+
+        aberration_coefs = self._fitted_parameters.copy()
+        rotation_angle = aberration_coefs.pop("rotation_angle", None)
+        return self.reconstruct(
+            aberration_coefs=aberration_coefs,
+            rotation_angle=rotation_angle,
+            **reconstruct_kwargs,
+        )
