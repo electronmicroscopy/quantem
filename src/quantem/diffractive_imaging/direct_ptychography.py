@@ -485,6 +485,112 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.corrected_stack = corrected_stack
         return self
 
+    def _icom_kernel_deconvolution(
+        self,
+        aberration_coefs=None,
+        upsampling_factor=None,
+        rotation_angle=None,
+        max_batch_size=None,
+        q_highpass=None,
+        verbose=None,
+    ):
+        """ """
+        if aberration_coefs is None:
+            aberration_coefs = self.aberration_coefs
+        else:
+            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
+
+        if rotation_angle is None:
+            rotation_angle = self.rotation_angle
+        else:
+            rotation_angle = float(rotation_angle)
+
+        if verbose is None:
+            verbose = self.verbose
+
+        if upsampling_factor is None:
+            upsampling_factor = 1
+        upsampling_factor = math.ceil(upsampling_factor)
+
+        kxa, kya = spatial_frequencies(
+            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+        )
+        qxa, qya = self._return_upsampled_qgrid(
+            upsampling_factor=upsampling_factor,
+        )
+
+        q2 = qxa.square() + qya.square()
+        q2[0, 0] = torch.inf
+        qx_op = -1.0j * qxa / q2
+        qy_op = -1.0j * qya / q2
+
+        env = torch.ones_like(q2)
+        if q_highpass:
+            butterworth_order = 12
+            env *= 1 - 1 / (1 + (torch.sqrt(q2) / q_highpass) ** (2 * butterworth_order))
+
+        k, phi = _polar_coordinates(kxa, kya)
+        alpha = k * self.wavelength
+        cmplx_probe = evaluate_probe(
+            alpha,
+            phi,
+            self.semiangle_cutoff,
+            self.angular_sampling,
+            self.wavelength,
+            aberration_coefs=aberration_coefs,
+        )
+
+        if max_batch_size is None:
+            max_batch_size = self.num_bf
+
+        pbar = tqdm(range(self.num_bf), disable=not verbose)
+        batcher = SimpleBatcher(
+            self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
+        )
+
+        corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
+
+        for batch_idx in batcher:
+            ind_i = self._bf_inds_i[batch_idx]
+            ind_j = self._bf_inds_j[batch_idx]
+
+            kx = kxa[ind_i, ind_j].view(-1, 1, 1)
+            ky = kya[ind_i, ind_j].view(-1, 1, 1)
+
+            qmkxa = qxa.unsqueeze(0) - kx
+            qmkya = qya.unsqueeze(0) - ky
+
+            qpkxa = qxa.unsqueeze(0) + kx
+            qpkya = qya.unsqueeze(0) + ky
+
+            cmplx_probe_at_k = cmplx_probe[ind_i, ind_j].view(-1, 1, 1)
+
+            gamma = gamma_factor(
+                (qmkxa, qmkya),
+                (qpkxa, qpkya),
+                cmplx_probe_at_k,
+                self.wavelength,
+                self.semiangle_cutoff,
+                self.soft_edges,
+                angular_sampling=self.angular_sampling,
+                aberration_coefs=aberration_coefs,
+            )
+
+            vbf_fourier = torch.tile(
+                self._vbf_fourier[batch_idx],
+                (1, upsampling_factor, upsampling_factor),
+            )
+
+            common_factor = vbf_fourier * gamma
+            icom_factor = (kx * qx_op + ky * qy_op) * env * common_factor
+            corrected_stack[batch_idx] = torch.fft.ifft2(icom_factor).imag * upsampling_factor
+
+            pbar.update(len(batch_idx))
+
+        pbar.close()
+        self.corrected_stack = corrected_stack
+        return self
+
     def reconstruct(
         self,
         use_parallax_approximation=True,
