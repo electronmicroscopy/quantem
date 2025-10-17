@@ -95,6 +95,7 @@ def _set_nested_value(target_dict, param_path, value):
     current = target_dict
     for part in parts[:-1]:
         current = current.setdefault(part, {})
+    current[parts[-1]] = value
 
 
 def _suggest_from_spec(trial, spec: Dict[str, Any], name: str) -> Any:
@@ -196,10 +197,11 @@ def _build_ptychography_instance(constructors, resolved_kwargs):
 
 def _build_ptycholite_instance(constructors, resolved_kwargs):
     """Build PtychoLite instance."""
-    ptycholite_kwargs = resolved_kwargs.get("ptycholite", {}).copy()
-    ptycholite_kwargs["verbose"] = False  # Force verbose=False during optimization
+    # FIX: Changed from "ptycholite" to "init"
+    init_kwargs = resolved_kwargs.get("init", {}).copy()
+    init_kwargs["verbose"] = False
 
-    return constructors["ptychography_class"](**ptycholite_kwargs)
+    return constructors["ptychography_class"](**init_kwargs)
 
 
 def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
@@ -212,6 +214,7 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
 
     # Reconstruct step
     reconstruct_kwargs = resolved_kwargs.get("reconstruct", {})
+    reconstruct_kwargs["verbose"] = False
     if reconstruct_kwargs:
         recon_obj.reconstruct(**reconstruct_kwargs)
 
@@ -270,7 +273,7 @@ def _OptimizePtychographyObjective(
                 raise ValueError("No ptychography_class constructor found.")
 
             constructor_name = str(main_constructor)
-            if "Ptycholite" in constructor_name:
+            if "PtychoLite" in constructor_name:
                 class_type = "ptycholite"
             elif "Ptychography" in constructor_name:
                 class_type = "ptychography"
@@ -394,7 +397,7 @@ class OptimizePtychography:
         direction: str = "minimize",
         study_kwargs: Optional[Dict[str, Any]] = None,
         unit: str = "trial",
-        verbose: bool = True,
+        verbose: bool = False,
     ):
         """Create optimizer from previous study, automatically using best values.
 
@@ -467,3 +470,90 @@ class OptimizePtychography:
             optuna.logging.set_verbosity(optuna.logging.INFO)
 
         return self
+
+    def visualize(self, figsize=(10, 6)):
+        """Visualize optimization results showing parameter values vs loss.
+
+        Args:
+            figsize: Figure size (width, height)
+            save_path: Optional path to save the figure
+
+        Returns:
+            matplotlib figure and axes objects
+
+        Example:
+            optimizer = OptimizePtychography.from_constructors(...)
+            optimizer.optimize()
+            optimizer.visualize()
+
+            # Or save to file
+            optimizer.visualize(save_path='optimization_results.png')
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        if not self.study.trials:
+            raise RuntimeError("No trials to plot. Run optimize() first.")
+
+        # Get completed trials
+        trials = [t for t in self.study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+
+        if not trials:
+            raise RuntimeError("No completed trials to plot.")
+
+        # Get parameter names (all parameters that were optimized)
+        param_names = list(trials[0].params.keys())
+
+        # Determine subplot layout
+        n_params = len(param_names)
+        n_cols = min(3, n_params)  # Max 3 columns
+        n_rows = (n_params + n_cols - 1) // n_cols  # Ceiling division
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+        axes = axes.flatten()
+
+        # Get best trial info
+        best_trial = self.study.best_trial
+        best_value = best_trial.value
+
+        # Plot each parameter
+        for idx, param_name in enumerate(param_names):
+            ax = axes[idx]
+
+            # Extract data
+            param_values = np.array([trial.params[param_name] for trial in trials])
+            losses = np.array([trial.value for trial in trials])
+
+            # Scatter plot
+            ax.scatter(param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5)
+
+            # Highlight best trial
+            best_param_value = best_trial.params[param_name]
+            ax.scatter(
+                [best_param_value],
+                [best_value],
+                color="red",
+                s=200,
+                marker="*",
+                edgecolors="black",
+                linewidth=1.5,
+                zorder=5,
+            )
+
+            # Vertical line at optimal parameter value
+            ax.axvline(best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7)
+
+            # Clean up parameter name for label (remove path prefixes)
+            clean_name = param_name.split(".")[-1]  # Get last part of dotted path
+
+            # Labels
+            ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
+            ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
+            ax.set_title(f"{param_name}", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+        # Hide unused subplots
+        for idx in range(n_params, len(axes)):
+            axes[idx].set_visible(False)
+
+        plt.tight_layout()
