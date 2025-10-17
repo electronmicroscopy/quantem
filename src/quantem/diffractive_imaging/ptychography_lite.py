@@ -107,7 +107,7 @@ class PtychoLite(Ptychography):
         }
 
         if polar_parameters is not None:
-            probe_params["polar_parameters"] = polar_parameters
+            probe_params.update(polar_parameters)
 
         probe_model = ProbePixelated.from_params(
             probe_params=probe_params,
