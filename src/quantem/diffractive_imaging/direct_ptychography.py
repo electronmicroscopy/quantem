@@ -624,26 +624,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self._optimization_study = study
         self._optimized_parameters = study.best_params
-        self._reconstruct_optimized(verbose=False, **reconstruct_kwargs)
+        self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
         return self
 
-    def _reconstruct_optimized(
-        self,
-        **reconstruct_kwargs,
-    ):
-        """ """
-        if not hasattr(self, "_optimized_parameters"):
-            raise ValueError("run self.optimize_hyperparameters first.")
-
-        aberration_coefs = self._optimized_parameters.copy()
-        rotation_angle = aberration_coefs.pop("rotation_angle", None)
-        return self.reconstruct(
-            aberration_coefs=aberration_coefs,
-            rotation_angle=rotation_angle,
-            **reconstruct_kwargs,
-        )
-
-    def fit_low_order_aberrations(
+    def fit_hyperparameters(
         self,
         bin_factors: tuple[int, ...] = (7, 6, 5, 4, 3, 2, 1),
         pair_connectivity: int = 4,
@@ -671,16 +655,32 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self.corrected_stack = vbf_stack
         self._fitted_parameters = fit_results
-        self._reconstruct_fitted(verbose=False, **reconstruct_kwargs)
+        self.reconstruct_with_fitted_parameters(verbose=False, **reconstruct_kwargs)
         return self
 
-    def _reconstruct_fitted(
+    def reconstruct_with_optimized_parameters(
+        self,
+        **reconstruct_kwargs,
+    ):
+        """ """
+        if not hasattr(self, "_optimized_parameters"):
+            raise ValueError("run self.optimize_hyperparameters first.")
+
+        aberration_coefs = self._optimized_parameters.copy()
+        rotation_angle = aberration_coefs.pop("rotation_angle", None)
+        return self.reconstruct(
+            aberration_coefs=aberration_coefs,
+            rotation_angle=rotation_angle,
+            **reconstruct_kwargs,
+        )
+
+    def reconstruct_with_fitted_parameters(
         self,
         **reconstruct_kwargs,
     ):
         """ """
         if not hasattr(self, "_fitted_parameters"):
-            raise ValueError("run self.fit_low_order_aberrations first.")
+            raise ValueError("run self.fit_hyperparameters first.")
 
         aberration_coefs = self._fitted_parameters.copy()
         rotation_angle = aberration_coefs.pop("rotation_angle", None)
