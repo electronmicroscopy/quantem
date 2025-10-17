@@ -24,7 +24,6 @@ from quantem.diffractive_imaging.complex_probe import (
     aberration_surface_cartesian_gradients,
     evaluate_probe,
     gamma_factor,
-    polar_spatial_frequencies,
     spatial_frequencies,
 )
 from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
@@ -312,213 +311,69 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             except AttributeError:
                 pass
 
-    def _parallax_approximation(
-        self,
-        aberration_coefs=None,
-        upsampling_factor=None,
-        rotation_angle=None,
-        max_batch_size=None,
-        flip_phase=True,
-        verbose=None,
+    def _compute_parallax_operator(
+        self, alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=True
     ):
-        """ """
-        if aberration_coefs is None:
-            aberration_coefs = self.aberration_coefs
-        else:
-            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
-
-        if rotation_angle is None:
-            rotation_angle = self.rotation_angle
-        else:
-            rotation_angle = float(rotation_angle)
-
-        if verbose is None:
-            verbose = self.verbose
-
-        if upsampling_factor is None:
-            upsampling_factor = 1
-        upsampling_factor = math.ceil(upsampling_factor)
-
-        if aberration_coefs:
-            k, phi = polar_spatial_frequencies(
-                self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
-            )
-            alpha = k * self.wavelength
-
-            dx, dy = aberration_surface_cartesian_gradients(
-                alpha,
-                phi,
-                aberration_coefs,
-            )
-
-            grad_k = torch.stack((dx[self.bf_mask], dy[self.bf_mask]), -1)
-
-            qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
-            qvec = torch.stack((qxa, qya), 0)
-
-            grad_kq = torch.einsum("na,amp->nmp", grad_k, qvec)
-            operator = torch.exp(-1j * grad_kq)
-
-            if flip_phase:
-                q = torch.sqrt(qxa.square() + qya.square())
-                theta = torch.arctan2(qya, qxa)
-
-                chi_q = aberration_surface(
-                    q * self.wavelength,
-                    theta,
-                    self.wavelength,
-                    aberration_coefs,
-                )
-                sign_sign_chi_q = torch.sign(torch.sin(chi_q))
-                operator = operator * sign_sign_chi_q
-
-            if max_batch_size is None:
-                max_batch_size = self.num_bf
-
-            pbar = tqdm(range(self.num_bf), disable=not verbose)
-            batcher = SimpleBatcher(
-                self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
-            )
-
-            corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
-            for batch_idx in batcher:
-                vbf_fourier = torch.tile(
-                    self._vbf_fourier[batch_idx],
-                    (1, upsampling_factor, upsampling_factor),
-                )
-                corrected_stack[batch_idx] = (
-                    torch.fft.ifft2(vbf_fourier * operator[batch_idx]).real * upsampling_factor
-                )
-                pbar.update(len(batch_idx))
-
-            pbar.close()
-            self.corrected_stack = corrected_stack
-
-        return self
-
-    def _kernel_deconvolution(
-        self,
-        aberration_coefs=None,
-        upsampling_factor=None,
-        rotation_angle=None,
-        max_batch_size=None,
-        verbose=None,
-    ):
-        """ """
-        if aberration_coefs is None:
-            aberration_coefs = self.aberration_coefs
-        else:
-            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
-
-        if rotation_angle is None:
-            rotation_angle = self.rotation_angle
-        else:
-            rotation_angle = float(rotation_angle)
-
-        if verbose is None:
-            verbose = self.verbose
-
-        if upsampling_factor is None:
-            upsampling_factor = 1
-        upsampling_factor = math.ceil(upsampling_factor)
-
-        kxa, kya = spatial_frequencies(
-            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
-        )
-        qxa, qya = self._return_upsampled_qgrid(
-            upsampling_factor=upsampling_factor,
-        )
-
-        k, phi = _polar_coordinates(kxa, kya)
-        alpha = k * self.wavelength
-        cmplx_probe = evaluate_probe(
+        """Compute parallax approximation operator."""
+        dx, dy = aberration_surface_cartesian_gradients(
             alpha,
             phi,
-            self.semiangle_cutoff,
-            self.angular_sampling,
-            self.wavelength,
-            aberration_coefs=aberration_coefs,
+            aberration_coefs,
         )
+        grad_k = torch.stack((dx[self.bf_mask], dy[self.bf_mask]), -1)
 
-        if max_batch_size is None:
-            max_batch_size = self.num_bf
+        qvec = torch.stack((qxa, qya), 0)
+        grad_kq = torch.einsum("na,amp->nmp", grad_k, qvec)
+        operator = torch.exp(-1j * grad_kq)
 
-        pbar = tqdm(range(self.num_bf), disable=not verbose)
-        batcher = SimpleBatcher(
-            self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
-        )
-
-        corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
-        for batch_idx in batcher:
-            ind_i = self._bf_inds_i[batch_idx]
-            ind_j = self._bf_inds_j[batch_idx]
-
-            qmkxa = qxa.unsqueeze(0) - kxa[ind_i, ind_j].view(-1, 1, 1)
-            qmkya = qya.unsqueeze(0) - kya[ind_i, ind_j].view(-1, 1, 1)
-
-            qpkxa = qxa.unsqueeze(0) + kxa[ind_i, ind_j].view(-1, 1, 1)
-            qpkya = qya.unsqueeze(0) + kya[ind_i, ind_j].view(-1, 1, 1)
-
-            cmplx_probe_at_k = cmplx_probe[ind_i, ind_j].view(-1, 1, 1)
-
-            gamma = gamma_factor(
-                (qmkxa, qmkya),
-                (qpkxa, qpkya),
-                cmplx_probe_at_k,
+        if flip_phase:
+            q = torch.sqrt(qxa.square() + qya.square())
+            theta = torch.arctan2(qya, qxa)
+            chi_q = aberration_surface(
+                q * self.wavelength,
+                theta,
                 self.wavelength,
-                self.semiangle_cutoff,
-                self.soft_edges,
-                angular_sampling=self.angular_sampling,
-                aberration_coefs=aberration_coefs,
+                aberration_coefs,
             )
+            sign_sign_chi_q = torch.sign(torch.sin(chi_q))
+            operator = operator * sign_sign_chi_q
 
-            vbf_fourier = torch.tile(
-                self._vbf_fourier[batch_idx],
-                (1, upsampling_factor, upsampling_factor),
-            )
-            corrected_stack[batch_idx] = (
-                torch.fft.ifft2(vbf_fourier * gamma).imag * upsampling_factor
-            )
-            pbar.update(len(batch_idx))
+        return operator
 
-        pbar.close()
-        self.corrected_stack = corrected_stack
-        return self
-
-    def _icom_kernel_deconvolution(
-        self,
-        aberration_coefs=None,
-        upsampling_factor=None,
-        rotation_angle=None,
-        max_batch_size=None,
-        q_highpass=None,
-        verbose=None,
+    def _compute_gamma_operator(
+        self, kxa, kya, qxa, qya, cmplx_probe, batch_idx, asymmetric_version=True, normalize=True
     ):
-        """ """
-        if aberration_coefs is None:
-            aberration_coefs = self.aberration_coefs
-        else:
-            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
+        """Compute gamma deconvolution operator."""
+        ind_i = self._bf_inds_i[batch_idx]
+        ind_j = self._bf_inds_j[batch_idx]
 
-        if rotation_angle is None:
-            rotation_angle = self.rotation_angle
-        else:
-            rotation_angle = float(rotation_angle)
+        kx = kxa[ind_i, ind_j].view(-1, 1, 1)
+        ky = kya[ind_i, ind_j].view(-1, 1, 1)
 
-        if verbose is None:
-            verbose = self.verbose
+        qmkxa = qxa.unsqueeze(0) - kx
+        qmkya = qya.unsqueeze(0) - ky
+        qpkxa = qxa.unsqueeze(0) + kx
+        qpkya = qya.unsqueeze(0) + ky
 
-        if upsampling_factor is None:
-            upsampling_factor = 1
-        upsampling_factor = math.ceil(upsampling_factor)
+        cmplx_probe_at_k = cmplx_probe[ind_i, ind_j].view(-1, 1, 1)
 
-        kxa, kya = spatial_frequencies(
-            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+        gamma = gamma_factor(
+            (qmkxa, qmkya),
+            (qpkxa, qpkya),
+            cmplx_probe_at_k,
+            self.wavelength,
+            self.semiangle_cutoff,
+            self.soft_edges,
+            angular_sampling=self.angular_sampling,
+            aberration_coefs=self.aberration_coefs,
+            asymmetric_version=asymmetric_version,
+            normalize=normalize,
         )
-        qxa, qya = self._return_upsampled_qgrid(
-            upsampling_factor=upsampling_factor,
-        )
 
+        return gamma
+
+    def _compute_icom_weighting(self, qxa, qya, kxa, kya, batch_idx, q_highpass=None):
+        """Compute iCOM Fourier-space weighting factors."""
         q2 = qxa.square() + qya.square()
         q2[0, 0] = torch.inf
         qx_op = -1.0j * qxa / q2
@@ -529,20 +384,103 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             butterworth_order = 12
             env *= 1 - 1 / (1 + (torch.sqrt(q2) / q_highpass) ** (2 * butterworth_order))
 
-        k, phi = _polar_coordinates(kxa, kya)
-        alpha = k * self.wavelength
-        cmplx_probe = evaluate_probe(
-            alpha,
-            phi,
-            self.semiangle_cutoff,
-            self.angular_sampling,
-            self.wavelength,
-            aberration_coefs=aberration_coefs,
-        )
+        ind_i = self._bf_inds_i[batch_idx]
+        ind_j = self._bf_inds_j[batch_idx]
+        kx = kxa[ind_i, ind_j].view(-1, 1, 1)
+        ky = kya[ind_i, ind_j].view(-1, 1, 1)
+
+        icom_weighting = (kx * qx_op + ky * qy_op) * env
+
+        return icom_weighting
+
+    def reconstruct(
+        self,
+        aberration_coefs=None,
+        upsampling_factor=None,
+        rotation_angle=None,
+        max_batch_size=None,
+        use_parallax_approximation=False,
+        use_center_of_mass_weighting=False,
+        flip_phase=True,
+        q_highpass=None,
+        verbose=None,
+    ):
+        """
+        Unified reconstruction method supporting multiple deconvolution techniques.
+
+        Parameters
+        ----------
+        aberration_coefs : dict, optional
+            Aberration coefficients for the probe
+        upsampling_factor : int, optional
+            Factor by which to upsample the reconstruction
+        rotation_angle : float, optional
+            Rotation angle for coordinate system
+        max_batch_size : int, optional
+            Maximum batch size for processing
+        use_parallax_approximation : bool, optional
+            If True, use parallax approximation method
+        use_center_of_mass_weighting : bool, optional
+            If True, apply iCOM Fourier-space weighting
+        flip_phase : bool, optional
+            If True, flip phase in parallax approximation (default: True)
+        q_highpass : float, optional
+            High-pass filter cutoff for iCOM weighting
+        verbose : bool, optional
+            If True, show progress bar
+
+        Returns
+        -------
+        self
+            Returns self with corrected_stack attribute set
+        """
+        # Validate and set parameters
+        if aberration_coefs is None:
+            aberration_coefs = self.aberration_coefs
+        else:
+            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
+
+        if rotation_angle is None:
+            rotation_angle = self.rotation_angle
+        else:
+            rotation_angle = float(rotation_angle)
+
+        if verbose is None:
+            verbose = self.verbose
+
+        if upsampling_factor is None:
+            upsampling_factor = 1
+        upsampling_factor = math.ceil(upsampling_factor)
 
         if max_batch_size is None:
             max_batch_size = self.num_bf
 
+        # Get upsampled q-space grid
+        qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
+        # Gamma deconvolution: need k-space grid and probe
+        kxa, kya = spatial_frequencies(
+            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+        )
+        k, phi = _polar_coordinates(kxa, kya)
+        alpha = k * self.wavelength
+
+        # Compute operator based on method
+        if use_parallax_approximation:
+            # Parallax approximation: compute operator once for all batches
+            operator = self._compute_parallax_operator(
+                alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=flip_phase
+            )
+        else:
+            cmplx_probe = evaluate_probe(
+                alpha,
+                phi,
+                self.semiangle_cutoff,
+                self.angular_sampling,
+                self.wavelength,
+                aberration_coefs=aberration_coefs,
+            )
+
+        # Process batches
         pbar = tqdm(range(self.num_bf), disable=not verbose)
         batcher = SimpleBatcher(
             self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
@@ -551,75 +489,44 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
 
         for batch_idx in batcher:
-            ind_i = self._bf_inds_i[batch_idx]
-            ind_j = self._bf_inds_j[batch_idx]
-
-            kx = kxa[ind_i, ind_j].view(-1, 1, 1)
-            ky = kya[ind_i, ind_j].view(-1, 1, 1)
-
-            qmkxa = qxa.unsqueeze(0) - kx
-            qmkya = qya.unsqueeze(0) - ky
-
-            qpkxa = qxa.unsqueeze(0) + kx
-            qpkya = qya.unsqueeze(0) + ky
-
-            cmplx_probe_at_k = cmplx_probe[ind_i, ind_j].view(-1, 1, 1)
-
-            gamma = gamma_factor(
-                (qmkxa, qmkya),
-                (qpkxa, qpkya),
-                cmplx_probe_at_k,
-                self.wavelength,
-                self.semiangle_cutoff,
-                self.soft_edges,
-                angular_sampling=self.angular_sampling,
-                aberration_coefs=aberration_coefs,
-                asymmetric_version=False,
-                normalize=False,
-            )
-
+            # Tile the Fourier-space VBF images
             vbf_fourier = torch.tile(
                 self._vbf_fourier[batch_idx],
                 (1, upsampling_factor, upsampling_factor),
             )
 
-            common_factor = vbf_fourier * gamma
-            icom_factor = (kx * qx_op + ky * qy_op) * env * common_factor
-            corrected_stack[batch_idx] = torch.fft.ifft2(icom_factor).real * upsampling_factor
+            if use_parallax_approximation:
+                # Use pre-computed operator
+                fourier_factor = vbf_fourier * operator[batch_idx]
+            else:
+                # Compute gamma operator for this batch
+                gamma = self._compute_gamma_operator(
+                    kxa,
+                    kya,
+                    qxa,
+                    qya,
+                    cmplx_probe,
+                    batch_idx,
+                    asymmetric_version=not use_center_of_mass_weighting,
+                    normalize=not use_center_of_mass_weighting,
+                )
+                fourier_factor = vbf_fourier * gamma
 
+            # Apply iCOM weighting if requested
+            if use_center_of_mass_weighting:
+                icom_weighting = self._compute_icom_weighting(
+                    qxa, qya, kxa, kya, batch_idx, q_highpass
+                )
+                fourier_factor = fourier_factor * icom_weighting
+            elif not use_parallax_approximation:
+                fourier_factor = fourier_factor * 1.0j
+
+            # Inverse FFT and extract appropriate component
+            corrected_stack[batch_idx] = torch.fft.ifft2(fourier_factor).real * upsampling_factor
             pbar.update(len(batch_idx))
 
         pbar.close()
         self.corrected_stack = corrected_stack
-        return self
-
-    def reconstruct(
-        self,
-        use_parallax_approximation=True,
-        aberration_coefs=None,
-        upsampling_factor=None,
-        rotation_angle=None,
-        max_batch_size=None,
-        flip_phase=True,
-        verbose=None,
-    ):
-        """ """
-        if use_parallax_approximation:
-            self._parallax_approximation(
-                aberration_coefs=aberration_coefs,
-                rotation_angle=rotation_angle,
-                upsampling_factor=upsampling_factor,
-                max_batch_size=max_batch_size,
-                flip_phase=flip_phase,
-                verbose=verbose,
-            )
-        else:
-            self._kernel_deconvolution(
-                aberration_coefs=aberration_coefs,
-                rotation_angle=rotation_angle,
-                upsampling_factor=upsampling_factor,
-                verbose=verbose,
-            )
 
         return self
 
