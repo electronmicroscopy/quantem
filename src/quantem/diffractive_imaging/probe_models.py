@@ -154,10 +154,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             # Optionally fill all up to a given order with zeros
             if max_order is not None:
                 for sym in POLAR_SYMBOLS:
-                    if sym.startswith("C"):
-                        order = int(sym[1])
-                    elif sym.startswith("phi"):
-                        order = int(sym[3])
+                    if sym.startswith(("C", "phi")):
+                        order = int(sym[-2])
                     else:
                         continue
                     if order <= max_order and sym not in polar_parameters:

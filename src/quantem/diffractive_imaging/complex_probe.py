@@ -307,12 +307,11 @@ def aberration_surface_cartesian_gradients(
 
 
 def gamma_factor(
-    qmks: torch.Tensor,
-    qpks: torch.Tensor,
-    cmplx_probe_at_k: torch.complex,
+    qmks: tuple[torch.Tensor, torch.Tensor],
+    qpks: tuple[torch.Tensor, torch.Tensor],
+    cmplx_probe_at_k: torch.Tensor,
     wavelength: float,
-    semiangle_cutoff: float | None,
-    vacuum_probe_intensity: torch.Tensor | None,
+    semiangle_cutoff: float,
     soft_edges: bool,
     aberration_coefs: Mapping[str, float | torch.Tensor],
     angular_sampling: Tuple[float, float],
@@ -329,7 +328,7 @@ def gamma_factor(
         angular_sampling,
         wavelength,
         soft_edges,
-        vacuum_probe_intensity,
+        None,
         aberration_coefs,
     )
 
@@ -340,7 +339,7 @@ def gamma_factor(
         angular_sampling,
         wavelength,
         soft_edges,
-        vacuum_probe_intensity,
+        None,
         aberration_coefs,
     )
 
