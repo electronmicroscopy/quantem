@@ -396,8 +396,8 @@ def spatial_frequencies(
     """ """
     kxa = torch.fft.fftfreq(gpts[0], sampling[0], device=device, dtype=torch.float32)
     kya = torch.fft.fftfreq(gpts[1], sampling[1], device=device, dtype=torch.float32)
-    kxa = kxa[:, None].broadcast_to(gpts)
-    kya = kya[None, :].broadcast_to(gpts)
+    kxa = kxa[:, None].broadcast_to(*gpts)
+    kya = kya[None, :].broadcast_to(*gpts)
 
     # passive grid rotation
     if rotation_angle is not None:
