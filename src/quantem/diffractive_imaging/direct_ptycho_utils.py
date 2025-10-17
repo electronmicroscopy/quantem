@@ -263,7 +263,7 @@ def _fourier_shift_stack(images: torch.Tensor, shifts: torch.Tensor):
     return shifted.to(dtype)
 
 
-def _align_vbf_stack_multiscale(
+def align_vbf_stack_multiscale(
     vbf_stack: torch.Tensor,
     bf_mask: torch.Tensor,
     inds_i: torch.Tensor,
@@ -328,7 +328,7 @@ def _align_vbf_stack_multiscale(
     return global_shifts, vbf_stack
 
 
-def _fit_aberrations_from_shifts(
+def fit_aberrations_from_shifts(
     shifts_px: torch.Tensor,
     bf_mask: torch.BoolTensor,
     wavelength: float,

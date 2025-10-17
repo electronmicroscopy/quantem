@@ -19,11 +19,11 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.diffractive_imaging.complex_probe import (
-    _polar_coordinates,
     aberration_surface,
     aberration_surface_cartesian_gradients,
     evaluate_probe,
     gamma_factor,
+    polar_coordinates,
     spatial_frequencies,
 )
 from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
@@ -36,8 +36,8 @@ else:
         import torch
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
-    _align_vbf_stack_multiscale,
-    _fit_aberrations_from_shifts,
+    align_vbf_stack_multiscale,
+    fit_aberrations_from_shifts,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -399,7 +399,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         upsampling_factor=None,
         rotation_angle=None,
         max_batch_size=None,
-        use_parallax_approximation=False,
+        deconvolution_kernel="full",
         use_center_of_mass_weighting=False,
         flip_phase=True,
         q_highpass=None,
@@ -418,8 +418,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Rotation angle for coordinate system
         max_batch_size : int, optional
             Maximum batch size for processing
-        use_parallax_approximation : bool, optional
-            If True, use parallax approximation method
+        deconvolution_kernel : str, one of ['full', 'quadratic', 'none']
+            deconvolution_kernel = 'full' -> SSB
+            deconvolution_kernel = 'quadratic' -> parallax
+            deconvolution_kernel = 'none' -> BF-STEM
         use_center_of_mass_weighting : bool, optional
             If True, apply iCOM Fourier-space weighting
         flip_phase : bool, optional
@@ -461,16 +463,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         kxa, kya = spatial_frequencies(
             self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
         )
-        k, phi = _polar_coordinates(kxa, kya)
+        k, phi = polar_coordinates(kxa, kya)
         alpha = k * self.wavelength
 
         # Compute operator based on method
-        if use_parallax_approximation:
-            # Parallax approximation: compute operator once for all batches
-            operator = self._compute_parallax_operator(
-                alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=flip_phase
-            )
-        else:
+        if deconvolution_kernel == "full":
+            # operator calculated inside loop
+            # compute common cmplx_probe instead
             cmplx_probe = evaluate_probe(
                 alpha,
                 phi,
@@ -479,6 +478,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 self.wavelength,
                 aberration_coefs=aberration_coefs,
             )
+        elif deconvolution_kernel == "quadratic":
+            # compute parallax operator once for all batches
+            operator = self._compute_parallax_operator(
+                alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=flip_phase
+            )
+        elif deconvolution_kernel == "none":
+            # nothing to do really
+            pass
+        else:
+            raise ValueError()
 
         # Process batches
         pbar = tqdm(range(self.num_bf), disable=not verbose)
@@ -495,12 +504,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 (1, upsampling_factor, upsampling_factor),
             )
 
-            if use_parallax_approximation:
-                # Use pre-computed operator
-                fourier_factor = vbf_fourier * operator[batch_idx]
-            else:
+            if deconvolution_kernel == "full":
                 # Compute gamma operator for this batch
-                gamma = self._compute_gamma_operator(
+                operator = self._compute_gamma_operator(
                     kxa,
                     kya,
                     qxa,
@@ -510,7 +516,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     asymmetric_version=not use_center_of_mass_weighting,
                     normalize=not use_center_of_mass_weighting,
                 )
-                fourier_factor = vbf_fourier * gamma
+                fourier_factor = vbf_fourier * operator
+            elif deconvolution_kernel == "quadratic":
+                # Use pre-computed operator
+                fourier_factor = vbf_fourier * operator[batch_idx]
+            else:
+                fourier_factor = vbf_fourier
 
             # Apply iCOM weighting if requested
             if use_center_of_mass_weighting:
@@ -518,7 +529,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     qxa, qya, kxa, kya, batch_idx, q_highpass
                 )
                 fourier_factor = fourier_factor * icom_weighting
-            elif not use_parallax_approximation:
+            elif deconvolution_kernel == "full":
                 fourier_factor = fourier_factor * 1.0j
 
             # Inverse FFT and extract appropriate component
@@ -563,7 +574,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float | OptimizationParameter | None = None,
         n_trials=50,
         sampler=None,
-        show_progress_bar=True,
         **reconstruct_kwargs,
     ):
         """
@@ -620,7 +630,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             return float(loss)
 
         study = optuna.create_study(direction="minimize", sampler=sampler)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=self.verbose)
 
         self._optimization_study = study
         self._optimized_parameters = study.best_params
@@ -638,7 +648,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         inds_i, inds_j = self._bf_inds_i, self._bf_inds_j
         vbf_stack = self.vbf_stack.clone()
 
-        global_shifts, vbf_stack = _align_vbf_stack_multiscale(
+        global_shifts, vbf_stack = align_vbf_stack_multiscale(
             vbf_stack,
             bf_mask,
             inds_i,
@@ -649,7 +659,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             verbose=self.verbose,
         )
 
-        fit_results = _fit_aberrations_from_shifts(
+        fit_results = fit_aberrations_from_shifts(
             global_shifts, bf_mask, self.wavelength, self.gpts, self.sampling, self.scan_sampling
         )
 

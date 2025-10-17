@@ -320,8 +320,8 @@ def gamma_factor(
 ):
     """ """
 
-    q_m, phi_m = _polar_coordinates(*qmks)
-    q_p, phi_p = _polar_coordinates(*qpks)
+    q_m, phi_m = polar_coordinates(*qmks)
+    q_p, phi_p = polar_coordinates(*qpks)
 
     probe_m = evaluate_probe(
         q_m * wavelength,
@@ -406,7 +406,7 @@ def spatial_frequencies(
     return kxa, kya
 
 
-def _polar_coordinates(kx: torch.Tensor, ky: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def polar_coordinates(kx: torch.Tensor, ky: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """ """
     k = torch.sqrt(kx.square() + ky.square())
     phi = torch.arctan2(ky, kx)
@@ -421,7 +421,7 @@ def polar_spatial_frequencies(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """ """
     kx, ky = spatial_frequencies(gpts, sampling, rotation_angle=rotation_angle, device=device)
-    return _polar_coordinates(kx, ky)
+    return polar_coordinates(kx, ky)
 
 
 def fourier_space_probe(
