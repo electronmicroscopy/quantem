@@ -16,6 +16,7 @@ class TestVector:
         assert v1.fields == ["field0", "field1", "field2"]
         assert v1.units == ["none", "none", "none"]
         assert v1.name == "2d ragged array"
+        assert hasattr(v1, "metadata")
 
         # Test with num_fields
         v2 = Vector.from_shape(shape=(2, 3), num_fields=3)
@@ -23,6 +24,7 @@ class TestVector:
         assert v2.num_fields == 3
         assert v2.fields == ["field_0", "field_1", "field_2"]
         assert v2.units == ["none", "none", "none"]
+        assert hasattr(v2, "metadata")
 
         # Test with custom name and units
         v3 = Vector.from_shape(
@@ -33,6 +35,7 @@ class TestVector:
         )
         assert v3.name == "my_vector"
         assert v3.units == ["unit0", "unit1", "unit2"]
+        assert hasattr(v3, "metadata")
 
         # Test error cases
         with pytest.raises(ValueError, match="Must specify either 'fields' or 'num_fields'."):
