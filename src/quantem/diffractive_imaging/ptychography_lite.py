@@ -7,7 +7,7 @@ import torch
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset4dstem
-from quantem.core.ml.cnn2d import CNN2d
+from quantem.core.ml.cnn import CNN2d
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
