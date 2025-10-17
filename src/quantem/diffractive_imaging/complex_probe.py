@@ -315,6 +315,8 @@ def gamma_factor(
     soft_edges: bool,
     aberration_coefs: Mapping[str, float | torch.Tensor],
     angular_sampling: Tuple[float, float],
+    asymmetric_version: bool = True,
+    normalize: bool = True,
 ):
     """ """
 
@@ -343,8 +345,12 @@ def gamma_factor(
         aberration_coefs,
     )
 
-    gamma = probe_m * cmplx_probe_at_k.conj() - probe_p.conj() * cmplx_probe_at_k
-    gamma /= gamma.abs().clamp(min=1e-8)
+    if asymmetric_version:
+        gamma = probe_m * cmplx_probe_at_k.conj() - probe_p.conj() * cmplx_probe_at_k
+    else:
+        gamma = probe_m * cmplx_probe_at_k.conj() + probe_p.conj() * cmplx_probe_at_k
+    if normalize:
+        gamma /= gamma.abs().clamp(min=1e-8)
     return gamma.conj()
 
 

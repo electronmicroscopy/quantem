@@ -574,6 +574,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 self.soft_edges,
                 angular_sampling=self.angular_sampling,
                 aberration_coefs=aberration_coefs,
+                asymmetric_version=False,
+                normalize=False,
             )
 
             vbf_fourier = torch.tile(
@@ -583,7 +585,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
             common_factor = vbf_fourier * gamma
             icom_factor = (kx * qx_op + ky * qy_op) * env * common_factor
-            corrected_stack[batch_idx] = torch.fft.ifft2(icom_factor).imag * upsampling_factor
+            corrected_stack[batch_idx] = torch.fft.ifft2(icom_factor).real * upsampling_factor
 
             pbar.update(len(batch_idx))
 
