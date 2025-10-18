@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Union
 
+import matplotlib.pyplot as plt
+import numpy as np
 import optuna
 from tqdm.auto import tqdm
+
+from quantem.core.visualization import show_2d
 
 _OPT_SPEC_MARKER = "__opt_param__"
 
@@ -375,6 +379,15 @@ class OptimizePtychography:
             _token=cls._token,
         )
 
+        instance._config = {
+            "constructors": constructors,
+            "base_kwargs": base_kwargs,
+            "dataset_constructor": dataset_constructor,
+            "dataset_kwargs": dataset_kwargs,
+            "dataset_preprocess_kwargs": dataset_preprocess_kwargs,
+            "loss_getter": loss_getter,
+            "reconstruction_class": reconstruction_class,
+        }
         # Set the objective function with Ptycholite support
         instance.objective_func = _OptimizePtychographyObjective(
             constructors=constructors,
@@ -472,25 +485,7 @@ class OptimizePtychography:
         return self
 
     def visualize(self, figsize=(10, 6)):
-        """Visualize optimization results showing parameter values vs loss.
-
-        Args:
-            figsize: Figure size (width, height)
-            save_path: Optional path to save the figure
-
-        Returns:
-            matplotlib figure and axes objects
-
-        Example:
-            optimizer = OptimizePtychography.from_constructors(...)
-            optimizer.optimize()
-            optimizer.visualize()
-
-            # Or save to file
-            optimizer.visualize(save_path='optimization_results.png')
-        """
-        import matplotlib.pyplot as plt
-        import numpy as np
+        """Visualize optimization results showing parameter values vs loss."""
 
         if not self.study.trials:
             raise RuntimeError("No trials to plot. Run optimize() first.")
@@ -504,17 +499,109 @@ class OptimizePtychography:
         # Get parameter names (all parameters that were optimized)
         param_names = list(trials[0].params.keys())
 
-        # Determine subplot layout
+        # Get best trial info
+        best_trial = self.study.best_trial
+        best_value = best_trial.value
+
+        # Special case: 2 parameters - add 2D scatter plot
+        if len(param_names) == 2:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+            # First subplot: 2D scatter plot
+            ax_2d = axes[0]
+            param1, param2 = param_names
+
+            # Extract data
+            param1_values = np.array([trial.params[param1] for trial in trials])
+            param2_values = np.array([trial.params[param2] for trial in trials])
+            losses = np.array([trial.value for trial in trials])
+
+            # 2D scatter with color-coded loss
+            scatter = ax_2d.scatter(
+                param1_values,
+                param2_values,
+                c=losses,
+                s=100,
+                cmap="magma",
+                edgecolors="black",
+                linewidth=0.5,
+                alpha=0.8,
+            )
+
+            # Highlight best trial
+            best_param1 = best_trial.params[param1]
+            best_param2 = best_trial.params[param2]
+            ax_2d.scatter(
+                [best_param1],
+                [best_param2],
+                color="red",
+                s=300,
+                marker="*",
+                edgecolors="black",
+                linewidth=2,
+                zorder=5,
+            )
+
+            # Colorbar
+            cbar = plt.colorbar(scatter, ax=ax_2d)
+            cbar.set_label("Loss", fontsize=11, fontweight="bold")
+
+            # Labels
+            clean_name1 = param1.split(".")[-1]
+            clean_name2 = param2.split(".")[-1]
+            ax_2d.set_xlabel(clean_name1, fontsize=11, fontweight="bold")
+            ax_2d.set_ylabel(clean_name2, fontsize=11, fontweight="bold")
+            ax_2d.set_title("2D Parameter Space", fontsize=12, fontweight="bold")
+            ax_2d.grid(True, alpha=0.3)
+
+            # Second and third subplots: individual parameter plots
+            for idx, param_name in enumerate(param_names):
+                ax = axes[idx + 1]
+
+                # Extract data
+                param_values = np.array([trial.params[param_name] for trial in trials])
+                losses = np.array([trial.value for trial in trials])
+
+                # Scatter plot
+                ax.scatter(
+                    param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5
+                )
+
+                # Highlight best trial
+                best_param_value = best_trial.params[param_name]
+                ax.scatter(
+                    [best_param_value],
+                    [best_value],
+                    color="red",
+                    s=200,
+                    marker="*",
+                    edgecolors="black",
+                    linewidth=1.5,
+                    zorder=5,
+                )
+
+                # Vertical line at optimal parameter value
+                ax.axvline(best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7)
+
+                # Clean up parameter name for label
+                clean_name = param_name.split(".")[-1]
+
+                # Labels
+                ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
+                ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
+                ax.set_title(f"{param_name}", fontsize=10)
+                ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            return fig, axes
+
+        # General case: any number of parameters
         n_params = len(param_names)
         n_cols = min(3, n_params)  # Max 3 columns
         n_rows = (n_params + n_cols - 1) // n_cols  # Ceiling division
 
         fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
         axes = axes.flatten()
-
-        # Get best trial info
-        best_trial = self.study.best_trial
-        best_value = best_trial.value
 
         # Plot each parameter
         for idx, param_name in enumerate(param_names):
@@ -543,8 +630,8 @@ class OptimizePtychography:
             # Vertical line at optimal parameter value
             ax.axvline(best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7)
 
-            # Clean up parameter name for label (remove path prefixes)
-            clean_name = param_name.split(".")[-1]  # Get last part of dotted path
+            # Clean up parameter name for label
+            clean_name = param_name.split(".")[-1]
 
             # Labels
             ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
@@ -557,3 +644,282 @@ class OptimizePtychography:
             axes[idx].set_visible(False)
 
         plt.tight_layout()
+        return fig, axes
+
+    def _extract_optimization_params(self):
+        """Extract OptimizationParameter specs from stored config."""
+        param_info = {}
+
+        def extract_recursive(obj, path=()):
+            if _is_opt_spec(obj):
+                param_name = obj.get("name") or ".".join(str(p) for p in path)
+                param_info[param_name] = obj
+            elif isinstance(obj, dict):
+                for k, v in obj.items():
+                    extract_recursive(v, (*path, k))
+
+        if hasattr(self, "_config") and self._config:
+            extract_recursive(self._config.get("base_kwargs", {}))
+
+        return param_info
+
+    def grid_search(self, n_points=5, plot_objects=True, figsize=None, return_results=False):
+        """Run grid search and plot reconstructed objects at each parameter value.
+
+        Args:
+            n_points: Number of evenly spaced points for each parameter
+            plot_objects: Whether to plot the reconstructed objects
+            figsize: Figure size (auto if None)
+            return_results: if True, returns 'results', 'best_result',
+            'param_grids', 'reconstructions'
+
+        Returns:
+            dict with 'results', 'best_result', 'param_grids', 'reconstructions'
+        """
+        from itertools import product
+
+        import numpy as np
+
+        if self.objective_func is None:
+            raise RuntimeError("No objective function set. Use from_constructors() first.")
+
+        # Extract optimization parameters
+        param_info = self._extract_optimization_params()
+
+        if not param_info:
+            raise RuntimeError("No OptimizationParameter found in base_kwargs.")
+
+        # Create grid of values
+        param_grids = {}
+        for param_name, spec in param_info.items():
+            if spec.get("choices") is not None:
+                param_grids[param_name] = spec["choices"]
+            else:
+                low, high = spec["low"], spec["high"]
+                if spec.get("log", False):
+                    param_grids[param_name] = np.logspace(np.log10(low), np.log10(high), n_points)
+                else:
+                    param_grids[param_name] = np.linspace(low, high, n_points)
+
+        param_names = list(param_grids.keys())
+        all_combinations = list(product(*param_grids.values()))
+
+        def objective_with_capture(trial):
+            """Modified objective that captures the reconstruction object."""
+            # Call the original objective
+            loss = self.objective_func(trial)
+
+            return loss
+
+        # Enqueue all grid points
+        for combo in all_combinations:
+            params = dict(zip(param_names, combo))
+            self.study.enqueue_trial(params)
+
+        # Run trials and capture reconstructions
+        print("\nRunning reconstructions...")
+        results = []
+
+        with tqdm(total=len(all_combinations), desc="Grid search", unit="point") as pbar:
+            for combo in all_combinations:
+                params = dict(zip(param_names, combo))
+
+                # Manually run reconstruction to capture the object
+                recon_obj, loss = self._run_reconstruction_with_params(params)
+
+                results.append(
+                    {
+                        "params": params.copy(),
+                        "loss": loss,
+                        "reconstruction": recon_obj,
+                    }
+                )
+
+                pbar.update(1)
+
+        # Find best
+        best_idx = np.argmin([r["loss"] for r in results])
+        best_result = results[best_idx]
+
+        # Plot objects
+        if plot_objects:
+            self._plot_grid_objects(results, param_names, figsize)
+
+        if return_results:
+            return {
+                "results": results,
+                "best_result": best_result,
+                "param_grids": param_grids,
+            }
+
+    def _run_reconstruction_with_params(self, params):
+        """Run a single reconstruction with given parameters and return the object.
+
+        Args:
+            params: Dict of parameter values
+
+        Returns:
+            tuple: (reconstruction_object, loss)
+        """
+        from quantem.diffractive_imaging.optimize_hyperparameters import _resolve_params_with_trial
+
+        # Create a mock trial that returns our fixed parameters
+        class FixedTrial:
+            def __init__(self, fixed_params):
+                self.params = fixed_params
+                self.number = 0
+
+            def suggest_float(self, name, low, high, **kwargs):
+                return self.params.get(name, (low + high) / 2)
+
+            def suggest_int(self, name, low, high, **kwargs):
+                return int(self.params.get(name, (low + high) // 2))
+
+            def suggest_categorical(self, name, choices):
+                return self.params.get(name, choices[0])
+
+        trial = FixedTrial(params)
+
+        # Resolve parameters
+        resolved_kwargs = _resolve_params_with_trial(trial, self._config["base_kwargs"])
+
+        # Handle dataset construction if needed
+        if self._config.get("dataset_constructor") is not None:
+            resolved_dataset_kwargs = _resolve_params_with_trial(
+                trial, self._config.get("dataset_kwargs", {})
+            )
+            pdset = self._config["dataset_constructor"](**resolved_dataset_kwargs)
+
+            if self._config.get("dataset_preprocess_kwargs") is not None:
+                resolved_preprocess_kwargs = _resolve_params_with_trial(
+                    trial, self._config["dataset_preprocess_kwargs"]
+                )
+                pdset.preprocess(**resolved_preprocess_kwargs)
+
+            resolved_kwargs.setdefault("init", {})["dset"] = pdset
+
+        # Determine reconstruction class
+        reconstruction_class = self._config.get("reconstruction_class", "auto")
+        constructors = self._config["constructors"]
+
+        if reconstruction_class == "auto":
+            main_constructor = constructors.get("ptychography_class")
+            if main_constructor is None:
+                raise ValueError("No ptychography_class constructor found.")
+
+            constructor_name = str(main_constructor)
+            if "PtychoLite" in constructor_name:
+                class_type = "ptycholite"
+            elif "Ptychography" in constructor_name:
+                class_type = "ptychography"
+            else:
+                raise ValueError(
+                    f"Could not auto-detect type from constructor: {constructor_name}"
+                )
+        else:
+            class_type = reconstruction_class
+
+        # Build reconstruction object
+        if class_type == "ptycholite":
+            from quantem.diffractive_imaging.optimize_hyperparameters import (
+                _build_ptycholite_instance,
+            )
+
+            recon_obj = _build_ptycholite_instance(constructors, resolved_kwargs)
+        else:
+            from quantem.diffractive_imaging.optimize_hyperparameters import (
+                _build_ptychography_instance,
+            )
+
+            recon_obj = _build_ptychography_instance(constructors, resolved_kwargs)
+
+        # Run reconstruction pipeline
+        from quantem.diffractive_imaging.optimize_hyperparameters import (
+            _run_reconstruction_pipeline,
+        )
+
+        _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type)
+
+        # Extract loss
+        loss_getter = self._config.get("loss_getter")
+        if loss_getter is not None:
+            loss = float(loss_getter(recon_obj))
+        else:
+            from quantem.diffractive_imaging.optimize_hyperparameters import _extract_default_loss
+
+            loss = _extract_default_loss(recon_obj, class_type)
+
+        return recon_obj, loss
+
+    def _plot_grid_objects(self, results, param_names, figsize):
+        """Plot reconstructed objects from grid search."""
+
+        n_results = len(results)
+
+        # Auto-calculate figure size
+        if figsize is None:
+            n_cols = min(5, n_results)
+            n_rows = (n_results + n_cols - 1) // n_cols
+            figsize = (n_cols * 3, n_rows * 3.5)
+        else:
+            n_cols = min(5, n_results)
+            n_rows = (n_results + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+        axes = axes.flatten()
+
+        # Find best result
+        losses = [r["loss"] for r in results]
+        best_idx = np.argmin(losses)
+
+        for idx, result in enumerate(results):
+            ax = axes[idx]
+
+            recon_obj = result["reconstruction"]
+
+            obj = recon_obj._to_numpy(recon_obj.obj_cropped)
+            if recon_obj.obj_type == "potential":
+                obj = np.abs(obj).sum(0)
+            elif recon_obj.obj_type == "pure_phase":
+                obj = np.angle(obj).sum(0)
+            else:
+                obj = np.angle(obj).sum(0)
+
+            if obj is not None:
+                show_2d(obj, cmap="magma", figax=(fig, ax))
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No object\navailable",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                    fontsize=10,
+                )
+                ax.set_facecolor("#f0f0f0")
+
+            # Title with parameters and loss
+            param_str = ", ".join(
+                [f"{k.split('.')[-1]}={v:.1f}" for k, v in result["params"].items()]
+            )
+            title = f"{param_str}\nLoss: {result['loss']:.2e}"
+
+            # Highlight best
+            if idx == best_idx:
+                ax.set_title(title, fontweight="bold", color="red", fontsize=9)
+                for spine in ax.spines.values():
+                    spine.set_edgecolor("red")
+                    spine.set_linewidth(3)
+            else:
+                ax.set_title(title, fontsize=8)
+
+            ax.axis("off")
+
+        # Hide unused subplots
+        for idx in range(n_results, len(axes)):
+            axes[idx].set_visible(False)
+
+        plt.suptitle("Grid Search: Reconstructed Objects", fontsize=14, fontweight="bold", y=1.00)
+        plt.tight_layout()
+        plt.show()
