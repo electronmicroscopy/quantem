@@ -43,7 +43,8 @@ config_lock = threading.Lock()
 PATH = Path(os.getenv("QUANTEM_CONFIG", "~/.config/quantem")).expanduser().resolve()
 
 config: dict = {}
-aliases: dict[str, dict[str, str]] = {"device": {"gpu": "cuda:0"}}
+# aliases: dict[str, dict[str, str]] = {"device": {"gpu": "cuda:0"}}
+aliases: dict[str, dict[str, str]] = {}
 deprecations: dict[str, str | None] = {}
 
 
@@ -502,6 +503,13 @@ def validate_device(dev: str | int | torch.device | None = None) -> tuple[str, i
         dev = torch.device(
             "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
         )
+    elif isinstance(dev, str) and dev.lower() == "gpu":
+        if torch.cuda.is_available():
+            dev = torch.device("cuda")
+        elif torch.mps.is_available():
+            dev = torch.device("mps")
+        else:
+            raise RuntimeError("Requested 'gpu' device, but neither CUDA nor MPS is available.")
 
     # Convert to torch.device early
     if isinstance(dev, (str, int)):
