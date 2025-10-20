@@ -90,8 +90,8 @@ def _make_periodic_pairs(
         dst = neighbor_idx[valid]
         pairs.append(torch.stack([src, dst], dim=1))
 
-    pairs = torch.cat(pairs, dim=0)
-    pairs = torch.unique(torch.sort(pairs, dim=1)[0], dim=0)
+    pairs = torch.sort(torch.cat(pairs, dim=0), dim=1)[0]
+    pairs = torch.unique(pairs.cpu(), dim=0).to(device=device)
 
     if max_pairs is not None and len(pairs) > max_pairs:
         # random subsampling
@@ -200,9 +200,10 @@ def _bin_mask_and_stack_centered(
 
     # Encode as single coordinate for unique operation
     coords = qb * Rb + rb
-    unique_coords, inverse = torch.unique(coords, return_inverse=True, sorted=True)
+    unique_coords, inverse = torch.unique(coords.cpu(), return_inverse=True, sorted=True)
+    unique_coords = unique_coords.to(device=device)
     Nb = unique_coords.numel()
-    mapping = inverse.to(torch.long)
+    mapping = inverse.to(dtype=torch.long, device=device)
 
     # Recover binned indices (corner-centered)
     inds_ib = (unique_coords // Rb).to(torch.long)
@@ -343,14 +344,13 @@ def fit_aberrations_from_shifts(
     kxa, kya = spatial_frequencies(gpts, sampling, device=device)
     kvec = torch.dstack((kxa[bf_mask], kya[bf_mask])).view((-1, 2))
     basis = kvec * wavelength
-    scan_s = torch.as_tensor(scan_sampling, device=device)
+    scan_s = torch.as_tensor(scan_sampling, device=device, dtype=torch.float32)
 
     # Convert shifts to physical units (Angstroms)
     shifts_ang = (shifts_px * scan_s).to(dtype=basis.dtype, device=device)
 
     # Least-squares fit: shifts = basis @ M
-    M = torch.linalg.lstsq(basis, shifts_ang, rcond=None)[0]
-
+    M = torch.linalg.lstsq(basis.cpu(), shifts_ang.cpu(), rcond=None)[0]
     # Decompose M = R @ A (rotation × aberration)
     M_rotation, M_aberration = _torch_polar(M)
 

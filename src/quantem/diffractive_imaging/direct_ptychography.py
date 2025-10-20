@@ -647,6 +647,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self._optimization_study = study
         self._optimized_parameters = study.best_params
+        if self.verbose:
+            print(f"Optimized parameters: {self._optimized_parameters}")
+
         self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
         return self
 
@@ -678,6 +681,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self.corrected_stack = vbf_stack
         self._fitted_parameters = fit_results
+        if self.verbose:
+            print(f"Fitted parameters: {self._fitted_parameters}")
+
         self.reconstruct_with_fitted_parameters(verbose=False, **reconstruct_kwargs)
         return self
 
