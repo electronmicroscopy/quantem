@@ -283,8 +283,9 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 offset *= self.constraints["fix_potential_baseline_factor"]
             else:
                 offset = 0
+            # print("offset: ", offset)
 
-            if self.constraints["positivity"]:
+            if self.constraints.get("positivity", True):
                 obj2 = torch.clamp(obj - offset, min=0.0)
             else:
                 obj2 = obj - offset

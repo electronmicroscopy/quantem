@@ -627,8 +627,8 @@ class ProbePixelated(ProbeConstraints):
         if self._from_params:
             self.check_probe_params()
             prb = real_space_probe(
-                gpts=self.roi_shape.astype("int"),
-                sampling=1 / (self.roi_shape * self.reciprocal_sampling).astype(np.float64),
+                gpts=tuple(self.roi_shape.astype("int")),
+                sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling).astype(np.float64)),
                 energy=self.probe_params["energy"],
                 semiangle_cutoff=self.probe_params["semiangle_cutoff"],
                 vacuum_probe_intensity=self.vacuum_probe_intensity,
@@ -920,8 +920,8 @@ class ProbeParametric(ProbeConstraints):
                 raise KeyError(f"Unknown aberration key {k}")
 
         probe = real_space_probe(
-            gpts=self.roi_shape.astype("int"),
-            sampling=1 / (self.roi_shape * self.reciprocal_sampling).astype(np.float64),
+            gpts=tuple(self.roi_shape.astype("int")),
+            sampling=tuple(1 / (self.roi_shape * self.reciprocal_sampling).astype(np.float64)),
             energy=self.probe_params["energy"],
             semiangle_cutoff=self.semiangle_cutoff,  # type:ignore
             vacuum_probe_intensity=self.vacuum_probe_intensity,  # type:ignore
