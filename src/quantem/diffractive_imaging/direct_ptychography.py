@@ -35,6 +35,8 @@ else:
     if config.get("has_torch"):
         import torch
 
+from itertools import product
+
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     align_vbf_stack_multiscale,
     fit_aberrations_from_shifts,
@@ -48,6 +50,16 @@ class OptimizationParameter:
     low: float
     high: float
     log: bool = False
+    n_points: int | None = None
+
+    def grid_values(self):
+        """Return an array of grid values for this parameter."""
+        if self.n_points is None:
+            raise ValueError("n_points must be specified for grid search parameters.")
+        if self.log:
+            return np.geomspace(self.low, self.high, self.n_points)
+        else:
+            return np.linspace(self.low, self.high, self.n_points)
 
 
 class DirectPtychography(RNGMixin, AutoSerialize):
@@ -574,7 +586,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         """ """
         if self.corrected_stack is None:
             return None
-        return ((self.corrected_stack - self.mean_corrected_bf).abs().square()).mean()
+        if self.corrected_stack.sum() > 0:
+            variance_loss = ((self.corrected_stack - self.mean_corrected_bf).abs().square()).mean()
+        else:
+            variance_loss = torch.tensor(
+                torch.inf, dtype=self.corrected_stack.dtype, device=self.device
+            )
+        return variance_loss
 
     @property
     def obj(self) -> np.ndarray:
@@ -651,6 +669,77 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             print(f"Optimized parameters: {self._optimized_parameters}")
 
         self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
+        return self
+
+    def grid_search_hyperparameters(
+        self,
+        aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
+        rotation_angle: float | OptimizationParameter | None = None,
+        **reconstruct_kwargs,
+    ):
+        """
+        Perform a grid search over specified hyperparameter combinations.
+
+        Parameters
+        ----------
+        aberration_coefs : dict[str, float | OptimizationParameter], optional
+            Dict of aberration names to either fixed values or OptimizationParameter ranges.
+        rotation_angle : float | OptimizationParameter, optional
+            Fixed rotation or optimization range.
+        **reconstruct_kwargs :
+            Extra arguments passed to reconstruct().
+        """
+        aberration_coefs = aberration_coefs or {}
+
+        # Build parameter grid
+        param_grid = {}
+        for name, val in aberration_coefs.items():
+            if isinstance(val, OptimizationParameter):
+                param_grid[name] = val.grid_values()
+            else:
+                param_grid[name] = [val]
+
+        if rotation_angle is not None:
+            if isinstance(rotation_angle, OptimizationParameter):
+                param_grid["rotation_angle"] = rotation_angle.grid_values()
+            else:
+                param_grid["rotation_angle"] = [rotation_angle]
+
+        # Cartesian product of all parameter combinations
+        keys = list(param_grid.keys())
+        grid = list(product(*(param_grid[k] for k in keys)))
+
+        results = []
+        best_loss = float("inf")
+        best_params = None
+
+        for combo in tqdm(grid):
+            params = dict(zip(keys, combo))
+            trial_aberration_coefs = params.copy()
+            trial_rotation_angle = trial_aberration_coefs.pop("rotation_angle", None)
+
+            self.reconstruct(
+                aberration_coefs=trial_aberration_coefs,
+                rotation_angle=trial_rotation_angle,
+                verbose=False,
+                **reconstruct_kwargs,
+            )
+
+            loss = float(self.variance_loss())
+            results.append((params, loss))
+
+            if loss < best_loss:
+                best_loss = loss
+                best_params = params
+
+        self._grid_search_results = results
+        self._optimized_parameters = best_params
+
+        if self.verbose:
+            print(f"Best grid parameters: {self._optimized_parameters}")
+
+        self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
+
         return self
 
     def fit_hyperparameters(
