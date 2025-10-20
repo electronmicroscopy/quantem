@@ -174,7 +174,9 @@ class CenterOfMassOriginModel(AutoSerialize):
                 centroid = points.mean(0)
                 centered_points = points - centroid
                 covariance_matrix = torch.cov(centered_points.T)
-                eigenvalues, eigenvectors = torch.linalg.eigh(covariance_matrix)
+
+                # Fall back to CPU (to support MPS)
+                eigenvectors = torch.linalg.eigh(covariance_matrix.cpu())[1].to(points.device)
 
                 # The normal vector to the plane is the eigenvector corresponding to the smallest eigenvalue
                 normal_vector = eigenvectors[:, 0]
@@ -226,7 +228,7 @@ class CenterOfMassOriginModel(AutoSerialize):
         self,
         origin_coordinate: Tuple[int | float, int | float] = (0, 0),
         max_batch_size: int | None = None,
-        mode: str = "bicubic",
+        mode: str = "bilinear",
     ):
         if self._origin_fitted is None:
             raise ValueError(
@@ -369,7 +371,7 @@ class CenterOfMassOriginModel(AutoSerialize):
         rotation_angles_deg: torch.Tensor | NDArray | None = None,
         shift_to_origin: bool = True,
         origin_coordinate: Tuple[int | float, int | float] = (0, 0),
-        mode: str = "bicubic",
+        mode: str = "bilinear",
     ):
         """
         Runs the full Center-of-Mass origin alignment workflow.
