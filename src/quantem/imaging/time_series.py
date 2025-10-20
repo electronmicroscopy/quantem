@@ -9,6 +9,7 @@ from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter
 from scipy.optimize import minimize
 from tqdm import tqdm
+from scipy import ndimage
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
@@ -22,17 +23,18 @@ class TimeSeries(Dataset3d):
         pad_val: [str , None] = None,
         edge_blend: Union[int, tuple[int, int], None] = (8,8),
         modify_in_place: bool = False,
+        attach: bool = True,
     ):
 
-        func_map = {
+        agg_func = {
             'mean': np.mean,
             'median': np.median,
             'max': np.max,
             'min': np.min
         }
 
-        if pad_val in func_map:
-            pad_val = func_map[pad_val](self.array)
+        if pad_val in agg_func:
+            pad_val = agg_func[pad_val](self.array)
         elif pad_val is None:
             pad_val = 0  
         
@@ -95,32 +97,96 @@ class TimeSeries(Dataset3d):
 
         #pad val that is mean, median, min, and max (take in strings)
         # None | str
-
-
-
+        
 
     def align_images(
-        self,
-        im_ref,
-        im,
-        # return_aligned_image=True,
-        # window_size=7,
+        pad_stack, 
+        window_size = 7,
+        running_average_frames = 20.0,
     ):
-        print(1)
+        stack_aligned = np.zeros_like(pad_stack)
+
+        print(stack_aligned.shape)
         
-        f_fft = np.fft.fft2(im_ref.array)
+        stack_aligned[0] = pad_stack[0]
+        dxy = np.zeros((pad_stack.shape[0],2))
 
-        print(2)
+        kx_shift = -2*np.pi*np.fft.fftfreq(pad_stack.shape[1])
+        ky_shift = -2*np.pi*np.fft.fftfreq(pad_stack.shape[2])
+
+        # print(kx_shift, ky_shift)
+
+        G_ref = np.fft.fft2(pad_stack[0])
+        for a0 in range(1,pad_stack.shape[0]):
+            G = np.fft.fft2(pad_stack[a0])
+            im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G)))
+
+            # Get subpixel shift
+                    # Get subpixel position
+            nrows, ncols = im_corr.shape
+            peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
+            half = window_size // 2
+
+            # Build periodic window
+            r_idx = np.mod(np.arange(peak_r - half, peak_r + half + 1), nrows)
+            c_idx = np.mod(np.arange(peak_c - half, peak_c + half + 1), ncols)
+            window = im_corr[np.ix_(r_idx, c_idx)]
+
+            print(window)
+
+            # Center of mass within window
+            com_r, com_c = ndimage.center_of_mass(window)
+
+            # Adjust back to full image coordinates (with periodicity)
+            shift_row = (((peak_r - half + com_r) + nrows/2) % nrows) - nrows/2
+            shift_col = (((peak_c - half + com_c) + ncols/2) % ncols) - ncols/2
+            shift = np.array((shift_row,shift_col))
+
+            dxy[a0] = shift
+
+            # Aligned image
+            G_shift = G * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
+            im_shift = np.real(np.fft.ifft2(G_shift))
+
+            stack_aligned[a0] = im_shift
+            weight = np.maximum(1/(a0+1),1/running_average_frames)
+            G_ref = G_ref * (1-weight) + G_shift * weight
+
+        return stack_aligned
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # def align_images(
+    #     arrays: Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
+    #     # return_aligned_image=True,
+    #     # window_size=7,
+    # ):
+    #     print(arrays)
         
-        g_fft = np.fft.fft2(im.array)
+        # f_fft = np.fft.fft2(im_ref.array)
 
-        print(3)
+        # print(2)
         
-        im_corr = np.real(np.fft.ifft2(f_fft * np.conj(g_fft)))
+        # g_fft = np.fft.fft2(im)
 
-        print(4)
+        # print(3)
+        
+        # im_corr = np.real(np.fft.ifft2(f_fft * np.conj(g_fft)))
 
-        return im_corr
+        # print(4)
+
+        # return im_corr
 
 
 
