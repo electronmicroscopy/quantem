@@ -457,6 +457,15 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if max_batch_size is None:
             max_batch_size = self.num_bf
 
+        if deconvolution_kernel is None:
+            deconvolution_kernel == "none"
+        elif deconvolution_kernel == "parallax":
+            deconvolution_kernel = "quadratic"
+        elif deconvolution_kernel not in ("full", "quadratic", "none"):
+            raise ValueError(
+                f"deconvolution_kernel needs to be one on 'full','quadratic' or 'parallax', 'none' or None, not '{deconvolution_kernel}'"
+            )
+
         # Get upsampled q-space grid
         qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
         # Gamma deconvolution: need k-space grid and probe
@@ -483,11 +492,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             operator = self._compute_parallax_operator(
                 alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=flip_phase
             )
-        elif deconvolution_kernel == "none":
-            # nothing to do really
-            pass
-        else:
-            raise ValueError()
 
         # Process batches
         pbar = tqdm(range(self.num_bf), disable=not verbose)
@@ -498,10 +502,15 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
 
         for batch_idx in batcher:
-            # Tile the Fourier-space VBF images
-            vbf_fourier = torch.tile(
-                self._vbf_fourier[batch_idx],
-                (1, upsampling_factor, upsampling_factor),
+            # MPS does not support complex tiling
+            # vbf_fourier = torch.tile(
+            #     self._vbf_fourier[batch_idx],
+            #     (1, upsampling_factor, upsampling_factor),
+            # )
+            vbf_fourier = torch.cat(
+                [torch.cat([self._vbf_fourier[batch_idx]] * upsampling_factor, dim=-1)]
+                * upsampling_factor,
+                dim=-2,
             )
 
             if deconvolution_kernel == "full":
@@ -522,6 +531,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 fourier_factor = vbf_fourier * operator[batch_idx]
             else:
                 fourier_factor = vbf_fourier
+                if flip_phase:
+                    fourier_factor = -fourier_factor
 
             # Apply iCOM weighting if requested
             if use_center_of_mass_weighting:
@@ -530,7 +541,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 )
                 fourier_factor = fourier_factor * icom_weighting
             elif deconvolution_kernel == "full":
-                fourier_factor = fourier_factor * 1.0j
+                fourier_factor = 1.0j * fourier_factor
+                if flip_phase:
+                    fourier_factor = -fourier_factor
 
             # Inverse FFT and extract appropriate component
             corrected_stack[batch_idx] = torch.fft.ifft2(fourier_factor).real * upsampling_factor
