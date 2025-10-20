@@ -154,7 +154,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
-        mode: str = "bicubic",
+        mode: str = "bilinear",
         force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         intensity_threshold: float = 0.5,
