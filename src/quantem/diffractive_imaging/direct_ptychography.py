@@ -92,19 +92,22 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.vbf_stack = vbf_dataset.array
         self.bf_mask = bf_mask_dataset.array
 
-        self.reciprocal_sampling = bf_mask_dataset.sampling
+        self.wavelength = electron_wavelength_angstrom(energy)
+        self.scan_units = vbf_dataset.units[-2:]
+        self.detector_units = bf_mask_dataset.units
 
-        self.scan_sampling = vbf_dataset.sampling[-2:]
         self.scan_gpts = vbf_dataset.shape[-2:]
+        self.scan_sampling = vbf_dataset.sampling[-2:]
+        self.reciprocal_sampling = bf_mask_dataset.sampling
+        self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
+
         self.num_bf = vbf_dataset.shape[0]
+        self.gpts = bf_mask_dataset.shape
+        self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
+
         self.semiangle_cutoff = semiangle_cutoff
         self.soft_edges = soft_edges
         self.rng = rng
-
-        self.gpts = bf_mask_dataset.shape
-        self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
-        self.wavelength = electron_wavelength_angstrom(energy)
-        self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
 
         self.rotation_angle = rotation_angle
         self.aberration_coefs = aberration_coefs
@@ -192,7 +195,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         bf_mask_dataset = Dataset2d.from_array(
             bf_mask.cpu().numpy(),
             name="BF mask",
-            units=("A^-1", "A^-1"),
+            units=dataset.units[-2:],
             sampling=dataset.sampling[-2:],
         )
 
@@ -204,7 +207,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         vbf_dataset = Dataset3d.from_array(
             vbf_stack.cpu().numpy(),
             name="vBF stack",
-            units=("index", "A", "A"),
+            units=("index",) + tuple(dataset.units[:2]),
             sampling=(1,) + tuple(dataset.sampling[:2]),
         )
 
@@ -322,6 +325,38 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 self.to(dev)
             except AttributeError:
                 pass
+
+    @property
+    def scan_sampling(self) -> NDArray:
+        return self._scan_sampling
+
+    @scan_sampling.setter
+    def scan_sampling(self, value: NDArray | tuple | list) -> None:
+        """
+        Units A or raises error
+        """
+        units = self.scan_units
+        if units[0] == "A":
+            self._scan_sampling = value
+        else:
+            raise ValueError("real-space needs to be given in 'A'")
+
+    @property
+    def reciprocal_sampling(self) -> NDArray:
+        return self._reciprocal_sampling
+
+    @reciprocal_sampling.setter
+    def reciprocal_sampling(self, value: NDArray | tuple | list) -> None:
+        """
+        Units A or raises error
+        """
+        units = self.detector_units
+        if units[0] == "A^-1":
+            self._reciprocal_sampling = value
+        elif units[0] == "mrad":
+            self._reciprocal_sampling = tuple(val / self.wavelength / 1e3 for val in value)
+        else:
+            raise ValueError("reciprocal-space needs to be given in 'A^-1' or 'mrad'")
 
     def _compute_parallax_operator(
         self, alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=True
