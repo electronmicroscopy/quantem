@@ -394,8 +394,13 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         ### this is not very efficient with Adam, should find a better way
         n_probes = start_probe.shape[0]
         orthogonal_probes = []
-        original_norms = torch.norm(start_probe, dim=(-2, -1), keepdim=True)
-        # original_norms = torch.norm(start_probe.view(n_probes, -1), dim=1, keepdim=True)
+        # Equivalent to torch.norm(..., dim=(-2,-1), keepdim=True)
+        # original_norms = torch.norm(start_probe, dim=(-2, -1), keepdim=True)
+        original_norms = torch.sqrt(
+            torch.sum(
+                start_probe.real.square() + start_probe.imag.square(), dim=(-2, -1), keepdim=True
+            )
+        )
 
         # Apply Gram-Schmidt process
         for i in range(n_probes):
@@ -408,7 +413,11 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
                 )
                 probe_i = probe_i - projection
 
-            orthogonal_probes.append(probe_i / torch.norm(probe_i))
+            # norm = torch.norm(probe_i)
+            norm = torch.sqrt(torch.sum(probe_i.real.square() + probe_i.imag.square())).clamp_min(
+                1e-12
+            )
+            orthogonal_probes.append(probe_i / norm)
 
         orthogonal_probes = torch.stack(orthogonal_probes)
         orthogonal_probes = orthogonal_probes * original_norms.view(-1, 1, 1)
@@ -417,7 +426,12 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         intensities = torch.sum(torch.abs(orthogonal_probes).square(), dim=(-2, -1))
         intensities_order = torch.argsort(intensities, descending=True)
 
-        return orthogonal_probes[intensities_order]
+        # MPS-safe fancy indexing
+        real_sorted = orthogonal_probes.real[intensities_order]
+        imag_sorted = orthogonal_probes.imag[intensities_order]
+        orthogonal_probes_sorted = torch.complex(real_sorted, imag_sorted)
+
+        return orthogonal_probes_sorted
 
 
 #    def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:

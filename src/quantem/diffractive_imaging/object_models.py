@@ -234,7 +234,13 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         else:
             obj_array2 = obj_array
         obj_flat = obj_array2.reshape(obj_array.shape[0], -1)
-        patches = obj_flat[:, patch_indices]
+
+        # patches = obj_flat[:, patch_indices]
+        # MPS does not support complex scatter kernel..
+        real = obj_flat.real
+        imag = obj_flat.imag
+        patches = torch.complex(real[:, patch_indices], imag[:, patch_indices])
+
         return patches
 
     def backward(self, *args, **kwargs):
