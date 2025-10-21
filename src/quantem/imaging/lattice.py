@@ -1061,6 +1061,7 @@ class Lattice(AutoSerialize):
         # Check for empty cells
         A_cell = self.atoms.get_data(measure_ind)
         B_cell = self.atoms.get_data(reference_ind)
+        self._pol_meas_ref_ind = (measure_ind, reference_ind)
 
         def is_empty(cell):
             return isinstance(cell, list) or cell is None or cell.size == 0
@@ -1276,6 +1277,413 @@ class Lattice(AutoSerialize):
 
         return out
 
+    def calculate_order_parameter(
+        self,
+        polarization_vectors: Vector,
+        num_phases: int = 2,
+        phase_polarization_peak_array: NDArray | None = None,
+        fix_polarization_peaks: bool = False,
+        plot_order_parameter: bool = True,
+        plot_gmm_visualization: bool = True,
+        # plot_confidence_map : bool = False,
+        **kwargs,
+    ):
+        """
+        Fit a Gaussian mixture model (GMM) to the fractional polarization vectors and compute
+        a multi-phase order parameter for each site. The order parameter is defined
+        as the posterior membership probabilities of each site to the mixture components,
+        evaluated in the (da, db) polarization space.
+        This method can optionally:
+            - Initialize or fix the phase centers (polarization peaks) during GMM fitting.
+            - Visualize the mixture model and confidence ellipses over a KDE density of (da, db).
+            - Plot the order parameter overlay on the original image coordinates.
+
+        Parameters
+        ----------
+        polarization_vectors : Vector
+            Collection of polarization data.
+            polarization_vectors[0] must be a Vector containing the fields:
+            - 'x' : NDArray, row coordinates for each site.
+            - 'y' : NDArray, column coordinates for each site.
+            - 'da' : NDArray, polarization fraction along a (e.g., du).
+            - 'db' : NDArray, polarization fraction along b (e.g., dv).
+            All arrays should be aligned and of equal length.
+        num_phases : int, default=2
+            Number of Gaussian components (phases) to fit in the mixture model.
+        phase_polarization_peak_array : NDArray | None, default=None
+            Optional array of shape (num_phases, 2) specifying phase centers (means)
+            in (da, db) space. If provided:
+            - With fix_polarization_peaks=False, these are used as initial means for the GMM.
+            - With fix_polarization_peaks=True, the means are held fixed during fitting.
+        fix_polarization_peaks : bool, default=False
+            If True, the GMM means are kept fixed at the provided phase_polarization_peak_array
+            and not updated during the M-step. Requires phase_polarization_peak_array to be set.
+        plot_order_parameter : bool, default=True
+            If True, overlays the sites on the image and colors them by their mixture
+            probabilities (order parameter). For 2 phases, a two-color bar is added;
+            for 3 phases, a color triangle legend is added; for other values, no legend is shown.
+        plot_gmm_visualization : bool, default=True
+            If True, shows a combined visualization in (da, db) space:
+            - KDE density contour (scipy.stats.gaussian_kde).
+            - Scatter of points colored by their mixture probabilities.
+            - GMM centers (means) and ~95% confidence ellipses (2 standard deviations).
+        **kwargs
+            Additional keyword arguments forwarded to the image plotting utility (show_2d),
+            for example cmap, title, etc., when plot_order_parameter is True.
+
+        Returns
+        -------
+        self
+            Returns the same object, modified in-place.
+
+        Notes
+        -----
+        - The fitted GMM uses full covariance matrices (covariance_type='full').
+        - The method stores results in:
+            - self._polarization_means : NDArray of shape (num_phases, 2), the fitted (or fixed) means in (da, db).
+            - self._order_parameter_probabilities : NDArray of shape (N, num_phases), posterior probabilities per site.
+        - Helper functions expected to exist in the class/module:
+            - create_colors_from_probabilities(probabilities, num_phases): maps mixture probabilities to RGB colors.
+            - add_2phase_colorbar(ax): adds a colorbar legend for two-phase coloring.
+            - add_3phase_color_triangle(fig, ax): adds a ternary-like color legend for three phases.
+            - show_2d(image, ...): displays the image and returns (fig, ax).
+        - Requires self._image.array to exist for the order parameter overlay plot.
+        - Raises ValueError if phase_polarization_peak_array is provided with an incorrect shape
+        (must be (num_phases, 2)).
+
+        Examples
+        --------
+        Fit a 2-phase GMM and plot both the mixture visualization and the order parameter:
+            lattice.calculate_order_parameter(polarization_vectors,
+                                            num_phases=2,
+                                            plot_gmm_visualization=True,
+                                            plot_order_parameter=True)
+
+        Use fixed phase peaks:
+            peaks = np.array([[0.1, -0.05],
+                            [0.3,  0.07]])
+            lattice.calculate_order_parameter(polarization_vectors,
+                                            num_phases=2,
+                                            phase_polarization_peak_array=peaks,
+                                            fix_polarization_peaks=True)
+        """
+        # Imports
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Ellipse
+        from scipy.stats import gaussian_kde
+        from sklearn.mixture import GaussianMixture
+
+        # Functions
+        def plot_gaussian_ellipse(ax, mean, cov, n_std=2, clip_path=None, **kwargs):
+            """
+            Plot confidence ellipse for a 2D Gaussian
+
+            Parameters:
+            -----------
+            ax : matplotlib axis
+            mean : array-like, shape (2,)
+                Mean of the Gaussian
+            cov : array-like, shape (2, 2)
+                Covariance matrix
+            n_std : float
+                Number of standard deviations (2 = ~95% confidence)
+            clip_path : matplotlib.path.Path, optional
+                Path to use for clipping the ellipse
+            """
+            # Eigendecomposition
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+            # Calculate ellipse parameters
+            angle = np.degrees(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+            width, height = 2 * n_std * np.sqrt(eigenvalues)
+
+            # Create ellipse
+            ellipse = Ellipse(mean, width, height, angle=angle, fill=False, **kwargs)
+
+            if clip_path is not None:
+                ellipse.set_clip_path(clip_path, transform=ax.transData)
+
+            ax.add_patch(ellipse)
+
+            return ellipse
+
+        # def create_colors(categories, intensities):
+        #     """Vectorized color creation"""
+        #     unique_categories = np.unique(categories)
+        #     n = len(categories)
+        #     colors = np.ones((n, 3))
+
+        #     if num_phases != 1:
+        #         intensities = (intensities - (1/num_phases))/(1 - (1/num_phases))
+
+        #     white = np.array([1.0, 1.0, 1.0])
+
+        #     for category in unique_categories:
+        #         mask = categories == category
+        #         base_color = np.array(site_colors(category))
+        #         intensity = intensities[mask, np.newaxis]
+        #         colors[mask] = intensity * base_color + (1 - intensity) * white
+
+        #     return colors
+
+        class FixedMeansGMM(GaussianMixture):
+            def __init__(self, fixed_means, **kwargs):
+                super().__init__(n_components=len(fixed_means), **kwargs)
+                self.fixed_means = fixed_means
+                self.means_init = fixed_means
+
+            def _m_step(self, X, log_resp):
+                """Override M-step to keep means fixed"""
+                super()._m_step(X, log_resp)
+                self.means_ = self.fixed_means.copy()
+
+        x_arr = polarization_vectors[0]["x"]
+        y_arr = polarization_vectors[0]["y"]
+
+        da_arr = polarization_vectors[0]["da"]
+        db_arr = polarization_vectors[0]["db"]
+
+        d_frac_arr = np.vstack([da_arr, db_arr])
+        data = np.column_stack([da_arr, db_arr])
+
+        # Fit GMM with N Gaussians
+        if phase_polarization_peak_array is None:
+            gmm = GaussianMixture(n_components=num_phases, covariance_type="full")
+        else:
+            # Basic checks
+            if phase_polarization_peak_array.shape != (num_phases, 2):
+                raise ValueError(
+                    f"phase_polarization_peak_array should have dimensions ({num_phases}, 2). You have input : {phase_polarization_peak_array.shape}"
+                )
+            if fix_polarization_peaks:
+                gmm = FixedMeansGMM(
+                    covariance_type="full", fixed_means=phase_polarization_peak_array
+                )
+            else:
+                gmm = GaussianMixture(
+                    n_components=num_phases,
+                    covariance_type="full",
+                    means_init=phase_polarization_peak_array,
+                )
+        gmm.fit(data)
+        # labels = gmm.predict(data)  # This has Gaussian number [0,num_phases-1) that the atom best fits to
+
+        # Calculate score between 0 and 1 for each point
+        # Get probabilities for each Gaussian
+        probabilities = gmm.predict_proba(data)  # Shape: (n_points, num_phases)
+
+        # Create grid for contour
+        x_grid = np.linspace(da_arr.min(), da_arr.max(), 100)
+        y_grid = np.linspace(db_arr.min(), db_arr.max(), 100)
+        X, Y = np.meshgrid(x_grid, y_grid)
+        positions = np.vstack([X.ravel(), Y.ravel()])
+        Z = gaussian_kde(d_frac_arr)(positions).reshape(X.shape)
+
+        # GMM density on grid
+        # grid_points = np.column_stack([X.ravel(), Y.ravel()])
+
+        # Save GMM data
+        self._polarization_means = gmm.means_
+        self._order_parameter_probabilities = probabilities
+
+        num_components = num_phases
+
+        # ========== Combined Plot: Scatter overlaid on Contour ==========
+        if plot_gmm_visualization:
+            from matplotlib.path import Path
+
+            if num_components == 3:
+                fig = plt.figure(figsize=(8, 7))
+            else:
+                fig = plt.figure(figsize=(8, 7))
+            ax = fig.add_subplot(111)
+
+            # First: Plot contour in the background with distinct colormap
+            contour = ax.contourf(X, Y, Z, levels=15, cmap="viridis", alpha=0.9)
+            ax.contour(X, Y, Z, levels=15, colors="gray", linewidths=0.5, alpha=0.9)
+
+            # Second: Overlay scatter points with classification colors
+            point_colors = create_colors_from_probabilities(probabilities, num_components)
+            ax.scatter(
+                da_arr,
+                db_arr,
+                c=point_colors,
+                alpha=0.7,
+                s=20,
+                edgecolors="black",
+                linewidths=0.3,
+                zorder=7,
+            )
+
+            # Create a clip path from the contour
+            contour_path = None
+            for collection in ax.collections:
+                if isinstance(collection, plt.matplotlib.collections.LineCollection):
+                    for path in collection.get_paths():
+                        if contour_path is None:
+                            contour_path = path
+                        else:
+                            contour_path = Path.make_compound_path(contour_path, path)
+
+            # Plot GMM centers and ellipses
+            ax.scatter(
+                gmm.means_[:, 0],
+                gmm.means_[:, 1],
+                c="black",
+                s=300,
+                marker="x",
+                linewidths=4,
+                alpha=0.6,
+                edgecolors="white",
+                label="GMM Centers",
+                zorder=10,
+            )
+
+            for i in range(num_components):
+                plot_gaussian_ellipse(
+                    ax,
+                    gmm.means_[i],
+                    gmm.covariances_[i],
+                    n_std=2,
+                    edgecolor="black",
+                    linewidth=2.5,
+                    linestyle="--",
+                    alpha=0.8,
+                    zorder=9,
+                    clip_path=contour_path,
+                )
+                plot_gaussian_ellipse(
+                    ax,
+                    gmm.means_[i],
+                    gmm.covariances_[i],
+                    n_std=2,
+                    edgecolor="white",
+                    linewidth=1.5,
+                    linestyle="-",
+                    alpha=0.6,
+                    zorder=8,
+                    clip_path=contour_path,
+                )
+
+            # Add x and y axes through origin
+            ax.axhline(y=0, color="black", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
+            ax.axvline(x=0, color="black", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
+
+            ax.set_xlabel("du")
+            ax.set_ylabel("dv")
+            ax.set_title("Classification & Contour Overlay")
+
+            # Add colorbar for contour (density)
+            plt.colorbar(contour, ax=ax, label="Density")
+
+            # Add appropriate color reference for classification
+            if num_components == 2:
+                add_2phase_colorbar(ax)
+            elif num_components == 3:
+                add_3phase_color_triangle(fig, ax)
+
+            ax.legend(loc="best")
+            plt.tight_layout()
+            plt.show()
+
+        # ========== Plot: Confidence Map ==========
+        # if plot_confidence_map:
+        #     if num_components == 3:
+        #         fig3, ax3 = plt.subplots(figsize=(6, 6))
+        #     else:
+        #         fig3, ax3 = plt.subplots(figsize=(7, 6))
+
+        #     # Get predictions and probabilities for grid
+        #     grid_predictions = gmm.predict(grid_points)
+        #     grid_probabilities = gmm.predict_proba(grid_points)
+
+        #     # For each grid point, get the probability of its assigned component
+        #     grid_max_probs = grid_probabilities[np.arange(len(grid_predictions)), grid_predictions]
+
+        #     # Create color map for grid based on category and max probability
+        #     grid_colors_flat = create_colors(grid_predictions, grid_max_probs)
+        #     grid_colors = grid_colors_flat.reshape(X.shape[0], X.shape[1], 3)
+
+        #     # Show as image
+        #     ax3.imshow(grid_colors, extent=[X.min(), X.max(), Y.min(), Y.max()],
+        #             origin='lower', aspect='auto', alpha=0.7)
+
+        #     # Add decision boundaries (probability contours)
+        #     grid_max_probs_2d = grid_max_probs.reshape(X.shape)
+        #     contour_boundary = ax3.contour(X, Y, grid_max_probs_2d,
+        #                                 levels=[0.5, 0.7, 0.9],
+        #                                 colors='red', linewidths=[3, 2, 1],
+        #                                 linestyles=['--', '-', ':'])
+        #     ax3.clabel(contour_boundary, inline=True, fontsize=8, fmt='P=%.1f')
+
+        #     # Add GMM centers with their colors
+        #     for i in range(num_components):
+        #         ax3.scatter(gmm.means_[i, 0], gmm.means_[i, 1],
+        #                 c=[site_colors(i)], s=300, marker='x', linewidths=4,
+        #                 edgecolors='black', zorder=10)
+
+        #     # Add confidence ellipses
+        #     for i in range(num_components):
+        #         plot_gaussian_ellipse(ax3, gmm.means_[i], gmm.covariances_[i],
+        #                             n_std=2, edgecolor='black', linewidth=2.5,
+        #                             linestyle='-')
+
+        #     ax3.set_xlabel('du')
+        #     ax3.set_ylabel('dv')
+        #     ax3.set_title('Classification Map\nwith Confidence')
+
+        #     # Create custom legend for components
+        #     from matplotlib.patches import Patch
+        #     legend_elements = [Patch(facecolor=site_colors(i), edgecolor='black',
+        #                             label=f'G{i}')
+        #                     for i in range(num_components)]
+        #     ax3.legend(handles=legend_elements, loc='best')
+
+        #     # Add appropriate color reference based on number of components
+        #     if num_components == 2:
+        #         add_2phase_colorbar(ax3)
+        #     elif num_components == 3:
+        #         add_3phase_color_triangle(fig3, ax3)
+        #     # For num_components > 3 or == 1, don't add any color reference
+
+        #     plt.tight_layout()
+        #     plt.show()
+
+        if plot_order_parameter:
+            # Create colors from full probability distribution
+            colors = create_colors_from_probabilities(probabilities, num_phases)
+
+            fig, ax = show_2d(
+                self._image.array,
+                axsize=(10, 10),
+                cmap="gray",
+            )
+
+            # Plot points with colormap
+            ax.scatter(
+                y_arr,  # col (x-axis)
+                x_arr,  # row (y-axis)
+                c=colors,  # color by probabilities
+                s=100,  # point size
+                alpha=0.8,  # slight transparency
+                edgecolors="black",  # edge for visibility
+                linewidth=1,
+            )
+
+            # Add appropriate color reference based on number of phases
+            if num_phases == 2:
+                add_2phase_colorbar(ax)
+            elif num_phases == 3:
+                add_3phase_color_triangle(fig, ax)
+            # For num_phases > 3 or == 1, don't add any color reference
+
+            ax.axis("off")
+            fig.tight_layout()
+            fig.show()
+
+        return self
+
+    # --- Plotting Functions ---
     def plot_polarization_vectors(
         self,
         pol_vec: "Vector",
@@ -1744,7 +2152,7 @@ class Lattice(AutoSerialize):
         return img_rgb
 
 
-# helper function for polar color mapping
+# helper functions for plotting
 def _compute_polar_color_mapping(
     dr: np.ndarray,
     dc: np.ndarray,
@@ -1782,25 +2190,280 @@ def _compute_polar_color_mapping(
     return dr, dc, amp, disp_cap_px
 
 
-def site_colors(number: int) -> tuple[float, float, float]:
+def site_colors(number):
     """
     Map an integer 'number' to an RGB triple in [0,1].
+    If 'number' is a list, array, or tuple, returns an array of RGB triples.
     Starts with the requested seed palette and cycles thereafter.
     """
+
     palette = [
-        (0.00, 0.00, 0.00),  # 0: black
-        (1.00, 0.00, 0.00),  # 1: red
-        (0.00, 0.70, 1.00),  # 2: light blue (cyan-ish)
-        (0.00, 0.70, 0.00),  # 3: green
-        (1.00, 0.00, 1.00),  # 4: magenta
-        (1.00, 0.70, 0.00),  # 5: orange
-        (0.00, 0.30, 1.00),  # 6: blue-ish
+        (1.00, 0.00, 0.00),  # 0: red
+        (0.00, 0.00, 1.00),  # 1: blue
+        (0.00, 1.00, 0.00),  # 2: green
+        (1.00, 0.00, 1.00),  # 3: magenta
+        (1.00, 0.70, 0.00),  # 4: orange
+        (0.00, 0.30, 1.00),  # 5: blue-ish
         # extras to improve variety when cycling:
         (0.60, 0.20, 0.80),
         (0.30, 0.75, 0.75),
         (0.80, 0.40, 0.00),
         (0.20, 0.60, 0.20),
         (0.70, 0.70, 0.00),
+        (0.00, 0.00, 0.00),  # -1: black
+        # ENSURE BLACK IS ALWAYS LAST IF ADDING NEW COLORS
     ]
-    idx = int(number) % len(palette)
-    return palette[idx]
+
+    # Check if input is a list, tuple, or array
+    if isinstance(number, int):
+        # Original behavior for single integer
+        idx = int(number) % len(palette)
+        return palette[idx]
+    else:
+        # Convert to numpy array for vectorized operations
+        numbers = np.asarray(number, dtype=int)
+        indices = numbers % len(palette)
+        # Return array of RGB tuples
+        return np.array([palette[idx] for idx in indices.flat]).reshape(numbers.shape + (3,))
+
+
+def create_colors_from_probabilities(probabilities, num_phases):
+    """
+    Create colors from probability distribution with a smooth transition to white for uncertainty.
+    Smoothing is applied only when num_phases = 3.
+
+    Parameters:
+    -----------
+    probabilities : array of shape (N, n_categories)
+        Probabilities for each category (rows should sum to 1)
+    num_phases : int
+        Number of phases/categories
+
+    Returns:
+    --------
+    colors : array of shape (N, 3)
+        RGB colors for each point
+    """
+    import matplotlib.colors as mcolors
+
+    # Get base colors for each category (assume 0-1 range)
+    category_colors = np.array([site_colors(i) for i in range(num_phases)])
+
+    # Mix colors based on probabilities
+    mixed_colors = probabilities @ category_colors
+
+    if num_phases == 3:
+        # Apply smoothing for 3-phase system
+        # Calculate certainty (max probability)
+        certainty = np.max(probabilities, axis=1)
+
+        # Create a smooth transition function
+        def smooth_transition(x):
+            return 4 * x**3 - 3 * x**4
+
+        # Apply smooth transition to certainty
+        smooth_certainty = smooth_transition(certainty)
+
+        # Blend with white: uncertain -> white, certain -> category color
+        white = np.array([1.0, 1.0, 1.0])
+        final_colors = (
+            smooth_certainty[:, np.newaxis] * mixed_colors
+            + (1 - smooth_certainty[:, np.newaxis]) * white
+        )
+
+        # Convert to HSV for final adjustments
+        hsv_colors = mcolors.rgb_to_hsv(final_colors)
+
+        # Adjust saturation based on certainty
+        hsv_colors[:, 1] *= smooth_certainty
+
+        # Convert back to RGB
+        final_colors = mcolors.hsv_to_rgb(hsv_colors)
+    else:
+        # For 2-phase system, use the original method
+        # Calculate certainty (inverse of entropy)
+        epsilon = 1e-10
+        entropy = -np.sum(probabilities * np.log(probabilities + epsilon), axis=1)
+        max_entropy = np.log(num_phases)
+
+        # Certainty: 0 (uncertain) to 1 (certain)
+        certainty = 1 - (entropy / max_entropy)
+
+        # Blend with white: uncertain -> white, certain -> category color
+        white = np.array([1.0, 1.0, 1.0])
+        final_colors = (
+            certainty[:, np.newaxis] * mixed_colors + (1 - certainty[:, np.newaxis]) * white
+        )
+
+    # Ensure final colors are in valid range [0, 1]
+    final_colors = np.clip(final_colors, 0, 1)
+
+    return final_colors
+
+
+def add_2phase_colorbar(ax):
+    """
+    Add a 1D colorbar for 2-phase system
+    Creates a colormap that goes: color0 -> white (center) -> color1
+    """
+    from matplotlib.colors import LinearSegmentedColormap
+
+    fig = ax.get_figure()
+
+    # Find the rightmost edge of all existing axes
+    max_right = ax.get_position().x1
+    for fig_ax in fig.get_axes():
+        if fig_ax != ax:
+            max_right = max(max_right, fig_ax.get_position().x1)
+
+    # Calculate the position for the new colorbar
+    ax_pos = ax.get_position()
+    cbar_width = 0.035  # Width of the colorbar
+    cbar_pad = 0.05  # Increased padding between colorbars
+    cbar_left = max_right + cbar_pad
+    cbar_bottom = ax_pos.y0
+    cbar_height = ax_pos.height
+
+    # Create new axes for colorbar
+    cax = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
+
+    # Get the two phase colors (assume 0-1 range)
+    color0 = np.array(site_colors(0))
+    color1 = np.array(site_colors(1))
+
+    # Create a colormap that goes: color0 -> white (center) -> color1
+    colors_list = [color0, (1, 1, 1), color1]
+    n_bins = 256
+    cmap = LinearSegmentedColormap.from_list("two_phase", colors_list, N=n_bins)
+    # Create gradient
+    gradient = np.linspace(0, 1, 256).reshape(256, 1)
+
+    # Display the colorbar
+    cax.imshow(gradient, aspect="auto", cmap=cmap, origin="lower")
+
+    # Configure ticks and labels
+    cax.set_xticks([])
+    cax.set_yticks([0, 128, 255])
+    cax.set_yticklabels(["Phase 0", "Uncertain", "Phase 1"])
+    cax.yaxis.tick_right()
+
+    return cax
+
+
+def add_3phase_color_triangle(fig, ax):
+    """Add a ternary color triangle for 3-phase system"""
+
+    # Check if there are existing colorbars/triangles attached to the figure
+    box = ax.get_position()
+    existing_elements = []
+
+    # Find all axes that might be colorbars or previous triangles
+    for fig_ax in fig.get_axes():
+        if fig_ax != ax:
+            pos = fig_ax.get_position()
+            # Check if it's positioned to the right of the main axes
+            if pos.x0 >= box.x1:
+                existing_elements.append(fig_ax)
+
+    # Calculate horizontal offset based on existing elements
+    if existing_elements:
+        # Find the rightmost existing element
+        rightmost_x = max(elem.get_position().x1 for elem in existing_elements)
+        x_offset = rightmost_x + 0.02  # Add spacing after the rightmost element
+    else:
+        x_offset = box.x1 + 0.02
+
+    # Create a new axes for the triangle
+    # Adjust position to account for existing colorbars
+    triangle_width = box.height * 0.8
+    triangle_ax = fig.add_axes([x_offset, box.y0, triangle_width, box.height * 0.8])
+
+    # Get the three phase colors (assume 0-1 range)
+    color0 = np.array(site_colors(0))
+    color1 = np.array(site_colors(1))
+    color2 = np.array(site_colors(2))
+
+    # Create ternary color grid
+    resolution = 100
+    positions = []
+    probabilities_list = []
+
+    for i in range(resolution + 1):
+        for j in range(resolution + 1 - i):
+            k = resolution - i - j
+
+            # Probabilities (barycentric coordinates)
+            p0, p1, p2 = i / resolution, j / resolution, k / resolution
+            probabilities_list.append([p0, p1, p2])
+
+            # Convert to Cartesian coordinates for ternary plot
+            x = 0.5 * (2 * p1 + p2)
+            y = (np.sqrt(3) / 2) * p2
+            positions.append([x, y])
+
+    positions = np.array(positions)
+    probabilities_array = np.array(probabilities_list)
+
+    # Get colors using the same function
+    colors = create_colors_from_probabilities(probabilities_array, 3)
+
+    # Plot the triangle
+    triangle_ax.scatter(
+        positions[:, 0], positions[:, 1], c=colors, s=20, marker="s", edgecolors="none"
+    )
+
+    # Draw triangle edges
+    triangle_vertices = np.array([[0, 0], [1, 0], [0.5, np.sqrt(3) / 2], [0, 0]])
+    triangle_ax.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], "k-", linewidth=2)
+
+    # Add vertex markers and labels
+    vertex_size = 150
+
+    # Vertex 0 (bottom left) - Phase 0
+    triangle_ax.scatter(
+        0, 0, s=vertex_size, c=[color0], edgecolors="black", linewidths=2, zorder=10
+    )
+    triangle_ax.text(0, -0.1, "Phase 0", ha="center", va="top", fontsize=10, fontweight="bold")
+
+    # Vertex 1 (bottom right) - Phase 1
+    triangle_ax.scatter(
+        1, 0, s=vertex_size, c=[color1], edgecolors="black", linewidths=2, zorder=10
+    )
+    triangle_ax.text(1, -0.1, "Phase 1", ha="center", va="top", fontsize=10, fontweight="bold")
+
+    # Vertex 2 (top) - Phase 2
+    triangle_ax.scatter(
+        0.5, np.sqrt(3) / 2, s=vertex_size, c=[color2], edgecolors="black", linewidths=2, zorder=10
+    )
+    triangle_ax.text(
+        0.5,
+        np.sqrt(3) / 2 + 0.1,
+        "Phase 2",
+        ha="center",
+        va="bottom",
+        fontsize=10,
+        fontweight="bold",
+    )
+
+    # Mark center (maximum uncertainty) - white
+    triangle_ax.scatter(
+        0.5, np.sqrt(3) / 6, s=vertex_size, c="white", edgecolors="black", linewidths=2, zorder=10
+    )
+    triangle_ax.text(
+        0.65,
+        np.sqrt(3) / 6,
+        "Uncertain\n(Equal)",
+        ha="left",
+        va="center",
+        fontsize=8,
+        style="italic",
+    )
+
+    # Set limits and styling
+    triangle_ax.set_xlim(-0.15, 1.15)
+    triangle_ax.set_ylim(-0.2, np.sqrt(3) / 2 + 0.15)
+    triangle_ax.set_aspect("equal")
+    triangle_ax.axis("off")
+    triangle_ax.set_title("Probability Map", fontsize=11, pad=10)
+
+    return triangle_ax
