@@ -422,9 +422,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def _compute_icom_weighting(self, qxa, qya, kxa, kya, batch_idx, q_highpass=None):
         """Compute iCOM Fourier-space weighting factors."""
         q2 = qxa.square() + qya.square()
-        q2[0, 0] = torch.inf
         qx_op = -1.0j * qxa / q2
         qy_op = -1.0j * qya / q2
+        qx_op[0, 0] = 0.0
+        qy_op[0, 0] = 0.0
 
         env = torch.ones_like(q2)
         if q_highpass:
