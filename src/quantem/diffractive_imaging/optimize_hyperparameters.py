@@ -202,6 +202,8 @@ def _OptimizePtychographyObjective(
                 resolved_preprocess_kwargs = _resolve_params_with_trial(
                     trial, dataset_preprocess_kwargs
                 )
+                resolved_preprocess_kwargs["plot_rotation"] = False
+                resolved_preprocess_kwargs["plot_com"] = False
                 pdset.preprocess(**resolved_preprocess_kwargs)
 
             resolved_kwargs.setdefault("init", {})["dset"] = pdset
