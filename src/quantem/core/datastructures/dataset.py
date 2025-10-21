@@ -574,66 +574,67 @@ class Dataset(AutoSerialize):
                     self.sampling[axis] *= factor
             return None
 
+    def __getitem__(self, index) -> "Dataset":
+        """
+        General indexing method for Dataset objects.
 
-def __getitem__(self, index) -> "Dataset":
-    """
-    General indexing method for Dataset objects.
+        Returns a new Dataset (or subclass) corresponding to the indexed data.
+        Metadata (origin, sampling, units) is sliced or reduced accordingly.
+        Handles step slicing (e.g., [::2]) by multiplying sampling accordingly.
 
-    Returns a new Dataset (or subclass) corresponding to the indexed data.
-    Metadata (origin, sampling, units) is sliced or reduced accordingly.
-    Handles step slicing (e.g., [::2]) by multiplying sampling accordingly.
+        Parameters
+        ----------
+        index : int | slice | tuple | Ellipsis
+            Indexing expression applied to the underlying array.
 
-    Parameters
-    ----------
-    index : int | slice | tuple | Ellipsis
-        Indexing expression applied to the underlying array.
+        Returns
+        -------
+        Dataset
+            A new Dataset instance with appropriately adjusted metadata.
+        """
+        array_view = self.array[index]
 
-    Returns
-    -------
-    Dataset
-        A new Dataset instance with appropriately adjusted metadata.
-    """
-    array_view = self.array[index]
+        # Normalize index into tuple form
+        if not isinstance(index, tuple):
+            index = (index,)
 
-    # Normalize index into tuple form
-    if not isinstance(index, tuple):
-        index = (index,)
+        # Expand Ellipsis
+        if Ellipsis in index:
+            ellipsis_pos = index.index(Ellipsis)
+            num_missing = self.ndim - (len(index) - 1)
+            index = index[:ellipsis_pos] + (slice(None),) * num_missing + index[ellipsis_pos + 1 :]
 
-    # Expand Ellipsis
-    if Ellipsis in index:
-        ellipsis_pos = index.index(Ellipsis)
-        num_missing = self.ndim - (len(index) - 1)
-        index = index[:ellipsis_pos] + (slice(None),) * num_missing + index[ellipsis_pos + 1 :]
+        # Pad with slices if index shorter than ndim
+        if len(index) < self.ndim:
+            index = index + (slice(None),) * (self.ndim - len(index))
 
-    # Pad with slices if index shorter than ndim
-    if len(index) < self.ndim:
-        index = index + (slice(None),) * (self.ndim - len(index))
+        # Compute which dimensions are kept
+        kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
 
-    # Compute which dimensions are kept
-    kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
+        # Slice/reduce metadata accordingly
+        new_origin = (
+            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        )
+        new_sampling = (
+            np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
+        )
+        new_units = [self.units[i] for i in kept_axes] if len(self.units) > 0 else self.units
 
-    # Slice/reduce metadata accordingly
-    new_origin = np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
-    new_sampling = (
-        np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
-    )
-    new_units = [self.units[i] for i in kept_axes] if len(self.units) > 0 else self.units
+        # Adjust sampling for slice steps (e.g. [::2] doubles spacing)
+        for i, idx in enumerate(index):
+            if isinstance(idx, slice) and idx.step not in (None, 1):
+                if i in kept_axes:
+                    j = kept_axes.index(i)
+                    new_sampling[j] *= idx.step
 
-    # Adjust sampling for slice steps (e.g. [::2] doubles spacing)
-    for i, idx in enumerate(index):
-        if isinstance(idx, slice) and idx.step not in (None, 1):
-            if i in kept_axes:
-                j = kept_axes.index(i)
-                new_sampling[j] *= idx.step
+        cls = type(self)
 
-    cls = type(self)
-
-    # Construct new dataset
-    return cls.from_array(
-        array=array_view,
-        name=f"{self.name}{index}",
-        origin=new_origin,
-        sampling=new_sampling,
-        units=new_units,
-        signal_units=self.signal_units,
-    )
+        # Construct new dataset
+        return cls.from_array(
+            array=array_view,
+            name=f"{self.name}{index}",
+            origin=new_origin,
+            sampling=new_sampling,
+            units=new_units,
+            signal_units=self.signal_units,
+        )
