@@ -422,9 +422,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def _compute_icom_weighting(self, qxa, qya, kxa, kya, batch_idx, q_highpass=None):
         """Compute iCOM Fourier-space weighting factors."""
         q2 = qxa.square() + qya.square()
-        q2[0, 0] = torch.inf
         qx_op = -1.0j * qxa / q2
         qy_op = -1.0j * qya / q2
+        qx_op[0, 0] = 0.0
+        qy_op[0, 0] = 0.0
 
         env = torch.ones_like(q2)
         if q_highpass:
@@ -449,6 +450,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         deconvolution_kernel="full",
         use_center_of_mass_weighting=False,
         flip_phase=True,
+        dark_field_contrast=True,
         q_highpass=None,
         verbose=None,
     ):
@@ -473,6 +475,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             If True, apply iCOM Fourier-space weighting
         flip_phase : bool, optional
             If True, flip phase in parallax approximation (default: True)
+        dark_field_contrast : bool, optional
+            If True, contrast is flipped to match dark field imaging  (default: True)
         q_highpass : float, optional
             High-pass filter cutoff for iCOM weighting
         verbose : bool, optional
@@ -560,6 +564,19 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 dim=-2,
             )
 
+            if use_center_of_mass_weighting:
+                icom_weighting = self._compute_icom_weighting(
+                    qxa, qya, kxa, kya, batch_idx, q_highpass
+                )
+            else:
+                icom_weighting = (
+                    -1.0j
+                    if deconvolution_kernel == "full"
+                    else 1.0
+                    if deconvolution_kernel == "quadratic"
+                    else -1.0
+                )
+
             if deconvolution_kernel == "full":
                 # Compute gamma operator for this batch
                 operator = self._compute_gamma_operator(
@@ -572,25 +589,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     asymmetric_version=not use_center_of_mass_weighting,
                     normalize=not use_center_of_mass_weighting,
                 )
-                fourier_factor = vbf_fourier * operator
+                fourier_factor = vbf_fourier * operator * icom_weighting
             elif deconvolution_kernel == "quadratic":
-                # Use pre-computed operator
-                fourier_factor = vbf_fourier * operator[batch_idx]
+                fourier_factor = vbf_fourier * operator[batch_idx] * icom_weighting
             else:
-                fourier_factor = vbf_fourier
-                if flip_phase:
-                    fourier_factor = -fourier_factor
+                fourier_factor = vbf_fourier * icom_weighting
 
-            # Apply iCOM weighting if requested
-            if use_center_of_mass_weighting:
-                icom_weighting = self._compute_icom_weighting(
-                    qxa, qya, kxa, kya, batch_idx, q_highpass
-                )
-                fourier_factor = fourier_factor * icom_weighting
-            elif deconvolution_kernel == "full":
-                fourier_factor = 1.0j * fourier_factor
-                if flip_phase:
-                    fourier_factor = -fourier_factor
+            if not dark_field_contrast:
+                fourier_factor = -fourier_factor
 
             # Inverse FFT and extract appropriate component
             corrected_stack[batch_idx] = torch.fft.ifft2(fourier_factor).real * upsampling_factor
