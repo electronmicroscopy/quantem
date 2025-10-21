@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
+import torch
 from tqdm.auto import tqdm
 
 from quantem.core.visualization import show_2d
@@ -363,6 +365,9 @@ class OptimizePtychography:
             def _on_trial_end(study_: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
                 pbar.update(1)
 
+                torch.cuda.empty_cache()
+                gc.collect()
+
             self.study.optimize(
                 self.objective_func,
                 n_trials=self.n_trials,
@@ -620,6 +625,9 @@ class OptimizePtychography:
                 )
 
                 pbar.update(1)
+
+                torch.cuda.empty_cache()
+                gc.collect()
 
         # Find best
         best_idx = np.argmin([r["loss"] for r in results])
