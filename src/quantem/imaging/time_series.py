@@ -26,6 +26,7 @@ class TimeSeries(Dataset3d):
         attach: bool = True,
     ):
 
+        # idk what to call this?
         agg_func = {
             'mean': np.mean,
             'median': np.median,
@@ -87,42 +88,93 @@ class TimeSeries(Dataset3d):
         
         print(stack_pad.shape)
 
-        if edge_blend[0] < 0 or edge_blend[0] > stack_pad.shape[1] / 2 or edge_blend[1] < 0 or edge_blend[1] > stack_pad.shape[2] / 2:
-            raise ValueError("edge_blend is outside of allowable range.")
+        # ensure edge blend values are within range
+        if edge_blend[0] < 0 or edge_blend[0] > stack_pad.shape[1] / 2:
+            if edge_blend[1] < 0 or edge_blend[1] > stack_pad.shape[2] / 2:
+                raise ValueError("edge_blend is outside of allowable range.")
         
         return stack_pad
-
-        # cap edge blending to 0-half-width (stack_pad.shape)
-
-
-        #pad val that is mean, median, min, and max (take in strings)
-        # None | str
         
 
     def align_images(
-        pad_stack, 
+        im_ref,
+        im,
+        return_aligned_image=True,
+        window_size = 7, # ???            
+    ):
+        
+        # take 2D DFT of an image (im) and the image before it as reference (im_ref)
+        G_ref = np.fft.fft2(im_ref) 
+        G = np.fft.fft2(im) 
+        
+        # get the cross correlation of the two image signals
+        # result is a 2D array with the same dimensions of the images with peaks that correlate to where the two functions are most similar
+        im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G)))
+        print(im_corr)
+
+        # Get subpixel position ... what is this actually doing...
+        # index position of the maximum 
+        nrows, ncols = im_corr.shape
+        peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
+        print(peak_r, peak_c)
+        half = window_size // 2
+
+        # TODO replace COM with DFT upsampling (already implemented in quantem)
+
+        # Build periodic window
+        # padding of the extra pixels
+        r_idx = np.mod(np.arange(peak_r - half, peak_r + half + 1), nrows)
+        c_idx = np.mod(np.arange(peak_c - half, peak_c + half + 1), ncols)
+        window = im_corr[np.ix_(r_idx, c_idx)]
+
+        # Center of mass within window
+        com_r, com_c = ndimage.center_of_mass(window)
+
+        # Adjust back to full image coordinates (with periodicity)
+        shift_row = (((peak_r - half + com_r) + nrows/2) % nrows) - nrows/2
+        shift_col = (((peak_c - half + com_c) + ncols/2) % ncols) - ncols/2
+        shift = np.array((shift_row,shift_col))
+
+        if return_aligned_image:
+            kx_shift = -2*np.pi*np.fft.fftfreq(im.shape[0])
+            ky_shift = -2*np.pi*np.fft.fftfreq(im.shape[1])
+            im_shift = np.real(np.fft.ifft2(
+                G * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
+            ))
+            return shift,im_shift
+
+        else:
+            return shift
+        
+
+    def align_stack(
+        stack_pad, 
         window_size = 7,
         running_average_frames = 20.0,
     ):
-        stack_aligned = np.zeros_like(pad_stack)
+        # initialize aligned stack
+        stack_aligned = np.zeros_like(stack_pad)
 
         print(stack_aligned.shape)
         
-        stack_aligned[0] = pad_stack[0]
-        dxy = np.zeros((pad_stack.shape[0],2))
+        # indexing the aligned stack the same as the padded stack
+        stack_aligned[0] = stack_pad[0]
+        
+        # initialize shifted 
+        dxy = np.zeros((stack_pad.shape[0],2))
 
-        kx_shift = -2*np.pi*np.fft.fftfreq(pad_stack.shape[1])
-        ky_shift = -2*np.pi*np.fft.fftfreq(pad_stack.shape[2])
-
-        # print(kx_shift, ky_shift)
-
-        G_ref = np.fft.fft2(pad_stack[0])
-        for a0 in range(1,pad_stack.shape[0]):
-            G = np.fft.fft2(pad_stack[a0])
+        # angular frequencies
+        kx_shift = -2*np.pi*np.fft.fftfreq(stack_pad.shape[1])
+        ky_shift = -2*np.pi*np.fft.fftfreq(stack_pad.shape[2])
+        G_ref = np.fft.fft2(stack_pad[0])
+        
+        for a0 in range(1,stack_pad.shape[0]):
+            G = np.fft.fft2(stack_pad[a0])
             im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G)))
 
             # Get subpixel shift
-                    # Get subpixel position
+            
+            # Get subpixel position
             nrows, ncols = im_corr.shape
             peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
             half = window_size // 2
@@ -131,8 +183,6 @@ class TimeSeries(Dataset3d):
             r_idx = np.mod(np.arange(peak_r - half, peak_r + half + 1), nrows)
             c_idx = np.mod(np.arange(peak_c - half, peak_c + half + 1), ncols)
             window = im_corr[np.ix_(r_idx, c_idx)]
-
-            print(window)
 
             # Center of mass within window
             com_r, com_c = ndimage.center_of_mass(window)
@@ -152,7 +202,8 @@ class TimeSeries(Dataset3d):
             weight = np.maximum(1/(a0+1),1/running_average_frames)
             G_ref = G_ref * (1-weight) + G_shift * weight
 
-        return stack_aligned
+        return stack_aligned, dxy
+    
 
 
 
@@ -164,29 +215,6 @@ class TimeSeries(Dataset3d):
 
 
 
-
-
-
-    # def align_images(
-    #     arrays: Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
-    #     # return_aligned_image=True,
-    #     # window_size=7,
-    # ):
-    #     print(arrays)
-        
-        # f_fft = np.fft.fft2(im_ref.array)
-
-        # print(2)
-        
-        # g_fft = np.fft.fft2(im)
-
-        # print(3)
-        
-        # im_corr = np.real(np.fft.ifft2(f_fft * np.conj(g_fft)))
-
-        # print(4)
-
-        # return im_corr
 
 
 
