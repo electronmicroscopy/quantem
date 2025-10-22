@@ -201,7 +201,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         # vbf_stack
         vbf_stack = shifted_tensor[..., bf_mask]
-        vbf_stack = vbf_stack / vbf_stack.mean((0, 1)) - 1
+        # ToDo: Add fancier normalization and windowing
+        vbf_stack = vbf_stack / vbf_stack.mean((0, 1))  # unity mean, important
         vbf_stack = torch.moveaxis(vbf_stack, (0, 1, 2), (1, 2, 0))
 
         vbf_dataset = Dataset3d.from_array(
@@ -450,7 +451,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         deconvolution_kernel="full",
         use_center_of_mass_weighting=False,
         flip_phase=True,
-        dark_field_contrast=True,
         q_highpass=None,
         verbose=None,
     ):
@@ -475,8 +475,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             If True, apply iCOM Fourier-space weighting
         flip_phase : bool, optional
             If True, flip phase in parallax approximation (default: True)
-        dark_field_contrast : bool, optional
-            If True, contrast is flipped to match dark field imaging  (default: True)
         q_highpass : float, optional
             High-pass filter cutoff for iCOM weighting
         verbose : bool, optional
@@ -512,9 +510,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             deconvolution_kernel == "none"
         elif deconvolution_kernel == "parallax":
             deconvolution_kernel = "quadratic"
+        elif deconvolution_kernel == "ssb":
+            deconvolution_kernel = "full"
         elif deconvolution_kernel not in ("full", "quadratic", "none"):
             raise ValueError(
-                f"deconvolution_kernel needs to be one on 'full','quadratic' or 'parallax', 'none' or None, not '{deconvolution_kernel}'"
+                f"deconvolution_kernel needs to be one on 'full' or 'ssb','quadratic' or 'parallax', 'none' or None, not '{deconvolution_kernel}'"
             )
 
         # Get upsampled q-space grid
@@ -529,7 +529,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # Compute operator based on method
         if deconvolution_kernel == "full":
             # operator calculated inside loop
-            # compute common cmplx_probe instead
             cmplx_probe = evaluate_probe(
                 alpha,
                 phi,
@@ -550,7 +549,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
         )
 
-        corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
+        if deconvolution_kernel == "full":
+            corrected_stack = torch.empty(
+                (self.num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
+            )
+            dc_per_image = self._vbf_fourier[..., 0, 0].mean()
+        else:
+            corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
 
         for batch_idx in batcher:
             # MPS does not support complex tiling
@@ -568,14 +573,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 icom_weighting = self._compute_icom_weighting(
                     qxa, qya, kxa, kya, batch_idx, q_highpass
                 )
+                if deconvolution_kernel == "full":
+                    icom_weighting = 1.0j * icom_weighting
             else:
-                icom_weighting = (
-                    -1.0j
-                    if deconvolution_kernel == "full"
-                    else 1.0
-                    if deconvolution_kernel == "quadratic"
-                    else -1.0
-                )
+                icom_weighting = 1.0
 
             if deconvolution_kernel == "full":
                 # Compute gamma operator for this batch
@@ -590,20 +591,30 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     normalize=not use_center_of_mass_weighting,
                 )
                 fourier_factor = vbf_fourier * operator * icom_weighting
+                fourier_factor[..., 0, 0] = dc_per_image
+
             elif deconvolution_kernel == "quadratic":
                 fourier_factor = vbf_fourier * operator[batch_idx] * icom_weighting
             else:
                 fourier_factor = vbf_fourier * icom_weighting
 
-            if not dark_field_contrast:
-                fourier_factor = -fourier_factor
-
             # Inverse FFT and extract appropriate component
-            corrected_stack[batch_idx] = torch.fft.ifft2(fourier_factor).real * upsampling_factor
+            if deconvolution_kernel == "full":
+                corrected_stack[batch_idx] = torch.fft.ifft2(fourier_factor) * upsampling_factor
+            else:
+                corrected_stack[batch_idx] = (
+                    torch.fft.ifft2(fourier_factor).real * upsampling_factor
+                )
             pbar.update(len(batch_idx))
 
         pbar.close()
-        self.corrected_stack = corrected_stack
+
+        if deconvolution_kernel == "full":
+            self.corrected_stack = corrected_stack.angle()
+            self.corrected_stack_amplitude = 2 - corrected_stack.abs()  # contrast flipping
+        else:
+            self.corrected_stack = corrected_stack
+            self.corrected_stack_amplitude = None
 
         return self
 
@@ -613,7 +624,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @corrected_stack.setter
     def corrected_stack(self, value: torch.Tensor):
-        self._corrected_stack = validate_tensor(value, "corrected_stack", dtype=torch.float).to(
+        self._corrected_stack = validate_tensor(value, "corrected_stack", dtype=torch.float32).to(
             device=self.device
         )
 
@@ -848,3 +859,31 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             rotation_angle=rotation_angle,
             **reconstruct_kwargs,
         )
+
+    def _reconstruct_all_permutations(self, **reconstruct_kwargs):
+        """ """
+        safe_kwargs = {
+            k: v
+            for k, v in reconstruct_kwargs.items()
+            if k not in ["deconvolution_kernel", "use_center_of_mass_weighting"]
+        }
+
+        verbose = self.verbose
+        self.verbose = False
+
+        combo = list(
+            product(
+                [False, True],
+                ["none", "quadratic", "full"],
+            )
+        )
+
+        recons = [
+            self.reconstruct(
+                deconvolution_kernel=kernel, use_center_of_mass_weighting=icom, **safe_kwargs
+            ).obj
+            for icom, kernel in tqdm(combo, disable=not verbose)
+        ]
+
+        self.verbose = verbose
+        return recons
