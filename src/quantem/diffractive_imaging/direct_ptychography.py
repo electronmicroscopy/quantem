@@ -798,10 +798,44 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         bin_factors: tuple[int, ...] = (7, 6, 5, 4, 3, 2, 1),
         pair_connectivity: int = 4,
-        use_reference: bool = True,
+        use_reference: bool = False,
+        reference: torch.Tensor | NDArray | None = None,
+        running_average: bool = False,
         **reconstruct_kwargs,
     ):
-        """ """
+        """
+        Fit aberrations and rotation angle from virtual BF stack.
+
+        Uses either pairwise alignment or reference-based alignment after initial reconstruction.
+
+        Parameters
+        ----------
+        bin_factors : tuple of int
+            Sequence of binning factors from coarse to fine
+        pair_connectivity : int
+            Neighbor connectivity for pairwise alignment (4 or 8)
+        use_reference : bool
+            If True, performs initial reconstruction and aligns against the mean.
+            If False, uses only pairwise alignment from scratch.
+        reference: array-like
+            If not None and use_reference=True, used as initial reference to align against.
+        running_average : bool
+            If True and use_reference=True, updates reference as running average during
+            alignment. Can help with noisy data but may slow convergence.
+        **reconstruct_kwargs
+            Additional arguments passed to reconstruct methods
+
+        Returns
+        -------
+        self : object
+            Returns self with fitted parameters stored in self._fitted_parameters
+
+        Notes
+        -----
+        The running_average option updates the reference at each bin level as:
+            ref_new = ref_old * n/(n+1) + aligned_mean / (n+1)
+        This helps with noisy data by gradually incorporating aligned images.
+        """
         bf_mask = self.bf_mask
         inds_i, inds_j = self._bf_inds_i, self._bf_inds_j
         scan_sampling = torch.as_tensor(
@@ -809,20 +843,28 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         )
 
         if use_reference:
-            # Use safer defaults for initial reconstruction
-            safe_kwargs = {
-                k: v
-                for k, v in reconstruct_kwargs.items()
-                if k not in ["deconvolution_kernel", "flip_phase"]
-            }
-            self.reconstruct(
-                deconvolution_kernel="quadratic", flip_phase=False, verbose=False, **safe_kwargs
-            )
+            if reference is not None:
+                reference = torch.as_tensor(reference, dtype=torch.float32, device=self.device)
+                vbf_stack = self.vbf_stack.clone()
+                initial_shifts = None
+            else:
+                # Use safer defaults for initial reconstruction
+                safe_kwargs = {
+                    k: v
+                    for k, v in reconstruct_kwargs.items()
+                    if k not in ["deconvolution_kernel", "flip_phase"]
+                }
+                self.reconstruct(
+                    deconvolution_kernel="quadratic",
+                    flip_phase=False,
+                    verbose=False,
+                    **safe_kwargs,
+                )
 
-            # Start from already-corrected stack and existing shifts
-            vbf_stack = self.corrected_stack.clone()
-            initial_shifts = self.lateral_shifts / scan_sampling
-            reference = vbf_stack.mean(0)
+                # Start from already-corrected stack and existing shifts
+                vbf_stack = self.corrected_stack.clone()
+                initial_shifts = self.lateral_shifts / scan_sampling
+                reference = vbf_stack.mean(0)
 
         else:
             # Start from scratch with pairwise alignment
@@ -840,6 +882,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             upsample_factor=1,
             reference=reference,
             initial_shifts=initial_shifts,
+            running_average=running_average,
             verbose=self.verbose,
         )
 

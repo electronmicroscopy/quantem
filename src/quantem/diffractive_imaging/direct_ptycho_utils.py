@@ -311,6 +311,7 @@ def align_vbf_stack_multiscale(
     upsample_factor: int = 1,
     reference: torch.Tensor | None = None,
     initial_shifts: torch.Tensor | None = None,
+    running_average: bool = False,
     verbose: int | bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -319,7 +320,8 @@ def align_vbf_stack_multiscale(
     Parameters
     ----------
     vbf_stack : torch.Tensor
-        (N, H, W) stack of virtual BF images to align
+        (N, H, W) stack of virtual BF images to align. If initial_shifts provided,
+        this should be the already-shifted stack.
     bf_mask : torch.BoolTensor
         (Q, R) corner-centered mask of valid BF positions
     inds_i, inds_j : torch.Tensor
@@ -327,9 +329,21 @@ def align_vbf_stack_multiscale(
     bin_factors : tuple of int
         Sequence of binning factors from coarse to fine (e.g., (7, 6, 5, 4, 3, 2, 1))
     pair_connectivity : int
-        Number of neighbors for pairwise alignment (4 or 8)
+        Number of neighbors for pairwise alignment (4 or 8). Ignored if reference is provided.
+    upsample_factor : int
+        Upsampling factor for subpixel accuracy
     reference : torch.Tensor, optional
         (H, W) reference image to align all images to. If None, uses pairwise alignment.
+        Should have same shape as each image in vbf_stack (no binning needed).
+    initial_shifts : torch.Tensor, optional
+        (N, 2) initial shifts already applied to vbf_stack. New shifts will be
+        added to these. If None, starts from zero.
+    running_average : bool
+        If True and using reference mode, updates reference as a running average of
+        aligned images at each bin level. Helps stabilize alignment with noisy data.
+    verbose : bool
+        Show progress bar
+
 
     Returns
     -------
@@ -357,17 +371,22 @@ def align_vbf_stack_multiscale(
 
     mode = "reference" if reference is not None else "pairwise"
     desc = f"Aligning ({mode})"
+
+    iteration = 0
+    current_reference = reference.clone() if reference is not None else None
+
     pbar = tqdm(bin_factors, desc=desc, disable=not verbose)
-    for bin_factor in bin_factors:
+    for bin_factor in pbar:
+        iteration += 1
         # Bin the mask and stack
         bf_mask_binned, inds_ib, inds_jb, vbf_binned, mapping = _bin_mask_and_stack_centered(
             bf_mask, inds_i, inds_j, vbf_stack, bin_factor=bin_factor
         )
 
-        if reference is not None:
+        if current_reference is not None:
             # Reference-based alignment: bin the reference too
             shifts = _compute_reference_shifts(
-                vbf_binned, reference, upsample_factor=upsample_factor
+                vbf_binned, current_reference, upsample_factor=upsample_factor
             )
         else:
             # Pairwise alignment with synchronization
@@ -382,7 +401,14 @@ def align_vbf_stack_multiscale(
         global_shifts += incremental_shifts
 
         vbf_stack = _fourier_shift_stack(vbf_stack, incremental_shifts)
-        pbar.update(n=1)
+
+        if current_reference is not None:
+            new_mean = vbf_stack.mean(0)
+            if running_average:
+                alpha = iteration / (iteration + 1)
+                current_reference = current_reference * alpha + new_mean * (1 - alpha)
+            else:
+                current_reference = new_mean
 
     pbar.close()
     return global_shifts, vbf_stack
