@@ -386,7 +386,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             sign_sign_chi_q = torch.sign(torch.sin(chi_q))
             operator = operator * sign_sign_chi_q
 
-        return operator
+        return operator, grad_k / 2 / np.pi
 
     def _compute_gamma_operator(
         self, kxa, kya, qxa, qya, cmplx_probe, batch_idx, asymmetric_version=True, normalize=True
@@ -539,7 +539,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             )
         elif deconvolution_kernel == "quadratic":
             # compute parallax operator once for all batches
-            operator = self._compute_parallax_operator(
+            operator, self.lateral_shifts = self._compute_parallax_operator(
                 alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=flip_phase
             )
 
@@ -798,14 +798,39 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         bin_factors: tuple[int, ...] = (7, 6, 5, 4, 3, 2, 1),
         pair_connectivity: int = 4,
+        use_reference: bool = True,
         **reconstruct_kwargs,
     ):
         """ """
         bf_mask = self.bf_mask
         inds_i, inds_j = self._bf_inds_i, self._bf_inds_j
-        vbf_stack = self.vbf_stack.clone()
+        scan_sampling = torch.as_tensor(
+            self.scan_sampling, device=self.device, dtype=torch.float32
+        )
 
-        global_shifts, vbf_stack = align_vbf_stack_multiscale(
+        if use_reference:
+            # Use safer defaults for initial reconstruction
+            safe_kwargs = {
+                k: v
+                for k, v in reconstruct_kwargs.items()
+                if k not in ["deconvolution_kernel", "flip_phase"]
+            }
+            self.reconstruct(
+                deconvolution_kernel="quadratic", flip_phase=False, verbose=False, **safe_kwargs
+            )
+
+            # Start from already-corrected stack and existing shifts
+            vbf_stack = self.corrected_stack.clone()
+            initial_shifts = self.lateral_shifts / scan_sampling
+            reference = vbf_stack.mean(0)
+
+        else:
+            # Start from scratch with pairwise alignment
+            vbf_stack = self.vbf_stack.clone()
+            initial_shifts = None
+            reference = None
+
+        shifts_px, vbf_stack = align_vbf_stack_multiscale(
             vbf_stack,
             bf_mask,
             inds_i,
@@ -813,19 +838,29 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             bin_factors,
             pair_connectivity=pair_connectivity,
             upsample_factor=1,
+            reference=reference,
+            initial_shifts=initial_shifts,
             verbose=self.verbose,
         )
 
+        self.lateral_shifts = shifts_px * scan_sampling
+
         fit_results = fit_aberrations_from_shifts(
-            global_shifts, bf_mask, self.wavelength, self.gpts, self.sampling, self.scan_sampling
+            self.lateral_shifts,
+            bf_mask,
+            self.wavelength,
+            self.gpts,
+            self.sampling,
         )
 
         self.corrected_stack = vbf_stack
         self._fitted_parameters = fit_results
+
         if self.verbose:
             print(f"Fitted parameters: {self._fitted_parameters}")
 
         self.reconstruct_with_fitted_parameters(verbose=False, **reconstruct_kwargs)
+
         return self
 
     def reconstruct_with_optimized_parameters(
@@ -838,10 +873,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         aberration_coefs = self._optimized_parameters.copy()
         rotation_angle = aberration_coefs.pop("rotation_angle", None)
+
+        safe_kwargs = {
+            k: v
+            for k, v in reconstruct_kwargs.items()
+            if k not in ["aberration_coefs", "rotation_angle"]
+        }
         return self.reconstruct(
             aberration_coefs=aberration_coefs,
             rotation_angle=rotation_angle,
-            **reconstruct_kwargs,
+            **safe_kwargs,
         )
 
     def reconstruct_with_fitted_parameters(
@@ -854,10 +895,15 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         aberration_coefs = self._fitted_parameters.copy()
         rotation_angle = aberration_coefs.pop("rotation_angle", None)
+        safe_kwargs = {
+            k: v
+            for k, v in reconstruct_kwargs.items()
+            if k not in ["aberration_coefs", "rotation_angle"]
+        }
         return self.reconstruct(
             aberration_coefs=aberration_coefs,
             rotation_angle=rotation_angle,
-            **reconstruct_kwargs,
+            **safe_kwargs,
         )
 
     def _reconstruct_all_permutations(self, **reconstruct_kwargs):
@@ -868,9 +914,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             if k not in ["deconvolution_kernel", "use_center_of_mass_weighting"]
         }
 
-        verbose = self.verbose
-        self.verbose = False
-
         combo = list(
             product(
                 [False, True],
@@ -880,10 +923,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         recons = [
             self.reconstruct(
-                deconvolution_kernel=kernel, use_center_of_mass_weighting=icom, **safe_kwargs
+                deconvolution_kernel=kernel,
+                use_center_of_mass_weighting=icom,
+                verbose=False,
+                **safe_kwargs,
             ).obj
-            for icom, kernel in tqdm(combo, disable=not verbose)
+            for icom, kernel in tqdm(combo, disable=not self.verbose)
         ]
 
-        self.verbose = verbose
         return recons

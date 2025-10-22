@@ -133,6 +133,43 @@ def _compute_pairwise_shifts(
     return rel_shifts
 
 
+def _compute_reference_shifts(
+    vbf_stack: torch.Tensor,
+    reference: torch.Tensor,
+    upsample_factor: int = 1,
+) -> torch.Tensor:
+    """
+    Compute shifts to align each image in the stack to a reference image.
+
+    Parameters
+    ----------
+    vbf_stack : torch.Tensor
+        (N, H, W) stack of virtual BF images
+    reference : torch.Tensor
+        (H, W) reference image to align to
+    upsample_factor : int
+        Upsampling factor for subpixel accuracy
+
+    Returns
+    -------
+    shifts : torch.Tensor
+        (N, 2) shifts for each image
+    """
+    N = len(vbf_stack)
+    device = vbf_stack.device
+    shifts = torch.zeros((N, 2), device=device)
+
+    for i in range(N):
+        shift, _ = cross_correlation_shift_torch(
+            reference,
+            vbf_stack[i],
+            upsample_factor=upsample_factor,
+        )
+        shifts[i] = shift
+
+    return shifts
+
+
 def _bin_mask_and_stack_centered(
     bf_mask: torch.Tensor,
     inds_i: torch.Tensor,
@@ -272,6 +309,8 @@ def align_vbf_stack_multiscale(
     bin_factors: tuple[int, ...],
     pair_connectivity: int = 4,
     upsample_factor: int = 1,
+    reference: torch.Tensor | None = None,
+    initial_shifts: torch.Tensor | None = None,
     verbose: int | bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -289,8 +328,8 @@ def align_vbf_stack_multiscale(
         Sequence of binning factors from coarse to fine (e.g., (7, 6, 5, 4, 3, 2, 1))
     pair_connectivity : int
         Number of neighbors for pairwise alignment (4 or 8)
-    device : torch.device
-        Device to use for computation
+    reference : torch.Tensor, optional
+        (H, W) reference image to align all images to. If None, uses pairwise alignment.
 
     Returns
     -------
@@ -298,56 +337,71 @@ def align_vbf_stack_multiscale(
         (N, 2) computed shifts in pixels for each vBF
     aligned_stack : torch.Tensor
         (N, H, W) aligned virtual BF stack
+
+    Notes
+    -----
+    Two alignment modes:
+    - **Pairwise** (reference=None): Uses graph synchronization on neighbor pairs.
+      More robust to outliers but slower.
+    - **Reference-based** (reference provided): Aligns each image directly to reference.
+      Faster and often more accurate when good reference is available.
     """
 
     device = vbf_stack.device
     N = len(vbf_stack)
-    global_shifts = torch.zeros((N, 2), device=device)
 
-    pbar = tqdm(range(len(bin_factors)), disable=not verbose)
+    if initial_shifts is None:
+        global_shifts = torch.zeros((N, 2), device=device)
+    else:
+        global_shifts = initial_shifts.clone().to(device)
+
+    mode = "reference" if reference is not None else "pairwise"
+    desc = f"Aligning ({mode})"
+    pbar = tqdm(bin_factors, desc=desc, disable=not verbose)
     for bin_factor in bin_factors:
         # Bin the mask and stack
         bf_mask_binned, inds_ib, inds_jb, vbf_binned, mapping = _bin_mask_and_stack_centered(
             bf_mask, inds_i, inds_j, vbf_stack, bin_factor=bin_factor
         )
 
-        # Create neighbor pairs for correlation
-        pairs = _make_periodic_pairs(bf_mask_binned, connectivity=pair_connectivity)
-
-        # Compute pairwise shifts
-        rel_shifts = _compute_pairwise_shifts(vbf_binned, pairs, upsample_factor=upsample_factor)
-
-        # Solve for global shifts via synchronization
-        shifts = _synchronize_shifts(len(vbf_binned), rel_shifts, device)
+        if reference is not None:
+            # Reference-based alignment: bin the reference too
+            shifts = _compute_reference_shifts(
+                vbf_binned, reference, upsample_factor=upsample_factor
+            )
+        else:
+            # Pairwise alignment with synchronization
+            pairs = _make_periodic_pairs(bf_mask_binned, connectivity=pair_connectivity)
+            rel_shifts = _compute_pairwise_shifts(
+                vbf_binned, pairs, upsample_factor=upsample_factor
+            )
+            shifts = _synchronize_shifts(len(vbf_binned), rel_shifts, device)
 
         # Accumulate shifts and apply to full-resolution stack
-        global_shifts += shifts[mapping]
-        vbf_stack = _fourier_shift_stack(vbf_stack, shifts[mapping])
-        pbar.update(n=1)
-    pbar.close()
+        incremental_shifts = shifts[mapping]
+        global_shifts += incremental_shifts
 
+        vbf_stack = _fourier_shift_stack(vbf_stack, incremental_shifts)
+        pbar.update(n=1)
+
+    pbar.close()
     return global_shifts, vbf_stack
 
 
 def fit_aberrations_from_shifts(
-    shifts_px: torch.Tensor,
+    shifts_ang: torch.Tensor,
     bf_mask: torch.BoolTensor,
     wavelength: float,
     gpts: tuple[int, int],
     sampling: tuple[float, float],
-    scan_sampling: tuple[float, float],
 ) -> dict[str, float]:
     """ """
-    device = shifts_px.device
+    device = shifts_ang.device
 
     # Get spatial frequencies at BF positions
     kxa, kya = spatial_frequencies(gpts, sampling, device=device)
     kvec = torch.dstack((kxa[bf_mask], kya[bf_mask])).view((-1, 2))
     basis = kvec * wavelength
-    scan_s = torch.as_tensor(scan_sampling, device=device, dtype=torch.float32)
-
-    # Convert shifts to physical units (Angstroms)
-    shifts_ang = (shifts_px * scan_s).to(dtype=basis.dtype, device=device)
 
     # Least-squares fit: shifts = basis @ M
     M = torch.linalg.lstsq(basis.cpu(), shifts_ang.cpu(), rcond=None)[0]
