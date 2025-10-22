@@ -194,3 +194,34 @@ class CNN2d(nn.Module):
                 reset_parameters()
 
         self.apply(_reset)
+
+
+class MultiChannelCNN2d(CNN2d):
+    def __init__(
+        self,
+        in_channels=1,
+        out_channels: int = 2,
+        final_activations: list = ["sigmoid", "sigmoid"],
+        **kwargs
+    ):
+        # Always use identity activation in base CNN, handle activations here
+        super().__init__(in_channels=in_channels, out_channels=out_channels, final_activation="identity", **kwargs)
+        self.final_activations = final_activations
+
+    @property
+    def final_activations(self): 
+        return self._final_activations
+
+    @final_activations.setter
+    def final_activations(self, value):
+        if not isinstance(value, (list, tuple)) or len(value) != self.out_channels:
+            raise ValueError(f"final_activations must be a list of length {self.out_channels}")
+        self._final_activations = [get_activation_function(act, self.dtype) for act in value]
+
+    def forward(self, x):
+        out = super().forward(x) # B,C,H,W
+        # Apply per-channel activation
+        outs = []
+        for i, fn in enumerate(self.final_activations):
+            outs.append(fn(out[:, i:i+1]))
+        return torch.cat(outs, dim=1)
