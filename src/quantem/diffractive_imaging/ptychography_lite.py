@@ -270,7 +270,7 @@ class PtychoLiteDIP(Ptychography):
             in_channels=ptycholite.obj_model.num_slices,
             out_channels=ptycholite.obj_model.num_slices,
             num_layers=cnn_num_layers,
-            dtype=torch.float32 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
+            dtype=torch.float32,
         )
 
         obj_model = ObjectDIP.from_pixelated(
