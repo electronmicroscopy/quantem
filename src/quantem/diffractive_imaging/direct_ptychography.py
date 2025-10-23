@@ -1,3 +1,4 @@
+import gc
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Tuple
@@ -608,6 +609,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             pbar.update(len(batch_idx))
 
         pbar.close()
+
+        torch.cuda.empty_cache()
+        gc.collect()
 
         if deconvolution_kernel == "full":
             self.corrected_stack = corrected_stack.angle()
