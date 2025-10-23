@@ -23,11 +23,12 @@ import torch.distributed as dist
 def get_num_samples_per_ray(epoch):
     """Increase number of samples per ray at specific epochs."""
     schedule = {
-        0: 25,
-        2: 50,
-        4: 100,
-        6: 200,
-        8: 350,
+        0: 500,
+        # 2: 500,
+        # 4: 500,
+        # 6: 500,
+        # 8: 500,
+        10: 500,
     }
 
     num_samples = 64
@@ -194,9 +195,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         return transformed_rays
 
     # TODO: Temp logger
-    def setup_logger(self):
+    def setup_logger(self, log_path):
         if self.global_rank == 0:
-            self.temp_logger = SummaryWriter()
+            self.temp_logger = SummaryWriter(log_dir=log_path)
         else:
             self.temp_logger = None
             
@@ -213,6 +214,8 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         optimizer_params: dict = None,
         scheduler_params: dict = None,
         soft_constraints: dict = None,
+        vol_save_path: str = None, # TODO: TEMPORARY
+        log_path = None,
     ):      
 
         if not self.ddp_instantiated:
@@ -227,7 +230,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
             self.obj.soft_constraints = soft_constraints
         
         if not hasattr(self, "temp_logger"):
-            self.setup_logger()
+            self.setup_logger(log_path=log_path)
 
         zero_tilt_idx = torch.argmin(torch.abs(self.dataset.tilt_angles)).item()
         
@@ -414,7 +417,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
             if epoch % checkpoint_freq == 0 or self.global_epochs == epochs - 1:
                 with torch.no_grad():
                     if self.global_rank == 0:
-                        save_path = f"new_dataset_logs/volume_epoch_{self.global_epochs:04d}.pt"
+                        save_path = f"{vol_save_path}/volume_epoch_{self.global_epochs:04d}.pt"
                         torch.save(pred_full.cpu(), save_path)
                         
             self.global_epochs += 1
