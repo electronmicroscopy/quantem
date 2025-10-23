@@ -103,7 +103,7 @@ def _make_periodic_pairs(
 def _compute_pairwise_shifts(
     vbf_stack: torch.Tensor,
     pairs: torch.Tensor,
-    upsample_factor: int = 1,
+    upsample_factor: int = 4,
 ) -> list[tuple[int, int, torch.Tensor]]:
     """
     Compute relative shifts between pairs of virtual BF images.
@@ -136,7 +136,7 @@ def _compute_pairwise_shifts(
 def _compute_reference_shifts(
     vbf_stack: torch.Tensor,
     reference: torch.Tensor,
-    upsample_factor: int = 1,
+    upsample_factor: int = 4,
 ) -> torch.Tensor:
     """
     Compute shifts to align each image in the stack to a reference image.
@@ -308,10 +308,11 @@ def align_vbf_stack_multiscale(
     inds_j: torch.Tensor,
     bin_factors: tuple[int, ...],
     pair_connectivity: int = 4,
-    upsample_factor: int = 1,
+    upsample_factor: int = 4,
     reference: torch.Tensor | None = None,
     initial_shifts: torch.Tensor | None = None,
     running_average: bool = False,
+    basis: torch.Tensor | None = None,
     verbose: int | bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -398,7 +399,19 @@ def align_vbf_stack_multiscale(
 
         # Accumulate shifts and apply to full-resolution stack
         incremental_shifts = shifts[mapping]
-        global_shifts += incremental_shifts
+
+        if basis is not None:
+            # constrain coefficients
+            global_shifts_new = global_shifts + incremental_shifts
+            coeffs = torch.linalg.lstsq(basis.cpu(), global_shifts_new.cpu(), rcond=None)[0].to(
+                basis.device
+            )
+            projected_shifts = basis @ coeffs
+
+            incremental_shifts = projected_shifts - global_shifts
+            global_shifts = projected_shifts
+        else:
+            global_shifts += incremental_shifts
 
         vbf_stack = _fourier_shift_stack(vbf_stack, incremental_shifts)
 

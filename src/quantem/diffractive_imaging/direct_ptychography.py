@@ -798,15 +798,15 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         bin_factors: tuple[int, ...] = (7, 6, 5, 4, 3, 2, 1),
         pair_connectivity: int = 4,
-        use_reference: bool = False,
+        alignment_method: str = "pairwise",
         reference: torch.Tensor | NDArray | None = None,
         running_average: bool = False,
+        regularize_shifts: bool = True,
+        dft_upsample_factor: int = 4,
         **reconstruct_kwargs,
     ):
         """
         Fit aberrations and rotation angle from virtual BF stack.
-
-        Uses either pairwise alignment or reference-based alignment after initial reconstruction.
 
         Parameters
         ----------
@@ -814,27 +814,30 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Sequence of binning factors from coarse to fine
         pair_connectivity : int
             Neighbor connectivity for pairwise alignment (4 or 8)
-        use_reference : bool
-            If True, performs initial reconstruction and aligns against the mean.
-            If False, uses only pairwise alignment from scratch.
-        reference: array-like
-            If not None and use_reference=True, used as initial reference to align against.
+        alignment_method : str
+            Alignment strategy:
+            - "pairwise": Graph-based pairwise alignment (most robust)
+            - "reference": Align all images to a reference
+        reference : array-like, optional
+            Reference image for alignment_method="reference".
+            If None, uses mean of initial reconstruction.
         running_average : bool
-            If True and use_reference=True, updates reference as running average during
-            alignment. Can help with noisy data but may slow convergence.
+            If True and alignment_method="reference", updates reference as running
+            average during alignment. Can help with noisy data.
+        regularize_shifts : bool
+            If True, constrains shifts to physical aberration model at each iteration.
         **reconstruct_kwargs
-            Additional arguments passed to reconstruct methods
+            Additional arguments passed to reconstruct methods.
+            If aberration coefficients are provided (e.g., C10, C12, phi12) or rotation_angle,
+            performs initial reconstruction to seed the alignment.
 
         Returns
         -------
         self : object
             Returns self with fitted parameters stored in self._fitted_parameters
 
-        Notes
-        -----
         The running_average option updates the reference at each bin level as:
             ref_new = ref_old * n/(n+1) + aligned_mean / (n+1)
-        This helps with noisy data by gradually incorporating aligned images.
         """
         bf_mask = self.bf_mask
         inds_i, inds_j = self._bf_inds_i, self._bf_inds_j
@@ -842,35 +845,39 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.scan_sampling, device=self.device, dtype=torch.float32
         )
 
-        if use_reference:
-            if reference is not None:
-                reference = torch.as_tensor(reference, dtype=torch.float32, device=self.device)
-                vbf_stack = self.vbf_stack.clone()
-                initial_shifts = None
-            else:
-                # Use safer defaults for initial reconstruction
-                safe_kwargs = {
-                    k: v
-                    for k, v in reconstruct_kwargs.items()
-                    if k not in ["deconvolution_kernel", "flip_phase"]
-                }
-                self.reconstruct(
-                    deconvolution_kernel="quadratic",
-                    flip_phase=False,
-                    verbose=False,
-                    **safe_kwargs,
-                )
+        # initial reconstruction
+        safe_kwargs = {
+            k: v
+            for k, v in reconstruct_kwargs.items()
+            if k not in ["deconvolution_kernel", "verbose"]
+        }
+        flip_phase = safe_kwargs.pop("flip_phase", False)
 
-                # Start from already-corrected stack and existing shifts
-                vbf_stack = self.corrected_stack.clone()
-                initial_shifts = self.lateral_shifts / scan_sampling
-                reference = vbf_stack.mean(0)
+        self.reconstruct(
+            deconvolution_kernel="parallax",
+            flip_phase=flip_phase,
+            verbose=False,
+            **safe_kwargs,
+        )
 
+        vbf_stack = self.corrected_stack.clone()
+        initial_shifts = self.lateral_shifts / scan_sampling
+
+        if alignment_method == "reference":
+            reference = (
+                vbf_stack.mean(0)
+                if reference is None
+                else torch.as_tensor(reference, dtype=torch.float32, device=self.device)
+            )
         else:
-            # Start from scratch with pairwise alignment
-            vbf_stack = self.vbf_stack.clone()
-            initial_shifts = None
             reference = None
+
+        if regularize_shifts:
+            kxa, kya = spatial_frequencies(self.gpts, self.sampling, device=self.device)
+            kvec = torch.dstack((kxa[bf_mask], kya[bf_mask])).view((-1, 2))
+            basis = kvec * self.wavelength / scan_sampling
+        else:
+            basis = None
 
         shifts_px, vbf_stack = align_vbf_stack_multiscale(
             vbf_stack,
@@ -879,10 +886,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             inds_j,
             bin_factors,
             pair_connectivity=pair_connectivity,
-            upsample_factor=1,
+            upsample_factor=dft_upsample_factor,
             reference=reference,
             initial_shifts=initial_shifts,
             running_average=running_average,
+            basis=basis,
             verbose=self.verbose,
         )
 
@@ -954,7 +962,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "use_center_of_mass_weighting"]
+            if k not in ["deconvolution_kernel", "use_center_of_mass_weighting", "verbose"]
         }
 
         combo = list(

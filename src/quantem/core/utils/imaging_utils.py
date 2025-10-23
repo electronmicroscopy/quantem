@@ -163,143 +163,188 @@ def cross_correlation_shift(
     return shifts, image_shifted
 
 
-def dft_upsample_torch(
-    F: torch.Tensor,
-    up: int,
-    shift: tuple[float, float],
+def cross_correlation_shift_torch(
+    im_ref: torch.Tensor, im: torch.Tensor, upsample_factor: int = 2
 ) -> torch.Tensor:
     """
-    Matrix multiplication DFT upsampling (Guizar-Sicairos et al., Opt. Lett. 33, 156–158, 2008)
-    Torch-native version with complex arithmetic.
-
-    Parameters
-    ----------
-    F : (M, N) complex tensor
-        Fourier-space correlation matrix.
-    up : int
-        Upsampling factor (integer).
-    shift : (float, float)
-        Subpixel shift (row, col) for region center.
-
-    Returns
-    -------
-    local_cc : (2*ceil(1.5*up)+1, 2*ceil(1.5*up)+1) real tensor
-        Local upsampled cross-correlation.
+    Align two real images using Fourier cross-correlation and DFT upsampling.
+    Returns dx, dy in pixel units (signed shifts).
     """
-    device = F.device
-    M, N = F.shape
-    du = int(math.ceil(1.5 * up))
-    rows = torch.arange(-du, du + 1, device=device)
-    cols = torch.arange(-du, du + 1, device=device)
+    G1 = torch.fft.fft2(im_ref)
+    G2 = torch.fft.fft2(im)
 
-    r_shift = shift[0] - M // 2
-    c_shift = shift[1] - N // 2
+    xy_shift = align_images_fourier_torch(G1, G2, upsample_factor)
 
-    # Frequency indices (centered)
-    m = torch.fft.ifftshift(torch.arange(M, device=device)) - M // 2 + r_shift
-    n = torch.fft.ifftshift(torch.arange(N, device=device)) - N // 2 + c_shift
+    # convert to centered signed shifts as original code
+    M, N = im_ref.shape
+    dx = ((xy_shift[0] + M / 2) % M) - M / 2
+    dy = ((xy_shift[1] + N / 2) % N) - N / 2
 
-    # Outer-product exponentials
-    kern_row = torch.exp(-2j * math.pi / (M * up) * rows[:, None] * m[None, :])
-    kern_col = torch.exp(-2j * math.pi / (N * up) * n[:, None] * cols[None, :])
-
-    local_cc = torch.real(kern_row @ F @ kern_col)
-    return local_cc
+    return torch.tensor([dx, dy])
 
 
-def cross_correlation_shift_torch(
-    im_ref: torch.Tensor,
-    im: torch.Tensor,
-    upsample_factor: int = 1,
-    max_shift: float | None = None,
-    return_shifted_image: bool = False,
-    fft_input: bool = False,
-    fft_output: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+def align_images_fourier_torch(
+    G1: torch.Tensor,
+    G2: torch.Tensor,
+    upsample_factor: int,
+) -> torch.Tensor:
     """
-    Estimate subpixel shift between two 2D images using Fourier cross-correlation.
-    Torch-native version.
-
-    Returns
-    -------
-    shifts : (2,) tensor of floats (row_shift, col_shift)
-    shifted_image : optional, only if return_shifted_image=True
+    Alignment using DFT upsampling of cross correlation.
+    G1, G2: torch tensors representing FTs of images (complex)
+    Returns: xy_shift (tensor length 2)
     """
-    device = im_ref.device
+    device = G1.device
+    cc = G1 * G2.conj()
+    cc_real = torch.fft.ifft2(cc).real
 
-    # --- Fourier transforms
-    F_ref = im_ref if fft_input else torch.fft.fft2(im_ref)
-    F_im = im if fft_input else torch.fft.fft2(im)
+    # local max (integer)
+    flat_idx = torch.argmax(cc_real)
+    x0 = (flat_idx // cc_real.shape[1]).to(torch.long).item()
+    y0 = (flat_idx % cc_real.shape[1]).to(torch.long).item()
 
-    # --- Cross-correlation
-    cc = F_ref * torch.conj(F_im)
-    cc /= torch.clamp(cc.abs(), min=1e-8)
-    cc_real = torch.real(torch.fft.ifft2(cc))
-
-    # --- Optional shift constraint mask
-    if max_shift is not None:
-        M, N = cc_real.shape
-        x = torch.fft.fftfreq(M, device=device) * M
-        y = torch.fft.fftfreq(N, device=device) * N
-        mask = (x[:, None] ** 2 + y[None, :] ** 2) >= max_shift**2
-        cc_real[mask] = 0.0
-
-    # --- Coarse peak
-    peak = torch.argmax(cc_real)
-    x0, y0 = torch.unravel_index(peak, cc_real.shape)
-
-    # --- Parabolic subpixel refinement
-    def parabolic_peak(v):
-        # v is 3-sample vector
-        return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0] + 1e-12)
-
+    # half pixel shifts: pick ±1 indices with wrap (mod)
     M, N = cc_real.shape
-    x_inds = torch.remainder(x0 + torch.arange(-1, 2, device=device), M).long()
-    y_inds = torch.remainder(y0 + torch.arange(-1, 2, device=device), N).long()
+    x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
+    y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
 
     vx = cc_real[x_inds, y0]
     vy = cc_real[x0, y_inds]
-    dx = parabolic_peak(vx)
-    dy = parabolic_peak(vy)
-    x0 = (x0 + dx) % M
-    y0 = (y0 + dy) % N
 
-    # --- Fine subpixel DFT upsampling
-    if upsample_factor > 1:
-        local = dft_upsample_torch(cc, upsample_factor, (x0.item(), y0.item()))
-        peak = torch.argmax(local)
-        lx, ly = torch.unravel_index(peak, local.shape)
-        # secondary refinement
-        if 1 <= lx < local.shape[0] - 1 and 1 <= ly < local.shape[1] - 1:
-            icc = local[lx - 1 : lx + 2, ly - 1 : ly + 2]
-            dxf = parabolic_peak(icc[:, 1])
-            dyf = parabolic_peak(icc[1, :])
+    # parabolic half-pixel refine
+    # dx = (vx[2] - vx[0]) / (4*vx[1] - 2*vx[2] - 2*vx[0])
+    denom_x = 4.0 * vx[1] - 2.0 * vx[2] - 2.0 * vx[0]
+    denom_y = 4.0 * vy[1] - 2.0 * vy[2] - 2.0 * vy[0]
+    dx = (vx[2] - vx[0]) / denom_x if denom_x != 0 else torch.tensor(0.0, device=device)
+    dy = (vy[2] - vy[0]) / denom_y if denom_y != 0 else torch.tensor(0.0, device=device)
+
+    # round to nearest half-pixel
+    x0 = torch.round((x0 + dx) * 2.0) / 2.0
+    y0 = torch.round((y0 + dy) * 2.0) / 2.0
+
+    xy_shift = torch.tensor([x0, y0])
+
+    if upsample_factor > 2:
+        xy_shift = upsampled_correlation_torch(cc, upsample_factor, xy_shift)
+
+    return xy_shift
+
+
+def upsampled_correlation_torch(
+    imageCorr: torch.Tensor,
+    upsampleFactor: int,
+    xyShift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Refine the correlation peak of imageCorr around xyShift by DFT upsampling.
+
+    imageCorr: complex-valued FT-domain cross-correlation (G1 * conj(G2))
+    upsampleFactor: integer > 2
+    xyShift: 2-element tensor (x,y) in image coords; must be half-pixel precision as described.
+    Returns refined xyShift (tensor length 2).
+    """
+
+    assert upsampleFactor > 2
+
+    xyShift = torch.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
+    globalShift = torch.floor(torch.ceil(torch.tensor(upsampleFactor * 1.5)) / 2.0)
+    upsampleCenter = globalShift - (upsampleFactor * xyShift)
+
+    conj_input = imageCorr.conj()
+    im_up = dftUpsample_torch(conj_input, upsampleFactor, upsampleCenter)
+    imageCorrUpsample = im_up.conj()
+
+    # find maximum
+    # flatten argmax -> unravel to 2D
+    flat_idx = torch.argmax(imageCorrUpsample.real)
+    # unravel_index
+    xySubShift0 = (flat_idx // imageCorrUpsample.shape[1]).to(torch.long)
+    xySubShift1 = (flat_idx % imageCorrUpsample.shape[1]).to(torch.long)
+    xySubShift = torch.tensor([xySubShift0.item(), xySubShift1.item()])
+
+    # parabolic subpixel refinement
+    dx = 0.0
+    dy = 0.0
+    try:
+        # extract 3x3 patch around found peak
+        r = xySubShift[0].item()
+        c = xySubShift[1].item()
+        patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
+        # if patch is incomplete (near edge) this will raise / have wrong shape -> except
+        if patch.shape == (3, 3):
+            icc = patch
+            # dx corresponds to row direction (vertical axis) as in original code:
+            dx = (icc[2, 1] - icc[0, 1]) / (4.0 * icc[1, 1] - 2.0 * icc[2, 1] - 2.0 * icc[0, 1])
+            dy = (icc[1, 2] - icc[1, 0]) / (4.0 * icc[1, 1] - 2.0 * icc[1, 2] - 2.0 * icc[1, 0])
+            dx = dx.item()
+            dy = dy.item()
         else:
-            dxf = dyf = 0.0
-        shift_sub = (
-            torch.tensor([x0, y0], device=device)
-            + (torch.tensor([lx, ly], device=device) - upsample_factor) / upsample_factor
-            + torch.tensor([dxf, dyf], device=device) / upsample_factor
-        )
-    else:
-        shift_sub = torch.tensor([x0, y0], device=device)
+            dx, dy = 0.0, 0.0
+    except Exception:
+        dx, dy = 0.0, 0.0
 
-    # --- Wrap to centered coordinates
-    shift_sub = (shift_sub + 0.5 * torch.tensor(cc_real.shape, device=device)) % torch.tensor(
-        cc_real.shape, device=device
-    ) - 0.5 * torch.tensor(cc_real.shape, device=device)
+    # convert xySubShift to zero-centered by subtracting globalShift
+    xySubShift = xySubShift.to(dtype=torch.get_default_dtype())
+    xySubShift = xySubShift - globalShift.to(xySubShift.dtype)
 
-    if not return_shifted_image:
-        return shift_sub, None
+    xyShift = xyShift + (xySubShift + torch.tensor([dx, dy])) / float(upsampleFactor)
 
-    # --- Apply subpixel Fourier shift to im
-    kx = torch.fft.fftfreq(F_im.shape[0], device=device)[:, None]
-    ky = torch.fft.fftfreq(F_im.shape[1], device=device)[None, :]
-    phase_ramp = torch.exp(-2j * math.pi * (kx * shift_sub[0] + ky * shift_sub[1]))
-    F_im_shifted = F_im * phase_ramp
-    image_shifted = F_im_shifted if fft_output else torch.real(torch.fft.ifft2(F_im_shifted))
+    return xyShift
 
-    return shift_sub, image_shifted
+
+def dftUpsample_torch(
+    imageCorr: torch.Tensor,
+    upsampleFactor: int,
+    xyShift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Corrected matrix-multiply DFT upsampling (matches the original numpy dftups).
+    Returns the real-valued upsampled correlation patch.
+
+    imageCorr: (M, N) complex tensor (FT-domain cross-correlation)
+    upsampleFactor: int > 2
+    xyShift: 2-element tensor [x0, y0] giving the (half-pixel-rounded) peak location
+             in the UPSAMPLED grid (same convention used elsewhere).
+    """
+    device = imageCorr.device
+    M, N = imageCorr.shape
+    pixelRadius = 1.5
+    numRow = int(math.ceil(pixelRadius * upsampleFactor))
+    numCol = numRow
+
+    # prepare the vectors exactly like the numpy version
+    # col: frequency indices (centered) for N
+    col_freq = torch.fft.ifftshift(torch.arange(N, device=device)) - math.floor(N / 2)
+    # row: frequency indices (centered) for M
+    row_freq = torch.fft.ifftshift(torch.arange(M, device=device)) - math.floor(M / 2)
+
+    # small upsample grid coordinates (integer positions in the UPSAMPLED GRID)
+    col_coords = torch.arange(numCol, device=device, dtype=torch.get_default_dtype()) - float(
+        xyShift[1]
+    )
+    row_coords = torch.arange(numRow, device=device, dtype=torch.get_default_dtype()) - float(
+        xyShift[0]
+    )
+
+    # build kernels: note factor signs and denominators match original numpy code
+    # colKern: shape (N, numCol)
+    factor_col = -2j * math.pi / (N * float(upsampleFactor))
+    # outer(col_freq, col_coords) -> shape (N, numCol)
+    colKern = torch.exp(factor_col * (col_freq.unsqueeze(1) * col_coords.unsqueeze(0))).to(
+        imageCorr.dtype
+    )
+
+    # rowKern: shape (numRow, M)
+    factor_row = -2j * math.pi / (M * float(upsampleFactor))
+    # outer(row_coords, row_freq) -> shape (numRow, M)
+    rowKern = torch.exp(factor_row * (row_coords.unsqueeze(1) * row_freq.unsqueeze(0))).to(
+        imageCorr.dtype
+    )
+
+    # perform the small-matrix DFT: (numRow, M) @ (M, N) @ (N, numCol) -> (numRow, numCol)
+    imageUpsample = rowKern @ imageCorr @ colKern
+
+    # original code took xp.real(...) before returning
+    return imageUpsample.real
 
 
 def bilinear_kde(
