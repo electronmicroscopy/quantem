@@ -40,6 +40,7 @@ from itertools import product
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     align_vbf_stack_multiscale,
+    create_edge_window,
     fit_aberrations_from_shifts,
 )
 
@@ -163,6 +164,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rng: np.random.Generator | int | None = None,
         device: str | int = "cpu",
         verbose: int | bool = True,
+        normalization_order: int = 0,
+        edge_blend_pixels: int = 0,
     ):
         """ """
 
@@ -201,13 +204,45 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         )
 
         # vbf_stack
-        vbf_stack = shifted_tensor[..., bf_mask]
-        # ToDo: Add fancier normalization and windowing
-        vbf_stack = vbf_stack / vbf_stack.mean((0, 1))  # unity mean, important
-        vbf_stack = torch.moveaxis(vbf_stack, (0, 1, 2), (1, 2, 0))
+        vbf_stack = shifted_tensor[..., bf_mask].cpu()
+        gpts = vbf_stack.shape[:2]
 
+        if normalization_order == 0:
+            vbf_stack = vbf_stack / vbf_stack.mean((0, 1))  # unity mean, important
+
+        elif normalization_order == 1:
+            # Fit linear background to each BF image
+            x = torch.linspace(-0.5, 0.5, gpts[0])
+            y = torch.linspace(-0.5, 0.5, gpts[1])
+            ya, xa = torch.meshgrid(y, x, indexing="ij")
+
+            # Basis for linear fit: [1, x, y]
+            basis = torch.stack(
+                [torch.ones_like(xa.ravel()), xa.ravel(), ya.ravel()], dim=1
+            )  # shape: [N_pixels, 3]
+
+            # Fit each BF image
+            for k in range(vbf_stack.shape[-1]):
+                intensities = vbf_stack[..., k].ravel()
+
+                # Least squares
+                coefs = torch.linalg.lstsq(basis, intensities).solution
+
+                # Normalize
+                background = (basis @ coefs).reshape(gpts)
+                vbf_stack[..., k] /= background
+        else:
+            raise ValueError()
+
+        # smooth window
+        window_edge = create_edge_window(
+            shape=gpts, edge_blend_pixels=edge_blend_pixels, device="cpu"
+        )
+        vbf_stack = (1 - window_edge[..., None]) + window_edge[..., None] * vbf_stack
+
+        vbf_stack = torch.moveaxis(vbf_stack, (0, 1, 2), (1, 2, 0))
         vbf_dataset = Dataset3d.from_array(
-            vbf_stack.cpu().numpy(),
+            vbf_stack.numpy(),
             name="vBF stack",
             units=("index",) + tuple(dataset.units[:2]),
             sampling=(1,) + tuple(dataset.sampling[:2]),

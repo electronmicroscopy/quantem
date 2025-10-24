@@ -16,6 +16,46 @@ from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
 from quantem.diffractive_imaging.complex_probe import spatial_frequencies
 
 
+def create_edge_window(shape, edge_blend_pixels, device="cpu"):
+    """
+    Create a smooth edge window that transitions from 0 at edges to 1 in center.
+
+    Parameters
+    ----------
+    shape : tuple
+        (height, width) of the window
+    edge_blend_pixels : float
+        Width of the transition region in pixels
+    device : str or torch.device
+        Device to create tensor on
+
+    Returns
+    -------
+    window : torch.Tensor
+        2D window with smooth edges, shape (height, width)
+    """
+    if edge_blend_pixels == 0:
+        return torch.ones(shape, device=device)
+
+    h, w = shape
+    # Create 1D windows for each dimension
+    x = torch.linspace(-1, 1, w, device=device)
+    y = torch.linspace(-1, 1, h, device=device)
+
+    # Distance from edge (0 at edge, increases toward center)
+    dist_x = torch.clamp((1 - torch.abs(x)) * w / 2 / edge_blend_pixels, 0, 1)
+    dist_y = torch.clamp((1 - torch.abs(y)) * h / 2 / edge_blend_pixels, 0, 1)
+
+    # Smooth transition using sin^2
+    wx = torch.sin(dist_x * (torch.pi / 2)) ** 2
+    wy = torch.sin(dist_y * (torch.pi / 2)) ** 2
+
+    # 2D window is product of 1D windows
+    window = wy[:, None] * wx[None, :]
+
+    return window
+
+
 def _synchronize_shifts(num_nodes, rel_shifts, device):
     """
     Solve for absolute shifts t[i] given pairwise differences δ_ij = t_j - t_i.
