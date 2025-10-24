@@ -124,7 +124,7 @@ def _compute_pairwise_shifts(
     """
     rel_shifts = []
     for i, j in pairs:
-        s_ij, _ = cross_correlation_shift_torch(
+        s_ij = cross_correlation_shift_torch(
             vbf_stack[i],
             vbf_stack[j],
             upsample_factor=upsample_factor,
@@ -160,7 +160,7 @@ def _compute_reference_shifts(
     shifts = torch.zeros((N, 2), device=device)
 
     for i in range(N):
-        shift, _ = cross_correlation_shift_torch(
+        shift = cross_correlation_shift_torch(
             reference,
             vbf_stack[i],
             upsample_factor=upsample_factor,
