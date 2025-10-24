@@ -4,3 +4,4 @@ from quantem.core import visualization as visualization
 
 from quantem import imaging as imaging
 from quantem import spectroscopy as spectroscopy
+from quantem import diffractive_imaging as diffractive_imaging
