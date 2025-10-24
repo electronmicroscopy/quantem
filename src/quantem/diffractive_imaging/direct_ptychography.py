@@ -234,7 +234,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
         self._vbf_fourier = torch.fft.fft2(self.vbf_stack)
+        self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
+        self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
+        self._corrected_stack_amplitude = None
 
         return self
 
@@ -563,16 +566,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             corrected_stack = torch.empty(
                 (self.num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
             )
-            dc_per_image = self._vbf_fourier[..., 0, 0].mean()
         else:
             corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
 
         for batch_idx in batcher:
-            # MPS does not support complex tiling
-            # vbf_fourier = torch.tile(
-            #     self._vbf_fourier[batch_idx],
-            #     (1, upsampling_factor, upsampling_factor),
-            # )
+            # Fourier-space tiling
             vbf_fourier = torch.cat(
                 [torch.cat([self._vbf_fourier[batch_idx]] * upsampling_factor, dim=-1)]
                 * upsampling_factor,
@@ -602,8 +600,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     normalize=not use_center_of_mass_weighting,
                 )
                 fourier_factor = vbf_fourier * operator * icom_weighting
-                fourier_factor[..., 0, 0] = dc_per_image * upsampling_factor
-
+                fourier_factor[..., 0, 0] = self._dc_per_image  # normalize by mean
             elif deconvolution_kernel == "quadratic":
                 fourier_factor = vbf_fourier * operator[batch_idx] * icom_weighting
             else:
@@ -611,10 +608,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
             # Inverse FFT and extract appropriate component
             if deconvolution_kernel == "full":
-                corrected_stack[batch_idx] = torch.fft.ifft2(fourier_factor) * upsampling_factor
+                corrected_stack[batch_idx] = torch.fft.ifft2(
+                    fourier_factor
+                )  # * upsampling_factor**2
             else:
                 corrected_stack[batch_idx] = (
-                    torch.fft.ifft2(fourier_factor).real * upsampling_factor
+                    torch.fft.ifft2(fourier_factor).real * upsampling_factor**2
                 )
             pbar.update(len(batch_idx))
 
@@ -628,7 +627,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         if deconvolution_kernel == "full":
             self.corrected_stack = corrected_stack.angle()
-            self.corrected_stack_amplitude = 2 - corrected_stack.abs()  # contrast flipping
+            self.corrected_stack_amplitude = (
+                2 - corrected_stack.abs()
+            )  # amplitude contrast flipping
         else:
             self.corrected_stack = corrected_stack
             self.corrected_stack_amplitude = None
