@@ -657,7 +657,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # memory management
         gc.collect()
         torch.cuda.empty_cache()
-        torch.mps.empty_cache()
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         gc.collect()
 
         if deconvolution_kernel == "full":
