@@ -96,8 +96,8 @@ def fourier_translation_operator(
     nr, nc = shape[-2:]
     r = positions[..., 0][:, None, None]
     c = positions[..., 1][:, None, None]
-    kr = af.match_device(np.fft.fftfreq(nr, d=1.0), positions)
-    kc = af.match_device(np.fft.fftfreq(nc, d=1.0), positions)
+    kr = af.match_device(np.fft.fftfreq(nr, d=1.0).astype(np.float32), positions)
+    kc = af.match_device(np.fft.fftfreq(nc, d=1.0).astype(np.float32), positions)
     ramp_r = af.exp(-2.0j * np.pi * kr[None, :, None] * r)
     ramp_c = af.exp(-2.0j * np.pi * kc[None, None, :] * c)
     ramp = ramp_r * ramp_c

@@ -107,7 +107,7 @@ class PtychoLite(Ptychography):
         }
 
         if polar_parameters is not None:
-            probe_params["polar_parameters"] = polar_parameters
+            probe_params.update(polar_parameters)
 
         probe_model = ProbePixelated.from_params(
             probe_params=probe_params,
@@ -253,6 +253,8 @@ class PtychoLiteDIP(Ptychography):
         ptycholite: PtychoLite,
         pretrain_iters: int | None = None,
         pretrain_lr: float = 1e-3,
+        pretrain_probe: bool = True,
+        pretrain_object: bool = True,
         # model settings
         cnn_num_layers: int = 3,
         # logging/device
@@ -270,7 +272,7 @@ class PtychoLiteDIP(Ptychography):
             in_channels=ptycholite.obj_model.num_slices,
             out_channels=ptycholite.obj_model.num_slices,
             num_layers=cnn_num_layers,
-            dtype=torch.float32 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
+            dtype=torch.complex64 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
         )
 
         obj_model = ObjectDIP.from_pixelated(
@@ -294,34 +296,35 @@ class PtychoLiteDIP(Ptychography):
         )
 
         if pretrain_iters is not None:
-            obj_model.pretrain(
-                reset=True,
-                num_epochs=pretrain_iters,
-                optimizer_params={
-                    "type": "adam",
-                    "lr": pretrain_lr,
-                },
-                scheduler_params={
-                    "type": "plateau",
-                    "factor": 0.5,
-                },
-                apply_constraints=False,
-                device=config.get("device"),
-            )
-
-            probe_model.pretrain(
-                reset=True,
-                num_epochs=pretrain_iters,
-                optimizer_params={
-                    "type": "adam",
-                    "lr": 1e-3,
-                },
-                scheduler_params={
-                    "type": "plateau",
-                    "factor": 0.5,
-                },
-                apply_constraints=False,
-            )
+            if pretrain_object:
+                obj_model.pretrain(
+                    reset=True,
+                    num_epochs=pretrain_iters,
+                    optimizer_params={
+                        "type": "adam",
+                        "lr": pretrain_lr,
+                    },
+                    scheduler_params={
+                        "type": "plateau",
+                        "factor": 0.5,
+                    },
+                    apply_constraints=False,
+                    device=config.get("device"),
+                )
+            if pretrain_probe:
+                probe_model.pretrain(
+                    reset=True,
+                    num_epochs=pretrain_iters,
+                    optimizer_params={
+                        "type": "adam",
+                        "lr": 1e-3,
+                    },
+                    scheduler_params={
+                        "type": "plateau",
+                        "factor": 0.5,
+                    },
+                    apply_constraints=False,
+                )
 
         if log_dir is not None:
             logger = LoggerPtychography(
