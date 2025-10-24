@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from scipy.optimize import least_squares
 
@@ -1285,93 +1286,139 @@ class Lattice(AutoSerialize):
         fix_polarization_peaks: bool = False,
         plot_order_parameter: bool = True,
         plot_gmm_visualization: bool = True,
+        torch_device: str = "cpu",
         # plot_confidence_map : bool = False,
         **kwargs,
     ):
         """
-        Fit a Gaussian mixture model (GMM) to the fractional polarization vectors and compute
-        a multi-phase order parameter for each site. The order parameter is defined
-        as the posterior membership probabilities of each site to the mixture components,
-        evaluated in the (da, db) polarization space.
-        This method can optionally:
-            - Initialize or fix the phase centers (polarization peaks) during GMM fitting.
-            - Visualize the mixture model and confidence ellipses over a KDE density of (da, db).
-            - Plot the order parameter overlay on the original image coordinates.
+        Estimate a multi-phase order parameter by fitting a Gaussian Mixture Model (GMM)
+        to fractional polarization components (da, db). The order parameter for each site
+        is defined as the posterior membership probabilities (responsibilities) of the
+        fitted GMM components evaluated in the 2D polarization space.
+
+        The method can optionally:
+            - Use provided phase centers (polarization peaks) to initialize or fix the GMM means.
+            - Visualize the mixture model in (da, db) space with KDE density, centers, and
+            ~95% confidence ellipses.
+            - Overlay the order parameter (probability-colored sites) on the original image grid.
 
         Parameters
-        ----------
-        polarization_vectors : Vector
-            Collection of polarization data.
-            polarization_vectors[0] must be a Vector containing the fields:
-            - 'x' : NDArray, row coordinates for each site.
-            - 'y' : NDArray, column coordinates for each site.
-            - 'da' : NDArray, polarization fraction along a (e.g., du).
-            - 'db' : NDArray, polarization fraction along b (e.g., dv).
-            All arrays should be aligned and of equal length.
-        num_phases : int, default=2
-            Number of Gaussian components (phases) to fit in the mixture model.
-        phase_polarization_peak_array : NDArray | None, default=None
+            - polarization_vectors: Vector
+            A collection holding polarization data. Only the first element
+            polarization_vectors[0] is used and must provide the following keys:
+                - 'x': NDArray of shape (N,), row coordinates for each site.
+                - 'y': NDArray of shape (N,), column coordinates for each site.
+                - 'da': NDArray of shape (N,), fractional polarization along a (e.g., du).
+                - 'db': NDArray of shape (N,), fractional polarization along b (e.g., dv).
+            All arrays must be one-dimensional, aligned, and of equal length N.
+
+            - num_phases: int, default=2
+            Number of Gaussian components (phases) in the mixture. Must be >= 1.
+            For num_phases=1, all sites belong to a single phase (probabilities are all 1).
+
+            - phase_polarization_peak_array: NDArray | None, default=None
             Optional array of shape (num_phases, 2) specifying phase centers (means)
-            in (da, db) space. If provided:
-            - With fix_polarization_peaks=False, these are used as initial means for the GMM.
-            - With fix_polarization_peaks=True, the means are held fixed during fitting.
-        fix_polarization_peaks : bool, default=False
-            If True, the GMM means are kept fixed at the provided phase_polarization_peak_array
-            and not updated during the M-step. Requires phase_polarization_peak_array to be set.
-        plot_order_parameter : bool, default=True
-            If True, overlays the sites on the image and colors them by their mixture
-            probabilities (order parameter). For 2 phases, a two-color bar is added;
-            for 3 phases, a color triangle legend is added; for other values, no legend is shown.
-        plot_gmm_visualization : bool, default=True
-            If True, shows a combined visualization in (da, db) space:
-            - KDE density contour (scipy.stats.gaussian_kde).
-            - Scatter of points colored by their mixture probabilities.
-            - GMM centers (means) and ~95% confidence ellipses (2 standard deviations).
-        **kwargs
-            Additional keyword arguments forwarded to the image plotting utility (show_2d),
-            for example cmap, title, etc., when plot_order_parameter is True.
+            in (da, db) space:
+                - If fix_polarization_peaks=False, these values initialize the GMM means.
+                - If fix_polarization_peaks=True, the means are held fixed during fitting
+                    and only covariances and weights are updated.
+
+            - fix_polarization_peaks: bool, default=False
+            If True, requires phase_polarization_peak_array to be provided with shape
+            (num_phases, 2). The GMM means are fixed to these values throughout EM.
+
+            - plot_order_parameter: bool, default=True
+            If True, overlays sites on self._image.array and colors them by their full
+            mixture probability distribution:
+                - For 2 phases, adds a two-color probability bar.
+                - For 3 phases, adds a ternary-style color triangle.
+                - For other values, no legend is shown.
+
+            - plot_gmm_visualization: bool, default=True
+            If True, shows a visualization in (da, db) space:
+                - A Gaussian KDE density (scipy.stats.gaussian_kde) on a symmetric grid
+                    spanning max(abs(da), abs(db)).
+                - Scatter of points colored by mixture probabilities.
+                - GMM centers (means) and ~95% confidence ellipses (2 standard deviations).
+
+            - torch_device: str, default='cpu'
+            Torch device used by the TorchGMM backend. Examples: 'cpu', 'cuda',
+            'cuda:0'. If a CUDA device is requested but unavailable, the underlying
+            GMM implementation may raise an error.
+
+            - **kwargs:
+            Additional keyword arguments forwarded to the image plotting utility
+            show_2d(...) when plot_order_parameter=True (e.g., cmap, title, vmin, vmax).
 
         Returns
-        -------
-        self
-            Returns the same object, modified in-place.
+            - self:
+            The same object, modified in-place.
+
+        Side Effects
+            - Sets the following attributes on self:
+            - self._polarization_means: NDArray of shape (num_phases, 2),
+                the fitted (or fixed) means in (da, db) space.
+            - self._order_parameter_probabilities: NDArray of shape (N, num_phases),
+                posterior probabilities per site.
+            - Produces plots if plot_gmm_visualization or plot_order_parameter is True.
 
         Notes
-        -----
-        - The fitted GMM uses full covariance matrices (covariance_type='full').
-        - The method stores results in:
-            - self._polarization_means : NDArray of shape (num_phases, 2), the fitted (or fixed) means in (da, db).
-            - self._order_parameter_probabilities : NDArray of shape (N, num_phases), posterior probabilities per site.
-        - Helper functions expected to exist in the class/module:
-            - create_colors_from_probabilities(probabilities, num_phases): maps mixture probabilities to RGB colors.
-            - add_2phase_colorbar(ax): adds a colorbar legend for two-phase coloring.
-            - add_3phase_color_triangle(fig, ax): adds a ternary-like color legend for three phases.
-            - show_2d(image, ...): displays the image and returns (fig, ax).
-        - Requires self._image.array to exist for the order parameter overlay plot.
-        - Raises ValueError if phase_polarization_peak_array is provided with an incorrect shape
-        (must be (num_phases, 2)).
+            - The GMM uses full covariance matrices (covariance_type='full') and an EM
+            implementation backed by TorchGMM (PyTorch).
+            - The KDE contour limits are symmetric around the origin and set by
+            max(abs(da), abs(db)).
+            - In the order-parameter overlay, coordinates are plotted as:
+            x-axis: 'y' (column), y-axis: 'x' (row).
+            - Helper functions expected to exist:
+            - create_colors_from_probabilities(probabilities, num_phases)
+            - add_2phase_colorbar(ax)
+            - add_3phase_color_triangle(fig, ax)
+            - show_2d(image, ...)
+            - Requires self._image.array to be present for the order-parameter overlay.
+
+        Raises
+            - ValueError:
+            If phase_polarization_peak_array is provided with incorrect shape
+            (must be (num_phases, 2)).
+            - ValueError:
+            If fix_polarization_peaks=True and phase_polarization_peak_array is None.
+            - AttributeError:
+            If plot_order_parameter=True but self._image or self._image.array is missing.
+            - ImportError:
+            If required plotting/scientific packages (matplotlib, scipy) are unavailable.
+            - RuntimeError or ValueError (from TorchGMM):
+            If the torch device is invalid or unavailable.
 
         Examples
-        --------
-        Fit a 2-phase GMM and plot both the mixture visualization and the order parameter:
-            lattice.calculate_order_parameter(polarization_vectors,
-                                            num_phases=2,
-                                            plot_gmm_visualization=True,
-                                            plot_order_parameter=True)
+            - Fit a 2-phase GMM and show both visualizations:
+            lattice.calculate_order_parameter(
+                polarization_vectors,
+                num_phases=2,
+                plot_gmm_visualization=True,
+                plot_order_parameter=True
+            )
 
-        Use fixed phase peaks:
-            peaks = np.array([[0.1, -0.05],
-                            [0.3,  0.07]])
-            lattice.calculate_order_parameter(polarization_vectors,
-                                            num_phases=2,
-                                            phase_polarization_peak_array=peaks,
-                                            fix_polarization_peaks=True)
+            - Use fixed phase peaks:
+            peaks = np.array([[0.10, -0.05],
+                                [0.30,  0.07]], dtype=float)
+            lattice.calculate_order_parameter(
+                polarization_vectors,
+                num_phases=2,
+                phase_polarization_peak_array=peaks,
+                fix_polarization_peaks=True
+            )
+
+            - Run on GPU (if available):
+            lattice.calculate_order_parameter(
+                polarization_vectors,
+                num_phases=3,
+                torch_device='cuda:0'
+            )
         """
         # Imports
         import matplotlib.pyplot as plt
         from matplotlib.patches import Ellipse
         from scipy.stats import gaussian_kde
-        from sklearn.mixture import GaussianMixture
 
         # Functions
         def plot_gaussian_ellipse(ax, mean, cov, n_std=2, clip_path=None, **kwargs):
@@ -1426,16 +1473,44 @@ class Lattice(AutoSerialize):
 
         #     return colors
 
-        class FixedMeansGMM(GaussianMixture):
-            def __init__(self, fixed_means, **kwargs):
-                super().__init__(n_components=len(fixed_means), **kwargs)
-                self.fixed_means = fixed_means
-                self.means_init = fixed_means
+        class FixedMeansGMM(TorchGMM):
+            """
+            GMM variant with fixed component means.
+            Means are set via fixed_means at init and held constant during EM;
+            only weights and covariances are updated.
+            """
 
-            def _m_step(self, X, log_resp):
-                """Override M-step to keep means fixed"""
-                super()._m_step(X, log_resp)
-                self.means_ = self.fixed_means.copy()
+            def __init__(self, fixed_means, **kwargs):
+                fixed_means = np.asarray(fixed_means, dtype=np.float32)
+                super().__init__(n_components=len(fixed_means), means_init=fixed_means, **kwargs)
+                self.fixed_means = fixed_means
+
+            def _m_step(self, X, r):
+                """
+                M-step with fixed means:
+                update mixture weights and covariances from responsibilities,
+                keeping means unchanged.
+                """
+                # Override to keep means fixed while updating weights and covariances
+                N, D = X.shape
+                K = self.n_components
+                Nk = r.sum(dim=0) + 1e-12
+                self._weights = (Nk / (N + 1e-12)).clamp_min(1e-12)
+
+                # Keep means fixed
+                self._means = self._to_tensor(self.fixed_means).clone()
+
+                # Update covariances with fixed means
+                covs = []
+                for k in range(K):
+                    diff = X - self._means[k]
+                    cov_k = (r[:, k][:, None] * diff).T @ diff
+                    cov_k = cov_k / (Nk[k] + 1e-12)
+                    cov_k = cov_k + self.reg_covar * torch.eye(
+                        D, device=self.device, dtype=self.dtype
+                    )
+                    covs.append(cov_k)
+                self._covariances = torch.stack(covs, dim=0)
 
         x_arr = polarization_vectors[0]["x"]
         y_arr = polarization_vectors[0]["y"]
@@ -1448,7 +1523,7 @@ class Lattice(AutoSerialize):
 
         # Fit GMM with N Gaussians
         if phase_polarization_peak_array is None:
-            gmm = GaussianMixture(n_components=num_phases, covariance_type="full")
+            gmm = TorchGMM(n_components=num_phases, covariance_type="full", device=torch_device)
         else:
             # Basic checks
             if phase_polarization_peak_array.shape != (num_phases, 2):
@@ -1457,13 +1532,16 @@ class Lattice(AutoSerialize):
                 )
             if fix_polarization_peaks:
                 gmm = FixedMeansGMM(
-                    covariance_type="full", fixed_means=phase_polarization_peak_array
+                    covariance_type="full",
+                    fixed_means=phase_polarization_peak_array,
+                    device=torch_device,
                 )
             else:
-                gmm = GaussianMixture(
+                gmm = TorchGMM(
                     n_components=num_phases,
                     covariance_type="full",
                     means_init=phase_polarization_peak_array,
+                    device=torch_device,
                 )
         gmm.fit(data)
         # labels = gmm.predict(data)  # This has Gaussian number [0,num_phases-1) that the atom best fits to
@@ -1472,9 +1550,11 @@ class Lattice(AutoSerialize):
         # Get probabilities for each Gaussian
         probabilities = gmm.predict_proba(data)  # Shape: (n_points, num_phases)
 
-        # Create grid for contour
-        x_grid = np.linspace(da_arr.min(), da_arr.max(), 100)
-        y_grid = np.linspace(db_arr.min(), db_arr.max(), 100)
+        # Create grid for contour - use max_bound to cover entire plot area
+        max_bound = max(abs(da_arr).max(), abs(db_arr).max())
+
+        x_grid = np.linspace(-max_bound, max_bound, 100)
+        y_grid = np.linspace(-max_bound, max_bound, 100)
         X, Y = np.meshgrid(x_grid, y_grid)
         positions = np.vstack([X.ravel(), Y.ravel()])
         Z = gaussian_kde(d_frac_arr)(positions).reshape(X.shape)
@@ -1492,14 +1572,15 @@ class Lattice(AutoSerialize):
         if plot_gmm_visualization:
             from matplotlib.path import Path
 
-            if num_components == 3:
-                fig = plt.figure(figsize=(8, 7))
-            else:
-                fig = plt.figure(figsize=(8, 7))
+            fig = plt.figure(figsize=(8, 7))
             ax = fig.add_subplot(111)
 
+            # Set symmetric limits centered at origin
+            ax.set_xlim(-max_bound, max_bound)
+            ax.set_ylim(-max_bound, max_bound)
+
             # First: Plot contour in the background with distinct colormap
-            contour = ax.contourf(X, Y, Z, levels=15, cmap="viridis", alpha=0.9)
+            contour = ax.contourf(X, Y, Z, levels=15, cmap="gray", alpha=0.9)
             ax.contour(X, Y, Z, levels=15, colors="gray", linewidths=0.5, alpha=0.9)
 
             # Second: Overlay scatter points with classification colors
@@ -1566,8 +1647,8 @@ class Lattice(AutoSerialize):
                 )
 
             # Add x and y axes through origin
-            ax.axhline(y=0, color="black", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
-            ax.axvline(x=0, color="black", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
+            ax.axhline(y=0, color="white", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
+            ax.axvline(x=0, color="white", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
 
             ax.set_xlabel("du")
             ax.set_ylabel("dv")
@@ -1655,7 +1736,7 @@ class Lattice(AutoSerialize):
 
             fig, ax = show_2d(
                 self._image.array,
-                axsize=(10, 10),
+                axsize=(8, 7),
                 cmap="gray",
             )
 
@@ -1664,7 +1745,7 @@ class Lattice(AutoSerialize):
                 y_arr,  # col (x-axis)
                 x_arr,  # row (y-axis)
                 c=colors,  # color by probabilities
-                s=100,  # point size
+                s=50,  # point size
                 alpha=0.8,  # slight transparency
                 edgecolors="black",  # edge for visibility
                 linewidth=1,
@@ -2150,6 +2231,149 @@ class Lattice(AutoSerialize):
                 return img_rgb, (fig, ax)
 
         return img_rgb
+
+
+# Implementing GMM using Torch (don't want skimage as a dependency)
+class TorchGMM:
+    """
+    PyTorch Gaussian Mixture Model with full covariances optimized via EM.
+    Only 'full' covariance is supported.
+    Allows custom means initialization, cov regularization, and device/dtype control.
+    After fit, exposes means_, covariances_, and weights_; use predict_proba for responsibilities.
+    """
+
+    def __init__(
+        self,
+        n_components,
+        covariance_type="full",
+        means_init=None,
+        tol=1e-4,
+        max_iter=200,
+        reg_covar=1e-6,
+        device=None,
+        dtype=torch.float32,
+    ):
+        if covariance_type != "full":
+            raise NotImplementedError("Only 'full' covariance_type is supported as of now.")
+        self.n_components = int(n_components)
+        self.covariance_type = covariance_type
+        self.means_init = None if means_init is None else np.asarray(means_init, dtype=np.float32)
+        self.tol = float(tol)
+        self.max_iter = int(max_iter)
+        self.reg_covar = float(reg_covar)
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = dtype
+
+        # Fitted attributes (NumPy for external access)
+        self.means_ = None
+        self.covariances_ = None
+        self.weights_ = None
+
+        # Internal torch parameters
+        self._means = None  # [K, D]
+        self._covariances = None  # [K, D, D]
+        self._weights = None  # [K]
+
+    def _to_tensor(self, x):
+        if isinstance(x, np.ndarray):
+            return torch.tensor(x, dtype=self.dtype, device=self.device)
+        elif isinstance(x, torch.Tensor):
+            return x.to(device=self.device, dtype=self.dtype)
+        else:
+            return torch.tensor(x, dtype=self.dtype, device=self.device)
+
+    def _init_params(self, X):
+        N, D = X.shape
+        K = self.n_components
+
+        if self.means_init is not None:
+            if self.means_init.shape != (K, D):
+                raise ValueError(
+                    f"means_init must have shape ({K}, {D}), got {self.means_init.shape}"
+                )
+            self._means = self._to_tensor(self.means_init).clone()
+        else:
+            # Initialize means by sampling K points from data
+            idx = torch.randperm(N, device=self.device)[:K]
+            self._means = X[idx].clone()
+
+        # Initialize covariances with global covariance for stability
+        X_centered = X - X.mean(dim=0, keepdim=True)
+        global_cov = (X_centered.T @ X_centered) / (max(N - 1, 1))
+        global_cov = global_cov + self.reg_covar * torch.eye(
+            D, device=self.device, dtype=self.dtype
+        )
+        self._covariances = global_cov.unsqueeze(0).repeat(K, 1, 1).clone()
+
+        # Initialize weights uniformly
+        self._weights = torch.full((K,), 1.0 / K, device=self.device, dtype=self.dtype)
+
+    def _log_gaussians(self, X):
+        # X: [N, D], means: [K, D], covs: [K, D, D]
+        dist = torch.distributions.MultivariateNormal(
+            loc=self._means, covariance_matrix=self._covariances
+        )
+        log_comp = dist.log_prob(X[:, None, :])  # [N, K] via broadcasting
+        return log_comp
+
+    def _e_step(self, X):
+        log_comp = self._log_gaussians(X)  # [N, K]
+        log_weights = torch.log(self._weights.clamp_min(1e-12))  # [K]
+        log_post = log_comp + log_weights[None, :]  # [N, K]
+        r = torch.softmax(log_post, dim=1)  # responsibilities [N, K]
+        return r, log_post
+
+    def _m_step(self, X, r):
+        N, D = X.shape
+        K = self.n_components
+        Nk = r.sum(dim=0) + 1e-12  # [K]
+        self._weights = (Nk / (N + 1e-12)).clamp_min(1e-12)
+
+        # Means
+        self._means = (r.T @ X) / Nk[:, None]
+
+        # Covariances (full)
+        covs = []
+        for k in range(K):
+            diff = X - self._means[k]  # [N, D]
+            cov_k = (r[:, k][:, None] * diff).T @ diff
+            cov_k = cov_k / (Nk[k] + 1e-12)
+            cov_k = cov_k + self.reg_covar * torch.eye(D, device=self.device, dtype=self.dtype)
+            covs.append(cov_k)
+        self._covariances = torch.stack(covs, dim=0)  # [K, D, D]
+
+    def fit(self, data):
+        X = self._to_tensor(data)
+        if X.ndim != 2:
+            raise ValueError("Input data must be 2D with shape (N, D)")
+        self._init_params(X)
+
+        prev_ll = torch.tensor(
+            -torch.inf, device=self.device, dtype=self.dtype
+        )  # Fixed: make it a tensor
+        for _ in range(self.max_iter):
+            r, _ = self._e_step(X)
+            self._m_step(X, r)
+
+            # Compute average log-likelihood of data under mixture
+            log_comp = self._log_gaussians(X)
+            ll = torch.logsumexp(log_comp + torch.log(self._weights)[None, :], dim=1).mean()
+
+            if torch.isfinite(prev_ll):
+                if (ll - prev_ll).abs().item() < self.tol:
+                    break
+            prev_ll = ll
+
+        # Store NumPy copies for external use
+        self.means_ = self._means.detach().cpu().numpy()
+        self.covariances_ = self._covariances.detach().cpu().numpy()
+        self.weights_ = self._weights.detach().cpu().numpy()
+        return self
+
+    def predict_proba(self, data):
+        X = self._to_tensor(data)
+        r, _ = self._e_step(X)
+        return r.detach().cpu().numpy()
 
 
 # helper functions for plotting
