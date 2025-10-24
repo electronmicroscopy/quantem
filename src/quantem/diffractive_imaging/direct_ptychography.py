@@ -390,7 +390,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         return operator, grad_k / 2 / np.pi
 
     def _compute_gamma_operator(
-        self, kxa, kya, qxa, qya, cmplx_probe, batch_idx, asymmetric_version=True, normalize=True
+        self,
+        kxa,
+        kya,
+        qxa,
+        qya,
+        aberration_coefs,
+        cmplx_probe,
+        batch_idx,
+        asymmetric_version=True,
+        normalize=True,
     ):
         """Compute gamma deconvolution operator."""
         ind_i = self._bf_inds_i[batch_idx]
@@ -414,7 +423,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.semiangle_cutoff,
             self.soft_edges,
             angular_sampling=self.angular_sampling,
-            aberration_coefs=self.aberration_coefs,
+            aberration_coefs=aberration_coefs,
             asymmetric_version=asymmetric_version,
             normalize=normalize,
         )
@@ -586,13 +595,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     kya,
                     qxa,
                     qya,
+                    aberration_coefs,
                     cmplx_probe,
                     batch_idx,
                     asymmetric_version=not use_center_of_mass_weighting,
                     normalize=not use_center_of_mass_weighting,
                 )
                 fourier_factor = vbf_fourier * operator * icom_weighting
-                fourier_factor[..., 0, 0] = dc_per_image
+                fourier_factor[..., 0, 0] = dc_per_image * upsampling_factor
 
             elif deconvolution_kernel == "quadratic":
                 fourier_factor = vbf_fourier * operator[batch_idx] * icom_weighting
@@ -610,7 +620,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         pbar.close()
 
+        # memory management
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.mps.empty_cache()
         gc.collect()
 
         if deconvolution_kernel == "full":
@@ -642,7 +655,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         """ """
         if self.corrected_stack is None:
             return None
-        if self.corrected_stack.sum() > 0:
+        if self.corrected_stack.abs().sum() > 0:
             variance_loss = ((self.corrected_stack - self.mean_corrected_bf).abs().square()).mean()
         else:
             variance_loss = torch.tensor(
@@ -800,7 +813,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def fit_hyperparameters(
         self,
-        bin_factors: tuple[int, ...] = (7, 6, 5, 4, 3, 2, 1),
+        bin_factors: tuple[int, ...] = (3, 2, 1),
         pair_connectivity: int = 4,
         alignment_method: str = "pairwise",
         reference: torch.Tensor | NDArray | None = None,
