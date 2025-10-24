@@ -180,7 +180,7 @@ def cross_correlation_shift_torch(
     dx = ((xy_shift[0] + M / 2) % M) - M / 2
     dy = ((xy_shift[1] + N / 2) % N) - N / 2
 
-    return torch.tensor([dx, dy])
+    return torch.tensor([dx, dy], device=G1.device)
 
 
 def align_images_fourier_torch(

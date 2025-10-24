@@ -815,7 +815,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         bin_factors: tuple[int, ...] = (3, 2, 1),
         pair_connectivity: int = 4,
-        alignment_method: str = "pairwise",
+        alignment_method: str = "reference",
         reference: torch.Tensor | NDArray | None = None,
         running_average: bool = False,
         regularize_shifts: bool = True,
