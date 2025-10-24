@@ -20,3 +20,11 @@ from quantem.diffractive_imaging.complex_probe import (
     real_space_probe as real_space_probe,
     fourier_space_probe as fourier_space_probe,
 )
+
+from quantem.diffractive_imaging.direct_ptychography import (
+    DirectPtychography as DirectPtychography,
+)
+
+from quantem.diffractive_imaging.origin_models import (
+    CenterOfMassOriginModel as CenterOfMassOriginModel,
+)

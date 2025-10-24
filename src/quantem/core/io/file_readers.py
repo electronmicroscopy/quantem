@@ -11,7 +11,8 @@ from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
 
 def read_4dstem(
     file_path: str,
-    file_type: str | None = None,
+    file_type: str,
+    dataset_index: int | None = None,
     **kwargs,
 ) -> Dataset4dstem:
     """
@@ -24,6 +25,9 @@ def read_4dstem(
     file_type: str
         The type of file reader needed. See rosettasciio for supported formats
         https://hyperspy.org/rosettasciio/supported_formats/index.html
+    dataset_index: int, optional
+        Index of the dataset to load if file contains multiple datasets.
+        If None, automatically selects the first 4D dataset found.
     **kwargs: dict
         Additional keyword arguments to pass to the Dataset4dstem constructor.
 
@@ -31,39 +35,49 @@ def read_4dstem(
     --------
     Dataset4dstem
     """
-    if file_type is None:
-        file_type = Path(file_path).suffix.lower().lstrip(".")
+    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
+    data_list = file_reader(file_path)
 
-    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
-    imported_data = file_reader(file_path)[0]
+    # If specific index provided, use it
+    if dataset_index is not None:
+        imported_data = data_list[dataset_index]
+        if imported_data["data"].ndim != 4:
+            raise ValueError(
+                f"Dataset at index {dataset_index} has {imported_data['data'].ndim} dimensions, "
+                f"expected 4D. Shape: {imported_data['data'].shape}"
+            )
+    else:
+        # Automatically find first 4D dataset
+        four_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 4]
+
+        if len(four_d_datasets) == 0:
+            print(f"No 4D datasets found in {file_path}. Available datasets:")
+            for i, d in enumerate(data_list):
+                print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+            raise ValueError("No 4D dataset found in file")
+
+        dataset_index, imported_data = four_d_datasets[0]
+
+        if len(data_list) > 1:
+            print(
+                f"File contains {len(data_list)} dataset(s). Using dataset {dataset_index} with shape {imported_data['data'].shape}"
+            )
+
     imported_axes = imported_data["axes"]
+
     sampling = kwargs.pop(
         "sampling",
-        [
-            imported_axes[0]["scale"],
-            imported_axes[1]["scale"],
-            imported_axes[2]["scale"],
-            imported_axes[3]["scale"],
-        ],
+        [ax["scale"] for ax in imported_axes],
     )
     origin = kwargs.pop(
         "origin",
-        [
-            imported_axes[0]["offset"],
-            imported_axes[1]["offset"],
-            imported_axes[2]["offset"],
-            imported_axes[3]["offset"],
-        ],
+        [ax["offset"] for ax in imported_axes],
     )
     units = kwargs.pop(
         "units",
-        [
-            "pixels" if imported_axes[0]["units"] == "1" else imported_axes[0]["units"],
-            "pixels" if imported_axes[1]["units"] == "1" else imported_axes[1]["units"],
-            "pixels" if imported_axes[2]["units"] == "1" else imported_axes[2]["units"],
-            "pixels" if imported_axes[3]["units"] == "1" else imported_axes[3]["units"],
-        ],
+        ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes],
     )
+
     dataset = Dataset4dstem.from_array(
         array=imported_data["data"],
         sampling=sampling,
@@ -71,7 +85,6 @@ def read_4dstem(
         units=units,
         **kwargs,
     )
-    dataset.file_path = file_path
 
     return dataset
 
