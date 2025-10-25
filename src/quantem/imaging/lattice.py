@@ -6,7 +6,6 @@ from scipy.optimize import least_squares
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 
 
@@ -34,18 +33,66 @@ class Lattice(AutoSerialize):
         normalize_min: bool = True,
         normalize_max: bool = True,
     ) -> "Lattice":
+        """
+        Create a Lattice instance from a 2D image-like input.
+
+        Parameters:
+        - image: A 2D numpy array or a Dataset2d instance representing the image.
+        - normalize_min: If True, shift the image so its minimum becomes 0.
+        - normalize_max: If True, scale the image by its maximum after min-shift
+          so values are in [0, 1]. If the maximum is 0 or non-finite (NaN/Inf),
+          scaling is skipped to avoid invalid operations.
+
+        Notes:
+        - Non-2D inputs and empty arrays raise a ValueError.
+        - Inputs with boolean dtype are safely converted to float before normalization.
+        - NaN values are ignored when computing min/max (using nanmin/nanmax). If the
+          data is all-NaN, normalization is skipped.
+        """
         if isinstance(image, Dataset2d):
             ds2d = image
+            # Ensure numeric operations are valid (e.g., for bool dtype)
+            ds2d.array = np.asarray(ds2d.array, dtype=float)
+            # Validate shape
+            if ds2d.array.ndim != 2:
+                raise ValueError("Input image must be a 2D array.")
+            if ds2d.array.size == 0:
+                raise ValueError("Input image array must not be empty.")
         else:
-            arr = ensure_valid_array(image, ndim=2)
+            # Validate dimensionality and emptiness before any processing
+            arr = np.asarray(image)
+            if arr.ndim != 2:
+                raise ValueError("Input image must be a 2D array.")
+            if arr.size == 0:
+                raise ValueError("Input image array must not be empty.")
+            # Convert to float for safe arithmetic (handles bool arrays)
+            arr = arr.astype(float, copy=False)
             if hasattr(Dataset2d, "from_array") and callable(getattr(Dataset2d, "from_array")):
                 ds2d = Dataset2d.from_array(arr)  # type: ignore[attr-defined]
             else:
                 ds2d = Dataset2d(arr)  # type: ignore[call-arg]
+
+        # Normalization (robust to constant, NaN, and bool inputs)
         if normalize_min:
-            ds2d.array -= np.min(ds2d.array)
+            # Use nanmin to ignore NaNs; if all-NaN, skip
+            try:
+                min_val = np.nanmin(ds2d.array)
+                if np.isfinite(min_val):
+                    ds2d.array = ds2d.array - min_val
+            except ValueError:
+                # Raised when all values are NaN; skip
+                pass
+
         if normalize_max:
-            ds2d.array /= np.max(ds2d.array)
+            # Use nanmax to ignore NaNs; skip division if max <= 0 or not finite
+            try:
+                max_val = np.nanmax(ds2d.array)
+                if np.isfinite(max_val) and max_val > 0.0:
+                    ds2d.array = ds2d.array / max_val
+            except ValueError:
+                # Raised when all values are NaN; skip
+                pass
+
         return cls(image=ds2d, _token=cls._token)
 
     # --- Properties ---
@@ -56,9 +103,21 @@ class Lattice(AutoSerialize):
     @image.setter
     def image(self, value: Dataset2d | NDArray):
         if isinstance(value, Dataset2d):
+            # Ensure numeric dtype to avoid boolean arithmetic issues downstream
+            value.array = np.asarray(value.array, dtype=float)
+            # Validate shape
+            if value.array.ndim != 2:
+                raise ValueError("Input image must be a 2D array.")
+            if value.array.size == 0:
+                raise ValueError("Input image array must not be empty.")
             self._image = value
         else:
-            arr = ensure_valid_array(value, ndim=2)
+            arr = np.asarray(value)
+            if arr.ndim != 2:
+                raise ValueError("Input image must be a 2D array.")
+            if arr.size == 0:
+                raise ValueError("Input image array must not be empty.")
+            arr = arr.astype(float, copy=False)
             if hasattr(Dataset2d, "from_array") and callable(getattr(Dataset2d, "from_array")):
                 self._image = Dataset2d.from_array(arr)  # type: ignore[attr-defined]
             else:
@@ -76,7 +135,7 @@ class Lattice(AutoSerialize):
         bound_num_vectors: int | None = None,
         refine_maxiter: int = 200,
         **kwargs,
-    ):
+    ) -> "Lattice":
         """
         Define the lattice for the image using the origin and the u and v vectors starting from the origin.
         The lattice is defined as r = r0 + nu + mv.
@@ -461,7 +520,7 @@ class Lattice(AutoSerialize):
         contrast_min=None,
         annulus_radii=None,
         **kwargs,
-    ):
+    ) -> "Lattice":
         """
         Add atoms for each lattice site by sampling all integer lattice translations that fall inside
         the image, measuring local intensity, and filtering candidates by bounds, edge distance,
@@ -556,6 +615,24 @@ class Lattice(AutoSerialize):
             colored markers per site. Colors are determined by site numbers. Axes are set to match image
             coordinates (x increasing downward).
         """
+        if not hasattr(self, "_lat") or self._lat is None:
+            raise ValueError(
+                "Lattice vectors have not been fitted. Please call define_lattice() first."
+            )
+        # Handle empty positions early without creating a Vector of length 0
+        positions_frac_arr = np.asarray(positions_frac, dtype=float)
+        if positions_frac_arr.size == 0:
+            # Bookkeeping for consistency
+            self._positions_frac = np.empty((0, 2), dtype=float)
+            self._num_sites = 0
+            self._numbers = (
+                np.array([], dtype=int)
+                if numbers is None
+                else np.atleast_1d(np.array(numbers, dtype=int))
+            )
+            # Do not construct an empty Vector with zero shape (causes error). Just return.
+            return self
+
         self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
         self._num_sites = self._positions_frac.shape[0]
         self._numbers = (
@@ -733,7 +810,7 @@ class Lattice(AutoSerialize):
         max_move_px: float | None = None,
         plot_atoms: bool = False,
         **kwargs,
-    ):
+    ) -> "Lattice":
         """
         Refine atom centers by local 2D Gaussian fitting around each previously detected atom.
         Updates atom positions and peak intensity and adds per-atom sigma and background fields.
@@ -810,7 +887,6 @@ class Lattice(AutoSerialize):
             semi-transparent colored markers per site. Colors are determined by site numbers.
             - Axes are set to match image coordinates (x increasing downward).
         """
-        import numpy as np
 
         if not hasattr(self, "atoms"):
             raise ValueError("No atoms to refine. Call add_atoms() first.")
@@ -972,7 +1048,7 @@ class Lattice(AutoSerialize):
         max_neighbours: int | None = None,
         plot_polarization_vectors: bool = False,
         **plot_kwargs,
-    ):
+    ) -> "Vector":
         """
         Measure the polarization of atoms at one site with respect to atoms at another site.
         Polarization is computed as a fractional displacement (da, db) of each atom in the
@@ -1053,29 +1129,45 @@ class Lattice(AutoSerialize):
                     "'reference_num' is deprecated. Use 'max_neighbours' and 'min_neighbours'."
                 )
 
-        # lattice vectors in pixels
-        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-
         measure_ind = int(measure_ind)
         reference_ind = int(reference_ind)
+
+        def is_empty(cell):
+            if cell is None:
+                return True
+            if isinstance(cell, list):
+                return len(cell) == 0
+            if isinstance(cell, dict):
+                x = cell.get("x", None)
+                return x is None or np.size(x) == 0
+            # Fallback to numpy-like objects
+            if hasattr(cell, "size"):
+                return cell.size == 0
+            return False
 
         # Check for empty cells
         A_cell = self.atoms.get_data(measure_ind)
         B_cell = self.atoms.get_data(reference_ind)
         self._pol_meas_ref_ind = (measure_ind, reference_ind)
 
-        def is_empty(cell):
-            return isinstance(cell, list) or cell is None or cell.size == 0
+        # Prepare a Vector with structured dtype (even for empty data)
+        fields = ("x", "y", "a", "b", "da", "db")
+        units = ("px", "px", "ind", "ind", "ind", "ind")
 
-        if is_empty(A_cell) or is_empty(B_cell):
+        def empty_vector():
             out = Vector.from_shape(
                 shape=(1,),
-                fields=("x", "y", "a", "b", "da", "db"),
-                units=("px", "px", "ind", "ind", "ind", "ind"),
+                fields=fields,
+                units=units,
                 name="polarization",
             )
-            out.set_data(np.zeros((0, 6), float), 0)
+            # Create empty array with shape (0, 6) to match expected format
+            empty_data = np.zeros((0, 6), dtype=float)
+            out.set_data(empty_data, 0)
             return out
+
+        if is_empty(A_cell) or is_empty(B_cell):
+            return empty_vector()
 
         # Extract common atom data
         Ax = self.atoms[measure_ind]["x"]
@@ -1087,11 +1179,20 @@ class Lattice(AutoSerialize):
         Ba = self.atoms[reference_ind]["a"]
         Bb = self.atoms[reference_ind]["b"]
 
+        if Ax.size == 0 or Bx.size == 0:
+            return empty_vector()
+
+        # Lattice vectors: r0 (unused here), u, v
+        lat = np.asarray(getattr(self, "_lat", None))
+        if lat is None or lat.shape[0] < 3:
+            raise ValueError("Lattice vectors (_lat) are missing or malformed.")
+        _, u, v = lat[0], lat[1], lat[2]
         L = np.column_stack((u, v))
         try:
             L_inv = np.linalg.inv(L)
         except np.linalg.LinAlgError:
             raise ValueError("Lattice vectors are singular and cannot be inverted.")
+
         query_coords = np.column_stack([Ax, Ay])
         ref_coords = np.column_stack([Bx, By])
 
@@ -1268,10 +1369,14 @@ class Lattice(AutoSerialize):
             name="polarization",
         )
 
-        arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
-        out.set_data(arr, 0)
+        # Create structured array if needed
+        if len(x_arr) > 0:
+            arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
+        else:
+            # Create empty array with shape (0, 6)
+            arr = np.zeros((0, 6), dtype=float)
 
-        # out.set_data(arr, 0)
+        out.set_data(arr, 0)
 
         if plot_polarization_vectors:
             self.plot_polarization_vectors(out, **plot_kwargs)
@@ -1289,7 +1394,7 @@ class Lattice(AutoSerialize):
         torch_device: str = "cpu",
         # plot_confidence_map : bool = False,
         **kwargs,
-    ):
+    ) -> "Lattice":
         """
         Estimate a multi-phase order parameter by fitting a Gaussian Mixture Model (GMM)
         to fractional polarization components (da, db). The order parameter for each site
@@ -1454,25 +1559,6 @@ class Lattice(AutoSerialize):
 
             return ellipse
 
-        # def create_colors(categories, intensities):
-        #     """Vectorized color creation"""
-        #     unique_categories = np.unique(categories)
-        #     n = len(categories)
-        #     colors = np.ones((n, 3))
-
-        #     if num_phases != 1:
-        #         intensities = (intensities - (1/num_phases))/(1 - (1/num_phases))
-
-        #     white = np.array([1.0, 1.0, 1.0])
-
-        #     for category in unique_categories:
-        #         mask = categories == category
-        #         base_color = np.array(site_colors(category))
-        #         intensity = intensities[mask, np.newaxis]
-        #         colors[mask] = intensity * base_color + (1 - intensity) * white
-
-        #     return colors
-
         class FixedMeansGMM(TorchGMM):
             """
             GMM variant with fixed component means.
@@ -1544,7 +1630,6 @@ class Lattice(AutoSerialize):
                     device=torch_device,
                 )
         gmm.fit(data)
-        # labels = gmm.predict(data)  # This has Gaussian number [0,num_phases-1) that the atom best fits to
 
         # Calculate score between 0 and 1 for each point
         # Get probabilities for each Gaussian
@@ -1558,9 +1643,6 @@ class Lattice(AutoSerialize):
         X, Y = np.meshgrid(x_grid, y_grid)
         positions = np.vstack([X.ravel(), Y.ravel()])
         Z = gaussian_kde(d_frac_arr)(positions).reshape(X.shape)
-
-        # GMM density on grid
-        # grid_points = np.column_stack([X.ravel(), Y.ravel()])
 
         # Save GMM data
         self._polarization_means = gmm.means_
@@ -1667,69 +1749,6 @@ class Lattice(AutoSerialize):
             plt.tight_layout()
             plt.show()
 
-        # ========== Plot: Confidence Map ==========
-        # if plot_confidence_map:
-        #     if num_components == 3:
-        #         fig3, ax3 = plt.subplots(figsize=(6, 6))
-        #     else:
-        #         fig3, ax3 = plt.subplots(figsize=(7, 6))
-
-        #     # Get predictions and probabilities for grid
-        #     grid_predictions = gmm.predict(grid_points)
-        #     grid_probabilities = gmm.predict_proba(grid_points)
-
-        #     # For each grid point, get the probability of its assigned component
-        #     grid_max_probs = grid_probabilities[np.arange(len(grid_predictions)), grid_predictions]
-
-        #     # Create color map for grid based on category and max probability
-        #     grid_colors_flat = create_colors(grid_predictions, grid_max_probs)
-        #     grid_colors = grid_colors_flat.reshape(X.shape[0], X.shape[1], 3)
-
-        #     # Show as image
-        #     ax3.imshow(grid_colors, extent=[X.min(), X.max(), Y.min(), Y.max()],
-        #             origin='lower', aspect='auto', alpha=0.7)
-
-        #     # Add decision boundaries (probability contours)
-        #     grid_max_probs_2d = grid_max_probs.reshape(X.shape)
-        #     contour_boundary = ax3.contour(X, Y, grid_max_probs_2d,
-        #                                 levels=[0.5, 0.7, 0.9],
-        #                                 colors='red', linewidths=[3, 2, 1],
-        #                                 linestyles=['--', '-', ':'])
-        #     ax3.clabel(contour_boundary, inline=True, fontsize=8, fmt='P=%.1f')
-
-        #     # Add GMM centers with their colors
-        #     for i in range(num_components):
-        #         ax3.scatter(gmm.means_[i, 0], gmm.means_[i, 1],
-        #                 c=[site_colors(i)], s=300, marker='x', linewidths=4,
-        #                 edgecolors='black', zorder=10)
-
-        #     # Add confidence ellipses
-        #     for i in range(num_components):
-        #         plot_gaussian_ellipse(ax3, gmm.means_[i], gmm.covariances_[i],
-        #                             n_std=2, edgecolor='black', linewidth=2.5,
-        #                             linestyle='-')
-
-        #     ax3.set_xlabel('du')
-        #     ax3.set_ylabel('dv')
-        #     ax3.set_title('Classification Map\nwith Confidence')
-
-        #     # Create custom legend for components
-        #     from matplotlib.patches import Patch
-        #     legend_elements = [Patch(facecolor=site_colors(i), edgecolor='black',
-        #                             label=f'G{i}')
-        #                     for i in range(num_components)]
-        #     ax3.legend(handles=legend_elements, loc='best')
-
-        #     # Add appropriate color reference based on number of components
-        #     if num_components == 2:
-        #         add_2phase_colorbar(ax3)
-        #     elif num_components == 3:
-        #         add_3phase_color_triangle(fig3, ax3)
-        #     # For num_components > 3 or == 1, don't add any color reference
-
-        #     plt.tight_layout()
-        #     plt.show()
-
         if plot_order_parameter:
             # Create colors from full probability distribution
             colors = create_colors_from_probabilities(probabilities, num_phases)
@@ -1818,23 +1837,19 @@ class Lattice(AutoSerialize):
         # Fields
         xA = pol_vec[0]["x"]
         yA = pol_vec[0]["y"]
-        # xR = pol_vec[0]["x_ref"]
-        # yR = pol_vec[0]["y_ref"]
         da = pol_vec[0]["da"]
         db = pol_vec[0]["db"]
 
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
         L = np.column_stack((u, v))
         dr = L @ np.vstack((da, db))
+
+        # Displacements (rows, cols)
         dr_raw = dr[0].astype(float)
         dc_raw = dr[1].astype(float)
 
         xR = xA - dr_raw
         yR = yA - dc_raw
-
-        # Displacements (rows, cols)
-        # dr_raw = (xA - xR).astype(float)  # down +
-        # dc_raw = (yA - yR).astype(float)  # right +
 
         # --- Unified color mapping (identical across scripts) ---
         dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
@@ -2113,36 +2128,6 @@ class Lattice(AutoSerialize):
 
             img_rgb[r0 : r0 + pixel_size, c0 : c0 + pixel_size, :] = color
 
-        # r_0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
-        # theta_u = np.arctan2(u[1], u[0])
-        # handedness = u[0] * v[1] - u[1] * v[0] > 0
-
-        # if theta_u > np.pi / 36 or theta_u < -np.pi / 36:
-        #     from scipy.ndimage import rotate
-
-        #     if not handedness:
-        #         img_rgb = np.fliplr(img_rgb)
-
-        #     img_rgb = rotate(
-        #         img_rgb,
-        #         np.degrees(theta_u),
-        #         axes=(1, 0),
-        #         reshape=True,
-        #         order=1,
-        #         mode="constant",
-        #         cval=0.0,
-        #     )
-
-        #     # Crop the image to deal with artifacts due to rotation
-        #     mask = np.linalg.norm(img_rgb, axis=2) > 0
-        #     rows, cols = np.where(mask)
-
-        #     if len(rows) > 0 and len(cols) > 0:
-        #         r_min, r_max = rows.min(), rows.max()
-        #         c_min, c_max = cols.min(), cols.max()
-
-        #         img_rgb = img_rgb[r_min : r_max + 1, c_min : c_max + 1, :]
-
         # --- Optional rendering with legend ---
         if plot:
             fig, ax = show_2d(img_rgb, returnfig=True, figsize=figsize, **kwargs)
@@ -2255,11 +2240,16 @@ class TorchGMM:
     ):
         if covariance_type != "full":
             raise NotImplementedError("Only 'full' covariance_type is supported as of now.")
+
+        # Store parameters - handle edge cases gracefully
         self.n_components = int(n_components)
+
+        # Convert negative max_iter to 0 (or absolute value)
+        self.max_iter = abs(int(max_iter))
+
         self.covariance_type = covariance_type
         self.means_init = None if means_init is None else np.asarray(means_init, dtype=np.float32)
-        self.tol = float(tol)
-        self.max_iter = int(max_iter)
+        self.tol = abs(float(tol))  # Also handle negative tolerance
         self.reg_covar = float(reg_covar)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
@@ -2274,7 +2264,7 @@ class TorchGMM:
         self._covariances = None  # [K, D, D]
         self._weights = None  # [K]
 
-    def _to_tensor(self, x):
+    def _to_tensor(self, x) -> torch.Tensor:
         if isinstance(x, np.ndarray):
             return torch.tensor(x, dtype=self.dtype, device=self.device)
         elif isinstance(x, torch.Tensor):
@@ -2282,7 +2272,41 @@ class TorchGMM:
         else:
             return torch.tensor(x, dtype=self.dtype, device=self.device)
 
-    def _init_params(self, X):
+    def _kmeans_plusplus_init(self, X: torch.Tensor, K: int) -> torch.Tensor:
+        """Initialize means using k-means++ algorithm for better spread."""
+        N, D = X.shape
+
+        # Work on CPU for deterministic behavior
+        X_cpu = X.cpu()
+
+        # First center: random choice
+        indices = [torch.randint(0, N, (1,), device="cpu").item()]
+
+        # Remaining centers: choose based on distance to existing centers
+        for _ in range(1, K):
+            # Compute distances to nearest existing center
+            centers = X_cpu[indices]
+            dists = torch.cdist(X_cpu, centers)  # [N, num_centers]
+            min_dists = dists.min(dim=1)[0]  # [N]
+
+            # Square distances for probability weighting
+            probs = min_dists**2
+            probs_sum = probs.sum()
+
+            # Handle case where all points are identical (probs_sum == 0)
+            if probs_sum > 1e-10:
+                probs = probs / probs_sum
+                # Sample next center
+                next_idx = torch.multinomial(probs, 1).item()
+            else:
+                # All points are very close, just pick randomly
+                next_idx = torch.randint(0, N, (1,), device="cpu").item()
+
+            indices.append(next_idx)
+
+        return X_cpu[indices].to(device=self.device, dtype=self.dtype)
+
+    def _init_params(self, X: torch.Tensor) -> None:
         N, D = X.shape
         K = self.n_components
 
@@ -2293,41 +2317,86 @@ class TorchGMM:
                 )
             self._means = self._to_tensor(self.means_init).clone()
         else:
-            # Initialize means by sampling K points from data
-            idx = torch.randperm(N, device=self.device)[:K]
-            self._means = X[idx].clone()
+            # Initialize means using k-means++ for better separation
+            if N > 0 and K > 0:
+                if N >= K:
+                    self._means = self._kmeans_plusplus_init(X, K)
+                else:
+                    # Sample with replacement if not enough samples
+                    X_cpu = X.cpu()
+                    indices = torch.randint(0, N, (K,), device="cpu")
+                    self._means = X_cpu[indices].clone().to(device=self.device, dtype=self.dtype)
+            else:
+                self._means = torch.zeros((K, D), device=self.device, dtype=self.dtype)
 
         # Initialize covariances with global covariance for stability
-        X_centered = X - X.mean(dim=0, keepdim=True)
-        global_cov = (X_centered.T @ X_centered) / (max(N - 1, 1))
-        global_cov = global_cov + self.reg_covar * torch.eye(
-            D, device=self.device, dtype=self.dtype
-        )
+        if N > 1:
+            X_centered = X - X.mean(dim=0, keepdim=True)
+            global_cov = (X_centered.T @ X_centered) / (N - 1)
+            # Add strong regularization for near-singular cases
+            global_cov = global_cov + self.reg_covar * torch.eye(
+                D, device=self.device, dtype=self.dtype
+            )
+        else:
+            global_cov = self.reg_covar * torch.eye(D, device=self.device, dtype=self.dtype)
+
+        # Ensure minimum eigenvalue for numerical stability
+        eigenvalues = torch.linalg.eigvalsh(global_cov)
+        if eigenvalues.min() < self.reg_covar:
+            global_cov = global_cov + (self.reg_covar - eigenvalues.min() + 1e-6) * torch.eye(
+                D, device=self.device, dtype=self.dtype
+            )
+
         self._covariances = global_cov.unsqueeze(0).repeat(K, 1, 1).clone()
 
-        # Initialize weights uniformly
-        self._weights = torch.full((K,), 1.0 / K, device=self.device, dtype=self.dtype)
-
-    def _log_gaussians(self, X):
-        # X: [N, D], means: [K, D], covs: [K, D, D]
-        dist = torch.distributions.MultivariateNormal(
-            loc=self._means, covariance_matrix=self._covariances
+        # Initialize weights uniformly - handle K=0 case
+        self._weights = torch.full(
+            (K,), 1.0 / K if K > 0 else 1.0, device=self.device, dtype=self.dtype
         )
-        log_comp = dist.log_prob(X[:, None, :])  # [N, K] via broadcasting
+
+    def _log_gaussians(self, X: torch.Tensor) -> torch.Tensor:
+        # X: [N, D], means: [K, D], covs: [K, D, D]
+        N, D = X.shape
+        K = self.n_components
+
+        # Compute log probabilities for each component
+        log_probs = []
+        for k in range(K):
+            # Ensure covariance is positive definite
+            cov_k = self._covariances[k]
+
+            # Check if covariance needs additional regularization
+            try:
+                # Try with current covariance
+                dist = torch.distributions.MultivariateNormal(
+                    loc=self._means[k], covariance_matrix=cov_k, validate_args=False
+                )
+                log_prob = dist.log_prob(X)
+            except (RuntimeError, ValueError):
+                # Add stronger regularization if needed
+                cov_reg = cov_k + 1e-3 * torch.eye(D, device=self.device, dtype=self.dtype)
+                dist = torch.distributions.MultivariateNormal(
+                    loc=self._means[k], covariance_matrix=cov_reg, validate_args=False
+                )
+                log_prob = dist.log_prob(X)
+
+            log_probs.append(log_prob)  # [N]
+
+        log_comp = torch.stack(log_probs, dim=1)  # [N, K]
         return log_comp
 
-    def _e_step(self, X):
+    def _e_step(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         log_comp = self._log_gaussians(X)  # [N, K]
         log_weights = torch.log(self._weights.clamp_min(1e-12))  # [K]
         log_post = log_comp + log_weights[None, :]  # [N, K]
         r = torch.softmax(log_post, dim=1)  # responsibilities [N, K]
         return r, log_post
 
-    def _m_step(self, X, r):
+    def _m_step(self, X: torch.Tensor, r: torch.Tensor) -> None:
         N, D = X.shape
         K = self.n_components
-        Nk = r.sum(dim=0) + 1e-12  # [K]
-        self._weights = (Nk / (N + 1e-12)).clamp_min(1e-12)
+        Nk = r.sum(dim=0).clamp_min(1e-12)  # [K]
+        self._weights = (Nk / N).clamp_min(1e-12)
 
         # Means
         self._means = (r.T @ X) / Nk[:, None]
@@ -2337,30 +2406,43 @@ class TorchGMM:
         for k in range(K):
             diff = X - self._means[k]  # [N, D]
             cov_k = (r[:, k][:, None] * diff).T @ diff
-            cov_k = cov_k / (Nk[k] + 1e-12)
+            cov_k = cov_k / Nk[k]
+
+            # Add regularization
             cov_k = cov_k + self.reg_covar * torch.eye(D, device=self.device, dtype=self.dtype)
+
+            # Ensure positive definiteness
+            eigenvalues = torch.linalg.eigvalsh(cov_k)
+            if eigenvalues.min() < self.reg_covar:
+                cov_k = cov_k + (self.reg_covar - eigenvalues.min() + 1e-6) * torch.eye(
+                    D, device=self.device, dtype=self.dtype
+                )
+
             covs.append(cov_k)
         self._covariances = torch.stack(covs, dim=0)  # [K, D, D]
 
-    def fit(self, data):
+    def fit(self, data) -> "TorchGMM":
         X = self._to_tensor(data)
         if X.ndim != 2:
             raise ValueError("Input data must be 2D with shape (N, D)")
+
         self._init_params(X)
 
-        prev_ll = torch.tensor(
-            -torch.inf, device=self.device, dtype=self.dtype
-        )  # Fixed: make it a tensor
-        for _ in range(self.max_iter):
+        prev_ll = torch.tensor(float("-inf"), device=self.device, dtype=self.dtype)
+
+        for iteration in range(self.max_iter):
             r, _ = self._e_step(X)
             self._m_step(X, r)
 
             # Compute average log-likelihood of data under mixture
             log_comp = self._log_gaussians(X)
-            ll = torch.logsumexp(log_comp + torch.log(self._weights)[None, :], dim=1).mean()
+            log_weighted = log_comp + torch.log(self._weights)[None, :]
+            ll = torch.logsumexp(log_weighted, dim=1).mean()
 
-            if torch.isfinite(prev_ll):
-                if (ll - prev_ll).abs().item() < self.tol:
+            # Check convergence
+            if iteration > 0 and torch.isfinite(prev_ll) and torch.isfinite(ll):
+                improvement = (ll - prev_ll).abs()
+                if improvement < self.tol:
                     break
             prev_ll = ll
 
@@ -2370,7 +2452,7 @@ class TorchGMM:
         self.weights_ = self._weights.detach().cpu().numpy()
         return self
 
-    def predict_proba(self, data):
+    def predict_proba(self, data) -> np.ndarray:
         X = self._to_tensor(data)
         r, _ = self._e_step(X)
         return r.detach().cpu().numpy()
