@@ -12,6 +12,7 @@ from quantem.diffractive_imaging.probe_models import (
     ProbeParametric as ProbeParametric,
 )
 from quantem.diffractive_imaging.ptychography import Ptychography as Ptychography
+from quantem.diffractive_imaging.ptychography_prism import PtychoPRISM as PtychoPRISM
 from quantem.diffractive_imaging.ptychography_lite import (
     PtychoLite as PtychoLite,
     PtychoLiteDIP as PtychoLiteDIP,
