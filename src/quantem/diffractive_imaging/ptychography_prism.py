@@ -103,6 +103,7 @@ class PtychoPRISM(PtychographyBase):
         else:
             transmission = obj_array
 
+        all_waves = []
         for start, end in generate_batches(plane_waves.shape[0], max_batch=max_batch_size):
             waves = plane_waves[start:end]
 
@@ -116,9 +117,9 @@ class PtychoPRISM(PtychographyBase):
                 if s < self.num_slices - 1:
                     waves = self._propagate_array(waves, self._propagators[s])
 
-            plane_waves[start:end] = waves
+            all_waves.append(waves)
 
-        return plane_waves
+        return torch.cat(all_waves, dim=0)
 
     def forward_operator(
         self,
@@ -148,16 +149,14 @@ class PtychoPRISM(PtychographyBase):
             prism_coefs,  # [num_probes, num_positions, num_waves]
             propagated_plane_waves,  # [num_waves, obj_h, obj_w]
             dims=((2,), (0,)),
-        )  # -> [num_probes, num_positions, obj_h, obj_w]
+        ).reshape((prism_coefs.shape[0], -1))  # -> [num_probes, num_positions, obj_h, obj_w]
 
-        return exit_waves
+        # MPS-safe indexing
+        real = exit_waves.real[:, patch_indices]
+        imag = exit_waves.imag[:, patch_indices]
+        exit_patches = torch.complex(real, imag)  # [num_probes, num_positions, roi_h, roi_w]
 
-        # # MPS-safe indexing
-        # real = exit_waves.real[:, patch_indices]
-        # imag = exit_waves.imag[:, patch_indices]
-        # exit_patches = torch.complex(real, imag)  # [num_probes, num_positions, roi_h, roi_w]
-
-        # return exit_patches
+        return exit_patches
 
     def reconstruct(
         self,
@@ -254,10 +253,9 @@ class PtychoPRISM(PtychographyBase):
                 self.obj_model.optimizer.zero_grad()
 
             # Get batch data
-            patch_indices, _positions_px, positions_px_fractional, _descan = self.dset.forward(
-                indices, self.obj_padding_px
-            )
-            positions = _positions_px * self.dset.scan_sampling
+            patch_indices = self.dset.patch_indices
+            positions_px = self.dset.scan_positions_px
+            positions = positions_px * torch.as_tensor(self.sampling, dtype=torch.float32)
 
             prism_coefs = self.probe_model.forward(positions)
             exit_waves = self.forward_operator(prism_coefs, patch_indices, self.batch_size)
