@@ -43,6 +43,7 @@ dependencies = [
   "rosettasciio>=0.8.0",
   "h5py>=3.13.0",
   "torch>=2.7.0",
+  "scikit-image>=0.25.2",
 ]
 
 [tool.hatch.build.targets.sdist]
