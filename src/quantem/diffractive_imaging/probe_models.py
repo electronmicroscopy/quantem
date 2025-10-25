@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from copy import deepcopy
 from typing import Any, Callable, Self, Union
@@ -16,7 +17,7 @@ from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.loss_functions import get_loss_function
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
-from quantem.core.utils.utils import to_numpy
+from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.core.utils.validators import (
     validate_arr_gt,
     validate_array,
@@ -29,6 +30,7 @@ from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging.complex_probe import (
     POLAR_ALIASES,
     POLAR_SYMBOLS,
+    evaluate_probe,
     real_space_probe,
 )
 from quantem.diffractive_imaging.constraints import BaseConstraints
@@ -1391,4 +1393,404 @@ class ProbeDIP(ProbeConstraints):
         )
 
 
-ProbeModelType = ProbePixelated | ProbeDIP
+class ProbePRISM(ProbeBase):
+    """
+    PRISM probe model that computes probe coefficients for plane wave decomposition.
+    """
+
+    def __init__(
+        self,
+        num_probes: int | None = None,
+        probe_params: dict = {},
+        roi_shape: tuple[int, int] | np.ndarray | None = None,
+        interpolation: tuple[int, int] = (1, 1),
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        _token: object | None = None,
+    ):
+        """
+        Parameters
+        ----------
+        aberration_coefs_list : Sequence[dict]
+            List of aberration coefficient dictionaries, one per probe mode
+        num_probes : int | None
+            Number of probe modes (if None, inferred from aberration_coefs_list)
+        probe_params : dict
+            Additional probe parameters (must contain 'energy')
+        roi_shape : tuple[int, int] | np.ndarray | None
+            Shape of the probe ROI
+        interpolation : tuple[int, int]
+            PRISM interpolation factors (f_x, f_y)
+        device : str
+            Device to use ('cpu' or 'cuda')
+        rng : np.random.Generator | int | None
+            Random number generator
+        """
+
+        # handle list of aberrations or defocus
+        if probe_params.get("aberration_coefs", None) is None:
+            if probe_params.get("defocus", None) is None:
+                coefs = [{}]
+            else:
+                coefs = probe_params.pop("defocus")
+                if not isinstance(coefs, list):
+                    coefs = [coefs]
+                coefs = [{"C10": -df} for df in coefs]
+        else:
+            coefs = probe_params.pop("aberration_coefs")
+            if not isinstance(coefs, list):
+                coefs = [coefs]
+
+        if num_probes is None:
+            num_probes = len(coefs)
+        elif num_probes != len(coefs):
+            raise ValueError(
+                f"num_probes {num_probes} does not match length of aberration_coefs {len(coefs)}"
+            )
+
+        super().__init__(
+            num_probes=num_probes,
+            probe_params=probe_params,
+            roi_shape=roi_shape,
+            device=device,
+            rng=rng,
+            _token=_token,
+        )
+
+        self.interpolation = interpolation
+        self.aberration_coefs_list = coefs
+        self._wave_vectors = None
+        self._plane_waves = None
+        self._ctf_coefs = None
+
+    @classmethod
+    def from_params(
+        cls,
+        probe_params: dict,
+        num_probes: int | None = None,
+        roi_shape: tuple[int, int] | None = None,
+        interpolation: tuple[int, int] = (1, 1),
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ):
+        """
+        Create ProbePRISM from parameters.
+
+        Parameters
+        ----------
+        probe_params : dict
+            Probe parameters including 'energy' (in eV)
+        num_probes : int | None
+            Number of probe modes
+        roi_shape : tuple[int, int] | None
+            Shape of the probe ROI
+        interpolation : tuple[int, int]
+            PRISM interpolation factors
+        device : str
+            Device to use
+        rng : np.random.Generator | int | None
+            Random number generator
+        """
+        return cls(
+            num_probes=num_probes,
+            probe_params=probe_params,
+            roi_shape=roi_shape,
+            interpolation=interpolation,
+            device=device,
+            rng=rng,
+            _token=cls._token,
+        )
+
+    @property
+    def interpolation(self) -> tuple[int, int]:
+        return self._interpolation
+
+    @interpolation.setter
+    def interpolation(self, interp: tuple[int, int] | list):
+        if len(interp) != 2:
+            raise ValueError(f"interpolation must have length 2, got {len(interp)}")
+        self._interpolation = (int(interp[0]), int(interp[1]))
+
+    @property
+    def wave_vectors(self) -> torch.Tensor:
+        """Wave vectors for plane wave decomposition [num_waves, 2]"""
+        return self._wave_vectors
+
+    @property
+    def plane_waves(self) -> torch.Tensor:
+        """Plane waves in real space [num_waves, roi_height, roi_width]"""
+        return self._plane_waves
+
+    @property
+    def ctf_coefs(self) -> torch.Tensor:
+        """CTF coefficients for each probe mode [num_probes, num_waves]"""
+        return self._ctf_coefs
+
+    @property
+    def probe(self) -> torch.Tensor:
+        """
+        Get probe in real space by reconstructing from PRISM basis at origin.
+        Returns [num_probes, roi_height, roi_width]
+        """
+
+        # Reconstruct probes
+        probes = torch.tensordot(
+            self.ctf_coefs,
+            self.plane_waves,
+            dims=((1,), (0,)),
+        )  # [num_probes, roi_height, roi_width]
+
+        return probes
+
+    @property
+    def params(self):
+        """No optimizable parameters for PRISM probe"""
+        return None
+
+    @property
+    def name(self) -> str:
+        return "ProbePRISM"
+
+    def set_initial_probe(
+        self,
+        roi_shape: np.ndarray | tuple,
+        reciprocal_sampling: np.ndarray,
+        mean_diffraction_intensity: float,
+        device: str | None = None,
+    ):
+        """
+        Initialize PRISM probe by computing plane wave basis and CTF coefficients.
+        """
+        super()._initialize_probe(
+            roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
+        )
+
+        # Check required probe parameters
+        if self.probe_params.get("energy", None) is None:
+            raise ValueError("probe_params must contain 'energy' for PRISM")
+        if self.probe_params.get("semiangle_cutoff", None) is None:
+            raise ValueError("probe_params must contain 'semiangle_cutoff' for PRISM")
+
+        energy = self.probe_params.get("energy")
+        semiangle_cutoff = self.probe_params.get("semiangle_cutoff")
+
+        wavelength = electron_wavelength_angstrom(energy)
+        extent = tuple((1 / self.reciprocal_sampling).astype(np.float32))
+        angular_sampling = (
+            wavelength * 1e3 / self.roi_shape / (1 / (self.roi_shape * self.reciprocal_sampling))
+        )
+
+        # Compute PRISM wave vectors
+        self._wave_vectors = self._prism_wave_vectors(
+            semiangle_cutoff=semiangle_cutoff,
+            extent=extent,
+            wavelength=wavelength,
+            interpolation=self.interpolation,
+        )
+
+        # Compute plane waves
+        self._plane_waves = self._prism_plane_waves(
+            wave_vectors=self.wave_vectors,
+            extent=extent,
+            gpts=tuple(self.roi_shape.astype(int)),
+        ) / math.sqrt(math.prod(self.roi_shape))
+
+        # Compute CTF coefficients for each probe mode
+        ctf_coefs_list = []
+        for aberration_coefs in self.aberration_coefs_list:
+            ctf_coef = self._ctf_coefficients(
+                wave_vectors=self.wave_vectors,
+                semiangle_cutoff=semiangle_cutoff,
+                angular_sampling=tuple(angular_sampling.astype(float)),
+                wavelength=wavelength,
+                aberration_coefs=aberration_coefs,
+            )
+            ctf_coefs_list.append(ctf_coef)
+
+        self._ctf_coefs = torch.stack(ctf_coefs_list)
+
+        # Normalize by mean diffraction intensity
+        probe_intensity = torch.sum(torch.abs(self.probe).square())
+        intensity_norm = torch.sqrt(mean_diffraction_intensity / probe_intensity)
+        self._ctf_coefs = self._ctf_coefs * intensity_norm
+
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Compute PRISM coefficients for given probe positions.
+
+        Parameters
+        ----------
+        fract_positions : torch.Tensor
+            Fractional probe positions [batch_size, 2]
+
+        Returns
+        -------
+        torch.Tensor
+            PRISM coefficients [num_probes, batch_size, num_waves]
+        """
+        # Compute position coefficients
+        position_coefs = self._position_coefficients(
+            positions=positions,
+            wave_vectors=self.wave_vectors,
+        )  # [batch_size, num_waves]
+
+        # Combine with CTF coefficients
+        coefs = position_coefs[None, :, :] * self.ctf_coefs[:, None, :]
+        # [num_probes, batch_size, num_waves]
+
+        return coefs
+
+    def reset(self):
+        """PRISM probe has no state to reset"""
+        pass
+
+    # --- PRISM helper functions ---
+
+    def _prism_wave_vectors(
+        self,
+        semiangle_cutoff: float,
+        extent: tuple[float, float],
+        wavelength: float,
+        interpolation: tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Returns planewave wave_vectors.
+
+        Parameters
+        ----------
+        semiangle_cutoff : float
+            Convergence semi-angle in mrad
+        extent : tuple[float, float]
+            Real-space extent in Angstroms
+        wavelength : float
+            Electron wavelength in Angstroms
+        interpolation : tuple[int, int]
+            PRISM interpolation factors
+
+        Returns
+        -------
+        torch.Tensor
+            Wave vectors [num_waves, 2]
+        """
+        cutoff = semiangle_cutoff * 1e-3
+        n_max = math.ceil(cutoff / (wavelength / extent[0] * interpolation[0]))
+        m_max = math.ceil(cutoff / (wavelength / extent[1] * interpolation[1]))
+
+        n = torch.arange(-n_max, n_max + 1, dtype=torch.float32, device=self.device)
+        m = torch.arange(-m_max, m_max + 1, dtype=torch.float32, device=self.device)
+        w, h = extent[0], extent[1]
+        int_n, int_m = float(interpolation[0]), float(interpolation[1])
+
+        kx = n / w * int_n
+        ky = m / h * int_m
+
+        mask = kx[:, None].square() + ky[None, :].square() < (cutoff / wavelength) ** 2
+
+        kx, ky = torch.meshgrid(kx, ky, indexing="ij")
+        kx = kx[mask]
+        ky = ky[mask]
+
+        return torch.stack((kx, ky), dim=-1)
+
+    def _prism_plane_waves(
+        self,
+        wave_vectors: torch.Tensor,
+        extent: tuple[float, float],
+        gpts: tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Compute plane waves in real space.
+
+        Parameters
+        ----------
+        wave_vectors : torch.Tensor
+            Wave vectors [num_waves, 2]
+        extent : tuple[float, float]
+            Real-space extent in Angstroms
+        gpts : tuple[int, int]
+            Grid points
+
+        Returns
+        -------
+        torch.Tensor
+            Plane waves [num_waves, roi_height, roi_width]
+        """
+        x = torch.linspace(0, extent[0], gpts[0] + 1, dtype=torch.float32, device=self.device)[:-1]
+        y = torch.linspace(0, extent[1], gpts[1] + 1, dtype=torch.float32, device=self.device)[:-1]
+
+        array = torch.exp(
+            1.0j * 2 * math.pi * wave_vectors[:, 0, None, None] * x[:, None]
+        ) * torch.exp(1.0j * 2 * math.pi * wave_vectors[:, 1, None, None] * y[None, :])
+
+        return array
+
+    def _position_coefficients(
+        self, positions: torch.Tensor, wave_vectors: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute position-dependent phase shifts for PRISM.
+
+        Parameters
+        ----------
+        positions : torch.Tensor
+            Probe positions [batch_size, 2]
+        wave_vectors : torch.Tensor
+            Wave vectors [num_waves, 2]
+
+        Returns
+        -------
+        torch.Tensor
+            Position coefficients [batch_size, num_waves]
+        """
+        coefficients = torch.exp(
+            -2.0j * math.pi * positions[..., 0, None] * wave_vectors[:, 0][None]
+        ) * torch.exp(-2.0j * math.pi * positions[..., 1, None] * wave_vectors[:, 1][None])
+
+        return coefficients
+
+    def _ctf_coefficients(
+        self,
+        wave_vectors: torch.Tensor,
+        semiangle_cutoff: float,
+        angular_sampling: tuple[float, float],
+        wavelength: float,
+        aberration_coefs: dict,
+    ) -> torch.Tensor:
+        """
+        Compute CTF coefficients for a single probe mode.
+
+        Parameters
+        ----------
+        wave_vectors : torch.Tensor
+            Wave vectors [num_waves, 2]
+        semiangle_cutoff : float
+            Convergence semi-angle in mrad
+        angular_sampling : tuple[float, float]
+            Angular sampling in mrad
+        wavelength : float
+            Electron wavelength in Angstroms
+        aberration_coefs : dict
+            Aberration coefficients
+
+        Returns
+        -------
+        torch.Tensor
+            CTF coefficients [num_waves]
+        """
+        alpha = torch.sqrt(wave_vectors[:, 0].square() + wave_vectors[:, 1].square()) * wavelength
+        phi = torch.arctan2(wave_vectors[:, 1], wave_vectors[:, 0])
+
+        array = evaluate_probe(
+            alpha,
+            phi,
+            semiangle_cutoff,
+            angular_sampling,
+            wavelength,
+            soft_edges=True,
+            vacuum_probe_intensity=None,
+            aberration_coefs=aberration_coefs,
+        )
+        return array / array.abs().square().sum().sqrt()
+
+
+ProbeModelType = ProbePixelated | ProbeDIP | ProbeParametric | ProbePRISM
