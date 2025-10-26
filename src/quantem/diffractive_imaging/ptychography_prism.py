@@ -145,16 +145,38 @@ class PtychoPRISM(PtychographyBase):
 
         # Extract patches from propagated plane waves
         propagated_plane_waves = self._compute_propagated_plane_waves(max_batch_size)
+
         exit_waves = torch.tensordot(
             prism_coefs,  # [num_probes, num_positions, num_waves]
             propagated_plane_waves,  # [num_waves, obj_h, obj_w]
             dims=((2,), (0,)),
-        ).reshape((prism_coefs.shape[0], -1))  # -> [num_probes, num_positions, obj_h, obj_w]
+        )  # -> [num_probes, num_positions, obj_h, obj_w]
 
-        # MPS-safe indexing
-        real = exit_waves.real[:, patch_indices]
-        imag = exit_waves.imag[:, patch_indices]
-        exit_patches = torch.complex(real, imag)  # [num_probes, num_positions, roi_h, roi_w]
+        num_probes, num_positions, obj_h, obj_w = exit_waves.shape
+        exit_flat = exit_waves.reshape(num_probes, num_positions, obj_h * obj_w)
+
+        patch_idx_expanded = patch_indices.unsqueeze(0).expand(num_probes, -1, -1, -1)
+        batch_idx = torch.arange(num_positions, device=exit_flat.device)
+        batch_idx = batch_idx[None, :, None, None].expand_as(patch_idx_expanded)
+
+        patch_idx_flat = patch_idx_expanded.reshape(num_probes, num_positions, -1).to(torch.int64)
+        real_patches = torch.gather(exit_flat.real, 2, patch_idx_flat)
+        imag_patches = torch.gather(exit_flat.imag, 2, patch_idx_flat)
+
+        roi_h, roi_w = patch_indices.shape[-2:]
+        real_patches = real_patches.reshape(num_probes, num_positions, roi_h, roi_w)
+        imag_patches = imag_patches.reshape(num_probes, num_positions, roi_h, roi_w)
+
+        exit_patches = torch.complex(real_patches, imag_patches)
+
+        # exit_waves_flat = exit_waves.reshape((prism_coefs.shape[0], -1))
+
+        # # MPS-safe indexing
+        # # real = torch.fft.fftshift(exit_waves_flat.real[:, patch_indices],dim=(-1,-2))
+        # # imag = torch.fft.fftshift(exit_waves_flat.imag[:, patch_indices],dim=(-1,-2))
+        # real = exit_waves_flat.real[:, patch_indices]
+        # imag = exit_waves_flat.imag[:, patch_indices]
+        # exit_patches = torch.complex(real, imag)  # [num_probes, num_positions, roi_h, roi_w]
 
         return exit_patches
 
@@ -222,22 +244,19 @@ class PtychoPRISM(PtychographyBase):
 
         self.constraints = constraints
 
-        # # Setup optimizers (only object model has parameters to optimize)
-        # new_scheduler = reset
-        # if optimizer_params is not None:
-        #     # Only object model needs optimization
-        #     if "object" in optimizer_params:
-        #         self.obj_model.set_optimizer(optimizer_params["object"])
-        #     else:
-        #         self.obj_model.set_optimizer(optimizer_params)
-        #     new_scheduler = True
+        # Setup optimizers (only object model has parameters to optimize)
+        if optimizer_params is not None:
+            # Only object model needs optimization
+            if "object" in optimizer_params:
+                self.obj_model.set_optimizer(optimizer_params["object"])
+            else:
+                self.obj_model.set_optimizer(optimizer_params)
 
-        # if scheduler_params is not None:
-        #     if "object" in scheduler_params:
-        #         self.obj_model.set_scheduler(scheduler_params["object"], num_iter)
-        #     else:
-        #         self.obj_model.set_scheduler(scheduler_params, num_iter)
-        #     new_scheduler = True
+        if scheduler_params is not None:
+            if "object" in scheduler_params:
+                self.obj_model.set_scheduler(scheduler_params["object"], num_iter)
+            else:
+                self.obj_model.set_scheduler(scheduler_params, num_iter)
 
         self.dset._set_targets(loss_type)
         pbar = tqdm(range(num_iter), disable=not self.verbose)
@@ -259,7 +278,7 @@ class PtychoPRISM(PtychographyBase):
 
             prism_coefs = self.probe_model.forward(positions)
             exit_waves = self.forward_operator(prism_coefs, patch_indices, self.batch_size)
-            pred_intensities = self.detector_model.forward(exit_waves)
+            pred_intensities = self.detector_model.forward(exit_waves) / self.roi_shape.prod()
 
             # Compute loss
             batch_consistency_loss, _targets = self.error_estimate(
