@@ -8,7 +8,7 @@ from quantem.core.utils.utils import generate_batches
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectModelType
+from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbePRISM
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 
@@ -94,10 +94,10 @@ class PtychoPRISM(PtychographyBase):
         # Get plane waves from probe model on object FOV
         plane_waves = self.probe_model._prism_plane_waves(
             self.probe_model.wave_vectors, extent, gpts
-        )  # [num_waves, obj_h, obj_w]
+        )
 
         # Get full object transmission functions
-        obj_array = self.obj_model.obj  # [num_slices, obj_h, obj_w]
+        obj_array = self.obj_model.obj
         if self.obj_model.obj_type == "potential":
             transmission = torch.exp(1.0j * obj_array)
         else:
@@ -168,15 +168,6 @@ class PtychoPRISM(PtychographyBase):
         imag_patches = imag_patches.reshape(num_probes, num_positions, roi_h, roi_w)
 
         exit_patches = torch.complex(real_patches, imag_patches)
-
-        # exit_waves_flat = exit_waves.reshape((prism_coefs.shape[0], -1))
-
-        # # MPS-safe indexing
-        # # real = torch.fft.fftshift(exit_waves_flat.real[:, patch_indices],dim=(-1,-2))
-        # # imag = torch.fft.fftshift(exit_waves_flat.imag[:, patch_indices],dim=(-1,-2))
-        # real = exit_waves_flat.real[:, patch_indices]
-        # imag = exit_waves_flat.imag[:, patch_indices]
-        # exit_patches = torch.complex(real, imag)  # [num_probes, num_positions, roi_h, roi_w]
 
         return exit_patches
 
@@ -252,11 +243,19 @@ class PtychoPRISM(PtychographyBase):
             else:
                 self.obj_model.set_optimizer(optimizer_params)
 
+            # Add probe optimizer if parameters are learnable
+            if "probe" in optimizer_params and self.probe_model.params is not None:
+                self.probe_model.set_optimizer(optimizer_params["probe"])
+
         if scheduler_params is not None:
             if "object" in scheduler_params:
                 self.obj_model.set_scheduler(scheduler_params["object"], num_iter)
             else:
                 self.obj_model.set_scheduler(scheduler_params, num_iter)
+            if "probe" in scheduler_params:
+                self.probe_model.set_scheduler(scheduler_params["probe"], num_iter)
+            else:
+                self.probe_model.set_scheduler(scheduler_params, num_iter)
 
         self.dset._set_targets(loss_type)
         pbar = tqdm(range(num_iter), disable=not self.verbose)
@@ -270,6 +269,8 @@ class PtychoPRISM(PtychographyBase):
             # Zero gradients
             if self.obj_model.optimizer is not None:
                 self.obj_model.optimizer.zero_grad()
+            if self.probe_model.optimizer is not None:
+                self.probe_model.optimizer.zero_grad()
 
             # Get batch data
             patch_indices = self.dset.patch_indices
@@ -293,19 +294,16 @@ class PtychoPRISM(PtychographyBase):
             batch_loss = batch_consistency_loss + batch_soft_constraint_loss
 
             # Backward pass (autograd)
-            batch_loss.backward()
+            self.backward(batch_loss)
 
             # Optimizer step
             if self.obj_model.optimizer is not None:
                 self.obj_model.optimizer.step()
+            if self.probe_model.optimizer is not None:
+                self.probe_model.optimizer.step()
 
             epoch_consistency_loss += batch_consistency_loss.item()
             epoch_loss += batch_loss.item()
-
-            # Average losses over batches
-            num_batches = len(indices)
-            epoch_loss /= num_batches
-            epoch_consistency_loss /= num_batches
 
             # Record epoch
             self._record_epoch(epoch_loss)
@@ -318,6 +316,13 @@ class PtychoPRISM(PtychographyBase):
                     self.obj_model.scheduler.step(epoch_loss)
                 else:
                     self.obj_model.scheduler.step()
+            if self.probe_model.scheduler is not None:
+                if isinstance(
+                    self.probe_model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+                ):
+                    self.probe_model.scheduler.step(epoch_loss)
+                else:
+                    self.probe_model.scheduler.step()
 
             # Store iteration
             if self.store_iterations and (epoch % self.store_iterations_every) == 0:
@@ -325,25 +330,38 @@ class PtychoPRISM(PtychographyBase):
 
             # Logging
             if self.logger is not None:
-                current_lr = (
-                    self.obj_model.optimizer.param_groups[0]["lr"]
-                    if self.obj_model.optimizer is not None
-                    else 0.0
-                )
                 self.logger.log_epoch(
                     self.obj_model,
                     self.probe_model,
                     self.dset,
                     self.num_epochs - 1,
                     epoch_consistency_loss,
-                    num_batches,
-                    {"object": current_lr},
+                    1,
+                    self._get_current_lrs(),
                 )
 
             pbar.set_description(f"Epoch {epoch + 1}/{num_iter}, Loss: {epoch_loss:.3e}")
 
         torch.cuda.empty_cache()
         return self
+
+    def _get_current_lrs(self) -> dict[str, float]:
+        return {
+            param_name: optimizer.param_groups[0]["lr"]
+            for param_name, optimizer in self.optimizers.items()
+            if optimizer is not None
+        }
+
+    def backward(
+        self,
+        loss: torch.Tensor,
+    ):
+        """ """
+        loss.backward()
+        # scaling pixelated ad gradients to closer match analytic
+        if isinstance(self.obj_model, ObjectPixelated):
+            obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
+            self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
 
     def _record_epoch(self, epoch_loss: float) -> None:
         """Record epoch metrics."""

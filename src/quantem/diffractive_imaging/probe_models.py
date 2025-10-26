@@ -1404,6 +1404,7 @@ class ProbePRISM(ProbeBase):
         probe_params: dict = {},
         roi_shape: tuple[int, int] | np.ndarray | None = None,
         interpolation: tuple[int, int] = (1, 1),
+        learn_aberrations: bool = True,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         _token: object | None = None,
@@ -1459,9 +1460,12 @@ class ProbePRISM(ProbeBase):
 
         self.interpolation = interpolation
         self.aberration_coefs_list = coefs
+        self.learn_aberrations = learn_aberrations
         self._wave_vectors = None
         self._plane_waves = None
-        self._ctf_coefs = None
+
+        self._ctf_params = None
+        self._intensity_norm_factor = 1.0
 
     @classmethod
     def from_params(
@@ -1470,6 +1474,7 @@ class ProbePRISM(ProbeBase):
         num_probes: int | None = None,
         roi_shape: tuple[int, int] | None = None,
         interpolation: tuple[int, int] = (1, 1),
+        learn_aberrations: bool = True,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
     ):
@@ -1496,6 +1501,7 @@ class ProbePRISM(ProbeBase):
             probe_params=probe_params,
             roi_shape=roi_shape,
             interpolation=interpolation,
+            learn_aberrations=learn_aberrations,
             device=device,
             rng=rng,
             _token=cls._token,
@@ -1523,8 +1529,15 @@ class ProbePRISM(ProbeBase):
 
     @property
     def ctf_coefs(self) -> torch.Tensor:
-        """CTF coefficients for each probe mode [num_probes, num_waves]"""
-        return self._ctf_coefs
+        """
+        Compute CTF coefficients on-the-fly from learnable parameters.
+        Returns [num_probes, num_waves]
+        """
+        if self._ctf_params is None:
+            raise RuntimeError("CTF parameters not initialized")
+
+        # Recompute CTF from current parameter values
+        return self._compute_ctf_from_params()
 
     @property
     def probe(self) -> torch.Tensor:
@@ -1544,8 +1557,18 @@ class ProbePRISM(ProbeBase):
 
     @property
     def params(self):
-        """No optimizable parameters for PRISM probe"""
-        return None
+        """Return learnable parameters for optimization"""
+
+        if self.learn_aberrations:
+            params = []
+            # Return all aberration parameters
+            for probe_idx in range(self.num_probes):
+                params.extend(self._ctf_params[probe_idx].values())
+            return params
+        else:
+            return None
+
+        return params
 
     @property
     def name(self) -> str:
@@ -1576,9 +1599,6 @@ class ProbePRISM(ProbeBase):
 
         wavelength = electron_wavelength_angstrom(energy)
         extent = tuple((1 / self.reciprocal_sampling).astype(np.float32))
-        angular_sampling = (
-            wavelength * 1e3 / self.roi_shape / (1 / (self.roi_shape * self.reciprocal_sampling))
-        )
 
         # Compute PRISM wave vectors
         self._wave_vectors = self._prism_wave_vectors(
@@ -1595,24 +1615,90 @@ class ProbePRISM(ProbeBase):
             gpts=tuple(self.roi_shape.astype(int)),
         ) / math.sqrt(math.prod(self.roi_shape))
 
-        # Compute CTF coefficients for each probe mode
+        # Initialize learnable CTF parameters for each probe mode
+        self._ctf_params = nn.ModuleList()
+        for probe_idx, aberration_coefs in enumerate(self.aberration_coefs_list):
+            probe_params = nn.ParameterDict()
+
+            for key, value in aberration_coefs.items():
+                if self.learn_aberrations:
+                    probe_params[key] = nn.Parameter(
+                        torch.tensor(float(value), dtype=torch.float32, device=self.device)
+                    )
+                else:
+                    probe_params.register_buffer(
+                        key, torch.tensor(float(value), dtype=torch.float32, device=self.device)
+                    )
+
+            self._ctf_params.append(probe_params)
+
+        # Store initial values for reset
+        self._store_initial_ctf_params()
+
+        # Normalize initial probe
+        self._normalize_probe_intensity(mean_diffraction_intensity)
+
+    def _store_initial_ctf_params(self):
+        """Store initial parameter values for reset."""
+        self._initial_ctf_params = []
+        for probe_params in self._ctf_params:
+            initial_dict = {}
+            for key, val in probe_params.items():
+                initial_dict[key] = val.detach().clone()
+            self._initial_ctf_params.append(initial_dict)
+
+    def _compute_ctf_from_params(self) -> torch.Tensor:
+        """
+        Compute CTF coefficients from current learnable parameters.
+        Returns [num_probes, num_waves]
+        """
         ctf_coefs_list = []
-        for aberration_coefs in self.aberration_coefs_list:
+
+        # Get current semiangle
+        semiangle = self.probe_params.get("semiangle_cutoff")
+        energy = self.probe_params.get("energy")
+        wavelength = electron_wavelength_angstrom(energy)
+
+        angular_sampling = (
+            wavelength * 1e3 / self.roi_shape / (1 / (self.roi_shape * self.reciprocal_sampling))
+        )
+
+        for probe_idx in range(self.num_probes):
+            # Get current aberration coefficients for this probe
+            aberration_coefs = {key: val for key, val in self._ctf_params[probe_idx].items()}
+
+            # Compute CTF for this probe mode
             ctf_coef = self._ctf_coefficients(
                 wave_vectors=self.wave_vectors,
-                semiangle_cutoff=semiangle_cutoff,
+                semiangle_cutoff=semiangle,
                 angular_sampling=tuple(angular_sampling.astype(float)),
                 wavelength=wavelength,
                 aberration_coefs=aberration_coefs,
             )
             ctf_coefs_list.append(ctf_coef)
 
-        self._ctf_coefs = torch.stack(ctf_coefs_list)
+        return torch.stack(ctf_coefs_list) * self._intensity_norm_factor
 
-        # Normalize by mean diffraction intensity
-        probe_intensity = torch.sum(torch.abs(self.probe).square())
+    def _normalize_probe_intensity(self, mean_diffraction_intensity: float):
+        """Normalize probe intensity to match experimental data."""
+        # Compute current probe
+        current_ctf = self._compute_ctf_from_params()
+        probe = torch.tensordot(current_ctf, self.plane_waves, dims=((1,), (0,)))
+
+        # Compute intensity normalization
+        probe_intensity = torch.sum(torch.abs(probe).square())
         intensity_norm = torch.sqrt(mean_diffraction_intensity / probe_intensity)
-        self._ctf_coefs = self._ctf_coefs * intensity_norm
+        self._intensity_norm_factor = intensity_norm.detach().item()
+
+    def reset(self):
+        """Reset learnable parameters to initial values."""
+        if not hasattr(self, "_initial_ctf_params"):
+            return
+
+        with torch.no_grad():
+            for probe_idx, initial_dict in enumerate(self._initial_ctf_params):
+                for key, initial_val in initial_dict.items():
+                    self._ctf_params[probe_idx][key].copy_(initial_val)
 
     def forward(self, positions: torch.Tensor) -> torch.Tensor:
         """
@@ -1639,10 +1725,6 @@ class ProbePRISM(ProbeBase):
         # [num_probes, batch_size, num_waves]
 
         return coefs
-
-    def reset(self):
-        """PRISM probe has no state to reset"""
-        pass
 
     # --- PRISM helper functions ---
 
