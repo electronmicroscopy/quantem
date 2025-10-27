@@ -586,19 +586,19 @@ def show_2d(
             for j in range(len(row), ncols):
                 axs[i][j].axis("off")  # type: ignore
 
-    # Safe layout handling
-    if kwargs.get("tight_layout", True):
-        only_subplots = all(
-            getattr(ax, "get_subplotspec", lambda: None)() is not None for ax in fig.axes
-        )
-        if only_subplots:
-            fig.tight_layout()
-        elif figax is None:
-            # We created the figure: provide modest spacing without tight_layout warnings.
-            fig.subplots_adjust(
-                wspace=kwargs.get("wspace", 0.25),
-                hspace=kwargs.get("hspace", 0.25),
+        # Safe layout handling
+        if kwargs.get("tight_layout", True):
+            only_subplots = all(
+                getattr(ax, "get_subplotspec", lambda: None)() is not None for ax in fig.axes
             )
+            if only_subplots:
+                fig.tight_layout()
+            elif figax is None:
+                # We created the figure: provide modest spacing without tight_layout warnings.
+                fig.subplots_adjust(
+                    wspace=kwargs.get("wspace", 0.25),
+                    hspace=kwargs.get("hspace", 0.25),
+                )
 
         # Squeeze the axes to the expected shape
         if axs.shape == (1, 1):
