@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from typing import List, Optional, Union
 
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
@@ -10,6 +11,8 @@ from scipy.ndimage import gaussian_filter
 from scipy.optimize import minimize
 from tqdm import tqdm
 from scipy import ndimage
+from IPython.display import display
+import plotly.graph_objects as go
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
@@ -23,10 +26,9 @@ class TimeSeries(Dataset3d):
         pad_val: [str , None] = None,
         edge_blend: Union[int, tuple[int, int], None] = (8,8),
         modify_in_place: bool = False,
-        attach: bool = True,
     ):
 
-        # idk what to call this?
+        # padding value dictionary 
         agg_func = {
             'mean': np.mean,
             'median': np.median,
@@ -95,33 +97,45 @@ class TimeSeries(Dataset3d):
         
         return stack_pad
         
-
     def align_images(
         im_ref,
         im,
         return_aligned_image=True,
-        window_size = 7, # ???            
+        window_size = 7,            
     ):
+        """
+        Using 2D cross correlation on an entire image stack.
+
+        Parameters
+        ----------
+        stack_pad
+            The unaligned image stack data
+        window_size
+            The size of the window around the subpixel position. If None, default is 7
+
+        Returns
+        -------
+        shift
+            shifted coordinates (x,y)
+        im_shift
+            shifted image with respect to the shifted coordinates
+        """
         
         # take 2D DFT of an image (im) and the image before it as reference (im_ref)
         G_ref = np.fft.fft2(im_ref) 
         G = np.fft.fft2(im) 
         
-        # get the cross correlation of the two image signals
-        # result is a 2D array with the same dimensions of the images with peaks that correlate to where the two functions are most similar
         im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G)))
-        print(im_corr)
 
-        # Get subpixel position ... what is this actually doing...
         # index position of the maximum 
         nrows, ncols = im_corr.shape
         peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
-        print(peak_r, peak_c)
         half = window_size // 2
 
         # TODO replace COM with DFT upsampling (already implemented in quantem)
 
         # Build periodic window
+
         # padding of the extra pixels
         r_idx = np.mod(np.arange(peak_r - half, peak_r + half + 1), nrows)
         c_idx = np.mod(np.arange(peak_c - half, peak_c + half + 1), ncols)
@@ -152,10 +166,22 @@ class TimeSeries(Dataset3d):
         window_size = 7,
         running_average_frames = 20.0,
     ):
+        """
+        Using 2D cross correlation on an entire image stack.
+
+        Parameters
+        ----------
+        stack_pad
+            The unaligned image stack data.
+        window_size
+            The size of the window around the subpixel position. If None, default is 7.
+        running_average_frames = 20.0
+            ... If None, default is 20.0.
+
+        """
+
         # initialize aligned stack
         stack_aligned = np.zeros_like(stack_pad)
-
-        print(stack_aligned.shape)
         
         # indexing the aligned stack the same as the padded stack
         stack_aligned[0] = stack_pad[0]
@@ -173,7 +199,7 @@ class TimeSeries(Dataset3d):
             im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G)))
 
             # Get subpixel shift
-            
+                                 
             # Get subpixel position
             nrows, ncols = im_corr.shape
             peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
@@ -204,6 +230,66 @@ class TimeSeries(Dataset3d):
 
         return stack_aligned, dxy
     
+def play_stack_plotly(stack, fps=30, vmin=None, vmax=None, cmap='inferno'):
+    """
+    Play a stack of images as a movie using plotly, with play/pause and frame slider.
+
+    Parameters:
+    -----------
+    stack : np.ndarray
+        Image stack with shape (num_frames, height, width).
+    fps : int, optional
+        Frames per second for playback. Default is 30.
+    vmin : float, optional
+        Minimum intensity for display. Defaults to stack min.
+    vmax : float, optional
+        Maximum intensity for display. Defaults to stack max.
+    cmap : str, optional
+        Colormap for display. Default is 'gray'.
+    """
+    if vmin is None:
+        vmin = float(np.min(stack))
+    if vmax is None:
+        vmax = float(np.max(stack))
+
+    frames = [
+        go.Frame(
+            data=[go.Heatmap(z=frame, colorscale=cmap, zmin=vmin, zmax=vmax, showscale=False)],
+            name=str(k)
+        ) for k, frame in enumerate(stack)
+    ]
+
+    fig = go.Figure(
+        data=[go.Heatmap(z=stack[0], colorscale=cmap, zmin=vmin, zmax=vmax, showscale=False)],
+        frames=frames
+    )
+
+    fig.update_layout(
+        width=600, height=600,
+        margin=dict(l=0, r=0, t=0, b=0),
+        updatemenus=[{
+            "type": "buttons",
+            "showactive": False,
+            "buttons": [
+                {"label": "Play", "method": "animate", "args": [None, {"frame": {"duration": 1000/fps}, "fromcurrent": True}]},
+                {"label": "Pause", "method": "animate", "args": [[None], {"frame": {"duration": 0}, "mode": "immediate"}]}
+            ],
+        }],
+        sliders=[{
+            "active": 0,
+            "steps": [
+                {"label": str(k), "method": "animate", "args": [[str(k)], {"frame": {"duration": 0}, "mode": "immediate"}]}
+                for k in range(len(stack))
+            ],
+        }]
+    )
+
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+
+    display(fig)
+
+    return fig
 
 
 
