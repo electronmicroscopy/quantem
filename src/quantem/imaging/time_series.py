@@ -1,20 +1,11 @@
-from collections.abc import Sequence
-from typing import List, Optional, Union
+from typing import Union
 
-import os
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal.windows import tukey
-from scipy.interpolate import interp1d
-from scipy.ndimage import gaussian_filter
-from scipy.optimize import minimize
-from tqdm import tqdm
 from scipy import ndimage
-from IPython.display import display
-import plotly.graph_objects as go
+from scipy.signal.windows import tukey
 
-from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
 
 
@@ -27,7 +18,25 @@ class TimeSeries(Dataset3d):
         edge_blend: Union[int, tuple[int, int], None] = (8,8),
         modify_in_place: bool = False,
     ):
+        """
+        Generating a padded and edge blended image stack.
 
+        Parameters
+        ----------
+        pad_width
+            Amount of padding in x and y to apply to an image stack. Defaults to None
+        pad_val
+            Calculated value for the padding background. Defaults to None
+        edge_blend
+            Amount of edge blending in x and y to apply to an image stack. Defaults in edge blending 8 in x and y
+        modify_in_place: bool = False
+            If True, modifies the dataset directly. Defaults to False, returns a new dataset
+        
+        Returns
+        -------
+        stack_pad
+            The padded image stack data (time, x, y)
+        """
         # padding value dictionary 
         agg_func = {
             'mean': np.mean,
@@ -87,8 +96,6 @@ class TimeSeries(Dataset3d):
                 pad_width[0]:stack_pad.shape[1]-pad_width[0], 
                 pad_width[1]:stack_pad.shape[2]-pad_width[1]] = \
                 self.array 
-        
-        print(stack_pad.shape)
 
         # ensure edge blend values are within range
         if edge_blend[0] < 0 or edge_blend[0] > stack_pad.shape[1] / 2:
@@ -104,19 +111,23 @@ class TimeSeries(Dataset3d):
         window_size = 7,            
     ):
         """
-        Using 2D cross correlation on an entire image stack.
+        Using 2D DFT cross correlation alignment on two images.
 
         Parameters
         ----------
-        stack_pad
-            The unaligned image stack data
+        im_ref
+            The first image to use as reference
+        im 
+            The second image to shift with respect to the reference
+        return_aligned_image
+            If True, returns the shifted second image
         window_size
-            The size of the window around the subpixel position. If None, default is 7
+            The size of the window around the subpixel position. If None, defaults to 7
 
         Returns
         -------
         shift
-            shifted coordinates (x,y)
+            shifted coordinates (x,y) between two images
         im_shift
             shifted image with respect to the shifted coordinates
         """
@@ -167,19 +178,24 @@ class TimeSeries(Dataset3d):
         running_average_frames = 20.0,
     ):
         """
-        Using 2D cross correlation on an entire image stack.
+        Using 2D DFT cross correlation alignment on an entire image stack.
 
         Parameters
         ----------
         stack_pad
-            The unaligned image stack data.
+            The unaligned image stack data (time, x, y)
         window_size
-            The size of the window around the subpixel position. If None, default is 7.
+            The size of the window around the subpixel position. If None, defaults to 7
         running_average_frames = 20.0
-            ... If None, default is 20.0.
-
+            The maximum number of images for the running average applied to the reference. If None, default is 20  
+        
+        Returns
+        -------
+        stack_aligned
+            The aligned image stack data (time, x, y)
+        dxy
+            shifted coordinate (x, y) for all images
         """
-
         # initialize aligned stack
         stack_aligned = np.zeros_like(stack_pad)
         
@@ -224,83 +240,11 @@ class TimeSeries(Dataset3d):
             G_shift = G * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
             im_shift = np.real(np.fft.ifft2(G_shift))
 
+            # Adding the shifted image to the aligned image stack
             stack_aligned[a0] = im_shift
+            
+            # Calculating the weight to be applied for the next reference
             weight = np.maximum(1/(a0+1),1/running_average_frames)
             G_ref = G_ref * (1-weight) + G_shift * weight
 
         return stack_aligned, dxy
-    
-def play_stack_plotly(stack, fps=30, vmin=None, vmax=None, cmap='inferno'):
-    """
-    Play a stack of images as a movie using plotly, with play/pause and frame slider.
-
-    Parameters:
-    -----------
-    stack : np.ndarray
-        Image stack with shape (num_frames, height, width).
-    fps : int, optional
-        Frames per second for playback. Default is 30.
-    vmin : float, optional
-        Minimum intensity for display. Defaults to stack min.
-    vmax : float, optional
-        Maximum intensity for display. Defaults to stack max.
-    cmap : str, optional
-        Colormap for display. Default is 'gray'.
-    """
-    if vmin is None:
-        vmin = float(np.min(stack))
-    if vmax is None:
-        vmax = float(np.max(stack))
-
-    frames = [
-        go.Frame(
-            data=[go.Heatmap(z=frame, colorscale=cmap, zmin=vmin, zmax=vmax, showscale=False)],
-            name=str(k)
-        ) for k, frame in enumerate(stack)
-    ]
-
-    fig = go.Figure(
-        data=[go.Heatmap(z=stack[0], colorscale=cmap, zmin=vmin, zmax=vmax, showscale=False)],
-        frames=frames
-    )
-
-    fig.update_layout(
-        width=600, height=600,
-        margin=dict(l=0, r=0, t=0, b=0),
-        updatemenus=[{
-            "type": "buttons",
-            "showactive": False,
-            "buttons": [
-                {"label": "Play", "method": "animate", "args": [None, {"frame": {"duration": 1000/fps}, "fromcurrent": True}]},
-                {"label": "Pause", "method": "animate", "args": [[None], {"frame": {"duration": 0}, "mode": "immediate"}]}
-            ],
-        }],
-        sliders=[{
-            "active": 0,
-            "steps": [
-                {"label": str(k), "method": "animate", "args": [[str(k)], {"frame": {"duration": 0}, "mode": "immediate"}]}
-                for k in range(len(stack))
-            ],
-        }]
-    )
-
-    fig.update_xaxes(visible=False)
-    fig.update_yaxes(visible=False)
-
-    display(fig)
-
-    return fig
-
-
-
-
-
-
-
-
-
-
-
-
-
-
