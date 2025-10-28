@@ -2601,10 +2601,10 @@ class TorchGMM:
                     break
             prev_ll = ll
 
-        # Store NumPy copies for external use
-        self.means_ = self._means.detach().cpu().numpy()
-        self.covariances_ = self._covariances.detach().cpu().numpy()
-        self.weights_ = self._weights.detach().cpu().numpy()
+        # Store NumPy copies for external use (decoupled from internal tensors)
+        self.means_ = self._means.detach().clone().cpu().numpy()
+        self.covariances_ = self._covariances.detach().clone().cpu().numpy()
+        self.weights_ = self._weights.detach().clone().cpu().numpy()
         return self
 
     def predict_proba(self, data) -> np.ndarray:
