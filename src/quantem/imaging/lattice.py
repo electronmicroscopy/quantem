@@ -1451,9 +1451,27 @@ class Lattice(AutoSerialize):
             'cuda:0'. If a CUDA device is requested but unavailable, the underlying
             GMM implementation may raise an error.
 
-            - **kwargs:
-            Additional keyword arguments forwarded to the image plotting utility
-            show_2d(...) when plot_order_parameter=True (e.g., cmap, title, vmin, vmax).
+            - **kwargs: Additional keyword arguments controlling visualization.
+                When plot_gmm_visualization=True, the following keys are supported and validated:
+                - contour_cmap: Matplotlib colormap name for the background contour;
+                    invalid names fall back to a preset ('gray') with a warning.
+                - gmm_center_colour: Color for GMM center markers;
+                    invalid values fall back to a preset with a warning.
+                    Presets depend on num_phases (2: 'lime'; 3-4: 'Yellow'; ≥5: 'Black').
+                - gmm_ellipse_colour: Color for GMM covariance ellipses;
+                    invalid values fall back to a preset with a warning.
+                    Presets depend on num_phases (2: 'lime'; 3-4: 'Yellow'; ≥5: 'White').
+                - scatter_colours: Colors used to map phase probabilities for scatter points
+                    (and the order-parameter map). Accepted forms:
+                        • callable f(i) -> RGB(A) (first 3 components used),
+                        • numpy array of shape (num_phases, 3) with RGB in [0, 1],
+                        • list/tuple of valid color names/values of length num_phases,
+                        • single valid color (applied to all phases; prints a warning).
+                    Invalid inputs fall back to a preset (site_colors) with a warning.
+                    When plot_order_parameter=True,
+                    scatter_colours is used to color points by phase probabilities.
+                Optionally, kwargs intended for show_2d (e.g., cmap, title, vmin, vmax)
+                may be provided and forwarded
 
         Returns
             - self:
@@ -1521,6 +1539,7 @@ class Lattice(AutoSerialize):
             )
         """
         # Imports
+        import matplotlib.colors as mcolors
         import matplotlib.pyplot as plt
         from matplotlib.patches import Ellipse
         from scipy.stats import gaussian_kde
@@ -1558,6 +1577,63 @@ class Lattice(AutoSerialize):
             ax.add_patch(ellipse)
 
             return ellipse
+
+        def to_percent(x, pos):
+            """Format axis labels as percentages"""
+            return f"{x * 100:.1f}%"
+
+        # Function to validate colormap
+        def is_valid_cmap(cmap_name):
+            """Check if a colormap name is valid in matplotlib"""
+            try:
+                plt.get_cmap(cmap_name)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+        # Function to validate color
+        def is_valid_color(color):
+            """Check if a color is valid in matplotlib"""
+            try:
+                mcolors.to_rgba(color)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+        # Function to convert color names to RGB for scatter_cmap
+        def convert_colors_to_rgb(colors, num_phases):
+            """
+            Convert colors to RGB array format.
+            Args:
+                colors: either a callable function, array of colors, or list of color names
+                num_phases: number of phases/clusters
+            Returns:
+                numpy array of shape (num_phases, 3) with RGB values
+            """
+            # If it's a function (like site_colors), call it for each index
+            if callable(colors):
+                rgb_array = np.array([colors(i)[:3] for i in range(num_phases)])
+                return rgb_array
+
+            # If it's already an array, validate dimensions
+            if isinstance(colors, np.ndarray):
+                if colors.shape == (num_phases, 3):
+                    return colors
+                else:
+                    return None
+
+            # If it's a list/tuple of color names or values
+            if isinstance(colors, (list, tuple)):
+                try:
+                    rgb_array = np.array([mcolors.to_rgb(c) for c in colors])
+                    if rgb_array.shape == (num_phases, 3):
+                        return rgb_array
+                    else:
+                        return None
+                except (ValueError, TypeError):
+                    return None
+
+            return None
 
         class FixedMeansGMM(TorchGMM):
             """
@@ -1653,6 +1729,84 @@ class Lattice(AutoSerialize):
         # ========== Combined Plot: Scatter overlaid on Contour ==========
         if plot_gmm_visualization:
             from matplotlib.path import Path
+            from matplotlib.ticker import FuncFormatter
+
+            # Define preset colors based on num_phases
+            preset_contour_cmap = "gray"
+            if num_phases == 2:
+                preset_gmm_center_colour = "lime"
+                preset_gmm_ellipse_colour = "lime"
+            elif num_phases < 5:
+                preset_gmm_center_colour = "Yellow"
+                preset_gmm_ellipse_colour = "Yellow"
+            else:
+                preset_gmm_center_colour = "Black"
+                preset_gmm_ellipse_colour = "White"
+
+            preset_scatter_colours = site_colors
+
+            # Check and assign contour_cmap
+            if "contour_cmap" in kwargs:
+                if is_valid_cmap(kwargs["contour_cmap"]):
+                    contour_cmap = kwargs["contour_cmap"]
+                else:
+                    print(
+                        f"Warning: '{kwargs['contour_cmap']}' is not a valid colormap, using preset"
+                    )
+                    contour_cmap = preset_contour_cmap
+            else:
+                contour_cmap = preset_contour_cmap
+
+            # Check and assign gmm_center_colour
+            if "gmm_center_colour" in kwargs:
+                if is_valid_color(kwargs["gmm_center_colour"]):
+                    gmm_center_colour = kwargs["gmm_center_colour"]
+                else:
+                    print(
+                        f"Warning: '{kwargs['gmm_center_colour']}' is not a valid color, using preset"
+                    )
+                    gmm_center_colour = preset_gmm_center_colour
+            else:
+                gmm_center_colour = preset_gmm_center_colour
+
+            # Check and assign gmm_ellipse_colour
+            if "gmm_ellipse_colour" in kwargs:
+                if is_valid_color(kwargs["gmm_ellipse_colour"]):
+                    gmm_ellipse_colour = kwargs["gmm_ellipse_colour"]
+                else:
+                    print(
+                        f"Warning: '{kwargs['gmm_ellipse_colour']}' is not a valid color, using preset"
+                    )
+                    gmm_ellipse_colour = preset_gmm_ellipse_colour
+            else:
+                gmm_ellipse_colour = preset_gmm_ellipse_colour
+
+            # Check and assign scatter_colours (with special handling)
+            if "scatter_colours" in kwargs:
+                scatter_colours_input = kwargs["scatter_colours"]
+
+                # Try to convert to RGB format
+                scatter_colours_rgb = convert_colors_to_rgb(scatter_colours_input, num_phases)
+
+                if scatter_colours_rgb is not None:
+                    # Successfully converted to (num_phases, 3) RGB array
+                    scatter_colours = scatter_colours_rgb
+                else:
+                    # Check if it's a single valid color
+                    if is_valid_color(scatter_colours_input):
+                        # Convert single color to repeated array for indexing
+                        single_color_rgb = mcolors.to_rgb(scatter_colours_input)
+                        scatter_colours = np.tile(single_color_rgb, (num_phases, 1))
+                        print(
+                            f"Warning: Using single color '{scatter_colours_input}' for all {num_phases} phases"
+                        )
+                    else:
+                        print(
+                            "Warning: scatter_colours invalid (must be (num_phases, 3) array, list of valid colors, or callable), using preset"
+                        )
+                        scatter_colours = convert_colors_to_rgb(preset_scatter_colours, num_phases)
+            else:
+                scatter_colours = convert_colors_to_rgb(preset_scatter_colours, num_phases)
 
             fig = plt.figure(figsize=(8, 7))
             ax = fig.add_subplot(111)
@@ -1661,12 +1815,21 @@ class Lattice(AutoSerialize):
             ax.set_xlim(-max_bound, max_bound)
             ax.set_ylim(-max_bound, max_bound)
 
+            # Format axes as percentages
+            percent_formatter = FuncFormatter(to_percent)
+            ax.xaxis.set_major_formatter(percent_formatter)
+            ax.yaxis.set_major_formatter(percent_formatter)
+
             # First: Plot contour in the background with distinct colormap
-            contour = ax.contourf(X, Y, Z, levels=15, cmap="gray", alpha=0.9)
-            ax.contour(X, Y, Z, levels=15, colors="gray", linewidths=0.5, alpha=0.9)
+            ax.contourf(X, Y, Z, levels=15, cmap=contour_cmap, alpha=0.9)
+            ax.contour(
+                X, Y, Z, levels=15, cmap=contour_cmap, linewidths=0.5, alpha=0.9
+            )  # FIXED: cmap instead of colors
 
             # Second: Overlay scatter points with classification colors
-            point_colors = create_colors_from_probabilities(probabilities, num_components)
+            point_colors = create_colors_from_probabilities(
+                probabilities, num_components, scatter_colours
+            )  # FIXED: pass scatter_colours
             ax.scatter(
                 da_arr,
                 db_arr,
@@ -1688,16 +1851,17 @@ class Lattice(AutoSerialize):
                         else:
                             contour_path = Path.make_compound_path(contour_path, path)
 
-            # Plot GMM centers and ellipses
+            # Plot GMM centers and ellipses using validated kwargs colors
+            gmm_color = [gmm_center_colour, gmm_ellipse_colour]  # FIXED: use kwargs values
+
             ax.scatter(
                 gmm.means_[:, 0],
                 gmm.means_[:, 1],
-                c="black",
+                c=gmm_color[0],
                 s=300,
                 marker="x",
                 linewidths=4,
-                alpha=0.6,
-                edgecolors="white",
+                alpha=0.8,
                 label="GMM Centers",
                 zorder=10,
             )
@@ -1708,19 +1872,7 @@ class Lattice(AutoSerialize):
                     gmm.means_[i],
                     gmm.covariances_[i],
                     n_std=2,
-                    edgecolor="black",
-                    linewidth=2.5,
-                    linestyle="--",
-                    alpha=0.8,
-                    zorder=9,
-                    clip_path=contour_path,
-                )
-                plot_gaussian_ellipse(
-                    ax,
-                    gmm.means_[i],
-                    gmm.covariances_[i],
-                    n_std=2,
-                    edgecolor="white",
+                    edgecolor=gmm_color[1],
                     linewidth=1.5,
                     linestyle="-",
                     alpha=0.6,
@@ -1737,21 +1889,22 @@ class Lattice(AutoSerialize):
             ax.set_title("Classification & Contour Overlay")
 
             # Add colorbar for contour (density)
-            plt.colorbar(contour, ax=ax, label="Density")
+            # plt.colorbar(contour, ax=ax, label="Density")
 
-            # Add appropriate color reference for classification
-            if num_components == 2:
-                add_2phase_colorbar(ax)
-            elif num_components == 3:
-                add_3phase_color_triangle(fig, ax)
+            # Add appropriate color reference based on number of phases
+            if num_phases == 2:
+                add_2phase_colorbar(ax, scatter_colours)
+            elif num_phases == 3:
+                add_3phase_color_triangle(fig, ax, scatter_colours)
+            # For num_phases > 3 or == 1, don't add any color reference
 
             ax.legend(loc="best")
-            plt.tight_layout()
+            # plt.tight_layout()
             plt.show()
 
         if plot_order_parameter:
-            # Create colors from full probability distribution
-            colors = create_colors_from_probabilities(probabilities, num_phases)
+            # Create colors from full probability distribution with custom scatter_colours
+            colors = create_colors_from_probabilities(probabilities, num_phases, scatter_colours)
 
             fig, ax = show_2d(
                 self._image.array,
@@ -1770,11 +1923,13 @@ class Lattice(AutoSerialize):
                 linewidth=1,
             )
 
+            ax.set_title("Spatial phase probability map")
+
             # Add appropriate color reference based on number of phases
             if num_phases == 2:
-                add_2phase_colorbar(ax)
+                add_2phase_colorbar(ax, scatter_colours)
             elif num_phases == 3:
-                add_3phase_color_triangle(fig, ax)
+                add_3phase_color_triangle(fig, ax, scatter_colours)
             # For num_phases > 3 or == 1, don't add any color reference
 
             ax.axis("off")
@@ -2533,7 +2688,7 @@ def site_colors(number):
         return np.array([palette[idx] for idx in indices.flat]).reshape(numbers.shape + (3,))
 
 
-def create_colors_from_probabilities(probabilities, num_phases):
+def create_colors_from_probabilities(probabilities, num_phases, category_colors=None):
     """
     Create colors from probability distribution with a smooth transition to white for uncertainty.
     Smoothing is applied only when num_phases = 3.
@@ -2544,6 +2699,8 @@ def create_colors_from_probabilities(probabilities, num_phases):
         Probabilities for each category (rows should sum to 1)
     num_phases : int
         Number of phases/categories
+    category_colors : array of shape (num_phases, 3), optional
+        Custom RGB colors for each category. If None, uses site_colors.
 
     Returns:
     --------
@@ -2553,7 +2710,8 @@ def create_colors_from_probabilities(probabilities, num_phases):
     import matplotlib.colors as mcolors
 
     # Get base colors for each category (assume 0-1 range)
-    category_colors = np.array([site_colors(i) for i in range(num_phases)])
+    if category_colors is None:
+        category_colors = np.array([site_colors(i) for i in range(num_phases)])
 
     # Mix colors based on probabilities
     mixed_colors = probabilities @ category_colors
@@ -2576,6 +2734,9 @@ def create_colors_from_probabilities(probabilities, num_phases):
             smooth_certainty[:, np.newaxis] * mixed_colors
             + (1 - smooth_certainty[:, np.newaxis]) * white
         )
+
+        # Ensure colors are in valid range [0, 1] BEFORE HSV conversion
+        final_colors = np.clip(final_colors, 0, 1)
 
         # Convert to HSV for final adjustments
         hsv_colors = mcolors.rgb_to_hsv(final_colors)
@@ -2607,10 +2768,17 @@ def create_colors_from_probabilities(probabilities, num_phases):
     return final_colors
 
 
-def add_2phase_colorbar(ax):
+def add_2phase_colorbar(ax, scatter_colours):
     """
     Add a 1D colorbar for 2-phase system
     Creates a colormap that goes: color0 -> white (center) -> color1
+
+    Parameters:
+    -----------
+    ax : matplotlib axes
+        The main plot axes
+    scatter_colours : array of shape (2, 3)
+        RGB colors for the two phases
     """
     from matplotlib.colors import LinearSegmentedColormap
 
@@ -2633,9 +2801,9 @@ def add_2phase_colorbar(ax):
     # Create new axes for colorbar
     cax = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
 
-    # Get the two phase colors (assume 0-1 range)
-    color0 = np.array(site_colors(0))
-    color1 = np.array(site_colors(1))
+    # Get the two phase colors from scatter_colours
+    color0 = scatter_colours[0]
+    color1 = scatter_colours[1]
 
     # Create a colormap that goes: color0 -> white (center) -> color1
     colors_list = [color0, (1, 1, 1), color1]
@@ -2656,8 +2824,19 @@ def add_2phase_colorbar(ax):
     return cax
 
 
-def add_3phase_color_triangle(fig, ax):
-    """Add a ternary color triangle for 3-phase system"""
+def add_3phase_color_triangle(fig, ax, scatter_colours):
+    """
+    Add a ternary color triangle for 3-phase system
+
+    Parameters:
+    -----------
+    fig : matplotlib figure
+        The figure object
+    ax : matplotlib axes
+        The main plot axes
+    scatter_colours : array of shape (3, 3)
+        RGB colors for the three phases
+    """
 
     # Check if there are existing colorbars/triangles attached to the figure
     box = ax.get_position()
@@ -2684,10 +2863,10 @@ def add_3phase_color_triangle(fig, ax):
     triangle_width = box.height * 0.8
     triangle_ax = fig.add_axes([x_offset, box.y0, triangle_width, box.height * 0.8])
 
-    # Get the three phase colors (assume 0-1 range)
-    color0 = np.array(site_colors(0))
-    color1 = np.array(site_colors(1))
-    color2 = np.array(site_colors(2))
+    # Get the three phase colors from scatter_colours
+    color0 = scatter_colours[0]
+    color1 = scatter_colours[1]
+    color2 = scatter_colours[2]
 
     # Create ternary color grid
     resolution = 100
@@ -2710,8 +2889,8 @@ def add_3phase_color_triangle(fig, ax):
     positions = np.array(positions)
     probabilities_array = np.array(probabilities_list)
 
-    # Get colors using the same function
-    colors = create_colors_from_probabilities(probabilities_array, 3)
+    # Get colors using the same function with custom scatter_colours
+    colors = create_colors_from_probabilities(probabilities_array, 3, scatter_colours)
 
     # Plot the triangle
     triangle_ax.scatter(
