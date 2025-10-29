@@ -123,9 +123,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         vbf_dataset: Dataset3d,
         bf_mask_dataset: Dataset2d,
         energy: float,
+        aberration_coefs: dict,
         rotation_angle_rad: float | None = None,
         rotation_angle_deg: float | None = None,
-        aberration_coefs: dict | None = None,
         semiangle_cutoff: float | None = None,
         soft_edges: bool = True,
         rng: np.random.Generator | int | None = None,
@@ -224,6 +224,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if rotation_angle is None:
             origin.estimate_detector_rotation()
             rotation_angle = origin.detector_rotation_deg / 180 * math.pi
+            if verbose:
+                print(f"Auto-estimated rotation angle: {origin.detector_rotation_deg:.2f}° ({rotation_angle:.4f} rad)")
+                print("Consider verifying this value and providing rotation_angle_deg explicitly for best results.")
 
         # shift to origin
         origin.shift_origin_to(
@@ -363,11 +366,22 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def rotation_angle(self) -> float:
+        """Rotation angle in radians (internal representation)."""
         return self._rotation_angle
 
     @rotation_angle.setter
     def rotation_angle(self, value: float):
         self._rotation_angle = float(value)
+
+    @property
+    def rotation_angle_rad(self) -> float:
+        """Rotation angle in radians."""
+        return self._rotation_angle
+
+    @property
+    def rotation_angle_deg(self) -> float:
+        """Rotation angle in degrees."""
+        return np.rad2deg(self._rotation_angle)
 
     @property
     def aberration_coefs(self) -> dict:

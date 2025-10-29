@@ -83,3 +83,8 @@ class TestAngleParameters:
         assert result.low == -180
         assert result.high == -160
 
+
+# Note: To test the DirectPtychography.rotation_angle_rad and rotation_angle_deg
+# properties, we would need to create a full DirectPtychography instance with
+# actual data, which is beyond the scope of these unit tests. Those properties
+# are tested implicitly through integration tests with real datasets.
