@@ -42,6 +42,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     align_vbf_stack_multiscale,
     create_edge_window,
     fit_aberrations_from_shifts,
+    process_angle_parameters,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -122,15 +123,38 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         vbf_dataset: Dataset3d,
         bf_mask_dataset: Dataset2d,
         energy: float,
-        rotation_angle: float,
-        aberration_coefs: dict,
+        rotation_angle_rad: float | None = None,
+        rotation_angle_deg: float | None = None,
+        aberration_coefs: dict | None = None,
         semiangle_cutoff: float | None = None,
         soft_edges: bool = True,
         rng: np.random.Generator | int | None = None,
         device: str | int = "cpu",
         verbose: int | bool = True,
     ):
-        """ """
+        """
+        Create a DirectPtychography instance from pre-computed virtual BFs.
+        
+        Parameters
+        ----------
+        rotation_angle_rad : float, optional
+            Rotation angle in radians between scan and detector coordinates.
+            Cannot be specified if rotation_angle_deg is provided.
+        rotation_angle_deg : float, optional
+            Rotation angle in degrees between scan and detector coordinates.
+            Cannot be specified if rotation_angle_rad is provided.
+        """
+        
+        # Process angle parameters
+        rotation_angle = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
+        
+        if rotation_angle is None:
+            raise ValueError(
+                "Either rotation_angle_rad or rotation_angle_deg must be provided."
+            )
+        
+        if aberration_coefs is None:
+            aberration_coefs = {}
 
         return cls(
             vbf_dataset=vbf_dataset,
@@ -153,7 +177,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         energy: float,
         aberration_coefs: dict,
         semiangle_cutoff: float,
-        rotation_angle: float | None = None,
+        rotation_angle_rad: float | None = None,
+        rotation_angle_deg: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
         mode: str = "bilinear",
@@ -167,7 +192,22 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         normalization_order: int = 0,
         edge_blend_pixels: int = 0,
     ):
-        """ """
+        """
+        Create a DirectPtychography instance from a 4D-STEM dataset.
+        
+        Parameters
+        ----------
+        rotation_angle_rad : float, optional
+            Rotation angle in radians between scan and detector coordinates.
+            Cannot be specified if rotation_angle_deg is provided.
+        rotation_angle_deg : float, optional
+            Rotation angle in degrees between scan and detector coordinates.
+            Cannot be specified if rotation_angle_rad is provided.
+            If neither angle is provided, it will be auto-estimated.
+        """
+
+        # Process angle parameters
+        rotation_angle = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
 
         origin = CenterOfMassOriginModel.from_dataset(dataset, device=device)
 
@@ -494,7 +534,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         aberration_coefs=None,
         upsampling_factor=None,
-        rotation_angle=None,
+        rotation_angle_rad=None,
+        rotation_angle_deg=None,
         max_batch_size=None,
         deconvolution_kernel="full",
         use_center_of_mass_weighting=False,
@@ -511,8 +552,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Aberration coefficients for the probe
         upsampling_factor : int, optional
             Factor by which to upsample the reconstruction
-        rotation_angle : float, optional
-            Rotation angle for coordinate system
+        rotation_angle_rad : float, optional
+            Rotation angle in radians for coordinate system.
+            Cannot be specified if rotation_angle_deg is provided.
+        rotation_angle_deg : float, optional
+            Rotation angle in degrees for coordinate system.
+            Cannot be specified if rotation_angle_rad is provided.
         max_batch_size : int, optional
             Maximum batch size for processing
         deconvolution_kernel : str, one of ['full', 'quadratic', 'none']
@@ -539,6 +584,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         else:
             aberration_coefs = validate_aberration_coefficients(aberration_coefs)
 
+        # Process angle parameters
+        rotation_angle = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
+        
         if rotation_angle is None:
             rotation_angle = self.rotation_angle
         else:
@@ -708,7 +756,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def optimize_hyperparameters(
         self,
         aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
-        rotation_angle: float | OptimizationParameter | None = None,
+        rotation_angle_rad: float | OptimizationParameter | None = None,
+        rotation_angle_deg: float | OptimizationParameter | None = None,
         n_trials=50,
         sampler=None,
         **reconstruct_kwargs,
@@ -720,8 +769,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         ----------
         aberration_coefs : dict[str, float|OptimizationParameter]
             Dict of aberration names to either fixed values or optimization ranges.
-        rotation_angle : float|OptimizationParameter
-            Fixed rotation or optimization range.
+        rotation_angle_rad : float|OptimizationParameter, optional
+            Fixed rotation in radians or optimization range.
+            Cannot be specified if rotation_angle_deg is provided.
+        rotation_angle_deg : float|OptimizationParameter, optional
+            Fixed rotation in degrees or optimization range.
+            Cannot be specified if rotation_angle_rad is provided.
         n_trials : int
             Number of Optuna trials.
         sampler : optuna.samplers.BaseSampler, optional
@@ -733,6 +786,18 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
         """
+
+        # Process angle parameters
+        rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
+        
+        # If rotation_angle_deg was an OptimizationParameter, convert it to radians
+        if isinstance(rotation_angle_deg, OptimizationParameter):
+            rotation_angle_param = OptimizationParameter(
+                low=np.deg2rad(rotation_angle_deg.low),
+                high=np.deg2rad(rotation_angle_deg.high),
+                log=rotation_angle_deg.log,
+                n_points=rotation_angle_deg.n_points,
+            )
 
         aberration_coefs = aberration_coefs or {}
         sampler = sampler or optuna.samplers.TPESampler()
@@ -747,19 +812,19 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 else:
                     trial_aberrations[name] = val
 
-            if isinstance(rotation_angle, OptimizationParameter):
+            if isinstance(rotation_angle_param, OptimizationParameter):
                 rot = trial.suggest_float(
                     "rotation_angle",
-                    rotation_angle.low,
-                    rotation_angle.high,
-                    log=rotation_angle.log,
+                    rotation_angle_param.low,
+                    rotation_angle_param.high,
+                    log=rotation_angle_param.log,
                 )
             else:
-                rot = rotation_angle
+                rot = rotation_angle_param
 
             self.reconstruct(
                 aberration_coefs=trial_aberrations,
-                rotation_angle=rot,
+                rotation_angle_rad=rot,
                 verbose=False,
                 **reconstruct_kwargs,
             )
@@ -780,7 +845,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def grid_search_hyperparameters(
         self,
         aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
-        rotation_angle: float | OptimizationParameter | None = None,
+        rotation_angle_rad: float | OptimizationParameter | None = None,
+        rotation_angle_deg: float | OptimizationParameter | None = None,
         **reconstruct_kwargs,
     ):
         """
@@ -790,11 +856,28 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         ----------
         aberration_coefs : dict[str, float | OptimizationParameter], optional
             Dict of aberration names to either fixed values or OptimizationParameter ranges.
-        rotation_angle : float | OptimizationParameter, optional
-            Fixed rotation or optimization range.
+        rotation_angle_rad : float | OptimizationParameter, optional
+            Fixed rotation in radians or optimization range.
+            Cannot be specified if rotation_angle_deg is provided.
+        rotation_angle_deg : float | OptimizationParameter, optional
+            Fixed rotation in degrees or optimization range.
+            Cannot be specified if rotation_angle_rad is provided.
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
         """
+        
+        # Process angle parameters
+        rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
+        
+        # If rotation_angle_deg was an OptimizationParameter, convert it to radians
+        if isinstance(rotation_angle_deg, OptimizationParameter):
+            rotation_angle_param = OptimizationParameter(
+                low=np.deg2rad(rotation_angle_deg.low),
+                high=np.deg2rad(rotation_angle_deg.high),
+                log=rotation_angle_deg.log,
+                n_points=rotation_angle_deg.n_points,
+            )
+        
         aberration_coefs = aberration_coefs or {}
 
         # Build parameter grid
@@ -805,11 +888,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             else:
                 param_grid[name] = [val]
 
-        if rotation_angle is not None:
-            if isinstance(rotation_angle, OptimizationParameter):
-                param_grid["rotation_angle"] = rotation_angle.grid_values()
+        if rotation_angle_param is not None:
+            if isinstance(rotation_angle_param, OptimizationParameter):
+                param_grid["rotation_angle"] = rotation_angle_param.grid_values()
             else:
-                param_grid["rotation_angle"] = [rotation_angle]
+                param_grid["rotation_angle"] = [rotation_angle_param]
 
         # Cartesian product of all parameter combinations
         keys = list(param_grid.keys())
@@ -826,7 +909,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
             self.reconstruct(
                 aberration_coefs=trial_aberration_coefs,
-                rotation_angle=trial_rotation_angle,
+                rotation_angle_rad=trial_rotation_angle,
                 verbose=False,
                 **reconstruct_kwargs,
             )
@@ -982,11 +1065,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["aberration_coefs", "rotation_angle"]
+            if k not in ["aberration_coefs", "rotation_angle_rad"]
         }
         return self.reconstruct(
             aberration_coefs=aberration_coefs,
-            rotation_angle=rotation_angle,
+            rotation_angle_rad=rotation_angle,
             **safe_kwargs,
         )
 
@@ -1003,11 +1086,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["aberration_coefs", "rotation_angle"]
+            if k not in ["aberration_coefs", "rotation_angle_rad"]
         }
         return self.reconstruct(
             aberration_coefs=aberration_coefs,
-            rotation_angle=rotation_angle,
+            rotation_angle_rad=rotation_angle,
             **safe_kwargs,
         )
 

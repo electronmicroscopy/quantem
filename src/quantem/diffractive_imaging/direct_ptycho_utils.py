@@ -10,10 +10,62 @@ else:
 
 import math
 
+import numpy as np
 from tqdm.auto import tqdm
 
 from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
 from quantem.diffractive_imaging.complex_probe import spatial_frequencies
+
+
+def process_angle_parameters(rotation_angle_rad=None, rotation_angle_deg=None):
+    """
+    Process rotation angle parameters, accepting either radians or degrees.
+    
+    Handles both scalar values and OptimizationParameter objects.
+    
+    Parameters
+    ----------
+    rotation_angle_rad : float or OptimizationParameter, optional
+        Rotation angle in radians
+    rotation_angle_deg : float or OptimizationParameter, optional
+        Rotation angle in degrees
+        
+    Returns
+    -------
+    float, OptimizationParameter, or None
+        Rotation angle in radians (or OptimizationParameter with bounds in radians),
+        or None if neither parameter provided
+        
+    Raises
+    ------
+    ValueError
+        If both rotation_angle_rad and rotation_angle_deg are provided
+        
+    Examples
+    --------
+    >>> process_angle_parameters(rotation_angle_deg=90)
+    1.5707963267948966
+    >>> process_angle_parameters(rotation_angle_rad=np.pi/2)
+    1.5707963267948966
+    >>> process_angle_parameters()
+    None
+    """
+    if rotation_angle_rad is not None and rotation_angle_deg is not None:
+        raise ValueError(
+            "Cannot specify both rotation_angle_rad and rotation_angle_deg. "
+            "Please provide only one."
+        )
+    
+    if rotation_angle_deg is not None:
+        # Check if it's an OptimizationParameter (duck typing)
+        if hasattr(rotation_angle_deg, 'low') and hasattr(rotation_angle_deg, 'high'):
+            # It's an OptimizationParameter - don't convert, just return it
+            # The conversion will be handled in the calling function
+            return rotation_angle_deg
+        # It's a scalar - convert to radians
+        return np.deg2rad(rotation_angle_deg)
+    
+    return rotation_angle_rad
 
 
 def create_edge_window(shape, edge_blend_pixels, device="cpu"):
