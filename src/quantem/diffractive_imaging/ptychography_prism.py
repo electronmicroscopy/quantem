@@ -1,4 +1,3 @@
-import math
 from typing import Literal, Self
 
 import numpy as np
@@ -269,9 +268,7 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
             )
 
             prism_coefs = self.probe_model.forward(positions)
-            exit_waves = self.forward_operator(
-                prism_coefs, patch_indices, self.batch_size
-            ) / math.sqrt(self.roi_shape.prod())
+            exit_waves = self.forward_operator(prism_coefs, patch_indices, self.batch_size)
             pred_intensities = self.detector_model.forward(exit_waves)
 
             # Compute loss

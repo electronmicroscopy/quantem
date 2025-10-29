@@ -1451,7 +1451,6 @@ class ProbePRISM(ProbeBase):
         self.aberration_coefs_list = coefs
         self.learn_aberrations = learn_aberrations
         self._wave_vectors = None
-        self._plane_waves = None
 
         self._ctf_params = None
         self._intensity_norm_factor = 1.0
@@ -1507,14 +1506,38 @@ class ProbePRISM(ProbeBase):
         self._interpolation = (int(interp[0]), int(interp[1]))
 
     @property
+    def extent(self) -> tuple[float, float] | None:
+        if not hasattr(self, "reciprocal_sampling"):
+            return None
+        return tuple((1 / self.reciprocal_sampling).astype(np.float32))
+
+    @property
+    def wavelength(self) -> float | None:
+        if "energy" not in self.probe_params:
+            return None
+        energy = self.probe_params.get("energy")
+        return electron_wavelength_angstrom(energy)
+
+    @property
+    def angular_sampling(self) -> tuple[float, float] | None:
+        if not hasattr(self, "reciprocal_sampling"):
+            return None
+        return self.wavelength * 1e3 * self.reciprocal_sampling
+
+    @property
     def wave_vectors(self) -> torch.Tensor:
         """Wave vectors for plane wave decomposition [num_waves, 2]"""
         return self._wave_vectors
 
     @property
     def plane_waves(self) -> torch.Tensor:
-        """Plane waves in real space [num_waves, roi_height, roi_width]"""
-        return self._plane_waves
+        """Compute plane waves on the fly"""
+        # Compute plane waves
+        return self._prism_plane_waves(
+            wave_vectors=self.wave_vectors,
+            extent=self.extent,
+            gpts=self.roi_shape.astype(int),
+        )
 
     @property
     def ctf_coefs(self) -> torch.Tensor:
@@ -1583,27 +1606,14 @@ class ProbePRISM(ProbeBase):
         if self.probe_params.get("semiangle_cutoff", None) is None:
             raise ValueError("probe_params must contain 'semiangle_cutoff' for PRISM")
 
-        energy = self.probe_params.get("energy")
-        semiangle_cutoff = self.probe_params.get("semiangle_cutoff")
-
-        wavelength = electron_wavelength_angstrom(energy)
-        extent = tuple((1 / self.reciprocal_sampling).astype(np.float32))
-        angular_sampling = wavelength * 1e3 * self.reciprocal_sampling
-
         # Compute PRISM wave vectors
         self._wave_vectors = self._prism_wave_vectors(
-            semiangle_cutoff=semiangle_cutoff + np.linalg.norm(angular_sampling),
-            extent=extent,
-            wavelength=wavelength,
+            semiangle_cutoff=self.probe_params.get("semiangle_cutoff")
+            + np.linalg.norm(self.angular_sampling),
+            extent=self.extent,
+            wavelength=self.wavelength,
             interpolation=self.interpolation,
         )
-
-        # Compute plane waves
-        self._plane_waves = self._prism_plane_waves(
-            wave_vectors=self.wave_vectors,
-            extent=extent,
-            gpts=tuple(self.roi_shape.astype(int)),
-        ) / math.sqrt(math.prod(self.roi_shape))
 
         # Initialize learnable CTF parameters for each probe mode
         self._ctf_params = nn.ModuleList()
@@ -1643,14 +1653,6 @@ class ProbePRISM(ProbeBase):
         Returns [num_probes, num_waves]
         """
         ctf_coefs_list = []
-
-        # Get current semiangle
-        semiangle = self.probe_params.get("semiangle_cutoff")
-        energy = self.probe_params.get("energy")
-        wavelength = electron_wavelength_angstrom(energy)
-
-        angular_sampling = wavelength * 1e3 * self.reciprocal_sampling
-
         for probe_idx in range(self.num_probes):
             # Get current aberration coefficients for this probe
             aberration_coefs = {key: val for key, val in self._ctf_params[probe_idx].items()}
@@ -1658,9 +1660,9 @@ class ProbePRISM(ProbeBase):
             # Compute CTF for this probe mode
             ctf_coef = self._ctf_coefficients(
                 wave_vectors=self.wave_vectors,
-                semiangle_cutoff=semiangle,
-                angular_sampling=tuple(angular_sampling.astype(float)),
-                wavelength=wavelength,
+                semiangle_cutoff=self.probe_params.get("semiangle_cutoff"),
+                angular_sampling=self.angular_sampling,
+                wavelength=self.wavelength,
                 aberration_coefs=aberration_coefs,
             )
             ctf_coefs_list.append(ctf_coef)
@@ -1792,7 +1794,7 @@ class ProbePRISM(ProbeBase):
             1.0j * 2 * math.pi * wave_vectors[:, 0, None, None] * x[:, None]
         ) * torch.exp(1.0j * 2 * math.pi * wave_vectors[:, 1, None, None] * y[None, :])
 
-        return array
+        return array / math.sqrt(math.prod(gpts))
 
     def _position_coefficients(
         self, positions: torch.Tensor, wave_vectors: torch.Tensor
