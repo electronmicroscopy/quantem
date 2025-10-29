@@ -116,7 +116,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         com_fit_function: Literal[
             "none", "plane", "parabola", "constant", "no_shift"
         ] = "constant",
-        force_com_rotation: float | None = None,
+        rotation_angle_rad: float | None = None,
+        rotation_angle_deg: float | None = None,
         force_com_transpose: bool | None = None,
         padded_diffraction_intensities_shape: tuple[int, int] | None = None,
         plot_rotation: bool = True,
@@ -134,7 +135,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if not self.dset.preprocessed:
             self.dset.preprocess(
                 com_fit_function=com_fit_function,
-                force_com_rotation=force_com_rotation,
+                rotation_angle_rad=rotation_angle_rad,
+                rotation_angle_deg=rotation_angle_deg,
                 force_com_transpose=force_com_transpose,
                 padded_diffraction_intensities_shape=padded_diffraction_intensities_shape,
                 obj_padding_px=obj_padding_px,

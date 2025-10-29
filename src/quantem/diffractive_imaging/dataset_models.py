@@ -916,7 +916,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
     def preprocess(
         self,
         com_fit_function: Literal["none", "plane", "parabola", "constant", "no_shift"] = "plane",
-        force_com_rotation: float | None = None,
+        rotation_angle_rad: float | None = None,
+        rotation_angle_deg: float | None = None,
         force_com_transpose: bool | None = None,
         padded_diffraction_intensities_shape: tuple[int, int] | None = None,
         obj_padding_px: tuple[int, int] | np.ndarray = (0, 0),
@@ -925,10 +926,14 @@ class PtychographyDatasetRaster(DatasetConstraints):
         vectorized: bool = True,
         probe_energy: float | None = None,
     ):
+        # Process angle parameters (handles mutual exclusivity and conversion)
+        from quantem.diffractive_imaging.direct_ptycho_utils import process_angle_parameters
+        rotation_angle_processed = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
+        
         # Store preprocessing parameters for serialization and reloading
         self._preprocessing_params = {
             "com_fit_function": com_fit_function,
-            "force_com_rotation": force_com_rotation,
+            "rotation_angle_rad": rotation_angle_processed,
             "force_com_transpose": force_com_transpose,
             "padded_diffraction_intensities_shape": padded_diffraction_intensities_shape,
             "obj_padding_px": obj_padding_px,
@@ -962,7 +967,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             vectorized_calculation=vectorized,
         )
         self._set_com_relative_rotation(
-            force_com_rotation=force_com_rotation,
+            rotation_angle_rad=rotation_angle_processed,
             force_com_transpose=force_com_transpose,
             plot_rotation=plot_rotation,
             plot_com=plot_com,
@@ -1069,7 +1074,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
     def _set_com_relative_rotation(
         self,
         rotation_angles_deg: np.ndarray | None = None,
-        force_com_rotation: float | None = None,
+        rotation_angle_rad: float | None = None,
         force_com_transpose: bool | None = None,
         plot_rotation: bool = True,
         plot_com: str | bool = "default",
@@ -1080,13 +1085,17 @@ class PtychographyDatasetRaster(DatasetConstraints):
         and the reciprocal coordinate system. We do this by minimizing the curl of the
         CoM gradient vector field or, alternatively, maximizing the divergence.
 
-        force_com_rotation: float (degrees), optional
-            Force relative rotation angle between real and reciprocal space
-        force_com_transpose: bool, optional
+        Parameters
+        ----------
+        rotation_angles_deg : np.ndarray, optional
+            Array of rotation angles in degrees to search over (default: -89 to 90 degrees)
+        rotation_angle_rad : float, optional
+            Force specific rotation angle in radians between real and reciprocal space
+        force_com_transpose : bool, optional
             Force whether diffraction intensities need to be transposed.
-        plot_rotation: bool, optional
+        plot_rotation : bool, optional
             If True, the CoM curl minimization search result will be displayed
-        plot_com: str, optional
+        plot_com : str, optional
             If 'default', the corrected CoM arrays will be displayed
             If 'all', the computed and fitted CoM arrays will be displayed
         """
@@ -1196,9 +1205,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
         rotation_angles_rad = np.deg2rad(rotation_angles_deg)
 
         # Case 1: Known rotation
-        if force_com_rotation is not None:
-            _rotation_best_rad = np.deg2rad(force_com_rotation)
-            self.vprint(f"Forcing best fit rotation to {force_com_rotation:.0f} degrees.")
+        if rotation_angle_rad is not None:
+            _rotation_best_rad = rotation_angle_rad
+            rotation_best_deg = np.rad2deg(rotation_angle_rad)
+            self.vprint(f"Forcing best fit rotation to {rotation_best_deg:.2f} degrees.")
 
             # Case 1.1: Known rotation and transpose
             if force_com_transpose is not None:

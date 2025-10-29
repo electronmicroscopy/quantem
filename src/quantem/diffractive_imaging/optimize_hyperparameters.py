@@ -95,9 +95,10 @@ def _is_dataset_param(param_path):
         "plot_rotation",
         "plot_com",
         "probe_energy",
-        "force_com_rotation",
         "force_com_transpose",
         "rotation_angle",
+        "rotation_angle_rad",
+        "rotation_angle_deg",
     }
     return param_path.split(".")[-1] in dataset_params
 

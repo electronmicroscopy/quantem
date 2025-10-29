@@ -140,7 +140,7 @@ def ptycho_dataset(complex_obj, probe_array):
         plot_rotation=True,
         plot_com=True,
         probe_energy=PROBE_ENERGY,
-        force_com_rotation=0,
+        rotation_angle_deg=0,
         force_com_transpose=False,
     )
     return pdset
