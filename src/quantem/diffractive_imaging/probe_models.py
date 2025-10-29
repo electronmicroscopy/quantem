@@ -1429,18 +1429,7 @@ class ProbePRISM(ProbeBase):
         """
 
         # handle list of aberrations or defocus
-        if probe_params.get("aberration_coefs", None) is None:
-            if probe_params.get("defocus", None) is None:
-                coefs = [{}]
-            else:
-                coefs = probe_params.pop("defocus")
-                if not isinstance(coefs, list):
-                    coefs = [coefs]
-                coefs = [{"C10": -df} for df in coefs]
-        else:
-            coefs = probe_params.pop("aberration_coefs")
-            if not isinstance(coefs, list):
-                coefs = [coefs]
+        coefs = self._extract_aberration_coefs(probe_params.copy())
 
         if num_probes is None:
             num_probes = len(coefs)
@@ -1599,10 +1588,11 @@ class ProbePRISM(ProbeBase):
 
         wavelength = electron_wavelength_angstrom(energy)
         extent = tuple((1 / self.reciprocal_sampling).astype(np.float32))
+        angular_sampling = wavelength * 1e3 * self.reciprocal_sampling
 
         # Compute PRISM wave vectors
         self._wave_vectors = self._prism_wave_vectors(
-            semiangle_cutoff=semiangle_cutoff,
+            semiangle_cutoff=semiangle_cutoff + np.linalg.norm(angular_sampling),
             extent=extent,
             wavelength=wavelength,
             interpolation=self.interpolation,
@@ -1659,9 +1649,7 @@ class ProbePRISM(ProbeBase):
         energy = self.probe_params.get("energy")
         wavelength = electron_wavelength_angstrom(energy)
 
-        angular_sampling = (
-            wavelength * 1e3 / self.roi_shape / (1 / (self.roi_shape * self.reciprocal_sampling))
-        )
+        angular_sampling = wavelength * 1e3 * self.reciprocal_sampling
 
         for probe_idx in range(self.num_probes):
             # Get current aberration coefficients for this probe
@@ -1873,6 +1861,106 @@ class ProbePRISM(ProbeBase):
             aberration_coefs=aberration_coefs,
         )
         return array / array.abs().square().sum().sqrt()
+
+    def _extract_aberration_coefs(self, probe_params: dict) -> list[dict]:
+        """
+        Extract and standardize aberration coefficients from probe_params.
+
+        Handles multiple input formats:
+        - Direct: {"C10": 100, "C30": 1e7}
+        - Nested: {"aberration_coefs": {"C10": 100}}
+        - List: {"aberration_coefs": [{"C10": 50}, {"C10": 100}]}
+        - Defocus: {"defocus": 100} or {"defocus": [50, 100]}
+        - Aliases: {"defocus": 100, "Cs": 1e7}
+
+        Returns
+        -------
+        list[dict]
+            List of aberration coefficient dictionaries, one per probe mode
+        """
+        # Start with empty list
+        coefs_list = []
+
+        # Check if aberration_coefs is explicitly provided
+        if "aberration_coefs" in probe_params:
+            aberration_coefs = probe_params.pop("aberration_coefs")
+
+            # Handle list vs single dict
+            if isinstance(aberration_coefs, list):
+                coefs_list = [self._standardize_aberration_dict(c) for c in aberration_coefs]
+            else:
+                coefs_list = [self._standardize_aberration_dict(aberration_coefs)]
+
+        # Check for defocus shorthand
+        elif "defocus" in probe_params:
+            defocus = probe_params.pop("defocus")
+
+            # Handle list vs single value
+            if isinstance(defocus, list):
+                coefs_list = [{"C10": -float(df)} for df in defocus]
+            else:
+                coefs_list = [{"C10": -float(defocus)}]
+
+        # Otherwise, look for aberration coefficients directly in probe_params
+        else:
+            # Extract any keys that look like aberrations
+            aberration_dict = {}
+            keys_to_remove = []
+
+            for key in probe_params.keys():
+                # Check if this is an aberration coefficient or alias
+                canonical = POLAR_ALIASES.get(key, key)
+                if canonical in POLAR_SYMBOLS or key in POLAR_ALIASES:
+                    aberration_dict[key] = probe_params[key]
+                    keys_to_remove.append(key)
+
+            # Remove aberration keys from probe_params
+            for key in keys_to_remove:
+                probe_params.pop(key)
+
+            # If we found aberrations, standardize them
+            if aberration_dict:
+                coefs_list = [self._standardize_aberration_dict(aberration_dict)]
+            else:
+                # No aberrations specified, use empty dict
+                coefs_list = [{}]
+
+        return coefs_list
+
+    def _standardize_aberration_dict(self, aberration_dict: dict) -> dict:
+        """
+        Standardize a single aberration coefficient dictionary.
+
+        Converts aliases to canonical names and handles special cases.
+
+        Parameters
+        ----------
+        aberration_dict : dict
+            Dictionary with aberration coefficients (may contain aliases)
+
+        Returns
+        -------
+        dict
+            Dictionary with canonical aberration coefficient names
+        """
+        standardized = {}
+
+        for key, val in aberration_dict.items():
+            # Get canonical name
+            canonical = POLAR_ALIASES.get(key, key)
+
+            # Special handling for defocus (sign convention)
+            if key == "defocus":
+                standardized["C10"] = -float(val)
+            elif canonical in POLAR_SYMBOLS:
+                standardized[canonical] = float(val)
+            else:
+                raise KeyError(
+                    f"Unknown aberration key '{key}'. "
+                    f"Expected one of: {', '.join(POLAR_SYMBOLS + tuple(POLAR_ALIASES))}"
+                )
+
+        return standardized
 
 
 ProbeModelType = ProbePixelated | ProbeDIP | ProbeParametric | ProbePRISM

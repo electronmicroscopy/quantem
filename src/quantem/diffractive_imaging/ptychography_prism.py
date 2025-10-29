@@ -1,3 +1,4 @@
+import math
 from typing import Literal, Self
 
 import numpy as np
@@ -275,11 +276,15 @@ class PtychoPRISM(PtychographyBase):
             # Get batch data
             patch_indices = self.dset.patch_indices
             positions_px = self.dset.scan_positions_px
-            positions = positions_px * torch.as_tensor(self.sampling, dtype=torch.float32)
+            positions = positions_px * torch.as_tensor(
+                self.sampling, dtype=torch.float32, device=self.device
+            )
 
             prism_coefs = self.probe_model.forward(positions)
-            exit_waves = self.forward_operator(prism_coefs, patch_indices, self.batch_size)
-            pred_intensities = self.detector_model.forward(exit_waves) / self.roi_shape.prod()
+            exit_waves = self.forward_operator(
+                prism_coefs, patch_indices, self.batch_size
+            ) / math.sqrt(self.roi_shape.prod())
+            pred_intensities = self.detector_model.forward(exit_waves)
 
             # Compute loss
             batch_consistency_loss, _targets = self.error_estimate(
@@ -390,4 +395,3 @@ class PtychoPRISM(PtychographyBase):
         """Reset reconstruction to initial state."""
         super().reset_recon()
         self.obj_model.reset_optimizer()
-        self._propagated_plane_waves = None
