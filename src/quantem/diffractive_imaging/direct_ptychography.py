@@ -48,23 +48,6 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
-@dataclass
-class OptimizationParameter:
-    low: float
-    high: float
-    log: bool = False
-    n_points: int | None = None
-
-    def grid_values(self):
-        """Return an array of grid values for this parameter."""
-        if self.n_points is None:
-            raise ValueError("n_points must be specified for grid search parameters.")
-        if self.log:
-            return np.geomspace(self.low, self.high, self.n_points)
-        else:
-            return np.linspace(self.low, self.high, self.n_points)
-
-
 class DirectPtychography(RNGMixin, AutoSerialize):
     """ """
 
@@ -769,9 +752,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def optimize_hyperparameters(
         self,
-        aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
-        rotation_angle_rad: float | OptimizationParameter | None = None,
-        rotation_angle_deg: float | OptimizationParameter | None = None,
+        aberration_coefs: dict[str, float | tuple[float, float]] | None = None,
+        rotation_angle_rad: float | tuple[float, float] | None = None,
+        rotation_angle_deg: float | tuple[float, float] | None = None,
         n_trials=50,
         sampler=None,
         **reconstruct_kwargs,
@@ -781,37 +764,43 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         Parameters
         ----------
-        aberration_coefs : dict[str, float|OptimizationParameter]
-            Dict of aberration names to either fixed values or optimization ranges.
-        rotation_angle_rad : float|OptimizationParameter, optional
-            Fixed rotation in radians or optimization range.
+        aberration_coefs : dict[str, float | tuple[float, float]]
+            Dict of aberration names to either fixed values or (min, max) ranges.
+            Example: {"C10": (-400, 400), "C12": 0, "phi12": (-np.pi/2, np.pi/2)}
+        rotation_angle_rad : float | tuple[float, float], optional
+            Fixed rotation in radians or (min, max) range.
             Cannot be specified if rotation_angle_deg is provided.
-        rotation_angle_deg : float|OptimizationParameter, optional
-            Fixed rotation in degrees or optimization range.
+        rotation_angle_deg : float | tuple[float, float], optional
+            Fixed rotation in degrees or (min, max) range.
             Cannot be specified if rotation_angle_rad is provided.
         n_trials : int
             Number of Optuna trials.
         sampler : optuna.samplers.BaseSampler, optional
             Custom Optuna sampler.
-        direction : str
-            "minimize" or "maximize" (default: "minimize").
-        show_progress_bar : bool
-            Show progress bar during optimization.
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
+            
+        Examples
+        --------
+        >>> # Optimize with degree ranges (more intuitive)
+        >>> direct_ptycho.optimize_hyperparameters(
+        ...     aberration_coefs={"C10": (-400, 400), "C12": (0, 100)},
+        ...     rotation_angle_deg=(-180, -160),
+        ...     n_trials=50
+        ... )
         """
 
-        # Process angle parameters
-        rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
-        
-        # If rotation_angle_deg was an OptimizationParameter, convert it to radians
-        if isinstance(rotation_angle_deg, OptimizationParameter):
-            rotation_angle_param = OptimizationParameter(
-                low=np.deg2rad(rotation_angle_deg.low),
-                high=np.deg2rad(rotation_angle_deg.high),
-                log=rotation_angle_deg.log,
-                n_points=rotation_angle_deg.n_points,
-            )
+        # Handle tuple conversion for degrees to radians
+        rotation_angle_param: float | tuple[float, float] | None
+        if isinstance(rotation_angle_deg, tuple):
+            # Convert tuple bounds from degrees to radians
+            rotation_angle_param = (np.deg2rad(rotation_angle_deg[0]), np.deg2rad(rotation_angle_deg[1]))
+        elif isinstance(rotation_angle_rad, tuple):
+            # Already in radians, use as-is
+            rotation_angle_param = rotation_angle_rad
+        else:
+            # Scalar values: use utility function for conversion and validation
+            rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
 
         aberration_coefs = aberration_coefs or {}
         sampler = sampler or optuna.samplers.TPESampler()
@@ -819,21 +808,18 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         def objective(trial):
             trial_aberrations = {}
             for name, val in aberration_coefs.items():
-                if isinstance(val, OptimizationParameter):
-                    trial_aberrations[name] = trial.suggest_float(
-                        name, val.low, val.high, log=val.log
-                    )
+                if isinstance(val, tuple):
+                    # Tuple represents (min, max) range for optimization
+                    trial_aberrations[name] = trial.suggest_float(name, val[0], val[1])
                 else:
+                    # Fixed value
                     trial_aberrations[name] = val
 
-            if isinstance(rotation_angle_param, OptimizationParameter):
-                rot = trial.suggest_float(
-                    "rotation_angle",
-                    rotation_angle_param.low,
-                    rotation_angle_param.high,
-                    log=rotation_angle_param.log,
-                )
+            if isinstance(rotation_angle_param, tuple):
+                # Tuple represents (min, max) range
+                rot = trial.suggest_float("rotation_angle", rotation_angle_param[0], rotation_angle_param[1])
             else:
+                # Fixed value
                 rot = rotation_angle_param
 
             self.reconstruct(
@@ -858,9 +844,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def grid_search_hyperparameters(
         self,
-        aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
-        rotation_angle_rad: float | OptimizationParameter | None = None,
-        rotation_angle_deg: float | OptimizationParameter | None = None,
+        aberration_coefs: dict[str, float | tuple[float, float, int]] | None = None,
+        rotation_angle_rad: float | tuple[float, float, int] | None = None,
+        rotation_angle_deg: float | tuple[float, float, int] | None = None,
         **reconstruct_kwargs,
     ):
         """
@@ -868,44 +854,64 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         Parameters
         ----------
-        aberration_coefs : dict[str, float | OptimizationParameter], optional
-            Dict of aberration names to either fixed values or OptimizationParameter ranges.
-        rotation_angle_rad : float | OptimizationParameter, optional
-            Fixed rotation in radians or optimization range.
+        aberration_coefs : dict[str, float | tuple[float, float, int]], optional
+            Dict of aberration names to either fixed values or (min, max, n_points) ranges.
+            Example: {"C10": (-400, 400, 10), "C12": 0}
+        rotation_angle_rad : float | tuple[float, float, int], optional
+            Fixed rotation in radians or (min, max, n_points) range.
             Cannot be specified if rotation_angle_deg is provided.
-        rotation_angle_deg : float | OptimizationParameter, optional
-            Fixed rotation in degrees or optimization range.
+        rotation_angle_deg : float | tuple[float, float, int], optional
+            Fixed rotation in degrees or (min, max, n_points) range.
             Cannot be specified if rotation_angle_rad is provided.
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
+            
+        Examples
+        --------
+        >>> # Grid search with degree ranges (more intuitive)
+        >>> direct_ptycho.grid_search_hyperparameters(
+        ...     aberration_coefs={"C10": (-400, 400, 10), "C12": (0, 100, 5)},
+        ...     rotation_angle_deg=(-180, -160, 20),
+        ... )
         """
         
-        # Process angle parameters
-        rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
-        
-        # If rotation_angle_deg was an OptimizationParameter, convert it to radians
-        if isinstance(rotation_angle_deg, OptimizationParameter):
-            rotation_angle_param = OptimizationParameter(
-                low=np.deg2rad(rotation_angle_deg.low),
-                high=np.deg2rad(rotation_angle_deg.high),
-                log=rotation_angle_deg.log,
-                n_points=rotation_angle_deg.n_points,
-            )
+        # Handle tuple conversion for degrees to radians
+        rotation_angle_param: float | tuple[float, float, int] | None
+        if isinstance(rotation_angle_deg, tuple):
+            # Convert tuple bounds from degrees to radians
+            min_rad = np.deg2rad(rotation_angle_deg[0])
+            max_rad = np.deg2rad(rotation_angle_deg[1])
+            n_points = rotation_angle_deg[2] if len(rotation_angle_deg) > 2 else 10
+            rotation_angle_param = (min_rad, max_rad, n_points)
+        elif isinstance(rotation_angle_rad, tuple):
+            # Already in radians, use as-is
+            rotation_angle_param = rotation_angle_rad
+        else:
+            # Scalar values: use utility function for conversion and validation
+            rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
         
         aberration_coefs = aberration_coefs or {}
 
         # Build parameter grid
         param_grid = {}
         for name, val in aberration_coefs.items():
-            if isinstance(val, OptimizationParameter):
-                param_grid[name] = val.grid_values()
+            if isinstance(val, tuple):
+                # Tuple: (min, max, n_points)
+                low, high = val[0], val[1]
+                n_points = val[2] if len(val) > 2 else 10
+                param_grid[name] = np.linspace(low, high, n_points)
             else:
+                # Fixed value
                 param_grid[name] = [val]
 
         if rotation_angle_param is not None:
-            if isinstance(rotation_angle_param, OptimizationParameter):
-                param_grid["rotation_angle"] = rotation_angle_param.grid_values()
+            if isinstance(rotation_angle_param, tuple):
+                # Tuple: (min, max, n_points)
+                low, high = rotation_angle_param[0], rotation_angle_param[1]
+                n_points = rotation_angle_param[2] if len(rotation_angle_param) > 2 else 10
+                param_grid["rotation_angle"] = np.linspace(low, high, n_points)
             else:
+                # Fixed value
                 param_grid["rotation_angle"] = [rotation_angle_param]
 
         # Cartesian product of all parameter combinations

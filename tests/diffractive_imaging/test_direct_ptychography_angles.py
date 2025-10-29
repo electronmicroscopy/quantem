@@ -67,24 +67,12 @@ class TestAngleParameters:
         result_rad = process_angle_parameters(rotation_angle_rad=2 * np.pi)
         assert np.isclose(result_deg, result_rad)
 
-    def test_optimization_parameter_passthrough(self):
-        """Test that OptimizationParameter objects are passed through unchanged."""
-        # Create a mock OptimizationParameter-like object
-        class MockOptParam:
-            def __init__(self, low, high):
-                self.low = low
-                self.high = high
-        
-        opt_param_deg = MockOptParam(-180, -160)
-        result = process_angle_parameters(rotation_angle_deg=opt_param_deg)
-        
-        # Should return the same object, not try to convert it
-        assert result is opt_param_deg
-        assert result.low == -180
-        assert result.high == -160
-
 
 # Note: To test the DirectPtychography.rotation_angle_rad and rotation_angle_deg
 # properties, we would need to create a full DirectPtychography instance with
 # actual data, which is beyond the scope of these unit tests. Those properties
 # are tested implicitly through integration tests with real datasets.
+#
+# OptimizationParameter handling is tested in the optimization methods themselves,
+# not in the process_angle_parameters utility function which is designed for
+# scalar values only.

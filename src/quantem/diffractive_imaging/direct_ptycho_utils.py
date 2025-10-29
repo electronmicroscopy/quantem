@@ -16,25 +16,24 @@ from tqdm.auto import tqdm
 from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
 from quantem.diffractive_imaging.complex_probe import spatial_frequencies
 
-
-def process_angle_parameters(rotation_angle_rad=None, rotation_angle_deg=None):
+def process_angle_parameters(rotation_angle_rad=None, rotation_angle_deg=None) -> float | None:
     """
     Process rotation angle parameters, accepting either radians or degrees.
     
-    Handles both scalar values and OptimizationParameter objects.
+    Handles only scalar (float/int) values. For OptimizationParameter objects,
+    handle conversion in the calling code where the optimization context is available.
     
     Parameters
     ----------
-    rotation_angle_rad : float or OptimizationParameter, optional
+    rotation_angle_rad : float, optional
         Rotation angle in radians
-    rotation_angle_deg : float or OptimizationParameter, optional
+    rotation_angle_deg : float, optional
         Rotation angle in degrees
         
     Returns
     -------
-    float, OptimizationParameter, or None
-        Rotation angle in radians (or OptimizationParameter with bounds in radians),
-        or None if neither parameter provided
+    float or None
+        Rotation angle in radians, or None if neither parameter provided
         
     Raises
     ------
@@ -49,6 +48,12 @@ def process_angle_parameters(rotation_angle_rad=None, rotation_angle_deg=None):
     1.5707963267948966
     >>> process_angle_parameters()
     None
+    
+    Notes
+    -----
+    This function is designed for scalar values only. If you need to handle
+    OptimizationParameter objects, perform the conversion in the optimization
+    method where the full context is available.
     """
     if rotation_angle_rad is not None and rotation_angle_deg is not None:
         raise ValueError(
@@ -57,12 +62,7 @@ def process_angle_parameters(rotation_angle_rad=None, rotation_angle_deg=None):
         )
     
     if rotation_angle_deg is not None:
-        # Check if it's an OptimizationParameter (duck typing)
-        if hasattr(rotation_angle_deg, 'low') and hasattr(rotation_angle_deg, 'high'):
-            # It's an OptimizationParameter - don't convert, just return it
-            # The conversion will be handled in the calling function
-            return rotation_angle_deg
-        # It's a scalar - convert to radians
+        # Convert scalar degrees to radians
         return np.deg2rad(rotation_angle_deg)
     
     return rotation_angle_rad
