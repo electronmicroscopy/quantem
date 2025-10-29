@@ -12,9 +12,11 @@ from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectModelType, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbePRISM
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
+from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
+from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
 
 
-class PtychoPRISM(PtychographyBase):
+class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase):
     """
     PRISM-accelerated ptychographic reconstruction using plane wave decomposition.
 
@@ -236,42 +238,28 @@ class PtychoPRISM(PtychographyBase):
 
         self.constraints = constraints
 
-        # Setup optimizers (only object model has parameters to optimize)
+        new_scheduler = reset
         if optimizer_params is not None:
-            # Only object model needs optimization
-            if "object" in optimizer_params:
-                self.obj_model.set_optimizer(optimizer_params["object"])
-            else:
-                self.obj_model.set_optimizer(optimizer_params)
-
-            # Add probe optimizer if parameters are learnable
-            if "probe" in optimizer_params and self.probe_model.params is not None:
-                self.probe_model.set_optimizer(optimizer_params["probe"])
+            self.optimizer_params = optimizer_params
+            self.set_optimizers()
+            new_scheduler = True
 
         if scheduler_params is not None:
-            if "object" in scheduler_params:
-                self.obj_model.set_scheduler(scheduler_params["object"], num_iter)
-            else:
-                self.obj_model.set_scheduler(scheduler_params, num_iter)
-            if "probe" in scheduler_params:
-                self.probe_model.set_scheduler(scheduler_params["probe"], num_iter)
-            else:
-                self.probe_model.set_scheduler(scheduler_params, num_iter)
+            self.scheduler_params = scheduler_params
+            new_scheduler = True
+
+        if new_scheduler:
+            self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
         self.dset._set_targets(loss_type)
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         indices = torch.arange(self.dset.num_gpts)
 
         for epoch in pbar:
-            epoch_loss = 0.0
-            epoch_consistency_loss = 0.0
             self._reset_epoch_constraints()
 
             # Zero gradients
-            if self.obj_model.optimizer is not None:
-                self.obj_model.optimizer.zero_grad()
-            if self.probe_model.optimizer is not None:
-                self.probe_model.optimizer.zero_grad()
+            self.zero_grad_all()
 
             # Get batch data
             patch_indices = self.dset.patch_indices
@@ -287,47 +275,26 @@ class PtychoPRISM(PtychographyBase):
             pred_intensities = self.detector_model.forward(exit_waves)
 
             # Compute loss
-            batch_consistency_loss, _targets = self.error_estimate(
+            epoch_consistency_loss, _targets = self.error_estimate(
                 pred_intensities,
                 indices,
                 loss_type=loss_type,
             )
 
             # Apply soft constraints
-            batch_soft_constraint_loss = self._soft_constraints()
+            epoch_soft_constraint_loss = self._soft_constraints()
 
-            batch_loss = batch_consistency_loss + batch_soft_constraint_loss
+            epoch_loss = epoch_consistency_loss + epoch_soft_constraint_loss
 
             # Backward pass (autograd)
-            self.backward(batch_loss)
-
-            # Optimizer step
-            if self.obj_model.optimizer is not None:
-                self.obj_model.optimizer.step()
-            if self.probe_model.optimizer is not None:
-                self.probe_model.optimizer.step()
-
-            epoch_consistency_loss += batch_consistency_loss.item()
-            epoch_loss += batch_loss.item()
+            self.backward(epoch_loss)
+            self.step_optimizers()
 
             # Record epoch
-            self._record_epoch(epoch_loss)
+            self._record_epoch(epoch_loss.item())
 
             # Step scheduler
-            if self.obj_model.scheduler is not None:
-                if isinstance(
-                    self.obj_model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
-                ):
-                    self.obj_model.scheduler.step(epoch_loss)
-                else:
-                    self.obj_model.scheduler.step()
-            if self.probe_model.scheduler is not None:
-                if isinstance(
-                    self.probe_model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
-                ):
-                    self.probe_model.scheduler.step(epoch_loss)
-                else:
-                    self.probe_model.scheduler.step()
+            self.step_schedulers(epoch_loss)
 
             # Store iteration
             if self.store_iterations and (epoch % self.store_iterations_every) == 0:
