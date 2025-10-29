@@ -367,6 +367,27 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         return np.rad2deg(self._rotation_angle)
 
     @property
+    def fitted_rotation_angle_rad(self) -> float | None:
+        """Fitted rotation angle in radians (from fit_hyperparameters)."""
+        if hasattr(self, "_fitted_parameters") and "rotation_angle" in self._fitted_parameters:
+            return self._fitted_parameters["rotation_angle"]
+        return None
+
+    @property
+    def fitted_rotation_angle_deg(self) -> float | None:
+        """Fitted rotation angle in degrees (from fit_hyperparameters)."""
+        angle_rad = self.fitted_rotation_angle_rad
+        return np.rad2deg(angle_rad) if angle_rad is not None else None
+
+    @property
+    def fitted_aberration_coefs(self) -> dict | None:
+        """Fitted aberration coefficients (from fit_hyperparameters)."""
+        if hasattr(self, "_fitted_parameters"):
+            # Return copy without rotation_angle key
+            return {k: v for k, v in self._fitted_parameters.items() if k != "rotation_angle"}
+        return None
+
+    @property
     def aberration_coefs(self) -> dict:
         return self._aberration_coefs
 
