@@ -1,5 +1,5 @@
 {
-    "python.languageServer": "None",
+    "python.languageServer": "Pylance",
     "python.terminal.activateEnvInCurrentTerminal": true,
     "python.defaultInterpreterPath": ".venv/bin/python",
     "cSpell.words": [
