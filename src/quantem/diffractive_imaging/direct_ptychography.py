@@ -369,8 +369,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     @property
     def fitted_rotation_angle_rad(self) -> float | None:
         """Fitted rotation angle in radians (from fit_hyperparameters)."""
-        if hasattr(self, "_fitted_parameters") and "rotation_angle" in self._fitted_parameters:
-            return self._fitted_parameters["rotation_angle"]
+        if hasattr(self, "_fitted_parameters") and "rotation_angle_rad" in self._fitted_parameters:
+            return self._fitted_parameters["rotation_angle_rad"]
         return None
 
     @property
@@ -383,8 +383,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def fitted_aberration_coefs(self) -> dict | None:
         """Fitted aberration coefficients (from fit_hyperparameters)."""
         if hasattr(self, "_fitted_parameters"):
-            # Return copy without rotation_angle key
-            return {k: v for k, v in self._fitted_parameters.items() if k != "rotation_angle"}
+            # Return copy without rotation_angle_rad key
+            return {k: v for k, v in self._fitted_parameters.items() if k != "rotation_angle_rad"}
         return None
 
     @property
@@ -838,7 +838,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
             if isinstance(rotation_angle_param, tuple):
                 # Tuple represents (min, max) range
-                rot = trial.suggest_float("rotation_angle", rotation_angle_param[0], rotation_angle_param[1])
+                rot = trial.suggest_float("rotation_angle_rad", rotation_angle_param[0], rotation_angle_param[1])
             else:
                 # Fixed value
                 rot = rotation_angle_param
@@ -930,10 +930,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 # Tuple: (min, max, n_points)
                 low, high = rotation_angle_param[0], rotation_angle_param[1]
                 n_points = rotation_angle_param[2] if len(rotation_angle_param) > 2 else 10
-                param_grid["rotation_angle"] = np.linspace(low, high, n_points)
+                param_grid["rotation_angle_rad"] = np.linspace(low, high, n_points)
             else:
                 # Fixed value
-                param_grid["rotation_angle"] = [rotation_angle_param]
+                param_grid["rotation_angle_rad"] = [rotation_angle_param]
 
         # Cartesian product of all parameter combinations
         keys = list(param_grid.keys())
@@ -946,7 +946,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         for combo in tqdm(grid):
             params = dict(zip(keys, combo))
             trial_aberration_coefs = params.copy()
-            trial_rotation_angle = trial_aberration_coefs.pop("rotation_angle", None)
+            trial_rotation_angle = trial_aberration_coefs.pop("rotation_angle_rad", None)
 
             self.reconstruct(
                 aberration_coefs=trial_aberration_coefs,
@@ -1101,7 +1101,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             raise ValueError("run self.optimize_hyperparameters first.")
 
         aberration_coefs = self._optimized_parameters.copy()
-        rotation_angle = aberration_coefs.pop("rotation_angle", None)
+        rotation_angle = aberration_coefs.pop("rotation_angle_rad", None)
 
         safe_kwargs = {
             k: v
@@ -1123,7 +1123,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             raise ValueError("run self.fit_hyperparameters first.")
 
         aberration_coefs = self._fitted_parameters.copy()
-        rotation_angle = aberration_coefs.pop("rotation_angle", None)
+        rotation_angle = aberration_coefs.pop("rotation_angle_rad", None)
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()

@@ -565,7 +565,7 @@ def fit_aberrations_from_shifts(
         "C10": C10.item(),
         "C12": C12.item(),
         "phi12": phi12.item(),
-        "rotation_angle": rotation_rad.item(),
+        "rotation_angle_rad": rotation_rad.item(),
     }
 
 

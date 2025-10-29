@@ -72,7 +72,3 @@ class TestAngleParameters:
 # properties, we would need to create a full DirectPtychography instance with
 # actual data, which is beyond the scope of these unit tests. Those properties
 # are tested implicitly through integration tests with real datasets.
-#
-# OptimizationParameter handling is tested in the optimization methods themselves,
-# not in the process_angle_parameters utility function which is designed for
-# scalar values only.
