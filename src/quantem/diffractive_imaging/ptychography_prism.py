@@ -123,9 +123,36 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
 
         return torch.cat(all_waves, dim=0)
 
+    def _propagate_plane_waves(self, wave_vectors, transmission):
+        """
+        Propagate PRISM plane waves through the object.
+
+        This is the core PRISM operation: instead of propagating probes at each
+        position, we propagate a compact set of plane waves once and reuse them.
+        """
+        sampling = self.sampling
+        gpts = transmission.shape[-2:]
+        extent = gpts * sampling
+
+        # Get plane waves from probe model on object FOV
+        waves = self.probe_model._prism_plane_waves(wave_vectors, extent, gpts)
+
+        # Multislice propagation
+        for s in range(self.num_slices):
+            # transmit
+            transmission_slice = transmission[s]
+            waves = waves * transmission_slice
+
+            # Propagate
+            if s < self.num_slices - 1:
+                waves = self._propagate_array(waves, self._propagators[s])
+
+        return waves
+
     def forward_operator(
         self,
         prism_coefs: torch.Tensor,
+        wave_vectors: torch.Tensor,
         patch_indices: torch.Tensor,
         max_batch_size: int | None = None,
     ) -> torch.Tensor:
@@ -145,31 +172,46 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
             Exit waves [num_probes, batch_size, roi_h, roi_w]
         """
 
-        # Extract patches from propagated plane waves
-        propagated_plane_waves = self._compute_propagated_plane_waves(max_batch_size)
+        # Get full object transmission functions
+        obj_array = self.obj_model.obj
+        if self.obj_model.obj_type == "potential":
+            transmission = torch.exp(1.0j * obj_array)
+        else:
+            transmission = obj_array
 
-        exit_waves = torch.tensordot(
-            prism_coefs,  # [num_probes, num_positions, num_waves]
-            propagated_plane_waves,  # [num_waves, obj_h, obj_w]
-            dims=((2,), (0,)),
-        )  # -> [num_probes, num_positions, obj_h, obj_w]
+        num_probes, num_positions, num_planewaves = prism_coefs.shape
+        obj_h, obj_w = transmission.shape[-2:]
+        roi_h, roi_w = self.roi_shape
 
-        num_probes, num_positions, obj_h, obj_w = exit_waves.shape
-        exit_flat = exit_waves.reshape(num_probes, num_positions, obj_h * obj_w)
-
+        exit_patches = torch.zeros(
+            (num_probes, num_positions, roi_h, roi_w),
+            dtype=torch.complex64,
+            device=self.device,
+        )
         patch_idx_expanded = patch_indices.unsqueeze(0).expand(num_probes, -1, -1, -1)
-        batch_idx = torch.arange(num_positions, device=exit_flat.device)
-        batch_idx = batch_idx[None, :, None, None].expand_as(patch_idx_expanded)
-
         patch_idx_flat = patch_idx_expanded.reshape(num_probes, num_positions, -1).to(torch.int64)
-        real_patches = torch.gather(exit_flat.real, 2, patch_idx_flat)
-        imag_patches = torch.gather(exit_flat.imag, 2, patch_idx_flat)
 
-        roi_h, roi_w = patch_indices.shape[-2:]
-        real_patches = real_patches.reshape(num_probes, num_positions, roi_h, roi_w)
-        imag_patches = imag_patches.reshape(num_probes, num_positions, roi_h, roi_w)
+        for start, end in generate_batches(num_planewaves, max_batch=max_batch_size):
+            # Extract patches from propagated plane waves
+            batch_wave_vectors = wave_vectors[start:end]
+            batch_coefs = prism_coefs[..., start:end]
+            propagated_plane_waves = self._propagate_plane_waves(batch_wave_vectors, transmission)
 
-        exit_patches = torch.complex(real_patches, imag_patches)
+            exit_waves = torch.tensordot(
+                batch_coefs,
+                propagated_plane_waves,
+                dims=((2,), (0,)),
+            )
+
+            exit_flat = exit_waves.reshape(num_probes, num_positions, obj_h * obj_w)
+
+            real_patches = torch.gather(exit_flat.real, 2, patch_idx_flat)
+            imag_patches = torch.gather(exit_flat.imag, 2, patch_idx_flat)
+
+            real_patches = real_patches.reshape(num_probes, num_positions, roi_h, roi_w)
+            imag_patches = imag_patches.reshape(num_probes, num_positions, roi_h, roi_w)
+
+            exit_patches = exit_patches + torch.complex(real_patches, imag_patches)
 
         return exit_patches
 
@@ -268,7 +310,10 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
             )
 
             prism_coefs = self.probe_model.forward(positions)
-            exit_waves = self.forward_operator(prism_coefs, patch_indices, self.batch_size)
+            wave_vectors = self.probe_model.wave_vectors
+            exit_waves = self.forward_operator(
+                prism_coefs, wave_vectors, patch_indices, self.batch_size
+            )
             pred_intensities = self.detector_model.forward(exit_waves)
 
             # Compute loss
