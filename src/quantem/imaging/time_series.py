@@ -1,4 +1,4 @@
-from typing import Any, Union
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -18,38 +18,38 @@ class TimeSeries(Dataset3d):
 
     def pad_images(
         self,
-        pad_width: Union[int, tuple[int, int], None],
-        pad_val: Union[str, int, None] = 0,
-        edge_blend: Union[int, tuple[int, int], None] = (8,8),
+        pad_width: int | tuple[int, int] | None,
+        pad_val: str | int | None = 0,
+        edge_blend: int | tuple[int, int] | None = (8,8),
         modify_in_place: bool = False,
-    ):
+    ) -> NDArray:
         """
-        Generating a padded and edge blended image stack.
+        Generate a padded and edge blended image stack.
 
         Parameters
         ----------
         pad_width: Union[int, tuple[int, int], None]
-            Amount of padding in x and y to apply to an image stack. Defaults to None
+            Amount of padding in x and y to apply to an image stack. Defaults to None.
         pad_val: [str, None] = 0
             Value for the padding background. If str with `mean`, `median`, `max`, or `min`, the padding value 
-            will be calculated. Defaults to 0
+            will be calculated. Defaults to 0.
         edge_blend: Union[int, tuple[int, int], None] = (8,8)
-            Amount of edge blending in x and y to apply to an image stack. Defaults in edge blending 8 in x and y
+            Amount of edge blending in x and y to apply to an image stack. Defaults in edge blending 8 in x and y.
         modify_in_place: bool = False
-            If True, modifies the dataset directly. Defaults to False, returns a new dataset
+            If True, modifies the dataset directly. Defaults to False, returns a new dataset.
         
         Returns
         -------
         stack_pad: NDArray
-            The padded image stack data (time, x, y)
+            The padded image stack data (time, x, y).
 
         Raises
         ------
         ValueError
-            If edge blending value is outside of allowable range
+            If edge blending value is outside of allowable range.
             
         """
-        # padding value dictionary 
+        # Padding value dictionary 
         agg_func = {
             'mean': np.mean,
             'median': np.median,
@@ -60,7 +60,7 @@ class TimeSeries(Dataset3d):
         if pad_val in agg_func:
             pad_val = agg_func[pad_val](self.array)
         
-        # padding values
+        # Padding values
         if pad_width is None:
             pad_width = np.zeros(2,dtype = 'int')
         else:
@@ -70,16 +70,16 @@ class TimeSeries(Dataset3d):
                     [pad_width,pad_width],
                 )
 
-        # apply padding
+        # Apply padding
         padded = self.pad(
             pad_width = ((0,0),(0,2 * pad_width[0]),(0,2 * pad_width[1])),
             modify_in_place = modify_in_place
         )
 
-        # initialize empty array
+        # Initialize empty array
         stack_pad = pad_val * np.ones(padded.shape)
 
-        # edge blend values
+        # Edge blend values
         if edge_blend is not None:
             edge_blend = np.array(edge_blend)
             
@@ -88,26 +88,26 @@ class TimeSeries(Dataset3d):
                     [edge_blend,edge_blend],
                 )
             
-            # create tukey window function for blending
+            # Create tukey window function for blending
             wx = tukey(self.shape[1],alpha=2*edge_blend[0]/self.shape[1])[None,:,None]
             wy = tukey(self.shape[2],alpha=2*edge_blend[1]/self.shape[2])[None,None,:]
             window = wx * wy
 
-            # combine tukey window and images
+            # Combine tukey window and images
             stack_pad[
                 :, 
                 pad_width[0]:stack_pad.shape[1]-pad_width[0], 
                 pad_width[1]:stack_pad.shape[2]-pad_width[1]] = \
                 self.array * window + pad_val * (1 - window)
         else:
-            # add image to stack
+            # Add image to stack
             stack_pad[
                 :, 
                 pad_width[0]:stack_pad.shape[1]-pad_width[0], 
                 pad_width[1]:stack_pad.shape[2]-pad_width[1]] = \
                 self.array 
 
-        # ensure edge blend values are within range
+        # Ensure edge blend values are within range
         if edge_blend[0] < 0 or edge_blend[0] > stack_pad.shape[1] / 2:
             if edge_blend[1] < 0 or edge_blend[1] > stack_pad.shape[2] / 2:
                 raise ValueError("edge_blend is outside of allowable range.")
@@ -115,37 +115,37 @@ class TimeSeries(Dataset3d):
         return stack_pad
         
     def align_images(
-        im_ref: [NDArray, Any],
-        im: [NDArray, Any],
+        im_ref: NDArray | Any,
+        im: NDArray | Any,
         return_aligned_image = True,
-        window_size: [int, None] = 7,            
-    ):
+        window_size: int | None = 7,            
+    ) -> NDArray: 
         """
-        Using 2D DFT cross correlation alignment on two images.
+        Use 2D DFT cross correlation alignment on two images.
 
         Parameters
         ----------
         im_ref: [NDArray, Any]
-            The first image to use as reference
+            First image to use as reference.
         im: [NDArray, Any]
-            The second image to shift with respect to the reference
+            Second image to shift with respect to the reference.
         return_aligned_image = True
-            If True, returns the shifted second image
+            If True, returns the shifted second image.
         window_size: [int, None] = 7
-            The size of the window around the subpixel position. If None, defaults to 7
+            Size of the window around the subpixel position. If None, defaults to 7.
 
         Returns
         -------
-        shift: NDArrray
+        shift: NDArray
             shifted coordinates (x,y) between two images
         im_shift: NDArray
             shifted image with respect to the shifted coordinates
         """
-        # take 2D DFT of an image (im) and the image before it as reference (im_ref)
+        # Take 2D DFT of an image (im) and the image before it as reference (im_ref)
         G_ref = np.fft.fft2(im_ref) 
-        G = np.fft.fft2(im) 
+        G_a0 = np.fft.fft2(im) 
         
-        im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G)))
+        im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G_a0)))
 
        # Index position of the maximum  
         nrows, ncols = im_corr.shape
@@ -155,7 +155,7 @@ class TimeSeries(Dataset3d):
         half = window_size // 2
 
         # Build periodic window
-        # padding of the extra pixels
+        # Padding of the extra pixels
         r_idx = np.mod(np.arange(peak_r - half, peak_r + half + 1), nrows)
         c_idx = np.mod(np.arange(peak_c - half, peak_c + half + 1), ncols)
         window = im_corr[np.ix_(r_idx, c_idx)]
@@ -172,7 +172,7 @@ class TimeSeries(Dataset3d):
             kx_shift = -2*np.pi*np.fft.fftfreq(im.shape[0])
             ky_shift = -2*np.pi*np.fft.fftfreq(im.shape[1])
             im_shift = np.real(np.fft.ifft2(
-                G * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
+                G_a0 * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
             ))
             return shift,im_shift
 
@@ -181,28 +181,28 @@ class TimeSeries(Dataset3d):
         
 
     def align_stack(
-        stack_pad: [NDArray, Any], 
-        window_size: [int, None] = 7,
-        running_average_frames: [float, int] = 20.0,
-    ):
+        stack_pad: NDArray | Any, 
+        window_size: int | None = 7,
+        running_average_frames: float | int = 20.0,
+    ) -> NDArray:
         """
-        Using 2D DFT cross correlation alignment on an entire image stack.
+        Use 2D DFT cross correlation alignment on an entire image stack.
 
         Parameters
         ----------
         stack_pad: [NDArray, Any]
-            The unaligned image stack data (time, x, y)
+            Unaligned image stack data (time, x, y).
         window_size: [int, None] = 7
-            The size of the window around the subpixel position. If None, defaults to 7
+            Size of the window around the subpixel position. If None, defaults to 7.
         running_average_frames: [float, int] = 20.0
-            The maximum number of images for the running average applied to the reference. If None, default is 20  
+            Maximum number of images for the running average applied to the reference. If None, default is 20  .
         
         Returns
         -------
         stack_aligned: NDArray
-            The aligned image stack data (time, x, y)
+            Aligned image stack data (time, x, y).
         dxy: NDArray
-            shifted coordinate (x, y) for all images
+            Shifted coordinates (x, y) for all images.
         """
         # Initializing aligned stack and shifts
         nframes, nx, ny = stack_pad.shape
@@ -223,8 +223,8 @@ class TimeSeries(Dataset3d):
         nrows, ncols = nx, ny
 
         for a0 in range(1, nframes):
-            G = G_all[a0]
-            im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G)))
+            G_a0 = G_all[a0]
+            im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G_a0)))
 
             # Get subpixel position
             peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
@@ -245,11 +245,11 @@ class TimeSeries(Dataset3d):
 
             # Apply shift
             phase = np.exp(1j * (kx_shift[:, None] * shift[0] + ky_shift[None, :] * shift[1]))
-            im_shift = np.real(np.fft.ifft2(G * phase))
+            im_shift = np.real(np.fft.ifft2(G_a0 * phase))
             stack_aligned[a0] = im_shift
 
             # Updating reference using running average
             weight = max(1 / (a0 + 1), 1 / running_average_frames)
-            G_ref = G_ref * (1 - weight) + G * phase * weight
+            G_ref = G_ref * (1 - weight) + G_a0 * phase * weight
 
         return stack_aligned, dxy
