@@ -130,7 +130,7 @@ class Lattice(AutoSerialize):
         u,
         v,
         refine_lattice: bool = True,
-        block_size: int = -1,
+        block_size: int | None = None,
         plot_lattice: bool = True,
         bound_num_vectors: int | None = None,
         refine_maxiter: int = 200,
@@ -154,11 +154,11 @@ class Lattice(AutoSerialize):
             Enter as (row, col) as a numpy array, list, or tuple.
         refine_lattice : bool, default=True
             If True, refines the values of r0, u, and v by maximizing the bilinear intensity sum.
-        block_size : int, default=-1
+        block_size : int | None , default=None
             Fit the lattice points in steps of block_size * lattice_vectors(u, v).
             For example, if block_size = 5, then the lattice points will be fit in steps of
             (-5, 5)u * (-5, 5)v -> (-10, 10)u * (-10, 10)v -> ...
-            block_size = -1 means the entire image will be fit at once.
+            block_size = None means the entire image will be fit at once.
         plot_lattice : bool, default=True
             If True, the lattice vectors and lines will be plotted overlaid on the image.
         bound_num_vectors : int | None, default=None
@@ -192,6 +192,8 @@ class Lattice(AutoSerialize):
         if refine_lattice:
             from scipy.optimize import minimize
 
+            assert block_size is None or block_size > 0, "block_size must be positive or None."
+
             H, W = self._image.shape  # rows (x), cols (y)
             im = np.asarray(self._image.array, dtype=float)
             r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)  # (x, y)
@@ -214,9 +216,14 @@ class Lattice(AutoSerialize):
             b_min, b_max = int(np.floor(ab[1].min())), int(np.ceil(ab[1].max()))
 
             max_ind = max(abs(a_min), a_max, abs(b_min), b_max)
-            steps = (
-                [*np.arange(0, max_ind + 1, block_size)[1:], max_ind] if max_ind > 0 else [max_ind]
-            )
+            if not block_size:
+                steps = [max_ind]
+            else:
+                steps = (
+                    [*np.arange(0, max_ind + 1, block_size)[1:], max_ind]
+                    if max_ind > 0
+                    else [max_ind]
+                )
 
             PENALTY = 1e10
             H_CLIP = H - 2
@@ -1388,7 +1395,7 @@ class Lattice(AutoSerialize):
         polarization_vectors: Vector,
         num_phases: int = 2,
         phase_polarization_peak_array: NDArray | None = None,
-        fix_polarization_peaks: bool = False,
+        refine_means: bool = True,
         plot_order_parameter: bool = True,
         plot_gmm_visualization: bool = True,
         torch_device: str = "cpu",
@@ -1424,12 +1431,12 @@ class Lattice(AutoSerialize):
             - phase_polarization_peak_array: NDArray | None, default=None
             Optional array of shape (num_phases, 2) specifying phase centers (means)
             in (da, db) space:
-                - If fix_polarization_peaks=False, these values initialize the GMM means.
-                - If fix_polarization_peaks=True, the means are held fixed during fitting
+                - If refine_means = True, these values initialize the GMM means.
+                - If refine_means = False, the means are held fixed during fitting
                     and only covariances and weights are updated.
 
-            - fix_polarization_peaks: bool, default=False
-            If True, requires phase_polarization_peak_array to be provided with shape
+            - refine_means: bool, default=True
+            If False, requires phase_polarization_peak_array to be provided with shape
             (num_phases, 2). The GMM means are fixed to these values throughout EM.
 
             - plot_order_parameter: bool, default=True
@@ -1504,7 +1511,7 @@ class Lattice(AutoSerialize):
             If phase_polarization_peak_array is provided with incorrect shape
             (must be (num_phases, 2)).
             - ValueError:
-            If fix_polarization_peaks=True and phase_polarization_peak_array is None.
+            If refine_means=False and phase_polarization_peak_array is None.
             - AttributeError:
             If plot_order_parameter=True but self._image or self._image.array is missing.
             - ImportError:
@@ -1528,7 +1535,7 @@ class Lattice(AutoSerialize):
                 polarization_vectors,
                 num_phases=2,
                 phase_polarization_peak_array=peaks,
-                fix_polarization_peaks=True
+                refine_means=True
             )
 
             - Run on GPU (if available):
@@ -1692,7 +1699,7 @@ class Lattice(AutoSerialize):
                 raise ValueError(
                     f"phase_polarization_peak_array should have dimensions ({num_phases}, 2). You have input : {phase_polarization_peak_array.shape}"
                 )
-            if fix_polarization_peaks:
+            if not refine_means:
                 gmm = FixedMeansGMM(
                     covariance_type="full",
                     fixed_means=phase_polarization_peak_array,
@@ -1732,7 +1739,7 @@ class Lattice(AutoSerialize):
             from matplotlib.ticker import FuncFormatter
 
             # Define preset colors based on num_phases
-            preset_contour_cmap = "gray"
+            preset_contour_cmap = "gray_r"
             if num_phases == 2:
                 preset_gmm_center_colour = "lime"
                 preset_gmm_ellipse_colour = "lime"
