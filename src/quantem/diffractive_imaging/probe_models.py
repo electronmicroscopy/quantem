@@ -509,7 +509,8 @@ class ProbePixelated(ProbeConstraints):
         else:
             num_probes = 1 if num_probes is None else num_probes
             probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
-            probe_array = torch.tile(probe_array, (num_probes, 1, 1))
+            # probe_array = torch.tile(probe_array, (num_probes, 1, 1))
+            probe_array = torch.cat([probe_array] * num_probes, dim=0)
 
         probe_model = cls(
             num_probes=num_probes,
@@ -644,7 +645,8 @@ class ProbePixelated(ProbeConstraints):
         if probes.ndim != 3:
             probes = probes[None]
         if probes.shape[0] != self.num_probes:
-            probes = torch.tile(probes, (self.num_probes, 1, 1))
+            # probes = torch.tile(probes, (self.num_probes, 1, 1))
+            probes = torch.cat([probes] * self.num_probes, dim=0)
 
         probes = self._apply_random_phase_shifts(probes)
         probes = self._apply_weights(probes)
@@ -1429,7 +1431,8 @@ class ProbePRISM(ProbeBase):
         """
 
         # handle list of aberrations or defocus
-        coefs = self._extract_aberration_coefs(probe_params.copy())
+        params = probe_params.copy()
+        coefs = self._extract_aberration_coefs(params)
 
         if num_probes is None:
             num_probes = len(coefs)
@@ -1440,7 +1443,7 @@ class ProbePRISM(ProbeBase):
 
         super().__init__(
             num_probes=num_probes,
-            probe_params=probe_params,
+            probe_params=params,
             roi_shape=roi_shape,
             device=device,
             rng=rng,

@@ -1,3 +1,4 @@
+import gc
 from typing import Literal, Self
 
 import numpy as np
@@ -81,47 +82,6 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
             rng=rng,
             _token=cls._token,
         )
-
-    def _compute_propagated_plane_waves(self, max_batch_size):
-        """
-        Propagate PRISM plane waves through the object.
-
-        This is the core PRISM operation: instead of propagating probes at each
-        position, we propagate a compact set of plane waves once and reuse them.
-        """
-        sampling = self.sampling
-        gpts = self.obj_shape_full[-2:]
-        extent = gpts * sampling
-
-        # Get plane waves from probe model on object FOV
-        plane_waves = self.probe_model._prism_plane_waves(
-            self.probe_model.wave_vectors, extent, gpts
-        )
-
-        # Get full object transmission functions
-        obj_array = self.obj_model.obj
-        if self.obj_model.obj_type == "potential":
-            transmission = torch.exp(1.0j * obj_array)
-        else:
-            transmission = obj_array
-
-        all_waves = []
-        for start, end in generate_batches(plane_waves.shape[0], max_batch=max_batch_size):
-            waves = plane_waves[start:end]
-
-            # Multislice propagation
-            for s in range(self.num_slices):
-                # transmit
-                transmission_slice = transmission[s]
-                waves = waves * transmission_slice
-
-                # Propagate
-                if s < self.num_slices - 1:
-                    waves = self._propagate_array(waves, self._propagators[s])
-
-            all_waves.append(waves)
-
-        return torch.cat(all_waves, dim=0)
 
     def _propagate_plane_waves(self, wave_vectors, transmission):
         """
@@ -356,7 +316,13 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
 
             pbar.set_description(f"Epoch {epoch + 1}/{num_iter}, Loss: {epoch_loss:.3e}")
 
+        # memory management
+        gc.collect()
         torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        gc.collect()
+
         return self
 
     def _get_current_lrs(self) -> dict[str, float]:
