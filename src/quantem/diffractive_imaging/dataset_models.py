@@ -1,141 +1,115 @@
 from abc import abstractmethod
+from pathlib import Path
 from typing import Any, Literal, Self
-from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from numpy.typing import NDArray
 
 from quantem.core import config
+from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.utils import electron_wavelength_angstrom, tqdmnd
 from quantem.core.utils.validators import (
     validate_array,
-    validate_float,
     validate_gt,
     validate_int,
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
+from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import AffineTransform, fit_origin, shift_array
 
+"""
+Dataset models for ptychographic reconstruction.
+"""
 
-class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
+
+class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     _token = object()
     _patch_indices: torch.Tensor
 
+    # TODO update optimizers and such to allow for different lrs for different parameters
+    DEFAULT_LRS = {
+        "descan": 1e-3,
+        "scan_positions": 1e-3,
+    }
+
     def __init__(
         self,
-        dset: Dataset4dstem,
+        dset: Dataset3d,
         verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
         _token: object | None = None,
     ):
+        AutoSerialize.__init__(self)
+        OptimizerMixin.__init__(self)
         torch.nn.Module.__init__(self)
-        if not isinstance(dset, Dataset4dstem):
-            raise TypeError(f"Expected a Dataset4dstem instance, got {type(dset)}")
+
+        if _token is not self._token:
+            raise RuntimeError("Use PtychographyDatasetRaster.from_* to instantiate this class.")
+
         if dset.units[-1] != "A^-1":
             if dset.units[-1] == "mrad":
                 pass
-                # raise NotImplementedError(
-                #     "The Dataset4dstem must have diffraction units of A^-1, "
-                #     + "but these are in mrad\n Converting from mrad -> A^-1 requires the probe energy,"
-                #     + " so we could either require conversion in advance or accept the energy here?\n"
-                #     + "if energy is hidden in metadata, we could potentially convert on dataset init"
-                # )
             else:
                 raise ValueError(f"Expected diffraction units to be 'A^-1', got {dset.units[-1]}")
+
         self.dset = dset
         self.verbose = verbose
-        self._descan_shifts = nn.Parameter(torch.zeros(self.num_gpts, 2))
-        self._scan_positions_px = nn.Parameter(torch.zeros(self.num_gpts, 2))
-        self.register_buffer("_initial_descan_shifts", self._descan_shifts.clone())
-        self.register_buffer("_initial_scan_positions_px", self._scan_positions_px.clone())
-        self.register_buffer("_intensities", torch.zeros(self.num_gpts, *self.roi_shape))
-        self.register_buffer("_centered_intensities", torch.zeros(self.num_gpts, *self.roi_shape))
-        self.register_buffer("_amplitudes", torch.zeros(self.num_gpts, *self.roi_shape))
-        self.register_buffer("_centered_amplitudes", torch.zeros(self.num_gpts, *self.roi_shape))
+        self._preprocessed = False
+        self._preprocessing_params = {}  # for serialization and reloading
+
+        # scan_positions_px: [num_positions, 2] in pixels
+        self._scan_positions_px = nn.Parameter(
+            torch.zeros((self.num_gpts, 2), dtype=getattr(torch, config.get("dtype_real"))),
+            requires_grad=learn_scan_positions,
+        )
+        self.learn_scan_positions = learn_scan_positions
+
+        # descan_shifts: [self.num_gpts, 2] descan shifts in pixels
+        self._descan_shifts = nn.Parameter(
+            torch.zeros((self.num_gpts, 2), dtype=getattr(torch, config.get("dtype_real"))),
+            requires_grad=learn_descan,
+        )
+        self.learn_descan = learn_descan
+
+        # Store initial values for reset
+        self._initial_scan_positions_px = torch.zeros_like(self._scan_positions_px)
+        self._initial_descan_shifts = torch.zeros_like(self._descan_shifts)
+
+        self.register_buffer("_targets", torch.zeros(self.num_gpts, *self.roi_shape))
         self.register_buffer(
             "_patch_indices", torch.zeros(self.num_gpts, *self.roi_shape, dtype=torch.int64)
         )
         self.register_buffer("_last_patch_positions_px", torch.zeros(self.num_gpts, 2))
         self._constraints = {}
         self._probe_energy = None
-        self._preprocessed = False
 
-    @classmethod
-    def from_file(cls, file_path: str, file_type: str, verbose: int | bool = 1) -> Self:
-        """
-        Create a new Dataset4dstem from a file.
+    def get_optimization_parameters(self):
+        """Get the combined descan and scan position parameters for optimization."""
+        params = []
+        if self.learn_descan:
+            params.append(self._descan_shifts)
+        if self.learn_scan_positions:
+            params.append(self._scan_positions_px)
+        if len(params) == 0:
+            raise RuntimeError(
+                "No parameters to optimize for dataset: learn_descan and learn_scan_positions are both False"
+            )
+        return params
 
-        Parameters
-        ----------
-        file_path : str
-            Path to the data file
-        file_type : str
-            The type of file reader needed. See rosettasciio for supported formats
-            https://hyperspy.org/rosettasciio/supported_formats/index.html
-
-        Returns
-        -------
-        Dataset4dstem
-            A new Dataset4dstem instance loaded from the file
-        """
-        # Import here to avoid circular imports
-        from quantem.core.io.file_readers import read_4dstem
-
-        dset = read_4dstem(file_path, file_type)
-        return cls(dset=dset, verbose=verbose, _token=cls._token)
-
-    @classmethod
-    def from_dataset(cls, dset: Dataset4dstem, verbose: int | bool = 1) -> Self:
-        return cls(dset=dset, verbose=verbose, _token=cls._token)
-
-    @classmethod
-    def from_array(
-        cls,
-        array: NDArray | Any,
-        name: str | None = None,
-        origin: NDArray | tuple | list | float | int | None = None,
-        sampling: NDArray | tuple | list | float | int | None = None,
-        units: list[str] | tuple | list | None = None,
-        signal_units: str = "arb. units",
-        verbose: int | bool = 1,
-    ) -> Self:
-        """
-        Create a new Dataset4dstem from an array.
-
-        Parameters
-        ----------
-        array : NDArray | Any
-            The underlying 4D array data
-        name : str | None, optional
-            A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
-        origin : NDArray | tuple | list | float | int | None, optional
-            The origin coordinates for each dimension. If None, defaults to zeros
-        sampling : NDArray | tuple | list | float | int | None, optional
-            The sampling rate/spacing for each dimension. If None, defaults to ones
-        units : list[str] | tuple | list | None, optional
-            Units for each dimension. If None, defaults to ["pixels"] * 4
-        signal_units : str, optional
-            Units for the array values, by default "arb. units"
-
-        Returns
-        -------
-        Dataset4dstem
-            A new Dataset4dstem instance
-        """
-        dset = Dataset4dstem.from_array(
-            array=array,
-            name=name if name is not None else "4D-STEM dataset",
-            origin=origin if origin is not None else np.zeros(4),
-            sampling=sampling if sampling is not None else np.ones(4),
-            units=units if units is not None else ["pixels"] * 4,
-            signal_units=signal_units,
-        )
-        return cls.from_dataset(dset=dset, verbose=verbose)
+    def to(self, *args, **kwargs):
+        """Move all relevant tensors to a different device."""
+        # Call parent's to() method to handle PyTorch's internal device management
+        super().to(*args, **kwargs)
+        # Reconnect optimizer to parameters on the new device
+        self.reconnect_optimizer_to_parameters()
+        return self
 
     # region --- optimizable parameters ---
     @property
@@ -147,11 +121,18 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         shifts = validate_tensor(
             shifts,
             name="descan_shifts",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), 2),
+            dtype=getattr(torch, config.get("dtype_real")),
+            shape=(self.num_gpts, 2),
         )
-        with torch.no_grad():
-            self._descan_shifts.copy_(shifts)
+        self._descan_shifts.data = shifts.to(self.device)
+
+    @property
+    def learn_descan(self) -> bool:
+        return self._learn_descan
+
+    @learn_descan.setter
+    def learn_descan(self, learn_descan: bool) -> None:
+        self._learn_descan = bool(learn_descan)
 
     @property
     def scan_positions_px(self) -> nn.Parameter:
@@ -162,14 +143,22 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         positions = validate_tensor(
             positions,
             name="scan_positions_px",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), 2),
+            dtype=getattr(torch, config.get("dtype_real")),
+            shape=(self.num_gpts, 2),
         )
-        with torch.no_grad():
-            self._scan_positions_px.copy_(positions)
+        self._scan_positions_px.data = positions.to(self.device)
 
     @property
-    def positions_px_fractional(self) -> torch.Tensor:  # TODO remove temp
+    def learn_scan_positions(self) -> bool:
+        return self._learn_scan_positions
+
+    @learn_scan_positions.setter
+    def learn_scan_positions(self, learn_scan_positions: bool) -> None:
+        self._learn_scan_positions = bool(learn_scan_positions)
+
+    @property
+    def positions_px_fractional(self) -> torch.Tensor:
+        """fractional component of positions_px_fractional"""
         return self.scan_positions_px - torch.round(self.scan_positions_px)
 
     # endregion --- optimizable parameters ---
@@ -185,8 +174,8 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         shifts = validate_tensor(
             shifts,
             name="initial_descan_shifts",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), 2),
+            dtype=getattr(torch, config.get("dtype_real")),
+            shape=(self.num_gpts, 2),
         )
         self._initial_descan_shifts = shifts
 
@@ -200,10 +189,52 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         positions = validate_tensor(
             positions,
             name="initial_scan_positions_px",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), 2),
+            dtype=getattr(torch, config.get("dtype_real")),
+            shape=(self.num_gpts, 2),
         )
         self._initial_scan_positions_px = positions
+
+    @property
+    def targets(self) -> torch.Tensor:
+        if not self._preprocessed:
+            raise ValueError("dset must be preprocessed before targets can be accessed")
+        return self._targets
+
+    def _set_targets(
+        self,
+        loss_type: Literal[
+            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
+        ],
+    ):
+        if "amplitude" in loss_type:
+            if self.learn_descan and self.has_optimizer():
+                self._targets = self.amplitudes.clone().to(self.device)
+            else:
+                self._targets = self.centered_amplitudes.clone().to(self.device)
+        elif "intensity" in loss_type or loss_type == "poisson":
+            if self.learn_descan and self.has_optimizer():
+                self._targets = self.intensities.clone().to(self.device)
+            else:
+                self._targets = self.centered_intensities.clone().to(self.device)
+        else:
+            raise ValueError(f"Unknown loss type {loss_type}")
+
+    @property
+    def patch_indices(self) -> torch.Tensor:
+        return self._patch_indices
+
+    # endregion --- buffers ---
+
+    # region --- explicit properties (have setters) ---
+    @property
+    def dset(self) -> Dataset3d:
+        return self._dset
+
+    @dset.setter
+    def dset(self, new_dset: Dataset3d):
+        # if not isinstance(new_dset, Dataset3d): # TODO put back
+        #     raise TypeError(f"dset should be a Dataset3d, got {type(new_dset)}")
+        self._dset = new_dset.copy()
 
     @property
     def centered_amplitudes(self) -> torch.Tensor:
@@ -217,8 +248,9 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         arr = validate_tensor(
             arr,
             name="centered_amplitudes",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), *self.roi_shape),
+            dtype=getattr(torch, config.get("dtype_real")),
+            ndim=3,
+            shape=(self.num_gpts, *self.roi_shape),
         )
         self._centered_amplitudes = arr
 
@@ -232,8 +264,9 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         arr = validate_tensor(
             arr,
             name="amplitudes",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), *self.roi_shape),
+            dtype=getattr(torch, config.get("dtype_real")),
+            ndim=3,
+            shape=(self.num_gpts, *self.roi_shape),
         )
         self._amplitudes = arr
 
@@ -249,8 +282,9 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         arr = validate_tensor(
             arr,
             name="centered_intensities",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), *self.roi_shape),
+            dtype=getattr(torch, config.get("dtype_real")),
+            ndim=3,
+            shape=(self.num_gpts, *self.roi_shape),
         )
         self._centered_intensities = arr
 
@@ -264,18 +298,12 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         arr = validate_tensor(
             arr,
             name="intensities",
-            dtype=config.get("dtype_real"),
-            shape=(np.prod(self.gpts), *self.roi_shape),
+            dtype=getattr(torch, config.get("dtype_real")),
+            ndim=3,
+            shape=(self.num_gpts, *self.roi_shape),
         )
         self._intensities = arr
 
-    @property
-    def patch_indices(self) -> torch.Tensor:
-        return self._patch_indices
-
-    # endregion --- buffers ---
-
-    # region --- explicit properties (have setters) ---
     @property
     def verbose(self) -> int:
         return self._verbose
@@ -285,23 +313,13 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         self._verbose = validate_int(validate_gt(v, -1, "verbose"), "verbose")
 
     @property
-    def dset(self) -> Dataset4dstem:
-        return self._dset
-
-    @dset.setter
-    def dset(self, new_dset: Dataset4dstem):
-        if not isinstance(new_dset, Dataset4dstem):
-            raise TypeError(f"dset should be a Dataset4dstem, got {type(new_dset)}")
-        self._dset = new_dset.copy()
-
-    @property
     def mean_diffraction_intensity(self) -> float:
         return self._mean_diffraction_intensity
 
     @mean_diffraction_intensity.setter
     def mean_diffraction_intensity(self, value: float) -> None:
         n = "mean_diffraction_intensity"
-        self._mean_diffraction_intensity = validate_float(validate_gt(value, 0, n), n)
+        self._mean_diffraction_intensity = validate_gt(value, 0, n)
 
     @property
     def com_transpose(self) -> bool:
@@ -331,36 +349,6 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         self._diffraction_padding = pad
 
     @property
-    def com_measured(self) -> np.ndarray:
-        """Measured center of mass in pixels"""
-        return self._com_measured
-
-    @com_measured.setter
-    def com_measured(self, com: np.ndarray | tuple) -> None:
-        com = validate_array(
-            com, name="com_measured", shape=(2, *self.gpts), dtype=config.get("dtype_real")
-        )
-        self._com_measured = com
-
-    @property
-    def com_fit(self) -> np.ndarray:
-        """fit center of mass in pixels"""
-        return self._com_fit
-
-    @com_fit.setter
-    def com_fit(self, com: np.ndarray | tuple) -> None:
-        com = validate_array(
-            com, name="com_fit", shape=(2, *self.gpts), dtype=config.get("dtype_real")
-        )
-        self._com_fit = com
-
-    @property
-    def com_normalized(self) -> np.ndarray:
-        """normalized center of mass: (measured - fitted) * reciprocal_sampling"""
-        difs = np.nan_to_num(self.com_measured - self.com_fit)
-        return difs * self.reciprocal_sampling[:, None, None]
-
-    @property
     def probe_energy(self) -> float | None:
         """Probe energy in eV, if known"""
         return self._probe_energy
@@ -370,7 +358,7 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         if energy is None:
             self._probe_energy = None
         else:
-            self._probe_energy = validate_float(energy, "probe_energy")
+            self._probe_energy = validate_gt(energy, 0, "probe_energy")
 
     # endregion --- explicit properties (have setters) ---
 
@@ -384,34 +372,26 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         return self._preprocessed
 
     @property
-    def roi_shape(self) -> np.ndarray:
-        return np.array(self.dset.shape[2:])
+    def shape(self) -> np.ndarray:
+        return np.array(self.dset.shape)
 
     @property
-    def gpts(self) -> np.ndarray:
-        return np.array(self.dset.shape[:2])
+    def roi_shape(self) -> np.ndarray:
+        return np.array(self.dset.shape[-2:])
 
     @property
     def num_gpts(self) -> int:
-        return int(np.prod(self.gpts))
-
-    @property
-    def scan_sampling(self) -> np.ndarray:
-        return self.dset.sampling[:2]
-
-    @property
-    def scan_units(self) -> list[str]:
-        return self.dset.units[:2]
+        return int(self.dset.shape[0])
 
     @property
     def detector_sampling(self) -> np.ndarray:
         """Detector sampling in reciprocal space. Units of A^-1"""
-        return self.dset.sampling[2:]
+        return self.dset.sampling[-2:]
 
     @property
     def detector_units(self) -> list[str]:
         """Detector units in reciprocal space"""
-        return self.dset.units[2:]
+        return self.dset.units[-2:]
 
     @property
     def obj_sampling(self) -> np.ndarray:
@@ -419,24 +399,19 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         return 1 / (self.roi_shape * self.reciprocal_sampling)
 
     @property
-    def fov(self) -> np.ndarray:
-        """Field of view in real space. Units of self.scan_units"""
-        return self.scan_sampling * (self.gpts - 1)
-
-    @property
     def reciprocal_sampling(self) -> np.ndarray:
         """
         Units A^-1 or raises error
         """
-        sampling = self.dset.sampling[2:]
-        units = self.dset.units[2:]
+        sampling = self.detector_sampling
+        units = self.detector_units
         if units[0] == "A^-1":
             pass
         elif units[0] == "mrad":
             if self.probe_energy is None:
                 raise ValueError(
                     "dset Q units given in mrad but no probe energy defined to "
-                    + "convert to A^-1. Please set probe_energy in preprocess()"
+                    + "convert to A^-1. Please set probe_energy in preprocess() or convert to A^-1"
                 )
             sampling = sampling / electron_wavelength_angstrom(self.probe_energy) / 1e3
         elif units[0] == "pixels":
@@ -458,7 +433,8 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         shp = shp.astype("int")
         return shp
 
-    def _obj_shape_full_2d(self, obj_padding_px: np.ndarray | tuple = (0, 0)) -> np.ndarray:
+    @property
+    def _obj_shape_rot_2d(self) -> np.ndarray:
         cshape = self._obj_shape_crop_2d.copy()
         rotshape = np.floor(
             [
@@ -469,8 +445,12 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
             ]
         )
         rotshape += rotshape % 2
-        rotshape += 2 * np.array(obj_padding_px)
         return rotshape.astype("int")
+
+    def _obj_shape_full_2d(self, obj_padding_px: np.ndarray | tuple) -> np.ndarray:
+        rshape = self._obj_shape_rot_2d.copy()
+        p = 2 * np.array(obj_padding_px)
+        return (rshape + p).astype("int")
 
     # endregion --- implicit properties (no setters) ---
 
@@ -480,7 +460,6 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
         self,
         batch_indices: np.ndarray | torch.Tensor,
         obj_padding_px: np.ndarray | tuple,
-        return_descan: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Forward pass to compute the diffraction intensities from the object and scan positions."""
         # return patch_indices, positions_px, positions_px_fractional
@@ -518,96 +497,358 @@ class PtychographyDatasetBase(AutoSerialize, torch.nn.Module):
 
         x_ind = torch.fft.fftfreq(self.roi_shape[0], d=1 / self.roi_shape[0]).to(self.device)
         y_ind = torch.fft.fftfreq(self.roi_shape[1], d=1 / self.roi_shape[1]).to(self.device)
-        row = (r0[:, None, None] + x_ind[None, :, None]) % obj_shape[-2]
-        col = (c0[:, None, None] + y_ind[None, None, :]) % obj_shape[-1]
 
-        self._patch_indices = (row * obj_shape[-1] + col).type(torch.int32)
+        # Process positions in chunks to reduce memory usage
+        chunk_size = min(1000, len(r0))
+        patch_indices_list = []
+
+        for i in range(0, len(r0), chunk_size):
+            end_idx = min(i + chunk_size, len(r0))
+            r0_chunk = r0[i:end_idx]
+            c0_chunk = c0[i:end_idx]
+
+            row_chunk = (r0_chunk[:, None, None] + x_ind[None, :, None]) % obj_shape[-2]
+            col_chunk = (c0_chunk[:, None, None] + y_ind[None, None, :]) % obj_shape[-1]
+
+            patch_indices_chunk = (row_chunk * obj_shape[-1] + col_chunk).type(torch.int32)
+            patch_indices_list.append(patch_indices_chunk)
+
+        self._patch_indices = torch.cat(patch_indices_list, dim=0)
         self._last_patch_positions_px = self.scan_positions_px.clone()
 
     def patch_indices_need_update(self) -> bool:
         """
         Returns True if scan_positions_px has changed enough to require updating patch indices.
         """
-        if not hasattr(self, "_last_patch_positions_px"):
-            return True
-
         old_pos = torch.round(self._last_patch_positions_px)
         new_pos = torch.round(self.scan_positions_px)
-        return not torch.equal(old_pos, new_pos)  # TODO test this
+        return not torch.equal(old_pos, new_pos)
 
     def reset(self) -> None:
-        self.descan_shifts = self.initial_descan_shifts.clone()
-        self.scan_positions_px = self.initial_scan_positions_px.clone()
+        self.descan_shifts = self.initial_descan_shifts.clone().to(self.device)
+        self.scan_positions_px = self.initial_scan_positions_px.clone().to(self.device)
 
     # endregion --- class methods ---
 
 
-class DatasetConstraints(PtychographyDatasetBase):
+class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
     DEFAULT_CONSTRAINTS = {
         "descan_tv_weight": 0.0,
         "descan_shifts_constant": False,
+        "center_scan_positions": False,
+        "clip_scan_positions": True,
     }
 
-    @property
-    def constraints(self) -> dict[str, Any]:
-        return self._constraints
+    def apply_soft_constraints(self, descan_shifts: torch.Tensor) -> torch.Tensor:
+        self.reset_soft_constraint_losses()
+        loss = self._get_zero_loss_tensor()
 
-    @constraints.setter
-    def constraints(self, c: dict[str, Any]):
-        gkeys = self.DEFAULT_CONSTRAINTS.keys()
-        for key, value in c.items():
-            if key not in gkeys:
-                raise KeyError(f"Invalid dataset constraint key '{key}', allowed keys are {gkeys}")
-            self._constraints[key] = value
+        if (
+            self.constraints.get("descan_tv_weight", 0) > 0
+            and self.learn_descan
+            and self.has_optimizer()
+        ):
+            tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints["descan_tv_weight"])
+            loss = loss + tv_loss
+            self.add_soft_constraint_loss("descan_tv_weight", tv_loss)
 
-    def add_constraint(self, key: str, value: Any):
-        """Add a constraint to the object model."""
-        gkeys = self.DEFAULT_CONSTRAINTS.keys()
-        if key not in gkeys:
-            raise KeyError(f"Invalid dataset constraint key '{key}', allowed keys are {gkeys}")
-        self._constraints[key] = value
+        self.accumulate_constraint_losses()
+        return loss
+
+    def get_descan_tv_loss(self, descan_shifts: torch.Tensor, weight: float = 0.0) -> torch.Tensor:
+        loss = torch.tensor(0, device=self.device, dtype=getattr(torch, config.get("dtype_real")))
+        if weight == 0:
+            return loss
+
+        x_loss = torch.mean(torch.abs(descan_shifts[:, 0].diff()))
+        y_loss = torch.mean(torch.abs(descan_shifts[:, 1].diff()))
+        return weight * (x_loss + y_loss) / 2
 
     def apply_descan_constraints(
         self,
         descan: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Apply constraints to the object model.
-        """
         if self.constraints["descan_shifts_constant"]:
-            new_descan = torch.ones_like(descan) * descan.mean(dim=0, keepdim=True)
-        else:
-            new_descan = descan
+            descan = torch.zeros_like(descan)
+        return descan
 
-        return new_descan
+    def apply_hard_constraints(self, obj_padding_px: np.ndarray | tuple) -> None:
+        # could clip positions here if needed
+        positions = self.scan_positions_px
+        obj_shape = torch.tensor(self._obj_shape_full_2d(obj_padding_px), device=positions.device)
+        if self.constraints.get(
+            "clip_scan_positions", self.DEFAULT_CONSTRAINTS["clip_scan_positions"]
+        ):
+            positions = torch.clamp(positions, min=torch.zeros_like(obj_shape), max=obj_shape - 1)
 
-    def apply_position_constraints(self, positions: torch.Tensor) -> torch.Tensor:
-        """
-        Apply constraints to the scan positions.
-        """
-        # Currently no position constraints
-        return positions
+        if self.constraints.get(
+            "center_scan_positions", self.DEFAULT_CONSTRAINTS["center_scan_positions"]
+        ):
+            # shift all positions uniformly so that the mean position is at the center of the object
+            positions = positions - positions.mean(dim=0, keepdim=True)
+            positions = positions + obj_shape / 2
+
+        self.scan_positions_px = positions
 
 
-class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
-    def forward(
+class PtychographyDatasetRaster(DatasetConstraints):
+    """
+    Currently calling this DatasetRaster because it only handles 4DSTEM datasets.
+    This top-level class has methods for: forward, preprocess, and _set_initial_scan_positions_px
+    along with classmethods for creating from 4DSTEM datasets and files.
+
+    As to whether this should be expanded vs making other top level classes, I see it coming
+    down to preprocessing, and how much is shared between the different dataset types. I don't
+    know what the usecases will be, and i'm happy for all this to be heavily refactored. -ARCM
+    """
+
+    def __init__(
         self,
-        batch_indices: np.ndarray | torch.Tensor,
-        obj_padding_px: np.ndarray | tuple,
-        return_descan: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Forward pass to compute the diffraction intensities from the object and scan positions."""
-        positions_px = self.apply_position_constraints(self.scan_positions_px)[batch_indices]
-        positions_px_fractional = positions_px - torch.round(positions_px)
-        with torch.no_grad():
-            if self.patch_indices_need_update():
-                self._set_patch_indices(obj_padding_px)
-        patch_indices = self.patch_indices[batch_indices]
-        if return_descan:
-            descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
-        else:
-            descan_shifts = None
-        return patch_indices, positions_px, positions_px_fractional, descan_shifts
+        dset: Dataset4dstem,
+        verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
+        _token: object | None = None,
+    ):
+        self.scan_sampling = dset.sampling[:2]
+        self.scan_units = dset.units[:2]
+        self.gpts = dset.shape[:2]
+        self.intensities_4d = dset.array.copy()
+
+        # convert to dataset3d
+        shp = dset.array.shape
+        dset3d = Dataset3d.from_array(
+            array=dset.array.reshape((shp[0] * shp[1], shp[2], shp[3])),
+            name=dset.name,
+            origin=[0, *dset.origin[2:]],
+            sampling=[0, *dset.sampling[2:]],
+            units=["pix", *dset.units[2:]],
+        )
+        p = Path(dset.file_path).expanduser().resolve() if dset.file_path is not None else None
+        dset3d.file_path = p  # any other attributes to transfer?
+
+        super().__init__(
+            dset=dset3d,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+            _token=_token,
+        )
+
+    # region --- classmethods ---
+    @classmethod
+    def from_dataset4dstem(
+        cls,
+        dset: Dataset4dstem,
+        verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
+    ) -> Self:
+        """
+        Create a new Dataset4dstem from a Dataset4dstem.
+
+        Parameters
+        ----------
+        dset : Dataset4dstem
+            The underlying 4D array data
+
+        Returns
+        -------
+        Dataset4dstem
+            A new Dataset4dstem instance
+        """
+        return cls(
+            dset=dset,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+            _token=cls._token,
+        )
+
+    @classmethod
+    def from_file(
+        cls,
+        file_path: str,
+        file_type: str,
+        verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
+    ) -> Self:
+        """
+        Create a new Dataset4dstem from a file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the data file
+        file_type : str
+            The type of file reader needed. See rosettasciio for supported formats
+            https://hyperspy.org/rosettasciio/supported_formats/index.html
+
+        Returns
+        -------
+        Dataset4dstem
+            A new Dataset4dstem instance loaded from the file
+        """
+        # Import here to avoid circular imports
+        from quantem.core.io.file_readers import read_4dstem
+
+        dset = read_4dstem(file_path, file_type)
+        return cls(
+            dset=dset,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+            _token=cls._token,
+        )
+
+    @classmethod
+    def from_array(
+        cls,
+        array: np.ndarray | Any,
+        name: str | None = None,
+        origin: np.ndarray | tuple | list | float | int | None = None,
+        sampling: np.ndarray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
+        signal_units: str = "arb. units",
+        verbose: int | bool = 1,
+        learn_descan: bool = True,
+        learn_scan_positions: bool = True,
+    ) -> Self:
+        """
+        Create a new Dataset4dstem from an array.
+
+        Parameters
+        ----------
+        array : np.ndarray | Any
+            The underlying 4D array data
+        name : str | None, optional
+            A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
+        origin : np.ndarray | tuple | list | float | int | None, optional
+            The origin coordinates for each dimension. If None, defaults to zeros
+        sampling : np.ndarray | tuple | list | float | int | None, optional
+            The sampling rate/spacing for each dimension. If None, defaults to ones
+        units : list[str] | tuple | list | None, optional
+            Units for each dimension. If None, defaults to ["pixels"] * 4
+        signal_units : str, optional
+            Units for the array values, by default "arb. units"
+
+        Returns
+        -------
+        Dataset4dstem
+            A new Dataset4dstem instance
+        """
+        dset = Dataset4dstem.from_array(
+            array=array,
+            name=name if name is not None else "4D-STEM dataset",
+            origin=origin if origin is not None else np.zeros(4),
+            sampling=sampling if sampling is not None else np.ones(4),
+            units=units if units is not None else ["pixels"] * 4,
+            signal_units=signal_units,
+        )
+        return cls.from_dataset4dstem(
+            dset=dset,
+            verbose=verbose,
+            learn_descan=learn_descan,
+            learn_scan_positions=learn_scan_positions,
+        )
+
+    # endregion --- classmethods ---
+
+    # region --- properties ---
+    @property
+    def intensities_4d(self) -> np.ndarray:
+        """4D diffraction intensities"""
+        return self._intensities_4d
+
+    @intensities_4d.setter
+    def intensities_4d(self, intensities: np.ndarray) -> None:
+        self._intensities_4d = validate_array(
+            intensities, name="intensities_4d", ndim=4, dtype=config.get("dtype_real")
+        )
+
+    @property
+    def com_measured(self) -> np.ndarray:
+        """Measured center of mass in pixels"""
+        return self._com_measured
+
+    @com_measured.setter
+    def com_measured(self, com: np.ndarray | tuple) -> None:
+        com = validate_array(
+            com, name="com_measured", shape=(2, *self.gpts), dtype=config.get("dtype_real")
+        )
+        self._com_measured = com
+
+    @property
+    def com_fit(self) -> np.ndarray:
+        """fit center of mass in pixels"""
+        return self._com_fit
+
+    @com_fit.setter
+    def com_fit(self, com: np.ndarray | tuple) -> None:
+        com = validate_array(
+            com, name="com_fit", shape=(2, *self.gpts), dtype=config.get("dtype_real")
+        )
+        self._com_fit = com
+
+    @property
+    def com_normalized(self) -> np.ndarray:
+        """normalized center of mass: (measured - fitted) * reciprocal_sampling"""
+        difs = np.nan_to_num(self.com_measured - self.com_fit)
+        return difs * self.reciprocal_sampling[:, None, None]
+
+    @property
+    def scan_sampling(self) -> np.ndarray:
+        """Scan sampling in pixels"""
+        return self._scan_sampling
+
+    @scan_sampling.setter
+    def scan_sampling(self, sampling: np.ndarray | tuple) -> None:
+        sampling = validate_array(
+            sampling,
+            name="scan_sampling",
+            shape=(2,),
+            dtype=config.get("dtype_real"),
+        )
+        self._scan_sampling = sampling
+
+    @property
+    def scan_units(self) -> list[str]:
+        """Scan units"""
+        return self._scan_units
+
+    @scan_units.setter
+    def scan_units(self, units: list[str]) -> None:
+        self._scan_units = units
+
+    @property
+    def gpts(self) -> np.ndarray:
+        """Number of gpts"""
+        return self._gpts
+
+    @gpts.setter
+    def gpts(self, gpts: np.ndarray | tuple | list) -> None:
+        gpts = validate_array(gpts, name="gpts", shape=(2,), dtype=int)
+        self._gpts = gpts
+
+    @property
+    def fov(self) -> np.ndarray:
+        """
+        Field of view in real space. Units of A matching self.obj_sampling
+        untying this from gpts is actually a little tricky, as the fov needs to be fixed as
+        it is used for calculating the object shape, which shouldn't change during the recon
+        """
+        # min_pos = torch.min(self.initial_scan_positions_px, dim=0)[0]
+        # max_pos = torch.max(self.initial_scan_positions_px, dim=0)[0]
+        # extent_px = max_pos - min_pos
+        # return extent_px.cpu().detach().numpy() * self.obj_sampling
+        return self.scan_sampling * (self.gpts - 1)
+
+    @property
+    def upsample_factor(self) -> float:
+        return (self._obj_shape_crop_2d / self.gpts).mean()
+
+    # endregion --- properties ---
 
     def _set_initial_scan_positions_px(
         self,
@@ -635,7 +876,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
             obj_padding_px = np.array([0, 0])
 
         nr, nc = self.gpts
-        Sr, Sc = self.scan_sampling
+        Sr, Sc = self._scan_sampling
         r = np.arange(nr) * Sr
         c = np.arange(nc) * Sc
 
@@ -674,9 +915,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
 
     def preprocess(
         self,
-        com_fit_function: Literal[
-            "none", "plane", "parabola", "bezier_two", "constant"
-        ] = "constant",
+        com_fit_function: Literal["none", "plane", "parabola", "constant", "no_shift"] = "plane",
         force_com_rotation: float | None = None,
         force_com_transpose: bool | None = None,
         padded_diffraction_intensities_shape: tuple[int, int] | None = None,
@@ -686,6 +925,18 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
         vectorized: bool = True,
         probe_energy: float | None = None,
     ):
+        # Store preprocessing parameters for serialization and reloading
+        self._preprocessing_params = {
+            "com_fit_function": com_fit_function,
+            "force_com_rotation": force_com_rotation,
+            "force_com_transpose": force_com_transpose,
+            "padded_diffraction_intensities_shape": padded_diffraction_intensities_shape,
+            "obj_padding_px": obj_padding_px,
+            "plot_rotation": False,
+            "plot_com": False,
+            "vectorized": vectorized,
+        }
+
         if probe_energy is not None:
             self.probe_energy = probe_energy
 
@@ -693,26 +944,20 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
             self.diffraction_padding = np.array(padded_diffraction_intensities_shape)
             self.dset.pad(
                 output_shape=(
-                    self.dset.shape[0],
-                    self.dset.shape[1],
+                    self.num_gpts,
                     *padded_diffraction_intensities_shape,
                 ),
                 in_place=True,
             )
-            warn(
-                "Padded diffraction intensities does not currently support vacuum probe intensity.",
-                UserWarning,
+            self.intensities_4d = self.dset.array.reshape(
+                (*self.gpts, *padded_diffraction_intensities_shape)
             )
-            # if vacuum_probe_intensity is not None:
-            #     vppad = Dataset.from_array(np.fft.fftshift(vacuum_probe_intensity))
-            #     vppad.pad(output_shape=padded_diffraction_intensities_shape, in_place=True)
-            #     vacuum_probe_intensity = np.fft.fftshift(vppad.array)
         else:
             self.diffraction_padding = (0, 0)
 
         # calculate CoM
         self._set_intensities_com(
-            self.dset.array,
+            self.intensities_4d,
             fit_function=com_fit_function,
             vectorized_calculation=vectorized,
         )
@@ -726,9 +971,10 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
         # set the various amplitudese and intensities (can be stripped down later)
         self._normalize_diffraction_intensities()
 
-        # self.obj_padding_px = obj_padding_px
         self._set_initial_scan_positions_px(obj_padding_px)
         self._set_patch_indices(obj_padding_px)
+
+        self._set_targets("l2_amplitude")
 
         self._preprocessed = True
         return
@@ -737,7 +983,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
         self,
         intensities: np.ndarray,
         dp_mask: np.ndarray | None = None,
-        fit_function: Literal["none", "plane", "parabola", "bezier_two", "constant"] = "plane",
+        fit_function: Literal["none", "plane", "parabola", "constant", "no_shift"] = "plane",
         vectorized_calculation=True,
     ) -> None:
         """
@@ -804,6 +1050,10 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
 
         if fit_function == "none":
             com_fit_r, com_fit_c = com_measured_r, com_measured_c
+        elif fit_function == "no_shift":
+            com_fit_r, com_fit_c = np.ones_like(com_measured_r), np.ones_like(com_measured_c)
+            com_fit_r = com_fit_r * self.roi_shape[0] / 2
+            com_fit_c = com_fit_c * self.roi_shape[1] / 2
         else:
             finite_mask = np.isfinite(com_measured_r)
             com_fit_r, com_fit_c, _com_res_r, _com_res_c = fit_origin(
@@ -914,6 +1164,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
             ax.set_aspect(np.ptp(angles_deg) / aspect_ratio / 4)
 
             fig.tight_layout()
+            plt.show()
 
         def plot_com_images(
             com_arrays: list[np.ndarray],
@@ -934,6 +1185,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
                 figsize=figsize,
                 scalebar={"sampling": self.obj_sampling[0], "units": "A"},
                 norm={"interval_type": "manual"},
+                force_show=True,
                 **plot_kwargs,
             )
 
@@ -1079,7 +1331,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
         bilinear: bool = False,
     ):
         dtype = config.get("dtype_real")
-        diff_intensities = self.dset.array.copy().astype(dtype)
+        diff_intensities = self.intensities_4d.copy().astype(dtype)
         com_fit = self.com_fit
 
         # Aggressive cropping for when off-centered high scattering angle data was recorded
@@ -1104,6 +1356,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
             pattern_crop_mask_shape = self.roi_shape
 
         mean_intensity = 0
+        mean_amplitude = 0
         centered_amplitudes = np.zeros(diff_intensities.shape, dtype=dtype)
         amplitudes = np.zeros(diff_intensities.shape, dtype=dtype)
         centered_intensities = np.zeros(diff_intensities.shape, dtype=dtype)
@@ -1123,8 +1376,9 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
             intensities[Rr, Rc] = intensity
             mean_intensity += np.sum(intensity)
             ### shifting amplitude rather than intensity to minimize ringing artifacts
-            amplitude = np.sqrt(intensity)
-            amplitudes[Rr, Rc] = np.maximum(amplitude, 0)
+            amplitude = np.maximum(np.sqrt(intensity), 0)
+            mean_amplitude += np.sum(amplitude)
+            amplitudes[Rr, Rc] = amplitude
 
             shift_amplitude = shift_array(  # shifting to 0,0 then fftshift
                 amplitude,
@@ -1160,6 +1414,7 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
             )
 
         mean_intensity /= amplitudes.shape[0]
+        mean_amplitude /= amplitudes.shape[0]
 
         self.centered_amplitudes = centered_amplitudes
         self.amplitudes = amplitudes
@@ -1172,9 +1427,29 @@ class PtychographyDatasetRaster(DatasetConstraints, PtychographyDatasetBase):
         self.initial_descan_shifts = self.descan_shifts.data.clone()
 
         self.mean_diffraction_intensity = mean_intensity
+        self.mean_diffraction_amplitude = mean_amplitude
         self._pattern_crop_mask = pattern_crop_mask
         self._pattern_crop_mask_shape = pattern_crop_mask_shape
         return
+
+    def forward(
+        self,
+        batch_indices: np.ndarray | torch.Tensor,
+        obj_padding_px: np.ndarray | tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Forward pass to compute the diffraction intensities from the object and scan positions."""
+        self.apply_hard_constraints(obj_padding_px)
+        positions_px = self.scan_positions_px[batch_indices]
+        positions_px_fractional = positions_px - torch.round(positions_px)
+        with torch.no_grad():
+            if self.patch_indices_need_update():
+                self._set_patch_indices(obj_padding_px)
+        patch_indices = self.patch_indices[batch_indices]
+        if self.learn_descan and self.has_optimizer():
+            descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
+        else:
+            descan_shifts = None
+        return patch_indices, positions_px, positions_px_fractional, descan_shifts
 
 
 DatasetModelType = PtychographyDatasetRaster  # | PtychographyDatasetSpiral

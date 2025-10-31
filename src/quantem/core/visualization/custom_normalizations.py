@@ -57,7 +57,8 @@ class BaseInterval(ABC):
 
         # subtract vmin
         values = np.subtract(values, vmin)
-
+        if np.issubdtype(values.dtype, np.integer):
+            values = values.astype(np.float64)
         # divide by interval
         if (vmax - vmin) != 0.0:
             np.true_divide(values, vmax - vmin, out=values)
@@ -519,6 +520,11 @@ class CustomNormalization(colors.Normalize):
         -------
         None
         """
+        if data.dtype == np.bool_ or data.dtype == bool:
+            self.vmin, self.vmax = 0.0, 1.0
+            self.interval = ManualInterval(self.vmin, self.vmax)
+            return None
+
         self.vmin, self.vmax = self.interval.get_limits(data)
         self.interval = ManualInterval(self.vmin, self.vmax)  # set explicitly with ManualInterval
         return None
@@ -608,6 +614,7 @@ class NormalizationConfig:
 
 NORMALIZATION_PRESETS = {
     "linear_auto": lambda: NormalizationConfig(),
+    "quantile": lambda: NormalizationConfig(),
     "linear_minmax": lambda: NormalizationConfig(interval_type="manual"),
     "minmax": lambda: NormalizationConfig(interval_type="manual"),
     "linear_centered": lambda: NormalizationConfig(interval_type="centered"),
