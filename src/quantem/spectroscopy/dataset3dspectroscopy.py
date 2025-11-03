@@ -396,18 +396,6 @@ class Dataset3dspectroscopy(Dataset3d):
     
     ## specturm picking
 
-
-class DataSpectroscopy:
-    """
-    Class for handling 3D spectroscopy data and extracting spectra from ROIs.
-    """
-    def __init__(self, array):
-        # Use the underlying array attribute, do not sum over axis 0
-        self.array = np.asarray(array.array, dtype=float)
-        self.sampling = array.sampling
-        self.origin = array.origin
-        self.shape = self.array.shape
-
     def image_to_spec(self, y, x, dy=None, dx=None, title=None):
         """
         Make and show a spectrum plot from a spatial ROI in a 3D EDS cube (E, Y, X).

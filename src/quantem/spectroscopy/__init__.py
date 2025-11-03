@@ -10,4 +10,3 @@ from quantem.spectroscopy.dataset3deds import (
 )
 
 
-from quantem.spectroscopy.dataset3dspectroscopy import DataSpectroscopy
