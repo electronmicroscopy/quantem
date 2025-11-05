@@ -1,6 +1,5 @@
 import gc
 import math
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Tuple
 
 import numpy as np
@@ -27,6 +26,7 @@ from quantem.diffractive_imaging.complex_probe import (
     polar_coordinates,
     spatial_frequencies,
 )
+from quantem.diffractive_imaging.optimize_hyperparameters import OptimizationParameter
 from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
 from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
 
@@ -117,7 +117,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         """
         Create a DirectPtychography instance from pre-computed virtual BFs.
-        
+
         Parameters
         ----------
         rotation_angle_rad : float, optional
@@ -127,15 +127,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Rotation angle in degrees between scan and detector coordinates.
             Cannot be specified if rotation_angle_rad is provided.
         """
-        
+
         # Process angle parameters
         rotation_angle = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
-        
+
         if rotation_angle is None:
-            raise ValueError(
-                "Either rotation_angle_rad or rotation_angle_deg must be provided."
-            )
-        
+            raise ValueError("Either rotation_angle_rad or rotation_angle_deg must be provided.")
+
         if aberration_coefs is None:
             aberration_coefs = {}
 
@@ -177,7 +175,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         """
         Create a DirectPtychography instance from a 4D-STEM dataset.
-        
+
         Parameters
         ----------
         rotation_angle_rad : float, optional
@@ -208,8 +206,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             origin.estimate_detector_rotation()
             rotation_angle = origin.detector_rotation_deg / 180 * math.pi
             if verbose:
-                print(f"Auto-estimated rotation angle: {origin.detector_rotation_deg:.2f}° ({rotation_angle:.4f} rad)")
-                print("Consider verifying this value and providing rotation_angle_deg explicitly for best results.")
+                print(
+                    f"Auto-estimated rotation angle: {origin.detector_rotation_deg:.2f}° ({rotation_angle:.4f} rad)"
+                )
+                print(
+                    "Consider verifying this value and providing rotation_angle_deg explicitly for best results."
+                )
 
         # shift to origin
         origin.shift_origin_to(
@@ -604,7 +606,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         # Process angle parameters
         rotation_angle = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
-        
+
         if rotation_angle is None:
             rotation_angle = self.rotation_angle
         else:
@@ -800,7 +802,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Custom Optuna sampler.
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
-            
+
         Examples
         --------
         >>> # Optimize with degree ranges (more intuitive)
@@ -812,13 +814,31 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         """
 
         # Handle tuple conversion for degrees to radians
-        rotation_angle_param: float | tuple[float, float] | None
-        if isinstance(rotation_angle_deg, tuple):
+        rotation_angle_param: float | tuple[float, float] | OptimizationParameter | None
+
+        if isinstance(rotation_angle_deg, OptimizationParameter):
+            # Convert OptimizationParameter bounds from degrees to radians
+            rotation_angle_param = OptimizationParameter(
+                low=np.deg2rad(rotation_angle_deg.low),
+                high=np.deg2rad(rotation_angle_deg.high),
+                log=rotation_angle_deg.log,
+                n_points=rotation_angle_deg.n_points,
+            )
+        elif isinstance(rotation_angle_rad, OptimizationParameter):
+            # Already in radians
+            rotation_angle_param = rotation_angle_rad
+        elif isinstance(rotation_angle_deg, tuple):
             # Convert tuple bounds from degrees to radians
-            rotation_angle_param = (np.deg2rad(rotation_angle_deg[0]), np.deg2rad(rotation_angle_deg[1]))
+            rotation_angle_param = (
+                np.deg2rad(rotation_angle_deg[0]),
+                np.deg2rad(rotation_angle_deg[1]),
+            )
         elif isinstance(rotation_angle_rad, tuple):
             # Already in radians, use as-is
             rotation_angle_param = rotation_angle_rad
+        elif rotation_angle_deg is None and rotation_angle_rad is None:
+            # Neither provided, use None
+            rotation_angle_param = None
         else:
             # Scalar values: use utility function for conversion and validation
             rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
@@ -829,16 +849,39 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         def objective(trial):
             trial_aberrations = {}
             for name, val in aberration_coefs.items():
-                if isinstance(val, tuple):
+                if isinstance(val, OptimizationParameter):
+                    # Handle OptimizationParameter objects
+                    if val.log:
+                        trial_aberrations[name] = trial.suggest_float(
+                            name, val.low, val.high, log=True
+                        )
+                    else:
+                        trial_aberrations[name] = trial.suggest_float(name, val.low, val.high)
+                elif isinstance(val, tuple):
                     # Tuple represents (min, max) range for optimization
                     trial_aberrations[name] = trial.suggest_float(name, val[0], val[1])
                 else:
                     # Fixed value
                     trial_aberrations[name] = val
 
-            if isinstance(rotation_angle_param, tuple):
+            if isinstance(rotation_angle_param, OptimizationParameter):
+                # Handle OptimizationParameter for rotation
+                if rotation_angle_param.log:
+                    rot = trial.suggest_float(
+                        "rotation_angle_rad",
+                        rotation_angle_param.low,
+                        rotation_angle_param.high,
+                        log=True,
+                    )
+                else:
+                    rot = trial.suggest_float(
+                        "rotation_angle_rad", rotation_angle_param.low, rotation_angle_param.high
+                    )
+            elif isinstance(rotation_angle_param, tuple):
                 # Tuple represents (min, max) range
-                rot = trial.suggest_float("rotation_angle_rad", rotation_angle_param[0], rotation_angle_param[1])
+                rot = trial.suggest_float(
+                    "rotation_angle_rad", rotation_angle_param[0], rotation_angle_param[1]
+                )
             else:
                 # Fixed value
                 rot = rotation_angle_param
@@ -886,7 +929,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Cannot be specified if rotation_angle_rad is provided.
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
-            
+
         Examples
         --------
         >>> # Grid search with degree ranges (more intuitive)
@@ -895,7 +938,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         ...     rotation_angle_deg=(-180, -160, 20),
         ... )
         """
-        
+
         # Handle tuple conversion for degrees to radians
         rotation_angle_param: float | tuple[float, float, int] | None
         if isinstance(rotation_angle_deg, tuple):
@@ -910,7 +953,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         else:
             # Scalar values: use utility function for conversion and validation
             rotation_angle_param = process_angle_parameters(rotation_angle_rad, rotation_angle_deg)
-        
+
         aberration_coefs = aberration_coefs or {}
 
         # Build parameter grid
