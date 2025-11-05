@@ -349,6 +349,9 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
         if array.is_complex():
             ph = array.angle()
+            warn(
+                "calculating TV loss for phase, need to check phase wrapping. Easiest fix is scalar phase array."
+            )
             loss = loss + self._calc_tv_loss(ph, w)
             amp = array.abs()
             if self.obj_type == "complex":
@@ -386,7 +389,11 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             if self.obj_type == "complex":
                 amp = array.abs()
                 loss = loss + weight * (torch.mean(1.0 - amp[0]) + torch.mean(1.0 - amp[-1]))
-            loss = loss + weight * (torch.mean(torch.diff(ph[0])) + torch.mean(torch.diff(ph[-1])))
+            warn("calculating surface zero loss for phase, need to check phase wrapping.")
+            loss = loss + weight * (
+                torch.mean(torch.abs(ph[0] - ph[0].mean()))
+                + torch.mean(torch.abs(ph[-1] - ph[-1].mean()))
+            )
         else:
             loss = loss + weight * (
                 torch.mean(torch.abs(array[0])) + torch.mean(torch.abs(array[-1]))
