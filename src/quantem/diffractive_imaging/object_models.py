@@ -261,7 +261,6 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         "tv_weight_yx": 0,
         "surface_zero_weight": 0,
         "gaussian_sigma": None,
-        "gaussian_weight": 1,
     }
 
     def apply_hard_constraints(
@@ -296,6 +295,9 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if self.constraints["apply_fov_mask"] and mask is not None:
             obj2 *= mask
 
+        if self.constraints["gaussian_sigma"] is not None:
+            obj2 = self.gaussian_blur_2d(obj2, sigma=self.constraints["gaussian_sigma"])
+
         if self.num_slices > 1:
             if self.constraints["identical_slices"]:
                 with torch.no_grad():
@@ -324,12 +326,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         )
         self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
 
-        gaussian_loss = self.get_gaussian_smoothness_loss(obj)
-        self.add_soft_constraint_loss("gaussian_loss", gaussian_loss)
-
-        self.accumulate_constraint_losses()
-
-        return tv_loss + surface_zero_loss + gaussian_loss
+        return tv_loss + surface_zero_loss
 
     def get_tv_loss(
         self, array: torch.Tensor, weights: None | tuple[float, float] = None
