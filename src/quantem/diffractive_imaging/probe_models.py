@@ -1024,8 +1024,10 @@ class ProbeDIP(ProbeConstraints):
         input_noise_std: float = 0.025,
         device: str = "cpu",
     ) -> "ProbeDIP":
-        if not isinstance(pixelated, ProbePixelated):
-            raise ValueError(f"Pixelated must be an ProbePixelated, got {type(pixelated)}")
+        if not isinstance(pixelated, ProbePixelated) and "ProbePixelated" not in str(
+            type(pixelated)
+        ):
+            raise TypeError(f"dset should be a ProbePixelated, got {type(pixelated)}")
 
         probe_model = cls(
             num_probes=pixelated.num_probes,
