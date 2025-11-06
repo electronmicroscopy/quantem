@@ -716,9 +716,7 @@ class ProbePixelated(ProbeConstraints):
             bilinear=True,
         )
 
-        self._vacuum_probe_intensity = torch.tensor(
-            vp2, dtype=config.get("dtype_real"), device=self.device
-        )
+        self._vacuum_probe_intensity = torch.tensor(vp2, dtype=torch.float32, device=self.device)
 
     def rescale_vacuum_probe(self, shape: tuple[int, int]):
         """hack, should be fixed"""
