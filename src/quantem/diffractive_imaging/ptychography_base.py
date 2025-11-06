@@ -85,12 +85,15 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._store_iterations: bool = False
         self._store_iterations_every: int = 1
         self._epoch_losses: list[float] = []
+        self._epoch_val_losses: list[float] = []
         self._epoch_recon_types: list[str] = []
         self._epoch_lrs: dict[str, list] = {}  # LRs/step_sizes across epochs
         self._epoch_snapshots: list[dict[str, int | np.ndarray]] = []
         self._obj_padding_px = np.array([0, 0])
         self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
         self.batch_size = self.dset.num_gpts
+        self._val_ratio = 0.0
+        self._val_mode: Literal["grid", "random"] = "grid"
 
         if (
             isinstance(probe_model, ProbePixelated)
@@ -124,6 +127,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         plot_probe_overlap: bool = False,
         vectorized: bool = True,
         batch_size: int | None = None,
+        val_ratio: float = 0.0,
+        val_mode: Literal["grid", "random"] = "grid",
     ):
         """
         Rather than passing 100 flags here, I'm going to suggest that if users want to run very
@@ -150,6 +155,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
         self._preprocessed = True
+        # store validation split ratio for reconstruction step
+        self.val_ratio = float(val_ratio)
+        self.val_mode = val_mode
         # if self.num_epochs == 0:
         #     self.reset_recon()  # if new models, reset to ensure shapes are correct
         return self
@@ -384,6 +392,34 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         Loss/MSE error for each epoch regardless of reconstruction method used
         """
         return np.array(self._epoch_losses)
+
+    @property
+    def val_epoch_losses(self) -> np.ndarray:
+        """
+        Validation loss (consistency) per epoch if a validation split was used.
+        """
+        return np.array(self._epoch_val_losses)
+
+    @property
+    def val_ratio(self) -> float:
+        return float(self._val_ratio)
+
+    @val_ratio.setter
+    def val_ratio(self, r: float) -> None:
+        r = float(r)
+        if r < 0.0 or r > 1.0:
+            raise ValueError("val_ratio must satisfy 0 <= val_ratio <= 1")
+        self._val_ratio = r
+
+    @property
+    def val_mode(self) -> Literal["grid", "random"]:
+        return self._val_mode
+
+    @val_mode.setter
+    def val_mode(self, mode: Literal["grid", "random"]) -> None:
+        if mode not in ["grid", "random"]:
+            raise ValueError(f"val_mode must be either 'grid' or 'random', got {mode}")
+        self._val_mode = mode
 
     @property
     def num_epochs(self) -> int:
@@ -805,6 +841,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.dset.reset()
         # detector reset if necessary
         self._epoch_losses = []
+        self._epoch_val_losses = []
         self._epoch_recon_types = []
         self._epoch_snapshots = []
         self._epoch_lrs = {}

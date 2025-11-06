@@ -194,7 +194,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
         self.dset._set_targets(loss_type)
-        batcher = SimpleBatcher(self.dset.num_gpts, self.batch_size, rng=self.rng)
+        batcher = SimpleBatcher(
+            self.dset.num_gpts,
+            self.batch_size,
+            rng=self.rng,
+            val_ratio=self.val_ratio,
+            val_mode=self.val_mode,
+        )
         pbar = tqdm(range(num_iter), disable=not self.verbose)
 
         for a0 in pbar:
@@ -239,7 +245,33 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             num_batches = len(batcher)
             total_loss = total_loss / num_batches
             consistency_loss = consistency_loss / num_batches
-            self._record_epoch(total_loss)
+
+            # Validation pass (no gradient, no optimizer steps)
+            val_loss = None
+            if batcher.has_validation:
+                val_consistency_loss = 0.0
+                val_batches = 0
+                with torch.no_grad():
+                    for batch_indices in batcher.iter_val():
+                        patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
+                            self.dset.forward(batch_indices, self.obj_padding_px)
+                        )
+                        shifted_probes = self.probe_model.forward(positions_px_fractional)
+                        obj_patches = self.obj_model.forward(patch_indices)
+                        _propagated_probes, overlap = self.forward_operator(
+                            obj_patches, shifted_probes, descan_shifts
+                        )
+                        pred_intensities = self.detector_model.forward(overlap)
+                        batch_val_loss, _ = self.error_estimate(
+                            pred_intensities, batch_indices, loss_type=loss_type
+                        )
+                        val_consistency_loss += batch_val_loss.item()
+                        val_batches += 1
+                if val_batches > 0:
+                    val_loss = val_consistency_loss / val_batches
+                    self._epoch_val_losses.append(val_loss)
+
+            self._record_epoch(total_loss)  # TODO record val loss as well
 
             # Step schedulers with current loss
             self.step_schedulers(total_loss)
@@ -258,7 +290,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     self._get_current_lrs(),
                 )
 
-            pbar.set_description(f"Epoch {a0 + 1}/{num_iter}, Loss: {total_loss:.3e}")
+            if val_loss is not None:
+                pbar.set_description(
+                    f"Epoch {a0 + 1}/{num_iter}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
+                )
+            else:
+                pbar.set_description(f"Epoch {a0 + 1}/{num_iter}, Loss: {total_loss:.3e}")
 
         torch.cuda.empty_cache()
         return self

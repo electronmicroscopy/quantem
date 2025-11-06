@@ -20,11 +20,59 @@ class SimpleBatcher:
         batch_size: int | None,
         shuffle: bool = True,
         rng: np.random.Generator | int | None = None,
+        val_ratio: float = 0.0,
+        val_mode: Literal["grid", "random"] = "grid",
+        train_indices: np.ndarray | None = None,
+        val_indices: np.ndarray | None = None,
     ):
         self.indices = np.arange(num)
         self.batch_size = batch_size if batch_size is not None else num
         self.shuffle = shuffle
         self.rng = rng
+
+        # Train/validation split (fixed for the lifetime of this batcher)
+        if train_indices is not None or val_indices is not None:
+            if train_indices is None or val_indices is None:
+                raise ValueError("Both train_indices and val_indices must be provided together.")
+            self.train_indices = np.asarray(train_indices, dtype=int)
+            self.val_indices = np.asarray(val_indices, dtype=int)
+        else:
+            # Validate ratio and split deterministically given rng
+            if val_ratio < 0 or val_ratio >= 1:
+                val_ratio = 0.0
+            n_val = int(round(len(self.indices) * val_ratio))
+            if n_val > 0:
+                if val_mode == "random":
+                    # Random unique selection for validation
+                    perm = self.rng.permutation(self.indices)
+                    self.val_indices = perm[:n_val]
+                    self.train_indices = np.setdiff1d(
+                        self.indices, self.val_indices, assume_unique=False
+                    )
+                else:  # grid/regular selection: every k-th index
+                    if val_ratio <= 0.5:
+                        k = max(1, int(round(1.0 / val_ratio)))
+                        invert = False
+                    else:
+                        k = max(1, int(round(1.0 / (1.0 - val_ratio))))
+                        invert = True
+
+                    grid_sel = self.indices[::k]
+                    if len(grid_sel) > n_val:
+                        grid_sel = grid_sel[:n_val]
+                    if invert:
+                        self.train_indices = grid_sel
+                        self.val_indices = np.setdiff1d(
+                            self.indices, grid_sel, assume_unique=False
+                        )
+                    else:
+                        self.val_indices = grid_sel
+                        self.train_indices = np.setdiff1d(
+                            self.indices, self.val_indices, assume_unique=False
+                        )
+            else:
+                self.val_indices = np.asarray([], dtype=int)
+                self.train_indices = self.indices
 
     @property
     def rng(self) -> np.random.Generator:
@@ -41,13 +89,32 @@ class SimpleBatcher:
         self._rng = rng
 
     def __iter__(self):
-        if self.shuffle:
-            self.indices = self.rng.permutation(self.indices)
-        for i in range(0, len(self.indices), self.batch_size):
-            yield self.indices[i : i + self.batch_size]
+        train_order = (
+            self.rng.permutation(self.train_indices) if self.shuffle else self.train_indices
+        )
+        for i in range(0, len(train_order), self.batch_size):
+            yield train_order[i : i + self.batch_size]
 
     def __len__(self):
-        return int(ceil(len(self.indices) / self.batch_size))
+        return int(ceil(len(self.train_indices) / self.batch_size))
+
+    def iter_val(self):
+        if len(self.val_indices) == 0:
+            return iter(())
+
+        # Do not shuffle validation by default
+        def _gen():
+            for i in range(0, len(self.val_indices), self.batch_size):
+                yield self.val_indices[i : i + self.batch_size]
+
+        return _gen()
+
+    @property
+    def has_validation(self) -> bool:
+        return len(self.val_indices) > 0
+
+    def val_len(self) -> int:
+        return int(ceil(len(self.val_indices) / self.batch_size)) if self.has_validation else 0
 
 
 @overload
