@@ -574,7 +574,7 @@ class Dataset(AutoSerialize):
                     self.sampling[axis] *= factor
             return None
 
-    def __getitem__(self, index) -> "Dataset":
+    def __getitem__(self, index) -> Self:
         """
         General indexing method for Dataset objects.
 
