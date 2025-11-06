@@ -901,7 +901,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._optimization_study = study
         self._optimized_parameters = study.best_params
         if self.verbose:
-            print(f"Optimized parameters: {self._optimized_parameters}")
+            # Print in same units that were used for optimization
+            params = self._optimized_parameters.copy()
+            if "rotation_angle_rad" in params:
+                if rotation_angle_deg is not None:  # User optimized in degrees
+                    params["rotation_angle_deg"] = np.rad2deg(params.pop("rotation_angle_rad"))
+            print(f"Optimized parameters: {params}")
 
         self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
         return self
@@ -1009,7 +1014,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._optimized_parameters = best_params
 
         if self.verbose:
-            print(f"Best grid parameters: {self._optimized_parameters}")
+            # Print in same units that were used for optimization
+            params = self._optimized_parameters.copy()
+            if "rotation_angle_rad" in params:
+                if rotation_angle_deg is not None:  # User did grid search in degrees
+                    params["rotation_angle_deg"] = np.rad2deg(params.pop("rotation_angle_rad"))
+            print(f"Best grid parameters: {params}")
 
         self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
 
