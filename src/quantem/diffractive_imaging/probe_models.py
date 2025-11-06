@@ -1025,7 +1025,7 @@ class ProbeDIP(ProbeConstraints):
         device: str = "cpu",
     ) -> "ProbeDIP":
         if not isinstance(pixelated, ProbePixelated):
-            raise ValueError(f"Pixelated must be an ObjectPixelated, got {type(pixelated)}")
+            raise ValueError(f"Pixelated must be an ProbePixelated, got {type(pixelated)}")
 
         probe_model = cls(
             num_probes=pixelated.num_probes,
