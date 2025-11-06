@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from copy import deepcopy
 from typing import Callable, Literal, Self, Sequence, cast
@@ -259,6 +260,8 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         "tv_weight_z": 0,
         "tv_weight_yx": 0,
         "surface_zero_weight": 0,
+        "gaussian_sigma": None,
+        "gaussian_weight": 1,
     }
 
     def apply_hard_constraints(
@@ -321,8 +324,12 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         )
         self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
 
+        gaussian_loss = self.get_gaussian_smoothness_loss(obj)
+        self.add_soft_constraint_loss("gaussian_loss", gaussian_loss)
+
         self.accumulate_constraint_losses()
-        return tv_loss + surface_zero_loss
+
+        return tv_loss + surface_zero_loss + gaussian_loss
 
     def get_tv_loss(
         self, array: torch.Tensor, weights: None | tuple[float, float] = None
@@ -398,6 +405,73 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             loss = loss + weight * (
                 torch.mean(torch.abs(array[0])) + torch.mean(torch.abs(array[-1]))
             )
+        return loss
+
+    def gaussian_blur_2d(self, tensor, sigma=1.0):
+        """
+        Apply Gaussian blur along dimensions 2 and 3 of a 3D tensor.
+
+        Args:
+            tensor: Can be real or complex
+            sigma: Standard deviation for Gaussian kernel
+        """
+        kernel_size = int(2 * math.ceil(3 * sigma) + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        ax = torch.arange(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0, device=tensor.device)
+        gauss = torch.exp(-0.5 * (ax / sigma) ** 2)
+        gauss = gauss / gauss.sum()
+
+        kernel_h = gauss.view(1, 1, -1, 1)
+        kernel_v = gauss.view(1, 1, 1, -1)
+
+        if tensor.is_complex():
+            real = tensor.real.unsqueeze(1)
+            imag = tensor.imag.unsqueeze(1)
+
+            real_h = nn.functional.conv2d(real, kernel_h, padding=(kernel_size // 2, 0))
+            real_blurred = nn.functional.conv2d(
+                real_h, kernel_v, padding=(0, kernel_size // 2)
+            ).squeeze(1)
+
+            imag_h = nn.functional.conv2d(imag, kernel_h, padding=(kernel_size // 2, 0))
+            imag_blurred = nn.functional.conv2d(
+                imag_h, kernel_v, padding=(0, kernel_size // 2)
+            ).squeeze(1)
+
+            return torch.complex(real_blurred, imag_blurred)
+        else:
+            x = tensor.unsqueeze(1)
+
+            x_h = nn.functional.conv2d(x, kernel_h, padding=(kernel_size // 2, 0))
+            x_blurred = nn.functional.conv2d(x_h, kernel_v, padding=(0, kernel_size // 2)).squeeze(
+                1
+            )
+
+            return x_blurred
+
+    def get_gaussian_smoothness_loss(
+        self,
+        obj: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Penalize difference between object and its Gaussian-filtered version.
+        Encourages smoothness in spatial dimensions (axes 1, 2).
+        """
+        loss = self._get_zero_loss_tensor()
+
+        sigma = self.constraints.get("gaussian_sigma")
+
+        if sigma is None:
+            return loss
+
+        weight = self.constraints.get("gaussian_weight", 1)
+
+        blurred = self.gaussian_blur_2d(obj, sigma=sigma)
+
+        loss = weight * ((obj - blurred).abs() ** 2).mean()
+
         return loss
 
 
