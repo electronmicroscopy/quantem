@@ -102,7 +102,7 @@ class Dataset4d(Dataset):
             signal_units=signal_units,
         )
 
-    def __getitem__(self, index) -> Dataset2d | Dataset3d:
+    def __getitem__(self, index) -> Dataset2d | Dataset3d | Self:
         """
         Simple indexing function to return Dataset2d or Dataset3d view.
 
@@ -124,8 +124,10 @@ class Dataset4d(Dataset):
             cls = Dataset2d
         elif ndim == 3:
             cls = Dataset3d
+        elif ndim == 4:  # return a dset of same type as self
+            return super().__getitem__(index)
         else:
-            raise ValueError("only 2D and 3D slices are supported.")
+            raise ValueError("only 2D, 3D, and 4D slices are supported.")
 
         return cls.from_array(
             array=array_view,
