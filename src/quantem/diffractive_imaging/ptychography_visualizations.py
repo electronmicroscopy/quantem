@@ -16,15 +16,27 @@ class PtychographyVisualizations(PtychographyBase):
         self,
         obj: np.ndarray | None = None,
         cbar: bool = False,
+        snapshot_iter: int | None = None,
         # norm: Literal["quantile", "manual", "minmax", "abs"] = "quantile",
         **kwargs,
     ):
+        obj_iter = "Final"
         if obj is None:
-            obj = self.obj_cropped
+            if snapshot_iter is not None:
+                if snapshot_iter < 0:
+                    snapshot_iter = len(self.epoch_snapshots) + snapshot_iter
+                snp = self.get_snapshot_by_epoch(snapshot_iter, closest=True)
+                obj_np = snp["obj"]
+                obj_iter = snp["iteration"]
+                obj_np = self._crop_rotate_obj_fov(obj_np)  # type:ignore # FIXME
+                if self.obj_type == "pure_phase":
+                    obj_np = np.exp(1j * np.angle(obj_np))
+            else:
+                obj_np = self.obj_cropped
         else:
-            obj = self._to_numpy(obj)
-            if obj.ndim == 2:
-                obj = obj[None, ...]
+            obj_np = self._to_numpy(obj)
+            if obj_np.ndim == 2:
+                obj_np = obj_np[None, ...]
 
         # if norm == "quantile":
         #     norm_dict = {"interval_type": "quantile"}
@@ -34,24 +46,27 @@ class PtychographyVisualizations(PtychographyBase):
         #     raise ValueError(f"Unknown norm type: {norm}")
 
         ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
-        if obj.shape[0] > 1:
-            t = "Summed "
-        else:
-            t = ""
+        t = kwargs.pop("title", "")
+        if len(t) > 0 and not t.endswith(" "):
+            t += " "
+        if obj_np.shape[0] > 1:
+            t += "Summed "
+        if obj_iter != "Final":
+            t += f"Epoch {obj_iter} "
 
         ims = []
         titles = []
         cmaps = []
         if self.obj_type == "potential":
-            ims.append(np.abs(obj).sum(0))
+            ims.append(np.abs(obj_np).sum(0))
             titles.append(t + "Potential")
             cmaps.append(ph_cmap)
         elif self.obj_type == "pure_phase":
-            ims.append(np.angle(obj).sum(0))
+            ims.append(np.angle(obj_np).sum(0))
             titles.append(t + "Pure Phase")
             cmaps.append(ph_cmap)
         else:
-            ims.extend([np.angle(obj).sum(0), np.abs(obj).sum(0)])
+            ims.extend([np.angle(obj_np).sum(0), np.abs(obj_np).sum(0)])
             titles.extend([t + "Phase", t + "Amplitude"])
             cmaps.extend([ph_cmap, "gray"])
 
@@ -308,7 +323,14 @@ class PtychographyVisualizations(PtychographyBase):
         epochs = np.arange(len(self.epoch_losses))
         # colors = plt.cm.Set1.colors  # type:ignore
         colors = config.get("viz.colors.set")  # [1:]
-        lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="loss", lw=lw))
+        if len(self.val_epoch_losses) > 0:
+            lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="train loss", lw=lw))
+            lines.extend(
+                ax.semilogy(epochs, self.val_epoch_losses, c=colors[6], label="val loss", lw=lw)
+            )
+        else:
+            lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="loss", lw=lw))
+
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
         ax.spines["left"].set_color("k")
@@ -357,8 +379,6 @@ class PtychographyVisualizations(PtychographyBase):
             nx.spines["right"].set_color(colors[0])
             nx.tick_params(axis="y", which="both", colors=colors[0])
 
-            labs = [lin.get_label() for lin in lines]
-            nx.legend(lines, labs, loc="upper right")
         else:
             # No learning rates to plot, add to title
             # set title to each lr type
@@ -366,6 +386,10 @@ class PtychographyVisualizations(PtychographyBase):
             for lr_type, lr_values in self.epoch_lrs.items():
                 title += f"{lr_type} LR: {lr_values[0]:.1e} | "
             ax.set_title(title[:-3], fontsize=10)
+
+        labs = [lin.get_label() for lin in lines]
+        if len(labs) > 1:
+            ax.legend(lines, labs, loc="upper right")
 
         ax.set_xbound(-2, np.max(epochs if np.any(epochs) else [1]) + 2)
         if figax is None:

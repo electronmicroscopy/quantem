@@ -755,6 +755,9 @@ class ObjectDIP(ObjectConstraints):
 
         return obj_model
 
+    # TODO add a from_params that sets the model input and target from params,
+    # will need to specify a shape as well, at least before pre-training (so just set here)
+
     @property
     def num_slices(self) -> int:
         return self._num_slices

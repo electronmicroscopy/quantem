@@ -116,7 +116,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def preprocess(
         self,
         obj_padding_px: tuple[int, int] = (0, 0),
-        com_fit_function: Literal[
+        val_ratio: float = 0.0,
+        val_mode: Literal["grid", "random"] = "grid",
+        vectorized: bool = True,
+        batch_size: int | None = None,
+        com_fit_function: Literal[  # TODO replace with dataset kwaargs?
             "none", "plane", "parabola", "constant", "no_shift"
         ] = "constant",
         force_com_rotation: float | None = None,
@@ -125,10 +129,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         plot_rotation: bool = True,
         plot_com: str | bool = True,
         plot_probe_overlap: bool = False,
-        vectorized: bool = True,
-        batch_size: int | None = None,
-        val_ratio: float = 0.0,
-        val_mode: Literal["grid", "random"] = "grid",
     ):
         """
         Rather than passing 100 flags here, I'm going to suggest that if users want to run very
