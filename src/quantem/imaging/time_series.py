@@ -10,13 +10,13 @@ from quantem.core.datastructures.dataset3d import Dataset3d
 
 class TimeSeries(Dataset3d):
     """
-    TimeSeries is for aligning sequential 2D time series (in situ) data. Includes padding and edge blending
+    TimeSeries is for aligning sequential 2D time series (in situ) data. Includes option to padding and edge blending
     for the alignment process.
 
     This class supports Dataset3d input arrays (time, x, y).
     """
 
-    def pad_images(
+    def pad_and_blend(
         self,
         pad_width: int | tuple[int, int] | None,
         pad_val: str | int | None = 0,
@@ -24,16 +24,16 @@ class TimeSeries(Dataset3d):
         modify_in_place: bool = False,
     ) -> NDArray:
         """
-        Generate a padded and edge blended image stack.
+        Generate a padded and/or edge blended image stack.
 
         Parameters
         ----------
-        pad_width: Union[int, tuple[int, int], None]
+        pad_width: int | tuple[int, int] | None
             Amount of padding in x and y to apply to an image stack. Defaults to None.
-        pad_val: [str, None] = 0
+        pad_val: str | None = 0
             Value for the padding background. If str with `mean`, `median`, `max`, or `min`, the padding value 
             will be calculated. Defaults to 0.
-        edge_blend: Union[int, tuple[int, int], None] = (8,8)
+        edge_blend: int | tuple[int, int] | None = (8,8)
             Amount of edge blending in x and y to apply to an image stack. Defaults in edge blending 8 in x and y.
         modify_in_place: bool = False
             If True, modifies the dataset directly. Defaults to False, returns a new dataset.
@@ -114,24 +114,24 @@ class TimeSeries(Dataset3d):
         
         return stack_pad
         
-    def align_images(
+    def align_image(
         im_ref: NDArray | Any,
         im: NDArray | Any,
         return_aligned_image = True,
         window_size: int | None = 7,            
     ) -> NDArray: 
         """
-        Use 2D DFT cross correlation alignment on two images.
+        Use 2D DFT cross correlation alignment on an image to a reference image.
 
         Parameters
         ----------
-        im_ref: [NDArray, Any]
+        im_ref: NDArray | Any
             First image to use as reference.
-        im: [NDArray, Any]
+        im: NDArray | Any
             Second image to shift with respect to the reference.
         return_aligned_image = True
             If True, returns the shifted second image.
-        window_size: [int, None] = 7
+        window_size: int | None = 7
             Size of the window around the subpixel position. If None, defaults to 7.
 
         Returns
@@ -147,7 +147,7 @@ class TimeSeries(Dataset3d):
         
         im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G_a0)))
 
-       # Index position of the maximum  
+        # Index position of the maximum  
         nrows, ncols = im_corr.shape
         peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
         
@@ -175,7 +175,6 @@ class TimeSeries(Dataset3d):
                 G_a0 * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
             ))
             return shift,im_shift
-
         else:
             return shift
         
@@ -190,25 +189,25 @@ class TimeSeries(Dataset3d):
 
         Parameters
         ----------
-        stack_pad: [NDArray, Any]
+        stack_pad: NDArray | Any
             Unaligned image stack data (time, x, y).
-        window_size: [int, None] = 7
+        window_size: int| None = 7
             Size of the window around the subpixel position. If None, defaults to 7.
-        running_average_frames: [float, int] = 20.0
+        running_average_frames: float | int = 20.0
             Maximum number of images for the running average applied to the reference. If None, default is 20  .
         
         Returns
         -------
         stack_aligned: NDArray
             Aligned image stack data (time, x, y).
-        dxy: NDArray
+        xy_shift: NDArray
             Shifted coordinates (x, y) for all images.
         """
         # Initializing aligned stack and shifts
         nframes, nx, ny = stack_pad.shape
         stack_aligned = np.zeros_like(stack_pad)
         stack_aligned[0] = stack_pad[0]
-        dxy = np.zeros((nframes, 2))
+        xy_shift = np.zeros((nframes, 2))
 
         # Angular frequencies
         kx_shift = -2 * np.pi * np.fft.fftfreq(nx)
@@ -241,7 +240,7 @@ class TimeSeries(Dataset3d):
             shift_row = (((peak_r - half + com_r) + nrows / 2) % nrows) - nrows / 2
             shift_col = (((peak_c - half + com_c) + ncols / 2) % ncols) - ncols / 2
             shift = np.array((shift_row, shift_col))
-            dxy[a0] = shift
+            xy_shift[a0] = shift
 
             # Apply shift
             phase = np.exp(1j * (kx_shift[:, None] * shift[0] + ky_shift[None, :] * shift[1]))
@@ -252,4 +251,4 @@ class TimeSeries(Dataset3d):
             weight = max(1 / (a0 + 1), 1 / running_average_frames)
             G_ref = G_ref * (1 - weight) + G_a0 * phase * weight
 
-        return stack_aligned, dxy
+        return stack_aligned, xy_shift
