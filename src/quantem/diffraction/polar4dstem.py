@@ -1,12 +1,13 @@
 # from collections.abc import Sequence
 from typing import List, Optional, Union
 
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 import numpy as np
 # from numpy.typing import NDArray
 # from scipy.interpolate import interp1d
+from numpy._core.multiarray import NEEDS_INIT
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter, map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, label, sum as label_sum, center_of_mass
 # from scipy.optimize import minimize
 from tqdm import tqdm
 import torch
@@ -39,6 +40,7 @@ class Polar4DStem(AutoSerialize):
     def __init__(
         self,
         dataset_cartesian: Dataset4d,
+        resized_cartesian_data: Union[List, NDArray],
         peaks_cartesian: Union[List, NDArray],  # cartesian peaks
         _token: object | None = None,
     ):
@@ -48,6 +50,7 @@ class Polar4DStem(AutoSerialize):
             )
 
         self._dataset_cartesian = dataset_cartesian
+        self.resized_cartesian_data = resized_cartesian_data
         self._peaks_cartesian = peaks_cartesian
 
     @classmethod
@@ -65,10 +68,12 @@ class Polar4DStem(AutoSerialize):
     def from_data(
         cls,
         dataset_cartesian: Dataset4d,
+        resized_cartesian_data: Union[List, NDArray],
         peaks_cartesian: Union[List, NDArray],
     ) -> "Polar4DStem":
         return cls(
             dataset_cartesian=dataset_cartesian,
+            resized_cartesian_data=resized_cartesian_data,
             peaks_cartesian=peaks_cartesian,
             _token=cls._token,
         )
@@ -78,81 +83,109 @@ class Polar4DStem(AutoSerialize):
 
     def preprocess(self):
         """ Find center of image through brightest peak, return polar transform of data and peaks"""
-        self.image_centers = self.find_central_beams_4d(self._dataset_cartesian)
-        self.polar_data = self.polar_transform_4d(self._dataset_cartesian, centers=self.image_centers)
+        self.image_centers = self.find_central_beams_4d(self.resized_cartesian_data)
+        self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
         self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self._peaks_cartesian, centers=self.image_centers)
 
     def refine_peaks(self,):
         pass
     
-    def find_central_beam_vectorized(self, image, sigma=1, search_radius=None, com_radius=5):
+    def find_central_beam_with_size_check(self, image, min_size=9, brightness_threshold=0.99999, com_radius=5):
         """
-        Find central beam by smoothing image, taking search window near geometrical center of image,
-        and then taking a center of mass around this point within a certain radius for refining center.
+        Find central beam by taking the maximum value, checking its size, and refining with center of mass.
 
         Parameters:
         -----------
         image : ndarray, shape (det_y, det_x)
             2D image
-        sigma : float
-            Gaussian smoothing sigma
-        search_radius : int, optional
-            Search radius around geometric center. Defaults to +/- 1/4 of smallest image shape dimension
+        min_size : int
+            Minimum size (in pixels) for a spot to be considered the central beam
+        brightness_threshold : float
+            Fraction of max intensity to use for segmentation
         com_radius : int
-            Radius for center of mass refinement
+            Radius around the brightest pixel to use for center of mass calculation
+
+        Returns:
+        --------
+        center : tuple
+            (y, x) coordinates of the beam center
         """
-
-        H, W = image.shape
-
-        # Gaussian smoothing
-        smoothed = gaussian_filter(image, sigma=sigma)
-        # Geometric center
-        geo_center_y = H // 2
-        geo_center_x = W // 2
-
-        # If no search radius provided take window based on shape of image
-        if search_radius is None:
-            search_radius = min(H, W) // 4
-
-        # Search region bounds
-        y_min = max(0, geo_center_y - search_radius)
-        y_max = min(H, geo_center_y + search_radius)
-        x_min = max(0, geo_center_x - search_radius)
-        x_max = min(W, geo_center_x + search_radius)
-
-        # Find max in search region
-        search_region = smoothed[y_min:y_max, x_min:x_max]
-        # Gives x and y coordinates in terms of search region shape
-        local_max_y, local_max_x = np.unravel_index(
-            np.argmax(search_region), 
-            search_region.shape
-        )
-        # getting absolute x and y positions in terms of image shape
-        max_y = y_min + local_max_y
-        max_x = x_min + local_max_x
-
-        # Create coordinate grids
-        y_grid = np.arange(H)[:, np.newaxis]
-        x_grid = np.arange(W)[np.newaxis, :]
-
-        # Circular mask
-        distances_sq = (y_grid - max_y)**2 + (x_grid - max_x)**2
-        circular_mask = distances_sq <= com_radius**2
-
-        # Center of mass
-        masked_image = image * circular_mask
-        total_intensity = masked_image.sum()
-
-        if total_intensity > 0:
-            com_y = (masked_image * y_grid).sum() / total_intensity
-            com_x = (masked_image * x_grid).sum() / total_intensity
-            return (com_y, com_x)
+        # Find the maximum intensity
+        max_intensity = np.max(image)
+        
+        # Create a binary image of bright spots
+        binary = image > (max_intensity * brightness_threshold)
+        
+        # Label connected components
+        labeled, num_features = label(binary)
+        
+        # Find sizes of all labeled regions
+        sizes = label_sum(binary, labeled, range(1, num_features + 1))
+        
+        # Find the label of the largest region that meets the minimum size
+        valid_labels = np.where(sizes >= min_size)[0] + 1  # +1 because labels start at 1
+        
+        if len(valid_labels) == 0:
+            # If no valid regions found, fall back to brightest pixel
+            center_y, center_x = np.unravel_index(np.argmax(image), image.shape)
         else:
-            # If divide by zero error then just return the max position in smoothed image
-            return (float(max_y), float(max_x))
+            largest_valid_label = valid_labels[np.argmax(sizes[valid_labels - 1])]
+            
+            # Find the brightest pixel within this region
+            mask = (labeled == largest_valid_label)
+            masked_image = image * mask
+            center_y, center_x = np.unravel_index(np.argmax(masked_image), image.shape)
+        
+        # Refine position using center of mass
+        y_min = max(0, int(center_y) - com_radius)
+        y_max = min(image.shape[0], int(center_y) + com_radius + 1)
+        x_min = max(0, int(center_x) - com_radius)
+        x_max = min(image.shape[1], int(center_x) + com_radius + 1)
+        
+        local_region = image[y_min:y_max, x_min:x_max]
+        local_com_y, local_com_x = center_of_mass(local_region)
+        
+        refined_center_y = y_min + local_com_y
+        refined_center_x = x_min + local_com_x
 
-    def find_central_beams_4d(self, data, sigma=2, search_radius=None, com_radius=5, 
-                                    use_tqdm=True):
+        # # Visualization
+        # plt.figure(figsize=(15, 10))
+        
+        # plt.subplot(2, 3, 1)
+        # plt.imshow(binary, cmap='gray')
+        # plt.title('Binary Image')
+        
+        # plt.subplot(2, 3, 2)
+        # plt.imshow(labeled, cmap='nipy_spectral')
+        # plt.title('Labeled Image')
+        
+        # plt.subplot(2, 3, 3)
+        # plt.imshow(masked_image, cmap='viridis')
+        # plt.title('Masked Image')
+        # plt.scatter(center_x, center_y, color='red', s=50, marker='x')
+        
+        # plt.subplot(2, 3, 4)
+        # plt.imshow(image, cmap='viridis')
+        # plt.title('Original Image')
+        # plt.scatter(center_x, center_y, color='red', s=50, marker='x', label='Max Intensity')
+        # plt.scatter(refined_center_x, refined_center_y, color='white', s=50, marker='o', label='Refined (CoM)')
+        # plt.legend()
+        
+        # plt.subplot(2, 3, 5)
+        # plt.imshow(local_region, cmap='viridis')
+        # plt.title('Local Region for CoM')
+        # plt.scatter(local_com_x, local_com_y, color='white', s=50, marker='o')
+        
+        # plt.tight_layout()
+        # plt.show()
+        
+        # print(f"Initial center: ({center_y:.2f}, {center_x:.2f})")
+        # print(f"Refined center: ({refined_center_y:.2f}, {refined_center_x:.2f})")
+        # input()
+        
+        return (float(refined_center_y), float(refined_center_x))
+
+    def find_central_beams_4d(self, data, min_size=9, brightness_threshold=0.5, use_tqdm=True):
         """
         Fast central beam finding for entire 4D dataset.
         
@@ -160,12 +193,10 @@ class Polar4DStem(AutoSerialize):
         -----------
         data : ndarray, shape (scan_y, scan_x, det_y, det_x)
             4D-STEM dataset
-        sigma : float
-            Gaussian smoothing sigma
-        search_radius : int, optional
-            Search radius around geometric center
-        com_radius : int
-            Radius for center of mass refinement
+        min_size : int
+            Minimum size (in pixels) for a spot to be considered the central beam
+        brightness_threshold : float
+            Fraction of max intensity to use for segmentation
         use_tqdm : bool
             Show progress bar
         
@@ -183,11 +214,10 @@ class Polar4DStem(AutoSerialize):
         
         for i in iterator:
             for j in range(scan_x):
-                centers[i, j] = self.find_central_beam_vectorized(
-                    data[i, j].array, 
-                    sigma=sigma,
-                    search_radius=search_radius,
-                    com_radius=com_radius
+                centers[i, j] = self.find_central_beam_with_size_check(
+                    data[i, j],
+                    min_size=min_size,
+                    brightness_threshold=brightness_threshold
                 )
         
         return centers
@@ -250,7 +280,7 @@ class Polar4DStem(AutoSerialize):
                 
                 # Use map_coordinates for interpolation
                 polar_data[i, j] = map_coordinates(
-                    data[i, j].array, 
+                    data[i, j], 
                     [y_coords, x_coords], 
                     order=1,  # linear interpolation
                     mode='constant',
@@ -278,6 +308,7 @@ class Polar4DStem(AutoSerialize):
                 dx = peaks[:, 1] - center_x
                 r = np.sqrt((dy)**2 + (dx)**2)
                 theta = np.arctan2(dy, dx)
+                theta = np.mod(theta + np.pi, 2 * np.pi)
                 polar_peaks[i, j] = np.column_stack([r, theta])
 
         return polar_peaks
@@ -287,6 +318,12 @@ class Polar4DStem(AutoSerialize):
 
     def save_polar_data(self, filepath):
         np.save(filepath, self.polar_data)
+
+    def load_polar_peaks(self, filepath):
+        self.polar_peaks = np.load(filepath, allow_pickle=True)
+
+    def load_polar_data(self, filepath):
+        self.polar_data = np.load(filepath, allow_pickle=True)
 
     def _postprocess_single(self, position_map, intensity_map, show=False, im_comp=None):
         """Process a single 2D image"""

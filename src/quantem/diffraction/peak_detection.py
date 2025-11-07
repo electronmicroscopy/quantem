@@ -212,3 +212,15 @@ if __name__ == "__main__":
     
     # Visualize
     visualize_blobs(image, blobs)
+
+def pair_peaks(peaks_experimental, peaks_reference):
+    # Pair off experimental Bragg peaks with reference peaks
+    for a0 in range(peaks_experimental.shape[0]):
+        dist_2 = (peaks_experimental[a0][0] - peaks_reference[:][0]) ** 2 + (
+            peaks_experimental[a0][1] - peaks_reference[:][1]
+        ) ** 2
+        ind_min = np.argmin(dist_2)
+
+        if dist_2[ind_min] <= radius_max_2:
+            inds_match[a0] = ind_min
+            keep[a0] = True

@@ -1,5 +1,5 @@
 # from collections.abc import Sequence
-# from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 # import matplotlib.pyplot as plt
 import numpy as np
@@ -52,6 +52,7 @@ class BraggPeaks(AutoSerialize):
         self,
         dataset: Dataset4d,
         model: MultiChannelCNN2d = None,
+        final_shape: Tuple[int, int] = (256, 256),
         device: str = 'cpu',
         _token: object | None = None,
     ):
@@ -62,6 +63,7 @@ class BraggPeaks(AutoSerialize):
 
         self._dataset = dataset
         self._device = device
+        self._final_shape = final_shape
         # Setup model
         input_channels = 1  # 1 for a greyscale image, 3 for RGB, 4 for RGBA, etc.
         k_size = 7
@@ -116,13 +118,16 @@ class BraggPeaks(AutoSerialize):
             device=device,
         )
     
-    def resize_data(self, final_shape, device:str = "cuda:1"):
+    def preprocess(self):
+        self.resize_data()
+
+    def resize_data(self, device:str = "cuda:1"):
         Ry, Rx, Qy, Qx = self._dataset.shape
-        scale_factor = (final_shape[0] * final_shape[1]) / (Qy * Qx)
-        resized_data = np.zeros((Ry, Rx, final_shape[0], final_shape[1]))
+        scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
+        resized_data = np.zeros((Ry, Rx, self._final_shape[0], self._final_shape[1]))
         for i in tqdm(range(Ry), desc='rows'):
             inp = torch.tensor(self._dataset[i].array, dtype=torch.float32).to(device)
-            inp = torch.nn.functional.interpolate(inp[None, ...], size=final_shape, mode='bilinear', align_corners=False) * scale_factor
+            inp = torch.nn.functional.interpolate(inp[None, ...], size=self._final_shape, mode='bilinear', align_corners=False) * scale_factor
             resized_data[i, :, :, :] = inp.squeeze().detach().cpu().numpy()
         self.resized_cartesian_data = resized_data
 
@@ -306,5 +311,5 @@ class BraggPeaks(AutoSerialize):
     def save_peaks(self, filepath):
         np.save(filepath, self.peak_coordinates_cartesian)
 
-    def save_peaks(self, filepath):
-        self.peak_coordinates_cartesian = np.load(filepath)
+    def load_peaks(self, filepath):
+        self.peak_coordinates_cartesian = np.load(filepath, allow_pickle=True)
