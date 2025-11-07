@@ -448,29 +448,6 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
             return x_blurred
 
-    def get_gaussian_smoothness_loss(
-        self,
-        obj: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Penalize difference between object and its Gaussian-filtered version.
-        Encourages smoothness in spatial dimensions (axes 1, 2).
-        """
-        loss = self._get_zero_loss_tensor()
-
-        sigma = self.constraints.get("gaussian_sigma")
-
-        if sigma is None:
-            return loss
-
-        weight = self.constraints.get("gaussian_weight", 1)
-
-        blurred = self.gaussian_blur_2d(obj, sigma=sigma)
-
-        loss = weight * ((obj - blurred).abs() ** 2).mean()
-
-        return loss
-
 
 class ObjectPixelated(ObjectConstraints):
     """
