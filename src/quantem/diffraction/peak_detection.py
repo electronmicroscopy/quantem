@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple
+from scipy.spatial import cKDTree
 
 class DoGBlobDetector:
     def __init__(self, min_sigma: float = 1.0, max_sigma: float = 50.0, 
@@ -213,14 +214,106 @@ if __name__ == "__main__":
     # Visualize
     visualize_blobs(image, blobs)
 
-def pair_peaks(peaks_experimental, peaks_reference):
-    # Pair off experimental Bragg peaks with reference peaks
-    for a0 in range(peaks_experimental.shape[0]):
-        dist_2 = (peaks_experimental[a0][0] - peaks_reference[:][0]) ** 2 + (
-            peaks_experimental[a0][1] - peaks_reference[:][1]
-        ) ** 2
-        ind_min = np.argmin(dist_2)
+def pair_peaks(peaks_experimental, peaks_reference, radius_max):
+    """
+    Pair experimental Bragg peaks with reference peaks.
+    
+    Parameters:
+    - peaks_experimental: np.array, shape (n, 2) for n experimental peaks
+    - peaks_reference: np.array, shape (m, 2) for m reference peaks
+    - radius_max: float, maximum distance for a match
+    
+    Returns:
+    - matches: list of tuples (exp_index, ref_index, distance)
+    - unmatched_exp: list of indices of unmatched experimental peaks
+    """
+    # Create KD-Tree for efficient nearest neighbor search
+    tree = cKDTree(peaks_reference)
+    
+    # Find nearest neighbors for all experimental peaks
+    distances, indices = tree.query(peaks_experimental, distance_upper_bound=radius_max)
+    
+    matches = []
+    unmatched_exp = []
+    
+    for exp_index, (dist, ref_index) in enumerate(zip(distances, indices)):
+        if dist <= radius_max:
+            matches.append((exp_index, ref_index, dist))
+        else:
+            unmatched_exp.append(exp_index)
+    
+    return matches, unmatched_exp
 
-        if dist_2[ind_min] <= radius_max_2:
-            inds_match[a0] = ind_min
-            keep[a0] = True
+def angle_difference(angle1, angle2):
+    """Calculate the smallest difference between two angles in degrees."""
+    return 180 - abs(abs(angle1 - angle2) - 180)
+
+def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=10):
+    """
+    Pair experimental Bragg peaks with reference peaks in polar coordinates.
+    
+    Parameters:
+    - peaks_experimental: np.array, shape (n, 2) for n experimental peaks (r, theta in degrees)
+    - peaks_reference: np.array, shape (m, 2) for m reference peaks (r, theta in degrees)
+    - radius_max: float, maximum radial distance for a match
+    - angle_max: float, maximum angular difference for a match (in degrees)
+    
+    Returns:
+    - matches: list of tuples (exp_index, ref_index, distance)
+    - unmatched_exp: list of indices of unmatched experimental peaks
+    - unmatched_ref: list of indices of unmatched reference peaks
+    """
+    matches = []
+    unmatched_exp = list(range(len(peaks_experimental)))
+    unmatched_ref = list(range(len(peaks_reference)))
+
+    for ref_index in unmatched_ref.copy():
+        ref_peak = peaks_reference[ref_index]
+        best_match = None
+        best_distance = float('inf')
+        
+        for exp_index in unmatched_exp.copy():
+            exp_peak = peaks_experimental[exp_index]
+            
+            r_diff = abs(exp_peak[0] - ref_peak[0])
+            theta_diff = angle_difference(exp_peak[1], ref_peak[1])
+            
+            # Use a combination of radial and angular difference for matching
+            distance = np.sqrt((r_diff / radius_max)**2 + (theta_diff / angle_max)**2)
+            
+            if distance < 1 and distance < best_distance:  # '1' represents a normalized distance threshold
+                best_match = (exp_index, ref_index, distance)
+                best_distance = distance
+        
+        if best_match:
+            matches.append(best_match)
+            unmatched_exp.remove(best_match[0])
+            unmatched_ref.remove(best_match[1])
+
+    return matches, unmatched_exp, unmatched_ref
+
+
+# Example usage:
+# peaks_experimental = np.array([[1, 0], [2, np.pi/2], [3, np.pi], [4, 3*np.pi/2]])
+# peaks_reference = np.array([[1.1, 0.1], [2.1, np.pi/2 + 0.1], [3.1, np.pi + 0.1], [5, 0]])
+# radius_max = 0.5
+
+# matches, unmatched = pair_peaks_polar(peaks_experimental, peaks_reference, radius_max)
+# print("Matches:", matches)
+# print("Unmatched experimental peaks:", unmatched)
+
+# matches, unmatched = pair_peaks(peaks_experimental, peaks_reference, radius_max)
+# print("Matches:", matches)
+# print("Unmatched experimental peaks:", unmatched)
+
+# def pair_peaks(peaks_experimental, peaks_reference):
+#     # Pair off experimental Bragg peaks with reference peaks
+#     for a0 in range(peaks_experimental.shape[0]):
+#         dist_2 = (peaks_experimental[a0][0] - peaks_reference[:][0]) ** 2 + (
+#             peaks_experimental[a0][1] - peaks_reference[:][1]
+#         ) ** 2
+#         ind_min = np.argmin(dist_2)
+
+#         if dist_2[ind_min] <= radius_max_2:
+#             inds_match[a0] = ind_min
+#             keep[a0] = True
