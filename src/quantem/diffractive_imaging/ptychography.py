@@ -454,7 +454,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.to("cpu")
 
         if self.verbose and verbose:
-            print(f"Saving ptychography object to {path}")
+            print(f"Saving ptychography object to {Path(path).absolute()}")
 
         super().save(
             path,

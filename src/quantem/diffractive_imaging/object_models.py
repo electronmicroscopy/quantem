@@ -570,6 +570,8 @@ class ObjectPixelated(ObjectConstraints):
         return self._initial_obj
 
     def _initialize_obj(self, shape: tuple[int, int, int] | np.ndarray) -> None:
+        if self.obj.numel() > 1:
+            return
         init_shape = tuple(int(x) for x in shape)
         if self._initialize_mode == "uniform":
             if self.obj_type in ["complex", "pure_phase"]:
