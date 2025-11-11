@@ -38,31 +38,7 @@ class AutoSerialize:
     and recreated as new instances during deserialization.
     """
 
-    # Stable class marker used to recognize AutoSerialize-like subclasses across
-    # reloads/sessions. This avoids relying solely on isinstance checks which can
-    # fail if classes are reloaded (e.g., in notebooks or hot-reload environments).
-    __autoserialize_marker__ = "quantem.autoserialize.v1"
-
-    def __init_subclass__(cls, **kwargs):  # type: ignore[override]
-        super().__init_subclass__(**kwargs)
-        # Ensure all subclasses carry the same stable marker string so that
-        # objects created before/after module reloads are recognized.
-        setattr(cls, "__autoserialize_marker__", AutoSerialize.__autoserialize_marker__)
-
-    @staticmethod
-    def is_autoserialize_like(value: Any) -> bool:
-        """Return True if value should be treated as AutoSerialize.
-
-        This is resilient to module reloads by checking a stable class marker in
-        addition to a normal isinstance() check.
-        """
-        try:
-            if isinstance(value, AutoSerialize):
-                return True
-            marker = getattr(value.__class__, "__autoserialize_marker__", None)
-            return marker == AutoSerialize.__autoserialize_marker__
-        except Exception:
-            return False
+    __autoserialize_marker__ = ("AutoSerialize", __module__)
 
     # ---- Helpers to reduce casting noise ----
     @staticmethod
@@ -195,6 +171,17 @@ class AutoSerialize:
                 return val
         return val
 
+    @staticmethod
+    def _is_autoserialize_instance(value: Any) -> bool:
+        """Return True if value behaves like an AutoSerialize instance, even across autoreloads."""
+        if isinstance(value, AutoSerialize):
+            return True
+        cls = getattr(value, "__class__", None)
+        if cls is None:
+            return False
+        marker = getattr(cls, "__autoserialize_marker__", None)
+        return marker == AutoSerialize.__autoserialize_marker__
+
     def save(
         self,
         path: str | Path,
@@ -320,12 +307,7 @@ class AutoSerialize:
         This eliminates duplication between _recursive_save and _serialize_container.
         """
         # --- Serialization handlers by type ---
-        if AutoSerialize.is_autoserialize_like(value):
-            # Nested AutoSerialize subtree
-            subgroup = group.require_group(name)
-            self._recursive_save(value, subgroup, skip_names, skip_types, compressors)
-
-        elif isinstance(value, torch.Tensor):
+        if isinstance(value, torch.Tensor):
             # Save entire tensor with torch.save to preserve requires_grad, grad_fn, etc.
             # This is more robust than converting to numpy which loses gradient information
             subgroup = group.require_group(name)
@@ -421,6 +403,11 @@ class AutoSerialize:
             # Handle pathlib.Path objects and other path-like objects
             group.attrs[name] = str(value)
             group.attrs[f"{name}.is_path"] = True
+
+        elif self._is_autoserialize_instance(value):
+            # Nested AutoSerialize subtree
+            subgroup = group.require_group(name)
+            self._recursive_save(value, subgroup, skip_names, skip_types, compressors)
 
         elif isinstance(value, (list, tuple, dict)):
             # Save containers recursively (with nested AutoSerialize support)
@@ -1208,7 +1195,7 @@ class AutoSerialize:
                 return ("└── ", "    ") if last else ("├── ", "│   ")
 
             # Handle objects using AutoSerialize
-            if AutoSerialize.is_autoserialize_like(val):
+            if AutoSerialize._is_autoserialize_instance(val):
                 # Filter out metadata keys unless user wants to see them
                 keys = [
                     k
@@ -1224,7 +1211,7 @@ class AutoSerialize:
                     if show_autoserialize_types and hasattr(subval, "_container_type"):
                         suffix = f" (_container_type = '{getattr(subval, '_container_type', '')}')"
                     # Branch: nested class, tensor, ndarray, container, or primitive
-                    if AutoSerialize.is_autoserialize_like(subval):
+                    if AutoSerialize._is_autoserialize_instance(subval):
                         # Optionally show full class path
                         s = (
                             f"{key}: class {subval.__class__.__name__}{suffix}"
