@@ -8,6 +8,7 @@ import numpy as np
 import scipy.ndimage as ndi
 import torch
 import torch.nn as nn
+from matplotlib.colors import to_rgb
 from tqdm.auto import tqdm
 
 from quantem.core import config
@@ -27,11 +28,13 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
+from quantem.diffractive_imaging._natural_neighbors_interpolation import beamlet_weights
 from quantem.diffractive_imaging.complex_probe import (
     POLAR_ALIASES,
     POLAR_SYMBOLS,
-    evaluate_probe,
+    fourier_space_probe,
     real_space_probe,
+    spatial_frequencies,
 )
 from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import (
@@ -1405,7 +1408,7 @@ class ProbePRISM(ProbeBase):
         num_probes: int | None = None,
         probe_params: dict = {},
         roi_shape: tuple[int, int] | np.ndarray | None = None,
-        interpolation: tuple[int, int] = (1, 1),
+        num_partitions: int = 3,
         learn_aberrations: bool = True,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -1422,8 +1425,8 @@ class ProbePRISM(ProbeBase):
             Additional probe parameters (must contain 'energy')
         roi_shape : tuple[int, int] | np.ndarray | None
             Shape of the probe ROI
-        interpolation : tuple[int, int]
-            PRISM interpolation factors (f_x, f_y)
+        num_partitions : int
+            Number of rings for parent wave vectors
         device : str
             Device to use ('cpu' or 'cuda')
         rng : np.random.Generator | int | None
@@ -1450,11 +1453,13 @@ class ProbePRISM(ProbeBase):
             _token=_token,
         )
 
-        self.interpolation = interpolation
+        self.num_partitions = num_partitions
         self.aberration_coefs_list = coefs
         self.learn_aberrations = learn_aberrations
-        self._wave_vectors = None
 
+        self._parent_wave_vectors = None
+        self._beamlet_wave_vectors = None
+        self._interpolation_weights = None
         self._ctf_params = None
         self._intensity_norm_factor = 1.0
 
@@ -1464,34 +1469,19 @@ class ProbePRISM(ProbeBase):
         probe_params: dict,
         num_probes: int | None = None,
         roi_shape: tuple[int, int] | None = None,
-        interpolation: tuple[int, int] = (1, 1),
+        num_partitions: int = 3,
         learn_aberrations: bool = True,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
     ):
         """
         Create ProbePRISM from parameters.
-
-        Parameters
-        ----------
-        probe_params : dict
-            Probe parameters including 'energy' (in eV)
-        num_probes : int | None
-            Number of probe modes
-        roi_shape : tuple[int, int] | None
-            Shape of the probe ROI
-        interpolation : tuple[int, int]
-            PRISM interpolation factors
-        device : str
-            Device to use
-        rng : np.random.Generator | int | None
-            Random number generator
         """
         return cls(
             num_probes=num_probes,
             probe_params=probe_params,
             roi_shape=roi_shape,
-            interpolation=interpolation,
+            num_partitions=num_partitions,
             learn_aberrations=learn_aberrations,
             device=device,
             rng=rng,
@@ -1499,20 +1489,16 @@ class ProbePRISM(ProbeBase):
         )
 
     @property
-    def interpolation(self) -> tuple[int, int]:
-        return self._interpolation
-
-    @interpolation.setter
-    def interpolation(self, interp: tuple[int, int] | list):
-        if len(interp) != 2:
-            raise ValueError(f"interpolation must have length 2, got {len(interp)}")
-        self._interpolation = (int(interp[0]), int(interp[1]))
-
-    @property
     def extent(self) -> tuple[float, float] | None:
         if not hasattr(self, "reciprocal_sampling"):
             return None
         return tuple((1 / self.reciprocal_sampling).astype(np.float32))
+
+    @property
+    def sampling(self) -> tuple[float, float] | None:
+        if not hasattr(self, "reciprocal_sampling"):
+            return None
+        return tuple(e.astype(np.float32) / n for e, n in zip(self.extent, self.roi_shape))
 
     @property
     def wavelength(self) -> float | None:
@@ -1528,31 +1514,29 @@ class ProbePRISM(ProbeBase):
         return self.wavelength * 1e3 * self.reciprocal_sampling
 
     @property
+    def parent_wave_vectors(self) -> torch.Tensor:
+        """Parent wave vectors for partitioned PRISM [num_parent, 2]"""
+        return self._parent_wave_vectors
+
+    @property
     def wave_vectors(self) -> torch.Tensor:
-        """Wave vectors for plane wave decomposition [num_waves, 2]"""
+        """Beamlet wave vectors (full k-space grid) [num_beamlets, 2]"""
         return self._wave_vectors
+
+    @property
+    def interpolation_weights(self) -> torch.Tensor:
+        """Natural neighbor interpolation weights [num_parent, num_beamlets]"""
+        return self._interpolation_weights
 
     @property
     def plane_waves(self) -> torch.Tensor:
         """Compute plane waves on the fly"""
         # Compute plane waves
         return self._prism_plane_waves(
-            wave_vectors=self.wave_vectors,
+            wave_vectors=self.parent_wave_vectors,
             extent=self.extent,
             gpts=self.roi_shape.astype(int),
         )
-
-    @property
-    def ctf_coefs(self) -> torch.Tensor:
-        """
-        Compute CTF coefficients on-the-fly from learnable parameters.
-        Returns [num_probes, num_waves]
-        """
-        if self._ctf_params is None:
-            raise RuntimeError("CTF parameters not initialized")
-
-        # Recompute CTF from current parameter values
-        return self._compute_ctf_from_params()
 
     @property
     def probe(self) -> torch.Tensor:
@@ -1561,12 +1545,7 @@ class ProbePRISM(ProbeBase):
         Returns [num_probes, roi_height, roi_width]
         """
 
-        # Reconstruct probes
-        probes = torch.tensordot(
-            self.ctf_coefs,
-            self.plane_waves,
-            dims=((1,), (0,)),
-        )  # [num_probes, roi_height, roi_width]
+        probes = self._compute_beamlet_basis(accumulated_thickness=0.0).sum(1)
 
         return probes
 
@@ -1609,14 +1588,29 @@ class ProbePRISM(ProbeBase):
         if self.probe_params.get("semiangle_cutoff", None) is None:
             raise ValueError("probe_params must contain 'semiangle_cutoff' for PRISM")
 
-        # Compute PRISM wave vectors
-        self._wave_vectors = self._prism_wave_vectors(
-            semiangle_cutoff=self.probe_params.get("semiangle_cutoff")
-            + np.linalg.norm(self.angular_sampling),
+        # Generate parent wave vectors
+        cutoff = self.probe_params.get("semiangle_cutoff") + np.linalg.norm(self.angular_sampling)
+        self._parent_wave_vectors = self._partitioned_prism_wave_vectors(
+            cutoff=cutoff,
             extent=self.extent,
             wavelength=self.wavelength,
-            interpolation=self.interpolation,
+            num_rings=self.num_partitions,
+            num_points_per_ring=6,
         )
+
+        self._wave_vectors = self._prism_wave_vectors(
+            cutoff=cutoff,
+            extent=self.extent,
+            wavelength=self.wavelength,
+        )
+
+        interpolation_weights = beamlet_weights(
+            self.parent_wave_vectors,
+            self.wave_vectors,
+            self.roi_shape,
+            self.sampling,
+        )
+        self._interpolation_weights = torch.from_numpy(interpolation_weights).to(self.device)
 
         # Initialize learnable CTF parameters for each probe mode
         self._ctf_params = nn.ModuleList()
@@ -1650,33 +1644,62 @@ class ProbePRISM(ProbeBase):
                 initial_dict[key] = val.detach().clone()
             self._initial_ctf_params.append(initial_dict)
 
-    def _compute_ctf_from_params(self) -> torch.Tensor:
+    def _compute_beamlet_basis(
+        self,
+        accumulated_thickness: float,
+        position_coefficients: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
-        Compute CTF coefficients from current learnable parameters.
-        Returns [num_probes, num_waves]
+        Compute beamlet basis functions including CTF and back-propagation.
+
+        Parameters
+        ----------
+        accumulated_thickness : float
+            Accumulated thickness for back-propagation (in Angstroms)
+        probe_idx : int
+            Probe mode index
+        gpts : tuple[int, int]
+            Grid points
+
+        Returns
+        -------
+        torch.Tensor
+            Beamlet basis [num_parent, gpts[0], gpts[1]]
         """
-        ctf_coefs_list = []
+        beamlets_list = []
         for probe_idx in range(self.num_probes):
             # Get current aberration coefficients for this probe
             aberration_coefs = {key: val for key, val in self._ctf_params[probe_idx].items()}
 
-            # Compute CTF for this probe mode
-            ctf_coef = self._ctf_coefficients(
-                wave_vectors=self.wave_vectors,
-                semiangle_cutoff=self.probe_params.get("semiangle_cutoff"),
-                angular_sampling=self.angular_sampling,
-                wavelength=self.wavelength,
+            # Add accumulated thickness to defocus (C10)
+            aberration_coefs = aberration_coefs.copy()
+            aberration_coefs["C10"] = aberration_coefs.get("C10", 0.0) + accumulated_thickness
+
+            ctf = fourier_space_probe(
+                gpts=self.roi_shape,
+                sampling=self.sampling,
+                energy=self.probe_params["energy"],
+                semiangle_cutoff=self.probe_params["semiangle_cutoff"],
                 aberration_coefs=aberration_coefs,
             )
-            ctf_coefs_list.append(ctf_coef)
 
-        return torch.stack(ctf_coefs_list) * self._intensity_norm_factor
+            weights = self.interpolation_weights
+
+            if position_coefficients is None:
+                beamlets_fft = ctf * weights
+            else:
+                beamlets_fft = ctf * weights * position_coefficients
+
+            # Apply CTF and weights, then inverse FFT
+            beamlets = torch.fft.ifft2(beamlets_fft)
+            beamlets_list.append(beamlets)
+
+        return torch.stack(beamlets_list) * self._intensity_norm_factor
 
     def _normalize_probe_intensity(self, mean_diffraction_intensity: float):
         """Normalize probe intensity to match experimental data."""
         # Compute current probe
-        current_ctf = self._compute_ctf_from_params()
-        probe = torch.tensordot(current_ctf, self.plane_waves, dims=((1,), (0,)))
+        probe = self.probe
 
         # Compute intensity normalization
         probe_intensity = torch.sum(torch.abs(probe).square())
@@ -1693,7 +1716,7 @@ class ProbePRISM(ProbeBase):
                 for key, initial_val in initial_dict.items():
                     self._ctf_params[probe_idx][key].copy_(initial_val)
 
-    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, positions: torch.Tensor, accumulated_thickness: float = 0.0) -> torch.Tensor:
         """
         Compute PRISM coefficients for given probe positions.
 
@@ -1708,14 +1731,17 @@ class ProbePRISM(ProbeBase):
             PRISM coefficients [num_probes, batch_size, num_waves]
         """
         # Compute position coefficients
+        kxa, kya = spatial_frequencies(self.roi_shape, sampling=self.sampling)
         position_coefs = self._position_coefficients(
             positions=positions,
-            wave_vectors=self.wave_vectors,
-        )  # [batch_size, num_waves]
+            kxa=kxa,
+            kya=kya,
+        )  # [batch_size, roi_h, roi_w]
 
-        # Combine with CTF coefficients
-        coefs = position_coefs[None, :, :] * self.ctf_coefs[:, None, :]
-        # [num_probes, batch_size, num_waves]
+        coefs = self._compute_beamlet_basis(
+            accumulated_thickness,
+            position_coefs,
+        )  # [num_probes, num_parent_waves, roi_h, roi_w]
 
         return coefs
 
@@ -1723,10 +1749,9 @@ class ProbePRISM(ProbeBase):
 
     def _prism_wave_vectors(
         self,
-        semiangle_cutoff: float,
+        cutoff: float,
         extent: tuple[float, float],
         wavelength: float,
-        interpolation: tuple[int, int],
     ) -> torch.Tensor:
         """
         Returns planewave wave_vectors.
@@ -1747,17 +1772,16 @@ class ProbePRISM(ProbeBase):
         torch.Tensor
             Wave vectors [num_waves, 2]
         """
-        cutoff = semiangle_cutoff * 1e-3
-        n_max = math.ceil(cutoff / (wavelength / extent[0] * interpolation[0]))
-        m_max = math.ceil(cutoff / (wavelength / extent[1] * interpolation[1]))
+        cutoff = cutoff * 1e-3
+        n_max = math.ceil(cutoff / (wavelength / extent[0]))
+        m_max = math.ceil(cutoff / (wavelength / extent[1]))
 
         n = torch.arange(-n_max, n_max + 1, dtype=torch.float32, device=self.device)
         m = torch.arange(-m_max, m_max + 1, dtype=torch.float32, device=self.device)
         w, h = extent[0], extent[1]
-        int_n, int_m = float(interpolation[0]), float(interpolation[1])
 
-        kx = n / w * int_n
-        ky = m / h * int_m
+        kx = n / w
+        ky = m / h
 
         mask = kx[:, None].square() + ky[None, :].square() < (cutoff / wavelength) ** 2
 
@@ -1766,6 +1790,49 @@ class ProbePRISM(ProbeBase):
         ky = ky[mask]
 
         return torch.stack((kx, ky), dim=-1)
+
+    def _partitioned_prism_wave_vectors(
+        self,
+        cutoff: float,
+        extent: tuple[float, float],
+        wavelength: float,
+        num_rings: int = 3,
+        num_points_per_ring: int = 6,
+    ) -> torch.Tensor:
+        """
+        Generate parent wave vectors in a hexagonal ring pattern.
+
+        Parameters
+        ----------
+        cutoff : float
+            Convergence semi-angle in mrad
+        extent : tuple[float, float]
+            Real-space extent in Angstroms
+        wavelength : float
+            Electron wavelength in Angstroms
+        num_rings : int
+            Number of rings (including center point)
+        num_points_per_ring : int
+            Base number of points per ring (increases linearly)
+
+        Returns
+        -------
+        np.ndarray
+            Parent wave vectors [num_parent, 2]
+        """
+        rings = [np.array([[0.0, 0.0]])]
+        n = num_points_per_ring
+
+        for r in np.linspace(cutoff / (num_rings - 1), cutoff, num_rings - 1):
+            angles = np.arange(n, dtype=np.float32) * 2 * np.pi / n + np.pi / 2
+            kx = r * np.sin(angles) / 1000.0 / wavelength
+            ky = r * np.cos(-angles) / 1000.0 / wavelength
+            rings.append(np.stack([kx, ky], axis=1))
+            n += num_points_per_ring
+
+        wavevectors = np.vstack(rings)
+
+        return torch.from_numpy(wavevectors).to(device=self.device, dtype=torch.float32)
 
     def _prism_plane_waves(
         self,
@@ -1800,7 +1867,7 @@ class ProbePRISM(ProbeBase):
         return array / math.sqrt(math.prod(gpts))
 
     def _position_coefficients(
-        self, positions: torch.Tensor, wave_vectors: torch.Tensor
+        self, positions: torch.Tensor, kxa: torch.Tensor, kya: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute position-dependent phase shifts for PRISM.
@@ -1817,55 +1884,37 @@ class ProbePRISM(ProbeBase):
         torch.Tensor
             Position coefficients [batch_size, num_waves]
         """
+
         coefficients = torch.exp(
-            -2.0j * math.pi * positions[..., 0, None] * wave_vectors[:, 0][None]
-        ) * torch.exp(-2.0j * math.pi * positions[..., 1, None] * wave_vectors[:, 1][None])
+            -2.0j * math.pi * positions[..., 0, None, None] * kxa[None, ...]
+        ) * torch.exp(-2.0j * math.pi * positions[..., 1, None, None] * kya[None, ...])
 
         return coefficients
 
-    def _ctf_coefficients(
-        self,
-        wave_vectors: torch.Tensor,
-        semiangle_cutoff: float,
-        angular_sampling: tuple[float, float],
-        wavelength: float,
-        aberration_coefs: dict,
-    ) -> torch.Tensor:
-        """
-        Compute CTF coefficients for a single probe mode.
+    def show_interpolation_weights(self, ax: plt.Axes | None = None):
+        """ """
+        weights = self._interpolation_weights.numpy()
 
-        Parameters
-        ----------
-        wave_vectors : torch.Tensor
-            Wave vectors [num_waves, 2]
-        semiangle_cutoff : float
-            Convergence semi-angle in mrad
-        angular_sampling : tuple[float, float]
-            Angular sampling in mrad
-        wavelength : float
-            Electron wavelength in Angstroms
-        aberration_coefs : dict
-            Aberration coefficients
+        color_cycle = [["c", "r"], ["m", "g"], ["b", "y"]]
+        colors = ["w"]
+        i = 1
+        while True:
+            colors += color_cycle[(i - 1) % 3] * (3 + (i - 1) * 3)
+            i += 1
+            if len(colors) >= len(weights):
+                break
 
-        Returns
-        -------
-        torch.Tensor
-            CTF coefficients [num_waves]
-        """
-        alpha = torch.sqrt(wave_vectors[:, 0].square() + wave_vectors[:, 1].square()) * wavelength
-        phi = torch.arctan2(wave_vectors[:, 1], wave_vectors[:, 0])
+        colors = np.array([to_rgb(color) for color in colors])
+        color_map = np.zeros(weights.shape[1:] + (3,))
 
-        array = evaluate_probe(
-            alpha,
-            phi,
-            semiangle_cutoff,
-            angular_sampling,
-            wavelength,
-            soft_edges=True,
-            vacuum_probe_intensity=None,
-            aberration_coefs=aberration_coefs,
-        )
-        return array / array.abs().square().sum().sqrt()
+        for i, color in enumerate(colors):
+            color_map += weights[i, ..., None] * color[None, None]
+
+        if ax is None:
+            fig, ax = plt.subplots()
+
+        ax.imshow(np.fft.fftshift(color_map, axes=(0, 1)))
+        ax.set(xticks=[], yticks=[])
 
     def _extract_aberration_coefs(self, probe_params: dict) -> list[dict]:
         """
