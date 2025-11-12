@@ -840,6 +840,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.obj_model.reset()
         self.probe_model.reset()
         self.dset.reset()
+        self.obj_model.constraints = self.obj_model.DEFAULT_CONSTRAINTS
         # detector reset if necessary
         self._epoch_losses = []
         self._epoch_val_losses = []
