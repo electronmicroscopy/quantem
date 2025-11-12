@@ -96,7 +96,7 @@ def read_4dstem(
     return dataset
 
 
-def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str) -> Dataset3dspectroscopy:
+def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset_index: int | None = None) -> Dataset3dspectroscopy:
     """
     File reader for 3D spectroscopy data data
 
@@ -114,7 +114,35 @@ def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str) -> Data
     Dataset3dspectroscopy
     """
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
-    imported_data = file_reader(file_path)[0]
+    data_list = file_reader(file_path)
+    
+    # If specific index provided, use it
+    if dataset_index is not None:
+        imported_data = data_list[dataset_index]
+        if imported_data["data"].ndim != 3:
+            raise ValueError(
+                f"Dataset at index {dataset_index} has {imported_data['data'].ndim} dimensions, "
+                f"expected 4D. Shape: {imported_data['data'].shape}"
+            )
+    else:
+        # Automatically find first 3D dataset
+        three_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 3]
+
+        if len(three_d_datasets) == 0:
+            print(f"No 3D datasets found in {file_path}. Available datasets:")
+            for i, d in enumerate(data_list):
+                print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+            raise ValueError("No 3D dataset found in file")
+
+        dataset_index, imported_data = three_d_datasets[0]
+
+        if len(data_list) > 1:
+            print(
+                f"File contains {len(data_list)} dataset(s). Using dataset {dataset_index} with shape {imported_data['data'].shape}"
+            )
+
+    imported_axes = imported_data["axes"]
+    # imported_data[0], 
     if data_type == "EELS":
         dataset = Dataset3deels.from_array(
             array=imported_data["data"].transpose((2, 0, 1)),
