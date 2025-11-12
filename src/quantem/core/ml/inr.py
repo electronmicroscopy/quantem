@@ -38,15 +38,15 @@ class Siren(nn.Module):
 
 class HSiren(nn.Module):
     def __init__(self, in_features=2, out_features=3, hidden_layers=3, hidden_features=256,
-                 first_omega_0=30, hidden_omega_0=30, alpha=1.0):
+                 first_omega_0=30, hidden_omega_0=30, alpha=1.0, r_first_layer = 3, r_hidden_layers = 2):
         super().__init__()
         self.net_list = []
         self.net_list.append(SineLayer(in_features, hidden_features, is_first=True,
-                                  omega_0=first_omega_0, hsiren=True, alpha=alpha))
+                                  omega_0=first_omega_0, hsiren=True, alpha=alpha, r=r_first_layer))
 
         for i in range(hidden_layers):
             self.net_list.append(SineLayer(hidden_features, hidden_features, is_first=False,
-                                     omega_0=hidden_omega_0, alpha=alpha))
+                                     omega_0=hidden_omega_0, alpha=alpha, r=r_hidden_layers))
 
         final_linear = nn.Linear(hidden_features, out_features)
         with torch.no_grad():

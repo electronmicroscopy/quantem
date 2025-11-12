@@ -376,6 +376,7 @@ class SineLayer(nn.Module):
         omega_0: float = 30,
         hsiren: bool = False,
         alpha: float = 1.0,
+        r: int = 2,
     ):
         super().__init__()
         self.omega_0 = omega_0
@@ -384,6 +385,7 @@ class SineLayer(nn.Module):
         self.in_features = in_features
         self.alpha = alpha
         self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.r = r
         self.init_weights()
 
     def init_weights(self):
@@ -399,7 +401,7 @@ class SineLayer(nn.Module):
 
     def forward(self, input):
         if self.is_first and self.hsiren:
-            out = torch.sin(self.omega_0 * torch.sinh(2*self.linear(input)))
+            out = torch.sin(self.omega_0 * torch.sinh(self.r*self.linear(input)))
         else:
             out = torch.sin(self.omega_0 * self.linear(input))
         return out

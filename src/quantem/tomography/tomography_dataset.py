@@ -167,6 +167,7 @@ class TomographyDataset(AutoSerialize, Dataset):
         self._z3_angles = self._z3_angles.to(device)
         self._shifts = self._shifts.to(device)
 
+
     # --- Properties ---
 
     @property
@@ -340,3 +341,67 @@ class TomographyDataset(AutoSerialize, Dataset):
         self._z1_angles = self._initial_z1_angles.clone()
         self._z3_angles = self._initial_z3_angles.clone()
         self._shifts = self._initial_shifts.clone()
+
+# TODO: Temporary for use when only doing validation
+class TomographyRayDataset(Dataset):
+    """
+    Dataset for ray-based tomography training.
+    Each sample contains: target pixel value, pixel coordinates, phi angle, and auxiliary info.
+    """
+
+    def __init__(self, tilt_series, phis, N, val_ratio=0.0, mode='train', seed=42):
+        """
+        Args:
+            tilt_series: [M, N, N] tensor of projections
+            phis: [M] tensor of tilt angles
+            N: Grid size
+        """
+        self.tilt_series = tilt_series.cpu()
+
+        self.tilt_series = torch.clamp(self.tilt_series, min=0.0)
+
+        # tilt_percentile = torch.quantile(self.tilt_series, .95)
+        tilt_percentile = np.quantile(self.tilt_series.numpy(), 0.95)
+
+        self.tilt_series = self.tilt_series / tilt_percentile
+
+        self.phis = phis.cpu()
+        self.N = N
+        self.M = tilt_series.shape[0]
+        self.total_pixels = self.M * self.N * self.N
+
+
+        # Create train/val split
+        torch.manual_seed(seed)
+        all_indices = torch.randperm(self.total_pixels)
+
+        num_val = int(self.total_pixels * val_ratio)
+        if mode == 'val':
+            self.indices = all_indices[:num_val]
+        else:  # train
+            self.indices = all_indices[num_val:]
+
+        self.mode = mode
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+
+        actual_idx = self.indices[idx].item()
+
+        projection_idx = actual_idx // (self.N * self.N)
+        remaining = actual_idx % (self.N * self.N)
+        pixel_i = remaining // self.N
+        pixel_j = remaining % self.N
+
+        target_value = self.tilt_series[projection_idx, pixel_i, pixel_j]
+        phi = self.phis[projection_idx]
+
+        return {
+            'projection_idx': projection_idx,
+            'pixel_i': pixel_i,
+            'pixel_j': pixel_j,
+            'target_value': target_value,
+            'phi': phi
+        }

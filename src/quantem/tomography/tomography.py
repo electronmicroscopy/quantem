@@ -23,13 +23,21 @@ import torch.distributed as dist
 def get_num_samples_per_ray(epoch):
     """Increase number of samples per ray at specific epochs."""
     schedule = {
-        0: 500,
-        # 2: 500,
-        # 4: 500,
-        # 6: 500,
+        0: 20,
+        2: 100,
+        4: 200,
+        6: 400,
         # 8: 500,
         10: 500,
     }
+    # schedule = {
+    #     0: 20,
+    #     2: 50,
+    #     4: 100,
+    #     6: 150,
+    #     8: 200,
+    #     10: 200,
+    # }
 
     num_samples = 64
     for epoch_threshold, samples in sorted(schedule.items()):
@@ -216,11 +224,12 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         soft_constraints: dict = None,
         vol_save_path: str = None, # TODO: TEMPORARY
         log_path = None,
+        val_fraction: float = 0.0,
     ):      
 
         if not self.ddp_instantiated:
             self.setup_distributed()
-            self.setup_dataloader(self.dataset, batch_size, num_workers)
+            self.setup_dataloader(self.dataset, batch_size, num_workers, val_fraction)
             self.ddp_instantiated = True
             obj.model = self.build_model(obj._model)
             self.obj = obj
@@ -370,11 +379,18 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     avg_mse_loss = epoch_mse_loss.item() / num_batches
                     avg_tv_loss = epoch_tv_loss.item() / num_batches
                     avg_z1_loss = epoch_z1_loss.item() / num_batches
-                    
+                    shifts, z1, z3 = self.dataset.auxiliary_params.forward()
+                    shifts = shifts.detach().cpu()
+                    z1 = z1.detach().cpu()
+                    z3 = z3.detach().cpu()
                     metrics = torch.tensor([avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss], device=self.device)
                     if self.world_size > 1:
                         dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
                     avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss = metrics.tolist()
+
+
+            if hasattr(self, "val_dataloader") and self.val_dataloader is not None:
+                val_loss = self.validate(aux_params, num_samples_per_ray, device_type, autocast_dtype, use_amp, N)
 
             if self.global_rank == 0 and (epoch % viz_freq == 0 or epoch == epochs - 1):
                 with torch.no_grad():
@@ -382,7 +398,8 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
                     # Log metrics
                     self.temp_logger.add_scalar("train/mse_loss", avg_mse_loss, self.global_epochs)
-
+                    if hasattr(self, "val_dataloader") and self.val_dataloader is not None:
+                        self.temp_logger.add_scalar("val/mse_loss", val_loss, self.global_epochs)
                     self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, self.global_epochs)
                     # if tv_weight > 0:
                     self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, self.global_epochs)
@@ -412,6 +429,14 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     axes[4].set_title('Sum over X-axis')
 
                     self.temp_logger.add_figure("train/viz", fig, self.global_epochs, close=True)
+
+                    fig, axes = plt.subplots(ncols = 3, figsize = (10, 5))
+                    axes[0].plot(shifts[:, 0].cpu().numpy(), label = 'Shifts X')
+                    axes[0].plot(shifts[:, 1].cpu().numpy(), label = 'Shifts Y')
+                    axes[0].legend()
+                    axes[1].plot(z1.cpu().numpy(), label = 'Z1')
+                    axes[2].plot(z3.cpu().numpy(), label = 'Z3')
+                    self.temp_logger.add_figure("train/auxiliary_params", fig, self.global_epochs, close=True)
                     plt.close(fig)
                     
             if epoch % checkpoint_freq == 0 or self.global_epochs == epochs - 1:
@@ -424,9 +449,74 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
         if self.global_rank == 0:
             print("Training complete.")
-
-        # print("Successfully setup DDP and dataloader")
         
+        torch.save(self.dataset.auxiliary_params.forward(), f"{log_path}/auxiliary_params.pt")
+        # print("Successfully setup DDP and dataloader")
+    def validate(self, aux_params, num_samples_per_ray, device_type, autocast_dtype, use_amp, N):
+        """Validate the model on the validation set."""
+        self.obj.model.eval()
+        aux_params.eval()
+
+        val_loss = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            for batch in self.val_dataloader:
+                pixel_i = batch['pixel_i'].float().to(self.device, non_blocking=True)
+                pixel_j = batch['pixel_j'].float().to(self.device, non_blocking=True)
+                target_values = batch['target_value'].to(self.device, non_blocking=True)
+                phis = batch['phi'].to(self.device, non_blocking=True)
+                projection_indices = batch['projection_idx'].to(self.device, non_blocking=True)
+
+                shifts, z1_params, z3_params = aux_params(None)
+                batch_shifts = torch.index_select(shifts, 0, projection_indices)
+                batch_z1 = torch.index_select(z1_params, 0, projection_indices)
+                batch_z3 = torch.index_select(z3_params, 0, projection_indices)
+
+                with torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=use_amp):
+                    with torch.no_grad():
+                        batch_ray_coords = self.create_batch_projection_rays(
+                            pixel_i, pixel_j, N, num_samples_per_ray
+                        )
+
+                    transformed_rays = self.transform_batch_ray_coordinates(
+                        batch_ray_coords,
+                        z1=batch_z1,
+                        x=phis,
+                        z3=batch_z3,
+                        shifts=batch_shifts,
+                        N=N,
+                        sampling_rate=1.0,
+                    )
+
+                    all_coords = transformed_rays.view(-1, 3)
+
+                    all_densities = self.obj.forward(all_coords)
+
+                    ray_densities = all_densities.view(len(target_values), num_samples_per_ray) # Reshape rays and integarte
+                    step_size = 2.0 / (num_samples_per_ray - 1)
+
+                    predicted_values = ray_densities.sum(dim=1) * step_size
+
+                    mse_loss = torch.nn.functional.mse_loss(predicted_values, target_values)
+
+                    loss = mse_loss
+
+                    val_loss += loss.detach()
+                    num_batches += 1
+
+        avg_val_loss = val_loss / num_batches if num_batches > 0 else 0.0
+
+        if self.world_size > 1:
+            val_loss_tensor = avg_val_loss.detach().clone()
+            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+            avg_val_loss = val_loss_tensor.item()
+
+        self.obj.model.train()
+        aux_params.train()
+
+        return avg_val_loss
+
     def ad_recon(
         self,
         optimizer_params: dict,

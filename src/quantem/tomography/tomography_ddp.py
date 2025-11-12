@@ -4,7 +4,9 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import torch.nn as nn
 import os
 import numpy as np
-from quantem.tomography.tomography_dataset import TomographyDataset
+from quantem.tomography.tomography_dataset import TomographyDataset, TomographyRayDataset
+
+from torch.utils.data import random_split
 
 class TomographyDDP:
     """
@@ -90,40 +92,94 @@ class TomographyDDP:
         tomo_dataset: TomographyDataset,
         batch_size: int,
         num_workers: int = 0,
+        val_fraction: float = 0.0,
     ):
-        
-        if self.world_size > 1:
-            sampler = DistributedSampler(
-                tomo_dataset,
-                num_replicas = self.world_size,
-                rank = self.global_rank,
-                shuffle = True,
-            )    
-            shuffle = False
-            
+        pin_mem = self.device.type == "cuda"
+        persist = num_workers > 0
+
+        # Split dataset if validation fraction > 0
+        if val_fraction > 0.0:
+            # TODO: Temporary for when only doing validation, current TomographyDataset doesn't work correctly
+            train_dataset = TomographyRayDataset(
+                tomo_dataset.tilt_series.detach().clone(),
+                tomo_dataset.tilt_angles.detach().clone(),
+                500, # TODO: TEMPORARY
+                val_ratio=val_fraction,
+                mode='train',
+                seed=42,
+            )
+            val_dataset = TomographyRayDataset(
+                tomo_dataset.tilt_series.detach().clone(),
+                tomo_dataset.tilt_angles.detach().clone(),
+                500, # TODO: TEMPORARY
+                val_ratio=val_fraction,
+                mode='val',
+                seed=42,
+            )
         else:
-            sampler = None
+            train_dataset, val_dataset = tomo_dataset, None
+
+        # Samplers for distributed training
+        if self.world_size > 1:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.world_size,
+                rank=self.global_rank,
+                shuffle=True,
+            )
+            if val_dataset:
+                val_sampler = DistributedSampler(
+                    val_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.global_rank,
+                    shuffle=False,
+                )
+            shuffle = False
+        else:
+            train_sampler = None
+            val_sampler = None
             shuffle = True
-            
+
+        # Main dataloader
         self.dataloader = DataLoader(
-            tomo_dataset,
-            batch_size = batch_size,
-            num_workers = num_workers,
-            sampler = sampler,
-            shuffle = shuffle,
-            pin_memory = True if self.device.type == "cuda" else False,
-            drop_last = True,
-            persistent_workers = False if num_workers == 0 else True,
+            train_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sampler=train_sampler,
+            shuffle=shuffle,
+            pin_memory=pin_mem,
+            drop_last=True,
+            persistent_workers=persist,
         )
-        
-        self.sampler = sampler
+
+        # Validation dataloader if applicable
+        if val_dataset:
+            self.val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=batch_size * 4,
+                num_workers=num_workers,
+                sampler=val_sampler,
+                shuffle=False,
+                pin_memory=pin_mem,
+                drop_last=False,
+                persistent_workers=persist,
+            )
+            self.val_sampler = val_sampler
+
+
+        self.sampler = train_sampler
+
         
         if self.global_rank == 0:
             print(f"Dataloader setup complete:")
             print(f"  Total projections: {len(tomo_dataset.tilt_angles)}")
+            if val_fraction > 0.0:
+                print(f"  Total projections (val): {len(val_dataset)}")
             print(f"  Grid size: {tomo_dataset.dims[1]}{tomo_dataset.dims[2]}")
             print(f"  Total pixels: {tomo_dataset.num_pixels:,}")
-            
+            if val_fraction > 0.0:
+                print(f"  Total pixels (val): {len(val_dataset):,}")
+                print(f"  Total pixels (train): {len(train_dataset):,}")
             print(f"  Local batch size (train): {batch_size}")
             print(f"  Global batch size: {batch_size*self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(self.dataloader)}")
