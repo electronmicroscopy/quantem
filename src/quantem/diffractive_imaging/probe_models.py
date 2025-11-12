@@ -731,7 +731,7 @@ class ProbePixelated(ProbeConstraints):
                 self.vacuum_probe_intensity.cpu().detach().numpy(),
                 scale_output,
             ),
-            dtype=config.get("dtype_real"),
+            dtype=getattr(torch, config.get("dtype_real")),
             device=self.device,
         )
 
