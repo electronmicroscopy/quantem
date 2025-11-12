@@ -261,6 +261,9 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         "tv_weight_yx": 0,
         "surface_zero_weight": 0,
         "gaussian_sigma": None,
+        "butterworth_order": 4,
+        "q_lowpass": None,
+        "q_highpass": None,
     }
 
     def apply_hard_constraints(
@@ -298,6 +301,11 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if self.constraints["gaussian_sigma"] is not None:
             obj2 = self.gaussian_blur_2d(obj2, sigma=self.constraints["gaussian_sigma"])
 
+        if any([self.constraints["q_lowpass"], self.constraints["q_highpass"]]):
+            obj2 = self.butterworth_constraint(
+                obj2,
+                sampling=self.sampling,
+            )
         if self.num_slices > 1:
             if self.constraints["identical_slices"]:
                 with torch.no_grad():
@@ -447,6 +455,50 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             )
 
             return x_blurred
+
+    def butterworth_constraint(
+        self,
+        tensor: torch.Tensor,
+        sampling: np.ndarray,
+    ) -> torch.Tensor:
+        """
+        Butterworth filter used for low/high-pass filtering.
+
+        """
+
+        q_lowpass = self.constraints["q_lowpass"]
+        q_highpass = self.constraints["q_highpass"]
+        butterworth_order = self.constraints["butterworth_order"]
+
+        sampling = tuple(float(s) for s in sampling)
+
+        qx = torch.fft.fftfreq(tensor.shape[-2], sampling[0], device=tensor.device)
+        qy = torch.fft.fftfreq(tensor.shape[-1], sampling[1], device=tensor.device)
+
+        qya, qxa = torch.meshgrid(qy, qx, indexing="ij")
+        qra = torch.sqrt(qxa**2 + qya**2)
+
+        env = torch.ones_like(qra)
+
+        if q_highpass:
+            env *= 1 - 1 / (1 + (qra / q_highpass) ** (2 * butterworth_order))
+
+        if q_lowpass:
+            env *= 1 / (1 + (qra / q_lowpass) ** (2 * butterworth_order))
+
+        tensor_mean = tensor.mean(dim=(-2, -1), keepdim=True)
+        tensor = tensor - tensor_mean
+
+        # Apply filter in Fourier space
+        tensor = torch.fft.ifft2(torch.fft.fft2(tensor) * env)
+
+        tensor = tensor + tensor_mean
+
+        # Take real part for potential tensorects
+        if self.obj_type == "potential":
+            tensor = tensor.real
+
+        return tensor
 
 
 class ObjectPixelated(ObjectConstraints):

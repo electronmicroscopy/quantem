@@ -160,6 +160,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.val_mode = val_mode
         # if self.num_epochs == 0:
         #     self.reset_recon()  # if new models, reset to ensure shapes are correct
+        self.obj_model.sampling = self.sampling.copy()
         return self
 
     def _compute_propagator_arrays(
