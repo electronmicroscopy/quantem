@@ -485,6 +485,7 @@ class Dataset(AutoSerialize):
         bin_factors,
         axes,
         modify_in_place: Literal[True],
+        reducer: str = "sum",
     ) -> None: ...
 
     @overload
@@ -493,6 +494,7 @@ class Dataset(AutoSerialize):
         bin_factors,
         axes=None,
         modify_in_place: Literal[False] = False,
+        reducer: str = "sum",
     ) -> Self: ...
 
     def bin(
@@ -500,6 +502,7 @@ class Dataset(AutoSerialize):
         bin_factors,
         axes=None,
         modify_in_place: bool = False,
+        reducer: str = "sum",
     ) -> Self | None:
         """
         Bin the Dataset by integer factors along selected axes using block reduction.
@@ -525,12 +528,10 @@ class Dataset(AutoSerialize):
         """
         xp = self._xp
 
-        # --- Validate reducer ---
         reducer_norm = reducer.lower()
         if reducer_norm not in ("sum", "mean"):
             raise ValueError("reducer must be 'sum' or 'mean'")
 
-        # --- Normalize axes ---
         if axes is None:
             axes = tuple(range(self.ndim))
         elif np.isscalar(axes):
@@ -538,7 +539,6 @@ class Dataset(AutoSerialize):
         else:
             axes = tuple(int(ax) for ax in axes)
 
-        # --- Normalize factors ---
         if isinstance(bin_factors, numbers.Integral):
             bin_factors = (int(bin_factors),) * len(axes)
         elif isinstance(bin_factors, (list, tuple)):
@@ -556,7 +556,6 @@ class Dataset(AutoSerialize):
 
         axis_to_factor = dict(zip(axes, bin_factors))
 
-        # --- Compute effective slices (drop remainder) ---
         slices = []
         effective_lengths = []
         for a0 in range(self.ndim):
@@ -569,7 +568,6 @@ class Dataset(AutoSerialize):
                 slices.append(slice(None))
                 effective_lengths.append(self.shape[a0])
 
-        # --- Build reshape dims & reduction axes ---
         reshape_dims = []
         reduce_axes = []
         running_axis = 0
@@ -578,31 +576,27 @@ class Dataset(AutoSerialize):
                 fac = axis_to_factor[a1]
                 nblocks = effective_lengths[a1] // fac
                 reshape_dims.extend([nblocks, fac])
-                reduce_axes.append(running_axis + 1)  # reduce over the 'fac' dim
+                reduce_axes.append(running_axis + 1)
                 running_axis += 2
             else:
                 reshape_dims.append(effective_lengths[a1])
                 running_axis += 1
 
-        # --- Perform block reduction ---
         array_view = self.array[tuple(slices)].reshape(tuple(reshape_dims))
         if reducer_norm == "sum":
             array_binned = xp.sum(array_view, axis=tuple(reduce_axes))
-        else:  # "mean"
+        else:
             array_binned = xp.sum(array_view, axis=tuple(reduce_axes))
-            # Divide by block volume (product of factors across selected axes)
             block_volume = 1
-            for ax_b, fac_b in axis_to_factor.items():
+            for fac_b in axis_to_factor.values():
                 block_volume *= fac_b
             array_binned = array_binned / block_volume
 
-        # --- Metadata updates (ensure float to avoid truncation) ---
         new_sampling = self.sampling.astype(float).copy()
         new_origin = self.origin.astype(float).copy()
         for ax_binned, fac_binned in axis_to_factor.items():
             old_sampling = new_sampling[ax_binned]
             new_sampling[ax_binned] = old_sampling * fac_binned
-            # shift origin to the center of the first block
             new_origin[ax_binned] = new_origin[ax_binned] + 0.5 * (fac_binned - 1) * old_sampling
 
         if modify_in_place:
@@ -616,13 +610,13 @@ class Dataset(AutoSerialize):
         dataset.sampling = new_sampling
         dataset.origin = new_origin
 
-        # Annotate name
         factors_str = " ".join(
             f"{axis_to_factor[a2]:.3g}" if a2 in axis_to_factor else "1" for a2 in range(self.ndim)
         )
         suffix = f"(binned factors {factors_str}" + (", mean)" if reducer_norm == "mean" else ")")
         dataset.name = f"{self.name} {suffix}"
         return dataset
+
 
     def fourier_resample(
         self,
@@ -678,12 +672,6 @@ class Dataset(AutoSerialize):
             out_shape = tuple(
                 max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors)
             )
-            # Update sampling for binned axes # TODO improve this implementation
-            for axis, factor in axis_to_factor.items():
-                axis = cast(int, axis)
-                if axis < len(dataset.sampling):
-                    dataset.sampling[axis] *= factor
-            return dataset
         else:
             if len(out_shape) != len(axes):
                 raise ValueError("out_shape length must match number of axes.")
@@ -703,8 +691,8 @@ class Dataset(AutoSerialize):
 
         # Center-aligned crop/pad per axis (so DC stays centered)
         axis_to_outlen = dict(zip(axes, out_shape))
-        slices = []
-        pad_specs = []
+        slices: list[slice] = []
+        pad_specs: list[tuple[int, int]] = []
         for a3 in range(self.ndim):
             if a3 in axis_to_outlen:
                 old_len = self.shape[a3]
@@ -760,76 +748,19 @@ class Dataset(AutoSerialize):
             new_center_idx = (out_len - 1) / 2.0
             old_sampling = self.sampling[a7]
             new_origin[a7] = (
-                self.origin[a7] + old_center_idx * old_sampling - new_center_idx * new_sampling[a7]
+                self.origin[a7]
+                + old_center_idx * old_sampling
+                - new_center_idx * new_sampling[a7]
             )
-            # Update sampling for binned axes
-            for axis, factor in axis_to_factor.items():
-                axis = cast(int, axis)
-                if axis < len(self.sampling):
-                    self.sampling[axis] *= factor
+
+        if modify_in_place:
+            self._array = array_resampled
+            self._sampling = new_sampling
+            self._origin = new_origin
             return None
 
-    def __getitem__(self, index) -> "Dataset":
-        """
-        General indexing method for Dataset objects.
-
-        Returns a new Dataset (or subclass) corresponding to the indexed data.
-        Metadata (origin, sampling, units) is sliced or reduced accordingly.
-        Handles step slicing (e.g., [::2]) by multiplying sampling accordingly.
-
-        Parameters
-        ----------
-        index : int | slice | tuple | Ellipsis
-            Indexing expression applied to the underlying array.
-
-        Returns
-        -------
-        Dataset
-            A new Dataset instance with appropriately adjusted metadata.
-        """
-        array_view = self.array[index]
-
-        # Normalize index into tuple form
-        if not isinstance(index, tuple):
-            index = (index,)
-
-        # Expand Ellipsis
-        if Ellipsis in index:
-            ellipsis_pos = index.index(Ellipsis)
-            num_missing = self.ndim - (len(index) - 1)
-            index = index[:ellipsis_pos] + (slice(None),) * num_missing + index[ellipsis_pos + 1 :]
-
-        # Pad with slices if index shorter than ndim
-        if len(index) < self.ndim:
-            index = index + (slice(None),) * (self.ndim - len(index))
-
-        # Compute which dimensions are kept
-        kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
-
-        # Slice/reduce metadata accordingly
-        new_origin = (
-            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
-        )
-        new_sampling = (
-            np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
-        )
-        new_units = [self.units[i] for i in kept_axes] if len(self.units) > 0 else self.units
-
-        # Adjust sampling for slice steps (e.g. [::2] doubles spacing)
-        for i, idx in enumerate(index):
-            if isinstance(idx, slice) and idx.step not in (None, 1):
-                if i in kept_axes:
-                    j = kept_axes.index(i)
-                    new_sampling[j] *= idx.step
-
-        cls = type(self)
-
-        # Construct new dataset
-        return cls.from_array(
-            array=array_view,
-            name=f"{self.name}{index}",
-            origin=new_origin,
-            sampling=new_sampling,
-            units=new_units,
-            signal_units=self.signal_units,
-        )
+        ds = self.copy()
+        ds.array = array_resampled
+        ds.sampling = new_sampling
+        ds.origin = new_origin
+        return ds
