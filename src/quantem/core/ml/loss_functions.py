@@ -1,9 +1,12 @@
 from typing import TYPE_CHECKING, Callable
 
-import torch
+from quantem.core import config
 
 if TYPE_CHECKING:
     import torch
+else:
+    if config.get("has_torch"):
+        import torch
 
 
 def get_loss_function(name: str | Callable, dtype: torch.dtype) -> Callable:

@@ -66,6 +66,7 @@ class TestDatasetInitialization:
         assert np.array_equal(dataset.sampling, np.array([1, 1]))
         assert dataset.units == ["nm", "nm"]
         assert dataset.signal_units == "arb. units"  # Default value
+        assert hasattr(dataset, "metadata")
 
     def test_from_array_defaults(self, sample_2d_array):
         """Test creating a Dataset with default parameters."""
@@ -77,6 +78,7 @@ class TestDatasetInitialization:
         assert np.array_equal(dataset.sampling, np.array([1, 1]))  # Default sampling
         assert dataset.units == ["pixels", "pixels"]  # Default units
         assert dataset.signal_units == "arb. units"  # Default signal units
+        assert hasattr(dataset, "metadata")
 
     def test_direct_initialization_error(self, sample_2d_array):
         """Test that direct initialization raises an error."""
@@ -238,7 +240,7 @@ class TestDatasetMethods:
     def test_crop(self, sample_dataset_2d):
         """Test crop method."""
         # Crop 1 pixel from each side
-        cropped_dataset = sample_dataset_2d.crop(crop_widths=((1, 1), (1, 1)))
+        cropped_dataset = sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)))
 
         # Check shape
         assert cropped_dataset.shape == (8, 8)  # Original (10, 10) - 1 from each side
@@ -247,7 +249,7 @@ class TestDatasetMethods:
         assert sample_dataset_2d.shape == (10, 10)
 
         # Test modify_in_place
-        sample_dataset_2d.crop(crop_widths=((1, 1), (1, 1)), modify_in_place=True)
+        sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)), modify_in_place=True)
         assert sample_dataset_2d.shape == (8, 8)
 
     def test_bin(self, sample_dataset_2d):

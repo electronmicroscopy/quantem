@@ -83,17 +83,74 @@ class Complex_Phase_ReLU(nn.Module):
 
         return f.type(torch.complex64)
 
+class FinerActivation(nn.Module):
+    """
+    Finer Activation function for complex and real inputs. 
+    
+    - Similar to sine activation function.  
+    """
+    def __init__(
+        self,
+        omega: float = 1,
+    ):
+        super().__init__()
+        self.omega = omega
+
+    def generate_alpha(self, x):
+        
+        with torch.no_grad():
+            return torch.abs(x) + 1
+    
+    def forward(self, x):
+        if x.is_complex(): # Complex Input Check
+            with torch.no_grad():
+                alpha_real = torch.abs(x.real) + 1
+                alpha_imag = torch.abs(x.imag) + 1
+            x.real = x.real * alpha_real
+            x.imag = x.imag * alpha_imag
+            return torch.sin(self.omega * self.generate_alpha(x) * x)
+        else:
+            return torch.sin(self.omega * self.generate_alpha(x) * x)
+
+    
+    
 
 def get_activation_function(
-    activation_type: str,
+    activation_type: str | Callable,
     dtype: "torch.dtype",
     activation_phase_frac: float = 0.5,
     activation_sigmoid: bool = True,
-) -> Callable:
+) -> nn.Module:
     """
-    Allowed activation_types: relu, phase_relu
+    Get an activation function module.
 
+    Args:
+        activation_type: String name of activation or a callable activation function
+        dtype: Data type (used for complex vs real activations)
+        activation_phase_frac: Fraction for phase relu (complex only)
+        activation_sigmoid: Whether to use sigmoid for phase relu (complex only)
+
+    Returns:
+        Activation function module
+
+    Allowed activation_types: relu, phase_relu, identity, etc.
     """
+    # If it's already a callable/module, check if it's a module
+    if callable(activation_type):
+        if isinstance(activation_type, nn.Module):
+            return activation_type
+        else:
+            # Wrap callable in a lambda module
+            class CallableWrapper(nn.Module):
+                def __init__(self, func):
+                    super().__init__()
+                    self.func = func
+
+                def forward(self, x):
+                    return self.func(x)
+
+            return CallableWrapper(activation_type)
+
     activation_type = activation_type.lower()
 
     if activation_type in ["identity", "eye", "ident"]:
@@ -125,6 +182,8 @@ def get_activation_function(
             activation = nn.Sigmoid()
         elif activation_type in ["softplus"]:
             activation = nn.Softplus()
+        elif activation_type in ["finer"]:
+            activation = FinerActivation()
         else:
             raise ValueError(f"Unknown activation type {activation_type}")
 

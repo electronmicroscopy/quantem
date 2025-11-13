@@ -3,6 +3,7 @@ from typing import List, Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import warnings
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import distance_transform_edt, gaussian_filter
@@ -446,7 +447,7 @@ class DriftCorrection(AutoSerialize):
 
         # Regenerate images
         for ind in range(self.shape[0]):
-            self.images_warped.array[a0], self.weights_warped.array[ind] = self.interpolator[
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
                 ind
             ].warp_image(
                 self.images[ind].array,
@@ -858,7 +859,7 @@ class DriftCorrection(AutoSerialize):
             # scale weights by upsample factor to normalize to mean value of 1.0
             mask_edge = np.prod(weight_corr >= (weight_thresh / upsample_factor**2), axis=0)
 
-            # ensure edges of mask are true for edge blending
+            # Set outermost pixels to False to define the boundary for edge blending
             mask_edge[:, 0] = False
             mask_edge[:, -1] = False
             mask_edge[0, :] = False
@@ -1156,9 +1157,20 @@ def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
     left_max = midpoint - width / 2
     right_min = midpoint + width / 2
     if left_max < 0:
-        width = 2 * midpoint  # can't start below zero
+        warnings.warn(
+            f"width={width} is too large for midpoint={midpoint}, "
+            f"clamping width to {2 * midpoint}.",
+            RuntimeWarning,
+        )
+        width = 2 * midpoint
+
     if right_min > 1:
-        width = 2 * (1 - midpoint)  # can't extend above one
+        warnings.warn(
+            f"width={width} is too large for midpoint={midpoint}, "
+            f"clamping width to {2 * (1 - midpoint)}.",
+            RuntimeWarning,
+        )
+        width = 2 * (1 - midpoint)
     # Recalculate edges
     left = midpoint - width / 2
     right = midpoint + width / 2

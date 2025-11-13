@@ -28,6 +28,7 @@ class Dataset4d(Dataset):
         sampling: NDArray | tuple | list | float | int,
         units: list[str] | tuple | list,
         signal_units: str = "arb. units",
+        metadata: dict = {},
         _token: object | None = None,
     ):
         """Initialize a 4D dataset.
@@ -56,6 +57,7 @@ class Dataset4d(Dataset):
             sampling=sampling,
             units=units,
             signal_units=signal_units,
+            metadata=metadata,
             _token=_token,
         )
 

@@ -1,11 +1,13 @@
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Optional, TypeAlias, Union, overload
 from warnings import warn
 
 import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
 from quantem.core import config
-from quantem.core.utils import array_funcs as arr
+from quantem.core.utils import array_funcs as af
 
 if TYPE_CHECKING:
     import cupy as cp
@@ -15,6 +17,8 @@ else:
         import torch
     if config.get("has_cupy"):
         import cupy as cp
+
+TensorLike: TypeAlias = ArrayLike | "torch.Tensor"
 
 
 # --- Dataset Validation Functions ---
@@ -130,20 +134,20 @@ def validate_ndinfo(
     return arr
 
 
-def validate_units(value: Union[List[str], tuple, list, str], ndim: int) -> List[str]:
+def validate_units(value: Union[list[str], tuple, list, str], ndim: int) -> list[str]:
     """
     Validate and convert units to a list of strings of correct length.
 
     Parameters
     ----------
-    value : Union[List[str], tuple, list, str]
+    value : Union[list[str], tuple, list, str]
         The units to validate and convert
     ndim : int
         The expected number of dimensions
 
     Returns
     -------
-    List[str]
+    list[str]
         A list of strings representing the units
 
     Raises
@@ -163,19 +167,30 @@ def validate_units(value: Union[List[str], tuple, list, str], ndim: int) -> List
     return [str(unit) for unit in value]
 
 
+def validate_pathlike(value: os.PathLike | str | None) -> Path | None:
+    if value is None:
+        return
+    if isinstance(value, os.PathLike):
+        return Path(value)
+    elif isinstance(value, str):
+        return Path(value)
+    else:
+        raise TypeError(f"Path must be a pathlike or string, got {type(value)}")
+
+
 # --- Vector Validation Functions ---
-def validate_shape(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+def validate_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     """
     Validate and convert shape to a tuple of integers.
 
     Parameters
     ----------
-    shape : Tuple[int, ...]
+    shape : tuple[int, ...]
         The shape to validate
 
     Returns
     -------
-    Tuple[int, ...]
+    tuple[int, ...]
         The validated shape
 
     Raises
@@ -199,7 +214,7 @@ def validate_shape(shape: Tuple[int, ...]) -> Tuple[int, ...]:
     return tuple(validated)
 
 
-def validate_fields(fields: List[str]) -> List[str]:
+def validate_fields(fields: list[str]) -> list[str]:
     if not isinstance(fields, (list, tuple)):
         raise TypeError(f"fields must be a list or tuple, got {type(fields)}")
     if len(set(fields)) != len(fields):
@@ -207,7 +222,7 @@ def validate_fields(fields: List[str]) -> List[str]:
     return [str(field) for field in fields]
 
 
-def validate_num_fields(num_fields: int, fields: Optional[List[str]] = None) -> int:
+def validate_num_fields(num_fields: int, fields: Optional[list[str]] = None) -> int:
     """
     Validate number of fields.
 
@@ -215,8 +230,8 @@ def validate_num_fields(num_fields: int, fields: Optional[List[str]] = None) -> 
     ----------
     num_fields : int
         The number of fields
-    fields : Optional[List[str]]
-        List of field names
+    fields : Optional[list[str]]
+        list of field names
 
     Returns
     -------
@@ -239,7 +254,7 @@ def validate_num_fields(num_fields: int, fields: Optional[List[str]] = None) -> 
     return num_fields
 
 
-def validate_vector_units(units: Optional[List[str]], num_fields: int) -> List[str]:
+def validate_vector_units(units: Optional[list[str]], num_fields: int) -> list[str]:
     if units is None:
         return ["none"] * num_fields
     if not isinstance(units, (list, tuple)):
@@ -249,7 +264,7 @@ def validate_vector_units(units: Optional[List[str]], num_fields: int) -> List[s
     return [str(unit) for unit in units]
 
 
-def validate_vector_data_for_inference(data: List[Any]) -> Tuple[Tuple[int, ...], int]:
+def validate_vector_data_for_inference(data: list[Any]) -> tuple[tuple[int, ...], int]:
     if not isinstance(data, list):
         raise TypeError("Data must be a list.")
     if len(data) == 0:
@@ -273,22 +288,22 @@ def validate_vector_data_for_inference(data: List[Any]) -> Tuple[Tuple[int, ...]
     return shape, inferred_num_fields
 
 
-def validate_vector_data(data: List[Any], shape: Tuple[int, ...], num_fields: int) -> List[Any]:
+def validate_vector_data(data: list[Any], shape: tuple[int, ...], num_fields: int) -> list[Any]:
     """
     Validate that the data structure matches the expected shape and number of fields.
 
     Parameters
     ----------
-    data : List[Any]
+    data : list[Any]
         The nested list structure containing the vector's data
-    shape : Tuple[int, ...]
+    shape : tuple[int, ...]
         The expected shape of the vector
     num_fields : int
         The expected number of fields
 
     Returns
     -------
-    List[Any]
+    list[Any]
         The validated data structure
 
     Raises
@@ -396,12 +411,17 @@ def validate_array_or_tensor(
     if dtype is not None:
         val_dtype_str = canonical_dtype_str(value.dtype)
         req_dtype_str = canonical_dtype_str(dtype)
-        if val_dtype_str != req_dtype_str:
-            value = arr.as_type(value, req_dtype_str)
+        if "complex" in val_dtype_str and "complex" not in req_dtype_str:
+            raise ValueError(
+                f"{name} must be real-valued of type {req_dtype_str}, got "
+                + f"{val_dtype_str}. Will not cast complex to real"
+            )
+        elif val_dtype_str != req_dtype_str:
+            value = af.as_type(value, req_dtype_str)
     if ndim is not None and value.ndim != ndim:
         if expand_dims and ndim > value.ndim:
             for _ in range(ndim - value.ndim):
-                value = arr.expand_dims(value, axis=0)
+                value = af.expand_dims(value, axis=0)
         else:
             raise ValueError(f"{name} must have {ndim} dimensions, got {value.ndim}")
     if shape is not None and not np.array_equal(value.shape, shape):
@@ -489,8 +509,18 @@ def validate_np_len(value: ArrayLike, length: int, name: str = "") -> np.ndarray
     return value
 
 
-def validate_arr_gt(value: "np.ndarray", cutoff: float | int, name: str) -> "np.ndarray":
-    if np.any(value <= cutoff):
+@overload
+def validate_arr_gt(value: np.ndarray, cutoff: float | int, name: str) -> np.ndarray: ...
+@overload
+def validate_arr_gt(value: "torch.Tensor", cutoff: float | int, name: str) -> "torch.Tensor": ...
+def validate_arr_gt(value: TensorLike, cutoff: float | int, name: str) -> TensorLike:
+    fail = False
+    if config.get("has_torch"):
+        if isinstance(value, torch.Tensor):
+            fail = torch.any(value <= cutoff)
+    if isinstance(value, np.ndarray):
+        fail = np.any(value <= cutoff)
+    if fail:
         raise ValueError(f"All elements of {name} must be greater than {cutoff}")
     return value
 
@@ -507,11 +537,61 @@ def validate_tens_shape(
     return value
 
 
-def validate_dict_keys(dict: dict, valid_keys: list):
-    keys = list(dict.keys())
+def validate_dict_keys(value: dict, valid_keys: list):
+    keys = list(value.keys())
     invalid_keys = list(set(keys) - set(valid_keys))
     if invalid_keys:
         raise ValueError(f"Invalid keys: {invalid_keys}")
+
+
+def validate_aberration_coefficients(value: dict):
+    """ """
+    # fmt: off
+    POLAR_ALIASES = {
+        "defocus": "C10",
+        "astigmatism": "C12",
+        "astigmatism_angle": "phi12",
+        "coma": "C21",
+        "coma_angle": "phi21",
+        "Cs": "C30",
+        "C5": "C50",
+    }
+
+    POLAR_SYMBOLS = (
+        "C10", "C12", "phi12",
+        "C21", "phi21", "C23", "phi23",
+        "C30", "C32", "phi32", "C34", "phi34",
+        "C41", "phi41", "C43", "phi43", "C45", "phi45",
+        "C50", "C52", "phi52", "C54", "phi54", "C56", "phi56",
+    )
+    # fmt: on
+
+    validate_dict_keys(
+        value,
+        [*POLAR_SYMBOLS, *POLAR_ALIASES.keys()],
+    )
+
+    def set_aberrations(params):
+        """Standardize aberration coefficients."""
+
+        def process_polar_params(p: dict):
+            for symbol, value in p.items():
+                if value is None:
+                    continue
+                elif symbol in POLAR_SYMBOLS:
+                    polar_parameters[symbol] = float(value)
+                elif symbol == "defocus":
+                    polar_parameters["C10"] = -float(value)
+                elif symbol in POLAR_ALIASES:
+                    polar_parameters[POLAR_ALIASES[symbol]] = float(value)
+
+        # Start only with explicitly passed aberrations
+        polar_parameters = {}
+        process_polar_params(params)
+        return polar_parameters
+
+    polar_parameters = set_aberrations(value.copy())
+    return polar_parameters
 
 
 # def validate_dtype(value: Any, dtype: DTypeLike, name: str) -> DTypeLike:
