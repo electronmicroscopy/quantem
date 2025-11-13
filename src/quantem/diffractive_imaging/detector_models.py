@@ -25,7 +25,7 @@ class DetectorPixelated(DetectorBase):
         """
         # exit_waves shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         # incoherent sum of all probe components
-        exit_fft = torch.fft.fft2(exit_waves)
+        exit_fft = torch.fft.fft2(exit_waves, norm="ortho")
         intensities = torch.sum(torch.abs(exit_fft) ** 2, dim=0)
         return torch.fft.fftshift(intensities, dim=(-2, -1))  # detector centering
 
