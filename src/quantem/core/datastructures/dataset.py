@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, Self, cast, overload
+from typing import Any, Literal, Self, cast, overload, Optional, Union
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
