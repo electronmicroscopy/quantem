@@ -277,7 +277,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self.step_schedulers(total_loss)
 
             if self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
-                self.append_recon_iteration()
+                self._store_current_iter_snapshot()
 
             if self.logger is not None:
                 self.logger.log_iter(

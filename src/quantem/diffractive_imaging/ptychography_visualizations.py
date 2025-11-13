@@ -7,7 +7,7 @@ from scipy.signal.windows import tukey
 
 from quantem.core import config
 from quantem.core.visualization import show_2d
-from quantem.diffractive_imaging.ptychography_base import PtychographyBase
+from quantem.diffractive_imaging.ptychography_base import PtychographyBase, Snapshot
 
 
 class PtychographyVisualizations(PtychographyBase):
@@ -463,7 +463,7 @@ class PtychographyVisualizations(PtychographyBase):
             print("Must show at least one of object or probe")
             return
 
-        all_iterations = [cast(int, snapshot["iteration"]) for snapshot in self.snapshots]
+        all_iterations = [snapshot["iteration"] for snapshot in self.snapshots]
 
         if iters is not None:
             if isinstance(iters, slice):
@@ -488,7 +488,7 @@ class PtychographyVisualizations(PtychographyBase):
         ]
 
         if show_object and show_probe:
-            self._show_object_and_probe_iters(selected_snapshots, norm, cbar, max_width, **kwargs)
+            self._show_object_and_probe_iters(selected_snapshots, cbar, max_width, **kwargs)
         elif show_object:
             self._show_object_iters_only(
                 selected_snapshots, norm, interval_scaling, cbar, max_width, **kwargs
@@ -497,7 +497,13 @@ class PtychographyVisualizations(PtychographyBase):
             self._show_probe_iters_only(selected_snapshots, cbar, max_width, **kwargs)
 
     def _show_object_iters_only(
-        self, snapshots, norm, interval_scaling, cbar, max_width, **kwargs
+        self,
+        snapshots: list[Snapshot],
+        norm: Literal["quantile", "manual", "minmax", "abs"],
+        interval_scaling: Literal["each", "all"],
+        cbar: bool,
+        max_width: int,
+        **kwargs,
     ):
         """Display only object reconstructions from iteration snapshots."""
         ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
@@ -507,7 +513,7 @@ class PtychographyVisualizations(PtychographyBase):
         all_cmaps = []
 
         for snapshot in snapshots:
-            obj = cast(np.ndarray, snapshot["obj"])
+            obj = snapshot["obj"]
             iteration = snapshot["iteration"]
             title_prefix = f"Iter {iteration} "
 
@@ -559,7 +565,9 @@ class PtychographyVisualizations(PtychographyBase):
             **kwargs,
         )
 
-    def _show_probe_iters_only(self, snapshots, cbar, max_width, **kwargs):
+    def _show_probe_iters_only(
+        self, snapshots: list[Snapshot], cbar: bool, max_width: int, **kwargs
+    ):
         """Display only probe reconstructions from iteration snapshots."""
         all_probes = []
         all_titles = []
@@ -597,7 +605,13 @@ class PtychographyVisualizations(PtychographyBase):
             **kwargs,
         )
 
-    def _show_object_and_probe_iters(self, snapshots, norm_dict, cbar, max_width, **kwargs):
+    def _show_object_and_probe_iters(
+        self,
+        snapshots: list[Snapshot],
+        cbar: bool,
+        max_width: int,
+        **kwargs,
+    ):
         """Display both object and probe reconstructions from iteration snapshots."""
         ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
 
@@ -664,7 +678,6 @@ class PtychographyVisualizations(PtychographyBase):
             all_images,
             title=all_titles,
             cmap=all_cmaps,
-            norm=norm_dict,
             cbar=cbar,
             scalebar=scalebars,
             **kwargs,

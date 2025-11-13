@@ -1,4 +1,4 @@
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Literal, Sequence, TypedDict, cast
 from warnings import warn
 
 import numpy as np
@@ -45,6 +45,25 @@ design patterns:
 """
 
 
+class Snapshot(TypedDict):
+    """
+    A snapshot of the object and probe at a given iteration.
+
+    Parameters
+    ----------
+    obj: np.ndarray
+        The object at the given iteration.
+    probe: np.ndarray
+        The probe at the given iteration.
+    iteration: int
+        The iteration number.
+    """
+
+    obj: np.ndarray
+    probe: np.ndarray
+    iteration: int
+
+
 class PtychographyBase(RNGMixin, AutoSerialize):
     """
     A base class for performing phase retrieval using the Ptychography algorithm.
@@ -88,7 +107,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._iter_val_losses: list[float] = []
         self._iter_recon_types: list[str] = []
         self._iter_lrs: dict[str, list] = {}  # LRs/step_sizes across iterations
-        self._snapshots: list[dict[str, int | np.ndarray]] = []
+        self._snapshots: list[Snapshot] = []
         self._obj_padding_px = np.array([0, 0])
         self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
         self.batch_size = self.dset.num_gpts
@@ -466,15 +485,31 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             self._store_snapshot_every = int(val)
 
     @property
-    def snapshots(self) -> list[dict[str, int | np.ndarray]]:
-        return self._snapshots  # TODO use a TypedDict?
+    def snapshots(self) -> list[Snapshot]:
+        return self._snapshots
 
-    def get_snapshot_by_iter(self, iteration: int, closest: bool = False, cropped: bool = False):
+    def get_snapshot_by_iter(
+        self, iteration: int, closest: bool = False, cropped: bool = False
+    ) -> Snapshot:
+        """
+        Get a snapshot by iteration number.
+        Parameters
+        ----------
+        iteration: int
+            The iteration number.
+        closest: bool
+            Whether to return the closest snapshot if one is not found at the exact iteration.
+        cropped: bool
+            Whether to crop the object to the field of view. False (default) -> full object.
+
+        Returns
+        -------
+        snapshot: Snapshot
+            The snapshot at the given iteration.
+        """
         iteration = int(iteration)
         if closest:
-            closest_snapshot = min(
-                self.snapshots, key=lambda s: abs(int(s["iteration"]) - iteration)
-            )
+            closest_snapshot = min(self.snapshots, key=lambda s: abs(s["iteration"] - iteration))
             snp = closest_snapshot
         else:
             for snp in self.snapshots:
@@ -486,12 +521,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                     + "to return the closest snapshot, set closest=True"
                 )
         if cropped:
-            snp2 = {
-                "iteration": snp["iteration"],
-                "probe": snp["probe"],
-            }
-            obj = cast(np.ndarray, snp["obj"])
-            cropped_obj = self._crop_rotate_obj_fov(obj)
+            snp2 = snp.copy()
+            cropped_obj = self._crop_rotate_obj_fov(snp2["obj"])
             # same logic as self.obj_cropped
             if self.obj_type == "pure_phase":
                 ph = np.angle(cropped_obj)
@@ -863,27 +894,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._iter_lrs = {}
         self._snapshots = []
 
-    def append_recon_iteration(
+    def _store_current_iter_snapshot(
         self,
-        obj: "torch.Tensor | np.ndarray | None" = None,
-        probe: "torch.Tensor | np.ndarray | None" = None,
     ) -> None:
-        if probe is None:
-            probe = self.probe
-        else:
-            probe = self._to_numpy(probe)
-        if obj is None:
-            obj = self.obj
-        else:
-            obj = self._to_numpy(obj)
-        self._snapshots.append(
-            {
-                "iteration": self.num_iters,
-                "obj": obj,
-                "probe": probe,
-            }
-        )
-        return
+        probe = self.probe
+        obj = self.obj
+        snp = Snapshot(iteration=self.num_iters, obj=obj, probe=probe)
+        self._snapshots.append(snp)
 
     def get_probe_intensities(
         self, probe: "torch.Tensor | np.ndarray | None" = None
