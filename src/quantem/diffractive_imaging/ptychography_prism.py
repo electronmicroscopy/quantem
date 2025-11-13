@@ -1,4 +1,5 @@
 import gc
+import math
 from typing import Literal, Self
 
 import numpy as np
@@ -6,6 +7,7 @@ import torch
 from tqdm.auto import tqdm
 
 from quantem.core.utils.utils import generate_batches
+from quantem.diffractive_imaging.complex_probe import spatial_frequencies
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
@@ -18,16 +20,10 @@ from quantem.diffractive_imaging.ptychography_visualizations import Ptychography
 
 class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase):
     """
-    PRISM-accelerated ptychographic reconstruction using plane wave decomposition.
+    Partitioned PRISM-accelerated ptychographic reconstruction.
 
-    This class implements the PRISM algorithm for efficient 4D-STEM simulation and
-    reconstruction. Instead of computing a multislice calculation for each probe
-    position, it:
-    1. Computes multislice for a set of tilted plane waves
-    2. Builds PRISM coefficients in reciprocal space
-    3. Reconstructs exit waves by linear combinations of propagated plane waves
-
-    The reconstruction uses automatic differentiation (autograd) for gradient computation.
+    Uses natural neighbor interpolation to reduce the number of parent
+    plane waves while maintaining accuracy.
     """
 
     _token = object()
@@ -83,7 +79,7 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
             _token=cls._token,
         )
 
-    def _propagate_plane_waves(self, wave_vectors, transmission):
+    def _propagate_plane_waves(self, parent_wave_vectors, transmission):
         """
         Propagate PRISM plane waves through the object.
 
@@ -95,7 +91,16 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
         extent = gpts * sampling
 
         # Get plane waves from probe model on object FOV
-        waves = self.probe_model._prism_plane_waves(wave_vectors, extent, gpts)
+
+        # Generate parent plane waves
+        x = torch.linspace(0, extent[0], gpts[0] + 1, dtype=torch.float32, device=self.device)[:-1]
+        y = torch.linspace(0, extent[1], gpts[1] + 1, dtype=torch.float32, device=self.device)[:-1]
+
+        waves = torch.exp(
+            1.0j * 2 * math.pi * parent_wave_vectors[:, 0, None, None] * x[:, None]
+        ) * torch.exp(1.0j * 2 * math.pi * parent_wave_vectors[:, 1, None, None] * y[None, :])
+        waves = waves / math.sqrt(math.prod(gpts))
+        back_waves = waves.clone().conj()
 
         # Multislice propagation
         for s in range(self.num_slices):
@@ -107,12 +112,16 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
             if s < self.num_slices - 1:
                 waves = self._propagate_array(waves, self._propagators[s])
 
+        # Refocusing & tilt-correct
+        waves = self._propagate_array(waves, self._total_back_propagator_array) * back_waves
+
         return waves
 
     def forward_operator(
         self,
-        prism_coefs: torch.Tensor,
-        wave_vectors: torch.Tensor,
+        beamlets_fft: torch.Tensor,
+        position_coefs: torch.Tensor,
+        parent_wave_vectors: torch.Tensor,
         patch_indices: torch.Tensor,
         max_batch_size: int | None = None,
     ) -> torch.Tensor:
@@ -139,9 +148,9 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
         else:
             transmission = obj_array
 
-        num_probes, num_positions, num_planewaves = prism_coefs.shape
+        num_probes, num_planewaves, roi_h, roi_w = beamlets_fft.shape
+        num_positions, roi_h, roi_w = position_coefs.shape
         obj_h, obj_w = transmission.shape[-2:]
-        roi_h, roi_w = self.roi_shape
 
         exit_patches = torch.zeros(
             (num_probes, num_positions, roi_h, roi_w),
@@ -153,9 +162,13 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
 
         for start, end in generate_batches(num_planewaves, max_batch=max_batch_size):
             # Extract patches from propagated plane waves
-            batch_wave_vectors = wave_vectors[start:end]
-            batch_coefs = prism_coefs[..., start:end]
+            batch_wave_vectors = parent_wave_vectors[start:end]
             propagated_plane_waves = self._propagate_plane_waves(batch_wave_vectors, transmission)
+
+            batch_coefs_fft = (
+                beamlets_fft[:, None, start:end, ...] * position_coefs[None, :, None, ...]
+            )
+            batch_coefs = torch.fft.ifft2(batch_coefs_fft)
 
             exit_waves = torch.tensordot(
                 batch_coefs,
@@ -182,7 +195,8 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         constraints: dict = {},
-        batch_size: int | None = None,
+        positions_batch_size: int | None = None,
+        parent_planewaves_batch_size: int | None = None,
         store_iterations: bool | None = None,
         store_iterations_every: int | None = None,
         device: Literal["cpu", "gpu"] | None = None,
@@ -226,7 +240,6 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
         if device is not None:
             self.to(device)
 
-        self.batch_size = batch_size
         self.store_iterations_every = store_iterations_every
 
         if store_iterations_every is not None and store_iterations is None:
@@ -254,42 +267,77 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
 
         self.dset._set_targets(loss_type)
         pbar = tqdm(range(num_iter), disable=not self.verbose)
-        indices = torch.arange(self.dset.num_gpts)
+
+        num_total_positions = self.dset.num_gpts
+        self.positions_batch_size = positions_batch_size or num_total_positions
+
+        num_parent_plane_waves = self.probe_model.parent_wave_vectors.shape[0]
+        self.parent_planewaves_batch_size = parent_planewaves_batch_size or num_parent_plane_waves
+
+        total_thickness = self.obj_model.slice_thicknesses.sum()
+        kxa, kya = spatial_frequencies(self.roi_shape, sampling=self.sampling, device=self.device)
+        self._total_back_propagator_array = torch.exp(
+            1.0j
+            * math.pi
+            * self.probe_model.wavelength
+            * total_thickness
+            * (kxa.square() + kya.square())
+        )
 
         for epoch in pbar:
-            self._reset_epoch_constraints()
-
             # Zero gradients
+            self._reset_epoch_constraints()
             self.zero_grad_all()
 
-            # Get batch data
+            epoch_loss = 0.0
+            num_batches = 0
+
+            # Compute all beamlets once
+            beamlets_fft = self.probe_model._compute_beamlet_basis_fft(total_thickness)
+
             patch_indices = self.dset.patch_indices
             positions_px = self.dset.scan_positions_px
             positions = positions_px * torch.as_tensor(
                 self.sampling, dtype=torch.float32, device=self.device
             )
+            parent_wave_vectors = self.probe_model.parent_wave_vectors
 
-            prism_coefs = self.probe_model.forward(positions)
-            wave_vectors = self.probe_model.wave_vectors
-            exit_waves = self.forward_operator(
-                prism_coefs, wave_vectors, patch_indices, self.batch_size
-            )
-            pred_intensities = self.detector_model.forward(exit_waves)
+            for start_pos, end_pos in generate_batches(
+                num_total_positions, max_batch=self.positions_batch_size
+            ):
+                batch_positions = positions[start_pos:end_pos]
+                batch_patch_indices = patch_indices[start_pos:end_pos]
+                position_coefs = self.probe_model._position_coefficients(
+                    positions=batch_positions,
+                    kxa=kxa,
+                    kya=kya,
+                )
 
-            # Compute loss
-            epoch_consistency_loss, _targets = self.error_estimate(
-                pred_intensities,
-                indices,
-                loss_type=loss_type,
-            )
+                batch_exit_waves = self.forward_operator(
+                    beamlets_fft,
+                    position_coefs,
+                    parent_wave_vectors,
+                    batch_patch_indices,
+                    self.parent_planewaves_batch_size,
+                )
+                pred_intensities = self.detector_model.forward(batch_exit_waves)
 
-            # Apply soft constraints
-            epoch_soft_constraint_loss = self._soft_constraints()
+                # Compute loss
+                batch_consistency_loss, _targets = self.error_estimate(
+                    pred_intensities,
+                    batch_patch_indices,
+                    loss_type=loss_type,
+                )
 
-            epoch_loss = epoch_consistency_loss + epoch_soft_constraint_loss
+                # Apply soft constraints
+                batch_soft_constraint_loss = self._soft_constraints()
+                batch_loss = batch_consistency_loss + batch_soft_constraint_loss
 
-            # Backward pass (autograd)
-            self.backward(epoch_loss)
+                # Backward pass (autograd)
+                self.backward(batch_loss)
+                epoch_loss += batch_loss
+                num_batches += 1
+
             self.step_optimizers()
 
             # Record epoch
@@ -309,7 +357,7 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
                     self.probe_model,
                     self.dset,
                     self.num_epochs - 1,
-                    epoch_consistency_loss,
+                    epoch_loss,
                     1,
                     self._get_current_lrs(),
                 )
@@ -337,7 +385,7 @@ class PtychoPRISM(PtychographyOpt, PtychographyVisualizations, PtychographyBase)
         loss: torch.Tensor,
     ):
         """ """
-        loss.backward()
+        loss.backward(retain_graph=True)
         # scaling pixelated ad gradients to closer match analytic
         if isinstance(self.obj_model, ObjectPixelated):
             obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad

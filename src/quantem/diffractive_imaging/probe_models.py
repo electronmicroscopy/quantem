@@ -1408,7 +1408,7 @@ class ProbePRISM(ProbeBase):
         num_probes: int | None = None,
         probe_params: dict = {},
         roi_shape: tuple[int, int] | np.ndarray | None = None,
-        num_partitions: int = 3,
+        num_partitions: int = 5,
         learn_aberrations: bool = True,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -1469,7 +1469,7 @@ class ProbePRISM(ProbeBase):
         probe_params: dict,
         num_probes: int | None = None,
         roi_shape: tuple[int, int] | None = None,
-        num_partitions: int = 3,
+        num_partitions: int = 5,
         learn_aberrations: bool = True,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -1529,23 +1529,13 @@ class ProbePRISM(ProbeBase):
         return self._interpolation_weights
 
     @property
-    def plane_waves(self) -> torch.Tensor:
-        """Compute plane waves on the fly"""
-        # Compute plane waves
-        return self._prism_plane_waves(
-            wave_vectors=self.parent_wave_vectors,
-            extent=self.extent,
-            gpts=self.roi_shape.astype(int),
-        )
-
-    @property
     def probe(self) -> torch.Tensor:
         """
         Get probe in real space by reconstructing from PRISM basis at origin.
         Returns [num_probes, roi_height, roi_width]
         """
 
-        probes = self._compute_beamlet_basis(accumulated_thickness=0.0).sum(1)
+        probes = torch.fft.ifft2(self._compute_beamlet_basis_fft(accumulated_thickness=0.0).sum(1))
 
         return probes
 
@@ -1610,7 +1600,9 @@ class ProbePRISM(ProbeBase):
             self.roi_shape,
             self.sampling,
         )
-        self._interpolation_weights = torch.from_numpy(interpolation_weights).to(self.device)
+        self._interpolation_weights = torch.from_numpy(interpolation_weights).to(
+            device=self.device, dtype=torch.float32
+        )
 
         # Initialize learnable CTF parameters for each probe mode
         self._ctf_params = nn.ModuleList()
@@ -1644,10 +1636,9 @@ class ProbePRISM(ProbeBase):
                 initial_dict[key] = val.detach().clone()
             self._initial_ctf_params.append(initial_dict)
 
-    def _compute_beamlet_basis(
+    def _compute_beamlet_basis_fft(
         self,
         accumulated_thickness: float,
-        position_coefficients: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute beamlet basis functions including CTF and back-propagation.
@@ -1666,7 +1657,7 @@ class ProbePRISM(ProbeBase):
         torch.Tensor
             Beamlet basis [num_parent, gpts[0], gpts[1]]
         """
-        beamlets_list = []
+        beamlets_fft_list = []
         for probe_idx in range(self.num_probes):
             # Get current aberration coefficients for this probe
             aberration_coefs = {key: val for key, val in self._ctf_params[probe_idx].items()}
@@ -1682,19 +1673,11 @@ class ProbePRISM(ProbeBase):
                 semiangle_cutoff=self.probe_params["semiangle_cutoff"],
                 aberration_coefs=aberration_coefs,
             )
-
             weights = self.interpolation_weights
+            beamlets_fft = ctf * weights
+            beamlets_fft_list.append(beamlets_fft)
 
-            if position_coefficients is None:
-                beamlets_fft = ctf * weights
-            else:
-                beamlets_fft = ctf * weights * position_coefficients
-
-            # Apply CTF and weights, then inverse FFT
-            beamlets = torch.fft.ifft2(beamlets_fft)
-            beamlets_list.append(beamlets)
-
-        return torch.stack(beamlets_list) * self._intensity_norm_factor
+        return torch.stack(beamlets_fft_list) * self._intensity_norm_factor
 
     def _normalize_probe_intensity(self, mean_diffraction_intensity: float):
         """Normalize probe intensity to match experimental data."""
@@ -1738,10 +1721,11 @@ class ProbePRISM(ProbeBase):
             kya=kya,
         )  # [batch_size, roi_h, roi_w]
 
-        coefs = self._compute_beamlet_basis(
+        coefs_fft = self._compute_beamlet_basis_fft(
             accumulated_thickness,
-            position_coefs,
         )  # [num_probes, num_parent_waves, roi_h, roi_w]
+
+        coefs = torch.fft.ifft2(coefs_fft[:, None, ...] * position_coefs[None, :, None, ...])
 
         return coefs
 
@@ -1833,38 +1817,6 @@ class ProbePRISM(ProbeBase):
         wavevectors = np.vstack(rings)
 
         return torch.from_numpy(wavevectors).to(device=self.device, dtype=torch.float32)
-
-    def _prism_plane_waves(
-        self,
-        wave_vectors: torch.Tensor,
-        extent: tuple[float, float],
-        gpts: tuple[int, int],
-    ) -> torch.Tensor:
-        """
-        Compute plane waves in real space.
-
-        Parameters
-        ----------
-        wave_vectors : torch.Tensor
-            Wave vectors [num_waves, 2]
-        extent : tuple[float, float]
-            Real-space extent in Angstroms
-        gpts : tuple[int, int]
-            Grid points
-
-        Returns
-        -------
-        torch.Tensor
-            Plane waves [num_waves, roi_height, roi_width]
-        """
-        x = torch.linspace(0, extent[0], gpts[0] + 1, dtype=torch.float32, device=self.device)[:-1]
-        y = torch.linspace(0, extent[1], gpts[1] + 1, dtype=torch.float32, device=self.device)[:-1]
-
-        array = torch.exp(
-            1.0j * 2 * math.pi * wave_vectors[:, 0, None, None] * x[:, None]
-        ) * torch.exp(1.0j * 2 * math.pi * wave_vectors[:, 1, None, None] * y[None, :])
-
-        return array / math.sqrt(math.prod(gpts))
 
     def _position_coefficients(
         self, positions: torch.Tensor, kxa: torch.Tensor, kya: torch.Tensor
