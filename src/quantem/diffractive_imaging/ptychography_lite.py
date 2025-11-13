@@ -114,7 +114,7 @@ class PtychoLite(Ptychography):
 
         if middle_focus:
             if num_slices > 1:
-                mean_thickness = np.mean(np.atleast_1d(slice_thicknesses))
+                mean_thickness = np.mean(np.atleast_1d(np.array(slice_thicknesses)))
                 half_thickness = mean_thickness * (num_slices) / 2
                 if "C10" in probe_params and probe_params["C10"] is not None:
                     probe_params["C10"] -= half_thickness
@@ -162,7 +162,7 @@ class PtychoLite(Ptychography):
 
     def reconstruct(  # type:ignore could do overloads but this is simpler...
         self,
-        num_iter: int = 0,
+        num_iters: int = 0,
         reset: bool = False,
         lr_obj: float = 5e-3,
         learn_probe: bool = True,
@@ -178,7 +178,7 @@ class PtychoLite(Ptychography):
     ) -> Self:
         self.verbose = verbose
 
-        if new_optimizers or reset or self.num_epochs == 0:
+        if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
                     "type": "adam",
@@ -207,13 +207,13 @@ class PtychoLite(Ptychography):
         constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
-            num_iter=num_iter,
+            num_iters=num_iters,
             reset=reset,
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
             constraints=constraints,
             batch_size=batch_size,
-            store_iterations_every=store_iterations_every,
+            store_snapshots_every=store_iterations_every,
             device=device,
         )
 
@@ -313,7 +313,7 @@ class PtychoLiteDIP(Ptychography):
             if pretrain_object:
                 obj_model.pretrain(
                     reset=True,
-                    num_epochs=pretrain_iters,
+                    num_iters=pretrain_iters,
                     optimizer_params={
                         "type": "adam",
                         "lr": pretrain_lr,
@@ -328,7 +328,7 @@ class PtychoLiteDIP(Ptychography):
             if pretrain_probe:
                 probe_model.pretrain(
                     reset=True,
-                    num_epochs=pretrain_iters,
+                    num_iters=pretrain_iters,
                     optimizer_params={
                         "type": "adam",
                         "lr": 1e-3,
@@ -372,7 +372,7 @@ class PtychoLiteDIP(Ptychography):
 
     def reconstruct(  # type:ignore could do overloads but this is simpler...
         self,
-        num_iter: int = 0,
+        num_iters: int = 0,
         reset: bool = False,
         lr_obj: float = 5e-4,
         learn_probe: bool = True,
@@ -388,7 +388,7 @@ class PtychoLiteDIP(Ptychography):
     ) -> Self:
         self.verbose = verbose
 
-        if new_optimizers or reset or self.num_epochs == 0:
+        if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
                     "type": "adam",
@@ -417,12 +417,12 @@ class PtychoLiteDIP(Ptychography):
         constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
-            num_iter=num_iter,
+            num_iters=num_iters,
             reset=reset,
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
             constraints=constraints,
             batch_size=batch_size,
-            store_iterations_every=store_iterations_every,
+            store_snapshots_every=store_iterations_every,
             device=device,
         )

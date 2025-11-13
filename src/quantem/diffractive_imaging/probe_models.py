@@ -1231,7 +1231,7 @@ class ProbeDIP(ProbeConstraints):
         model_input: torch.Tensor | None = None,
         pretrain_target: torch.Tensor | None = None,
         reset: bool = False,
-        num_epochs: int = 100,
+        num_iters: int = 100,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l2",
@@ -1246,7 +1246,7 @@ class ProbeDIP(ProbeConstraints):
             self.set_optimizer(optimizer_params)
 
         if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_epochs)
+            self.set_scheduler(scheduler_params, num_iters)
 
         if reset:
             self.model.apply(reset_weights)
@@ -1266,7 +1266,7 @@ class ProbeDIP(ProbeConstraints):
 
         loss_fn = get_loss_function(loss_fn, self.dtype)
         self._pretrain(
-            num_epochs=num_epochs,
+            num_iters=num_iters,
             loss_fn=loss_fn,
             apply_constraints=apply_constraints,
             show=show,
@@ -1275,7 +1275,7 @@ class ProbeDIP(ProbeConstraints):
 
     def _pretrain(
         self,
-        num_epochs: int,
+        num_iters: int,
         loss_fn: Callable,
         apply_constraints: bool = False,
         show: bool = False,
@@ -1290,7 +1290,7 @@ class ProbeDIP(ProbeConstraints):
             raise ValueError("Optimizer not set. Call set_optimizer() first.")
 
         sch = self.scheduler
-        pbar = tqdm(range(num_epochs))
+        pbar = tqdm(range(num_iters))
         output = self.probe
 
         for a0 in pbar:
@@ -1325,7 +1325,7 @@ class ProbeDIP(ProbeConstraints):
 
             self._pretrain_losses.append(loss.item())
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
-            pbar.set_description(f"Epoch {a0 + 1}/{num_epochs}, Loss: {loss.item():.3e}, ")
+            pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
 
         if show:
             self.visualize_pretrain(output)
@@ -1345,7 +1345,7 @@ class ProbeDIP(ProbeConstraints):
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
         ax.spines["left"].set_color("k")
-        ax.set_xlabel("Epochs")
+        ax.set_xlabel("Iterations")
         nx = ax.twinx()
         nx.spines["left"].set_visible(False)
         lines.extend(
@@ -1378,7 +1378,7 @@ class ProbeDIP(ProbeConstraints):
             cbar=True,
         )
         plt.suptitle(
-            f"Final loss: {self._pretrain_losses[-1]:.3e} | Epochs: {len(self._pretrain_losses)}",
+            f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
             fontsize=14,
             y=0.94,
         )

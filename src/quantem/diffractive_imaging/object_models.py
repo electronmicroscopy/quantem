@@ -66,6 +66,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self.register_buffer("_mask", torch.tensor([]))
         self.device = device
         self._obj_type = obj_type
+        self._sampling_xy = None
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -104,6 +105,20 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     @obj_type.setter
     def obj_type(self, t: str | None) -> None:
         self._obj_type = self._process_obj_type(t)
+
+    @property
+    def sampling_xy(self) -> tuple[float, float]:
+        """Realspace in-plane sampling in A"""
+        if self._sampling_xy is None:
+            raise ValueError("ObjectModel sampling_xy not set, call _initialize_obj() first")
+        return self._sampling_xy
+
+    @sampling_xy.setter
+    def sampling_xy(self, sampling: tuple[float, float] | np.ndarray | torch.Tensor):
+        smp = validate_arr_gt(
+            validate_tensor(sampling, name="sampling_xy", ndim=1, shape=(2,)), 0, "sampling_xy"
+        )
+        self._sampling_xy = (smp[0].item(), smp[1].item())
 
     def _process_obj_type(self, obj_type: str | None) -> object_type:
         if obj_type is None:
@@ -191,8 +206,13 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         raise NotImplementedError()
 
     @abstractmethod
-    def _initialize_obj(self, shape: tuple[int, int, int] | np.ndarray) -> None:
-        raise NotImplementedError()
+    def _initialize_obj(
+        self,
+        shape: tuple[int, int, int] | np.ndarray,
+        sampling: np.ndarray | tuple[float, float] | None = None,
+    ) -> None:
+        if sampling is not None:
+            self.sampling_xy = sampling
 
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device. Overrides nn.Module.to()."""
@@ -260,10 +280,10 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         "tv_weight_z": 0,
         "tv_weight_yx": 0,
         "surface_zero_weight": 0,
-        "gaussian_sigma": None,
+        "gaussian_sigma": None,  # pixels
         "butterworth_order": 4,
-        "q_lowpass": None,
-        "q_highpass": None,
+        "q_lowpass": None,  # A^-1
+        "q_highpass": None,  # A^-1
     }
 
     def apply_hard_constraints(
@@ -304,7 +324,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if any([self.constraints["q_lowpass"], self.constraints["q_highpass"]]):
             obj2 = self.butterworth_constraint(
                 obj2,
-                sampling=self.sampling,
+                sampling=self.sampling_xy,
             )
         if self.num_slices > 1:
             if self.constraints["identical_slices"]:
@@ -459,7 +479,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
     def butterworth_constraint(
         self,
         tensor: torch.Tensor,
-        sampling: np.ndarray,
+        sampling: tuple[float, float],
     ) -> torch.Tensor:
         """
         Butterworth filter used for low/high-pass filtering.
@@ -469,8 +489,6 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         q_lowpass = self.constraints["q_lowpass"]
         q_highpass = self.constraints["q_highpass"]
         butterworth_order = self.constraints["butterworth_order"]
-
-        sampling = tuple(float(s) for s in sampling)
 
         qx = torch.fft.fftfreq(tensor.shape[-2], sampling[0], device=tensor.device)
         qy = torch.fft.fftfreq(tensor.shape[-1], sampling[1], device=tensor.device)
@@ -621,8 +639,13 @@ class ObjectPixelated(ObjectConstraints):
     def initial_obj(self):
         return self._initial_obj
 
-    def _initialize_obj(self, shape: tuple[int, int, int] | np.ndarray) -> None:
-        if self.obj.numel() > self.num_slices:
+    def _initialize_obj(
+        self,
+        shape: tuple[int, int, int] | np.ndarray,
+        sampling: tuple[float, float] | np.ndarray | None = None,
+    ) -> None:
+        super()._initialize_obj(shape, sampling)
+        if self.obj.numel() > self.num_slices and np.array_equal(self.shape, shape):
             return
         init_shape = tuple(int(x) for x in shape)
         if self._initialize_mode == "uniform":
@@ -1014,7 +1037,12 @@ class ObjectDIP(ObjectConstraints):
         """Reset the object model to its initial or pre-trained state"""
         self.model.load_state_dict(self.pretrained_weights.copy())
 
-    def _initialize_obj(self, shape: tuple[int, int, int] | np.ndarray) -> None:
+    def _initialize_obj(
+        self,
+        shape: tuple[int, int, int] | np.ndarray,
+        sampling: tuple[float, float] | np.ndarray | None = None,
+    ) -> None:
+        super()._initialize_obj(shape, sampling)
         if not np.array_equal(shape, self.model_input.shape[1:]):
             raise ValueError(
                 f"shape {shape} does not match model_input.shape {self.model_input.shape}"
@@ -1025,7 +1053,7 @@ class ObjectDIP(ObjectConstraints):
         model_input: torch.Tensor | None = None,
         pretrain_target: torch.Tensor | None = None,
         reset: bool = False,
-        num_epochs: int = 100,
+        num_iters: int = 100,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l2",
@@ -1040,7 +1068,7 @@ class ObjectDIP(ObjectConstraints):
             self.set_optimizer(optimizer_params)
 
         if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_epochs)
+            self.set_scheduler(scheduler_params, num_iters)
 
         if reset:
             self.model.apply(reset_weights)
@@ -1063,7 +1091,7 @@ class ObjectDIP(ObjectConstraints):
 
         loss_fn = get_loss_function(loss_fn, self.dtype)
         self._pretrain(
-            num_epochs=num_epochs,
+            num_iters=num_iters,
             loss_fn=loss_fn,
             apply_constraints=apply_constraints,
             show=show,
@@ -1072,7 +1100,7 @@ class ObjectDIP(ObjectConstraints):
 
     def _pretrain(
         self,
-        num_epochs: int,
+        num_iters: int,
         loss_fn: Callable,
         apply_constraints: bool = False,
         show: bool = False,
@@ -1087,7 +1115,7 @@ class ObjectDIP(ObjectConstraints):
             raise ValueError("Optimizer not set. Call set_optimizer() first.")
 
         scheduler = self.scheduler
-        pbar = tqdm(range(num_epochs))
+        pbar = tqdm(range(num_iters))
         output = self.obj
 
         for a0 in pbar:
@@ -1124,7 +1152,7 @@ class ObjectDIP(ObjectConstraints):
 
             self._pretrain_losses.append(loss.item())
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
-            pbar.set_description(f"Epoch {a0 + 1}/{num_epochs}, Loss: {loss.item():.3e}, ")
+            pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
 
         if show:
             self.visualize_pretrain(output)
@@ -1144,7 +1172,7 @@ class ObjectDIP(ObjectConstraints):
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
         ax.spines["left"].set_color("k")
-        ax.set_xlabel("Epochs")
+        ax.set_xlabel("Iterations")
         nx = ax.twinx()
         nx.spines["left"].set_visible(False)
         lines.extend(
@@ -1195,7 +1223,7 @@ class ObjectDIP(ObjectConstraints):
                 cbar=True,
             )
         plt.suptitle(
-            f"Final loss: {self._pretrain_losses[-1]:.3e} | Epochs: {len(self._pretrain_losses)}",
+            f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
             fontsize=14,
             y=0.94,
         )
@@ -1222,5 +1250,8 @@ class ObjectDIP(ObjectConstraints):
 #     ### input (which maybe is just the raw patch indices? tbd) for the implicit input
 #     ### so it will be parallelized inference across the batches rather than inference once
 #     ### and then patching that, like it will be for DIP
+
+# constraints are going to be tricky, specifically the TV and filtering if we want to allow
+# multiscale reconstructions
 
 ObjectModelType = ObjectPixelated | ObjectDIP  # | ObjectImplicit

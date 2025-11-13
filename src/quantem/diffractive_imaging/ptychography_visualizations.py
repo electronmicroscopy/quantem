@@ -7,7 +7,6 @@ from scipy.signal.windows import tukey
 
 from quantem.core import config
 from quantem.core.visualization import show_2d
-from quantem.diffractive_imaging.ptycho_utils import center_crop_arr
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 
 
@@ -24,13 +23,10 @@ class PtychographyVisualizations(PtychographyBase):
         if obj is None:
             if snapshot_iter is not None:
                 if snapshot_iter < 0:
-                    snapshot_iter = len(self.epoch_snapshots) + snapshot_iter
-                snp = self.get_snapshot_by_epoch(snapshot_iter, closest=True)
-                obj_np = snp["obj"]
+                    snapshot_iter = len(self.snapshots) + snapshot_iter
+                snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
+                obj_np = cast(np.ndarray, snp["obj"])
                 obj_iter = snp["iteration"]
-                obj_np = self._crop_rotate_obj_fov(obj_np)  # type:ignore # FIXME
-                if self.obj_type == "pure_phase":
-                    obj_np = np.exp(1j * np.angle(obj_np))
             else:
                 obj_np = self.obj_cropped
         else:
@@ -52,7 +48,7 @@ class PtychographyVisualizations(PtychographyBase):
         if obj_np.shape[0] > 1:
             t += "Summed "
         if obj_iter != "Final":
-            t += f"Epoch {obj_iter} "
+            t += f"Iter {obj_iter} "
 
         ims = []
         titles = []
@@ -94,7 +90,7 @@ class PtychographyVisualizations(PtychographyBase):
     ):
         if obj is None:
             if snapshot_idx is not None:
-                obj_np = self.epoch_snapshots[snapshot_idx]["obj"]
+                obj_np = self.snapshots[snapshot_idx]["obj"]
                 obj_np = self._crop_rotate_obj_fov(obj_np).sum(0)  # type:ignore # FIXME
                 if self.obj_type == "pure_phase":
                     obj_np = np.exp(1j * np.angle(obj_np))
@@ -131,7 +127,7 @@ class PtychographyVisualizations(PtychographyBase):
                 obj_show = np.angle(obj_pad)
             stitle = kwargs.pop("title", "")
             if snapshot_idx is not None:
-                stitle += f" epoch {self.epoch_snapshots[snapshot_idx]['iteration']}"
+                stitle += f" iter {self.snapshots[snapshot_idx]['iteration']}"
             if len(stitle) > 0:
                 stitle = stitle + " "
             show_2d(
@@ -320,40 +316,40 @@ class PtychographyVisualizations(PtychographyBase):
 
         lw = 2
         lines = []
-        epochs = np.arange(len(self.epoch_losses))
+        iters = np.arange(len(self.iter_losses))
         # colors = plt.cm.Set1.colors  # type:ignore
         colors = config.get("viz.colors.set")  # [1:]
-        if len(self.val_epoch_losses) > 0:
-            lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="train loss", lw=lw))
+        if len(self.val_iter_losses) > 0:
+            lines.extend(ax.semilogy(iters, self.iter_losses, c="k", label="train loss", lw=lw))
             lines.extend(
-                ax.semilogy(epochs, self.val_epoch_losses, c=colors[6], label="val loss", lw=lw)
+                ax.semilogy(iters, self.val_iter_losses, c=colors[6], label="val loss", lw=lw)
             )
         else:
-            lines.extend(ax.semilogy(epochs, self.epoch_losses, c="k", label="loss", lw=lw))
+            lines.extend(ax.semilogy(iters, self.iter_losses, c="k", label="loss", lw=lw))
 
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
         ax.spines["left"].set_color("k")
-        ax.set_xlabel("Epochs")
+        ax.set_xlabel("Iterations")
 
         # check if all lrs are constant and if so, don't plot lr
-        if all(np.all(lr == self.epoch_lrs["object"][0]) for lr in self.epoch_lrs.values()):
+        if all(np.all(lr == self.iter_lrs["object"][0]) for lr in self.iter_lrs.values()):
             plot_lrs = False
 
-        if plot_lrs and len(self.epoch_lrs) > 0:
+        if plot_lrs and len(self.iter_lrs) > 0:
             nx = ax.twinx()
             nx.spines["left"].set_visible(False)
             color_idx = 0
 
             # Sort optimizers: object first, then probe, then the rest
             sorted_items = sorted(
-                self.epoch_lrs.items(),
+                self.iter_lrs.items(),
                 key=lambda x: (0 if x[0] == "object" else 1 if x[0] == "probe" else 2, x[0]),
             )
             for lr_type, lr_values in sorted_items:
                 if len(lr_values) > 0:
-                    # Create epochs array that matches lr_values length
-                    lr_epochs = np.arange(len(lr_values))
+                    # Create iterations array that matches lr_values length
+                    lr_iters = np.arange(len(lr_values))
                     linestyles = ["-", "--", ":", "-."]
                     linestyle = linestyles[color_idx % len(linestyles)]
                     if lr_type == "probe":
@@ -364,7 +360,7 @@ class PtychographyVisualizations(PtychographyBase):
                         zorder = 1
                     lines.extend(
                         nx.semilogy(
-                            lr_epochs,
+                            lr_iters,
                             lr_values,
                             c=colors[color_idx % len(colors)],
                             label=f"{lr_type} LR",
@@ -383,7 +379,7 @@ class PtychographyVisualizations(PtychographyBase):
             # No learning rates to plot, add to title
             # set title to each lr type
             title = ""
-            for lr_type, lr_values in self.epoch_lrs.items():
+            for lr_type, lr_values in self.iter_lrs.items():
                 title += f"{lr_type} LR: {lr_values[0]:.1e} | "
             ax.set_title(title[:-3], fontsize=10)
 
@@ -391,7 +387,7 @@ class PtychographyVisualizations(PtychographyBase):
         if len(labs) > 1:
             ax.legend(lines, labs, loc="upper right")
 
-        ax.set_xbound(-2, np.max(epochs if np.any(epochs) else [1]) + 2)
+        ax.set_xbound(-2, np.max(iters if np.any(iters) else [1]) + 2)
         if figax is None:
             plt.tight_layout()
             plt.show()
@@ -407,17 +403,17 @@ class PtychographyVisualizations(PtychographyBase):
         axs_bot = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(n_bot)])
         self.show_obj_and_probe(figax=(fig, axs_bot), cbar=cbar)
         plt.suptitle(
-            f"Final loss: {self.epoch_losses[-1]:.3e} | Epochs: {len(self.epoch_losses)}",
+            f"Final loss: {self.iter_losses[-1]:.3e} | Iters: {len(self.iter_losses)}",
             fontsize=14,
             y=0.95,
         )
         plt.show()
 
-    def show_epochs(
+    def show_iters(
         self,
         show_probe: bool = True,
         show_object: bool = True,
-        epochs: list[int] | slice | None = None,
+        iters: list[int] | slice | None = None,
         every_nth: int | None = None,
         max_n: int | None = None,
         cbar: bool = False,
@@ -425,10 +421,11 @@ class PtychographyVisualizations(PtychographyBase):
         interval_scaling: Literal["each", "all"] = "each",
         max_width: int = 4,
         cropped: bool = True,
+        closest: bool = True,
         **kwargs,
     ):
         """
-        Display object and/or probe reconstructions from stored epoch snapshots.
+        Display object and/or probe reconstructions from stored iteration snapshots.
 
         Parameters
         ----------
@@ -436,18 +433,19 @@ class PtychographyVisualizations(PtychographyBase):
             Whether to show probe reconstructions, by default True
         show_object : bool, optional
             Whether to show object reconstructions, by default True
-        epochs : list[int] | slice | None, optional
-            Specific epoch iterations to display. If None, shows all available epochs
+        iters : list[int] | slice | None, optional
+            Specific iter iterations to display. If None, shows all available iters
         every_nth : int | None, optional
-            Show every nth epoch instead of all. Overrides epochs parameter
-        max_epochs : int | None, optional
-            Maximum number of epochs to display
+            Show every nth iter instead of all. Overrides iters parameter
+        max_n : int | None, optional
+            Maximum number of iterations to display
         cbar : bool, optional
             Whether to show colorbars, by default False
         norm : str, optional
-            Normalization method for object display, by default "quantile"
+            Normalization method for object display, by default "quantile",
         interval_scaling : str, optional
-            How to scale intervals: "each" for per-image scaling, "all" for global scaling across all epochs, by default "each"
+            How to scale intervals: "each" for per-image scaling, "all" for global scaling across
+            all iterations, by default "each". Does not work if show_probe is True.
         max_width : int, optional
             Maximum number of images per row, by default 4
         cropped : bool, optional
@@ -455,70 +453,86 @@ class PtychographyVisualizations(PtychographyBase):
         **kwargs
             Additional arguments passed to show_2d
         """
-        if not self.epoch_snapshots:
-            print("No epoch snapshots available. Use store_iterations=True during reconstruction.")
+        if not self.snapshots:
+            print(
+                "No iteration snapshots available. Use store_snapshots=True during reconstruction."
+            )
             return
 
         if not show_object and not show_probe:
             print("Must show at least one of object or probe")
             return
 
-        all_iterations = [snapshot["iteration"] for snapshot in self.epoch_snapshots]
+        all_iterations = [cast(int, snapshot["iteration"]) for snapshot in self.snapshots]
 
-        if every_nth is not None:
-            selected_indices = list(range(0, len(self.epoch_snapshots), every_nth))
-        elif epochs is not None:
-            if isinstance(epochs, slice):
-                selected_indices = list(range(*epochs.indices(len(self.epoch_snapshots))))
+        if iters is not None:
+            if isinstance(iters, slice):
+                selected_iterations = all_iterations[iters]
             else:
-                selected_indices = []
-                for epoch in epochs:
-                    try:
-                        idx = all_iterations.index(epoch)
-                        selected_indices.append(idx)
-                    except ValueError:
-                        print(f"Warning: Epoch {epoch} not found in snapshots")
+                selected_iterations = iters
+        elif every_nth is not None:
+            selected_iterations = all_iterations[::every_nth]
         else:
-            selected_indices = list(range(len(self.epoch_snapshots)))
+            selected_iterations = all_iterations
 
         if max_n is not None:
-            selected_indices = selected_indices[:max_n]  # TEST
+            selected_iterations = selected_iterations[:max_n]  # truncate to max_n
 
-        if not selected_indices:
-            print("No valid epochs selected for display")
+        if len(selected_iterations) == 0:
+            print("No valid iterations selected for display")
             return
 
-        selected_snapshots = [self.epoch_snapshots[i] for i in selected_indices]
+        selected_snapshots = [
+            self.get_snapshot_by_iter(i, closest=closest, cropped=cropped)
+            for i in selected_iterations
+        ]
+
+        if show_object and show_probe:
+            self._show_object_and_probe_iters(selected_snapshots, norm, cbar, max_width, **kwargs)
+        elif show_object:
+            self._show_object_iters_only(
+                selected_snapshots, norm, interval_scaling, cbar, max_width, **kwargs
+            )
+        elif show_probe:
+            self._show_probe_iters_only(selected_snapshots, cbar, max_width, **kwargs)
+
+    def _show_object_iters_only(
+        self, snapshots, norm, interval_scaling, cbar, max_width, **kwargs
+    ):
+        """Display only object reconstructions from iteration snapshots."""
+        ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
+
+        all_images = []
+        all_titles = []
+        all_cmaps = []
+
+        for snapshot in snapshots:
+            obj = cast(np.ndarray, snapshot["obj"])
+            iteration = snapshot["iteration"]
+            title_prefix = f"Iter {iteration} "
+
+            if self.obj_type == "potential":
+                all_images.append(np.abs(obj).sum(0))
+                all_titles.append(title_prefix + "Potential")
+                all_cmaps.append(ph_cmap)
+            elif self.obj_type == "pure_phase":
+                all_images.append(np.angle(obj).sum(0))
+                all_titles.append(title_prefix + "Phase")
+                all_cmaps.append(ph_cmap)
+            else:  # complex
+                all_images.extend([np.angle(obj).sum(0), np.abs(obj).sum(0)])
+                all_titles.extend([title_prefix + "Phase", title_prefix + "Amplitude"])
+                all_cmaps.extend([ph_cmap, "gray"])
 
         if norm == "quantile":
             norm_dict = {"interval_type": "quantile"}
             # TODO: implement global quantile scaling for interval_scaling="all"
         elif norm in ["manual", "minmax", "abs"]:
             norm_dict: dict[str, Any] = {"interval_type": "manual"}
-
             # Calculate global vmin/vmax if interval_scaling="all" and objects are shown
-            if interval_scaling == "all" and show_object:
-                all_object_values = []
-                for snapshot in selected_snapshots:
-                    obj = cast(np.ndarray, snapshot["obj"])
-
-                    if cropped:
-                        obj = self._crop_epoch_obj(obj)
-
-                    if obj.ndim == 3 and obj.shape[0] > 1:
-                        obj_display = obj.sum(0)
-                    else:
-                        obj_display = obj[0] if obj.ndim == 3 else obj
-
-                    if self.obj_type == "potential":
-                        all_object_values.append(np.abs(obj_display))
-                    elif self.obj_type == "pure_phase":
-                        all_object_values.append(np.angle(obj_display))
-                    else:  # complex
-                        all_object_values.extend([np.angle(obj_display), np.abs(obj_display)])
-
-                if all_object_values:
-                    all_values_flat = np.concatenate([arr.ravel() for arr in all_object_values])
+            if interval_scaling == "all":
+                if len(all_images) > 0:
+                    all_values_flat = np.concatenate([arr.ravel() for arr in all_images])
                     norm_dict["vmin"] = float(np.min(all_values_flat))
                     norm_dict["vmax"] = float(np.max(all_values_flat))
             else:
@@ -526,60 +540,6 @@ class PtychographyVisualizations(PtychographyBase):
                 norm_dict["vmax"] = kwargs.get("vmax")
         else:
             raise ValueError(f"Unknown norm type: {norm}")
-
-        if show_object and show_probe:
-            self._show_object_and_probe_epochs(
-                selected_snapshots, norm_dict, cbar, max_width, cropped, **kwargs
-            )
-        elif show_object:
-            self._show_object_epochs_only(
-                selected_snapshots, norm_dict, cbar, max_width, cropped, **kwargs
-            )
-        elif show_probe:
-            self._show_probe_epochs_only(selected_snapshots, cbar, max_width, **kwargs)
-
-    def _crop_epoch_obj(self, obj: np.ndarray) -> np.ndarray:
-        """Apply the same cropping logic as obj_cropped property to epoch snapshot objects."""
-        cropped = self._crop_rotate_obj_fov(obj)
-        if self.obj_type == "pure_phase":
-            cropped = np.exp(1j * np.angle(cropped))
-        cropped = center_crop_arr(cropped, tuple(self.obj_shape_crop))
-        return cropped
-
-    def _show_object_epochs_only(self, snapshots, norm_dict, cbar, max_width, cropped, **kwargs):
-        """Display only object reconstructions from epoch snapshots."""
-        ph_cmap = config.get("viz.phase_cmap")
-
-        all_images = []
-        all_titles = []
-        all_cmaps = []
-
-        for snapshot in snapshots:
-            obj = snapshot["obj"]
-            iteration = snapshot["iteration"]
-
-            if cropped:
-                obj = self._crop_epoch_obj(obj)
-
-            if obj.ndim == 3 and obj.shape[0] > 1:
-                obj_display = obj.sum(0)
-                title_prefix = f"Epoch {iteration} Summed "
-            else:
-                obj_display = obj[0] if obj.ndim == 3 else obj
-                title_prefix = f"Epoch {iteration} "
-
-            if self.obj_type == "potential":
-                all_images.append(np.abs(obj_display))
-                all_titles.append(title_prefix + "Potential")
-                all_cmaps.append(ph_cmap)
-            elif self.obj_type == "pure_phase":
-                all_images.append(np.angle(obj_display))
-                all_titles.append(title_prefix + "Phase")
-                all_cmaps.append(ph_cmap)
-            else:  # complex
-                all_images.extend([np.angle(obj_display), np.abs(obj_display)])
-                all_titles.extend([title_prefix + "Phase", title_prefix + "Amplitude"])
-                all_cmaps.extend([ph_cmap, "gray"])
 
         images_grid = [all_images[i : i + max_width] for i in range(0, len(all_images), max_width)]
         titles_grid = [all_titles[i : i + max_width] for i in range(0, len(all_titles), max_width)]
@@ -599,8 +559,8 @@ class PtychographyVisualizations(PtychographyBase):
             **kwargs,
         )
 
-    def _show_probe_epochs_only(self, snapshots, cbar, max_width, **kwargs):
-        """Display only probe reconstructions from epoch snapshots."""
+    def _show_probe_iters_only(self, snapshots, cbar, max_width, **kwargs):
+        """Display only probe reconstructions from iteration snapshots."""
         all_probes = []
         all_titles = []
 
@@ -610,10 +570,10 @@ class PtychographyVisualizations(PtychographyBase):
 
             if probe.ndim == 3 and probe.shape[0] > 1:
                 probe_display = np.fft.fftshift(probe.sum(0))
-                title = f"Epoch {iteration} Summed Probe"
+                title = f"Iter {iteration} Coherently summed Probe"
             else:
                 probe_display = np.fft.fftshift(probe[0] if probe.ndim == 3 else probe)
-                title = f"Epoch {iteration} Probe"
+                title = f"Iter {iteration} Probe"
 
             all_probes.append(probe_display)
             all_titles.append(title)
@@ -637,79 +597,68 @@ class PtychographyVisualizations(PtychographyBase):
             **kwargs,
         )
 
-    def _show_object_and_probe_epochs(
-        self, snapshots, norm_dict, cbar, max_width, cropped, **kwargs
-    ):
-        """Display both object and probe reconstructions from epoch snapshots."""
-        ph_cmap = config.get("viz.phase_cmap")
+    def _show_object_and_probe_iters(self, snapshots, norm_dict, cbar, max_width, **kwargs):
+        """Display both object and probe reconstructions from iteration snapshots."""
+        ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
 
         all_images = []
         all_titles = []
         all_cmaps = []
-        all_scalebars = []
 
-        for snapshot in snapshots:
-            obj = snapshot["obj"]
-            probe = snapshot["probe"]
-            iteration = snapshot["iteration"]
-
-            # Apply cropping if requested
-            if cropped:
-                obj = self._crop_epoch_obj(obj)
-
+        for i in range(0, len(snapshots), max_width // 2):
             row_images = []
             row_titles = []
             row_cmaps = []
-            row_scalebars = []
 
-            # Process object
-            if obj.ndim == 3 and obj.shape[0] > 1:
-                obj_display = obj.sum(0)
-                obj_prefix = "Summed "
-            else:
-                obj_display = obj[0] if obj.ndim == 3 else obj
-                obj_prefix = ""
+            for j in range(max_width // 2):
+                if i + j >= len(snapshots):
+                    continue
+                snapshot = snapshots[i + j]
+                obj = cast(np.ndarray, snapshot["obj"])
+                probe = cast(np.ndarray, snapshot["probe"])
+                iteration = snapshot["iteration"]
 
-            if self.obj_type == "potential":
-                row_images.append(np.abs(obj_display))
-                row_titles.append(f"Epoch {iteration} {obj_prefix}Potential")
-                row_cmaps.append(ph_cmap)
-                row_scalebars.append({"sampling": self.sampling[0], "units": "Å"})
-            elif self.obj_type == "pure_phase":
-                row_images.append(np.angle(obj_display))
-                row_titles.append(f"Epoch {iteration} {obj_prefix}Phase")
-                row_cmaps.append(ph_cmap)
-                row_scalebars.append({"sampling": self.sampling[0], "units": "Å"})
-            else:  # complex
-                row_images.extend([np.angle(obj_display), np.abs(obj_display)])
-                row_titles.extend(
-                    [
-                        f"Epoch {iteration} {obj_prefix}Phase",
-                        f"Epoch {iteration} {obj_prefix}Amplitude",
-                    ]
-                )
-                row_cmaps.extend([ph_cmap, "gray"])
-                row_scalebars.extend([{"sampling": self.sampling[0], "units": "Å"}, None])
+                if self.obj_type == "potential":
+                    row_images.append(np.abs(obj).sum(0))
+                    row_titles.append(f"Iter {iteration} Potential")
+                    row_cmaps.append(ph_cmap)
+                elif self.obj_type == "pure_phase":
+                    row_images.append(np.angle(obj).sum(0))
+                    row_titles.append(f"Iter {iteration} Phase")
+                    row_cmaps.append(ph_cmap)
+                else:  # complex
+                    row_images.extend([np.angle(obj).sum(0), np.abs(obj).sum(0)])
+                    row_titles.extend(
+                        [
+                            f"Iter {iteration} Phase",
+                            f"Iter {iteration} Amplitude",
+                        ]
+                    )
+                    row_cmaps.extend([ph_cmap, "gray"])
 
-            # Process probe
-            if probe.ndim == 3 and probe.shape[0] > 1:
-                probe_display = np.fft.fftshift(probe.sum(0))
-                probe_title = f"Epoch {iteration} Summed Probe"
-            else:
-                probe_display = np.fft.fftshift(probe[0] if probe.ndim == 3 else probe)
-                probe_title = f"Epoch {iteration} Probe"
+                # Process probe
+                if probe.ndim == 3 and probe.shape[0] > 1:
+                    probe_display = np.fft.fftshift(probe.sum(0))
+                    probe_title = f"Iter {iteration} Summed Probe"
+                else:
+                    probe_display = np.fft.fftshift(probe[0] if probe.ndim == 3 else probe)
+                    probe_title = f"Iter {iteration} Probe"
 
-            row_images.append(probe_display)
-            row_titles.append(probe_title)
-            row_cmaps.append(None)
-            row_scalebars.append(
-                {"sampling": self.reciprocal_sampling[0], "units": r"$\mathrm{A^{-1}}$"}
-            )
+                row_images.append(probe_display)
+                row_titles.append(probe_title)
+                row_cmaps.append(None)
 
             all_images.append(row_images)
             all_titles.append(row_titles)
             all_cmaps.append(row_cmaps)
-            all_scalebars.append(row_scalebars)
+
+        scalebars: list = [[None for _ in row] for row in all_images]
+        if scalebars:
+            scalebars[0][0] = {"sampling": self.sampling[0], "units": "Å"}
+            scalebars[0][1] = {
+                "sampling": self.reciprocal_sampling[0],
+                "units": r"$\mathrm{A^{-1}}$",
+            }
 
         show_2d(
             all_images,
@@ -717,7 +666,7 @@ class PtychographyVisualizations(PtychographyBase):
             cmap=all_cmaps,
             norm=norm_dict,
             cbar=cbar,
-            scalebar=all_scalebars,
+            scalebar=scalebars,
             **kwargs,
         )
 

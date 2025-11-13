@@ -82,13 +82,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # initializing default attributes
         self._preprocessed: bool = False
         self._obj_padding_force_power2_level: int = 3
-        self._store_iterations: bool = False
-        self._store_iterations_every: int = 1
-        self._epoch_losses: list[float] = []
-        self._epoch_val_losses: list[float] = []
-        self._epoch_recon_types: list[str] = []
-        self._epoch_lrs: dict[str, list] = {}  # LRs/step_sizes across epochs
-        self._epoch_snapshots: list[dict[str, int | np.ndarray]] = []
+        self._store_snapshots: bool = False
+        self._store_snapshot_every: int = 1
+        self._iter_losses: list[float] = []
+        self._iter_val_losses: list[float] = []
+        self._iter_recon_types: list[str] = []
+        self._iter_lrs: dict[str, list] = {}  # LRs/step_sizes across iterations
+        self._snapshots: list[dict[str, int | np.ndarray]] = []
         self._obj_padding_px = np.array([0, 0])
         self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
         self.batch_size = self.dset.num_gpts
@@ -135,7 +135,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         customized pre-processing, they just call the functions themselves directly.
         """
         # self.to(self.device)
-        self.obj_padding_px = obj_padding_px
+        self.obj_padding_px = obj_padding_px  # also initializes the object model
         if not self.dset.preprocessed:
             self.dset.preprocess(
                 com_fit_function=com_fit_function,
@@ -158,9 +158,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # store validation split ratio for reconstruction step
         self.val_ratio = float(val_ratio)
         self.val_mode = val_mode
-        # if self.num_epochs == 0:
+        # if self.num_iters == 0:
         #     self.reset_recon()  # if new models, reset to ensure shapes are correct
-        self.obj_model.sampling = self.sampling.copy()
         return self
 
     def _compute_propagator_arrays(
@@ -277,7 +276,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     def set_obj_type(self, t: str | None, force: bool = False) -> None:
         new_obj_type = self.obj_model._process_obj_type(t)
-        if self.num_epochs > 0 and new_obj_type != self.obj_model.obj_type and not force:
+        if self.num_iters > 0 and new_obj_type != self.obj_model.obj_type and not force:
             raise ValueError(
                 "Cannot change object type after training. Run with reset=True or rerun preprocess."
             )
@@ -367,7 +366,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self._obj_padding_force_power2_level,
             )
         self._obj_padding_px = p2
-        self.obj_model._initialize_obj(shape=self.obj_shape_full)
+        self.obj_model._initialize_obj(shape=self.obj_shape_full, sampling=self.sampling)
         self.dset._set_initial_scan_positions_px(self.obj_padding_px)
         self.dset._set_patch_indices(self.obj_padding_px)
         self.dset._preprocessing_params["obj_padding_px"] = self.obj_padding_px
@@ -388,18 +387,18 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._obj_fov_mask = self._to_torch(mask)
 
     @property
-    def epoch_losses(self) -> np.ndarray:
+    def iter_losses(self) -> np.ndarray:
         """
-        Loss/MSE error for each epoch regardless of reconstruction method used
+        Loss/MSE error for each iteration regardless of reconstruction method used
         """
-        return np.array(self._epoch_losses)
+        return np.array(self._iter_losses)
 
     @property
-    def val_epoch_losses(self) -> np.ndarray:
+    def val_iter_losses(self) -> np.ndarray:
         """
-        Validation loss (consistency) per epoch if a validation split was used.
+        Validation loss (consistency) per iteration if a validation split was used.
         """
-        return np.array(self._epoch_val_losses)
+        return np.array(self._iter_val_losses)
 
     @property
     def val_ratio(self) -> float:
@@ -423,25 +422,25 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._val_mode = mode
 
     @property
-    def num_epochs(self) -> int:
+    def num_iters(self) -> int:
         """
-        Number of epochs for which the recon has been run so far
+        Number of iterations for which the recon has been run so far
         """
-        return len(self.epoch_losses)
+        return len(self.iter_losses)
 
     @property
-    def epoch_recon_types(self) -> np.ndarray:
+    def iter_recon_types(self) -> np.ndarray:
         """
         Keeping track of what reconstruction type was used
         """
-        return np.array(self._epoch_recon_types)
+        return np.array(self._iter_recon_types)
 
     @property
-    def epoch_lrs(self) -> dict[str, np.ndarray]:
+    def iter_lrs(self) -> dict[str, np.ndarray]:
         """
         List of step sizes/LRs depending on recon type
         """
-        return {k: np.array(v) for k, v in self._epoch_lrs.items()}
+        return {k: np.array(v) for k, v in self._iter_lrs.items()}
 
     @property
     def probe(self) -> np.ndarray:
@@ -449,41 +448,61 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self._to_numpy(self.probe_model.probe)
 
     @property
-    def store_iterations(self) -> bool:  # TODO rename to store_epochs or store_snapshots
-        return self._store_iterations
+    def store_snapshots(self) -> bool:
+        return self._store_snapshots
 
-    @store_iterations.setter
-    def store_iterations(self, val: bool | None) -> None:
+    @store_snapshots.setter
+    def store_snapshots(self, val: bool | None) -> None:
         if val is not None:
-            self._store_iterations = bool(val)
+            self._store_snapshots = bool(val)
 
     @property
-    def store_iterations_every(self) -> int:
-        return self._store_iterations_every
+    def store_snapshot_every(self) -> int:
+        return self._store_snapshot_every
 
-    @store_iterations_every.setter
-    def store_iterations_every(self, val: int | None) -> None:
+    @store_snapshot_every.setter
+    def store_snapshot_every(self, val: int | None) -> None:
         if val is not None:
-            self._store_iterations_every = int(val)
+            self._store_snapshot_every = int(val)
 
     @property
-    def epoch_snapshots(self) -> list[dict[str, int | np.ndarray]]:
-        return self._epoch_snapshots
+    def snapshots(self) -> list[dict[str, int | np.ndarray]]:
+        return self._snapshots  # TODO use a TypedDict?
 
-    def get_snapshot_by_epoch(self, iteration: int, closest: bool = False):
+    def get_snapshot_by_iter(self, iteration: int, closest: bool = False, cropped: bool = False):
         iteration = int(iteration)
-        for snapshot in self.epoch_snapshots:
-            if snapshot["iteration"] == iteration:
-                return snapshot
         if closest:
             closest_snapshot = min(
-                self.epoch_snapshots, key=lambda s: abs(int(s["iteration"]) - iteration)
+                self.snapshots, key=lambda s: abs(int(s["iteration"]) - iteration)
             )
-            return closest_snapshot
-        raise ValueError(
-            f"No snapshot found at iteration: {iteration}, "
-            + "to return the closest snapshot, set closest=True"
-        )
+            snp = closest_snapshot
+        else:
+            for snp in self.snapshots:
+                if snp["iteration"] == iteration:
+                    break
+            else:
+                raise ValueError(
+                    f"No snapshot found at iteration: {iteration}, "
+                    + "to return the closest snapshot, set closest=True"
+                )
+        if cropped:
+            snp2 = {
+                "iteration": snp["iteration"],
+                "probe": snp["probe"],
+            }
+            obj = cast(np.ndarray, snp["obj"])
+            cropped_obj = self._crop_rotate_obj_fov(obj)
+            # same logic as self.obj_cropped
+            if self.obj_type == "pure_phase":
+                ph = np.angle(cropped_obj)
+                cropped_obj = np.exp(1j * (ph - ph.mean()))
+            if self.obj_type in ["pure_phase", "complex"]:
+                ph = np.angle(cropped_obj)
+                cropped_obj = np.abs(cropped_obj) * np.exp(1j * (ph - ph.mean()))
+            snp2["obj"] = cropped_obj
+            return snp2
+        else:
+            return snp
 
     # TODO is there a way to type hint proper object model type? probably not...
     @property
@@ -617,12 +636,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def obj_cropped(self) -> np.ndarray:
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "pure_phase":
-            cropped = np.exp(1j * np.angle(cropped))
-        # TEMP testing for bugs
-        if cropped.shape != tuple(self.obj_shape_crop):
-            raise ValueError(
-                f"Object shape {cropped.shape} does not match expected shape {self.obj_shape_crop}"
-            )
+            ph = np.angle(cropped)
+            cropped = np.exp(1j * (ph - ph.mean()))
         if self.obj_type in ["pure_phase", "complex"]:
             ph = np.angle(cropped)
             cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
@@ -842,11 +857,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.dset.reset()
         self.obj_model.constraints = self.obj_model.DEFAULT_CONSTRAINTS
         # detector reset if necessary
-        self._epoch_losses = []
-        self._epoch_val_losses = []
-        self._epoch_recon_types = []
-        self._epoch_snapshots = []
-        self._epoch_lrs = {}
+        self._iter_losses = []
+        self._iter_val_losses = []
+        self._iter_recon_types = []
+        self._iter_lrs = {}
+        self._snapshots = []
 
     def append_recon_iteration(
         self,
@@ -861,9 +876,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             obj = self.obj
         else:
             obj = self._to_numpy(obj)
-        self._epoch_snapshots.append(
+        self._snapshots.append(
             {
-                "iteration": self.num_epochs,
+                "iteration": self.num_iters,
                 "obj": obj,
                 "probe": probe,
             }

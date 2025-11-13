@@ -98,28 +98,28 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.probe_model.reset_optimizer()
         self.dset.reset_optimizer()
 
-    def _record_epoch(self, epoch_loss: float) -> None:
-        self._epoch_losses.append(epoch_loss)
+    def _record_iter(self, iter_loss: float) -> None:
+        self._iter_losses.append(iter_loss)
         optimizers = self.optimizers
-        all_keys = set(self._epoch_lrs.keys()) | set(optimizers.keys())
+        all_keys = set(self._iter_lrs.keys()) | set(optimizers.keys())
         for key in all_keys:
-            if key in self._epoch_lrs.keys():
+            if key in self._iter_lrs.keys():
                 if key in optimizers.keys():
-                    self._epoch_lrs[key].append(optimizers[key].param_groups[0]["lr"])
+                    self._iter_lrs[key].append(optimizers[key].param_groups[0]["lr"])
                 else:
-                    self._epoch_lrs[key].append(0.0)
+                    self._iter_lrs[key].append(0.0)
             else:  # new optimizer
-                # For new optimizers, backfill with 0.0 LR for previous epochs
-                current_epoch = self.num_epochs - 1  # -1 because loss was just appended
-                prev_lrs = [0.0] * current_epoch
+                # For new optimizers, backfill with 0.0 LR for previous iterations
+                current_iter = self.num_iters - 1  # -1 because loss was just appended
+                prev_lrs = [0.0] * current_iter
                 prev_lrs.append(optimizers[key].param_groups[0]["lr"])
-                self._epoch_lrs[key] = prev_lrs
+                self._iter_lrs[key] = prev_lrs
 
-    def _reset_epoch_constraints(self) -> None:
+    def _reset_iter_constraints(self) -> None:
         """Reset constraint loss accumulation for all models."""
-        self.obj_model.reset_epoch_constraint_losses()
-        self.probe_model.reset_epoch_constraint_losses()
-        self.dset.reset_epoch_constraint_losses()
+        self.obj_model.reset_iter_constraint_losses()
+        self.probe_model.reset_iter_constraint_losses()
+        self.dset.reset_iter_constraint_losses()
 
     def _soft_constraints(self) -> torch.Tensor:
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
@@ -144,14 +144,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
     def reconstruct(
         self,
-        num_iter: int = 0,
+        num_iters: int = 0,
         reset: bool = False,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         constraints: dict = {},
         batch_size: int | None = None,
-        store_iterations: bool | None = None,
-        store_iterations_every: int | None = None,
+        store_snapshots: bool | None = None,
+        store_snapshots_every: int | None = None,
         device: Literal["cpu", "gpu"] | None = None,
         autograd: bool = True,
         loss_type: Literal[
@@ -170,11 +170,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         if device is not None:
             self.to(device)
         self.batch_size = batch_size
-        self.store_iterations_every = store_iterations_every
-        if store_iterations_every is not None and store_iterations is None:
-            self.store_iterations = True
+        self.store_snapshot_every = store_snapshots_every
+        if store_snapshots_every is not None and store_snapshots is None:
+            self.store_snapshots = True
         else:
-            self.store_iterations = store_iterations
+            self.store_snapshots = store_snapshots
 
         if reset:
             self.reset_recon()
@@ -191,7 +191,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             new_scheduler = True
 
         if new_scheduler:
-            self.set_schedulers(self.scheduler_params, num_iter=num_iter)
+            self.set_schedulers(self.scheduler_params, num_iter=num_iters)
 
         self.dset._set_targets(loss_type)
         batcher = SimpleBatcher(
@@ -201,12 +201,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             val_ratio=self.val_ratio,
             val_mode=self.val_mode,
         )
-        pbar = tqdm(range(num_iter), disable=not self.verbose)
+        pbar = tqdm(range(num_iters), disable=not self.verbose)
 
         for a0 in pbar:
             consistency_loss = 0.0
             total_loss = 0.0
-            self._reset_epoch_constraints()
+            self._reset_iter_constraints()
 
             for batch_indices in batcher:
                 self.zero_grad_all()
@@ -269,22 +269,22 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         val_batches += 1
                 if val_batches > 0:
                     val_loss = val_consistency_loss / val_batches
-                    self._epoch_val_losses.append(val_loss)
+                    self._iter_val_losses.append(val_loss)
 
-            self._record_epoch(total_loss)  # TODO record val loss as well
+            self._record_iter(total_loss)  # TODO record val loss as well
 
             # Step schedulers with current loss
             self.step_schedulers(total_loss)
 
-            if self.store_iterations and (a0 % self.store_iterations_every) == 0:
+            if self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
                 self.append_recon_iteration()
 
             if self.logger is not None:
-                self.logger.log_epoch(
+                self.logger.log_iter(
                     self.obj_model,
                     self.probe_model,
                     self.dset,
-                    self.num_epochs - 1,
+                    self.num_iters - 1,
                     consistency_loss,
                     num_batches,
                     self._get_current_lrs(),
@@ -292,10 +292,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
             if val_loss is not None:
                 pbar.set_description(
-                    f"Epoch {a0 + 1}/{num_iter}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
+                    f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
                 )
             else:
-                pbar.set_description(f"Epoch {a0 + 1}/{num_iter}, Loss: {total_loss:.3e}")
+                pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
 
         torch.cuda.empty_cache()
         return self
