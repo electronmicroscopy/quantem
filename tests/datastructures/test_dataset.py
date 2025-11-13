@@ -284,3 +284,88 @@ class TestDatasetRepresentation:
         assert "quantem Dataset" in str_str
         assert "shape: (10, 10)" in str_str
         assert "name: 'test_2d_dataset'" in str_str or "named 'test_2d_dataset'" in str_str
+
+
+class TestBinMetadata:
+    def test_bin_updates_sampling_and_origin(self, sample_dataset_2d):
+        # Original metadata
+        assert np.array_equal(sample_dataset_2d.origin, np.array([0.0, 0.0]))
+        assert np.array_equal(sample_dataset_2d.sampling, np.array([1.0, 1.0]))
+
+        # Bin by 2 on both axes
+        binned = sample_dataset_2d.bin(bin_factors=2)
+
+        # Shape reduced
+        assert binned.shape == (5, 5)
+
+        # Sampling doubled
+        assert np.allclose(binned.sampling, np.array([2.0, 2.0]))
+
+        # Origin shifted to center of first 2x2 block: +0.5 * (2-1) * old_sampling
+        assert np.allclose(binned.origin, np.array([0.5, 0.5]))
+
+
+class TestFourierResample:
+    def test_downsample_mean_and_sampling(self):
+        # Constant array → easy mean check; 10x10 → factors 0.5,0.5 → 5x5
+        arr = np.ones((10, 10), dtype=float)
+        ds = Dataset.from_array(arr, origin=(0, 0), sampling=(1.0, 1.0), units=["px", "px"])
+
+        ds2 = ds.fourier_resample(factors=0.5)  # apply to all axes
+        assert ds2.shape == (5, 5)
+
+        # Mean preserved ~ 1
+        assert np.isclose(ds2.array.mean(), 1.0, rtol=1e-6, atol=1e-6)
+
+        # Sampling doubled
+        assert np.allclose(ds2.sampling, np.array([2.0, 2.0]))
+
+        # Center preserved in world coords
+        def center_world(d):
+            return d.origin + (np.array(d.shape) - 1) / 2.0 * d.sampling
+
+        assert np.allclose(center_world(ds), center_world(ds2), rtol=1e-12, atol=1e-12)
+
+    def test_upsample_mean_and_sampling(self):
+        # 5x6 → factors 2 → 10x12
+        arr = np.ones((5, 6), dtype=float)
+        ds = Dataset.from_array(arr, origin=(1.5, -2.0), sampling=(0.2, 0.5), units=["nm", "nm"])
+
+        ds2 = ds.fourier_resample(factors=2.0)
+        assert ds2.shape == (10, 12)
+
+        # Mean preserved ~ 1
+        assert np.isclose(ds2.array.mean(), 1.0, rtol=1e-6, atol=1e-6)
+
+        # Sampling halved
+        assert np.allclose(ds2.sampling, np.array([0.1, 0.25]))
+
+        # Center preserved in world coords (with nonzero origin/sampling)
+        def center_world(d):
+            return d.origin + (np.array(d.shape) - 1) / 2.0 * d.sampling
+
+        assert np.allclose(center_world(ds), center_world(ds2), rtol=1e-10, atol=1e-10)
+
+    def test_odd_even_center_preservation(self):
+        # Odd→even sizes; check center preservation rather than sampling integers
+        arr = np.random.rand(9, 7)
+        ds = Dataset.from_array(arr, origin=(0.0, 0.0), sampling=(1.0, 1.0), units=["px", "px"])
+
+        # Target out_shape (5, 4) explicitly
+        ds2 = ds.fourier_resample(out_shape=(5, 4))
+        assert ds2.shape == (5, 4)
+
+        # Center preserved
+        def center_world(d):
+            return d.origin + (np.array(d.shape) - 1) / 2.0 * d.sampling
+
+        assert np.allclose(center_world(ds), center_world(ds2), rtol=1e-12, atol=1e-12)
+
+    def test_api_errors(self, sample_dataset_2d):
+        # Both specified
+        with pytest.raises(ValueError):
+            sample_dataset_2d.fourier_resample(out_shape=(5, 5), factors=0.5)
+
+        # Neither specified
+        with pytest.raises(ValueError):
+            sample_dataset_2d.fourier_resample()
