@@ -507,6 +507,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         snapshot: Snapshot
             The snapshot at the given iteration.
         """
+        if len(self.snapshots) == 0:
+            raise ValueError(
+                "No snapshots available. Use store_snapshots=True during reconstruction."
+            )
         iteration = int(iteration)
         if closest:
             closest_snapshot = min(self.snapshots, key=lambda s: abs(s["iteration"] - iteration))

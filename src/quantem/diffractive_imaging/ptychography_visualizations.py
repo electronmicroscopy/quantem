@@ -1,4 +1,4 @@
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
@@ -14,18 +14,34 @@ class PtychographyVisualizations(PtychographyBase):
     def show_obj(
         self,
         obj: np.ndarray | None = None,
-        cbar: bool = False,
         snapshot_iter: int | None = None,
-        # norm: Literal["quantile", "manual", "minmax", "abs"] = "quantile",
+        slice_index: int | None = None,
+        cbar: bool = False,
         **kwargs,
     ):
+        """
+        Show the projected object.
+
+        Parameters
+        ----------
+        obj: np.ndarray | None, optional
+            The object to show. If None, the summed object from the last iteration is shown.
+        snapshot_iter: int | None, optional
+            The iteration number to show. If None, the last iteration is shown.
+        slice_index: int | None, optional
+            The slice index to show. If None, the object is shown as a 2D image.
+        cbar: bool, optional
+            Whether to show a colorbar, by default False
+        **kwargs: dict, optional
+            Additional arguments passed to show_2d
+        """
         obj_iter = "Final"
         if obj is None:
             if snapshot_iter is not None:
                 if snapshot_iter < 0:
                     snapshot_iter = len(self.snapshots) + snapshot_iter
                 snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
-                obj_np = cast(np.ndarray, snp["obj"])
+                obj_np = snp["obj"]
                 obj_iter = snp["iteration"]
             else:
                 obj_np = self.obj_cropped
@@ -34,21 +50,19 @@ class PtychographyVisualizations(PtychographyBase):
             if obj_np.ndim == 2:
                 obj_np = obj_np[None, ...]
 
-        # if norm == "quantile":
-        #     norm_dict = {"interval_type": "quantile"}
-        # elif norm in ["manual", "minmax", "abs"]:
-        #     norm_dict = {"interval_type": "manual"}
-        # else:
-        #     raise ValueError(f"Unknown norm type: {norm}")
-
         ph_cmap = kwargs.pop("cmap", config.get("viz.phase_cmap"))
+
         t = kwargs.pop("title", "")
         if len(t) > 0 and not t.endswith(" "):
             t += " "
-        if obj_np.shape[0] > 1:
-            t += "Summed "
         if obj_iter != "Final":
             t += f"Iter {obj_iter} "
+
+        if slice_index is not None:
+            obj_np = obj_np[slice_index][None]
+            t += f"Slice {slice_index} "
+        elif obj_np.shape[0] > 1:
+            t += "Projected "
 
         ims = []
         titles = []
@@ -72,7 +86,6 @@ class PtychographyVisualizations(PtychographyBase):
             ims,
             title=titles,
             cmap=cmaps,
-            # norm=norm_dict,
             cbar=cbar,
             scalebar=scalebar,
             **kwargs,
@@ -84,34 +97,61 @@ class PtychographyVisualizations(PtychographyBase):
         tukey_alpha: float = 0.5,
         pad: int = 0,
         show_obj: bool = False,
-        snapshot_idx: int | None = None,
+        snapshot_iter: int | None = None,
         return_fft: bool = False,
         **kwargs,
     ):
+        """
+        Show the Fourier transform of the object.
+        Parameters
+        ----------
+        obj: np.ndarray | None, optional
+            The object to show. If None, the object from the last iteration is shown.
+        tukey_alpha: float, optional
+            The alpha parameter for the tukey window, by default 0.5
+        pad: int, optional
+            The padding to add to the object, by default 0
+        show_obj: bool, optional
+            Whether to show the object, by default False
+        snapshot_iter: int | None, optional
+            The iteration number of the snapshot to show. If None, the last iteration is shown.
+        return_fft: bool, optional
+            Whether to return the Fourier transform, by default False
+        **kwargs: dict, optional
+            Additional arguments passed to show_2d
+
+        Returns
+        -------
+        np.ndarray | None
+            The Fourier transform of the object if return_fft is True, otherwise None
+        """
+        obj_iter = "Final"
         if obj is None:
-            if snapshot_idx is not None:
-                obj_np = self.snapshots[snapshot_idx]["obj"]
-                obj_np = self._crop_rotate_obj_fov(obj_np).sum(0)  # type:ignore # FIXME
-                if self.obj_type == "pure_phase":
-                    obj_np = np.exp(1j * np.angle(obj_np))
+            if snapshot_iter is not None:
+                if snapshot_iter < 0:
+                    snapshot_iter = len(self.snapshots) + snapshot_iter
+                snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
+                obj_np = snp["obj"]
+                obj_iter = snp["iteration"]
             else:
-                obj_np = self.obj_cropped.sum(0)
+                obj_np = self.obj_cropped
         else:
             obj_np = self._to_numpy(obj)
-            if obj_np.ndim == 3:
-                obj_np = obj.sum(0)
-            else:
-                if obj_np.ndim != 2:
-                    raise ValueError(f"obj must be 2D, got {obj_np.ndim}D")
+            if obj_np.ndim == 2:
+                obj_np = obj_np[None, ...]
 
         window_2d = (
-            tukey(obj_np.shape[0], tukey_alpha)[:, None]
-            * tukey(obj_np.shape[1], tukey_alpha)[None, :]
+            tukey(obj_np.shape[-2], tukey_alpha)[:, None]
+            * tukey(obj_np.shape[-1], tukey_alpha)[None, :]
         )
         if self.obj_type == "potential":
-            windowed_obj = obj_np * window_2d
+            windowed_obj = obj_np.sum(0) * window_2d
         else:
-            windowed_obj = np.abs(obj_np) * window_2d * np.exp(1j * np.angle(obj_np) * window_2d)
+            windowed_obj = (
+                np.abs(obj_np).sum(0)
+                * window_2d
+                * np.exp(1j * np.angle(obj_np).sum(0) * window_2d)
+            )
         obj_pad = np.pad(windowed_obj, pad, mode="constant", constant_values=0)
 
         obj_fft = np.fft.fftshift(np.fft.fft2(obj_pad))
@@ -119,51 +159,117 @@ class PtychographyVisualizations(PtychographyBase):
         fft_sampling = 1 / (self.sampling[0] * obj_pad.shape[0])
         fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
 
+        t = kwargs.pop("title", "")
+        if len(t) > 0 and not t.endswith(" "):
+            t += " "
+        if obj_iter != "Final":
+            t += f"Iter {obj_iter} "
+
         if show_obj:
             obj_scalebar = {"sampling": self.sampling[0], "units": "Å"}
-            if self.obj_type == "potential" or self.obj_type == "complex":
+            if self.obj_type == "potential":
                 obj_show = obj_pad
-            else:  # self.obj_type == "pure_phase":
+            else:  # complex or pure phase just show the phase
                 obj_show = np.angle(obj_pad)
-            stitle = kwargs.pop("title", "")
-            if snapshot_idx is not None:
-                stitle += f" iter {self.snapshots[snapshot_idx]['iteration']}"
-            if len(stitle) > 0:
-                stitle = stitle + " "
             show_2d(
                 [
                     obj_show,
                     np.abs(obj_fft),
                 ],
-                title=[stitle + "Object", stitle + "Fourier Transform"],
+                title=[t + "Object", t + "Fourier Transform"],
                 scalebar=[obj_scalebar, fft_scalebar],
                 **kwargs,
             )
         else:
-            show_2d(np.abs(obj_fft), scalebar=fft_scalebar, **kwargs)
+            show_2d(
+                np.abs(obj_fft), scalebar=fft_scalebar, title=t + "Fourier Transform", **kwargs
+            )
         if return_fft:
             return obj_fft
         else:
             return
 
-    def show_probe(self, probe: np.ndarray | None = None):
+    def show_probe(
+        self,
+        probe: np.ndarray | None = None,
+        snapshot_iter: int | None = None,
+        sum_probes: bool = False,
+        **kwargs,
+    ):
+        """
+        Show the probe, each probe mode is shown separately.
+        Parameters
+        ----------
+        probe: np.ndarray | None, optional
+            The probe to show. If None, the probe from the last iteration is shown.
+        snapshot_iter: int | None, optional
+            The index of the snapshot to show. If None, the last iteration is shown.
+        sum_probes: bool, optional
+            Whether to sum the probes, by default False
+        **kwargs: dict, optional
+            Additional arguments passed to show_2d
+
+        Returns
+        -------
+        None
+            The probe is shown in a new figure
+        """
+        probe_iter = "Final"
         if probe is None:
-            probe = self.probe
+            if snapshot_iter is not None:
+                if snapshot_iter < 0:
+                    snapshot_iter = len(self.snapshots) + snapshot_iter
+                snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
+                probe = snp["probe"]
+                probe_iter = snp["iteration"]
+            else:
+                probe = self.probe
         else:
             probe = self._to_numpy(probe)
             if probe.ndim == 2:
                 probe = probe[None, ...]
 
-        probes = [np.fft.fftshift(probe[i]) for i in range(len(probe))]
-        scalebar = [{"sampling": self.sampling[0], "units": "Å"}] + [None] * (len(probes) - 1)
-        if len(probes) > 1:
-            titles = self.get_probe_intensities(probe)
-            titles = [f"Probe {i + 1}/{len(titles)}: {t * 100:.1f}%" for i, t in enumerate(titles)]
+        t = kwargs.pop("title", "")
+        if len(t) > 0 and not t.endswith(" "):
+            t += " "
+        if sum_probes and self.num_probes > 1:
+            t += "Summed "
+        if probe_iter != "Final":
+            t += f"Iter {probe_iter} "
+
+        scalebar = [{"sampling": self.sampling[0], "units": "Å"}]
+        if sum_probes:
+            probes = [np.fft.fftshift(probe.sum(0))]
         else:
-            titles = "Probe"
-        show_2d(probes, title=titles, scalebar=scalebar)
+            probes = [np.fft.fftshift(probe[i]) for i in range(len(probe))]
+            scalebar += [None] * (len(probes) - 1)
+
+        if len(probes) > 1:
+            prb_intensities = self.get_probe_intensities(probe)
+            titles = [
+                t + f"Probe {i + 1}/{len(prb_intensities)}: {prb_intensity * 100:.1f}%"
+                for i, prb_intensity in enumerate(prb_intensities)
+            ]
+        else:
+            titles = [t + "Probe"]
+
+        show_2d(probes, title=titles, scalebar=scalebar, **kwargs)
 
     def show_fourier_probe(self, probe: np.ndarray | None = None):
+        """
+        Show the Fourier transform of the probe.
+        Parameters
+        ----------
+        probe: np.ndarray | None, optional
+            The probe to show. If None, the probe from the last iteration is shown.
+        **kwargs: dict, optional
+            Additional arguments passed to show_2d
+
+        Returns
+        -------
+        None
+            The Fourier transform of the probe is shown in a new figure
+        """
         if probe is None:
             probe = self.probe
         else:
@@ -185,72 +291,55 @@ class PtychographyVisualizations(PtychographyBase):
             titles = "Fourier Probe"
         show_2d(probes, title=titles, scalebar=scalebar)
 
-    def show_fourier_probe_and_amplitudes(
+    def show_obj_and_probe(
         self,
-        probe: np.ndarray | None = None,
-        amplitudes: np.ndarray | None = None,
-        fft_shift: bool = False,
+        cbar: bool = False,
+        snapshot_iter: int | None = None,
+        sum_probes: bool = False,
+        figax: tuple | None = None,
         **kwargs,
     ):
-        if probe is None:
-            probe = self.probe
+        """
+        Shows the projected object and the probe in one figure. Calls show_obj and show_probe.
+        Parameters
+        ----------
+        cbar: bool, optional
+            Whether to show a colorbar, by default False
+        snapshot_iter: int | None, optional
+            The iteration number of the snapshot to show. If None, the last iteration is shown.
+        **kwargs: dict, optional
+            Additional arguments passed to show_obj and show_probe
+
+        Returns
+        -------
+        None
+            The object and probe are shown in a new figure
+        """
+        axsize = kwargs.pop("axsize", (5, 5))
+        if sum_probes:
+            num_probes = 1
         else:
-            probe = self._to_numpy(probe)
-            if probe.ndim == 2:
-                probe = probe[None, ...]
-
-        probe_plot = np.abs(np.fft.fft2(probe[0]))
-
-        if amplitudes is None:
-            amplitudes = self._to_numpy(self.dset.centered_amplitudes.sum(0))
+            num_probes = self.num_probes
+        ncols = 2 + num_probes if self.obj_type == "complex" else 1 + num_probes
+        if figax is None:
+            fig, axs = plt.subplots(
+                ncols=ncols, figsize=kwargs.pop("figsize", (axsize[0] * ncols, axsize[1]))
+            )
         else:
-            amplitudes = self._to_numpy(amplitudes.sum(0))
-
-        scalebar = [{"sampling": self.reciprocal_sampling[0], "units": r"$\mathrm{A^{-1}}$"}]
-
-        if fft_shift:
-            probe_plot = np.fft.fftshift(probe_plot)
-        else:
-            amplitudes = np.fft.fftshift(amplitudes)
-
-        figsize = kwargs.pop("figsize", (10, 5))
-        fig, ax = plt.subplots(1, 2, figsize=figsize)
-        show_2d(probe_plot, title="fourier probe", scalebar=scalebar, figax=(fig, ax[0]), **kwargs)
-        show_2d(amplitudes, title="amplitudes", figax=(fig, ax[1]), **kwargs)
-
-    def show_obj_and_probe(self, cbar: bool = False, figax=None):
-        """shows the summed object and summed probe"""
-        ims = []
-        titles = []
-        cmaps = []
-        if self.obj_type == "potential":
-            ims.append(np.abs(self.obj_cropped).sum(0))
-            titles.append("Potential")
-            cmaps.append(config.get("viz.phase_cmap"))
-        elif self.obj_type == "pure_phase":
-            ims.append(np.angle(self.obj_cropped).sum(0))
-            titles.append("Pure Phase")
-            cmaps.append(config.get("viz.phase_cmap"))
-        else:
-            ims.append(np.angle(self.obj_cropped).sum(0))
-            ims.append(np.abs(self.obj_cropped).sum(0))
-            titles.extend(["Phase", "Amplitude"])
-            cmaps.extend([config.get("viz.phase_cmap"), config.get("viz.cmap")])
-
-        ims.append(np.fft.fftshift(self.probe.sum(0)))
-        titles.append("Probe")
-        cmaps.append(None)
-        scalebar = [{"sampling": self.sampling[0], "units": "Å"}] + [None] * (len(ims) - 1)
-        cbars = [True] * (len(ims) - 1) + [False] if cbar else False
-        show_2d(
-            ims,
-            title=titles,
-            cmap=cmaps,
-            scalebar=scalebar,
-            cbar=cbars,
-            figax=figax,
-            tight_layout=True if figax is None else False,
+            fig, axs = figax
+        self.show_obj(
+            figax=(fig, axs[:-num_probes]), cbar=cbar, snapshot_iter=snapshot_iter, **kwargs
         )
+        self.show_probe(
+            figax=(fig, axs[-num_probes:]),
+            cbar=False,
+            snapshot_iter=snapshot_iter,
+            sum_probes=sum_probes,
+            **kwargs,
+        )
+        if figax is None:
+            plt.tight_layout()
+            plt.show()
 
     def show_obj_slices(
         self,
@@ -261,6 +350,28 @@ class PtychographyVisualizations(PtychographyBase):
         max_width: int = 4,
         **kwargs,
     ):
+        """
+        Show the object slices.
+        Parameters
+        ----------
+        obj: np.ndarray | None, optional
+            The object to show. If None, the object from the last iteration is shown.
+        cbar: bool, optional
+            Whether to show a colorbar, by default False
+        interval_type: Literal["quantile", "manual"], optional
+            The interval type to use for the colorbar, by default "quantile"
+        interval_scaling: Literal["each", "all"], optional
+            The interval scaling to use for the colorbar, by default "each"
+        max_width: int, optional
+            The maximum width of the object slices, by default 4
+        **kwargs: dict, optional
+            Additional arguments passed to show_2d
+
+        Returns
+        -------
+        None
+            The object slices are shown in a new figure
+        """
         if obj is None:
             obj = self.obj_cropped
         else:
@@ -268,15 +379,19 @@ class PtychographyVisualizations(PtychographyBase):
             if obj.ndim == 2:
                 obj = obj[None, ...]
 
+        t_parts = [f"0/{len(obj)} | 0 Å"]
+        for i in range(1, len(obj)):
+            t_parts.append(f"{i + 1}/{len(obj)} | {self.slice_thicknesses[i - 1]:.1f} Å")
+
         if self.obj_type == "potential":
             objs_flat = [np.abs(obj[i]) for i in range(len(obj))]
-            titles_flat = [f"Potential {i + 1}/{len(obj)}" for i in range(len(obj))]
+            titles_flat = [f"Potential {t_parts[i]}" for i in range(len(obj))]
         elif self.obj_type == "pure_phase":
             objs_flat = [np.angle(obj[i]) for i in range(len(obj))]
-            titles_flat = [f"Pure Phase {i + 1}/{len(obj)}" for i in range(len(obj))]
+            titles_flat = [f"Pure Phase {t_parts[i]}" for i in range(len(obj))]
         else:
             objs_flat = [np.angle(obj[i]) for i in range(len(obj))]
-            titles_flat = [f"Phase {i + 1}/{len(obj)}" for i in range(len(obj))]
+            titles_flat = [f"Phase {t_parts[i]}" for i in range(len(obj))]
 
         # Nest lists with max length max_width
         objs = [objs_flat[i : i + max_width] for i in range(0, len(objs_flat), max_width)]
@@ -309,10 +424,24 @@ class PtychographyVisualizations(PtychographyBase):
         )
 
     def plot_losses(self, figax: tuple | None = None, plot_lrs: bool = True):
+        """
+        Plot the losses and learning rates.
+        Parameters
+        ----------
+        figax: tuple | None, optional
+            The figure and axes to plot on. If None, a new figure is created.
+        plot_lrs: bool, optional
+            Whether to plot the learning rates, by default True
+
+        Returns
+        -------
+        None
+        """
+
         if figax is None:
-            fig, ax = plt.subplots()
+            _fig, ax = plt.subplots()
         else:
-            fig, ax = figax
+            _fig, ax = figax
 
         lw = 2
         lines = []
@@ -338,6 +467,9 @@ class PtychographyVisualizations(PtychographyBase):
 
         if plot_lrs and len(self.iter_lrs) > 0:
             nx = ax.twinx()
+            ax.set_zorder(2)  # putting the twinx behind
+            nx.set_zorder(1)
+            ax.patch.set_visible(False)
             nx.spines["left"].set_visible(False)
             color_idx = 0
 
@@ -393,6 +525,17 @@ class PtychographyVisualizations(PtychographyBase):
             plt.show()
 
     def visualize(self, cbar: bool = True):
+        """
+        Plot losses and show object and probe.
+        Parameters
+        ----------
+        cbar: bool, optional
+            Whether to show a colorbar, by default True
+
+        Returns
+        -------
+        None
+        """
         fig = plt.figure(figsize=(12, 6))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax_top = fig.add_subplot(gs[0])
@@ -401,7 +544,7 @@ class PtychographyVisualizations(PtychographyBase):
         n_bot = 3 if self.obj_type == "complex" else 2
         gs_bot = gridspec.GridSpecFromSubplotSpec(1, n_bot, subplot_spec=gs[1])
         axs_bot = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(n_bot)])
-        self.show_obj_and_probe(figax=(fig, axs_bot), cbar=cbar)
+        self.show_obj_and_probe(figax=(fig, axs_bot), cbar=cbar, sum_probes=True)
         plt.suptitle(
             f"Final loss: {self.iter_losses[-1]:.3e} | Iters: {len(self.iter_losses)}",
             fontsize=14,
@@ -628,8 +771,8 @@ class PtychographyVisualizations(PtychographyBase):
                 if i + j >= len(snapshots):
                     continue
                 snapshot = snapshots[i + j]
-                obj = cast(np.ndarray, snapshot["obj"])
-                probe = cast(np.ndarray, snapshot["probe"])
+                obj = snapshot["obj"]
+                probe = snapshot["probe"]
                 iteration = snapshot["iteration"]
 
                 if self.obj_type == "potential":
@@ -684,6 +827,17 @@ class PtychographyVisualizations(PtychographyBase):
         )
 
     def show_scan_positions(self, plot_radii: bool = True):
+        """
+        Show the scan positions and the probe radius.
+        Parameters
+        ----------
+        plot_radii: bool, optional
+            Whether to plot the probe radius, by default True
+
+        Returns
+        -------
+        None
+        """
         # for each scan position, sum the intensity of self.probe at that position
         scan_positions = self.dset.scan_positions_px.cpu().detach().numpy()
 
@@ -718,3 +872,48 @@ class PtychographyVisualizations(PtychographyBase):
                 linestyle="--",
             )
         plt.show()
+
+    def show_fourier_probe_and_amplitudes(
+        self,
+        probe: np.ndarray | None = None,
+        amplitudes: np.ndarray | None = None,
+        fft_shift: bool = False,
+        **kwargs,
+    ):
+        """show the fourier probe and amplitudes, useful for debugging
+        Parameters
+        ----------
+        probe: np.ndarray | None, optional
+            The probe to show. If None, the probe from the last iteration is shown.
+        amplitudes: np.ndarray | None, optional
+            The amplitudes to show. If None, the amplitudes from the last iteration are shown.
+        fft_shift: bool, optional
+            Whether to fftshift the probe and amplitudes, by default False
+        **kwargs: dict, optional
+            Additional arguments passed to show_2d
+        """
+        if probe is None:
+            probe = self.probe
+        else:
+            probe = self._to_numpy(probe)
+            if probe.ndim == 2:
+                probe = probe[None, ...]
+
+        probe_plot = np.abs(np.fft.fft2(probe[0]))
+
+        if amplitudes is None:
+            amplitudes = self._to_numpy(self.dset.centered_amplitudes.sum(0))
+        else:
+            amplitudes = self._to_numpy(amplitudes.sum(0))
+
+        scalebar = [{"sampling": self.reciprocal_sampling[0], "units": r"$\mathrm{A^{-1}}$"}]
+
+        if fft_shift:
+            probe_plot = np.fft.fftshift(probe_plot)
+        else:
+            amplitudes = np.fft.fftshift(amplitudes)
+
+        figsize = kwargs.pop("figsize", (10, 5))
+        fig, ax = plt.subplots(1, 2, figsize=figsize)
+        show_2d(probe_plot, title="fourier probe", scalebar=scalebar, figax=(fig, ax[0]), **kwargs)
+        show_2d(amplitudes, title="amplitudes", figax=(fig, ax[1]), **kwargs)
