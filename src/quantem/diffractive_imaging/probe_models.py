@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from typing import Any, Callable, Self, Union
+from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -954,6 +955,7 @@ class ProbeDIP(ProbeConstraints):
 
     def __init__(
         self,
+        model: "torch.nn.Module",
         num_probes: int = 1,
         probe_params: dict = {},
         roi_shape: tuple[int, int] | np.ndarray | None = None,
@@ -971,6 +973,10 @@ class ProbeDIP(ProbeConstraints):
         )
         self.register_buffer("_model_input", torch.tensor([]))
         self.register_buffer("_pretrain_target", torch.tensor([]))
+
+        self._model = model.to(self._device)
+        self._check_roi_shape()
+        self.set_pretrained_weights(self._model)
 
         self._optimizer = None
         self._scheduler = None
@@ -990,6 +996,7 @@ class ProbeDIP(ProbeConstraints):
         rng: np.random.Generator | int | None = None,
     ):
         probe_model = cls(
+            model=model,
             num_probes=num_probes,
             probe_params=probe_params.copy(),
             roi_shape=roi_shape,
@@ -997,8 +1004,6 @@ class ProbeDIP(ProbeConstraints):
             rng=rng,
             _token=cls._token,
         )
-        probe_model._model = model.to(device)
-        probe_model.set_pretrained_weights(model)
 
         if model_input is None:
             # Create default model input - use roi_shape if provided, otherwise placeholder
@@ -1030,6 +1035,7 @@ class ProbeDIP(ProbeConstraints):
             raise TypeError(f"dset should be a ProbePixelated, got {type(pixelated)}")
 
         probe_model = cls(
+            model=model,
             num_probes=pixelated.num_probes,
             probe_params=pixelated.probe_params.copy(),
             roi_shape=pixelated.roi_shape,
@@ -1037,9 +1043,6 @@ class ProbeDIP(ProbeConstraints):
             rng=pixelated._rng_seed,
             _token=cls._token,
         )
-
-        probe_model._model = model.to(device)
-        probe_model.set_pretrained_weights(model)
 
         probe_model.model_input = pixelated.probe.clone().detach()
         probe_model.pretrain_target = probe_model.model_input.clone().detach()
@@ -1375,7 +1378,7 @@ class ProbeDIP(ProbeConstraints):
                 "Target Probe",
             ],
             cmap="magma",
-            cbar=True,
+            cbar=False,
         )
         plt.suptitle(
             f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
@@ -1389,6 +1392,22 @@ class ProbeDIP(ProbeConstraints):
         raise NotImplementedError(
             f"Analytical gradients are not implemented for {self.name}, use autograd=True"
         )
+
+    def _check_roi_shape(self):
+        num_layers = getattr(self.model, "num_layers", None)
+        if num_layers is not None:
+            if not np.all(np.array(self.roi_shape) % 2**num_layers == 0):
+                raise ValueError(
+                    f"Model has {num_layers} layers, but ROI shape {self.roi_shape} is not "
+                    f"divisible by 2^{num_layers} for all dimensions.\nPlease crop or pad the "
+                    "dataset in reciprocal space to fix this error."
+                )
+        else:
+            warn(
+                "Model has no num_layers attribute, so cannot check if the ROI shape is "
+                "compatible with the model.\nIf using a ConvNet, ensure that the ROI shape is "
+                "divisble by 2^num_layers for all dimensions."
+            )
 
 
 ProbeModelType = ProbePixelated | ProbeDIP
