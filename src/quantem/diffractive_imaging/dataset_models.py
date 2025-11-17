@@ -64,6 +64,8 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self.verbose = verbose
         self._preprocessed = False
         self._preprocessing_params = {}  # for serialization and reloading
+        self._com_rotation_rad = 0  # default
+        self._com_transpose = False  # default
 
         # scan_positions_px: [num_positions, 2] in pixels
         self._scan_positions_px = nn.Parameter(

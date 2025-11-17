@@ -154,8 +154,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         customized pre-processing, they just call the functions themselves directly.
         """
         # self.to(self.device)
-        self.obj_padding_px = obj_padding_px  # also initializes the object model
         if not self.dset.preprocessed:
+            self.vprint("Dataset was not preprocessed, proceeding with defaults.")
             self.dset.preprocess(
                 com_fit_function=com_fit_function,
                 force_com_rotation=force_com_rotation,
@@ -166,10 +166,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 plot_com=plot_com,
                 vectorized=vectorized,
             )
-        else:
-            # change obj_padding_px and whatever else needs to be changed
-            self.dset._set_initial_scan_positions_px(self.obj_padding_px)
-            self.dset._set_patch_indices(self.obj_padding_px)
+            self._probe_model.set_initial_probe(
+                self.roi_shape,
+                self.reciprocal_sampling,
+                self.dset.mean_diffraction_intensity,
+                device=self.device,
+            )
+
+        # change obj_padding_px and whatever else needs to be changed
+        self.obj_padding_px = obj_padding_px  # also initializes the object model
+        self.dset._set_initial_scan_positions_px(self.obj_padding_px)
+        self.dset._set_patch_indices(self.obj_padding_px)
 
         self.compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
@@ -513,12 +520,15 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._probe_model = cast(
             ProbeModelType, model
         )  # have before so that energy available to set initial probe
-        self._probe_model.set_initial_probe(
-            self.roi_shape,
-            self.reciprocal_sampling,
-            self.dset.mean_diffraction_intensity,
-            device=self.device,
-        )
+        try:
+            self._probe_model.set_initial_probe(
+                self.roi_shape,
+                self.reciprocal_sampling,
+                self.dset.mean_diffraction_intensity,
+                device=self.device,
+            )
+        except Exception:
+            pass
         self._probe_model.to(self.device)
 
     @property
