@@ -3,6 +3,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
+from scipy.signal import convolve, convolve2d
 from scipy.signal.windows import tukey
 
 from quantem.core.datastructures.dataset3d import Dataset3d
@@ -16,6 +17,26 @@ class TimeSeries(Dataset3d):
     This class supports Dataset3d input arrays (time, x, y).
     """
 
+    def edge_filtering(
+        stack,
+        kernel: NDArray,
+    ):
+        stack_edge_filtered = np.sqrt(
+            convolve(
+                stack.array,kernel[None,:,:],'same'
+            )**2 + \
+            convolve(
+                stack.array,kernel.T[None,:,:],'same'
+            )**2
+        )
+
+        stack_edge_filtered[:,:,0] = 0
+        stack_edge_filtered[:,:,-1] = 0
+        stack_edge_filtered[:,0,:] = 0
+        stack_edge_filtered[:,-1,:] = 0
+
+        return stack_edge_filtered
+    
     def pad_and_blend(
         self,
         pad_width: int | tuple[int, int] | None,
@@ -177,13 +198,13 @@ class TimeSeries(Dataset3d):
             return shift,im_shift
         else:
             return shift
-        
 
     def align_stack(
         stack_pad: NDArray | Any, 
         window_size: int | None = 7,
         running_average_frames: float | int = 20.0,
         correlation_power = 1.0,
+        # edge_filter_kernel: NDArray | None = None,
     ) -> NDArray:
         """
         Use 2D DFT cross correlation alignment on an entire image stack.
@@ -195,7 +216,7 @@ class TimeSeries(Dataset3d):
         window_size: int| None = 7
             Size of the window around the subpixel position. If None, defaults to 7.
         running_average_frames: float | int = 20.0
-            Maximum number of images for the running average applied to the reference. If None, default is 20  .
+            Maximum number of images for the running average applied to the reference. If None, default is 20.0.
         
         Returns
         -------
@@ -204,6 +225,25 @@ class TimeSeries(Dataset3d):
         xy_shift: NDArray
             Shifted coordinates (x, y) for all images.
         """
+        # if edge_filter_kernel is not None:
+        #     stack_edge_filtered = np.sqrt(
+        #         convolve(
+        #             stack_pad,edge_filter_kernel[None,:,:],'same'
+        #         )**2 + \
+        #         convolve(
+        #             stack_pad,edge_filter_kernel.T[None,:,:],'same'
+        #         )**2
+        #     )
+
+        #     stack_edge_filtered[:,:,0] = 0
+        #     stack_edge_filtered[:,:,-1] = 0
+        #     stack_edge_filtered[:,0,:] = 0
+        #     stack_edge_filtered[:,-1,:] = 0
+
+        #     stack_pad = stack_edge_filtered
+        # else:
+        #     pass
+        
         # Initializing aligned stack and shifts
         nframes, nx, ny = stack_pad.shape
         stack_aligned = np.zeros_like(stack_pad)
