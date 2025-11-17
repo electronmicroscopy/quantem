@@ -911,7 +911,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         else:
             preds = pred_intensities
 
-        diff = preds - targets
+        diff = preds * self.dset.detector_mask - targets * self.dset.detector_mask
         if "l1" in loss_type:
             error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
         elif "l2" in loss_type:

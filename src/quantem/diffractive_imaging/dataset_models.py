@@ -41,6 +41,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     def __init__(
         self,
         dset: Dataset3d,
+        detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
@@ -87,6 +88,8 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             "_patch_indices", torch.zeros(self.num_gpts, *self.roi_shape, dtype=torch.int64)
         )
         self.register_buffer("_last_patch_positions_px", torch.zeros(self.num_gpts, 2))
+        self.register_buffer("_detector_mask", torch.ones(*self.roi_shape))
+        self.detector_mask = detector_mask
         self._constraints = {}
         self._probe_energy = None
 
@@ -164,6 +167,23 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     # endregion --- optimizable parameters ---
 
     # region --- buffers ---
+    @property
+    def detector_mask(self) -> torch.Tensor:
+        return self._detector_mask
+
+    @detector_mask.setter
+    def detector_mask(self, mask: torch.Tensor | np.ndarray | None) -> None:
+        if mask is None:
+            mask = torch.ones(*self.roi_shape, dtype=getattr(torch, config.get("dtype_real")))
+        else:
+            mask = validate_tensor(
+                mask,
+                "detector_mask",
+                dtype=getattr(torch, config.get("dtype_real")),
+                shape=self.roi_shape,
+            )
+        self._detector_mask = mask.to(self.device)
+
     @property
     def initial_descan_shifts(self) -> torch.Tensor:
         """Initial descan shifts, used for resetting the dataset"""
@@ -605,6 +625,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
     def __init__(
         self,
         dset: Dataset4dstem,
+        detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
@@ -629,6 +650,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
         super().__init__(
             dset=dset3d,
+            detector_mask=detector_mask,
             verbose=verbose,
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
@@ -640,6 +662,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
     def from_dataset4dstem(
         cls,
         dset: Dataset4dstem,
+        detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
@@ -659,6 +682,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         """
         return cls(
             dset=dset,
+            detector_mask=detector_mask,
             verbose=verbose,
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
@@ -670,6 +694,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         cls,
         file_path: str,
         file_type: str,
+        detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
@@ -696,6 +721,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         dset = read_4dstem(file_path, file_type)
         return cls(
             dset=dset,
+            detector_mask=detector_mask,
             verbose=verbose,
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
@@ -711,6 +737,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         sampling: np.ndarray | tuple | list | float | int | None = None,
         units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
+        detector_mask: torch.Tensor | np.ndarray | None = None,
         verbose: int | bool = 1,
         learn_descan: bool = True,
         learn_scan_positions: bool = True,
@@ -748,6 +775,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         )
         return cls.from_dataset4dstem(
             dset=dset,
+            detector_mask=detector_mask,
             verbose=verbose,
             learn_descan=learn_descan,
             learn_scan_positions=learn_scan_positions,
@@ -918,6 +946,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         com_fit_function: Literal["none", "plane", "parabola", "constant", "no_shift"] = "plane",
         force_com_rotation: float | None = None,
         force_com_transpose: bool | None = None,
+        bilinear: bool = False,
         padded_diffraction_intensities_shape: tuple[int, int] | None = None,
         obj_padding_px: tuple[int, int] | np.ndarray = (0, 0),
         plot_rotation: bool = True,
@@ -930,6 +959,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             "com_fit_function": com_fit_function,
             "force_com_rotation": force_com_rotation,
             "force_com_transpose": force_com_transpose,
+            "bilinear": bilinear,
             "padded_diffraction_intensities_shape": padded_diffraction_intensities_shape,
             "obj_padding_px": obj_padding_px,
             "plot_rotation": False,
@@ -941,7 +971,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
             self.probe_energy = probe_energy
 
         if padded_diffraction_intensities_shape is not None:
-            self.diffraction_padding = np.array(padded_diffraction_intensities_shape)
+            self.diffraction_padding = (
+                np.array(padded_diffraction_intensities_shape) - np.array(self.dset.shape[-2:])
+            ) // 2
             self.dset.pad(
                 output_shape=(
                     self.num_gpts,
@@ -952,6 +984,17 @@ class PtychographyDatasetRaster(DatasetConstraints):
             self.intensities_4d = self.dset.array.reshape(
                 (*self.gpts, *padded_diffraction_intensities_shape)
             )
+            self.detector_mask = torch.nn.functional.pad(
+                self.detector_mask,
+                (
+                    self.diffraction_padding[0],
+                    self.diffraction_padding[0],
+                    self.diffraction_padding[1],
+                    self.diffraction_padding[1],
+                ),
+                mode="constant",
+                value=0,
+            )
         else:
             self.diffraction_padding = (0, 0)
 
@@ -959,6 +1002,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self._set_intensities_com(
             self.intensities_4d,
             fit_function=com_fit_function,
+            dp_mask=self.detector_mask.cpu().detach().numpy(),
             vectorized_calculation=vectorized,
         )
         self._set_com_relative_rotation(
@@ -969,7 +1013,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         )
 
         # set the various amplitudese and intensities (can be stripped down later)
-        self._normalize_diffraction_intensities()
+        self._normalize_diffraction_intensities(bilinear=bilinear)
 
         self._set_initial_scan_positions_px(obj_padding_px)
         self._set_patch_indices(obj_padding_px)
