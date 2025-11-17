@@ -168,9 +168,9 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
 def _extract_default_loss(recon_obj, class_type):
     """Extract loss from reconstruction object."""
     if class_type == "ptycholite":
-        losses = getattr(recon_obj, "_losses", None) or getattr(recon_obj, "_iter_losses", None)
+        losses = getattr(recon_obj, "_losses", None) or getattr(recon_obj, "_epoch_losses", None)
     else:
-        losses = getattr(recon_obj, "_iter_losses", None)
+        losses = getattr(recon_obj, "_epoch_losses", None)
 
     if not losses:
         msg = f"No losses available on {class_type} object. Provide a loss_getter."
@@ -549,7 +549,18 @@ class OptimizePtychography:
                     extract_recursive(v, (*path, k))
 
         if hasattr(self, "_config") and self._config:
+            # Extract from base_kwargs
             extract_recursive(self._config.get("base_kwargs", {}))
+
+            # Extract from dataset_preprocess_kwargs
+            dataset_preprocess = self._config.get("dataset_preprocess_kwargs")
+            if dataset_preprocess:
+                extract_recursive(dataset_preprocess)
+
+            # Extract from dataset_kwargs
+            dataset_kw = self._config.get("dataset_kwargs")
+            if dataset_kw:
+                extract_recursive(dataset_kw)
 
         return param_info
 
