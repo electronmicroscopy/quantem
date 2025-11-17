@@ -181,7 +181,7 @@ class PtychoLite(Ptychography):
         if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_obj,
                 },
             }
@@ -193,7 +193,7 @@ class PtychoLite(Ptychography):
             }
             if learn_probe:
                 opt_params["probe"] = {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {
@@ -315,7 +315,7 @@ class PtychoLiteDIP(Ptychography):
                     reset=True,
                     num_iters=pretrain_iters,
                     optimizer_params={
-                        "type": "adam",
+                        "type": "adamw",
                         "lr": pretrain_lr,
                     },
                     scheduler_params={
@@ -330,7 +330,7 @@ class PtychoLiteDIP(Ptychography):
                     reset=True,
                     num_iters=pretrain_iters,
                     optimizer_params={
-                        "type": "adam",
+                        "type": "adamw",
                         "lr": 1e-3,
                     },
                     scheduler_params={
@@ -391,7 +391,7 @@ class PtychoLiteDIP(Ptychography):
         if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_obj,
                 },
             }
@@ -403,7 +403,7 @@ class PtychoLiteDIP(Ptychography):
             }
             if learn_probe:
                 opt_params["probe"] = {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {

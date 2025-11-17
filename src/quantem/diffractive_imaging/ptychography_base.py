@@ -125,7 +125,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.probe_model = probe_model
         self.obj_model = obj_model
         self.detector_model = detector_model
-        self._compute_propagator_arrays()
+        self.compute_propagator_arrays()
         self.logger = logger
         self.to(self.device)
 
@@ -171,7 +171,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             self.dset._set_initial_scan_positions_px(self.obj_padding_px)
             self.dset._set_patch_indices(self.obj_padding_px)
 
-        self._compute_propagator_arrays()
+        self.compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
         self._preprocessed = True
         # store validation split ratio for reconstruction step
@@ -180,60 +180,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # if self.num_iters == 0:
         #     self.reset_recon()  # if new models, reset to ensure shapes are correct
         return self
-
-    def _compute_propagator_arrays(
-        self,
-        theta_r: float | None = None,
-        theta_c: float | None = None,
-    ):
-        """
-        Precomputes propagator arrays complex wave-function will be convolved by,
-        for all slice thicknesses.
-
-        Parameters
-        ----------
-        theta_r: float, optional
-            tilt of propagator in mrad around the row-axis
-        theta_c: float, optional
-            tilt of propagator in mrad around the column-axis
-
-        Returns
-        -------
-        propagator_arrays: np.ndarray
-            (T,Sr,Sc) shape array storing propagator arrays
-        """
-
-        if self.num_slices == 1:
-            self.propagators = torch.tensor([])
-            return
-
-        kr, kc = tuple(torch.fft.fftfreq(n, d) for n, d in zip(self.roi_shape, self.sampling))
-        k2 = (kr[:, None] ** 2 + kc[None] ** 2).to(torch.complex64)  # broadcasting to match shape
-        probe_energy = self.probe_model.probe_params["energy"]
-        if probe_energy is None:
-            raise ValueError("probe_model energy must be set to compute propagators.")
-        wavelength = electron_wavelength_angstrom(probe_energy)
-        propagators = torch.empty(
-            (self.num_slices - 1, kr.shape[0], kc.shape[0]), dtype=torch.complex64
-        )
-
-        # TODO vectorize -- allow for optimizing over tilts
-        for i, dz in enumerate(self.slice_thicknesses):
-            phase_factor = torch.tensor(-1.0j * np.pi * wavelength * dz)
-            propagators[i] = torch.exp(phase_factor * k2)
-
-            if theta_r is not None:
-                propagators[i] *= torch.exp(
-                    1.0j * (-2 * kr[:, None] * np.pi * dz * np.tan(theta_r / 1e3))
-                )
-
-            if theta_c is not None:
-                propagators[i] *= torch.exp(
-                    1.0j * (-2 * kc[None] * np.pi * dz * np.tan(theta_c / 1e3))
-                )
-
-        self.propagators = propagators
-        return
 
     def _set_obj_fov_mask(self, gaussian_sigma: float = 2.0, batch_size=None):
         overlap = self._get_probe_overlap(batch_size)
@@ -307,11 +253,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self.obj_model.num_slices
 
     @property
-    def propagators(self) -> np.ndarray:
+    def propagators(self) -> torch.Tensor:
         if self.num_slices == 1:
-            return np.array([])
+            return torch.tensor([])
         else:
-            return self._to_numpy(self._propagators)
+            return self._propagators
 
     @propagators.setter
     def propagators(
@@ -346,7 +292,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def slice_thicknesses(self, val: float | Sequence | None) -> None:
         self._obj_model.slice_thicknesses = val
         if hasattr(self, "_propagators"):  # propagators already set, update with new slices
-            self._compute_propagator_arrays()
+            self.compute_propagator_arrays()
 
     @property
     def verbose(self) -> int:
@@ -890,6 +836,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.obj_model.reset()
         self.probe_model.reset()
         self.dset.reset()
+        self.compute_propagator_arrays()
         self.obj_model.constraints = self.obj_model.DEFAULT_CONSTRAINTS
         # detector reset if necessary
         self._iter_losses = []
@@ -940,6 +887,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         shifted_input_probes: torch.Tensor,
         descan: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.probe_model.learn_probe_tilt:
+            self.compute_propagator_arrays()
         propagated_probes, overlap = self.overlap_projection(obj_patches, shifted_input_probes)
         ## prop_probes shape: (nslices, nprobes, batch_size, roi_shape[0], roi_shape[1])
         ## overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
@@ -1030,6 +979,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         """
         propagated = torch.fft.ifft2(torch.fft.fft2(array) * propagator_array)
         return propagated
+
+    def compute_propagator_arrays(self):
+        self.propagators = self.probe_model._compute_propagator_arrays(
+            self.sampling, self.num_slices, self.slice_thicknesses
+        )
 
     # endregion
 

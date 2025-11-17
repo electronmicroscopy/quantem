@@ -16,7 +16,7 @@ class OptimizerMixin:
     Each model (object, probe, dataset) can inherit from this to manage its own optimizers.
     """
 
-    DEFAULT_OPTIMIZER_TYPE = "adam"
+    DEFAULT_OPTIMIZER_TYPE = "adamw"
 
     def __init__(self):
         """Initialize the optimizer mixin."""

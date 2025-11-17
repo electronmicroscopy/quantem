@@ -194,6 +194,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self.set_schedulers(self.scheduler_params, num_iter=num_iters)
 
         self.dset._set_targets(loss_type)
+        self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
         batcher = SimpleBatcher(
             self.dset.num_gpts,
             self.batch_size,
@@ -585,7 +586,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         """Helper method to load an object from a path using AutoSerialize."""
         return autoserialize_load(path)
 
-    def clone(self, device: str | int = "cpu") -> Self:
+    def clone(self, device: str | int = "cpu") -> Self:  # TODO make this faster
         """
         Create a deep-copy clone of this Ptychography instance.
 

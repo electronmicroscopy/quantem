@@ -1027,12 +1027,6 @@ class ObjectDIP(ObjectConstraints):
         """optimization parameters"""
         return self.model.parameters()
 
-    def get_optimization_parameters(self):
-        """Get the parameters that should be optimized for this model."""
-        # Since model is registered as a submodule, we can use the parent's parameters() method
-        # which will automatically include all submodule parameters
-        return list(self.parameters())
-
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
         self.model.load_state_dict(self.pretrained_weights.copy())
