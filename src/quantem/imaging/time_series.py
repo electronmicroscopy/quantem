@@ -183,6 +183,7 @@ class TimeSeries(Dataset3d):
         stack_pad: NDArray | Any, 
         window_size: int | None = 7,
         running_average_frames: float | int = 20.0,
+        correlation_power = 1.0,
     ) -> NDArray:
         """
         Use 2D DFT cross correlation alignment on an entire image stack.
@@ -194,8 +195,10 @@ class TimeSeries(Dataset3d):
         window_size: int| None = 7
             Size of the window around the subpixel position. If None, defaults to 7.
         running_average_frames: float | int = 20.0
-            Maximum number of images for the running average applied to the reference. If None, default is 20  .
-        
+            Maximum number of images for the running average applied to the reference. If None, default is 20.0.
+        correlation_power: int | None = 1.0
+            Option for either cross correlation (1.0) or phase correlation (0.0). If None, defaults to 1.0 (cross correlation)
+            
         Returns
         -------
         stack_aligned: NDArray
@@ -223,7 +226,13 @@ class TimeSeries(Dataset3d):
 
         for a0 in range(1, nframes):
             G_a0 = G_all[a0]
-            im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G_a0)))
+            if correlation_power < 1.0:
+                m = G_ref * np.conj(G_a0)
+                im_corr = np.real(np.fft.ifft2(
+                    (np.abs(m)**correlation_power) * np.exp(1j*np.angle(m))
+                ))
+            else:
+                im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G_a0)))
 
             # Get subpixel position
             peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
