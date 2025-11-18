@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import gc
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Self, Sequence, cast
@@ -298,7 +299,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             else:
                 pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
 
+        gc.collect()
         torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        gc.collect()
+
         return self
 
     def _get_current_lrs(self) -> dict[str, float]:
