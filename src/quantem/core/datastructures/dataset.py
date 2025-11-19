@@ -635,10 +635,14 @@ class Dataset(AutoSerialize):
                     new_sampling[j] *= idx.step
 
         out_ndim = array_view.ndim
-        try:
-            cls = self._registry[out_ndim]
-        except KeyError:
-            cls = Dataset
+
+        if out_ndim == self.ndim:
+            cls = type(self)
+        else:
+            try:
+                cls = self._registry[out_ndim]
+            except KeyError:
+                cls = Dataset
 
         # Construct new dataset
         return cls.from_array(
