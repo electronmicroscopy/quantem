@@ -199,7 +199,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
             return polar_parameters
 
-        polar_parameters = set_aberrations(params.copy(), self._max_aberrations_order)
+        polar_parameters = set_aberrations(deepcopy(params), self._max_aberrations_order)
         params["aberration_coefs"] = polar_parameters
         self._probe_params = self.DEFAULT_PROBE_PARAMS | self._probe_params | params
 
