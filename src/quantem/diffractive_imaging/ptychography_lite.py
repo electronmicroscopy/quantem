@@ -114,8 +114,7 @@ class PtychoLite(Ptychography):
 
         if middle_focus:
             if num_slices > 1:
-                mean_thickness = np.mean(np.atleast_1d(np.array(slice_thicknesses)))
-                half_thickness = mean_thickness * (num_slices) / 2
+                half_thickness = obj_model.slice_thicknesses.sum() / 2
                 if "C10" in probe_params and probe_params["C10"] is not None:
                     probe_params["C10"] -= half_thickness
                 if "defocus" in probe_params and probe_params["defocus"] is not None:
