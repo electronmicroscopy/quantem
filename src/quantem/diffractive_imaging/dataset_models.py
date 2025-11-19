@@ -1004,7 +1004,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self._set_intensities_com(
             self.intensities_4d,
             fit_function=com_fit_function,
-            dp_mask=self.detector_mask.cpu().detach().numpy(),
+            # dp_mask=self.detector_mask.cpu().detach().numpy(),
             vectorized_calculation=vectorized,
         )
         self._set_com_relative_rotation(

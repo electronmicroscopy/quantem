@@ -25,10 +25,12 @@ def fit_probe_circle(
     """
     if threshold is None:
         threshold = otsu_threshold(img)
-    binary: np.ndarray = ndi.binary_fill_holes(img > threshold)  # type: ignore
+    binary = ndi.binary_closing(img > threshold, iterations=2)
+    binary: np.ndarray = ndi.binary_fill_holes(binary)  # type: ignore
 
     smoothed = ndi.gaussian_filter(binary.astype(float), sigma=1)
     grad_mag = np.hypot(ndi.sobel(smoothed, axis=1), ndi.sobel(smoothed, axis=0))
+
     edge_points = np.argwhere(grad_mag > grad_mag.mean())
     y, x = edge_points[:, 0], edge_points[:, 1]
 
