@@ -4,40 +4,30 @@
 # edge_blend as int and tuple
 import numpy as np
 import pytest
+from scipy.ndimage import shift as ndi_shift
+
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.imaging.time_series import TimeSeries
-
-@pytest.fixture
-def sample_image():
-    im_ref = np.zeros((10,10))
-    im = np.zeros((10,10))
-    im_ref[3,3] = 1
-    im[2:4,5:7] = 1
-    return im_ref, im
 
 
 @pytest.fixture
 def sample_static_stack():
-    static = np.random.randint(0, 255, (10, 64, 64))
+    static = np.random.randint(0, 255, (3, 64, 64))
     frames = Dataset3d.from_array(static)
     return frames
 
-
 @pytest.fixture
-def sample_pixel_stack():
-    im0 = np.zeros((10,10))
-    im1 = np.zeros((10,10))
-    im2 = np.zeros((10,10))
-    im0[3,3] = 1
-    im1[2:4,5:7] = 1
-    im2[5,4] = 1
+def padded_static_stack(sample_static_stack):
+    padded_frames = TimeSeries.pad_and_blend(sample_static_stack, pad_width=(3,10))
+    return padded_frames
 
-    im_stack = np.zeros((3,10,10))
-    im_stack[0][:][:] = im0
-    im_stack[1][:][:] = im1
-    im_stack[2][:][:] = im2
-
-    return im_stack
+def shifted_stack(im,shift):
+    stack = []
+    for s in range(len(shift)):
+        print(shift[s])
+        stack.append(ndi_shift(im, shift=shift[s]))
+        print(stack)
+    return np.stack(stack)
 
 
 class TestPadAndBlendFunction:
@@ -58,15 +48,47 @@ class TestPadAndBlendFunction:
         assert padded.shape[1] == sample_static_stack.array.shape[1]
         assert padded.shape[2] == sample_static_stack.array.shape[2]
 
-#     def test_pad_val_mean:
-    
 
 class TestAlignImage:
-    def test_coord_shift(self, sample_pixel_stack):
-        aligned, xy = TimeSeries.align_stack(sample_pixel_stack)
-        expected_shift = [(0,0),(0.5,-2.5),(-2,-1)]
+    def test_pixel_shift(self, padded_static_stack):
+        expected_shift = [(0,0),(1,-3)]
+        stack = shifted_stack(padded_static_stack[0], expected_shift)
+        aligned, xy = TimeSeries.align_image(stack[0],stack[1])
+        expected = np.array(expected_shift[1])
+        detected = -1*xy
+        assert np.allclose(detected, expected, atol=1e-3)
+
+    def test_subpixel_shift(self, padded_static_stack):
+        expected_shift = [(0,0),(1.5,-3.5)]
+        stack = shifted_stack(padded_static_stack[0], expected_shift)
+        aligned, xy = TimeSeries.align_image(stack[0],stack[1])
+        expected = np.array(expected_shift[1])
+        detected = -1*xy
+        assert np.allclose(detected, expected, atol=0.5)
+
+
+class TestAlignStack:
+    def test_pixel_shift(self, padded_static_stack):
+        expected_shift = [(0,0),(1,-3),(-2,-2)]
+        stack = shifted_stack(padded_static_stack[0], expected_shift)
+        aligned, xy = TimeSeries.align_stack(stack)
+        expected = np.array(expected_shift)
+        detected = -1*xy   
         assert np.allclose(xy[0], 0)
-        assert np.allclose(xy, expected_shift, atol = 0.5)
+        assert np.allclose(detected, expected, atol=1e-3)
+
+    def test_subpixel_shift(self, padded_static_stack):
+        expected_shift = [(0,0),(1.5,-3.5),(-2.5,-4.5)]
+        stack = shifted_stack(padded_static_stack[0], expected_shift)
+        aligned, xy = TimeSeries.align_stack(stack)
+        expected = np.array(expected_shift)
+        detected = -1 * xy   
+        assert np.allclose(xy[0], 0)
+        assert np.allclose(detected, expected, atol=0.5)
 
 
-# class TestAlignStack:
+    
+        
+        
+
+

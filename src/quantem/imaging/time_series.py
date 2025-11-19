@@ -136,10 +136,10 @@ class TimeSeries(Dataset3d):
 
         Returns
         -------
-        shift: NDArray
-            shifted coordinates (x,y) between two images
         im_shift: NDArray
             shifted image with respect to the shifted coordinates
+        shift: NDArray
+            shifted coordinates (x,y) between two images
         """
         # Take 2D DFT of an image (im) and the image before it as reference (im_ref)
         G_ref = np.fft.fft2(im_ref) 
@@ -174,7 +174,7 @@ class TimeSeries(Dataset3d):
             im_shift = np.real(np.fft.ifft2(
                 G_a0 * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
             ))
-            return shift,im_shift
+            return im_shift, shift
         else:
             return shift
         
