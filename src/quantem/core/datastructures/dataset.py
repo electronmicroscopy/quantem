@@ -31,6 +31,7 @@ class Dataset(AutoSerialize):
     """
 
     _token = object()
+    _registry: dict[int, type] = {}
 
     def __init__(
         self,
@@ -633,7 +634,11 @@ class Dataset(AutoSerialize):
                     j = kept_axes.index(i)
                     new_sampling[j] *= idx.step
 
-        cls = type(self)
+        out_ndim = array_view.ndim
+        try:
+            cls = self._registry[out_ndim]
+        except KeyError:
+            cls = Dataset
 
         # Construct new dataset
         return cls.from_array(
@@ -644,3 +649,13 @@ class Dataset(AutoSerialize):
             units=new_units,
             signal_units=self.signal_units,
         )
+
+    @classmethod
+    def register_dimension(cls, ndim: int):
+        """Decorator for registering subclasses for a specific dimensionality."""
+
+        def decorator(subclass):
+            cls._registry[ndim] = subclass
+            return subclass
+
+        return decorator
