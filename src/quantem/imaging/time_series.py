@@ -238,13 +238,20 @@ class TimeSeries(Dataset3d):
             # Get subpixel position
             peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
             
+            print('int:', peak_r,peak_c)
+            
             # Padding of the extra pixels
             r_idx = np.mod(np.arange(peak_r - half, peak_r + half + 1), nrows)
             c_idx = np.mod(np.arange(peak_c - half, peak_c + half + 1), ncols)
             window = im_corr[np.ix_(r_idx, c_idx)]
 
+            print('int:', r_idx,c_idx)
+            print(window.shape)
+
             # Center of mass within window
             com_r, com_c = ndimage.center_of_mass(window)
+            
+            print('floating:',com_r,com_c)
 
             # Adjust back to full image coordinates (with periodicity)
             shift_row = (((peak_r - half + com_r) + nrows / 2) % nrows) - nrows / 2
