@@ -7,7 +7,7 @@ import torch
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset4dstem
-from quantem.core.ml.cnn2d import CNN2d
+from quantem.core.ml.cnn import CNN2d
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
@@ -39,6 +39,7 @@ class PtychoLite(Ptychography):
         defocus: float | None = None,
         semiangle_cutoff: float | None = None,
         polar_parameters: dict | None = None,
+        middle_focus: bool = False,
         vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
         initial_probe_weights: list[float] | np.ndarray | None = None,
         # preprocessing
@@ -63,6 +64,8 @@ class PtychoLite(Ptychography):
             Number of object slices.
         slice_thicknesses : float | Sequence | None
             Slice thickness(es) in Å. If None and num_slices>1, must be set later.
+        middle_focus: bool = False
+            if True, modifies defocus to include half the sample thickness
         obj_type : {"complex","pure_phase","potential"}
             Object parameterization.
         num_probes : int
@@ -107,7 +110,15 @@ class PtychoLite(Ptychography):
         }
 
         if polar_parameters is not None:
-            probe_params["polar_parameters"] = polar_parameters
+            probe_params.update(polar_parameters)
+
+        if middle_focus:
+            if num_slices > 1:
+                half_thickness = obj_model.slice_thicknesses.sum() / 2
+                if "C10" in probe_params and probe_params["C10"] is not None:
+                    probe_params["C10"] -= half_thickness
+                if "defocus" in probe_params and probe_params["defocus"] is not None:
+                    probe_params["defocus"] += half_thickness
 
         probe_model = ProbePixelated.from_params(
             probe_params=probe_params,
@@ -143,12 +154,14 @@ class PtychoLite(Ptychography):
             verbose=verbose,
             rng=rng,
         )
-        ptycho.preprocess(obj_padding_px=obj_padding_px)
+        ptycho.preprocess(
+            obj_padding_px=obj_padding_px,
+        )
         return ptycho
 
     def reconstruct(  # type:ignore could do overloads but this is simpler...
         self,
-        num_iter: int = 0,
+        num_iters: int = 0,
         reset: bool = False,
         lr_obj: float = 5e-3,
         learn_probe: bool = True,
@@ -164,10 +177,10 @@ class PtychoLite(Ptychography):
     ) -> Self:
         self.verbose = verbose
 
-        if new_optimizers or reset or self.num_epochs == 0:
+        if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_obj,
                 },
             }
@@ -179,7 +192,7 @@ class PtychoLite(Ptychography):
             }
             if learn_probe:
                 opt_params["probe"] = {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {
@@ -193,13 +206,13 @@ class PtychoLite(Ptychography):
         constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
-            num_iter=num_iter,
+            num_iters=num_iters,
             reset=reset,
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
             constraints=constraints,
             batch_size=batch_size,
-            store_iterations_every=store_iterations_every,
+            store_snapshots_every=store_iterations_every,
             device=device,
         )
 
@@ -253,6 +266,8 @@ class PtychoLiteDIP(Ptychography):
         ptycholite: PtychoLite,
         pretrain_iters: int | None = None,
         pretrain_lr: float = 1e-3,
+        pretrain_probe: bool = True,
+        pretrain_object: bool = True,
         # model settings
         cnn_num_layers: int = 3,
         # logging/device
@@ -270,7 +285,7 @@ class PtychoLiteDIP(Ptychography):
             in_channels=ptycholite.obj_model.num_slices,
             out_channels=ptycholite.obj_model.num_slices,
             num_layers=cnn_num_layers,
-            dtype=torch.float32 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
+            dtype=torch.complex64 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
         )
 
         obj_model = ObjectDIP.from_pixelated(
@@ -294,34 +309,35 @@ class PtychoLiteDIP(Ptychography):
         )
 
         if pretrain_iters is not None:
-            obj_model.pretrain(
-                reset=True,
-                num_epochs=pretrain_iters,
-                optimizer_params={
-                    "type": "adam",
-                    "lr": pretrain_lr,
-                },
-                scheduler_params={
-                    "type": "plateau",
-                    "factor": 0.5,
-                },
-                apply_constraints=False,
-                device=config.get("device"),
-            )
-
-            probe_model.pretrain(
-                reset=True,
-                num_epochs=pretrain_iters,
-                optimizer_params={
-                    "type": "adam",
-                    "lr": 1e-3,
-                },
-                scheduler_params={
-                    "type": "plateau",
-                    "factor": 0.5,
-                },
-                apply_constraints=False,
-            )
+            if pretrain_object:
+                obj_model.pretrain(
+                    reset=True,
+                    num_iters=pretrain_iters,
+                    optimizer_params={
+                        "type": "adamw",
+                        "lr": pretrain_lr,
+                    },
+                    scheduler_params={
+                        "type": "plateau",
+                        "factor": 0.5,
+                    },
+                    apply_constraints=False,
+                    device=config.get("device"),
+                )
+            if pretrain_probe:
+                probe_model.pretrain(
+                    reset=True,
+                    num_iters=pretrain_iters,
+                    optimizer_params={
+                        "type": "adamw",
+                        "lr": 1e-3,
+                    },
+                    scheduler_params={
+                        "type": "plateau",
+                        "factor": 0.5,
+                    },
+                    apply_constraints=False,
+                )
 
         if log_dir is not None:
             logger = LoggerPtychography(
@@ -355,7 +371,7 @@ class PtychoLiteDIP(Ptychography):
 
     def reconstruct(  # type:ignore could do overloads but this is simpler...
         self,
-        num_iter: int = 0,
+        num_iters: int = 0,
         reset: bool = False,
         lr_obj: float = 5e-4,
         learn_probe: bool = True,
@@ -371,10 +387,10 @@ class PtychoLiteDIP(Ptychography):
     ) -> Self:
         self.verbose = verbose
 
-        if new_optimizers or reset or self.num_epochs == 0:
+        if new_optimizers or reset or self.num_iters == 0:
             opt_params = {
                 "object": {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_obj,
                 },
             }
@@ -386,7 +402,7 @@ class PtychoLiteDIP(Ptychography):
             }
             if learn_probe:
                 opt_params["probe"] = {
-                    "type": "adam",
+                    "type": "adamw",
                     "lr": lr_probe,
                 }
                 scheduler_params["probe"] = {
@@ -400,12 +416,12 @@ class PtychoLiteDIP(Ptychography):
         constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
-            num_iter=num_iter,
+            num_iters=num_iters,
             reset=reset,
             optimizer_params=opt_params,
             scheduler_params=scheduler_params,
             constraints=constraints,
             batch_size=batch_size,
-            store_iterations_every=store_iterations_every,
+            store_snapshots_every=store_iterations_every,
             device=device,
         )

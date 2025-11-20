@@ -23,7 +23,7 @@ config-settings = { editable_mode = "compat" }
 
 [project]
 name = "quantem"
-version = "0.1.6"
+version = "0.1.7"
 description = "quantitative electron microscopy analysis toolkit."
 keywords = ["EM","TEM","STEM","4DSTEM"]
 readme = "README.md"
@@ -47,6 +47,7 @@ dependencies = [
   "torchmetrics>=1.7.3",
   "torchsummary>=1.5.1",
   "optuna>=4.5.0",
+  "hdf5plugin>=6.0.0",
 ]
 
 [tool.hatch.build.targets.sdist]

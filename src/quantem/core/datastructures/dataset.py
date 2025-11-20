@@ -31,6 +31,7 @@ class Dataset(AutoSerialize):
     """
 
     _token = object()
+    _registry: dict[int, type] = {}
 
     def __init__(
         self,
@@ -40,6 +41,7 @@ class Dataset(AutoSerialize):
         sampling: NDArray | tuple | list | float | int,
         units: list[str] | tuple | list,
         signal_units: str = "arb. units",
+        metadata: dict = {},
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -52,6 +54,7 @@ class Dataset(AutoSerialize):
         self.units = units
         self.signal_units = signal_units
         self._file_path = None
+        self._metadata = metadata
 
     @classmethod
     def from_array(
@@ -115,6 +118,10 @@ class Dataset(AutoSerialize):
     def array(self, value: NDArray) -> None:
         self._array = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
         # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
+
+    @property
+    def metadata(self) -> dict:
+        return self._metadata
 
     @property
     def name(self) -> str:
@@ -573,3 +580,86 @@ class Dataset(AutoSerialize):
                 if axis < len(self.sampling):
                     self.sampling[axis] *= factor
             return None
+
+    def __getitem__(self, index) -> Self:
+        """
+        General indexing method for Dataset objects.
+
+        Returns a new Dataset (or subclass) corresponding to the indexed data.
+        Metadata (origin, sampling, units) is sliced or reduced accordingly.
+        Handles step slicing (e.g., [::2]) by multiplying sampling accordingly.
+
+        Parameters
+        ----------
+        index : int | slice | tuple | Ellipsis
+            Indexing expression applied to the underlying array.
+
+        Returns
+        -------
+        Dataset
+            A new Dataset instance with appropriately adjusted metadata.
+        """
+        array_view = self.array[index]
+
+        # Normalize index into tuple form
+        if not isinstance(index, tuple):
+            index = (index,)
+
+        # Expand Ellipsis
+        if Ellipsis in index:
+            ellipsis_pos = index.index(Ellipsis)
+            num_missing = self.ndim - (len(index) - 1)
+            index = index[:ellipsis_pos] + (slice(None),) * num_missing + index[ellipsis_pos + 1 :]
+
+        # Pad with slices if index shorter than ndim
+        if len(index) < self.ndim:
+            index = index + (slice(None),) * (self.ndim - len(index))
+
+        # Compute which dimensions are kept
+        kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
+
+        # Slice/reduce metadata accordingly
+        new_origin = (
+            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        )
+        new_sampling = (
+            np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
+        )
+        new_units = [self.units[i] for i in kept_axes] if len(self.units) > 0 else self.units
+
+        # Adjust sampling for slice steps (e.g. [::2] doubles spacing)
+        for i, idx in enumerate(index):
+            if isinstance(idx, slice) and idx.step not in (None, 1):
+                if i in kept_axes:
+                    j = kept_axes.index(i)
+                    new_sampling[j] *= idx.step
+
+        out_ndim = array_view.ndim
+
+        if out_ndim == self.ndim:
+            cls = type(self)
+        else:
+            try:
+                cls = self._registry[out_ndim]
+            except KeyError:
+                cls = Dataset
+
+        # Construct new dataset
+        return cls.from_array(  # type: ignore ## would be nice to properly type slicing, but hard
+            array=array_view,
+            name=f"{self.name}{index}",
+            origin=new_origin,
+            sampling=new_sampling,
+            units=new_units,
+            signal_units=self.signal_units,
+        )
+
+    @classmethod
+    def register_dimension(cls, ndim: int):
+        """Decorator for registering subclasses for a specific dimensionality."""
+
+        def decorator(subclass):
+            cls._registry[ndim] = subclass
+            return subclass
+
+        return decorator
