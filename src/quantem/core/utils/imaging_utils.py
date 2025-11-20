@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
+from scipy.signal import convolve2d
 
 from quantem.core.utils.utils import generate_batches
 
@@ -546,3 +547,46 @@ def fourier_cropping(
     result[-h2:, -w2:] = corner_centered_array[-h2:, -w2:]
 
     return result
+
+
+def edge_filtering(
+        im,
+        sigma_edge,
+        sf_val,
+        ):
+    """
+    """
+    
+    sf_val = np.array(sf_val)
+    if sf_val.size == 1:
+        sf_val = np.array(
+            [sf_val, sf_val],
+            )
+
+
+    r = np.arange(
+        -np.ceil(2.0*sigma_edge),
+        np.ceil(2.0*sigma_edge+1),
+    )
+
+    k = np.exp(
+        (r[:,None]**2) / (-2*sigma_edge**2)
+    )
+
+    sf = np.array([
+        [-sf_val[0],0,sf_val[1]],
+    ])
+
+    im_x = convolve2d(im, sf, mode = 'same') 
+    im_x = convolve2d(im_x, k, mode = 'same')
+    im_x = convolve2d(im_x, k.T, mode = 'same')
+
+    im_y = convolve2d(im, sf.T, mode = 'same')
+    im_y = convolve2d(im_y, k, mode = 'same')
+    im_y = convolve2d(im_y, k.T, mode = 'same')
+
+    im_edge = np.sqrt(im_x**2 + im_y**2)
+
+    return im_edge
+
+

@@ -3,10 +3,10 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage
-from scipy.signal import convolve, convolve2d
 from scipy.signal.windows import tukey
 
 from quantem.core.datastructures.dataset3d import Dataset3d
+from quantem.core.utils.imaging_utils import ImagingUtils
 
 
 class TimeSeries(Dataset3d):
@@ -17,26 +17,6 @@ class TimeSeries(Dataset3d):
     This class supports Dataset3d input arrays (time, x, y).
     """
 
-    def edge_filtering(
-        stack,
-        kernel: NDArray,
-    ):
-        stack_edge_filtered = np.sqrt(
-            convolve(
-                stack.array,kernel[None,:,:],'same'
-            )**2 + \
-            convolve(
-                stack.array,kernel.T[None,:,:],'same'
-            )**2
-        )
-
-        stack_edge_filtered[:,:,0] = 0
-        stack_edge_filtered[:,:,-1] = 0
-        stack_edge_filtered[:,0,:] = 0
-        stack_edge_filtered[:,-1,:] = 0
-
-        return stack_edge_filtered
-    
     def pad_and_blend(
         self,
         pad_width: int | tuple[int, int] | None,
@@ -157,10 +137,10 @@ class TimeSeries(Dataset3d):
 
         Returns
         -------
-        shift: NDArray
-            shifted coordinates (x,y) between two images
         im_shift: NDArray
             shifted image with respect to the shifted coordinates
+        shift: NDArray
+            shifted coordinates (x,y) between two images
         """
         # Take 2D DFT of an image (im) and the image before it as reference (im_ref)
         G_ref = np.fft.fft2(im_ref) 
@@ -195,16 +175,16 @@ class TimeSeries(Dataset3d):
             im_shift = np.real(np.fft.ifft2(
                 G_a0 * np.exp(1j * (kx_shift[:,None] * shift[0] + ky_shift[None,:] * shift[1]))
             ))
-            return shift,im_shift
+            return im_shift, shift
         else:
             return shift
+        
 
     def align_stack(
         stack_pad: NDArray | Any, 
         window_size: int | None = 7,
         running_average_frames: float | int = 20.0,
         correlation_power = 1.0,
-        # edge_filter_kernel: NDArray | None = None,
     ) -> NDArray:
         """
         Use 2D DFT cross correlation alignment on an entire image stack.
@@ -217,7 +197,9 @@ class TimeSeries(Dataset3d):
             Size of the window around the subpixel position. If None, defaults to 7.
         running_average_frames: float | int = 20.0
             Maximum number of images for the running average applied to the reference. If None, default is 20.0.
-        
+        correlation_power: int | None = 1.0
+            Option for either cross correlation (1.0) or phase correlation (0.0). If None, defaults to 1.0 (cross correlation)
+            
         Returns
         -------
         stack_aligned: NDArray
@@ -225,25 +207,6 @@ class TimeSeries(Dataset3d):
         xy_shift: NDArray
             Shifted coordinates (x, y) for all images.
         """
-        # if edge_filter_kernel is not None:
-        #     stack_edge_filtered = np.sqrt(
-        #         convolve(
-        #             stack_pad,edge_filter_kernel[None,:,:],'same'
-        #         )**2 + \
-        #         convolve(
-        #             stack_pad,edge_filter_kernel.T[None,:,:],'same'
-        #         )**2
-        #     )
-
-        #     stack_edge_filtered[:,:,0] = 0
-        #     stack_edge_filtered[:,:,-1] = 0
-        #     stack_edge_filtered[:,0,:] = 0
-        #     stack_edge_filtered[:,-1,:] = 0
-
-        #     stack_pad = stack_edge_filtered
-        # else:
-        #     pass
-        
         # Initializing aligned stack and shifts
         nframes, nx, ny = stack_pad.shape
         stack_aligned = np.zeros_like(stack_pad)
@@ -299,3 +262,114 @@ class TimeSeries(Dataset3d):
             G_ref = G_ref * (1 - weight) + G_a0 * phase * weight
 
         return stack_aligned, xy_shift
+
+
+# def align_stack_filter(
+#         stack_pad: NDArray | Any, 
+#         window_size: int | None = 7,
+#         running_average_frames: float | int = 20.0,
+#         correlation_power = 1.0,
+#         edge_filter = True,
+#     ) -> NDArray:
+#         """
+#         Use 2D DFT cross correlation alignment on an entire image stack.
+
+#         Parameters
+#         ----------
+#         stack_pad: NDArray | Any
+#             Unaligned image stack data (time, x, y).
+#         window_size: int| None = 7
+#             Size of the window around the subpixel position. If None, defaults to 7.
+#         running_average_frames: float | int = 20.0
+#             Maximum number of images for the running average applied to the reference. If None, default is 20.0.
+#         correlation_power: int | None = 1.0
+#             Option for either cross correlation (1.0) or phase correlation (0.0). If None, defaults to 1.0 (cross correlation)
+            
+#         Returns
+#         -------
+#         stack_aligned: NDArray
+#             Aligned image stack data (time, x, y).
+#         xy_shift: NDArray
+#             Shifted coordinates (x, y) for all images.
+#         """
+        
+#         if edge_filter is True:
+#             filtered_stack = np.zeros_like(stack_pad)
+#             filtered_stack[0] = stack_pad[0]
+#             for i in range(stack_pad.shape[0]):
+#                 filtered_frame = ImagingUtils.edge_filtering(
+#                     stack_pad[i], 
+#                     sigma_edge = 5, 
+#                     sf_val = 0.5,
+#                 )
+
+#                 filtered_stack[i] = filtered_frame
+    
+#                 stack_pad = filtered_stack
+
+
+#         else:
+
+
+
+
+        
+        
+        
+        
+        
+#         # Initializing aligned stack and shifts
+#         nframes, nx, ny = stack_pad.shape
+#         stack_aligned = np.zeros_like(stack_pad)
+#         stack_aligned[0] = stack_pad[0]
+#         xy_shift = np.zeros((nframes, 2))
+
+#         # Angular frequencies
+#         kx_shift = -2 * np.pi * np.fft.fftfreq(nx)
+#         ky_shift = -2 * np.pi * np.fft.fftfreq(ny)
+
+#         # Precomputing FFTs for all frames
+#         G_all = np.fft.fft2(stack_pad, axes=(1, 2))
+#         G_ref = G_all[0].copy()
+
+#         # Constants
+#         half = window_size // 2
+#         nrows, ncols = nx, ny
+
+#         for a0 in range(1, nframes):
+#             G_a0 = G_all[a0]
+#             if correlation_power < 1.0:
+#                 m = G_ref * np.conj(G_a0)
+#                 im_corr = np.real(np.fft.ifft2(
+#                     (np.abs(m)**correlation_power) * np.exp(1j*np.angle(m))
+#                 ))
+#             else:
+#                 im_corr = np.real(np.fft.ifft2(G_ref * np.conj(G_a0)))
+
+#             # Get subpixel position
+#             peak_r, peak_c = np.unravel_index(np.argmax(im_corr), im_corr.shape)
+            
+#             # Padding of the extra pixels
+#             r_idx = np.mod(np.arange(peak_r - half, peak_r + half + 1), nrows)
+#             c_idx = np.mod(np.arange(peak_c - half, peak_c + half + 1), ncols)
+#             window = im_corr[np.ix_(r_idx, c_idx)]
+
+#             # Center of mass within window
+#             com_r, com_c = ndimage.center_of_mass(window)
+
+#             # Adjust back to full image coordinates (with periodicity)
+#             shift_row = (((peak_r - half + com_r) + nrows / 2) % nrows) - nrows / 2
+#             shift_col = (((peak_c - half + com_c) + ncols / 2) % ncols) - ncols / 2
+#             shift = np.array((shift_row, shift_col))
+#             xy_shift[a0] = shift
+
+#             # Apply shift
+#             phase = np.exp(1j * (kx_shift[:, None] * shift[0] + ky_shift[None, :] * shift[1]))
+#             im_shift = np.real(np.fft.ifft2(G_a0 * phase))
+#             stack_aligned[a0] = im_shift
+
+#             # Updating reference using running average
+#             weight = max(1 / (a0 + 1), 1 / running_average_frames)
+#             G_ref = G_ref * (1 - weight) + G_a0 * phase * weight
+
+#         return stack_aligned, xy_shift
