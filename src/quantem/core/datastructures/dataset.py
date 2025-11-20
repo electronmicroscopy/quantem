@@ -645,7 +645,7 @@ class Dataset(AutoSerialize):
                 cls = Dataset
 
         # Construct new dataset
-        return cls.from_array(
+        return cls.from_array(  # type: ignore ## would be nice to properly type slicing, but hard
             array=array_view,
             name=f"{self.name}{index}",
             origin=new_origin,
