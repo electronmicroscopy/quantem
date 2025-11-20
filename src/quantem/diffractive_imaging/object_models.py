@@ -44,7 +44,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     DEFAULT_LRS = {
         "object": 5e-3,
         "tv_weight_z": 0,
-        "tv_weight_yx": 0,
+        "tv_weight_xy": 0,
     }
     _token = object()
 
@@ -278,7 +278,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         "identical_slices": False,
         "apply_fov_mask": False,
         "tv_weight_z": 0,
-        "tv_weight_yx": 0,
+        "tv_weight_xy": 0,
         "surface_zero_weight": 0,
         "gaussian_sigma": None,  # pixels
         "butterworth_order": 4,
@@ -342,10 +342,6 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
 
         tv_loss = self.get_tv_loss(
             obj,
-            weights=(
-                self.constraints["tv_weight_z"],
-                self.constraints["tv_weight_yx"],
-            ),
         )
         self.add_soft_constraint_loss("tv_loss", tv_loss)
 
@@ -354,7 +350,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             weight=self.constraints["surface_zero_weight"],
         )
         self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
-
+        self.accumulate_constraint_losses()
         return tv_loss + surface_zero_loss
 
     def get_tv_loss(
@@ -364,7 +360,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if weights is None:
             w = (
                 self.constraints["tv_weight_z"],
-                self.constraints["tv_weight_yx"],
+                self.constraints["tv_weight_xy"],
             )
         elif isinstance(weights, (float, int)):
             if weights == 0:
