@@ -66,7 +66,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self.register_buffer("_mask", torch.tensor([]))
         self.device = device
         self._obj_type = obj_type
-        self._sampling_xy = None
+        self._sampling = None
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -107,18 +107,18 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self._obj_type = self._process_obj_type(t)
 
     @property
-    def sampling_xy(self) -> tuple[float, float]:
+    def sampling(self) -> tuple[float, float]:
         """Realspace in-plane sampling in A"""
-        if self._sampling_xy is None:
-            raise ValueError("ObjectModel sampling_xy not set, call _initialize_obj() first")
-        return self._sampling_xy
+        if self._sampling is None:
+            raise ValueError("ObjectModel sampling not set, call _initialize_obj() first")
+        return self._sampling
 
-    @sampling_xy.setter
-    def sampling_xy(self, sampling: tuple[float, float] | np.ndarray | torch.Tensor):
+    @sampling.setter
+    def sampling(self, sampling: tuple[float, float] | np.ndarray | torch.Tensor):
         smp = validate_arr_gt(
-            validate_tensor(sampling, name="sampling_xy", ndim=1, shape=(2,)), 0, "sampling_xy"
+            validate_tensor(sampling, name="sampling", ndim=1, shape=(2,)), 0, "sampling"
         )
-        self._sampling_xy = (smp[0].item(), smp[1].item())
+        self._sampling = (smp[0].item(), smp[1].item())
 
     def _process_obj_type(self, obj_type: str | None) -> object_type:
         if obj_type is None:
@@ -212,7 +212,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         sampling: np.ndarray | tuple[float, float] | None = None,
     ) -> None:
         if sampling is not None:
-            self.sampling_xy = sampling
+            self.sampling = sampling
 
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device. Overrides nn.Module.to()."""
@@ -318,13 +318,14 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         if self.constraints["apply_fov_mask"] and mask is not None:
             obj2 *= mask
 
-        if self.constraints["gaussian_sigma"] is not None:
+        # want backwards compatibility for gaussian_sigma and q_lowpass/q_highpass, so use get
+        if self.constraints.get("gaussian_sigma") is not None:
             obj2 = self.gaussian_blur_2d(obj2, sigma=self.constraints["gaussian_sigma"])
 
         if any([self.constraints["q_lowpass"], self.constraints["q_highpass"]]):
             obj2 = self.butterworth_constraint(
                 obj2,
-                sampling=self.sampling_xy,
+                sampling=self.sampling,
             )
         if self.num_slices > 1:
             if self.constraints["identical_slices"]:

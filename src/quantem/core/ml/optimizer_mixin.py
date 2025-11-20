@@ -113,7 +113,6 @@ class OptimizerMixin:
 
         if isinstance(opt_type, type):
             self._optimizer = opt_type(params, **opt_params)
-            self.optimizer_params["type"] = opt_type.__module__.split(".")[-1]
         elif isinstance(opt_type, str):
             if opt_type.lower() == "adam":
                 self._optimizer = torch.optim.Adam(params, **opt_params)

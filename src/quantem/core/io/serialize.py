@@ -378,7 +378,9 @@ class AutoSerialize:
             if hasattr(value, "level"):
                 subgroup.attrs["logger_level"] = int(value.level)
 
-        elif isinstance(value, torch.nn.Module):
+        elif isinstance(value, torch.nn.Module) or (
+            hasattr(value, "__module__") and ("torch" in str(value.__module__))
+        ):
             # Save entire torch module with torch.save for robustness
             subgroup = group.require_group(name)
             subgroup.attrs["_torch_whole_module"] = True

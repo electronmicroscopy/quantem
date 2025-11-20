@@ -520,14 +520,15 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._probe_model = cast(
             ProbeModelType, model
         )  # have before so that energy available to set initial probe
-        try:
+        if self.dset.preprocessed:
             self._probe_model.set_initial_probe(
                 self.roi_shape,
                 self.reciprocal_sampling,
                 self.dset.mean_diffraction_intensity,
                 device=self.device,
             )
-        except Exception:
+        else:
+            # will be set in ptycho.preprocess after dset is preprocessed
             pass
         self._probe_model.to(self.device)
 
@@ -626,9 +627,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     @property
     def obj_cropped(self) -> np.ndarray:
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
-        if self.obj_type == "pure_phase":
-            ph = np.angle(cropped)
-            cropped = np.exp(1j * (ph - ph.mean()))
         if self.obj_type in ["pure_phase", "complex"]:
             ph = np.angle(cropped)
             cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))

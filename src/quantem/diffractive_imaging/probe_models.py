@@ -316,7 +316,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         """Reset the probe"""
         self.probe_tilt = self._initial_probe_tilt.clone().to(self.device)
 
-    def _initialize_probe(
+    def set_initial_probe(
         self,
         roi_shape: np.ndarray | tuple,
         reciprocal_sampling: np.ndarray,
@@ -641,7 +641,7 @@ class ProbePixelated(ProbeConstraints):
     ):
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params.copy(),
+            probe_params=deepcopy(probe_params),  # this seems to be needed for nested dicts
             roi_shape=roi_shape,
             dtype=dtype,
             probe_tilt=probe_tilt,
@@ -726,7 +726,7 @@ class ProbePixelated(ProbeConstraints):
         mean_diffraction_intensity: float,
         device: str | None = None,
     ):
-        super()._initialize_probe(
+        super().set_initial_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 
@@ -1315,7 +1315,7 @@ class ProbeDIP(ProbeConstraints):
         *args,
     ):
         """Set initial probe and create appropriate model input"""
-        super()._initialize_probe(
+        super().set_initial_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 
