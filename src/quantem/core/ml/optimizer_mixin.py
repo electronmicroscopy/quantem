@@ -16,7 +16,7 @@ class OptimizerMixin:
     Each model (object, probe, dataset) can inherit from this to manage its own optimizers.
     """
 
-    DEFAULT_OPTIMIZER_TYPE = "adam"
+    DEFAULT_OPTIMIZER_TYPE = "adamw"
 
     def __init__(self):
         """Initialize the optimizer mixin."""
@@ -55,7 +55,14 @@ class OptimizerMixin:
     def scheduler_params(self, params: dict):
         """Set the scheduler parameters."""
         if params:
-            if params["type"] not in ["cyclic", "plateau", "exp", "gamma", "linear", "none"]:
+            if params["type"].lower() not in [
+                "cyclic",
+                "plateau",
+                "exp",
+                "gamma",
+                "linear",
+                "none",
+            ]:
                 raise ValueError(
                     f"Unknown scheduler type: {params['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'none']"
                 )
