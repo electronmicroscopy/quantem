@@ -491,7 +491,7 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         qx = torch.fft.fftfreq(tensor.shape[-2], sampling[0], device=tensor.device)
         qy = torch.fft.fftfreq(tensor.shape[-1], sampling[1], device=tensor.device)
 
-        qya, qxa = torch.meshgrid(qy, qx, indexing="ij")
+        qya, qxa = torch.meshgrid(qy, qx, indexing="xy")
         qra = torch.sqrt(qxa**2 + qya**2)
 
         env = torch.ones_like(qra)
