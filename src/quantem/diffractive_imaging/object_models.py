@@ -367,11 +367,12 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
                 return loss
             w = (weights, weights)
         else:
-            if not any(weights):
-                return loss
             if len(weights) != 2:
                 raise ValueError(f"weights must be a tuple of length 2, got {weights}")
             w = weights
+
+        if not any(w):
+            return loss
 
         if self.num_slices == 1:
             w = (0, w[1])
