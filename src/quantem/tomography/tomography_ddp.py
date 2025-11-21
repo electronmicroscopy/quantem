@@ -4,7 +4,7 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import torch.nn as nn
 import os
 import numpy as np
-from quantem.tomography.tomography_dataset import TomographyDataset, TomographyRayDataset
+from quantem.tomography.tomography_dataset import TomographyDataset, TomographyRayDataset, PretrainVolumeDataset
 
 from torch.utils.data import random_split
 
@@ -86,7 +86,7 @@ class TomographyDDP:
             
         return model
 
-    
+    # Setup Tomo DataLoader
     def setup_dataloader(
         self,
         tomo_dataset: TomographyDataset,
@@ -183,6 +183,52 @@ class TomographyDDP:
             print(f"  Local batch size (train): {batch_size}")
             print(f"  Global batch size: {batch_size*self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(self.dataloader)}")
+
+
+    # Setup pretraining dataloader
+
+    def setup_pretraining_dataloader(
+        self,
+        volume_dataset: PretrainVolumeDataset,
+        batch_size: int,
+    ):
+        #TODO: temp
+
+        num_workers = 0
+        if self.world_size > 1:
+            sampler = DistributedSampler(
+                volume_dataset,
+                num_replicas = self.world_size,
+                rank = self.global_rank,
+                shuffle = True,
+                drop_last = True,
+            )
+            shuffle = False
+        else:
+            sampler = None
+            shuffle = True
+
+        self.pretraining_dataloader = DataLoader(
+            volume_dataset,
+            batch_size = batch_size,
+            sampler = sampler,
+            shuffle = shuffle,
+            pin_memory = self.device.type == "cuda",
+            drop_last = True,
+            persistent_workers = num_workers > 0,
+        )
+
+        self.pretraining_sampler = sampler
+
+        if self.global_rank == 0:
+            print(f"Pretraining dataloader setup complete:")
+            print(f"  Total samples: {len(volume_dataset)}")
+            print(f"  Grid size: {volume_dataset.N**3}")
+            print(f"  Local batch size: {batch_size}")
+            print(f"  Global batch size: {batch_size*self.world_size}")
+            print(f"  Pretraining batches per GPU per epoch: {len(self.pretraining_dataloader)}")
+
+            
             
     def get_scaled_lr(self, base_lr, scaling_rule="sqrt"):
         if scaling_rule == "sqrt":

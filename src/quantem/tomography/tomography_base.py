@@ -392,6 +392,7 @@ class TomographyBase(AutoSerialize):
         norm: str = "log_auto",
         figax: tuple[plt.Figure, plt.Axes] | None = None,
         fft_vmax: Tuple[float, float] = (0, 40),
+        vmin: float = 0,
         **kwargs,
     ):
         """
@@ -416,18 +417,21 @@ class TomographyBase(AutoSerialize):
             figax=(fig, ax[0]),
             cmap=cmap,
             title="Y-X Projection",
+            vmin=vmin,
         )
         show_2d(
             volume_obj_np.sum(axis=1),
             figax=(fig, ax[1]),
             cmap=cmap,
             title="Z-X Projection",
+            vmin=vmin,
         )
         show_2d(
             volume_obj_np.sum(axis=2),
             figax=(fig, ax[2]),
             cmap=cmap,
             title="Z-Y Projection",
+            vmin=vmin,
         )
 
         if fft:

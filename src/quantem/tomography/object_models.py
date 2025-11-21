@@ -1,5 +1,6 @@
 from abc import abstractmethod
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Callable, Union
 
 import numpy as np
@@ -539,6 +540,13 @@ class ObjectDIP(ObjectConstraints):
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
             pbar.set_description(f"Epoch {a0 + 1}/{num_epochs}, Loss: {loss.item():.4f}, ")
 
+
+
+# INR stuff
+
+
+    
+
 class ObjectINN(ObjectConstraints):
     """
     Object model for INN objects.
@@ -713,7 +721,14 @@ class ObjectINN(ObjectConstraints):
         all_densities = all_densities * valid_mask
         
         return all_densities
+
         
         
 
 ObjectModelType = ObjectVoxelwise | ObjectINN # | ObjectDIP | ObjectImplicit (ObjectFFN?)
+
+
+# Pretrain Volume Dataset
+
+
+    

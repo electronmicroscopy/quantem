@@ -7,9 +7,10 @@ from quantem.tomography.object_models import ObjectVoxelwise
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_conv import TomographyConv
 from quantem.tomography.tomography_ml import TomographyML
-from quantem.tomography.tomography_ddp import TomographyDDP
+from quantem.tomography.tomography_ddp import PretrainVolumeDataset, TomographyDDP
 from quantem.tomography.utils import differentiable_shift_2d, gaussian_kernel_1d, rot_ZXZ
 
+from quantem.core.ml.loss_functions import L1Loss, MSELoss, MSELogMSELoss
 # Temporary imports for TomographyNERF
 from quantem.tomography.models import HSiren
 from quantem.tomography.object_models import ObjectINN
@@ -22,13 +23,21 @@ import torch.distributed as dist
 # TODO: Maybe put this in INN?
 def get_num_samples_per_ray(epoch):
     """Increase number of samples per ray at specific epochs."""
+    # schedule = {
+    #     0: 20,
+    #     2: 100,
+    #     4: 200,
+    #     6: 400,
+    #     # 8: 500,
+    #     10: 500,
+    # }
     schedule = {
         0: 20,
         2: 100,
-        4: 200,
-        6: 400,
+        4: 150,
+        6: 250,
         # 8: 500,
-        10: 500,
+        10: 300,
     }
     # schedule = {
     #     0: 20,
@@ -66,6 +75,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         # TODO: More elegant way of doing this.
         self.global_epochs = 0
         self.ddp_instantiated = False
+        self.pretraining_instantiated = False
         
     # --- Reconstruction Method ---
 
@@ -209,7 +219,119 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         else:
             self.temp_logger = None
             
+
+    def pretrain(
+        self,
+        volume_dataset: PretrainVolumeDataset,
+        obj: ObjectINN,
+        batch_size: int,
+        soft_constraints: dict = None,
+        log_path: str = None,
+        optimizer_params: dict = None,
+        epochs: int = 100,
+        viz_freq: int = 1,
+        l1_loss: bool = False,
+    ):
+        if not self.pretraining_instantiated:
+            self.setup_distributed()
+            self.setup_pretraining_dataloader(volume_dataset, batch_size)
+            self.pretraining_instantiated = True
+            obj.model = self.build_model(obj._model)
+            self.obj = obj
+
+        if soft_constraints is not None:
+            self.obj.soft_constraints = soft_constraints
+        
+        if not hasattr(self, "temp_logger"):
+            self.setup_logger(log_path=log_path)
+        
+        if optimizer_params is not None:
+            optimizer_params = self.scale_lr(optimizer_params)
+            self.optimizer_params = optimizer_params
+            self.set_optimizers()
+        device_type = self.device.type
+
+        for epoch in range(epochs):
+            if self.pretraining_sampler is not None:
+                self.pretraining_sampler.set_epoch(epoch)
+
+            self.obj.model.train()
+
+            epoch_loss = 0.0
+            epoch_consistency_loss = 0.0
+            epoch_tv_loss = 0.0
+            num_batches = 0
+
+            for batch_idx, batch in enumerate(self.pretraining_dataloader):
+                coords = batch['coords'].to(self.device, non_blocking=True)
+                target = batch['target'].to(self.device, non_blocking=True)
+
+                for _, opt in self.optimizers.items():
+                    opt.zero_grad()
+
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
+                    
+                    outputs = self.obj.forward(coords)
+                    
+                    if l1_loss:
+                        consistency_loss = torch.nn.functional.l1_loss(outputs, target)
+                    else:
+                        consistency_loss = torch.nn.functional.mse_loss(outputs, target)
+                    tv_loss = self.obj.apply_soft_constraints(coords)
+                    
+                    loss = consistency_loss + tv_loss
+
+                loss.backward()
+
+                epoch_loss += loss.detach()
+                epoch_consistency_loss += consistency_loss.detach()
+                epoch_tv_loss += tv_loss.detach()
+
+                torch.nn.utils.clip_grad_norm_(self.obj.model.parameters(), max_norm = 1.0)
+
+                for _, opt in self.optimizers.items():
+                    opt.step()
+                epoch_loss += loss.detach()
+                num_batches +=1
             
+            if epoch % viz_freq == 0 or epoch == epochs - 1:
+                avg_loss = epoch_loss / num_batches
+                with torch.no_grad():
+                    self.obj.create_volume(world_size = self.world_size, global_rank = self.global_rank, ray_size = volume_dataset.N)
+                    pred_full = self.obj.obj
+                    loss_tensor = avg_loss.clone().detach()
+                    avg_loss = loss_tensor.item()
+                    avg_tv_loss = epoch_tv_loss / num_batches
+                    avg_consistency_loss = epoch_consistency_loss / num_batches
+
+                    metrics = torch.tensor([avg_loss, avg_consistency_loss, avg_tv_loss], device=self.device)
+                    if self.world_size > 1:
+                        dist.all_reduce(metrics, op = dist.ReduceOp.AVG)
+                    avg_loss, avg_consistency_loss, avg_tv_loss = metrics.tolist()
+                
+                if self.global_rank == 0:
+                    self.temp_logger.add_scalar("Pretrain/total_loss", avg_loss, epoch)
+                    self.temp_logger.add_scalar("Pretrain/consistency_loss", avg_consistency_loss, epoch)
+                    self.temp_logger.add_scalar("Pretrain/tv_loss", avg_tv_loss, epoch)
+                    
+                    # current_lr = self.schedulers["model"].get_last_lr()[0]
+                    # self.temp_logger.add_scalar("Pretrain/lr", current_lr, epoch)
+
+                    fig, ax = plt.subplots(ncols = 4, figsize = (36, 12))
+                    ax[0].matshow(pred_full.sum(dim=0).cpu().numpy(), cmap='turbo', vmin=0)
+                    ax[0].set_title('Sum over Z-axis')
+                    ax[1].matshow(pred_full[volume_dataset.N//2].cpu().numpy(), cmap='turbo', vmin=0)
+                    ax[1].set_title(f'Slice at Z={volume_dataset.N//2}')
+                    ax[2].matshow(pred_full.sum(dim=1).cpu().numpy(), cmap='turbo', vmin=0)
+                    ax[2].set_title('Sum over Y-axis')
+                    ax[3].matshow(pred_full.sum(dim=2).cpu().numpy(), cmap='turbo', vmin=0)
+                    ax[3].set_title('Sum over X-axis')
+                    self.temp_logger.add_figure("Pretrain/viz", fig, epoch, close=True)
+
+                    plt.close(fig)
+                    print(f"Epoch [{epoch}/{epochs}] Pretrain Total Loss: {avg_loss:.6f}, Consistency Loss: {avg_consistency_loss:.6f}, TV Loss: {avg_tv_loss:.6f}")
+
+
     def recon(
         self,
         obj: ObjectINN,
@@ -225,14 +347,19 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         vol_save_path: str = None, # TODO: TEMPORARY
         log_path = None,
         val_fraction: float = 0.0,
+        learn_shifts: bool = True,
+        # l1_loss: bool = False,
+        consistency_criterion: str = 'mse',
     ):      
 
         if not self.ddp_instantiated:
-            self.setup_distributed()
+            if self.pretraining_instantiated == False:
+                self.setup_distributed()
+                obj.model = self.build_model(obj._model)
+                self.obj = obj
+
             self.setup_dataloader(self.dataset, batch_size, num_workers, val_fraction)
             self.ddp_instantiated = True
-            obj.model = self.build_model(obj._model)
-            self.obj = obj
         
         
         if soft_constraints is not None:
@@ -245,9 +372,10 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         
         if self.global_rank == 0:
             print(f"Using projection {zero_tilt_idx} (angle={self.dataset.tilt_angles[zero_tilt_idx]:.2f}°) as reference")
+            print(f"Using consistency criterion: {consistency_criterion}")
         
         # Auxiliary params setup
-        self.dataset.setup_auxiliary_params(zero_tilt_idx, self.device)
+        self.dataset.setup_auxiliary_params(zero_tilt_idx, self.device, learn_shifts)
         aux_params = self.dataset.auxiliary_params
         
         # Scaling learning rates to account for distributed training
@@ -294,12 +422,21 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                 self.sampler.set_epoch(epoch)
 
             epoch_loss = 0.0
-            epoch_mse_loss = 0.0
+            epoch_consistency_loss = 0.0
             epoch_tv_loss = 0.0
             epoch_z1_loss = 0.0
 
             num_batches = 0
-            
+            consistency_loss_fn = None
+            if consistency_criterion == 'mse':
+                consistency_loss_fn = MSELoss()
+            elif consistency_criterion == 'l1':
+                consistency_loss_fn = L1Loss()
+            elif consistency_criterion == 'mse_log':
+                consistency_loss_fn = MSELogMSELoss()
+            else:
+                raise ValueError(f"Invalid consistency criterion: {consistency_criterion}")
+
             for batch_idx, batch in enumerate(self.dataloader):
 
                 projection_indices = batch['projection_idx']
@@ -343,15 +480,15 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
                     predicted_values = ray_densities.sum(dim=1) * step_size
 
-                    mse_loss = torch.nn.functional.mse_loss(predicted_values, target_values)
+                    consistency_loss = consistency_loss_fn(predicted_values, target_values)
                     tv_loss_z1 = torch.tensor(0.0, device=self.device)
 
-                    loss = mse_loss + tv_loss + tv_loss_z1
+                    loss = consistency_loss + tv_loss + tv_loss_z1
                     
                 loss.backward()
 
                 epoch_loss += loss.detach()
-                epoch_mse_loss += mse_loss.detach()
+                epoch_consistency_loss += consistency_loss.detach()
                 epoch_tv_loss += tv_loss.detach()
                 epoch_z1_loss += tv_loss_z1.detach()
                 num_batches += 1
@@ -365,9 +502,12 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                         aux_norm = torch.nn.utils.clip_grad_norm_(self.dataset.auxiliary_params.parameters(), max_norm = 1)
                     opt.step()
                     opt.zero_grad()
-                    
+            
             for key, sched in self.schedulers.items():
-                sched.step()
+                if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    sched.step(epoch_loss)
+                else:   
+                    sched.step()
 
                     
             if epoch % viz_freq == 0 or epoch == epochs - 1 or epoch % checkpoint_freq == 0 :
@@ -376,17 +516,17 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     self.obj.create_volume(world_size = self.world_size, global_rank = self.global_rank, ray_size = num_samples_per_ray)
                     pred_full = self.obj.obj
                     avg_loss = epoch_loss.item() / num_batches
-                    avg_mse_loss = epoch_mse_loss.item() / num_batches
+                    avg_consistency_loss = epoch_consistency_loss.item() / num_batches
                     avg_tv_loss = epoch_tv_loss.item() / num_batches
                     avg_z1_loss = epoch_z1_loss.item() / num_batches
                     shifts, z1, z3 = self.dataset.auxiliary_params.forward()
                     shifts = shifts.detach().cpu()
                     z1 = z1.detach().cpu()
                     z3 = z3.detach().cpu()
-                    metrics = torch.tensor([avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss], device=self.device)
+                    metrics = torch.tensor([avg_loss, avg_consistency_loss, avg_tv_loss, avg_z1_loss], device=self.device)
                     if self.world_size > 1:
                         dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
-                    avg_loss, avg_mse_loss, avg_tv_loss, avg_z1_loss = metrics.tolist()
+                    avg_loss, avg_consistency_loss, avg_tv_loss, avg_z1_loss = metrics.tolist()
 
 
             if hasattr(self, "val_dataloader") and self.val_dataloader is not None:
@@ -397,9 +537,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     current_lr = self.schedulers["model"].get_last_lr()[0]
 
                     # Log metrics
-                    self.temp_logger.add_scalar("train/mse_loss", avg_mse_loss, self.global_epochs)
+                    self.temp_logger.add_scalar(f"train/consistency_loss_{consistency_criterion}", avg_consistency_loss, self.global_epochs)
                     if hasattr(self, "val_dataloader") and self.val_dataloader is not None:
-                        self.temp_logger.add_scalar("val/mse_loss", val_loss, self.global_epochs)
+                        self.temp_logger.add_scalar(f"val/consistency_loss_{consistency_criterion}", val_loss, self.global_epochs)
                     self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, self.global_epochs)
                     # if tv_weight > 0:
                     self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, self.global_epochs)

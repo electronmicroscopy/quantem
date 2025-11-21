@@ -2,6 +2,8 @@ from typing import TYPE_CHECKING, Callable
 
 from quantem.core import config
 
+import torch.nn as nn
+
 if TYPE_CHECKING:
     import torch
 else:
@@ -65,3 +67,51 @@ def combined_l2(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.7) ->
     comp_l2 = complex_l2(pred, target)
     amp_ph_l2 = amp_phase_l2(pred, target)
     return alpha * amp_ph_l2 + (1 - alpha) * comp_l2
+
+
+# TODO: Better loss function implementation? More torch-like.
+
+class L1Loss(nn.Module):
+
+    def __init__(
+        self,
+        reduction: str = "mean",
+    ):
+        super(L1Loss, self).__init__()
+        self.reduction = reduction
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.l1_loss(pred, target, reduction=self.reduction)
+
+
+class MSELoss(nn.Module):
+
+    def __init__(
+        self,
+        reduction: str = "mean",
+    ):
+        super(MSELoss, self).__init__()
+        self.reduction = reduction
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.mse_loss(pred, target, reduction=self.reduction)
+
+class MSELogMSELoss(nn.Module):
+
+    def __init__(
+        self,
+        eps: float = 1e-8,
+        reduction: str = 'mean',
+    ):
+        super(MSELogMSELoss, self).__init__()
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        mse = (pred - target) ** 2
+        log_mse = mse * torch.log(pred + self.eps)
+        if self.reduction == 'mean':
+            return log_mse.mean()
+        elif self.reduction == 'sum':
+            return log_mse.sum()
+        return log_mse

@@ -11,10 +11,14 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 
+from pathlib import Path
+
 
 class AuxiliaryParams(torch.nn.Module):
-    def __init__(self, num_tilts, device, zero_tilt_idx=None):
+    def __init__(self, num_tilts, device, zero_tilt_idx=None, learn_shifts: bool = True):
         super().__init__()
+
+        self.learn_shifts = learn_shifts
 
         if zero_tilt_idx is None:
             # If not provided, assume first projection is reference
@@ -25,18 +29,18 @@ class AuxiliaryParams(torch.nn.Module):
 
         # Shifts: only parameterize non-reference tilts
         num_param_tilts = num_tilts - 1
-        self.shifts_param = torch.nn.Parameter(torch.zeros(num_param_tilts, 2, device=device))
+        self.shifts_param = torch.nn.Parameter(torch.zeros(num_param_tilts, 2, device=device), requires_grad = learn_shifts)
 
         # Fixed zero shifts for reference
         self.shifts_ref = torch.zeros(1, 2, device=device)
 
         # Z1 and Z3: parameterize all tilts EXCEPT the reference
         self.z1_param = torch.nn.Parameter(torch.zeros(num_param_tilts, device=device))
-        # self.z3_param = torch.nn.Parameter(torch.zeros(num_param_tilts, device=device))
+        self.z3_param = torch.nn.Parameter(torch.zeros(num_param_tilts, device=device))
 
         # Fixed zeros for reference tilt
         self.z1_ref = torch.zeros(1, device=device)
-        # self.z3_ref = torch.zeros(1, device=device)
+        self.z3_ref = torch.zeros(1, device=device)
 
     def forward(self, dummy_input=None):
         # Reconstruct full arrays with zeros at reference position
@@ -48,11 +52,11 @@ class AuxiliaryParams(torch.nn.Module):
         after_z1 = self.z1_param[self.zero_tilt_idx :]
         z1 = torch.cat([before_z1, self.z1_ref, after_z1], dim=0)
 
-        # before_z3 = self.z3_param[:self.zero_tilt_idx]
-        # after_z3 = self.z3_param[self.zero_tilt_idx:]
-        # z3 = torch.cat([before_z3, self.z3_ref, after_z3], dim=0)
+        before_z3 = self.z3_param[:self.zero_tilt_idx]
+        after_z3 = self.z3_param[self.zero_tilt_idx:]
+        z3 = torch.cat([before_z3, self.z3_ref, after_z3], dim=0)
 
-        return shifts, z1, -z1
+        return shifts, z1, z3
 
 
 class TomographyDataset(AutoSerialize, Dataset):
@@ -319,12 +323,13 @@ class TomographyDataset(AutoSerialize, Dataset):
 
     # TODO: Temp auxiliary params
 
-    def setup_auxiliary_params(self, zero_tilt_idx: int = None, device: str = "cpu") -> None:
+    def setup_auxiliary_params(self, zero_tilt_idx: int = None, device: str = "cpu", learn_shifts: bool = True) -> None:
         if not hasattr(self, "_auxiliary_params"):
             self._auxiliary_params = AuxiliaryParams(
                 num_tilts=len(self.tilt_angles),
                 device=device,
                 zero_tilt_idx=zero_tilt_idx,
+                learn_shifts=learn_shifts,
             )
 
         else:
@@ -405,3 +410,61 @@ class TomographyRayDataset(Dataset):
             'target_value': target_value,
             'phi': phi
         }
+
+
+# Pretrain Volume Dataset
+class PretrainVolumeDataset(Dataset):
+
+    def __init__(
+        self,
+        volume_path: Path | str,
+        N: int,
+    ):
+        self._N = N
+        if str(volume_path).endswith(".npy"):
+            data = torch.from_numpy(np.load(volume_path)).float()
+        elif str(volume_path).endswith(".pt"):
+            data = torch.load(volume_path).float()
+        else:
+            raise ValueError(f"Unsupported file format: {volume_path}")
+
+        # Normalize data
+        total_elements = data.numel()
+        if total_elements > 1e6:
+            sample_size = min(int(1e6), total_elements)
+            flat_data = data.flatten()
+            indices = torch.randperm(total_elements)[:sample_size]
+            sampled_data = flat_data[indices]
+            data_quantile = torch.quantile(sampled_data, 0.95)
+        else:
+            data_quantile = torch.quantile(data, 0.95)
+
+        data = data / data_quantile
+        data = torch.permute(data, (2, 1, 0))
+        # data = torch.flip(data, dims=(2,))
+
+        self.volume = data.cpu() 
+        self.N = N
+        self.total_samples = N**3
+
+        coords_1d = torch.linspace(-1, 1, N)
+        x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing='ij')
+        self.coords = torch.stack([x, y, z], dim=-1).reshape(-1, 3).cpu()
+        self.targets = self.volume.reshape(-1).cpu()
+    
+    def __len__(self):
+        return self.total_samples
+    
+    def __getitem__(self, idx):
+        return {
+            'coords': self.coords[idx],
+            'target': self.targets[idx]
+        }
+
+    @property
+    def N(self):
+        return self._N
+
+    @N.setter
+    def N(self, N: int):
+        self._N = N
