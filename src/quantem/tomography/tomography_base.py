@@ -8,6 +8,8 @@ from tqdm.auto import tqdm
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.visualization.visualization import show_2d
+from quantem.imaging.scanning_probe import cross_correlation_shift
+from quantem.tomography.tilt_series_dataset import TiltSeries
 from quantem.imaging.drift import cross_correlation_shift
 from quantem.tomography.object_models import ObjectModelType, ObjectVoxelwise
 from quantem.tomography.tomography_dataset import TomographyDataset
