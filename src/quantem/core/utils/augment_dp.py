@@ -53,6 +53,8 @@ class DPAugmentor(RNGMixin):
         add_bkg: bool = False,
         bkg_weight: list[float] | float = [0.001, 0.05],
         bkg_q: list[float] | float = [0.01, 0.1],
+        apply_background_to_label: bool = False,
+        background_label_application: list[bool] | None = None,
         add_shot: bool = False,
         e_dose: list[float] | float = [1e4, 1e7],
         add_shift: bool = False,
@@ -91,6 +93,10 @@ class DPAugmentor(RNGMixin):
             Range for background weight (fraction of total intensity).
         bkg_q : list[float] | float, default=[0.01, 0.1]
             Range for plasmon scattering parameter q₀ in 1/(q² + q₀²) form factor.
+        apply_background_to_label: bool, defautl=False
+            Flag for whether background should be applied to labels, and which ones according to background_label_application
+        background_label_application: list[bool]
+            List of 1/0 for if background should be applied to label
 
         add_shot : bool, default=False
             Enable Poisson shot noise based on electron dose.
@@ -165,6 +171,8 @@ class DPAugmentor(RNGMixin):
             add_bkg,
             bkg_weight,
             bkg_q,
+            apply_background_to_label,
+            background_label_application,
             add_shot,
             e_dose,
             add_shift,
@@ -219,6 +227,8 @@ class DPAugmentor(RNGMixin):
         add_bkg: bool = False,
         bkg_weight: list[float] | float = [0.01, 0.1],
         bkg_q: list[float] | float = [0.01, 0.1],
+        apply_background_to_label: list[bool] | None = None,
+        background_label_application: bool = False,
         add_shot: bool = False,
         e_dose: list[float] | float = [1e5, 1e10],
         add_shift: bool = False,
@@ -247,7 +257,7 @@ class DPAugmentor(RNGMixin):
         self.add_shot = add_shot
         self.add_shift = add_shift
         self.add_ellipticity = add_ellipticity
-        self.add_ellipticity_to_label = add_ellipticity_to_label
+        self.add_ellipticity_to_label = add_ellipticity_to_label or []
         self.add_salt_and_pepper = add_salt_and_pepper
         self.add_gaussian_noise = add_gaussian_noise
         self.gaussian_noise_mu = gaussian_noise_mu
@@ -259,6 +269,8 @@ class DPAugmentor(RNGMixin):
 
         self._bkg_weight_range = self._check_input(bkg_weight) if add_bkg else [0, 0]
         self._bkg_q_range = self._check_input(bkg_q) if add_bkg else [0, 0]
+        self.apply_background_to_label = apply_background_to_label
+        self.background_label_application = background_label_application
         self._e_dose_range = self._check_input(e_dose) if add_shot else [np.inf, np.inf]
         self._xshift_range = self._check_input(xshift) if add_shift else [0, 0]
         self._yshift_range = self._check_input(yshift) if add_shift else [0, 0]
@@ -492,7 +504,7 @@ class DPAugmentor(RNGMixin):
                     transformed_label = self._apply_flipshift(label)
             # if transformed_label is not None:
             #     transformed_label = self._apply_flipshift(transformed_label)
-        
+
         # sequence exchanged
         if self.add_ellipticity or self.add_shift or self.add_scale:
             result = self._apply_elastic(result)
@@ -507,6 +519,11 @@ class DPAugmentor(RNGMixin):
 
         if self.add_bkg:
             result = self._apply_bkg(result, probe)
+            # Apply background to specified label channels BEFORE elastic transforms
+            if label is not None and self.apply_background_to_label and self.background_label_application is not None:
+                if len(self.background_label_application) > 0:
+                    if len(transformed_label.shape) == 3:
+                        transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
         # modification: aperture
         if self.add_aperture: # currently input can only be Tensor
             result = self._apply_aperture(result)
@@ -653,7 +670,7 @@ class DPAugmentor(RNGMixin):
         if self.add_shift:
             x_new += self.xshift
             y_new += self.yshift
-
+        
         x_norm = 2.0 * x_new / (width - 1) - 1.0
         y_norm = 2.0 * y_new / (height - 1) - 1.0
         grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)
@@ -701,9 +718,37 @@ class DPAugmentor(RNGMixin):
             CBEDbgConv = af.fftshift(af.ifft2(af.fft2(CBEDbg) * af.fft2(probe)))
         else:
             CBEDbgConv = CBEDbg
-
+        
         inputs_float = af.as_type(inputs, torch.float32 if self.use_torch else np.float32)
-        return inputs_float * (1 - self.bkg_weight) + CBEDbgConv.real * self.bkg_weight
+        background = CBEDbgConv.real * self.bkg_weight * af.max(inputs_float)
+        return inputs_float + background
+        # inputs_float = af.as_type(inputs, torch.float32 if self.use_torch else np.float32)
+        # return inputs_float * (1 - self.bkg_weight) + CBEDbgConv.real * self.bkg_weight
+
+    def _apply_bkg_to_multichannel_label(self, label: ArrayLike, probe: ArrayLike | None = None) -> ArrayLike:
+        """Apply background to specified channels of multichannel label"""
+        if len(label.shape) != 3:
+            # Single channel label - shouldn't normally happen
+            return label
+        
+        if len(self.background_label_application) == 0:
+            # No background specification
+            return label
+        
+        # Process each channel
+        result_channels = []
+        for c in range(label.shape[0]):
+            if c < len(self.background_label_application) and self.background_label_application[c]:
+                # Apply background to this channel
+                result_channels.append(self._apply_bkg(label[c], probe))
+            else:
+                # Keep channel as-is (no background)
+                result_channels.append(label[c])
+        
+        if self.use_torch:
+            return torch.stack(result_channels)
+        else:
+            return np.stack(result_channels)
 
     def _apply_blur(self, inputs: ArrayLike) -> ArrayLike:
         """Apply Gaussian blur"""
@@ -897,21 +942,20 @@ class DPAugmentor(RNGMixin):
             # Free rotation using scipy
             return ndi.rotate(image, angle, mode="constant", cval=0, reshape=False)
 
-    def _apply_elastic_to_label(self, inputs: ArrayLike) -> ArrayLike:
+    def _apply_elastic_to_label(self, inputs: ArrayLike, background: bool = False) -> ArrayLike:
         """Apply elastic transformations to label, optionally excluding ellipticity"""
         if not self.add_ellipticity_to_label:
             # Temporarily override ellipticity parameters for label processing
             orig_exx, orig_eyy, orig_exy = self.exx, self.eyy, self.exy
             self.exx, self.eyy, self.exy = 1.0, 1.0, 0.0
 
-            result = self._apply_elastic(inputs)
+            result = self._apply_elastic(inputs, background)
 
             # Restore original ellipticity parameters
             self.exx, self.eyy, self.exy = orig_exx, orig_eyy, orig_exy
             return result
         else:
             return self._apply_elastic(inputs)
-        
 
 # class DPAugmentor(RNGMixin):
 #     def __init__(
@@ -919,6 +963,8 @@ class DPAugmentor(RNGMixin):
 #         add_bkg: bool = False,
 #         bkg_weight: list[float] | float = [0.001, 0.05],
 #         bkg_q: list[float] | float = [0.01, 0.1],
+#         apply_background_to_label: bool = False,
+#         background_label_application: list[bool] | None = None,
 #         add_shot: bool = False,
 #         e_dose: list[float] | float = [1e4, 1e7],
 #         add_shift: bool = False,
@@ -929,6 +975,9 @@ class DPAugmentor(RNGMixin):
 #         add_ellipticity_to_label: bool = True,
 #         add_salt_and_pepper: bool = False,
 #         salt_and_pepper: list[float] | float = [0, 5e-4],
+#         add_gaussian_noise: bool = False,
+#         gaussian_noise_mu: float = 1.0,
+#         gaussian_noise_std: float = 0.5,
 #         add_scale: bool = False,
 #         scale_factor: list[float] | float = [0.9, 1.1],
 #         add_blur: bool = False,
@@ -936,14 +985,12 @@ class DPAugmentor(RNGMixin):
 #         add_flipshift: bool = False,
 #         free_rotation: bool = False,
 #         rotation_range: list[float] | float = [-180, 180],
-#         add_gaussian_noise: bool = False,
-#         gaussian_noise_mu: list[float] | float = 1,
-#         gaussian_noise_std: list[float] | float = 0.5,
-#         apply_factor: bool = False,
-#         factor_magnitude: list[float] | float = 1,
 #         log_file: os.PathLike | None = None,
 #         rng: np.random.Generator | int | None = None,
 #         device: str = "cpu",
+#         add_aperture: bool = False,
+#         radius_factor: list[float] | float = [0.8, 1],
+#         aperture_shift: list[float] | float = [0, 10],
 #     ):
 #         """
 #         Initialize diffraction pattern augmentor with configurable transformations.
@@ -956,6 +1003,10 @@ class DPAugmentor(RNGMixin):
 #             Range for background weight (fraction of total intensity).
 #         bkg_q : list[float] | float, default=[0.01, 0.1]
 #             Range for plasmon scattering parameter q₀ in 1/(q² + q₀²) form factor.
+#         apply_background_to_label: bool, defautl=False
+#             Flag for whether background should be applied to labels, and which ones according to background_label_application
+#         background_label_application: list[bool]
+#             List of 1/0 for if background should be applied to label
 
 #         add_shot : bool, default=False
 #             Enable Poisson shot noise based on electron dose.
@@ -981,6 +1032,13 @@ class DPAugmentor(RNGMixin):
 #             Enable salt and pepper (impulse) noise.
 #         salt_and_pepper : list[float] | float, default=[0, 5e-4]
 #             Range for fraction of pixels affected by salt and pepper noise.
+
+#         add_gaussian_noise : bool, default=False
+#             Enable gaussian noise.
+#         gaussian_noise_mu : float, default=1.0
+#             Mean for gaussian noise distribution
+#         gaussian_noise_std : float, defualt=0.5
+#             Standard deviation for gaussian noise distribution
 
 #         add_scale : bool, default=False
 #             Enable uniform scaling of the diffraction pattern.
@@ -1023,6 +1081,8 @@ class DPAugmentor(RNGMixin):
 #             add_bkg,
 #             bkg_weight,
 #             bkg_q,
+#             apply_background_to_label,
+#             background_label_application,
 #             add_shot,
 #             e_dose,
 #             add_shift,
@@ -1033,6 +1093,9 @@ class DPAugmentor(RNGMixin):
 #             add_ellipticity_to_label,
 #             add_salt_and_pepper,
 #             salt_and_pepper,
+#             add_gaussian_noise,
+#             gaussian_noise_mu,
+#             gaussian_noise_std,
 #             add_scale,
 #             scale_factor,
 #             add_blur,
@@ -1040,11 +1103,9 @@ class DPAugmentor(RNGMixin):
 #             add_flipshift,
 #             free_rotation,
 #             rotation_range,
-#             add_gaussian_noise,
-#             gaussian_noise_mu,
-#             gaussian_noise_std,
-#             apply_factor,
-#             factor_magnitude,
+#             add_aperture,
+#             radius_factor,
+#             aperture_shift,
 #         )
 #         self.generate_params()
 #         self._init_log_file()
@@ -1076,6 +1137,8 @@ class DPAugmentor(RNGMixin):
 #         add_bkg: bool = False,
 #         bkg_weight: list[float] | float = [0.01, 0.1],
 #         bkg_q: list[float] | float = [0.01, 0.1],
+#         apply_background_to_label: list[bool] | None = None,
+#         background_label_application: bool = False,
 #         add_shot: bool = False,
 #         e_dose: list[float] | float = [1e5, 1e10],
 #         add_shift: bool = False,
@@ -1086,6 +1149,9 @@ class DPAugmentor(RNGMixin):
 #         add_ellipticity_to_label: bool = True,
 #         add_salt_and_pepper: bool = False,
 #         salt_and_pepper: list[float] | float = [0, 1e-3],
+#         add_gaussian_noise: bool = False,
+#         gaussian_noise_mu: list[float] | float = 1,
+#         gaussian_noise_std: list[float] | float = 0.5,
 #         add_scale: bool = False,
 #         scale_factor: list[float] | float = [0.9, 1.1],
 #         add_blur: bool = False,
@@ -1093,27 +1159,28 @@ class DPAugmentor(RNGMixin):
 #         add_flipshift: bool = False,
 #         free_rotation: bool = False,
 #         rotation_range: list[float] | float = [-180, 180],
-#         add_gaussian_noise: bool = False,
-#         gaussian_noise_mu: list[float] | float = 1,
-#         gaussian_noise_std: list[float] | float = 0.5,
-#         apply_factor: bool = False,
-#         factor_magnitude: list[float] | float = 1,
+#         add_aperture: bool = False,
+#         radius_factor: list[float] | float = [0.8, 1],
+#         aperture_shift: list[float] | float = [0, 10],
 #     ) -> None:
 #         self.add_bkg = add_bkg
 #         self.add_shot = add_shot
 #         self.add_shift = add_shift
 #         self.add_ellipticity = add_ellipticity
-#         self.add_ellipticity_to_label = add_ellipticity_to_label
+#         self.add_ellipticity_to_label = add_ellipticity_to_label or []
 #         self.add_salt_and_pepper = add_salt_and_pepper
+#         self.add_gaussian_noise = add_gaussian_noise
+#         self.gaussian_noise_mu = gaussian_noise_mu
+#         self.gaussian_noise_std = gaussian_noise_std
 #         self.add_scale = add_scale
 #         self.add_blur = add_blur
 #         self.add_flipshift = add_flipshift
-#         self.add_gaussian_noise = add_gaussian_noise
-#         self.apply_factor = apply_factor
-#         self.factor_magnitude = factor_magnitude
+#         self.add_aperture = add_aperture
 
 #         self._bkg_weight_range = self._check_input(bkg_weight) if add_bkg else [0, 0]
 #         self._bkg_q_range = self._check_input(bkg_q) if add_bkg else [0, 0]
+#         self.apply_background_to_label = apply_background_to_label
+#         self.background_label_application = background_label_application
 #         self._e_dose_range = self._check_input(e_dose) if add_shot else [np.inf, np.inf]
 #         self._xshift_range = self._check_input(xshift) if add_shift else [0, 0]
 #         self._yshift_range = self._check_input(yshift) if add_shift else [0, 0]
@@ -1128,8 +1195,10 @@ class DPAugmentor(RNGMixin):
 
 #         self.free_rotation = free_rotation
 #         self._rotation_range = self._check_input(rotation_range) if add_flipshift else [0, 0]
-#         self.gaussian_noise_mu = gaussian_noise_mu
-#         self.gaussian_noise_std = gaussian_noise_std
+
+#         # modification: aperture, by HAADF detector
+#         self._radius_range = self._check_input(radius_factor) if add_aperture else [0, 0]
+#         self._aptshift_range = self._check_input(aperture_shift) if add_aperture else [0, 0]
 
 #     def generate_params(self) -> None:
 #         self.bkg_weight = self._uniform_or_zero(self._bkg_weight_range, self.add_bkg)
@@ -1141,6 +1210,8 @@ class DPAugmentor(RNGMixin):
 #         self.blur_sigma = self._uniform_or_zero(self._blur_range, self.add_blur)
 #         self.xshift = self._uniform_with_sign(self._xshift_range, self.add_shift)
 #         self.yshift = self._uniform_with_sign(self._yshift_range, self.add_shift)
+#         self.xshiftapt = self._uniform_with_sign(self._aptshift_range, self.add_aperture)
+#         self.yshiftapt = self._uniform_with_sign(self._aptshift_range, self.add_aperture)
 #         self._generate_ellipticity_params()
 #         self._generate_flipshift_params()
 
@@ -1148,6 +1219,12 @@ class DPAugmentor(RNGMixin):
 #             self.scale_factor = self.rng.uniform(self._scale_range[0], self._scale_range[1])
 #         else:
 #             self.scale_factor = 0
+
+#         # modification: aperture
+#         if self.add_aperture:
+#             self.radius_factor = self.rng.uniform(self._radius_range[0], self._radius_range[1])
+#         else:
+#             self.radius_factor = 0
 
 #     def _uniform_or_zero(self, range_vals: list, enabled: bool) -> float:
 #         return self.rng.uniform(range_vals[0], range_vals[1]) if enabled else 0
@@ -1218,6 +1295,7 @@ class DPAugmentor(RNGMixin):
 #                 f"Flip: H={self.flip_horizontal}, V={self.flip_vertical}, Rot: {self.rotation_angle:.1f}°",
 #             ),
 #             ("Salt & pepper", self.add_salt_and_pepper, f"Amount: {self.salt_and_pepper:.2e}"),
+#             ("Gaussian noise", self.add_gaussian_noise, f"Mean: {self.gaussian_noise_mu:.2e}", f"Std: {self.gaussian_noise_std:.2e}"),
 #             ("Gaussian blur", self.add_blur, f"Sigma: {self.blur_sigma:.2f}"),
 #         ]
 
@@ -1268,38 +1346,31 @@ class DPAugmentor(RNGMixin):
 
 #         if probe_stack is not None and probe_stack.shape[0] != batch_size:
 #             raise ValueError(f"Probe stack size {probe_stack.shape[0]} != DP size {batch_size}")
-        
-#         # Modified validation for multichannel labels
-#         if label_stack is not None:
-#             # Special case: single image (batch_size=1) with multichannel labels
-#             if batch_size == 1 and len(label_stack.shape) == 3:
-#                 # This is your case: dp=(1,256,256), label=(2,256,256)
-#                 # Single image with multichannel labels - this is valid
+#         if batch_size == 1 and len(label_stack.shape) == 3:
 #                 pass
-#             elif label_stack.shape[0] != batch_size:
-#                 raise ValueError(f"Label stack size {label_stack.shape[0]} != DP size {batch_size}")
+#         elif label_stack.shape[0] != batch_size:
+#             raise ValueError(f"Label stack size {label_stack.shape[0]} != DP size {batch_size}")
+#         # if label_stack is not None and label_stack.shape[0] != batch_size:
+#             # raise ValueError(f"Label stack size {label_stack.shape[0]} != DP size {batch_size}")
 
 #         augmented_dps = []
 #         augmented_labels = [] if label_stack is not None else None
 
-#         # Only show progress bar for larger batches (more than 1 item)
 #         iterator = tqdm(range(batch_size), desc="augmenting") if batch_size > 1 else range(batch_size)
-        
 #         for i in iterator:
 #             dp_single = dp_stack[i]
 #             probe_single = probe_stack[i] if probe_stack is not None else None
-            
-#             # Handle multichannel labels
+
 #             if label_stack is not None:
 #                 if batch_size == 1 and len(label_stack.shape) == 3:
 #                     # Single image with multichannel labels
 #                     label_single = label_stack  # Use entire multichannel label
 #                 else:
-#                     # Standard case
 #                     label_single = label_stack[i]
+#             # label_single = label_stack[i] if label_stack is not None else None
 #             else:
 #                 label_single = None
-
+                
 #             if label_single is not None:
 #                 aug_dp, aug_label = self._augment_single(dp_single, probe_single, label_single)
 #                 augmented_dps.append(aug_dp)
@@ -1311,9 +1382,8 @@ class DPAugmentor(RNGMixin):
 #         if self.use_torch:
 #             stacked_dps = torch.stack(augmented_dps)  # type: ignore
 #             if augmented_labels is not None:
-#                 # Special handling for single image with multichannel labels
 #                 if batch_size == 1 and len(label_stack.shape) == 3:
-#                     stacked_labels = augmented_labels[0]  # Don't stack, just return the single multichannel label
+#                     stacked_labels = augmented_labels[0]  # If multichannel just return, don't stack
 #                 else:
 #                     stacked_labels = torch.stack(augmented_labels)  # type: ignore
 #                 return stacked_dps, stacked_labels
@@ -1321,9 +1391,8 @@ class DPAugmentor(RNGMixin):
 #         else:
 #             stacked_dps = np.stack(augmented_dps)
 #             if augmented_labels is not None:
-#                 # Special handling for single image with multichannel labels
 #                 if batch_size == 1 and len(label_stack.shape) == 3:
-#                     stacked_labels = augmented_labels[0]  # Don't stack, just return the single multichannel label
+#                     stacked_labels = augmented_labels[0]  # If multichannel just return, don't stack
 #                 else:
 #                     stacked_labels = np.stack(augmented_labels)
 #                 return stacked_dps, stacked_labels
@@ -1343,12 +1412,10 @@ class DPAugmentor(RNGMixin):
 #                     transformed_label = self._apply_flipshift_to_multichannel_label(label)
 #                 else:
 #                     transformed_label = self._apply_flipshift(label)
-        
-#         if self.add_bkg:
-#             result = self._apply_bkg(result, probe)
-#         if self.add_gaussian_noise:
-#             result = self._apply_gaussian_noise(result)
-        
+#             # if transformed_label is not None:
+#             #     transformed_label = self._apply_flipshift(transformed_label)
+
+#         # sequence exchanged
 #         if self.add_ellipticity or self.add_shift or self.add_scale:
 #             result = self._apply_elastic(result)
 #             if label is not None:
@@ -1357,15 +1424,28 @@ class DPAugmentor(RNGMixin):
 #                     transformed_label = self._apply_elastic_to_multichannel_label(transformed_label)
 #                 else:
 #                     transformed_label = self._apply_elastic_to_label(transformed_label)
-        
+#             # if transformed_label is not None:
+#             #     transformed_label = self._apply_elastic_to_label(transformed_label)
+
+#         if self.add_bkg:
+#             result = self._apply_bkg(result, probe)
+#             # Apply background to specified label channels BEFORE elastic transforms
+#             if label is not None and self.apply_background_to_label and self.background_label_application is not None:
+#                 if len(self.background_label_application) > 0:
+#                     if len(transformed_label.shape) == 3:
+#                         transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
+#         # modification: aperture
+#         if self.add_aperture: # currently input can only be Tensor
+#             result = self._apply_aperture(result)
 #         if self.add_shot:
 #             result = self._apply_shot(result)
+#         if self.add_gaussian_noise:
+#             result = self._apply_gaussian_noise(result)
 #         if self.add_blur:
 #             result = self._apply_blur(result)
 #         if self.add_salt_and_pepper:
 #             result = self._apply_salt_and_pepper(result)
-#         if self.apply_factor:
-#             result = self._apply_factor(result)
+
 
 #         self.write_logs()
 #         self.generate_params()
@@ -1413,40 +1493,67 @@ class DPAugmentor(RNGMixin):
 #             self.use_torch = True
 #             self._rng_to_device(self.device)
 
+#     def _apply_flipshift_to_multichannel_label(self, label: ArrayLike) -> ArrayLike:
+#         """Apply flipshift to multichannel label"""
+#         if len(label.shape) == 3:  # Multichannel (C, H, W)
+#             transformed_channels = []
+#             for c in range(label.shape[0]):
+#                 transformed_channels.append(self._apply_flipshift(label[c]))
+#             if self.use_torch:
+#                 return torch.stack(transformed_channels)
+#             else:
+#                 return np.stack(transformed_channels)
+#         else:
+#             # Single channel, use existing method
+#             return self._apply_flipshift(label)
+
+#     def _apply_elastic_to_multichannel_label(self, label: ArrayLike) -> ArrayLike:
+#         """Apply elastic transforms to multichannel label"""
+#         if len(label.shape) == 3:  # Multichannel (C, H, W)
+#             transformed_channels = []
+#             for c in range(label.shape[0]):
+#                 transformed_channels.append(self._apply_elastic_to_label(label[c]))
+#             if self.use_torch:
+#                 return torch.stack(transformed_channels)
+#             else:
+#                 return np.stack(transformed_channels)
+#         else:
+#             # Single channel, use existing method
+#             return self._apply_elastic_to_label(label)
+
 #     def _apply_shot(self, inputs: ArrayLike) -> ArrayLike:
 #         """Apply Poisson shot noise"""
 #         if self.use_torch:
 #             image = inputs.clone()  # type: ignore
 #             offset = image.min()
-#             image = (image - offset) / (image - offset).sum()
-#             return torch.poisson(image * self.e_dose, generator=self._rng_torch) + offset
+#             sum_int = (image - offset).sum()
+#             image = (image - offset) / sum_int
+#             return torch.poisson(image * self.e_dose, generator=self._rng_torch) * sum_int / self.e_dose + offset
 #         else:
 #             image = np.array(inputs)
 #             offset = image.min()
 #             image = (image - offset) / (image - offset).sum()
 #             return self.rng.poisson(image * self.e_dose) + offset
 
-#     def _apply_gaussian_noise(self, inputs: ArrayLike) -> ArrayLike:
-#         # Constant background applied to everything
-#         # Gaussian uniform to whole image, clipped to 0
-#         # Just camera noise, electronic noise
-#         # Just some random scale value (std 5 pixels for example, mean is std, then clip. Makes it so gaussian shifted so half isn't negative)
-#         mean = self.gaussian_noise_mu
-#         std = self.gaussian_noise_std
-#         if self.use_torch:
-#             image = inputs.clone()
-#             noise = torch.clip(torch.normal(mean=mean, std=std, size=inputs.shape), min=0)
-#             image += noise
-#             return image
-#         else:
-#             image = np.array(inputs).copy()
-#             noise = np.clip(np.random.normal(loc=mean, scale=std, size=inputs.shape), min=0)
-#             image += noise
-#             return image
+#     def _apply_aperture(self, inputs: "torch.Tensor") -> "torch.Tensor":
+#         height, width = inputs.shape
+#         device = inputs.device
+#         y, x = torch.meshgrid(
+#             torch.arange(height, dtype=torch.float32, device=device),
+#             torch.arange(width, dtype=torch.float32, device=device),
+#             indexing="ij",
+#         )
+#         y_center, x_center = height // 2, width // 2
+#         y = y.clone() - y_center + self.yshiftapt
+#         x = x.clone() - x_center + self.xshiftapt
+#         r = torch.sqrt(x**2+y**2)
 
+#         aperture_mask = (r <= self.radius_factor*np.sqrt(y_center**2+x_center**2)).float()
+#         output = inputs * aperture_mask
+#         return output
 
 #     def _apply_elastic(self, inputs: ArrayLike) -> ArrayLike:
-#         """Apply elastic transformations (scaling, rotation, translation)"""
+#         """Apply elastic transformations (scaling, translation)"""
 #         if self.use_torch:
 #             return self._apply_elastic_torch(inputs)  # type: ignore
 #         else:
@@ -1473,7 +1580,7 @@ class DPAugmentor(RNGMixin):
 #         if self.add_shift:
 #             x_new += self.xshift
 #             y_new += self.yshift
-
+        
 #         x_norm = 2.0 * x_new / (width - 1) - 1.0
 #         y_norm = 2.0 * y_new / (height - 1) - 1.0
 #         grid = torch.stack([x_norm, y_norm], dim=-1).unsqueeze(0)
@@ -1504,20 +1611,6 @@ class DPAugmentor(RNGMixin):
 
 #         return ndi.map_coordinates(image, [y_new, x_new], order=1, mode="constant")
 
-#     def _apply_elastic_to_multichannel_label(self, label: ArrayLike) -> ArrayLike:
-#         """Apply elastic transforms to multichannel label"""
-#         if len(label.shape) == 3:  # Multichannel (C, H, W)
-#             transformed_channels = []
-#             for c in range(label.shape[0]):
-#                 transformed_channels.append(self._apply_elastic_to_label(label[c]))
-#             if self.use_torch:
-#                 return torch.stack(transformed_channels)
-#             else:
-#                 return np.stack(transformed_channels)
-#         else:
-#             # Single channel, use existing method
-#             return self._apply_elastic_to_label(label)
-
 #     def _apply_bkg(self, inputs: ArrayLike, probe: ArrayLike | None = None) -> ArrayLike:
 #         """Apply inelastic plasmon background via convolution with probe"""
 #         height, width = inputs.shape
@@ -1525,16 +1618,47 @@ class DPAugmentor(RNGMixin):
 #         qx = af.view(af.sort(af.fftfreq(height, 0.1, like=inputs), axis=0), (-1, 1))
 #         qy = af.view(af.sort(af.fftfreq(width, 0.1, like=inputs), axis=0), (1, -1))
 
-#         CBEDbg = 1.0 / (qx**2 + qy**2 + self.bkg_q**2)  # Plasmon form factor: 1/(q² + q₀²)
+#         qxc = self.yshift / (height*0.1)
+#         qyc = self.xshift / (width*0.1)
+
+#         CBEDbg = 1.0 / ((qx+qxc)**2 + (qy+qyc)**2 + self.bkg_q**2)  # Plasmon form factor: 1/(q² + q₀²)
 #         CBEDbg = CBEDbg.squeeze() / af.sum(CBEDbg.squeeze())
 
 #         if probe is not None:
 #             CBEDbgConv = af.fftshift(af.ifft2(af.fft2(CBEDbg) * af.fft2(probe)))
 #         else:
 #             CBEDbgConv = CBEDbg
-
+        
 #         inputs_float = af.as_type(inputs, torch.float32 if self.use_torch else np.float32)
-#         return inputs_float * (1 - self.bkg_weight) + CBEDbgConv.real * self.bkg_weight
+#         background = CBEDbgConv.real * self.bkg_weight * af.max(inputs_float)
+#         return inputs_float + background
+#         # inputs_float = af.as_type(inputs, torch.float32 if self.use_torch else np.float32)
+#         # return inputs_float * (1 - self.bkg_weight) + CBEDbgConv.real * self.bkg_weight
+
+#     def _apply_bkg_to_multichannel_label(self, label: ArrayLike, probe: ArrayLike | None = None) -> ArrayLike:
+#         """Apply background to specified channels of multichannel label"""
+#         if len(label.shape) != 3:
+#             # Single channel label - shouldn't normally happen
+#             return label
+        
+#         if len(self.background_label_application) == 0:
+#             # No background specification
+#             return label
+        
+#         # Process each channel
+#         result_channels = []
+#         for c in range(label.shape[0]):
+#             if c < len(self.background_label_application) and self.background_label_application[c]:
+#                 # Apply background to this channel
+#                 result_channels.append(self._apply_bkg(label[c], probe))
+#             else:
+#                 # Keep channel as-is (no background)
+#                 result_channels.append(label[c])
+        
+#         if self.use_torch:
+#             return torch.stack(result_channels)
+#         else:
+#             return np.stack(result_channels)
 
 #     def _apply_blur(self, inputs: ArrayLike) -> ArrayLike:
 #         """Apply Gaussian blur"""
@@ -1596,11 +1720,26 @@ class DPAugmentor(RNGMixin):
 #             out[flipped & ~salted] = pepper_val
 #             return out
 
-#     def _apply_factor(self, inputs: ArrayLike):
-#         # Can be one-liner 
-#         inputs = np.array(inputs)
-#         image = np.multiply(inputs, self.factor_magnitude)
-#         return image
+#     def _apply_gaussian_noise(self, inputs: ArrayLike) -> ArrayLike:
+#         # Constant background applied to everything
+#         # Gaussian uniform to whole image, clipped to 0
+#         # Just camera noise, electronic noise
+#         # Just some random scale value (std 5 pixels for example, mean is std, then clip. Makes it so gaussian shifted so half isn't negative)
+#         mean = self.gaussian_noise_mu
+#         # mean = self.gaussian_noise_mu * self.e_dose if self.add_shot else self.gaussian_noise_mu
+#         std = self.gaussian_noise_std
+#         # std = self.gaussian_noise_std * self.e_dose if self.add_shot else self.gaussian_noise_std
+
+#         if self.use_torch:
+#             image = inputs.clone()
+#             noise = torch.clip(torch.normal(mean=mean, std=std, size=inputs.shape), min=0)
+#             image += noise
+#             return image
+#         else:
+#             image = np.array(inputs).copy()
+#             noise = np.clip(np.random.normal(loc=mean, scale=std, size=inputs.shape), min=0)
+#             image += noise
+#             return image
 
 #     def write_logs(self) -> None:
 #         if self.log_file is None:
@@ -1676,20 +1815,6 @@ class DPAugmentor(RNGMixin):
 
 #         return result
 
-#     def _apply_flipshift_to_multichannel_label(self, label: ArrayLike) -> ArrayLike:
-#         """Apply flipshift to multichannel label"""
-#         if len(label.shape) == 3:  # Multichannel (C, H, W)
-#             transformed_channels = []
-#             for c in range(label.shape[0]):
-#                 transformed_channels.append(self._apply_flipshift(label[c]))
-#             if self.use_torch:
-#                 return torch.stack(transformed_channels)
-#             else:
-#                 return np.stack(transformed_channels)
-#         else:
-#             # Single channel, use existing method
-#             return self._apply_flipshift(label)
-    
 #     def _rotate_torch(self, inputs: "torch.Tensor", angle: float) -> "torch.Tensor":
 #         """Torch implementation of rotation"""
 #         if angle in [90, 180, 270]:
@@ -1727,14 +1852,14 @@ class DPAugmentor(RNGMixin):
 #             # Free rotation using scipy
 #             return ndi.rotate(image, angle, mode="constant", cval=0, reshape=False)
 
-#     def _apply_elastic_to_label(self, inputs: ArrayLike) -> ArrayLike:
+#     def _apply_elastic_to_label(self, inputs: ArrayLike, background: bool = False) -> ArrayLike:
 #         """Apply elastic transformations to label, optionally excluding ellipticity"""
 #         if not self.add_ellipticity_to_label:
 #             # Temporarily override ellipticity parameters for label processing
 #             orig_exx, orig_eyy, orig_exy = self.exx, self.eyy, self.exy
 #             self.exx, self.eyy, self.exy = 1.0, 1.0, 0.0
 
-#             result = self._apply_elastic(inputs)
+#             result = self._apply_elastic(inputs, background)
 
 #             # Restore original ellipticity parameters
 #             self.exx, self.eyy, self.exy = orig_exx, orig_eyy, orig_exy

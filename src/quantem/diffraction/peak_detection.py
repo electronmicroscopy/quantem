@@ -246,9 +246,9 @@ def pair_peaks(peaks_experimental, peaks_reference, radius_max):
 
 def angle_difference(angle1, angle2):
     """Calculate the smallest difference between two angles in degrees."""
-    return 180 - abs(abs(angle1 - angle2) - 180)
+    return np.mod(angle1 - angle2 + 180, 360) - 180
 
-def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=10):
+def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=180, central_radius_threshold=5, filter_central_beam=False):
     """
     Pair experimental Bragg peaks with reference peaks in polar coordinates.
     
@@ -257,15 +257,34 @@ def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=
     - peaks_reference: np.array, shape (m, 2) for m reference peaks (r, theta in degrees)
     - radius_max: float, maximum radial distance for a match
     - angle_max: float, maximum angular difference for a match (in degrees)
+    - central_radius_threshold: float, radius below which angles are ignored for matching
+    - filter_central_beam: bool, if True return central beam info
     
     Returns:
-    - matches: list of tuples (exp_index, ref_index, distance)
+    - matches: list of tuples (exp_index, ref_index, distance, delta_r, delta_phi)
     - unmatched_exp: list of indices of unmatched experimental peaks
     - unmatched_ref: list of indices of unmatched reference peaks
+    - central_beam_info_exp: dict with keys 'exp_index', 'match_index' (ref_index if matched), 'in_unmatched_exp'
+    - central_beam_info_ref: dict with keys 'ref_index', 'match_index' (exp_index if matched), 'in_unmatched_ref'
     """
     matches = []
     unmatched_exp = list(range(len(peaks_experimental)))
     unmatched_ref = list(range(len(peaks_reference)))
+    
+    # Find the central beams (smallest radius in both experimental and reference peaks)
+    central_beam_exp_index = np.argmin(peaks_experimental[:, 0])
+    central_beam_ref_index = np.argmin(peaks_reference[:, 0])
+    
+    central_beam_info_exp = {
+        'exp_index': central_beam_exp_index,
+        'match_index': None,  # ref_index if matched
+        'in_unmatched_exp': None,  # Index in unmatched_exp list if unmatched
+    }
+    central_beam_info_ref = {
+        'ref_index': central_beam_ref_index,
+        'match_index': None,  # exp_index if matched
+        'in_unmatched_ref': None,  # Index in unmatched_ref list if unmatched
+    }
 
     for ref_index in unmatched_ref.copy():
         ref_peak = peaks_reference[ref_index]
@@ -275,45 +294,98 @@ def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=
         for exp_index in unmatched_exp.copy():
             exp_peak = peaks_experimental[exp_index]
             
-            r_diff = abs(exp_peak[0] - ref_peak[0])
-            theta_diff = angle_difference(exp_peak[1], ref_peak[1])
+            delta_r = exp_peak[0] - ref_peak[0]
+            delta_phi = angle_difference(exp_peak[1], ref_peak[1])
+            delta_x = exp_peak[0] * np.cos(exp_peak[1] * np.pi/180) - ref_peak[0] * np.cos(ref_peak[1] * np.pi/180)
+            delta_y = exp_peak[0] * np.sin(exp_peak[1] * np.pi/180) - ref_peak[0] * np.sin(ref_peak[1] * np.pi/180)
             
-            # Use a combination of radial and angular difference for matching
-            distance = np.sqrt((r_diff / radius_max)**2 + (theta_diff / angle_max)**2)
+            # Check if either peak is within the central radius threshold
+            if exp_peak[0] <= central_radius_threshold or ref_peak[0] <= central_radius_threshold:
+                # For central peaks, only consider radial distance
+                distance = np.sqrt(delta_x**2 + delta_y**2)
+            else:
+                # Use a combination of radial and angular difference for matching
+                distance = np.sqrt(delta_x**2 + delta_y**2)
             
-            if distance < 1 and distance < best_distance:  # '1' represents a normalized distance threshold
-                best_match = (exp_index, ref_index, distance)
+            if distance < radius_max and distance < best_distance and np.abs(delta_phi) < angle_max:
+                best_match = (exp_index, ref_index, distance, delta_r, delta_phi, delta_x, delta_y)
                 best_distance = distance
         
         if best_match:
+            # Check if this match involves the experimental central beam
+            if best_match[0] == central_beam_exp_index:
+                central_beam_info_exp['match_index'] = best_match[1]  # Store the ref_index
+            
+            # Check if this match involves the reference central beam
+            if best_match[1] == central_beam_ref_index:
+                central_beam_info_ref['match_index'] = best_match[0]  # Store the exp_index
+            
             matches.append(best_match)
             unmatched_exp.remove(best_match[0])
             unmatched_ref.remove(best_match[1])
+    
+    # Update central beam info for unmatched cases
+    if central_beam_exp_index in unmatched_exp:
+        central_beam_info_exp['in_unmatched_exp'] = unmatched_exp.index(central_beam_exp_index)
+    
+    if central_beam_ref_index in unmatched_ref:
+        central_beam_info_ref['in_unmatched_ref'] = unmatched_ref.index(central_beam_ref_index)
+    
+    if filter_central_beam:
+        return matches, unmatched_exp, unmatched_ref, central_beam_info_exp, central_beam_info_ref
+    else:
+        return matches, unmatched_exp, unmatched_ref
 
-    return matches, unmatched_exp, unmatched_ref
+# def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=180, central_radius_threshold=5, filter_central_beam=False):
+#     """
+#     Pair experimental Bragg peaks with reference peaks in polar coordinates.
+    
+#     Parameters:
+#     - peaks_experimental: np.array, shape (n, 2) for n experimental peaks (r, theta in degrees)
+#     - peaks_reference: np.array, shape (m, 2) for m reference peaks (r, theta in degrees)
+#     - radius_max: float, maximum radial distance for a match
+#     - angle_max: float, maximum angular difference for a match (in degrees)
+#     - central_radius_threshold: float, radius below which angles are ignored for matching
+    
+#     Returns:
+#     - matches: list of tuples (exp_index, ref_index, distance, delta_r, delta_phi)
+#     - unmatched_exp: list of indices of unmatched experimental peaks
+#     - unmatched_ref: list of indices of unmatched reference peaks
+#     """
+#     matches = []
+#     unmatched_exp = list(range(len(peaks_experimental)))
+#     unmatched_ref = list(range(len(peaks_reference)))
 
+#     for ref_index in unmatched_ref.copy():
+#         ref_peak = peaks_reference[ref_index]
+#         best_match = None
+#         best_distance = float('inf')
+        
+#         for exp_index in unmatched_exp.copy():
+#             exp_peak = peaks_experimental[exp_index]
+            
+#             delta_r = exp_peak[0] - ref_peak[0]
+#             delta_phi = angle_difference(exp_peak[1], ref_peak[1])
+#             delta_x = exp_peak[0] * np.cos(exp_peak[1] * np.pi/180) - ref_peak[0] * np.cos(ref_peak[1] * np.pi/180)
+#             delta_y = exp_peak[0] * np.sin(exp_peak[1] * np.pi/180) - ref_peak[0] * np.sin(ref_peak[1] * np.pi/180)
+#             # Check if either peak is within the central radius threshold
+#             if exp_peak[0] <= central_radius_threshold or ref_peak[0] <= central_radius_threshold:
+#                 # For central peaks, only consider radial distance
+#                 # distance = abs(delta_r)
+#                 distance = np.sqrt(delta_x**2 + delta_y**2)
+#             else:
+#                 # Use a combination of radial and angular difference for matching
+#                 distance = np.sqrt(delta_x**2 + delta_y**2)
+#                 # distance = np.sqrt((delta_r / radius_max)**2 + (delta_phi / angle_max)**2)
+            
+#             if distance < radius_max and distance < best_distance and np.abs(delta_phi) < angle_max:  # '1' represents a normalized distance threshold
+#                 best_match = (exp_index, ref_index, distance, delta_r, delta_phi, delta_x, delta_y)
+#                 best_distance = distance
+        
+#         if best_match:
+#             matches.append(best_match)
+#             unmatched_exp.remove(best_match[0])
+#             unmatched_ref.remove(best_match[1])
 
-# Example usage:
-# peaks_experimental = np.array([[1, 0], [2, np.pi/2], [3, np.pi], [4, 3*np.pi/2]])
-# peaks_reference = np.array([[1.1, 0.1], [2.1, np.pi/2 + 0.1], [3.1, np.pi + 0.1], [5, 0]])
-# radius_max = 0.5
-
-# matches, unmatched = pair_peaks_polar(peaks_experimental, peaks_reference, radius_max)
-# print("Matches:", matches)
-# print("Unmatched experimental peaks:", unmatched)
-
-# matches, unmatched = pair_peaks(peaks_experimental, peaks_reference, radius_max)
-# print("Matches:", matches)
-# print("Unmatched experimental peaks:", unmatched)
-
-# def pair_peaks(peaks_experimental, peaks_reference):
-#     # Pair off experimental Bragg peaks with reference peaks
-#     for a0 in range(peaks_experimental.shape[0]):
-#         dist_2 = (peaks_experimental[a0][0] - peaks_reference[:][0]) ** 2 + (
-#             peaks_experimental[a0][1] - peaks_reference[:][1]
-#         ) ** 2
-#         ind_min = np.argmin(dist_2)
-
-#         if dist_2[ind_min] <= radius_max_2:
-#             inds_match[a0] = ind_min
-#             keep[a0] = True
+#     return matches, unmatched_exp, unmatched_ref
+    

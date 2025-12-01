@@ -15,8 +15,11 @@ from skimage.feature import blob_dog, blob_log, blob_doh
 
 # from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures import Vector
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.cnn2d import MultiChannelCNN2d
+from quantem.core.utils.polar import polar_transform_vector, cartesian_transform_vector
+
 # from quantem.core.utils.compound_validators import (
 #     validate_list_of_dataset2d,
 #     validate_pad_value,
@@ -40,8 +43,8 @@ class Polar4DStem(AutoSerialize):
     def __init__(
         self,
         dataset_cartesian: Dataset4d,
-        resized_cartesian_data: Union[List, NDArray],
-        peaks_cartesian: Union[List, NDArray],  # cartesian peaks
+        resized_cartesian_data: Union[List, NDArray, Vector],
+        peaks_cartesian: Union[List, NDArray, Vector],  # cartesian peaks
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -290,26 +293,37 @@ class Polar4DStem(AutoSerialize):
         return polar_data
 
     def polar_transform_peaks(self, cartesian_peaks, centers, use_tqdm: bool=True):
+        polar_peaks = polar_transform_vector(cartesian_vector=cartesian_peaks, centers=centers, use_tqdm=use_tqdm)
+
         # Does polar transform of peaks in native units
-        N, M = cartesian_peaks.shape
-        polar_peaks = np.empty((N, M), dtype=object)  # Will be a ragged array. N, M, 1 where entry is a (L, 2) array with L peaks, 2 coordinates for each
-        iterator = tqdm(range(N), disable=not use_tqdm, desc="Transforming peaks")
-        for i in iterator:
-            for j in range(M):
-                center_y, center_x = centers[i, j]    
-                peaks = cartesian_peaks[i, j]
+        # N, M = cartesian_peaks.shape
+        # polar_peaks = Vector.from_shape(
+        #     shape=(N, M),
+        #     fields=["r", "theta"],
+        #     name="polar_peaks_vector",
+        #     units=["Pixels", "Radians"],
+        # )
+        # # polar_peaks = np.empty((N, M), dtype=object)  # Will be a ragged array. N, M, 1 where entry is a (L, 2) array with L peaks, 2 coordinates for each
+        # iterator = tqdm(range(N), disable=not use_tqdm, desc="Transforming peaks")
+        # for i in iterator:
+        #     for j in range(M):
+        #         center_y, center_x = centers[i, j]    
+        #         peaks = cartesian_peaks[i, j]
 
-                # Check if no peaks for DP
-                if peaks is None or len(peaks) == 0:
-                    polar_peaks[i, j] = np.zeros((0, 2))  
-                    continue
+        #         # Check if no peaks for DP
+        #         if peaks is None or len(peaks) == 0:
+        #             polar_peaks.set_data(np.zeros((0, 2)), i, j)
+        #             # polar_peaks[i, j] = np.zeros((0, 2))  
+        #             continue
 
-                dy = peaks[:, 0] - center_y
-                dx = peaks[:, 1] - center_x
-                r = np.sqrt((dy)**2 + (dx)**2)
-                theta = np.arctan2(dy, dx)
-                theta = np.mod(theta + np.pi, 2 * np.pi)
-                polar_peaks[i, j] = np.column_stack([r, theta])
+        #         dy = peaks[:, 0] - center_y
+        #         dx = peaks[:, 1] - center_x
+        #         r = np.sqrt((dy)**2 + (dx)**2)
+        #         theta = np.arctan2(dy, dx)
+        #         theta = np.mod(theta + np.pi, 2 * np.pi)
+        #         polar_coords = np.column_stack([r, theta])
+        #         polar_peaks.set_data(polar_coords, i, j)
+        #         # polar_peaks[i, j] = np.column_stack([r, theta])
 
         return polar_peaks
 
@@ -320,9 +334,15 @@ class Polar4DStem(AutoSerialize):
         np.save(filepath, self.polar_data)
 
     def load_polar_peaks(self, filepath):
-        self.polar_peaks = np.load(filepath, allow_pickle=True)
+        polar_peaks = np.load(filepath, allow_pickle=True)
+        if isinstance(polar_peaks, np.ndarray) and polar_peaks.dtype == object and polar_peaks.size == 1:
+            polar_peaks = polar_peaks.item()
+        self.polar_peaks = polar_peaks
 
     def load_polar_data(self, filepath):
+        polar_data = np.load(filepath, allow_pickle=True)
+        if isinstance(polar_data, np.ndarray) and polar_data.dtype == object and polar_data.size == 1:
+            polar_data = polar_data.item()
         self.polar_data = np.load(filepath, allow_pickle=True)
 
     def _postprocess_single(self, position_map, intensity_map, show=False, im_comp=None):

@@ -10,11 +10,12 @@ import numpy as np
 from tqdm import tqdm
 import torch
 from skimage.feature import blob_dog, blob_log, blob_doh
-
+from train_classes import compute_parameters, normalize_data
 # from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.cnn2d import MultiChannelCNN2d
+from quantem.core.datastructures import Vector
 # from quantem.core.utils.compound_validators import (
 #     validate_list_of_dataset2d,
 #     validate_pad_value,
@@ -64,27 +65,30 @@ class BraggPeaks(AutoSerialize):
         self._dataset = dataset
         self._device = device
         self._final_shape = final_shape
-        # Setup model
-        input_channels = 1  # 1 for a greyscale image, 3 for RGB, 4 for RGBA, etc.
-        k_size = 7
-        num_layers = 4
-        start_filters = 16
-        num_per_layer = 2
-        use_skip_connections = True
-        dtype = torch.float32
-        dropout = 0     
-        model = MultiChannelCNN2d(
-            in_channels=input_channels,
-            out_channels=2,
-            start_filters=start_filters,
-            num_layers=num_layers,
-            num_per_layer=num_per_layer,
-            use_skip_connections=use_skip_connections,
-            dtype=dtype,
-            dropout=dropout,
-            final_activations=["sigmoid", "sigmoid"],
-            conv_kernel_size=k_size,
-        )
+        if model is None:
+            # Setup model
+            input_channels = 1  # 1 for a greyscale image, 3 for RGB, 4 for RGBA, etc.
+            k_size = 3
+            # k_size = 7
+            num_layers = 4
+            start_filters = 16
+            num_per_layer = 3
+            # num_per_layer = 2
+            use_skip_connections = True
+            dtype = torch.float32
+            dropout = 0.2     
+            model = MultiChannelCNN2d(
+                in_channels=input_channels,
+                out_channels=2,
+                start_filters=start_filters,
+                num_layers=num_layers,
+                num_per_layer=num_per_layer,
+                use_skip_connections=use_skip_connections,
+                dtype=dtype,
+                dropout=dropout,
+                final_activations=["sigmoid", "sigmoid"],
+                conv_kernel_size=k_size,
+            )
         self._model = model
 
     @property
@@ -144,7 +148,7 @@ class BraggPeaks(AutoSerialize):
         self._model.load_state_dict(torch.load(path_to_weights, weights_only=True, map_location=f"cuda:{gpu_id}"))
         self._model.to(gpu_id)
 
-    def _postprocess_single(self, position_map, intensity_map, show=False, im_comp=None):
+    def _postprocess_single(self, position_map, intensity_map, threshold=0.1, max_sigma=30, min_sigma=1, overlap=0.5, show=False, im_comp=None):
         """Process a single 2D image"""
         # Detect blobs
         # blobs_log = blob_log(
@@ -276,40 +280,113 @@ class BraggPeaks(AutoSerialize):
         self, 
         device: str = "cuda:1",
         n_normalize_samples: int = 100,
-        ):
+    ):
         Ry, Rx, Qy, Qx = self.resized_cartesian_data.shape
-        # outs = np.zeros((Ry, Rx, 2, Qy, Qx))  # 2 output channels
-        peaks = np.empty((Ry, Rx), dtype='object')  # Ragged array for peak coordinates
-        intensities = np.empty((Ry, Rx), dtype='object')  # Ragged array for peak intensities
-        # Normalize
+        peaks = Vector.from_shape(
+            shape=(Ry, Rx),
+            fields=["y", "x"],
+            name="peaks_vector",
+            units=["Pixels", "Pixels"],
+        )
+        # peaks = np.empty((Ry, Rx), dtype='object')
+        intensities = Vector.from_shape(
+            shape=(Ry, Rx),
+            fields=["intensities"],
+            name="intensities_vector",
+            units=["Normalized"],
+        )
+        # intensities = np.empty((Ry, Rx), dtype='object')
+        
+        # Normalize - compute parameters from sample
         scan_shape = (Ry, Rx)
-        dp_shape = (Qy, Qx)
         n_positions = scan_shape[0] * scan_shape[1]
         n_normalize_samples = min(n_normalize_samples, n_positions)
-        flat_indices = torch.randperm(n_positions, device=device)[:n_normalize_samples]
-        scan_y_indices = flat_indices // scan_shape[1]  # row indices, given by floor division by number in row
-        scan_x_indices = flat_indices % scan_shape[1]   # column indices, given by remainder of number in row
-        stats_patterns = torch.tensor(self.resized_cartesian_data[scan_y_indices.cpu(), scan_x_indices.cpu()], dtype=torch.float32).to(device)
-        percentile_lower, percentile_upper = percentile_calc(stats_patterns)
-        for i in tqdm(range(Ry), desc="rows"):
-            # Go row-by-row with model outputs to prevent memory issues
-            ins = torch.tensor(self.resized_cartesian_data[i], dtype=torch.float32).to(device).squeeze()  # Should be of shape (Rx, Ry, Qx, Qy)
-            dps_norm = percentile_normalize(ins, percentile_lower, percentile_upper)
-            ins = dps_norm[:, None, ...]
+        
+        # Get stats patterns and move to CPU for parameter computation
+        # Sample indices (use numpy instead of torch for this)
+        flat_indices = np.random.permutation(n_positions)[:n_normalize_samples]
+        scan_y_indices = flat_indices // scan_shape[1]
+        scan_x_indices = flat_indices % scan_shape[1]
+
+        # Get stats patterns directly as numpy (never touches GPU)
+        stats_patterns = self.resized_cartesian_data[scan_y_indices, scan_x_indices]
+
+        # Move to CPU and convert to numpy for compute_parameters
+        # stats_patterns = torch.squeeze(stats_patterns).detach().cpu().numpy()
+        median, iqr = compute_parameters(stats_patterns)
+        
+        # Process row by row
+        for i in tqdm(range(1), desc="rows"):
+        # for i in tqdm(range(Ry), desc="rows"):
+            # Get row data
+            i=30
+            ins = torch.tensor(
+                self.resized_cartesian_data[i], 
+                dtype=torch.float32
+            ).to(device).squeeze()  # Shape: (Rx, Qy, Qx)
+            
+            # Normalize using new function (works with tensors on GPU)
+            dps_norm = normalize_data(ins, median, iqr)
+            ins = dps_norm[:, None, ...]  # Add channel dimension: (Rx, 1, Qy, Qx)
+            
             # Pass through model
             outs = self.model(ins).detach().cpu().numpy()
-            # outs[i] = self.model(ins).detach().cpu().numpy()
-            for r0 in range(outs.shape[0]):  # Expect shape N x 2 x Qy x Qx
-            # for r0 in range(outs[i].shape[0]):  # Expect shape N x 2 x Qy x Qx
-                peak_coords, peak_intensities = self._postprocess_single(outs[r0, 0], outs[r0, 1])
-                peaks[i, r0] = np.array(peak_coords)
-                intensities[i, r0] = np.array(peak_intensities)
+            
+            # Post-process each pattern in the row
+            for r0 in range(outs.shape[0]):
+                peak_coords, peak_intensities = self._postprocess_single(
+                    outs[r0, 0], 
+                    outs[r0, 1]
+                )
+                peaks.set_data(np.array(peak_coords), i, r0)
+                # peaks[i, r0] = np.array(peak_coords)
+                intensities.set_data(np.array(peak_intensities).reshape(-1, 1), i, r0)
+                # intensities[i, r0] = np.array(peak_intensities)
+        
         print('done')
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
+    # def find_peaks_model(
+    #     self, 
+    #     device: str = "cuda:1",
+    #     n_normalize_samples: int = 100,
+    #     ):
+    #     Ry, Rx, Qy, Qx = self.resized_cartesian_data.shape
+    #     # outs = np.zeros((Ry, Rx, 2, Qy, Qx))  # 2 output channels
+    #     peaks = np.empty((Ry, Rx), dtype='object')  # Ragged array for peak coordinates
+    #     intensities = np.empty((Ry, Rx), dtype='object')  # Ragged array for peak intensities
+    #     # Normalize
+    #     scan_shape = (Ry, Rx)
+    #     dp_shape = (Qy, Qx)
+    #     n_positions = scan_shape[0] * scan_shape[1]
+    #     n_normalize_samples = min(n_normalize_samples, n_positions)
+    #     flat_indices = torch.randperm(n_positions, device=device)[:n_normalize_samples]
+    #     scan_y_indices = flat_indices // scan_shape[1]  # row indices, given by floor division by number in row
+    #     scan_x_indices = flat_indices % scan_shape[1]   # column indices, given by remainder of number in row
+    #     stats_patterns = torch.tensor(self.resized_cartesian_data[scan_y_indices.cpu(), scan_x_indices.cpu()], dtype=torch.float32).to(device)
+    #     percentile_lower, percentile_upper = percentile_calc(stats_patterns)
+    #     for i in tqdm(range(Ry), desc="rows"):
+    #         # Go row-by-row with model outputs to prevent memory issues
+    #         ins = torch.tensor(self.resized_cartesian_data[i], dtype=torch.float32).to(device).squeeze()  # Should be of shape (Rx, Ry, Qx, Qy)
+    #         dps_norm = percentile_normalize(ins, percentile_lower, percentile_upper)
+    #         ins = dps_norm[:, None, ...]
+    #         # Pass through model
+    #         outs = self.model(ins).detach().cpu().numpy()
+    #         # outs[i] = self.model(ins).detach().cpu().numpy()
+    #         for r0 in range(outs.shape[0]):  # Expect shape N x 2 x Qy x Qx
+    #         # for r0 in range(outs[i].shape[0]):  # Expect shape N x 2 x Qy x Qx
+    #             peak_coords, peak_intensities = self._postprocess_single(outs[r0, 0], outs[r0, 1])
+    #             peaks[i, r0] = np.array(peak_coords)
+    #             intensities[i, r0] = np.array(peak_intensities)
+    #     print('done')
+    #     self.peak_coordinates_cartesian = peaks
+    #     self.peak_intensities = intensities
 
     def save_peaks(self, filepath):
         np.save(filepath, self.peak_coordinates_cartesian)
 
     def load_peaks(self, filepath):
-        self.peak_coordinates_cartesian = np.load(filepath, allow_pickle=True)
+        peak_coordinates_cartesian = np.load(filepath, allow_pickle=True)
+        if isinstance(peak_coordinates_cartesian, np.ndarray) and peak_coordinates_cartesian.dtype == object and peak_coordinates_cartesian.size == 1:
+            peak_coordinates_cartesian = peak_coordinates_cartesian.item()
+        self.peak_coordinates_cartesian = peak_coordinates_cartesian
