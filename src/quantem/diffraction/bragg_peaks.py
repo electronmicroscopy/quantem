@@ -29,6 +29,9 @@ from quantem.core.datastructures import Vector
 # from quantem.core.visualization import show_2d
 
 
+# TODO: Likely dataset4dSTEM rather than dataset4d input class
+# Bragg peaks from crystalline vs polymer
+# 
 def percentile_calc(data, lower_percentile=1, upper_percentile=99):
     # Flatten the data for global percentile calculation
     data_flat = data.flatten()
@@ -41,7 +44,7 @@ def percentile_calc(data, lower_percentile=1, upper_percentile=99):
 def percentile_normalize(data, p_lower, p_upper):
     return torch.clamp((data - p_lower) / (p_upper - p_lower), 0, 1)  
 
-
+# TODO: "BraggPeaksPolymer" vs "BraggPeaksCrystal"
 class BraggPeaks(AutoSerialize):
     """
     
@@ -279,7 +282,8 @@ class BraggPeaks(AutoSerialize):
     def find_peaks_model(
         self, 
         device: str = "cuda:1",
-        n_normalize_samples: int = 100,
+        indices = none,
+        n_normalize_samples: int = 1000,
     ):
         Ry, Rx, Qy, Qx = self.resized_cartesian_data.shape
         peaks = Vector.from_shape(

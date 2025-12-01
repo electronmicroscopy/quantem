@@ -3,18 +3,28 @@ from tqdm import tqdm
 
 from quantem.core.datastructures import Vector
 
+
+# TODO: Elliptical polar transform
+# TODO: Add offset options, such as rotation. Change of basis? if rotated basis, then maintain rotation?
+# TODO: Add as method to vector? if method change names more
+# TODO: Inheritence of units from input vector
+# For input vector, when load dataset, get vector units from dataset
+
+# "cartesian_to_polar_vector"
 def polar_transform_vector(
     cartesian_vector: Vector,
-    centers: np.ndarray,
+    centers: np.ndarray, # Make optional union with array, list, etc. Default to [0, 0] . Take into account descan too
     x_field: str = "x",
     y_field: str = "y",
-    r_unit: str = "Pixels",
-    theta_unit: str = "Radians",
+    r_unit: str = "pixels",
+    theta_unit: str = "radians",
     name_suffix: str = "_polar",
     use_tqdm: bool = True,
 ) -> Vector:
     """
     Transform a Vector with Cartesian coordinates to polar coordinates.
+    Returns new Vector with x field and y field converted to r and theta.
+    Preserves all other fields.
     
     Parameters
     ----------
@@ -159,13 +169,15 @@ def polar_transform_vector(
     return polar_vector
 
 
+# TODO: Round-trip test
+# "polar_to_cartesian_vector"
 def cartesian_transform_vector(
     polar_vector: Vector,
     centers: np.ndarray,
     r_field: str = "r",
     theta_field: str = "theta",
-    x_unit: str = "Pixels",
-    y_unit: str = "Pixels",
+    x_unit: str = "pixels",
+    y_unit: str = "pixels",
     name_suffix: str = "_cartesian",
     use_tqdm: bool = True,
 ) -> Vector:

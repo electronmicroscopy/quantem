@@ -345,6 +345,9 @@ class Polar4DStem(AutoSerialize):
             polar_data = polar_data.item()
         self.polar_data = np.load(filepath, allow_pickle=True)
 
+
+    # Facade function
+    # "detect_peaks_ML" function, no need to do this
     def _postprocess_single(self, position_map, intensity_map, show=False, im_comp=None):
         """Process a single 2D image"""
 
