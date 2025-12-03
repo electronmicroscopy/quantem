@@ -7,6 +7,8 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
+
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -751,3 +753,6 @@ class Dataset4dstem(Dataset4d):
             self.array[:, :, index_x, index_y] = np.median(
                 self.array[:, :, x_min:x_max, y_min:y_max], axis=(2, 3)
             )
+
+
+    polar_transform = dataset4dstem_polar_transform
