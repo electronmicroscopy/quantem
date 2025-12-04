@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple
 from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter, maximum_filter, grey_dilation, map_coordinates
 
 class DoGBlobDetector:
     def __init__(self, min_sigma: float = 1.0, max_sigma: float = 50.0, 
@@ -164,7 +165,6 @@ class DoGBlobDetector:
         return np.array(keep)
 
 
-# Example usage:
 def visualize_blobs(image: np.ndarray, blobs: np.ndarray):
     """Visualize detected blobs"""
     import matplotlib.pyplot as plt
@@ -180,39 +180,128 @@ def visualize_blobs(image: np.ndarray, blobs: np.ndarray):
     ax.set_title(f'Detected {len(blobs)} blobs')
     plt.show()
 
+def detect_blobs(image, sigma=1.0, threshold=None):
+    """
+    Detect strict local maxima (greater than 8 nearest neighbors) with subpixel quadratic refinement.
+    
+    Parameters:
+    -----------
+    image : 2D array
+    sigma : float, for Gaussian smoothing
+    threshold : float or None, minimum intensity for peak to be valid
+    
+    Returns:
+    --------
+    peaks : Nx2 array of (row, col) subpixel coordinates
+    intensities : N array of signal intensities for peak position
+    success : N array of booleans (True if refinement succeeded)
+    """
+    
+    smoothed = gaussian_filter(image, sigma=sigma)
+    local_max = maximum_filter(smoothed, size=3)
+    # Make strict: exclude plateaus by checking inequality with neighbors
+    # Use erosion to get image of maximum value in kernel convolution.
+    # Used to check if strictly greater than nearest 8
+    # Footprint to exclude center pixel. Evaluates nearest 8.
+    footprint = np.array([[1, 1, 1],
+                          [1, 0, 1],
+                          [1, 1, 1]], dtype=bool)
+    max_neighbors = grey_dilation(smoothed, footprint=footprint)
+    peaks = (smoothed == local_max) & (smoothed > max_neighbors)
+    
+    # Remove borders and apply threshold
+    peaks[:, 0] = peaks[:, -1] = peaks[0, :] = peaks[-1, :] = False
+    if threshold is not None:
+        peaks &= (smoothed > threshold)
+    
+    # Get integer coordinates
+    peak_coords = np.argwhere(peaks)
+    # If no peaks, return empty lists
+    if len(peak_coords) == 0:
+        return np.array([]), np.array([]), np.array([])
+    
+    # Subpixel refinement
+    refined_coords, success = refine_peaks_quadratic(smoothed, peak_coords)
+    # Get intensities of peak position signal
+    intensities = map_coordinates(smoothed, refined_coords.T, order=1)
+    
+    return refined_coords, intensities, success
 
-# Demo
-if __name__ == "__main__":
-    # Create synthetic test image with blobs
-    from scipy import ndimage
+def refine_peaks_quadratic(smoothed, peak_coords):
+    """
+    Refine peak positions to subpixel accuracy using 2D quadratic fitting.
     
-    image = np.zeros((512, 512))
-    # Add some blobs
-    image[100, 100] = 1
-    image[300, 400] = 1
-    image[200, 300] = 1
-    image = ndimage.gaussian_filter(image, sigma=10)
+    Parameters:
+    -----------
+    smoothed : 2D array, image after Gaussian smoothing
+    peak_coords : Nx2 array of (row, col) integer peak positions
     
-    # Convert to torch
-    image_torch = torch.from_numpy(image).float()
+    Returns:
+    --------
+    refined_coords : Nx2 array of (row, col) subpixel peak positions
+    success : N array of booleans, True if refinement succeeded
+    """
+    refined = []
+    success = []
     
-    # Detect blobs
-    detector = DoGBlobDetector(
-        min_sigma=5,
-        max_sigma=30,
-        num_sigma=10,
-        threshold=0.005,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
+    for y, x in peak_coords:
+        # Skip peaks too close to border (need 3x3 neighborhood)
+        if y < 1 or y >= smoothed.shape[0]-1 or x < 1 or x >= smoothed.shape[1]-1:
+            refined.append([float(y), float(x)])
+            success.append(False)
+            continue
+        
+        # Get 3x3 neighborhood
+        patch = smoothed[y-1:y+2, x-1:x+2]
+        
+        # Taylor expansion around the peak:
+        # f(x+dx, y+dy) ≈ f(x,y) + g·[dx,dy] + 0.5·[dx,dy]·H·[dx,dy]
+        # where g is gradient (1st power) and H is Hessian (2nd power)
+        
+        # First derivatives (gradient) using central differences
+        dy = (patch[2, 1] - patch[0, 1]) / 2.0
+        dx = (patch[1, 2] - patch[1, 0]) / 2.0
+        
+        # Second derivatives (Hessian) using finite differences
+        dyy = patch[2, 1] - 2*patch[1, 1] + patch[0, 1]
+        dxx = patch[1, 2] - 2*patch[1, 1] + patch[1, 0]
+        dxy = (patch[2, 2] - patch[2, 0] - patch[0, 2] + patch[0, 0]) / 4.0
+        
+        # Build Hessian matrix
+        H = np.array([[dyy, dxy],
+                      [dxy, dxx]])
+        
+        # Gradient vector
+        g = np.array([dy, dx])
+        
+        # At the peak, gradient should be zero: g + H·offset = 0
+        # So: offset = -H^(-1)·g
+        try:
+            # Check if Hessian is negative definite (proper maximum)
+            eigenvalues = np.linalg.eigvalsh(H)
+            if np.all(eigenvalues < 0):  # Both eigenvalues negative = local maximum
+                offset = -np.linalg.solve(H, g)
+                
+                # Sanity check: offset shouldn't be too large
+                # (if it is, the quadratic approximation is probably bad and should just use integer coords)
+                if np.all(np.abs(offset) <= 1.5):
+                    refined.append([y + offset[0], x + offset[1]])
+                    success.append(True)
+                else:
+                    # Offset too large, use integer position, as more accurate
+                    refined.append([float(y), float(x)])
+                    success.append(False)
+            else:
+                # Not a proper maximum (saddle point or minimum)
+                refined.append([float(y), float(x)])
+                success.append(False)
+                
+        except np.linalg.LinAlgError:
+            # Singular matrix (flat region), use integer position
+            refined.append([float(y), float(x)])
+            success.append(False)
     
-    blobs = detector.detect_blobs(image_torch)
-    
-    print(f"Found {len(blobs)} blobs")
-    print("Blobs (y, x, radius):")
-    print(blobs)
-    
-    # Visualize
-    visualize_blobs(image, blobs)
+    return np.array(refined), np.array(success)
 
 def pair_peaks(peaks_experimental, peaks_reference, radius_max):
     """
@@ -245,7 +334,7 @@ def pair_peaks(peaks_experimental, peaks_reference, radius_max):
     return matches, unmatched_exp
 
 def angle_difference(angle1, angle2):
-    """Calculate the smallest difference between two angles in degrees."""
+    """Calculate the smallest difference between two angles in degrees with ML model coordinate system."""
     return np.mod(angle1 - angle2 + 180, 360) - 180
 
 def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=180, central_radius_threshold=5, filter_central_beam=False):

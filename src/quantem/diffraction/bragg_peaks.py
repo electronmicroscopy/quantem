@@ -1,51 +1,26 @@
 # from collections.abc import Sequence
 from typing import List, Optional, Union, Tuple
 
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 import numpy as np
-# from numpy.typing import NDArray
-# from scipy.interpolate import interp1d
-# from scipy.ndimage import gaussian_filter
-# from scipy.optimize import minimize
+from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, label, sum as label_sum, center_of_mass
 from tqdm import tqdm
 import torch
-from skimage.feature import blob_dog, blob_log, blob_doh
 from train_classes import compute_parameters, normalize_data
-# from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.cnn2d import MultiChannelCNN2d
 from quantem.core.datastructures import Vector
-# from quantem.core.utils.compound_validators import (
-#     validate_list_of_dataset2d,
-#     validate_pad_value,
-# )
-# from quantem.core.utils.imaging_utils import (
-#     bilinear_kde,
-#     cross_correlation_shift,
-#     fourier_cropping,
-# )
-# from quantem.core.utils.validators import ensure_valid_array
-# from quantem.core.visualization import show_2d
+from quantem.core.utils.polar import polar_transform_vector, cartesian_transform_vector
+from quantem.diffraction.peak_detection import detect_blobs
 
 
 # TODO: Likely dataset4dSTEM rather than dataset4d input class
 # Bragg peaks from crystalline vs polymer
 # 
-def percentile_calc(data, lower_percentile=1, upper_percentile=99):
-    # Flatten the data for global percentile calculation
-    data_flat = data.flatten()
-    # Convert percentiles to quantiles (0-1 range)
-    p_lower = torch.quantile(data_flat, lower_percentile / 100.0)
-    p_upper = torch.quantile(data_flat, upper_percentile / 100.0)
-    
-    return p_lower, p_upper
-
-def percentile_normalize(data, p_lower, p_upper):
-    return torch.clamp((data - p_lower) / (p_upper - p_lower), 0, 1)  
-
 # TODO: "BraggPeaksPolymer" vs "BraggPeaksCrystal"
-class BraggPeaks(AutoSerialize):
+class BraggPeaksPolymer(AutoSerialize):
     """
     
     """
@@ -54,7 +29,7 @@ class BraggPeaks(AutoSerialize):
 
     def __init__(
         self,
-        dataset: Dataset4d,
+        dataset_cartesian: Dataset4dstem,
         model: MultiChannelCNN2d = None,
         final_shape: Tuple[int, int] = (256, 256),
         device: str = 'cpu',
@@ -65,9 +40,21 @@ class BraggPeaks(AutoSerialize):
                 "Use BraggPeaks.from_data() or .from_file() to instantiate this class."
             )
 
-        self._dataset = dataset
+        self._dataset_cartesian = dataset_cartesian
         self._device = device
         self._final_shape = final_shape
+
+        # To be set by class methods
+        self.resized_cartesian_data = None
+        self.peak_coordinates_cartesian = None
+        self.peak_intensities = None
+        self.image_centers = None
+        self.polar_data = None
+        self.polar_peaks = None
+        self.max_radius = None
+        self.num_radial_bins = None
+        self.num_annular_bins = None
+
         if model is None:
             # Setup model
             input_channels = 1  # 1 for a greyscale image, 3 for RGB, 4 for RGBA, etc.
@@ -107,20 +94,20 @@ class BraggPeaks(AutoSerialize):
         cls,
         file_path: str,
         file_type: str | None = None,
-    ) -> "BraggPeaks":
-        dataset = Dataset4d.from_file(file_path, file_type=file_type)
+    ) -> "BraggPeaksPolymer":
+        dataset_cartesian = Dataset4dstem.from_file(file_path, file_type=file_type)
         return cls.from_data(
-            dataset,
+            dataset_cartesian,
         )
 
     @classmethod
     def from_data(
         cls,
-        dataset: Dataset4d,
+        dataset_cartesian: Dataset4dstem,
         device: str,
-    ) -> "BraggPeaks":
+    ) -> "BraggPeaksPolymer":
         return cls(
-            dataset=dataset,
+            dataset_cartesian=dataset_cartesian,
             _token=cls._token,
             device=device,
         )
@@ -129,11 +116,11 @@ class BraggPeaks(AutoSerialize):
         self.resize_data()
 
     def resize_data(self, device:str = "cuda:1"):
-        Ry, Rx, Qy, Qx = self._dataset.shape
+        Ry, Rx, Qy, Qx = self._dataset_cartesian.shape
         scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
         resized_data = np.zeros((Ry, Rx, self._final_shape[0], self._final_shape[1]))
         for i in tqdm(range(Ry), desc='rows'):
-            inp = torch.tensor(self._dataset[i].array, dtype=torch.float32).to(device)
+            inp = torch.tensor(self._dataset_cartesian[i].array, dtype=torch.float32).to(device)
             inp = torch.nn.functional.interpolate(inp[None, ...], size=self._final_shape, mode='bilinear', align_corners=False) * scale_factor
             resized_data[i, :, :, :] = inp.squeeze().detach().cpu().numpy()
         self.resized_cartesian_data = resized_data
@@ -143,7 +130,7 @@ class BraggPeaks(AutoSerialize):
         # path_to_model: str = None,
         path_to_weights: str = None,
         gpu_id: int = 1,
-    ) -> "BraggPeaks":
+    ) -> "BraggPeaksPolymer":
         # if path_to_model is None:
             # path_to_model = ""
         if path_to_weights is None:
@@ -151,139 +138,70 @@ class BraggPeaks(AutoSerialize):
         self._model.load_state_dict(torch.load(path_to_weights, weights_only=True, map_location=f"cuda:{gpu_id}"))
         self._model.to(gpu_id)
 
-    def _postprocess_single(self, position_map, intensity_map, threshold=0.1, max_sigma=30, min_sigma=1, overlap=0.5, show=False, im_comp=None):
+    def _postprocess_single(self, position_map, intensity_map, show=False):
         """Process a single 2D image"""
-        # Detect blobs
-        # blobs_log = blob_log(
-        #     position_map, 
-        #     max_sigma=30, 
-        #     num_sigma=10, 
-        #     threshold=0.1
-        # )
-        
-        blobs_dog = blob_dog(
-            position_map, 
-            max_sigma=30, 
-            threshold=0.1
+        # Find peaks with subpixel-refinement
+        peak_coords, peak_position_signal_intensities, refinement_success = detect_blobs(
+            position_map,
+            sigma=1.0,  # Sigma for Gaussian smoothing used in processing
+            threshold=0.25  # Threshold for strength of peak position signal to be valid peak
         )
-        if len(blobs_dog) == 0:
-            return np.array([]), np.array([]), np.array([])
-        
-        # Convert sigma to radius
-        blobs_dog[:, 2] = blobs_dog[:, 2] * np.sqrt(2)
-        
-        # Extract coordinates and radii
-        coordinates = blobs_dog[:, :2]  # (y, x)
-        sigma_gaussian = blobs_dog[:, 2]
-        
-        # Extract intensities (vectorized)
-        y_coords = np.clip(coordinates[:, 0].astype(int), 0, intensity_map.shape[0] - 1)
-        x_coords = np.clip(coordinates[:, 1].astype(int), 0, intensity_map.shape[1] - 1)
-        intensities = intensity_map[y_coords, x_coords]
-        
-        # if show:
-        #     self._visualize(position_map, intensity_map, blobs_log, 
-        #                 coordinates, intensities, im_comp)
-        
-        return coordinates, intensities
 
-    def postprocessing(self, position_map, intensity_map, show=False, im_comp=None):
-        """
-        Detect blobs and extract intensities
+        # If no peaks found, return empty lists
+        if len(peak_coords) == 0:
+            return np.array([]), np.array([])
+
+        # map_coordinates expects coordinates in (row, col) = (y, x) order
+        # peak_coords is already in [row, col] format from detect_blobs
+        interpolated_intensities = map_coordinates(
+            intensity_map, 
+            peak_coords.T,  # Transpose to get [[all_y], [all_x]]
+            order=1,  # 1 = bilinear interpolation
+            mode='nearest'  # How to handle edges
+        )
         
-        Parameters
-        ----------
-        position_map : np.ndarray
-            Binary or grayscale image for blob detection
-            Shape: (H, W) or (N, H, W)
-        intensity_map : np.ndarray
-            Image from which to extract intensities at blob positions
-            Shape: (H, W) or (N, H, W)
-        show : bool
-            Whether to visualize results
-        im_comp : np.ndarray, optional
-            Comparison image for visualization
-            
-        Returns
-        -------
-        If 2D input:
-            coordinates, sigma_gaussian, intensities
-        If 3D input:
-            List of (coordinates, sigma_gaussian, intensities) for each image
-        """
-        # Handle 2D case (single image)
-        if position_map.ndim == 2:
-            return self._postprocess_single(position_map, intensity_map, show, im_comp)
+        # Optional: filter out peaks that were not successfully refined
+        if np.any(refinement_success):
+            pass
         
-        # Handle 3D case (batch of images)
-        elif position_map.ndim == 3:
-            N = position_map.shape[0]
-            results = []
-            
-            for i in range(N):
-                coords, radii, intensities = self._postprocess_single(
-                    position_map[i], 
-                    intensity_map[i],
-                    show=show and i == 0,  # Only show first image
-                    im_comp=im_comp[i] if im_comp is not None else None
-                )
-                results.append((coords, intensities))
-            
-            return results
-        
-        else:
-            raise ValueError(f"Expected 2D or 3D array, got {position_map.ndim}D")
-        # intensities = [np.average(intensity_map[int(coordinates[i, 0])-2:int(coordinates[i, 0])+2, int(coordinates[i, 1])-2:int(coordinates[i, 1])+2]) for i in range(len(coordinates))]
-        # print(f"peak coordinates: {coordinates}")
-        # print(f"intensities: {intensities}")
+        if show:
+            # Peak positions only
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.imshow(position_map, cmap='gray', alpha=0.8)
+            ax.set_title("Input Position Map with Marked Peaks")
+            ax.scatter(peak_coords[:, 1], peak_coords[:, 0], s=10, c='r', label="Peaks")
+            ax.legend()
+            plt.tight_layout()
+            plt.show()
 
-        # if show:
-        #     blobs_dog = blob_dog(position_map, max_sigma=30, threshold=0.1)
-        #     blobs_dog[:, 2] = blobs_dog[:, 2] * np.sqrt(2)
+            # Peak positions with color representing intensity
+            fig, ax = plt.subplots(figsize=(10, 8))
+            im = ax.imshow(position_map, cmap='gray', alpha=0.8)
+            scatter = ax.scatter(
+                peak_coords[:, 1],  # x coordinates
+                peak_coords[:, 0],  # y coordinates
+                c=interpolated_intensities,      # color by intensity
+                s=10,
+                cmap='turbo',    
+                edgecolors='black', # white border for visibility
+                linewidths=2,
+                alpha=0.9,
+                marker='o'
+            )
+            cbar = plt.colorbar(scatter, ax=ax)
+            cbar.set_label('Intensity', fontsize=12)
+            ax.set_title('Peak Positions and Intensities', fontsize=14)
+            ax.axis('off')
+            plt.tight_layout()
+            plt.show()
 
-        #     blobs_doh = blob_doh(position_map, max_sigma=30, threshold=0.01)
-
-        #     blobs_list = [blobs_log, blobs_dog, blobs_doh]
-        #     colors = ['yellow', 'lime', 'red']
-        #     titles = ['Laplacian of Gaussian', 'Difference of Gaussian', 'Determinant of Hessian']
-        #     sequence = zip(blobs_list, colors, titles)
-
-        #     fig, axes = plt.subplots(1, 3, figsize=(9, 3), sharex=True, sharey=True)
-        #     ax = axes.ravel()
-        #     for idx, (blobs, color, title) in enumerate(sequence):
-        #         ax[idx].set_title(title)
-        #         ax[idx].imshow(position_map)
-        #         for blob in blobs:
-        #             y, x, r = blob
-        #             c = plt.Circle((x, y), r, color=color, linewidth=2, fill=False)
-        #             ax[idx].add_patch(c)
-        #         ax[idx].set_axis_off()
-        #     fig.tight_layout() 
-            
-        #     if im_comp is not None:
-        #         fig2, axes2 = plt.subplots(1, 4, figsize=(9, 3), sharex=True, sharey=True)
-        #         ax2 = axes2.ravel()
-        #         sequence = zip(blobs_list, colors, titles)
-        #         ax2[0].set_title("Original Image")
-        #         ax2[0].imshow(im_comp, cmap='magma', norm='linear', vmin=0.02, vmax=0.98)
-        #         ax2[0].set_axis_off()
-        #         for idx, (blobs, color, title) in enumerate(sequence):
-        #             ax2[idx+1].set_title(title)
-        #             ax2[idx+1].imshow(im_comp, cmap='gray', norm='linear', vmin=0.02, vmax=0.98)  # Display the im_comp image
-        #             for blob in blobs:
-        #                 y, x, r = blob
-        #                 # Check if the blob coordinates are valid
-        #                 if x >= 0 and x < im_comp.shape[1] and y >= 0 and y < im_comp.shape[0]:
-        #                     c = plt.Circle((x, y), r, color=color, linewidth=2, fill=False)
-        #                     ax2[idx+1].add_patch(c)
-        #             ax2[idx+1].set_axis_off()   
-        #         fig2.tight_layout() 
+        return peak_coords, interpolated_intensities
 
     def find_peaks_model(
         self, 
         device: str = "cuda:1",
-        indices = none,
         n_normalize_samples: int = 1000,
+        show_plots=False,
     ):
         Ry, Rx, Qy, Qx = self.resized_cartesian_data.shape
         peaks = Vector.from_shape(
@@ -320,10 +238,8 @@ class BraggPeaks(AutoSerialize):
         median, iqr = compute_parameters(stats_patterns)
         
         # Process row by row
-        for i in tqdm(range(1), desc="rows"):
-        # for i in tqdm(range(Ry), desc="rows"):
+        for i in tqdm(range(Ry), desc="rows"):
             # Get row data
-            i=30
             ins = torch.tensor(
                 self.resized_cartesian_data[i], 
                 dtype=torch.float32
@@ -340,7 +256,8 @@ class BraggPeaks(AutoSerialize):
             for r0 in range(outs.shape[0]):
                 peak_coords, peak_intensities = self._postprocess_single(
                     outs[r0, 0], 
-                    outs[r0, 1]
+                    outs[r0, 1],
+                    show=show_plots,
                 )
                 peaks.set_data(np.array(peak_coords), i, r0)
                 # peaks[i, r0] = np.array(peak_coords)
@@ -350,41 +267,6 @@ class BraggPeaks(AutoSerialize):
         print('done')
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
-    # def find_peaks_model(
-    #     self, 
-    #     device: str = "cuda:1",
-    #     n_normalize_samples: int = 100,
-    #     ):
-    #     Ry, Rx, Qy, Qx = self.resized_cartesian_data.shape
-    #     # outs = np.zeros((Ry, Rx, 2, Qy, Qx))  # 2 output channels
-    #     peaks = np.empty((Ry, Rx), dtype='object')  # Ragged array for peak coordinates
-    #     intensities = np.empty((Ry, Rx), dtype='object')  # Ragged array for peak intensities
-    #     # Normalize
-    #     scan_shape = (Ry, Rx)
-    #     dp_shape = (Qy, Qx)
-    #     n_positions = scan_shape[0] * scan_shape[1]
-    #     n_normalize_samples = min(n_normalize_samples, n_positions)
-    #     flat_indices = torch.randperm(n_positions, device=device)[:n_normalize_samples]
-    #     scan_y_indices = flat_indices // scan_shape[1]  # row indices, given by floor division by number in row
-    #     scan_x_indices = flat_indices % scan_shape[1]   # column indices, given by remainder of number in row
-    #     stats_patterns = torch.tensor(self.resized_cartesian_data[scan_y_indices.cpu(), scan_x_indices.cpu()], dtype=torch.float32).to(device)
-    #     percentile_lower, percentile_upper = percentile_calc(stats_patterns)
-    #     for i in tqdm(range(Ry), desc="rows"):
-    #         # Go row-by-row with model outputs to prevent memory issues
-    #         ins = torch.tensor(self.resized_cartesian_data[i], dtype=torch.float32).to(device).squeeze()  # Should be of shape (Rx, Ry, Qx, Qy)
-    #         dps_norm = percentile_normalize(ins, percentile_lower, percentile_upper)
-    #         ins = dps_norm[:, None, ...]
-    #         # Pass through model
-    #         outs = self.model(ins).detach().cpu().numpy()
-    #         # outs[i] = self.model(ins).detach().cpu().numpy()
-    #         for r0 in range(outs.shape[0]):  # Expect shape N x 2 x Qy x Qx
-    #         # for r0 in range(outs[i].shape[0]):  # Expect shape N x 2 x Qy x Qx
-    #             peak_coords, peak_intensities = self._postprocess_single(outs[r0, 0], outs[r0, 1])
-    #             peaks[i, r0] = np.array(peak_coords)
-    #             intensities[i, r0] = np.array(peak_intensities)
-    #     print('done')
-    #     self.peak_coordinates_cartesian = peaks
-    #     self.peak_intensities = intensities
 
     def save_peaks(self, filepath):
         np.save(filepath, self.peak_coordinates_cartesian)
@@ -394,3 +276,232 @@ class BraggPeaks(AutoSerialize):
         if isinstance(peak_coordinates_cartesian, np.ndarray) and peak_coordinates_cartesian.dtype == object and peak_coordinates_cartesian.size == 1:
             peak_coordinates_cartesian = peak_coordinates_cartesian.item()
         self.peak_coordinates_cartesian = peak_coordinates_cartesian
+    
+    def save_polar_peaks(self, filepath):
+        np.save(filepath, self.polar_peaks)
+
+    def save_polar_data(self, filepath):
+        np.save(filepath, self.polar_data)
+
+    def load_polar_peaks(self, filepath):
+        polar_peaks = np.load(filepath, allow_pickle=True)
+        if isinstance(polar_peaks, np.ndarray) and polar_peaks.dtype == object and polar_peaks.size == 1:
+            polar_peaks = polar_peaks.item()
+        self.polar_peaks = polar_peaks
+
+    def load_polar_data(self, filepath):
+        polar_data = np.load(filepath, allow_pickle=True)
+        if isinstance(polar_data, np.ndarray) and polar_data.dtype == object and polar_data.size == 1:
+            polar_data = polar_data.item()
+        self.polar_data = np.load(filepath, allow_pickle=True)
+
+    def process_polar(self):
+        """ Find center of image through brightest peak, return polar transform of data and peaks"""
+        self.image_centers = self.find_central_beams_4d(self.resized_cartesian_data)
+        self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
+        self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self.peak_coordinates_cartesian, centers=self.image_centers)
+
+    def find_central_beam_with_size_check(self, image, min_size=9, brightness_threshold=0.99999, com_radius=5, show_plots=False):
+        """
+        Find central beam by taking the maximum value, checking its size, and refining with center of mass.
+
+        Parameters:
+        -----------
+        image : ndarray, shape (det_y, det_x)
+            2D image
+        min_size : int
+            Minimum size (in pixels) for a spot to be considered the central beam
+        brightness_threshold : float
+            Fraction of max intensity to use for segmentation
+        com_radius : int
+            Radius around the brightest pixel to use for center of mass calculation
+
+        Returns:
+        --------
+        center : tuple
+            (y, x) coordinates of the beam center
+        """
+        # Find the maximum intensity
+        max_intensity = np.max(image)
+        
+        # Create a binary image of bright spots
+        binary = image > (max_intensity * brightness_threshold)
+        
+        # Label connected components
+        labeled, num_features = label(binary)
+        
+        # Find sizes of all labeled regions
+        sizes = label_sum(binary, labeled, range(1, num_features + 1))
+        
+        # Find the label of the largest region that meets the minimum size
+        valid_labels = np.where(sizes >= min_size)[0] + 1  # +1 because labels start at 1
+        
+        if len(valid_labels) == 0:
+            # If no valid regions found, fall back to brightest pixel
+            center_y, center_x = np.unravel_index(np.argmax(image), image.shape)
+        else:
+            largest_valid_label = valid_labels[np.argmax(sizes[valid_labels - 1])]
+            
+            # Find the brightest pixel within this region
+            mask = (labeled == largest_valid_label)
+            masked_image = image * mask
+            center_y, center_x = np.unravel_index(np.argmax(masked_image), image.shape)
+        
+        # Refine position using center of mass
+        y_min = max(0, int(center_y) - com_radius)
+        y_max = min(image.shape[0], int(center_y) + com_radius + 1)
+        x_min = max(0, int(center_x) - com_radius)
+        x_max = min(image.shape[1], int(center_x) + com_radius + 1)
+        
+        local_region = image[y_min:y_max, x_min:x_max]
+        local_com_y, local_com_x = center_of_mass(local_region)
+        
+        refined_center_y = y_min + local_com_y
+        refined_center_x = x_min + local_com_x
+
+        # # Visualization
+        if show_plots:
+            plt.figure(figsize=(15, 10))
+            
+            plt.subplot(2, 3, 1)
+            plt.imshow(binary, cmap='gray')
+            plt.title('Binary Image')
+            
+            plt.subplot(2, 3, 2)
+            plt.imshow(labeled, cmap='nipy_spectral')
+            plt.title('Labeled Image')
+            
+            plt.subplot(2, 3, 3)
+            plt.imshow(masked_image, cmap='viridis')
+            plt.title('Masked Image')
+            plt.scatter(center_x, center_y, color='red', s=50, marker='x')
+            
+            plt.subplot(2, 3, 4)
+            plt.imshow(image, cmap='viridis')
+            plt.title('Original Image')
+            plt.scatter(center_x, center_y, color='red', s=50, marker='x', label='Max Intensity')
+            plt.scatter(refined_center_x, refined_center_y, color='white', s=50, marker='o', label='Refined (CoM)')
+            plt.legend()
+            
+            plt.subplot(2, 3, 5)
+            plt.imshow(local_region, cmap='viridis')
+            plt.title('Local Region for CoM')
+            plt.scatter(local_com_x, local_com_y, color='white', s=50, marker='o')
+            
+            plt.tight_layout()
+            plt.show()
+            
+            print(f"Initial center: ({center_y:.2f}, {center_x:.2f})")
+            print(f"Refined center: ({refined_center_y:.2f}, {refined_center_x:.2f})")
+            input()
+        
+        return (float(refined_center_y), float(refined_center_x))
+
+    def find_central_beams_4d(self, data, min_size=9, brightness_threshold=0.5, use_tqdm=True):
+        """
+        Fast central beam finding for entire 4D dataset.
+        
+        Parameters:
+        -----------
+        data : ndarray, shape (scan_y, scan_x, det_y, det_x)
+            4D-STEM dataset
+        min_size : int
+            Minimum size (in pixels) for a spot to be considered the central beam
+        brightness_threshold : float
+            Fraction of max intensity to use for segmentation
+        use_tqdm : bool
+            Show progress bar
+        
+        Returns:
+        --------
+        centers : ndarray, shape (scan_y, scan_x, 2)
+            Center coordinates (y, x) for each scan position
+        """
+        from tqdm import tqdm
+        
+        scan_y, scan_x, det_y, det_x = data.shape
+        centers = np.zeros((scan_y, scan_x, 2))
+        
+        iterator = tqdm(range(scan_y), disable=not use_tqdm, desc="Finding centers")
+        
+        for i in iterator:
+            for j in range(scan_x):
+                centers[i, j] = self.find_central_beam_with_size_check(
+                    data[i, j],
+                    min_size=min_size,
+                    brightness_threshold=brightness_threshold
+                )
+        
+        return centers
+
+    def polar_transform_peaks(self, cartesian_peaks, centers, use_tqdm: bool=True):
+        polar_peaks = polar_transform_vector(cartesian_vector=cartesian_peaks, centers=centers, use_tqdm=use_tqdm)
+        return polar_peaks
+
+    def polar_transform_4d(self, data, centers, num_r=None, num_theta=360, use_tqdm: bool=True):
+        """
+        Perform polar transform on the last two axes of a 4D array.
+        
+        Parameters:
+        -----------
+        data : ndarray, shape (N, M, H, W)
+            4D input array where H, W are the axes to transform
+        centers : ndarray, shape (N, M, 2)
+            Center of each diffraction pattern (usually determined by central beam)
+        num_r : int, optional
+            Number of radial bins. If None, uses max radius across all patterns
+        num_theta : int, optional
+            Number of angular bins (default: 360)
+        
+        Returns:
+        --------
+        polar_data : ndarray, shape (N, M, num_r, num_theta)
+            Polar-transformed array
+        """
+        N, M, H, W = data.shape
+        
+        # Calculate consistent max_radius across entire dataset
+        # This distance will be used to store and display data in terms of bins as well as natural units
+        # Distance from closest center to (0,0)
+        dist_to_origin = np.sqrt(centers[..., 0]**2 + centers[..., 1]**2).min()
+        # Distance from furthest center to bottom-right corner
+        dist_to_corner = np.sqrt((H-1 - centers[..., 0])**2 + (W-1 - centers[..., 1])**2).max()
+        max_radius = max(dist_to_origin, dist_to_corner)
+        # If no radial bins set, use this distance to be number of radial bins
+        if num_r is None:
+            num_r = int(np.ceil(max_radius))
+        
+        # Store value for reference later in use when displaying data or returning values
+        self.max_radius = max_radius
+        self.num_radial_bins = num_r
+        self.num_annular_bins = num_theta
+        # Pre-calculate radial array (same for all patterns now)
+        r = np.linspace(0, max_radius, num_r)
+        theta = np.linspace(0, 2*np.pi, num_theta, endpoint=False)
+        
+        polar_data = np.zeros((N, M, num_r, num_theta))
+        
+        # Transform each 2D slice
+        iterator = tqdm(range(N), disable=not use_tqdm, desc="Transforming data")
+        for i in iterator:
+            for j in range(M):
+                center_y, center_x = centers[i, j]
+                
+                # Create meshgrid
+                r_grid, theta_grid = np.meshgrid(r, theta, indexing='ij')
+                
+                # Convert polar to Cartesian coordinates
+                y_coords = center_y + r_grid * np.sin(theta_grid)
+                x_coords = center_x + r_grid * np.cos(theta_grid)
+                
+                # Use map_coordinates for interpolation
+                polar_data[i, j] = map_coordinates(
+                    data[i, j], 
+                    [y_coords, x_coords], 
+                    order=1,  # linear interpolation
+                    mode='constant',
+                    cval=0.0
+                )
+        
+        return polar_data
+
