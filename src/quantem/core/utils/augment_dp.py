@@ -47,6 +47,7 @@ ArrayLike = Union[np.ndarray, "torch.Tensor"]
 # add gaussian noise
 
 
+
 class DPAugmentor(RNGMixin):
     def __init__(
         self,
@@ -505,7 +506,6 @@ class DPAugmentor(RNGMixin):
             # if transformed_label is not None:
             #     transformed_label = self._apply_flipshift(transformed_label)
 
-        # sequence exchanged
         if self.add_ellipticity or self.add_shift or self.add_scale:
             result = self._apply_elastic(result)
             if label is not None:
@@ -514,8 +514,6 @@ class DPAugmentor(RNGMixin):
                     transformed_label = self._apply_elastic_to_multichannel_label(transformed_label)
                 else:
                     transformed_label = self._apply_elastic_to_label(transformed_label)
-            # if transformed_label is not None:
-            #     transformed_label = self._apply_elastic_to_label(transformed_label)
 
         if self.add_bkg:
             result = self._apply_bkg(result, probe)
@@ -827,7 +825,7 @@ class DPAugmentor(RNGMixin):
             return image
         else:
             image = np.array(inputs).copy()
-            noise = np.clip(np.random.normal(loc=mean, scale=std, size=inputs.shape), min=0)
+            noise = np.clip(np.random.normal(loc=mean, scale=std, size=inputs.shape), a_min=0, a_max=None)
             image += noise
             return image
 

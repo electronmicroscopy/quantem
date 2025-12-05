@@ -6,7 +6,6 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, label, sum as label_sum, center_of_mass
 from tqdm import tqdm
 import torch
-from train_classes import compute_parameters, normalize_data
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
@@ -30,6 +29,8 @@ class BraggPeaksPolymer(AutoSerialize):
     def __init__(
         self,
         dataset_cartesian: Dataset4dstem,
+        compute_parameters: callable = None,
+        normalize_data: callable = None,
         model: MultiChannelCNN2d = None,
         final_shape: Tuple[int, int] = (256, 256),
         device: str = 'cpu',
@@ -43,7 +44,9 @@ class BraggPeaksPolymer(AutoSerialize):
         self._dataset_cartesian = dataset_cartesian
         self._device = device
         self._final_shape = final_shape
-
+        # Setting functions for normalization
+        self.compute_parameters = compute_parameters
+        self.normalize_data = normalize_data
         # To be set by class methods
         self.resized_cartesian_data = None
         self.peak_coordinates_cartesian = None
@@ -235,8 +238,8 @@ class BraggPeaksPolymer(AutoSerialize):
 
         # Move to CPU and convert to numpy for compute_parameters
         # stats_patterns = torch.squeeze(stats_patterns).detach().cpu().numpy()
-        median, iqr = compute_parameters(stats_patterns)
-        
+        median, iqr = self.compute_parameters(stats_patterns)
+        normalized_dps_array = np.zeros((Ry, Rx, Qy, Qx))
         # Process row by row
         for i in tqdm(range(Ry), desc="rows"):
             # Get row data
@@ -246,7 +249,8 @@ class BraggPeaksPolymer(AutoSerialize):
             ).to(device).squeeze()  # Shape: (Rx, Qy, Qx)
             
             # Normalize using new function (works with tensors on GPU)
-            dps_norm = normalize_data(ins, median, iqr)
+            dps_norm = self.normalize_data(ins, median, iqr)
+            normalized_dps_array[i, :, :, :] = dps_norm.detach().cpu().numpy()
             ins = dps_norm[:, None, ...]  # Add channel dimension: (Rx, 1, Qy, Qx)
             
             # Pass through model
@@ -259,14 +263,16 @@ class BraggPeaksPolymer(AutoSerialize):
                     outs[r0, 1],
                     show=show_plots,
                 )
-                peaks.set_data(np.array(peak_coords), i, r0)
-                # peaks[i, r0] = np.array(peak_coords)
-                intensities.set_data(np.array(peak_intensities).reshape(-1, 1), i, r0)
-                # intensities[i, r0] = np.array(peak_intensities)
+                if len(peak_coords) > 0:
+                    peaks.set_data(np.array(peak_coords), i, r0)
+                    # peaks[i, r0] = np.array(peak_coords)
+                    intensities.set_data(np.array(peak_intensities).reshape(-1, 1), i, r0)
+                    # intensities[i, r0] = np.array(peak_intensities)
         
         print('done')
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
+        self.normalized_dps_array = normalized_dps_array
 
     def save_peaks(self, filepath):
         np.save(filepath, self.peak_coordinates_cartesian)
