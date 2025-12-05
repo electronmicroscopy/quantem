@@ -264,7 +264,6 @@ class DPAugmentor(RNGMixin):
         self.free_rotation = free_rotation
         self._rotation_range = self._check_input(rotation_range) if add_flipshift else [0, 0]
 
-        # modification: aperture, by HAADF detector
         self._radius_range = self._check_input(radius_factor) if add_aperture else [0, 0]
         self._aptshift_range = self._check_input(aperture_shift) if add_aperture else [0, 0]
 
@@ -483,6 +482,13 @@ class DPAugmentor(RNGMixin):
                 else:
                     transformed_label = self._apply_flipshift(label)
 
+        if self.add_bkg:
+            result = self._apply_bkg(result, probe)
+            if transformed_label is not None and self.apply_background_to_label and self.background_label_application is not None:
+                if len(self.background_label_application) > 0:
+                    if len(transformed_label.shape) == 3:
+                        transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
+        
         if self.add_ellipticity or self.add_shift or self.add_scale:
             result = self._apply_elastic(result)
             if transformed_label is not None:
@@ -492,14 +498,6 @@ class DPAugmentor(RNGMixin):
                 else:
                     transformed_label = self._apply_elastic_to_label(transformed_label)
 
-        if self.add_bkg:
-            result = self._apply_bkg(result, probe)
-            # Apply background to specified label channels BEFORE elastic transforms
-            if transformed_label is not None and self.apply_background_to_label and self.background_label_application is not None:
-                if len(self.background_label_application) > 0:
-                    if len(transformed_label.shape) == 3:
-                        transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
-        # modification: aperture
         if self.add_aperture: # currently input can only be Tensor
             result = self._apply_aperture(result)
         if self.add_shot:
