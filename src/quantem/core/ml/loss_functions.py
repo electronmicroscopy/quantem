@@ -109,9 +109,56 @@ class MSELogMSELoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         mse = (pred - target) ** 2
-        log_mse = mse * torch.log(pred + self.eps)
+        log_mse = -mse * torch.log(mse + self.eps)
         if self.reduction == 'mean':
             return log_mse.mean()
         elif self.reduction == 'sum':
             return log_mse.sum()
         return log_mse
+
+class LLMSELoss(nn.Module):
+    """
+    Logarithmic Linear Mean Squared Error (LLMSE) loss:
+        L = -log(1 - |y - y_hat| / max(|y - y_hat|))
+    """
+
+    def __init__(self, eps: float = 1e-8, reduction: str = 'mean'):
+        super().__init__()
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Absolute residual
+        abs_diff = torch.abs(pred - target)
+        
+        # Normalization by max error in batch (avoid div-by-zero)
+        max_diff = torch.max(abs_diff.detach()) + self.eps
+        norm_diff = abs_diff / max_diff
+
+        # Apply -log(1 - normalized_error)
+        loss = -torch.log(1.0 - norm_diff + self.eps)
+
+        # Reduce
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
+class CharbonnierLoss(nn.Module):
+    def __init__(self, epsilon=1e-12, reduction='mean'):
+        super(CharbonnierLoss, self).__init__()
+        self.epsilon = epsilon
+        self.reduction = reduction
+
+    def forward(self, prediction, target):
+        diff = prediction - target
+        loss = torch.sqrt(diff * diff + self.epsilon**2)
+
+        if self.reduction == 'mean':
+            return torch.mean(loss)
+        elif self.reduction == 'sum':
+            return torch.sum(loss)
+        else: # 'none'
+            return loss

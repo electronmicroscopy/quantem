@@ -1,3 +1,6 @@
+from typing import Any
+
+
 import torch
 
 # from torch_radon.radon import ParallelBeam as Radon
@@ -7,10 +10,11 @@ from quantem.tomography.object_models import ObjectVoxelwise
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_conv import TomographyConv
 from quantem.tomography.tomography_ml import TomographyML
-from quantem.tomography.tomography_ddp import PretrainVolumeDataset, TomographyDDP
+from quantem.tomography.tomography_ddp import PretrainVolumeDataset, TomographyDDP, AdaptiveSmoothL1LossDDP
 from quantem.tomography.utils import differentiable_shift_2d, gaussian_kernel_1d, rot_ZXZ
 
-from quantem.core.ml.loss_functions import L1Loss, MSELoss, MSELogMSELoss
+from quantem.core.ml.loss_functions import L1Loss, MSELoss, MSELogMSELoss, LLMSELoss, CharbonnierLoss
+from torch.nn import SmoothL1Loss
 # Temporary imports for TomographyNERF
 from quantem.tomography.models import HSiren
 from quantem.tomography.object_models import ObjectINN
@@ -21,35 +25,21 @@ import torch.distributed as dist
 
 # Temporary aux class for TomographyNERF
 # TODO: Maybe put this in INN?
-def get_num_samples_per_ray(epoch):
+def get_num_samples_per_ray(N: int, epoch: int):
     """Increase number of samples per ray at specific epochs."""
-    # schedule = {
-    #     0: 20,
-    #     2: 100,
-    #     4: 200,
-    #     6: 400,
-    #     # 8: 500,
-    #     10: 500,
-    # }
-    schedule = {
-        0: 20,
-        2: 100,
-        4: 150,
-        6: 250,
-        # 8: 500,
-        10: 300,
-    }
-    # schedule = {
-    #     0: 20,
-    #     2: 50,
-    #     4: 100,
-    #     6: 150,
-    #     8: 200,
-    #     10: 200,
-    # }
+    # Exponential schedule
 
-    num_samples = 64
-    for epoch_threshold, samples in sorted(schedule.items()):
+    epochs = np.linspace(0, 10, 5, dtype=int)
+    # schedule = np.linspace(20, N, 5, dtype=int)
+    # schedule = np.array([20, 100, 150, 200, 200])
+    # schedule = np.array([200, 200, 200, 200, 200])
+    schedule = np.array([20, 100, 250, 500, 500])
+    # schedule = np.array([500, 500, 500, 500, 500])
+    # schedule = np.array([300, 300, 300, 300, 300])
+    # schedule = np.exp(schedule)
+    schedule_warmup = dict[int, int](zip(epochs, schedule))
+
+    for epoch_threshold, samples in schedule_warmup.items():
         if epoch >= epoch_threshold:
             num_samples = samples
 
@@ -230,7 +220,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         optimizer_params: dict = None,
         epochs: int = 100,
         viz_freq: int = 1,
-        l1_loss: bool = False,
+        consistency_criterion: str = 'mse',
     ):
         if not self.pretraining_instantiated:
             self.setup_distributed()
@@ -250,6 +240,23 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
             self.optimizer_params = optimizer_params
             self.set_optimizers()
         device_type = self.device.type
+        consistency_loss_fn = None
+        if consistency_criterion[0].lower() == 'mse':
+            consistency_loss_fn = MSELoss()
+        elif consistency_criterion[0].lower() == 'l1':
+            consistency_loss_fn = L1Loss()
+        elif consistency_criterion[0].lower() == 'mse_log':
+            consistency_loss_fn = MSELogMSELoss()
+        elif consistency_criterion[0].lower() == 'llmse':
+            consistency_loss_fn = LLMSELoss()
+        elif consistency_criterion[0].lower() == 'smooth_l1':
+            consistency_loss_fn = SmoothL1Loss(beta = consistency_criterion[1])
+        elif consistency_criterion[0].lower() == 'adaptive_smooth_l1':
+            consistency_loss_fn = AdaptiveSmoothL1LossDDP(beta_init = consistency_criterion[1], ema_factor = 0.99, eps = 1e-8)
+        elif consistency_criterion[0].lower() == 'charbonnier':
+            consistency_loss_fn = CharbonnierLoss(epsilon = 1e-12, reduction = 'mean')
+        else:
+            raise ValueError(f"Invalid consistency criterion: {consistency_criterion}")
 
         for epoch in range(epochs):
             if self.pretraining_sampler is not None:
@@ -272,11 +279,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=True):
                     
                     outputs = self.obj.forward(coords)
-                    
-                    if l1_loss:
-                        consistency_loss = torch.nn.functional.l1_loss(outputs, target)
-                    else:
-                        consistency_loss = torch.nn.functional.mse_loss(outputs, target)
+                    consistency_loss = consistency_loss_fn(outputs, target)
                     tv_loss = self.obj.apply_soft_constraints(coords)
                     
                     loss = consistency_loss + tv_loss
@@ -330,7 +333,11 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
                     plt.close(fig)
                     print(f"Epoch [{epoch}/{epochs}] Pretrain Total Loss: {avg_loss:.6f}, Consistency Loss: {avg_consistency_loss:.6f}, TV Loss: {avg_tv_loss:.6f}")
+            self.global_epochs += 1
+        if self.global_rank == 0:
 
+            print(f"Pretraining Completed, saving model weights to {log_path}/model_weights.pth")
+            torch.save(self.obj.model.state_dict(), f"{log_path}/model_weights.pth")
 
     def recon(
         self,
@@ -350,11 +357,24 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         learn_shifts: bool = True,
         # l1_loss: bool = False,
         consistency_criterion: str = 'mse',
+        model_weights_path: str = None,
     ):      
 
         if not self.ddp_instantiated:
             if self.pretraining_instantiated == False:
                 self.setup_distributed()
+                if model_weights_path is not None:
+                    print(f"Loading model weights from {model_weights_path}")
+                    state_dict = torch.load(model_weights_path, map_location='cpu')
+
+                    # Handle DataParallel/DDP checkpoints
+                    if any(k.startswith('module.') for k in state_dict.keys()):
+                        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+                    else:
+                        new_state_dict = state_dict
+
+                    obj.model.load_state_dict(new_state_dict)
+                    print("Model weights loaded successfully")
                 obj.model = self.build_model(obj._model)
                 self.obj = obj
 
@@ -402,7 +422,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
         
         
         for epoch in range(epochs):
-            num_samples_per_ray = get_num_samples_per_ray(self.global_epochs)
+            num_samples_per_ray = get_num_samples_per_ray(N = N, epoch = self.global_epochs)
             
             # num_samples_per_ray = get_num_samples_per_ray(epoch)
             # Log the change if it happens
@@ -411,7 +431,7 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                 
             
             if self.global_rank == 0 and self.global_epochs > 0:
-                prev_samples = get_num_samples_per_ray(self.global_epochs - 1)
+                prev_samples = get_num_samples_per_ray(N = N, epoch = self.global_epochs - 1)
                 
                 if num_samples_per_ray != prev_samples:
                     print(f"Epoch {epoch}: Changing num_samples_per_ray from {prev_samples} to {num_samples_per_ray}")
@@ -428,12 +448,20 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
 
             num_batches = 0
             consistency_loss_fn = None
-            if consistency_criterion == 'mse':
+            if consistency_criterion[0].lower() == 'mse':
                 consistency_loss_fn = MSELoss()
-            elif consistency_criterion == 'l1':
+            elif consistency_criterion[0].lower() == 'l1':
                 consistency_loss_fn = L1Loss()
-            elif consistency_criterion == 'mse_log':
+            elif consistency_criterion[0].lower() == 'mse_log':
                 consistency_loss_fn = MSELogMSELoss()
+            elif consistency_criterion[0].lower() == 'llmse':
+                consistency_loss_fn = LLMSELoss()
+            elif consistency_criterion[0].lower() == 'smooth_l1':
+                consistency_loss_fn = SmoothL1Loss(beta = consistency_criterion[1])
+            elif consistency_criterion[0].lower() == 'adaptive_smooth_l1':
+                consistency_loss_fn = AdaptiveSmoothL1LossDDP(beta_init = consistency_criterion[1], ema_factor = 0.99, eps = 1e-8)
+            elif consistency_criterion[0].lower() == 'charbonnier':
+                consistency_loss_fn = CharbonnierLoss(epsilon = 1e-12, reduction = 'mean')
             else:
                 raise ValueError(f"Invalid consistency criterion: {consistency_criterion}")
 
@@ -537,9 +565,9 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     current_lr = self.schedulers["model"].get_last_lr()[0]
 
                     # Log metrics
-                    self.temp_logger.add_scalar(f"train/consistency_loss_{consistency_criterion}", avg_consistency_loss, self.global_epochs)
+                    self.temp_logger.add_scalar(f"train/consistency_loss_{consistency_criterion[0] if isinstance(consistency_criterion, tuple) else consistency_criterion}", avg_consistency_loss, self.global_epochs)
                     if hasattr(self, "val_dataloader") and self.val_dataloader is not None:
-                        self.temp_logger.add_scalar(f"val/consistency_loss_{consistency_criterion}", val_loss, self.global_epochs)
+                        self.temp_logger.add_scalar(f"val/consistency_loss_{consistency_criterion[0] if isinstance(consistency_criterion, tuple) else consistency_criterion}", val_loss, self.global_epochs)
                     self.temp_logger.add_scalar("train/z1_loss", avg_z1_loss, self.global_epochs)
                     # if tv_weight > 0:
                     self.temp_logger.add_scalar("train/tv_loss", avg_tv_loss, self.global_epochs)
@@ -548,7 +576,8 @@ class Tomography(TomographyConv, TomographyML, TomographyBase, TomographyDDP):
                     self.temp_logger.add_scalar("train/aux_grad_norm", aux_norm.item(), self.global_epochs)
                     self.temp_logger.add_scalar("train/lr", current_lr, self.global_epochs)
                     self.temp_logger.add_scalar("train/num_samples_per_ray", num_samples_per_ray, self.global_epochs)
-
+                    if consistency_criterion[0].lower() == 'adaptive_smooth_l1':
+                        self.temp_logger.add_scalar("train/beta_2", consistency_loss_fn.beta2.item(), self.global_epochs)
                     fig, axes = plt.subplots(1, 5, figsize=(36, 12))
                     axes[0].matshow(pred_full.sum(dim=0).cpu().numpy(), cmap='turbo', vmin=0)
                     axes[0].set_title('Sum over Z-axis')

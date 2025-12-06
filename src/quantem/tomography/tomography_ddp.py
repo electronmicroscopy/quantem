@@ -262,3 +262,60 @@ class TomographyDDP:
         return new_optimizer_params
             
     
+
+    # TODO: Temporary Adaptive L1 Smooth Loss
+
+class AdaptiveSmoothL1Loss(nn.Module):
+    def __init__(self, beta_init=None, ema_factor=0.99, eps=1e-8):
+        """
+        Adaptive smooth L1 loss with EMA-based beta adaptation.
+
+        Args:
+            beta_init (float): optional initial β value; if None, starts as 1.0
+            ema_factor (float): smoothing factor for EMA (1 - 1/N_b in Eq. 38)
+            eps (float): small constant for numerical stability
+        """
+        super().__init__()
+        self.register_buffer('beta2', torch.tensor(beta_init**2 if beta_init else 1.0))
+        self.ema_factor = ema_factor
+        self.eps = eps
+
+    def forward(self, pred, target):
+        diff = pred - target
+        abs_diff = diff.abs()
+
+        # compute current batch MSE (Eq. 38)
+        mse_batch = torch.mean(diff ** 2)
+
+        # update β² adaptively using Eq. (39)
+        with torch.no_grad():
+            self.beta2 = self.ema_factor * self.beta2 + (1 - self.ema_factor) * torch.min(self.beta2, mse_batch)
+
+        beta = torch.sqrt(self.beta2 + self.eps)
+
+        # Smooth L1 (Eq. 36)
+        loss = torch.where(
+            abs_diff < beta,
+            0.5 * (diff ** 2) / (beta + self.eps),
+            abs_diff - 0.5 * beta
+        )
+        return loss.mean()
+
+class AdaptiveSmoothL1LossDDP(AdaptiveSmoothL1Loss):
+    def forward(self, pred, target):
+        diff = pred - target
+        abs_diff = diff.abs()
+        mse_batch = torch.mean(diff ** 2)
+
+        # Synchronize β across all GPUs
+        if dist.is_initialized():
+            mse_batch_all = mse_batch.clone()
+            dist.all_reduce(mse_batch_all, op=dist.ReduceOp.AVG)
+            mse_batch = mse_batch_all / dist.get_world_size()
+
+        with torch.no_grad():
+            self.beta2 = self.ema_factor * self.beta2 + (1 - self.ema_factor) * torch.min(self.beta2, mse_batch)
+
+        beta = torch.sqrt(self.beta2 + self.eps)
+        loss = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / (beta + self.eps), abs_diff - 0.5 * beta)
+        return loss.mean()
