@@ -13,7 +13,7 @@ from quantem.core.ml.cnn2d import MultiChannelCNN2d
 from quantem.core.datastructures import Vector
 from quantem.core.utils.polar import polar_transform_vector, cartesian_transform_vector
 from quantem.diffraction.peak_detection import detect_blobs
-
+from quantem.diffraction.peak_detection import find_central_beam_from_peaks
 
 # TODO: Likely dataset4dSTEM rather than dataset4d input class
 # Bragg peaks from crystalline vs polymer
@@ -29,8 +29,8 @@ class BraggPeaksPolymer(AutoSerialize):
     def __init__(
         self,
         dataset_cartesian: Dataset4dstem,
-        compute_parameters: callable = None,
-        normalize_data: callable = None,
+        compute_parameters: callable,
+        normalize_data: callable,
         model: MultiChannelCNN2d = None,
         final_shape: Tuple[int, int] = (256, 256),
         device: str = 'cpu',
@@ -92,15 +92,29 @@ class BraggPeaksPolymer(AutoSerialize):
     def model(self, model):
         self._model = model
 
+    @property
+    def device(self) -> str:
+        return self._device
+
+    @device.setter
+    def device(self, device):
+        self._device = device
+    
     @classmethod
     def from_file(
         cls,
         file_path: str,
+        device: str,
+        compute_parameters: callable,
+        normalize_data: callable,
         file_type: str | None = None,
     ) -> "BraggPeaksPolymer":
         dataset_cartesian = Dataset4dstem.from_file(file_path, file_type=file_type)
         return cls.from_data(
-            dataset_cartesian,
+            dataset_cartesian=dataset_cartesian,
+            device=device,
+            compute_parameters=compute_parameters,
+            normalize_data=normalize_data,
         )
 
     @classmethod
@@ -108,17 +122,23 @@ class BraggPeaksPolymer(AutoSerialize):
         cls,
         dataset_cartesian: Dataset4dstem,
         device: str,
+        compute_parameters: callable,
+        normalize_data: callable,
     ) -> "BraggPeaksPolymer":
         return cls(
             dataset_cartesian=dataset_cartesian,
             _token=cls._token,
             device=device,
+            compute_parameters=compute_parameters,
+            normalize_data=normalize_data,
         )
     
     def preprocess(self):
-        self.resize_data()
+        print(self.device)
+        self.resize_data(device=self.device)
 
-    def resize_data(self, device:str = "cuda:1"):
+    def resize_data(self, device:str = "cuda:0"):
+        print(device)
         Ry, Rx, Qy, Qx = self._dataset_cartesian.shape
         scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
         resized_data = np.zeros((Ry, Rx, self._final_shape[0], self._final_shape[1]))
@@ -132,14 +152,13 @@ class BraggPeaksPolymer(AutoSerialize):
         self,
         # path_to_model: str = None,
         path_to_weights: str = None,
-        gpu_id: int = 1,
     ) -> "BraggPeaksPolymer":
         # if path_to_model is None:
             # path_to_model = ""
         if path_to_weights is None:
             path_to_weights = ""  # TODO: Load weights from cloud
-        self._model.load_state_dict(torch.load(path_to_weights, weights_only=True, map_location=f"cuda:{gpu_id}"))
-        self._model.to(gpu_id)
+        self._model.load_state_dict(torch.load(path_to_weights, weights_only=True, map_location=self.device))
+        self._model.to(self.device)
 
     def _postprocess_single(self, position_map, intensity_map, show=False):
         """Process a single 2D image"""
@@ -202,7 +221,7 @@ class BraggPeaksPolymer(AutoSerialize):
 
     def find_peaks_model(
         self, 
-        device: str = "cuda:1",
+        device: str = "cuda:0",
         n_normalize_samples: int = 1000,
         show_plots=False,
     ):
@@ -303,7 +322,7 @@ class BraggPeaksPolymer(AutoSerialize):
 
     def process_polar(self):
         """ Find center of image through brightest peak, return polar transform of data and peaks"""
-        self.image_centers = self.find_central_beams_4d(self.resized_cartesian_data)
+        self.image_centers = self.find_central_beams_4d()
         self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
         self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self.peak_coordinates_cartesian, centers=self.image_centers)
 
@@ -403,18 +422,12 @@ class BraggPeaksPolymer(AutoSerialize):
         
         return (float(refined_center_y), float(refined_center_x))
 
-    def find_central_beams_4d(self, data, min_size=9, brightness_threshold=0.5, use_tqdm=True):
+    def find_central_beams_4d(self, intensity_threshold=0.3, distance_weight=0.5, sampling_radius=2, debug=False, use_tqdm=True):
         """
         Fast central beam finding for entire 4D dataset.
         
         Parameters:
         -----------
-        data : ndarray, shape (scan_y, scan_x, det_y, det_x)
-            4D-STEM dataset
-        min_size : int
-            Minimum size (in pixels) for a spot to be considered the central beam
-        brightness_threshold : float
-            Fraction of max intensity to use for segmentation
         use_tqdm : bool
             Show progress bar
         
@@ -425,19 +438,23 @@ class BraggPeaksPolymer(AutoSerialize):
         """
         from tqdm import tqdm
         
-        scan_y, scan_x, det_y, det_x = data.shape
+        scan_y, scan_x, det_y, det_x = self.resized_cartesian_data.shape
         centers = np.zeros((scan_y, scan_x, 2))
         
         iterator = tqdm(range(scan_y), disable=not use_tqdm, desc="Finding centers")
         
         for i in iterator:
             for j in range(scan_x):
-                centers[i, j] = self.find_central_beam_with_size_check(
-                    data[i, j],
-                    min_size=min_size,
-                    brightness_threshold=brightness_threshold
+                centers[i, j] = find_central_beam_from_peaks(
+                    peak_coords=self.peak_coordinates_cartesian[i, j],
+                    peak_intensities=None,
+                    image_shape=self._final_shape,
+                    intensity_threshold=intensity_threshold,
+                    distance_weight=distance_weight,
+                    debug=debug,
+                    image=self.resized_cartesian_data[i, j].squeeze(),  # Provide actual DP
+                    sampling_radius=sampling_radius  # Sample n-pixel radius around each peak
                 )
-        
         return centers
 
     def polar_transform_peaks(self, cartesian_peaks, centers, use_tqdm: bool=True):
@@ -511,3 +528,136 @@ class BraggPeaksPolymer(AutoSerialize):
         
         return polar_data
 
+    def visualize_peak_detection(self, n_images=10, indices=None, images_per_row=5, figsize_per_image=(3.2, 3), vmax_polar=20, vmax_cartesian=1):
+        """
+        Visualize peak detection results for multiple diffraction patterns.
+        
+        Parameters:
+        -----------
+        self : BraggPeaksPolymer
+            BraggPeaksPolymer object with processed data
+        n_images : int
+            Number of images to display (ignored if indices is provided)
+        indices : list of tuples, optional
+            List of (ind_y, ind_x) coordinates to visualize. If None, random indices are selected.
+        images_per_row : int
+            Number of images per row (default: 5)
+        figsize_per_image : tuple
+            Size of each subplot (width, height)
+        vmax_polar : float
+            Maximum value for polar data colormap
+        vmax_cartesian : float
+            Maximum value for cartesian data colormap
+        
+        Returns:
+        --------
+        fig, axes : matplotlib figure and axes
+        """
+        
+        # Generate or validate indices
+        if indices is None:
+            Ry, Rx = self.resized_cartesian_data.shape[:2]
+            # Generate random indices
+            flat_indices = np.random.choice(Ry * Rx, size=min(n_images, Ry * Rx), replace=False)
+            indices = [(idx // Rx, idx % Rx) for idx in flat_indices]
+        else:
+            n_images = len(indices)
+        
+        # Calculate grid dimensions
+        n_rows = int(np.ceil(n_images / images_per_row))
+        n_cols = 5  # 5 types of visualizations per pattern
+        actual_cols = images_per_row * n_cols
+        
+        # Create figure
+        fig_width = figsize_per_image[0] * actual_cols
+        fig_height = figsize_per_image[1] * n_rows
+        fig, axes = plt.subplots(n_rows, actual_cols, figsize=(fig_width, fig_height))
+        
+        # Handle single row case
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        
+        # Column titles (only for first row)
+        col_titles = [
+            "Polar Transform",
+            "Polar + Peaks",
+            "Cartesian + Peaks",
+            "Cartesian Original",
+            "Cartesian Normalized"
+        ]
+        
+        # Process each image
+        for img_idx, (ind_y, ind_x) in enumerate(indices):
+            row = img_idx // images_per_row
+            col_offset = (img_idx % images_per_row) * n_cols
+            
+            # Check if peaks exist for this pattern
+            has_peaks = (self.peak_coordinates_cartesian[ind_y, ind_x] is not None and 
+                         len(self.peak_coordinates_cartesian[ind_y, ind_x]) > 0)
+            
+            # 1. Polar Transform
+            ax = axes[row, col_offset]
+            im = ax.matshow(self.polar_data[ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+            if row == 0:
+                ax.set_title(col_titles[0], fontsize=10, pad=10)
+            ax.text(0.05, 0.95, f'({ind_y},{ind_x})', transform=ax.transAxes, 
+                    fontsize=8, va='top', ha='left', color='white', 
+                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.5))
+            ax.set_axis_off()
+            
+            # 2. Polar Transform with Peaks
+            ax = axes[row, col_offset + 1]
+            ax.matshow(self.polar_data[ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+            if has_peaks and self.polar_peaks[ind_y, ind_x] is not None and len(self.polar_peaks[ind_y, ind_x]) > 0:
+                # Convert radial coordinates to bin indices
+                r_coords = self.polar_peaks[ind_y, ind_x][:, 0]
+                theta_coords = self.polar_peaks[ind_y, ind_x][:, 1]
+                
+                # Convert theta from radians to angular bins (0 to num_annular_bins)
+                theta_bins = theta_coords * (self.num_annular_bins / (2 * np.pi))
+                
+                ax.scatter(theta_bins, r_coords, c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
+            if row == 0:
+                ax.set_title(col_titles[1], fontsize=10, pad=10)
+            ax.set_axis_off()
+            
+            # 3. Cartesian with Peaks and Center
+            ax = axes[row, col_offset + 2]
+            ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            if has_peaks:
+                ax.scatter(self.peak_coordinates_cartesian[ind_y, ind_x][:, 1], 
+                          self.peak_coordinates_cartesian[ind_y, ind_x][:, 0], 
+                          c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
+            ax.scatter(self.image_centers[ind_y, ind_x][1], 
+                      self.image_centers[ind_y, ind_x][0], 
+                      c='red', s=500, marker='x', linewidths=2)
+            if row == 0:
+                ax.set_title(col_titles[2], fontsize=10, pad=10)
+            ax.set_axis_off()
+            
+            # 4. Original Cartesian
+            ax = axes[row, col_offset + 3]
+            im = ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            if row == 0:
+                ax.set_title(col_titles[3], fontsize=10, pad=10)
+            ax.set_axis_off()
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            
+            # 5. Normalized Cartesian
+            ax = axes[row, col_offset + 4]
+            im = ax.matshow(self.normalized_dps_array[ind_y, ind_x], cmap="gray")
+            if row == 0:
+                ax.set_title(col_titles[4], fontsize=10, pad=10)
+            ax.set_axis_off()
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        
+        # Hide unused subplots
+        total_plots = n_images
+        for idx in range(total_plots, n_rows * images_per_row):
+            row = idx // images_per_row
+            col_offset = (idx % images_per_row) * n_cols
+            for col in range(n_cols):
+                axes[row, col_offset + col].set_visible(False)
+        
+        fig.tight_layout()
+        return fig, axes

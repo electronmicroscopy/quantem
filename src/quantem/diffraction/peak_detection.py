@@ -477,4 +477,374 @@ def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=
 #             unmatched_ref.remove(best_match[1])
 
 #     return matches, unmatched_exp, unmatched_ref
+
+
+def get_peak_intensity_from_image(peak_coord, image, radius=2):
+    """
+    Get average intensity in a circular region around a peak.
     
+    Parameters:
+    -----------
+    peak_coord : tuple or array
+        Peak coordinate (y, x)
+    image : ndarray
+        Original diffraction pattern
+    radius : int
+        Radius in pixels for sampling region
+    
+    Returns:
+    --------
+    intensity : float
+        Average intensity in the circular region
+    """
+    y, x = peak_coord
+    h, w = image.shape
+    
+    # Create coordinate grids
+    y_grid, x_grid = np.ogrid[:h, :w]
+    
+    # Calculate distance from peak
+    distances = np.sqrt((y_grid - y)**2 + (x_grid - x)**2)
+    
+    # Create circular mask
+    mask = distances <= radius
+    
+    # Get average intensity in the circular region
+    if np.sum(mask) > 0:
+        intensity = np.mean(image[mask])
+    else:
+        # Fallback: just use the pixel value at the peak
+        intensity = image[int(np.clip(y, 0, h-1)), int(np.clip(x, 0, w-1))]
+    
+    return intensity
+
+
+def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape, 
+                                 intensity_threshold=0.5, distance_weight=0.3,
+                                 debug=False, image=None, sampling_radius=2):
+    """
+    Find central beam from detected peaks with debugging visualization.
+    
+    Parameters:
+    -----------
+    peak_coords : ndarray, shape (N, 2)
+        Peak coordinates (y, x)
+    peak_intensities : ndarray, shape (N,) or None
+        Peak intensities from model (ignored if image is provided)
+    image_shape : tuple
+        Shape of image (H, W)
+    intensity_threshold : float
+        Minimum intensity to consider (0-1)
+    distance_weight : float
+        Weight for distance vs intensity (0=only intensity, 1=only distance)
+    debug : bool
+        Show debug plots and print info
+    image : ndarray, optional
+        Original diffraction pattern for intensity sampling (if provided, uses this instead of peak_intensities)
+    sampling_radius : int
+        Radius in pixels for sampling intensity around each peak (only used if image is provided)
+    
+    Returns:
+    --------
+    center : tuple
+        (y, x) coordinates of central beam
+    """
+    if len(peak_coords) == 0:
+        if debug:
+            print("⚠️ No peaks detected! Using image center as fallback.")
+        return (image_shape[0] / 2, image_shape[1] / 2)
+    
+    # Image center
+    center_y, center_x = image_shape[0] / 2, image_shape[1] / 2
+    
+    # Determine which intensities to use
+    if image is not None:
+        # Sample intensities from actual diffraction pattern
+        sampled_intensities = np.array([
+            get_peak_intensity_from_image(coord, image, radius=sampling_radius)
+            for coord in peak_coords
+        ])
+        intensities_to_use = sampled_intensities
+        intensity_source = f"Sampled from DP (radius={sampling_radius}px)"
+    else:
+        # Use model-predicted intensities
+        intensities_to_use = peak_intensities
+        intensity_source = "Model predictions"
+    
+    # Normalize intensities to [0, 1]
+    max_intensity = np.max(intensities_to_use)
+    if max_intensity > 0:
+        intensities_norm = intensities_to_use / max_intensity
+    else:
+        intensities_norm = intensities_to_use
+    
+    if debug:
+        print(f"\n{'='*60}")
+        print(f"DEBUG: Central Beam Detection")
+        print(f"{'='*60}")
+        print(f"Number of peaks detected: {len(peak_coords)}")
+        print(f"Image shape: {image_shape}")
+        print(f"Image center: ({center_y:.1f}, {center_x:.1f})")
+        print(f"Intensity source: {intensity_source}")
+        print(f"Intensity threshold: {intensity_threshold}")
+        print(f"Distance weight: {distance_weight}")
+        print(f"\nAll peaks:")
+        for i, (coord, intensity, intensity_norm) in enumerate(zip(peak_coords, intensities_to_use, intensities_norm)):
+            print(f"  Peak {i}: coord=({coord[0]:.2f}, {coord[1]:.2f}), "
+                  f"intensity={intensity:.4f}, normalized={intensity_norm:.4f}")
+    
+    # Filter by intensity threshold
+    intensity_mask = intensities_norm > intensity_threshold
+    num_above_threshold = np.sum(intensity_mask)
+    
+    if debug:
+        print(f"\nPeaks above intensity threshold ({intensity_threshold}): {num_above_threshold}/{len(peak_coords)}")
+    
+    if num_above_threshold == 0:
+        if debug:
+            print("⚠️ No peaks above intensity threshold! Using all peaks.")
+        intensity_mask = np.ones(len(intensities_norm), dtype=bool)
+    
+    filtered_coords = peak_coords[intensity_mask]
+    filtered_intensities = intensities_to_use[intensity_mask]
+    filtered_intensities_norm = intensities_norm[intensity_mask]
+    
+    if debug:
+        print(f"\nFiltered peaks ({len(filtered_coords)}):")
+        for i, (coord, intensity, intensity_norm) in enumerate(zip(filtered_coords, filtered_intensities, filtered_intensities_norm)):
+            print(f"  Peak {i}: coord=({coord[0]:.2f}, {coord[1]:.2f}), "
+                  f"intensity={intensity:.4f}, normalized={intensity_norm:.4f}")
+    
+    # Calculate distance from image center
+    distances = np.sqrt(
+        (filtered_coords[:, 0] - center_y)**2 + 
+        (filtered_coords[:, 1] - center_x)**2
+    )
+    
+    if debug:
+        print(f"\nDistances from center:")
+        for i, dist in enumerate(distances):
+            print(f"  Peak {i}: {dist:.2f} pixels")
+    
+    # Normalize distances
+    if np.max(distances) > 0:
+        distances_norm = distances / np.max(distances)
+    else:
+        distances_norm = distances
+    
+    if debug:
+        print(f"\nNormalized values:")
+        print(f"  Distance range: [{np.min(distances_norm):.3f}, {np.max(distances_norm):.3f}]")
+        print(f"  Intensity range: [{np.min(filtered_intensities_norm):.3f}, {np.max(filtered_intensities_norm):.3f}]")
+    
+    # Score: high intensity, low distance wins
+    # Lower score is better
+    scores = (1 - filtered_intensities_norm) * (1 - distance_weight) + distances_norm * distance_weight
+    
+    if debug:
+        print(f"\nScores (lower is better):")
+        print(f"  Formula: (1 - intensity_norm) * {1-distance_weight:.2f} + distance_norm * {distance_weight:.2f}")
+        for i, score in enumerate(scores):
+            print(f"  Peak {i}: score={score:.4f} "
+                  f"[intensity_term={(1-filtered_intensities_norm[i])*(1-distance_weight):.4f}, "
+                  f"distance_term={distances_norm[i]*distance_weight:.4f}]")
+    
+    # Pick peak with best score
+    best_idx = np.argmin(scores)
+    central_beam_coords = filtered_coords[best_idx]
+    
+    # Map back to original peak index for reference
+    original_indices = np.where(intensity_mask)[0]
+    original_best_idx = original_indices[best_idx]
+    
+    if debug:
+        print(f"\n{'='*60}")
+        print(f"SELECTED CENTRAL BEAM:")
+        print(f"  Peak index (filtered): {best_idx}")
+        print(f"  Peak index (original): {original_best_idx}")
+        print(f"  Coordinates: ({central_beam_coords[0]:.2f}, {central_beam_coords[1]:.2f})")
+        print(f"  Intensity: {filtered_intensities[best_idx]:.4f}")
+        print(f"  Normalized intensity: {filtered_intensities_norm[best_idx]:.4f}")
+        print(f"  Distance from center: {distances[best_idx]:.2f} pixels")
+        print(f"  Score: {scores[best_idx]:.4f}")
+        print(f"{'='*60}\n")
+    
+    # Visualization
+    if debug and image is not None:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Circle
+        
+        fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+        
+        # Top-left: Diffraction pattern with sampling circles
+        ax = axes[0, 0]
+        ax.imshow(image, cmap='viridis')
+        ax.axhline(center_y, color='white', linestyle='--', alpha=0.5, linewidth=1, label='Image center')
+        ax.axvline(center_x, color='white', linestyle='--', alpha=0.5, linewidth=1)
+        
+        # Draw sampling circles for all peaks
+        for i, coord in enumerate(peak_coords):
+            circle = Circle((coord[1], coord[0]), sampling_radius, 
+                          fill=False, edgecolor='cyan', linewidth=1, alpha=0.5)
+            ax.add_patch(circle)
+            ax.text(coord[1] + sampling_radius + 2, coord[0], f'{i}', 
+                   color='cyan', fontsize=8, alpha=0.7)
+        
+        # Highlight filtered peaks
+        for i, coord in enumerate(filtered_coords):
+            circle = Circle((coord[1], coord[0]), sampling_radius, 
+                          fill=False, edgecolor='yellow', linewidth=2, alpha=0.8)
+            ax.add_patch(circle)
+        
+        # Highlight selected central beam
+        circle = Circle((central_beam_coords[1], central_beam_coords[0]), sampling_radius, 
+                       fill=False, edgecolor='red', linewidth=3)
+        ax.add_patch(circle)
+        ax.scatter(central_beam_coords[1], central_beam_coords[0], 
+                  s=500, c='red', marker='*', 
+                  edgecolors='yellow', linewidths=3, zorder=10, label='Selected central beam')
+        
+        ax.set_title(f'Diffraction Pattern with Sampling Circles (radius={sampling_radius}px)', 
+                    fontsize=12, fontweight='bold')
+        ax.set_xlabel('X (pixels)')
+        ax.set_ylabel('Y (pixels)')
+        ax.legend(loc='upper right', fontsize=9)
+        
+        # Top-right: Peaks colored by sampled intensity
+        ax = axes[0, 1]
+        ax.imshow(image, cmap='viridis', alpha=0.6)
+        
+        scatter = ax.scatter(filtered_coords[:, 1], filtered_coords[:, 0], 
+                           c=filtered_intensities, s=300, cmap='hot', marker='o',
+                           edgecolors='black', linewidths=2, label='Filtered peaks')
+        
+        ax.scatter(central_beam_coords[1], central_beam_coords[0], 
+                  s=500, c='red', marker='*', 
+                  edgecolors='yellow', linewidths=3, label='Selected central beam',
+                  zorder=10)
+        
+        plt.colorbar(scatter, ax=ax, label='Sampled Intensity')
+        ax.set_title('Peaks Colored by Sampled Intensity', fontsize=12, fontweight='bold')
+        ax.legend()
+        
+        # Bottom-left: Score visualization
+        ax = axes[1, 0]
+        ax.imshow(image, cmap='viridis', alpha=0.6)
+        
+        scatter = ax.scatter(filtered_coords[:, 1], filtered_coords[:, 0], 
+                           c=scores, s=300, cmap='RdYlGn_r', marker='o',
+                           edgecolors='black', linewidths=2, 
+                           vmin=0, vmax=1, label='Filtered peaks (by score)')
+        
+        ax.scatter(central_beam_coords[1], central_beam_coords[0], 
+                  s=500, c='red', marker='*', 
+                  edgecolors='yellow', linewidths=3, label='Selected central beam',
+                  zorder=10)
+        
+        # Add score labels
+        for i, (coord, score) in enumerate(zip(filtered_coords, scores)):
+            ax.annotate(f'{i}\n{score:.2f}', 
+                       xy=(coord[1], coord[0]), 
+                       xytext=(10, 10), textcoords='offset points',
+                       fontsize=8, color='white',
+                       bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7))
+        
+        plt.colorbar(scatter, ax=ax, label='Score (lower = better)')
+        ax.set_title('Peaks Colored by Score', fontsize=12, fontweight='bold')
+        ax.legend()
+        
+        # Bottom-right: Score breakdown
+        ax = axes[1, 1]
+        
+        x = np.arange(len(filtered_coords))
+        width = 0.35
+        
+        intensity_component = (1 - filtered_intensities_norm) * (1 - distance_weight)
+        distance_component = distances_norm * distance_weight
+        
+        bars1 = ax.bar(x - width/2, intensity_component, width, 
+                      label=f'Intensity term (weight={1-distance_weight:.2f})', 
+                      alpha=0.8, color='steelblue')
+        bars2 = ax.bar(x + width/2, distance_component, width, 
+                      label=f'Distance term (weight={distance_weight:.2f})', 
+                      alpha=0.8, color='coral')
+        
+        # Highlight selected peak
+        bars1[best_idx].set_color('darkblue')
+        bars1[best_idx].set_edgecolor('yellow')
+        bars1[best_idx].set_linewidth(3)
+        bars2[best_idx].set_color('darkred')
+        bars2[best_idx].set_edgecolor('yellow')
+        bars2[best_idx].set_linewidth(3)
+        
+        ax.set_xlabel('Peak Index (filtered)', fontsize=12)
+        ax.set_ylabel('Score Component', fontsize=12)
+        ax.set_title('Score Breakdown by Component', fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        ax.legend(fontsize=10)
+        ax.grid(axis='y', alpha=0.3)
+        
+        # Add total score line
+        ax.plot(x, scores, 'ko-', linewidth=2, markersize=8, 
+               label='Total score', zorder=5)
+        ax.scatter([best_idx], [scores[best_idx]], s=300, c='red', 
+                  marker='*', edgecolors='yellow', linewidths=2, 
+                  zorder=10, label='Selected')
+        ax.legend(fontsize=9)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Additional info table
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+        
+        peak_info = []
+        for i in range(len(filtered_coords)):
+            peak_info.append({
+                'Peak': i,
+                'Y': f"{filtered_coords[i, 0]:.1f}",
+                'X': f"{filtered_coords[i, 1]:.1f}",
+                'Intensity': f"{filtered_intensities[i]:.4f}",
+                'Norm Int': f"{filtered_intensities_norm[i]:.3f}",
+                'Distance': f"{distances[i]:.1f}",
+                'Score': f"{scores[i]:.4f}",
+                'Selected': '★' if i == best_idx else ''
+            })
+        
+        # Create table
+        table_data = [[info[key] for key in ['Peak', 'Y', 'X', 'Intensity', 'Norm Int', 'Distance', 'Score', 'Selected']] 
+                     for info in peak_info]
+        
+        table = ax.table(cellText=table_data,
+                        colLabels=['Peak', 'Y', 'X', 'Intensity', 'Norm Int', 'Distance', 'Score', ''],
+                        cellLoc='center',
+                        loc='center',
+                        bbox=[0, 0, 1, 1])
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 2)
+        
+        # Color header
+        for j in range(8):
+            table[(0, j)].set_facecolor('#4472C4')
+            table[(0, j)].set_text_props(weight='bold', color='white')
+        
+        # Highlight selected row
+        for i in range(len(peak_info)):
+            if i == best_idx:
+                for j in range(8):
+                    table[(i+1, j)].set_facecolor('#ffff99')
+                    table[(i+1, j)].set_text_props(weight='bold')
+        
+        ax.axis('off')
+        title_text = f'Peak Summary ({intensity_source})\n'
+        title_text += f'distance_weight={distance_weight}, intensity_threshold={intensity_threshold}'
+        if image is not None:
+            title_text += f', sampling_radius={sampling_radius}px'
+        ax.set_title(title_text, fontsize=12, fontweight='bold', pad=20)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    return (float(central_beam_coords[0]), float(central_beam_coords[1]))
