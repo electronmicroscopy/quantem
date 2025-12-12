@@ -7,6 +7,7 @@ import numpy as np
 import scipy.ndimage as ndi
 from matplotlib.patches import Circle, Ellipse
 from scipy.optimize import least_squares
+from scipy.ndimage import uniform_filter
 from tqdm.auto import tqdm
 
 from quantem.core import config
@@ -458,6 +459,94 @@ def fit_probe_ellipse(
         plt.show()
 
     return yc, xc, a_axis, b_axis, theta
+
+
+def parse_reciprocal_units(unit_string: str) -> tuple[str, float]:
+    """
+    Parse reciprocal space unit strings and return normalized unit and conversion factor to 1/Å.
+    
+    Args:
+        unit_string (str): Unit string like '1/nm', 'nm^-1', '1/A', 'A^-1', etc.
+    
+    Returns:
+        normalized_unit (str): Either '1/nm' or '1/A'
+        conversion_factor (float): Multiplication factor to convert to 1/Å
+    
+    Examples:
+        >>> parse_reciprocal_units('1/nm')
+        ('1/nm', 10.0)
+        >>> parse_reciprocal_units('nm^-1')
+        ('1/nm', 10.0)
+        >>> parse_reciprocal_units('1/A')
+        ('1/A', 1.0)
+    """
+    # Normalize the string: remove spaces, convert to lowercase
+    s = unit_string.replace(' ', '').lower()
+    
+    # Check for nanometer variants
+    nm_patterns = [
+        '1/nm', 'nm^-1', 'nm-1', 'inv_nm', 'invm',
+        'per_nm', 'pernm', '/nm'
+    ]
+    
+    # Check for angstrom variants (including unicode and common substitutes)
+    angstrom_patterns = [
+        '1/a', 'a^-1', 'a-1', 'inv_a', 'inva',
+        'per_a', 'pera', '/a',
+        '1/å', 'å^-1', 'å-1', 'inv_å', 'invå',
+        '1/ang', 'ang^-1', 'ang-1', 'inv_ang',
+        '1/angstrom', 'angstrom^-1', 'angstrom-1'
+    ]
+    
+    if any(pattern in s for pattern in nm_patterns):
+        return '1/nm', 10.0
+    elif any(pattern in s for pattern in angstrom_patterns):
+        return '1/A', 1.0
+    else:
+        # Default to assuming it's already in 1/Å and warn
+        import warnings
+        warnings.warn(
+            f"Unrecognized unit '{unit_string}'. Assuming 1/Å (no conversion).",
+            UserWarning
+        )
+        return 'unknown', 1.0
+
+
+def sample_average_from_image(image, coordinates, radius_dim1=2, radius_dim2=2):
+    """
+    Get the average intensity in a region around each coordinate in a polar image.
+    
+    Parameters:
+    - image: 2D numpy array
+    - coordinates: Nx2 array of (dim1, dim2) coordinates
+    - radius_dim1: radius of the region in the dim1 direction (in pixels)
+    - radius_dim2: radius of the region in the dim2 direction (in pixels)
+    
+    Returns:
+    - average_intensities: array of average intensities for each coordinate
+    """
+    height, width = image.shape
+    
+    # Pad the image in both dimensions
+    padded_image = np.pad(image, ((radius_dim1, radius_dim1), (0, 0)), mode='constant')
+    padded_image = np.pad(padded_image, ((0, 0), (radius_dim2, radius_dim2)), mode='wrap')
+    
+    # Use uniform filter to get the average of intensities in the neighborhood
+    average_map = uniform_filter(
+        padded_image, 
+        size=(2*radius_dim1+1, 2*radius_dim2+1), 
+        mode='constant', 
+        cval=0
+    )
+    
+    # Adjust coordinates for padded image
+    dim1_coords = np.clip(coordinates[:, 0].astype(int) + radius_dim1, 0, height + 2*radius_dim1 - 1)
+    dim2_coords = (coordinates[:, 1].astype(int) + radius_dim2) % width + radius_dim2
+    
+    # Get the average intensities at the coordinates
+    average = average_map[dim1_coords, dim2_coords]
+    
+    return average
 
 
 class RNGMixin:

@@ -4,6 +4,8 @@ import numpy as np
 from typing import List, Tuple
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter, maximum_filter, grey_dilation, map_coordinates
+from quantem.core.datastructures import Vector
+
 
 class DoGBlobDetector:
     def __init__(self, min_sigma: float = 1.0, max_sigma: float = 50.0, 
@@ -521,14 +523,16 @@ def get_peak_intensity_from_image(peak_coord, image, radius=2):
 
 def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape, 
                                  intensity_threshold=0.5, distance_weight=0.3,
-                                 debug=False, image=None, sampling_radius=2):
+                                 debug=False, image=None, sampling_radius=2, 
+                                 vector_x_field=['x_pixels', 'x'], 
+                                 vector_y_field=['y_pixels', 'y']):
     """
     Find central beam from detected peaks with debugging visualization.
     
     Parameters:
     -----------
-    peak_coords : ndarray, shape (N, 2)
-        Peak coordinates (y, x)
+    peak_coords : ndarray, shape (N, 2) or (N, 4), or Vector
+        Peak coordinates (y, x) or Vector with coordinate fields
     peak_intensities : ndarray, shape (N,) or None
         Peak intensities from model (ignored if image is provided)
     image_shape : tuple
@@ -540,20 +544,70 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
     debug : bool
         Show debug plots and print info
     image : ndarray, optional
-        Original diffraction pattern for intensity sampling (if provided, uses this instead of peak_intensities)
+        Original diffraction pattern for intensity sampling
     sampling_radius : int
-        Radius in pixels for sampling intensity around each peak (only used if image is provided)
+        Radius in pixels for sampling intensity around each peak
+    vector_x_field : str or list of str
+        Field name(s) for x-coordinates. Default: ['x_pixels', 'x']
+    vector_y_field : str or list of str
+        Field name(s) for y-coordinates. Default: ['y_pixels', 'y']
     
     Returns:
     --------
     center : tuple
         (y, x) coordinates of central beam
     """
+    # Helper function to find first matching field
+    def find_field(field_options, available_fields):
+        fields = [field_options] if isinstance(field_options, str) else field_options
+        return next((f for f in fields if f in available_fields), None)
+    
+    # Handle Vector input
+    if isinstance(peak_coords, Vector):
+        if debug:
+            print(f"Vector fields: {peak_coords.fields}")
+        
+        x_field = find_field(vector_x_field, peak_coords.fields)
+        y_field = find_field(vector_y_field, peak_coords.fields)
+        
+        if not (x_field and y_field):
+            raise ValueError(
+                f"Missing fields in Vector. Available: {peak_coords.fields}\n"
+                f"Looking for x in {[vector_x_field] if isinstance(vector_x_field, str) else vector_x_field}, "
+                f"y in {[vector_y_field] if isinstance(vector_y_field, str) else vector_y_field}"
+            )
+        
+        if debug:
+            print(f"Using x='{x_field}', y='{y_field}'")
+        
+        if len(peak_coords.data) > 0:
+            y_idx = peak_coords.fields.index(y_field)
+            x_idx = peak_coords.fields.index(x_field)
+            peak_coords = np.column_stack([peak_coords.data[:, y_idx],
+                                           peak_coords.data[:, x_idx]])
+        else:
+            peak_coords = np.empty((0, 2))
+    # Handle ndarray input
+    elif isinstance(peak_coords, np.ndarray):
+        if peak_coords.ndim == 2 and peak_coords.shape[1] == 4:
+            if debug:
+                print("ndarray with 4 columns, using first 2 (y, x)")
+            peak_coords = peak_coords[:, :2]
+        elif peak_coords.ndim == 2 and peak_coords.shape[1] == 2:
+            pass  # Already correct
+        elif peak_coords.ndim == 1 and len(peak_coords) == 0:
+            peak_coords = np.empty((0, 2))
+        else:
+            raise ValueError(f"Array must be (N, 2) or (N, 4), got {peak_coords.shape}")
+    else:
+        raise TypeError(f"peak_coords must be Vector or ndarray, got {type(peak_coords)}")
+        
+    # Check for empty peaks
     if len(peak_coords) == 0:
         if debug:
-            print("⚠️ No peaks detected! Using image center as fallback.")
+            print("⚠️ No peaks! Using image center.")
         return (image_shape[0] / 2, image_shape[1] / 2)
-    
+
     # Image center
     center_y, center_x = image_shape[0] / 2, image_shape[1] / 2
     
