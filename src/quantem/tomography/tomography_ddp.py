@@ -1,31 +1,36 @@
-import torch.distributed as dist
-import torch
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
-import torch.nn as nn
 import os
-import numpy as np
-from quantem.tomography.tomography_dataset import TomographyDataset, TomographyRayDataset, PretrainVolumeDataset
 
-from torch.utils.data import random_split
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.utils.data import DataLoader, DistributedSampler
+
+from quantem.tomography.tomography_dataset import (
+    PretrainVolumeDataset,
+    TomographyDataset,
+    TomographyRayDataset,
+)
+
 
 class TomographyDDP:
     """
     Initializing DDP stuff for tomo class.
     """
+
     def __init__(
         self,
     ):
-        
         self.setup_distributed()
-        
-    
+
     def setup_distributed(self):
-        
         # Check if in distributed env
         if "RANK" in os.environ:
             # Distributed training
             if not dist.is_initialized():
-                dist.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo', init_method='env://') 
+                dist.init_process_group(
+                    backend="nccl" if torch.cuda.is_available() else "gloo", init_method="env://"
+                )
 
             self.world_size = dist.get_world_size()
             self.global_rank = dist.get_rank()
@@ -33,7 +38,7 @@ class TomographyDDP:
 
             torch.cuda.set_device(self.local_rank)
             self.device = torch.device("cuda", self.local_rank)
-            
+
         else:
             # Single GPU/CPU training
             self.world_size = 1
@@ -41,49 +46,47 @@ class TomographyDDP:
             self.local_rank = 0
 
             if torch.cuda.is_available():
-                self.device = torch.device("cuda:0")
+                self.device = torch.device("cuda")
                 torch.cuda.set_device(0)
                 print("Single GPU training")
             else:
                 self.device = torch.device("cpu")
                 print("CPU training")
-        
+
         # Optional performance optimizations (only for CUDA)
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            
+
     def build_model(
         self,
         model: nn.Module,
     ):
-        
         # TODO: Generalized model --> Should be instantiated in the object? Where does `HSIREN` get instantiated?
         model = model.to(self.device)
-        
+
         if self.world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
-                device_ids = [self.local_rank],
-                output_device = self.local_rank,
-                find_unused_parameters = False,
-                broadcast_buffers = True,
-                bucket_cap_mb = 100,
-                gradient_as_bucket_view = True,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=False,
+                broadcast_buffers=True,
+                bucket_cap_mb=100,
+                gradient_as_bucket_view=True,
             )
-            
+
             if self.global_rank == 0:
                 print("Model wrapped with DDP")
-                
+
         if self.world_size > 1:
-            
             if self.global_rank == 0:
                 print("Model built, distributed, and compiled successfully")
-                
+
         else:
             print("Model built, compiled successfully")
-            
+
         return model
 
     # Setup Tomo DataLoader
@@ -103,17 +106,17 @@ class TomographyDDP:
             train_dataset = TomographyRayDataset(
                 tomo_dataset.tilt_series.detach().clone(),
                 tomo_dataset.tilt_angles.detach().clone(),
-                500, # TODO: TEMPORARY
+                500,  # TODO: TEMPORARY
                 val_ratio=val_fraction,
-                mode='train',
+                mode="train",
                 seed=42,
             )
             val_dataset = TomographyRayDataset(
                 tomo_dataset.tilt_series.detach().clone(),
                 tomo_dataset.tilt_angles.detach().clone(),
-                500, # TODO: TEMPORARY
+                500,  # TODO: TEMPORARY
                 val_ratio=val_fraction,
-                mode='val',
+                mode="val",
                 seed=42,
             )
         else:
@@ -166,12 +169,10 @@ class TomographyDDP:
             )
             self.val_sampler = val_sampler
 
-
         self.sampler = train_sampler
 
-        
         if self.global_rank == 0:
-            print(f"Dataloader setup complete:")
+            print("Dataloader setup complete:")
             print(f"  Total projections: {len(tomo_dataset.tilt_angles)}")
             if val_fraction > 0.0:
                 print(f"  Total projections (val): {len(val_dataset)}")
@@ -181,9 +182,8 @@ class TomographyDDP:
                 print(f"  Total pixels (val): {len(val_dataset):,}")
                 print(f"  Total pixels (train): {len(train_dataset):,}")
             print(f"  Local batch size (train): {batch_size}")
-            print(f"  Global batch size: {batch_size*self.world_size}")
+            print(f"  Global batch size: {batch_size * self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(self.dataloader)}")
-
 
     # Setup pretraining dataloader
 
@@ -192,16 +192,16 @@ class TomographyDDP:
         volume_dataset: PretrainVolumeDataset,
         batch_size: int,
     ):
-        #TODO: temp
+        # TODO: temp
 
         num_workers = 0
         if self.world_size > 1:
             sampler = DistributedSampler(
                 volume_dataset,
-                num_replicas = self.world_size,
-                rank = self.global_rank,
-                shuffle = True,
-                drop_last = True,
+                num_replicas=self.world_size,
+                rank=self.global_rank,
+                shuffle=True,
+                drop_last=True,
             )
             shuffle = False
         else:
@@ -210,26 +210,24 @@ class TomographyDDP:
 
         self.pretraining_dataloader = DataLoader(
             volume_dataset,
-            batch_size = batch_size,
-            sampler = sampler,
-            shuffle = shuffle,
-            pin_memory = self.device.type == "cuda",
-            drop_last = True,
-            persistent_workers = num_workers > 0,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=shuffle,
+            pin_memory=self.device.type == "cuda",
+            drop_last=True,
+            persistent_workers=num_workers > 0,
         )
 
         self.pretraining_sampler = sampler
 
         if self.global_rank == 0:
-            print(f"Pretraining dataloader setup complete:")
+            print("Pretraining dataloader setup complete:")
             print(f"  Total samples: {len(volume_dataset)}")
             print(f"  Grid size: {volume_dataset.N**3}")
             print(f"  Local batch size: {batch_size}")
-            print(f"  Global batch size: {batch_size*self.world_size}")
+            print(f"  Global batch size: {batch_size * self.world_size}")
             print(f"  Pretraining batches per GPU per epoch: {len(self.pretraining_dataloader)}")
 
-            
-            
     def get_scaled_lr(self, base_lr, scaling_rule="sqrt"):
         if scaling_rule == "sqrt":
             return base_lr * np.sqrt(self.world_size)
@@ -237,15 +235,13 @@ class TomographyDDP:
             return base_lr * self.world_size
         else:
             raise ValueError(f"Invalid scaling rule: {scaling_rule}")
-        
+
     def scale_lr(
         self,
         optimizer_params: dict,
     ):
-        
         new_optimizer_params = {}
         for key, value in optimizer_params.items():
-        
             if "original_lr" in value:
                 new_optimizer_params[key] = {
                     "type": value["type"],
@@ -258,12 +254,11 @@ class TomographyDDP:
                     "lr": self.get_scaled_lr(value["lr"]),
                     "original_lr": value["lr"],
                 }
-            
+
         return new_optimizer_params
-            
-    
 
     # TODO: Temporary Adaptive L1 Smooth Loss
+
 
 class AdaptiveSmoothL1Loss(nn.Module):
     def __init__(self, beta_init=None, ema_factor=0.99, eps=1e-8):
@@ -276,7 +271,7 @@ class AdaptiveSmoothL1Loss(nn.Module):
             eps (float): small constant for numerical stability
         """
         super().__init__()
-        self.register_buffer('beta2', torch.tensor(beta_init**2 if beta_init else 1.0))
+        self.register_buffer("beta2", torch.tensor(beta_init**2 if beta_init else 1.0))
         self.ema_factor = ema_factor
         self.eps = eps
 
@@ -285,27 +280,28 @@ class AdaptiveSmoothL1Loss(nn.Module):
         abs_diff = diff.abs()
 
         # compute current batch MSE (Eq. 38)
-        mse_batch = torch.mean(diff ** 2)
+        mse_batch = torch.mean(diff**2)
 
         # update β² adaptively using Eq. (39)
         with torch.no_grad():
-            self.beta2 = self.ema_factor * self.beta2 + (1 - self.ema_factor) * torch.min(self.beta2, mse_batch)
+            self.beta2 = self.ema_factor * self.beta2 + (1 - self.ema_factor) * torch.min(
+                self.beta2, mse_batch
+            )
 
         beta = torch.sqrt(self.beta2 + self.eps)
 
         # Smooth L1 (Eq. 36)
         loss = torch.where(
-            abs_diff < beta,
-            0.5 * (diff ** 2) / (beta + self.eps),
-            abs_diff - 0.5 * beta
+            abs_diff < beta, 0.5 * (diff**2) / (beta + self.eps), abs_diff - 0.5 * beta
         )
         return loss.mean()
+
 
 class AdaptiveSmoothL1LossDDP(AdaptiveSmoothL1Loss):
     def forward(self, pred, target):
         diff = pred - target
         abs_diff = diff.abs()
-        mse_batch = torch.mean(diff ** 2)
+        mse_batch = torch.mean(diff**2)
 
         # Synchronize β across all GPUs
         if dist.is_initialized():
@@ -314,8 +310,12 @@ class AdaptiveSmoothL1LossDDP(AdaptiveSmoothL1Loss):
             mse_batch = mse_batch_all / dist.get_world_size()
 
         with torch.no_grad():
-            self.beta2 = self.ema_factor * self.beta2 + (1 - self.ema_factor) * torch.min(self.beta2, mse_batch)
+            self.beta2 = self.ema_factor * self.beta2 + (1 - self.ema_factor) * torch.min(
+                self.beta2, mse_batch
+            )
 
         beta = torch.sqrt(self.beta2 + self.eps)
-        loss = torch.where(abs_diff < beta, 0.5 * (diff ** 2) / (beta + self.eps), abs_diff - 0.5 * beta)
+        loss = torch.where(
+            abs_diff < beta, 0.5 * (diff**2) / (beta + self.eps), abs_diff - 0.5 * beta
+        )
         return loss.mean()
