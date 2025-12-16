@@ -1,2 +1,1 @@
 from quantem.diffraction.bragg_peaks import BraggPeaksPolymer as BraggPeaksPolymer
-from quantem.diffraction.peak_detection import DoGBlobDetector

@@ -7,6 +7,7 @@ from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, labe
 from tqdm import tqdm
 import torch
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.cnn2d import MultiChannelCNN2d
@@ -17,6 +18,8 @@ from quantem.diffraction.polymer_analytical_functions import add_to_histogram_bi
 from quantem.core.utils.utils import parse_reciprocal_units, sample_average_from_image
 from emdfile import tqdmnd
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks, peak_widths
+from ipywidgets import interact, IntSlider
 
 # TODO: Likely dataset4dSTEM rather than dataset4d input class
 # Bragg peaks from crystalline vs polymer
@@ -165,7 +168,7 @@ class BraggPeaksPolymer(AutoSerialize):
     
     def preprocess(self):
         print(self.device)
-        self.resize_data(device=self.device)
+        # self.resize_data(device=self.device)
 
     def resize_data(self, device:str = "cuda:0"):
         print(device)
@@ -178,8 +181,14 @@ class BraggPeaksPolymer(AutoSerialize):
             resized_data[i, :, :, :] = inp.squeeze().detach().cpu().numpy()
         self.resized_cartesian_data = resized_data
 
-    def resize_images(self, images, device: str = "cuda:0", initial_chunk_size: int = 100):
-        print(device)
+    def resize_images(self, images, device: str = "cuda:0", initial_chunk_size: int = 100, show_progress=False):
+        # Handle Dataset objects - extract array
+        if hasattr(images, 'array'):
+            images = images.array
+        elif isinstance(images, Dataset3d):
+            # If it's a Dataset3d, get the underlying array
+            images = np.array([images[i].array for i in range(images.shape[0])])
+        
         N, Qy, Qx = images.shape
         scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
         resized_data = np.zeros((N, self._final_shape[0], self._final_shape[1]))
@@ -187,7 +196,7 @@ class BraggPeaksPolymer(AutoSerialize):
         chunk_size = initial_chunk_size
         i = 0
         
-        with tqdm(total=N, desc='images') as pbar:
+        with tqdm(total=N, desc='images', disable=not show_progress) as pbar:
             while i < N:
                 try:
                     # Determine the end index for this chunk
@@ -307,9 +316,11 @@ class BraggPeaksPolymer(AutoSerialize):
         self, 
         device: str = "cuda:0",
         n_normalize_samples: int = 1000,
+        initial_chunk_size: int = 100,
         show_plots=False,
     ):
         Ry, Rx, Qy, Qx = self.dataset_cartesian.shape
+        total_positions = Ry * Rx
         peaks = Vector.from_shape(
             shape=(Ry, Rx),
             fields=["y_pixels", "x_pixels", "y_invA", "x_invA"],
@@ -325,69 +336,143 @@ class BraggPeaksPolymer(AutoSerialize):
         )
         # intensities = np.empty((Ry, Rx), dtype='object')
         
-        # Normalize - compute parameters from sample
-        scan_shape = (Ry, Rx)
-        n_positions = scan_shape[0] * scan_shape[1]
-        n_normalize_samples = min(n_normalize_samples, n_positions)
+        # ============================================
+        # 1. Compute normalization parameters
+        # ============================================
+        n_normalize_samples = min(n_normalize_samples, total_positions)  # Can't have more samples than exist in dataset
+        flat_indices = np.random.permutation(total_positions)[:n_normalize_samples]
+
+        # Convert flat indices to 2D
+        scan_y_indices = flat_indices // Rx
+        scan_x_indices = flat_indices % Rx
         
         # Get stats patterns and move to CPU for parameter computation
         # Sample indices (use numpy instead of torch for this)
-        flat_indices = np.random.permutation(n_positions)[:n_normalize_samples]
-        scan_y_indices = flat_indices // scan_shape[1]
-        scan_x_indices = flat_indices % scan_shape[1]
-
-        # Get stats patterns directly as numpy (never touches GPU)
-        stats_patterns = self.resize_images[scan_y_indices, scan_x_indices]
+        stats_patterns = np.array([
+            self.dataset_cartesian[i, j].array 
+            for i, j in zip(scan_y_indices, scan_x_indices)
+        ])
         # stats_patterns = self.resized_cartesian_data[scan_y_indices, scan_x_indices]
-
-        # Move to CPU and convert to numpy for compute_parameters
         # stats_patterns = torch.squeeze(stats_patterns).detach().cpu().numpy()
-        median, iqr = self.compute_parameters(stats_patterns)
+        # Move to CPU and convert to numpy for compute_parameters
+        stats_patterns_resized = self.resize_images(stats_patterns, device=device)
+        median, iqr = self.compute_parameters(stats_patterns_resized)
         # normalized_dps_array = np.zeros((Ry, Rx, Qy, Qx))
-        # Process row by row
-        for i in tqdm(range(Ry), desc="rows"):
-            # Get row data
-            ins = torch.tensor(
-                self.resize_images(self.dataset_cartesian[i]), 
-                dtype=torch.float32
-            ).to(device).squeeze()  # Shape: (Rx, Qy, Qx)
-            
-            # Normalize using new function (works with tensors on GPU)
-            dps_norm = self.normalize_data(ins, median, iqr)
-            # normalized_dps_array[i, :, :, :] = dps_norm.detach().cpu().numpy()
-            ins = dps_norm[:, None, ...]  # Add channel dimension: (Rx, 1, Qy, Qx)
-            
-            # Pass through model
-            outs = self.model(ins).detach().cpu().numpy()
-            
-            # Post-process each pattern in the row
-            for r0 in range(outs.shape[0]):
-                peak_coords, peak_intensities = self._postprocess_single(
-                    outs[r0, 0], 
-                    outs[r0, 1],
-                    show=show_plots,
-                )
-                if len(peak_coords) > 0:
-                    # Get sampled intensities from DP
-                    peak_intensity_averages = sample_average_from_image(ins[r0].squeeze().detach().cpu().numpy(), peak_coords)
-                    peak_intensities_data = np.column_stack([
-                        peak_intensities,
-                        peak_intensity_averages,
-                    ])
-                    # Convert peak coordinates back to original coordinate system
-                    peak_coods *= self.dataset_cartesian.shape[2] / self.final_shape
-                    # Convert to inv A to add to Vector fields
-                    peak_data = np.column_stack([
-                        peak_coords,  # y_pixels, x_pixels
-                        peak_coords * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])  # y_invA, x_invA
-                    ])
-                    peaks.set_data(peak_data, i, r0)
-                    # peaks.set_data(np.array(peak_coords), i, r0)
-                    # peaks[i, r0] = np.array(peak_coords)
-                    intensities.set_data(peak_intensities_data, i, r0)
-                    # intensities[i, r0] = np.array(peak_intensities)
+
+        # ============================================
+        # 2. Process entire dataset with 2D chunking
+        # ============================================
+        chunk_size = initial_chunk_size
+        flat_idx = 0
+        with tqdm(total=total_positions, desc="Processing patterns") as pbar:
+            while flat_idx < total_positions:
+                try:
+                    # ----------------------------------------
+                    # 2a. Determine chunk boundaries
+                    # ----------------------------------------
+                    end_flat_idx = min(flat_idx + chunk_size, total_positions)
+                    actual_chunk_size = end_flat_idx - flat_idx
+                    
+                    # ----------------------------------------
+                    # 2b. Extract chunk data
+                    # ----------------------------------------
+                    chunk_data = []
+                    chunk_positions = []  # Store (ry, rx) for each item in chunk
+                    
+                    for pos in range(flat_idx, end_flat_idx):
+                        ry = pos // Rx
+                        rx = pos % Rx
+                        chunk_data.append(self.dataset_cartesian[ry, rx].array)
+                        chunk_positions.append((ry, rx))
+                    
+                    chunk_array = np.array(chunk_data)  # Shape: (chunk_size, Qy, Qx)
+                    
+                    # ----------------------------------------
+                    # 2c. Resize chunk
+                    # ----------------------------------------
+                    chunk_resized = self.resize_images(
+                        chunk_array, 
+                        device=device, 
+                        initial_chunk_size=actual_chunk_size
+                    )
+                    
+                    # ----------------------------------------
+                    # 2d. Normalize and run model
+                    # ----------------------------------------
+                    ins = torch.tensor(chunk_resized, dtype=torch.float32).to(device)
+                    dps_norm = self.normalize_data(ins, median, iqr)
+                    ins_batch = dps_norm[:, None, ...]  # Add channel: (chunk_size, 1, Qy, Qx)
+                    
+                    outs = self.model(ins_batch).detach().cpu().numpy()
+                    
+                    # ----------------------------------------
+                    # 2e. Post-process each pattern in chunk
+                    # ----------------------------------------
+                    for k in range(outs.shape[0]):
+                        ry, rx = chunk_positions[k]
+                        
+                        peak_coords, peak_intensities = self._postprocess_single(
+                            outs[k, 0], 
+                            outs[k, 1],
+                            show=show_plots,
+                        )
+                        
+                        if len(peak_coords) > 0:
+                            # Sample intensities from DP
+                            peak_intensity_averages = sample_average_from_image(
+                                ins_batch[k].squeeze().detach().cpu().numpy(), 
+                                peak_coords
+                            )
+                            peak_intensities_data = np.column_stack([
+                                peak_intensities,
+                                peak_intensity_averages,
+                            ])
+                            
+                            # Convert coordinates
+                            peak_coords_original = peak_coords * (
+                                self.dataset_cartesian.shape[2] / self.final_shape[0]
+                            )
+                            
+                            peak_data = np.column_stack([
+                                peak_coords_original,  # y_pixels, x_pixels
+                                peak_coords_original * self.pixels_to_inv_A(
+                                    original_shape=self.dataset_cartesian.shape[2], 
+                                    final_shape=self.final_shape[0]
+                                )  # y_invA, x_invA
+                            ])
+                            
+                            peaks.set_data(peak_data, ry, rx)
+                            intensities.set_data(peak_intensities_data, ry, rx)
+                    
+                    # ----------------------------------------
+                    # 2f. Memory cleanup
+                    # ----------------------------------------
+                    del ins, dps_norm, ins_batch, outs, chunk_array, chunk_resized
+                    if 'cuda' in device:
+                        torch.cuda.empty_cache()
+                    
+                    # ----------------------------------------
+                    # 2g. Update progress and move to next chunk
+                    # ----------------------------------------
+                    pbar.update(actual_chunk_size)
+                    flat_idx = end_flat_idx
+                    
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        # Clear cache and reduce chunk size
+                        if 'cuda' in device:
+                            torch.cuda.empty_cache()
+                        
+                        chunk_size = max(1, chunk_size // 2)
+                        print(f"\nGPU OOM! Reducing chunk size to {chunk_size}")
+                        
+                        if chunk_size == 1:
+                            print("Falling back to CPU processing")
+                            device = "cpu"
+                    else:
+                        raise e
         
-        print('done')
+        print('Done!')
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
         # self.normalized_dps_array = normalized_dps_array
@@ -439,9 +524,7 @@ class BraggPeaksPolymer(AutoSerialize):
         --------
         centers : ndarray, shape (scan_y, scan_x, 2)
             Center coordinates (y, x) for each scan position
-        """
-        from tqdm import tqdm
-        
+        """        
         scan_y, scan_x, det_y, det_x = self.dataset_cartesian.shape
         # scan_y, scan_x, det_y, det_x = self.resized_cartesian_data.shape
         centers = np.zeros((scan_y, scan_x, 2))
@@ -712,6 +795,137 @@ class BraggPeaksPolymer(AutoSerialize):
         fig.tight_layout()
         return fig, axes
 
+    def estimate_peak_windows(
+        self,
+        num_bins=200,
+        q_min=None,
+        q_max=None,
+        n_peaks=5,
+        height_percentile=10,
+        prominence_factor=0.1,
+        width_factor=2.0,
+        min_width=0.05,
+        smoothing_sigma=2.0,
+    ):
+        """
+        Automatically detect the top N most prominent peaks and estimate their windows.
+        
+        Parameters
+        ----------
+        num_bins : int
+            Number of radial bins
+        q_min : float, optional
+            Minimum q value for binning
+        q_max : float, optional
+            Maximum q value for binning
+        n_peaks : int
+            Number of top peaks to detect
+        height_percentile : float
+            Percentile threshold for peak height (peaks below this are ignored)
+        prominence_factor : float
+            Factor of max intensity for minimum peak prominence
+        width_factor : float
+            Multiplier for estimating peak window width from FWHM
+        min_width : float
+            Minimum window width in 1/Å
+        smoothing_sigma : float
+            Gaussian smoothing sigma for noise reduction before peak detection
+            
+        Returns
+        -------
+        peak_centers : array
+            q-values for peak centers (shape: n_peaks)
+        peak_windows : array
+            Window boundaries for each peak (shape: n_peaks, 2)
+            Each row is [q_min, q_max] for that peak
+        peak_info : dict
+            Additional information about detected peaks including:
+            - 'heights': peak heights
+            - 'prominences': peak prominences
+            - 'widths': estimated peak widths (FWHM)
+        """
+        
+        # Get radial intensity profile
+        all_r = self.polar_peaks['r_invA'].flatten()
+        all_intensity = self.peak_intensities['intensities_sampled_from_dp'].flatten()
+        
+        if q_min is None:
+            q_min = 0
+        if q_max is None:
+            q_max = np.max(all_r)
+        
+        r_bins = np.linspace(q_min, q_max, num_bins + 1)
+        intensity_sum, _ = np.histogram(all_r, bins=r_bins, weights=all_intensity)
+        r_centers = (r_bins[:-1] + r_bins[1:]) / 2
+        
+        # Smooth the data to reduce noise
+        if smoothing_sigma > 0:
+            intensity_smooth = gaussian_filter1d(intensity_sum, smoothing_sigma)
+        else:
+            intensity_smooth = intensity_sum
+        
+        # Calculate thresholds
+        height_threshold = np.percentile(intensity_smooth, height_percentile)
+        prominence_threshold = prominence_factor * np.max(intensity_smooth)
+        
+        # Find peaks
+        peaks_indices, properties = find_peaks(
+            intensity_smooth,
+            height=height_threshold,
+            prominence=prominence_threshold,
+            distance=int(min_width / (r_centers[1] - r_centers[0]))  # Minimum separation
+        )
+        
+        if len(peaks_indices) == 0:
+            print("No peaks found with current parameters!")
+            return np.array([]), np.array([]).reshape(0, 2), {}
+        
+        # Sort by prominence and take top N
+        prominences = properties['prominences']
+        sorted_indices = np.argsort(prominences)[::-1][:n_peaks]
+        top_peak_indices = peaks_indices[sorted_indices]
+        top_peak_indices = np.sort(top_peak_indices)  # Re-sort by position
+        
+        # Get peak centers
+        peak_centers = r_centers[top_peak_indices]
+        
+        # Calculate peak widths (FWHM)
+        widths_data = peak_widths(intensity_smooth, top_peak_indices, rel_height=0.5)
+        fwhm_bins = widths_data[0]  # Width in bins
+        fwhm_invA = fwhm_bins * (r_centers[1] - r_centers[0])  # Convert to 1/Å
+        
+        # Estimate windows: center ± width_factor * FWHM/2, with minimum width
+        half_widths = np.maximum(width_factor * fwhm_invA / 2, min_width / 2)
+        peak_windows = np.column_stack([
+            peak_centers - half_widths,
+            peak_centers + half_widths
+        ])
+        
+        # Clip windows to data range
+        peak_windows[:, 0] = np.maximum(peak_windows[:, 0], q_min)
+        peak_windows[:, 1] = np.minimum(peak_windows[:, 1], q_max)
+        
+        # Collect additional info
+        peak_info = {
+            'heights': intensity_smooth[top_peak_indices],
+            'prominences': prominences[sorted_indices],
+            'widths_fwhm': fwhm_invA,
+            'intensity_profile': intensity_smooth,
+            'r_centers': r_centers,
+        }
+        
+        # Print summary
+        print(f"Detected {len(peak_centers)} peaks:")
+        for i, (center, window, height, prom, width) in enumerate(zip(
+            peak_centers, peak_windows, peak_info['heights'], 
+            peak_info['prominences'], peak_info['widths_fwhm']
+        )):
+            print(f"  Peak {i+1}: center={center:.3f} 1/Å, "
+                  f"window=[{window[0]:.3f}, {window[1]:.3f}] 1/Å, "
+                  f"height={height:.1f}, prominence={prom:.1f}, FWHM={width:.3f} 1/Å")
+        
+        return peak_centers, peak_windows, peak_info
+
     def peak_radial_intensity_plot(
         self,
         num_bins=200,
@@ -719,9 +933,15 @@ class BraggPeaksPolymer(AutoSerialize):
         q_max=None,
         ROI_xs=None,
         ROI_ys=None,
+        peak_centers=None,
+        peak_windows=None,
         vlines=None,
         vline_colors=None,
         vline_labels=None,
+        window_alpha=0.3,
+        window_color='red',
+        fill_alpha=0.5,
+        fill_color=None,
         plot=True,
         return_data=False,
     ):
@@ -740,14 +960,24 @@ class BraggPeaksPolymer(AutoSerialize):
             X range for region of interest (not yet implemented)
         ROI_ys : tuple, optional
             Y range for region of interest (not yet implemented)
+        peak_centers : array, optional
+            1D array of peak center positions to mark with vertical lines
+        peak_windows : array, optional
+            2D array (N, 2) of [q_min, q_max] for each peak window to highlight
         vlines : list of lists/arrays, optional
-            Vertical lines to plot. Each element is a list/array of x-positions.
-            Example: [[1.5, 2.0], [3.0, 3.5]] for two groups of lines
+            Additional vertical lines to plot. Each element is a list/array of x-positions.
         vline_colors : list of colors, optional
-            Colors for each group of vertical lines. Must match length of vlines.
-            Example: ['red', 'blue'] or ['#FF0000', '#0000FF']
+            Colors for each group of vertical lines
         vline_labels : list of str, optional
             Labels for each group of vertical lines (for legend)
+        window_alpha : float
+            Transparency for peak window background highlighting (0-1)
+        window_color : str or color
+            Color for peak window background highlighting
+        fill_alpha : float
+            Transparency for filled area under curve within windows (0-1)
+        fill_color : str or color, optional
+            Color for filled area under curve. If None, uses window_color
         plot : bool
             Whether to display the plot
         return_data : bool
@@ -760,7 +990,6 @@ class BraggPeaksPolymer(AutoSerialize):
         intensity_sum : array (optional)
             Integrated intensity per bin
         """
-        # all_r = self.polar_peaks['r'].flatten() * self.dataset_cartesian.sampling[2]
         all_r = self.polar_peaks['r_invA'].flatten()
         all_intensity = self.peak_intensities['intensities_sampled_from_dp'].flatten()
         
@@ -776,17 +1005,49 @@ class BraggPeaksPolymer(AutoSerialize):
     
         # Bin centers
         r_centers = (r_bins[:-1] + r_bins[1:]) / 2
+        
+        # Use window_color for fill if not specified
+        if fill_color is None:
+            fill_color = window_color
     
         if plot:
             # Create line plot
             fig, ax = plt.subplots()
-            ax.plot(r_centers, intensity_sum, linewidth=2, label='Intensity')
+            ax.plot(r_centers, intensity_sum, linewidth=2, label='Intensity', color='black')
             ax.set_xlabel('Radial Distance (1/Å)', fontsize=12)
             ax.set_ylabel('Integrated Intensity', fontsize=12)
             ax.set_title('Radial Intensity Profile (All Patterns)', fontsize=14)
             ax.grid(True, alpha=0.3)
             
-            # Add vertical lines if provided
+            # Add peak windows as filled regions and fill under curve
+            if peak_windows is not None:
+                peak_windows = np.atleast_2d(peak_windows)
+                for i, (q_min_win, q_max_win) in enumerate(peak_windows):
+                    # Background window highlight
+                    ax.axvspan(q_min_win, q_max_win, alpha=window_alpha, 
+                              color=window_color, zorder=0,
+                              label='Peak windows' if i == 0 else None)
+                    
+                    # Fill under the curve within this window
+                    # Find indices within the window
+                    mask = (r_centers >= q_min_win) & (r_centers <= q_max_win)
+                    if np.any(mask):
+                        r_window = r_centers[mask]
+                        intensity_window = intensity_sum[mask]
+                        ax.fill_between(r_window, 0, intensity_window, 
+                                       alpha=fill_alpha, color=fill_color,
+                                       label='Peak intensity' if i == 0 else None,
+                                       zorder=1)
+            
+            # Add peak centers as vertical lines
+            if peak_centers is not None:
+                peak_centers = np.atleast_1d(peak_centers)
+                for i, center in enumerate(peak_centers):
+                    ax.axvline(center, color=window_color, linestyle='-', 
+                              linewidth=2, alpha=0.8,
+                              label='Peak centers' if i == 0 else None, zorder=2)
+            
+            # Add additional vertical lines if provided
             if vlines is not None:
                 # Convert to list of lists if needed
                 if not isinstance(vlines[0], (list, np.ndarray)):
@@ -818,11 +1079,13 @@ class BraggPeaksPolymer(AutoSerialize):
                         # Only add label to first line in group (for legend)
                         line_label = label if j == 0 else None
                         ax.axvline(x_pos, color=color, linestyle='--', 
-                                  linewidth=1.5, alpha=0.7, label=line_label)
+                                  linewidth=1.5, alpha=0.7, label=line_label, zorder=2)
             
-                # Add legend if labels were provided
-                if vline_labels is not None:
-                    ax.legend()
+                # Add legend
+                ax.legend()
+            elif peak_centers is not None or peak_windows is not None:
+                # Add legend for peak markers if present
+                ax.legend()
             
             fig.tight_layout()
             plt.show()
@@ -1133,24 +1396,98 @@ class BraggPeaksPolymer(AutoSerialize):
                 )
     
         return orient_hist
-
-    def plot_interactive_peak_map(self, radial_range=None, vmax_cartesian=7):
+    
+    def plot_interactive_image_map(self, intensity_map=None, vmax_cartesian=7, 
+                                    map_cmap='viridis', map_title='Intensity Map'):
         """
-        Interactive plot using sliders - more reliable than clicking in Jupyter.
+        Interactive plot for browsing diffraction patterns with optional intensity map.
+        
+        Parameters
+        ----------
+        intensity_map : array, optional
+            2D array (Ry, Rx) to display as reference map. If None, shows mean intensity.
+        vmax_cartesian : float
+            Maximum value for diffraction pattern display
+        map_cmap : str
+            Colormap for the intensity map
+        map_title : str
+            Title for the intensity map panel
+        """
+        from ipywidgets import interact, IntSlider
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Create default intensity map if none provided
+        if intensity_map is None:
+            intensity_map = np.zeros((Ry, Rx))
+            for i in range(Ry):
+                for j in range(Rx):
+                    intensity_map[i, j] = np.mean(self.dataset_cartesian[i, j])
+        
+        def show_pattern(ry, rx):
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            
+            # Plot intensity map with current position marked
+            im1 = ax1.imshow(intensity_map, cmap=map_cmap, origin='lower', 
+                            interpolation='nearest')
+            ax1.plot(rx, ry, 'r+', markersize=15, markeredgewidth=2)
+            ax1.set_title(map_title)
+            ax1.set_xlabel('Rx')
+            ax1.set_ylabel('Ry')
+            plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+            
+            # Plot diffraction pattern
+            im2 = ax2.imshow(self.dataset_cartesian[ry, rx], cmap='gray', vmax=vmax_cartesian)
+            ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+            ax2.axis('off')
+            plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        interact(show_pattern,
+                 ry=IntSlider(min=0, max=Ry-1, step=1, value=Ry//2, 
+                             description='Ry:', continuous_update=False),
+                 rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, 
+                             description='Rx:', continuous_update=False))
+    
+    
+    def plot_interactive_peak_map(self, radial_range=None, vmax_cartesian=7,
+                                  show_all_peaks=True, show_center=True,
+                                  selected_peak_color='red', other_peak_color='gray',
+                                  center_color='cyan'):
+        """
+        Interactive plot for browsing diffraction patterns with peak overlay.
+        
+        Parameters
+        ----------
+        radial_range : tuple, optional
+            (q_min, q_max) in 1/Å to filter peaks. If None, shows all peaks.
+        vmax_cartesian : float
+            Maximum value for diffraction pattern display
+        show_all_peaks : bool
+            If True and radial_range is set, show non-selected peaks in gray
+        show_center : bool
+            Whether to show the beam center marker
+        selected_peak_color : str or color
+            Color for selected peaks (within radial_range)
+        other_peak_color : str or color
+            Color for non-selected peaks (outside radial_range)
+        center_color : str or color
+            Color for beam center marker
         """
         from ipywidgets import interact, IntSlider
         
         Ry, Rx = self.peak_coordinates_cartesian.shape
         
-        # Create intensity map
+        # Create intensity map based on selected radial range
         intensity_map = np.zeros((Ry, Rx))
         for i in range(Ry):
             for j in range(Rx):
                 peaks_r_invA = self.polar_peaks['r_invA'][i, j]
                 if peaks_r_invA is not None and len(peaks_r_invA) > 0:
                     if radial_range is not None:
-                        distances = peaks_r_invA
-                        mask = (distances >= radial_range[0]) & (distances < radial_range[1])
+                        mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
                     else:
                         mask = np.ones(len(peaks_r_invA), dtype=bool)
                     
@@ -1158,45 +1495,68 @@ class BraggPeaksPolymer(AutoSerialize):
                     if intensities is not None and len(intensities) > 0:
                         intensity_map[i, j] = np.sum(intensities[mask])
         
+        # Determine map title
+        if radial_range is not None:
+            map_title = f'Peak Intensity Map\n({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)'
+        else:
+            map_title = 'Peak Intensity Map (All Peaks)'
+        
         def show_pattern(ry, rx):
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
             
             # Plot intensity map with current position marked
-            ax1.imshow(intensity_map, cmap='viridis', origin='lower', interpolation='nearest')
+            im1 = ax1.imshow(intensity_map, cmap='viridis', origin='lower', 
+                            interpolation='nearest')
             ax1.plot(rx, ry, 'r+', markersize=15, markeredgewidth=2)
-            ax1.set_title('Intensity Map')
+            ax1.set_title(map_title)
             ax1.set_xlabel('Rx')
             ax1.set_ylabel('Ry')
+            plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
             
             # Plot diffraction pattern
             ax2.imshow(self.dataset_cartesian[ry, rx], cmap='gray', vmax=vmax_cartesian)
-            # ax2.imshow(self.resized_cartesian_data[ry, rx], cmap='gray', vmax=vmax_cartesian)
             
-            peaks_r_invA = self.peak_coordinates_cartesian['r_invA'][ry, rx]
-            peaks_y_invA = self.peak_coordinates_cartesian['y_invA'][ry, rx]
-            peaks_x_invA = self.peak_coordinates_cartesian['x_invA'][ry, rx]
-            if peaks is not None and len(peaks) > 0:
+            # Overlay peaks
+            peaks_r_invA = self.polar_peaks['r_invA'][ry, rx]
+            peaks_y_pixels = self.peak_coordinates_cartesian['y_pixels'][ry, rx]
+            peaks_x_pixels = self.peak_coordinates_cartesian['x_pixels'][ry, rx]
+            
+            if peaks_r_invA is not None and len(peaks_r_invA) > 0:
                 if radial_range is not None:
-                    distances = peaks_r_invA
-                    mask = (distances >= radial_range[0]) & (distances < radial_range[1])
+                    mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
                     
-                    ax2.scatter(peaks_y_invA, peaks_x_invA, c='gray', s=30, alpha=0.5,
-                               edgecolors='white', linewidths=0.5, label='Other peaks')
+                    # Show non-selected peaks if requested
+                    if show_all_peaks and np.any(~mask):
+                        ax2.scatter(peaks_x_pixels[~mask], peaks_y_pixels[~mask], 
+                                   c=other_peak_color, s=30, alpha=0.5,
+                                   edgecolors='white', linewidths=0.5, 
+                                   label='Other peaks')
                     
+                    # Show selected peaks
                     if np.any(mask):
-                        ax2.scatter(peaks_y_invA[mask], peaks_x_invA[mask], c='red', s=30, alpha=0.8,
+                        ax2.scatter(peaks_x_pixels[mask], peaks_y_pixels[mask], 
+                                   c=selected_peak_color, s=30, alpha=0.8,
                                    edgecolors='white', linewidths=0.5, 
                                    label=f'Selected ({np.sum(mask)} peaks)')
-                        ax2.legend(fontsize=8, loc='upper right')
                 else:
-                    ax2.scatter(peaks_y_invA, peaks_x_invA, c='red', s=30, alpha=0.8,
-                               edgecolors='white', linewidths=0.5)
+                    # Show all peaks
+                    ax2.scatter(peaks_x_pixels, peaks_y_pixels, 
+                               c=selected_peak_color, s=30, alpha=0.8,
+                               edgecolors='white', linewidths=0.5,
+                               label=f'All peaks ({len(peaks_r_invA)})')
             
-            if hasattr(self, 'image_centers') and self.image_centers is not None:
+            # Show beam center if requested
+            if show_center and hasattr(self, 'image_centers') and self.image_centers is not None:
                 ax2.scatter(self.image_centers[ry, rx, 1], self.image_centers[ry, rx, 0],
-                           c='cyan', s=500, marker='x', linewidths=2, label='Center')
+                           c=center_color, s=500, marker='x', linewidths=2, 
+                           label='Center', zorder=10)
             
-            title_str = f'Position (Ry={ry}, Rx={rx})'
+            # Add legend if there are labeled elements
+            handles, labels = ax2.get_legend_handles_labels()
+            if labels:
+                ax2.legend(fontsize=8, loc='upper right')
+            
+            title_str = f'Diffraction Pattern (Ry={ry}, Rx={rx})'
             if radial_range is not None:
                 title_str += f'\nRange: {radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å'
             ax2.set_title(title_str)
@@ -1206,8 +1566,10 @@ class BraggPeaksPolymer(AutoSerialize):
             plt.show()
         
         interact(show_pattern,
-                 ry=IntSlider(min=0, max=Ry-1, step=1, value=Ry//2, description='Ry:', continuous_update=False),
-                 rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, description='Rx:', continuous_update=False))
+                 ry=IntSlider(min=0, max=Ry-1, step=1, value=Ry//2, 
+                             description='Ry:', continuous_update=False),
+                 rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, 
+                             description='Rx:', continuous_update=False))
 
 
     def plot_peak_count_map(self, q_ranges, figsize_per_map=(5, 4), cmap='viridis'):
