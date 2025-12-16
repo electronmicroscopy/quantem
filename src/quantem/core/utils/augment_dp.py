@@ -144,7 +144,7 @@ class DPAugmentor(RNGMixin):
         
         Notes
         -----
-        - Augmentations are applied in order: flipshift → background → elastic →
+        - Augmentations are applied in order: flipshift → elastic → background →
           shot noise → blur → salt & pepper
         - For labels, only geometric transforms (flipshift, elastic) are applied
         - Ellipticity creates anisotropic scaling via exx, eyy, exy parameters
