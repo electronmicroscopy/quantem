@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import torch
 from numpy.typing import NDArray
@@ -10,8 +12,6 @@ from quantem.core.utils.validators import (
     validate_array,
     validate_tensor,
 )
-
-from pathlib import Path
 
 
 class AuxiliaryParams(torch.nn.Module):
@@ -29,7 +29,9 @@ class AuxiliaryParams(torch.nn.Module):
 
         # Shifts: only parameterize non-reference tilts
         num_param_tilts = num_tilts - 1
-        self.shifts_param = torch.nn.Parameter(torch.zeros(num_param_tilts, 2, device=device), requires_grad = learn_shifts)
+        self.shifts_param = torch.nn.Parameter(
+            torch.zeros(num_param_tilts, 2, device=device), requires_grad=learn_shifts
+        )
 
         # Fixed zero shifts for reference
         self.shifts_ref = torch.zeros(1, 2, device=device)
@@ -52,8 +54,8 @@ class AuxiliaryParams(torch.nn.Module):
         after_z1 = self.z1_param[self.zero_tilt_idx :]
         z1 = torch.cat([before_z1, self.z1_ref, after_z1], dim=0)
 
-        before_z3 = self.z3_param[:self.zero_tilt_idx]
-        after_z3 = self.z3_param[self.zero_tilt_idx:]
+        before_z3 = self.z3_param[: self.zero_tilt_idx]
+        after_z3 = self.z3_param[self.zero_tilt_idx :]
         z3 = torch.cat([before_z3, self.z3_ref, after_z3], dim=0)
 
         return shifts, z1, z3
@@ -170,7 +172,6 @@ class TomographyDataset(AutoSerialize, Dataset):
         self._z1_angles = self._z1_angles.to(device)
         self._z3_angles = self._z3_angles.to(device)
         self._shifts = self._shifts.to(device)
-
 
     # --- Properties ---
 
@@ -323,7 +324,9 @@ class TomographyDataset(AutoSerialize, Dataset):
 
     # TODO: Temp auxiliary params
 
-    def setup_auxiliary_params(self, zero_tilt_idx: int = None, device: str = "cpu", learn_shifts: bool = True) -> None:
+    def setup_auxiliary_params(
+        self, zero_tilt_idx: int = None, device: str = "cpu", learn_shifts: bool = True
+    ) -> None:
         if not hasattr(self, "_auxiliary_params"):
             self._auxiliary_params = AuxiliaryParams(
                 num_tilts=len(self.tilt_angles),
@@ -347,6 +350,7 @@ class TomographyDataset(AutoSerialize, Dataset):
         self._z3_angles = self._initial_z3_angles.clone()
         self._shifts = self._initial_shifts.clone()
 
+
 # TODO: Temporary for use when only doing validation
 class TomographyRayDataset(Dataset):
     """
@@ -354,7 +358,7 @@ class TomographyRayDataset(Dataset):
     Each sample contains: target pixel value, pixel coordinates, phi angle, and auxiliary info.
     """
 
-    def __init__(self, tilt_series, phis, N, val_ratio=0.0, mode='train', seed=42):
+    def __init__(self, tilt_series, phis, N, val_ratio=0.0, mode="train", seed=42):
         """
         Args:
             tilt_series: [M, N, N] tensor of projections
@@ -375,13 +379,12 @@ class TomographyRayDataset(Dataset):
         self.M = tilt_series.shape[0]
         self.total_pixels = self.M * self.N * self.N
 
-
         # Create train/val split
         torch.manual_seed(seed)
         all_indices = torch.randperm(self.total_pixels)
 
         num_val = int(self.total_pixels * val_ratio)
-        if mode == 'val':
+        if mode == "val":
             self.indices = all_indices[:num_val]
         else:  # train
             self.indices = all_indices[num_val:]
@@ -392,7 +395,6 @@ class TomographyRayDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-
         actual_idx = self.indices[idx].item()
 
         projection_idx = actual_idx // (self.N * self.N)
@@ -404,17 +406,16 @@ class TomographyRayDataset(Dataset):
         phi = self.phis[projection_idx]
 
         return {
-            'projection_idx': projection_idx,
-            'pixel_i': pixel_i,
-            'pixel_j': pixel_j,
-            'target_value': target_value,
-            'phi': phi
+            "projection_idx": projection_idx,
+            "pixel_i": pixel_i,
+            "pixel_j": pixel_j,
+            "target_value": target_value,
+            "phi": phi,
         }
 
 
 # Pretrain Volume Dataset
 class PretrainVolumeDataset(Dataset):
-
     def __init__(
         self,
         volume_path: Path | str,
@@ -443,23 +444,20 @@ class PretrainVolumeDataset(Dataset):
         data = torch.permute(data, (2, 1, 0))
         # data = torch.flip(data, dims=(2,))
 
-        self.volume = data.cpu() 
+        self.volume = data.cpu()
         self.N = N
         self.total_samples = N**3
 
         coords_1d = torch.linspace(-1, 1, N)
-        x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing='ij')
+        x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
         self.coords = torch.stack([x, y, z], dim=-1).reshape(-1, 3).cpu()
         self.targets = self.volume.reshape(-1).cpu()
-    
+
     def __len__(self):
         return self.total_samples
-    
+
     def __getitem__(self, idx):
-        return {
-            'coords': self.coords[idx],
-            'target': self.targets[idx]
-        }
+        return {"coords": self.coords[idx], "target": self.targets[idx]}
 
     @property
     def N(self):
