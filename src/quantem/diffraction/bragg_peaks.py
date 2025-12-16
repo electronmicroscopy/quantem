@@ -51,7 +51,7 @@ class BraggPeaksPolymer(AutoSerialize):
         self.compute_parameters = compute_parameters
         self.normalize_data = normalize_data
         # To be set by class methods
-        self.resized_cartesian_data = None
+        # self.resized_cartesian_data = None
         self.peak_coordinates_cartesian = None
         self.peak_intensities = None
         self.image_centers = None
@@ -110,6 +110,15 @@ class BraggPeaksPolymer(AutoSerialize):
     @dataset_cartesian.setter
     def dataset_cartesian(self, dataset_cartesian):
         self._dataset_cartesian = dataset_cartesian
+
+    @property
+    def final_shape(self) -> str:
+        return self._final_shape
+
+    @final_shape.setter
+    def final_shape(self, final_shape):
+        self._final_shape = final_shape
+        
     @classmethod
     def from_file(
         cls,
@@ -143,12 +152,15 @@ class BraggPeaksPolymer(AutoSerialize):
             normalize_data=normalize_data,
         )
 
-    def pixels_to_inv_A(self):
+    def pixels_to_inv_A(self, original_shape=None, final_shape=None):
         # Get sampling conversion factor
         sampling_unit, sampling_angstrom_conversion_factor = parse_reciprocal_units(
             self.dataset_cartesian.units[2]
         )
         sampling_conversion_factor = self.dataset_cartesian.sampling[2] * sampling_angstrom_conversion_factor
+        if original_shape is not None and final_shape is not None:
+            sampling_conversion_factor *= original_shape / final_shape
+            
         return sampling_conversion_factor
     
     def preprocess(self):
@@ -165,6 +177,60 @@ class BraggPeaksPolymer(AutoSerialize):
             inp = torch.nn.functional.interpolate(inp[None, ...], size=self._final_shape, mode='bilinear', align_corners=False) * scale_factor
             resized_data[i, :, :, :] = inp.squeeze().detach().cpu().numpy()
         self.resized_cartesian_data = resized_data
+
+    def resize_images(self, images, device: str = "cuda:0", initial_chunk_size: int = 100):
+        print(device)
+        N, Qy, Qx = images.shape
+        scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
+        resized_data = np.zeros((N, self._final_shape[0], self._final_shape[1]))
+        
+        chunk_size = initial_chunk_size
+        i = 0
+        
+        with tqdm(total=N, desc='images') as pbar:
+            while i < N:
+                try:
+                    # Determine the end index for this chunk
+                    end_idx = min(i + chunk_size, N)
+                    chunk = images[i:end_idx]
+                    
+                    # Process chunk on GPU
+                    inp = torch.tensor(chunk, dtype=torch.float32).to(device)
+                    inp = torch.nn.functional.interpolate(
+                        inp.unsqueeze(1),  # Add channel dimension
+                        size=self._final_shape, 
+                        mode='bilinear', 
+                        align_corners=False
+                    ) * scale_factor
+                    
+                    resized_data[i:end_idx, :, :] = inp.squeeze(1).detach().cpu().numpy()
+                    
+                    # Clear GPU cache
+                    del inp
+                    if 'cuda' in device:
+                        torch.cuda.empty_cache()
+                    
+                    # Update progress and move to next chunk
+                    pbar.update(end_idx - i)
+                    i = end_idx
+                    
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        # Clear cache and reduce chunk size
+                        if 'cuda' in device:
+                            torch.cuda.empty_cache()
+                        
+                        chunk_size = max(1, chunk_size // 2)
+                        print(f"\nGPU OOM! Reducing chunk size to {chunk_size}")
+                        
+                        if chunk_size == 1:
+                            # If even single image fails, fall back to CPU
+                            print("Falling back to CPU processing")
+                            device = "cpu"
+                    else:
+                        raise e
+        
+        return resized_data
 
     def set_model_weights(
         self,
@@ -243,7 +309,7 @@ class BraggPeaksPolymer(AutoSerialize):
         n_normalize_samples: int = 1000,
         show_plots=False,
     ):
-        Ry, Rx, Qy, Qx = self.resized_cartesian_data.shape
+        Ry, Rx, Qy, Qx = self.dataset_cartesian.shape
         peaks = Vector.from_shape(
             shape=(Ry, Rx),
             fields=["y_pixels", "x_pixels", "y_invA", "x_invA"],
@@ -271,23 +337,24 @@ class BraggPeaksPolymer(AutoSerialize):
         scan_x_indices = flat_indices % scan_shape[1]
 
         # Get stats patterns directly as numpy (never touches GPU)
-        stats_patterns = self.resized_cartesian_data[scan_y_indices, scan_x_indices]
+        stats_patterns = self.resize_images[scan_y_indices, scan_x_indices]
+        # stats_patterns = self.resized_cartesian_data[scan_y_indices, scan_x_indices]
 
         # Move to CPU and convert to numpy for compute_parameters
         # stats_patterns = torch.squeeze(stats_patterns).detach().cpu().numpy()
         median, iqr = self.compute_parameters(stats_patterns)
-        normalized_dps_array = np.zeros((Ry, Rx, Qy, Qx))
+        # normalized_dps_array = np.zeros((Ry, Rx, Qy, Qx))
         # Process row by row
         for i in tqdm(range(Ry), desc="rows"):
             # Get row data
             ins = torch.tensor(
-                self.resized_cartesian_data[i], 
+                self.resize_images(self.dataset_cartesian[i]), 
                 dtype=torch.float32
             ).to(device).squeeze()  # Shape: (Rx, Qy, Qx)
             
             # Normalize using new function (works with tensors on GPU)
             dps_norm = self.normalize_data(ins, median, iqr)
-            normalized_dps_array[i, :, :, :] = dps_norm.detach().cpu().numpy()
+            # normalized_dps_array[i, :, :, :] = dps_norm.detach().cpu().numpy()
             ins = dps_norm[:, None, ...]  # Add channel dimension: (Rx, 1, Qy, Qx)
             
             # Pass through model
@@ -307,10 +374,12 @@ class BraggPeaksPolymer(AutoSerialize):
                         peak_intensities,
                         peak_intensity_averages,
                     ])
-                    # First convert to inv A to add to Vector fields
+                    # Convert peak coordinates back to original coordinate system
+                    peak_coods *= self.dataset_cartesian.shape[2] / self.final_shape
+                    # Convert to inv A to add to Vector fields
                     peak_data = np.column_stack([
                         peak_coords,  # y_pixels, x_pixels
-                        peak_coords * self.pixels_to_inv_A()  # y_invA, x_invA
+                        peak_coords * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])  # y_invA, x_invA
                     ])
                     peaks.set_data(peak_data, i, r0)
                     # peaks.set_data(np.array(peak_coords), i, r0)
@@ -321,7 +390,7 @@ class BraggPeaksPolymer(AutoSerialize):
         print('done')
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
-        self.normalized_dps_array = normalized_dps_array
+        # self.normalized_dps_array = normalized_dps_array
 
     def save_peaks(self, filepath):
         np.save(filepath, self.peak_coordinates_cartesian)
@@ -353,7 +422,8 @@ class BraggPeaksPolymer(AutoSerialize):
     def process_polar(self):
         """ Find center of image through brightest peak, return polar transform of data and peaks"""
         self.image_centers = self.find_central_beams_4d()
-        self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
+        self.polar_data = self.polar_transform_4d(self.dataset_cartesian, centers=self.image_centers)
+        # self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
         self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self.peak_coordinates_cartesian, centers=self.image_centers)
 
     def find_central_beams_4d(self, intensity_threshold=0.3, distance_weight=0.5, sampling_radius=2, debug=False, use_tqdm=True):
@@ -372,7 +442,8 @@ class BraggPeaksPolymer(AutoSerialize):
         """
         from tqdm import tqdm
         
-        scan_y, scan_x, det_y, det_x = self.resized_cartesian_data.shape
+        scan_y, scan_x, det_y, det_x = self.dataset_cartesian.shape
+        # scan_y, scan_x, det_y, det_x = self.resized_cartesian_data.shape
         centers = np.zeros((scan_y, scan_x, 2))
         
         iterator = tqdm(range(scan_y), disable=not use_tqdm, desc="Finding centers")
@@ -386,14 +457,15 @@ class BraggPeaksPolymer(AutoSerialize):
                     intensity_threshold=intensity_threshold,
                     distance_weight=distance_weight,
                     debug=debug,
-                    image=self.resized_cartesian_data[i, j].squeeze(),  # Provide actual DP
+                    image=self.dataset_cartesian[i, j].squeeze(),  # Provide actual DP
+                    # image=self.resized_cartesian_data[i, j].squeeze(),  # Provide actual DP
                     sampling_radius=sampling_radius  # Sample n-pixel radius around each peak
                 )
         return centers
 
     def polar_transform_peaks(self, cartesian_peaks, centers, use_tqdm: bool=True):
         # Get sampling conversion factor
-        sampling_conversion_factor = self.pixels_to_inv_A()
+        sampling_conversion_factor = self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
         polar_peaks = polar_transform_vector(cartesian_vector=cartesian_peaks, centers=centers, use_tqdm=use_tqdm, sampling_conversion_factor=sampling_conversion_factor)
         return polar_peaks
 
@@ -441,7 +513,7 @@ class BraggPeaksPolymer(AutoSerialize):
             num_r = int(np.ceil(max_radius_pixels))
         
         # Calculate maximum radius in inverse angstroms
-        max_radius_invA = max_radius_pixels * self.pixels_to_inv_A()
+        max_radius_invA = max_radius_pixels * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
         
         # Store metadata
         self.max_radius_pixels = max_radius_pixels
@@ -451,7 +523,7 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # Pre-calculate coordinate arrays in both units
         r_pixels = np.linspace(0, max_radius_pixels, num_r)
-        r_invA = r_pixels * self.pixels_to_inv_A()
+        r_invA = r_pixels * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
         theta = np.linspace(0, 2*np.pi, num_theta, endpoint=False)
         
         # Create Vector to store polar data with coordinates
@@ -488,7 +560,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 # Each point in the polar grid becomes a row
                 r_flat = r_grid.ravel()
                 theta_flat = theta_grid.ravel()
-                r_invA_flat = r_flat * self.pixels_to_inv_A()
+                r_invA_flat = r_flat * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
                 intensity_flat = polar_image.ravel()
                 
                 # Create data array: [r_pixels, theta, r_invA, intensity]
@@ -532,7 +604,7 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # Generate or validate indices
         if indices is None:
-            Ry, Rx = self.resized_cartesian_data.shape[:2]
+            Ry, Rx = self.dataset_cartesian.shape[:2]
             # Generate random indices
             flat_indices = np.random.choice(Ry * Rx, size=min(n_images, Ry * Rx), replace=False)
             indices = [(idx // Rx, idx % Rx) for idx in flat_indices]
@@ -599,7 +671,8 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # 3. Cartesian with Peaks and Center
             ax = axes[row, col_offset + 2]
-            ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            ax.matshow(self.dataset_cartesian[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            # ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
             if has_peaks:
                 ax.scatter(self.peak_coordinates_cartesian[ind_y, ind_x][:, 1], 
                           self.peak_coordinates_cartesian[ind_y, ind_x][:, 0], 
@@ -613,7 +686,8 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # 4. Original Cartesian
             ax = axes[row, col_offset + 3]
-            im = ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            im = ax.matshow(self.dataset_cartesian[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            # im = ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
             if row == 0:
                 ax.set_title(col_titles[3], fontsize=10, pad=10)
             ax.set_axis_off()
@@ -1095,7 +1169,8 @@ class BraggPeaksPolymer(AutoSerialize):
             ax1.set_ylabel('Ry')
             
             # Plot diffraction pattern
-            ax2.imshow(self.resized_cartesian_data[ry, rx], cmap='gray', vmax=vmax_cartesian)
+            ax2.imshow(self.dataset_cartesian[ry, rx], cmap='gray', vmax=vmax_cartesian)
+            # ax2.imshow(self.resized_cartesian_data[ry, rx], cmap='gray', vmax=vmax_cartesian)
             
             peaks_r_invA = self.peak_coordinates_cartesian['r_invA'][ry, rx]
             peaks_y_invA = self.peak_coordinates_cartesian['y_invA'][ry, rx]
@@ -1226,3 +1301,780 @@ class BraggPeaksPolymer(AutoSerialize):
         plt.show()
         
         return fig, axes, count_maps
+
+    def make_flowline_map(
+        self,
+        orient_hist,
+        thresh_seed=0.2,
+        thresh_grow=0.05,
+        thresh_collision=0.001,
+        sep_seeds=None,
+        sep_xy=6.0,
+        sep_theta=5.0,
+        sort_seeds="intensity",
+        linewidth=2.0,
+        step_size=0.5,
+        min_steps=4,
+        max_steps=1000,
+        sigma_x=1.0,
+        sigma_y=1.0,
+        sigma_theta=2.0,
+        progress_bar: bool = True,
+    ):
+        """
+        Create an 3D or 4D orientation flowline map - essentially a pixelated "stream map" which represents diffraction data.
+    
+        Args:
+            orient_hist (array):        Histogram of all orientations with coordinates
+                                        [radial_bin x_probe y_probe theta]
+                                        We assume theta bin ranges from 0 to 180 degrees and is periodic.
+            thresh_seed (float):        Threshold for seed generation in histogram.
+            thresh_grow (float):        Threshold for flowline growth in histogram.
+            thresh_collision (float):   Threshold for termination of flowline growth in histogram.
+            sep_seeds (float):          Initial seed separation in bins - set to None to use default value,
+                                        which is equal to 0.5*sep_xy.
+            sep_xy (float):             Search radius for flowline direction in x and y.
+            sep_theta = (float):        Search radius for flowline direction in theta.
+            sort_seeds (str):           How to sort the initial seeds for growth:
+                                            None - no sorting
+                                            'intensity' - sort by histogram intensity
+                                            'random' - random order
+            linewidth (float):          Thickness of the flowlines in pixels.
+            step_size (float):          Step size for flowline growth in pixels.
+            min_steps (int):            Minimum number of steps for a flowline to be drawn.
+            max_steps (int):            Maximum number of steps for a flowline to be drawn.
+            sigma_x (float):            Weighted sigma in x direction for direction update.
+            sigma_y (float):            Weighted sigma in y direction for direction update.
+            sigma_theta (float):        Weighted sigma in theta for direction update.
+            progress_bar (bool):        Enable progress bar
+    
+        Returns:
+            orient_flowlines (array):   4D array containing flowlines
+                                        [radial_bin x_probe y_probe theta]
+        """
+    
+        # Ensure sep_xy and sep_theta are arrays
+        sep_xy = np.atleast_1d(sep_xy)
+        sep_theta = np.atleast_1d(sep_theta)
+    
+        # number of radial bins
+        num_radii = orient_hist.shape[0]
+        if num_radii > 1 and len(sep_xy) == 1:
+            sep_xy = np.ones(num_radii) * sep_xy
+        if num_radii > 1 and len(sep_theta) == 1:
+            sep_theta = np.ones(num_radii) * sep_theta
+    
+        # Default seed separation
+        if sep_seeds is None:
+            sep_seeds = np.round(np.min(sep_xy) / 2 + 0.5).astype("int")
+        else:
+            sep_seeds = np.atleast_1d(sep_seeds).astype("int")
+            if num_radii > 1 and len(sep_seeds) == 1:
+                sep_seeds = (np.ones(num_radii) * sep_seeds).astype("int")
+    
+        # coordinates
+        theta = np.linspace(0, np.pi, orient_hist.shape[3], endpoint=False)
+        dtheta = theta[1] - theta[0]
+        size_3D = np.array(
+            [
+                orient_hist.shape[1],
+                orient_hist.shape[2],
+                orient_hist.shape[3],
+            ]
+        )
+    
+        # initialize weighting array
+        vx = np.arange(-np.ceil(2 * sigma_x), np.ceil(2 * sigma_x) + 1)
+        vy = np.arange(-np.ceil(2 * sigma_y), np.ceil(2 * sigma_y) + 1)
+        vt = np.arange(-np.ceil(2 * sigma_theta), np.ceil(2 * sigma_theta) + 1)
+        ay, ax, at = np.meshgrid(vy, vx, vt)
+        k = (
+            np.exp(ax**2 / (-2 * sigma_x**2))
+            * np.exp(ay**2 / (-2 * sigma_y**2))
+            * np.exp(at**2 / (-2 * sigma_theta**2))
+        )
+        k = k / np.sum(k)
+        vx = vx[:, None, None].astype("int")
+        vy = vy[None, :, None].astype("int")
+        vt = vt[None, None, :].astype("int")
+    
+        # initalize flowline array
+        orient_flowlines = np.zeros_like(orient_hist)
+    
+        # initialize output
+        xy_t_int = np.zeros((max_steps + 1, 4))
+        xy_t_int_rev = np.zeros((max_steps + 1, 4))
+    
+        # Loop over radial bins
+        for a0 in range(num_radii):
+            # initialize collision check array
+            cr = np.arange(-np.ceil(sep_xy[a0]), np.ceil(sep_xy[a0]) + 1)
+            ct = np.arange(-np.ceil(sep_theta[a0]), np.ceil(sep_theta[a0]) + 1)
+            ay, ax, at = np.meshgrid(cr, cr, ct)
+            c_mask = (
+                (ax**2 + ay**2) / sep_xy[a0] ** 2 + at**2 / sep_theta[a0] ** 2
+                <= (1 + 1 / sep_xy[a0]) ** 2
+            )[None, :, :, :]
+            cx = cr[None, :, None, None].astype("int")
+            cy = cr[None, None, :, None].astype("int")
+            ct = ct[None, None, None, :].astype("int")
+    
+            # Find all seed locations
+            orient = orient_hist[a0, :, :, :]
+            sub_seeds = np.logical_and(
+                np.logical_and(
+                    orient >= np.roll(orient, 1, axis=2),
+                    orient >= np.roll(orient, -1, axis=2),
+                ),
+                orient >= thresh_seed,
+            )
+    
+            # Separate seeds
+            if sep_seeds > 0:
+                for a1 in range(sep_seeds - 1):
+                    sub_seeds[a1::sep_seeds, :, :] = False
+                    sub_seeds[:, a1::sep_seeds, :] = False
+    
+            # Index seeds
+            x_inds, y_inds, t_inds = np.where(sub_seeds)
+            if sort_seeds is not None:
+                if sort_seeds == "intensity":
+                    inds_sort = np.argsort(orient[sub_seeds])[::-1]
+                elif sort_seeds == "random":
+                    inds_sort = np.random.permutation(np.count_nonzero(sub_seeds))
+                x_inds = x_inds[inds_sort]
+                y_inds = y_inds[inds_sort]
+                t_inds = t_inds[inds_sort]
+    
+            # for a1 in tqdmnd(range(0,40), desc="Drawing flowlines",unit=" seeds", disable=not progress_bar):
+            t = "Drawing flowlines " + str(a0)
+            for a1 in tqdmnd(
+                range(0, x_inds.shape[0]), desc=t, unit=" seeds", disable=not progress_bar
+            ):
+                # initial coordinate and intensity
+                xy0 = np.array((x_inds[a1], y_inds[a1]))
+                t0 = theta[t_inds[a1]]
+    
+                # init theta
+                inds_theta = np.mod(
+                    np.round(t0 / dtheta).astype("int") + vt, orient.shape[2]
+                )
+                orient_crop = (
+                    k
+                    * orient[
+                        np.clip(
+                            np.round(xy0[0]).astype("int") + vx, 0, orient.shape[0] - 1
+                        ),
+                        np.clip(
+                            np.round(xy0[1]).astype("int") + vy, 0, orient.shape[1] - 1
+                        ),
+                        inds_theta,
+                    ]
+                )
+                theta_crop = theta[inds_theta]
+                t0 = np.sum(orient_crop * theta_crop) / np.sum(orient_crop)
+    
+                # forward direction
+                t = t0
+                v0 = np.array((-np.sin(t), np.cos(t)))
+                v = v0 * step_size
+                xy = xy0
+                int_val = self.get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
+                xy_t_int[0, 0:2] = xy0
+                xy_t_int[0, 2] = t / dtheta
+                xy_t_int[0, 3] = int_val
+                # main loop
+                grow = True
+                count = 0
+                while grow is True:
+                    count += 1
+    
+                    # update position and intensity
+                    xy = xy + v
+                    int_val = self.get_intensity(orient, xy[0], xy[1], t / dtheta)
+    
+                    # check for collision
+                    flow_crop = orient_flowlines[
+                        a0,
+                        np.clip(np.round(xy[0]).astype("int") + cx, 0, orient.shape[0] - 1),
+                        np.clip(np.round(xy[1]).astype("int") + cy, 0, orient.shape[1] - 1),
+                        np.mod(np.round(t / dtheta).astype("int") + ct, orient.shape[2]),
+                    ]
+                    int_flow = np.max(flow_crop[c_mask])
+    
+                    if (
+                        xy[0] < 0
+                        or xy[1] < 0
+                        or xy[0] > orient.shape[0]
+                        or xy[1] > orient.shape[1]
+                        or int_val < thresh_grow
+                        or int_flow > thresh_collision
+                    ):
+                        grow = False
+                    else:
+                        # update direction
+                        inds_theta = np.mod(
+                            np.round(t / dtheta).astype("int") + vt, orient.shape[2]
+                        )
+                        orient_crop = (
+                            k
+                            * orient[
+                                np.clip(
+                                    np.round(xy[0]).astype("int") + vx,
+                                    0,
+                                    orient.shape[0] - 1,
+                                ),
+                                np.clip(
+                                    np.round(xy[1]).astype("int") + vy,
+                                    0,
+                                    orient.shape[1] - 1,
+                                ),
+                                inds_theta,
+                            ]
+                        )
+                        theta_crop = theta[inds_theta]
+                        t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop)
+                        v = np.array((-np.sin(t), np.cos(t))) * step_size
+    
+                        xy_t_int[count, 0:2] = xy
+                        xy_t_int[count, 2] = t / dtheta
+                        xy_t_int[count, 3] = int_val
+    
+                        if count > max_steps - 1:
+                            grow = False
+    
+                # reverse direction
+                t = t0 + np.pi
+                v0 = np.array((-np.sin(t), np.cos(t)))
+                v = v0 * step_size
+                xy = xy0
+                int_val = self.get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
+                xy_t_int_rev[0, 0:2] = xy0
+                xy_t_int_rev[0, 2] = t / dtheta
+                xy_t_int_rev[0, 3] = int_val
+                # main loop
+                grow = True
+                count_rev = 0
+                while grow is True:
+                    count_rev += 1
+    
+                    # update position and intensity
+                    xy = xy + v
+                    int_val = self.get_intensity(orient, xy[0], xy[1], t / dtheta)
+    
+                    # check for collision
+                    flow_crop = orient_flowlines[
+                        a0,
+                        np.clip(np.round(xy[0]).astype("int") + cx, 0, orient.shape[0] - 1),
+                        np.clip(np.round(xy[1]).astype("int") + cy, 0, orient.shape[1] - 1),
+                        np.mod(np.round(t / dtheta).astype("int") + ct, orient.shape[2]),
+                    ]
+                    int_flow = np.max(flow_crop[c_mask])
+    
+                    if (
+                        xy[0] < 0
+                        or xy[1] < 0
+                        or xy[0] > orient.shape[0]
+                        or xy[1] > orient.shape[1]
+                        or int_val < thresh_grow
+                        or int_flow > thresh_collision
+                    ):
+                        grow = False
+                    else:
+                        # update direction
+                        inds_theta = np.mod(
+                            np.round(t / dtheta).astype("int") + vt, orient.shape[2]
+                        )
+                        orient_crop = (
+                            k
+                            * orient[
+                                np.clip(
+                                    np.round(xy[0]).astype("int") + vx,
+                                    0,
+                                    orient.shape[0] - 1,
+                                ),
+                                np.clip(
+                                    np.round(xy[1]).astype("int") + vy,
+                                    0,
+                                    orient.shape[1] - 1,
+                                ),
+                                inds_theta,
+                            ]
+                        )
+                        theta_crop = theta[inds_theta]
+                        t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop) + np.pi
+                        v = np.array((-np.sin(t), np.cos(t))) * step_size
+    
+                        xy_t_int_rev[count_rev, 0:2] = xy
+                        xy_t_int_rev[count_rev, 2] = t / dtheta
+                        xy_t_int_rev[count_rev, 3] = int_val
+    
+                        if count_rev > max_steps - 1:
+                            grow = False
+    
+                # write into output array
+                if count + count_rev > min_steps:
+                    if count > 0:
+                        orient_flowlines[a0, :, :, :] = self.set_intensity(
+                            orient_flowlines[a0, :, :, :], xy_t_int[1:count, :]
+                        )
+                    if count_rev > 1:
+                        orient_flowlines[a0, :, :, :] = self.set_intensity(
+                            orient_flowlines[a0, :, :, :], xy_t_int_rev[1:count_rev, :]
+                        )
+    
+        # normalize to step size
+        orient_flowlines = orient_flowlines * step_size
+    
+        # linewidth
+        if linewidth > 1.0:
+            s = linewidth - 1.0
+    
+            orient_flowlines = gaussian_filter1d(orient_flowlines, s, axis=1, truncate=3.0)
+            orient_flowlines = gaussian_filter1d(orient_flowlines, s, axis=2, truncate=3.0)
+            orient_flowlines = orient_flowlines * (s**2)
+    
+        return orient_flowlines
+    
+    
+    def make_flowline_rainbow_image(
+        self,
+        orient_flowlines,
+        int_range=[0, 0.2],
+        sym_rotation_order=2,
+        theta_offset=0.0,
+        greyscale=False,
+        greyscale_max=True,
+        white_background=False,
+        power_scaling=1.0,
+        sum_radial_bins=False,
+        plot_images=True,
+        figsize=None,
+    ):
+        """
+        Generate RGB output images from the flowline arrays.
+    
+        Args:
+            orient_flowline (array):    Histogram of all orientations with coordinates [x y radial_bin theta]
+                                        We assume theta bin ranges from 0 to 180 degrees and is periodic.
+            int_range (float)           2 element array giving the intensity range
+            sym_rotation_order (int):   rotational symmety for colouring
+            theta_offset (float):       Offset the anglular coloring by this value in radians.
+            greyscale (bool):           Set to False for color output, True for greyscale output.
+            greyscale_max (bool):       If output is greyscale, use max instead of mean for overlapping flowlines.
+            white_background (bool):    For either color or greyscale output, switch to white background (from black).
+            power_scaling (float):      Power law scaling for flowline intensity output.
+            sum_radial_bins (bool):     Sum all radial bins (alternative is to output separate images).
+            plot_images (bool):         Plot the outputs for quick visualization.
+            figsize (2-tuple):          Size of output figure.
+    
+        Returns:
+            im_flowline (array):        3D or 4D array containing flowline images
+        """
+    
+        # init array
+        size_input = orient_flowlines.shape
+        size_output = np.array([size_input[0], size_input[1], size_input[2], 3])
+        im_flowline = np.zeros(size_output)
+        theta_offset = np.atleast_1d(theta_offset)
+    
+        if greyscale is True:
+            for a0 in range(size_input[0]):
+                if greyscale_max is True:
+                    im = np.max(orient_flowlines[a0, :, :, :], axis=2)
+                else:
+                    im = np.mean(orient_flowlines[a0, :, :, :], axis=2)
+    
+                sig = np.clip((im - int_range[0]) / (int_range[1] - int_range[0]), 0, 1)
+    
+                if power_scaling != 1:
+                    sig = sig**power_scaling
+    
+                if white_background is False:
+                    im_flowline[a0, :, :, :] = sig[:, :, None]
+                else:
+                    im_flowline[a0, :, :, :] = 1 - sig[:, :, None]
+    
+        else:
+            # Color basis
+            c0 = np.array([1.0, 0.0, 0.0])
+            c1 = np.array([0.0, 0.7, 0.0])
+            c2 = np.array([0.0, 0.3, 1.0])
+    
+            # angles
+            theta = np.linspace(0, np.pi, size_input[3], endpoint=False)
+            theta_color = theta * sym_rotation_order
+    
+            if size_input[0] > 1 and len(theta_offset) == 1:
+                theta_offset = np.ones(size_input[0]) * theta_offset
+    
+            for a0 in range(size_input[0]):
+                # color projections
+                b0 = np.maximum(
+                    1
+                    - np.abs(
+                        np.mod(theta_offset[a0] + theta_color + np.pi, 2 * np.pi) - np.pi
+                    )
+                    ** 2
+                    / (np.pi * 2 / 3) ** 2,
+                    0,
+                )
+                b1 = np.maximum(
+                    1
+                    - np.abs(
+                        np.mod(
+                            theta_offset[a0] + theta_color - np.pi * 2 / 3 + np.pi,
+                            2 * np.pi,
+                        )
+                        - np.pi
+                    )
+                    ** 2
+                    / (np.pi * 2 / 3) ** 2,
+                    0,
+                )
+                b2 = np.maximum(
+                    1
+                    - np.abs(
+                        np.mod(
+                            theta_offset[a0] + theta_color - np.pi * 4 / 3 + np.pi,
+                            2 * np.pi,
+                        )
+                        - np.pi
+                    )
+                    ** 2
+                    / (np.pi * 2 / 3) ** 2,
+                    0,
+                )
+    
+                sig = np.clip(
+                    (orient_flowlines[a0, :, :, :] - int_range[0])
+                    / (int_range[1] - int_range[0]),
+                    0,
+                    1,
+                )
+                if power_scaling != 1:
+                    sig = sig**power_scaling
+    
+                im_flowline[a0, :, :, :] = (
+                    np.sum(sig * b0[None, None, :], axis=2)[:, :, None] * c0[None, None, :]
+                    + np.sum(sig * b1[None, None, :], axis=2)[:, :, None]
+                    * c1[None, None, :]
+                    + np.sum(sig * b2[None, None, :], axis=2)[:, :, None]
+                    * c2[None, None, :]
+                )
+    
+                # clip limits
+                im_flowline[a0, :, :, :] = np.clip(im_flowline[a0, :, :, :], 0, 1)
+    
+                # contrast flip
+                if white_background is True:
+                    im = rgb_to_hsv(im_flowline[a0])
+                    im_v = im[:, :, 2]
+                    im[:, :, 1] = im_v
+                    im[:, :, 2] = 1
+                    im_flowline[a0] = hsv_to_rgb(im)
+    
+        if sum_radial_bins is True:
+            if white_background is False:
+                im_flowline = np.clip(np.sum(im_flowline, axis=0), 0, 1)[None, :, :, :]
+            else:
+                # im_flowline = np.clip(np.sum(im_flowline,axis=0)+1-im_flowline.shape[0],0,1)[None,:,:,:]
+                im_flowline = np.min(im_flowline, axis=0)[None, :, :, :]
+    
+        if plot_images is True:
+            if figsize is None:
+                fig, ax = plt.subplots(
+                    im_flowline.shape[0], 1, figsize=(10, im_flowline.shape[0] * 10)
+                )
+            else:
+                fig, ax = plt.subplots(im_flowline.shape[0], 1, figsize=figsize)
+    
+            if im_flowline.shape[0] > 1:
+                for a0 in range(im_flowline.shape[0]):
+                    ax[a0].imshow(im_flowline[a0])
+                    # ax[a0].axis('off')
+                plt.subplots_adjust(wspace=0, hspace=0.02)
+            else:
+                ax.imshow(im_flowline[0])
+                # ax.axis('off')
+            plt.show()
+    
+        return im_flowline
+    
+    
+    def make_flowline_rainbow_legend(
+        self,
+        im_size=np.array([256, 256]),
+        sym_rotation_order=2,
+        theta_offset_degrees=0.0,
+        white_background=False,
+        return_image=False,
+        radial_range=np.array([0.45, 0.9]),
+        plot_legend=True,
+        figsize=(4, 4),
+    ):
+        """
+        This function generates a legend for a the rainbow colored flowline maps, and returns it as an RGB image.
+    
+        Parameters
+        ----------
+        im_size (np.array):
+            Size of legend image in pixels.
+        sym_rotation_order (int):
+            rotational symmety for colouring
+        theta_offset_degrees (float):
+            Offset the anglular coloring by this value in degrees.
+            Rotation is Q with respect to R, in the positive (counter clockwise) direction.
+        white_background (bool):
+            For either color or greyscale output, switch to white background (from black).
+        return_image (bool):
+            Return the image array.
+        radial_range (np.array):
+            Inner and outer radius for the legend ring.
+        plot_legend (bool):
+            Plot the generated legend.
+        figsize (tuple or list):
+            Size of the plotted legend.
+    
+        Returns
+        ----------
+    
+        im_legend (array):
+            Image array for the legend.
+        """
+    
+        # Coordinates
+        x = np.linspace(-1, 1, im_size[0])
+        y = np.linspace(-1, 1, im_size[1])
+        ya, xa = np.meshgrid(y, x)
+        ra = np.sqrt(xa**2 + ya**2)
+        ta = np.arctan2(ya, xa) + np.deg2rad(theta_offset_degrees)
+        ta_sym = ta * sym_rotation_order
+    
+        # mask
+        mask = np.logical_and(ra > radial_range[0], ra < radial_range[1])
+    
+        # rgb image
+        z = mask * np.exp(1j * ta_sym)
+        # hue_offset = 0
+        amp = np.abs(z)
+        vmin = np.min(amp)
+        vmax = np.max(amp)
+        ph = np.angle(z)  # + hue_offset
+        h = np.mod(ph / (2 * np.pi), 1)
+        s = 0.85 * np.ones_like(h)
+        v = (amp - vmin) / (vmax - vmin)
+        im_legend = hsv_to_rgb(np.dstack((h, s, v)))
+    
+        if white_background is True:
+            im_legend[im_legend.sum(2) == 0] = 1
+    
+        # plotting
+        if plot_legend:
+            fig, ax = plt.subplots(1, 1, figsize=figsize)
+            ax.imshow(im_legend)
+            ax.invert_yaxis()
+            # ax.set_axis_off()
+            ax.axis("off")
+    
+        if return_image:
+            return im_legend
+    
+    
+    def make_flowline_combined_image(
+        self,
+        orient_flowlines,
+        int_range=[0, 0.2],
+        cvals=np.array(
+            [
+                [0.0, 0.7, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.7, 1.0],
+            ]
+        ),
+        white_background=False,
+        power_scaling=1.0,
+        sum_radial_bins=True,
+        plot_images=True,
+        figsize=None,
+    ):
+        """
+        Generate RGB output images from the flowline arrays.
+    
+        Args:
+            orient_flowline (array):    Histogram of all orientations with coordinates [x y radial_bin theta]
+                                        We assume theta bin ranges from 0 to 180 degrees and is periodic.
+            int_range (float)           2 element array giving the intensity range
+            cvals (array):              Nx3 size array containing RGB colors for different radial ibns.
+            white_background (bool):    For either color or greyscale output, switch to white background (from black).
+            power_scaling (float):      Power law scaling for flowline intensities.
+            sum_radial_bins (bool):     Sum outputs over radial bins.
+            plot_images (bool):         Plot the output images for quick visualization.
+            figsize (2-tuple):          Size of output figure.
+    
+        Returns:
+            im_flowline (array):        flowline images
+        """
+    
+        # init array
+        size_input = orient_flowlines.shape
+        size_output = np.array([size_input[0], size_input[1], size_input[2], 3])
+        im_flowline = np.zeros(size_output)
+        cvals = np.array(cvals)
+    
+        # Generate all color images
+        for a0 in range(size_input[0]):
+            sig = np.clip(
+                (np.sum(orient_flowlines[a0, :, :, :], axis=2) - int_range[0])
+                / (int_range[1] - int_range[0]),
+                0,
+                1,
+            )
+            if power_scaling != 1:
+                sig = sig**power_scaling
+    
+            if white_background:
+                im_flowline[a0, :, :, :] = 1 - sig[:, :, None] * (
+                    1 - cvals[a0, :][None, None, :]
+                )
+            else:
+                im_flowline[a0, :, :, :] = sig[:, :, None] * cvals[a0, :][None, None, :]
+    
+            # # contrast flip
+            # if white_background is True:
+            #     im = rgb_to_hsv(im_flowline[a0,:,:,:])
+            #     # im_s = im[:,:,1]
+            #     im_v = im[:,:,2]
+            #     v_range = [np.min(im_v), np.max(im_v)]
+            #     print(v_range)
+    
+            #     im[:,:,1] = im_v
+            #     im[:,:,2] = 1
+            #     im_flowline[a0,:,:,:] = hsv_to_rgb(im)
+    
+        if sum_radial_bins is True:
+            if white_background is False:
+                im_flowline = np.clip(np.sum(im_flowline, axis=0), 0, 1)[None, :, :, :]
+            else:
+                # im_flowline = np.clip(np.sum(im_flowline,axis=0)+1-im_flowline.shape[0],0,1)[None,:,:,:]
+                im_flowline = np.min(im_flowline, axis=0)[None, :, :, :]
+    
+        if plot_images is True:
+            if figsize is None:
+                fig, ax = plt.subplots(
+                    im_flowline.shape[0], 1, figsize=(10, im_flowline.shape[0] * 10)
+                )
+            else:
+                fig, ax = plt.subplots(im_flowline.shape[0], 1, figsize=figsize)
+    
+            if im_flowline.shape[0] > 1:
+                for a0 in range(im_flowline.shape[0]):
+                    ax[a0].imshow(im_flowline[a0])
+                    ax[a0].axis("off")
+                plt.subplots_adjust(wspace=0, hspace=0.02)
+            else:
+                ax.imshow(im_flowline[0])
+                ax.axis("off")
+            plt.show()
+    
+        return im_flowline
+
+    def get_intensity(
+        self, 
+        orient, 
+        x, 
+        y, 
+        t
+    ):
+        # utility function to get histogram intensites
+    
+        x = np.clip(x, 0, orient.shape[0] - 2)
+        y = np.clip(y, 0, orient.shape[1] - 2)
+    
+        xF = np.floor(x).astype("int")
+        yF = np.floor(y).astype("int")
+        tF = np.floor(t).astype("int")
+        dx = x - xF
+        dy = y - yF
+        dt = t - tF
+        t1 = np.mod(tF, orient.shape[2])
+        t2 = np.mod(tF + 1, orient.shape[2])
+    
+        int_vals = (
+            orient[xF, yF, t1] * ((1 - dx) * (1 - dy) * (1 - dt))
+            + orient[xF, yF, t2] * ((1 - dx) * (1 - dy) * (dt))
+            + orient[xF, yF + 1, t1] * ((1 - dx) * (dy) * (1 - dt))
+            + orient[xF, yF + 1, t2] * ((1 - dx) * (dy) * (dt))
+            + orient[xF + 1, yF, t1] * ((dx) * (1 - dy) * (1 - dt))
+            + orient[xF + 1, yF, t2] * ((dx) * (1 - dy) * (dt))
+            + orient[xF + 1, yF + 1, t1] * ((dx) * (dy) * (1 - dt))
+            + orient[xF + 1, yF + 1, t2] * ((dx) * (dy) * (dt))
+        )
+    
+        return int_vals
+    
+    
+    def set_intensity(
+        self, 
+        orient, 
+        xy_t_int
+    ):
+        # utility function to set flowline intensites
+    
+        xF = np.floor(xy_t_int[:, 0]).astype("int")
+        yF = np.floor(xy_t_int[:, 1]).astype("int")
+        tF = np.floor(xy_t_int[:, 2]).astype("int")
+        dx = xy_t_int[:, 0] - xF
+        dy = xy_t_int[:, 1] - yF
+        dt = xy_t_int[:, 2] - tF
+    
+        inds_1D = np.ravel_multi_index(
+            [xF, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            1 - dy
+        ) * (1 - dt)
+        inds_1D = np.ravel_multi_index(
+            [xF, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            1 - dy
+        ) * (dt)
+        inds_1D = np.ravel_multi_index(
+            [xF, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            dy
+        ) * (1 - dt)
+        inds_1D = np.ravel_multi_index(
+            [xF, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            dy
+        ) * (dt)
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (
+            1 - dy
+        ) * (1 - dt)
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (
+            1 - dy
+        ) * (dt)
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (
+            1 - dt
+        )
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (
+            dt
+        )
+    
+        return orient

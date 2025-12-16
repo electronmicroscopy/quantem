@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
@@ -30,8 +31,7 @@ class DPAugmentor(RNGMixin):
         add_bkg: bool = False,
         bkg_weight: list[float] | float = [0.001, 0.05],
         bkg_q: list[float] | float = [0.01, 0.1],
-        apply_background_to_label: bool = False,
-        background_label_application: list[bool] | None = None,
+        apply_background_to_label: list[bool] | None = None,
         add_shot: bool = False,
         e_dose: list[float] | float = [1e4, 1e7],
         add_shift: bool = False,
@@ -43,8 +43,8 @@ class DPAugmentor(RNGMixin):
         add_salt_and_pepper: bool = False,
         salt_and_pepper: list[float] | float = [0, 5e-4],
         add_gaussian_noise: bool = False,
-        gaussian_noise_mu: list[float] | float = 0.0,
-        gaussian_noise_std: list[float] | float = 1e-5,
+        gaussian_noise_mu: float = 0.0,
+        gaussian_noise_std: float = 1e-5,
         add_scale: bool = False,
         scale_factor: list[float] | float = [0.9, 1.1],
         add_blur: bool = False,
@@ -70,11 +70,9 @@ class DPAugmentor(RNGMixin):
             Range for background weight (fraction of total intensity).
         bkg_q : list[float] | float, default=[0.01, 0.1]
             Range for plasmon scattering parameter q₀ in 1/(q² + q₀²) form factor.
-        apply_background_to_label: bool, defautl=False
-            Flag for whether background should be applied to labels, and which ones according to background_label_application
-        background_label_application: list[bool]
-            List of 1/0 for if background should be applied to label
-
+        apply_background_to_label: list[bool] | None, default=None
+            Flag for whether background should be applied to labels, and which ones based on 1/0 list.
+            List of 1/0 for if background should be applied to label. None if no application.
         add_shot : bool, default=False
             Enable Poisson shot noise based on electron dose.
         e_dose : list[float] | float, default=[1e4, 1e7]
@@ -102,10 +100,12 @@ class DPAugmentor(RNGMixin):
 
         add_gaussian_noise : bool, default=False
             Enable gaussian noise.
-        gaussian_noise_mu : list[float] | float, default=1.0
-            Mean for gaussian noise distribution
-        gaussian_noise_std : list[float] | float, defualt=0.5
-            Standard deviation for gaussian noise distribution
+        gaussian_noise_mu : float, default=0.0
+            Mean for gaussian noise distribution. Should be 0 for scientifically accurate representation.
+            Scaled by electron dose. So value of 0.1 represents mean = 10% of electron dose.
+        gaussian_noise_std : float, defualt=1e-5
+            Standard deviation for gaussian noise distribution.
+            Scaled by electron dose. So value of 0.1 represents std. dev. = 10% of electron dose.
 
         add_scale : bool, default=False
             Enable uniform scaling of the diffraction pattern.
@@ -132,6 +132,16 @@ class DPAugmentor(RNGMixin):
         device : str, default="cpu"
             Device for computations ("cpu", "cuda", "cuda:0", etc.).
 
+        add_aperture : bool, default=False
+            Enable circular aperture mask to simulate objective aperture effects.
+        radius_factor : list[float] | float, default=[0.8, 1]
+            Range for aperture radius as fraction of maximum image radius (distance from
+            center to corner). Values < 1 create vignetted diffraction patterns. The mask
+            is centered at (height//2, width//2) + aperture_shift.
+        aperture_shift : list[float] | float, default=[0, 10]
+            Range for random shift of aperture center in pixels (applied with random sign
+            to both x and y). Simulates misalignment of the objective aperture.
+        
         Notes
         -----
         - Augmentations are applied in order: flipshift → background → elastic →
@@ -149,7 +159,6 @@ class DPAugmentor(RNGMixin):
             bkg_weight,
             bkg_q,
             apply_background_to_label,
-            background_label_application,
             add_shot,
             e_dose,
             add_shift,
@@ -194,7 +203,7 @@ class DPAugmentor(RNGMixin):
         if self.log_file is not None:
             with open(self.log_file, "a") as f:
                 f.write(
-                    "bkg_weight,bkg_q,background_label_application,e_dose,xshift,yshift,exx,eyy,exy,"
+                    "bkg_weight,bkg_q,apply_background_to_label,e_dose,xshift,yshift,exx,eyy,exy,"
                     "gaussian_noise_mu,gaussian_noise_std,scale_factor,flip_horizontal,flip_vertical,"
                     "rotation_angle,blur_sigma,salt_and_pepper,rng_seed\n"
                 )
@@ -206,7 +215,6 @@ class DPAugmentor(RNGMixin):
         bkg_weight: list[float] | float = [0.01, 0.1],
         bkg_q: list[float] | float = [0.01, 0.1],
         apply_background_to_label: list[bool] | None = None,
-        background_label_application: bool = False,
         add_shot: bool = False,
         e_dose: list[float] | float = [1e5, 1e10],
         add_shift: bool = False,
@@ -218,7 +226,7 @@ class DPAugmentor(RNGMixin):
         add_salt_and_pepper: bool = False,
         salt_and_pepper: list[float] | float = [0, 1e-3],
         add_gaussian_noise: bool = False,
-        gaussian_noise_mu: list[float] | float = 0,
+        gaussian_noise_mu: list[float] | float = 0.0,
         gaussian_noise_std: list[float] | float = 1e-5,
         add_scale: bool = False,
         scale_factor: list[float] | float = [0.9, 1.1],
@@ -238,6 +246,8 @@ class DPAugmentor(RNGMixin):
         self.add_ellipticity_to_label = add_ellipticity_to_label or []
         self.add_salt_and_pepper = add_salt_and_pepper
         self.add_gaussian_noise = add_gaussian_noise
+        self.gaussian_noise_mu = gaussian_noise_mu
+        self.gaussian_noise_std = gaussian_noise_std
         self.add_scale = add_scale
         self.add_blur = add_blur
         self.add_flipshift = add_flipshift
@@ -246,7 +256,6 @@ class DPAugmentor(RNGMixin):
         self._bkg_weight_range = self._check_input(bkg_weight) if add_bkg else [0, 0]
         self._bkg_q_range = self._check_input(bkg_q) if add_bkg else [0, 0]
         self.apply_background_to_label = apply_background_to_label
-        self.background_label_application = background_label_application
         self._e_dose_range = self._check_input(e_dose) if add_shot else [np.inf, np.inf]
         self._xshift_range = self._check_input(xshift) if add_shift else [0, 0]
         self._yshift_range = self._check_input(yshift) if add_shift else [0, 0]
@@ -256,8 +265,6 @@ class DPAugmentor(RNGMixin):
         self._salt_and_pepper_range = (
             self._check_input(salt_and_pepper) if add_salt_and_pepper else [0, 0]
         )
-        self._gaussian_noise_std = self._check_input(gaussian_noise_std) if add_gaussian_noise else 0
-        self._gaussian_noise_mu = self._check_input(gaussian_noise_mu) if add_gaussian_noise else 0
         self._scale_range = self._check_input(scale_factor) if add_scale else [0, 0]
         self._blur_range = self._check_input(blur_sigma) if add_blur else [0, 0]
 
@@ -274,8 +281,6 @@ class DPAugmentor(RNGMixin):
         self.salt_and_pepper = self._uniform_or_zero(
             self._salt_and_pepper_range, self.add_salt_and_pepper
         )
-        self.gaussian_noise_std = self._uniform_or_zero(self._gaussian_noise_std, self.add_gaussian_noise)
-        self.gaussian_noise_mu = self._uniform_or_zero(self._gaussian_noise_mu, self.add_gaussian_noise)
         self.blur_sigma = self._uniform_or_zero(self._blur_range, self.add_blur)
         self.xshift = self._uniform_with_sign(self._xshift_range, self.add_shift)
         self.yshift = self._uniform_with_sign(self._yshift_range, self.add_shift)
@@ -484,13 +489,6 @@ class DPAugmentor(RNGMixin):
                 else:
                     transformed_label = self._apply_flipshift(label)
 
-        if self.add_bkg:
-            result = self._apply_bkg(result, probe)
-            if transformed_label is not None and self.apply_background_to_label and self.background_label_application is not None:
-                if len(self.background_label_application) > 0:
-                    if len(transformed_label.shape) == 3:
-                        transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
-        
         if self.add_ellipticity or self.add_shift or self.add_scale:
             result = self._apply_elastic(result)
             if transformed_label is not None:
@@ -500,6 +498,13 @@ class DPAugmentor(RNGMixin):
                 else:
                     transformed_label = self._apply_elastic_to_label(transformed_label)
 
+        if self.add_bkg:
+            result = self._apply_bkg(result, probe)
+            if transformed_label is not None and self.apply_background_to_label is not None:
+                if len(self.apply_background_to_label) > 0:
+                    if len(transformed_label.shape) == 3:
+                        transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
+        
         if self.add_aperture: # currently input can only be Tensor
             result = self._apply_aperture(result)
         if self.add_shot:
@@ -685,7 +690,10 @@ class DPAugmentor(RNGMixin):
         qx = af.view(af.sort(af.fftfreq(height, 0.1, like=inputs), axis=0), (-1, 1))
         qy = af.view(af.sort(af.fftfreq(width, 0.1, like=inputs), axis=0), (1, -1))
 
-        CBEDbg = 1.0 / (qx**2 + qy**2 + self.bkg_q**2)  # Plasmon form factor: 1/(q² + q₀²)
+        qxc = self.yshift / (height*0.1)
+        qyc = self.xshift / (width*0.1)
+        
+        CBEDbg = 1.0 / ((qx+qxc)**2 + (qy+qyc)**2 + self.bkg_q**2)  # Plasmon form factor: 1/(q² + q₀²)
         CBEDbg = CBEDbg.squeeze() / af.sum(CBEDbg.squeeze())
 
         if probe is not None:
@@ -699,17 +707,18 @@ class DPAugmentor(RNGMixin):
     def _apply_bkg_to_multichannel_label(self, label: ArrayLike, probe: ArrayLike | None = None) -> ArrayLike:
         """Apply background to specified channels of multichannel label"""
         if len(label.shape) != 3:
-            # Single channel label - shouldn't normally happen
+            warnings.warn(f"Expected shape (C,H,W), got {label.shape}. Returning unchanged.", stacklevel=2)
             return label
+        
         if len(self.background_label_application) == 0:
-            # No background specification
+            warnings.warn("background_label_application is empty. Returning unchanged.", stacklevel=2)
             return label
         
         # Process each channel
         result_channels = []
         for c in range(label.shape[0]):
-            if c < len(self.background_label_application) and self.background_label_application[c]:
-                # Apply background to this channel per background_label_application
+            if c < len(self.apply_background_to_label) and self.apply_background_to_label[c]:
+                # Apply background to this channel per apply_background_to_label
                 result_channels.append(self._apply_bkg(label[c], probe))
             else:
                 # Keep channel as-is
@@ -804,7 +813,7 @@ class DPAugmentor(RNGMixin):
             return
         with open(self.log_file, "a") as f:
             f.write(
-                f"{self.bkg_weight},{self.bkg_q},{self.background_label_application},{self.e_dose},{self.xshift},"
+                f"{self.bkg_weight},{self.bkg_q},{self.apply_background_to_label},{self.e_dose},{self.xshift},"
                 f"{self.yshift},{self.exx},{self.eyy},{self.exy},"
                 f"{self.gaussian_noise_mu},{self.gaussian_noise_std},{self.scale_factor},{self.flip_horizontal},{self.flip_vertical},"
                 f"{self.rotation_angle},{self.blur_sigma},{self.salt_and_pepper},"

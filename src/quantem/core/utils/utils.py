@@ -474,9 +474,9 @@ def parse_reciprocal_units(unit_string: str) -> tuple[str, float]:
     
     Examples:
         >>> parse_reciprocal_units('1/nm')
-        ('1/nm', 10.0)
+        ('1/nm', 0.1)
         >>> parse_reciprocal_units('nm^-1')
-        ('1/nm', 10.0)
+        ('1/nm', 0.1)
         >>> parse_reciprocal_units('1/A')
         ('1/A', 1.0)
     """
@@ -499,7 +499,7 @@ def parse_reciprocal_units(unit_string: str) -> tuple[str, float]:
     ]
     
     if any(pattern in s for pattern in nm_patterns):
-        return '1/nm', 10.0
+        return '1/nm', 0.1
     elif any(pattern in s for pattern in angstrom_patterns):
         return '1/A', 1.0
     else:
