@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,7 @@ class DatasetValue:
     target: torch.Tensor
     tilt_angle: int | float
     pixel_loc: tuple[int, int] | None = None  # Only for INRDataset
+    # pose: tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter] | None = None # If there is pose optimization.
 
 
 class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
@@ -36,7 +37,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     def __init__(
         self,
-        tilt_stack: Dataset3d,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
         learn_pose: bool = True,
         _token: object | None = None,
@@ -56,10 +57,14 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             )
 
         self.tilt_stack = tilt_stack
+        self.volume_size = (int(tilt_stack.shape.max()), tilt_stack.shape[1], tilt_stack.shape[2])
         self.tilt_angles = tilt_angles
         self.learn_pose = learn_pose
 
+        # The reference tilt angle is the one with the smallest absolute tilt angle.
+        # I.e, the pose will not be optimized for the reference tilt angle.
         self._reference_tilt_angle_idx = torch.argmin(torch.abs(self.tilt_angles))
+        # TODO: Implement AuxParams from old tomography_dataset.py here.
 
     @abstractmethod
     def forward(
@@ -93,7 +98,11 @@ class TomographyPixDataset(
     def forward(
         self,
         proj_idx: int,
-    ):
+    ) -> DatasetValue:
+        """
+        Forward pass for pixel-based tomography.
+        Returns the full tilt image for the given projection index, and the tilt angle.
+        """
         return DatasetValue(
             target=self.tilt_stack[proj_idx],
             tilt_angle=self.tilt_angles[proj_idx],
@@ -111,8 +120,29 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
 
     def __init__(
         self,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_pose: bool = True,
+        val_ratio: float = 0.0,
+        mode: Literal["train", "val"] = "train",
+        seed: int = 42,
+        _token: object | None = None,
     ):
-        pass
+        super().__init__(tilt_stack, tilt_angles, learn_pose, _token)
+
+        self._total_pixels = self.volume_size[0] * self.volume_size[1] * self.volume_size[2]
+
+        # Create train/val split
+        torch.manual_seed(seed)
+        all_indices = torch.randperm(self.total_pixels)
+
+        num_val = int(self.total_pixels * val_ratio)
+        if mode == "val":
+            self.indices = all_indices[:num_val]
+        else:  # train
+            self.indices = all_indices[num_val:]
+
+        self._mode = mode
 
     def forward(self, dummy_input: Any = None):
         """
@@ -124,7 +154,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
     def __getitem__(
         self,
         idx: int,
-    ) -> dict[str, Any]:
+    ) -> DatasetValue:
         """
         Gets the item for INR i.e, the project index, pixel value at (i, j), and the tilt angle.
         """
@@ -150,7 +180,15 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         """
         Returns the number of pixels in the tilt stack.
         """
-        pass
+
+        return self._total_pixels
+
+    @property
+    def mode(self) -> Literal["train", "val"]:
+        """
+        Returns the mode of the dataset.
+        """
+        return self._mode
 
 
-DatasetModelType = TomographyINRDataset
+DatasetModelType = TomographyINRDataset | TomographyPixDataset
