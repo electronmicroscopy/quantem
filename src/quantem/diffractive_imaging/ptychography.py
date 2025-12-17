@@ -158,6 +158,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        multichannel_mode=False,
     ) -> Self:
         """
         reason for having a single reconstruct() is so that updating things like constraints
@@ -216,7 +217,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     self.dset.forward(batch_indices, self.obj_padding_px)
                 )
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
-                obj_patches = self.obj_model.forward(patch_indices)
+                if multichannel_mode:
+                    obj_patches = self.obj_model.forward(patch_indices, batch_indices)
+                else:
+                    obj_patches = self.obj_model.forward(patch_indices)
                 propagated_probes, overlap = self.forward_operator(
                     obj_patches, shifted_probes, descan_shifts
                 )
