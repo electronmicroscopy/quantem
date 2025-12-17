@@ -1,29 +1,29 @@
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
-from quantem.core import config
+import torch
+import torch.nn as nn
 
 from .activation_functions import get_activation_function
-from .blocks import Conv2dBlock, Upsample2dBlock, Conv3dBlock, Upsample3dBlock, complex_pool, passfunc
-
-if TYPE_CHECKING:
-    import torch
-    import torch.nn as nn
-else:
-    if config.get("has_torch"):
-        import torch
-        import torch.nn as nn
+from .blocks import (
+    Conv2dBlock,
+    Conv3dBlock,
+    Upsample2dBlock,
+    Upsample3dBlock,
+    complex_pool,
+    passfunc,
+)
 
 
 class CNN2d(nn.Module):
-    """ """
+    """UNet-like CNN for 2D images. Can be used for classification, regression, or segmentation."""
 
     def __init__(
         self,
-        in_channels: int,  # input channels (C_in, H, W)
-        out_channels: int | None = None,  # output channels (C_out, H, W)
+        in_channels: int,
+        out_channels: int | None = None,
         start_filters: int = 16,
-        num_layers: int = 3,  # num_layers
-        num_per_layer: int = 2,  # number conv per layer
+        num_layers: int = 3,
+        num_per_layer: int = 2,
         use_skip_connections: bool = True,
         dtype: torch.dtype = torch.float32,
         dropout: float = 0,
@@ -31,6 +31,38 @@ class CNN2d(nn.Module):
         final_activation: str | Callable = nn.Identity(),
         use_batchnorm: bool = True,
     ):
+        """Initialize CNN2d.
+
+        Parameters
+        ----------
+        in_channels : int
+            Number of input channels.
+        out_channels : int or None, optional
+            Number of output channels. If None, defaults to in_channels, by default None
+        start_filters : int, optional
+            Starting number of filters for CNN, by default 16
+        num_layers : int, optional
+            Number of CNN encoder layers, by default 3
+        num_per_layer : int, optional
+            Number of conv blocks per CNN layer, by default 2
+        use_skip_connections : bool, optional
+            Whether to use skip connections, by default True
+        dtype : torch.dtype, optional
+            Data type for the network, by default torch.float32
+        dropout : float, optional
+            Dropout probability, by default 0
+        activation : str or Callable, optional
+            Activation function for hidden layers, by default "relu"
+        final_activation : str or Callable, optional
+            Activation function for output layer, by default nn.Identity()
+        use_batchnorm : bool, optional
+            Whether to use batch normalization, by default True
+
+        Raises
+        ------
+        ValueError
+            If use_skip_connections is True and num_per_layer < 2.
+        """
         super().__init__()
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels) if out_channels is not None else int(in_channels)
@@ -83,7 +115,7 @@ class CNN2d(nn.Module):
         else:
             self._final_activation = get_activation_function(act, self.dtype)
 
-    def _build(self):
+    def _build(self) -> None:
         self.down_conv_blocks = nn.ModuleList()
         self.up_conv_blocks = nn.ModuleList()
         self.upsample_blocks = nn.ModuleList()
@@ -175,9 +207,7 @@ class CNN2d(nn.Module):
         return y
 
     def reset_weights(self):
-        """
-        Reset all weights.
-        """
+        """Reset all weights in the network."""
 
         def _reset(m: nn.Module) -> None:
             reset_parameters = getattr(m, "reset_parameters", None)
@@ -188,11 +218,11 @@ class CNN2d(nn.Module):
 
 
 class CNN3d(nn.Module):
-    """Complex 3D CNN for processing volumetric data."""
+    """UNet-like 3D CNN for processing volumetric data."""
 
     def __init__(
         self,
-        num_channels: int,  # (C, D, H, W) input shape same as output shape
+        num_channels: int,
         start_filters: int = 16,
         num_layers: int = 3,
         num_per_layer: int = 2,
@@ -204,6 +234,38 @@ class CNN3d(nn.Module):
         use_batchnorm: bool = True,
         mode: str = "complex",
     ):
+        """Initialize CNN3d.
+
+        Parameters
+        ----------
+        num_channels : int
+            Number of input/output channels (C, D, H, W).
+        start_filters : int, optional
+            Starting number of filters for CNN, by default 16
+        num_layers : int, optional
+            Number of CNN encoder layers, by default 3
+        num_per_layer : int, optional
+            Number of conv blocks per CNN layer, by default 2
+        use_skip_connections : bool, optional
+            Whether to use skip connections, by default True
+        dtype : torch.dtype, optional
+            Data type for the network, by default torch.complex64
+        dropout : float, optional
+            Dropout probability, by default 0
+        activation : str or Callable, optional
+            Activation function for hidden layers, by default "relu"
+        final_activation : str or Callable, optional
+            Activation function for output layer, by default nn.Identity()
+        use_batchnorm : bool, optional
+            Whether to use batch normalization, by default True
+        mode : str, optional
+            Mode for the network, by default "complex"
+
+        Raises
+        ------
+        ValueError
+            If use_skip_connections is True and num_per_layer < 2.
+        """
         super().__init__()
         self.in_channels = self.out_channels = int(num_channels)
         self.start_filters = start_filters
@@ -252,7 +314,7 @@ class CNN3d(nn.Module):
         else:
             self._final_activation = get_activation_function(act, self.dtype)
 
-    def _build(self):
+    def _build(self) -> None:
         self.down_conv_blocks = nn.ModuleList()
         self.up_conv_blocks = nn.ModuleList()
         self.upsample_blocks = nn.ModuleList()
@@ -358,9 +420,7 @@ class CNN3d(nn.Module):
         return y
 
     def reset_weights(self):
-        """
-        Reset all weights.
-        """
+        """Reset all weights in the network."""
 
         def _reset(m: nn.Module) -> None:
             reset_parameters = getattr(m, "reset_parameters", None)

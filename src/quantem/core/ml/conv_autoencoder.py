@@ -9,6 +9,8 @@ from .blocks import Conv2dBlock, Upsample2dBlock, complex_pool, passfunc
 
 
 class ConvAutoencoder2d(nn.Module):
+    """Convolutional autoencoder for 4DSTEM diffraction pattern analysis."""
+
     def __init__(
         self,
         input_size: int | tuple[int, int],
@@ -23,30 +25,37 @@ class ConvAutoencoder2d(nn.Module):
         final_activation: str | Callable = "relu",
         use_batchnorm: bool = True,
         latent_normalization: Literal["none", "l2", "layer", "tanh"] = "none",
-    ):
-        """
-        Convolutional autoencoder for 4DSTEM diffraction pattern analysis.
+    ) -> None:
+        """Initialize ConvAutoencoder2d.
 
         Parameters
         ----------
-        input_size : int | tuple[int, int]
+        input_size : int or tuple[int, int]
             Input image size. If int, assumes square image.
-        input_channels : int, default=1
-            Number of input channels (typically 1 for grayscale diffraction patterns)
-        latent_dim : int, default=128
-            Dimensionality of the latent representation for clustering
-        final_activation : str | Callable, default="relu"
-            Output activation. Common choices:
-            - "relu": For positive-valued intensities [0,∞)
-            - "sigmoid": For normalized intensities [0,1]
-            - "softplus": Smooth positive activation
-            - "identity": For preprocessed data (mean=0, std=1)
-        latent_normalization : Literal["none", "l2", "layer", "tanh"], default="none"
-            Latent space normalization for clustering:
-            - "l2": For DBScan, K-means (unit hypersphere)
-            - "layer": For GMM (Gaussian-like distributions)
-            - "tanh": Bounded latent space [-1,1]
-            - "none": Raw learned representations
+        input_channels : int, optional
+            Number of input channels (typically 1 for grayscale diffraction patterns), by default 1
+        latent_dim : int, optional
+            Dimensionality of the latent representation for clustering, by default 128
+        start_filters : int, optional
+            Starting number of filters, by default 16
+        num_layers : int, optional
+            Number of encoder/decoder layers, by default 4
+        num_per_layer : int, optional
+            Number of conv blocks per layer, by default 2
+        dtype : torch.dtype, optional
+            Data type for the network, by default torch.float32
+        dropout : float, optional
+            Dropout probability, by default 0.0
+        activation : str or Callable, optional
+            Activation function for hidden layers, by default "relu"
+        final_activation : str or Callable, optional
+            Output activation. Common choices: "relu" (positive intensities),
+            "sigmoid" (normalized [0,1]), "softplus" (smooth positive), "identity" (preprocessed), by default "relu"
+        use_batchnorm : bool, optional
+            Whether to use batch normalization, by default True
+        latent_normalization : Literal["none", "l2", "layer", "tanh"], optional
+            Latent space normalization: "l2" (unit hypersphere for DBScan/K-means),
+            "layer" (Gaussian-like for GMM), "tanh" (bounded [-1,1]), "none" (raw), by default "none"
         """
         super().__init__()
         self.input_size = input_size
@@ -102,7 +111,7 @@ class ConvAutoencoder2d(nn.Module):
             get_activation_function(act, self.dtype) if not callable(act) else act
         )
 
-    def _build(self):
+    def _build(self) -> None:
         self.encoder_blocks = nn.ModuleList()
         self.decoder_blocks = nn.ModuleList()
         self.upsample_blocks = nn.ModuleList()
@@ -229,7 +238,9 @@ class ConvAutoencoder2d(nn.Module):
         reconstructed = self.decode(latent)
         return reconstructed, latent
 
-    def reset_weights(self):
+    def reset_weights(self) -> None:
+        """Reset all weights in the network."""
+
         def _reset(m: nn.Module) -> None:
             reset_parameters = getattr(m, "reset_parameters", None)
             if callable(reset_parameters):

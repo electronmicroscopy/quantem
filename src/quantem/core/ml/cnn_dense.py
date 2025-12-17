@@ -28,26 +28,38 @@ class CNNDense(nn.Module):
         final_activation: str | Callable = nn.Identity(),
         use_batchnorm: bool = True,
     ):
-        """
-        Initialize CNNDense.
+        """Initialize CNNDense.
 
-        Args:
-            in_channels: Input channels (C_in, H, W)
-            output_dim: Output dimension
-            image_size: Input image size (H, W)
-            start_filters: Starting number of filters for CNN
-            cnn_num_layers: Number of CNN encoder layers
-            cnn_num_per_layer: Number of conv blocks per CNN layer
-            dense_num_layers: Number of dense layers
-            dense_hidden_size: Size of dense hidden layers
-            dense_hidden_dims: List of hidden layer dimensions for dense part (overrides num_dense_layers/hidden_size)
-            dense_hidden_size: Size of dense hidden layers
-            dense_hidden_dims: List of hidden layer dimensions for dense part (overrides num_dense_layers/hidden_size)
-            dtype: Data type for the network
-            dropout: Dropout probability
-            activation: Activation function for hidden layers
-            final_activation: Activation function for output layer
-            use_batchnorm: Whether to use batch normalization
+        Parameters
+        ----------
+        in_channels : int
+            Number of input channels.
+        output_dim : int
+            Output dimension.
+        image_size : tuple[int, int]
+            Input image size (H, W).
+        start_filters : int, optional
+            Starting number of filters for CNN, by default 16
+        cnn_num_layers : int, optional
+            Number of CNN encoder layers, by default 3
+        cnn_num_per_layer : int, optional
+            Number of conv blocks per CNN layer, by default 2
+        dense_num_layers : int, optional
+            Number of dense layers, by default 2
+        dense_hidden_size : int, optional
+            Size of dense hidden layers, by default 128
+        dense_hidden_dims : list[int] or None, optional
+            List of hidden layer dimensions for dense part (overrides dense_num_layers/dense_hidden_size), by default None
+        dtype : torch.dtype, optional
+            Data type for the network, by default torch.float32
+        dropout : float, optional
+            Dropout probability, by default 0
+        activation : str or Callable, optional
+            Activation function for hidden layers, by default "relu"
+        final_activation : str or Callable, optional
+            Activation function for output layer, by default nn.Identity()
+        use_batchnorm : bool, optional
+            Whether to use batch normalization, by default True
         """
         super().__init__()
         self.in_channels = int(in_channels)
@@ -100,7 +112,7 @@ class CNNDense(nn.Module):
         else:
             self._final_activation = get_activation_function(act, self.dtype)
 
-    def _build(self):
+    def _build(self) -> None:
         self.cnn_blocks = nn.ModuleList()
 
         in_channels = self.in_channels
@@ -149,7 +161,7 @@ class CNNDense(nn.Module):
         return y
 
     def reset_weights(self):
-        """Reset all weights."""
+        """Reset all weights in the network."""
 
         def _reset(m: nn.Module) -> None:
             reset_parameters = getattr(m, "reset_parameters", None)

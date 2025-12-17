@@ -23,21 +23,31 @@ class DenseNN(nn.Module):
         activation: str | Callable = "relu",
         final_activation: str | Callable = nn.Identity(),
         use_batchnorm: bool = False,
-    ):
-        """
-        Initialize DenseNN.
+    ) -> None:
+        """Initialize DenseNN.
 
-        Args:
-            input_dim: Input dimension
-            output_dim: Output dimension (defaults to input_dim if None)
-            hidden_dims: List of hidden layer dimensions (overrides num_layers/hidden_size)
-            num_layers: Number of hidden layers (used if hidden_dims not provided)
-            hidden_size: Size of hidden layers (used if hidden_dims not provided)
-            dtype: Data type for the network
-            dropout: Dropout probability
-            activation: Activation function for hidden layers
-            final_activation: Activation function for output layer
-            use_batchnorm: Whether to use batch normalization
+        Parameters
+        ----------
+        input_dim : int
+            Input dimension.
+        output_dim : int or None, optional
+            Output dimension. If None, defaults to input_dim, by default None
+        hidden_dims : list[int] or None, optional
+            List of hidden layer dimensions (overrides num_layers/hidden_size), by default None
+        num_layers : int, optional
+            Number of hidden layers (used if hidden_dims not provided), by default 3
+        hidden_size : int, optional
+            Size of hidden layers (used if hidden_dims not provided), by default 128
+        dtype : torch.dtype, optional
+            Data type for the network, by default torch.float32
+        dropout : float, optional
+            Dropout probability, by default 0
+        activation : str or Callable, optional
+            Activation function for hidden layers, by default "relu"
+        final_activation : str or Callable, optional
+            Activation function for output layer, by default nn.Identity()
+        use_batchnorm : bool, optional
+            Whether to use batch normalization, by default False
         """
         super().__init__()
         self.input_dim = int(input_dim)
@@ -79,7 +89,7 @@ class DenseNN(nn.Module):
         else:
             self._final_activation = get_activation_function(act, self.dtype)
 
-    def _build(self):
+    def _build(self) -> None:
         self.layers = nn.ModuleList()
 
         dims = [self.input_dim] + self.hidden_dims
@@ -126,8 +136,8 @@ class DenseNN(nn.Module):
 
         return y
 
-    def reset_weights(self):
-        """Reset all weights."""
+    def reset_weights(self) -> None:
+        """Reset all weights in the network."""
 
         def _reset(m: nn.Module) -> None:
             reset_parameters = getattr(m, "reset_parameters", None)
