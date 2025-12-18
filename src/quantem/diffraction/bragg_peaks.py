@@ -9,13 +9,16 @@ import torch
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.datastructures.polar4dstem import Polar4dstem, dataset4dstem_polar_transform
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.cnn2d import MultiChannelCNN2d
 from quantem.core.datastructures import Vector
+from quantem.core.visualization import show_2d
 from quantem.core.utils.polar import polar_transform_vector, cartesian_transform_vector
 from quantem.diffraction.peak_detection import detect_blobs, find_central_beam_from_peaks
 from quantem.diffraction.polymer_analytical_functions import add_to_histogram_bilinear
 from quantem.core.utils.utils import parse_reciprocal_units, sample_average_from_image
+from quantem.diffraction.polar_new import RDF_new
 from emdfile import tqdmnd
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
@@ -155,14 +158,12 @@ class BraggPeaksPolymer(AutoSerialize):
             normalize_data=normalize_data,
         )
 
-    def pixels_to_inv_A(self, original_shape=None, final_shape=None):
+    def pixels_to_inv_A(self):
         # Get sampling conversion factor
         sampling_unit, sampling_angstrom_conversion_factor = parse_reciprocal_units(
             self.dataset_cartesian.units[2]
         )
         sampling_conversion_factor = self.dataset_cartesian.sampling[2] * sampling_angstrom_conversion_factor
-        if original_shape is not None and final_shape is not None:
-            sampling_conversion_factor *= original_shape / final_shape
             
         return sampling_conversion_factor
     
@@ -435,10 +436,7 @@ class BraggPeaksPolymer(AutoSerialize):
                             
                             peak_data = np.column_stack([
                                 peak_coords_original,  # y_pixels, x_pixels
-                                peak_coords_original * self.pixels_to_inv_A(
-                                    original_shape=self.dataset_cartesian.shape[2], 
-                                    final_shape=self.final_shape[0]
-                                )  # y_invA, x_invA
+                                peak_coords_original * self.pixels_to_inv_A()  # y_invA, x_invA
                             ])
                             
                             peaks.set_data(peak_data, ry, rx)
@@ -507,7 +505,16 @@ class BraggPeaksPolymer(AutoSerialize):
     def process_polar(self):
         """ Find center of image through brightest peak, return polar transform of data and peaks"""
         self.image_centers = self.find_central_beams_4d()
-        self.polar_data = self.polar_transform_4d(self.dataset_cartesian, centers=self.image_centers)
+        # self.polar_data = dataset4dstem_polar_transform(self.dataset_cartesian, origin_row=self.image_centers[0], origin_col=self.image_centers[1])
+        self.polar_data = self.polar_transform(
+            origin_row=self.image_centers[1],
+            origin_col=self.image_centers[0],
+            two_fold_rotation_symmetry=True,
+            # name: str | None = None,
+            # signal_units: str | None = None,
+        )
+        # rdf_new = RDF_new.from_data(data=self.dataset_cartesian, origin_row=self.image_centers[1], origin_col=self.image_centers[0])
+        # self.polar_data = self.polar_transform_4d(self.dataset_cartesian, centers=self.image_centers)
         # self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
         self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self.peak_coordinates_cartesian, centers=self.image_centers)
 
@@ -527,20 +534,22 @@ class BraggPeaksPolymer(AutoSerialize):
         """        
         scan_y, scan_x, det_y, det_x = self.dataset_cartesian.shape
         # scan_y, scan_x, det_y, det_x = self.resized_cartesian_data.shape
-        centers = np.zeros((scan_y, scan_x, 2))
+        centers = np.zeros((2, scan_y, scan_x))
         
         iterator = tqdm(range(scan_y), disable=not use_tqdm, desc="Finding centers")
         
         for i in iterator:
             for j in range(scan_x):
-                centers[i, j] = find_central_beam_from_peaks(
+                if self.peak_coordinates_cartesian[i, j] is None:
+                    print(f"None at i={i}, j={j}")
+                centers[:, i, j] = find_central_beam_from_peaks(
                     peak_coords=self.peak_coordinates_cartesian[i, j],
                     peak_intensities=None,
                     image_shape=self._final_shape,
                     intensity_threshold=intensity_threshold,
                     distance_weight=distance_weight,
                     debug=debug,
-                    image=self.dataset_cartesian[i, j].squeeze(),  # Provide actual DP
+                    image=self.dataset_cartesian[i, j].array.squeeze(),  # Provide actual DP
                     # image=self.resized_cartesian_data[i, j].squeeze(),  # Provide actual DP
                     sampling_radius=sampling_radius  # Sample n-pixel radius around each peak
                 )
@@ -548,7 +557,7 @@ class BraggPeaksPolymer(AutoSerialize):
 
     def polar_transform_peaks(self, cartesian_peaks, centers, use_tqdm: bool=True):
         # Get sampling conversion factor
-        sampling_conversion_factor = self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
+        sampling_conversion_factor = self.pixels_to_inv_A()
         polar_peaks = polar_transform_vector(cartesian_vector=cartesian_peaks, centers=centers, use_tqdm=use_tqdm, sampling_conversion_factor=sampling_conversion_factor)
         return polar_peaks
 
@@ -560,7 +569,7 @@ class BraggPeaksPolymer(AutoSerialize):
         -----------
         data : ndarray, shape (N, M, H, W)
             4D input array where H, W are the axes to transform
-        centers : ndarray, shape (N, M, 2)
+        centers : ndarray, shape (2, N, M)
             Center of each diffraction pattern (usually determined by central beam)
         num_r : int, optional
             Number of radial bins. If None, uses max radius across all patterns
@@ -586,17 +595,16 @@ class BraggPeaksPolymer(AutoSerialize):
         - self.num_annular_bins : number of angular bins
         """
         N, M, H, W = data.shape
-        
         # Calculate consistent max_radius across entire dataset
-        dist_to_origin = np.sqrt(centers[..., 0]**2 + centers[..., 1]**2).min()
-        dist_to_corner = np.sqrt((H-1 - centers[..., 0])**2 + (W-1 - centers[..., 1])**2).max()
-        max_radius_pixels = max(dist_to_origin, dist_to_corner)
+        dist_to_origin_sq = (centers[0]**2 + centers[1]**2).min()
+        dist_to_corner_sq = ((H-1 - centers[0])**2 + (W-1 - centers[1])**2).max()
+        max_radius_pixels = np.sqrt(max(dist_to_origin_sq, dist_to_corner_sq))
         
         if num_r is None:
             num_r = int(np.ceil(max_radius_pixels))
         
         # Calculate maximum radius in inverse angstroms
-        max_radius_invA = max_radius_pixels * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
+        max_radius_invA = max_radius_pixels * self.pixels_to_inv_A()
         
         # Store metadata
         self.max_radius_pixels = max_radius_pixels
@@ -606,7 +614,7 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # Pre-calculate coordinate arrays in both units
         r_pixels = np.linspace(0, max_radius_pixels, num_r)
-        r_invA = r_pixels * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
+        r_invA = r_pixels * self.pixels_to_inv_A()
         theta = np.linspace(0, 2*np.pi, num_theta, endpoint=False)
         
         # Create Vector to store polar data with coordinates
@@ -621,7 +629,7 @@ class BraggPeaksPolymer(AutoSerialize):
         iterator = tqdm(range(N), disable=not use_tqdm, desc="Transforming data")
         for i in iterator:
             for j in range(M):
-                center_y, center_x = centers[i, j]
+                center_y, center_x = centers[:, i, j]
                 
                 # Create meshgrid (always work in pixels for interpolation)
                 r_grid, theta_grid = np.meshgrid(r_pixels, theta, indexing='ij')
@@ -632,7 +640,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 
                 # Use map_coordinates for interpolation
                 polar_image = map_coordinates(
-                    data[i, j], 
+                    data[i, j].array, 
                     [y_coords, x_coords], 
                     order=1,
                     mode='constant',
@@ -643,7 +651,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 # Each point in the polar grid becomes a row
                 r_flat = r_grid.ravel()
                 theta_flat = theta_grid.ravel()
-                r_invA_flat = r_flat * self.pixels_to_inv_A(original_shape=self.dataset_cartesian.shape[2], final_shape=self.final_shape[0])
+                r_invA_flat = r_flat * self.pixels_to_inv_A()
                 intensity_flat = polar_image.ravel()
                 
                 # Create data array: [r_pixels, theta, r_invA, intensity]
@@ -728,7 +736,8 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # 1. Polar Transform
             ax = axes[row, col_offset]
-            im = ax.matshow(self.polar_data[ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+            print(self.polar_data["intensity"][ind_y, ind_x].shape)
+            im = ax.matshow(self.polar_data["intensity"][ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
             if row == 0:
                 ax.set_title(col_titles[0], fontsize=10, pad=10)
             ax.text(0.05, 0.95, f'({ind_y},{ind_x})', transform=ax.transAxes, 
@@ -738,7 +747,7 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # 2. Polar Transform with Peaks
             ax = axes[row, col_offset + 1]
-            ax.matshow(self.polar_data[ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+            ax.matshow(self.polar_data["intensity"][ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
             if has_peaks and self.polar_peaks[ind_y, ind_x] is not None and len(self.polar_peaks[ind_y, ind_x]) > 0:
                 # Convert radial coordinates to bin indices
                 r_coords = self.polar_peaks[ind_y, ind_x][:, 0]
@@ -754,14 +763,14 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # 3. Cartesian with Peaks and Center
             ax = axes[row, col_offset + 2]
-            ax.matshow(self.dataset_cartesian[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
             # ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
             if has_peaks:
                 ax.scatter(self.peak_coordinates_cartesian[ind_y, ind_x][:, 1], 
                           self.peak_coordinates_cartesian[ind_y, ind_x][:, 0], 
                           c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
-            ax.scatter(self.image_centers[ind_y, ind_x][1], 
-                      self.image_centers[ind_y, ind_x][0], 
+            ax.scatter(self.image_centers[1, ind_y, ind_x], 
+                      self.image_centers[0, ind_y, ind_x], 
                       c='red', s=500, marker='x', linewidths=2)
             if row == 0:
                 ax.set_title(col_titles[2], fontsize=10, pad=10)
@@ -769,20 +778,20 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # 4. Original Cartesian
             ax = axes[row, col_offset + 3]
-            im = ax.matshow(self.dataset_cartesian[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            im = ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
             # im = ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
             if row == 0:
                 ax.set_title(col_titles[3], fontsize=10, pad=10)
             ax.set_axis_off()
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             
-            # 5. Normalized Cartesian
-            ax = axes[row, col_offset + 4]
-            im = ax.matshow(self.normalized_dps_array[ind_y, ind_x], cmap="gray")
-            if row == 0:
-                ax.set_title(col_titles[4], fontsize=10, pad=10)
-            ax.set_axis_off()
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            # # 5. Normalized Cartesian
+            # ax = axes[row, col_offset + 4]
+            # im = ax.matshow(self.normalized_dps_array[ind_y, ind_x], cmap="gray")
+            # if row == 0:
+            #     ax.set_title(col_titles[4], fontsize=10, pad=10)
+            # ax.set_axis_off()
+            # plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         
         # Hide unused subplots
         total_plots = n_images
@@ -1422,27 +1431,30 @@ class BraggPeaksPolymer(AutoSerialize):
             intensity_map = np.zeros((Ry, Rx))
             for i in range(Ry):
                 for j in range(Rx):
-                    intensity_map[i, j] = np.mean(self.dataset_cartesian[i, j])
+                    intensity_map[i, j] = np.mean(self.dataset_cartesian[i, j].array)
         
         def show_pattern(ry, rx):
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            # Create marked intensity map
+            marked_map = intensity_map.copy()
+            # Note: Can't easily add marker with show_2d, may need to keep matplotlib for this part
+            # Or overlay after the fact
             
-            # Plot intensity map with current position marked
-            im1 = ax1.imshow(intensity_map, cmap=map_cmap, origin='lower', 
-                            interpolation='nearest')
-            ax1.plot(rx, ry, 'r+', markersize=15, markeredgewidth=2)
-            ax1.set_title(map_title)
-            ax1.set_xlabel('Rx')
-            ax1.set_ylabel('Ry')
-            plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+            fig, axs = show_2d(
+                [intensity_map, self.dataset_cartesian[ry, rx].array],
+                cmap=[map_cmap, 'gray'],
+                title=[map_title, f'Diffraction Pattern (Ry={ry}, Rx={rx})'],
+                cbar=[True, True],
+                norm=['linear_minmax', {'vmax': vmax_cartesian}],
+                show_ticks=[True, False],
+                axsize=(6, 5),
+                tight_layout=True
+            )
             
-            # Plot diffraction pattern
-            im2 = ax2.imshow(self.dataset_cartesian[ry, rx], cmap='gray', vmax=vmax_cartesian)
-            ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
-            ax2.axis('off')
-            plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+            # Add marker to first axes
+            axs[0].plot(rx, ry, 'r+', markersize=15, markeredgewidth=2)
+            axs[0].set_xlabel('Rx')
+            axs[0].set_ylabel('Ry')
             
-            plt.tight_layout()
             plt.show()
         
         interact(show_pattern,
@@ -1450,7 +1462,6 @@ class BraggPeaksPolymer(AutoSerialize):
                              description='Ry:', continuous_update=False),
                  rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, 
                              description='Rx:', continuous_update=False))
-    
     
     def plot_interactive_peak_map(self, radial_range=None, vmax_cartesian=7,
                                   show_all_peaks=True, show_center=True,
@@ -1477,6 +1488,7 @@ class BraggPeaksPolymer(AutoSerialize):
             Color for beam center marker
         """
         from ipywidgets import interact, IntSlider
+        from quantem.core.visualization import show_2d
         
         Ry, Rx = self.peak_coordinates_cartesian.shape
         
@@ -1502,21 +1514,26 @@ class BraggPeaksPolymer(AutoSerialize):
             map_title = 'Peak Intensity Map (All Peaks)'
         
         def show_pattern(ry, rx):
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            # Use show_2d for the base images
+            fig, axs = show_2d(
+                [intensity_map, self.dataset_cartesian[ry, rx].array],
+                cmap=['viridis', 'gray'],
+                title=[map_title, f'Diffraction Pattern (Ry={ry}, Rx={rx})'],
+                cbar=[True, False],
+                norm=['linear_minmax', {'vmax': vmax_cartesian}],
+                show_ticks=[True, False],
+                axsize=(6, 5),
+                tight_layout=True
+            )
             
-            # Plot intensity map with current position marked
-            im1 = ax1.imshow(intensity_map, cmap='viridis', origin='lower', 
-                            interpolation='nearest')
+            ax1, ax2 = axs[0], axs[1]
+            
+            # Add position marker to intensity map
             ax1.plot(rx, ry, 'r+', markersize=15, markeredgewidth=2)
-            ax1.set_title(map_title)
             ax1.set_xlabel('Rx')
             ax1.set_ylabel('Ry')
-            plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
             
-            # Plot diffraction pattern
-            ax2.imshow(self.dataset_cartesian[ry, rx], cmap='gray', vmax=vmax_cartesian)
-            
-            # Overlay peaks
+            # Overlay peaks on diffraction pattern
             peaks_r_invA = self.polar_peaks['r_invA'][ry, rx]
             peaks_y_pixels = self.peak_coordinates_cartesian['y_pixels'][ry, rx]
             peaks_x_pixels = self.peak_coordinates_cartesian['x_pixels'][ry, rx]
@@ -1547,7 +1564,7 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # Show beam center if requested
             if show_center and hasattr(self, 'image_centers') and self.image_centers is not None:
-                ax2.scatter(self.image_centers[ry, rx, 1], self.image_centers[ry, rx, 0],
+                ax2.scatter(self.image_centers[1, ry, rx], self.image_centers[0, ry, rx],
                            c=center_color, s=500, marker='x', linewidths=2, 
                            label='Center', zorder=10)
             
@@ -1556,13 +1573,11 @@ class BraggPeaksPolymer(AutoSerialize):
             if labels:
                 ax2.legend(fontsize=8, loc='upper right')
             
-            title_str = f'Diffraction Pattern (Ry={ry}, Rx={rx})'
+            # Update title with range info
             if radial_range is not None:
-                title_str += f'\nRange: {radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å'
-            ax2.set_title(title_str)
-            ax2.axis('off')
+                current_title = ax2.get_title()
+                ax2.set_title(f'{current_title}\nRange: {radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å')
             
-            plt.tight_layout()
             plt.show()
         
         interact(show_pattern,
@@ -1571,8 +1586,7 @@ class BraggPeaksPolymer(AutoSerialize):
                  rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, 
                              description='Rx:', continuous_update=False))
 
-
-    def plot_peak_count_map(self, q_ranges, figsize_per_map=(5, 4), cmap='viridis'):
+    def plot_peak_count_map(self, q_ranges, figsize_per_map=(5, 4), cmap='viridis', return_values=False):
         """
         Plot 2D maps showing the number of peaks in specified q-ranges.
         
@@ -1628,22 +1642,44 @@ class BraggPeaksPolymer(AutoSerialize):
             
             count_maps.append(count_map)
             
-            # Plot
-            im = axes[idx].imshow(count_map, cmap=cmap, origin='lower', interpolation='nearest')
-            axes[idx].set_title(f'Peak Count\n{q_min:.2f} - {q_max:.2f} 1/Å', fontsize=12)
-            axes[idx].set_xlabel('Rx')
-            axes[idx].set_ylabel('Ry')
-            
-            # Colorbar with integer ticks
-            cbar = plt.colorbar(im, ax=axes[idx])
-            cbar.set_label('Number of Peaks', fontsize=10)
-            
-            # Set colorbar ticks to integers
+            # Calculate max_count early for use in both colorbar and statistics
             max_count = int(np.max(count_map))
-            if max_count > 0:
-                tick_spacing = max(1, max_count // 5)  # About 5 ticks
-                ticks = np.arange(0, max_count + 1, tick_spacing)
-                cbar.set_ticks(ticks)
+            
+            # Plot
+            _, _ = show_2d(
+                count_map,
+                cmap=cmap,
+                title=f'Peak Count\n{q_min:.2f} - {q_max:.2f} 1/Å',
+                cbar=True,
+                show_ticks=True,
+                figax=(fig, axes[idx])
+            )
+            
+            # Customize colorbar - get it from the axes image
+            try:
+                # Try to get colorbar from the image in the axes
+                im = axes[idx].images[0]
+                cbar = im.colorbar
+                
+                if cbar is not None:
+                    cbar.set_label('Number of Peaks', fontsize=10)
+                    
+                    # Set colorbar ticks to integers
+                    if max_count > 0:
+                        tick_spacing = max(1, max_count // 5)  # About 5 ticks
+                        ticks = np.arange(0, max_count + 1, tick_spacing)
+                        cbar.set_ticks(ticks)
+            except (AttributeError, IndexError):
+                # If colorbar access fails, create it manually
+                im = axes[idx].images[0]
+                cbar = plt.colorbar(im, ax=axes[idx])
+                cbar.set_label('Number of Peaks', fontsize=10)
+                
+                # Set colorbar ticks to integers
+                if max_count > 0:
+                    tick_spacing = max(1, max_count // 5)
+                    ticks = np.arange(0, max_count + 1, tick_spacing)
+                    cbar.set_ticks(ticks)
             
             # Print statistics
             total_peaks = int(np.sum(count_map))
@@ -1661,8 +1697,9 @@ class BraggPeaksPolymer(AutoSerialize):
         
         plt.tight_layout()
         plt.show()
-        
-        return fig, axes, count_maps
+
+        if return_values:
+            return fig, axes, count_maps
 
     def make_flowline_map(
         self,
@@ -2209,12 +2246,15 @@ class BraggPeaksPolymer(AutoSerialize):
         x = np.linspace(-1, 1, im_size[0])
         y = np.linspace(-1, 1, im_size[1])
         ya, xa = np.meshgrid(y, x)
-        ra = np.sqrt(xa**2 + ya**2)
+        # TODO: Can replace with squared term? ra2? Faster
+        # ra = np.sqrt(xa**2 + ya**2)
+        ra2 = xa**2 + ya**2
         ta = np.arctan2(ya, xa) + np.deg2rad(theta_offset_degrees)
         ta_sym = ta * sym_rotation_order
     
         # mask
-        mask = np.logical_and(ra > radial_range[0], ra < radial_range[1])
+        mask = np.logical_and(ra2 > radial_range[0]**2, ra2 < radial_range[1]**2)
+        # mask = np.logical_and(ra > radial_range[0], ra < radial_range[1])
     
         # rgb image
         z = mask * np.exp(1j * ta_sym)

@@ -122,10 +122,10 @@ def polar_transform_vector(
     
     # Handle default centers
     if centers is None:
-        centers = np.zeros((N, M, 2))
+        centers = np.zeros((2, N, M))
     
     # Validate centers shape
-    expected_centers_shape = (N, M, 2)
+    expected_centers_shape = (2, N, M)
     if centers.shape != expected_centers_shape:
         raise ValueError(
             f"Centers shape {centers.shape} doesn't match expected {expected_centers_shape}"
@@ -166,7 +166,7 @@ def polar_transform_vector(
     
     for i in iterator:
         for j in range(M):
-            center_y, center_x = centers[i, j]
+            center_y, center_x = centers[:, i, j]
             cartesian_data = cartesian_vector[i, j]
             
             # Handle empty cells

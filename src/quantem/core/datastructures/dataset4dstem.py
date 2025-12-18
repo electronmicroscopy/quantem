@@ -7,6 +7,8 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
+
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -47,6 +49,7 @@ class Dataset4dstem(Dataset4d):
         sampling: NDArray | tuple | list | float | int,
         units: list[str] | tuple | list,
         signal_units: str = "arb. units",
+        metadata: dict = {},
         _token: object | None = None,
     ):
         """Initialize a 4D-STEM dataset.
@@ -65,9 +68,17 @@ class Dataset4dstem(Dataset4d):
             Units for each dimension
         signal_units : str, optional
             Units for the array values, by default "arb. units"
+        metadata : dict
+            "r_to_q_rotation_cw_deg":  rotation r to q clockwise in degrees
+            "ellipticity": 3 parameters (a, b, theta (degrees))
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
+        mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
+        for k in mdata_keys_4dstem:
+            if k not in metadata.keys():
+                metadata[k] = None
+
         super().__init__(
             array=array,
             name=name,
@@ -75,6 +86,7 @@ class Dataset4dstem(Dataset4d):
             sampling=sampling,
             units=units,
             signal_units=signal_units,
+            metadata=metadata,
             _token=_token,
         )
         self._virtual_images = {}
@@ -185,7 +197,6 @@ class Dataset4dstem(Dataset4d):
         if hasattr(self, "_dp_mean"):
             return self._dp_mean
         else:
-            print("Calculating dp_mean, attach with Dataset4dstem.get_dp_mean()")
             return self.get_dp_mean(attach=False)
 
     def get_dp_mean(self, attach: bool = True) -> Dataset2d:
@@ -231,7 +242,6 @@ class Dataset4dstem(Dataset4d):
         if hasattr(self, "_dp_max"):
             return self._dp_max
         else:
-            print("Calculating dp_max, attach with Dataset4dstem.get_dp_max()")
             return self.get_dp_max(attach=False)
 
     def get_dp_max(self, attach: bool = True) -> Dataset2d:
@@ -277,7 +287,6 @@ class Dataset4dstem(Dataset4d):
         if hasattr(self, "_dp_median"):
             return self._dp_median
         else:
-            print("Calculating dp_median, attach with Dataset4dstem.get_dp_median()")
             return self.get_dp_median(attach=False)
 
     def get_dp_median(self, attach: bool = True) -> Dataset2d:
@@ -744,3 +753,6 @@ class Dataset4dstem(Dataset4d):
             self.array[:, :, index_x, index_y] = np.median(
                 self.array[:, :, x_min:x_max, y_min:y_max], axis=(2, 3)
             )
+
+
+    polar_transform = dataset4dstem_polar_transform

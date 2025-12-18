@@ -401,7 +401,13 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
     def find_field(field_options, available_fields):
         fields = [field_options] if isinstance(field_options, str) else field_options
         return next((f for f in fields if f in available_fields), None)
-    
+
+    # Check if None type passed (indicates no entries in Vector FieldView)
+    if peak_coords is None:
+        if debug:
+            print("⚠️ No peaks! Using image center.")
+        return (image_shape[0] / 2, image_shape[1] / 2)
+        
     # Handle Vector input
     if isinstance(peak_coords, Vector):
         if debug:
@@ -441,13 +447,13 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
             raise ValueError(f"Array must be (N, 2) or (N, 4), got {peak_coords.shape}")
     else:
         raise TypeError(f"peak_coords must be Vector or ndarray, got {type(peak_coords)}")
-        
+
     # Check for empty peaks
     if len(peak_coords) == 0:
         if debug:
             print("⚠️ No peaks! Using image center.")
         return (image_shape[0] / 2, image_shape[1] / 2)
-
+        
     # Image center
     center_y, center_x = image_shape[0] / 2, image_shape[1] / 2
     
