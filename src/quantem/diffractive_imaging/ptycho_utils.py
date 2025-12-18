@@ -1,22 +1,14 @@
-from typing import TYPE_CHECKING, Literal, Union, overload
+from math import ceil, floor
+from typing import Literal, Union, overload
 
 import numpy as np
+import torch
 from scipy.optimize import curve_fit
 
-from quantem.core import config
-from quantem.core.utils import array_funcs as arr
+from quantem.core.utils import array_funcs as af
 
-ArrayLike = Union[np.ndarray, "cp.ndarray", "torch.Tensor"]
+ArrayLike = Union[np.ndarray, "torch.Tensor"]
 
-
-if TYPE_CHECKING:
-    import cupy as cp
-    import torch
-else:
-    if config.get("has_cupy"):
-        import cupy as cp
-    if config.get("has_torch"):
-        import torch
 
 # TODO: figure out what here should be put into ptycho base vs kept in a utilities file
 
@@ -28,11 +20,59 @@ class SimpleBatcher:
         batch_size: int | None,
         shuffle: bool = True,
         rng: np.random.Generator | int | None = None,
+        val_ratio: float = 0.0,
+        val_mode: Literal["grid", "random"] = "grid",
+        train_indices: np.ndarray | None = None,
+        val_indices: np.ndarray | None = None,
     ):
         self.indices = np.arange(num)
         self.batch_size = batch_size if batch_size is not None else num
         self.shuffle = shuffle
         self.rng = rng
+
+        # Train/validation split (fixed for the lifetime of this batcher)
+        if train_indices is not None or val_indices is not None:
+            if train_indices is None or val_indices is None:
+                raise ValueError("Both train_indices and val_indices must be provided together.")
+            self.train_indices = np.asarray(train_indices, dtype=int)
+            self.val_indices = np.asarray(val_indices, dtype=int)
+        else:
+            # Validate ratio and split deterministically given rng
+            if val_ratio < 0 or val_ratio >= 1:
+                val_ratio = 0.0
+            n_val = int(round(len(self.indices) * val_ratio))
+            if n_val > 0:
+                if val_mode == "random":
+                    # Random unique selection for validation
+                    perm = self.rng.permutation(self.indices)
+                    self.val_indices = perm[:n_val]
+                    self.train_indices = np.setdiff1d(
+                        self.indices, self.val_indices, assume_unique=False
+                    )
+                else:  # grid/regular selection: every k-th index
+                    if val_ratio <= 0.5:
+                        k = max(1, int(round(1.0 / val_ratio)))
+                        invert = False
+                    else:
+                        k = max(1, int(round(1.0 / (1.0 - val_ratio))))
+                        invert = True
+
+                    grid_sel = self.indices[::k]
+                    if len(grid_sel) > n_val:
+                        grid_sel = grid_sel[:n_val]
+                    if invert:
+                        self.train_indices = grid_sel
+                        self.val_indices = np.setdiff1d(
+                            self.indices, grid_sel, assume_unique=False
+                        )
+                    else:
+                        self.val_indices = grid_sel
+                        self.train_indices = np.setdiff1d(
+                            self.indices, self.val_indices, assume_unique=False
+                        )
+            else:
+                self.val_indices = np.asarray([], dtype=int)
+                self.train_indices = self.indices
 
     @property
     def rng(self) -> np.random.Generator:
@@ -49,10 +89,32 @@ class SimpleBatcher:
         self._rng = rng
 
     def __iter__(self):
-        if self.shuffle:
-            self.indices = self.rng.permutation(self.indices)
-        for i in range(0, len(self.indices), self.batch_size):
-            yield self.indices[i : i + self.batch_size]
+        train_order = (
+            self.rng.permutation(self.train_indices) if self.shuffle else self.train_indices
+        )
+        for i in range(0, len(train_order), self.batch_size):
+            yield train_order[i : i + self.batch_size]
+
+    def __len__(self):
+        return int(ceil(len(self.train_indices) / self.batch_size))
+
+    def iter_val(self):
+        if len(self.val_indices) == 0:
+            return iter(())
+
+        # Do not shuffle validation by default
+        def _gen():
+            for i in range(0, len(self.val_indices), self.batch_size):
+                yield self.val_indices[i : i + self.batch_size]
+
+        return _gen()
+
+    @property
+    def has_validation(self) -> bool:
+        return len(self.val_indices) > 0
+
+    def val_len(self) -> int:
+        return int(ceil(len(self.val_indices) / self.batch_size)) if self.has_validation else 0
 
 
 @overload
@@ -68,10 +130,10 @@ def fourier_shift_expand(
 ) -> ArrayLike:
     """Fourier-shift array by flat array of positions."""
     phase = fourier_translation_operator(positions, array.shape, expand_dim, dtype=array.dtype)
-    fourier_array = arr.fft2(array, norm="ortho")
+    fourier_array = af.fft2(array)
     shifted_fourier_array = fourier_array * phase
-    shifted_array = arr.ifft2(shifted_fourier_array, norm="ortho")
-    if arr.is_complex(array):
+    shifted_array = af.ifft2(shifted_fourier_array)
+    if af.is_complex(array):
         return shifted_array
     else:
         return shifted_array.real
@@ -101,16 +163,16 @@ def fourier_translation_operator(
     nr, nc = shape[-2:]
     r = positions[..., 0][:, None, None]
     c = positions[..., 1][:, None, None]
-    kr = arr.match_device(np.fft.fftfreq(nr, d=1.0), positions)
-    kc = arr.match_device(np.fft.fftfreq(nc, d=1.0), positions)
-    ramp_r = arr.exp(-2.0j * np.pi * kr[None, :, None] * r)
-    ramp_c = arr.exp(-2.0j * np.pi * kc[None, None, :] * c)
+    kr = af.match_device(np.fft.fftfreq(nr, d=1.0).astype(np.float32), positions)
+    kc = af.match_device(np.fft.fftfreq(nc, d=1.0).astype(np.float32), positions)
+    ramp_r = af.exp(-2.0j * np.pi * kr[None, :, None] * r)
+    ramp_c = af.exp(-2.0j * np.pi * kc[None, None, :] * c)
     ramp = ramp_r * ramp_c
     if expand_dim:
         for _ in range(len(shape) - 2):
             ramp = ramp[:, None, ...]
     if dtype is not None:
-        ramp = arr.as_type(ramp, dtype)
+        ramp = af.as_type(ramp, dtype)
     return ramp
 
 
@@ -130,16 +192,16 @@ def get_com_2d(ar: ArrayLike, corner_centered: bool = False) -> ArrayLike:
     else:
         c, r = np.meshgrid(np.arange(nc), np.arange(nr))
 
-    rc = arr.match_device(np.stack([r, c]), ar)
+    rc = af.match_device(np.stack([r, c]), ar)
     com = (
-        arr.sum(
+        af.sum(
             rc * ar[..., None, :, :],
             axis=(
                 -1,
                 -2,
             ),
         )
-        / arr.sum(
+        / af.sum(
             ar,
             axis=(
                 -1,
@@ -155,7 +217,7 @@ def sum_patches_base(
 ) -> torch.Tensor:
     flat_weights = patches.reshape(-1)
     flat_indices = indices.reshape(-1)
-    out = arr.match_device(
+    out = af.match_device(
         torch.zeros(
             int(torch.prod(torch.tensor(obj_shape))), dtype=patches.dtype, device=patches.device
         ),
@@ -196,7 +258,7 @@ def shift_array(
         Returns:
             (array) the shifted array
     """
-    xp = arr.get_xp_module(ar)
+    xp = af.get_xp_module(ar)
 
     # Apply image shift
     if bilinear is False:
@@ -206,7 +268,7 @@ def shift_array(
         qc = xp.asarray(qc)
 
         p = xp.exp(-(2j * xp.pi) * ((cshift * qc) + (rshift * qr)))
-        shifted_ar = xp.real(xp.fft.ifft2((xp.fft.fft2(ar, norm="ortho")) * p, norm="ortho"))
+        shifted_ar = xp.real(xp.fft.ifft2((xp.fft.fft2(ar)) * p))
 
     else:
         rF = xp.floor(rshift).astype(int).item()
@@ -523,7 +585,9 @@ class AffineTransform:
         )
 
 
-def center_crop_arr(arr: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+def center_crop_arr(
+    arr: np.ndarray, shape: tuple[int, ...], pad_if_needed: bool = False
+) -> np.ndarray:
     """
     Crop an array to a given shape, centered along all axes.
 
@@ -541,11 +605,17 @@ def center_crop_arr(arr: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
             f"Got shape with {len(shape)} dimensions and arr with {arr.ndim} dimensions."
         )
 
+    pad = [[0, 0]] * len(shape)
     for i, (s, a) in enumerate(zip(shape, arr.shape)):
         if s > a:
-            raise ValueError(
-                f"Dimension {i} of shape ({s}) is larger than dimension {i} of arr ({a})."
-            )
+            if not pad_if_needed:
+                raise ValueError(
+                    f"Dimension {i} of shape ({s}) is larger than dimension {i} of arr ({a})."
+                )
+            pad[i] = [int(floor(s - a) / 2), int(ceil(s - a) / 2)]
+
+    if any(pad):
+        arr = np.pad(arr, pad_width=pad, mode="constant")
 
     slices = []
     for i, (s, a) in enumerate(zip(shape, arr.shape)):

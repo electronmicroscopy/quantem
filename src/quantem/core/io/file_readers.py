@@ -1,4 +1,5 @@
 import importlib
+from os import PathLike
 from pathlib import Path
 
 import h5py
@@ -10,8 +11,13 @@ from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
 
 
 def read_4dstem(
+<<<<<<< HEAD
     file_path: str,
     file_type: str,
+=======
+    file_path: str | PathLike,
+    file_type: str | None = None,
+>>>>>>> origin/dev
     dataset_index: int | None = None,
     **kwargs,
 ) -> Dataset4dstem:
@@ -20,10 +26,14 @@ def read_4dstem(
 
     Parameters
     ----------
-    file_path: str
+    file_path: str | PathLike
         Path to data
     file_type: str
         The type of file reader needed. See rosettasciio for supported formats
+<<<<<<< HEAD
+=======
+        https://hyperspy.org/rosettasciio/supported_formats/index.html
+>>>>>>> origin/dev
     dataset_index: int, optional
         Index of the dataset to load if file contains multiple datasets.
         If None, automatically selects the first 4D dataset found.
@@ -34,6 +44,7 @@ def read_4dstem(
     --------
     Dataset4dstem
     """
+<<<<<<< HEAD
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
     data_list = file_reader(file_path)
     
@@ -41,19 +52,37 @@ def read_4dstem(
     if dataset_index is not None:
         imported_data = data_list[dataset_index]
         if imported_data['data'].ndim != 4:
+=======
+    if file_type is None:
+        file_type = Path(file_path).suffix.lower().lstrip(".")
+
+    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
+    data_list = file_reader(file_path)
+
+    # If specific index provided, use it
+    if dataset_index is not None:
+        imported_data = data_list[dataset_index]
+        if imported_data["data"].ndim != 4:
+>>>>>>> origin/dev
             raise ValueError(
                 f"Dataset at index {dataset_index} has {imported_data['data'].ndim} dimensions, "
                 f"expected 4D. Shape: {imported_data['data'].shape}"
             )
     else:
         # Automatically find first 4D dataset
+<<<<<<< HEAD
         four_d_datasets = [(i, d) for i, d in enumerate(data_list) if d['data'].ndim == 4]
         
+=======
+        four_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 4]
+
+>>>>>>> origin/dev
         if len(four_d_datasets) == 0:
             print(f"No 4D datasets found in {file_path}. Available datasets:")
             for i, d in enumerate(data_list):
                 print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
             raise ValueError("No 4D dataset found in file")
+<<<<<<< HEAD
         
         dataset_index, imported_data = four_d_datasets[0]
         
@@ -62,6 +91,18 @@ def read_4dstem(
     
     imported_axes = imported_data["axes"]
     
+=======
+
+        dataset_index, imported_data = four_d_datasets[0]
+
+        if len(data_list) > 1:
+            print(
+                f"File contains {len(data_list)} dataset(s). Using dataset {dataset_index} with shape {imported_data['data'].shape}"
+            )
+
+    imported_axes = imported_data["axes"]
+
+>>>>>>> origin/dev
     sampling = kwargs.pop(
         "sampling",
         [ax["scale"] for ax in imported_axes],
@@ -74,7 +115,11 @@ def read_4dstem(
         "units",
         ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes],
     )
+<<<<<<< HEAD
     
+=======
+
+>>>>>>> origin/dev
     dataset = Dataset4dstem.from_array(
         array=imported_data["data"],
         sampling=sampling,
@@ -86,7 +131,7 @@ def read_4dstem(
     return dataset
 
 def read_2d(
-    file_path: str,
+    file_path: str | PathLike,
     file_type: str | None = None,
 ) -> Dataset2d:
     """
@@ -94,7 +139,7 @@ def read_2d(
 
     Parameters
     ----------
-    file_path: str
+    file_path: str | PathLike
         Path to data
     file_type: str
         The type of file reader needed. See rosettasciio for supported formats
@@ -125,19 +170,22 @@ def read_2d(
             imported_data["axes"][1]["units"],
         ],
     )
+    dataset.file_path = file_path
 
     return dataset
 
 
 def read_emdfile_to_4dstem(
-    file_path: str, data_keys: list[str] | None = None, calibration_keys: list[str] | None = None
+    file_path: str | PathLike,
+    data_keys: list[str] | None = None,
+    calibration_keys: list[str] | None = None,
 ) -> Dataset4dstem:
     """
     File reader for legacy `emdFile` / `py4DSTEM` files.
 
     Parameters
     ----------
-    file_path: str
+    file_path: str | PathLike
         Path to data
 
     Returns
@@ -177,5 +225,6 @@ def read_emdfile_to_4dstem(
             sampling=[r_pixel_size, r_pixel_size, q_pixel_size, q_pixel_size],
             units=[r_pixel_units, r_pixel_units, q_pixel_units, q_pixel_units],
         )
+    dataset.file_path = file_path
 
     return dataset

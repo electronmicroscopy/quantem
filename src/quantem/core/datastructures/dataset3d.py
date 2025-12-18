@@ -4,11 +4,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
-from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization.visualization_utils import ScalebarConfig
 
 
+@Dataset.register_dimension(3)
 class Dataset3d(Dataset):
     """3D dataset class that inherits from Dataset.
 
@@ -99,36 +99,6 @@ class Dataset3d(Dataset):
             sampling=sampling,
             units=units,
             signal_units=signal_units,
-        )
-
-    def __getitem__(self, index) -> Dataset2d:
-        """
-        Simple indexing function to return Dataset2d or Dataset3d view.
-
-        Parameters
-        ----------
-        index : tuple
-            Index to access a subset of the dataset
-
-        Returns
-        -------
-        dataset
-            A new Dataset2d or Dataset3D instance containing the indexed data
-        """
-        array_view = self.array[index]
-        ndim = array_view.ndim
-        calibrated_origin = self.origin.ndim == self.ndim
-
-        if ndim != 2:
-            raise ValueError("only 2D slices are supported.")
-
-        return Dataset2d.from_array(
-            array=array_view,
-            name=self.name + str(index),
-            origin=self.origin[index] if calibrated_origin else self.origin[-ndim:],
-            sampling=self.sampling[-ndim:],
-            units=self.units[-ndim:],
-            signal_units=self.signal_units,
         )
 
     def to_dataset2d(self):

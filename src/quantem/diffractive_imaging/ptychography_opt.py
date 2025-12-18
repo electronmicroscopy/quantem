@@ -20,8 +20,8 @@ class PtychographyOpt(PtychographyBase):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._optimizer_params = {}
-        self._scheduler_params = {}
+        # self._optimizer_params = {}
+        # self._scheduler_params = {}
 
     def _get_default_lr(self, key: str) -> float:
         """Get default learning rate for a given optimization key."""
@@ -38,8 +38,15 @@ class PtychographyOpt(PtychographyBase):
 
     @property
     def optimizer_params(self) -> dict[str, dict]:
-        """Returns the parameters used to set the optimizers."""
-        return self._optimizer_params
+        return {
+            key: params
+            for key, params in [
+                ("object", self.obj_model.optimizer_params),
+                ("probe", self.probe_model.optimizer_params),
+                ("dataset", self.dset.optimizer_params),
+            ]
+            if params
+        }
 
     @optimizer_params.setter
     def optimizer_params(self, d: dict) -> None:
@@ -61,36 +68,48 @@ class PtychographyOpt(PtychographyBase):
             ...
         }
         """
-        self._optimizer_params = {}
         if isinstance(d, (tuple, list)):
             d = {k: {} for k in d}
 
+        ## previously removed unspecified optimizers, but I think its better to keep them
+        ## and only remove if type is none
+        # for key in self.OPTIMIZABLE_VALS:
+        #     # if not specified, remove the scheduler for that model
+        #     if key not in d:
+        #         d[key] = {"type": "none"}
+
         for k, v in d.items():
-            if k not in self.OPTIMIZABLE_VALS:
-                raise ValueError(
-                    f"key to be optimized, {k}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
-                )
             if "type" not in v.keys():
                 v["type"] = self.DEFAULT_OPTIMIZER_TYPE
             if "lr" not in v.keys():
                 v["lr"] = self._get_default_lr(k)
-            self._optimizer_params[k] = v
+            # self._optimizer_params[k] = v
+            if k == "object":
+                self.obj_model.optimizer_params = v
+            elif k == "probe":
+                self.probe_model.optimizer_params = v
+            elif k == "dataset":
+                self.dset.optimizer_params = v
+            else:
+                raise ValueError(
+                    f"key to be optimized, {k}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
+                )
 
     @property
     def optimizers(self) -> dict[str, "torch.optim.Optimizer"]:
         """Get optimizers from all models."""
         optimizers = {}
-        if "object" in self._optimizer_params and self.obj_model.has_optimizer():
+        if self.obj_model.has_optimizer():
             optimizers["object"] = self.obj_model.optimizer
-        if "probe" in self._optimizer_params and self.probe_model.has_optimizer():
+        if self.probe_model.has_optimizer():
             optimizers["probe"] = self.probe_model.optimizer
-        if "dataset" in self._optimizer_params and self.dset.has_optimizer():
+        if self.dset.has_optimizer():
             optimizers["dataset"] = self.dset.optimizer
         return optimizers
 
     def set_optimizers(self):
         """Set optimizers for each model."""
-        for key, params in self._optimizer_params.items():
+        for key, params in self.optimizer_params.items():
             if key == "object":
                 self.obj_model.set_optimizer(params)
             elif key == "probe":
@@ -104,18 +123,21 @@ class PtychographyOpt(PtychographyBase):
 
     def remove_optimizer(self, key: str) -> None:
         """Remove optimizer from a specific model."""
-        self._optimizer_params.pop(key, None)
         if key == "object":
-            self.obj_model.reset_optimizer()
+            self.obj_model.remove_optimizer()
         elif key == "probe":
-            self.probe_model.reset_optimizer()
+            self.probe_model.remove_optimizer()
         elif key == "dataset":
-            self.dset.reset_optimizer()
+            self.dset.remove_optimizer()
 
     @property
     def scheduler_params(self) -> dict[str, dict]:
         """Returns the parameters used to set the schedulers."""
-        return self._scheduler_params
+        return {
+            "object": self.obj_model.scheduler_params,
+            "probe": self.probe_model.scheduler_params,
+            "dataset": self.dset.scheduler_params,
+        }
 
     @scheduler_params.setter
     def scheduler_params(self, d: dict) -> None:
@@ -132,28 +154,31 @@ class PtychographyOpt(PtychographyBase):
             ...
         }
         """
+        for key in self.OPTIMIZABLE_VALS:
+            # if not specified, remove the scheduler for that model
+            if key not in d:
+                d[key] = {}
         for k, v in d.items():
-            if not any(v):
-                continue
-            if k not in self.OPTIMIZABLE_VALS:
+            if k == "object":
+                self.obj_model.scheduler_params = v
+            elif k == "probe":
+                self.probe_model.scheduler_params = v
+            elif k == "dataset":
+                self.dset.scheduler_params = v
+            else:
                 raise ValueError(
                     f"key to be optimized, {k}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
                 )
-            if v["type"] not in ["cyclic", "plateau", "exp", "gamma", "none"]:
-                raise ValueError(
-                    f"Unknown scheduler type: {v['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'none']"
-                )
-        self._scheduler_params = d
 
     @property
     def schedulers(self) -> dict[str, "torch.optim.lr_scheduler._LRScheduler"]:
         """Get schedulers from all models."""
         schedulers = {}
-        if "object" in self._scheduler_params and self.obj_model.scheduler is not None:
+        if self.obj_model.scheduler is not None:
             schedulers["object"] = self.obj_model.scheduler
-        if "probe" in self._scheduler_params and self.probe_model.scheduler is not None:
+        if self.probe_model.scheduler is not None:
             schedulers["probe"] = self.probe_model.scheduler
-        if "dataset" in self._scheduler_params and self.dset.scheduler is not None:
+        if self.dset.scheduler is not None:
             schedulers["dataset"] = self.dset.scheduler
         return schedulers
 
@@ -164,8 +189,6 @@ class PtychographyOpt(PtychographyBase):
     ):
         """Set schedulers for each model."""
         for key, scheduler_params in params.items():
-            if not any(scheduler_params):
-                continue
             if key not in self.OPTIMIZABLE_VALS:
                 raise ValueError(
                     f"key to be optimized, {key}, not in allowed keys: {self.OPTIMIZABLE_VALS}"
@@ -180,7 +203,7 @@ class PtychographyOpt(PtychographyBase):
 
     def step_optimizers(self):
         """Step all active optimizers."""
-        for key in self._optimizer_params.keys():
+        for key in self.optimizer_params.keys():
             if key == "object" and self.obj_model.has_optimizer():
                 self.obj_model.step_optimizer()
             elif key == "probe" and self.probe_model.has_optimizer():
@@ -190,17 +213,17 @@ class PtychographyOpt(PtychographyBase):
 
     def zero_grad_all(self):
         """Zero gradients for all active optimizers."""
-        for key in self._optimizer_params.keys():
+        for key in self.optimizer_params.keys():
             if key == "object" and self.obj_model.has_optimizer():
-                self.obj_model.zero_grad()
+                self.obj_model.zero_optimizer_grad()
             elif key == "probe" and self.probe_model.has_optimizer():
-                self.probe_model.zero_grad()
+                self.probe_model.zero_optimizer_grad()
             elif key == "dataset" and self.dset.has_optimizer():
-                self.dset.zero_grad()
+                self.dset.zero_optimizer_grad()
 
     def step_schedulers(self, loss: float | None = None):
         """Step all active schedulers."""
-        for key in self._scheduler_params.keys():
+        for key in self.scheduler_params.keys():
             if key == "object" and self.obj_model.scheduler is not None:
                 self.obj_model.step_scheduler(loss)
             elif key == "probe" and self.probe_model.scheduler is not None:

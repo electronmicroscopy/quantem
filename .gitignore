@@ -181,6 +181,7 @@ cython_debug/
 
 # jupyter notebooks
 *.ipynb
+ipynb-playground/
 
 # zip files
 *.zip

@@ -1,5 +1,11 @@
+import contextlib
+import copy
 import datetime
+import os
+import shutil
+import tempfile
 from pathlib import Path
+from typing import Self, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,7 +14,7 @@ from numpy.typing import NDArray
 from torch._tensor import Tensor
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from quantem.core.io.serialize import AutoSerialize
+from quantem.core.io.serialize import AutoSerialize, load
 
 """
 Tensorboard logger class for AD/ML reconstruction methods
@@ -18,7 +24,7 @@ Tensorboard logger class for AD/ML reconstruction methods
 class LoggerBase(AutoSerialize):
     def __init__(
         self,
-        base_log_dir: Path | str,
+        base_log_dir: os.PathLike | str,
         run_prefix: str,
         run_suffix: str = "",
         log_images_every: int = 10,
@@ -56,7 +62,43 @@ class LoggerBase(AutoSerialize):
         self.writer.flush()
 
     def close(self) -> None:
+        self.writer.flush()
         self.writer.close()
+
+    def new_timestamp(self) -> None:
+        self.close()
+        self._timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = self.run_prefix + "_" + self._timestamp
+        if self.run_suffix:
+            name += f"_{self.run_suffix}"
+        new_log_dir = self.log_dir.parent / name
+        new_log_dir.mkdir(exist_ok=True)
+        self._log_dir = new_log_dir
+        self.writer = SummaryWriter(str(self.log_dir))
+
+    def clone(self) -> Self:
+        try:
+            cloned: Self = copy.deepcopy(self)
+        except Exception:
+            # using tempfile saving as fallback
+            tmp_path = Path(tempfile.gettempdir()) / f"logger_clone_{self.run_prefix}.zip"
+            try:
+                self.save(
+                    tmp_path,
+                    mode="o",
+                    store="zip",
+                )
+                cloned = cast(Self, load(tmp_path))
+            finally:
+                with contextlib.suppress(Exception):
+                    tmp_path.unlink()
+        cloned.new_timestamp()
+
+        # copy old log file to new log dir
+        files = list(self.log_dir.glob("events.out.tfevents.*"))
+        for file in files:
+            shutil.copy(file, cloned.log_dir)
+        return cloned
 
     # --- Properties ---
 
@@ -65,8 +107,8 @@ class LoggerBase(AutoSerialize):
         return self._log_dir
 
     @log_dir.setter
-    def log_dir(self, dir: str | Path) -> None:
-        if not isinstance(dir, (str, Path)):
+    def log_dir(self, dir: str | os.PathLike) -> None:
+        if not isinstance(dir, str | os.PathLike):
             raise TypeError("Log directory must be a str or Path.")
 
         dir = Path(dir)
@@ -107,11 +149,7 @@ class LoggerBase(AutoSerialize):
 
     @log_images_every.setter
     def log_images_every(self, value: int) -> None:
-        if not isinstance(value, int):
-            raise TypeError("Log images every must be an integer")
-        if value < 1:
-            raise ValueError("Log images every must be at least 1")
-        self._log_images_every = value
+        self._log_images_every = int(value)
 
     # --- Helper Functions ---
 

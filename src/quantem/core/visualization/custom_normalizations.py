@@ -520,6 +520,11 @@ class CustomNormalization(colors.Normalize):
         -------
         None
         """
+        if data.dtype == np.bool_ or data.dtype == bool:
+            self.vmin, self.vmax = 0.0, 1.0
+            self.interval = ManualInterval(self.vmin, self.vmax)
+            return None
+
         self.vmin, self.vmax = self.interval.get_limits(data)
         self.interval = ManualInterval(self.vmin, self.vmax)  # set explicitly with ManualInterval
         return None
