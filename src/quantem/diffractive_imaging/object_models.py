@@ -350,9 +350,20 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             weight=self.constraints["surface_zero_weight"],
         )
         self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
-        self.accumulate_constraint_losses()
-        return tv_loss + surface_zero_loss
 
+        loss = tv_loss + surface_zero_loss
+        # Patchy. Should be moved to subclass
+        if "tv_channel_diff" in self.constraints and self.constraints["tv_channel_diff"] > 0:
+            tv_channel_diff = self.get_multi_channel_tv_loss(
+                obj,
+                weight=self.constraints["tv_channel_diff"]
+            )
+            self.add_soft_constraint_loss("tv_channel_diff", tv_channel_diff)
+            loss = loss + tv_channel_diff
+
+        self.accumulate_constraint_losses()
+        return loss
+    
     def get_tv_loss(
         self, array: torch.Tensor, weights: None | tuple[float, float] = None
     ) -> torch.Tensor:
@@ -1235,6 +1246,11 @@ class ObjectMultiplexed(ObjectPixelated):
     This object will descrive a sample in more then one state,
     Usually the base state and it's response to external stimulis
     """
+    DEFAULT_CONSTRAINTS = {
+        **ObjectPixelated.DEFAULT_CONSTRAINTS,
+        "tv_channel_diff": 0.0,
+        "joint_tv": 0.0,
+    }
 
     def __init__(
         self,
@@ -1247,6 +1263,9 @@ class ObjectMultiplexed(ObjectPixelated):
             num_slices=num_slices,
             **kwargs
         )
+
+        self._constraints = self.DEFAULT_CONSTRAINTS.copy()
+
         self.num_channels = num_channels
         self._obj = nn.Parameter(torch.ones(num_channels, num_slices, 1, 1), requires_grad=True)
 
@@ -1321,6 +1340,42 @@ class ObjectMultiplexed(ObjectPixelated):
         )
 
         return obj_model
+
+    def get_multi_channel_tv_loss(self, obj, weight, channels=(1,0)):
+        loss = self._get_zero_loss_tensor()
+        diff_phase = obj[channels[0],...].angle() - obj[channels[1],...].angle()        
+        loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-1)))
+        loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-2)))
+
+        return loss
+
+    def get_joint_tv_loss(self, obj, weight, channels=(1, 0), eps=1e-8):
+        """
+        Joint TV (vectorial TV) for two channels.
+        Encourages their gradients to be aligned and share edge locations.
+
+        obj:    tensor with shape (..., H, W)
+        channels: tuple of two indices into the channel dimension of obj
+        """
+        loss = self._get_zero_loss_tensor()
+
+        c0, c1 = channels
+
+        # Finite differences in x (last dim)
+        gx0 = obj[c0, ...].diff(dim=-1)
+        gx1 = obj[c1, ...].diff(dim=-1)
+        # vectorial TV in x: sqrt(gx0^2 + gx1^2)
+        joint_gx = torch.sqrt(gx0 ** 2 + gx1 ** 2 + eps)
+        loss = loss + weight * torch.mean(torch.abs(joint_gx))
+
+        # Finite differences in y (second-to-last dim)
+        gy0 = obj[c0, ...].diff(dim=-2)
+        gy1 = obj[c1, ...].diff(dim=-2)
+        # vectorial TV in y: sqrt(gy0^2 + gy1^2)
+        joint_gy = torch.sqrt(gy0 ** 2 + gy1 ** 2 + eps)
+        loss = loss + weight * torch.mean(torch.abs(joint_gy))
+
+        return loss
 
     def forward(self, patch_indices: torch.Tensor, batch_indices: torch.Tensor):
         """Get patch indices of the object"""
