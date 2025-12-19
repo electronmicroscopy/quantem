@@ -9,10 +9,11 @@ from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import ObjectModelType
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
+from quantem.tomography.tomography_opt import TomographyOpt
 from quantem.tomography.utils import torch_phase_cross_correlation
 
 
-class Tomography:
+class Tomography(TomographyBase, TomographyOpt):
     """
     Class for handling all ML tomography reconstruction methods.
     Automatic handling between AD and INR-based tomography.
