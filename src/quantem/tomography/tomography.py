@@ -1,4 +1,4 @@
-from typing import Literal, Self
+from typing import Literal, Optional, Self, Tuple
 
 import numpy as np
 import torch
@@ -34,6 +34,23 @@ class Tomography(TomographyBase, TomographyOpt):
             logger=logger,
             device=device,
         )
+
+    def reconstruct(
+        self,
+        obj_model: ObjectModelType,
+        dset: DatasetModelType,
+        num_iter: int = 10,
+        reset: bool = False,
+        optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        constraints=None,  # TODO: What to pass into the constraints?
+        loss_func: Tuple[str, Optional[float]] = ("smooth_l1", 0.07),
+    ):
+        raise NotImplementedError
+        """
+        This function should be able to handle both AD and INR-based tomography reconstruction methods.
+        I.e, auto-detection through the obj model type, while both share the same pose optimization.
+        """
 
 
 class TomographyConventional(TomographyBase):

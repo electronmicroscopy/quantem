@@ -264,4 +264,8 @@ class ObjectPixelated(ObjectConstraints):
         self._obj = self._obj.to(device)
 
 
-ObjectModelType = ObjectPixelated
+class ObjectINR(ObjectConstraints):
+    pass
+
+
+ObjectModelType = ObjectPixelated | ObjectINR
