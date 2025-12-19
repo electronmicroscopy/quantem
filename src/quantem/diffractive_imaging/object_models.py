@@ -302,13 +302,17 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         else:  # potential
             if self.constraints["fix_potential_baseline"]:
                 if mask is not None:
-                    offset = obj[mask < 0.5 * mask.max()].mean()
+                    background = mask < 0.5 * mask.max()
+                    if background.any():
+                        offset = obj[background].mean()
+                    else:
+                        offset = obj.min()
                 else:
-                    offset = torch.min(obj)
+                    offset = obj.min()
+                offset = offset.detach()
                 offset *= self.constraints["fix_potential_baseline_factor"]
             else:
                 offset = 0
-            # print("offset: ", offset)
 
             if self.constraints.get("positivity", True):
                 obj2 = torch.clamp(obj - offset, min=0.0)
