@@ -563,7 +563,6 @@ def edge_filtering(
             [sf_val, sf_val],
             )
 
-
     r = np.arange(
         -np.ceil(2.0*sigma_edge),
         np.ceil(2.0*sigma_edge+1),
@@ -577,16 +576,35 @@ def edge_filtering(
         [-sf_val[0],0,sf_val[1]],
     ])
 
-    im_x = convolve2d(im, sf, mode = 'same') 
-    im_x = convolve2d(im_x, k, mode = 'same')
-    im_x = convolve2d(im_x, k.T, mode = 'same')
+    im_x = convolve2d(im, sf, mode='same', boundary='symm')
+    im_x = convolve2d(im_x, k, mode='same', boundary='symm')
+    im_x = convolve2d(im_x, k.T, mode='same', boundary='symm')
 
-    im_y = convolve2d(im, sf.T, mode = 'same')
-    im_y = convolve2d(im_y, k, mode = 'same')
-    im_y = convolve2d(im_y, k.T, mode = 'same')
+    im_y = convolve2d(im, sf.T, mode='same', boundary='symm')
+    im_y = convolve2d(im_y, k, mode='same', boundary='symm')
+    im_y = convolve2d(im_y, k.T, mode='same', boundary='symm')
 
     im_edge = np.sqrt(im_x**2 + im_y**2)
 
     return im_edge
+
+
+# def boundary_blend(
+#     stack,
+#     blend_shape,
+#     # modify_in_place: bool = True,
+# ):
+#     stack_pad = 
+    
+
+
+
+# def pad():
+
+
+
+
+
+
 
 
