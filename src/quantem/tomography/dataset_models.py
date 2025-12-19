@@ -2,6 +2,7 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import numpy as np
 import torch
 import torch.nn as nn
 from numpy.typing import NDArray
@@ -21,7 +22,9 @@ class DatasetValue:
     target: torch.Tensor
     tilt_angle: int | float
     pixel_loc: tuple[int, int] | None = None  # Only for INRDataset
-    # pose: tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter] | None = None # If there is pose optimization.
+    pose: tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter] | None = (
+        None  # If there is pose optimization.
+    )
 
 
 class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
@@ -45,9 +48,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         AutoSerialize.__init__(self)
         OptimizerMixin.__init__(self)
         nn.Module.__init__(self)
-
-        if _token is not self._token:
-            raise RuntimeError("Use TomographyDatasetBase.from_* to instantiate this class.")
+        # if _token is not self._token: TODO: Idk why this isn't working.
+        #     raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
         if not (
             tilt_stack.shape[0] < tilt_stack.shape[1] or tilt_stack.shape[0] < tilt_stack.shape[2]
@@ -56,8 +58,19 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
 
+        self.volume_size = (int(max(tilt_stack.shape)), tilt_stack.shape[1], tilt_stack.shape[2])
+
+        # TODO: Maybe have the validation in here too.
+        max_val = np.quantile(tilt_stack, 0.95)
+        if type(tilt_stack) is not torch.Tensor:
+            tilt_stack = torch.from_numpy(tilt_stack)
+        if type(tilt_angles) is not torch.Tensor:
+            tilt_angles = torch.from_numpy(tilt_angles)
+
+        # Tilt stack normalization
+        tilt_stack = tilt_stack / max_val
+
         self.tilt_stack = tilt_stack
-        self.volume_size = (int(tilt_stack.shape.max()), tilt_stack.shape[1], tilt_stack.shape[2])
         self.tilt_angles = tilt_angles
         self.learn_pose = learn_pose
 
@@ -76,6 +89,11 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         """
         raise NotImplementedError("This method should be implemented in subclasses.")
 
+    # --- Helper Functions ---
+    def to(self, device: str):
+        self.tilt_stack = self.tilt_stack.to(device)
+        self.tilt_angles = self.tilt_angles.to(device)
+
 
 class TomographyPixDataset(
     TomographyDatasetBase
@@ -88,12 +106,16 @@ class TomographyPixDataset(
        In SIRT, it's only the tilt image.
     """
 
-    pass
-
     def __init__(
         self,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_pose: bool = False,
+        _token: object | None = None,
     ):
-        pass
+        super().__init__(
+            tilt_stack=tilt_stack, tilt_angles=tilt_angles, learn_pose=learn_pose, _token=_token
+        )
 
     def forward(
         self,
@@ -103,11 +125,21 @@ class TomographyPixDataset(
         Forward pass for pixel-based tomography.
         Returns the full tilt image for the given projection index, and the tilt angle.
         """
+
         return DatasetValue(
             target=self.tilt_stack[proj_idx],
             tilt_angle=self.tilt_angles[proj_idx],
             pixel_loc=None,
         )
+
+    @classmethod
+    def from_data(
+        cls,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_pose: bool = False,
+    ):
+        return cls(tilt_stack=tilt_stack, tilt_angles=tilt_angles, learn_pose=learn_pose)
 
 
 class TomographyINRDataset(TomographyDatasetBase, Dataset):
@@ -126,9 +158,9 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         val_ratio: float = 0.0,
         mode: Literal["train", "val"] = "train",
         seed: int = 42,
-        _token: object | None = None,
+        token: object | None = None,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_pose, _token)
+        super().__init__(tilt_stack, tilt_angles, learn_pose, token)
 
         self._total_pixels = self.volume_size[0] * self.volume_size[1] * self.volume_size[2]
 

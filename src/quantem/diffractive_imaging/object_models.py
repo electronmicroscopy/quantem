@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn.parameter import Parameter
 from tqdm.auto import tqdm
 
 from quantem.core import config
@@ -927,7 +928,7 @@ class ObjectDIP(ObjectConstraints):
         """Get the parameters that should be optimized for this model."""
         # Since model is registered as a submodule, we can use the parent's parameters() method
         # which will automatically include all submodule parameters
-        return list(self.parameters())
+        return list[Parameter](self.parameters())
 
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
