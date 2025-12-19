@@ -2,6 +2,7 @@ from typing import Any, Self, Optional, Tuple
 
 import os
 import json
+import csv
 from scipy.signal import find_peaks
 
 import numpy as np
@@ -17,15 +18,11 @@ from quantem.core.utils.validators import ensure_valid_array
 
 
 class Dataset3dspectroscopy(Dataset3d):
-    """
-    Class for handling 3D spectroscopy data and extracting spectra from ROIs.
-    Accepts either a dataset-like object or explicit arguments, and works as a base class.
-    """
 
     # stores the element line info so you don't need to reload each time
     element_info = None
 
-    # loads the element info
+    # loads the xray lines dataset
     @classmethod
     def load_element_info(cls, path='xray_lines.json'):
         if cls.element_info is not None:
@@ -50,8 +47,6 @@ class Dataset3dspectroscopy(Dataset3d):
                 signal_units=getattr(array, "signal_units", signal_units),
                 _token=type(self)._token if _token is None else _token,
             )
-            # Initialize model elements storage
-            self.model_elements = None
         else:
             super().__init__(
                 array=array,
@@ -269,7 +264,8 @@ class Dataset3dspectroscopy(Dataset3d):
         plt.tight_layout()
         plt.show()
 
-    '''
+# QUANTIFICATION -----------------------------------------------
+
     def quantify_composition(self, roi=None, elements=None, k_factors=None, method='cliff_lorimer', mask=None):
         """
         Quantify elemental composition from EDS spectrum using Cliff-Lorimer approach.
@@ -334,7 +330,7 @@ class Dataset3dspectroscopy(Dataset3d):
             intensities[element] = intensity
             
         # Handle k-factors
-        if k_factors is None:
+        if k_factors is None: # if they arent provided, calculate from kfacs_Titan_300_keV.csv
             k_factors = self._calculate_theoretical_k_factors(elements)
         else:
             # Validate k-factors
@@ -343,7 +339,7 @@ class Dataset3dspectroscopy(Dataset3d):
         
         # Apply Cliff-Lorimer quantification
         if method == 'cliff_lorimer':
-            results = self._cliff_lorimer_quantification(elements, intensities, k_factors)
+            results = self._cliff_lorimer_quantification(elements, intensities, k_factors, method, roi)
         else:
             raise ValueError(f"Unknown quantification method: {method}")
         
@@ -408,7 +404,7 @@ class Dataset3dspectroscopy(Dataset3d):
         for weight, line_energy, line_name in weighted_lines[:3]:
             if weight > 0.1:  # Only significant lines
                 # Find integration window around the line
-                # Use ±0.1 keV window or adaptive based on energy resolution
+                # Use +/- 0.1 keV window or adaptive based on energy resolution
                 window_width = max(0.1, line_energy * 0.01)  # 1% of energy or 0.1 keV minimum
                 
                 # Find energy indices for integration
@@ -427,41 +423,96 @@ class Dataset3dspectroscopy(Dataset3d):
         return total_intensity
     
     def _calculate_theoretical_k_factors(self, elements):
-        """Calculate theoretical k-factors using atomic number approximation."""
-        # This is a simplified approach - in practice you'd use more sophisticated
-        # quantum mechanical calculations or experimental values
+        """Load k-factors from Titan 300 keV CSV file."""
+        # Get the path to the CSV file (same directory as this Python file)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        csv_path = os.path.join(current_dir, 'kfacs_Titan_300_keV.csv')
         
-        # Atomic numbers for common elements
-        atomic_numbers = {
-            'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14,
-            'P': 15, 'S': 16, 'Cl': 17, 'K': 19, 'Ca': 20, 'Ti': 22, 'Cr': 24, 
-            'Mn': 25, 'Fe': 26, 'Co': 27, 'Ni': 28, 'Cu': 29, 'Zn': 30, 'Ag': 47,
-            'Pt': 78, 'Au': 79
-        }
+        # Load k-factors from CSV
+        k_factor_data = {}
+        try:
+            with open(csv_path, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    element = row['Element']
+                    k_factor_data[element] = {
+                        'K': float(row['K']),
+                        'L': float(row['L']),
+                        'M': float(row['M'])
+                    }
+        except FileNotFoundError:
+            print(f"Warning: K-factor CSV file not found at {csv_path}")
+            print("Using simplified k-factors (all set to 1.0)")
+            return {elem: 1.0 for elem in elements}
         
-        # Use first element as reference (k = 1.0)
-        reference_element = elements[0]
-        ref_z = atomic_numbers.get(reference_element, 26)  # Default to Fe
+        # Get element info database to determine which X-ray line to use
+        all_info = type(self).element_info
         
-        k_factors = {reference_element: 1.0}
+        k_factors = {}
+        for element in elements:
+            if element not in k_factor_data:
+                print(f"Warning: Element {element} not found in k-factor database, using 1.0")
+                k_factors[element] = 1.0
+                continue
+            
+            # Determine which X-ray line (K, L, or M) to use based on the element's primary lines
+            if element in all_info:
+                element_lines = all_info[element]
+                
+                # Check which X-ray series is most prominent for this element
+                has_k_lines = any('Ka' in line or 'Kb' in line for line in element_lines.keys())
+                has_l_lines = any('La' in line or 'Lb' in line for line in element_lines.keys())
+                has_m_lines = any('Ma' in line or 'Mb' in line for line in element_lines.keys())
+                
+                # Prioritize K-lines, then L-lines, then M-lines
+                if has_k_lines and k_factor_data[element]['K'] > 0:
+                    k_factors[element] = k_factor_data[element]['K']
+                    line_type = 'K'
+                elif has_l_lines and k_factor_data[element]['L'] > 0:
+                    k_factors[element] = k_factor_data[element]['L']
+                    line_type = 'L'
+                elif has_m_lines and k_factor_data[element]['M'] > 0:
+                    k_factors[element] = k_factor_data[element]['M']
+                    line_type = 'M'
+                else:
+                    # Default to K-line k-factor if available
+                    if k_factor_data[element]['K'] > 0:
+                        k_factors[element] = k_factor_data[element]['K']
+                        line_type = 'K'
+                    elif k_factor_data[element]['L'] > 0:
+                        k_factors[element] = k_factor_data[element]['L']
+                        line_type = 'L'
+                    elif k_factor_data[element]['M'] > 0:
+                        k_factors[element] = k_factor_data[element]['M']
+                        line_type = 'M'
+                    else:
+                        k_factors[element] = 1.0
+                        line_type = 'default'
+            else:
+                # Element not in database, use K-line if available
+                if k_factor_data[element]['K'] > 0:
+                    k_factors[element] = k_factor_data[element]['K']
+                    line_type = 'K'
+                elif k_factor_data[element]['L'] > 0:
+                    k_factors[element] = k_factor_data[element]['L']
+                    line_type = 'L'
+                elif k_factor_data[element]['M'] > 0:
+                    k_factors[element] = k_factor_data[element]['M']
+                    line_type = 'M'
+                else:
+                    k_factors[element] = 1.0
+                    line_type = 'default'
         
-        # Rough approximation: k_factor scales with atomic number ratio
-        # This is very approximate - real k-factors depend on X-ray cross sections,
-        # fluorescence yields, detector efficiency, etc.
-        for element in elements[1:]:
-            element_z = atomic_numbers.get(element, 26)
-            # Simplified relationship - should be replaced with proper theoretical calculation
-            k_factors[element] = (ref_z / element_z) ** 0.7  # Approximate scaling
-        
-        print(f"Using theoretical k-factors: {k_factors}")
-        print("Note: For accurate quantification, use experimentally determined k-factors")
+        print(f"Using k-factors from Titan 300 keV database: {csv_path}")
+        for elem in elements:
+            print(f"  {elem}: {k_factors[elem]:.3f}")
         
         return k_factors
     
-    def _cliff_lorimer_quantification(self, elements, intensities, k_factors):
+    def _cliff_lorimer_quantification(self, elements, intensities, k_factors, method, roi):
         """Apply Cliff-Lorimer quantification method."""
         # Cliff-Lorimer equation: CA/CB = kAB * (IA/IB)
-        # For multiple elements: CA = kA * IA / Σ(ki * Ii)
+        # For multiple elements: CA = kA * IA / SUM(ki * Ii)
         
         # Calculate weighted intensities
         weighted_sum = 0.0
@@ -502,39 +553,34 @@ class Dataset3dspectroscopy(Dataset3d):
             else:
                 weight_percent[element] = 0.0
         
-        # Print summary for verification
-        print(f"\n=== Quantification Results ===")
-        print(f"Method: {method}")
-        print(f"Elements: {elements}")
+        # Print summary in Cliff-Lorimer format
+        print(f"\n=== Quantification (Cliff-Lorimer) ===")
         print(f"ROI: {'Full image' if roi is None else roi}")
+        print(f"Elements: {', '.join(elements)}")
+        
         print(f"\nRaw Intensities:")
         for elem in elements:
-            print(f"  {elem}: {intensities[elem]:.1f}")
-        print(f"\nK-factors used:")
+            print(f"  {elem}: {intensities[elem]:.2f}")
+        
+        print(f"\nk-factors:")
         for elem in elements:
-            print(f"  {elem}: {k_factors[elem]:.3f}")
-        print(f"\nAtomic Composition:")
-        total_atomic = sum(atomic_percent.values())
+            print(f"  {elem}: {k_factors[elem]:.2f}")
+        
+        print(f"\nAtomic %:")
         for elem in elements:
             print(f"  {elem}: {atomic_percent[elem]:.1f} at%")
-        print(f"  Total: {total_atomic:.1f} at%")
-        print(f"\nWeight Composition:")
-        total_weight = sum(weight_percent.values())
+        
+        print(f"\nWeight %:")
         for elem in elements:
             print(f"  {elem}: {weight_percent[elem]:.1f} wt%")
-        print(f"  Total: {total_weight:.1f} wt%")
         
         return {
             'atomic_percent': atomic_percent,
             'weight_percent': weight_percent,
             'intensities': intensities,
             'k_factors': k_factors,
-            'method': 'cliff_lorimer',
-            'total_atomic': total_atomic,
-            'total_weight': total_weight
+            'method': 'cliff_lorimer'
         }
-  
-    '''
 
     def _find_best_element_combinations(self, peak_energies, peak_intensities, tolerance=0.15):
         """
@@ -585,26 +631,18 @@ class Dataset3dspectroscopy(Dataset3d):
         """
         Calculate a cost function score for a given combination of elements.
         Lower scores are better.
+        
+        Strategy: Prioritize explaining ALL major peaks with the FEWEST elements.
+        Only accept combinations that explain most peaks with high-weight lines.
         """
         score = 0.0
-        explained_peaks = set()
+        explained_peaks = {}  # peak_idx -> (matched_distance, line_weight, element)
         
-        # General element categories (no specific element bias)
-        # Only penalize obvious contaminants/artifacts, don't favor specific elements
-        substrate_elements = {'Cu': 0.5, 'C': 0.3}  # Mild penalty for substrate/grid elements
-        very_rare_elements = {'Ir': -1.0, 'Os': -1.0, 'Ru': -1.0}  # Small penalty for very unlikely elements
-        
-        # Apply minimal element category adjustments
-        for element in element_combo:
-            if element in substrate_elements:
-                score += substrate_elements[element]   # Small penalty for substrate
-            elif element in very_rare_elements:
-                score -= very_rare_elements[element]   # Small penalty for very rare elements
-        
-        # For each detected peak, find if it can be explained by the element combination
+        # For each detected peak, find the BEST match in the element combination
         for i, (peak_energy, peak_intensity) in enumerate(zip(peak_energies, peak_intensities)):
             best_match_distance = float('inf')
             best_line_weight = 0.0
+            best_element = None
             found_match = False
             
             # Check all elements in the combination
@@ -615,55 +653,137 @@ class Dataset3dspectroscopy(Dataset3d):
                         line_weight = line_info.get('weight', 0.5)
                         distance = abs(peak_energy - line_energy)
                         
-                        if distance <= tolerance:
-                            found_match = True
-                            if distance < best_match_distance:
+                        # Only consider lines with significant weight (major lines only)
+                        if line_weight > 0.2 and distance <= tolerance:
+                            # Update best match if this line is better
+                            if distance < best_match_distance or (distance == best_match_distance and line_weight > best_line_weight):
                                 best_match_distance = distance
                                 best_line_weight = line_weight
+                                best_element = element
+                                found_match = True
             
             if found_match:
-                explained_peaks.add(i)
-                # Add distance penalty (smaller is better)
-                score += best_match_distance
-                # Bonus for high-weight lines (major lines like Kα vs minor lines like M-lines)
-                score -= best_line_weight * 1.0
+                explained_peaks[i] = (best_match_distance, best_line_weight, best_element)
+                # Penalty for distance (prefer closer matches)
+                score += best_match_distance * 10.0
+                # Bonus for high-weight lines (major lines score much better)
+                score -= best_line_weight * 3.0
             else:
-                # Heavy penalty for unexplained peaks
-                score += 10.0
+                # HEAVY penalty for unexplained peaks - this is the key constraint
+                score += 50.0
         
-        # Add penalty for unused elements (prefer simpler explanations)
-        unused_element_penalty = (len(element_combo) - 1) * 2.0
-        score += unused_element_penalty
-        
-        # Add penalty for unexplained peaks
+        # Primary objective: explain ALL detected peaks
         unexplained_peaks = len(peak_energies) - len(explained_peaks)
-        score += unexplained_peaks * 5.0
+        if unexplained_peaks > 0:
+            score += unexplained_peaks * 100.0  # Very high penalty for unexplained peaks
         
-        # Bonus for explaining multiple peaks with common elements (like Fe Kα + Kβ)
-        multi_peak_bonus = 0.0
-        for element in element_combo:
-            if element in all_info:
-                element_peaks = 0
-                major_peaks = 0  # Count major lines (weight > 0.5)
-                for line_name, line_info in all_info[element].items():
-                    line_energy = line_info['energy (keV)']
-                    line_weight = line_info.get('weight', 0.5)
-                    for peak_energy in peak_energies:
-                        if abs(peak_energy - line_energy) <= tolerance:
-                            element_peaks += 1
-                            if line_weight > 0.5:
-                                major_peaks += 1
-                
-                if element_peaks > 1:
-                    multi_peak_bonus += 2.0  # Bonus for elements with multiple matched peaks
-                if major_peaks > 0:
-                    multi_peak_bonus += 1.0  # Additional bonus for major line matches
+        # Secondary objective: prefer simpler explanations (fewer elements)
+        score += len(element_combo) * 5.0
         
-        score -= multi_peak_bonus
+        # Tertiary objective: prefer explanations with multiple peaks per element
+        # This avoids one-off false matches and encourages coherent solutions
+        peaks_per_element = {}
+        for peak_idx, (dist, weight, elem) in explained_peaks.items():
+            if elem not in peaks_per_element:
+                peaks_per_element[elem] = []
+            peaks_per_element[elem].append((dist, weight))
+        
+        # Bonus if each element explains multiple peaks (coherence - more likely correct)
+        for elem, matches in peaks_per_element.items():
+            if len(matches) > 1:
+                # Elements with 2+ peak matches are much more likely correct
+                score -= len(matches) * 2.0
         
         return score
 
-    def show_mean_spectrum(self, roi=None, energy_range=None, elements=None, ignore_range=None, threshold=5.0, tolerance=0.15, mask=None, show_lines=True):
+    def _subtract_background_eds(self, spectrum, energy_axis):
+        """
+        Subtract power-law background typical for EDS Bremsstrahlung.
+        Uses a conservative approach with heavy smoothing to avoid creating artifacts.
+        
+        Parameters
+        ----------
+        spectrum : ndarray
+            1D spectrum
+        energy_axis : ndarray
+            Energy axis corresponding to spectrum
+            
+        Returns
+        -------
+        ndarray
+            Background-subtracted spectrum
+        """
+        from scipy.ndimage import gaussian_filter
+        
+        # Use a larger window for more conservative background estimation
+        window_size = 15  # Larger window = smoother, less aggressive
+        background = np.zeros_like(spectrum)
+        half_window = window_size // 2
+        
+        # Estimate background from sliding minimum
+        for i in range(len(spectrum)):
+            start = max(0, i - half_window)
+            end = min(len(spectrum), i + half_window + 1)
+            # Use percentile instead of minimum for more robustness
+            background[i] = np.percentile(spectrum[start:end], 10)
+        
+        # Apply heavy smoothing to avoid creating artificial features
+        background = gaussian_filter(background, sigma=5.0)
+        
+        # Be very conservative - only subtract 80% of estimated background
+        # This prevents over-subtraction that creates artificial peaks
+        background = background * 0.8
+        
+        # Ensure background doesn't exceed spectrum
+        background = np.minimum(background, spectrum * 0.9)
+        
+        return np.maximum(spectrum - background, 0)
+    
+    def _subtract_background_eels(self, spectrum, energy_axis):
+        """
+        Subtract background typical for EELS using iterative Gaussian fitting.
+        This method isolates the continuum background from the low-loss region.
+        
+        WARNING: Only use with EELS data! Will remove peaks if used with EDS.
+        
+        Parameters
+        ----------
+        spectrum : ndarray
+            1D EELS spectrum
+        energy_axis : ndarray
+            Energy axis corresponding to spectrum
+            
+        Returns
+        -------
+        ndarray
+            Background-subtracted spectrum
+        """
+        from scipy.stats import norm
+        from scipy.ndimage import gaussian_filter
+        
+        # Smooth for better fitting
+        spec_smooth = gaussian_filter(spectrum, sigma=1.0)
+        pixel_vals = spec_smooth.copy()
+        
+        # Iteratively fit Gaussian to low-intensity values (the continuum)
+        # Remove outliers (edge peaks) iteratively
+        num_iterations = 10
+        cutoff = 3  # +/- 3 sigma
+        
+        for _ in range(num_iterations):
+            mu, std = norm.fit(pixel_vals)
+            if std == 0:
+                break
+            # Keep only values within +/- 3 sigma (removes edge contributions)
+            lower = mu - cutoff * std
+            upper = mu + cutoff * std
+            pixel_vals = pixel_vals[(pixel_vals >= lower) & (pixel_vals <= upper)]
+        
+        # Subtract the estimated background level
+        background_fit = mu
+        return np.maximum(spectrum - background_fit, 0)
+
+    def show_mean_spectrum(self, roi=None, energy_range=None, elements=None, ignore_range=None, threshold=5.0, tolerance=0.15, mask=None, show_lines=True, show_text=True, snr_min=None, snr_threshold=None, distance_threshold_for_sample=0.05, contamination_elements=None, grid_peaks=None, background_subtraction='none', data_type='eds',peaks=15):
         """
         Make and show a spectrum plot from a spatial ROI in a 3D EDS cube (E, Y, X).
 
@@ -674,9 +794,9 @@ class Dataset3dspectroscopy(Dataset3d):
             - y, x: top-left pixel coordinates
             - dy, dx: height and width of ROI
             Use None for default values:
-            - [y, None, dy, None] → row y with height dy, full width
-            - [None, x, None, dx] → column x with width dx, full height  
-            - [y, x, None, None] → from (y,x) to bottom-right corner
+            - [y, None, dy, None] = row y with height dy, full width
+            - [None, x, None, dx] = column x with width dx, full height  
+            - [y, x, None, None] = from (y,x) to bottom-right corner
             If roi=None, uses full image. Can also be [y, x] for single pixel.
         energy_range : list or tuple, optional
             Energy range to display as [min_energy, max_energy] in keV.
@@ -695,12 +815,56 @@ class Dataset3dspectroscopy(Dataset3d):
         show_lines : bool, optional
             Whether to show element lines and/or auto-detected peaks. 
             Auto-enabled if elements are specified or auto-detection is used.
+        show_text : bool, optional
+            Whether to show text labels for detected elements. Default: True.
+            When False, vertical lines are still shown but element labels are hidden.
+        snr_min : float, optional
+            Minimum SNR threshold for detecting any peak. If None, automatically determined
+            from peak distribution (typically 20-30 based on data characteristics).
+            Lower values detect more peaks, higher values are more selective.
+        snr_threshold : float, optional
+            Minimum SNR for identifying a peak as a sample element (not contamination).
+            If None, automatically determined based on peak statistics. For sparse spectra
+            (few strong peaks), uses lower threshold (~30). For dense spectra (many peaks),
+            uses higher threshold (~50-80) to filter noise.
+        distance_threshold_for_sample : float, optional
+            Maximum energy distance (keV) between detected peak and characteristic line
+            for identifying as a sample element. Default: 0.05. Stricter values (smaller)
+            reduce false positives.
+        contamination_elements : set or list, optional
+            Element symbols to exclude from sample detection (e.g., {'C', 'Cu', 'O'}).
+            Default: {'C', 'N', 'O', 'Cu', 'Si', 'K', 'Kr', 'Po', 'Pb', 'Os', 'Ir', 'At', 'Do', 'Po'}
+            These are common TEM support materials and artifacts.
+        grid_peaks : dict, optional
+            Dictionary of known grid/support peaks for labeling, e.g., {'C': 0.260, 'Cu': 8.020}.
+            Default: {'C': 0.260, 'Cu': 8.020} for carbon support film and copper TEM grid.
+        background_subtraction : str, optional
+            Background subtraction method. Options:
+            - 'none' (default): No background subtraction
+            - 'auto': Automatically choose best method for data_type (EDS -> power-law, EELS -> iterative Gaussian)
+            - 'powerlaw': Power-law background (best for EDS, suitable for Bremsstrahlung)
+            - 'iterative': Iterative Gaussian fitting (best for EELS, isolates continuum)
+        data_type : str, optional
+            Type of spectroscopy data. Options: 'eds' (default) or 'eels'.
+            Used with background_subtraction='auto' to select optimal method.
+        peaks : int, optional
+            Maximum number of peaks to display in the output table and plot as vertical lines.
+            Default: 15. Limits output to peaks with highest SNR (most statistically significant).
 
         Returns
         -------
         (fig, ax) : tuple
             The Matplotlib Figure and Axes of the spectrum plot.
         """
+        
+        # Set defaults for detection parameters
+        if contamination_elements is None:
+            contamination_elements = {'C', 'N', 'O', 'Cu', 'Si', 'K', 'Kr', 'Po', 'Pb', 'Os', 'Ir', 'At', 'Do', 'Po'}
+        else:
+            contamination_elements = set(contamination_elements)
+        
+        if grid_peaks is None:
+            grid_peaks = {'C': 0.260, 'Cu': 8.020}
  
 
     # ADJUST ROI BASED ON GIVEN FLAGS -----------------------------------------------
@@ -724,7 +888,7 @@ class Dataset3dspectroscopy(Dataset3d):
             raise ValueError("roi must be None, [y, x], or [y, x, dy, dx] (with None for defaults)")
 
 
-    # ERROR HANDLING -------------------------------------------------------------------
+    # VALIDATE ROI BOUNDS ---------------------------------------------------------------------------
         errs = []
         Ymax = int(self.shape[1])
         Xmax = int(self.shape[2])
@@ -763,7 +927,6 @@ class Dataset3dspectroscopy(Dataset3d):
         dE = float(self.sampling[0])
         E0 = float(self.origin[0]) if hasattr(self, "origin") else 0.0
         E  = E0 + dE * np.arange(self.shape[0])
-
 
         # MASK HANDLING ---------------------------------------------------------------------
         if mask is not None:
@@ -805,12 +968,30 @@ class Dataset3dspectroscopy(Dataset3d):
         # Store ignore_range for later use in element line filtering
         if ignore_range is None:
             ignore_range = [0, 0.25]  # Default: ignore 0-0.25 keV for element lines only
+        
+        # BACKGROUND SUBTRACTION -------------------------------------------------------------------
+        # Apply appropriate background subtraction method
+        if background_subtraction == 'auto':
+            # Automatically select best method for the data type
+            if data_type.lower() == 'eels':
+                background_subtraction = 'iterative'
+            else:  # Default to EDS
+                background_subtraction = 'powerlaw'
+        
+        if background_subtraction == 'powerlaw':
+            # EDS: Power-law Bremsstrahlung background
+            spec = self._subtract_background_eds(spec, E)
+        elif background_subtraction == 'iterative':
+            # EELS: Iterative Gaussian fitting for continuum
+            spec = self._subtract_background_eels(spec, E)
+        # else: 'none' - no subtraction
 
    
     # PLOTTING ---------------------------------------------------------------------------
         
         # Create subplot layout: image on left, spectrum on right
         fig, (ax_img, ax_spec) = plt.subplots(1, 2, figsize=(12, 4))
+
         
         # LEFT PLOT: Show sum image with ROI highlighted
         # Create sum image across all energy channels (or masked channels)
@@ -858,27 +1039,71 @@ class Dataset3dspectroscopy(Dataset3d):
             plt.show()
             return fig, (ax_img, ax_spec)
 
-        # AUTO-DETECT ELEMENTS FROM STATISTICALLY SIGNIFICANT PEAKS -------------------
-        auto_peak_labels = []  # Store label positions to avoid overlap
-        if elements is None:
+        # AUTO-DETECT PEAKS AND MATCH TO DATABASE -------------------
+        if elements is None or (isinstance(elements, list) and len(elements) > 0):
+            # elements is either None (full auto-detection) or a list of specific elements to search for
             try:
-                # Statistical peak detection based on intensity distribution
                 # Step 1: Find all potential peaks
                 peak_indices, peak_properties = find_peaks(spec, height=0, distance=5)
                 peak_heights = peak_properties['peak_heights']
                 
                 # Step 2: Calculate background statistics
-                # Use lower percentiles to estimate background level
-                background_level = np.percentile(spec, 25)  # 25th percentile as background
-                background_std = np.std(spec[spec <= np.percentile(spec, 50)])  # Std of lower half
+                # Use nanpercentile to handle any NaN values in the spectrum
+                background_level = np.nanpercentile(spec, 25)
+                background_std = np.nanstd(spec[spec <= np.nanpercentile(spec, 50)])
                 
-                # Step 3: Statistical significance threshold
-                # A peak is significant if it's above background + N*sigma
-                significance_threshold = background_level + 3.0 * background_std
+                # Step 3: Determine dynamic SNR thresholds if not provided
+                # Calculate initial SNR for all peaks to assess data characteristics
+                initial_snrs = []
+                for peak_idx, height in zip(peak_indices, peak_heights):
+                    snr = height / background_std if background_std > 0 else float('inf')
+                    initial_snrs.append(snr)
                 
-                # Step 4: Filter peaks by statistical significance
+                # Calculate statistics of SNR distribution
+                if len(initial_snrs) > 0:
+                    snr_median = np.nanmedian(initial_snrs)
+                    snr_75th = np.nanpercentile(initial_snrs, 75)
+                    snr_95th = np.nanpercentile(initial_snrs, 95)
+                    num_high_snr_peaks = np.sum(np.array(initial_snrs) > 50)
+                else:
+                    snr_median = 0
+                    snr_75th = 0
+                    snr_95th = 0
+                    num_high_snr_peaks = 0
+                
+                # Set snr_min (detection threshold) if not provided
+                if snr_min is None:
+                    # Use adaptive threshold based on SNR distribution
+                    # For noisy data with many weak peaks, use higher threshold
+                    if snr_median > 30:
+                        min_snr = 25.0  # Many peaks -> slightly higher threshold
+                    else:
+                        min_snr = 20.0  # Sparse peaks -> standard threshold
+                else:
+                    min_snr = snr_min
+                
+                # Set snr_threshold (sample element threshold) if not provided
+                if snr_threshold is None:
+                    # Adaptive threshold based on peak density and SNR distribution
+                    # Sparse spectra (few strong peaks) -> lower threshold
+                    # Dense spectra (many peaks) -> higher threshold to filter noise
+                    if num_high_snr_peaks > 50:  # Many high-SNR peaks (dense spectrum like map1)
+                        snr_threshold_for_sample = min(80.0, snr_75th * 1.2)
+                    elif num_high_snr_peaks > 20:  # Moderate number of peaks
+                        snr_threshold_for_sample = min(60.0, snr_75th * 1.1)
+                    elif num_high_snr_peaks < 10:  # Few peaks (sparse spectrum like Bare)
+                        snr_threshold_for_sample = max(30.0, snr_75th * 0.8)
+                    else:  # Default case
+                        snr_threshold_for_sample = 40.0
+                    
+                    print(f"Auto-determined thresholds: snr_min={min_snr:.1f}, snr_threshold={snr_threshold_for_sample:.1f}")
+                    print(f"  (Based on: median_snr={snr_median:.1f}, 75th_percentile={snr_75th:.1f}, high_snr_peaks={num_high_snr_peaks})")
+                else:
+                    snr_threshold_for_sample = snr_threshold
+                
+                # Step 4: Filter peaks by SNR
                 significant_peaks = []
-                for i, (peak_idx, height) in enumerate(zip(peak_indices, peak_heights)):
+                for peak_idx, height in zip(peak_indices, peak_heights):
                     peak_energy = E[peak_idx]
                     
                     # Skip peaks in ignore range
@@ -887,321 +1112,227 @@ class Dataset3dspectroscopy(Dataset3d):
                         if min_ignore <= peak_energy <= max_ignore:
                             continue
                     
-                    # Check statistical significance
-                    if height > significance_threshold:
-                        significant_peaks.append((peak_idx, height, peak_energy))
+                    snr = height / background_std if background_std > 0 else float('inf')
+                    
+                    # Keep peaks with good SNR
+                    if snr >= min_snr:
+                        significant_peaks.append((peak_idx, height, peak_energy, snr))
                 
-                # Step 5: Additional filtering based on relative prominence
                 if len(significant_peaks) > 0:
-                    # Calculate signal-to-noise ratio for each significant peak
-                    max_intensity = max([height for _, height, _ in significant_peaks])
+                    # Sort by SNR (signal-to-noise ratio) for most statistically significant peaks
+                    significant_peaks.sort(key=lambda x: x[3], reverse=True)
                     
-                    # Use a more inclusive approach: take significant peaks with good SNR
-                    # Lower prominence threshold to 5% and include more peaks
-                    prominence_threshold = 0.05 * max_intensity
-                    important_peaks = []
+                    # Limit to top N peaks for display
+                    display_peaks = significant_peaks[:peaks]
                     
-                    for peak_idx, height, energy in significant_peaks:
-                        snr = height / background_std if background_std > 0 else float('inf')
-                        # Include peaks above prominence OR with good SNR
-                        if height >= prominence_threshold or snr >= 5.0:
-                            important_peaks.append((peak_idx, height, energy, snr))
+                    # Match detected peaks to xray_lines.json
+                    all_info = type(self).element_info
+                    peak_matches = []  # List of (peak_idx, height, peak_energy, snr, element, match_string, distance)
                     
-                    print(f"  {len(important_peaks)} peaks above prominence threshold (5% of max) or SNR >= 5")
-                    print(f"  → ALL {len(important_peaks)} peaks used for element identification analysis")
+                    # If specific elements are requested, filter the database to only those
+                    if elements is not None and isinstance(elements, list):
+                        search_elements = set(elements)
+                        search_mode = f"for {search_elements}"
+                    else:
+                        search_elements = None
+                        search_mode = "for all elements"
                     
-                    # Sort by signal-to-noise ratio for analysis
-                    important_peaks.sort(key=lambda x: x[3], reverse=True)  # Sort by SNR
+                    print(f"\nDetected {len(significant_peaks)} peaks (SNR >= {min_snr:.1f}) {search_mode}")
+                    if len(significant_peaks) > peaks:
+                        print(f"Showing top {peaks} peaks by SNR (most statistically significant)")
+                    print(f"{'Energy (keV)':<12} {'Intensity':<12} {'SNR':<8} {'Best Match':<25}")
+                    print("-"*60)
                     
-                    # Use all important peaks for cost function analysis
-                    analysis_peak_indices = [peak[0] for peak in important_peaks]
+                    # For each detected peak, find the best match in the database
+                    for peak_idx, height, peak_energy, snr in display_peaks:
+                        best_match = None
+                        best_distance = float('inf')
+                        best_element = None
+                        
+                        # Search through elements in database
+                        if all_info:
+                            for elem, lines in all_info.items():
+                                # If specific elements requested, only search those
+                                if search_elements is not None and elem not in search_elements:
+                                    continue
+                                
+                                for line_name, line_info in lines.items():
+                                    line_energy = line_info['energy (keV)']
+                                    line_weight = line_info.get('weight', 0.5)
+                                    distance = abs(peak_energy - line_energy)
+                                    
+                                    # Prioritize K and L lines over M lines for element identification
+                                    # M-lines are very weak and prone to false positives at low energies
+                                    is_m_line = 'M' in line_name and not ('Ma' in line_name or 'Mb' in line_name)
+                                    
+                                    # Match to characteristic lines within tolerance
+                                    # Require weight > 0.3 (filters weakest M-lines)
+                                    # Penalize M-line matches by requiring closer distance
+                                    effective_tolerance = tolerance * 0.5 if is_m_line else tolerance
+                                    
+                                    if line_weight > 0.3 and distance <= effective_tolerance and distance < best_distance:
+                                        best_distance = distance
+                                        best_match = f"{elem} {line_name}"
+                                        best_element = elem
+                        
+                        if best_match:
+                            peak_matches.append((peak_idx, height, peak_energy, snr, best_element, best_match, best_distance))
+                            print(f"{peak_energy:<12.3f} {height:<12.1f} {snr:<8.1f} {best_match:<25}")
+                        else:
+                            print(f"{peak_energy:<12.3f} {height:<12.1f} {snr:<8.1f} {'Unknown':<25}")
                     
-                    # For display, limit to most significant peaks if there are many
-                    display_limit = min(len(important_peaks), 15)  # Show max 15 in table
-                    print(f"  → Showing top {display_limit} peaks in detailed table below")
-                    top_peaks = [peak[0] for peak in important_peaks[:display_limit]]
+                    print("-"*60)
+                    
+                    # Detect elements: use only the strongest peaks that match VERY well
+                    # Strategy: keep only peaks that:
+                    # 1. Match a characteristic line within distance_threshold_for_sample (very tight tolerance)
+                    # 2. Have SNR > snr_threshold_for_sample (strong peaks)
+                    # 3. Are from non-contamination elements (or requested elements if specified)
+                    detected_elements = set()
+                    detected_sample_peaks = {}  # Map peak_energy -> is_sample_element for line styling
+                    
+                    for peak_idx, height, peak_energy, snr, element, match_str, distance in peak_matches:
+                        # Very strict criteria for element detection
+                        if (snr > snr_threshold_for_sample and                    # Strong peak
+                            distance < distance_threshold_for_sample):            # Very close match to characteristic line
+                            
+                            # If specific elements requested, only keep those; otherwise exclude contamination
+                            if search_elements is not None:
+                                if element in search_elements:
+                                    detected_elements.add(element)
+                                    detected_sample_peaks[peak_energy] = True
+                            else:
+                                if element not in contamination_elements:  # Not a known contamination
+                                    detected_elements.add(element)
+                                    detected_sample_peaks[peak_energy] = True
+                    
+                    # MULTI-PEAK COHERENCE CHECK: Filter out elements with only single weak matches
+                    # Count DISTINCT characteristic lines for each element (Ka vs Kb, La vs Lb, etc.)
+                    element_line_types = {}  # element -> set of line types (e.g., 'Ka', 'Lb')
+                    element_total_snr = {}
+                    element_has_major_lines = {}  # Track if element has K or L lines (not just M)
+                    
+                    for peak_idx, height, peak_energy, snr, element, match_str, distance in peak_matches:
+                        # Count ALL good matches for each element (not just sample-quality ones)
+                        if distance < tolerance * 2:  # Within 2x tolerance for counting
+                            if element not in element_line_types:
+                                element_line_types[element] = set()
+                                element_total_snr[element] = 0
+                                element_has_major_lines[element] = False
+                            
+                            # Extract line type from match_str (e.g., "Pt La" -> "La")
+                            line_type = match_str.split()[-1] if match_str else ""
+                            element_line_types[element].add(line_type)
+                            element_total_snr[element] += snr
+                            
+                            # Check if this is a major line (K or L series)
+                            if any(x in line_type for x in ['Ka', 'Kb', 'La', 'Lb', 'Lg']):
+                                element_has_major_lines[element] = True
+                    
+                    # Filter detected_elements: keep only if multiple DISTINCT lines OR very high SNR
+                    # CRITICAL: Reject elements with only M-lines (no K or L confirmation)
+                    filtered_detected_elements = set()
+                    for element in detected_elements:
+                        distinct_line_count = len(element_line_types.get(element, set()))
+                        total_snr = element_total_snr.get(element, 0)
+                        avg_snr = total_snr / distinct_line_count if distinct_line_count > 0 else 0
+                        has_major_lines = element_has_major_lines.get(element, False)
+                        
+                        # Keep element if:
+                        # - Has K or L lines (not just M-lines) - required for heavy elements
+                        # - AND (has 2+ DISTINCT lines OR 1 line with very high SNR >70)
+                        if has_major_lines and (distinct_line_count >= 2 or avg_snr > 70):
+                            filtered_detected_elements.add(element)
+                    
+                    # Update detected_elements with filtered set
+                    detected_elements = filtered_detected_elements
+                    
+                    # Update detected_sample_peaks to only include filtered elements
+                    filtered_sample_peaks = {}
+                    for peak_energy, is_sample in detected_sample_peaks.items():
+                        # Find which element this peak belongs to
+                        for peak_idx, height, pe, snr, element, match_str, distance in peak_matches:
+                            if abs(pe - peak_energy) < 0.001 and element in detected_elements:
+                                filtered_sample_peaks[peak_energy] = is_sample
+                                break
+                    detected_sample_peaks = filtered_sample_peaks
+                    
+                    # Plot detected peaks with appropriate line style (limit to display_peaks)
+                    for peak_idx, height, peak_energy, snr in display_peaks:
+                        # Use solid line for sample elements, dotted for others
+                        is_sample = detected_sample_peaks.get(peak_energy, False)
+                        linestyle = '-' if is_sample else ':'
+                        
+                        ax_spec.axvline(peak_energy, color='red', linestyle=linestyle, alpha=0.3, linewidth=1.5)
+                        
+                        # Add labels for grid artifacts and sample elements (if show_text enabled)
+                        if show_text:
+                            y_pos = height * 0.7  # Position label at 70% of peak height
+                            
+                            # Check if this is a grid/contamination peak
+                            is_grid_peak = False
+                            for grid_elem, grid_energy in grid_peaks.items():
+                                if abs(peak_energy - grid_energy) < 0.1:  # Within 0.1 keV of known grid peak
+                                    ax_spec.text(peak_energy, y_pos, f'{grid_elem}\n(grid)', 
+                                               ha='center', va='bottom', fontsize=8, color='gray', style='italic')
+                                    is_grid_peak = True
+                                    break
+                    
+                    # If elements were detected, use them for element identification only (not for line plotting)
+                    if detected_elements:
+                        print(f"\nDetected elements: {', '.join(sorted(detected_elements))}")
+                        
+                        # Prepare labels with vertical orientation and offset handling
+                        # Group labels by energy proximity (within 0.3 keV)
+                        labels_to_plot = []  # List of (peak_energy, label_text, color, height)
+                        colors_map = {'Fe': 'darkblue', 'Pt': 'darkred'}
+                        
+                        for peak_idx, height, peak_energy, snr, element, match_str, distance in peak_matches:
+                            if element in detected_elements:
+                                # Extract line name from match_str (e.g., "Fe Ka" -> "Ka")
+                                line_name = match_str.split()[-1] if match_str else ""
+                                label_text = f"{element} {line_name}" if line_name else element
+                                color = colors_map.get(element, 'black')
+                                labels_to_plot.append((peak_energy, label_text, color, height))
+                        
+                        # Sort by energy to group nearby peaks
+                        labels_to_plot.sort(key=lambda x: x[0])
+                        
+                        # Offset overlapping labels vertically
+                        label_offset_map = {}  # Map peak_energy -> vertical offset multiplier
+                        proximity_threshold = 1.5  # 1.5 keV
+                        
+                        for i, (energy, label, color, height) in enumerate(labels_to_plot):
+                            # Check if this label is close to previous labels
+                            offset_count = 0
+                            for j in range(i):
+                                prev_energy, prev_label, prev_color, prev_height = labels_to_plot[j]
+                                if abs(energy - prev_energy) < proximity_threshold:
+                                    offset_count += 1
+                            
+                            label_offset_map[energy] = offset_count
+                        
+                        # Plot labels with vertical text and offsets (if show_text enabled)
+                        if show_text:
+                            for peak_energy, label_text, color, height in labels_to_plot:
+                                # Position label above the peak
+                                y_pos = height * 1.2
+                                
+                                ax_spec.text(peak_energy, y_pos, label_text, 
+                                           ha='center', va='bottom', fontsize=10, color=color, 
+                                           weight='bold', rotation=90)
                 else:
-                    analysis_peak_indices = []
-                    top_peaks = []
-                
-                # Simple element line matching - only include significant lines
-                element_lines_db = []
-                all_info = type(self).element_info
-                if all_info is not None:
-                    for elem, lines in all_info.items():
-                        # Get top 3 weighted lines per element
-                        weighted_lines = [(info['weight'], info['energy (keV)'], elem, line) 
-                                        for line, info in lines.items() 
-                                        if info['energy (keV)'] <= 12.0]  # Ignore > 12 keV
-                        # Sort by weight (highest first) and take top 3
-                        weighted_lines.sort(reverse=True)
-                        for weight, energy, elem, line in weighted_lines[:3]:
-                            if weight > 0.1:  # Only include lines with significant weight
-                                element_lines_db.append((energy, elem, line, weight))
-                
-                # Use cost function with all statistically significant peaks
-                if len(analysis_peak_indices) > 0:
-                    analysis_energies = E[analysis_peak_indices]
-                    analysis_intensities = spec[analysis_peak_indices]
+                    print(f"\nNo peaks detected with SNR >= {min_snr:.1f}")
                     
-                    # Find optimal element combination using all significant peaks
-                    best_elements = self._find_best_element_combinations(
-                        analysis_energies, analysis_intensities, tolerance
-                    )
-                    
-                    peak_energies = E[top_peaks]  # For display table
-                    peak_intensities = spec[top_peaks]
-                else:
-                    best_elements = set()
-                    peak_energies = []
-                    peak_intensities = []
-                
-                # Now create detailed peak matching report (only if we found significant peaks)
-                if len(top_peaks) > 0:
-                    peak_data = []
-                    for idx in top_peaks:
-                        peak_energy = E[idx]
-                        peak_intensity = spec[idx]
-                        # Find matches within the identified elements first, then others
-                        matches = []
-                        if element_lines_db:
-                            distances = []
-                            for el_energy, elem, line, weight in element_lines_db:
-                                distance = abs(el_energy - peak_energy)
-                                if distance <= tolerance:
-                                    # Prioritize matches from identified elements
-                                    priority = 0 if elem in best_elements else 1
-                                    distances.append((priority, distance, elem, line, el_energy, weight))
-                            
-                            # Sort by priority (identified elements first), then distance
-                            distances.sort(key=lambda x: (x[0], x[1]))
-                            matches = [(d[1], d[2], d[3], d[4], d[5]) for d in distances[:3]]  # distance, elem, line, energy, weight
-                        
-                        peak_data.append((peak_energy, peak_intensity, matches, idx))
-                    
-                    # Sort by energy for table display
-                    peak_data_sorted = sorted(peak_data, key=lambda x: x[0])
-                    
-                    # Print detailed peak summary table with backup options
-                    print(f"\nIdentified Elements: {', '.join(sorted(best_elements)) if best_elements else 'None detected'}")
-                    print(f"{'Energy (keV)':<12} {'Intensity':<12} {'Primary Match':<20} {'2nd Option':<20} {'3rd Option':<20}")
-                    print("-"*84)
-                    
-                    for energy, intensity, matches, idx in peak_data_sorted:
-                        # Primary match
-                        if len(matches) > 0:
-                            elem = matches[0][1]
-                            line = matches[0][2]
-                            if elem == 'Cu':
-                                primary = f"{elem} {line} (grid)"
-                            elif elem == 'C':
-                                primary = f"{elem} {line} (carbon)"
-                            else:
-                                primary = f"{elem} {line}"
-                        else:
-                            primary = "Unknown"
-                        
-                        # Secondary match
-                        if len(matches) > 1:
-                            elem2 = matches[1][1]
-                            line2 = matches[1][2]
-                            if elem2 == 'Cu':
-                                secondary = f"{elem2} {line2} (grid)"
-                            elif elem2 == 'C':
-                                secondary = f"{elem2} {line2} (carbon)"
-                            else:
-                                secondary = f"{elem2} {line2}"
-                        else:
-                            secondary = "-"
-                        
-                        # Tertiary match
-                        if len(matches) > 2:
-                            elem3 = matches[2][1]
-                            line3 = matches[2][2]
-                            if elem3 == 'Cu':
-                                tertiary = f"{elem3} {line3} (grid)"
-                            elif elem3 == 'C':
-                                tertiary = f"{elem3} {line3} (carbon)"
-                            else:
-                                tertiary = f"{elem3} {line3}"
-                        else:
-                            tertiary = "-"
-                        
-                        print(f"{energy:<12.3f} {intensity:<12.1f} {primary:<20} {secondary:<20} {tertiary:<20}")
-                    print("-"*84)
-                    
-                    # Plot lines for the identified elements
-                    y_max = ax_spec.get_ylim()[1] 
-                    element_colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
-                    
-                    # Plot lines for cost-function identified elements
-                    for color_idx, elem in enumerate(list(best_elements)):
-                        if elem in all_info:
-                            elem_color = element_colors[color_idx % len(element_colors)]
-                            
-                            # Get top 3 weighted lines for this element (same logic as above)
-                            weighted_lines = [(info['weight'], info['energy (keV)'], line_name) 
-                                            for line_name, info in all_info[elem].items() 
-                                            if info['energy (keV)'] <= 12.0]
-                            weighted_lines.sort(reverse=True)
-                            
-                            # Plot only top 3 significant lines
-                            for weight, line_energy, line_name in weighted_lines[:3]:
-                                if weight > 0.1 and line_energy >= E[0] and line_energy <= E[-1]:
-                                    # Skip lines in ignore range
-                                    if ignore_range is not None and len(ignore_range) == 2:
-                                        min_ignore, max_ignore = ignore_range
-                                        if min_ignore <= line_energy <= max_ignore:
-                                            continue
-                                    
-                                    # Plot line at theoretical position
-                                    line_alpha = 0.3 + 0.2 * weight  # More prominent for higher weight
-                                    ax_spec.axvline(line_energy, color=elem_color, linestyle='--', 
-                                             alpha=min(line_alpha, 0.8), linewidth=1.5)
-                                    
-                                    # Add label with better positioning and spacing
-                                    y_pos = y_max * (0.85 - color_idx * 0.08)  # Start higher, space down
-                                    label_x = line_energy + 0.1  # More offset from line
-                                    
-                                    # Add special labeling for substrate elements
-                                    if elem == 'Cu':
-                                        label_text = f"{elem} {line_name} (grid)"
-                                    elif elem == 'C':
-                                        label_text = f"{elem} {line_name} (carbon)"
-                                    else:
-                                        label_text = f"{elem} {line_name}"
-                                    
-                                    ax_spec.text(label_x, y_pos, label_text, 
-                                           rotation=90, va='bottom', ha='left', 
-                                           fontsize=8, color=elem_color, weight='normal',
-                                           alpha=0.8)
             except ImportError:
-                print("scipy is required for auto peak labeling. Please install scipy.")
-
-        # ELEMENT LINES ---------------------------------------------------------------------
-        lines_to_plot = None
-        if elements is not None:
-            if isinstance(elements, list):
-                # Convert list of element symbols to dict using class element_info
-                all_info = type(self).element_info
-                if all_info is not None:
-                    lines_to_plot = {el: all_info[el] for el in elements if el in all_info}
-            elif isinstance(elements, dict):
-                lines_to_plot = elements
-        elif hasattr(self, 'model_elements'):
-            # Use model elements if available
-            lines_to_plot = self.model_elements
-
-        if lines_to_plot is not None:
-            E_min = E[0] if len(E) > 0 else 0
-            E_max = E[-1] if len(E) > 0 else 20
-            element_labels = []  # Store element label positions (energy, y_position)
-            element_line_data = []  # Store element line data for summary table
-            y_max = ax.get_ylim()[1]
-            colors = ['orange', 'red', 'blue', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan', 'magenta']
-            
-            # Collect all lines to plot first for better positioning
-            all_lines_to_plot = []
-            
-            # First pass: collect all lines that will be plotted and track elements
-            elements_to_label = {}  # Track which element gets labeled and where
-            
-            for color_idx, (elem, lines) in enumerate(lines_to_plot.items()):
-                color = colors[color_idx % len(colors)]
-                
-                # Get top 3 weighted lines for this element
-                weighted_lines = [(info['weight'], info['energy (keV)'], line, info) 
-                                for line, info in lines.items() 
-                                if info['energy (keV)'] <= 12.0]  # Ignore > 12 keV
-                weighted_lines.sort(reverse=True)
-                
-                element_lines = []  # Lines for this element that will be plotted
-                
-                # Process only top 3 significant lines
-                for weight, energy, line, info in weighted_lines[:3]:
-                    if weight <= 0.1:  # Skip lines with very low weight
-                        continue
-                    
-                    # Skip lines outside energy range
-                    if energy < E_min or energy > E_max:
-                        continue
-                    
-                    # Skip element lines in ignore range
-                    if ignore_range is not None and len(ignore_range) == 2:
-                        min_ignore, max_ignore = ignore_range
-                        if min_ignore <= energy <= max_ignore:
-                            continue
-                    
-                    all_lines_to_plot.append((energy, elem, line, color, weight))
-                    element_lines.append((energy, line, weight))
-                
-                # Determine which line should get the element label (highest weight)
-                if element_lines:
-                    # Sort by weight and choose the most prominent line for labeling
-                    element_lines.sort(key=lambda x: x[2], reverse=True)
-                    label_energy, label_line, _ = element_lines[0]
-                    elements_to_label[elem] = (label_energy, label_line, color)
-            
-            # Sort all lines by energy for better positioning
-            all_lines_to_plot.sort(key=lambda x: x[0])
-            
-            # Second pass: plot all lines (but only label once per element)
-            for i, (energy, elem, line, color, weight) in enumerate(all_lines_to_plot):
-                # Find the closest channel
-                idx = np.abs(E - energy).argmin()
-                
-                # Weight-based alpha (more prominent for higher weights)
-                line_alpha = 0.3 + 0.4 * weight
-                ax.axvline(E[idx], color=color, linestyle='-', alpha=min(line_alpha, 0.8), linewidth=1.5)
-                
-                # Store element line data for summary table
-                intensity = spec[idx] if 'spec' in locals() else 0
-                element_line_data.append((E[idx], intensity, elem, line, weight))
-            
-            # Third pass: Add labels only for the most prominent line of each element
-            # Sort elements by energy for systematic positioning
-            sorted_elements = sorted(elements_to_label.items(), key=lambda x: x[1][0])
-            
-            for i, (elem, (label_energy, label_line, color)) in enumerate(sorted_elements):
-                # Find the closest channel for the label energy
-                idx = np.abs(E - label_energy).argmin()
-                
-                # Simple vertical spacing - each element gets its own height level
-                base_y = y_max * 0.9  # Start near top
-                vertical_spacing = y_max * 0.08  # 8% spacing between labels
-                
-                # Position labels at regular intervals going down
-                final_y_pos = base_y - (i * vertical_spacing)
-                
-                # Keep within reasonable bounds
-                final_y_pos = max(final_y_pos, y_max * 0.2)  # Don't go below 20%
-                
-                element_labels.append((E[idx], final_y_pos))
-                
-                # Add label with better offset and styling
-                label_x = E[idx] - 0.1  # Offset from line
-                
-                # Add special labeling for substrate elements (element name only, no line designation)
-                if elem == 'Cu':
-                    label_text = f"{elem} (grid)"
-                elif elem == 'C':
-                    label_text = f"{elem} (carbon)"
-                else:
-                    label_text = elem  # Just the element symbol
-                
-                ax.text(label_x, final_y_pos, label_text, rotation=90, va='bottom', ha='right', 
-                       fontsize=8, color=color, weight='normal', alpha=0.8, clip_on=True)
-            
-            # Print concise element lines summary
-            if element_line_data:
-                element_line_data_sorted = sorted(element_line_data, key=lambda x: x[0])  # Sort by energy
-                print(f"\nElement Lines: {', '.join([f'{elem} {line}' for _, _, elem, line, _ in element_line_data_sorted])}")
+                print("scipy is required for peak detection. Please install scipy.")
+        
+        # Skip element lines plotting - only show detected peaks
+        # (Element characteristic lines are not plotted when using auto-detection)
 
         fig.tight_layout()
         plt.show()
-
         return fig, (ax_img, ax_spec)
-    
 
 
 Dataset3dspectroscopy.load_element_info()
