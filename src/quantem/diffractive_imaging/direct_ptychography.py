@@ -1,7 +1,7 @@
 import gc
 import math
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import numpy as np
 import optuna
@@ -62,6 +62,30 @@ class OptimizationParameter:
             return np.geomspace(self.low, self.high, self.n_points)
         else:
             return np.linspace(self.low, self.high, self.n_points)
+
+
+@dataclass
+class HyperparameterState:
+    fixed_aberrations: Dict[str, float] = field(default_factory=dict)
+    fixed_rotation_angle: float | None = None
+    optimized_aberrations: Dict[str, float] = field(default_factory=dict)
+    optimized_rotation_angle: float | None = None
+    optimized_keys: set[str] = field(default_factory=set)
+    study: optuna.Study | None = None
+
+    def merged_aberrations(self) -> Dict[str, float]:
+        """Return full aberration dictionary (fixed ⊕ optimized)."""
+        out = dict(self.fixed_aberrations)
+        out.update(self.optimized_aberrations)
+        return out
+
+    def merged_rotation_angle(self) -> float | None:
+        """Return rotation angle (optimized takes precedence)."""
+        return (
+            self.optimized_rotation_angle
+            if self.optimized_rotation_angle is not None
+            else self.fixed_rotation_angle
+        )
 
 
 class DirectPtychography(RNGMixin, AutoSerialize):
@@ -735,9 +759,21 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
         """
-
-        aberration_coefs = aberration_coefs or {}
         sampler = sampler or optuna.samplers.TPESampler()
+
+        state = HyperparameterState()
+        aberration_coefs = aberration_coefs or {}
+
+        for name, val in aberration_coefs.items():
+            if isinstance(val, OptimizationParameter):
+                state.optimized_keys.add(name)
+            else:
+                state.fixed_aberrations["name"] = val
+
+            if isinstance(rotation_angle, OptimizationParameter):
+                state.optimized_keys.add("rotation_angle")
+            else:
+                state.fixed_rotation_angle = rotation_angle
 
         def objective(trial):
             trial_aberrations = {}
@@ -771,10 +807,17 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         study = optuna.create_study(direction="minimize", sampler=sampler)
         study.optimize(objective, n_trials=n_trials, show_progress_bar=self.verbose)
 
-        self._optimization_study = study
-        self._optimized_parameters = study.best_params
+        state.study = study
+        opt_aberration_coefs = study.best_params
+        opt_rotation_angle = opt_aberration_coefs.pop("rotation_angle", None)
+
+        state.optimized_aberrations = opt_aberration_coefs
+        state.optimized_rotation_angle = opt_rotation_angle
+
+        self._hyperparameter_state = state
+
         if self.verbose:
-            print(f"Optimized parameters: {self._optimized_parameters}")
+            print(self._hyperparameter_state)
 
         self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
         return self
@@ -975,20 +1018,20 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         **reconstruct_kwargs,
     ):
         """ """
-        if not hasattr(self, "_optimized_parameters"):
+        if not hasattr(self, "_hyperparameter_state"):
             raise ValueError("run self.optimize_hyperparameters first.")
 
-        aberration_coefs = self._optimized_parameters.copy()
-        rotation_angle = aberration_coefs.pop("rotation_angle", None)
+        state = self._hyperparameter_state
 
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
             if k not in ["aberration_coefs", "rotation_angle"]
         }
+
         return self.reconstruct(
-            aberration_coefs=aberration_coefs,
-            rotation_angle=rotation_angle,
+            aberration_coefs=state.merged_aberrations(),
+            rotation_angle=state.merged_rotation_angle(),
             **safe_kwargs,
         )
 
