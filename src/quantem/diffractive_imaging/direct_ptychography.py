@@ -87,6 +87,25 @@ class HyperparameterState:
             else self.fixed_rotation_angle
         )
 
+    def __repr__(self) -> str:
+        cls = self.__class__.__name__
+        lines = []
+
+        if self.fixed_aberrations:
+            lines.append(f"  fixed_aberrations={self.fixed_aberrations!r},")
+        if self.fixed_rotation_angle is not None:
+            lines.append(f"  fixed_rotation_angle={self.fixed_rotation_angle!r},")
+        if self.optimized_aberrations:
+            lines.append(f"  optimized_aberrations={self.optimized_aberrations!r},")
+        if self.optimized_rotation_angle is not None:
+            lines.append(f"  optimized_rotation_angle={self.optimized_rotation_angle!r},")
+
+        if not lines:
+            return f"{cls}()"
+
+        body = "\n".join(lines)
+        return f"{cls}(\n{body}\n)"
+
 
 class DirectPtychography(RNGMixin, AutoSerialize):
     """ """
@@ -808,7 +827,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         study.optimize(objective, n_trials=n_trials, show_progress_bar=self.verbose)
 
         state.study = study
-        opt_aberration_coefs = study.best_params
+        opt_aberration_coefs = study.best_params.copy()
         opt_rotation_angle = opt_aberration_coefs.pop("rotation_angle", None)
 
         state.optimized_aberrations = opt_aberration_coefs
@@ -819,7 +838,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if self.verbose:
             print(self._hyperparameter_state)
 
-        self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
+        self.reconstruct_with_hyperparameters(verbose=False, **reconstruct_kwargs)
         return self
 
     def grid_search_hyperparameters(
@@ -842,6 +861,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         """
         aberration_coefs = aberration_coefs or {}
 
+        optimized_keys: set[str] = {
+            name
+            for name, val in aberration_coefs.items()
+            if isinstance(val, OptimizationParameter)
+        }
+        if isinstance(rotation_angle, OptimizationParameter):
+            optimized_keys.add("rotation_angle")
+
         # Build parameter grid
         param_grid = {}
         for name, val in aberration_coefs.items():
@@ -862,12 +889,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         results = []
         best_loss = float("inf")
-        best_params = None
+        best_params: dict[str, float] | None = None
 
         for combo in tqdm(grid):
             params = dict(zip(keys, combo))
-            trial_aberration_coefs = params.copy()
-            trial_rotation_angle = trial_aberration_coefs.pop("rotation_angle", None)
+
+            trial_aberration_coefs = {k: v for k, v in params.items() if k != "rotation_angle"}
+            trial_rotation_angle = params.get("rotation_angle", None)
 
             self.reconstruct(
                 aberration_coefs=trial_aberration_coefs,
@@ -884,12 +912,35 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 best_params = params
 
         self._grid_search_results = results
-        self._optimized_parameters = best_params
+
+        fixed_aberrations = {}
+        optimized_aberrations = {}
+        fixed_rotation_angle = None
+        optimized_rotation_angle = None
+
+        for name, val in best_params.items():
+            if name == "rotation_angle":
+                if "rotation_angle" in optimized_keys:
+                    optimized_rotation_angle = val
+                else:
+                    fixed_rotation_angle = val
+            elif name in optimized_keys:
+                optimized_aberrations[name] = val
+            else:
+                fixed_aberrations[name] = val
+
+        self._hyperparameter_state = HyperparameterState(
+            fixed_aberrations=fixed_aberrations,
+            fixed_rotation_angle=fixed_rotation_angle,
+            optimized_aberrations=optimized_aberrations,
+            optimized_rotation_angle=optimized_rotation_angle,
+            optimized_keys=optimized_keys,
+        )
 
         if self.verbose:
-            print(f"Best grid parameters: {self._optimized_parameters}")
+            print(self._hyperparameter_state)
 
-        self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
+        self.reconstruct_with_hyperparameters(verbose=False, **reconstruct_kwargs)
 
         return self
 
@@ -1004,22 +1055,31 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         )
 
         self.corrected_stack = vbf_stack
-        self._fitted_parameters = fit_results
+
+        fitted_aberration_coefs = fit_results.copy()
+        fitted_rotation_angle = fitted_aberration_coefs.pop("rotation_angle", None)
+        self._hyperparameter_state = HyperparameterState(
+            optimized_aberrations=fitted_aberration_coefs,
+            optimized_rotation_angle=fitted_rotation_angle,
+            optimized_keys={"C10", "C12", "phi12", "rotation_angle"},
+        )
 
         if self.verbose:
-            print(f"Fitted parameters: {self._fitted_parameters}")
+            print(self._hyperparameter_state)
 
-        self.reconstruct_with_fitted_parameters(verbose=False, **reconstruct_kwargs)
+        self.reconstruct_with_hyperparameters(verbose=False, **reconstruct_kwargs)
 
         return self
 
-    def reconstruct_with_optimized_parameters(
+    def reconstruct_with_hyperparameters(
         self,
         **reconstruct_kwargs,
     ):
         """ """
         if not hasattr(self, "_hyperparameter_state"):
-            raise ValueError("run self.optimize_hyperparameters first.")
+            raise ValueError(
+                "run self.optimize_hyperparameters or self.fit_hyperparameters first."
+            )
 
         state = self._hyperparameter_state
 
@@ -1032,27 +1092,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         return self.reconstruct(
             aberration_coefs=state.merged_aberrations(),
             rotation_angle=state.merged_rotation_angle(),
-            **safe_kwargs,
-        )
-
-    def reconstruct_with_fitted_parameters(
-        self,
-        **reconstruct_kwargs,
-    ):
-        """ """
-        if not hasattr(self, "_fitted_parameters"):
-            raise ValueError("run self.fit_hyperparameters first.")
-
-        aberration_coefs = self._fitted_parameters.copy()
-        rotation_angle = aberration_coefs.pop("rotation_angle", None)
-        safe_kwargs = {
-            k: v
-            for k, v in reconstruct_kwargs.items()
-            if k not in ["aberration_coefs", "rotation_angle"]
-        }
-        return self.reconstruct(
-            aberration_coefs=aberration_coefs,
-            rotation_angle=rotation_angle,
             **safe_kwargs,
         )
 
