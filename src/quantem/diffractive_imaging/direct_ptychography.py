@@ -689,21 +689,22 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             power /= self.BF_weights
 
             if deconvolution_kernel == "obf":
-                norm = power.sqrt().clip(1e-8)
+                norm = power.sqrt().clamp_min(1e-8)
             elif deconvolution_kernel == "mf":
                 epsilon = 1e-2
-                norm = (power + epsilon * (power.max())).clip(1e-8)
+                norm = (power + epsilon * (power.max())).clamp_min(1e-8)
 
-        # # second pass
+        # second pass
         for batch_idx in batcher:
-            fourier_factor_batch = fourier_factor[batch_idx]
+            ff = fourier_factor[batch_idx]
+
             if power is not None:
-                fourier_factor_batch /= norm
+                ff /= norm
 
-            fourier_factor_batch *= butterworth_env
-            fourier_factor_batch[:, 0, 0] = self._dc_per_image
+            ff *= butterworth_env
+            ff[:, 0, 0] = self._dc_per_image
 
-            fourier_factor[batch_idx] = torch.fft.ifft2(fourier_factor_batch)
+            fourier_factor[batch_idx] = torch.fft.ifft2(ff)
 
         self.corrected_stack = fourier_factor.real
 
