@@ -555,22 +555,21 @@ def show_2d(
             for j in range(len(row), ncols):
                 axs[i][j].axis("off")  # type: ignore
 
-        if kwargs.get("tight_layout", True):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                fig.tight_layout()
-
-    if kwargs.get("tight_layout", True):
-        only_subplots = all(
-            getattr(ax, "get_subplotspec", lambda: None)() is not None for ax in fig.axes
-        )
-        if only_subplots:
-            fig.tight_layout()
-        elif figax is None:
-            fig.subplots_adjust(
-                wspace=kwargs.get("wspace", 0.25),
-                hspace=kwargs.get("hspace", 0.25),
+        # Safe layout handling: only adjust layout if we created the figure
+        tight_layout = kwargs.get("tight_layout", True)
+        if figax is None and tight_layout:
+            only_subplots = all(
+                getattr(ax, "get_subplotspec", lambda: None)() is not None for ax in fig.axes
             )
+            if only_subplots:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    fig.tight_layout()
+            else:
+                fig.subplots_adjust(
+                    wspace=kwargs.get("wspace", 0.25),
+                    hspace=kwargs.get("hspace", 0.25),
+                )
 
     if kwargs.get("force_show", False):
         plt.show()
