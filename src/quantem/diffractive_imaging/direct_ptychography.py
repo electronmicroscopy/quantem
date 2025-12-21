@@ -516,6 +516,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aliases = {
             "ssb": "ssb",
             "single-sideband": "ssb",
+            "acbf": "ssb",
+            "aberration-corrected-bright-field": "ssb",
             "obf": "obf",
             "optimum-bright-field": "obf",
             "mf": "mf",
