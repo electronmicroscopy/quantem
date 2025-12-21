@@ -546,6 +546,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         q_lowpass=None,
         butterworth_order=12,
         matched_filter_norm_epsilon=1e-1,
+        parallax_flip_phase=True,
         verbose=None,
     ):
         """
@@ -617,13 +618,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             grad_k = torch.stack((dx[self.bf_mask], dy[self.bf_mask]), -1)
             self.lateral_shifts = grad_k / 2 / np.pi
 
-            chi_q = aberration_surface(
-                q * self.wavelength,
-                theta,
-                self.wavelength,
-                aberration_coefs=aberration_coefs,
-            )
-            sign_sin_chi_q = torch.sign(torch.sin(chi_q))
+            if parallax_flip_phase:
+                chi_q = aberration_surface(
+                    q * self.wavelength,
+                    theta,
+                    self.wavelength,
+                    aberration_coefs=aberration_coefs,
+                )
+                sign_sin_chi_q = torch.sign(torch.sin(chi_q))
+            else:
+                sign_sin_chi_q = torch.ones_like(q)
         else:
             grad_k = None
             sign_sin_chi_q = None
@@ -1008,11 +1012,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             for k, v in reconstruct_kwargs.items()
             if k not in ["deconvolution_kernel", "verbose"]
         }
-        flip_phase = safe_kwargs.pop("flip_phase", False)
+        parallax_flip_phase = safe_kwargs.pop("parallax_flip_phase", False)
 
         self.reconstruct(
             deconvolution_kernel="parallax",
-            flip_phase=flip_phase,
+            parallax_flip_phase=parallax_flip_phase,
             verbose=False,
             **safe_kwargs,
         )
