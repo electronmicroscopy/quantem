@@ -519,7 +519,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             "obf": "obf",
             "optimum-bright-field": "obf",
             "mf": "mf",
-            "mixed-filter": "mf",
+            "matched-filter": "mf",
             "prlx": "prlx",
             "parallax": "prlx",
             "tcbf": "prlx",
