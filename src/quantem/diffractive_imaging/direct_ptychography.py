@@ -545,6 +545,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         q_highpass=None,
         q_lowpass=None,
         butterworth_order=12,
+        matched_filter_norm_epsilon=1e-1,
         verbose=None,
     ):
         """
@@ -698,8 +699,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             if deconvolution_kernel == "obf":
                 norm = power.sqrt().clamp_min(1e-8)
             elif deconvolution_kernel == "mf":
-                epsilon = 1e-2
-                norm = (power + epsilon * (power.max())).clamp_min(1e-8)
+                norm = (power + matched_filter_norm_epsilon * power.max()).clamp_min(1e-8)
 
             # second pass
             for batch_idx in batcher:
