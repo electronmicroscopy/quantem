@@ -678,8 +678,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 aberration_coefs,
                 batch_idx,
             )
-            fourier_factor[batch_idx] = num
-            if power is not None:
+            if power is None:
+                num *= butterworth_env
+                num[:, 0, 0] = self._dc_per_image
+
+                fourier_factor[batch_idx] = torch.fft.ifft2(num)
+            else:
+                fourier_factor[batch_idx] = num
                 power += pow
 
             pbar.update(len(batch_idx))
@@ -694,17 +699,17 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 epsilon = 1e-2
                 norm = (power + epsilon * (power.max())).clamp_min(1e-8)
 
-        # second pass
-        for batch_idx in batcher:
-            ff = fourier_factor[batch_idx]
+            # second pass
+            for batch_idx in batcher:
+                ff = fourier_factor[batch_idx]
 
-            if power is not None:
-                ff /= norm
+                if power is not None:
+                    ff /= norm
 
-            ff *= butterworth_env
-            ff[:, 0, 0] = self._dc_per_image
+                ff *= butterworth_env
+                ff[:, 0, 0] = self._dc_per_image
 
-            fourier_factor[batch_idx] = torch.fft.ifft2(ff)
+                fourier_factor[batch_idx] = torch.fft.ifft2(ff)
 
         self.corrected_stack = fourier_factor.real
 
