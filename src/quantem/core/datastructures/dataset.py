@@ -32,6 +32,7 @@ class Dataset(AutoSerialize):
     """
 
     _token = object()
+    _registry: dict[int, type] = {}
 
     def __init__(
         self,

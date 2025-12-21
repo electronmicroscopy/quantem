@@ -33,7 +33,7 @@ class LoggerPtychography(LoggerBase):
         self._phase_cmap = config.get("viz.phase_cmap")
         self._log_probe_images = log_probe_images
 
-    def object_image(self, volume_obj: ObjectModelType, epoch: int, logger_cmap: str = "turbo"):
+    def object_image(self, volume_obj: ObjectModelType, iter: int, logger_cmap: str = "turbo"):
         """Log object images with object type-aware visualization (optimized)."""
         try:
             obj = volume_obj.obj.cpu().detach().numpy()
@@ -46,34 +46,34 @@ class LoggerPtychography(LoggerBase):
                 self.log_image(
                     tag="object/potential_zsum",
                     image=obj_sum,
-                    step=epoch,
+                    step=iter,
                     cmap=logger_cmap,
                 )
             elif obj_type == "pure_phase":
                 self.log_image(
                     tag="object/phase_zsum",
                     image=np.angle(obj_sum),
-                    step=epoch,
+                    step=iter,
                     cmap=self._phase_cmap,
                 )
             elif obj_type == "complex":
                 self.log_image(
                     tag="object/amplitude_zsum",
                     image=np.abs(obj_sum),
-                    step=epoch,
+                    step=iter,
                     cmap=logger_cmap,
                 )
                 self.log_image(
                     tag="object/phase_zsum",
                     image=np.angle(obj_sum),
-                    step=epoch,
+                    step=iter,
                     cmap=self._phase_cmap,
                 )
 
         except Exception as e:
-            print(f"Warning: Failed to log object images at epoch {epoch}: {e}")
+            print(f"Warning: Failed to log object images at iteration {iter}: {e}")
 
-    def probe_image(self, probe_model: ProbeModelType, epoch: int, logger_cmap: str = "turbo"):
+    def probe_image(self, probe_model: ProbeModelType, iter: int, logger_cmap: str = "turbo"):
         """Log probe images showing both real-space and fourier-space representations (optimized)."""
         try:
             probe = probe_model.probe
@@ -90,18 +90,18 @@ class LoggerPtychography(LoggerBase):
                 self.log_image(
                     tag=f"probe/amplitude/probe_{probe_idx}",
                     image=np.abs(probe_data),
-                    step=epoch,
+                    step=iter,
                     cmap=logger_cmap,
                 )
                 self.log_image(
                     tag=f"probe/phase/probe_{probe_idx}",
                     image=np.angle(probe_data),
-                    step=epoch,
+                    step=iter,
                     cmap=self._phase_cmap,
                 )
 
         except Exception as e:
-            print(f"Warning: Failed to log probe images at epoch {epoch}: {e}")
+            print(f"Warning: Failed to log probe images at iteration {iter}: {e}")
 
     def organize_constraint_losses(
         self,
@@ -113,14 +113,11 @@ class LoggerPtychography(LoggerBase):
         """Organize constraint losses with minimal overhead."""
         organized_losses = {}
 
-        models = [
-            ("object_constraints", object_model),
-            ("probe_constraints", probe_model),
-            ("dataset_constraints", dataset_model),
-        ]
-
-        for model_name, model in models:
-            losses = model.get_epoch_constraint_losses()
+        for model_name, model in zip(
+            ["object_constraints", "probe_constraints", "dataset_constraints"],
+            [object_model, probe_model, dataset_model],
+        ):
+            losses = model.get_iter_constraint_losses()
             if losses:
                 # Only create dict if there are non-zero losses
                 nonzero_losses = {k: v / num_batches for k, v in losses.items() if v != 0.0}
@@ -129,20 +126,18 @@ class LoggerPtychography(LoggerBase):
 
         return organized_losses
 
-    def log_epoch(
+    def log_iter(
         self,
         object_model: ObjectModelType,
         probe_model: ProbeModelType,
         dataset_model: DatasetModelType,
-        epoch: int,
+        iter: int,
         consistency_loss: float,
         num_batches: int,
-        # epoch_loss: float,
-        # batch_losses: list[dict],
         learning_rates: dict | None = None,
         logger_cmap: str = "turbo",
     ):
-        """Condensed epoch logging that handles losses, learning rates, and images."""
+        """Condensed iteration logging that handles losses, learning rates, and images."""
         try:
             organized_losses = self.organize_constraint_losses(
                 object_model, probe_model, dataset_model, num_batches
@@ -150,31 +145,31 @@ class LoggerPtychography(LoggerBase):
             total_constraint_loss = 0.0
             for category, constraint_losses in organized_losses.items():
                 for constraint_name, value in constraint_losses.items():
-                    self.log_scalar(f"constraints/{category}/{constraint_name}", value, epoch)
+                    self.log_scalar(f"constraints/{category}/{constraint_name}", value, iter)
                     total_constraint_loss += value
 
-            self.log_scalar("loss/consistency", consistency_loss, epoch)
-            self.log_scalar("loss/constraint", total_constraint_loss, epoch)
-            self.log_scalar("loss/total", total_constraint_loss + consistency_loss, epoch)
+            self.log_scalar("loss/consistency", consistency_loss, iter)
+            self.log_scalar("loss/constraint", total_constraint_loss, iter)
+            self.log_scalar("loss/total", total_constraint_loss + consistency_loss, iter)
 
             # Learning rates
             if learning_rates:
                 for param_name, lr_value in learning_rates.items():
                     if hasattr(lr_value, "item"):
                         lr_value = lr_value.item()
-                    self.log_scalar(f"learning_rate/{param_name}", float(lr_value), epoch)
+                    self.log_scalar(f"learning_rate/{param_name}", float(lr_value), iter)
 
             # Images (only when needed)
-            if epoch % self.log_images_every == 0 and self.log_images_every > 0:
-                self.object_image(object_model, epoch, logger_cmap)
+            if iter % self.log_images_every == 0 and self.log_images_every > 0:
+                self.object_image(object_model, iter, logger_cmap)
                 if self._log_probe_images:
-                    self.probe_image(probe_model, epoch, logger_cmap)
+                    self.probe_image(probe_model, iter, logger_cmap)
 
             # Flush occasionally, default is 120 sec
-            if epoch % 50 == 0:
+            if iter % 50 == 0:
                 self.flush()
 
         except Exception as e:
-            warn(f"Warning: Epoch logging failed at epoch {epoch}: {e}")
+            warn(f"Warning: Logging failed at iteration {iter}: {e}")
             # Allow caller to decide whether to continue
             # Avoid unreachable code

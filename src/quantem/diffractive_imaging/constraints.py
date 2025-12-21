@@ -16,7 +16,7 @@ class BaseConstraints(ABC):
         super().__init__(*args, **kwargs)
         self._soft_constraint_loss = {}
         self._constraints = self.DEFAULT_CONSTRAINTS.copy()
-        self._epoch_constraint_losses = {}
+        self._iter_constraint_losses = {}
 
     @property
     def constraints(self) -> dict[str, Any]:
@@ -88,12 +88,12 @@ class BaseConstraints(ABC):
                     v = loss_value.detach().mean().item()
             else:
                 v = float(loss_value)
-            self._epoch_constraint_losses[loss_name] = (
-                self._epoch_constraint_losses.get(loss_name, 0.0) + v
+            self._iter_constraint_losses[loss_name] = (
+                self._iter_constraint_losses.get(loss_name, 0.0) + v
             )
 
-    def get_epoch_constraint_losses(self) -> dict[str, float]:
-        return getattr(self, "_epoch_constraint_losses", {})  # TODO clean this up
+    def get_iter_constraint_losses(self) -> dict[str, float]:
+        return getattr(self, "_iter_constraint_losses", {})  # TODO clean this up
 
-    def reset_epoch_constraint_losses(self) -> None:
-        self._epoch_constraint_losses = {}
+    def reset_iter_constraint_losses(self) -> None:
+        self._iter_constraint_losses = {}
