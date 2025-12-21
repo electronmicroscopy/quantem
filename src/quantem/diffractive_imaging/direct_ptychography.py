@@ -1100,24 +1100,18 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "use_center_of_mass_weighting", "verbose"]
+            if k not in ["deconvolution_kernel", "verbose"]
         }
 
-        combo = list(
-            product(
-                [False, True],
-                ["none", "quadratic", "full"],
-            )
-        )
+        kernels = ["ssb", "obf", "mf", "prlx", "icom"]
 
         recons = [
             self.reconstruct(
                 deconvolution_kernel=kernel,
-                use_center_of_mass_weighting=icom,
                 verbose=False,
                 **safe_kwargs,
             ).obj
-            for icom, kernel in tqdm(combo, disable=not self.verbose)
+            for kernel in tqdm(kernels, disable=not self.verbose)
         ]
 
         return recons
