@@ -351,7 +351,7 @@ def gamma_factor(
         gamma = probe_m * cmplx_probe_at_k.conj() + probe_p.conj() * cmplx_probe_at_k
     if normalize:
         gamma /= gamma.abs().clamp(min=1e-8)
-    return gamma.conj()
+    return gamma
 
 
 def evaluate_probe(

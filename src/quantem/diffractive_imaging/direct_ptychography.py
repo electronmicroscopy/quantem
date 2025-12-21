@@ -315,7 +315,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
-        self._corrected_stack_amplitude = None
 
         return self
 
@@ -441,97 +440,98 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         else:
             raise ValueError("reciprocal-space needs to be given in 'A^-1' or 'mrad'")
 
-    def _compute_parallax_operator(
-        self, alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=True
-    ):
-        """Compute parallax approximation operator."""
-        dx, dy = aberration_surface_cartesian_gradients(
-            alpha,
-            phi,
-            aberration_coefs,
-        )
-        grad_k = torch.stack((dx[self.bf_mask], dy[self.bf_mask]), -1)
-
-        qvec = torch.stack((qxa, qya), 0)
-        grad_kq = torch.einsum("na,amp->nmp", grad_k, qvec)
-        operator = torch.exp(-1j * grad_kq)
-
-        if flip_phase:
-            q = torch.sqrt(qxa.square() + qya.square())
-            theta = torch.arctan2(qya, qxa)
-            chi_q = aberration_surface(
-                q * self.wavelength,
-                theta,
-                self.wavelength,
-                aberration_coefs,
-            )
-            sign_sign_chi_q = torch.sign(torch.sin(chi_q))
-            operator = operator * sign_sign_chi_q
-
-        return operator, grad_k / 2 / np.pi
-
-    def _compute_gamma_operator(
+    def _return_kernel_contributions(
         self,
+        deconvolution_kernel,
+        vbf_fourier,
         kxa,
         kya,
         qxa,
         qya,
+        cmplx_probe_k,
+        grad_k,
+        sign_sin_chi_q,
         aberration_coefs,
-        cmplx_probe,
         batch_idx,
-        asymmetric_version=True,
-        normalize=True,
     ):
-        """Compute gamma deconvolution operator."""
+        """ """
+
         ind_i = self._bf_inds_i[batch_idx]
         ind_j = self._bf_inds_j[batch_idx]
 
         kx = kxa[ind_i, ind_j].view(-1, 1, 1)
         ky = kya[ind_i, ind_j].view(-1, 1, 1)
 
-        qmkxa = qxa.unsqueeze(0) - kx
-        qmkya = qya.unsqueeze(0) - ky
-        qpkxa = qxa.unsqueeze(0) + kx
-        qpkya = qya.unsqueeze(0) + ky
+        power = None
 
-        cmplx_probe_at_k = cmplx_probe[ind_i, ind_j].view(-1, 1, 1)
+        if deconvolution_kernel in ("ssb", "obf", "mf"):
+            qmkxa = qxa.unsqueeze(0) - kx
+            qmkya = qya.unsqueeze(0) - ky
+            qpkxa = qxa.unsqueeze(0) + kx
+            qpkya = qya.unsqueeze(0) + ky
 
-        gamma = gamma_factor(
-            (qmkxa, qmkya),
-            (qpkxa, qpkya),
-            cmplx_probe_at_k,
-            self.wavelength,
-            self.semiangle_cutoff,
-            self.soft_edges,
-            angular_sampling=self.angular_sampling,
-            aberration_coefs=aberration_coefs,
-            asymmetric_version=asymmetric_version,
-            normalize=normalize,
-        )
+            cmplx_probe_at_k = cmplx_probe_k[ind_i, ind_j].view(-1, 1, 1)
 
-        return gamma
+            gamma = gamma_factor(
+                (qmkxa, qmkya),
+                (qpkxa, qpkya),
+                cmplx_probe_at_k,
+                self.wavelength,
+                self.semiangle_cutoff,
+                self.soft_edges,
+                angular_sampling=self.angular_sampling,
+                aberration_coefs=aberration_coefs,
+                normalize=False,
+            )
 
-    def _compute_icom_weighting(self, qxa, qya, kxa, kya, batch_idx, q_highpass=None):
-        """Compute iCOM Fourier-space weighting factors."""
-        q2 = qxa.square() + qya.square()
-        qx_op = -1.0j * qxa / q2
-        qy_op = -1.0j * qya / q2
-        qx_op[0, 0] = 0.0
-        qy_op[0, 0] = 0.0
+            fourier_factor = -1.0j * vbf_fourier * gamma.conj()
+            abs_gamma = gamma.abs()
 
-        env = torch.ones_like(q2)
-        if q_highpass:
-            butterworth_order = 12
-            env *= 1 - 1 / (1 + (torch.sqrt(q2) / q_highpass) ** (2 * butterworth_order))
+            if deconvolution_kernel == "ssb":
+                fourier_factor = fourier_factor / abs_gamma.clip(1e-8)
+            else:
+                power = abs_gamma.square().sum(0)
 
-        ind_i = self._bf_inds_i[batch_idx]
-        ind_j = self._bf_inds_j[batch_idx]
-        kx = kxa[ind_i, ind_j].view(-1, 1, 1)
-        ky = kya[ind_i, ind_j].view(-1, 1, 1)
+        elif deconvolution_kernel == "prlx":
+            qvec = torch.stack((qxa, qya), 0)
+            grad_kq = torch.einsum("na,amp->nmp", grad_k[batch_idx], qvec)
+            operator = torch.exp(-1j * grad_kq) * sign_sin_chi_q
+            fourier_factor = vbf_fourier * operator
 
-        icom_weighting = (kx * qx_op + ky * qy_op) * env
+        else:
+            q2 = qxa.square() + qya.square()
+            qx_op = -1.0j * qxa / q2
+            qy_op = -1.0j * qya / q2
+            qx_op[0, 0] = 0.0
+            qy_op[0, 0] = 0.0
 
-        return icom_weighting
+            operator = kx * qx_op + ky * qy_op
+            fourier_factor = vbf_fourier * operator
+
+        return fourier_factor, power
+
+    def _normalize_kernel_name(self, kernel):
+        kernel = kernel.lower()
+
+        aliases = {
+            "ssb": "ssb",
+            "single-sideband": "ssb",
+            "obf": "obf",
+            "optimum-bright-field": "obf",
+            "mf": "mf",
+            "mixed-filter": "mf",
+            "prlx": "prlx",
+            "parallax": "prlx",
+            "tcbf": "prlx",
+            "tilt-corrected-bright-field": "prlx",
+            "icom": "icom",
+            "center-of-mass": "icom",
+        }
+
+        if kernel not in aliases:
+            raise ValueError(f"Unknown deconvolution kernel '{kernel}'")
+
+        return aliases[kernel]
 
     def reconstruct(
         self,
@@ -539,10 +539,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         upsampling_factor=None,
         rotation_angle=None,
         max_batch_size=None,
-        deconvolution_kernel="full",
-        use_center_of_mass_weighting=False,
-        flip_phase=True,
+        deconvolution_kernel="single-sideband",
         q_highpass=None,
+        q_lowpass=None,
+        butterworth_order=12,
         verbose=None,
     ):
         """
@@ -558,16 +558,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Rotation angle for coordinate system
         max_batch_size : int, optional
             Maximum batch size for processing
-        deconvolution_kernel : str, one of ['full', 'quadratic', 'none']
-            deconvolution_kernel = 'full' -> SSB
-            deconvolution_kernel = 'quadratic' -> parallax
-            deconvolution_kernel = 'none' -> BF-STEM
-        use_center_of_mass_weighting : bool, optional
-            If True, apply iCOM Fourier-space weighting
-        flip_phase : bool, optional
-            If True, flip phase in parallax approximation (default: True)
+        deconvolution_kernel : str, one of ['ssb', 'obf', 'mf','prlx','icom']
         q_highpass : float, optional
-            High-pass filter cutoff for iCOM weighting
+            High-pass filter cutoff
+        q_lowpass : float, optional
+            Low-pass filter cutoff
         verbose : bool, optional
             If True, show progress bar
 
@@ -597,42 +592,55 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if max_batch_size is None:
             max_batch_size = self.num_bf
 
-        if deconvolution_kernel is None:
-            deconvolution_kernel == "none"
-        elif deconvolution_kernel == "parallax":
-            deconvolution_kernel = "quadratic"
-        elif deconvolution_kernel == "ssb":
-            deconvolution_kernel = "full"
-        elif deconvolution_kernel not in ("full", "quadratic", "none"):
-            raise ValueError(
-                f"deconvolution_kernel needs to be one on 'full' or 'ssb','quadratic' or 'parallax', 'none' or None, not '{deconvolution_kernel}'"
-            )
+        deconvolution_kernel = self._normalize_kernel_name(deconvolution_kernel)
 
         # Get upsampled q-space grid
         qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
-        # Gamma deconvolution: need k-space grid and probe
+        q, theta = polar_coordinates(qxa, qya)
+
+        # Get k-space grid
         kxa, kya = spatial_frequencies(
             self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
         )
         k, phi = polar_coordinates(kxa, kya)
-        alpha = k * self.wavelength
 
-        # Compute operator based on method
-        if deconvolution_kernel == "full":
-            # operator calculated inside loop
-            cmplx_probe = evaluate_probe(
-                alpha,
+        # compute global / cheap functions for prlx
+        if deconvolution_kernel == "prlx":
+            dx, dy = aberration_surface_cartesian_gradients(
+                k * self.wavelength,
                 phi,
-                self.semiangle_cutoff,
-                self.angular_sampling,
+                aberration_coefs=aberration_coefs,
+            )
+            grad_k = torch.stack((dx[self.bf_mask], dy[self.bf_mask]), -1)
+            self.lateral_shifts = grad_k / 2 / np.pi
+
+            chi_q = aberration_surface(
+                q * self.wavelength,
+                theta,
                 self.wavelength,
                 aberration_coefs=aberration_coefs,
             )
-        elif deconvolution_kernel == "quadratic":
-            # compute parallax operator once for all batches
-            operator, self.lateral_shifts = self._compute_parallax_operator(
-                alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=flip_phase
-            )
+            sign_sin_chi_q = torch.sign(torch.sin(chi_q))
+        else:
+            grad_k = None
+            sign_sin_chi_q = None
+
+        # compute global / cheap functions for all
+        cmplx_probe_k = evaluate_probe(
+            k * self.wavelength,
+            phi,
+            self.semiangle_cutoff,
+            self.angular_sampling,
+            self.wavelength,
+            aberration_coefs=aberration_coefs,
+        )
+        self.BF_weights = cmplx_probe_k.abs().square().sum()
+
+        butterworth_env = torch.ones_like(q)
+        if q_lowpass:
+            butterworth_env *= 1 / (1 + (q / q_lowpass) ** (2 * butterworth_order))
+        if q_highpass:
+            butterworth_env *= 1 - 1 / (1 + (q / q_highpass) ** (2 * butterworth_order))
 
         # Process batches
         pbar = tqdm(range(self.num_bf), disable=not verbose)
@@ -640,13 +648,15 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
         )
 
-        if deconvolution_kernel == "full":
-            corrected_stack = torch.empty(
-                (self.num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
-            )
+        fourier_factor = torch.empty(
+            (self.num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
+        )
+        if deconvolution_kernel in ("obf", "mf"):
+            power = torch.zeros(qxa.shape, device=self.device)
         else:
-            corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
+            power = None
 
+        # first pass
         for batch_idx in batcher:
             # Fourier-space tiling
             vbf_fourier = torch.cat(
@@ -655,49 +665,47 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 dim=-2,
             )
 
-            if use_center_of_mass_weighting:
-                icom_weighting = self._compute_icom_weighting(
-                    qxa, qya, kxa, kya, batch_idx, q_highpass
-                )
-                if deconvolution_kernel == "full":
-                    icom_weighting = 1.0j * icom_weighting
-                elif deconvolution_kernel == "quadratic":
-                    icom_weighting = -1.0 * icom_weighting
-            else:
-                icom_weighting = 1.0
+            num, pow = self._return_kernel_contributions(
+                deconvolution_kernel,
+                vbf_fourier,
+                kxa,
+                kya,
+                qxa,
+                qya,
+                cmplx_probe_k,
+                grad_k,
+                sign_sin_chi_q,
+                aberration_coefs,
+                batch_idx,
+            )
+            fourier_factor[batch_idx] = num
+            if power is not None:
+                power += pow
 
-            if deconvolution_kernel == "full":
-                # Compute gamma operator for this batch
-                operator = self._compute_gamma_operator(
-                    kxa,
-                    kya,
-                    qxa,
-                    qya,
-                    aberration_coefs,
-                    cmplx_probe,
-                    batch_idx,
-                    asymmetric_version=not use_center_of_mass_weighting,
-                    normalize=not use_center_of_mass_weighting,
-                )
-                fourier_factor = vbf_fourier * operator * icom_weighting
-                fourier_factor[..., 0, 0] = self._dc_per_image  # normalize by mean
-            elif deconvolution_kernel == "quadratic":
-                fourier_factor = vbf_fourier * operator[batch_idx] * icom_weighting
-            else:
-                fourier_factor = vbf_fourier * icom_weighting
-
-            # Inverse FFT and extract appropriate component
-            if deconvolution_kernel == "full":
-                corrected_stack[batch_idx] = torch.fft.ifft2(
-                    fourier_factor
-                )  # * upsampling_factor**2
-            else:
-                corrected_stack[batch_idx] = (
-                    torch.fft.ifft2(fourier_factor).real * upsampling_factor**2
-                )
             pbar.update(len(batch_idx))
-
         pbar.close()
+
+        if power is not None:
+            power /= self.BF_weights
+
+            if deconvolution_kernel == "obf":
+                norm = power.sqrt().clip(1e-8)
+            elif deconvolution_kernel == "mf":
+                epsilon = 1e-2
+                norm = (power + epsilon * (power.max())).clip(1e-8)
+
+        # # second pass
+        for batch_idx in batcher:
+            fourier_factor_batch = fourier_factor[batch_idx]
+            if power is not None:
+                fourier_factor_batch /= norm
+
+            fourier_factor_batch *= butterworth_env
+            fourier_factor_batch[:, 0, 0] = self._dc_per_image
+
+            fourier_factor[batch_idx] = torch.fft.ifft2(fourier_factor_batch)
+
+        self.corrected_stack = fourier_factor.real
 
         # memory management
         gc.collect()
@@ -706,19 +714,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             torch.mps.empty_cache()
         gc.collect()
 
-        if deconvolution_kernel == "full":
-            self.corrected_stack = corrected_stack.angle()
-            self.corrected_stack_amplitude = (
-                2 - corrected_stack.abs()
-            )  # amplitude contrast flipping
-        else:
-            self.corrected_stack = corrected_stack
-            self.corrected_stack_amplitude = None
-
         return self
 
     @property
-    def corrected_stack(self) -> torch.Tensor:
+    def corrected_stack(self):
         return self._corrected_stack
 
     @corrected_stack.setter
@@ -731,7 +730,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def mean_corrected_bf(self):
         if self.corrected_stack is None:
             return None
-        return self.corrected_stack.mean(dim=0)
+        return self.corrected_stack.sum(dim=0) / self.BF_weights
 
     def variance_loss(self):
         """ """
