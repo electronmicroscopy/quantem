@@ -546,3 +546,93 @@ def fourier_cropping(
     result[-h2:, -w2:] = corner_centered_array[-h2:, -w2:]
 
     return result
+
+def plot_image_grid(
+    images,
+    titles=None,
+    n_per_row=3,
+    figsize_per_image=(4, 4),
+    cmap='gray',
+    vmin=None,
+    vmax=None,
+    axis_off=True,
+    suptitle=None,
+    return_fig=False,
+):
+    """
+    Plot a grid of images with flexible layout.
+    
+    Parameters:
+    -----------
+    images : list or ndarray
+        Images to plot. Can be list of 2D/3D arrays or 4D array.
+    titles : list of str, optional
+        Title for each image.
+    n_per_row : int
+        Number of images per row.
+    figsize_per_image : tuple
+        Size (width, height) of each subplot.
+    cmap : str or list
+        Colormap(s). Ignored for RGB images.
+    vmin, vmax : float or list, optional
+        Color scale limits.
+    axis_off : bool
+        Hide axes.
+    suptitle : str, optional
+        Overall figure title.
+    return_fig : bool
+        Return (fig, axes) instead of displaying.
+    """
+    
+    # Convert to list
+    if isinstance(images, np.ndarray) and images.ndim == 4:
+        images = [images[i] for i in range(images.shape[0])]
+    elif not isinstance(images, list):
+        images = [images]
+    
+    n_images = len(images)
+    n_cols = min(n_per_row, n_images)
+    n_rows = int(np.ceil(n_images / n_per_row))
+    
+    # Create figure
+    fig, axes = plt.subplots(
+        n_rows, n_cols, 
+        figsize=(figsize_per_image[0] * n_cols, figsize_per_image[1] * n_rows)
+    )
+    axes = np.atleast_1d(axes).flatten()
+    
+    # Convert parameters to lists
+    def to_list(val, n): 
+        return [val] * n if not isinstance(val, (list, tuple)) else val
+    
+    cmaps = to_list(cmap, n_images)
+    vmins = to_list(vmin, n_images)
+    vmaxs = to_list(vmax, n_images)
+    titles = to_list(None, n_images) if titles is None else titles
+    
+    # Plot images
+    for idx, (ax, img) in enumerate(zip(axes[:n_images], images)):
+        is_rgb = img.ndim == 3 and img.shape[2] in [3, 4]
+        
+        ax.imshow(
+            img, 
+            cmap=None if is_rgb else cmaps[idx],
+            vmin=vmins[idx], 
+            vmax=vmaxs[idx]
+        )
+        
+        if titles[idx]:
+            ax.set_title(titles[idx])
+        if axis_off:
+            ax.axis('off')
+    
+    # Hide unused subplots
+    for ax in axes[n_images:]:
+        ax.set_visible(False)
+    
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=14)
+    
+    plt.tight_layout()
+    
+    return (fig, axes) if return_fig else plt.show()

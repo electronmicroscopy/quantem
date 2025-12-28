@@ -165,8 +165,20 @@ def dataset4dstem_polar_transform(
     if self.array.ndim != 4:
         raise ValueError("polar_transform requires a 4D-STEM dataset (ndim=4).")
     scan_y, scan_x, ny, nx = self.array.shape
-    origin_row_f = float(origin_row)
-    origin_col_f = float(origin_col)
+
+    # Handle single origin for all DP or an array listing origins for each DP
+    origin_row_arr = np.asarray(origin_row)
+    origin_col_arr = np.asarray(origin_col)
+    is_array = origin_row_arr.ndim > 0 or origin_col_arr.ndim > 0
+    
+    if is_array:
+        # Re-cast to scan shape
+        origin_row_arr = np.broadcast_to(origin_row_arr, (scan_y, scan_x))
+        origin_col_arr = np.broadcast_to(origin_col_arr, (scan_y, scan_x))
+
+    # Take first value as default, as if float will be array of length 1
+    origin_row_f = float(origin_row_arr.flat[0]) if is_array else float(origin_row)
+    origin_col_f = float(origin_col_arr.flat[0]) if is_array else float(origin_col)
     coords, phi_bins, radial_bins, radial_max_eff = _precompute_polar_coords(
         ny=ny,
         nx=nx,
@@ -185,6 +197,20 @@ def dataset4dstem_polar_transform(
     out = np.empty((scan_y, scan_x, n_phi, n_r), dtype=result_dtype)
     for iy in range(scan_y):
         for ix in range(scan_x):
+            # Recompute coords if varying origins
+            if is_array:
+                coords, _, _, _ = _precompute_polar_coords(
+                    ny=ny,
+                    nx=nx,
+                    origin_row=float(origin_row_arr[iy, ix]),
+                    origin_col=float(origin_col_arr[iy, ix]),
+                    ellipse_params=ellipse_params,
+                    num_annular_bins=num_annular_bins,
+                    radial_min=radial_min,
+                    radial_max=radial_max,
+                    radial_step=radial_step,
+                    two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                )
             dp = self.array[iy, ix]
             out[iy, ix] = map_coordinates(
                 dp,

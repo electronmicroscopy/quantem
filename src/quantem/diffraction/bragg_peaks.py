@@ -3,6 +3,7 @@ from typing import List, Optional, Union, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy.ndimage import gaussian_filter, map_coordinates, maximum_filter, label, sum as label_sum, center_of_mass
 from tqdm import tqdm
 import torch
@@ -22,6 +23,7 @@ from quantem.diffraction.polar_new import RDF_new
 from emdfile import tqdmnd
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
+import ipywidgets as widgets
 from ipywidgets import interact, IntSlider
 
 # TODO: Likely dataset4dSTEM rather than dataset4d input class
@@ -254,13 +256,13 @@ class BraggPeaksPolymer(AutoSerialize):
         self._model.load_state_dict(torch.load(path_to_weights, weights_only=True, map_location=self.device))
         self._model.to(self.device)
 
-    def _postprocess_single(self, position_map, intensity_map, show=False):
+    def _postprocess_single(self, position_map, intensity_map, sigma=1.0, threshold=0.25, show=False):
         """Process a single 2D image"""
         # Find peaks with subpixel-refinement
         peak_coords, peak_position_signal_intensities, refinement_success = detect_blobs(
             position_map,
-            sigma=1.0,  # Sigma for Gaussian smoothing used in processing
-            threshold=0.25  # Threshold for strength of peak position signal to be valid peak
+            sigma=sigma,  # Sigma for Gaussian smoothing used in processing
+            threshold=threshold,  # Threshold for strength of peak position signal to be valid peak
         )
 
         # If no peaks found, return empty lists
@@ -316,77 +318,84 @@ class BraggPeaksPolymer(AutoSerialize):
     def find_peaks_model(
         self, 
         device: str = "cuda:0",
+        scan_mask: ArrayLike = None,
         n_normalize_samples: int = 1000,
         initial_chunk_size: int = 100,
+        sigma_peak_blur: float = 1.0,
+        threshold_peak: float = 0.25,
         show_plots=False,
     ):
         Ry, Rx, Qy, Qx = self.dataset_cartesian.shape
         total_positions = Ry * Rx
+        
+        # ============================================
+        # Handle scan_mask
+        # ============================================
+        if scan_mask is None:
+            scan_mask = np.ones((Ry, Rx), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+            if scan_mask.shape != (Ry, Rx):
+                raise ValueError(f"scan_mask shape {scan_mask.shape} must match scan shape ({Ry}, {Rx})")
+        
+        # Get list of valid positions
+        valid_positions = np.argwhere(scan_mask)  # Returns array of (ry, rx) pairs
+        n_valid = len(valid_positions)
+        
         peaks = Vector.from_shape(
             shape=(Ry, Rx),
             fields=["y_pixels", "x_pixels", "y_invA", "x_invA"],
             name="peaks_vector",
             units=["Pixels", "Pixels", "1/Å", "1/Å"],
         )
-        # peaks = np.empty((Ry, Rx), dtype='object')
         intensities = Vector.from_shape(
             shape=(Ry, Rx),
             fields=["intensities", "intensities_sampled_from_dp"],
             name="intensities_vector",
             units=["Normalized", "Normalized"],
         )
-        # intensities = np.empty((Ry, Rx), dtype='object')
         
         # ============================================
-        # 1. Compute normalization parameters
+        # 1. Compute normalization parameters (only from valid positions)
         # ============================================
-        n_normalize_samples = min(n_normalize_samples, total_positions)  # Can't have more samples than exist in dataset
-        flat_indices = np.random.permutation(total_positions)[:n_normalize_samples]
-
-        # Convert flat indices to 2D
-        scan_y_indices = flat_indices // Rx
-        scan_x_indices = flat_indices % Rx
+        n_normalize_samples = min(n_normalize_samples, n_valid)
+        sample_indices = np.random.choice(n_valid, size=n_normalize_samples, replace=False)
         
-        # Get stats patterns and move to CPU for parameter computation
-        # Sample indices (use numpy instead of torch for this)
         stats_patterns = np.array([
-            self.dataset_cartesian[i, j].array 
-            for i, j in zip(scan_y_indices, scan_x_indices)
+            self.dataset_cartesian[ry, rx].array 
+            for ry, rx in valid_positions[sample_indices]
         ])
-        # stats_patterns = self.resized_cartesian_data[scan_y_indices, scan_x_indices]
-        # stats_patterns = torch.squeeze(stats_patterns).detach().cpu().numpy()
-        # Move to CPU and convert to numpy for compute_parameters
+        
         stats_patterns_resized = self.resize_images(stats_patterns, device=device)
         median, iqr = self.compute_parameters(stats_patterns_resized)
-        # normalized_dps_array = np.zeros((Ry, Rx, Qy, Qx))
-
+    
         # ============================================
-        # 2. Process entire dataset with 2D chunking
+        # 2. Process only valid positions with chunking
         # ============================================
         chunk_size = initial_chunk_size
-        flat_idx = 0
-        with tqdm(total=total_positions, desc="Processing patterns") as pbar:
-            while flat_idx < total_positions:
+        pos_idx = 0
+        
+        with tqdm(total=n_valid, desc="Processing patterns") as pbar:
+            while pos_idx < n_valid:
                 try:
                     # ----------------------------------------
                     # 2a. Determine chunk boundaries
                     # ----------------------------------------
-                    end_flat_idx = min(flat_idx + chunk_size, total_positions)
-                    actual_chunk_size = end_flat_idx - flat_idx
+                    end_pos_idx = min(pos_idx + chunk_size, n_valid)
+                    actual_chunk_size = end_pos_idx - pos_idx
                     
                     # ----------------------------------------
-                    # 2b. Extract chunk data
+                    # 2b. Extract chunk data (only valid positions)
                     # ----------------------------------------
                     chunk_data = []
-                    chunk_positions = []  # Store (ry, rx) for each item in chunk
+                    chunk_positions = []
                     
-                    for pos in range(flat_idx, end_flat_idx):
-                        ry = pos // Rx
-                        rx = pos % Rx
+                    for i in range(pos_idx, end_pos_idx):
+                        ry, rx = valid_positions[i]
                         chunk_data.append(self.dataset_cartesian[ry, rx].array)
                         chunk_positions.append((ry, rx))
                     
-                    chunk_array = np.array(chunk_data)  # Shape: (chunk_size, Qy, Qx)
+                    chunk_array = np.array(chunk_data)
                     
                     # ----------------------------------------
                     # 2c. Resize chunk
@@ -402,7 +411,7 @@ class BraggPeaksPolymer(AutoSerialize):
                     # ----------------------------------------
                     ins = torch.tensor(chunk_resized, dtype=torch.float32).to(device)
                     dps_norm = self.normalize_data(ins, median, iqr)
-                    ins_batch = dps_norm[:, None, ...]  # Add channel: (chunk_size, 1, Qy, Qx)
+                    ins_batch = dps_norm[:, None, ...]
                     
                     outs = self.model(ins_batch).detach().cpu().numpy()
                     
@@ -416,10 +425,11 @@ class BraggPeaksPolymer(AutoSerialize):
                             outs[k, 0], 
                             outs[k, 1],
                             show=show_plots,
+                            sigma=sigma_peak_blur,
+                            threshold=threshold_peak,
                         )
                         
                         if len(peak_coords) > 0:
-                            # Sample intensities from DP
                             peak_intensity_averages = sample_average_from_image(
                                 ins_batch[k].squeeze().detach().cpu().numpy(), 
                                 peak_coords
@@ -429,14 +439,13 @@ class BraggPeaksPolymer(AutoSerialize):
                                 peak_intensity_averages,
                             ])
                             
-                            # Convert coordinates
                             peak_coords_original = peak_coords * (
                                 self.dataset_cartesian.shape[2] / self.final_shape[0]
                             )
                             
                             peak_data = np.column_stack([
-                                peak_coords_original,  # y_pixels, x_pixels
-                                peak_coords_original * self.pixels_to_inv_A()  # y_invA, x_invA
+                                peak_coords_original,
+                                peak_coords_original * self.pixels_to_inv_A()
                             ])
                             
                             peaks.set_data(peak_data, ry, rx)
@@ -453,11 +462,10 @@ class BraggPeaksPolymer(AutoSerialize):
                     # 2g. Update progress and move to next chunk
                     # ----------------------------------------
                     pbar.update(actual_chunk_size)
-                    flat_idx = end_flat_idx
+                    pos_idx = end_pos_idx
                     
                 except RuntimeError as e:
                     if 'out of memory' in str(e):
-                        # Clear cache and reduce chunk size
                         if 'cuda' in device:
                             torch.cuda.empty_cache()
                         
@@ -473,7 +481,6 @@ class BraggPeaksPolymer(AutoSerialize):
         print('Done!')
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
-        # self.normalized_dps_array = normalized_dps_array
 
     def save_peaks(self, filepath):
         np.save(filepath, self.peak_coordinates_cartesian)
@@ -502,44 +509,58 @@ class BraggPeaksPolymer(AutoSerialize):
             polar_data = polar_data.item()
         self.polar_data = np.load(filepath, allow_pickle=True)
 
-    def process_polar(self):
+    def process_polar(self, scan_mask: ArrayLike = None):
         """ Find center of image through brightest peak, return polar transform of data and peaks"""
-        self.image_centers = self.find_central_beams_4d()
+        self.image_centers = self.find_central_beams_4d(scan_mask=scan_mask)
+        self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self.peak_coordinates_cartesian, centers=self.image_centers, scan_mask=scan_mask)
+        self.polar_data = self.polar_transform_4d(self.dataset_cartesian, centers=self.image_centers, scan_mask=scan_mask)
+        # self.image_centers = self.find_central_beams_4d()
+        # self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self.peak_coordinates_cartesian, centers=self.image_centers)
+        # self.polar_data = self.polar_transform_4d(self.dataset_cartesian, centers=self.image_centers)
+
         # self.polar_data = dataset4dstem_polar_transform(self.dataset_cartesian, origin_row=self.image_centers[0], origin_col=self.image_centers[1])
-        self.polar_data = self.polar_transform(
-            origin_row=self.image_centers[1],
-            origin_col=self.image_centers[0],
-            two_fold_rotation_symmetry=True,
+        # self.polar_data = self.dataset_cartesian.polar_transform(
+            # origin_row=self.image_centers[1],
+            # origin_col=self.image_centers[0],
+            # two_fold_rotation_symmetry=True,
             # name: str | None = None,
             # signal_units: str | None = None,
-        )
+        # )
+        
         # rdf_new = RDF_new.from_data(data=self.dataset_cartesian, origin_row=self.image_centers[1], origin_col=self.image_centers[0])
-        # self.polar_data = self.polar_transform_4d(self.dataset_cartesian, centers=self.image_centers)
         # self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
-        self.polar_peaks = self.polar_transform_peaks(cartesian_peaks=self.peak_coordinates_cartesian, centers=self.image_centers)
 
-    def find_central_beams_4d(self, intensity_threshold=0.3, distance_weight=0.5, sampling_radius=2, debug=False, use_tqdm=True):
+    def find_central_beams_4d(self, scan_mask: ArrayLike = None, intensity_threshold=0.3, distance_weight=0.5, sampling_radius=2, debug=False, use_tqdm=True):
         """
         Fast central beam finding for entire 4D dataset.
         
         Parameters:
         -----------
+        scan_mask : ArrayLike, optional
+            Boolean mask (Ry, Rx) indicating which positions to process
         use_tqdm : bool
             Show progress bar
         
         Returns:
         --------
-        centers : ndarray, shape (scan_y, scan_x, 2)
+        centers : ndarray, shape (2, scan_y, scan_x)
             Center coordinates (y, x) for each scan position
         """        
         scan_y, scan_x, det_y, det_x = self.dataset_cartesian.shape
-        # scan_y, scan_x, det_y, det_x = self.resized_cartesian_data.shape
         centers = np.zeros((2, scan_y, scan_x))
+        
+        # Handle scan_mask
+        if scan_mask is None:
+            scan_mask = np.ones((scan_y, scan_x), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
         
         iterator = tqdm(range(scan_y), disable=not use_tqdm, desc="Finding centers")
         
         for i in iterator:
             for j in range(scan_x):
+                if not scan_mask[i, j]:
+                    continue
                 if self.peak_coordinates_cartesian[i, j] is None:
                     print(f"None at i={i}, j={j}")
                 centers[:, i, j] = find_central_beam_from_peaks(
@@ -549,19 +570,24 @@ class BraggPeaksPolymer(AutoSerialize):
                     intensity_threshold=intensity_threshold,
                     distance_weight=distance_weight,
                     debug=debug,
-                    image=self.dataset_cartesian[i, j].array.squeeze(),  # Provide actual DP
-                    # image=self.resized_cartesian_data[i, j].squeeze(),  # Provide actual DP
-                    sampling_radius=sampling_radius  # Sample n-pixel radius around each peak
+                    image=self.dataset_cartesian[i, j].array.squeeze(),
+                    sampling_radius=sampling_radius
                 )
         return centers
-
-    def polar_transform_peaks(self, cartesian_peaks, centers, use_tqdm: bool=True):
+    
+    def polar_transform_peaks(self, cartesian_peaks, centers, scan_mask: ArrayLike = None, use_tqdm: bool=True):
         # Get sampling conversion factor
         sampling_conversion_factor = self.pixels_to_inv_A()
-        polar_peaks = polar_transform_vector(cartesian_vector=cartesian_peaks, centers=centers, use_tqdm=use_tqdm, sampling_conversion_factor=sampling_conversion_factor)
+        polar_peaks = polar_transform_vector(
+            cartesian_vector=cartesian_peaks,
+            centers=centers,
+            scan_mask=scan_mask,
+            use_tqdm=use_tqdm,
+            sampling_conversion_factor=sampling_conversion_factor,
+        )
         return polar_peaks
-
-    def polar_transform_4d(self, data, centers, num_r=None, num_theta=360, use_tqdm: bool=True):
+    
+    def polar_transform_4d(self, data, centers, scan_mask: ArrayLike = None, num_r=None, num_theta=360, use_tqdm: bool=True):
         """
         Perform polar transform on the last two axes of a 4D array.
         
@@ -571,6 +597,8 @@ class BraggPeaksPolymer(AutoSerialize):
             4D input array where H, W are the axes to transform
         centers : ndarray, shape (2, N, M)
             Center of each diffraction pattern (usually determined by central beam)
+        scan_mask : ArrayLike, optional
+            Boolean mask (N, M) indicating which positions to process
         num_r : int, optional
             Number of radial bins. If None, uses max radius across all patterns
         num_theta : int, optional
@@ -580,11 +608,6 @@ class BraggPeaksPolymer(AutoSerialize):
         --------
         polar_data : Vector
             Vector with shape (N, M) containing polar-transformed data.
-            Each cell has fields:
-            - 'r_pixels': radial coordinate in pixels
-            - 'theta': angular coordinate in radians
-            - 'r_invA': radial coordinate in 1/Å
-            - 'intensity': transformed intensity value
         
         Notes:
         ------
@@ -595,9 +618,18 @@ class BraggPeaksPolymer(AutoSerialize):
         - self.num_annular_bins : number of angular bins
         """
         N, M, H, W = data.shape
-        # Calculate consistent max_radius across entire dataset
-        dist_to_origin_sq = (centers[0]**2 + centers[1]**2).min()
-        dist_to_corner_sq = ((H-1 - centers[0])**2 + (W-1 - centers[1])**2).max()
+        
+        # Handle scan_mask
+        if scan_mask is None:
+            scan_mask = np.ones((N, M), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+        
+        # Calculate consistent max_radius across entire dataset (only from masked positions)
+        valid_centers_0 = centers[0][scan_mask]
+        valid_centers_1 = centers[1][scan_mask]
+        dist_to_origin_sq = (valid_centers_0**2 + valid_centers_1**2).min()
+        dist_to_corner_sq = ((H-1 - valid_centers_0)**2 + (W-1 - valid_centers_1)**2).max()
         max_radius_pixels = np.sqrt(max(dist_to_origin_sq, dist_to_corner_sq))
         
         if num_r is None:
@@ -625,10 +657,13 @@ class BraggPeaksPolymer(AutoSerialize):
             name="polar_transformed_data"
         )
         
-        # Transform each 2D slice
+        # Transform each 2D slice (only masked positions)
         iterator = tqdm(range(N), disable=not use_tqdm, desc="Transforming data")
         for i in iterator:
             for j in range(M):
+                if not scan_mask[i, j]:
+                    continue
+                    
                 center_y, center_x = centers[:, i, j]
                 
                 # Create meshgrid (always work in pixels for interpolation)
@@ -648,7 +683,6 @@ class BraggPeaksPolymer(AutoSerialize):
                 )
                 
                 # Flatten the 2D polar image to 1D for storage in Vector
-                # Each point in the polar grid becomes a row
                 r_flat = r_grid.ravel()
                 theta_flat = theta_grid.ravel()
                 r_invA_flat = r_flat * self.pixels_to_inv_A()
@@ -1102,6 +1136,171 @@ class BraggPeaksPolymer(AutoSerialize):
         if return_data:
             return r_centers, intensity_sum
 
+    def peak_radial_count_plot(
+        self,
+        num_bins=200,
+        q_min=None,
+        q_max=None,
+        ROI_xs=None,
+        ROI_ys=None,
+        peak_centers=None,
+        peak_windows=None,
+        vlines=None,
+        vline_colors=None,
+        vline_labels=None,
+        window_alpha=0.3,
+        window_color='red',
+        fill_alpha=0.5,
+        fill_color=None,
+        plot=True,
+        return_data=False,
+    ):
+        """
+        Create radial peak count line plot summarizing polar peaks.
+    
+        Parameters
+        ----------
+        num_bins : int
+            Number of radial bins
+        q_min : float, optional
+            Minimum q value for binning
+        q_max : float, optional
+            Maximum q value for binning
+        ROI_xs : tuple, optional
+            X range for region of interest (not yet implemented)
+        ROI_ys : tuple, optional
+            Y range for region of interest (not yet implemented)
+        peak_centers : array, optional
+            1D array of peak center positions to mark with vertical lines
+        peak_windows : array, optional
+            2D array (N, 2) of [q_min, q_max] for each peak window to highlight
+        vlines : list of lists/arrays, optional
+            Additional vertical lines to plot. Each element is a list/array of x-positions.
+        vline_colors : list of colors, optional
+            Colors for each group of vertical lines
+        vline_labels : list of str, optional
+            Labels for each group of vertical lines (for legend)
+        window_alpha : float
+            Transparency for peak window background highlighting (0-1)
+        window_color : str or color
+            Color for peak window background highlighting
+        fill_alpha : float
+            Transparency for filled area under curve within windows (0-1)
+        fill_color : str or color, optional
+            Color for filled area under curve. If None, uses window_color
+        plot : bool
+            Whether to display the plot
+        return_data : bool
+            Whether to return the binned data
+            
+        Returns
+        -------
+        r_centers : array (optional)
+            Radial bin centers
+        peak_counts : array (optional)
+            Number of peaks per bin
+        """
+        all_r = self.polar_peaks['r_invA'].flatten()
+        
+        if q_min is None:
+            q_min = 0
+        if q_max is None:
+            q_max = np.max(all_r)
+        r_bins = np.linspace(q_min, q_max, num_bins + 1)
+    
+        # Histogram the data - counts only, no weights
+        peak_counts, _ = np.histogram(all_r, bins=r_bins)
+    
+        # Bin centers
+        r_centers = (r_bins[:-1] + r_bins[1:]) / 2
+        
+        # Use window_color for fill if not specified
+        if fill_color is None:
+            fill_color = window_color
+    
+        if plot:
+            # Create line plot
+            fig, ax = plt.subplots()
+            ax.plot(r_centers, peak_counts, linewidth=2, label='Peak Count', color='black')
+            ax.set_xlabel('Radial Distance (1/Å)', fontsize=12)
+            ax.set_ylabel('Number of Peaks', fontsize=12)
+            ax.set_title('Radial Peak Count Profile (All Patterns)', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            
+            # Add peak windows as filled regions and fill under curve
+            if peak_windows is not None:
+                peak_windows = np.atleast_2d(peak_windows)
+                for i, (q_min_win, q_max_win) in enumerate(peak_windows):
+                    # Background window highlight
+                    ax.axvspan(q_min_win, q_max_win, alpha=window_alpha, 
+                              color=window_color, zorder=0,
+                              label='Peak windows' if i == 0 else None)
+                    
+                    # Fill under the curve within this window
+                    # Find indices within the window
+                    mask = (r_centers >= q_min_win) & (r_centers <= q_max_win)
+                    if np.any(mask):
+                        r_window = r_centers[mask]
+                        counts_window = peak_counts[mask]
+                        ax.fill_between(r_window, 0, counts_window, 
+                                       alpha=fill_alpha, color=fill_color,
+                                       label='Peak counts' if i == 0 else None,
+                                       zorder=1)
+            
+            # Add peak centers as vertical lines
+            if peak_centers is not None:
+                peak_centers = np.atleast_1d(peak_centers)
+                for i, center in enumerate(peak_centers):
+                    ax.axvline(center, color=window_color, linestyle='-', 
+                              linewidth=2, alpha=0.8,
+                              label='Peak centers' if i == 0 else None, zorder=2)
+            
+            # Add additional vertical lines if provided
+            if vlines is not None:
+                # Convert to list of lists if needed
+                if not isinstance(vlines[0], (list, np.ndarray)):
+                    vlines = [vlines]
+                
+                # Default colors if not provided
+                if vline_colors is None:
+                    default_colors = plt.cm.tab10(np.linspace(0, 1, len(vlines)))
+                    vline_colors = default_colors
+                
+                # Ensure vline_colors is a list
+                if not isinstance(vline_colors, list):
+                    vline_colors = [vline_colors]
+                
+                # Check length match
+                if len(vline_colors) != len(vlines):
+                    raise ValueError(
+                        f"Number of vline_colors ({len(vline_colors)}) must match "
+                        f"number of vline groups ({len(vlines)})"
+                    )
+                
+                # Plot each group of vertical lines
+                for i, (vline_group, color) in enumerate(zip(vlines, vline_colors)):
+                    # Get label if provided
+                    label = vline_labels[i] if vline_labels is not None and i < len(vline_labels) else None
+                    
+                    # Plot each line in the group
+                    for j, x_pos in enumerate(vline_group):
+                        # Only add label to first line in group (for legend)
+                        line_label = label if j == 0 else None
+                        ax.axvline(x_pos, color=color, linestyle='--', 
+                                  linewidth=1.5, alpha=0.7, label=line_label, zorder=2)
+            
+                # Add legend
+                ax.legend()
+            elif peak_centers is not None or peak_windows is not None:
+                # Add legend for peak markers if present
+                ax.legend()
+            
+            fig.tight_layout()
+            plt.show()
+        
+        if return_data:
+            return r_centers, peak_counts
+
     def make_orientation_histogram(
         self,
         radial_ranges: np.ndarray = None,
@@ -1407,7 +1606,8 @@ class BraggPeaksPolymer(AutoSerialize):
         return orient_hist
     
     def plot_interactive_image_map(self, intensity_map=None, vmax_cartesian=7, 
-                                    map_cmap='viridis', map_title='Intensity Map'):
+                                    map_cmap='viridis', map_title='Intensity Map',
+                                    norm_upper_quantile=None, norm_power=1.0):
         """
         Interactive plot for browsing diffraction patterns with optional intensity map.
         
@@ -1421,8 +1621,11 @@ class BraggPeaksPolymer(AutoSerialize):
             Colormap for the intensity map
         map_title : str
             Title for the intensity map panel
+        norm_upper_quantile : float, optional
+            Upper quantile for normalization (0-1). If None, not used.
+        norm_power : float
+            Power law normalization exponent
         """
-        from ipywidgets import interact, IntSlider
         
         Ry, Rx = self.dataset_cartesian.shape[:2]
         
@@ -1434,20 +1637,24 @@ class BraggPeaksPolymer(AutoSerialize):
                     intensity_map[i, j] = np.mean(self.dataset_cartesian[i, j].array)
         
         def show_pattern(ry, rx):
-            # Create marked intensity map
-            marked_map = intensity_map.copy()
-            # Note: Can't easily add marker with show_2d, may need to keep matplotlib for this part
-            # Or overlay after the fact
+            # Build norm dictionary using dict comprehension to filter None values
+            norm_dict = {
+                k: v for k, v in {
+                    'vmax': vmax_cartesian,
+                    'upper_quantile': norm_upper_quantile,
+                    'power': norm_power,
+                }.items() if v is not None
+            }
             
             fig, axs = show_2d(
                 [intensity_map, self.dataset_cartesian[ry, rx].array],
                 cmap=[map_cmap, 'gray'],
                 title=[map_title, f'Diffraction Pattern (Ry={ry}, Rx={rx})'],
                 cbar=[True, True],
-                norm=['linear_minmax', {'vmax': vmax_cartesian}],
+                norm=['linear_minmax', norm_dict],
                 show_ticks=[True, False],
                 axsize=(6, 5),
-                tight_layout=True
+                tight_layout=True,
             )
             
             # Add marker to first axes
@@ -1464,9 +1671,9 @@ class BraggPeaksPolymer(AutoSerialize):
                              description='Rx:', continuous_update=False))
     
     def plot_interactive_peak_map(self, radial_range=None, vmax_cartesian=7,
-                                  show_all_peaks=True, show_center=True,
-                                  selected_peak_color='red', other_peak_color='gray',
-                                  center_color='cyan'):
+                                  show_all_peaks=True, show_center=True,selected_peak_color='red',
+                                  other_peak_color='gray',center_color='cyan', norm_upper_quantile=None,
+                                  norm_power=1.0):
         """
         Interactive plot for browsing diffraction patterns with peak overlay.
         
@@ -1486,9 +1693,11 @@ class BraggPeaksPolymer(AutoSerialize):
             Color for non-selected peaks (outside radial_range)
         center_color : str or color
             Color for beam center marker
+        norm_upper_quantile : float, optional
+            Upper quantile for normalization (0-1). If None, not used.
+        norm_power : float
+            Power law normalization exponent
         """
-        from ipywidgets import interact, IntSlider
-        from quantem.core.visualization import show_2d
         
         Ry, Rx = self.peak_coordinates_cartesian.shape
         
@@ -1514,13 +1723,22 @@ class BraggPeaksPolymer(AutoSerialize):
             map_title = 'Peak Intensity Map (All Peaks)'
         
         def show_pattern(ry, rx):
+            # Build norm dictionary dynamically
+            norm_dict = {
+                k: v for k, v in {
+                    'vmax': vmax_cartesian,
+                    'upper_quantile': norm_upper_quantile,
+                    'power': norm_power,
+                }.items() if v is not None
+            }
+            
             # Use show_2d for the base images
             fig, axs = show_2d(
                 [intensity_map, self.dataset_cartesian[ry, rx].array],
                 cmap=['viridis', 'gray'],
                 title=[map_title, f'Diffraction Pattern (Ry={ry}, Rx={rx})'],
                 cbar=[True, False],
-                norm=['linear_minmax', {'vmax': vmax_cartesian}],
+                norm=['linear_minmax', norm_dict],
                 show_ticks=[True, False],
                 axsize=(6, 5),
                 tight_layout=True
@@ -1586,6 +1804,275 @@ class BraggPeaksPolymer(AutoSerialize):
                  rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, 
                              description='Rx:', continuous_update=False))
 
+    def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,
+                                         reference_image=None, overlay_alpha=0.3):
+        """
+        Interactive mask creation with sliders for circular region selection.
+        
+        Parameters
+        ----------
+        initial_x0 : int, optional
+            Initial x center position. If None, uses center of scan.
+        initial_y0 : int, optional
+            Initial y center position. If None, uses center of scan.
+        initial_r : int, optional
+            Initial radius. If None, uses 1/3 of minimum scan dimension.
+        reference_image : array, optional
+            2D array (Ry, Rx) to display as reference. If None, uses virtual image.
+        overlay_alpha : float
+            Transparency for mask overlay (0=transparent, 1=opaque)
+        
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - 'mask': final boolean mask array
+            - 'x0', 'y0', 'r': final circle parameters
+        """
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Set defaults
+        if initial_x0 is None:
+            initial_x0 = Ry // 2
+        if initial_y0 is None:
+            initial_y0 = Rx // 2
+        if initial_r is None:
+            initial_r = min(Ry, Rx) // 3
+        
+        # Get reference image and ensure it's a proper numpy array
+        if reference_image is None:
+            if hasattr(self.dataset_cartesian, 'virtual_images') and 'virtual_image' in self.dataset_cartesian.virtual_images:
+                vimg = self.dataset_cartesian.virtual_images['virtual_image']
+                # Extract array from Dataset2d object
+                if hasattr(vimg, 'array'):
+                    reference_image = vimg.array
+                elif hasattr(vimg, 'data'):
+                    reference_image = vimg.data
+                else:
+                    reference_image = np.array(vimg)
+            else:
+                # Create mean intensity image
+                print("Creating reference image from mean intensities...")
+                reference_image = np.zeros((Ry, Rx), dtype=float)
+                for i in range(Ry):
+                    for j in range(Rx):
+                        dp = self.dataset_cartesian[i, j]
+                        if hasattr(dp, 'array'):
+                            reference_image[i, j] = np.mean(dp.array)
+                        else:
+                            reference_image[i, j] = np.mean(dp)
+        
+        # Ensure it's a float array
+        reference_image = np.asarray(reference_image, dtype=float)
+        
+        # Verify reference_image is valid
+        if reference_image.shape != (Ry, Rx):
+            raise ValueError(f"reference_image shape {reference_image.shape} must match scan shape ({Ry}, {Rx})")
+        
+        # Store current state
+        result = {'mask': None, 'x0': initial_x0, 'y0': initial_y0, 'r': initial_r}
+        
+        # Create sliders with proper orientation
+        # X slider is inverted so bottom = 0, top = Ry-1
+        x0_slider = widgets.IntSlider(
+            min=0, max=Ry-1, step=1, value=Ry-1-initial_x0,  # Inverted initial value
+            description='X (vert):',
+            orientation='vertical',
+            continuous_update=False,
+            style={'description_width': '60px'},
+            layout=widgets.Layout(height='300px'),
+            readout=False  # We'll use custom label
+        )
+        
+        # Custom label to show actual (inverted) value
+        x0_label = widgets.Label(value=f'{initial_x0}')
+        x0_label.layout.width = '60px'
+        
+        y0_slider = widgets.IntSlider(
+            min=0, max=Rx-1, step=1, value=initial_y0,
+            description='Y (horiz):',
+            orientation='horizontal',
+            continuous_update=False,
+            style={'description_width': '80px'},
+            layout=widgets.Layout(width='400px')
+        )
+        
+        r_slider = widgets.IntSlider(
+            min=1, max=max(Ry, Rx), step=1, value=initial_r,
+            description='Radius:',
+            orientation='horizontal',
+            continuous_update=False,
+            style={'description_width': '80px'},
+            layout=widgets.Layout(width='400px')
+        )
+        
+        output = widgets.Output()
+        
+        def update_mask(change=None):
+            x0 = Ry - 1 - x0_slider.value  # Invert the slider value
+            y0 = y0_slider.value
+            r = r_slider.value
+            
+            # Update custom label
+            x0_label.value = f'{x0}'
+            
+            # Create mask
+            x = np.arange(Ry)[:, None]
+            y = np.arange(Rx)[None, :]
+            mask = (x - x0)**2 + (y - y0)**2 < r**2
+            
+            # Update result
+            result['mask'] = mask
+            result['x0'] = x0
+            result['y0'] = y0
+            result['r'] = r
+            
+            # Create matplotlib figure directly
+            with output:
+                output.clear_output(wait=True)
+                fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+                
+                # Plot 1: Reference image with circle outline
+                im0 = axs[0].imshow(reference_image, cmap='gray')
+                circle = plt.Circle((y0, x0), r, color='red', fill=False, linewidth=2, linestyle='--')
+                axs[0].add_patch(circle)
+                axs[0].plot(y0, x0, 'r+', markersize=15, markeredgewidth=2)
+                axs[0].set_title('Reference Image')
+                axs[0].set_xlabel('Rx')
+                axs[0].set_ylabel('Ry')
+                plt.colorbar(im0, ax=axs[0])
+                
+                # Plot 2: Mask only
+                im1 = axs[1].imshow(mask.astype(float), cmap='Reds')
+                axs[1].set_title('Mask')
+                axs[1].set_xlabel('Rx')
+                axs[1].set_ylabel('Ry')
+                axs[1].text(0.02, 0.98, f'Center: ({x0}, {y0})\nRadius: {r}\nPixels: {mask.sum()}',
+                           transform=axs[1].transAxes, fontsize=10, verticalalignment='top',
+                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                
+                # Plot 3: Overlay
+                im2 = axs[2].imshow(reference_image, cmap='gray')
+                axs[2].imshow(mask.astype(float), alpha=overlay_alpha, cmap='Reds')
+                axs[2].set_title('Overlay')
+                axs[2].set_xlabel('Rx')
+                axs[2].set_ylabel('Ry')
+                plt.colorbar(im2, ax=axs[2])
+                
+                plt.tight_layout()
+                plt.show()
+        
+        # Link sliders to update function
+        x0_slider.observe(update_mask, names='value')
+        y0_slider.observe(update_mask, names='value')
+        r_slider.observe(update_mask, names='value')
+        
+        # Create layout: vertical slider with label on left, horizontal sliders and output stacked on right
+        x0_controls = widgets.VBox([
+            x0_slider,
+            x0_label
+        ], layout=widgets.Layout(align_items='center'))
+        
+        ui = widgets.HBox([
+            x0_controls,
+            widgets.VBox([
+                y0_slider,
+                r_slider,
+                output
+            ])
+        ])
+        
+        # Initial plot
+        update_mask()
+        
+        # Display the widget
+        display(ui)
+        
+        return result
+
+    def plot_peak_histogram_map(
+        self, 
+        intensity_threshold=None,
+        intensity_percentile=None,
+        figsize=(8, 6), 
+        cmap='viridis',
+        return_values=False,
+    ):
+        """
+        Plot 2D map showing the number of peaks found at each scan position.
+        
+        Parameters:
+        -----------
+        intensity_threshold : float, optional
+            Absolute intensity threshold. Only count peaks above this value.
+        intensity_percentile : float, optional
+            Percentile threshold (0-100). Overrides intensity_threshold.
+        figsize : tuple
+            Figure size (width, height)
+        cmap : str
+            Colormap to use
+        return_values : bool
+            If True, return figure, axes, and count_map
+        
+        Returns:
+        --------
+        fig, ax, count_map : (optional) matplotlib figure, axes, and count array
+        """
+        Ry, Rx = self.peak_coordinates_cartesian.shape
+        
+        # Convert percentile to threshold if needed
+        if intensity_percentile is not None:
+            all_intensities = [
+                self.peak_intensities['intensities_sampled_from_dp'][i, j]
+                for i in range(Ry) for j in range(Rx)
+                if self.peak_intensities['intensities_sampled_from_dp'][i, j] is not None
+            ]
+            if all_intensities:
+                intensity_threshold = np.percentile(np.concatenate(all_intensities), intensity_percentile)
+        
+        # Build count map
+        count_map = np.zeros((Ry, Rx))
+        for i in range(Ry):
+            for j in range(Rx):
+                peaks = self.peak_coordinates_cartesian[i, j]
+                if peaks is None or len(peaks) == 0:
+                    continue
+                
+                if intensity_threshold is None:
+                    count_map[i, j] = len(peaks)
+                else:
+                    intensities = self.peak_intensities['intensities_sampled_from_dp'][i, j]
+                    if intensities is not None:
+                        count_map[i, j] = np.sum(intensities >= intensity_threshold)
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.imshow(count_map, cmap=cmap, origin='lower')
+        
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Number of Peaks', fontsize=12)
+        
+        # Integer colorbar ticks
+        max_count = int(np.max(count_map))
+        if max_count > 0:
+            ticks = np.arange(0, max_count + 1, max(1, max_count // 5))
+            cbar.set_ticks(ticks)
+        
+        # Title
+        title = 'Peak Count per Scan Position'
+        if intensity_threshold is not None:
+            title += f'\n(intensity ≥ {intensity_threshold:.3f})'
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel('Scan X', fontsize=12)
+        ax.set_ylabel('Scan Y', fontsize=12)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        if return_values:
+            return fig, ax, count_map
+            
     def plot_peak_count_map(self, q_ranges, figsize_per_map=(5, 4), cmap='viridis', return_values=False):
         """
         Plot 2D maps showing the number of peaks in specified q-ranges.
@@ -2480,3 +2967,330 @@ class BraggPeaksPolymer(AutoSerialize):
         )
     
         return orient
+
+    def interactive_probe_selector(self, probe_map=None, figsize=(14, 8), cmap='viridis'):
+        """
+        Interactive GUI to select probe positions and view diffraction patterns.
+        
+        Parameters
+        ----------
+        probe_map : ndarray, optional
+            2D array to display as the probe position map. If None, uses mean diffraction intensity.
+        figsize : tuple
+            Figure size (width, height)
+        cmap : str
+            Colormap for the probe map
+            
+        Returns
+        -------
+        selected_positions : list of tuples
+            List of (ry, rx) coordinates of selected positions
+        """
+        from matplotlib.widgets import Button
+        from matplotlib.patches import Circle
+        import ipywidgets as widgets
+        from IPython.display import display, clear_output
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Create default probe map if not provided
+        if probe_map is None:
+            probe_map = np.mean(self.dataset_cartesian.array, axis=(2, 3))
+        
+        # Storage for selected positions
+        selected_positions = []
+        markers = []
+        
+        # Create figure
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(2, 3, width_ratios=[2, 2, 1], height_ratios=[1, 1], 
+                              hspace=0.3, wspace=0.3)
+        
+        # Probe map axis
+        ax_probe = fig.add_subplot(gs[:, 0])
+        im_probe = ax_probe.imshow(probe_map, cmap=cmap, origin='lower', 
+                                    interpolation='nearest', aspect='auto')
+        ax_probe.set_title('Probe Position Map\n(Click to add point)', fontsize=12)
+        ax_probe.set_xlabel('Rx')
+        ax_probe.set_ylabel('Ry')
+        plt.colorbar(im_probe, ax=ax_probe, label='Intensity')
+        
+        # Diffraction pattern axes
+        ax_dp1 = fig.add_subplot(gs[0, 1])
+        ax_dp2 = fig.add_subplot(gs[1, 1])
+        ax_dp1.set_title('Diffraction Pattern 1')
+        ax_dp2.set_title('Diffraction Pattern 2')
+        ax_dp1.axis('off')
+        ax_dp2.axis('off')
+        
+        # Text area for position list
+        ax_list = fig.add_subplot(gs[:, 2])
+        ax_list.axis('off')
+        ax_list.set_title('Selected Positions', fontsize=11, fontweight='bold')
+        
+        # Add clear all button
+        ax_button = plt.axes([0.7, 0.02, 0.1, 0.04])
+        btn_clear = Button(ax_button, 'Clear All')
+        
+        def update_display():
+            """Update the position list and diffraction patterns."""
+            # Clear position list
+            ax_list.clear()
+            ax_list.axis('off')
+            ax_list.set_title('Selected Positions', fontsize=11, fontweight='bold')
+            
+            # Display positions
+            y_pos = 0.95
+            for idx, (ry, rx) in enumerate(selected_positions):
+                text = f"{idx+1}. ({ry}, {rx})"
+                ax_list.text(0.1, y_pos, text, fontsize=10, transform=ax_list.transAxes,
+                            verticalalignment='top')
+                y_pos -= 0.08
+            
+            # Update diffraction patterns
+            if len(selected_positions) >= 1:
+                ry, rx = selected_positions[-1]
+                dp = self.dataset_cartesian[ry, rx].array
+                ax_dp1.clear()
+                ax_dp1.imshow(dp, cmap='gray')
+                ax_dp1.set_title(f'DP at ({ry}, {rx})')
+                ax_dp1.axis('off')
+            
+            if len(selected_positions) >= 2:
+                ry, rx = selected_positions[-2]
+                dp = self.dataset_cartesian[ry, rx].array
+                ax_dp2.clear()
+                ax_dp2.imshow(dp, cmap='gray')
+                ax_dp2.set_title(f'DP at ({ry}, {rx})')
+                ax_dp2.axis('off')
+            
+            fig.canvas.draw_idle()
+        
+        def onclick(event):
+            """Handle click events on probe map."""
+            if event.inaxes == ax_probe and event.button == 1:  # Left click
+                rx = int(np.round(event.xdata))
+                ry = int(np.round(event.ydata))
+                
+                # Check bounds
+                if 0 <= ry < Ry and 0 <= rx < Rx:
+                    selected_positions.append((ry, rx))
+                    
+                    # Add marker
+                    marker = Circle((rx, ry), radius=0.5, color='red', 
+                                   fill=True, zorder=10)
+                    ax_probe.add_patch(marker)
+                    markers.append(marker)
+                    
+                    # Add label
+                    label = ax_probe.text(rx, ry, str(len(selected_positions)), 
+                                         color='white', fontsize=8, ha='center', 
+                                         va='center', fontweight='bold', zorder=11)
+                    markers.append(label)
+                    
+                    update_display()
+        
+        def clear_all(event):
+            """Clear all selected positions."""
+            selected_positions.clear()
+            for marker in markers:
+                marker.remove()
+            markers.clear()
+            ax_dp1.clear()
+            ax_dp1.axis('off')
+            ax_dp2.clear()
+            ax_dp2.axis('off')
+            update_display()
+        
+        # Connect events
+        fig.canvas.mpl_connect('button_press_event', onclick)
+        btn_clear.on_clicked(clear_all)
+        
+        plt.show()
+        
+        return selected_positions
+    
+    
+    def visualize_selected_patterns(self, positions, ncols=4, figsize_per_pattern=(3, 3), 
+                                     cmap='gray', vmax=None):
+        """
+        Display diffraction patterns at selected probe positions in a grid.
+        
+        Parameters
+        ----------
+        positions : list of tuples
+            List of (ry, rx) coordinates
+        ncols : int
+            Number of columns in the grid
+        figsize_per_pattern : tuple
+            Size of each subplot (width, height)
+        cmap : str
+            Colormap for diffraction patterns
+        vmax : float, optional
+            Maximum value for colormap normalization
+            
+        Returns
+        -------
+        fig, axes : matplotlib figure and axes
+        """
+        n_positions = len(positions)
+        nrows = int(np.ceil(n_positions / ncols))
+        
+        fig, axes = plt.subplots(nrows, ncols, 
+                                figsize=(figsize_per_pattern[0]*ncols, 
+                                        figsize_per_pattern[1]*nrows))
+        
+        # Handle single subplot case
+        if n_positions == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        for idx, (ry, rx) in enumerate(positions):
+            dp = self.dataset_cartesian[ry, rx].array
+            
+            im = axes[idx].imshow(dp, cmap=cmap, vmax=vmax)
+            axes[idx].set_title(f'({ry}, {rx})', fontsize=10)
+            axes[idx].axis('off')
+            plt.colorbar(im, ax=axes[idx], fraction=0.046, pad=0.04)
+        
+        # Hide unused subplots
+        for idx in range(n_positions, len(axes)):
+            axes[idx].set_visible(False)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return fig, axes
+    
+    
+    def interactive_probe_selector_widget(self, probe_map=None, cmap='viridis'):
+        """
+        Enhanced interactive GUI using ipywidgets for fine-tuning positions.
+        
+        Parameters
+        ----------
+        probe_map : ndarray, optional
+            2D array to display as the probe position map
+        cmap : str
+            Colormap for the probe map
+            
+        Returns
+        -------
+        selected_positions : list of tuples
+            List of (ry, rx) coordinates of selected positions
+        """
+        import ipywidgets as widgets
+        from IPython.display import display, clear_output
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Create default probe map if not provided
+        if probe_map is None:
+            probe_map = np.mean(self.dataset_cartesian.array, axis=(2, 3))
+        
+        # Storage
+        selected_positions = []
+        
+        # Create output widgets
+        output_plot = widgets.Output()
+        output_list = widgets.Output()
+        
+        def update_plot():
+            """Update the main plot with markers."""
+            with output_plot:
+                clear_output(wait=True)
+                fig, ax = plt.subplots(figsize=(8, 6))
+                
+                im = ax.imshow(probe_map, cmap=cmap, origin='lower', 
+                              interpolation='nearest', aspect='auto')
+                ax.set_title('Probe Position Map (Click to add point)', fontsize=12)
+                ax.set_xlabel('Rx')
+                ax.set_ylabel('Ry')
+                plt.colorbar(im, ax=ax, label='Intensity')
+                
+                # Add markers
+                for idx, (ry, rx) in enumerate(selected_positions):
+                    circle = Circle((rx, ry), radius=0.5, color='red', 
+                                   fill=True, zorder=10)
+                    ax.add_patch(circle)
+                    ax.text(rx, ry, str(idx+1), color='white', fontsize=8, 
+                           ha='center', va='center', fontweight='bold', zorder=11)
+                
+                def onclick(event):
+                    if event.inaxes == ax and event.button == 1:
+                        rx = int(np.round(event.xdata))
+                        ry = int(np.round(event.ydata))
+                        if 0 <= ry < Ry and 0 <= rx < Rx:
+                            selected_positions.append((ry, rx))
+                            update_plot()
+                            update_list()
+                
+                fig.canvas.mpl_connect('button_press_event', onclick)
+                plt.show()
+        
+        def update_list():
+            """Update the position list with controls."""
+            with output_list:
+                clear_output(wait=True)
+                
+                if not selected_positions:
+                    print("No positions selected")
+                    return
+                
+                for idx, (ry, rx) in enumerate(selected_positions):
+                    print(f"--- Position {idx+1} ---")
+                    
+                    # Create sliders for fine-tuning
+                    ry_slider = widgets.IntSlider(
+                        value=ry, min=0, max=Ry-1, step=1,
+                        description=f'Ry {idx+1}:', continuous_update=False
+                    )
+                    rx_slider = widgets.IntSlider(
+                        value=rx, min=0, max=Rx-1, step=1,
+                        description=f'Rx {idx+1}:', continuous_update=False
+                    )
+                    
+                    def make_update(i):
+                        def update_position(change):
+                            selected_positions[i] = (ry_slider.value, rx_slider.value)
+                            update_plot()
+                        return update_position
+                    
+                    ry_slider.observe(make_update(idx), names='value')
+                    rx_slider.observe(make_update(idx), names='value')
+                    
+                    # Delete button
+                    delete_btn = widgets.Button(description=f'Delete {idx+1}', 
+                                                button_style='danger')
+                    
+                    def make_delete(i):
+                        def delete_position(b):
+                            del selected_positions[i]
+                            update_plot()
+                            update_list()
+                        return delete_position
+                    
+                    delete_btn.on_click(make_delete(idx))
+                    
+                    display(widgets.HBox([ry_slider, rx_slider, delete_btn]))
+                
+                # Clear all button
+                clear_btn = widgets.Button(description='Clear All', button_style='warning')
+                def clear_all(b):
+                    selected_positions.clear()
+                    update_plot()
+                    update_list()
+                clear_btn.on_click(clear_all)
+                
+                display(clear_btn)
+        
+        # Layout
+        ui = widgets.VBox([
+            widgets.HBox([output_plot, output_list])
+        ])
+        
+        display(ui)
+        update_plot()
+        update_list()
+        
+        return selected_positions

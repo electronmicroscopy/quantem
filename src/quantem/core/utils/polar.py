@@ -15,6 +15,7 @@ from quantem.core.datastructures import Vector
 def polar_transform_vector(
     cartesian_vector: Vector,
     centers: Optional[np.ndarray] = None,
+    scan_mask: Optional[np.ndarray] = None,
     x_field: Union[str, List[str]] = ['x_pixels', 'x'],
     y_field: Union[str, List[str]] = ['y_pixels', 'y'],
     sampling_conversion_factor: Optional[float] = None,
@@ -37,6 +38,8 @@ def polar_transform_vector(
         Array of center coordinates with shape matching cartesian_vector.shape + (2,).
         Last dimension should be [y, x] coordinates of the center for each position.
         If None, uses (0, 0) for all centers.
+    scan_mask : np.ndarray, optional
+        Boolean mask indicating which positions to process. If None, processes all.
     x_field : str or list of str, optional
         Field name(s) for x-coordinates. If list, tries each in order.
         Default: ['x_pixels', 'x']
@@ -124,6 +127,14 @@ def polar_transform_vector(
     if centers is None:
         centers = np.zeros((2, N, M))
     
+    # Handle scan_mask
+    if scan_mask is None:
+        scan_mask = np.ones((N, M), dtype=bool)
+    else:
+        scan_mask = np.asarray(scan_mask, dtype=bool)
+        if scan_mask.shape != (N, M):
+            raise ValueError(f"scan_mask shape {scan_mask.shape} must match vector shape ({N}, {M})")
+    
     # Validate centers shape
     expected_centers_shape = (2, N, M)
     if centers.shape != expected_centers_shape:
@@ -166,6 +177,12 @@ def polar_transform_vector(
     
     for i in iterator:
         for j in range(M):
+            # Skip if not in mask
+            if not scan_mask[i, j]:
+                empty_data = np.zeros((0, len(output_fields)))
+                polar_vector.set_data(empty_data, i, j)
+                continue
+            
             center_y, center_x = centers[:, i, j]
             cartesian_data = cartesian_vector[i, j]
             
@@ -202,7 +219,7 @@ def polar_transform_vector(
             polar_vector.set_data(polar_coords, i, j)
     
     return polar_vector
-
+        
 # TODO: Round-trip test
 # "polar_to_cartesian_vector"
 def cartesian_transform_vector(
