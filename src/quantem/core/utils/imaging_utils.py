@@ -558,30 +558,7 @@ def rotate_image(
     mode: str = "constant",
     cval: float = 0.0,
 ):
-    """Rotate an array about a pixel origin using bilinear/bicubic interpolation.
-
-    Parameters
-    ----------
-    im
-        Input array; last two dimensions are treated as (H, W). Any leading
-        dimensions are treated as batch and rotated independently.
-    rotation_deg
-        Rotation angle in degrees. Interpreted as clockwise if clockwise=True,
-        otherwise counterclockwise.
-    origin
-        Rotation origin (row, col) in pixel coordinates. If None, uses (H//2, W//2).
-    clockwise
-        If True, interpret rotation_deg as clockwise; if False, as counterclockwise.
-    interpolation
-        "bilinear" (order=1) or "bicubic" (order=3).
-    mode, cval
-        Boundary handling passed to scipy.ndimage.map_coordinates.
-
-    Returns
-    -------
-    out
-        Rotated array with the same shape as `im`.
-    """
+    """Rotate an array about a pixel origin using bilinear/bicubic interpolation."""
     im = np.asarray(im)
     if im.ndim < 2:
         raise ValueError("im must have at least 2 dimensions")
@@ -603,7 +580,7 @@ def rotate_image(
         raise ValueError("interpolation must be 'bilinear' or 'bicubic'")
 
     theta = float(np.deg2rad(rotation_deg))
-    if clockwise:
+    if not clockwise:
         theta = -theta
 
     ct = float(np.cos(theta))
