@@ -69,4 +69,5 @@ dev = [
     "pre-commit>=4.2.0",
     "ruff>=0.11.5",
     "tomli>=2.2.1",
+    "hdf5plugin>=6.0.0",
 ]

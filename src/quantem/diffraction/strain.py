@@ -59,7 +59,7 @@ class StrainMap(AutoSerialize):
     def diffraction_mask(
         self,
         threshold = None,
-        edge_blend = 32.0,
+        edge_blend = 64.0,
         plot_mask = True,
         figsize = (8,4),
     ):
@@ -103,6 +103,7 @@ class StrainMap(AutoSerialize):
         mode: str = "linear",
         q_to_r_rotation_ccw_deg: float | None = None,
         q_transpose: bool | None = None,
+        skip = None,
         plot_transform: bool = True,
         cropping_factor: float = 0.25,
         **plot_kwargs: Any,
@@ -178,18 +179,32 @@ class StrainMap(AutoSerialize):
         self.metadata["q_to_r_rotation_ccw_deg"] = float(q_to_r_rotation_ccw_deg)
         self.metadata["q_transpose"] = bool(q_transpose)
 
-        if self.metadata["mode"] == "linear":
-            im = np.mean(np.abs(np.fft.fft2(
-                self.dataset.array * self.mask_diffraction[None,None,:,:] + \
-                self.mask_diffraction_inv[None,None,:,:] 
-            )), axis=(0, 1))
-        elif self.metadata["mode"]  == "log":
-            im = np.mean(np.abs(np.fft.fft2(np.log(
-                self.dataset.array * self.mask_diffraction[None,None,:,:] + \
-                self.mask_diffraction_inv[None,None,:,:] 
-            ))), axis=(0, 1))
+        if skip is None:
+            if self.metadata["mode"] == "linear":
+                im = np.mean(np.abs(np.fft.fft2(
+                    self.dataset.array * self.mask_diffraction[None,None,:,:] + \
+                    self.mask_diffraction_inv[None,None,:,:] 
+                )), axis=(0, 1))
+            elif self.metadata["mode"]  == "log":
+                im = np.mean(np.abs(np.fft.fft2(np.log1p(
+                    self.dataset.array * self.mask_diffraction[None,None,:,:] + \
+                    self.mask_diffraction_inv[None,None,:,:] 
+                ))), axis=(0, 1))
+            else:
+                raise ValueError("mode must be 'linear' or 'log'")
         else:
-            raise ValueError("mode must be 'linear' or 'log'")
+            if self.metadata["mode"] == "linear":
+                im = np.mean(np.abs(np.fft.fft2(
+                    self.dataset.array[::skip,::skip] * self.mask_diffraction[None,None,:,:] + \
+                    self.mask_diffraction_inv[None,None,:,:] 
+                )), axis=(0, 1))
+            elif self.metadata["mode"]  == "log":
+                im = np.mean(np.abs(np.fft.fft2(np.log1p(
+                    self.dataset.array[::skip,::skip] * self.mask_diffraction[None,None,:,:] + \
+                    self.mask_diffraction_inv[None,None,:,:] 
+                ))), axis=(0, 1))
+            else:
+                raise ValueError("mode must be 'linear' or 'log'")
 
         im = np.fft.fftshift(im)
 
@@ -239,8 +254,19 @@ class StrainMap(AutoSerialize):
         target_units = float(scalebar_fraction) * view_w_px * sampling
         sb_len = _nice_length_units(target_units)
 
+        # intensity scaling: compute from transform, apply same scaling to both panels
+        kr = (np.arange(self.transform.shape[0], dtype=float) - self.transform.shape[0] // 2)[:, None]
+        kc = (np.arange(self.transform.shape[1], dtype=float) - self.transform.shape[1] // 2)[None, :]
+        qmag = np.sqrt(kr * kr + kc * kc)
+        im0 = self.transform.array
+        tmp = im0 * qmag
+        i0 = np.unravel_index(int(np.nanargmax(tmp)), tmp.shape)
+        vmin = 0.0
+        vmax = im0[i0]
+
         defaults = dict(
-            vmax=1.0,
+            vmin=vmin,
+            vmax=vmax,
             title=("Original Transform", "Rotated Transform"),
             scalebar=ScalebarConfig(
                 sampling=sampling,
@@ -371,8 +397,7 @@ class StrainMap(AutoSerialize):
             if mode == "linear":
                 im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
             elif mode == "log":
-                int_range = np.max(dp) - np.min(dp)
-                im = np.fft.fftshift(np.abs(np.fft.fft2(np.log(dp + int_range*0.01))))
+                im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
             else:
                 raise ValueError("metadata['mode'] must be 'linear' or 'log'")
 
