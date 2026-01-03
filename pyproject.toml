@@ -83,4 +83,5 @@ dev = [
     "ruff>=0.11.5",
     "tomli>=2.2.1",
     "hdf5plugin>=6.0.0",
+    "hdf5plugin>=6.0.0",
 ]
