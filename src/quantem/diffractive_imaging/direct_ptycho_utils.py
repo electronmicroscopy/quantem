@@ -469,7 +469,7 @@ def align_vbf_stack_multiscale(
 
 def fit_aberrations_from_shifts(
     shifts_ang: torch.Tensor,
-    bf_mask: torch.BoolTensor,
+    bf_mask: torch.Tensor,
     wavelength: float,
     gpts: tuple[int, int],
     sampling: tuple[float, float],

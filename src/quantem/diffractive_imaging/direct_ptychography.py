@@ -134,8 +134,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self.device = device
         self.verbose = verbose
-        self.vbf_stack = vbf_dataset.array
-        self.bf_mask = bf_mask_dataset.array
+        self.vbf_stack = vbf_dataset.array  # ty:ignore[invalid-assignment]
+        self.bf_mask = bf_mask_dataset.array  # ty:ignore[invalid-assignment]
 
         self.wavelength = electron_wavelength_angstrom(energy)
         self.scan_units = vbf_dataset.units[-2:]
@@ -147,10 +147,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
 
         self.num_bf = vbf_dataset.shape[0]
-        self.gpts = bf_mask_dataset.shape
+        self.gpts = bf_mask_dataset.shape[:2]
         self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
 
-        self.semiangle_cutoff = semiangle_cutoff
+        self.semiangle_cutoff = semiangle_cutoff  # ty:ignore[invalid-assignment]
         self.soft_edges = soft_edges
         self.rng = rng
 
@@ -219,10 +219,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             if force_measured_origin is None:
                 origin.calculate_origin(max_batch_size)
             else:
-                origin.origin_measured = force_measured_origin
+                origin.origin_measured = force_measured_origin  # ty:ignore[invalid-assignment]
             origin.fit_origin_background(fit_method=fit_method)
         else:
-            origin.origin_fitted = force_fitted_origin
+            origin.origin_fitted = force_fitted_origin  # ty:ignore[invalid-assignment]
 
         if rotation_angle is None:
             origin.estimate_detector_rotation()
@@ -381,7 +381,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._aberration_coefs = value
 
     @property
-    def semiangle_cutoff(self) -> dict:
+    def semiangle_cutoff(self) -> float:
         return self._semiangle_cutoff
 
     @semiangle_cutoff.setter
@@ -390,10 +390,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._semiangle_cutoff = value
 
     @property
-    def device(self) -> str:
+    def device(self) -> str | torch.device:
         """This should be of form 'cuda:X' or 'cpu', as defined by quantem.config"""
         if hasattr(self, "_device"):
-            return self._device
+            return self._device  # ty:ignore[invalid-return-type]
         else:
             return config.get("device")
 
@@ -403,14 +403,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if device is not None:
             dev, _id = config.validate_device(device)
             self._device = dev
-            try:
-                self.to(dev)
-            except AttributeError:
-                pass
+            # try:
+            #     self.to(dev)
+            # except AttributeError:
+            #     pass
 
     @property
     def scan_sampling(self) -> NDArray:
-        return self._scan_sampling
+        return self._scan_sampling  # ty:ignore[invalid-return-type]
 
     @scan_sampling.setter
     def scan_sampling(self, value: NDArray | tuple | list) -> None:
@@ -425,7 +425,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def reciprocal_sampling(self) -> NDArray:
-        return self._reciprocal_sampling
+        return self._reciprocal_sampling  # ty:ignore[invalid-return-type]
 
     @reciprocal_sampling.setter
     def reciprocal_sampling(self, value: NDArray | tuple | list) -> None:
@@ -929,7 +929,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         fixed_rotation_angle = None
         optimized_rotation_angle = None
 
-        for name, val in best_params.items():
+        for name, val in best_params.items():  # ty:ignore[possibly-missing-attribute]
             if name == "rotation_angle":
                 if "rotation_angle" in optimized_keys:
                     optimized_rotation_angle = val

@@ -2,6 +2,7 @@ import math
 from typing import Mapping, Tuple
 
 import torch
+from numpy.typing import NDArray
 
 from quantem.core.utils.utils import electron_wavelength_angstrom
 
@@ -123,7 +124,7 @@ def aperture(
         return hard_aperture(alpha, semiangle_cutoff)
 
 
-def standardize_aberration_coefs(aberration_coefs: Mapping[str, float]) -> dict[str, float]:
+def standardize_aberration_coefs(aberration_coefs: Mapping[str, float]) -> dict[str, torch.Tensor]:
     """
     Convert user-supplied aberration coefficient dictionary into canonical
     polar-aberration symbols (C_nm, phi_nm), resolving aliases and conventions.
@@ -389,7 +390,7 @@ def _passively_rotate_grid(
 
 def spatial_frequencies(
     gpts: Tuple[int, int],
-    sampling: Tuple[float, float],
+    sampling: Tuple[float, float] | NDArray,
     rotation_angle: float | None = None,
     device: str | torch.device = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
