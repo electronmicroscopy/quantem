@@ -665,9 +665,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         # first pass
         for batch_idx in batcher:
+            if hasattr(self, "_vbf_index_mapping"):
+                mapped_idx = self._vbf_index_mapping[batch_idx]
+            else:
+                mapped_idx = batch_idx
+
             # Fourier-space tiling
             vbf_fourier = torch.cat(
-                [torch.cat([self._vbf_fourier[batch_idx]] * upsampling_factor, dim=-1)]
+                [torch.cat([self._vbf_fourier[mapped_idx]] * upsampling_factor, dim=-1)]
                 * upsampling_factor,
                 dim=-2,
             )
@@ -1126,3 +1131,65 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         ]
 
         return recons
+
+    def _reconstruct_with_halfsets(self, **reconstruct_kwargs):
+        """
+        Compute two half-set reconstructions using alternating BF pixels (checkerboard pattern).
+
+        Returns
+        -------
+        halfset_1 : torch.Tensor
+            Reconstruction using first half of BF pixels
+        halfset_2 : torch.Tensor
+            Reconstruction using second half of BF pixels
+        """
+        # Store original bf_mask, indices, and num_bf
+        original_bf_mask = self.bf_mask.clone()
+        original_bf_inds_i = self._bf_inds_i.clone()
+        original_bf_inds_j = self._bf_inds_j.clone()
+        original_num_bf = self.num_bf
+
+        # Create checkerboard pattern
+        i_coords = torch.arange(self.gpts[0], device=self.device)
+        j_coords = torch.arange(self.gpts[1], device=self.device)
+        i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing="ij")
+        checkerboard = torch.fft.ifftshift(((i_grid + j_grid) % 2).bool())
+
+        safe_kwargs = {k: v for k, v in reconstruct_kwargs.items() if k not in ["verbose"]}
+
+        try:
+            # === First half-set ===
+            halfset_mask_1 = original_bf_mask & checkerboard
+            self.bf_mask = halfset_mask_1
+            self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
+            self.num_bf = len(self._bf_inds_i)
+
+            # Create mapping: new_index -> original_index
+            halfset_1_in_original = torch.where(halfset_mask_1[original_bf_mask])[0]
+            self._vbf_index_mapping = halfset_1_in_original
+
+            self.reconstruct(**safe_kwargs, verbose=False)
+            halfset_1 = self.mean_corrected_bf.clone()
+
+            # === Second half-set ===
+            halfset_mask_2 = original_bf_mask & (~checkerboard)
+            self.bf_mask = halfset_mask_2
+            self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
+            self.num_bf = len(self._bf_inds_i)
+
+            halfset_2_in_original = torch.where(halfset_mask_2[original_bf_mask])[0]
+            self._vbf_index_mapping = halfset_2_in_original
+
+            self.reconstruct(**safe_kwargs, verbose=False)
+            halfset_2 = self.mean_corrected_bf.clone()
+
+        finally:
+            # Always restore everything
+            self.bf_mask = original_bf_mask
+            self._bf_inds_i = original_bf_inds_i
+            self._bf_inds_j = original_bf_inds_j
+            self.num_bf = original_num_bf
+            if hasattr(self, "_vbf_index_mapping"):
+                delattr(self, "_vbf_index_mapping")
+
+        return [halfset_1, halfset_2]
