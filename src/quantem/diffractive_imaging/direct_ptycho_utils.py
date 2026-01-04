@@ -524,7 +524,9 @@ def _torch_polar(m: torch.Tensor):
     return u, p
 
 
-def compute_spectral_snr_from_halfsets(halfset_recons: list[torch.Tensor]):
+def compute_spectral_snr_from_halfsets(
+    halfset_recons: list[torch.Tensor], relative_noise_floor: float = 1e-6
+):
     """
     Compute spectral SNR from two half-set reconstructions using symmetric/antisymmetric decomposition.
 
@@ -561,6 +563,10 @@ def compute_spectral_snr_from_halfsets(halfset_recons: list[torch.Tensor]):
     total_power = symmetric.abs().square()
     signal_power = (total_power - noise_power).clamp_min(0)
 
-    ssnr_2d = torch.sqrt(signal_power / (noise_power + 1e-10))
+    adaptive_floor = relative_noise_floor * total_power.mean()
+    noise_power_safe = noise_power.clamp_min(adaptive_floor)
+
+    norm_factor = math.sqrt(halfset_1.numel())
+    ssnr_2d = torch.sqrt(signal_power / noise_power_safe / norm_factor) / 2
 
     return ssnr_2d

@@ -312,7 +312,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
         self._vbf_fourier = torch.fft.fft2(self.vbf_stack)
-        self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
+        # self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
 
@@ -692,7 +692,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             )
             if power is None:
                 num *= butterworth_env
-                num[:, 0, 0] = self._dc_per_image
+                # num[:, 0, 0] = self._dc_per_image
 
                 fourier_factor[batch_idx] = torch.fft.ifft2(num)
             else:
@@ -718,7 +718,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     ff /= norm
 
                 ff *= butterworth_env
-                ff[:, 0, 0] = self._dc_per_image
+                # ff[:, 0, 0] = self._dc_per_image
 
                 fourier_factor[batch_idx] = torch.fft.ifft2(ff)
 
@@ -1164,12 +1164,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
             self.num_bf = len(self._bf_inds_i)
 
-            # Create mapping: new_index -> original_index
             halfset_1_in_original = torch.where(halfset_mask_1[original_bf_mask])[0]
             self._vbf_index_mapping = halfset_1_in_original
 
             self.reconstruct(**safe_kwargs, verbose=False)
-            halfset_1 = self.mean_corrected_bf.clone()
+            halfset_1 = self.mean_corrected_bf.clone() * 2
 
             # === Second half-set ===
             halfset_mask_2 = original_bf_mask & (~checkerboard)
@@ -1181,7 +1180,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self._vbf_index_mapping = halfset_2_in_original
 
             self.reconstruct(**safe_kwargs, verbose=False)
-            halfset_2 = self.mean_corrected_bf.clone()
+            halfset_2 = self.mean_corrected_bf.clone() * 2
 
         finally:
             # Always restore everything
