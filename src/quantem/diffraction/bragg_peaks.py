@@ -322,7 +322,7 @@ class BraggPeaksPolymer(AutoSerialize):
         n_normalize_samples: int = 1000,
         initial_chunk_size: int = 100,
         sigma_peak_blur: float = 1.0,
-        threshold_peak: float = 0.25,
+        threshold_peak: float = 0.5,
         show_plots=False,
     ):
         Ry, Rx, Qy, Qx = self.dataset_cartesian.shape
@@ -584,6 +584,7 @@ class BraggPeaksPolymer(AutoSerialize):
             scan_mask=scan_mask,
             use_tqdm=use_tqdm,
             sampling_conversion_factor=sampling_conversion_factor,
+            two_fold_symmetry=True,
         )
         return polar_peaks
     
@@ -648,14 +649,17 @@ class BraggPeaksPolymer(AutoSerialize):
         r_pixels = np.linspace(0, max_radius_pixels, num_r)
         r_invA = r_pixels * self.pixels_to_inv_A()
         theta = np.linspace(0, 2*np.pi, num_theta, endpoint=False)
-        
+        # Create meshgrid (always work in pixels for interpolation)
+        r_grid, theta_grid = np.meshgrid(r_pixels, theta, indexing='ij')
+        r_invA_grid = r_grid * self.pixels_to_inv_A()
+        polar_intensity = np.zeros((N, M, num_r, num_theta), dtype=np.float32)
         # Create Vector to store polar data with coordinates
-        polar_data = Vector.from_shape(
-            shape=(N, M),
-            fields=["r_pixels", "theta", "r_invA", "intensity"],
-            units=["Pixels", "Radians", "1/Å", "Intensity"],
-            name="polar_transformed_data"
-        )
+        # polar_data = Vector.from_shape(
+        #     shape=(N, M),
+        #     fields=["r_pixels", "theta", "r_invA", "intensity"],
+        #     units=["Pixels", "Radians", "1/Å", "Intensity"],
+        #     name="polar_transformed_data"
+        # )
         
         # Transform each 2D slice (only masked positions)
         iterator = tqdm(range(N), disable=not use_tqdm, desc="Transforming data")
@@ -666,15 +670,12 @@ class BraggPeaksPolymer(AutoSerialize):
                     
                 center_y, center_x = centers[:, i, j]
                 
-                # Create meshgrid (always work in pixels for interpolation)
-                r_grid, theta_grid = np.meshgrid(r_pixels, theta, indexing='ij')
-                
                 # Convert polar to Cartesian coordinates
                 y_coords = center_y + r_grid * np.sin(theta_grid)
                 x_coords = center_x + r_grid * np.cos(theta_grid)
                 
                 # Use map_coordinates for interpolation
-                polar_image = map_coordinates(
+                polar_intensity[i, j] = map_coordinates(
                     data[i, j].array, 
                     [y_coords, x_coords], 
                     order=1,
@@ -683,21 +684,22 @@ class BraggPeaksPolymer(AutoSerialize):
                 )
                 
                 # Flatten the 2D polar image to 1D for storage in Vector
-                r_flat = r_grid.ravel()
-                theta_flat = theta_grid.ravel()
-                r_invA_flat = r_flat * self.pixels_to_inv_A()
-                intensity_flat = polar_image.ravel()
-                
-                # Create data array: [r_pixels, theta, r_invA, intensity]
-                polar_data_array = np.column_stack([
-                    r_flat,
-                    theta_flat,
-                    r_invA_flat,
-                    intensity_flat
-                ])
+                    # Create data array: [r_pixels, theta, r_invA, intensity]
+                # polar_data_array = np.stack([
+                #     r_grid,
+                #     theta_grid,
+                #     r_invA_grid,
+                #     intensity_grid
+                # ], axis=-1)
                 
                 # Store in Vector
-                polar_data.set_data(polar_data_array, i, j)
+                # polar_data.set_data(polar_data_array, i, j)
+        polar_data = {
+            "r_pixels": r_grid,
+            "theta": theta_grid,
+            "r_invA": r_invA_grid,
+            "intensity": polar_intensity,
+        }
         
         return polar_data
 
@@ -1301,6 +1303,310 @@ class BraggPeaksPolymer(AutoSerialize):
         if return_data:
             return r_centers, peak_counts
 
+    # def make_orientation_histogram(
+    #     self,
+    #     radial_ranges: np.ndarray = None,
+    #     orientation_map=None,
+    #     orientation_ind: int = 0,
+    #     orientation_growth_angles: np.array = 0.0,
+    #     orientation_separate_bins: bool = False,
+    #     orientation_flip_sign: bool = False,
+    #     upsample_factor=4.0,
+    #     theta_step_deg=1.0,
+    #     sigma_x=1.0,
+    #     sigma_y=1.0,
+    #     sigma_theta=3.0,
+    #     normalize_intensity_image: bool = False,
+    #     normalize_intensity_stack: bool = True,
+    #     progress_bar: bool = True,
+    #     r_field: str = "r",
+    #     theta_field: str = "theta",
+    #     intensity_field: str = "intensities_sampled_from_dp",
+    # ):
+    #     """
+    #     Create an 3D or 4D orientation histogram from a braggpeaks PointListArray
+    #     from user-specified radial ranges, or from the Euler angles from a fiber
+    #     texture OrientationMap generated by the ACOM module of py4DSTEM.
+    
+    #     Args:
+    #         bragg_peaks (BraggVectors):         bragg_vectors containing centered peak locations.
+    #         radial_ranges (np array):           Size (N x 2) array for N radial bins, or (2,) for a single bin.
+    #         orientation_map (OrientationMap):   Class containing the Euler angles to generate a flowline map.
+    #         orientation_ind (int):              Index of the orientation map (default 0)
+    #         orientation_growth_angles (array):  Angles to place into histogram, relative to orientation.
+    #         orientation_separate_bins (bool):   whether to place multiple angles into multiple radial bins.
+    #         upsample_factor (float):            Upsample factor
+    #         theta_step_deg (float):             Step size along annular direction in degrees
+    #         sigma_x (float):                    Smoothing in x direction before upsample
+    #         sigma_y (float):                    Smoothing in x direction before upsample
+    #         sigma_theta (float):                Smoothing in annular direction (units of bins, periodic)
+    #         normalize_intensity_image (bool):   Normalize to max peak intensity = 1, per image
+    #         normalize_intensity_stack (bool):   Normalize to max peak intensity = 1, all images
+    #         progress_bar (bool):                Enable progress bar
+    #         r_field (str):                      Name of radial coordinate field (default: "r")
+    #         theta_field (str):                  Name of angular coordinate field (default: "theta")
+    #         intensity_field (str):              Name of intensity field (default: "intensity")
+    
+    #     Returns:
+    #         orient_hist (array):                4D array containing Bragg peak intensity histogram
+    #                                             [radial_bin x_probe y_probe theta]
+    #     """
+    #     # coordinates
+    #     theta = np.arange(0, 180, theta_step_deg) * np.pi / 180.0
+    #     dtheta = theta[1] - theta[0]
+    #     dtheta_deg = dtheta * 180 / np.pi
+    #     num_theta_bins = np.size(theta)
+    
+    #     if orientation_map is None:
+    #         # Input bins
+    #         radial_ranges = np.array(radial_ranges)
+    #         if radial_ranges.ndim == 1:
+    #             radial_ranges = radial_ranges[None, :]
+    #         radial_ranges_2 = radial_ranges**2
+    #         num_radii = radial_ranges.shape[0]
+    #         size_input = self.polar_peaks.shape
+    #     else:
+    #         orientation_growth_angles = np.atleast_1d(orientation_growth_angles)
+    #         num_angles = orientation_growth_angles.shape[0]
+    #         size_input = [orientation_map.num_x, orientation_map.num_y]
+    #         if orientation_separate_bins is False:
+    #             num_radii = 1
+    #         else:
+    #             num_radii = num_angles
+    
+    #     size_output = np.round(
+    #         np.array(size_input).astype("float") * upsample_factor
+    #     ).astype("int")
+    
+    #     # output init
+    #     orient_hist = np.zeros([num_radii, size_output[0], size_output[1], num_theta_bins])
+    
+    #     # Loop over all probe positions
+    #     for a0 in range(num_radii):
+    #         t = "Generating histogram " + str(a0)
+    #         # for rx, ry in tqdmnd(
+    #         #         *bragg_peaks.shape, desc=t,unit=" probe positions", disable=not progress_bar
+    #         #     ):
+    #         for rx, ry in tqdmnd(
+    #             *size_input, desc=t, unit=" probe positions", disable=not progress_bar
+    #         ):
+    #             x = (rx + 0.5) * upsample_factor - 0.5
+    #             y = (ry + 0.5) * upsample_factor - 0.5
+    #             x = np.clip(x, 0, size_output[0] - 2)
+    #             y = np.clip(y, 0, size_output[1] - 2)
+    
+    #             xF = np.floor(x).astype("int")
+    #             yF = np.floor(y).astype("int")
+    #             dx = x - xF
+    #             dy = y - yF
+    
+    #             add_data = False
+    
+    #             if orientation_map is None:
+    #                 p_r_invA = self.polar_peaks['r_invA'][rx, ry]
+    #                 p_theta = self.polar_peaks['theta'][rx, ry]
+                    
+    #                 if p_r_invA is not None and len(p_r_invA) > 0:
+    #                     # Extract columns: p is shape (N_peaks, 4)
+    #                     # Column 0: y_pixels, Column 1: x_pixels
+    #                     # Column 2: y_invA,   Column 3: x_invA
+    #                     # p_y_invA = p[:, 2]
+    #                     # p_x_invA = p[:, 3]
+    #                     # r2 = p_y_invA**2 + p_x_invA**2
+    #                     r2 = p_r_invA**2
+    #                     sub = np.logical_and(
+    #                         r2 >= radial_ranges_2[a0, 0], 
+    #                         r2 < radial_ranges_2[a0, 1]
+    #                     )
+    #                     if np.any(sub):
+    #                         intensity_data = self.peak_intensities['intensities_sampled_from_dp'][rx, ry]
+    #                         if intensity_data is not None and len(intensity_data) > 0:
+    #                             add_data = True
+    #                             intensity = intensity_data[sub]
+    #                             # Use theta directly from polar_peaks instead of recalculating
+    #                             theta_radians = p_theta[sub]  # Already in radians
+    #                             # Fold to 0-180° range (0 to π)
+    #                             theta_folded = np.mod(theta_radians, np.pi)
+    #                             t = theta_folded / dtheta
+    #             else:
+    #                 if orientation_map.corr[rx, ry, orientation_ind] > 0:
+    #                     if orientation_separate_bins is False:
+    #                         if orientation_flip_sign:
+    #                             t = (
+    #                                 np.array(
+    #                                     [
+    #                                         (
+    #                                             -orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 0
+    #                                             ]
+    #                                             - orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 2
+    #                                             ]
+    #                                         )
+    #                                         / dtheta
+    #                                     ]
+    #                                 )
+    #                                 + orientation_growth_angles
+    #                             )
+    #                         else:
+    #                             t = (
+    #                                 np.array(
+    #                                     [
+    #                                         (
+    #                                             orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 0
+    #                                             ]
+    #                                             + orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 2
+    #                                             ]
+    #                                         )
+    #                                         / dtheta
+    #                                     ]
+    #                                 )
+    #                                 + orientation_growth_angles
+    #                             )
+    #                         intensity = (
+    #                             np.ones(num_angles)
+    #                             * orientation_map.corr[rx, ry, orientation_ind]
+    #                         )
+    #                         add_data = True
+    #                     else:
+    #                         if orientation_flip_sign:
+    #                             t = (
+    #                                 np.array(
+    #                                     [
+    #                                         (
+    #                                             -orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 0
+    #                                             ]
+    #                                             - orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 2
+    #                                             ]
+    #                                         )
+    #                                         / dtheta
+    #                                     ]
+    #                                 )
+    #                                 + orientation_growth_angles[a0]
+    #                             )
+    #                         else:
+    #                             t = (
+    #                                 np.array(
+    #                                     [
+    #                                         (
+    #                                             orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 0
+    #                                             ]
+    #                                             + orientation_map.angles[
+    #                                                 rx, ry, orientation_ind, 2
+    #                                             ]
+    #                                         )
+    #                                         / dtheta
+    #                                     ]
+    #                                 )
+    #                                 + orientation_growth_angles[a0]
+    #                             )
+    #                         intensity = orientation_map.corr[rx, ry, orientation_ind]
+    #                         add_data = True
+    
+    #             if add_data:
+    #                 tF = np.floor(t).astype("int")
+    #                 dt = t - tF
+    
+    #                 orient_hist[a0, xF, yF, :] = orient_hist[a0, xF, yF, :] + np.bincount(
+    #                     np.mod(tF, num_theta_bins),
+    #                     weights=(1 - dx) * (1 - dy) * (1 - dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    #                 orient_hist[a0, xF, yF, :] = orient_hist[a0, xF, yF, :] + np.bincount(
+    #                     np.mod(tF + 1, num_theta_bins),
+    #                     weights=(1 - dx) * (1 - dy) * (dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    
+    #                 orient_hist[a0, xF + 1, yF, :] = orient_hist[
+    #                     a0, xF + 1, yF, :
+    #                 ] + np.bincount(
+    #                     np.mod(tF, num_theta_bins),
+    #                     weights=(dx) * (1 - dy) * (1 - dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    #                 orient_hist[a0, xF + 1, yF, :] = orient_hist[
+    #                     a0, xF + 1, yF, :
+    #                 ] + np.bincount(
+    #                     np.mod(tF + 1, num_theta_bins),
+    #                     weights=(dx) * (1 - dy) * (dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    
+    #                 orient_hist[a0, xF, yF + 1, :] = orient_hist[
+    #                     a0, xF, yF + 1, :
+    #                 ] + np.bincount(
+    #                     np.mod(tF, num_theta_bins),
+    #                     weights=(1 - dx) * (dy) * (1 - dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    #                 orient_hist[a0, xF, yF + 1, :] = orient_hist[
+    #                     a0, xF, yF + 1, :
+    #                 ] + np.bincount(
+    #                     np.mod(tF + 1, num_theta_bins),
+    #                     weights=(1 - dx) * (dy) * (dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    
+    #                 orient_hist[a0, xF + 1, yF + 1, :] = orient_hist[
+    #                     a0, xF + 1, yF + 1, :
+    #                 ] + np.bincount(
+    #                     np.mod(tF, num_theta_bins),
+    #                     weights=(dx) * (dy) * (1 - dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    #                 orient_hist[a0, xF + 1, yF + 1, :] = orient_hist[
+    #                     a0, xF + 1, yF + 1, :
+    #                 ] + np.bincount(
+    #                     np.mod(tF + 1, num_theta_bins),
+    #                     weights=(dx) * (dy) * (dt) * intensity,
+    #                     minlength=num_theta_bins,
+    #                 )
+    
+    #     # smoothing / interpolation
+    #     if (sigma_x is not None) or (sigma_y is not None) or (sigma_theta is not None):
+    #         if num_radii > 1:
+    #             print("Interpolating orientation matrices ...", end="")
+    #         else:
+    #             print("Interpolating orientation matrix ...", end="")
+    #         if sigma_x is not None and sigma_x > 0:
+    #             orient_hist = gaussian_filter1d(
+    #                 orient_hist,
+    #                 sigma_x * upsample_factor,
+    #                 mode="nearest",
+    #                 axis=1,
+    #                 truncate=3.0,
+    #             )
+    #         if sigma_y is not None and sigma_y > 0:
+    #             orient_hist = gaussian_filter1d(
+    #                 orient_hist,
+    #                 sigma_y * upsample_factor,
+    #                 mode="nearest",
+    #                 axis=2,
+    #                 truncate=3.0,
+    #             )
+    #         if sigma_theta is not None and sigma_theta > 0:
+    #             orient_hist = gaussian_filter1d(
+    #                 orient_hist, sigma_theta / dtheta_deg, mode="wrap", axis=3, truncate=2.0
+    #             )
+    #         print(" done.")
+    
+    #     # normalization
+    #     if normalize_intensity_stack is True:
+    #         orient_hist = orient_hist / np.max(orient_hist)
+    #     elif normalize_intensity_image is True:
+    #         for a0 in range(num_radii):
+    #             orient_hist[a0, :, :, :] = orient_hist[a0, :, :, :] / np.max(
+    #                 orient_hist[a0, :, :, :]
+    #             )
+    
+    #     return orient_hist
+
     def make_orientation_histogram(
         self,
         radial_ranges: np.ndarray = None,
@@ -1309,51 +1615,87 @@ class BraggPeaksPolymer(AutoSerialize):
         orientation_growth_angles: np.array = 0.0,
         orientation_separate_bins: bool = False,
         orientation_flip_sign: bool = False,
-        upsample_factor=4.0,
-        theta_step_deg=1.0,
-        sigma_x=1.0,
-        sigma_y=1.0,
-        sigma_theta=3.0,
+        orientation_offset_degrees: float = 0.0,
+        upsample_factor: float = 4.0,
+        theta_step_deg: float = 1.0,
+        sigma_x: float = 1.0,
+        sigma_y: float = 1.0,
+        sigma_theta: float = 3.0,
+        use_peak_sigma: bool = False,
+        peak_sigma_samples: int = 6,
         normalize_intensity_image: bool = False,
         normalize_intensity_stack: bool = True,
         progress_bar: bool = True,
-        r_field: str = "r",
+        r_field: str = "r_invA",
         theta_field: str = "theta",
         intensity_field: str = "intensities_sampled_from_dp",
     ):
         """
-        Create an 3D or 4D orientation histogram from a braggpeaks PointListArray
-        from user-specified radial ranges, or from the Euler angles from a fiber
-        texture OrientationMap generated by the ACOM module of py4DSTEM.
+        Create a 3D or 4D orientation histogram from bragg peaks.
+        
+        Can generate histograms from either:
+        1. Polar peak data with radial ranges
+        2. Orientation map with Euler angles (for fiber textures)
     
-        Args:
-            bragg_peaks (BraggVectors):         bragg_vectors containing centered peak locations.
-            radial_ranges (np array):           Size (N x 2) array for N radial bins, or (2,) for a single bin.
-            orientation_map (OrientationMap):   Class containing the Euler angles to generate a flowline map.
-            orientation_ind (int):              Index of the orientation map (default 0)
-            orientation_growth_angles (array):  Angles to place into histogram, relative to orientation.
-            orientation_separate_bins (bool):   whether to place multiple angles into multiple radial bins.
-            upsample_factor (float):            Upsample factor
-            theta_step_deg (float):             Step size along annular direction in degrees
-            sigma_x (float):                    Smoothing in x direction before upsample
-            sigma_y (float):                    Smoothing in x direction before upsample
-            sigma_theta (float):                Smoothing in annular direction (units of bins, periodic)
-            normalize_intensity_image (bool):   Normalize to max peak intensity = 1, per image
-            normalize_intensity_stack (bool):   Normalize to max peak intensity = 1, all images
-            progress_bar (bool):                Enable progress bar
-            r_field (str):                      Name of radial coordinate field (default: "r")
-            theta_field (str):                  Name of angular coordinate field (default: "theta")
-            intensity_field (str):              Name of intensity field (default: "intensity")
+        Parameters
+        ----------
+        radial_ranges : np.ndarray, optional
+            Size (N x 2) array for N radial bins, or (2,) for a single bin.
+        orientation_map : OrientationMap, optional
+            Class containing Euler angles to generate a flowline map.
+        orientation_ind : int
+            Index of the orientation map (default 0)
+        orientation_growth_angles : np.array
+            Angles to place into histogram, relative to orientation.
+        orientation_separate_bins : bool
+            Whether to place multiple angles into multiple radial bins.
+        orientation_flip_sign : bool
+            Flip the direction of theta
+        orientation_offset_degrees : float
+            Offset for orientation angles in degrees
+        upsample_factor : float
+            Upsample factor for output histogram
+        theta_step_deg : float
+            Step size along annular direction in degrees
+        sigma_x : float
+            Smoothing in x direction before upsample
+        sigma_y : float
+            Smoothing in y direction before upsample
+        sigma_theta : float
+            Smoothing in annular direction (units of bins, periodic)
+        use_peak_sigma : bool
+            Spread signal along annular direction using measured peak width
+        peak_sigma_samples : int
+            Number of samples for peak sigma spreading
+        normalize_intensity_image : bool
+            Normalize to max peak intensity = 1, per image
+        normalize_intensity_stack : bool
+            Normalize to max peak intensity = 1, all images
+        progress_bar : bool
+            Enable progress bar
+        r_field : str
+            Name of radial coordinate field
+        theta_field : str
+            Name of angular coordinate field
+        intensity_field : str
+            Name of intensity field
     
-        Returns:
-            orient_hist (array):                4D array containing Bragg peak intensity histogram
-                                                [radial_bin x_probe y_probe theta]
+        Returns
+        -------
+        orient_hist : np.ndarray
+            4D array containing Bragg peak intensity histogram
+            [radial_bin, x_probe, y_probe, theta]
         """
-        # coordinates
+        # Coordinates
         theta = np.arange(0, 180, theta_step_deg) * np.pi / 180.0
         dtheta = theta[1] - theta[0]
         dtheta_deg = dtheta * 180 / np.pi
         num_theta_bins = np.size(theta)
+        
+        # Setup for peak sigma spreading
+        if use_peak_sigma:
+            v_sigma = np.linspace(-2, 2, 2 * peak_sigma_samples + 1)
+            w_sigma = np.exp(-(v_sigma**2) / 2)
     
         if orientation_map is None:
             # Input bins
@@ -1376,15 +1718,12 @@ class BraggPeaksPolymer(AutoSerialize):
             np.array(size_input).astype("float") * upsample_factor
         ).astype("int")
     
-        # output init
+        # Output init
         orient_hist = np.zeros([num_radii, size_output[0], size_output[1], num_theta_bins])
     
         # Loop over all probe positions
         for a0 in range(num_radii):
             t = "Generating histogram " + str(a0)
-            # for rx, ry in tqdmnd(
-            #         *bragg_peaks.shape, desc=t,unit=" probe positions", disable=not progress_bar
-            #     ):
             for rx, ry in tqdmnd(
                 *size_input, desc=t, unit=" probe positions", disable=not progress_bar
             ):
@@ -1401,31 +1740,39 @@ class BraggPeaksPolymer(AutoSerialize):
                 add_data = False
     
                 if orientation_map is None:
-                    p_r_invA = self.polar_peaks['r_invA'][rx, ry]
-                    p_theta = self.polar_peaks['theta'][rx, ry]
+                    p_r = self.polar_peaks[r_field][rx, ry]
+                    p_theta = self.polar_peaks[theta_field][rx, ry]
                     
-                    if p_r_invA is not None and len(p_r_invA) > 0:
-                        # Extract columns: p is shape (N_peaks, 4)
-                        # Column 0: y_pixels, Column 1: x_pixels
-                        # Column 2: y_invA,   Column 3: x_invA
-                        # p_y_invA = p[:, 2]
-                        # p_x_invA = p[:, 3]
-                        # r2 = p_y_invA**2 + p_x_invA**2
-                        r2 = p_r_invA**2
+                    if p_r is not None and len(p_r) > 0:
+                        r2 = p_r**2
                         sub = np.logical_and(
                             r2 >= radial_ranges_2[a0, 0], 
                             r2 < radial_ranges_2[a0, 1]
                         )
                         if np.any(sub):
-                            intensity_data = self.peak_intensities['intensities_sampled_from_dp'][rx, ry]
+                            intensity_data = self.peak_intensities[intensity_field][rx, ry]
                             if intensity_data is not None and len(intensity_data) > 0:
                                 add_data = True
                                 intensity = intensity_data[sub]
-                                # Use theta directly from polar_peaks instead of recalculating
-                                theta_radians = p_theta[sub]  # Already in radians
+                                
+                                # Get theta values
+                                theta_radians = p_theta[sub]
+                                if orientation_flip_sign:
+                                    theta_radians *= -1
+                                # Add offset
+                                theta_radians += orientation_offset_degrees * np.pi / 180
+                                
                                 # Fold to 0-180° range (0 to π)
                                 theta_folded = np.mod(theta_radians, np.pi)
                                 t = theta_folded / dtheta
+                                
+                                # Spread signal using peak sigma if requested
+                                if use_peak_sigma:
+                                    # Try to get sigma values if available
+                                    if 'sigma_theta' in self.polar_peaks.fields:
+                                        theta_std = self.polar_peaks['sigma_theta'][rx, ry][sub] / dtheta
+                                        t = (t[:, None] + theta_std[:, None] * v_sigma[None, :]).ravel()
+                                        intensity = (intensity[:, None] * w_sigma[None, :]).ravel()
                 else:
                     if orientation_map.corr[rx, ry, orientation_ind] > 0:
                         if orientation_separate_bins is False:
@@ -1463,6 +1810,8 @@ class BraggPeaksPolymer(AutoSerialize):
                                     )
                                     + orientation_growth_angles
                                 )
+                            # Add offset
+                            t += orientation_offset_degrees / dtheta_deg
                             intensity = (
                                 np.ones(num_angles)
                                 * orientation_map.corr[rx, ry, orientation_ind]
@@ -1503,6 +1852,8 @@ class BraggPeaksPolymer(AutoSerialize):
                                     )
                                     + orientation_growth_angles[a0]
                                 )
+                            # Add offset
+                            t += orientation_offset_degrees / dtheta_deg
                             intensity = orientation_map.corr[rx, ry, orientation_ind]
                             add_data = True
     
@@ -1566,7 +1917,7 @@ class BraggPeaksPolymer(AutoSerialize):
                         minlength=num_theta_bins,
                     )
     
-        # smoothing / interpolation
+        # Smoothing / interpolation
         if (sigma_x is not None) or (sigma_y is not None) or (sigma_theta is not None):
             if num_radii > 1:
                 print("Interpolating orientation matrices ...", end="")
@@ -1594,7 +1945,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 )
             print(" done.")
     
-        # normalization
+        # Normalization
         if normalize_intensity_stack is True:
             orient_hist = orient_hist / np.max(orient_hist)
         elif normalize_intensity_image is True:
@@ -1604,17 +1955,20 @@ class BraggPeaksPolymer(AutoSerialize):
                 )
     
         return orient_hist
-    
+
     def plot_interactive_image_map(self, intensity_map=None, vmax_cartesian=7, 
                                     map_cmap='viridis', map_title='Intensity Map',
-                                    norm_upper_quantile=None, norm_power=1.0):
+                                    norm_upper_quantile=None, norm_power=1.0,
+                                    show_polar=True, vmax_polar=7):
         """
         Interactive plot for browsing diffraction patterns with optional intensity map.
         
         Parameters
         ----------
         intensity_map : array, optional
-            2D array (Ry, Rx) to display as reference map. If None, shows mean intensity.
+            2D array to display as reference map. Can be upsampled relative to dataset.
+            If None, shows mean intensity at original resolution.
+            Upsample factor is automatically detected from array dimensions.
         vmax_cartesian : float
             Maximum value for diffraction pattern display
         map_cmap : str
@@ -1625,9 +1979,19 @@ class BraggPeaksPolymer(AutoSerialize):
             Upper quantile for normalization (0-1). If None, not used.
         norm_power : float
             Power law normalization exponent
+        show_polar : bool
+            Whether to show the polar transformed data panel
+        vmax_polar : float, optional
+            Maximum value for polar pattern display. If None, uses vmax_cartesian.
         """
         
         Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Check if polar data exists
+        has_polar = hasattr(self, 'polar_data') and self.polar_data is not None
+        if show_polar and not has_polar:
+            print("Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first.")
+            show_polar = False
         
         # Create default intensity map if none provided
         if intensity_map is None:
@@ -1635,45 +1999,86 @@ class BraggPeaksPolymer(AutoSerialize):
             for i in range(Ry):
                 for j in range(Rx):
                     intensity_map[i, j] = np.mean(self.dataset_cartesian[i, j].array)
+            upsample_factor = 1
+        else:
+            # Auto-detect upsample factor from dimensions
+            map_Ry, map_Rx = intensity_map.shape
+            upsample_factor_y = map_Ry // Ry
+            upsample_factor_x = map_Rx // Rx
+            
+            if upsample_factor_y != upsample_factor_x:
+                raise ValueError(f"Inconsistent upsample factors: Y={upsample_factor_y}, X={upsample_factor_x}")
+            
+            if map_Ry % Ry != 0 or map_Rx % Rx != 0:
+                raise ValueError(f"intensity_map shape {intensity_map.shape} is not an integer multiple "
+                               f"of dataset shape ({Ry}, {Rx})")
+            
+            upsample_factor = upsample_factor_y
+            print(f"Auto-detected upsample_factor: {upsample_factor}")
         
-        def show_pattern(ry, rx):
-            # Build norm dictionary using dict comprehension to filter None values
-            norm_dict = {
-                k: v for k, v in {
-                    'vmax': vmax_cartesian,
-                    'upper_quantile': norm_upper_quantile,
-                    'power': norm_power,
-                }.items() if v is not None
-            }
+        # Set vmax_polar default
+        if vmax_polar is None:
+            vmax_polar = vmax_cartesian
+        
+        # Calculate slider ranges based on upsampled map
+        slider_Ry = Ry * upsample_factor
+        slider_Rx = Rx * upsample_factor
+        
+        def show_pattern(ry_slider, rx_slider):
+            # Map slider position to original data indices
+            ry_data = ry_slider // upsample_factor
+            rx_data = rx_slider // upsample_factor
             
-            fig, axs = show_2d(
-                [intensity_map, self.dataset_cartesian[ry, rx].array],
-                cmap=[map_cmap, 'gray'],
-                title=[map_title, f'Diffraction Pattern (Ry={ry}, Rx={rx})'],
-                cbar=[True, True],
-                norm=['linear_minmax', norm_dict],
-                show_ticks=[True, False],
-                axsize=(6, 5),
-                tight_layout=True,
-            )
+            # Calculate marker position in upsampled coordinates
+            marker_ry = ry_slider
+            marker_rx = rx_slider
             
-            # Add marker to first axes
-            axs[0].plot(rx, ry, 'r+', markersize=15, markeredgewidth=2)
-            axs[0].set_xlabel('Rx')
-            axs[0].set_ylabel('Ry')
+            # Create figure
+            if show_polar:
+                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
+            else:
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
             
+            # Plot intensity map (no normalization)
+            im1 = ax1.imshow(intensity_map, cmap=map_cmap)
+            ax1.plot(marker_rx, marker_ry, 'r+', markersize=15, markeredgewidth=2)
+            ax1.set_title(map_title)
+            ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            plt.colorbar(im1, ax=ax1)
+            
+            # Plot diffraction pattern (with vmax)
+            im2 = ax2.imshow(self.dataset_cartesian[ry_data, rx_data].array, cmap='gray', vmax=vmax_cartesian)
+            ax2.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})')
+            ax2.set_xticks([])
+            ax2.set_yticks([])
+            plt.colorbar(im2, ax=ax2)
+            
+            # Plot polar transform if requested
+            if show_polar:
+                im3 = ax3.imshow(self.polar_data['intensity'][ry_data, rx_data].T, cmap='gray', vmax=vmax_polar, aspect='auto')
+                ax3.set_title(f'Polar Transform (Ry={ry_data}, Rx={rx_data})')
+                ax3.set_xlabel('Radius (bins)')
+                ax3.set_ylabel('Theta (bins)')
+                plt.colorbar(im3, ax=ax3)
+            
+            plt.tight_layout()
             plt.show()
         
         interact(show_pattern,
-                 ry=IntSlider(min=0, max=Ry-1, step=1, value=Ry//2, 
+                 ry_slider=IntSlider(min=0, max=slider_Ry-1, step=1, value=slider_Ry//2, 
                              description='Ry:', continuous_update=False),
-                 rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, 
+                 rx_slider=IntSlider(min=0, max=slider_Rx-1, step=1, value=slider_Rx//2, 
                              description='Rx:', continuous_update=False))
-    
-    def plot_interactive_peak_map(self, radial_range=None, vmax_cartesian=7,
-                                  show_all_peaks=True, show_center=True,selected_peak_color='red',
-                                  other_peak_color='gray',center_color='cyan', norm_upper_quantile=None,
-                                  norm_power=1.0):
+        
+    def plot_interactive_peak_map(self, radial_range=None, intensity_map_override=None,
+                                  vmax_cartesian=7, show_all_peaks=True, 
+                                  show_center=True, selected_peak_color='red', 
+                                  other_peak_color='gray', center_color='cyan', 
+                                  norm_upper_quantile=None, norm_power=1.0, 
+                                  peak_intensity_mode='size', peak_size_range=(30, 300), 
+                                  peak_cmap='hot', peak_vmin=None, peak_vmax=None,
+                                  show_polar=True, vmax_polar=None):
         """
         Interactive plot for browsing diffraction patterns with peak overlay.
         
@@ -1681,6 +2086,10 @@ class BraggPeaksPolymer(AutoSerialize):
         ----------
         radial_range : tuple, optional
             (q_min, q_max) in 1/Å to filter peaks. If None, shows all peaks.
+        intensity_map_override : array, optional
+            If provided, uses this 2D array instead of calculating peak intensity map.
+            Can be upsampled relative to dataset_cartesian.
+            Upsample factor is automatically detected from array dimensions.
         vmax_cartesian : float
             Maximum value for diffraction pattern display
         show_all_peaks : bool
@@ -1688,7 +2097,7 @@ class BraggPeaksPolymer(AutoSerialize):
         show_center : bool
             Whether to show the beam center marker
         selected_peak_color : str or color
-            Color for selected peaks (within radial_range)
+            Color for selected peaks (within radial_range) when peak_intensity_mode is None
         other_peak_color : str or color
             Color for non-selected peaks (outside radial_range)
         center_color : str or color
@@ -1697,111 +2106,236 @@ class BraggPeaksPolymer(AutoSerialize):
             Upper quantile for normalization (0-1). If None, not used.
         norm_power : float
             Power law normalization exponent
+        peak_intensity_mode : str or None
+            How to represent peak intensity: 'size', 'color', 'both', or None (fixed)
+        peak_size_range : tuple
+            (min_size, max_size) for marker sizes when using intensity-based sizing
+        peak_cmap : str
+            Colormap name for peak intensity coloring
+        peak_vmin : float, optional
+            Minimum intensity value for peak colormap normalization. If None, uses data min.
+        peak_vmax : float, optional
+            Maximum intensity value for peak colormap normalization. If None, uses data max.
+        show_polar : bool
+            Whether to show the polar transformed data panel
+        vmax_polar : float, optional
+            Maximum value for polar pattern display. If None, uses vmax_cartesian.
         """
         
         Ry, Rx = self.peak_coordinates_cartesian.shape
         
-        # Create intensity map based on selected radial range
-        intensity_map = np.zeros((Ry, Rx))
-        for i in range(Ry):
-            for j in range(Rx):
-                peaks_r_invA = self.polar_peaks['r_invA'][i, j]
-                if peaks_r_invA is not None and len(peaks_r_invA) > 0:
-                    if radial_range is not None:
-                        mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
-                    else:
-                        mask = np.ones(len(peaks_r_invA), dtype=bool)
-                    
-                    intensities = self.peak_intensities['intensities_sampled_from_dp'][i, j]
-                    if intensities is not None and len(intensities) > 0:
-                        intensity_map[i, j] = np.sum(intensities[mask])
+        # Check if polar data exists
+        has_polar = hasattr(self, 'polar_data') and self.polar_data is not None
+        if show_polar and not has_polar:
+            print("Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first.")
+            show_polar = False
         
-        # Determine map title
-        if radial_range is not None:
-            map_title = f'Peak Intensity Map\n({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)'
+        # Use override if provided, otherwise create intensity map based on selected radial range
+        if intensity_map_override is not None:
+            intensity_map = intensity_map_override
+            
+            # Auto-detect upsample factor from dimensions
+            map_Ry, map_Rx = intensity_map.shape
+            upsample_factor_y = map_Ry // Ry
+            upsample_factor_x = map_Rx // Rx
+            
+            if upsample_factor_y != upsample_factor_x:
+                raise ValueError(f"Inconsistent upsample factors: Y={upsample_factor_y}, X={upsample_factor_x}")
+            
+            if map_Ry % Ry != 0 or map_Rx % Rx != 0:
+                raise ValueError(f"intensity_map_override shape {intensity_map.shape} is not an integer multiple "
+                               f"of dataset shape ({Ry}, {Rx})")
+            
+            upsample_factor = upsample_factor_y
+            print(f"Auto-detected upsample_factor: {upsample_factor}")
+            
+            # Determine map title for override case
+            if radial_range is not None:
+                map_title = f'Custom Intensity Map\n({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)'
+            else:
+                map_title = 'Custom Intensity Map'
         else:
-            map_title = 'Peak Intensity Map (All Peaks)'
+            # Calculate at original resolution
+            intensity_map = np.zeros((Ry, Rx))
+            for i in range(Ry):
+                for j in range(Rx):
+                    peaks_r_invA = self.polar_peaks['r_invA'][i, j]
+                    if peaks_r_invA is not None and len(peaks_r_invA) > 0:
+                        if radial_range is not None:
+                            mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
+                        else:
+                            mask = np.ones(len(peaks_r_invA), dtype=bool)
+                        
+                        intensities = self.peak_intensities['intensities_sampled_from_dp'][i, j]
+                        if intensities is not None and len(intensities) > 0:
+                            intensity_map[i, j] = np.sum(intensities[mask])
+            
+            upsample_factor = 1
+            
+            # Determine map title for calculated case
+            if radial_range is not None:
+                map_title = f'Peak Intensity Map\n({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)'
+            else:
+                map_title = 'Peak Intensity Map (All Peaks)'
         
-        def show_pattern(ry, rx):
-            # Build norm dictionary dynamically
-            norm_dict = {
-                k: v for k, v in {
-                    'vmax': vmax_cartesian,
-                    'upper_quantile': norm_upper_quantile,
-                    'power': norm_power,
-                }.items() if v is not None
-            }
+        # Set vmax_polar default
+        if vmax_polar is None:
+            vmax_polar = vmax_cartesian
+        
+        # Calculate slider ranges based on upsampled map
+        slider_Ry = Ry * upsample_factor
+        slider_Rx = Rx * upsample_factor
+        
+        def show_pattern(ry_slider, rx_slider):
+            # Map slider position to original data indices
+            ry_data = ry_slider // upsample_factor
+            rx_data = rx_slider // upsample_factor
             
-            # Use show_2d for the base images
-            fig, axs = show_2d(
-                [intensity_map, self.dataset_cartesian[ry, rx].array],
-                cmap=['viridis', 'gray'],
-                title=[map_title, f'Diffraction Pattern (Ry={ry}, Rx={rx})'],
-                cbar=[True, False],
-                norm=['linear_minmax', norm_dict],
-                show_ticks=[True, False],
-                axsize=(6, 5),
-                tight_layout=True
-            )
+            # Calculate marker position in upsampled coordinates
+            marker_ry = ry_slider
+            marker_rx = rx_slider
             
-            ax1, ax2 = axs[0], axs[1]
+            # Create figure
+            if show_polar:
+                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
+            else:
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
             
-            # Add position marker to intensity map
-            ax1.plot(rx, ry, 'r+', markersize=15, markeredgewidth=2)
-            ax1.set_xlabel('Rx')
-            ax1.set_ylabel('Ry')
+            # Plot intensity map (no normalization)
+            im1 = ax1.imshow(intensity_map, cmap='viridis')
+            ax1.plot(marker_rx, marker_ry, 'r+', markersize=15, markeredgewidth=2)
+            ax1.set_title(map_title)
+            ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            plt.colorbar(im1, ax=ax1)
+            
+            # Plot diffraction pattern (with vmax)
+            im2 = ax2.imshow(self.dataset_cartesian[ry_data, rx_data].array, cmap='gray', vmax=vmax_cartesian)
+            ax2.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})')
+            ax2.set_xticks([])
+            ax2.set_yticks([])
             
             # Overlay peaks on diffraction pattern
-            peaks_r_invA = self.polar_peaks['r_invA'][ry, rx]
-            peaks_y_pixels = self.peak_coordinates_cartesian['y_pixels'][ry, rx]
-            peaks_x_pixels = self.peak_coordinates_cartesian['x_pixels'][ry, rx]
+            peaks_r_invA = self.polar_peaks['r_invA'][ry_data, rx_data]
+            peaks_y_pixels = self.peak_coordinates_cartesian['y_pixels'][ry_data, rx_data]
+            peaks_x_pixels = self.peak_coordinates_cartesian['x_pixels'][ry_data, rx_data]
+            peak_intensities = self.peak_intensities['intensities_sampled_from_dp'][ry_data, rx_data]
             
             if peaks_r_invA is not None and len(peaks_r_invA) > 0:
                 if radial_range is not None:
                     mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
                     
-                    # Show non-selected peaks if requested
                     if show_all_peaks and np.any(~mask):
                         ax2.scatter(peaks_x_pixels[~mask], peaks_y_pixels[~mask], 
-                                   c=other_peak_color, s=30, alpha=0.5,
-                                   edgecolors='white', linewidths=0.5, 
-                                   label='Other peaks')
+                                   c=other_peak_color, s=30, alpha=0.5, marker='x',
+                                   linewidths=1.5, label='Other peaks')
                     
-                    # Show selected peaks
                     if np.any(mask):
-                        ax2.scatter(peaks_x_pixels[mask], peaks_y_pixels[mask], 
-                                   c=selected_peak_color, s=30, alpha=0.8,
-                                   edgecolors='white', linewidths=0.5, 
-                                   label=f'Selected ({np.sum(mask)} peaks)')
+                        selected_x = peaks_x_pixels[mask]
+                        selected_y = peaks_y_pixels[mask]
+                        selected_intensities = peak_intensities[mask] if peak_intensities is not None else None
+                        
+                        if selected_intensities is not None and peak_intensity_mode is not None:
+                            int_min = peak_vmin if peak_vmin is not None else np.min(selected_intensities)
+                            int_max = peak_vmax if peak_vmax is not None else np.max(selected_intensities)
+                            
+                            if int_max > int_min:
+                                norm_intensities = (selected_intensities - int_min) / (int_max - int_min)
+                            else:
+                                norm_intensities = np.ones_like(selected_intensities)
+                            
+                            if peak_intensity_mode == 'color':
+                                colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
+                                sizes = np.full(len(selected_intensities), 100)
+                            elif peak_intensity_mode == 'size':
+                                colors = selected_peak_color
+                                sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
+                            elif peak_intensity_mode == 'both':
+                                colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
+                                sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
+                            else:
+                                colors = selected_peak_color
+                                sizes = np.full(len(selected_intensities), 100)
+                            
+                            ax2.scatter(selected_x, selected_y, c=colors, s=sizes, alpha=0.8, 
+                                       marker='x', linewidths=2, label=f'Selected ({np.sum(mask)} peaks)')
+                            
+                            if peak_intensity_mode in ['color', 'both']:
+                                sm = plt.cm.ScalarMappable(cmap=peak_cmap, 
+                                                           norm=plt.Normalize(vmin=int_min, vmax=int_max))
+                                sm.set_array([])
+                                cbar = plt.colorbar(sm, ax=ax2, pad=0.02, fraction=0.046)
+                                cbar.set_label('Peak Intensity', fontsize=8)
+                        else:
+                            ax2.scatter(selected_x, selected_y, c=selected_peak_color, s=100, 
+                                       alpha=0.8, marker='x', linewidths=2, 
+                                       label=f'Selected ({np.sum(mask)} peaks)')
                 else:
-                    # Show all peaks
-                    ax2.scatter(peaks_x_pixels, peaks_y_pixels, 
-                               c=selected_peak_color, s=30, alpha=0.8,
-                               edgecolors='white', linewidths=0.5,
-                               label=f'All peaks ({len(peaks_r_invA)})')
+                    if peak_intensities is not None and peak_intensity_mode is not None:
+                        int_min = peak_vmin if peak_vmin is not None else np.min(peak_intensities)
+                        int_max = peak_vmax if peak_vmax is not None else np.max(peak_intensities)
+                        
+                        if int_max > int_min:
+                            norm_intensities = (peak_intensities - int_min) / (int_max - int_min)
+                        else:
+                            norm_intensities = np.ones_like(peak_intensities)
+                        
+                        if peak_intensity_mode == 'color':
+                            colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
+                            sizes = np.full(len(peak_intensities), 100)
+                        elif peak_intensity_mode == 'size':
+                            colors = selected_peak_color
+                            sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
+                        elif peak_intensity_mode == 'both':
+                            colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
+                            sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
+                        else:
+                            colors = selected_peak_color
+                            sizes = np.full(len(peak_intensities), 100)
+                        
+                        ax2.scatter(peaks_x_pixels, peaks_y_pixels, c=colors, s=sizes, 
+                                   alpha=0.8, marker='x', linewidths=2, 
+                                   label=f'All peaks ({len(peaks_r_invA)})')
+                        
+                        if peak_intensity_mode in ['color', 'both']:
+                            sm = plt.cm.ScalarMappable(cmap=peak_cmap, 
+                                                       norm=plt.Normalize(vmin=int_min, vmax=int_max))
+                            sm.set_array([])
+                            cbar = plt.colorbar(sm, ax=ax2, pad=0.02, fraction=0.046)
+                            cbar.set_label('Peak Intensity', fontsize=8)
+                    else:
+                        ax2.scatter(peaks_x_pixels, peaks_y_pixels, c=selected_peak_color, 
+                                   s=100, alpha=0.8, marker='x', linewidths=2, 
+                                   label=f'All peaks ({len(peaks_r_invA)})')
             
-            # Show beam center if requested
             if show_center and hasattr(self, 'image_centers') and self.image_centers is not None:
-                ax2.scatter(self.image_centers[1, ry, rx], self.image_centers[0, ry, rx],
+                ax2.scatter(self.image_centers[1, ry_data, rx_data], 
+                           self.image_centers[0, ry_data, rx_data],
                            c=center_color, s=500, marker='x', linewidths=2, 
                            label='Center', zorder=10)
             
-            # Add legend if there are labeled elements
             handles, labels = ax2.get_legend_handles_labels()
             if labels:
                 ax2.legend(fontsize=8, loc='upper right')
             
-            # Update title with range info
             if radial_range is not None:
-                current_title = ax2.get_title()
-                ax2.set_title(f'{current_title}\nRange: {radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å')
+                ax2.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})\nRange: {radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å')
             
+            # Plot polar transform if requested
+            if show_polar:
+                im3 = ax3.imshow(self.polar_data['intensity'][ry_data, rx_data].T, cmap='gray', vmax=vmax_polar, aspect='auto')
+                ax3.set_title(f'Polar Transform (Ry={ry_data}, Rx={rx_data})')
+                ax3.set_xlabel('Radius (bins)')
+                ax3.set_ylabel('Theta (bins)')
+                plt.colorbar(im3, ax=ax3)
+            
+            plt.tight_layout()
             plt.show()
         
         interact(show_pattern,
-                 ry=IntSlider(min=0, max=Ry-1, step=1, value=Ry//2, 
+                 ry_slider=IntSlider(min=0, max=slider_Ry-1, step=1, value=slider_Ry//2, 
                              description='Ry:', continuous_update=False),
-                 rx=IntSlider(min=0, max=Rx-1, step=1, value=Rx//2, 
+                 rx_slider=IntSlider(min=0, max=slider_Rx-1, step=1, value=slider_Rx//2, 
                              description='Rx:', continuous_update=False))
 
     def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,

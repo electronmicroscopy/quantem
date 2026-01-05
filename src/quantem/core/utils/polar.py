@@ -19,6 +19,7 @@ def polar_transform_vector(
     x_field: Union[str, List[str]] = ['x_pixels', 'x'],
     y_field: Union[str, List[str]] = ['y_pixels', 'y'],
     sampling_conversion_factor: Optional[float] = None,
+    two_fold_symmetry: bool = True,
     r_unit: str = "pixels",
     theta_unit: str = "radians",
     name_suffix: str = "_polar",
@@ -202,8 +203,11 @@ def polar_transform_vector(
             r_pixels = np.sqrt(dx**2 + dy**2)
             theta = np.arctan2(dy, dx)
             
-            # Normalize theta to [0, 2π)
-            theta = np.mod(theta, 2 * np.pi)
+            # Normalize theta and apply two-fold symmetry if requested
+            if two_fold_symmetry:
+                theta = np.mod(theta, np.pi)  # Fold to [0, π]
+            else:
+                theta = np.mod(theta, 2 * np.pi)  # Normalize to [0, 2π]
             
             # Calculate r in inverse angstroms
             r_invA = r_pixels * sampling_conversion_factor

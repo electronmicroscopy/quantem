@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
 
@@ -583,9 +584,9 @@ def plot_image_grid(
     return_fig : bool
         Return (fig, axes) instead of displaying.
     """
-    
+    import matplotlib.pyplot as plt
     # Convert to list
-    if isinstance(images, np.ndarray) and images.ndim == 4:
+    if isinstance(images, np.ndarray) and (images.ndim == 4 or images.ndim == 3):
         images = [images[i] for i in range(images.shape[0])]
     elif not isinstance(images, list):
         images = [images]
