@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .activation_functions import Complex_ReLU
+from .activation_functions import get_activation_function
 
 # region ---- Utility Functions ----
 
@@ -64,7 +64,7 @@ class Conv2dBlock(nn.Module):
         use_batchnorm: bool = False,
         dropout: float = 0.0,
         dtype: torch.dtype = torch.float32,
-        activation: Callable | None = None,
+        activation: str | Callable | None = None,
     ) -> None:
         """Initialize Conv2dBlock.
 
@@ -88,8 +88,8 @@ class Conv2dBlock(nn.Module):
             Dropout probability, by default 0.0
         dtype : torch.dtype, optional
             Data type for the layers, by default torch.float32
-        activation : Callable or None, optional
-            Activation function to use. If None, defaults to ReLU (or Complex_ReLU for complex), by default None
+        activation : str or Callable or None, optional
+            Activation function to use (string or callable). If None, defaults to "relu", by default None
         """
         super().__init__()
 
@@ -112,11 +112,7 @@ class Conv2dBlock(nn.Module):
         else:
             self.bn = nn.BatchNorm2d
 
-        if activation is None:  # defaults to ReLU
-            if dtype == torch.complex64:
-                activation = Complex_ReLU()
-            else:
-                activation = nn.ReLU()
+        self._activation = activation if activation is not None else "relu"
 
         block = []
         for idx in range(nb_layers):
@@ -131,7 +127,8 @@ class Conv2dBlock(nn.Module):
                     padding_mode="circular",
                 )
             )
-            block.append(activation)
+            # Get new activation instance for each conv layer
+            block.append(get_activation_function(self._activation, dtype))
             if use_batchnorm:
                 block.append(self.bn(output_channels_list[idx]))
             if dropout > 0:
@@ -341,7 +338,7 @@ class Conv3dBlock(nn.Module):
         use_batchnorm: bool = False,
         dropout: float = 0.0,
         dtype: torch.dtype = torch.float32,
-        activation: None | Callable = None,
+        activation: str | Callable | None = None,
     ) -> None:
         """Initialize Conv3dBlock.
 
@@ -365,13 +362,13 @@ class Conv3dBlock(nn.Module):
             Dropout probability, by default 0.0
         dtype : torch.dtype, optional
             Data type for the layers, by default torch.float32
-        activation : Callable or None, optional
-            Activation function to use, by default None
+        activation : str or Callable or None, optional
+            Activation function to use (string or callable). If None, defaults to "relu", by default None
         """
         super().__init__()
         self.dtype = dtype
         self.bn = ComplexBatchNorm3D if dtype.is_complex else nn.BatchNorm3d
-        activation_func = activation
+        self._activation = activation if activation is not None else "relu"
 
         layers = []
         for _ in range(nb_layers):
@@ -388,7 +385,10 @@ class Conv3dBlock(nn.Module):
             )
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
-            layers.append(activation_func)
+            # Get new activation instance for each conv layer
+            from .activation_functions import get_activation_function
+
+            layers.append(get_activation_function(self._activation, dtype))
             if use_batchnorm:
                 layers.append(self.bn(output_channels))
             input_channels = output_channels

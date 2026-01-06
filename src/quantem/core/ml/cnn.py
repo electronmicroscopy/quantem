@@ -95,14 +95,12 @@ class CNN2d(nn.Module):
 
     @property
     def activation(self) -> Callable:
-        return self._activation
+        """Create a new activation instance each time this is accessed."""
+        return get_activation_function(self._activation, self.dtype)
 
     @activation.setter
     def activation(self, act: str | Callable):
-        if callable(act):
-            self._activation = act
-        else:
-            self._activation = get_activation_function(act, self.dtype)
+        self._activation = act
 
     @property
     def final_activation(self) -> Callable:
@@ -110,10 +108,7 @@ class CNN2d(nn.Module):
 
     @final_activation.setter
     def final_activation(self, act: str | Callable):
-        if callable(act):
-            self._final_activation = act
-        else:
-            self._final_activation = get_activation_function(act, self.dtype)
+        self._final_activation = get_activation_function(act, self.dtype)
 
     def _build(self) -> None:
         self.down_conv_blocks = nn.ModuleList()
@@ -133,7 +128,7 @@ class CNN2d(nn.Module):
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
-                    activation=self.activation,
+                    activation=self._activation,  # Pass activation config, not instance
                 )
             )
             in_channels = out_channels
@@ -146,7 +141,7 @@ class CNN2d(nn.Module):
             use_batchnorm=self._use_batchnorm,
             dropout=self.dropout,
             dtype=self.dtype,
-            activation=self.activation,
+            activation=self._activation,
         )
         in_channels = out_channels
 
@@ -169,7 +164,7 @@ class CNN2d(nn.Module):
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
-                    activation=self.activation,
+                    activation=self._activation,
                 )
             )
 
@@ -222,7 +217,8 @@ class CNN3d(nn.Module):
 
     def __init__(
         self,
-        num_channels: int,
+        in_channels: int,
+        out_channels: int | None = None,
         start_filters: int = 16,
         num_layers: int = 3,
         num_per_layer: int = 2,
@@ -238,8 +234,10 @@ class CNN3d(nn.Module):
 
         Parameters
         ----------
-        num_channels : int
-            Number of input/output channels (C, D, H, W).
+        in_channels : int
+            Number of input channels.
+        out_channels : int or None, optional
+            Number of output channels. If None, defaults to in_channels, by default None
         start_filters : int, optional
             Starting number of filters for CNN, by default 16
         num_layers : int, optional
@@ -267,7 +265,8 @@ class CNN3d(nn.Module):
             If use_skip_connections is True and num_per_layer < 2.
         """
         super().__init__()
-        self.in_channels = self.out_channels = int(num_channels)
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels) if out_channels is not None else int(in_channels)
         self.start_filters = start_filters
         self.num_layers = num_layers
         self._num_per_layer = num_per_layer
@@ -294,14 +293,12 @@ class CNN3d(nn.Module):
 
     @property
     def activation(self) -> Callable:
-        return self._activation
+        """Create a new activation instance each time this is accessed."""
+        return get_activation_function(self._activation, self.dtype)
 
     @activation.setter
     def activation(self, act: str | Callable):
-        if isinstance(act, Callable):
-            self._activation = act
-        else:
-            self._activation = get_activation_function(act, self.dtype)
+        self._activation = act
 
     @property
     def final_activation(self) -> Callable:
@@ -309,10 +306,7 @@ class CNN3d(nn.Module):
 
     @final_activation.setter
     def final_activation(self, act: str | Callable):
-        if isinstance(act, Callable):
-            self._final_activation = act
-        else:
-            self._final_activation = get_activation_function(act, self.dtype)
+        self._final_activation = get_activation_function(act, self.dtype)
 
     def _build(self) -> None:
         self.down_conv_blocks = nn.ModuleList()
@@ -332,7 +326,7 @@ class CNN3d(nn.Module):
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
-                    activation=self.activation,
+                    activation=self._activation,
                 )
             )
             in_channels = out_channels
@@ -345,7 +339,7 @@ class CNN3d(nn.Module):
             use_batchnorm=self._use_batchnorm,
             dropout=self.dropout,
             dtype=self.dtype,
-            activation=self.activation,
+            activation=self._activation,
         )
         in_channels = out_channels
 
@@ -374,7 +368,7 @@ class CNN3d(nn.Module):
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
-                    activation=self.activation,
+                    activation=self._activation,
                 )
             )
 
