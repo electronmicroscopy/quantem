@@ -21,6 +21,7 @@ class Siren(nn.Module):
         hidden_omega_0: float = 30.0,
         alpha: float = 1.0,
         hsiren: bool = False,
+        dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
     ) -> None:
         """Initialize Siren.
@@ -43,47 +44,128 @@ class Siren(nn.Module):
             Weight initialization scaling factor, by default 1.0
         hsiren : bool, optional
             Whether to use the H-Siren activation function, by default False
+        dtype : torch.dtype, optional
+            Data type for the network, by default torch.float32
         final_activation : str or Callable, optional
             Final activation function, by default "identity"
         """
         super().__init__()
-        self.net_list = []
-        self.net_list.append(
+        self.in_features = in_features
+        self.out_features = out_features
+        self.hidden_layers = hidden_layers
+        self.hidden_features = hidden_features
+        self.first_omega_0 = first_omega_0
+        self.hidden_omega_0 = hidden_omega_0
+        self.alpha = alpha
+        self.hsiren = hsiren
+        self.dtype = dtype
+
+        self.final_activation = final_activation
+
+        self._build()
+
+    @property
+    def final_activation(self) -> Callable:
+        return self._final_activation
+
+    @final_activation.setter
+    def final_activation(self, act: str | Callable):
+        self._final_activation = get_activation_function(act, dtype=self.dtype)
+
+    def _build(self) -> None:
+        net_list = []
+        net_list.append(
             SineLayer(
-                in_features,
-                hidden_features,
+                self.in_features,
+                self.hidden_features,
                 is_first=True,
-                omega_0=first_omega_0,
-                hsiren=True,
-                alpha=alpha,
+                omega_0=self.first_omega_0,
+                hsiren=self.hsiren,
+                alpha=self.alpha,
+                dtype=self.dtype,
             )
         )
 
-        for i in range(hidden_layers):
-            self.net_list.append(
+        for i in range(self.hidden_layers):
+            net_list.append(
                 SineLayer(
-                    hidden_features,
-                    hidden_features,
+                    self.hidden_features,
+                    self.hidden_features,
                     is_first=False,
-                    omega_0=hidden_omega_0,
-                    alpha=alpha,
+                    omega_0=self.hidden_omega_0,
+                    alpha=self.alpha,
+                    dtype=self.dtype,
                 )
             )
 
-        final_linear = nn.Linear(hidden_features, out_features)
+        final_linear = nn.Linear(self.hidden_features, self.out_features, dtype=self.dtype)
         with torch.no_grad():
             # Final layer keeps original initialization (no alpha scaling)
             final_linear.weight.uniform_(
-                -np.sqrt(6 / hidden_features) / hidden_omega_0,
-                np.sqrt(6 / hidden_features) / hidden_omega_0,
+                -np.sqrt(6 / self.hidden_features) / self.hidden_omega_0,
+                np.sqrt(6 / self.hidden_features) / self.hidden_omega_0,
             )
-        self.net_list.append(final_linear)
-        self.net_list.append(get_activation_function(final_activation, dtype=torch.float32))
-        self.net = nn.Sequential(*self.net_list)
+        net_list.append(final_linear)
+        net_list.append(self._final_activation)
+        self.net = nn.Sequential(*net_list)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         output = self.net(coords)
         return output
+
+    def reset_weights(self) -> None:
+        """Reset all weights in the network."""
+        self._build()
+
+    def make_equispaced_grid(
+        self, bounds: tuple[tuple[float, float], ...], sampling: tuple[float, ...]
+    ) -> torch.Tensor:
+        """Create an equispaced coordinate grid for the implicit neural representation.
+
+        Parameters
+        ----------
+        bounds : tuple of tuples
+            Bounds for each dimension as ((min_0, max_0), (min_1, max_1), ...).
+            Length must match in_features.
+        sampling : tuple of float
+            Sampling interval for each dimension (spacing_0, spacing_1, ...).
+            Length must match in_features.
+
+        Returns
+        -------
+        torch.Tensor
+            Flattened coordinate grid of shape (N, in_features), where N is the
+            total number of grid points.
+
+        Raises
+        ------
+        ValueError
+            If bounds or sampling length does not match in_features.
+
+        Examples
+        --------
+        For a model with in_features=2:
+        >>> bounds = ((0, 1), (0, 1))
+        >>> sampling = (0.1, 0.1)
+        >>> coords = siren.make_equispaced_grid(bounds, sampling)
+        """
+        if len(bounds) != self.in_features:
+            raise ValueError(
+                f"Bounds length ({len(bounds)}) must match in_features ({self.in_features})"
+            )
+        if len(sampling) != self.in_features:
+            raise ValueError(
+                f"Sampling length ({len(sampling)}) must match in_features ({self.in_features})"
+            )
+
+        grids = []
+        for (bound_min, bound_max), sample in zip(bounds, sampling):
+            num_points = int((bound_max - bound_min) / sample) + 1
+            grids.append(torch.linspace(bound_min, bound_max, num_points))
+
+        coords = torch.meshgrid(*grids, indexing="ij")
+        coords = torch.stack(coords, dim=-1).to(self.dtype)
+        return coords.reshape(-1, self.in_features)
 
 
 class HSiren(Siren):
@@ -98,6 +180,7 @@ class HSiren(Siren):
         first_omega_0: float = 30,
         hidden_omega_0: float = 30,
         alpha: float = 1.0,
+        dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
     ) -> None:
         """Initialize HSiren.
@@ -118,6 +201,8 @@ class HSiren(Siren):
             Activation function scaling factor for the hidden layers, by default 30
         alpha : float, optional
             Weight initialization scaling factor, by default 1.0
+        dtype : torch.dtype, optional
+            Data type for the network, by default torch.float32
         final_activation : str or Callable, optional
             Final activation function, by default "identity"
         """
@@ -130,5 +215,6 @@ class HSiren(Siren):
             hidden_omega_0,
             alpha,
             hsiren=True,
+            dtype=dtype,
             final_activation=final_activation,
         )

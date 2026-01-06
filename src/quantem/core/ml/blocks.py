@@ -456,38 +456,6 @@ class Upsample3dBlock(nn.Module):
 
 # endregion ---- Convolutional Layers ----
 
-# region ---- Linear Layers ----
-
-
-class ComplexLinear(nn.Module):
-    """Linear layer for complex-valued inputs and outputs.
-
-    Stores weights and biases as real tensors in their complex representation
-    and converts them back to complex for computation.
-    """
-
-    def __init__(self, in_features: int, out_features: int):
-        """Initialize ComplexLinear.
-
-        Parameters
-        ----------
-        in_features : int
-            Size of each input sample.
-        out_features : int
-            Size of each output sample.
-        """
-        super().__init__()
-        linear = nn.Linear(in_features, out_features, dtype=torch.cfloat)
-        self.weight = nn.Parameter(torch.view_as_real(linear.weight))
-        self.bias = nn.Parameter(torch.view_as_real(linear.bias))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = torch.view_as_complex(self.weight)
-        bias = torch.view_as_complex(self.bias)
-        return F.linear(x, weight, bias)
-
-
-# endregion ---- Linear Layers ----
 
 # region ---- Siren Family of Layers ----
 
@@ -507,6 +475,7 @@ class SineLayer(nn.Module):
         omega_0: float = 30,
         hsiren: bool = False,
         alpha: float = 1.0,
+        dtype: torch.dtype = torch.float32,
     ):
         """Initialize SineLayer.
 
@@ -526,6 +495,8 @@ class SineLayer(nn.Module):
             Whether this is an H-Siren layer (uses hyperbolic sine for first layer if True), by default False
         alpha : float, optional
             Scaling factor for weight initialization, by default 1.0
+        dtype : torch.dtype, optional
+            Data type for the layer, by default torch.float32
         """
         super().__init__()
         self.omega_0 = omega_0
@@ -533,7 +504,8 @@ class SineLayer(nn.Module):
         self.hsiren = hsiren
         self.in_features = in_features
         self.alpha = alpha
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.dtype = dtype
+        self.linear = nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
         self.init_weights()
 
     def init_weights(self) -> None:

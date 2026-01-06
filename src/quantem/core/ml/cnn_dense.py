@@ -15,7 +15,7 @@ class CNNDense(nn.Module):
         self,
         in_channels: int,
         output_dim: int,
-        image_size: tuple[int, int],
+        image_shape: tuple[int, int],
         start_filters: int = 16,
         cnn_num_layers: int = 3,
         cnn_num_per_layer: int = 2,
@@ -36,8 +36,8 @@ class CNNDense(nn.Module):
             Number of input channels.
         output_dim : int
             Output dimension.
-        image_size : tuple[int, int]
-            Input image size (H, W).
+        image_shape : tuple[int, int]
+            2D input image shape (H, W).
         start_filters : int, optional
             Starting number of filters for CNN, by default 16
         cnn_num_layers : int, optional
@@ -64,7 +64,7 @@ class CNNDense(nn.Module):
         super().__init__()
         self.in_channels = int(in_channels)
         self.output_dim = int(output_dim)
-        self.image_size = image_size
+        self.image_shape = image_shape
         self.start_filters = start_filters
         self.num_cnn_layers = cnn_num_layers
         self._num_per_layer = cnn_num_per_layer
@@ -92,14 +92,12 @@ class CNNDense(nn.Module):
 
     @property
     def activation(self) -> Callable:
-        return self._activation
+        """Create a new activation instance each time this is accessed."""
+        return get_activation_function(self._activation, self.dtype)
 
     @activation.setter
     def activation(self, act: str | Callable):
-        if callable(act):
-            self._activation = act
-        else:
-            self._activation = get_activation_function(act, self.dtype)
+        self._activation = act
 
     @property
     def final_activation(self) -> Callable:
@@ -107,10 +105,7 @@ class CNNDense(nn.Module):
 
     @final_activation.setter
     def final_activation(self, act: str | Callable):
-        if callable(act):
-            self._final_activation = act
-        else:
-            self._final_activation = get_activation_function(act, self.dtype)
+        self._final_activation = get_activation_function(act, self.dtype)
 
     def _build(self) -> None:
         self.cnn_blocks = nn.ModuleList()
@@ -128,12 +123,12 @@ class CNNDense(nn.Module):
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
-                    activation=self.activation,
+                    activation=self._activation,
                 )
             )
             in_channels = out_channels
 
-        h, w = self.image_size
+        h, w = self.image_shape
         for _ in range(self.num_cnn_layers):
             h = h // 2
             w = w // 2
@@ -145,7 +140,7 @@ class CNNDense(nn.Module):
             hidden_dims=self.hidden_dims,
             dtype=self.dtype,
             dropout=self.dropout,
-            activation=self.activation,
+            activation=self._activation,
             final_activation=self.final_activation,
             use_batchnorm=self._use_batchnorm,
         )
