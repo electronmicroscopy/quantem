@@ -69,14 +69,13 @@ class DenseNN(nn.Module):
 
     @property
     def activation(self) -> Callable:
-        return self._activation
+        """Create a new activation instance each time this is accessed.
+        This avoids caching the activation function and helps with summary()"""
+        return get_activation_function(self._activation, self.dtype)
 
     @activation.setter
     def activation(self, act: str | Callable):
-        if callable(act):
-            self._activation = act
-        else:
-            self._activation = get_activation_function(act, self.dtype)
+        self._activation = act
 
     @property
     def final_activation(self) -> Callable:
@@ -84,10 +83,7 @@ class DenseNN(nn.Module):
 
     @final_activation.setter
     def final_activation(self, act: str | Callable):
-        if callable(act):
-            self._final_activation = act
-        else:
-            self._final_activation = get_activation_function(act, self.dtype)
+        self._final_activation = get_activation_function(act, self.dtype)
 
     def _build(self) -> None:
         self.layers = nn.ModuleList()
@@ -100,7 +96,6 @@ class DenseNN(nn.Module):
 
             block = []
             block.append(nn.Linear(in_dim, out_dim, dtype=self.dtype))
-
             block.append(self.activation)
 
             if self._use_batchnorm:
