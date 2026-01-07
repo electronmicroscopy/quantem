@@ -358,7 +358,7 @@ def bilinear_kde(
     lowpass_filter: bool = False,
     max_batch_size: Optional[int] = None,
     return_pix_count: bool = False,
-) -> NDArray:
+) -> NDArray | tuple[NDArray, NDArray]:
     """
     Compute a bilinear kernel density estimate (KDE) with smooth threshold masking.
 
@@ -546,3 +546,209 @@ def fourier_cropping(
     result[-h2:, -w2:] = corner_centered_array[-h2:, -w2:]
 
     return result
+
+
+def compute_fsc_from_halfsets(
+    halfset_recons: list[torch.Tensor],
+    sampling: tuple[float, float],
+    epsilon: float = 1e-12,
+):
+    """
+    Compute radially averaged Fourier Shell Correlation (FSC)
+    from two half-set reconstructions.
+
+    Parameters
+    ----------
+    halfset_recons : [tensor, tensor]
+        Real-space half-set reconstructions
+    sampling : (sx, sy)
+        Real-space sampling
+    eps : float
+        Numerical stability constant
+
+    Returns
+    -------
+    k : torch.Tensor
+        Radial spatial frequencies
+    fsc : torch.Tensor
+        FSC(q)
+    """
+    r1, r2 = halfset_recons
+
+    F1 = torch.fft.fft2(r1)
+    F2 = torch.fft.fft2(r2)
+
+    cross = (F1 * F2.conj()).real
+    p1 = F1.abs().square()
+    p2 = F2.abs().square()
+
+    device = F1.device
+    nx, ny = F1.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    cross = cross.reshape(-1)
+    p1 = p1.reshape(-1)
+    p2 = p2.reshape(-1)
+
+    # Accumulate
+    cross_b = torch.bincount(inds_f, weights=cross * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=cross * w1, minlength=num_bins
+    )
+
+    p1_b = torch.bincount(inds_f, weights=p1 * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=p1 * w1, minlength=num_bins
+    )
+
+    p2_b = torch.bincount(inds_f, weights=p2 * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=p2 * w1, minlength=num_bins
+    )
+
+    denom = torch.sqrt(p1_b * p2_b).clamp_min(epsilon)
+    fsc = cross_b / denom
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), fsc[valid].cpu().numpy()
+
+
+def compute_spectral_snr_from_halfsets(
+    halfset_recons: list[torch.Tensor],
+    sampling: tuple[float, float],
+    num_bf: int,
+    epsilon: float = 1e-12,
+):
+    """
+    Compute spectral SNR from two half-set reconstructions using symmetric/antisymmetric decomposition.
+
+    The method decomposes the Fourier transforms into:
+    - Symmetric: (F₁ + F₂)/2  → signal + correlated noise
+    - Antisymmetric: (F₁ - F₂)/2  → uncorrelated noise only
+
+    SSNR(q) = sqrt(signal_power / noise_power)
+
+    where:
+    - signal_power = (|symmetric|² - |antisymmetric|²)₊
+    - noise_power = |antisymmetric|²
+
+    Parameters
+    ----------
+    halfset_recons : list[torch.Tensor]
+
+    Returns
+    -------
+    ssnr : torch.Tensor
+        Spectral SNR as function of spatial frequency
+    """
+    # Compute Fourier transforms
+    halfset_1, halfset_2 = halfset_recons
+    F1 = torch.fft.fft2(halfset_1)
+    F2 = torch.fft.fft2(halfset_2)
+
+    # Symmetric and antisymmetric decomposition
+    symmetric = (F1 + F2) / 2
+    antisymmetric = (F1 - F2) / 2
+
+    # Power spectra
+    noise_power = antisymmetric.abs()
+    total_power = symmetric.abs()
+    signal_power = (total_power - noise_power).clamp_min(0)
+
+    device = F1.device
+    nx, ny = F1.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    signal = signal_power.reshape(-1)
+    noise = noise_power.reshape(-1)
+
+    # Accumulate
+    signal_b = torch.bincount(inds_f, weights=signal * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=signal * w1, minlength=num_bins
+    )
+
+    noise_b = torch.bincount(inds_f, weights=noise * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=noise * w1, minlength=num_bins
+    )
+
+    ssnr = torch.sqrt(signal_b / noise_b.clamp_min(epsilon)) / (math.sqrt(num_bf) / 2)
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), ssnr[valid].cpu().numpy()
+
+
+def radially_average_fourier_array(
+    corner_centered_array: torch.Tensor,
+    sampling: tuple[float, float],
+):
+    device = corner_centered_array.device
+    nx, ny = corner_centered_array.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    array = corner_centered_array.reshape(-1)
+
+    # Accumulate
+    array_b = torch.bincount(inds_f, weights=array * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=array * w1, minlength=num_bins
+    )
+
+    counts_b = (
+        torch.bincount(inds_f, weights=w0, minlength=num_bins)
+        + torch.bincount(inds_f + 1, weights=w1, minlength=num_bins)
+    ).clamp_min(1)
+
+    array_b = array_b / counts_b
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), array_b[valid].cpu().numpy()
