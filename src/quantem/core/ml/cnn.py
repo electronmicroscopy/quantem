@@ -3,7 +3,14 @@ from typing import TYPE_CHECKING, Callable
 from quantem.core import config
 
 from .activation_functions import get_activation_function
-from .blocks import Conv2dBlock, Upsample2dBlock, Conv3dBlock, Upsample3dBlock, complex_pool, passfunc
+from .blocks import (
+    Conv2dBlock,
+    Conv3dBlock,
+    Upsample2dBlock,
+    Upsample3dBlock,
+    complex_pool,
+    passfunc,
+)
 
 if TYPE_CHECKING:
     import torch

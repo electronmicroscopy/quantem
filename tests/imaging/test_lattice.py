@@ -5,7 +5,7 @@ from matplotlib.figure import Figure
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.vector import Vector
-from quantem.imaging.lattice import Lattice  # Replace with actual import path
+from quantem.imaging.lattice import Lattice
 
 
 class TestLatticeInitialization:
@@ -887,6 +887,367 @@ class TestLatticeMeasurePolarization:
         assert isinstance(result, Vector)
 
 
+class TestCalculateOrderParameterRunWithRestarts:
+    """Test run_with_restarts functionality in calculate_order_parameter."""
+
+    @pytest.fixture
+    def lattice_with_polarization(self):
+        """Create lattice with polarization data for testing."""
+        # Create synthetic image
+        image = np.random.randn(200, 200)
+        lattice = Lattice.from_data(image)
+
+        # Mock lattice vectors and image
+        lattice._lat = np.array(
+            [
+                [10.0, 10.0],  # origin
+                [20.0, 0.0],  # u vector
+                [0.0, 20.0],  # v vector
+            ]
+        )
+        lattice._image = lattice.image
+
+        # Create synthetic polarization vectors matching measure_polarization output
+        n_sites = 100
+
+        polarization_vectors = Vector.from_shape(
+            shape=(1,),
+            fields=("x", "y", "a", "b", "da", "db"),
+            units=("px", "px", "ind", "ind", "ind", "ind"),
+            name="polarization",
+        )
+
+        # Create data array (n_sites, 6)
+        polarization_data = np.column_stack(
+            [
+                np.random.randn(n_sites) * 10 + 50,  # x
+                np.random.randn(n_sites) * 10 + 50,  # y
+                np.random.randint(0, 10, n_sites).astype(float),  # a
+                np.random.randint(0, 10, n_sites).astype(float),  # b
+                np.random.randn(n_sites) * 0.1,  # da
+                np.random.randn(n_sites) * 0.1,  # db
+            ]
+        )
+
+        polarization_vectors.set_data(polarization_data, 0)
+
+        return lattice, polarization_vectors
+
+    def test_run_with_restarts_single_restart(self, lattice_with_polarization):
+        """Test with num_restarts=1"""
+        lattice, polarization = lattice_with_polarization
+
+        result = lattice.calculate_order_parameter(
+            polarization,
+            num_phases=2,
+            run_with_restarts=True,
+            num_restarts=1,
+            plot_gmm_visualization=False,
+            plot_order_parameter=False,
+        )
+
+        assert result is lattice
+        assert hasattr(lattice, "_polarization_means")
+        assert hasattr(lattice, "_order_parameter_probabilities")
+
+    def test_run_with_restarts_multiple_restarts(self, lattice_with_polarization):
+        """Test with multiple restarts."""
+        lattice, polarization = lattice_with_polarization
+
+        result = lattice.calculate_order_parameter(
+            polarization,
+            num_phases=2,
+            run_with_restarts=True,
+            num_restarts=5,
+            plot_gmm_visualization=False,
+            plot_order_parameter=False,
+        )
+
+        assert result is lattice
+        assert lattice._polarization_means.shape == (2, 2)
+        assert lattice._order_parameter_probabilities.shape[1] == 2
+
+    def test_run_with_restarts_consistency(self, lattice_with_polarization):
+        """Test that best result is chosen across restarts."""
+        lattice, polarization = lattice_with_polarization
+
+        # Run with multiple restarts
+        lattice.calculate_order_parameter(
+            polarization,
+            num_phases=3,
+            run_with_restarts=True,
+            num_restarts=10,
+            plot_gmm_visualization=False,
+            plot_order_parameter=False,
+        )
+
+        # Verify shapes
+        assert lattice._polarization_means.shape == (3, 2)
+        assert lattice._order_parameter_probabilities.shape[1] == 3
+
+        # Verify probabilities sum to 1
+        prob_sums = np.sum(lattice._order_parameter_probabilities, axis=1)
+        assert np.allclose(prob_sums, 1.0, atol=1e-5)
+
+    def test_run_with_restarts_different_num_phases(self, lattice_with_polarization):
+        """Test restarts with different numbers of phases."""
+        lattice, polarization = lattice_with_polarization
+
+        for num_phases in [1, 2, 3, 4]:
+            result = lattice.calculate_order_parameter(
+                polarization,
+                num_phases=num_phases,
+                run_with_restarts=True,
+                num_restarts=3,
+                plot_gmm_visualization=False,
+                plot_order_parameter=False,
+            )
+
+            assert result is lattice
+            assert lattice._polarization_means.shape == (num_phases, 2)
+            assert lattice._order_parameter_probabilities.shape[1] == num_phases
+
+    def test_run_with_restarts_invalid_num_restarts(self, lattice_with_polarization):
+        """Test that invalid num_restarts raises assertion error."""
+        lattice, polarization = lattice_with_polarization
+
+        with pytest.raises(AssertionError):
+            lattice.calculate_order_parameter(
+                polarization,
+                num_phases=2,
+                run_with_restarts=True,
+                num_restarts=0,
+                plot_gmm_visualization=False,
+                plot_order_parameter=False,
+            )
+
+        with pytest.raises(AssertionError):
+            lattice.calculate_order_parameter(
+                polarization,
+                num_phases=2,
+                run_with_restarts=True,
+                num_restarts=-1,
+                plot_gmm_visualization=False,
+                plot_order_parameter=False,
+            )
+
+    @pytest.mark.slow
+    def test_run_with_restarts_large_number(self):
+        """Test with large number of restarts."""
+        # Create fresh lattice
+        image = np.random.randn(200, 200)
+        lattice = Lattice.from_data(image)
+        lattice._lat = np.array([[10.0, 10.0], [20.0, 0.0], [0.0, 20.0]])
+        lattice._image = lattice.image
+
+        # Use smaller dataset for speed
+        n_sites = 20
+        small_polarization = Vector.from_shape(
+            shape=(1,),
+            fields=("x", "y", "a", "b", "da", "db"),
+            units=("px", "px", "ind", "ind", "ind", "ind"),
+            name="polarization",
+        )
+
+        small_data = np.column_stack(
+            [
+                np.random.randn(n_sites) * 10 + 50,
+                np.random.randn(n_sites) * 10 + 50,
+                np.random.randint(0, 10, n_sites).astype(float),
+                np.random.randint(0, 10, n_sites).astype(float),
+                np.random.randn(n_sites) * 0.1,
+                np.random.randn(n_sites) * 0.1,
+            ]
+        )
+        small_polarization.set_data(small_data, 0)
+
+        result = lattice.calculate_order_parameter(
+            small_polarization,
+            num_phases=2,
+            run_with_restarts=True,
+            num_restarts=25,
+            plot_gmm_visualization=False,
+            plot_order_parameter=False,
+        )
+
+        assert result is lattice
+        assert lattice._polarization_means.shape == (2, 2)
+
+    def test_run_with_restarts_empty_polarization(self):
+        """Test restarts with empty polarization vectors"""
+        lattice = Lattice.from_data(np.random.randn(100, 100))
+        lattice._lat = np.array([[10, 10], [20, 0], [0, 20]])
+        lattice._image = lattice.image
+
+        # Create Vector with empty data
+        empty_polarization = Vector.from_shape(
+            shape=(1,),
+            fields=("x", "y", "a", "b", "da", "db"),
+            units=("px", "px", "ind", "ind", "ind", "ind"),
+            name="polarization",
+        )
+
+        empty_data = np.zeros((0, 6), dtype=float)
+        empty_polarization.set_data(empty_data, 0)
+
+        # Empty polarization should raise an error or be handled gracefully
+        try:
+            result = lattice.calculate_order_parameter(
+                empty_polarization,
+                num_phases=2,
+                run_with_restarts=True,
+                num_restarts=3,
+                plot_gmm_visualization=False,
+                plot_order_parameter=False,
+            )
+            # If it succeeds, check that result is returned
+            assert result is lattice
+        except (ValueError, IndexError) as e:
+            # Empty polarization may raise an error, which is acceptable
+            assert (
+                "empty" in str(e).lower() or "zero" in str(e).lower() or "sample" in str(e).lower()
+            )
+
+    def test_run_with_restarts_few_sites(self):
+        """Test restarts with few polarization sites."""
+        lattice = Lattice.from_data(np.random.randn(100, 100))
+        lattice._lat = np.array([[10, 10], [20, 0], [0, 20]])
+        lattice._image = lattice.image
+
+        # Use at least 5 sites to avoid KDE issues
+        n_sites = 5
+        small_polarization = Vector.from_shape(
+            shape=(1,),
+            fields=("x", "y", "a", "b", "da", "db"),
+            units=("px", "px", "ind", "ind", "ind", "ind"),
+            name="polarization",
+        )
+
+        small_data = np.column_stack(
+            [
+                10.0 + np.arange(n_sites, dtype=float),
+                20.0 + np.arange(n_sites, dtype=float),
+                np.zeros(n_sites, dtype=float),
+                np.zeros(n_sites, dtype=float),
+                1.0 + np.random.randn(n_sites) * 0.1,
+                2.0 + np.random.randn(n_sites) * 0.1,
+            ]
+        )
+        small_polarization.set_data(small_data, 0)
+
+        result = lattice.calculate_order_parameter(
+            small_polarization,
+            num_phases=1,
+            run_with_restarts=True,
+            num_restarts=5,
+            plot_gmm_visualization=False,
+            plot_order_parameter=False,
+        )
+
+        assert result is lattice
+        assert lattice._order_parameter_probabilities.shape == (n_sites, 1)
+
+    def test_run_with_restarts_deterministic_seed(self, lattice_with_polarization):
+        """Test that setting torch seed gives reproducible results."""
+        lattice, polarization = lattice_with_polarization
+
+        try:
+            import torch
+
+            # Run twice with same seed
+            torch.manual_seed(42)
+            result1 = lattice.calculate_order_parameter(
+                polarization,
+                num_phases=2,
+                run_with_restarts=True,
+                num_restarts=3,
+                plot_gmm_visualization=False,
+                plot_order_parameter=False,
+            )
+            means1 = result1._polarization_means.copy()
+            probs1 = result1._order_parameter_probabilities.copy()
+
+            torch.manual_seed(42)
+            result2 = lattice.calculate_order_parameter(
+                polarization,
+                num_phases=2,
+                run_with_restarts=True,
+                num_restarts=3,
+                plot_gmm_visualization=False,
+                plot_order_parameter=False,
+            )
+            means2 = result2._polarization_means.copy()
+            probs2 = result2._order_parameter_probabilities.copy()
+
+            # Results should be identical with same seed
+            assert np.allclose(means1, means2, atol=1e-5)
+            assert np.allclose(probs1, probs2, atol=1e-5)
+
+        except ImportError:
+            pytest.skip("PyTorch not available")
+
+    def test_run_with_restarts_torch_device(self, lattice_with_polarization):
+        """Test that torch_device parameter is accepted."""
+        lattice, polarization = lattice_with_polarization
+
+        try:
+            # Test CPU device
+            result = lattice.calculate_order_parameter(
+                polarization,
+                num_phases=2,
+                run_with_restarts=True,
+                num_restarts=2,
+                torch_device="cpu",
+                plot_gmm_visualization=False,
+                plot_order_parameter=False,
+            )
+
+            assert result is lattice
+
+        except ImportError:
+            pytest.skip("PyTorch not available")
+
+    def test_run_with_restarts_probability_bounds(self, lattice_with_polarization):
+        """Test that probabilities are properly bounded after restarts."""
+        lattice, polarization = lattice_with_polarization
+
+        lattice.calculate_order_parameter(
+            polarization,
+            num_phases=3,
+            run_with_restarts=True,
+            num_restarts=5,
+            plot_gmm_visualization=False,
+            plot_order_parameter=False,
+        )
+
+        probs = lattice._order_parameter_probabilities
+
+        # All probabilities should be between 0 and 1
+        assert np.all(probs >= 0.0)
+        assert np.all(probs <= 1.0)
+
+        # Each row should sum to 1
+        row_sums = np.sum(probs, axis=1)
+        assert np.allclose(row_sums, 1.0, atol=1e-5)
+
+    def test_run_with_restarts_false_behavior(self, lattice_with_polarization):
+        """Test that run_with_restarts=False still works correctly."""
+        lattice, polarization = lattice_with_polarization
+
+        result = lattice.calculate_order_parameter(
+            polarization,
+            num_phases=2,
+            run_with_restarts=False,
+            num_restarts=1,
+            plot_gmm_visualization=False,
+            plot_order_parameter=False,
+        )
+
+        assert result is lattice
+        assert hasattr(lattice, "_polarization_means")
+        assert hasattr(lattice, "_order_parameter_probabilities")
+
+
 class TestLatticeEdgeCases:
     """Test edge cases and error handling for Lattice class."""
 
@@ -1267,17 +1628,6 @@ class TestLatticeRobustness:
         lattice = Lattice.from_data(image)
 
         assert lattice is not None
-
-    def test_lattice_with_complex_numbers(self):
-        """Test lattice behavior with complex numbers."""
-        image = np.random.randn(50, 50) + 1j * np.random.randn(50, 50)
-
-        # Should either handle complex or raise appropriate error
-        try:
-            lattice = Lattice.from_data(image)
-            assert lattice is not None
-        except (ValueError, TypeError):
-            pass  # Expected for complex numbers
 
     def test_lattice_with_sparse_data(self):
         """Test lattice with mostly zero data."""

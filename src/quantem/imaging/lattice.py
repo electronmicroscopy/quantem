@@ -194,9 +194,9 @@ class Lattice(AutoSerialize):
 
             assert block_size is None or block_size > 0, "block_size must be positive or None."
 
-            H, W = self._image.shape  # rows (x), cols (y)
+            H, W = self._image.shape
             im = np.asarray(self._image.array, dtype=float)
-            r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)  # (x, y)
+            r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
 
             corners = np.array(
                 [
@@ -212,6 +212,7 @@ class Lattice(AutoSerialize):
             A = np.column_stack((u, v))  # (2,2)
             ab = np.linalg.lstsq(A, (corners - r0[None, :]).T, rcond=None)[0]  # (2,4)
 
+            # Getting the min and max values for the indices a, b from the corners
             a_min, a_max = int(np.floor(ab[0].min())), int(np.ceil(ab[0].max()))
             b_min, b_max = int(np.floor(ab[1].min())), int(np.ceil(ab[1].max()))
 
@@ -315,6 +316,7 @@ class Lattice(AutoSerialize):
             current_basis = None
 
             def objective(theta: np.ndarray) -> float:
+                """Function to be minimized"""
                 # theta is 6-vector -> (3,2) matrix [[r0],[u],[v]]
                 lat = theta.reshape(3, 2)
                 xy = current_basis @ lat  # (N,2) with columns (x,y)
@@ -356,12 +358,10 @@ class Lattice(AutoSerialize):
             if ax.images:
                 ax.images[-1].set_zorder(0)
 
-            H, W = self._image.shape  # rows (x), cols (y)
-            r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)  # each (x, y) == (row, col)
+            H, W = self._image.shape
+            r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
 
-            # -------------------------------
             # Origin marker (TOP of stack)
-            # -------------------------------
             ax.scatter(
                 r0[1],
                 r0[0],  # (y, x)
@@ -372,9 +372,7 @@ class Lattice(AutoSerialize):
                 zorder=30,
             )
 
-            # -------------------------------
             # Lattice vectors as arrows
-            # -------------------------------
             n_vec = int(bound_num_vectors) if bound_num_vectors is not None else 1
 
             # draw n_vec arrows for u (red)
@@ -409,9 +407,7 @@ class Lattice(AutoSerialize):
                     zorder=20,
                 )
 
-            # -----------------------------------------
             # Solve for a,b at plot corners (bounds)
-            # -----------------------------------------
             if bound_num_vectors is None:
                 corners = np.array(
                     [
@@ -434,18 +430,16 @@ class Lattice(AutoSerialize):
                 )
 
             # a,b from corners; A = [u v] in columns (2x2), rhs = (corner - r0)
-            A = np.column_stack((u, v))  # shape (2,2)
-            ab = np.linalg.lstsq(A, (corners - r0[None, :]).T, rcond=None)[0]  # (2,4)
+            A = np.column_stack((u, v))
+            ab = np.linalg.lstsq(A, (corners - r0[None, :]).T, rcond=None)[0]
 
             a_min, a_max = int(np.floor(np.min(ab[0]))), int(np.ceil(np.max(ab[0])))
             b_min, b_max = int(np.floor(np.min(ab[1]))), int(np.ceil(np.max(ab[1])))
 
-            # -----------------------------------------
             # Clipping rectangle (image or custom)
-            # -----------------------------------------
             if bound_num_vectors is None:
-                x_lo, x_hi = 0.0, float(H)  # rows
-                y_lo, y_hi = 0.0, float(W)  # cols
+                x_lo, x_hi = 0.0, float(H)
+                y_lo, y_hi = 0.0, float(W)
             else:
                 # Bounds are the min/max over the provided corners
                 x_lo, x_hi = float(np.min(corners[:, 0])), float(np.max(corners[:, 0]))
@@ -485,10 +479,8 @@ class Lattice(AutoSerialize):
                 p2 = base + t1 * direction
                 return p1, p2
 
-            # -----------------------------------------
             # Lattice lines (zorder above image)
             # Using x=rows, y=cols: plot(y, x)
-            # -----------------------------------------
 
             # Lines parallel to v (vary a)
             for a in range(a_min, a_max + 1):
@@ -643,16 +635,17 @@ class Lattice(AutoSerialize):
         self._positions_frac = np.atleast_2d(np.array(positions_frac, dtype=float))
         self._num_sites = self._positions_frac.shape[0]
         self._numbers = (
-            np.arange(1, self._num_sites + 1, dtype=int)
+            np.arange(0, self._num_sites, dtype=int)
             if numbers is None
             else np.atleast_1d(np.array(numbers, dtype=int))
         )
 
         im = np.asarray(self._image.array, dtype=float)
-        H, W = self._image.shape  # x=rows, y=cols
+        H, W = self._image.shape
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
         A = np.column_stack((u, v))
 
+        # Min and max values of a,b are calculated based on corners
         corners = np.array(
             [[0.0, 0.0], [float(H), 0.0], [0.0, float(W)], [float(H), float(W)]], dtype=float
         )
@@ -661,6 +654,10 @@ class Lattice(AutoSerialize):
         b_min, b_max = int(np.floor(np.min(ab[1]))), int(np.ceil(np.max(ab[1])))
 
         def _auto_radius_px() -> float:
+            """
+            Estimate a default disk radius in pixels as half the nearest-neighbor spacing
+            (with periodic wrapping), or from lattice vectors if insufficient points.
+            """
             S = self._positions_frac
             if S.shape[0] >= 2:
                 d = S[:, None, :] - S[None, :, :]
@@ -695,6 +692,10 @@ class Lattice(AutoSerialize):
                 DT = None
 
         def mean_disk(x: float, y: float) -> float:
+            """
+            Compute the mean image intensity within a circular disk of radius r_px centered at (x, y),
+            with boundary clipping and fallback to the center pixel if empty.
+            """
             ix0, iy0 = int(np.floor(x)), int(np.floor(y))
             i0, i1 = max(0, ix0 - R_disk), min(H - 1, ix0 + R_disk)
             j0, j1 = max(0, iy0 - R_disk), min(W - 1, iy0 + R_disk)
@@ -708,6 +709,10 @@ class Lattice(AutoSerialize):
             return float(vals.mean())
 
         def mean_std_annulus(x: float, y: float) -> tuple[float, float]:
+            """
+            Compute the mean and standard deviation of intensities within an annulus [rin, rout] centered at (x, y),
+            with boundary clipping and fallback to the center pixel and zero std if empty.
+            """
             ix0, iy0 = int(np.floor(x)), int(np.floor(y))
             i0, i1 = max(0, ix0 - R_ring), min(H - 1, ix0 + R_ring)
             j0, j1 = max(0, iy0 - R_ring), min(W - 1, iy0 + R_ring)
@@ -736,7 +741,7 @@ class Lattice(AutoSerialize):
                 indexing="ij",
             )
             basis = np.vstack((np.ones(aa.size), aa.ravel(), bb.ravel())).T
-            xy = basis @ self._lat  # (N,2) in (x,y)
+            xy = basis @ self._lat  # (N,2)
 
             x, y = xy[:, 0], xy[:, 1]
             in_bounds = (x >= 0.0) & (x <= H - 1) & (y >= 0.0) & (y <= W - 1)
@@ -1106,9 +1111,6 @@ class Lattice(AutoSerialize):
             - If k-nearest search is used with `min_neighbours` < 2 or `max_neighbours` < 2.
             - If `min_neighbours` > `max_neighbours`.
             - If no atoms have any neighbors identified (increase `reference_radius`).
-        DeprecationWarning
-            If `reference_num` is provided.
-            Use `max_neighbours` and `min_neighbours` instead.
         Warning
             If some atoms do not have any neighbors identified (suggests increasing `reference_radius`).
 
@@ -1127,14 +1129,6 @@ class Lattice(AutoSerialize):
         - If either the measure or reference site is empty, an empty Vector (with zero rows) is returned.
         """
         from scipy.spatial import cKDTree
-
-        # This is temporary. In case any old notebooks are still using "reference_num"
-        if "reference_num" in plot_kwargs:
-            if max_neighbours is None:
-                max_neighbours = plot_kwargs["reference_num"]
-                raise DeprecationWarning(
-                    "'reference_num' is deprecated. Use 'max_neighbours' and 'min_neighbours'."
-                )
 
         measure_ind = int(measure_ind)
         reference_ind = int(reference_ind)
@@ -1176,7 +1170,7 @@ class Lattice(AutoSerialize):
         if is_empty(A_cell) or is_empty(B_cell):
             return empty_vector()
 
-        # Extract common atom data
+        # Extract site data
         Ax = self.atoms[measure_ind]["x"]
         Ay = self.atoms[measure_ind]["y"]
         Aa = self.atoms[measure_ind]["a"]
@@ -1189,7 +1183,7 @@ class Lattice(AutoSerialize):
         if Ax.size == 0 or Bx.size == 0:
             return empty_vector()
 
-        # Lattice vectors: r0 (unused here), u, v
+        # Lattice vectors: r0, u, v
         lat = np.asarray(getattr(self, "_lat", None))
         if lat is None or lat.shape[0] < 3:
             raise ValueError("Lattice vectors (_lat) are missing or malformed.")
@@ -1236,19 +1230,18 @@ class Lattice(AutoSerialize):
                 workers=-1,
             )
 
-            # Vectorized distance calculations where possible
             for i, neighbors in enumerate(neighbor_lists):
                 if len(neighbors) == 0:
                     dists.append(np.array([]))
                     idxs.append(np.array([]))
                     continue
 
-                # Vectorized distance calculation
+                # Distance calculation
                 neighbor_coords = ref_coords[neighbors]
                 query_point = query_coords[i]
                 distances = np.linalg.norm(neighbor_coords - query_point, axis=1)
 
-                # Vectorized sorting
+                # Sorting
                 sort_idx = np.argsort(distances)
                 sorted_distances = distances[sort_idx]
                 sorted_indices = np.array(neighbors)[sort_idx]
@@ -1261,7 +1254,7 @@ class Lattice(AutoSerialize):
                 dists.append(sorted_distances)
                 idxs.append(sorted_indices)
 
-            # Vectorized length checking
+            # Length checking
             lengths = np.array([len(row) for row in dists])
             if min_neighbours is not None and np.any(lengths < min_neighbours):
                 raise ValueError(
@@ -1287,14 +1280,14 @@ class Lattice(AutoSerialize):
                 workers=-1,
             )
 
-            # Vectorized processing of results
+            # Processing of results
             finite_mask = np.isfinite(dist_array)
             for i in range(len(query_coords)):
                 mask = finite_mask[i]
                 dists.append(dist_array[i][mask])
                 idxs.append(idx_array[i][mask])
 
-        # Vectorized neighbor checking
+        # Neighbor checking
         lengths = np.array([len(row) for row in dists])
         atoms_with_atleast_one_neighbour = lengths > 0
 
@@ -1318,11 +1311,13 @@ class Lattice(AutoSerialize):
         # Calculate displacements with optimizations
         for i, (atom_dists, atom_idxs) in enumerate(zip(dists, idxs)):
             if len(atom_idxs) == 0:
-                continue  # Arrays already initialized to 0
+                # Arrays already initialized to 0
+                continue
 
             # Check if we have enough neighbors
             if min_neighbours is not None and len(atom_idxs) < min_neighbours:
-                continue  # Arrays already initialized to 0
+                # Arrays already initialized to 0
+                continue
 
             # Determine how many neighbors to use
             num_neighbors_to_use = len(atom_idxs)
@@ -1333,9 +1328,8 @@ class Lattice(AutoSerialize):
                     num_neighbors_to_use, min(min_neighbours, len(atom_idxs))
                 )
 
-            # Select the neighbors to use (closest ones) - optimized
+            # Select the neighbors to use
             if num_neighbors_to_use < len(atom_idxs):
-                # Use argpartition for better performance when we don't need full sort
                 closest_order = np.argpartition(atom_dists, num_neighbors_to_use)[
                     :num_neighbors_to_use
                 ]
@@ -1343,29 +1337,26 @@ class Lattice(AutoSerialize):
             else:
                 nbr_idx = atom_idxs.astype(int)
 
-            # Vectorized position calculations
+            # Get actual positions of the atoms
             actual_pos = np.array([x_arr[i], y_arr[i]])
 
-            # Vectorized fractional calculations
+            # Calculate the expected positions of the atoms using its n_neighbors
             a, b = a_arr[i], b_arr[i]
             ai, bi = Ba[nbr_idx], Bb[nbr_idx]
             xi, yi = Bx[nbr_idx], By[nbr_idx]
 
-            # Vectorized matrix operations
             fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
             neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
 
-            # Single matrix multiplication for all neighbors
             expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
 
-            # Vectorized mean calculation
+            # Taking the mean of the expected position calculated using each neighbor for better robustness.
             expected_position = np.mean(expected_positions, axis=1)  # (2,)
 
-            # Vectorized displacement calculations
+            # Difference between actual and expected positions gives us polarization.
             displacement_cartesian = actual_pos - expected_position
             displacement_fractional = L_inv @ displacement_cartesian
 
-            # Direct assignment
             da_arr[i] = displacement_fractional[0]
             db_arr[i] = displacement_fractional[1]
 
@@ -1380,7 +1371,6 @@ class Lattice(AutoSerialize):
         if len(x_arr) > 0:
             arr = np.column_stack([x_arr, y_arr, a_arr, b_arr, da_arr, db_arr])
         else:
-            # Create empty array with shape (0, 6)
             arr = np.zeros((0, 6), dtype=float)
 
         out.set_data(arr, 0)
@@ -1396,10 +1386,12 @@ class Lattice(AutoSerialize):
         num_phases: int = 2,
         phase_polarization_peak_array: NDArray | None = None,
         refine_means: bool = True,
+        run_with_restarts: bool = False,
+        num_restarts: int = 1,
+        verbose: bool = False,
         plot_order_parameter: bool = True,
         plot_gmm_visualization: bool = True,
         torch_device: str = "cpu",
-        # plot_confidence_map : bool = False,
         **kwargs,
     ) -> "Lattice":
         """
@@ -1415,7 +1407,8 @@ class Lattice(AutoSerialize):
             - Overlay the order parameter (probability-colored sites) on the original image grid.
 
         Parameters
-            - polarization_vectors: Vector
+        ----------
+        polarization_vectors : Vector
             A collection holding polarization data. Only the first element
             polarization_vectors[0] is used and must provide the following keys:
                 - 'x': NDArray of shape (N,), row coordinates for each site.
@@ -1424,132 +1417,168 @@ class Lattice(AutoSerialize):
                 - 'db': NDArray of shape (N,), fractional polarization along b (e.g., dv).
             All arrays must be one-dimensional, aligned, and of equal length N.
 
-            - num_phases: int, default=2
+        num_phases : int, default=2
             Number of Gaussian components (phases) in the mixture. Must be >= 1.
             For num_phases=1, all sites belong to a single phase (probabilities are all 1).
 
-            - phase_polarization_peak_array: NDArray | None, default=None
+        phase_polarization_peak_array : NDArray | None, default=None
             Optional array of shape (num_phases, 2) specifying phase centers (means)
             in (da, db) space:
                 - If refine_means = True, these values initialize the GMM means.
                 - If refine_means = False, the means are held fixed during fitting
                     and only covariances and weights are updated.
 
-            - refine_means: bool, default=True
+        refine_means : bool, default=True
             If False, requires phase_polarization_peak_array to be provided with shape
             (num_phases, 2). The GMM means are fixed to these values throughout EM.
 
-            - plot_order_parameter: bool, default=True
+        run_with_restarts : bool, default=False
+            If True, runs the GMM fitting multiple times with different initializations
+            and selects the best result based on classification certainty.
+
+        num_restarts : int, default=1
+            Number of random restarts when run_with_restarts=True. Must be >= 1.
+
+        verbose : bool, default=False
+            If True, prints diagnostic information including fitted means and error
+            metrics for each restart.
+
+        plot_order_parameter : bool, default=True
             If True, overlays sites on self._image.array and colors them by their full
             mixture probability distribution:
                 - For 2 phases, adds a two-color probability bar.
                 - For 3 phases, adds a ternary-style color triangle.
                 - For other values, no legend is shown.
 
-            - plot_gmm_visualization: bool, default=True
+        plot_gmm_visualization : bool, default=True
             If True, shows a visualization in (da, db) space:
                 - A Gaussian KDE density (scipy.stats.gaussian_kde) on a symmetric grid
                     spanning max(abs(da), abs(db)).
                 - Scatter of points colored by mixture probabilities.
                 - GMM centers (means) and ~95% confidence ellipses (2 standard deviations).
 
-            - torch_device: str, default='cpu'
+        torch_device : str, default='cpu'
             Torch device used by the TorchGMM backend. Examples: 'cpu', 'cuda',
             'cuda:0'. If a CUDA device is requested but unavailable, the underlying
             GMM implementation may raise an error.
 
-            - **kwargs: Additional keyword arguments controlling visualization.
-                When plot_gmm_visualization=True, the following keys are supported and validated:
-                - contour_cmap: Matplotlib colormap name for the background contour;
-                    invalid names fall back to a preset ('gray') with a warning.
-                - gmm_center_colour: Color for GMM center markers;
-                    invalid values fall back to a preset with a warning.
-                    Presets depend on num_phases (2: 'lime'; 3-4: 'Yellow'; ≥5: 'Black').
-                - gmm_ellipse_colour: Color for GMM covariance ellipses;
-                    invalid values fall back to a preset with a warning.
-                    Presets depend on num_phases (2: 'lime'; 3-4: 'Yellow'; ≥5: 'White').
-                - scatter_colours: Colors used to map phase probabilities for scatter points
-                    (and the order-parameter map). Accepted forms:
-                        • callable f(i) -> RGB(A) (first 3 components used),
-                        • numpy array of shape (num_phases, 3) with RGB in [0, 1],
-                        • list/tuple of valid color names/values of length num_phases,
-                        • single valid color (applied to all phases; prints a warning).
-                    Invalid inputs fall back to a preset (site_colors) with a warning.
-                    When plot_order_parameter=True,
-                    scatter_colours is used to color points by phase probabilities.
-                Optionally, kwargs intended for show_2d (e.g., cmap, title, vmin, vmax)
-                may be provided and forwarded
+        **kwargs : dict
+            Additional keyword arguments controlling visualization.
+            When plot_gmm_visualization=True, the following keys are supported and validated:
+
+            contour_cmap : str, optional
+                Matplotlib colormap name for the background contour;
+                invalid names fall back to a preset ('gray_r') with a warning.
+
+            gmm_center_colour : color specification, optional
+                Color for GMM center markers; invalid values fall back to a preset with a warning.
+                Presets depend on num_phases (2: lime; 3-4: Yellow; ≥5: Black).
+
+            gmm_ellipse_colour : color specification, optional
+                Color for GMM covariance ellipses; invalid values fall back to a preset with a warning.
+                Presets depend on num_phases (2: lime; 3-4: Yellow; ≥5: White).
+
+            scatter_colours : callable, array, or list, optional
+                Colors used to map phase probabilities for scatter points
+                (and the order-parameter map). Accepted forms:
+                    • callable f(i) -> RGB(A) (first 3 components used),
+                    • numpy array of shape (num_phases, 3) with RGB in [0, 1],
+                    • list/tuple of valid color names/values of length num_phases,
+                    • single valid color (applied to all phases; prints a warning).
+                Invalid inputs fall back to a preset (site_colors) with a warning.
+                When plot_order_parameter=True,
+                scatter_colours is used to color points by phase probabilities.
 
         Returns
-            - self:
+        -------
+        self : Lattice
             The same object, modified in-place.
 
         Side Effects
-            - Sets the following attributes on self:
-            - self._polarization_means: NDArray of shape (num_phases, 2),
+        ------------
+        Sets the following attributes on self:
+            - self._polarization_means : NDArray of shape (num_phases, 2),
                 the fitted (or fixed) means in (da, db) space.
-            - self._order_parameter_probabilities: NDArray of shape (N, num_phases),
+            - self._order_parameter_probabilities : NDArray of shape (N, num_phases),
                 posterior probabilities per site.
-            - Produces plots if plot_gmm_visualization or plot_order_parameter is True.
+
+        Produces plots if plot_gmm_visualization or plot_order_parameter is True.
 
         Notes
-            - The GMM uses full covariance matrices (covariance_type='full') and an EM
-            implementation backed by TorchGMM (PyTorch).
-            - The KDE contour limits are symmetric around the origin and set by
-            max(abs(da), abs(db)).
-            - In the order-parameter overlay, coordinates are plotted as:
-            x-axis: 'y' (column), y-axis: 'x' (row).
-            - Helper functions expected to exist:
-            - create_colors_from_probabilities(probabilities, num_phases)
-            - add_2phase_colorbar(ax)
-            - add_3phase_color_triangle(fig, ax)
+        -----
+        - The GMM uses full covariance matrices (covariance_type='full') and an EM
+        implementation backed by TorchGMM (PyTorch).
+        - The KDE contour limits are symmetric around the origin and set by
+        max(abs(da), abs(db)).
+        - In the order-parameter overlay, coordinates are plotted as:
+        x-axis: 'y' (column), y-axis: 'x' (row).
+        - Helper functions expected to exist:
+            - create_colors_from_probabilities(probabilities, num_phases, colors)
+            - add_2phase_colorbar(ax, colors)
+            - add_3phase_color_triangle(fig, ax, colors)
             - show_2d(image, ...)
-            - Requires self._image.array to be present for the order-parameter overlay.
+        - Requires self._image.array to be present for the order-parameter overlay.
 
         Raises
-            - ValueError:
+        ------
+        ValueError
             If phase_polarization_peak_array is provided with incorrect shape
             (must be (num_phases, 2)).
-            - ValueError:
+        ValueError
             If refine_means=False and phase_polarization_peak_array is None.
-            - AttributeError:
+        AttributeError
             If plot_order_parameter=True but self._image or self._image.array is missing.
-            - ImportError:
+        ImportError
             If required plotting/scientific packages (matplotlib, scipy) are unavailable.
-            - RuntimeError or ValueError (from TorchGMM):
-            If the torch device is invalid or unavailable.
+        RuntimeError or ValueError
+            From TorchGMM if the torch device is invalid or unavailable.
 
         Examples
-            - Fit a 2-phase GMM and show both visualizations:
-            lattice.calculate_order_parameter(
-                polarization_vectors,
-                num_phases=2,
-                plot_gmm_visualization=True,
-                plot_order_parameter=True
-            )
+        --------
+        Fit a 2-phase GMM and show both visualizations:
 
-            - Use fixed phase peaks:
-            peaks = np.array([[0.10, -0.05],
-                                [0.30,  0.07]], dtype=float)
-            lattice.calculate_order_parameter(
-                polarization_vectors,
-                num_phases=2,
-                phase_polarization_peak_array=peaks,
-                refine_means=True
-            )
+        >>> lattice.calculate_order_parameter(
+        ...     polarization_vectors,
+        ...     num_phases=2,
+        ...     plot_gmm_visualization=True,
+        ...     plot_order_parameter=True
+        ... )
 
-            - Run on GPU (if available):
-            lattice.calculate_order_parameter(
-                polarization_vectors,
-                num_phases=3,
-                torch_device='cuda:0'
-            )
+        Use fixed phase peaks:
+
+        >>> peaks = np.array([[0.10, -0.05],
+        ...                   [0.30,  0.07]], dtype=float)
+        >>> lattice.calculate_order_parameter(
+        ...     polarization_vectors,
+        ...     num_phases=2,
+        ...     phase_polarization_peak_array=peaks,
+        ...     refine_means=True
+        ... )
+
+        Run on GPU (if available):
+
+        >>> lattice.calculate_order_parameter(
+        ...     polarization_vectors,
+        ...     num_phases=3,
+        ...     torch_device='cuda:0'
+        ... )
         """
         # Imports
         import matplotlib.colors as mcolors
         import matplotlib.pyplot as plt
         from matplotlib.patches import Ellipse
         from scipy.stats import gaussian_kde
+
+        # Validate inputs
+        if run_with_restarts:
+            assert isinstance(num_restarts, int) and num_restarts > 0, (
+                "num_restarts must be positive when run_with_restarts is True"
+            )
+        else:
+            assert num_restarts == 1, "num_restarts must be 1 when run_with_restarts is False"
+        assert isinstance(num_phases, int) and num_phases >= 1, (
+            "num_phases must be an integer >= 1"
+        )
 
         # Functions
         def plot_gaussian_ellipse(ax, mean, cov, n_std=2, clip_path=None, **kwargs):
@@ -1690,6 +1719,35 @@ class Lattice(AutoSerialize):
         d_frac_arr = np.vstack([da_arr, db_arr])
         data = np.column_stack([da_arr, db_arr])
 
+        # Important validations and error handling
+        # Handle empty polarization vectors early
+        if len(da_arr) == 0:
+            # Set empty attributes and return early
+            self._polarization_means = np.empty((num_phases, 2), dtype=float)
+            self._order_parameter_probabilities = np.empty((0, num_phases), dtype=float)
+            if hasattr(self, "_polarization_labels"):
+                self._polarization_labels = np.array([], dtype=int)
+            return self
+
+        # Check for minimum number of samples for GMM
+        n_samples = len(da_arr)
+        if n_samples < num_phases:
+            raise ValueError(
+                f"Number of samples ({n_samples}) must be >= num_phases ({num_phases}) "
+                f"for Gaussian Mixture Model fitting."
+            )
+
+        # For KDE visualization, need at least 2 samples
+        if plot_gmm_visualization and n_samples < 2:
+            import warnings
+
+            warnings.warn(
+                f"Cannot plot KDE with only {n_samples} sample(s). "
+                "Disabling GMM visualization plot.",
+                UserWarning,
+            )
+            plot_gmm_visualization = False
+
         # Fit GMM with N Gaussians
         if phase_polarization_peak_array is None:
             gmm = TorchGMM(n_components=num_phases, covariance_type="full", device=torch_device)
@@ -1712,11 +1770,46 @@ class Lattice(AutoSerialize):
                     means_init=phase_polarization_peak_array,
                     device=torch_device,
                 )
-        gmm.fit(data)
 
-        # Calculate score between 0 and 1 for each point
-        # Get probabilities for each Gaussian
-        probabilities = gmm.predict_proba(data)  # Shape: (n_points, num_phases)
+        # Intialize best fit tracking variables if run_with_restarts
+        if run_with_restarts:
+            best_error = np.inf
+            best_means = None
+            best_probabilities = None
+            best_cov = None
+
+        for i in range(num_restarts):
+            gmm.fit(data)
+
+            # Calculate score between 0 and 1 for each point
+            # Get probabilities for each Gaussian
+            probabilities = gmm.predict_proba(data)  # Shape: (n_points, num_phases)
+
+            # Measure error as 1 - (mean of (probabilities of best fit))
+            error = 1 - probabilities.max(axis=1).mean()
+
+            # Calculate means
+            means = gmm.means_
+
+            if verbose:
+                print(f"Restart {i + 1}/{num_restarts}:")
+                print(f"    Means: \n{means}")
+                print(f"    Error: {error:.4f}")
+            if run_with_restarts:
+                if error < best_error:
+                    best_error = error
+                    best_means = means
+                    best_probabilities = probabilities
+                    best_cov = gmm.covariances_
+
+        if run_with_restarts and verbose:
+            print("Best results after restarts:")
+            print(f"    Means: \n{best_means}")
+            print(f"    Error: {best_error:.4f}")
+        elif verbose:
+            print("GMM fitting results:")
+            print(f"    Means: \n{gmm.means_}")
+            print(f"    Error: {i - probabilities.max(axis=1).mean():.4f}")
 
         # Create grid for contour - use max_bound to cover entire plot area
         max_bound = max(abs(da_arr).max(), abs(db_arr).max())
@@ -1728,12 +1821,19 @@ class Lattice(AutoSerialize):
         Z = gaussian_kde(d_frac_arr)(positions).reshape(X.shape)
 
         # Save GMM data
-        self._polarization_means = gmm.means_
-        self._order_parameter_probabilities = probabilities
+        if run_with_restarts:
+            self._polarization_means = best_means
+            self._order_parameter_probabilities = best_probabilities
+        else:
+            self._polarization_means = gmm.means_
+            self._order_parameter_probabilities = probabilities
+            best_means = gmm.means_
+            best_probabilities = probabilities
+            best_cov = gmm.covariances_
 
         num_components = num_phases
 
-        # ========== Combined Plot: Scatter overlaid on Contour ==========
+        # --- Combined Plot: Scatter overlaid on Contour ---
         if plot_gmm_visualization:
             from matplotlib.path import Path
             from matplotlib.ticker import FuncFormatter
@@ -1741,8 +1841,8 @@ class Lattice(AutoSerialize):
             # Define preset colors based on num_phases
             preset_contour_cmap = "gray_r"
             if num_phases == 2:
-                preset_gmm_center_colour = "lime"
-                preset_gmm_ellipse_colour = "lime"
+                preset_gmm_center_colour = (0, 0.7, 0)
+                preset_gmm_ellipse_colour = (0, 0.7, 0)
             elif num_phases < 5:
                 preset_gmm_center_colour = "Yellow"
                 preset_gmm_ellipse_colour = "Yellow"
@@ -1829,14 +1929,12 @@ class Lattice(AutoSerialize):
 
             # First: Plot contour in the background with distinct colormap
             ax.contourf(X, Y, Z, levels=15, cmap=contour_cmap, alpha=0.9)
-            ax.contour(
-                X, Y, Z, levels=15, cmap=contour_cmap, linewidths=0.5, alpha=0.9
-            )  # FIXED: cmap instead of colors
+            ax.contour(X, Y, Z, levels=15, cmap=contour_cmap, linewidths=0.5, alpha=0.9)
 
             # Second: Overlay scatter points with classification colors
             point_colors = create_colors_from_probabilities(
-                probabilities, num_components, scatter_colours
-            )  # FIXED: pass scatter_colours
+                best_probabilities, num_components, scatter_colours
+            )
             ax.scatter(
                 da_arr,
                 db_arr,
@@ -1859,11 +1957,11 @@ class Lattice(AutoSerialize):
                             contour_path = Path.make_compound_path(contour_path, path)
 
             # Plot GMM centers and ellipses using validated kwargs colors
-            gmm_color = [gmm_center_colour, gmm_ellipse_colour]  # FIXED: use kwargs values
+            gmm_color = [gmm_center_colour, gmm_ellipse_colour]
 
             ax.scatter(
-                gmm.means_[:, 0],
-                gmm.means_[:, 1],
+                best_means[:, 0],
+                best_means[:, 1],
                 c=gmm_color[0],
                 s=300,
                 marker="x",
@@ -1876,8 +1974,8 @@ class Lattice(AutoSerialize):
             for i in range(num_components):
                 plot_gaussian_ellipse(
                     ax,
-                    gmm.means_[i],
-                    gmm.covariances_[i],
+                    best_means[i],
+                    best_cov[i],
                     n_std=2,
                     edgecolor=gmm_color[1],
                     linewidth=1.5,
@@ -1888,8 +1986,8 @@ class Lattice(AutoSerialize):
                 )
 
             # Add x and y axes through origin
-            ax.axhline(y=0, color="white", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
-            ax.axvline(x=0, color="white", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
+            ax.axhline(y=0, color="black", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
+            ax.axvline(x=0, color="black", linewidth=1.5, linestyle="-", alpha=0.7, zorder=1)
 
             ax.set_xlabel("du")
             ax.set_ylabel("dv")
@@ -1911,7 +2009,9 @@ class Lattice(AutoSerialize):
 
         if plot_order_parameter:
             # Create colors from full probability distribution with custom scatter_colours
-            colors = create_colors_from_probabilities(probabilities, num_phases, scatter_colours)
+            colors = create_colors_from_probabilities(
+                best_probabilities, num_phases, scatter_colours
+            )
 
             fig, ax = show_2d(
                 self._image.array,
@@ -2176,9 +2276,10 @@ class Lattice(AutoSerialize):
         chroma_boost: float = 2.0,
         use_magnitude_lightness: bool = True,
         disp_color_max: float | None = None,
-        phase_offset_deg: float = 180.0,  # red = down (your convention)
+        phase_offset_deg: float = 180.0,  # red = down
         phase_dir_flip: bool = False,  # flip global hue mapping if desired
         aggregator: str = "mean",  # 'mean' or 'maxmag'
+        square_tiles: bool = False,  # if True, use square pixels; if False, use rectangles
         plot: bool = False,  # if True, draw with show_2d and legend
         returnfig: bool = False,  # if True (and plot=True) also return (fig, ax)
         show_colorbar: bool = True,
@@ -2186,8 +2287,20 @@ class Lattice(AutoSerialize):
         **kwargs,
     ):
         """
-        Build and return an RGB superpixel image indexed by integer (a,b), colored by
-        the same JCh cyclic mapping used for polarization vectors.
+        Build and return an RGB superpixel image indexed by integer (a,b), where each
+        pixel is colored according to the direction and magnitude of polarization vectors
+        using a perceptually uniform polar color mapping.
+
+        The hue encodes the displacement direction, while lightness and chroma encode the
+        magnitude. This provides a consistent visual representation across both arrow and
+        image-based polarization visualizations.
+
+        Parameters
+        ----------
+        square_tiles : bool, default False
+            If True, use square pixels (original method).
+            If False, use rectangular pixels proportional to lattice vectors u and v,
+            with area close to pixel_size^2.
 
         Returns
         -------
@@ -2199,8 +2312,6 @@ class Lattice(AutoSerialize):
         from mpl_toolkits.axes_grid1 import make_axes_locatable
 
         from quantem.core.visualization.visualization_utils import array_to_rgba
-        # Requires the shared helper from the arrow script:
-        # _compute_polar_color_mapping(dr, dc, subtract_median=..., use_magnitude_lightness=..., disp_color_max=...)
 
         # --- Extract data ---
         data = pol_vec.get_data(0)
@@ -2233,6 +2344,33 @@ class Lattice(AutoSerialize):
         dr_raw = displacement_cartesian[0].astype(float)  # down +
         dc_raw = displacement_cartesian[1].astype(float)  # right +
 
+        # --- Calculate pixel sizes ---
+        if square_tiles:
+            # Square pixels
+            pixel_size_a = pixel_size
+            pixel_size_b = pixel_size
+        else:
+            # Rectangular pixels proportional to u and v
+            # We want pixel_size_a * pixel_size_b ≈ pixel_size^2
+            # and pixel_size_a / pixel_size_b = |u| / |v|
+
+            # Get lattice vector magnitudes
+            u_mag = np.linalg.norm(u)
+            v_mag = np.linalg.norm(v)
+
+            # Calculate aspect ratio
+            aspect_ratio = u_mag / v_mag
+
+            # Solve for pixel dimensions:
+            # pixel_size_a = aspect_ratio * pixel_size_b
+            # pixel_size_a * pixel_size_b = pixel_size^2
+            # => aspect_ratio * pixel_size_b^2 = pixel_size^2
+            # => pixel_size_b = pixel_size / sqrt(aspect_ratio)
+            # => pixel_size_a = pixel_size * sqrt(aspect_ratio)
+
+            pixel_size_b = max(1, round(pixel_size / np.sqrt(aspect_ratio)))
+            pixel_size_a = max(1, round(pixel_size * np.sqrt(aspect_ratio)))
+
         # --- Unified color mapping (identical to arrow plot) ---
         dr, dc, amp, disp_cap_px = _compute_polar_color_mapping(
             dr_raw,
@@ -2248,7 +2386,7 @@ class Lattice(AutoSerialize):
             ang = -ang
         ang += np.deg2rad(phase_offset_deg)
 
-        # Per-sample RGB from JCh mapping
+        # Per-sample RGB from perceptually uniform polar color mapping
         rgba = array_to_rgba(amp, ang, chroma_boost=chroma_boost)
         colors = rgba.reshape(-1, 4)[:, :3] if rgba.ndim != 2 else rgba[:, :3]
 
@@ -2262,8 +2400,8 @@ class Lattice(AutoSerialize):
         ncols = b_max - b_min + 1
 
         # Output canvas
-        H = padding * 2 + nrows * pixel_size + (nrows - 1) * spacing
-        W = padding * 2 + ncols * pixel_size + (ncols - 1) * spacing
+        H = padding * 2 + nrows * pixel_size_a + (nrows - 1) * spacing
+        W = padding * 2 + ncols * pixel_size_b + (ncols - 1) * spacing
         img_rgb = np.zeros((H, W, 3), dtype=float)
 
         # Group indices by (a,b)
@@ -2279,8 +2417,8 @@ class Lattice(AutoSerialize):
         # Fill tiles
         for (aa, bb), idx_list in groups.items():
             rr, cc = aa - a_min, bb - b_min
-            r0 = padding + rr * (pixel_size + spacing)
-            c0 = padding + cc * (pixel_size + spacing)
+            r0 = padding + rr * (pixel_size_a + spacing)
+            c0 = padding + cc * (pixel_size_b + spacing)
 
             if aggregator == "maxmag":
                 j = idx_list[int(np.argmax(mag[idx_list]))]
@@ -2288,7 +2426,7 @@ class Lattice(AutoSerialize):
             else:  # 'mean'
                 color = colors[idx_list].mean(axis=0)
 
-            img_rgb[r0 : r0 + pixel_size, c0 : c0 + pixel_size, :] = color
+            img_rgb[r0 : r0 + pixel_size_a, c0 : c0 + pixel_size_b, :] = color
 
         # --- Optional rendering with legend ---
         if plot:
@@ -2667,11 +2805,11 @@ def site_colors(number):
 
     palette = [
         (1.00, 0.00, 0.00),  # 0: red
-        (0.00, 0.00, 1.00),  # 1: blue
-        (0.00, 1.00, 0.00),  # 2: green
+        (0.00, 0.70, 1.00),  # 1: lighter blue
+        (0.00, 0.70, 0.00),  # 2: green with lower perceptual brightness
         (1.00, 0.00, 1.00),  # 3: magenta
         (1.00, 0.70, 0.00),  # 4: orange
-        (0.00, 0.30, 1.00),  # 5: blue-ish
+        (0.00, 0.00, 1.00),  # 5: full blue
         # extras to improve variety when cycling:
         (0.60, 0.20, 0.80),
         (0.30, 0.75, 0.75),
@@ -2716,7 +2854,7 @@ def create_colors_from_probabilities(probabilities, num_phases, category_colors=
     """
     import matplotlib.colors as mcolors
 
-    # Get base colors for each category (assume 0-1 range)
+    # Get base colors for each category (0-1 range)
     if category_colors is None:
         category_colors = np.array([site_colors(i) for i in range(num_phases)])
 
@@ -2730,7 +2868,7 @@ def create_colors_from_probabilities(probabilities, num_phases, category_colors=
 
         # Create a smooth transition function
         def smooth_transition(x):
-            return 4 * x**3 - 3 * x**4
+            return 3 * x**2 - 2 * x**3
 
         # Apply smooth transition to certainty
         smooth_certainty = smooth_transition(certainty)
@@ -2797,10 +2935,10 @@ def add_2phase_colorbar(ax, scatter_colours):
         if fig_ax != ax:
             max_right = max(max_right, fig_ax.get_position().x1)
 
-    # Calculate the position for the new colorbar
+    # Calculate the position for the colorbar
     ax_pos = ax.get_position()
-    cbar_width = 0.035  # Width of the colorbar
-    cbar_pad = 0.05  # Increased padding between colorbars
+    cbar_width = 0.035
+    cbar_pad = 0.05
     cbar_left = max_right + cbar_pad
     cbar_bottom = ax_pos.y0
     cbar_height = ax_pos.height
@@ -2896,7 +3034,7 @@ def add_3phase_color_triangle(fig, ax, scatter_colours):
     positions = np.array(positions)
     probabilities_array = np.array(probabilities_list)
 
-    # Get colors using the same function with custom scatter_colours
+    # Get colors with custom scatter_colours
     colors = create_colors_from_probabilities(probabilities_array, 3, scatter_colours)
 
     # Plot the triangle
