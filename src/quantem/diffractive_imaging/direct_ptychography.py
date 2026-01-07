@@ -772,7 +772,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         )
 
     @property
-    def mean_corrected_bf(self):
+    def corrected_bf(self):
         if self.corrected_stack is None:
             return None
         return self.corrected_stack.sum(dim=0)
@@ -782,7 +782,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if self.corrected_stack is None:
             return None
         if self.corrected_stack.abs().sum() > 0:
-            variance_loss = ((self.corrected_stack - self.mean_corrected_bf).abs().square()).mean()
+            mean_corrected_bf = self.corrected_stack.mean(dim=0)
+            variance_loss = ((self.corrected_stack - mean_corrected_bf).abs().square()).mean()
         else:
             variance_loss = torch.tensor(
                 torch.inf, dtype=self.corrected_stack.dtype, device=self.device
@@ -791,7 +792,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
-        obj = to_numpy(self.mean_corrected_bf)
+        obj = to_numpy(self.corrected_bf)
         return obj
 
     def optimize_hyperparameters(
@@ -1226,9 +1227,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         }
 
         self.reconstruct(**safe_kwargs, bf_mask=bf1, verbose=False)
-        halfset_1 = self.mean_corrected_bf
+        halfset_1 = self.corrected_bf
 
         self.reconstruct(**safe_kwargs, bf_mask=bf2, verbose=False)
-        halfset_2 = self.mean_corrected_bf
+        halfset_2 = self.corrected_bf
 
         return [halfset_1, halfset_2]
