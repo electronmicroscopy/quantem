@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import (
     Any,
     List,
@@ -161,7 +162,7 @@ class Vector(AutoSerialize):
     @classmethod
     def from_shape(
         cls,
-        shape: Tuple[int, ...],
+        shape: Union[int, np.integer, Tuple[int, ...], Sequence[int]],
         num_fields: Optional[int] = None,
         fields: Optional[List[str]] = None,
         units: Optional[List[str]] = None,
@@ -172,25 +173,42 @@ class Vector(AutoSerialize):
 
         Parameters
         ----------
-        shape : Tuple[int, ...]
-            The shape of the vector (dimensions)
-        num_fields : Optional[int]
-            Number of fields in the vector
-        name : Optional[str]
-            Name of the vector
-        fields : Optional[List[str]]
-            List of field names
-        units : Optional[List[str]]
-            List of units for each field
+        shape
+            The fixed indexed dimensions of the ragged vector.
+            Accepts:
+              - int / np.integer  -> treated as (int,)
+              - tuple[int, ...]   -> used as-is
+              - sequence[int]     -> converted to tuple[int, ...]
+              - ()                 -> 0-D (no indexed dims)
+        num_fields
+            Number of fields in the vector (ignored if `fields` is provided).
+        fields
+            List of field names (mutually exclusive with `num_fields`).
+        units
+            Unit strings per field. If None, defaults are used.
+        name
+            Optional name.
 
         Returns
         -------
         Vector
-            A new Vector instance
+            A new Vector instance.
         """
-        validated_shape = validate_shape(shape)
+        # --- Normalize 'shape' to a tuple[int, ...] to satisfy validate_shape ---
+        if isinstance(shape, (int, np.integer)):
+            shape_tuple: Tuple[int, ...] = (int(shape),)
+        elif isinstance(shape, tuple):
+            shape_tuple = tuple(int(s) for s in shape)
+        elif isinstance(shape, Sequence):
+            shape_tuple = tuple(int(s) for s in shape)
+        else:
+            raise TypeError(f"Unsupported type for shape: {type(shape)}")
+
+        # validate_shape expects a tuple and applies your project-specific checks
+        validated_shape = validate_shape(shape_tuple)
         ndim = len(validated_shape)
 
+        # --- Fields / num_fields handling (unchanged) ---
         if fields is not None:
             validated_fields = validate_fields(fields)
             validated_num_fields = len(validated_fields)
@@ -446,16 +464,18 @@ class Vector(AutoSerialize):
             np.asarray(i) if isinstance(i, (list, np.ndarray)) else i for i in normalized
         )
 
-        # Check if we should return a numpy array (all indices are integers)
-        return_np = all(isinstance(i, (int, np.integer)) for i in idx_converted[: len(self.shape)])
+        # Check if we should return a single-cell view (all indices are integers)
+        return_cell = all(
+            isinstance(i, (int, np.integer)) for i in idx_converted[: len(self.shape)]
+        )
         if len(idx_converted) < len(self.shape):
-            return_np = False
+            return_cell = False
 
-        if return_np:
-            view = self._data
-            for i in idx_converted:
-                view = view[i]
-            return cast(NDArray[Any], view)
+        if return_cell:
+            # Return a CellView so atoms[0]['x'] works;
+            # still behaves like ndarray via __array__ when used numerically.
+            indices_tuple = tuple(int(i) for i in idx_converted[: len(self.shape)])
+            return _CellView(self, indices_tuple)
 
         # Handle fancy indexing and slicing
         def get_indices(dim_idx: Any, dim_size: int) -> np.ndarray:
@@ -1024,3 +1044,124 @@ class _FieldView:
     def __array__(self) -> np.ndarray:
         """Convert to numpy array when needed."""
         return self.flatten()
+
+
+class _CellView:
+    """
+    View over a single Vector cell (fixed indices over the indexed dims).
+    Supports item access by field name, e.g., v[0]['x'] -> 1D array for that cell.
+    Behaves like a numpy array via __array__ for backward compatibility.
+    """
+
+    def __init__(self, vector: "Vector", indices: Tuple[int, ...]) -> None:
+        self.vector = vector
+        self.indices = indices  # tuple of ints, one per indexed dimension
+
+    @property
+    def array(self) -> NDArray:
+        ref = self.vector._data
+        for i in self.indices:
+            ref = ref[i]
+        return ref  # shape: (rows, num_fields)
+
+    def __array__(self) -> np.ndarray:
+        # Allows numpy to transparently consume this as an ndarray
+        return self.array
+
+    def __getitem__(self, field_name: str) -> NDArray:
+        if not isinstance(field_name, str):
+            raise TypeError("Use a field name string, e.g. cell['x']")
+        if field_name not in self.vector._fields:
+            raise KeyError(f"Field '{field_name}' not found.")
+        j = self.vector._fields.index(field_name)
+        return self.array[:, j]
+
+    def save_csv(
+        self,
+        filename: str,
+        *,
+        # Jupyter-friendly defaults:
+        jupyter_friendly: bool = True,
+        include_units: bool = True,
+        delimiter: str = ",",
+        float_fmt: str = "%.6g",
+        append_csv_ext: bool = True,
+        create_dirs: bool = True,
+        # Legacy/optional extras (ignored when jupyter_friendly=True):
+        add_comment_header: bool = False,  # writes a leading "# ..." line
+        add_units_row: bool = False,  # writes a separate units row
+    ) -> str:
+        """
+        Save this cell's rows to a CSV file.
+
+        If jupyter_friendly=True (default), writes a single header row suitable
+        for JupyterLab's CSV viewer. Units are merged into the column names
+        as 'field (unit)'. No extra header lines.
+
+        If jupyter_friendly=False, you can enable:
+          - add_comment_header=True   -> a commented first line
+          - add_units_row=True        -> a second line with units only
+        """
+        import csv
+        import os
+
+        import numpy as np
+
+        path = os.fspath(filename)
+        if append_csv_ext and not path.lower().endswith(".csv"):
+            path += ".csv"
+
+        parent = os.path.dirname(path)
+        if parent and create_dirs:
+            os.makedirs(parent, exist_ok=True)
+
+        arr = self.array
+        fields = list(self.vector.fields)
+        units = list(self.vector.units)
+
+        # Build header row
+        if jupyter_friendly:
+            if include_units:
+                header = [f"{n} ({u})" for n, u in zip(fields, units)]
+            else:
+                header = fields
+            write_comment = False
+            write_units_row = False
+        else:
+            header = fields
+            write_comment = bool(add_comment_header)
+            write_units_row = bool(add_units_row and include_units)
+
+        # Prepare a small formatter to apply float_fmt to numeric values
+        def fmt_row(row: np.ndarray) -> list[str]:
+            out = []
+            for v in row:
+                try:
+                    out.append(float_fmt % float(v))
+                except Exception:
+                    out.append(str(v))
+            return out
+
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
+
+            # Optional legacy comment header
+            if write_comment:
+                vec_name = getattr(self.vector, "name", "Vector")
+                idx_str = ", ".join(str(i) for i in self.indices)
+                nrows = 0 if (not isinstance(arr, np.ndarray)) else int(arr.shape[0])
+                f.write(f"# {vec_name} — cell indices ({idx_str}), rows={nrows}\n")
+
+            # Header row (always)
+            w.writerow(header)
+
+            # Optional legacy separate units row
+            if write_units_row:
+                w.writerow(units)
+
+            # Data rows
+            if isinstance(arr, np.ndarray) and arr.size:
+                for r in range(arr.shape[0]):
+                    w.writerow(fmt_row(arr[r, :]))
+
+        return path

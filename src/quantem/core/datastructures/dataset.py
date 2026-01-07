@@ -1,7 +1,7 @@
-import os
 import numbers
+import os
 from pathlib import Path
-from typing import Any, Literal, Optional, Self, Union, overload
+from typing import Any, Literal, Optional, Self, overload
 
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
@@ -52,7 +52,9 @@ class Dataset(AutoSerialize):
         super().__init__()
         arr = ensure_valid_array(array)
         if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         self._array = arr
         self.name = name
         self.origin = origin
@@ -97,7 +99,9 @@ class Dataset(AutoSerialize):
         """
         validated_array = ensure_valid_array(array)
         if not isinstance(validated_array, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         _ndim = validated_array.ndim
 
         # Set defaults if None
@@ -126,7 +130,9 @@ class Dataset(AutoSerialize):
     def array(self, value: NDArray) -> None:
         arr = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
         if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         self._array = arr
         # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
 
@@ -593,6 +599,7 @@ class Dataset(AutoSerialize):
                 reshape_dims.append(effective_lengths[a1])
                 running_axis += 1
 
+        # --- Perform block reduction ---
         array_view = self.array[tuple(slices)].reshape(tuple(reshape_dims))
         array_binned = np.sum(array_view, axis=tuple(reduce_axes))
         if reducer_norm == "mean":
@@ -628,11 +635,11 @@ class Dataset(AutoSerialize):
 
     def fourier_resample(
         self,
-        out_shape: Optional[tuple[int, ...]] = None,
-        factors: Optional[Union[float, tuple[float, ...]]] = None,
-        axes: Optional[tuple[int, ...]] = None,
+        out_shape: tuple[int, ...] | None = None,
+        factors: float | tuple[float, ...] | None = None,
+        axes: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
-    ) -> Optional["Dataset"]:
+    ) -> Self | None:
         """
         Fourier resample the dataset by centered cropping (downsample) or zero padding (upsample).
         The operation is performed in the Fourier domain using fftshift alignment and default FFT
@@ -676,7 +683,9 @@ class Dataset(AutoSerialize):
                 factors = tuple(float(f) for f in factors)
                 if len(factors) != len(axes):
                     raise ValueError("factors length must match number of axes.")
-            out_shape = tuple(max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors))
+            out_shape = tuple(
+                max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors)
+            )
         else:
             if len(out_shape) != len(axes):
                 raise ValueError("out_shape length must match number of axes.")
@@ -768,6 +777,87 @@ class Dataset(AutoSerialize):
         ds.origin = new_origin
         return ds
 
+    def transpose(
+        self,
+        order: tuple[int, ...] | None = None,
+        modify_in_place: bool = False,
+    ) -> Self | None:
+        """
+        Transpose (permute) axes of the dataset and reorder metadata accordingly.
+
+        Parameters
+        ----------
+        order : tuple[int, ...], optional
+            A permutation of range(self.ndim). If None, axes are reversed (NumPy's default).
+        modify_in_place : bool, default False
+            If True, modify this dataset in place. Otherwise return a new Dataset.
+
+        Returns
+        -------
+        Dataset or None
+            Transposed dataset if modify_in_place is False, otherwise None.
+        """
+        if order is None:
+            order = tuple(range(self.ndim - 1, -1, -1))
+
+        if len(order) != self.ndim or set(order) != set(range(self.ndim)):
+            raise ValueError(f"'order' must be a permutation of 0..{self.ndim - 1}; got {order!r}")
+
+        array_t = self.array.transpose(order)
+
+        # Reorder metadata to match new axis order
+        new_origin = self.origin[list(order)].copy()
+        new_sampling = self.sampling[list(order)].copy()
+        new_units = [self.units[ax] for ax in order]
+
+        if modify_in_place:
+            # Use private attrs to avoid dtype/ndim enforcement in the setter
+            self._array = array_t
+            self._origin = new_origin
+            self._sampling = new_sampling
+            self._units = new_units
+            return None
+
+        # Create a new Dataset without extra array copies
+        return type(self).from_array(
+            array=array_t,
+            name=self.name,  # keep name unchanged for now
+            origin=new_origin,
+            sampling=new_sampling,
+            units=new_units,
+            signal_units=self.signal_units,
+        )
+
+    def astype(
+        self,
+        dtype: DTypeLike,
+        copy: bool = True,
+        modify_in_place: bool = False,
+    ) -> Self | None:
+        """
+        Cast the array to a new dtype. Metadata is unchanged.
+
+        Parameters
+        ----------
+        dtype : DTypeLike
+            Target dtype (e.g., np.float32, "complex64", etc.).
+        copy : bool, default True
+            If False and no cast is needed, a view may be returned by the backend.
+        modify_in_place : bool, default False
+            If True, modify this dataset in place. Otherwise return a new Dataset.
+
+        Returns
+        -------
+        Dataset or None
+            Dtype-cast dataset if modify_in_place is False, otherwise None.
+        """
+        array_cast = self.array.astype(dtype, copy=copy)
+
+        if modify_in_place:
+            # Bypass the array setter so we can actually change dtype
+            self._array = array_cast
+            return None
+
     def __getitem__(self, index) -> Self:
         """
         General indexing method for Dataset objects.
@@ -806,7 +896,9 @@ class Dataset(AutoSerialize):
         kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
 
         # Slice/reduce metadata accordingly
-        new_origin = np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        new_origin = (
+            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        )
         new_sampling = (
             np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
         )

@@ -56,7 +56,7 @@ def array_to_rgba(
         rgba = cmap_obj(scaled_amplitude)
     else:
         if scaled_angle.shape != scaled_amplitude.shape:
-            raise ValueError()
+            raise ValueError("scaled_angle must have the same shape as scaled_amplitude.")
 
         J = scaled_amplitude * 61.5
         C = np.minimum(chroma_boost * 98 * J / 123, 110)
@@ -64,10 +64,13 @@ def array_to_rgba(
 
         JCh = np.stack((J, C, h), axis=-1)
         with np.errstate(invalid="ignore"):
-            rgb = cspace_convert(JCh, "JCh", "sRGB1").clip(0, 1)
+            rgb = cspace_convert(JCh, "JCh", "sRGB1").clip(0, 1)  # shape (..., 3)
 
-        alpha = np.ones_like(scaled_amplitude)
-        rgba = np.dstack((rgb, alpha))
+        # >>> FIX: ensure alpha has a trailing channel dim, even for 1D <<<
+        alpha = np.ones_like(scaled_amplitude, dtype=rgb.dtype)[..., np.newaxis]  # (..., 1)
+
+        # Use concatenate along the last axis for clarity
+        rgba = np.concatenate((rgb, alpha), axis=-1)  # shape (..., 4)
 
     return rgba
 
