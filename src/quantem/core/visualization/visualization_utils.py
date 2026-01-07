@@ -533,7 +533,6 @@ def axes_with_inset(
     - Fractional inset by default (relative to main axes size).
     - Only the inset axes background is set to black (main axes stays default).
     """
-    # your file already has: import matplotlib as mpl
     fig, ax_main = mpl.pyplot.subplots(1, 1, figsize=axsize)
 
     # lazy import here (some environments need it this way)

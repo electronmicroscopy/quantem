@@ -146,6 +146,7 @@ class Vector(AutoSerialize):
         fields: List[str],
         units: List[str],
         name: str,
+        metadata: dict = {},
         _token: object | None = None,
     ) -> None:
         if _token is not self._token:
@@ -156,6 +157,7 @@ class Vector(AutoSerialize):
         self.units = units
         self.name = name
         self._data = nested_list(self.shape, fill=None)
+        self._metadata = metadata
 
     @classmethod
     def from_shape(
@@ -760,6 +762,10 @@ class Vector(AutoSerialize):
             f"  units: {self._units}",
         ]
         return "\n".join(description)
+
+    @property
+    def metadata(self) -> dict:
+        return self._metadata
 
     @property
     def shape(self) -> Tuple[int, ...]:

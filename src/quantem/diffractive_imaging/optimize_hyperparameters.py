@@ -549,7 +549,18 @@ class OptimizePtychography:
                     extract_recursive(v, (*path, k))
 
         if hasattr(self, "_config") and self._config:
+            # Extract from base_kwargs
             extract_recursive(self._config.get("base_kwargs", {}))
+
+            # Extract from dataset_preprocess_kwargs
+            dataset_preprocess = self._config.get("dataset_preprocess_kwargs")
+            if dataset_preprocess:
+                extract_recursive(dataset_preprocess)
+
+            # Extract from dataset_kwargs
+            dataset_kw = self._config.get("dataset_kwargs")
+            if dataset_kw:
+                extract_recursive(dataset_kw)
 
         return param_info
 
