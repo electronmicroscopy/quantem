@@ -1,7 +1,7 @@
 import gc
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Mapping, Tuple
 
 import numpy as np
 import optuna
@@ -105,6 +105,15 @@ class HyperparameterState:
 
         body = "\n".join(lines)
         return f"{cls}(\n{body}\n)"
+
+
+@dataclass(frozen=True)
+class BrightFieldContext:
+    bf_mask: torch.Tensor
+    bf_inds_i: torch.Tensor
+    bf_inds_j: torch.Tensor
+    num_bf: int
+    vbf_index_mapping: torch.Tensor
 
 
 class DirectPtychography(RNGMixin, AutoSerialize):
@@ -310,13 +319,30 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         """ """
 
-        self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
         self._vbf_fourier = torch.fft.fft2(self.vbf_stack)
-        # self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
+        self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
 
         return self
+
+    def _return_bf_context(self, bf_mask):
+        """
+        Given a BF mask, compute all BF-dependent geometry and indexing.
+        """
+        bf_mask = torch.as_tensor(bf_mask, dtype=torch.bool, device=self.device)
+
+        bf_inds_i, bf_inds_j = torch.nonzero(bf_mask, as_tuple=True)
+        vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
+        num_bf = bf_inds_i.numel()
+
+        return BrightFieldContext(
+            bf_mask=bf_mask,
+            bf_inds_i=bf_inds_i,
+            bf_inds_j=bf_inds_j,
+            num_bf=num_bf,
+            vbf_index_mapping=vbf_index_mapping,
+        )
 
     def _return_upsampled_qgrid(
         self,
@@ -399,14 +425,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @device.setter
     def device(self, device: str | int | None):
-        # allow setting gpu/cpu, but not changing the device from the config gpu device
         if device is not None:
             dev, _id = config.validate_device(device)
             self._device = dev
-            # try:
-            #     self.to(dev)
-            # except AttributeError:
-            #     pass
 
     @property
     def scan_sampling(self) -> NDArray:
@@ -442,6 +463,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def _return_kernel_contributions(
         self,
+        bf,
         deconvolution_kernel,
         vbf_fourier,
         kxa,
@@ -455,9 +477,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         batch_idx,
     ):
         """ """
-
-        ind_i = self._bf_inds_i[batch_idx]
-        ind_j = self._bf_inds_j[batch_idx]
+        ind_i = bf.bf_inds_i[batch_idx]
+        ind_j = bf.bf_inds_j[batch_idx]
 
         kx = kxa[ind_i, ind_j].view(-1, 1, 1)
         ky = kya[ind_i, ind_j].view(-1, 1, 1)
@@ -537,6 +558,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def reconstruct(
         self,
+        bf_mask=None,
         aberration_coefs=None,
         upsampling_factor=None,
         rotation_angle=None,
@@ -554,6 +576,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         Parameters
         ----------
+        bf_mask: torch.Tensor, optional
+            Subset of bright field mask to use for reconstruction. Note this must be
+            strictly smaller than the bf_mask used for initialization.
         aberration_coefs : dict, optional
             Aberration coefficients for the probe
         upsampling_factor : int, optional
@@ -593,8 +618,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             upsampling_factor = 1
         upsampling_factor = math.ceil(upsampling_factor)
 
+        if bf_mask is None:
+            bf_mask = self.bf_mask
+        bf = self._return_bf_context(bf_mask)
+
+        num_bf = bf.num_bf
+        bf_mask = bf.bf_mask
+        vbf_index_mapping = bf.vbf_index_mapping
+
         if max_batch_size is None:
-            max_batch_size = self.num_bf
+            max_batch_size = num_bf
 
         deconvolution_kernel = self._normalize_kernel_name(deconvolution_kernel)
 
@@ -615,8 +648,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 phi,
                 aberration_coefs=aberration_coefs,
             )
-            grad_k = torch.stack((dx[self.bf_mask], dy[self.bf_mask]), -1)
-            self.lateral_shifts = grad_k / 2 / np.pi
+            grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
 
             if parallax_flip_phase:
                 chi_q = aberration_surface(
@@ -641,7 +673,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             self.wavelength,
             aberration_coefs=aberration_coefs,
         )
-        self.BF_weights = cmplx_probe_k.abs().square().sum()
+        BF_weights = cmplx_probe_k[bf_mask].abs().square().sum()
 
         butterworth_env = torch.ones_like(q)
         if q_lowpass:
@@ -650,13 +682,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             butterworth_env *= 1 - 1 / (1 + (q / q_highpass) ** (2 * butterworth_order))
 
         # Process batches
-        pbar = tqdm(range(self.num_bf), disable=not verbose)
-        batcher = SimpleBatcher(
-            self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
-        )
+        pbar = tqdm(range(num_bf), disable=not verbose)
+        batcher = SimpleBatcher(num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng)
 
         fourier_factor = torch.empty(
-            (self.num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
+            (num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
         )
         if deconvolution_kernel in ("obf", "mf"):
             power = torch.zeros(qxa.shape, device=self.device)
@@ -665,19 +695,17 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         # first pass
         for batch_idx in batcher:
-            if hasattr(self, "_vbf_index_mapping"):
-                mapped_idx = self._vbf_index_mapping[batch_idx]
-            else:
-                mapped_idx = batch_idx
+            mapped_idx = vbf_index_mapping[batch_idx]
+            vbf_fourier = self._vbf_fourier[mapped_idx]
 
             # Fourier-space tiling
             vbf_fourier = torch.cat(
-                [torch.cat([self._vbf_fourier[mapped_idx]] * upsampling_factor, dim=-1)]
-                * upsampling_factor,
+                [torch.cat([vbf_fourier] * upsampling_factor, dim=-1)] * upsampling_factor,
                 dim=-2,
             )
 
             num, pow = self._return_kernel_contributions(
+                bf,
                 deconvolution_kernel,
                 vbf_fourier,
                 kxa,
@@ -692,7 +720,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             )
             if power is None:
                 num *= butterworth_env
-                # num[:, 0, 0] = self._dc_per_image
+                num[:, 0, 0] = self._dc_per_image
 
                 fourier_factor[batch_idx] = torch.fft.ifft2(num)
             else:
@@ -703,7 +731,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         pbar.close()
 
         if power is not None:
-            power /= self.BF_weights
+            power /= BF_weights
 
             if deconvolution_kernel == "obf":
                 norm = power.sqrt().clamp_min(1e-8)
@@ -718,11 +746,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     ff /= norm
 
                 ff *= butterworth_env
-                # ff[:, 0, 0] = self._dc_per_image
+                ff[:, 0, 0] = self._dc_per_image
 
                 fourier_factor[batch_idx] = torch.fft.ifft2(ff)
 
-        self.corrected_stack = fourier_factor.real
+        self.corrected_stack = fourier_factor.real / BF_weights
 
         # memory management
         gc.collect()
@@ -747,7 +775,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def mean_corrected_bf(self):
         if self.corrected_stack is None:
             return None
-        return self.corrected_stack.sum(dim=0) / self.BF_weights
+        return self.corrected_stack.sum(dim=0)
 
     def variance_loss(self):
         """ """
@@ -960,8 +988,32 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         return self
 
+    def _return_lateral_shifts(
+        self,
+        rotation_angle,
+        aberration_coefs,
+        bf_mask,
+    ):
+        # Get initial shifts
+        kxa, kya = spatial_frequencies(
+            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+        )
+        k, phi = polar_coordinates(kxa, kya)
+
+        dx, dy = aberration_surface_cartesian_gradients(
+            k * self.wavelength,
+            phi,
+            aberration_coefs=aberration_coefs,  # ty:ignore[invalid-argument-type]
+        )
+        grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
+        lateral_shifts = grad_k / 2 / np.pi
+        return lateral_shifts
+
     def fit_hyperparameters(
         self,
+        bf_mask: torch.Tensor | None = None,
+        rotation_angle: float | None = None,
+        aberration_coefs: Mapping[str, int | float | torch.Tensor] = {},
         bin_factors: tuple[int, ...] = (3, 2, 1),
         pair_connectivity: int = 4,
         alignment_method: str = "reference",
@@ -976,6 +1028,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         Parameters
         ----------
+        bf_mask: torch.Tensor, optional
+            Subset of bright field mask to use for reconstruction. Note this must be
+            strictly smaller than the bf_mask used for initialization.
         bin_factors : tuple of int
             Sequence of binning factors from coarse to fine
         pair_connectivity : int
@@ -1005,8 +1060,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         The running_average option updates the reference at each bin level as:
             ref_new = ref_old * n/(n+1) + aligned_mean / (n+1)
         """
-        bf_mask = self.bf_mask
-        inds_i, inds_j = self._bf_inds_i, self._bf_inds_j
+
+        if bf_mask is None:
+            bf_mask = self.bf_mask
+        bf = self._return_bf_context(bf_mask)
+        bf_mask = bf.bf_mask
+        inds_i, inds_j = bf.bf_inds_i, bf.bf_inds_j
+
         scan_sampling = torch.as_tensor(
             self.scan_sampling, device=self.device, dtype=torch.float32
         )
@@ -1015,19 +1075,23 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "verbose"]
+            if k not in ["deconvolution_kernel", "verbose", "parallax_flip_phase"]
         }
-        parallax_flip_phase = safe_kwargs.pop("parallax_flip_phase", False)
 
         self.reconstruct(
+            rotation_angle=rotation_angle,
+            aberration_coefs=aberration_coefs,
             deconvolution_kernel="parallax",
-            parallax_flip_phase=parallax_flip_phase,
+            parallax_flip_phase=False,
             verbose=False,
             **safe_kwargs,
         )
 
         vbf_stack = self.corrected_stack.clone()
-        initial_shifts = self.lateral_shifts / scan_sampling
+
+        # Get initial shifts
+        lateral_shifts = self._return_lateral_shifts(rotation_angle, aberration_coefs, bf_mask)
+        initial_shifts = lateral_shifts / scan_sampling
 
         if alignment_method == "reference":
             reference = (
@@ -1060,10 +1124,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             verbose=self.verbose,
         )
 
-        self.lateral_shifts = shifts_px * scan_sampling
+        lateral_shifts = shifts_px * scan_sampling
 
         fit_results = fit_aberrations_from_shifts(
-            self.lateral_shifts,
+            lateral_shifts,
             bf_mask,
             self.wavelength,
             self.gpts,
@@ -1132,6 +1196,18 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         return recons
 
+    def _make_checkerboard_bf_masks(self, gpts, bf_mask):
+        """ """
+        i_coords = torch.arange(gpts[0], device=self.device)
+        j_coords = torch.arange(gpts[1], device=self.device)
+        i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing="ij")
+        checkerboard = torch.fft.ifftshift(((i_grid + j_grid) % 2).bool())
+
+        bf1 = bf_mask & checkerboard
+        bf2 = bf_mask & (~checkerboard)
+
+        return [bf1, bf2]
+
     def _reconstruct_with_halfsets(self, **reconstruct_kwargs):
         """
         Compute two half-set reconstructions using alternating BF pixels (checkerboard pattern).
@@ -1143,52 +1219,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         halfset_2 : torch.Tensor
             Reconstruction using second half of BF pixels
         """
-        # Store original bf_mask, indices, and num_bf
-        original_bf_mask = self.bf_mask.clone()
-        original_bf_inds_i = self._bf_inds_i.clone()
-        original_bf_inds_j = self._bf_inds_j.clone()
-        original_num_bf = self.num_bf
 
-        # Create checkerboard pattern
-        i_coords = torch.arange(self.gpts[0], device=self.device)
-        j_coords = torch.arange(self.gpts[1], device=self.device)
-        i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing="ij")
-        checkerboard = torch.fft.ifftshift(((i_grid + j_grid) % 2).bool())
+        bf1, bf2 = self._make_checkerboard_bf_masks(self.gpts, self.bf_mask)
+        safe_kwargs = {
+            k: v for k, v in reconstruct_kwargs.items() if k not in ["verbose", "bf_mask"]
+        }
 
-        safe_kwargs = {k: v for k, v in reconstruct_kwargs.items() if k not in ["verbose"]}
+        self.reconstruct(**safe_kwargs, bf_mask=bf1, verbose=False)
+        halfset_1 = self.mean_corrected_bf
 
-        try:
-            # === First half-set ===
-            halfset_mask_1 = original_bf_mask & checkerboard
-            self.bf_mask = halfset_mask_1
-            self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
-            self.num_bf = len(self._bf_inds_i)
-
-            halfset_1_in_original = torch.where(halfset_mask_1[original_bf_mask])[0]
-            self._vbf_index_mapping = halfset_1_in_original
-
-            self.reconstruct(**safe_kwargs, verbose=False)
-            halfset_1 = self.mean_corrected_bf.clone() * 2
-
-            # === Second half-set ===
-            halfset_mask_2 = original_bf_mask & (~checkerboard)
-            self.bf_mask = halfset_mask_2
-            self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
-            self.num_bf = len(self._bf_inds_i)
-
-            halfset_2_in_original = torch.where(halfset_mask_2[original_bf_mask])[0]
-            self._vbf_index_mapping = halfset_2_in_original
-
-            self.reconstruct(**safe_kwargs, verbose=False)
-            halfset_2 = self.mean_corrected_bf.clone() * 2
-
-        finally:
-            # Always restore everything
-            self.bf_mask = original_bf_mask
-            self._bf_inds_i = original_bf_inds_i
-            self._bf_inds_j = original_bf_inds_j
-            self.num_bf = original_num_bf
-            if hasattr(self, "_vbf_index_mapping"):
-                delattr(self, "_vbf_index_mapping")
+        self.reconstruct(**safe_kwargs, bf_mask=bf2, verbose=False)
+        halfset_2 = self.mean_corrected_bf
 
         return [halfset_1, halfset_2]
