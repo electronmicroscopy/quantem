@@ -832,7 +832,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             if isinstance(val, OptimizationParameter):
                 state.optimized_keys.add(name)
             else:
-                state.fixed_aberrations["name"] = val
+                state.fixed_aberrations[name] = val
 
             if isinstance(rotation_angle, OptimizationParameter):
                 state.optimized_keys.add("rotation_angle")
