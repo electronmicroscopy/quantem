@@ -1,5 +1,4 @@
 from collections.abc import Sequence
-from typing import List, Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -103,7 +102,7 @@ class DriftCorrection(AutoSerialize):
 
     def __init__(
         self,
-        images: List[Dataset2d],
+        images: list[Dataset2d],
         scan_direction_degrees: NDArray,
         _token: object | None = None,
     ):
@@ -119,7 +118,7 @@ class DriftCorrection(AutoSerialize):
     def from_file(
         cls,
         file_paths: Sequence[str],
-        scan_direction_degrees: Union[Sequence[float], NDArray],
+        scan_direction_degrees: Sequence[float] | NDArray,
         file_type: str | None = None,
     ) -> "DriftCorrection":
         image_list = [Dataset2d.from_file(fp, file_type=file_type) for fp in file_paths]
@@ -131,8 +130,8 @@ class DriftCorrection(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        images: Union[List[Dataset2d], List[NDArray], Dataset3d, NDArray],
-        scan_direction_degrees: Union[List[float], NDArray],
+        images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
+        scan_direction_degrees: list[float] | NDArray,
     ) -> "DriftCorrection":
         validated_images = validate_list_of_dataset2d(images)
 
@@ -144,20 +143,20 @@ class DriftCorrection(AutoSerialize):
 
     # --- Properties ---
     @property
-    def images(self) -> List[Dataset2d]:
+    def images(self) -> list[Dataset2d]:
         return self._images
 
     @images.setter
-    def images(self, value: Union[List[Dataset2d], List[NDArray], Dataset3d, NDArray]):
+    def images(self, value: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray):
         self._images = validate_list_of_dataset2d(value)
         self.pad_value = self.pad_value
 
     @property
-    def pad_value(self) -> List[float]:
+    def pad_value(self) -> list[float]:
         return self._pad_value
 
     @pad_value.setter
-    def pad_value(self, value: Union[float, str, List[float]]):
+    def pad_value(self, value: float | str | list[float]):
         self._pad_value = validate_pad_value(value, self.images)
 
     @property
@@ -165,7 +164,7 @@ class DriftCorrection(AutoSerialize):
         return self._scan_direction_degrees
 
     @scan_direction_degrees.setter
-    def scan_direction_degrees(self, value: Union[List[float], NDArray]):
+    def scan_direction_degrees(self, value: list[float] | NDArray):
         self._scan_direction_degrees = ensure_valid_array(value, ndim=1)
 
     @property
@@ -195,7 +194,7 @@ class DriftCorrection(AutoSerialize):
     def preprocess(
         self,
         pad_fraction: float = 0.25,
-        pad_value: Union[float, str, List[float]] = "median",
+        pad_value: float | str | list[float] = "median",
         kde_sigma: float = 0.5,
         number_knots: int = 1,
         show_merged: bool = False,
@@ -300,7 +299,7 @@ class DriftCorrection(AutoSerialize):
     def align_translation(
         self,
         upsample_factor: int = 8,
-        min_image_shift: Optional[float] = None,
+        min_image_shift: float | None = None,
         max_image_shift: float = 32,
         show_merged: bool = True,
         show_images: bool = False,
@@ -559,16 +558,16 @@ class DriftCorrection(AutoSerialize):
         # Shared parameters
         num_iterations: int = 8,
         regularization_sigma_px: float = 16.0,
-        regularization_update_step_size: Optional[float] = 0.8,
-        min_image_shift: Optional[float] = None,
-        max_image_shift: Optional[float] = 32.0,
+        regularization_update_step_size: float | None = 0.8,
+        min_image_shift: float | None = None,
+        max_image_shift: float | None = 32.0,
         # PyTorch parameters
         adam_steps: int = 50,
         lr: float = 0.02,
         # SciPy parameters
         max_optimize_iterations: int = 10,
         regularization_poly_order: int = 1,
-        regularization_max_image_shift_px: Optional[float] = None,
+        regularization_max_image_shift_px: float | None = None,
         solve_individual_rows: bool = True,
         # Display parameters
         show_merged: bool = True,
