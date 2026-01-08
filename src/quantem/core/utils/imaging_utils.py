@@ -559,19 +559,19 @@ def compute_fsc_from_halfsets(
 
     Parameters
     ----------
-    halfset_recons : [tensor, tensor]
-        Real-space half-set reconstructions
-    sampling : (sx, sy)
-        Real-space sampling
-    eps : float
-        Numerical stability constant
+    halfset_recons : list[torch.Tensor]
+        Two statistically-independent reconstructions, using half the dataset.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+    epsilon: float, optional
+        Small number to avoid dividing by zero
 
     Returns
     -------
-    k : torch.Tensor
-        Radial spatial frequencies
-    fsc : torch.Tensor
-        FSC(q)
+    q_bins: NDarray
+        Spatial frequency bins
+    fsc : NDarray
+        Fourier shell correlation as function of spatial frequency
     """
     r1, r2 = halfset_recons
 
@@ -631,7 +631,7 @@ def compute_fsc_from_halfsets(
 def compute_spectral_snr_from_halfsets(
     halfset_recons: list[torch.Tensor],
     sampling: tuple[float, float],
-    num_bf: int,
+    total_dose: float,
     epsilon: float = 1e-12,
 ):
     """
@@ -650,11 +650,20 @@ def compute_spectral_snr_from_halfsets(
     Parameters
     ----------
     halfset_recons : list[torch.Tensor]
+        Two statistically-independent reconstructions, using half the dataset.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+    total_dose: float
+        Total _normalized_ electron dose, e.g. in DirectPtychography this is ~self.num_bf
+    epsilon: float, optional
+        Small number to avoid dividing by zero
 
     Returns
     -------
-    ssnr : torch.Tensor
-        Spectral SNR as function of spatial frequency
+    q_bins: NDarray
+        Spatial frequency bins
+    ssnr : NDarray
+        Radially averaged spectral SNR as function of spatial frequency
     """
     # Compute Fourier transforms
     halfset_1, halfset_2 = halfset_recons
@@ -702,7 +711,7 @@ def compute_spectral_snr_from_halfsets(
         inds_f + 1, weights=noise * w1, minlength=num_bins
     )
 
-    ssnr = torch.sqrt(signal_b / noise_b.clamp_min(epsilon)) / (math.sqrt(num_bf) / 2)
+    ssnr = torch.sqrt(signal_b / noise_b.clamp_min(epsilon)) / (math.sqrt(total_dose) / 2)
 
     k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
     valid = k_bins <= kx.abs().max()
@@ -714,6 +723,23 @@ def radially_average_fourier_array(
     corner_centered_array: torch.Tensor,
     sampling: tuple[float, float],
 ):
+    """
+    Radially average a corner-centered Fourier array.
+
+    Parameters
+    ----------
+    corner_centered_array : list[torch.Tensor]
+        Fourier array to average radially.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+
+    Returns
+    -------
+    q_bins: NDarray
+        Spatial frequency bins
+    array_1d : NDarray
+        Radially averaged Fourier array as function of spatial frequency
+    """
     device = corner_centered_array.device
     nx, ny = corner_centered_array.shape
     sx, sy = sampling
