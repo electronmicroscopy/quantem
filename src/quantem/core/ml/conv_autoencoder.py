@@ -95,21 +95,20 @@ class ConvAutoencoder2d(nn.Module):
 
     @property
     def activation(self) -> Callable:
-        return self._activation
+        """Create a new activation instance each time this is accessed."""
+        return get_activation_function(self._activation, self.dtype)
 
     @activation.setter
     def activation(self, act: str | Callable):
-        self._activation = get_activation_function(act, self.dtype) if not callable(act) else act
+        self._activation = act
 
     @property
     def final_activation(self) -> Callable:
-        return self._final_activation
+        return get_activation_function(self._final_activation, self.dtype)
 
     @final_activation.setter
     def final_activation(self, act: str | Callable):
-        self._final_activation = (
-            get_activation_function(act, self.dtype) if not callable(act) else act
-        )
+        self._final_activation = act
 
     def _build(self) -> None:
         self.encoder_blocks = nn.ModuleList()
@@ -131,7 +130,7 @@ class ConvAutoencoder2d(nn.Module):
                     use_batchnorm=self._use_batchnorm,
                     dropout=self.dropout,
                     dtype=self.dtype,
-                    activation=self.activation,
+                    activation=self._activation,
                 )
             )
             in_channels = out_channels
@@ -176,9 +175,9 @@ class ConvAutoencoder2d(nn.Module):
                 )
             )
 
-            # Final layer uses different activation
+            # Final layer uses different activation (pass config string, not instance)
             layer_activation = (
-                self.final_activation if layer_idx == self.num_layers - 1 else self.activation
+                self.final_activation if layer_idx == self.num_layers - 1 else self._activation
             )
 
             self.decoder_blocks.append(
