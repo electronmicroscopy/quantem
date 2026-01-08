@@ -270,6 +270,7 @@ def update(
 
     """
     for k, v in new.items():
+        k, v = check_key_val(k, v)
         k = canonical_name(k, old)
 
         if isinstance(v, Mapping):
@@ -478,6 +479,8 @@ def check_key_val(key: str, val: Any, deprecations: dict = deprecations) -> tupl
     if key == "device":
         if "cpu" in str(new_val):
             new_val = "cpu"
+            if torch.cuda.is_available():
+                torch.cuda.set_device(0)  # resetting back to default value of 0
         else:
             new_val, gpu_id = validate_device(new_val)
             if config["has_torch"]:
@@ -560,7 +563,7 @@ def write(path: Path | str = PATH / "config.yaml") -> None:
         yaml.dump(config, f)
 
 
-def set_device(dev: str | int) -> None:
+def set_device(dev: str | int | "torch.device") -> None:
     set({"device": dev})
 
 
