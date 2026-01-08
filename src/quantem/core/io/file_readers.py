@@ -1,4 +1,5 @@
 import importlib
+from os import PathLike
 from pathlib import Path
 
 import h5py
@@ -17,8 +18,8 @@ from quantem.spectroscopy import Dataset3dspectroscopy as Dataset3dspectroscopy
 
 
 def read_4dstem(
-    file_path: str,
-    file_type: str,
+    file_path: str | PathLike,
+    file_type: str | None = None,
     dataset_index: int | None = None,
     **kwargs,
 ) -> Dataset4dstem:
@@ -27,7 +28,7 @@ def read_4dstem(
 
     Parameters
     ----------
-    file_path: str
+    file_path: str | PathLike
         Path to data
     file_type: str
         The type of file reader needed. See rosettasciio for supported formats
@@ -42,6 +43,9 @@ def read_4dstem(
     --------
     Dataset4dstem
     """
+    if file_type is None:
+        file_type = Path(file_path).suffix.lower().lstrip(".")
+
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
     data_list = file_reader(file_path)
 
@@ -188,7 +192,7 @@ def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset
 
 
 def read_2d(
-    file_path: str,
+    file_path: str | PathLike,
     file_type: str | None = None,
 ) -> Dataset2d:
     """
@@ -196,7 +200,7 @@ def read_2d(
 
     Parameters
     ----------
-    file_path: str
+    file_path: str | PathLike
         Path to data
     file_type: str
         The type of file reader needed. See rosettasciio for supported formats
@@ -233,14 +237,16 @@ def read_2d(
 
 
 def read_emdfile_to_4dstem(
-    file_path: str, data_keys: list[str] | None = None, calibration_keys: list[str] | None = None
+    file_path: str | PathLike,
+    data_keys: list[str] | None = None,
+    calibration_keys: list[str] | None = None,
 ) -> Dataset4dstem:
     """
     File reader for legacy `emdFile` / `py4DSTEM` files.
 
     Parameters
     ----------
-    file_path: str
+    file_path: str | PathLike
         Path to data
 
     Returns

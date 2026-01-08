@@ -618,6 +618,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 )
                 if deconvolution_kernel == "full":
                     icom_weighting = 1.0j * icom_weighting
+                elif deconvolution_kernel == "quadratic":
+                    icom_weighting = -1.0 * icom_weighting
             else:
                 icom_weighting = 1.0
 
