@@ -479,8 +479,6 @@ def check_key_val(key: str, val: Any, deprecations: dict = deprecations) -> tupl
     if key == "device":
         if "cpu" in str(new_val):
             new_val = "cpu"
-            if torch.cuda.is_available():
-                torch.cuda.set_device(0)  # resetting back to default value of 0
         else:
             new_val, gpu_id = validate_device(new_val)
             if config["has_torch"]:
