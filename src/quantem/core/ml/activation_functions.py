@@ -1,70 +1,86 @@
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
-from quantem.core import config
-
-if TYPE_CHECKING:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-else:
-    if config.get("has_torch"):
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ModReLU(nn.Module):
-    def __init__(self):
+    """Modulated ReLU activation for complex-valued inputs.
+
+    Applies ReLU to the absolute value plus a learnable bias, then multiplies
+    by the complex exponential of the phase.
+    """
+
+    def __init__(self) -> None:
         super().__init__()
         self.b = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.relu(torch.abs(x) + self.b) * torch.exp(1.0j * torch.angle(x))
 
 
 class Complex_ReLU(nn.Module):
+    """Complex ReLU activation that applies ReLU separately to real and imaginary parts.
+
+    For a complex input z = a + bi, returns ReLU(a) + ReLU(b)i.
+    """
+
     def __init__(self) -> None:
         super().__init__()
 
-    def _complex_relu(self, z: "torch.Tensor"):
+    def _complex_relu(self, z: torch.Tensor) -> torch.Tensor:
         return F.relu(z.real) + 1.0j * F.relu(z.imag)
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self._complex_relu(z)
 
 
 class Complex_Phase_ReLU(nn.Module):
-    def __init__(self, phase_frac=0.5, sigmoid=True) -> None:
+    """Complex Phase ReLU activation that modulates activation based on complex phase.
+
+    Applies activation based on the magnitude and phase of complex inputs,
+    with configurable phase fraction and activation function type.
+    """
+
+    def __init__(self, phase_frac: float = 0.5, sigmoid: bool = True) -> None:
+        """Initialize Complex_Phase_ReLU.
+
+        Parameters
+        ----------
+        phase_frac : float, optional
+            Fraction of the complex phase range that gets activated (0-1), by default 0.5
+        sigmoid : bool, optional
+            Whether to use sigmoid-like activation (True) or linear (False), by default True
+        """
         super().__init__()
         self.phase_frac = phase_frac
         self.sigmoid = sigmoid
 
-    def forward(self, z):
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.PhaseReLU(z, self.phase_frac, self.sigmoid)
 
     def PhaseReLU(
         self,
-        z,
-        phase_frac=0.5,
-        sigmoid=True,
-    ):
-        """
-        This function returns the activation for an array of complex numbers z.
+        z: torch.Tensor,
+        phase_frac: float = 0.5,
+        sigmoid: bool = True,
+    ) -> torch.Tensor:
+        """Apply phase-based ReLU activation to complex tensor.
 
         Parameters
         ----------
-        z: np.array
-            array-like inputs
-        phase_frac: float
-            Fraction of complex number phase range which are activated.
-        sigmoid: bool
-            Set to True to use a sigmoid function along phase, or False to use a linear function.
+        z : torch.Tensor
+            Complex input tensor.
+        phase_frac : float, optional
+            Fraction of complex phase range that gets activated, by default 0.5
+        sigmoid : bool, optional
+            If True, use sigmoid function along phase; if False, use linear, by default True
 
         Returns
         -------
-        f: np.array
-            output array with the same dimensions as z.
-
+        torch.Tensor
+            Activated complex tensor with same shape as input.
         """
 
         # complex inputs
@@ -83,37 +99,6 @@ class Complex_Phase_ReLU(nn.Module):
 
         return f.type(torch.complex64)
 
-class FinerActivation(nn.Module):
-    """
-    Finer Activation function for complex and real inputs. 
-    
-    - Similar to sine activation function.  
-    """
-    def __init__(
-        self,
-        omega: float = 1,
-    ):
-        super().__init__()
-        self.omega = omega
-
-    def generate_alpha(self, x):
-        
-        with torch.no_grad():
-            return torch.abs(x) + 1
-    
-    def forward(self, x):
-        if x.is_complex(): # Complex Input Check
-            with torch.no_grad():
-                alpha_real = torch.abs(x.real) + 1
-                alpha_imag = torch.abs(x.imag) + 1
-            x.real = x.real * alpha_real
-            x.imag = x.imag * alpha_imag
-            return torch.sin(self.omega * self.generate_alpha(x) * x)
-        else:
-            return torch.sin(self.omega * self.generate_alpha(x) * x)
-
-    
-    
 
 def get_activation_function(
     activation_type: str | Callable,
@@ -121,19 +106,29 @@ def get_activation_function(
     activation_phase_frac: float = 0.5,
     activation_sigmoid: bool = True,
 ) -> nn.Module:
-    """
-    Get an activation function module.
+    """Get an activation function module.
 
-    Args:
-        activation_type: String name of activation or a callable activation function
-        dtype: Data type (used for complex vs real activations)
-        activation_phase_frac: Fraction for phase relu (complex only)
-        activation_sigmoid: Whether to use sigmoid for phase relu (complex only)
+    Parameters
+    ----------
+    activation_type : str or Callable
+        String name of activation (e.g., 'relu', 'phase_relu', 'identity') or
+        a callable activation function.
+    dtype : torch.dtype
+        Data type (used to determine complex vs real activations).
+    activation_phase_frac : float, optional
+        Fraction for phase relu (complex only), by default 0.5
+    activation_sigmoid : bool, optional
+        Whether to use sigmoid for phase relu (complex only), by default True
 
-    Returns:
-        Activation function module
+    Returns
+    -------
+    nn.Module
+        Activation function module.
 
-    Allowed activation_types: relu, phase_relu, identity, etc.
+    Raises
+    ------
+    ValueError
+        If activation type is unknown or not supported for the given dtype.
     """
     # If it's already a callable/module, check if it's a module
     if callable(activation_type):
@@ -142,11 +137,11 @@ def get_activation_function(
         else:
             # Wrap callable in a lambda module
             class CallableWrapper(nn.Module):
-                def __init__(self, func):
+                def __init__(self, func: Callable) -> None:
                     super().__init__()
                     self.func = func
 
-                def forward(self, x):
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
                     return self.func(x)
 
             return CallableWrapper(activation_type)
@@ -182,8 +177,11 @@ def get_activation_function(
             activation = nn.Sigmoid()
         elif activation_type in ["softplus"]:
             activation = nn.Softplus()
-        elif activation_type in ["finer"]:
-            activation = FinerActivation()
+        elif activation_type in ["finer", "siren", "hsiren"]:
+            raise ValueError(
+                "Siren type layers are not supported for activation functions. "
+                + "Use the Siren class instead."
+            )
         else:
             raise ValueError(f"Unknown activation type {activation_type}")
 
