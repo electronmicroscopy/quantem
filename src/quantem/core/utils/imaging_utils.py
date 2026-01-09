@@ -549,14 +549,16 @@ def fourier_cropping(
     return result
 
 
-def edge_filtering(
+def edge_filter_single(
         im,
         sigma_edge,
         sf_val,
+        # modify_in_place: bool = True,
+        # filter_stack: bool = True,
         ):
     """
     """
-    
+
     sf_val = np.array(sf_val)
     if sf_val.size == 1:
         sf_val = np.array(
@@ -587,19 +589,6 @@ def edge_filtering(
     im_edge = np.sqrt(im_x**2 + im_y**2)
 
     return im_edge
-
-
-# def boundary_blend(
-#     stack,
-#     blend_shape,
-#     # modify_in_place: bool = True,
-# ):
-#     stack_pad = 
-    
-
-
-
-# def pad():
 
 
 
