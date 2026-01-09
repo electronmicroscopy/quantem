@@ -14,11 +14,11 @@ if TYPE_CHECKING:
     import torch
     TensorLike: TypeAlias = ArrayLike | torch.Tensor
 else:
+    TensorLike: TypeAlias = ArrayLike
     if config.get("has_torch"):
         import torch
     if config.get("has_cupy"):
         import cupy as cp
-    TensorLike: TypeAlias = ArrayLike  # fallback when torch is not available
 
 # --- Dataset Validation Functions ---
 def ensure_valid_array(
