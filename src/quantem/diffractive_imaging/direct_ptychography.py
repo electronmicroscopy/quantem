@@ -1187,7 +1187,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         kernels = ["ssb", "obf", "mf", "prlx", "icom"]
 
         recons = [
-            self.reconstruct(
+            self.reconstruct_with_hyperparameters(
                 deconvolution_kernel=kernel,
                 verbose=False,
                 **safe_kwargs,
