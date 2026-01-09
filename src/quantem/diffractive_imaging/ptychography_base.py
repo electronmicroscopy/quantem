@@ -26,7 +26,7 @@ from quantem.diffractive_imaging.dataset_models import (
 )
 from quantem.diffractive_imaging.detector_models import DetectorBase, DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType
+from quantem.diffractive_imaging.object_models import ObjectBase, ObjectINR, ObjectModelType
 from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
 from quantem.diffractive_imaging.ptycho_utils import (
     AffineTransform,
@@ -300,6 +300,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._obj_model.slice_thicknesses = val
         if hasattr(self, "_propagators"):  # propagators already set, update with new slices
             self.compute_propagator_arrays()
+        # keep dataset geometry in sync for INR coordinate generation
+        try:
+            thk = self._obj_model.slice_thicknesses
+            self.dset.set_object_geometry(
+                self._obj_model.num_slices, thk if thk is not None else None
+            )
+        except Exception:
+            pass
 
     @property
     def verbose(self) -> int:
@@ -506,6 +514,20 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # Set object shape
         model.to(self.device)
         self._obj_model = cast(ObjectModelType, model)
+        # Wire dataset patch mode based on object model type
+        if hasattr(self.dset, "patch_mode"):
+            if isinstance(model, ObjectINR) or "ObjectINR" in str(type(model)):
+                self.dset.patch_mode = "coords"
+            else:
+                self.dset.patch_mode = "indices"
+        # Provide dataset the z-geometry needed for coords mode
+        try:
+            thk = self._obj_model.slice_thicknesses
+            self.dset.set_object_geometry(
+                self._obj_model.num_slices, thk if thk is not None else None
+            )
+        except Exception:
+            pass
 
     @property
     def probe_model(self) -> ProbeModelType:
@@ -928,7 +950,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             error = torch.sum(preds - targets * torch.log(preds + 1e-6))
         else:
             raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
-        loss = error / self.dset.mean_diffraction_intensity
+        denom = float(self.dset.mean_diffraction_intensity)
+        if denom <= 0 or not np.isfinite(denom):
+            denom = 1.0
+        loss = error / (denom + 1e-12)
         return loss, targets
 
     def overlap_projection(self, obj_patches, input_probe):
@@ -936,6 +961,18 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         This version is for GD only -- AD does not require all the propagated probe
         slices and trying to store them causes in-place issues
         """
+        # Allow probe to be provided with a singleton batch dim (e.g. when skipping subpixel shifting)
+        if input_probe.ndim != 4:
+            raise ValueError(f"input_probe must be (nprobes,batch,H,W), got {input_probe.shape}")
+        B = int(obj_patches.shape[1])
+        if input_probe.shape[1] != B:
+            if input_probe.shape[1] == 1:
+                input_probe = input_probe.expand(input_probe.shape[0], B, *input_probe.shape[2:])
+            else:
+                raise ValueError(
+                    f"input_probe batch dim {input_probe.shape[1]} does not match obj_patches batch dim {B}"
+                )
+
         propagated_probes = [input_probe]
         overlap = obj_patches[0] * input_probe
         for s in range(1, self.num_slices):

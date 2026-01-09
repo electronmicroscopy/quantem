@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -91,6 +91,8 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         )
         self.register_buffer("_last_patch_positions_px", torch.zeros(self.num_gpts, 2))
         self.register_buffer("_detector_mask", torch.ones(*self.roi_shape))
+        self.register_buffer("_slice_z_angstrom", torch.tensor([]))
+        self.patch_mode: Literal["indices", "coords"] = "indices"
         self.detector_mask = detector_mask
         self._constraints = {}
         self._probe_energy = None
@@ -482,7 +484,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self,
         batch_indices: np.ndarray | torch.Tensor,
         obj_padding_px: np.ndarray | tuple,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Forward pass to compute the diffraction intensities from the object and scan positions."""
         # return patch_indices, positions_px, positions_px_fractional
         # positions_px and fractional can just return
@@ -545,6 +547,51 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         old_pos = torch.round(self._last_patch_positions_px)
         new_pos = torch.round(self.scan_positions_px)
         return not torch.equal(old_pos, new_pos)
+
+    def set_object_geometry(
+        self,
+        num_slices: int,
+        slice_thicknesses: torch.Tensor | np.ndarray | Sequence | float | int | None,
+    ) -> None:
+        """
+        Store object geometry needed to generate INR coordinates.
+
+        Parameters
+        ----------
+        num_slices:
+            Number of object slices (D).
+        slice_thicknesses:
+            Thicknesses between slices (length D-1) in Angstrom.
+        """
+        D = int(validate_gt(num_slices, 0, "num_slices"))
+        if D == 1:
+            z = torch.zeros(
+                (1,), device=self.device, dtype=getattr(torch, config.get("dtype_real"))
+            )
+        else:
+            if slice_thicknesses is None:
+                raise ValueError("slice_thicknesses cannot be None when num_slices > 1")
+            if isinstance(slice_thicknesses, (float, int)):
+                thk = float(validate_gt(slice_thicknesses, 0, "slice_thicknesses"))
+                thk_t = thk * torch.ones(
+                    (D - 1,), device=self.device, dtype=getattr(torch, config.get("dtype_real"))
+                )
+            else:
+                thk_t = validate_tensor(
+                    slice_thicknesses,
+                    name="slice_thicknesses",
+                    dtype=getattr(torch, config.get("dtype_real")),
+                    ndim=1,
+                    shape=(D - 1,),
+                ).to(self.device)
+            z = torch.cat(
+                [
+                    torch.zeros((1,), device=self.device, dtype=thk_t.dtype),
+                    torch.cumsum(thk_t, dim=0),
+                ],
+                dim=0,
+            )
+        self._slice_z_angstrom = z.to(self.device)
 
     def reset(self) -> None:
         self.descan_shifts = self.initial_descan_shifts.clone().to(self.device)
@@ -1483,15 +1530,55 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self,
         batch_indices: np.ndarray | torch.Tensor,
         obj_padding_px: np.ndarray | tuple,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Forward pass to compute the diffraction intensities from the object and scan positions."""
         self.apply_hard_constraints(obj_padding_px)
         positions_px = self.scan_positions_px[batch_indices]
-        positions_px_fractional = positions_px - torch.round(positions_px)
         with torch.no_grad():
             if self.patch_indices_need_update():
                 self._set_patch_indices(obj_padding_px)
-        patch_indices = self.patch_indices[batch_indices]
+
+        if self.patch_mode == "coords":
+            if self._slice_z_angstrom.numel() == 0:
+                raise ValueError(
+                    "Dataset patch_mode='coords' requires slice z-geometry. "
+                    "Call dset.set_object_geometry(num_slices, slice_thicknesses) first."
+                )
+            D = int(self._slice_z_angstrom.numel())
+            # continuous pixel coordinates for each ROI pixel around each scan position
+            obj_shape_full = self._obj_shape_full_2d(obj_padding_px)
+            Hfull, Wfull = int(obj_shape_full[-2]), int(obj_shape_full[-1])
+            Hr, Wr = int(self.roi_shape[-2]), int(self.roi_shape[-1])
+
+            # offsets centered at 0 (same convention as integer patch indexing)
+            r_off = torch.fft.fftfreq(Hr, d=1 / Hr).to(positions_px.device)
+            c_off = torch.fft.fftfreq(Wr, d=1 / Wr).to(positions_px.device)
+
+            rr = positions_px[:, 0][:, None, None] + r_off[None, :, None]
+            cc = positions_px[:, 1][:, None, None] + c_off[None, None, :]
+            rr = torch.remainder(rr, Hfull)
+            cc = torch.remainder(cc, Wfull)
+
+            # convert to Angstrom using object sampling
+            smp = torch.tensor(
+                self.obj_sampling, device=positions_px.device, dtype=positions_px.dtype
+            )
+            y_ang = rr * smp[0]
+            x_ang = cc * smp[1]
+            z_ang = self._slice_z_angstrom.to(device=positions_px.device, dtype=positions_px.dtype)
+
+            B = int(positions_px.shape[0])
+            y_ang = y_ang[:, None].expand(B, D, Hr, Wr)
+            x_ang = x_ang[:, None].expand(B, D, Hr, Wr)
+            z_ang = z_ang[None, :, None, None].expand(B, D, Hr, Wr)
+
+            coords_ang = torch.stack([z_ang, y_ang, x_ang], dim=-1)  # (B,D,H,W,3) (z,y,x)
+            patch_indices = coords_ang
+            positions_px_fractional = None  # signal probe models to skip subpixel shifting
+        else:
+            positions_px_fractional = positions_px - torch.round(positions_px)
+            patch_indices = self.patch_indices[batch_indices]
+
         if self.learn_descan and self.has_optimizer():
             descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
         else:

@@ -308,7 +308,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         """get the model input"""
         raise NotImplementedError()
 
-    def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, fract_positions: torch.Tensor | None) -> torch.Tensor:
         """Get probe positions"""
         raise NotImplementedError()
 
@@ -715,7 +715,10 @@ class ProbePixelated(ProbeConstraints):
         )
         self._initial_probe = probe
 
-    def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, fract_positions: torch.Tensor | None) -> torch.Tensor:
+        if fract_positions is None:
+            # No subpixel shifting; broadcast happens downstream as needed.
+            return self.probe[:, None]
         shifted_probes = fourier_shift_expand(self.probe, fract_positions).swapaxes(0, 1)
         return shifted_probes
 
@@ -1047,8 +1050,10 @@ class ProbeParametric(ProbeConstraints):
         mean_diffraction_intensity = getattr(self, "_mean_diffraction_intensity", 1.0)
         return probe[None] * np.sqrt(mean_diffraction_intensity)
 
-    def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, fract_positions: torch.Tensor | None) -> torch.Tensor:
         """Generate probe on the fly and apply subpixel shifts."""
+        if fract_positions is None:
+            return self.probe[:, None]
         shifted_probes = fourier_shift_expand(self.probe, fract_positions).swapaxes(0, 1)
         return shifted_probes
 
@@ -1286,8 +1291,10 @@ class ProbeDIP(ProbeConstraints):
     def _probe(self) -> torch.Tensor:
         return self.forward(None)  # type: ignore
 
-    def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, fract_positions: torch.Tensor | None) -> torch.Tensor:
         """Get shifted probes at fractional positions"""
+        if fract_positions is None:
+            return self.probe[:, None]
         if self._input_noise_std > 0.0:
             noise = (
                 torch.randn(

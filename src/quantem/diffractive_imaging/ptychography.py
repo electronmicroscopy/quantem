@@ -126,16 +126,36 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         """Calculate soft constraints by calling apply_soft_constraints on each model."""
         total_loss = torch.tensor(0, device=self.device, dtype=self._dtype_real)
 
-        obj_loss = self.obj_model.apply_soft_constraints(
-            self.obj_model.obj, mask=self.obj_model.mask
+        obj_c = self.obj_model.constraints
+        obj_soft_needed = bool(
+            obj_c.get("tv_weight_z", 0)
+            or obj_c.get("tv_weight_xy", 0)
+            or obj_c.get("surface_zero_weight", 0)
         )
-        total_loss += obj_loss
+        if obj_soft_needed:
+            obj_loss = self.obj_model.apply_soft_constraints(
+                self.obj_model.obj, mask=self.obj_model.mask
+            )
+            total_loss += obj_loss
+        else:
+            # avoid forcing a full-object evaluation for implicit models when no soft constraints are active
+            self.obj_model.reset_soft_constraint_losses()
 
-        probe_loss = self.probe_model.apply_soft_constraints(self.probe_model.probe)
-        total_loss += probe_loss
+        prb_c = self.probe_model.constraints
+        probe_soft_needed = bool(prb_c.get("tv_weight", 0))
+        if probe_soft_needed:
+            probe_loss = self.probe_model.apply_soft_constraints(self.probe_model.probe)
+            total_loss += probe_loss
+        else:
+            self.probe_model.reset_soft_constraint_losses()
 
-        dataset_loss = self.dset.apply_soft_constraints(self.dset.descan_shifts)
-        total_loss += dataset_loss
+        dset_c = self.dset.constraints
+        dset_soft_needed = bool(dset_c.get("descan_tv_weight", 0))
+        if dset_soft_needed:
+            dataset_loss = self.dset.apply_soft_constraints(self.dset.descan_shifts)
+            total_loss += dataset_loss
+        else:
+            self.dset.reset_soft_constraint_losses()
 
         return total_loss
 

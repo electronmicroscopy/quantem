@@ -261,7 +261,6 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         real = obj_flat.real
         imag = obj_flat.imag
         patches = torch.complex(real[:, patch_indices], imag[:, patch_indices])
-
         return patches
 
     def backward(self, *args, **kwargs):
@@ -1226,28 +1225,567 @@ class ObjectDIP(ObjectConstraints):
         plt.show()
 
 
-# class ObjectImplicit(ObjectBase):
-#     """
-#     Object model for implicit objects. Importantly, the forward call from scan positions
-#     for this model will not require subpixel shifting of the object probe, as subpixel shifting
-#     will be done in the object model itself, so it is properly aligned around the probe positions
-#     """
+class ObjectINR(ObjectConstraints):
+    """
+    Object model for implicit objects. Importantly, the forward call from scan positions
+    for this model will not require subpixel shifting of the object probe, as subpixel shifting
+    will be done in the object model itself, so it is properly aligned around the probe positions
+    """
 
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self._obj = None
-#         self._obj_shape = None
-#         self._num_slices = None
+    def __init__(
+        self,
+        model: "torch.nn.Module",
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        device: str = "cpu",
+        obj_type: object_type = "complex",
+        coord_normalization: Literal["none", "centered_unit_box"] = "centered_unit_box",
+        rng: np.random.Generator | int | None = None,
+        _token: object | None = None,
+    ):
+        if _token is not self._token:
+            raise RuntimeError("Use a factory method to instantiate this class.")
 
-#     def pretrain(self, *args, **kwargs):
+        super().__init__(
+            device=device,
+            obj_type=obj_type,
+            rng=rng,
+            _token=_token,
+        )
 
+        if num_slices < 1:
+            raise ValueError(f"num_slices must be >= 1, got {num_slices}")
+        self._num_slices: int = int(num_slices)
+        self.slice_thicknesses = slice_thicknesses
 
-#     ### here the forward call will take the batch indices and create the appropriate
-#     ### input (which maybe is just the raw patch indices? tbd) for the implicit input
-#     ### so it will be parallelized inference across the batches rather than inference once
-#     ### and then patching that, like it will be for DIP
+        self._model = model.to(device)
+        self._set_pretrained_weights(self._model)
+
+        # cached full-volume coordinate grid (B=1) used by .obj and visualization
+        self.register_buffer("_full_region_coords", torch.tensor([]))
+        self.register_buffer("_pretrain_target", torch.tensor([]))
+        self._obj_shape: tuple[int, int, int] | None = None
+        self._extent_ang: tuple[float, float, float] | None = None  # (z,y,x) extent in Å
+        self._pretrain_losses: list[float] = []
+        self._pretrain_lrs: list[float] = []
+        self._coord_normalization: Literal["none", "centered_unit_box"] = coord_normalization
+
+    @classmethod
+    def from_model(
+        cls,
+        model: "torch.nn.Module",
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | torch.Tensor | None = None,
+        device: str = "cpu",
+        obj_type: object_type = "complex",
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectINR":
+        """
+        Create an ObjectINR from an implicit neural representation (INR) model.
+
+        The INR model is expected to accept coordinates shaped (B, N, 3) with channels (z, y, x)
+        in Angstrom, and output either:
+        - complex tensor shaped (B, N) (or (B, N, 1)), OR
+        - real tensor shaped (B, N, 2) interpreted as (real, imag), OR
+        - real tensor shaped (B, N) for potential / phase-only parameterizations.
+        """
+        return cls(
+            model=model,
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            rng=rng,
+            _token=cls._token,
+        )
+
+    @classmethod
+    def from_pixelated(cls, model: "torch.nn.Module", *args, **kwargs):
+        raise NotImplementedError(
+            "Not implemented yet. Use ObjectINR.from_model(...) and (optionally) pretrain manually."
+        )
+
+    @property
+    def obj(self) -> torch.Tensor:
+        coords = self.coords
+        # Evaluate full object (B=1) and apply hard constraints on the full volume
+        obj = self._eval_inr(coords)[0]  # (D, H, W)
+        if bool(self.constraints.get("apply_fov_mask", False)):
+            raise NotImplementedError("ObjectINR apply_fov_mask is not implemented yet.")
+        if self.obj_type == "potential":
+            raise NotImplementedError("ObjectINR potential objects are not implemented yet.")
+        return self.apply_hard_constraints(obj, mask=None)
+
+    @property
+    def coords(self) -> torch.Tensor:
+        if self._obj_shape is None:
+            raise ValueError("ObjectINR not initialized; call _initialize_obj() first.")
+        if self._full_region_coords.numel() == 0:
+            self._full_region_coords = self._generate_full_region_coords()
+        return self._full_region_coords
+
+    @property
+    def num_slices(self) -> int:
+        return int(self._num_slices)
+
+    @property
+    def name(self) -> str:
+        return "ObjectINR"
+
+    @property
+    def model(self) -> "torch.nn.Module":
+        return self._model
+
+    def _set_pretrained_weights(self, model: torch.nn.Module) -> None:
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError(f"Model must be a torch.nn.Module, got {type(model)}")
+        self._pretrained_weights = deepcopy(model.state_dict())
+
+    @property
+    def pretrained_weights(self) -> dict[str, torch.Tensor]:
+        return self._pretrained_weights
+
+    @property
+    def params(self):
+        return self.model.parameters()
+
+    def reset(self):
+        self.model.load_state_dict(self.pretrained_weights.copy())
+
+    def _initialize_obj(
+        self,
+        shape: tuple[int, int, int] | np.ndarray,
+        sampling: tuple[float, float] | np.ndarray | None = None,
+    ) -> None:
+        super()._initialize_obj(shape, sampling)
+        shp_arr = np.array(shape).astype(int).ravel()
+        if shp_arr.size != 3:
+            raise ValueError(f"shape must be length-3 (D,H,W), got {tuple(shp_arr)}")
+        shp: tuple[int, int, int] = (int(shp_arr[0]), int(shp_arr[1]), int(shp_arr[2]))
+        if shp[0] != self.num_slices:
+            raise ValueError(f"shape[0]={shp[0]} does not match num_slices={self.num_slices}")
+        self._obj_shape = shp
+        # Invalidate cached coords if geometry changed
+        self._full_region_coords = torch.tensor([], device=self._device)
+        if sampling is not None:
+            self.sampling = sampling
+        # store extent in Angstrom for debugging / future normalization
+        sy, sx = self.sampling
+        self._extent_ang = (float(shp[0]), float(shp[1]) * sy, float(shp[2]) * sx)
+
+    def _generate_full_region_coords(self) -> torch.Tensor:
+        """
+        Generate full object coordinate grid in Angstrom.
+
+        Returns
+        -------
+        coords: (1, D, H, W, 3) tensor with channels (z, y, x)
+        """
+        if self._obj_shape is None:
+            raise ValueError("ObjectINR not initialized; call _initialize_obj() first.")
+        D, H, W = self._obj_shape
+        sy, sx = self.sampling
+
+        # z positions (slice planes) in Angstrom
+        if D == 1:
+            z = torch.zeros(
+                (1,), device=self.device, dtype=getattr(torch, config.get("dtype_real"))
+            )
+        else:
+            thk = self.slice_thicknesses
+            if thk is None or thk.numel() == 0:
+                raise ValueError("slice_thicknesses must be set for num_slices > 1")
+            z = torch.cat(
+                [
+                    torch.zeros((1,), device=self.device, dtype=thk.dtype),
+                    torch.cumsum(thk, dim=0),
+                ],
+                dim=0,
+            ).to(dtype=getattr(torch, config.get("dtype_real")))
+
+        y = (
+            torch.arange(H, device=self.device, dtype=getattr(torch, config.get("dtype_real")))
+            * sy
+        )
+        x = (
+            torch.arange(W, device=self.device, dtype=getattr(torch, config.get("dtype_real")))
+            * sx
+        )
+        zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")  # (D,H,W)
+        coords = torch.stack([zz, yy, xx], dim=-1).unsqueeze(0)  # (1,D,H,W,3)
+        return coords
+
+    def forward(self, patch_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate object patches on the provided coordinate grid.
+
+        Parameters
+        ----------
+        coords_angstrom: torch.Tensor
+            Shape (B, D, H, W, 3) with channels (z, y, x) in Angstrom.
+
+        Returns
+        -------
+        obj_patches: torch.Tensor
+            Shape (D, B, H, W)
+        """
+        coords = validate_tensor(
+            patch_indices,
+            name="coords_angstrom",
+            dtype=getattr(torch, config.get("dtype_real")),
+            ndim=5,
+        )
+        if coords.shape[-1] != 3:
+            raise ValueError(f"coords_angstrom last dim must be 3 (z,y,x), got {coords.shape}")
+        if coords.shape[1] != self.num_slices:
+            raise ValueError(
+                f"coords_angstrom.shape[1]={coords.shape[1]} does not match num_slices={self.num_slices}"
+            )
+        B, D, H, W, _ = coords.shape
+
+        pred = self._eval_inr(coords)  # (B, D, H, W) or complex
+
+        if bool(self.constraints.get("apply_fov_mask", False)):
+            raise NotImplementedError("ObjectINR apply_fov_mask is not implemented yet.")
+        if self.obj_type == "potential":
+            raise NotImplementedError("ObjectINR potential objects are not implemented yet.")
+
+        pred = self._apply_hard_constraints_patches(pred)  # (D,B,H,W)
+        return pred
+
+    def _eval_inr(self, coords: torch.Tensor) -> torch.Tensor:
+        """Evaluate INR on coords (B,D,H,W,3) -> returns (D,B,H,W) tensor."""
+        B, D, H, W, _ = coords.shape
+        coords_flat = coords.reshape(B, D * H * W, 3)
+        coords_in = self._coords_to_model_input(coords_flat)
+        out = self.model(coords_in)
+
+        # Normalize common output shapes
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(f"INR model must return a torch.Tensor, got {type(out)}")
+
+        vals = out.squeeze()
+
+        # Apply object-type conventions
+        if self.obj_type == "potential":
+            raise NotImplementedError("ObjectINR potential objects are not implemented yet.")
+        elif self.obj_type == "pure_phase":
+            # Allow a real-valued model to output phase directly
+            if not vals.is_complex():
+                vals = torch.exp(1.0j * vals.to(dtype=getattr(torch, config.get("dtype_real"))))
+        else:
+            # complex object
+            if not vals.is_complex():
+                # Interpret real output as phase-only by default
+                vals = torch.exp(1.0j * vals.to(dtype=getattr(torch, config.get("dtype_real"))))
+
+        vals = vals.reshape(B, D, H, W)
+        return vals.permute(1, 0, 2, 3).contiguous()  # (D, B, H, W)
+
+    def _coords_to_model_input(self, coords_flat_ang: torch.Tensor) -> torch.Tensor:
+        """
+        Convert (B,N,3) coords in Angstrom (z,y,x) into the model input coordinate space.
+        Scale to [0, 1] for numerical stability.
+        """
+        if getattr(self, "_coord_normalization", "centered_unit_box") == "none":
+            return coords_flat_ang
+
+        if self._obj_shape is None:
+            raise ValueError("ObjectINR not initialized; call _initialize_obj() first.")
+
+        D, H, W = self._obj_shape
+        sy, sx = self.sampling
+
+        # ranges in Angstrom
+        if D == 1:
+            z_max = torch.tensor(1.0, device=coords_flat_ang.device, dtype=coords_flat_ang.dtype)
+        else:
+            thk = self.slice_thicknesses
+            if thk is None or thk.numel() == 0:
+                raise ValueError("slice_thicknesses must be set for num_slices > 1")
+            z_max = torch.sum(
+                thk.to(device=coords_flat_ang.device, dtype=coords_flat_ang.dtype)
+            ).clamp_min(1e-12)
+
+        y_max = torch.tensor(
+            (H - 1) * sy, device=coords_flat_ang.device, dtype=coords_flat_ang.dtype
+        ).clamp_min(1e-12)
+        x_max = torch.tensor(
+            (W - 1) * sx, device=coords_flat_ang.device, dtype=coords_flat_ang.dtype
+        ).clamp_min(1e-12)
+
+        scale = torch.stack([z_max, y_max, x_max])[None, None, :].clamp_min(1e-12)
+        return coords_flat_ang / scale
+
+    def _apply_hard_constraints_patches(self, obj_patches: torch.Tensor) -> torch.Tensor:
+        """Apply hard constraints in a patch-wise way. Expects (D,B,H,W) tensor."""
+        D, B, H, W = obj_patches.shape
+        x = obj_patches
+
+        # For patch-wise constraints, remove mean phase per (D,B) patch (not global over batch)
+        if not x.is_complex():
+            raise NotImplementedError(
+                "ObjectINR currently assumes complex-valued patches (complex or pure_phase)."
+            )
+
+        phase = x.angle()
+        phase = phase - phase.mean(dim=(-2, -1), keepdim=True)
+        if self.obj_type == "complex":
+            amp = torch.clamp(x.abs(), 0.0, 1.0)
+        else:  # pure_phase
+            amp = 1.0
+        x2 = amp * torch.exp(1.0j * phase)
+
+        # Optional filtering constraints: apply on (D*B, H, W) for reuse of existing helpers
+        if self.constraints.get("gaussian_sigma") is not None:
+            x3 = x2.reshape(D * B, H, W)
+            x3 = self.gaussian_blur_2d(x3, sigma=self.constraints["gaussian_sigma"])
+            x2 = x3.reshape(D, B, H, W)
+
+        if any([self.constraints.get("q_lowpass"), self.constraints.get("q_highpass")]):
+            x3 = x2.reshape(D * B, H, W)
+            x3 = self.butterworth_constraint(x3, sampling=self.sampling)
+            x2 = x3.reshape(D, B, H, W)
+
+        if self.constraints.get("identical_slices", False) and D > 1:
+            with torch.no_grad():
+                x2[:] = torch.mean(x2, dim=0, keepdim=True)
+
+        return x2
+
+    @property
+    def dtype(self) -> "torch.dtype":
+        if hasattr(self.model, "dtype"):
+            return getattr(self.model, "dtype")
+        else:
+            if self.obj_type in ["complex"]:
+                return config.get("dtype_complex")
+            else:
+                return config.get("dtype_real")
+
+    # --- pretraining (recommended for INR) ---
+
+    @property
+    def pretrain_target(self) -> torch.Tensor:
+        return self._pretrain_target
+
+    @pretrain_target.setter
+    def pretrain_target(self, target: torch.Tensor | np.ndarray | None) -> None:
+        if target is None:
+            self._pretrain_target = torch.tensor([])
+            return
+        target_t = validate_tensor(
+            target,
+            name="pretrain_target",
+            ndim=3,
+            expand_dims=True,
+        )
+        # Pretraining targets should never carry an autograd graph (common when passing obj_model.obj)
+        target_t = target_t.detach()
+        if self._obj_shape is not None:
+            if tuple(int(x) for x in target_t.shape) != tuple(self._obj_shape):
+                raise ValueError(
+                    f"pretrain_target shape {tuple(target_t.shape)} does not match object shape {self._obj_shape}"
+                )
+        self._pretrain_target = target_t.to(self.device)
+
+    @property
+    def pretrain_losses(self) -> np.ndarray:
+        return np.array(self._pretrain_losses)
+
+    @property
+    def pretrain_lrs(self) -> np.ndarray:
+        return np.array(self._pretrain_lrs)
+
+    def pretrain(
+        self,
+        pretrain_target: torch.Tensor | np.ndarray | None = None,
+        reset: bool = False,
+        num_iters: int = 200,
+        optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        loss_fn: Callable | str = "l2",
+        show: bool = True,
+        batch_size_points: int = int(1e6),
+    ) -> None:
+        """
+        Pretrain the INR model to fit a provided target object volume.
+
+        This is strongly recommended before running `Ptychography.reconstruct()` to avoid
+        unstable INR outputs early in optimization.
+        """
+        if self.obj_type == "potential":
+            raise NotImplementedError("ObjectINR potential objects are not implemented yet.")
+        if bool(self.constraints.get("apply_fov_mask", False)):
+            raise NotImplementedError("ObjectINR apply_fov_mask is not implemented yet.")
+
+        if pretrain_target is not None:
+            self.pretrain_target = pretrain_target
+        if self.pretrain_target.numel() == 0:
+            raise ValueError(
+                "No pretrain target set. Provide pretrain_target or set it beforehand."
+            )
+
+        if reset:
+            try:
+                self.model.reset_weights()  # type: ignore
+                self.model.to(self.device)
+            except AttributeError:
+                print("reset_weights not found, using apply which might screw things up")
+                self.model.apply(reset_weights)
+            self._pretrain_losses = []
+            self._pretrain_lrs = []
+
+        if optimizer_params is not None:
+            self.set_optimizer(optimizer_params)
+        if scheduler_params is not None:
+            self.set_scheduler(scheduler_params, num_iters)
+
+        loss_fn = get_loss_function(loss_fn, self.dtype)
+        self._pretrain(
+            num_iters=num_iters, loss_fn=loss_fn, batch_size_points=batch_size_points, show=show
+        )
+        self._set_pretrained_weights(self.model)
+
+    def _pretrain(
+        self, num_iters: int, loss_fn: Callable, batch_size_points: int, show: bool = False
+    ) -> None:
+        # self.model.train()
+        optimizer = self.optimizer
+        if optimizer is None:
+            raise ValueError(
+                "Optimizer not set. Call set_optimizer() first or pass optimizer_params."
+            )
+        scheduler = self.scheduler
+
+        target = self.pretrain_target.detach().to(self.device)
+        if target.is_complex() and self.obj_type == "pure_phase":
+            target = target.angle()
+
+        coords = self.coords  # (1,D,H,W,3)
+        D, H, W = target.shape
+        N = int(D * H * W)
+        coords_flat = coords.reshape(1, N, 3)
+        coords_flat = self._coords_to_model_input(coords_flat)
+        target_flat = target.reshape(N)
+
+        pbar = tqdm(range(int(num_iters)))
+        for a0 in pbar:
+            loss_total = self._get_zero_loss_tensor()
+            # chunk over points to control memory
+            for start in range(0, N, int(batch_size_points)):
+                end = min(N, start + int(batch_size_points))
+                out = self.model(coords_flat[:, start:end, :])
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+                pred_patch = out.squeeze()
+                tgt = target_flat[start:end]
+                loss = loss_fn(pred_patch, tgt)
+                loss.backward()
+                loss_total = loss_total + loss.detach()
+
+            optimizer.step()
+            optimizer.zero_grad()
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(float(loss_total))
+                else:
+                    scheduler.step()
+
+            self._pretrain_losses.append(float(loss_total))
+            self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
+            pbar.set_description(f"INR pretrain {a0 + 1}/{num_iters} loss={float(loss_total):.3e}")
+        if show:
+            fpred = self.model(coords_flat).reshape(D, H, W)
+            self.visualize_pretrain(fpred)
+
+    def visualize_pretrain(self, pred_obj: torch.Tensor):
+        import matplotlib.gridspec as gridspec
+
+        fig = plt.figure(figsize=(12, 6))
+        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
+        ax = fig.add_subplot(gs[0])
+        lines = []
+        lines.extend(
+            ax.semilogy(
+                np.arange(len(self._pretrain_losses)), self._pretrain_losses, c="k", label="loss"
+            )
+        )
+        ax.set_ylabel("Loss", color="k")
+        ax.tick_params(axis="y", which="both", colors="k")
+        ax.spines["left"].set_color("k")
+        ax.set_xlabel("Iterations")
+        nx = ax.twinx()
+        nx.spines["left"].set_visible(False)
+        lines.extend(
+            nx.semilogy(
+                np.arange(len(self._pretrain_lrs)),
+                self._pretrain_lrs,
+                c="tab:orange",
+                label="LR",
+            )
+        )
+        labs = [lin.get_label() for lin in lines]
+        nx.legend(lines, labs, loc="upper center")
+        nx.set_ylabel("LRs")
+
+        n_bot = 4 if self.obj_type == "complex" else 2
+        gs_bot = gridspec.GridSpecFromSubplotSpec(1, n_bot, subplot_spec=gs[1])
+        axs_bot = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(n_bot)])
+        target = self.pretrain_target
+        if target is None:
+            raise ValueError("Model has not been pre-trained")
+        if n_bot == 4:
+            show_2d(
+                [
+                    pred_obj.mean(0).angle().cpu().detach().numpy(),
+                    target.mean(0).angle().cpu().detach().numpy(),
+                    pred_obj.mean(0).abs().cpu().detach().numpy(),
+                    target.mean(0).abs().cpu().detach().numpy(),
+                ],
+                figax=(fig, axs_bot),
+                title=[
+                    "Predicted Phase",
+                    "Target Phase",
+                    "Predicted Amplitude",
+                    "Target Amplitude",
+                ],
+                cmap="magma",
+                cbar=True,
+            )
+        else:
+            show_2d(
+                [
+                    pred_obj.mean(0).cpu().detach().numpy(),
+                    target.mean(0).cpu().detach().numpy(),
+                ],
+                figax=(fig, axs_bot),
+                title=[f"Pred obj ({self.obj_type})", f"Target obj ({self.obj_type})"],
+                cmap="magma",
+                cbar=True,
+            )
+        plt.suptitle(
+            f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
+            fontsize=14,
+            y=0.94,
+        )
+        plt.show()
+
+    ### here the forward call will take the batch indices and create the appropriate
+    ### input (which maybe is just the raw patch indices? tbd) for the implicit input
+    ### so it will be parallelized inference across the batches rather than inference once
+    ### and then patching that, like it will be for DIP
+
 
 # constraints are going to be tricky, specifically the TV and filtering if we want to allow
 # multiscale reconstructions
 
-ObjectModelType = ObjectPixelated | ObjectDIP  # | ObjectImplicit
+# other notes/todos
+# implement pretraining
+# don't worry about constraints for now
+# dtype of input needs to match dtype of model, if potential or pure_phase then real, if complex then complex
+
+ObjectModelType = ObjectPixelated | ObjectDIP | ObjectINR  # | ObjectImplicit
