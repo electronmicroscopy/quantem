@@ -125,7 +125,13 @@ class HyperparameterState:
         self.initial_rotation_angle = None
         self.clear_optimized()
 
-    def summarize(self, *, which: str = "current") -> str:
+    def summarize(
+        self,
+        *,
+        which: str = "current",
+        override_aberration_coefs: dict[str, float] | None = None,
+        override_rotation_angle: float | None = None,
+    ) -> str:
         cls = self.__class__.__name__
         lines: list[str] = []
 
@@ -145,8 +151,8 @@ class HyperparameterState:
                 add("optimized_rotation_angle", self.optimized_rotation_angle)
 
         elif which == "current":
-            current_abers = self.current_aberrations()
-            current_rot = self.current_rotation_angle()
+            current_abers = self.current_aberrations(override_aberration_coefs)
+            current_rot = self.current_rotation_angle(override_rotation_angle)
 
             if current_abers:
                 add("current_aberrations", current_abers)
@@ -679,7 +685,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         if use_optimized_state:
             if verbose:
-                print("Reconstructing with:\n\n", state.summarize(which="current"))
+                print(
+                    "Reconstructing with:\n\n",
+                    state.summarize(
+                        which="current",
+                        override_aberration_coefs=override_aberration_coefs,
+                        override_rotation_angle=override_rotation_angle,
+                    ),
+                )
             aberration_coefs = state.current_aberrations(override_aberration_coefs)
             rotation_angle = state.current_rotation_angle(override_rotation_angle)
         else:
@@ -952,7 +965,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         state.study = study
 
         if self.verbose:
-            print(self.hyperparameter_state)
+            print("Optimized state:\n\n", self.hyperparameter_state)
 
         self.reconstruct(verbose=False, **reconstruct_kwargs)
         return self
@@ -1039,7 +1052,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             state.optimized_aberrations = best_params
 
         if self.verbose:
-            print(self.hyperparameter_state)
+            print("Optimized state:\n\n", self.hyperparameter_state)
 
         # Final reconstruction using merged state
         self.reconstruct(verbose=False, **reconstruct_kwargs)
@@ -1204,7 +1217,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         state.optimized_keys = {"C10", "C12", "phi12", "rotation_angle"}
 
         if self.verbose:
-            print(self.hyperparameter_state)
+            print("Optimized state:\n\n", self.hyperparameter_state)
 
         self.reconstruct(verbose=False, **reconstruct_kwargs)
 
