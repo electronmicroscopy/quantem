@@ -81,10 +81,6 @@ class HyperparameterState:
         self.initial_aberrations = validate_aberration_coefficients(dict(self.initial_aberrations))
         self.optimized_aberrations = validate_aberration_coefficients(self.optimized_aberrations)
 
-        if self.initial_rotation_angle is None:
-            self.initial_rotation_angle = 0.0
-
-        # Canonicalize optimized_keys as well
         if self.optimized_keys:
             canonical = validate_aberration_coefficients(
                 {k: 0.0 for k in self.optimized_keys if k != "rotation_angle"}
@@ -102,7 +98,7 @@ class HyperparameterState:
         """Return full aberration dictionary (fixed ⊕ optimized)."""
         out = dict(self.initial_aberrations)
         out.update(self.optimized_aberrations)
-        if override_fixed:
+        if override_fixed is not None:
             out.update(validate_aberration_coefficients(override_fixed))
         return out
 
@@ -112,7 +108,22 @@ class HyperparameterState:
             return override_fixed
         if self.optimized_rotation_angle is not None:
             return self.optimized_rotation_angle
-        return self.initial_rotation_angle  # ty:ignore[invalid-return-type]
+        if self.initial_rotation_angle is not None:
+            return self.initial_rotation_angle
+        return 0.0
+
+    def clear_optimized(self):
+        """Clear all optimized aberrations and rotation angle."""
+        self.optimized_aberrations.clear()
+        self.optimized_rotation_angle = None
+        self.optimized_keys.clear()
+        self.study = None
+
+    def clear_all(self):
+        """Clear everything: initial and optimized hyperparameters."""
+        self.initial_aberrations.clear()
+        self.initial_rotation_angle = None
+        self.clear_optimized()
 
     def summarize(self, *, which: str = "current") -> str:
         cls = self.__class__.__name__
@@ -618,9 +629,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def reconstruct(
         self,
         bf_mask=None,
-        aberration_coefs=None,
+        override_aberration_coefs=None,
         upsampling_factor=None,
-        rotation_angle=None,
+        override_rotation_angle=None,
         max_batch_size=None,
         deconvolution_kernel="single-sideband",
         q_highpass=None,
@@ -639,11 +650,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         bf_mask: torch.Tensor, optional
             Subset of bright field mask to use for reconstruction. Note this must be
             strictly smaller than the bf_mask used for initialization.
-        aberration_coefs : dict, optional
+        override_aberration_coefs : dict, optional
             Aberration coefficients for the probe
         upsampling_factor : int, optional
             Factor by which to upsample the reconstruction
-        rotation_angle : float, optional
+        override_rotation_angle : float, optional
             Rotation angle for coordinate system
         max_batch_size : int, optional
             Maximum batch size for processing
@@ -668,12 +679,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         if use_optimized_state:
             if verbose:
-                print(state.summarize(which="current"))
-            aberration_coefs = state.current_aberrations(aberration_coefs)
-            rotation_angle = state.current_rotation_angle(rotation_angle)
+                print("Reconstructing with:\n\n", state.summarize(which="current"))
+            aberration_coefs = state.current_aberrations(override_aberration_coefs)
+            rotation_angle = state.current_rotation_angle(override_rotation_angle)
         else:
             if verbose:
-                print(state.summarize(which="initial"))
+                print("Reconstructing with:\n\n", state.summarize(which="initial"))
             aberration_coefs = state.initial_aberrations
             rotation_angle = state.initial_rotation_angle
 
@@ -892,9 +903,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs = aberration_coefs or {}
 
         # Reset optimized bookkeeping
-        state.optimized_keys.clear()
-        state.optimized_aberrations.clear()
-        state.optimized_rotation_angle = None
+        state.clear_optimized()
 
         # Partition inputs
         fixed_override_aberrations = {}
@@ -926,8 +935,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 rot = rotation_angle
 
             self.reconstruct(
-                aberration_coefs=trial_aberrations,
-                rotation_angle=rot,
+                override_aberration_coefs=trial_aberrations,
+                override_rotation_angle=rot,
                 verbose=False,
                 **reconstruct_kwargs,
             )
@@ -958,9 +967,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         state = self.hyperparameter_state
 
         # Reset optimized bookkeeping
-        state.optimized_keys.clear()
-        state.optimized_aberrations.clear()
-        state.optimized_rotation_angle = None
+        state.clear_optimized()
 
         # Partition inputs
         fixed_override_aberrations: dict[str, float] = {}
@@ -1010,8 +1017,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 rot = rotation_angle
 
             self.reconstruct(
-                aberration_coefs=trial_aberrations,
-                rotation_angle=rot,
+                override_aberration_coefs=trial_aberrations,
+                override_rotation_angle=rot,
                 verbose=False,
                 **reconstruct_kwargs,
             )
@@ -1128,9 +1135,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             if k not in ["deconvolution_kernel", "verbose", "parallax_flip_phase"]
         }
 
+        state = self.hyperparameter_state
+        state.clear_optimized()
+
         self.reconstruct(
-            rotation_angle=rotation_angle,
-            aberration_coefs=aberration_coefs,
+            override_rotation_angle=rotation_angle,
+            override_aberration_coefs=aberration_coefs,
             deconvolution_kernel="parallax",
             parallax_flip_phase=False,
             verbose=False,
@@ -1189,7 +1199,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         fitted_aberration_coefs = fit_results.copy()
         fitted_rotation_angle = fitted_aberration_coefs.pop("rotation_angle", None)
 
-        state = self.hyperparameter_state
         state.optimized_aberrations = validate_aberration_coefficients(fitted_aberration_coefs)
         state.optimized_rotation_angle = fitted_rotation_angle
         state.optimized_keys = {"C10", "C12", "phi12", "rotation_angle"}
