@@ -9,6 +9,7 @@
 <!--
 Use the following checklist items when applicable (select only what applies):
 - [ ] This PR introduces a public-facing change (e.g., figures, CLI input/output, API).
+    - [ ] For functional and algorithmic changes, tests are written or updated.
     - [ ] Documentation (e.g., tutorials, examples, README) has been updated.
     - [ ] A tracking issue or plan to update documentation exists.
 - [ ] This PR affects internal functionality only (no user-facing change).
