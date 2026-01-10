@@ -39,9 +39,13 @@ else:
 from itertools import product
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
+    ABERRATION_PRESETS,
     align_vbf_stack_multiscale,
+    concentric_ring_wavevectors,
     create_edge_window,
+    find_nearest_k_indices,
     fit_aberrations_from_shifts,
+    fit_aberrations_using_least_squares,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1151,6 +1155,68 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.reconstruct_with_hyperparameters(verbose=False, **reconstruct_kwargs)
 
         return self
+
+    def fit_hyperparameters_least_squares(
+        self,
+        cartesian_basis: str | list[str] = "low_order",
+        rotation_angle: float | None = None,
+        aberration_coefs: dict[str, int | float | torch.Tensor] | None = None,
+        num_bf_rings: int = 3,
+        num_bf_points_per_ring: int = 6,
+    ):
+        if aberration_coefs is None:
+            aberration_coefs = self.aberration_coefs
+        else:
+            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
+
+        if rotation_angle is None:
+            rotation_angle = self.rotation_angle
+        else:
+            rotation_angle = float(rotation_angle)
+
+        if isinstance(cartesian_basis, str):
+            cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
+
+        # spatial frequencies
+        qxa, qya = self._return_upsampled_qgrid()
+
+        # BF geometry
+        kxa, kya = spatial_frequencies(
+            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+        )
+
+        k_bf_target = concentric_ring_wavevectors(
+            self.semiangle_cutoff * 0.95,
+            num_rings=num_bf_rings,
+            num_points_per_ring=num_bf_points_per_ring,
+            wavelength=self.wavelength,
+            include_center=False,
+            device=self.device,
+        )
+
+        inds_i, inds_j = find_nearest_k_indices(k_bf_target, kxa, kya)
+
+        k_bf = torch.stack((kxa[inds_i, inds_j], kya[inds_i, inds_j]), -1)
+
+        bf_mask = torch.zeros_like(self.bf_mask)
+        bf_mask[inds_i, inds_j] = True
+        vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
+        vbf_fourier = self._vbf_fourier[vbf_index_mapping]
+
+        updated_aberrations_polar, delta_cartesian, phi_obj = fit_aberrations_using_least_squares(
+            vbf_fourier=vbf_fourier,
+            qxa=qxa,
+            qya=qya,
+            k_bf=k_bf,
+            cartesian_basis=cartesian_basis,
+            wavelength=self.wavelength,
+            semiangle_cutoff=self.semiangle_cutoff,
+            angular_sampling=self.angular_sampling,
+            soft_edges=True,
+            aberration_coefs_init=aberration_coefs,
+        )
+
+        return updated_aberrations_polar
 
     def reconstruct_with_hyperparameters(
         self,
