@@ -39,13 +39,13 @@ else:
 from itertools import product
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
-    ABERRATION_PRESETS,
+    # ABERRATION_PRESETS,
     align_vbf_stack_multiscale,
-    concentric_ring_wavevectors,
+    # concentric_ring_wavevectors,
     create_edge_window,
-    find_nearest_k_indices,
+    # find_nearest_k_indices,
     fit_aberrations_from_shifts,
-    fit_aberrations_using_least_squares,
+    # fit_aberrations_using_least_squares,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -888,6 +888,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float | OptimizationParameter | None = None,
         n_trials=50,
         sampler=None,
+        verbose=None,
         **reconstruct_kwargs,
     ):
         """
@@ -910,6 +911,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
         """
+
+        if verbose is None:
+            verbose = self.verbose
+
         sampler = sampler or optuna.samplers.TPESampler()
 
         state = self.hyperparameter_state
@@ -956,7 +961,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             return float(self.variance_loss())
 
         study = optuna.create_study(direction="minimize", sampler=sampler)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=self.verbose)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=verbose)
 
         # Write back optimized results
         best = study.best_params.copy()
@@ -964,7 +969,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         state.optimized_aberrations = best
         state.study = study
 
-        if self.verbose:
+        if verbose:
             print("Optimized state:\n\n", self.hyperparameter_state)
 
         self.reconstruct(verbose=False, **reconstruct_kwargs)
@@ -974,8 +979,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
         rotation_angle: float | OptimizationParameter | None = None,
+        verbose=None,
         **reconstruct_kwargs,
     ):
+        if verbose is None:
+            verbose = self.verbose
+
         aberration_coefs = aberration_coefs or {}
         state = self.hyperparameter_state
 
@@ -1016,7 +1025,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         best_params: dict[str, float] | None = None
         results = []
 
-        for combo in tqdm(grid):
+        for combo in tqdm(grid, disable=not verbose):
             trial_params = dict(zip(keys, combo))
 
             trial_aberrations = dict(fixed_override_aberrations)
@@ -1051,7 +1060,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             state.optimized_rotation_angle = best_params.pop("rotation_angle", None)
             state.optimized_aberrations = best_params
 
-        if self.verbose:
+        if verbose:
             print("Optimized state:\n\n", self.hyperparameter_state)
 
         # Final reconstruction using merged state
@@ -1091,6 +1100,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         running_average: bool = False,
         regularize_shifts: bool = True,
         dft_upsample_factor: int = 4,
+        verbose=None,
         **reconstruct_kwargs,
     ):
         """
@@ -1131,6 +1141,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             ref_new = ref_old * n/(n+1) + aligned_mean / (n+1)
         """
 
+        if verbose is None:
+            verbose = self.verbose
+
         if bf_mask is None:
             bf_mask = self.bf_mask
         bf = self._return_bf_context(bf_mask)
@@ -1145,7 +1158,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "verbose", "parallax_flip_phase"]
+            if k not in ["deconvolution_kernel", "parallax_flip_phase"]
         }
 
         state = self.hyperparameter_state
@@ -1194,7 +1207,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             initial_shifts=initial_shifts,
             running_average=running_average,
             basis=basis,
-            verbose=self.verbose,
+            verbose=verbose,
         )
 
         lateral_shifts = shifts_px * scan_sampling
@@ -1216,81 +1229,83 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         state.optimized_rotation_angle = fitted_rotation_angle
         state.optimized_keys = {"C10", "C12", "phi12", "rotation_angle"}
 
-        if self.verbose:
+        if verbose:
             print("Optimized state:\n\n", self.hyperparameter_state)
 
         self.reconstruct(verbose=False, **reconstruct_kwargs)
 
         return self
 
-    def fit_hyperparameters_least_squares(
-        self,
-        cartesian_basis: str | list[str] = "low_order",
-        rotation_angle: float | None = None,
-        aberration_coefs: dict[str, int | float | torch.Tensor] | None = None,
-        num_bf_rings: int = 3,
-        num_bf_points_per_ring: int = 6,
-    ):
-        if aberration_coefs is None:
-            aberration_coefs = self.aberration_coefs
-        else:
-            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
+    # def fit_hyperparameters_least_squares(
+    #     self,
+    #     cartesian_basis: str | list[str] = "low_order",
+    #     rotation_angle: float | None = None,
+    #     aberration_coefs: dict[str, int | float | torch.Tensor] | None = None,
+    #     num_bf_rings: int = 3,
+    #     num_bf_points_per_ring: int = 6,
+    # ):
+    #     if aberration_coefs is None:
+    #         aberration_coefs = self.aberration_coefs
+    #     else:
+    #         aberration_coefs = validate_aberration_coefficients(aberration_coefs)
 
-        if rotation_angle is None:
-            rotation_angle = self.rotation_angle
-        else:
-            rotation_angle = float(rotation_angle)
+    #     if rotation_angle is None:
+    #         rotation_angle = self.rotation_angle
+    #     else:
+    #         rotation_angle = float(rotation_angle)
 
-        if isinstance(cartesian_basis, str):
-            cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
+    #     if isinstance(cartesian_basis, str):
+    #         cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
 
-        # spatial frequencies
-        qxa, qya = self._return_upsampled_qgrid()
+    #     # spatial frequencies
+    #     qxa, qya = self._return_upsampled_qgrid()
 
-        # BF geometry
-        kxa, kya = spatial_frequencies(
-            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
-        )
+    #     # BF geometry
+    #     kxa, kya = spatial_frequencies(
+    #         self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+    #     )
 
-        k_bf_target = concentric_ring_wavevectors(
-            self.semiangle_cutoff * 0.95,
-            num_rings=num_bf_rings,
-            num_points_per_ring=num_bf_points_per_ring,
-            wavelength=self.wavelength,
-            include_center=False,
-            device=self.device,
-        )
+    #     k_bf_target = concentric_ring_wavevectors(
+    #         self.semiangle_cutoff * 0.95,
+    #         num_rings=num_bf_rings,
+    #         num_points_per_ring=num_bf_points_per_ring,
+    #         wavelength=self.wavelength,
+    #         include_center=False,
+    #         device=self.device,
+    #     )
 
-        inds_i, inds_j = find_nearest_k_indices(k_bf_target, kxa, kya)
+    #     inds_i, inds_j = find_nearest_k_indices(k_bf_target, kxa, kya)
 
-        k_bf = torch.stack((kxa[inds_i, inds_j], kya[inds_i, inds_j]), -1)
+    #     k_bf = torch.stack((kxa[inds_i, inds_j], kya[inds_i, inds_j]), -1)
 
-        bf_mask = torch.zeros_like(self.bf_mask)
-        bf_mask[inds_i, inds_j] = True
-        vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
-        vbf_fourier = self._vbf_fourier[vbf_index_mapping]
+    #     bf_mask = torch.zeros_like(self.bf_mask)
+    #     bf_mask[inds_i, inds_j] = True
+    #     vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
+    #     vbf_fourier = self._vbf_fourier[vbf_index_mapping]
 
-        updated_aberrations_polar, delta_cartesian, phi_obj = fit_aberrations_using_least_squares(
-            vbf_fourier=vbf_fourier,
-            qxa=qxa,
-            qya=qya,
-            k_bf=k_bf,
-            cartesian_basis=cartesian_basis,
-            wavelength=self.wavelength,
-            semiangle_cutoff=self.semiangle_cutoff,
-            angular_sampling=self.angular_sampling,
-            soft_edges=True,
-            aberration_coefs_init=aberration_coefs,
-        )
+    #     updated_aberrations_polar, delta_cartesian, phi_obj = fit_aberrations_using_least_squares(
+    #         vbf_fourier=vbf_fourier,
+    #         qxa=qxa,
+    #         qya=qya,
+    #         k_bf=k_bf,
+    #         cartesian_basis=cartesian_basis,
+    #         wavelength=self.wavelength,
+    #         semiangle_cutoff=self.semiangle_cutoff,
+    #         angular_sampling=self.angular_sampling,
+    #         soft_edges=True,
+    #         aberration_coefs_init=aberration_coefs,
+    #     )
 
-        return updated_aberrations_polar
+    #     return updated_aberrations_polar
 
-    def _reconstruct_all_permutations(self, **reconstruct_kwargs):
+    def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
         """ """
+
+        if verbose is None:
+            verbose = self.verbose
+
         safe_kwargs = {
-            k: v
-            for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "verbose"]
+            k: v for k, v in reconstruct_kwargs.items() if k not in ["deconvolution_kernel"]
         }
 
         kernels = ["ssb", "obf", "mf", "prlx", "icom"]
@@ -1301,7 +1316,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 verbose=False,
                 **safe_kwargs,
             ).obj
-            for kernel in tqdm(kernels, disable=not self.verbose)
+            for kernel in tqdm(kernels, disable=not verbose)
         ]
 
         return recons
@@ -1318,7 +1333,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         return [bf1, bf2]
 
-    def _reconstruct_with_halfsets(self, **reconstruct_kwargs):
+    def _reconstruct_with_halfsets(self, verbose=None, **reconstruct_kwargs):
         """
         Compute two half-set reconstructions using alternating BF pixels (checkerboard pattern).
 
@@ -1329,16 +1344,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         halfset_2 : torch.Tensor
             Reconstruction using second half of BF pixels
         """
+        if verbose is None:
+            verbose = False
 
         bf1, bf2 = self._make_checkerboard_bf_masks(self.gpts, self.bf_mask)
-        safe_kwargs = {
-            k: v for k, v in reconstruct_kwargs.items() if k not in ["verbose", "bf_mask"]
-        }
+        safe_kwargs = {k: v for k, v in reconstruct_kwargs.items() if k not in ["bf_mask"]}
 
-        self.reconstruct(**safe_kwargs, bf_mask=bf1, verbose=False)
+        self.reconstruct(**safe_kwargs, bf_mask=bf1, verbose=verbose)
         halfset_1 = self.corrected_bf
 
-        self.reconstruct(**safe_kwargs, bf_mask=bf2, verbose=False)
+        self.reconstruct(**safe_kwargs, bf_mask=bf2, verbose=verbose)
         halfset_2 = self.corrected_bf
 
         return [halfset_1, halfset_2]
