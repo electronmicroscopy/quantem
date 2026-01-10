@@ -1252,14 +1252,25 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         kernels = ["ssb", "obf", "mf", "prlx", "icom"]
 
-        recons = [
-            self.reconstruct(
-                deconvolution_kernel=kernel,
-                verbose=False,
-                **safe_kwargs,
-            ).obj
-            for kernel in tqdm(kernels, disable=not self.verbose)
-        ]
+        if hasattr(self, "_hyperparameter_state"):
+            recons = [
+                self.reconstruct_with_hyperparameters(
+                    deconvolution_kernel=kernel,
+                    verbose=False,
+                    **safe_kwargs,
+                ).obj
+                for kernel in tqdm(kernels, disable=not self.verbose)
+            ]
+
+        else:
+            recons = [
+                self.reconstruct(
+                    deconvolution_kernel=kernel,
+                    verbose=False,
+                    **safe_kwargs,
+                ).obj
+                for kernel in tqdm(kernels, disable=not self.verbose)
+            ]
 
         return recons
 
