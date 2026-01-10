@@ -1,7 +1,7 @@
 import gc
 import math
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import numpy as np
 import optuna
@@ -39,9 +39,13 @@ else:
 from itertools import product
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
+    # ABERRATION_PRESETS,
     align_vbf_stack_multiscale,
+    # concentric_ring_wavevectors,
     create_edge_window,
+    # find_nearest_k_indices,
     fit_aberrations_from_shifts,
+    # fit_aberrations_using_least_squares,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -62,6 +66,129 @@ class OptimizationParameter:
             return np.geomspace(self.low, self.high, self.n_points)
         else:
             return np.linspace(self.low, self.high, self.n_points)
+
+
+@dataclass
+class HyperparameterState:
+    initial_aberrations: dict[str, float] = field(default_factory=dict)
+    initial_rotation_angle: float | None = None
+    optimized_aberrations: dict[str, float] = field(default_factory=dict)
+    optimized_rotation_angle: float | None = None
+    optimized_keys: set[str] = field(default_factory=set)
+    study: optuna.Study | None = None
+
+    def __post_init__(self):
+        self.initial_aberrations = validate_aberration_coefficients(dict(self.initial_aberrations))
+        self.optimized_aberrations = validate_aberration_coefficients(self.optimized_aberrations)
+
+        if self.optimized_keys:
+            canonical = validate_aberration_coefficients(
+                {k: 0.0 for k in self.optimized_keys if k != "rotation_angle"}
+            )
+            self.optimized_keys = set(canonical.keys()) | {
+                k for k in self.optimized_keys if k == "rotation_angle"
+            }
+
+    def __repr__(self) -> str:
+        return self.summarize(which="all")
+
+    def current_aberrations(
+        self, override_fixed: dict[str, float] | None = None
+    ) -> Dict[str, float]:
+        """Return full aberration dictionary (fixed ⊕ optimized)."""
+        out = dict(self.initial_aberrations)
+        out.update(self.optimized_aberrations)
+        if override_fixed is not None:
+            out.update(validate_aberration_coefficients(override_fixed))
+        return out
+
+    def current_rotation_angle(self, override_fixed: float | None = None) -> float:
+        """Return rotation angle (optimized takes precedence)."""
+        if override_fixed is not None:
+            return override_fixed
+        if self.optimized_rotation_angle is not None:
+            return self.optimized_rotation_angle
+        if self.initial_rotation_angle is not None:
+            return self.initial_rotation_angle
+        return 0.0
+
+    def clear_optimized(self):
+        """Clear all optimized aberrations and rotation angle."""
+        self.optimized_aberrations.clear()
+        self.optimized_rotation_angle = None
+        self.optimized_keys.clear()
+        self.study = None
+
+    def clear_all(self):
+        """Clear everything: initial and optimized hyperparameters."""
+        self.initial_aberrations.clear()
+        self.initial_rotation_angle = None
+        self.clear_optimized()
+
+    def summarize(
+        self,
+        *,
+        which: str = "current",
+        override_aberration_coefs: dict[str, float] | None = None,
+        override_rotation_angle: float | None = None,
+    ) -> str:
+        cls = self.__class__.__name__
+        lines: list[str] = []
+
+        def add(name: str, value):
+            lines.append(f"  {name}={value!r},")
+
+        if which == "initial":
+            if self.initial_aberrations:
+                add("initial_aberrations", self.initial_aberrations)
+            if self.initial_rotation_angle is not None:
+                add("initial_rotation_angle", self.initial_rotation_angle)
+
+        elif which == "optimized":
+            if self.optimized_aberrations:
+                add("optimized_aberrations", self.optimized_aberrations)
+            if self.optimized_rotation_angle is not None:
+                add("optimized_rotation_angle", self.optimized_rotation_angle)
+
+        elif which == "current":
+            current_abers = self.current_aberrations(override_aberration_coefs)
+            current_rot = self.current_rotation_angle(override_rotation_angle)
+
+            if current_abers:
+                add("current_aberrations", current_abers)
+            if current_rot is not None:
+                add("current_rotation_angle", current_rot)
+
+        elif which == "all":
+            if self.initial_aberrations:
+                add("initial_aberrations", self.initial_aberrations)
+            if self.initial_rotation_angle is not None:
+                add("initial_rotation_angle", self.initial_rotation_angle)
+            if self.optimized_aberrations:
+                add("optimized_aberrations", self.optimized_aberrations)
+            if self.optimized_rotation_angle is not None:
+                add("optimized_rotation_angle", self.optimized_rotation_angle)
+
+        else:
+            raise ValueError(
+                f"`which` must be one of "
+                f'{{"initial", "optimized", "current", "all"}}, got {which!r}'
+            )
+
+        if not lines:
+            return f"{cls}()"
+
+        body = "\n".join(lines)
+        return f"{cls}(\n{body}\n)"
+
+
+@dataclass(frozen=True)
+class BrightFieldContext:
+    bf_mask: torch.Tensor
+    bf_inds_i: torch.Tensor
+    bf_inds_j: torch.Tensor
+    num_bf: int
+    vbf_index_mapping: torch.Tensor
 
 
 class DirectPtychography(RNGMixin, AutoSerialize):
@@ -91,8 +218,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         self.device = device
         self.verbose = verbose
-        self.vbf_stack = vbf_dataset.array
-        self.bf_mask = bf_mask_dataset.array
+        self.vbf_stack = vbf_dataset.array  # ty:ignore[invalid-assignment]
+        self.bf_mask = bf_mask_dataset.array  # ty:ignore[invalid-assignment]
 
         self.wavelength = electron_wavelength_angstrom(energy)
         self.scan_units = vbf_dataset.units[-2:]
@@ -104,15 +231,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
 
         self.num_bf = vbf_dataset.shape[0]
-        self.gpts = bf_mask_dataset.shape
+        self.gpts = bf_mask_dataset.shape[:2]
         self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
 
-        self.semiangle_cutoff = semiangle_cutoff
+        self.semiangle_cutoff = semiangle_cutoff  # ty:ignore[invalid-assignment]
         self.soft_edges = soft_edges
         self.rng = rng
 
-        self.rotation_angle = rotation_angle
-        self.aberration_coefs = aberration_coefs
+        self.hyperparameter_state = HyperparameterState(
+            initial_aberrations=aberration_coefs, initial_rotation_angle=rotation_angle
+        )
 
         self._preprocess()
 
@@ -123,7 +251,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         bf_mask_dataset: Dataset2d,
         energy: float,
         rotation_angle: float,
-        aberration_coefs: dict,
+        aberration_coefs: dict = {},
         semiangle_cutoff: float | None = None,
         soft_edges: bool = True,
         rng: np.random.Generator | int | None = None,
@@ -151,8 +279,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         cls,
         dataset: Dataset4d,
         energy: float,
-        aberration_coefs: dict,
         semiangle_cutoff: float,
+        aberration_coefs: dict = {},
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -176,10 +304,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             if force_measured_origin is None:
                 origin.calculate_origin(max_batch_size)
             else:
-                origin.origin_measured = force_measured_origin
+                origin.origin_measured = force_measured_origin  # ty:ignore[invalid-assignment]
             origin.fit_origin_background(fit_method=fit_method)
         else:
-            origin.origin_fitted = force_fitted_origin
+            origin.origin_fitted = force_fitted_origin  # ty:ignore[invalid-assignment]
 
         if rotation_angle is None:
             origin.estimate_detector_rotation()
@@ -267,14 +395,30 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         """ """
 
-        self._bf_inds_i, self._bf_inds_j = torch.where(self.bf_mask)
         self._vbf_fourier = torch.fft.fft2(self.vbf_stack)
         self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
-        self._corrected_stack_amplitude = None
 
         return self
+
+    def _return_bf_context(self, bf_mask):
+        """
+        Given a BF mask, compute all BF-dependent geometry and indexing.
+        """
+        bf_mask = torch.as_tensor(bf_mask, dtype=torch.bool, device=self.device)
+
+        bf_inds_i, bf_inds_j = torch.nonzero(bf_mask, as_tuple=True)
+        vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
+        num_bf = bf_inds_i.numel()
+
+        return BrightFieldContext(
+            bf_mask=bf_mask,
+            bf_inds_i=bf_inds_i,
+            bf_inds_j=bf_inds_j,
+            num_bf=num_bf,
+            vbf_index_mapping=vbf_index_mapping,
+        )
 
     def _return_upsampled_qgrid(
         self,
@@ -323,23 +467,23 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def rotation_angle(self) -> float:
-        return self._rotation_angle
+        return self.hyperparameter_state.current_rotation_angle()
 
-    @rotation_angle.setter
-    def rotation_angle(self, value: float):
-        self._rotation_angle = float(value)
+    # @rotation_angle.setter
+    # def rotation_angle(self, value: float):
+    #     self._rotation_angle = float(value)
 
     @property
     def aberration_coefs(self) -> dict:
-        return self._aberration_coefs
+        return self.hyperparameter_state.current_aberrations()
 
-    @aberration_coefs.setter
-    def aberration_coefs(self, value: dict):
-        value = validate_aberration_coefficients(value)
-        self._aberration_coefs = value
+    # @aberration_coefs.setter
+    # def aberration_coefs(self, value: dict):
+    #     value = validate_aberration_coefficients(value)
+    #     self._aberration_coefs = value
 
     @property
-    def semiangle_cutoff(self) -> dict:
+    def semiangle_cutoff(self) -> float:
         return self._semiangle_cutoff
 
     @semiangle_cutoff.setter
@@ -348,27 +492,22 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._semiangle_cutoff = value
 
     @property
-    def device(self) -> str:
+    def device(self) -> str | torch.device:
         """This should be of form 'cuda:X' or 'cpu', as defined by quantem.config"""
         if hasattr(self, "_device"):
-            return self._device
+            return self._device  # ty:ignore[invalid-return-type]
         else:
             return config.get("device")
 
     @device.setter
     def device(self, device: str | int | None):
-        # allow setting gpu/cpu, but not changing the device from the config gpu device
         if device is not None:
             dev, _id = config.validate_device(device)
             self._device = dev
-            try:
-                self.to(dev)
-            except AttributeError:
-                pass
 
     @property
     def scan_sampling(self) -> NDArray:
-        return self._scan_sampling
+        return self._scan_sampling  # ty:ignore[invalid-return-type]
 
     @scan_sampling.setter
     def scan_sampling(self, value: NDArray | tuple | list) -> None:
@@ -383,7 +522,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def reciprocal_sampling(self) -> NDArray:
-        return self._reciprocal_sampling
+        return self._reciprocal_sampling  # ty:ignore[invalid-return-type]
 
     @reciprocal_sampling.setter
     def reciprocal_sampling(self, value: NDArray | tuple | list) -> None:
@@ -398,133 +537,138 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         else:
             raise ValueError("reciprocal-space needs to be given in 'A^-1' or 'mrad'")
 
-    def _compute_parallax_operator(
-        self, alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=True
-    ):
-        """Compute parallax approximation operator."""
-        dx, dy = aberration_surface_cartesian_gradients(
-            alpha,
-            phi,
-            aberration_coefs,
-        )
-        grad_k = torch.stack((dx[self.bf_mask], dy[self.bf_mask]), -1)
-
-        qvec = torch.stack((qxa, qya), 0)
-        grad_kq = torch.einsum("na,amp->nmp", grad_k, qvec)
-        operator = torch.exp(-1j * grad_kq)
-
-        if flip_phase:
-            q = torch.sqrt(qxa.square() + qya.square())
-            theta = torch.arctan2(qya, qxa)
-            chi_q = aberration_surface(
-                q * self.wavelength,
-                theta,
-                self.wavelength,
-                aberration_coefs,
-            )
-            sign_sign_chi_q = torch.sign(torch.sin(chi_q))
-            operator = operator * sign_sign_chi_q
-
-        return operator, grad_k / 2 / np.pi
-
-    def _compute_gamma_operator(
+    def _return_kernel_contributions(
         self,
+        bf,
+        deconvolution_kernel,
+        vbf_fourier,
         kxa,
         kya,
         qxa,
         qya,
+        cmplx_probe_k,
+        grad_k,
+        sign_sin_chi_q,
         aberration_coefs,
-        cmplx_probe,
         batch_idx,
-        asymmetric_version=True,
-        normalize=True,
     ):
-        """Compute gamma deconvolution operator."""
-        ind_i = self._bf_inds_i[batch_idx]
-        ind_j = self._bf_inds_j[batch_idx]
+        """ """
+        ind_i = bf.bf_inds_i[batch_idx]
+        ind_j = bf.bf_inds_j[batch_idx]
 
         kx = kxa[ind_i, ind_j].view(-1, 1, 1)
         ky = kya[ind_i, ind_j].view(-1, 1, 1)
 
-        qmkxa = qxa.unsqueeze(0) - kx
-        qmkya = qya.unsqueeze(0) - ky
-        qpkxa = qxa.unsqueeze(0) + kx
-        qpkya = qya.unsqueeze(0) + ky
+        power = None
 
-        cmplx_probe_at_k = cmplx_probe[ind_i, ind_j].view(-1, 1, 1)
+        if deconvolution_kernel in ("ssb", "obf", "mf"):
+            qmkxa = qxa.unsqueeze(0) - kx
+            qmkya = qya.unsqueeze(0) - ky
+            qpkxa = qxa.unsqueeze(0) + kx
+            qpkya = qya.unsqueeze(0) + ky
 
-        gamma = gamma_factor(
-            (qmkxa, qmkya),
-            (qpkxa, qpkya),
-            cmplx_probe_at_k,
-            self.wavelength,
-            self.semiangle_cutoff,
-            self.soft_edges,
-            angular_sampling=self.angular_sampling,
-            aberration_coefs=aberration_coefs,
-            asymmetric_version=asymmetric_version,
-            normalize=normalize,
-        )
+            cmplx_probe_at_k = cmplx_probe_k[ind_i, ind_j].view(-1, 1, 1)
 
-        return gamma
+            gamma = gamma_factor(
+                (qmkxa, qmkya),
+                (qpkxa, qpkya),
+                cmplx_probe_at_k,
+                self.wavelength,
+                self.semiangle_cutoff,
+                self.soft_edges,
+                angular_sampling=self.angular_sampling,
+                aberration_coefs=aberration_coefs,
+                normalize=False,
+            )
 
-    def _compute_icom_weighting(self, qxa, qya, kxa, kya, batch_idx, q_highpass=None):
-        """Compute iCOM Fourier-space weighting factors."""
-        q2 = qxa.square() + qya.square()
-        qx_op = -1.0j * qxa / q2
-        qy_op = -1.0j * qya / q2
-        qx_op[0, 0] = 0.0
-        qy_op[0, 0] = 0.0
+            fourier_factor = -1.0j * vbf_fourier * gamma.conj()
+            abs_gamma = gamma.abs()
 
-        env = torch.ones_like(q2)
-        if q_highpass:
-            butterworth_order = 12
-            env *= 1 - 1 / (1 + (torch.sqrt(q2) / q_highpass) ** (2 * butterworth_order))
+            if deconvolution_kernel == "ssb":
+                fourier_factor = fourier_factor / abs_gamma.clip(1e-8)
+            else:
+                power = abs_gamma.square().sum(0)
 
-        ind_i = self._bf_inds_i[batch_idx]
-        ind_j = self._bf_inds_j[batch_idx]
-        kx = kxa[ind_i, ind_j].view(-1, 1, 1)
-        ky = kya[ind_i, ind_j].view(-1, 1, 1)
+        elif deconvolution_kernel == "prlx":
+            qvec = torch.stack((qxa, qya), 0)
+            grad_kq = torch.einsum("na,amp->nmp", grad_k[batch_idx], qvec)
+            operator = torch.exp(-1j * grad_kq) * sign_sin_chi_q
+            fourier_factor = vbf_fourier * operator
 
-        icom_weighting = (kx * qx_op + ky * qy_op) * env
+        else:
+            q2 = qxa.square() + qya.square()
+            qx_op = -1.0j * qxa / q2
+            qy_op = -1.0j * qya / q2
+            qx_op[0, 0] = 0.0
+            qy_op[0, 0] = 0.0
 
-        return icom_weighting
+            operator = kx * qx_op + ky * qy_op
+            fourier_factor = vbf_fourier * operator
+
+        return fourier_factor, power
+
+    def _normalize_kernel_name(self, kernel):
+        kernel = kernel.lower()
+
+        aliases = {
+            "ssb": "ssb",
+            "single-sideband": "ssb",
+            "acbf": "ssb",
+            "aberration-corrected-bright-field": "ssb",
+            "obf": "obf",
+            "optimum-bright-field": "obf",
+            "mf": "mf",
+            "matched-filter": "mf",
+            "prlx": "prlx",
+            "parallax": "prlx",
+            "tcbf": "prlx",
+            "tilt-corrected-bright-field": "prlx",
+            "icom": "icom",
+            "center-of-mass": "icom",
+        }
+
+        if kernel not in aliases:
+            raise ValueError(f"Unknown deconvolution kernel '{kernel}'")
+
+        return aliases[kernel]
 
     def reconstruct(
         self,
-        aberration_coefs=None,
+        bf_mask=None,
+        override_aberration_coefs=None,
         upsampling_factor=None,
-        rotation_angle=None,
+        override_rotation_angle=None,
         max_batch_size=None,
-        deconvolution_kernel="full",
-        use_center_of_mass_weighting=False,
-        flip_phase=True,
+        deconvolution_kernel="single-sideband",
         q_highpass=None,
+        q_lowpass=None,
+        butterworth_order=12,
+        matched_filter_norm_epsilon=1e-1,
+        parallax_flip_phase=True,
         verbose=None,
+        use_optimized_state=True,
     ):
         """
         Unified reconstruction method supporting multiple deconvolution techniques.
 
         Parameters
         ----------
-        aberration_coefs : dict, optional
+        bf_mask: torch.Tensor, optional
+            Subset of bright field mask to use for reconstruction. Note this must be
+            strictly smaller than the bf_mask used for initialization.
+        override_aberration_coefs : dict, optional
             Aberration coefficients for the probe
         upsampling_factor : int, optional
             Factor by which to upsample the reconstruction
-        rotation_angle : float, optional
+        override_rotation_angle : float, optional
             Rotation angle for coordinate system
         max_batch_size : int, optional
             Maximum batch size for processing
-        deconvolution_kernel : str, one of ['full', 'quadratic', 'none']
-            deconvolution_kernel = 'full' -> SSB
-            deconvolution_kernel = 'quadratic' -> parallax
-            deconvolution_kernel = 'none' -> BF-STEM
-        use_center_of_mass_weighting : bool, optional
-            If True, apply iCOM Fourier-space weighting
-        flip_phase : bool, optional
-            If True, flip phase in parallax approximation (default: True)
+        deconvolution_kernel : str, one of ['ssb', 'obf', 'mf','prlx','icom']
         q_highpass : float, optional
-            High-pass filter cutoff for iCOM weighting
+            High-pass filter cutoff
+        q_lowpass : float, optional
+            Low-pass filter cutoff
         verbose : bool, optional
             If True, show progress bar
 
@@ -533,128 +677,167 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self
             Returns self with corrected_stack attribute set
         """
-        # Validate and set parameters
-        if aberration_coefs is None:
-            aberration_coefs = self.aberration_coefs
-        else:
-            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
 
-        if rotation_angle is None:
-            rotation_angle = self.rotation_angle
-        else:
-            rotation_angle = float(rotation_angle)
+        state = self.hyperparameter_state
 
         if verbose is None:
             verbose = self.verbose
+
+        if use_optimized_state:
+            if verbose:
+                print(
+                    "Reconstructing with:\n\n",
+                    state.summarize(
+                        which="current",
+                        override_aberration_coefs=override_aberration_coefs,
+                        override_rotation_angle=override_rotation_angle,
+                    ),
+                )
+            aberration_coefs = state.current_aberrations(override_aberration_coefs)
+            rotation_angle = state.current_rotation_angle(override_rotation_angle)
+        else:
+            if verbose:
+                print("Reconstructing with:\n\n", state.summarize(which="initial"))
+            aberration_coefs = state.initial_aberrations
+            rotation_angle = state.initial_rotation_angle
 
         if upsampling_factor is None:
             upsampling_factor = 1
         upsampling_factor = math.ceil(upsampling_factor)
 
-        if max_batch_size is None:
-            max_batch_size = self.num_bf
+        if bf_mask is None:
+            bf_mask = self.bf_mask
+        bf = self._return_bf_context(bf_mask)
 
-        if deconvolution_kernel is None:
-            deconvolution_kernel == "none"
-        elif deconvolution_kernel == "parallax":
-            deconvolution_kernel = "quadratic"
-        elif deconvolution_kernel == "ssb":
-            deconvolution_kernel = "full"
-        elif deconvolution_kernel not in ("full", "quadratic", "none"):
-            raise ValueError(
-                f"deconvolution_kernel needs to be one on 'full' or 'ssb','quadratic' or 'parallax', 'none' or None, not '{deconvolution_kernel}'"
-            )
+        num_bf = bf.num_bf
+        bf_mask = bf.bf_mask
+        vbf_index_mapping = bf.vbf_index_mapping
+
+        if max_batch_size is None:
+            max_batch_size = num_bf
+
+        deconvolution_kernel = self._normalize_kernel_name(deconvolution_kernel)
 
         # Get upsampled q-space grid
         qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
-        # Gamma deconvolution: need k-space grid and probe
+        q, theta = polar_coordinates(qxa, qya)
+
+        # Get k-space grid
         kxa, kya = spatial_frequencies(
             self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
         )
         k, phi = polar_coordinates(kxa, kya)
-        alpha = k * self.wavelength
 
-        # Compute operator based on method
-        if deconvolution_kernel == "full":
-            # operator calculated inside loop
-            cmplx_probe = evaluate_probe(
-                alpha,
+        # compute global / cheap functions for prlx
+        if deconvolution_kernel == "prlx":
+            dx, dy = aberration_surface_cartesian_gradients(
+                k * self.wavelength,
                 phi,
-                self.semiangle_cutoff,
-                self.angular_sampling,
-                self.wavelength,
                 aberration_coefs=aberration_coefs,
             )
-        elif deconvolution_kernel == "quadratic":
-            # compute parallax operator once for all batches
-            operator, self.lateral_shifts = self._compute_parallax_operator(
-                alpha, phi, qxa, qya, aberration_coefs, rotation_angle, flip_phase=flip_phase
-            )
+            grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
+
+            if parallax_flip_phase:
+                chi_q = aberration_surface(
+                    q * self.wavelength,
+                    theta,
+                    self.wavelength,
+                    aberration_coefs=aberration_coefs,
+                )
+                sign_sin_chi_q = torch.sign(torch.sin(chi_q))
+            else:
+                sign_sin_chi_q = torch.ones_like(q)
+        else:
+            grad_k = None
+            sign_sin_chi_q = None
+
+        # compute global / cheap functions for all
+        cmplx_probe_k = evaluate_probe(
+            k * self.wavelength,
+            phi,
+            self.semiangle_cutoff,
+            self.angular_sampling,
+            self.wavelength,
+            aberration_coefs=aberration_coefs,
+        )
+        BF_weights = cmplx_probe_k[bf_mask].abs().square().sum()
+
+        butterworth_env = torch.ones_like(q)
+        if q_lowpass:
+            butterworth_env *= 1 / (1 + (q / q_lowpass) ** (2 * butterworth_order))
+        if q_highpass:
+            butterworth_env *= 1 - 1 / (1 + (q / q_highpass) ** (2 * butterworth_order))
 
         # Process batches
-        pbar = tqdm(range(self.num_bf), disable=not verbose)
-        batcher = SimpleBatcher(
-            self.num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng
+        pbar = tqdm(range(num_bf), disable=not verbose)
+        batcher = SimpleBatcher(num_bf, batch_size=max_batch_size, shuffle=False, rng=self.rng)
+
+        fourier_factor = torch.empty(
+            (num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
         )
-
-        if deconvolution_kernel == "full":
-            corrected_stack = torch.empty(
-                (self.num_bf,) + qxa.shape, device=self.device, dtype=torch.complex64
-            )
+        if deconvolution_kernel in ("obf", "mf"):
+            power = torch.zeros(qxa.shape, device=self.device)
         else:
-            corrected_stack = torch.empty((self.num_bf,) + qxa.shape, device=self.device)
+            power = None
 
+        # first pass
         for batch_idx in batcher:
+            mapped_idx = vbf_index_mapping[batch_idx]
+            vbf_fourier = self._vbf_fourier[mapped_idx]
+
             # Fourier-space tiling
             vbf_fourier = torch.cat(
-                [torch.cat([self._vbf_fourier[batch_idx]] * upsampling_factor, dim=-1)]
-                * upsampling_factor,
+                [torch.cat([vbf_fourier] * upsampling_factor, dim=-1)] * upsampling_factor,
                 dim=-2,
             )
 
-            if use_center_of_mass_weighting:
-                icom_weighting = self._compute_icom_weighting(
-                    qxa, qya, kxa, kya, batch_idx, q_highpass
-                )
-                if deconvolution_kernel == "full":
-                    icom_weighting = 1.0j * icom_weighting
-                elif deconvolution_kernel == "quadratic":
-                    icom_weighting = -1.0 * icom_weighting
-            else:
-                icom_weighting = 1.0
+            num, pow = self._return_kernel_contributions(
+                bf,
+                deconvolution_kernel,
+                vbf_fourier,
+                kxa,
+                kya,
+                qxa,
+                qya,
+                cmplx_probe_k,
+                grad_k,
+                sign_sin_chi_q,
+                aberration_coefs,
+                batch_idx,
+            )
+            if power is None:
+                num *= butterworth_env
+                # num[:, 0, 0] = self._dc_per_image
 
-            if deconvolution_kernel == "full":
-                # Compute gamma operator for this batch
-                operator = self._compute_gamma_operator(
-                    kxa,
-                    kya,
-                    qxa,
-                    qya,
-                    aberration_coefs,
-                    cmplx_probe,
-                    batch_idx,
-                    asymmetric_version=not use_center_of_mass_weighting,
-                    normalize=not use_center_of_mass_weighting,
-                )
-                fourier_factor = vbf_fourier * operator * icom_weighting
-                fourier_factor[..., 0, 0] = self._dc_per_image  # normalize by mean
-            elif deconvolution_kernel == "quadratic":
-                fourier_factor = vbf_fourier * operator[batch_idx] * icom_weighting
+                fourier_factor[batch_idx] = torch.fft.ifft2(num)
             else:
-                fourier_factor = vbf_fourier * icom_weighting
+                fourier_factor[batch_idx] = num
+                power += pow
 
-            # Inverse FFT and extract appropriate component
-            if deconvolution_kernel == "full":
-                corrected_stack[batch_idx] = torch.fft.ifft2(
-                    fourier_factor
-                )  # * upsampling_factor**2
-            else:
-                corrected_stack[batch_idx] = (
-                    torch.fft.ifft2(fourier_factor).real * upsampling_factor**2
-                )
             pbar.update(len(batch_idx))
-
         pbar.close()
+
+        if power is not None:
+            power /= BF_weights
+
+            if deconvolution_kernel == "obf":
+                norm = power.sqrt().clamp_min(1e-8)
+            elif deconvolution_kernel == "mf":
+                norm = (power + matched_filter_norm_epsilon * power.max()).clamp_min(1e-8)
+
+            # second pass
+            for batch_idx in batcher:
+                ff = fourier_factor[batch_idx]
+
+                if power is not None:
+                    ff /= norm
+
+                ff *= butterworth_env
+                # ff[:, 0, 0] = self._dc_per_image
+
+                fourier_factor[batch_idx] = torch.fft.ifft2(ff)
+
+        self.corrected_stack = fourier_factor.real / BF_weights
 
         # memory management
         gc.collect()
@@ -663,19 +846,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             torch.mps.empty_cache()
         gc.collect()
 
-        if deconvolution_kernel == "full":
-            self.corrected_stack = corrected_stack.angle()
-            self.corrected_stack_amplitude = (
-                2 - corrected_stack.abs()
-            )  # amplitude contrast flipping
-        else:
-            self.corrected_stack = corrected_stack
-            self.corrected_stack_amplitude = None
-
         return self
 
     @property
-    def corrected_stack(self) -> torch.Tensor:
+    def corrected_stack(self):
         return self._corrected_stack
 
     @corrected_stack.setter
@@ -685,17 +859,18 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         )
 
     @property
-    def mean_corrected_bf(self):
+    def corrected_bf(self):
         if self.corrected_stack is None:
             return None
-        return self.corrected_stack.mean(dim=0)
+        return self.corrected_stack.sum(dim=0)
 
     def variance_loss(self):
         """ """
         if self.corrected_stack is None:
             return None
         if self.corrected_stack.abs().sum() > 0:
-            variance_loss = ((self.corrected_stack - self.mean_corrected_bf).abs().square()).mean()
+            mean_corrected_bf = self.corrected_stack.mean(dim=0)
+            variance_loss = ((self.corrected_stack - mean_corrected_bf).abs().square()).mean()
         else:
             variance_loss = torch.tensor(
                 torch.inf, dtype=self.corrected_stack.dtype, device=self.device
@@ -704,7 +879,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
-        obj = to_numpy(self.mean_corrected_bf)
+        obj = to_numpy(self.corrected_bf)
         return obj
 
     def optimize_hyperparameters(
@@ -713,6 +888,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float | OptimizationParameter | None = None,
         n_trials=50,
         sampler=None,
+        verbose=None,
         **reconstruct_kwargs,
     ):
         """
@@ -736,18 +912,35 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             Extra arguments passed to reconstruct().
         """
 
-        aberration_coefs = aberration_coefs or {}
+        if verbose is None:
+            verbose = self.verbose
+
         sampler = sampler or optuna.samplers.TPESampler()
+
+        state = self.hyperparameter_state
+        aberration_coefs = aberration_coefs or {}
+
+        # Reset optimized bookkeeping
+        state.clear_optimized()
+
+        # Partition inputs
+        fixed_override_aberrations = {}
+        optimizable_aberrations = {}
+
+        for name, val in aberration_coefs.items():
+            if isinstance(val, OptimizationParameter):
+                optimizable_aberrations[name] = val
+                state.optimized_keys.add(name)
+            else:
+                fixed_override_aberrations[name] = val
+
+        if isinstance(rotation_angle, OptimizationParameter):
+            state.optimized_keys.add("rotation_angle")
 
         def objective(trial):
             trial_aberrations = {}
-            for name, val in aberration_coefs.items():
-                if isinstance(val, OptimizationParameter):
-                    trial_aberrations[name] = trial.suggest_float(
-                        name, val.low, val.high, log=val.log
-                    )
-                else:
-                    trial_aberrations[name] = val
+            for name, val in optimizable_aberrations.items():
+                trial_aberrations[name] = trial.suggest_float(name, val.low, val.high, log=val.log)
 
             if isinstance(rotation_angle, OptimizationParameter):
                 rot = trial.suggest_float(
@@ -760,98 +953,146 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 rot = rotation_angle
 
             self.reconstruct(
-                aberration_coefs=trial_aberrations,
-                rotation_angle=rot,
+                override_aberration_coefs=trial_aberrations,
+                override_rotation_angle=rot,
                 verbose=False,
                 **reconstruct_kwargs,
             )
-            loss = self.variance_loss()
-            return float(loss)
+            return float(self.variance_loss())
 
         study = optuna.create_study(direction="minimize", sampler=sampler)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=self.verbose)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=verbose)
 
-        self._optimization_study = study
-        self._optimized_parameters = study.best_params
-        if self.verbose:
-            print(f"Optimized parameters: {self._optimized_parameters}")
+        # Write back optimized results
+        best = study.best_params.copy()
+        state.optimized_rotation_angle = best.pop("rotation_angle", None)
+        state.optimized_aberrations = best
+        state.study = study
 
-        self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
+        if verbose:
+            print("Optimized state:\n\n", self.hyperparameter_state)
+
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
         return self
 
     def grid_search_hyperparameters(
         self,
         aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
         rotation_angle: float | OptimizationParameter | None = None,
+        verbose=None,
         **reconstruct_kwargs,
     ):
-        """
-        Perform a grid search over specified hyperparameter combinations.
+        if verbose is None:
+            verbose = self.verbose
 
-        Parameters
-        ----------
-        aberration_coefs : dict[str, float | OptimizationParameter], optional
-            Dict of aberration names to either fixed values or OptimizationParameter ranges.
-        rotation_angle : float | OptimizationParameter, optional
-            Fixed rotation or optimization range.
-        **reconstruct_kwargs :
-            Extra arguments passed to reconstruct().
-        """
         aberration_coefs = aberration_coefs or {}
+        state = self.hyperparameter_state
 
-        # Build parameter grid
-        param_grid = {}
+        # Reset optimized bookkeeping
+        state.clear_optimized()
+
+        # Partition inputs
+        fixed_override_aberrations: dict[str, float] = {}
+        optimizable_aberrations: dict[str, OptimizationParameter] = {}
+
         for name, val in aberration_coefs.items():
             if isinstance(val, OptimizationParameter):
-                param_grid[name] = val.grid_values()
+                optimizable_aberrations[name] = val
+                state.optimized_keys.add(name)
             else:
-                param_grid[name] = [val]
+                fixed_override_aberrations[name] = val
 
-        if rotation_angle is not None:
-            if isinstance(rotation_angle, OptimizationParameter):
-                param_grid["rotation_angle"] = rotation_angle.grid_values()
-            else:
-                param_grid["rotation_angle"] = [rotation_angle]
+        optimize_rotation = isinstance(rotation_angle, OptimizationParameter)
+        if optimize_rotation:
+            state.optimized_keys.add("rotation_angle")
 
-        # Cartesian product of all parameter combinations
+        # Build parameter grid (only over optimizable parameters)
+        param_grid: dict[str, list[float]] = {}
+
+        for name, param in optimizable_aberrations.items():
+            param_grid[name] = param.grid_values()
+
+        if optimize_rotation:
+            param_grid["rotation_angle"] = (
+                rotation_angle.grid_values()  # ty:ignore[possibly-missing-attribute]
+            )
+
+        # Cartesian product
         keys = list(param_grid.keys())
         grid = list(product(*(param_grid[k] for k in keys)))
 
-        results = []
         best_loss = float("inf")
-        best_params = None
+        best_params: dict[str, float] | None = None
+        results = []
 
-        for combo in tqdm(grid):
-            params = dict(zip(keys, combo))
-            trial_aberration_coefs = params.copy()
-            trial_rotation_angle = trial_aberration_coefs.pop("rotation_angle", None)
+        for combo in tqdm(grid, disable=not verbose):
+            trial_params = dict(zip(keys, combo))
+
+            trial_aberrations = dict(fixed_override_aberrations)
+            trial_aberrations.update(
+                {k: v for k, v in trial_params.items() if k != "rotation_angle"}
+            )
+
+            if optimize_rotation:
+                rot = trial_params["rotation_angle"]
+            else:
+                rot = rotation_angle
 
             self.reconstruct(
-                aberration_coefs=trial_aberration_coefs,
-                rotation_angle=trial_rotation_angle,
+                override_aberration_coefs=trial_aberrations,
+                override_rotation_angle=rot,
                 verbose=False,
                 **reconstruct_kwargs,
             )
 
             loss = float(self.variance_loss())
-            results.append((params, loss))
+            results.append((trial_params, loss))
 
             if loss < best_loss:
                 best_loss = loss
-                best_params = params
+                best_params = trial_params
 
         self._grid_search_results = results
-        self._optimized_parameters = best_params
 
-        if self.verbose:
-            print(f"Best grid parameters: {self._optimized_parameters}")
+        # Write back best optimized values
+        if best_params is not None:
+            best_params = best_params.copy()
+            state.optimized_rotation_angle = best_params.pop("rotation_angle", None)
+            state.optimized_aberrations = best_params
 
-        self.reconstruct_with_optimized_parameters(verbose=False, **reconstruct_kwargs)
+        if verbose:
+            print("Optimized state:\n\n", self.hyperparameter_state)
 
+        # Final reconstruction using merged state
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
         return self
+
+    def _return_lateral_shifts(
+        self,
+        rotation_angle,
+        aberration_coefs,
+        bf_mask,
+    ):
+        # Get initial shifts
+        kxa, kya = spatial_frequencies(
+            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+        )
+        k, phi = polar_coordinates(kxa, kya)
+
+        dx, dy = aberration_surface_cartesian_gradients(
+            k * self.wavelength,
+            phi,
+            aberration_coefs=aberration_coefs,  # ty:ignore[invalid-argument-type]
+        )
+        grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
+        lateral_shifts = grad_k / 2 / np.pi
+        return lateral_shifts
 
     def fit_hyperparameters(
         self,
+        bf_mask: torch.Tensor | None = None,
+        rotation_angle: float | None = None,
+        aberration_coefs: dict[str, int | float | torch.Tensor] = {},
         bin_factors: tuple[int, ...] = (3, 2, 1),
         pair_connectivity: int = 4,
         alignment_method: str = "reference",
@@ -859,6 +1100,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         running_average: bool = False,
         regularize_shifts: bool = True,
         dft_upsample_factor: int = 4,
+        verbose=None,
         **reconstruct_kwargs,
     ):
         """
@@ -866,6 +1108,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         Parameters
         ----------
+        bf_mask: torch.Tensor, optional
+            Subset of bright field mask to use for reconstruction. Note this must be
+            strictly smaller than the bf_mask used for initialization.
         bin_factors : tuple of int
             Sequence of binning factors from coarse to fine
         pair_connectivity : int
@@ -895,8 +1140,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         The running_average option updates the reference at each bin level as:
             ref_new = ref_old * n/(n+1) + aligned_mean / (n+1)
         """
-        bf_mask = self.bf_mask
-        inds_i, inds_j = self._bf_inds_i, self._bf_inds_j
+
+        if verbose is None:
+            verbose = self.verbose
+
+        if bf_mask is None:
+            bf_mask = self.bf_mask
+        bf = self._return_bf_context(bf_mask)
+        bf_mask = bf.bf_mask
+        inds_i, inds_j = bf.bf_inds_i, bf.bf_inds_j
+
         scan_sampling = torch.as_tensor(
             self.scan_sampling, device=self.device, dtype=torch.float32
         )
@@ -905,19 +1158,26 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         safe_kwargs = {
             k: v
             for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "verbose"]
+            if k not in ["deconvolution_kernel", "parallax_flip_phase"]
         }
-        flip_phase = safe_kwargs.pop("flip_phase", False)
+
+        state = self.hyperparameter_state
+        state.clear_optimized()
 
         self.reconstruct(
+            override_rotation_angle=rotation_angle,
+            override_aberration_coefs=aberration_coefs,
             deconvolution_kernel="parallax",
-            flip_phase=flip_phase,
+            parallax_flip_phase=False,
             verbose=False,
             **safe_kwargs,
         )
 
         vbf_stack = self.corrected_stack.clone()
-        initial_shifts = self.lateral_shifts / scan_sampling
+
+        # Get initial shifts
+        lateral_shifts = self._return_lateral_shifts(rotation_angle, aberration_coefs, bf_mask)
+        initial_shifts = lateral_shifts / scan_sampling
 
         if alignment_method == "reference":
             reference = (
@@ -947,13 +1207,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             initial_shifts=initial_shifts,
             running_average=running_average,
             basis=basis,
-            verbose=self.verbose,
+            verbose=verbose,
         )
 
-        self.lateral_shifts = shifts_px * scan_sampling
+        lateral_shifts = shifts_px * scan_sampling
 
         fit_results = fit_aberrations_from_shifts(
-            self.lateral_shifts,
+            lateral_shifts,
             bf_mask,
             self.wavelength,
             self.gpts,
@@ -961,81 +1221,139 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         )
 
         self.corrected_stack = vbf_stack
-        self._fitted_parameters = fit_results
 
-        if self.verbose:
-            print(f"Fitted parameters: {self._fitted_parameters}")
+        fitted_aberration_coefs = fit_results.copy()
+        fitted_rotation_angle = fitted_aberration_coefs.pop("rotation_angle", None)
 
-        self.reconstruct_with_fitted_parameters(verbose=False, **reconstruct_kwargs)
+        state.optimized_aberrations = validate_aberration_coefficients(fitted_aberration_coefs)
+        state.optimized_rotation_angle = fitted_rotation_angle
+        state.optimized_keys = {"C10", "C12", "phi12", "rotation_angle"}
+
+        if verbose:
+            print("Optimized state:\n\n", self.hyperparameter_state)
+
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
 
         return self
 
-    def reconstruct_with_optimized_parameters(
-        self,
-        **reconstruct_kwargs,
-    ):
-        """ """
-        if not hasattr(self, "_optimized_parameters"):
-            raise ValueError("run self.optimize_hyperparameters first.")
+    # def fit_hyperparameters_least_squares(
+    #     self,
+    #     cartesian_basis: str | list[str] = "low_order",
+    #     rotation_angle: float | None = None,
+    #     aberration_coefs: dict[str, int | float | torch.Tensor] | None = None,
+    #     num_bf_rings: int = 3,
+    #     num_bf_points_per_ring: int = 6,
+    # ):
+    #     if aberration_coefs is None:
+    #         aberration_coefs = self.aberration_coefs
+    #     else:
+    #         aberration_coefs = validate_aberration_coefficients(aberration_coefs)
 
-        aberration_coefs = self._optimized_parameters.copy()
-        rotation_angle = aberration_coefs.pop("rotation_angle", None)
+    #     if rotation_angle is None:
+    #         rotation_angle = self.rotation_angle
+    #     else:
+    #         rotation_angle = float(rotation_angle)
+
+    #     if isinstance(cartesian_basis, str):
+    #         cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
+
+    #     # spatial frequencies
+    #     qxa, qya = self._return_upsampled_qgrid()
+
+    #     # BF geometry
+    #     kxa, kya = spatial_frequencies(
+    #         self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+    #     )
+
+    #     k_bf_target = concentric_ring_wavevectors(
+    #         self.semiangle_cutoff * 0.95,
+    #         num_rings=num_bf_rings,
+    #         num_points_per_ring=num_bf_points_per_ring,
+    #         wavelength=self.wavelength,
+    #         include_center=False,
+    #         device=self.device,
+    #     )
+
+    #     inds_i, inds_j = find_nearest_k_indices(k_bf_target, kxa, kya)
+
+    #     k_bf = torch.stack((kxa[inds_i, inds_j], kya[inds_i, inds_j]), -1)
+
+    #     bf_mask = torch.zeros_like(self.bf_mask)
+    #     bf_mask[inds_i, inds_j] = True
+    #     vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
+    #     vbf_fourier = self._vbf_fourier[vbf_index_mapping]
+
+    #     updated_aberrations_polar, delta_cartesian, phi_obj = fit_aberrations_using_least_squares(
+    #         vbf_fourier=vbf_fourier,
+    #         qxa=qxa,
+    #         qya=qya,
+    #         k_bf=k_bf,
+    #         cartesian_basis=cartesian_basis,
+    #         wavelength=self.wavelength,
+    #         semiangle_cutoff=self.semiangle_cutoff,
+    #         angular_sampling=self.angular_sampling,
+    #         soft_edges=True,
+    #         aberration_coefs_init=aberration_coefs,
+    #     )
+
+    #     return updated_aberrations_polar
+
+    def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
+        """ """
+
+        if verbose is None:
+            verbose = self.verbose
 
         safe_kwargs = {
-            k: v
-            for k, v in reconstruct_kwargs.items()
-            if k not in ["aberration_coefs", "rotation_angle"]
-        }
-        return self.reconstruct(
-            aberration_coefs=aberration_coefs,
-            rotation_angle=rotation_angle,
-            **safe_kwargs,
-        )
-
-    def reconstruct_with_fitted_parameters(
-        self,
-        **reconstruct_kwargs,
-    ):
-        """ """
-        if not hasattr(self, "_fitted_parameters"):
-            raise ValueError("run self.fit_hyperparameters first.")
-
-        aberration_coefs = self._fitted_parameters.copy()
-        rotation_angle = aberration_coefs.pop("rotation_angle", None)
-        safe_kwargs = {
-            k: v
-            for k, v in reconstruct_kwargs.items()
-            if k not in ["aberration_coefs", "rotation_angle"]
-        }
-        return self.reconstruct(
-            aberration_coefs=aberration_coefs,
-            rotation_angle=rotation_angle,
-            **safe_kwargs,
-        )
-
-    def _reconstruct_all_permutations(self, **reconstruct_kwargs):
-        """ """
-        safe_kwargs = {
-            k: v
-            for k, v in reconstruct_kwargs.items()
-            if k not in ["deconvolution_kernel", "use_center_of_mass_weighting", "verbose"]
+            k: v for k, v in reconstruct_kwargs.items() if k not in ["deconvolution_kernel"]
         }
 
-        combo = list(
-            product(
-                [False, True],
-                ["none", "quadratic", "full"],
-            )
-        )
+        kernels = ["ssb", "obf", "mf", "prlx", "icom"]
 
         recons = [
             self.reconstruct(
                 deconvolution_kernel=kernel,
-                use_center_of_mass_weighting=icom,
                 verbose=False,
                 **safe_kwargs,
             ).obj
-            for icom, kernel in tqdm(combo, disable=not self.verbose)
+            for kernel in tqdm(kernels, disable=not verbose)
         ]
 
         return recons
+
+    def _make_checkerboard_bf_masks(self, gpts, bf_mask):
+        """ """
+        i_coords = torch.arange(gpts[0], device=self.device)
+        j_coords = torch.arange(gpts[1], device=self.device)
+        i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing="ij")
+        checkerboard = torch.fft.ifftshift(((i_grid + j_grid) % 2).bool())
+
+        bf1 = bf_mask & checkerboard
+        bf2 = bf_mask & (~checkerboard)
+
+        return [bf1, bf2]
+
+    def _reconstruct_with_halfsets(self, verbose=None, **reconstruct_kwargs):
+        """
+        Compute two half-set reconstructions using alternating BF pixels (checkerboard pattern).
+
+        Returns
+        -------
+        halfset_1 : torch.Tensor
+            Reconstruction using first half of BF pixels
+        halfset_2 : torch.Tensor
+            Reconstruction using second half of BF pixels
+        """
+        if verbose is None:
+            verbose = False
+
+        bf1, bf2 = self._make_checkerboard_bf_masks(self.gpts, self.bf_mask)
+        safe_kwargs = {k: v for k, v in reconstruct_kwargs.items() if k not in ["bf_mask"]}
+
+        self.reconstruct(**safe_kwargs, bf_mask=bf1, verbose=verbose)
+        halfset_1 = self.corrected_bf
+
+        self.reconstruct(**safe_kwargs, bf_mask=bf2, verbose=verbose)
+        halfset_2 = self.corrected_bf
+
+        return [halfset_1, halfset_2]
