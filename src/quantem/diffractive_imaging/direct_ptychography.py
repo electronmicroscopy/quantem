@@ -1,7 +1,7 @@
 import gc
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Mapping, Tuple
+from typing import TYPE_CHECKING, Dict, Tuple
 
 import numpy as np
 import optuna
@@ -70,39 +70,93 @@ class OptimizationParameter:
 
 @dataclass
 class HyperparameterState:
-    fixed_aberrations: Dict[str, float] = field(default_factory=dict)
-    fixed_rotation_angle: float | None = None
-    optimized_aberrations: Dict[str, float] = field(default_factory=dict)
+    initial_aberrations: dict[str, float] = field(default_factory=dict)
+    initial_rotation_angle: float | None = None
+    optimized_aberrations: dict[str, float] = field(default_factory=dict)
     optimized_rotation_angle: float | None = None
     optimized_keys: set[str] = field(default_factory=set)
     study: optuna.Study | None = None
 
-    def merged_aberrations(self) -> Dict[str, float]:
-        """Return full aberration dictionary (fixed ⊕ optimized)."""
-        out = dict(self.fixed_aberrations)
-        out.update(self.optimized_aberrations)
-        return out
+    def __post_init__(self):
+        self.initial_aberrations = validate_aberration_coefficients(dict(self.initial_aberrations))
+        self.optimized_aberrations = validate_aberration_coefficients(self.optimized_aberrations)
 
-    def merged_rotation_angle(self) -> float | None:
-        """Return rotation angle (optimized takes precedence)."""
-        return (
-            self.optimized_rotation_angle
-            if self.optimized_rotation_angle is not None
-            else self.fixed_rotation_angle
-        )
+        if self.initial_rotation_angle is None:
+            self.initial_rotation_angle = 0.0
+
+        # Canonicalize optimized_keys as well
+        if self.optimized_keys:
+            canonical = validate_aberration_coefficients(
+                {k: 0.0 for k in self.optimized_keys if k != "rotation_angle"}
+            )
+            self.optimized_keys = set(canonical.keys()) | {
+                k for k in self.optimized_keys if k == "rotation_angle"
+            }
 
     def __repr__(self) -> str:
-        cls = self.__class__.__name__
-        lines = []
+        return self.summarize(which="all")
 
-        if self.fixed_aberrations:
-            lines.append(f"  fixed_aberrations={self.fixed_aberrations!r},")
-        if self.fixed_rotation_angle is not None:
-            lines.append(f"  fixed_rotation_angle={self.fixed_rotation_angle!r},")
-        if self.optimized_aberrations:
-            lines.append(f"  optimized_aberrations={self.optimized_aberrations!r},")
+    def current_aberrations(
+        self, override_fixed: dict[str, float] | None = None
+    ) -> Dict[str, float]:
+        """Return full aberration dictionary (fixed ⊕ optimized)."""
+        out = dict(self.initial_aberrations)
+        out.update(self.optimized_aberrations)
+        if override_fixed:
+            out.update(validate_aberration_coefficients(override_fixed))
+        return out
+
+    def current_rotation_angle(self, override_fixed: float | None = None) -> float:
+        """Return rotation angle (optimized takes precedence)."""
+        if override_fixed is not None:
+            return override_fixed
         if self.optimized_rotation_angle is not None:
-            lines.append(f"  optimized_rotation_angle={self.optimized_rotation_angle!r},")
+            return self.optimized_rotation_angle
+        return self.initial_rotation_angle  # ty:ignore[invalid-return-type]
+
+    def summarize(self, *, which: str = "current") -> str:
+        cls = self.__class__.__name__
+        lines: list[str] = []
+
+        def add(name: str, value):
+            lines.append(f"  {name}={value!r},")
+
+        if which == "initial":
+            if self.initial_aberrations:
+                add("initial_aberrations", self.initial_aberrations)
+            if self.initial_rotation_angle is not None:
+                add("initial_rotation_angle", self.initial_rotation_angle)
+
+        elif which == "optimized":
+            if self.optimized_aberrations:
+                add("optimized_aberrations", self.optimized_aberrations)
+            if self.optimized_rotation_angle is not None:
+                add("optimized_rotation_angle", self.optimized_rotation_angle)
+
+        elif which == "current":
+            current_abers = self.current_aberrations()
+            current_rot = self.current_rotation_angle()
+
+            if current_abers:
+                add("current_aberrations", current_abers)
+            if current_rot is not None:
+                add("current_rotation_angle", current_rot)
+
+        elif which == "all":
+            if self.initial_aberrations:
+                add("initial_aberrations", self.initial_aberrations)
+            if self.initial_rotation_angle is not None:
+                add("initial_rotation_angle", self.initial_rotation_angle)
+            if self.optimized_aberrations:
+                add("optimized_aberrations", self.optimized_aberrations)
+            if self.optimized_rotation_angle is not None:
+                add("optimized_rotation_angle", self.optimized_rotation_angle)
+
+        else:
+            raise ValueError(
+                f"`which` must be one of "
+                f'{{"initial", "optimized", "current", "all"}}, got {which!r}'
+            )
 
         if not lines:
             return f"{cls}()"
@@ -167,8 +221,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.soft_edges = soft_edges
         self.rng = rng
 
-        self.rotation_angle = rotation_angle
-        self.aberration_coefs = aberration_coefs
+        self.hyperparameter_state = HyperparameterState(
+            initial_aberrations=aberration_coefs, initial_rotation_angle=rotation_angle
+        )
 
         self._preprocess()
 
@@ -179,7 +234,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         bf_mask_dataset: Dataset2d,
         energy: float,
         rotation_angle: float,
-        aberration_coefs: dict,
+        aberration_coefs: dict = {},
         semiangle_cutoff: float | None = None,
         soft_edges: bool = True,
         rng: np.random.Generator | int | None = None,
@@ -207,8 +262,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         cls,
         dataset: Dataset4d,
         energy: float,
-        aberration_coefs: dict,
         semiangle_cutoff: float,
+        aberration_coefs: dict = {},
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -395,20 +450,20 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def rotation_angle(self) -> float:
-        return self._rotation_angle
+        return self.hyperparameter_state.current_rotation_angle()
 
-    @rotation_angle.setter
-    def rotation_angle(self, value: float):
-        self._rotation_angle = float(value)
+    # @rotation_angle.setter
+    # def rotation_angle(self, value: float):
+    #     self._rotation_angle = float(value)
 
     @property
     def aberration_coefs(self) -> dict:
-        return self._aberration_coefs
+        return self.hyperparameter_state.current_aberrations()
 
-    @aberration_coefs.setter
-    def aberration_coefs(self, value: dict):
-        value = validate_aberration_coefficients(value)
-        self._aberration_coefs = value
+    # @aberration_coefs.setter
+    # def aberration_coefs(self, value: dict):
+    #     value = validate_aberration_coefficients(value)
+    #     self._aberration_coefs = value
 
     @property
     def semiangle_cutoff(self) -> float:
@@ -574,6 +629,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         matched_filter_norm_epsilon=1e-1,
         parallax_flip_phase=True,
         verbose=None,
+        use_optimized_state=True,
     ):
         """
         Unified reconstruction method supporting multiple deconvolution techniques.
@@ -604,19 +660,22 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self
             Returns self with corrected_stack attribute set
         """
-        # Validate and set parameters
-        if aberration_coefs is None:
-            aberration_coefs = self.aberration_coefs
-        else:
-            aberration_coefs = validate_aberration_coefficients(aberration_coefs)
 
-        if rotation_angle is None:
-            rotation_angle = self.rotation_angle
-        else:
-            rotation_angle = float(rotation_angle)
+        state = self.hyperparameter_state
 
         if verbose is None:
             verbose = self.verbose
+
+        if use_optimized_state:
+            if verbose:
+                print(state.summarize(which="current"))
+            aberration_coefs = state.current_aberrations(aberration_coefs)
+            rotation_angle = state.current_rotation_angle(rotation_angle)
+        else:
+            if verbose:
+                print(state.summarize(which="initial"))
+            aberration_coefs = state.initial_aberrations
+            rotation_angle = state.initial_rotation_angle
 
         if upsampling_factor is None:
             upsampling_factor = 1
@@ -724,7 +783,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             )
             if power is None:
                 num *= butterworth_env
-                num[:, 0, 0] = self._dc_per_image
+                # num[:, 0, 0] = self._dc_per_image
 
                 fourier_factor[batch_idx] = torch.fft.ifft2(num)
             else:
@@ -750,7 +809,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     ff /= norm
 
                 ff *= butterworth_env
-                ff[:, 0, 0] = self._dc_per_image
+                # ff[:, 0, 0] = self._dc_per_image
 
                 fourier_factor[batch_idx] = torch.fft.ifft2(ff)
 
@@ -829,29 +888,32 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         """
         sampler = sampler or optuna.samplers.TPESampler()
 
-        state = HyperparameterState()
+        state = self.hyperparameter_state
         aberration_coefs = aberration_coefs or {}
+
+        # Reset optimized bookkeeping
+        state.optimized_keys.clear()
+        state.optimized_aberrations.clear()
+        state.optimized_rotation_angle = None
+
+        # Partition inputs
+        fixed_override_aberrations = {}
+        optimizable_aberrations = {}
 
         for name, val in aberration_coefs.items():
             if isinstance(val, OptimizationParameter):
+                optimizable_aberrations[name] = val
                 state.optimized_keys.add(name)
             else:
-                state.fixed_aberrations[name] = val
+                fixed_override_aberrations[name] = val
 
-            if isinstance(rotation_angle, OptimizationParameter):
-                state.optimized_keys.add("rotation_angle")
-            else:
-                state.fixed_rotation_angle = rotation_angle
+        if isinstance(rotation_angle, OptimizationParameter):
+            state.optimized_keys.add("rotation_angle")
 
         def objective(trial):
             trial_aberrations = {}
-            for name, val in aberration_coefs.items():
-                if isinstance(val, OptimizationParameter):
-                    trial_aberrations[name] = trial.suggest_float(
-                        name, val.low, val.high, log=val.log
-                    )
-                else:
-                    trial_aberrations[name] = val
+            for name, val in optimizable_aberrations.items():
+                trial_aberrations[name] = trial.suggest_float(name, val.low, val.high, log=val.log)
 
             if isinstance(rotation_angle, OptimizationParameter):
                 rot = trial.suggest_float(
@@ -869,25 +931,21 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 verbose=False,
                 **reconstruct_kwargs,
             )
-            loss = self.variance_loss()
-            return float(loss)
+            return float(self.variance_loss())
 
         study = optuna.create_study(direction="minimize", sampler=sampler)
         study.optimize(objective, n_trials=n_trials, show_progress_bar=self.verbose)
 
+        # Write back optimized results
+        best = study.best_params.copy()
+        state.optimized_rotation_angle = best.pop("rotation_angle", None)
+        state.optimized_aberrations = best
         state.study = study
-        opt_aberration_coefs = study.best_params.copy()
-        opt_rotation_angle = opt_aberration_coefs.pop("rotation_angle", None)
-
-        state.optimized_aberrations = opt_aberration_coefs
-        state.optimized_rotation_angle = opt_rotation_angle
-
-        self._hyperparameter_state = state
 
         if self.verbose:
-            print(self._hyperparameter_state)
+            print(self.hyperparameter_state)
 
-        self.reconstruct_with_hyperparameters(verbose=False, **reconstruct_kwargs)
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
         return self
 
     def grid_search_hyperparameters(
@@ -896,101 +954,88 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float | OptimizationParameter | None = None,
         **reconstruct_kwargs,
     ):
-        """
-        Perform a grid search over specified hyperparameter combinations.
-
-        Parameters
-        ----------
-        aberration_coefs : dict[str, float | OptimizationParameter], optional
-            Dict of aberration names to either fixed values or OptimizationParameter ranges.
-        rotation_angle : float | OptimizationParameter, optional
-            Fixed rotation or optimization range.
-        **reconstruct_kwargs :
-            Extra arguments passed to reconstruct().
-        """
         aberration_coefs = aberration_coefs or {}
+        state = self.hyperparameter_state
 
-        optimized_keys: set[str] = {
-            name
-            for name, val in aberration_coefs.items()
-            if isinstance(val, OptimizationParameter)
-        }
-        if isinstance(rotation_angle, OptimizationParameter):
-            optimized_keys.add("rotation_angle")
+        # Reset optimized bookkeeping
+        state.optimized_keys.clear()
+        state.optimized_aberrations.clear()
+        state.optimized_rotation_angle = None
 
-        # Build parameter grid
-        param_grid = {}
+        # Partition inputs
+        fixed_override_aberrations: dict[str, float] = {}
+        optimizable_aberrations: dict[str, OptimizationParameter] = {}
+
         for name, val in aberration_coefs.items():
             if isinstance(val, OptimizationParameter):
-                param_grid[name] = val.grid_values()
+                optimizable_aberrations[name] = val
+                state.optimized_keys.add(name)
             else:
-                param_grid[name] = [val]
+                fixed_override_aberrations[name] = val
 
-        if rotation_angle is not None:
-            if isinstance(rotation_angle, OptimizationParameter):
-                param_grid["rotation_angle"] = rotation_angle.grid_values()
-            else:
-                param_grid["rotation_angle"] = [rotation_angle]
+        optimize_rotation = isinstance(rotation_angle, OptimizationParameter)
+        if optimize_rotation:
+            state.optimized_keys.add("rotation_angle")
 
-        # Cartesian product of all parameter combinations
+        # Build parameter grid (only over optimizable parameters)
+        param_grid: dict[str, list[float]] = {}
+
+        for name, param in optimizable_aberrations.items():
+            param_grid[name] = param.grid_values()
+
+        if optimize_rotation:
+            param_grid["rotation_angle"] = (
+                rotation_angle.grid_values()  # ty:ignore[possibly-missing-attribute]
+            )
+
+        # Cartesian product
         keys = list(param_grid.keys())
         grid = list(product(*(param_grid[k] for k in keys)))
 
-        results = []
         best_loss = float("inf")
         best_params: dict[str, float] | None = None
+        results = []
 
         for combo in tqdm(grid):
-            params = dict(zip(keys, combo))
+            trial_params = dict(zip(keys, combo))
 
-            trial_aberration_coefs = {k: v for k, v in params.items() if k != "rotation_angle"}
-            trial_rotation_angle = params.get("rotation_angle", None)
+            trial_aberrations = dict(fixed_override_aberrations)
+            trial_aberrations.update(
+                {k: v for k, v in trial_params.items() if k != "rotation_angle"}
+            )
+
+            if optimize_rotation:
+                rot = trial_params["rotation_angle"]
+            else:
+                rot = rotation_angle
 
             self.reconstruct(
-                aberration_coefs=trial_aberration_coefs,
-                rotation_angle=trial_rotation_angle,
+                aberration_coefs=trial_aberrations,
+                rotation_angle=rot,
                 verbose=False,
                 **reconstruct_kwargs,
             )
 
             loss = float(self.variance_loss())
-            results.append((params, loss))
+            results.append((trial_params, loss))
 
             if loss < best_loss:
                 best_loss = loss
-                best_params = params
+                best_params = trial_params
 
         self._grid_search_results = results
 
-        fixed_aberrations = {}
-        optimized_aberrations = {}
-        fixed_rotation_angle = None
-        optimized_rotation_angle = None
-
-        for name, val in best_params.items():  # ty:ignore[possibly-missing-attribute]
-            if name == "rotation_angle":
-                if "rotation_angle" in optimized_keys:
-                    optimized_rotation_angle = val
-                else:
-                    fixed_rotation_angle = val
-            elif name in optimized_keys:
-                optimized_aberrations[name] = val
-            else:
-                fixed_aberrations[name] = val
-
-        self._hyperparameter_state = HyperparameterState(
-            fixed_aberrations=fixed_aberrations,
-            fixed_rotation_angle=fixed_rotation_angle,
-            optimized_aberrations=optimized_aberrations,
-            optimized_rotation_angle=optimized_rotation_angle,
-            optimized_keys=optimized_keys,
-        )
+        # Write back best optimized values
+        if best_params is not None:
+            best_params = best_params.copy()
+            state.optimized_rotation_angle = best_params.pop("rotation_angle", None)
+            state.optimized_aberrations = best_params
 
         if self.verbose:
-            print(self._hyperparameter_state)
+            print(self.hyperparameter_state)
 
-        self.reconstruct_with_hyperparameters(verbose=False, **reconstruct_kwargs)
-
+        # Final reconstruction using merged state
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
         return self
 
     def _return_lateral_shifts(
@@ -1018,7 +1063,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         bf_mask: torch.Tensor | None = None,
         rotation_angle: float | None = None,
-        aberration_coefs: Mapping[str, int | float | torch.Tensor] = {},
+        aberration_coefs: dict[str, int | float | torch.Tensor] = {},
         bin_factors: tuple[int, ...] = (3, 2, 1),
         pair_connectivity: int = 4,
         alignment_method: str = "reference",
@@ -1143,16 +1188,16 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         fitted_aberration_coefs = fit_results.copy()
         fitted_rotation_angle = fitted_aberration_coefs.pop("rotation_angle", None)
-        self._hyperparameter_state = HyperparameterState(
-            optimized_aberrations=fitted_aberration_coefs,
-            optimized_rotation_angle=fitted_rotation_angle,
-            optimized_keys={"C10", "C12", "phi12", "rotation_angle"},
-        )
+
+        state = self.hyperparameter_state
+        state.optimized_aberrations = validate_aberration_coefficients(fitted_aberration_coefs)
+        state.optimized_rotation_angle = fitted_rotation_angle
+        state.optimized_keys = {"C10", "C12", "phi12", "rotation_angle"}
 
         if self.verbose:
-            print(self._hyperparameter_state)
+            print(self.hyperparameter_state)
 
-        self.reconstruct_with_hyperparameters(verbose=False, **reconstruct_kwargs)
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
 
         return self
 
@@ -1218,30 +1263,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         return updated_aberrations_polar
 
-    def reconstruct_with_hyperparameters(
-        self,
-        **reconstruct_kwargs,
-    ):
-        """ """
-        if not hasattr(self, "_hyperparameter_state"):
-            raise ValueError(
-                "run self.optimize_hyperparameters or self.fit_hyperparameters first."
-            )
-
-        state = self._hyperparameter_state
-
-        safe_kwargs = {
-            k: v
-            for k, v in reconstruct_kwargs.items()
-            if k not in ["aberration_coefs", "rotation_angle"]
-        }
-
-        return self.reconstruct(
-            aberration_coefs=state.merged_aberrations(),
-            rotation_angle=state.merged_rotation_angle(),
-            **safe_kwargs,
-        )
-
     def _reconstruct_all_permutations(self, **reconstruct_kwargs):
         """ """
         safe_kwargs = {
@@ -1252,25 +1273,14 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         kernels = ["ssb", "obf", "mf", "prlx", "icom"]
 
-        if hasattr(self, "_hyperparameter_state"):
-            recons = [
-                self.reconstruct_with_hyperparameters(
-                    deconvolution_kernel=kernel,
-                    verbose=False,
-                    **safe_kwargs,
-                ).obj
-                for kernel in tqdm(kernels, disable=not self.verbose)
-            ]
-
-        else:
-            recons = [
-                self.reconstruct(
-                    deconvolution_kernel=kernel,
-                    verbose=False,
-                    **safe_kwargs,
-                ).obj
-                for kernel in tqdm(kernels, disable=not self.verbose)
-            ]
+        recons = [
+            self.reconstruct(
+                deconvolution_kernel=kernel,
+                verbose=False,
+                **safe_kwargs,
+            ).obj
+            for kernel in tqdm(kernels, disable=not self.verbose)
+        ]
 
         return recons
 
