@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quantem.widget"
+version = "0.0.1"
+description = "Interactive custom Python widgets for electron microscopy"
+license = { file = "../LICENSE" }
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quantem"]
