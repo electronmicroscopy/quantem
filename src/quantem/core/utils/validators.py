@@ -12,14 +12,13 @@ from quantem.core.utils import array_funcs as af
 if TYPE_CHECKING:
     import cupy as cp
     import torch
+    TensorLike: TypeAlias = ArrayLike | torch.Tensor
 else:
+    TensorLike: TypeAlias = ArrayLike
     if config.get("has_torch"):
         import torch
     if config.get("has_cupy"):
         import cupy as cp
-
-TensorLike: TypeAlias = ArrayLike | "torch.Tensor"
-
 
 # --- Dataset Validation Functions ---
 def ensure_valid_array(
