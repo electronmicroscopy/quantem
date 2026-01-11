@@ -7,6 +7,12 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+members = [
+    "quantem",
+    "quantem-widget",
+]
+
 [[package]]
 name = "absl-py"
 version = "2.3.1"
@@ -2577,6 +2583,11 @@ dev = [
     { name = "tomli", specifier = ">=2.2.1" },
 ]
 test = [{ name = "pytest", specifier = ">=8.3.5" }]
+
+[[package]]
+name = "quantem-widget"
+version = "0.0.1"
+source = { editable = "widget" }
 
 [[package]]
 name = "referencing"
