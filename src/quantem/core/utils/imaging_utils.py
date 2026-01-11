@@ -778,3 +778,207 @@ def radially_average_fourier_array(
     valid = k_bins <= kx.abs().max()
 
     return k_bins[valid].cpu().numpy(), array_b[valid].cpu().numpy()
+
+
+def torch_dct2(x):
+    """
+    2D DCT-II implemented via FFT.
+    """
+    N, M = x.shape[-2], x.shape[-1]
+
+    # even extension
+    x_ext = torch.cat([x, torch.flip(x, dims=(-1,))], dim=-1)
+    X = torch.fft.fft(x_ext, dim=-1)
+
+    factor = torch.exp(-1j * math.pi * torch.arange(M, device=x.device) / (2 * M))
+    X = X[..., :M] * factor
+
+    # repeat for second axis
+    x_ext = torch.cat([X.real, torch.flip(X.real, dims=(-2,))], dim=-2)
+    X2 = torch.fft.fft(x_ext, dim=-2)
+
+    factor = torch.exp(-1j * math.pi * torch.arange(N, device=x.device) / (2 * N)).unsqueeze(-1)
+    return (X2[..., :N, :] * factor).real
+
+
+def torch_idct2(X):
+    """
+    2D inverse DCT-II (i.e. DCT-III).
+    """
+    N, M = X.shape[-2], X.shape[-1]
+
+    factor = torch.exp(1j * math.pi * torch.arange(N, device=X.device) / (2 * N)).unsqueeze(-1)
+    X = X * factor
+
+    X_ext = torch.zeros(
+        (*X.shape[:-2], 2 * N, M),
+        dtype=torch.complex64,
+        device=X.device,
+    )
+    X_ext[..., :N, :] = X
+    X_ext[..., N:, :] = torch.flip(X, dims=(-2,)).conj()
+
+    x = torch.fft.ifft(X_ext, dim=-2).real[..., :N, :]
+
+    factor = torch.exp(1j * math.pi * torch.arange(M, device=X.device) / (2 * M))
+    x = x * factor
+
+    x_ext = torch.zeros(
+        (*x.shape[:-2], N, 2 * M),
+        dtype=torch.complex64,
+        device=x.device,
+    )
+    x_ext[..., :, :M] = x
+    x_ext[..., :, M:] = torch.flip(x, dims=(-1,)).conj()
+
+    return torch.fft.ifft(x_ext, dim=-1).real[..., :, :M]
+
+
+def _poisson_solver_dct(rho):
+    """
+    Solve ∇²φ = rho using DCT.
+    """
+    N, M = rho.shape[-2], rho.shape[-1]
+
+    dct_rho = torch_dct2(rho)
+
+    I = torch.arange(M, device=rho.device)  # noqa: E741
+    J = torch.arange(N, device=rho.device)
+    I, J = torch.meshgrid(I, J, indexing="xy")  # noqa: E741
+
+    denom = 2 * (torch.cos(math.pi * I / M) + torch.cos(math.pi * J / N) - 2)
+    denom[0, 0] = 1.0  # avoid div-by-zero
+
+    dct_phi = dct_rho / denom
+    dct_phi[0, 0] = 0.0  # remove piston
+
+    return torch_idct2(dct_phi)
+
+
+def _poisson_solver_fft(rho):
+    """
+    Solve ∇²φ = rho with periodic BCs using FFT.
+    """
+    Ny, Nx = rho.shape[-2:]
+
+    ky = torch.fft.fftfreq(Ny, device=rho.device).reshape(-1, 1)
+    kx = torch.fft.fftfreq(Nx, device=rho.device).reshape(1, -1)
+
+    denom = 2 * torch.cos(2 * math.pi * kx) + 2 * torch.cos(2 * math.pi * ky) - 4
+
+    rho_hat = torch.fft.fft2(rho)
+
+    phi_hat = torch.zeros_like(rho_hat)
+    mask = denom != 0
+    phi_hat[mask] = rho_hat[mask] / denom[mask]
+
+    phi = torch.real(torch.fft.ifft2(phi_hat))
+    return phi
+
+
+def _wrap_to_pi(x):
+    return (x + math.pi) % (2 * math.pi) - math.pi
+
+
+# def _unwrap_phase_2d_torch_single(phase_wrap):
+
+#     psi = torch.exp(1j * phase_wrap)
+
+#     # wrapped phase gradients
+#     dphix = _wrap_to_pi(
+#         torch.angle(psi[..., :, 1:] * psi[..., :, :-1].conj())
+#     )
+#     dphiy = _wrap_to_pi(
+#         torch.angle(psi[..., 1:, :] * psi[..., :-1, :].conj())
+#     )
+
+#     # pad gradients (same as MATLAB zeros([...]) trick)
+#     edx = torch.zeros_like(psi)
+#     edy = torch.zeros_like(psi)
+
+#     edx[..., :, 1:-1] = dphix[..., :, 1:] - dphix[..., :, :-1]
+#     edy[..., 1:-1, :] = dphiy[..., 1:, :] - dphiy[..., :-1, :]
+
+#     # Laplacian on interior
+#     lap = edx[..., 1:-1, 1:-1] + edy[..., 1:-1, 1:-1]
+
+#     # RHS of Poisson equation
+#     rho = torch.imag(
+#         torch.conj(psi[..., 1:-1, 1:-1]) * lap
+#     )
+
+#     return _poisson_solver_dct(rho)
+
+
+def _unwrap_phase_2d_torch_single(phase_wrap):
+    psi = torch.exp(1j * phase_wrap)
+
+    dphix = _wrap_to_pi(torch.angle(psi[..., :, 1:] * psi[..., :, :-1].conj()))
+    dphiy = _wrap_to_pi(torch.angle(psi[..., 1:, :] * psi[..., :-1, :].conj()))
+
+    edx = torch.zeros_like(psi)
+    edy = torch.zeros_like(psi)
+
+    edx[..., :, 1:-1] = dphix[..., :, 1:] - dphix[..., :, :-1]
+    edy[..., 1:-1, :] = dphiy[..., 1:, :] - dphiy[..., :-1, :]
+
+    lap = edx[..., 1:-1, 1:-1] + edy[..., 1:-1, 1:-1]
+
+    rho = torch.imag(torch.conj(psi[..., 1:-1, 1:-1]) * lap)
+
+    phi_inner = _poisson_solver_fft(rho)
+
+    # embed back into full array
+    phi = torch.zeros_like(phase_wrap)
+    phi[..., 1:-1, 1:-1] = phi_inner
+
+    return phi
+
+
+# def unwrap_phase_2d_torch(phase_wrap, max_iter=20):
+#     phi = _unwrap_phase_2d_torch_single(phase_wrap)
+#     phi = phi + phase_wrap.mean() - phi.mean()
+
+#     K1 = torch.round((phi - phase_wrap) / (2 * math.pi))
+#     phase_unwrap = phase_wrap + 2 * math.pi * K1
+#     residue = _wrap_to_pi(phase_unwrap - phi)
+
+#     for _ in range(max_iter):
+#         phi_c = _unwrap_phase_2d_torch_single(residue)
+#         phi = phi + phi_c
+#         phi = phi + phase_wrap.mean() - phi.mean()
+
+#         K2 = torch.round((phi - phase_wrap) / (2 * math.pi))
+#         if torch.all(K2 == K1):
+#             break
+#         K1 = K2
+#         phase_unwrap = phase_wrap + 2 * math.pi * K2
+#         residue = _wrap_to_pi(phase_unwrap - phi)
+
+#     return phase_unwrap
+
+
+def _fix_piston(unwrapped, wrapped, mask=None):
+    if mask is None:
+        delta = wrapped - unwrapped
+    else:
+        delta = (wrapped - unwrapped)[mask]
+
+    k = torch.round(torch.median(delta) / (2 * math.pi))
+    return unwrapped + 2 * math.pi * k
+
+
+def unwrap_phase_2d_torch(phase_wrap, mask=None):
+    dx = _wrap_to_pi(phase_wrap[..., :, 1:] - phase_wrap[..., :, :-1])
+    dy = _wrap_to_pi(phase_wrap[..., 1:, :] - phase_wrap[..., :-1, :])
+
+    div = torch.zeros_like(phase_wrap)
+    div[..., :, 1:] += dx
+    div[..., :, :-1] -= dx
+    div[..., 1:, :] += dy
+    div[..., :-1, :] -= dy
+
+    phi = _poisson_solver_fft(div)
+    phi = _fix_piston(phi, phase_wrap, mask)
+
+    return phi
