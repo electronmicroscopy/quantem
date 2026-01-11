@@ -9,6 +9,12 @@ Getting started:
 - run `uv sync` to install all the dependencies in an editable environment
 - run `uv sync --all-packages` to also install `quantem.widget` (optional)
 
+For widget developers (requires [Node.js](https://nodejs.org/)):
+
+- `cd widget && npm install` to install JS dependencies
+- `npm run build` to build the widget
+- `npm run dev` to watch for changes during development
+
 The following will set up the pre-commit and [ruff](https://github.com/astral-sh/ruff) for linting and formatting. These commands only need to be run once when first setting up your dev environment: 
 
 - `uv tool install pre-commit` 
