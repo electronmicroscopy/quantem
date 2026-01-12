@@ -561,22 +561,24 @@ def unwrap_bf_overlap_phase_torch(
     phase_grid[bf_mask] = phase_bf
     mask_grid[bf_mask] = mask_bf
 
-    phase_grid = unwrap_phase_2d_torch(
-        phase_grid * mask_grid,
-        method=method,
-        mask=mask_grid,
-        **unwrap_kwargs,
-    )
-    phase_grid = phase_grid * mask_grid
+    if mask_grid.any():
+        if phase_grid.max() - phase_grid.min() > math.pi:
+            phase_grid = unwrap_phase_2d_torch(
+                phase_grid * mask_grid,
+                method=method,
+                mask=mask_grid,
+                **unwrap_kwargs,
+            )
+            phase_grid = phase_grid * mask_grid
 
-    if two_pass:
-        phase_grid = unwrap_phase_2d_torch(
-            phase_grid,
-            method=method,
-            mask=mask_grid,
-            **unwrap_kwargs,
-        )
-        phase_grid = phase_grid * mask_grid
+            if two_pass:
+                phase_grid = unwrap_phase_2d_torch(
+                    phase_grid,
+                    method=method,
+                    mask=mask_grid,
+                    **unwrap_kwargs,
+                )
+                phase_grid = phase_grid * mask_grid
 
     return phase_grid[bf_mask]
 
@@ -623,3 +625,11 @@ def group_basis_by_method(
 
     else:
         raise ValueError(f"Unknown fit_method: {fit_method}")
+
+
+def _crop_corner_centered_mask(mask: torch.Tensor):
+    mask_c = torch.fft.fftshift(mask)
+    ys, xs = torch.where(mask_c)
+    y0, y1 = ys.min() - 1, ys.max() + 2
+    x0, x1 = xs.min() - 1, xs.max() + 2
+    return torch.fft.ifftshift(mask_c[y0:y1, x0:x1])

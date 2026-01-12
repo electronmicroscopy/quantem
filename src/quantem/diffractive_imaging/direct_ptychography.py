@@ -43,6 +43,7 @@ from itertools import product
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     ABERRATION_PRESETS,
+    _crop_corner_centered_mask,
     align_vbf_stack_multiscale,
     create_edge_window,
     fit_aberrations_from_shifts,
@@ -222,6 +223,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.verbose = verbose
         self.vbf_stack = vbf_dataset.array  # ty:ignore[invalid-assignment]
         self.bf_mask = bf_mask_dataset.array  # ty:ignore[invalid-assignment]
+        self.bf_mask = _crop_corner_centered_mask(self.bf_mask)
 
         self.wavelength = electron_wavelength_angstrom(energy)
         self.scan_units = vbf_dataset.units[-2:]
@@ -233,7 +235,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
 
         self.num_bf = vbf_dataset.shape[0]
-        self.gpts = bf_mask_dataset.shape[:2]
+        self.gpts = self.bf_mask.shape[:2]
         self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
 
         self.semiangle_cutoff = semiangle_cutoff  # ty:ignore[invalid-assignment]
@@ -1091,7 +1093,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         lateral_shifts = grad_k / 2 / np.pi
         return lateral_shifts
 
-    def fit_hyperparameters(
+    def fit_hyperparameters_cross_correlation(
         self,
         bf_mask: torch.Tensor | None = None,
         rotation_angle: float | None = None,
@@ -1273,9 +1275,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         rotation_angle: float | None = None,
         cartesian_basis: str | list[str] = "low_order",
         num_q_modes: int = 6,
-        q_signal_weight: float = 0.5,
+        q_signal_weight: float = 0.05,
         unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
-        two_pass_unwrapping: bool = True,
+        two_pass_unwrapping: bool = False,
     ):
         """
         Phase-only least-squares aberration fit from vBF Fourier data.
@@ -1401,69 +1403,55 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         phi_minus_all = torch.zeros_like(deconv, dtype=torch.float32)
 
         for j in range(N_q):
-            if plus_mask[:, j].any():
-                phi_plus_all[:, j] = unwrap_bf_overlap_phase_torch(
-                    complex_data_bf=deconv[:, j],
-                    mask_bf=plus_mask[:, j],
-                    bf_mask=bf_mask,
-                    method=unwrap_method,
-                    two_pass=two_pass_unwrapping,
-                )
+            phi_plus_all[:, j] = unwrap_bf_overlap_phase_torch(
+                complex_data_bf=deconv[:, j],
+                mask_bf=plus_mask[:, j],
+                bf_mask=bf_mask,
+                method=unwrap_method,
+                two_pass=two_pass_unwrapping,
+            )
 
-            if minus_mask[:, j].any():
-                phi_minus_all[:, j] = unwrap_bf_overlap_phase_torch(
-                    complex_data_bf=deconv[:, j],
-                    mask_bf=minus_mask[:, j],
-                    bf_mask=bf_mask,
-                    method=unwrap_method,
-                    two_pass=two_pass_unwrapping,
-                )
+            phi_minus_all[:, j] = unwrap_bf_overlap_phase_torch(
+                complex_data_bf=deconv[:, j],
+                mask_bf=minus_mask[:, j],
+                bf_mask=bf_mask,
+                method=unwrap_method,
+                two_pass=two_pass_unwrapping,
+            )
 
-        # Count total number of equations
-        n_plus = plus_mask.sum().item()
-        n_minus = minus_mask.sum().item()
-        n_total = n_plus + n_minus
+        mask_plus_flat = plus_mask.reshape(-1)
+        mask_minus_flat = minus_mask.reshape(-1)
 
-        # Pre-allocate full matrices
-        A = torch.zeros((n_total, P + N_q), device=device, dtype=torch.float32)
-        b = torch.zeros(n_total, device=device, dtype=torch.float32)
+        # dchi_plus_flat: (N_k*N_q, P)
+        dchi_plus_flat = (chi_p_basis - chi_0_basis[:, None, :]).reshape(-1, P)
+        dchi_minus_flat = (chi_0_basis[:, None, :] - chi_m_basis).reshape(-1, P)
 
-        # Fill in plus contributions
-        idx = 0
-        for j in range(N_q):
-            mask_j = plus_mask[:, j]
-            n_j = mask_j.sum().item()
+        # rhs
+        phi_plus_flat = phi_plus_all.reshape(-1)
+        phi_minus_flat = phi_minus_all.reshape(-1)
 
-            if n_j > 0:
-                # dchi for this q-mode
-                dchi = chi_p_basis[:, j, :] - chi_0_basis  # (N_k, P)
+        A_plus = torch.cat(
+            [
+                dchi_plus_flat[mask_plus_flat],
+                torch.eye(N_q, device=device).repeat_interleave(plus_mask.sum(0), dim=0),
+            ],
+            dim=1,
+        )
 
-                # Fill A matrix
-                A[idx : idx + n_j, :P] = dchi[mask_j]
-                A[idx : idx + n_j, P + j] = 1.0
+        b_plus = phi_plus_flat[mask_plus_flat]
 
-                # Fill b vector
-                b[idx : idx + n_j] = phi_plus_all[mask_j, j]
+        A_minus = torch.cat(
+            [
+                dchi_minus_flat[mask_minus_flat],
+                torch.eye(N_q, device=device).repeat_interleave(minus_mask.sum(0), dim=0),
+            ],
+            dim=1,
+        )
 
-                idx += n_j
+        b_minus = phi_minus_flat[mask_minus_flat]
 
-        # Fill in minus contributions
-        for j in range(N_q):
-            mask_j = minus_mask[:, j]
-            n_j = mask_j.sum().item()
-
-            if n_j > 0:
-                # dchi for this q-mode
-                dchi = chi_0_basis - chi_m_basis[:, j, :]  # (N_k, P)
-
-                # Fill A matrix
-                A[idx : idx + n_j, :P] = dchi[mask_j]
-                A[idx : idx + n_j, P + j] = 1.0
-
-                # Fill b vector
-                b[idx : idx + n_j] = phi_minus_all[mask_j, j]
-
-                idx += n_j
+        A = torch.cat([A_plus, A_minus], dim=0)
+        b = torch.cat([b_plus, b_minus], dim=0)
 
         # ---------------------------------------------------------
         # Solve LS
@@ -1483,10 +1471,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         q_signal_weight: float = 0.5,
         fit_method: Literal["global", "recursive", "sequential"] = "recursive",
         unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
-        two_pass_unwrapping: bool = True,
+        two_pass_unwrapping: bool = False,
         verbose=None,
         use_optimized_state=True,
         bf_mask=None,
+        **reconstruct_kwargs,
     ):
         """
         Fit aberration coefficients using least squares.
@@ -1549,9 +1538,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         }
 
         # Iterate through basis groups
-        for i, basis_group in enumerate(
-            pbar := tqdm(basis_groups, desc="Fitting aberrations", unit="order")
-        ):
+        pbar = tqdm(basis_groups, desc="Fitting aberrations", unit="order", disable=not verbose)
+        for i, basis_group in enumerate(pbar):
             pbar.set_postfix_str(f"{basis_group}"[:50])
 
             current_coefs = self._fit_hyperparameters_least_squares_inner(
@@ -1564,6 +1552,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 unwrap_method=unwrap_method,
                 two_pass_unwrapping=two_pass_unwrapping,
             )
+        pbar.close()
 
         optimized_coefs = {k: float(v) for k, v in current_coefs.items() if v != 0.0}
         state.optimized_aberrations = validate_aberration_coefficients(optimized_coefs)
@@ -1571,7 +1560,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if verbose:
             print("Optimized state:\n\n", self.hyperparameter_state)
 
-        return current_coefs
+        self.reconstruct(verbose=False, **reconstruct_kwargs)
+
+        return self
 
     def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
         """ """
