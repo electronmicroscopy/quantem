@@ -1476,8 +1476,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def fit_hyperparameters_least_squares(
         self,
-        override_aberration_coefs: dict[str, int | float] | None = None,
-        override_rotation_angle: float | None = None,
+        aberration_coefs: dict[str, int | float] | None = None,
+        rotation_angle: float | None = None,
         cartesian_basis: str | list[str] | list[list[str]] = "low_order",
         num_q_modes: int = 6,
         q_signal_weight: float = 0.5,
@@ -1517,8 +1517,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             verbose = self.verbose
 
         if use_optimized_state:
-            aberration_coefs = state.current_aberrations(override_aberration_coefs)
-            rotation_angle = state.current_rotation_angle(override_rotation_angle)
+            aberration_coefs = state.current_aberrations(aberration_coefs)
+            rotation_angle = state.current_rotation_angle(rotation_angle)
         else:
             aberration_coefs = state.initial_aberrations
             rotation_angle = state.initial_rotation_angle
@@ -1564,7 +1564,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 unwrap_method=unwrap_method,
                 two_pass_unwrapping=two_pass_unwrapping,
             )
-            state.optimized_aberrations = validate_aberration_coefficients(current_coefs)
+
+        optimized_coefs = {k: float(v) for k, v in current_coefs.items() if v != 0.0}
+        state.optimized_aberrations = validate_aberration_coefficients(optimized_coefs)
 
         if verbose:
             print("Optimized state:\n\n", self.hyperparameter_state)
