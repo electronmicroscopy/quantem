@@ -36,18 +36,12 @@ function roundToNiceValue(value: number): number {
 /** Format scale bar label with appropriate unit */
 function formatScaleLabel(value: number, unit: "Å" | "mrad"): string {
   const nice = roundToNiceValue(value);
-
   if (unit === "Å") {
     if (nice >= 10) return `${Math.round(nice / 10)} nm`;
-    if (nice >= 1) return `${Math.round(nice)} Å`;
-    return `${nice.toFixed(2)} Å`;
+    return nice >= 1 ? `${Math.round(nice)} Å` : `${nice.toFixed(2)} Å`;
   }
-  if (unit === "mrad") {
-    if (nice >= 1000) return `${Math.round(nice / 1000)} rad`;
-    if (nice >= 1) return `${Math.round(nice)} mrad`;
-    return `${nice.toFixed(2)} mrad`;
-  }
-  return `${Math.round(nice)} ${unit}`;
+  if (nice >= 1000) return `${Math.round(nice / 1000)} rad`;
+  return nice >= 1 ? `${Math.round(nice)} mrad` : `${nice.toFixed(2)} mrad`;
 }
 
 /**
@@ -59,9 +53,9 @@ function drawScaleBarHiDPI(
   dpr: number,
   zoom: number,
   pixelSize: number,
-  unit: string = "Å",
-  imageWidth: number,  // Original image width in pixels
-  imageHeight: number  // Original image height in pixels
+  unit: "Å" | "mrad",
+  imageWidth: number,
+  imageHeight: number
 ) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -485,6 +479,7 @@ function Show4DSTEM() {
   const [isHoveringResize, setIsHoveringResize] = React.useState(false);
   const [isHoveringResizeInner, setIsHoveringResizeInner] = React.useState(false);
   const [colormap, setColormap] = React.useState("inferno");
+  const [showFft, setShowFft] = React.useState(true);
 
   // Band-pass filter range [innerCutoff, outerCutoff] in pixels - [0, 0] means disabled
   const [bandpass, setBandpass] = React.useState<number[]>([0, 0]);
@@ -595,11 +590,17 @@ function Show4DSTEM() {
   const dpCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const dpOverlayRef = React.useRef<HTMLCanvasElement>(null);
   const dpUiRef = React.useRef<HTMLCanvasElement>(null);  // High-DPI UI overlay for scale bar
+  const dpOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
+  const dpImageDataRef = React.useRef<ImageData | null>(null);
   const virtualCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const virtualOverlayRef = React.useRef<HTMLCanvasElement>(null);
   const viUiRef = React.useRef<HTMLCanvasElement>(null);  // High-DPI UI overlay for scale bar
+  const viOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
+  const viImageDataRef = React.useRef<ImageData | null>(null);
   const fftCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const fftOverlayRef = React.useRef<HTMLCanvasElement>(null);
+  const fftOffscreenRef = React.useRef<HTMLCanvasElement | null>(null);
+  const fftImageDataRef = React.useRef<ImageData | null>(null);
 
   // Display size for high-DPI UI overlays
   const UI_SIZE = 400;
@@ -619,16 +620,24 @@ function Show4DSTEM() {
 
   // Store raw virtual image data for filtering
   const rawVirtualImageRef = React.useRef<Float32Array | null>(null);
+  const viWorkRealRef = React.useRef<Float32Array | null>(null);
+  const viWorkImagRef = React.useRef<Float32Array | null>(null);
+  const fftWorkRealRef = React.useRef<Float32Array | null>(null);
+  const fftWorkImagRef = React.useRef<Float32Array | null>(null);
+  const fftMagnitudeRef = React.useRef<Float32Array | null>(null);
 
   // Parse virtual image bytes into Float32Array
   React.useEffect(() => {
     if (!virtualImageBytes) return;
     const bytes = new Uint8Array(virtualImageBytes.buffer, virtualImageBytes.byteOffset, virtualImageBytes.byteLength);
-    const floatData = new Float32Array(bytes.length);
+    let floatData = rawVirtualImageRef.current;
+    if (!floatData || floatData.length !== bytes.length) {
+      floatData = new Float32Array(bytes.length);
+      rawVirtualImageRef.current = floatData;
+    }
     for (let i = 0; i < bytes.length; i++) {
       floatData[i] = bytes[i];
     }
-    rawVirtualImageRef.current = floatData;
   }, [virtualImageBytes]);
 
   // Render DP with zoom
@@ -641,13 +650,25 @@ function Show4DSTEM() {
     const bytes = new Uint8Array(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
     const lut = COLORMAPS[colormap] || COLORMAPS.inferno;
 
-    const offscreen = document.createElement("canvas");
-    offscreen.width = detY;
-    offscreen.height = detX;
+    let offscreen = dpOffscreenRef.current;
+    if (!offscreen) {
+      offscreen = document.createElement("canvas");
+      dpOffscreenRef.current = offscreen;
+    }
+    const sizeChanged = offscreen.width !== detY || offscreen.height !== detX;
+    if (sizeChanged) {
+      offscreen.width = detY;
+      offscreen.height = detX;
+      dpImageDataRef.current = null;
+    }
     const offCtx = offscreen.getContext("2d");
     if (!offCtx) return;
 
-    const imgData = offCtx.createImageData(detY, detX);
+    let imgData = dpImageDataRef.current;
+    if (!imgData) {
+      imgData = offCtx.createImageData(detY, detX);
+      dpImageDataRef.current = imgData;
+    }
     const rgba = imgData.data;
 
     for (let i = 0; i < bytes.length; i++) {
@@ -699,13 +720,25 @@ function Show4DSTEM() {
       }
 
       const lut = COLORMAPS[colormap] || COLORMAPS.inferno;
-      const offscreen = document.createElement("canvas");
-      offscreen.width = width;
-      offscreen.height = height;
+      let offscreen = viOffscreenRef.current;
+      if (!offscreen) {
+        offscreen = document.createElement("canvas");
+        viOffscreenRef.current = offscreen;
+      }
+      const sizeChanged = offscreen.width !== width || offscreen.height !== height;
+      if (sizeChanged) {
+        offscreen.width = width;
+        offscreen.height = height;
+        viImageDataRef.current = null;
+      }
       const offCtx = offscreen.getContext("2d");
       if (!offCtx) return;
 
-      const imageData = offCtx.createImageData(width, height);
+      let imageData = viImageDataRef.current;
+      if (!imageData) {
+        imageData = offCtx.createImageData(width, height);
+        viImageDataRef.current = imageData;
+      }
       for (let i = 0; i < filtered.length; i++) {
         const val = Math.floor(((filtered[i] - min) / (max - min || 1)) * 255);
         imageData.data[i * 4] = lut[val * 3];
@@ -758,8 +791,22 @@ function Show4DSTEM() {
         return () => { isCancelled = true; };
       } else {
         // CPU Fallback (Sync)
-        const real = rawVirtualImageRef.current.slice();
-        const imag = new Float32Array(real.length);
+        const source = rawVirtualImageRef.current;
+        if (!source) return;
+        const len = source.length;
+        let real = viWorkRealRef.current;
+        if (!real || real.length !== len) {
+          real = new Float32Array(len);
+          viWorkRealRef.current = real;
+        }
+        real.set(source);
+        let imag = viWorkImagRef.current;
+        if (!imag || imag.length !== len) {
+          imag = new Float32Array(len);
+          viWorkImagRef.current = imag;
+        } else {
+          imag.fill(0);
+        }
         fft2d(real, imag, width, height, false);
         fftshift(real, width, height);
         fftshift(imag, width, height);
@@ -770,6 +817,7 @@ function Show4DSTEM() {
         renderData(real);
       }
     } else {
+      if (!rawVirtualImageRef.current) return;
       renderData(rawVirtualImageRef.current);
     }
   }, [virtualImageBytes, shapeX, shapeY, colormap, viZoom, viPanX, viPanY, bpInner, bpOuter, gpuReady]);
@@ -790,6 +838,10 @@ function Show4DSTEM() {
     const canvas = fftCanvasRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    if (!showFft) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
 
     const width = shapeY;
     const height = shapeX;
@@ -799,7 +851,11 @@ function Show4DSTEM() {
     // Helper to render magnitude to canvas
     const renderMagnitude = (real: Float32Array, imag: Float32Array) => {
       // Compute log magnitude
-      const magnitude = new Float32Array(real.length);
+      let magnitude = fftMagnitudeRef.current;
+      if (!magnitude || magnitude.length !== real.length) {
+        magnitude = new Float32Array(real.length);
+        fftMagnitudeRef.current = magnitude;
+      }
       for (let i = 0; i < real.length; i++) {
         magnitude[i] = Math.log1p(Math.sqrt(real[i] * real[i] + imag[i] * imag[i]));
       }
@@ -811,13 +867,25 @@ function Show4DSTEM() {
         if (magnitude[i] > max) max = magnitude[i];
       }
 
-      const offscreen = document.createElement("canvas");
-      offscreen.width = width;
-      offscreen.height = height;
+      let offscreen = fftOffscreenRef.current;
+      if (!offscreen) {
+        offscreen = document.createElement("canvas");
+        fftOffscreenRef.current = offscreen;
+      }
+      const sizeChanged = offscreen.width !== width || offscreen.height !== height;
+      if (sizeChanged) {
+        offscreen.width = width;
+        offscreen.height = height;
+        fftImageDataRef.current = null;
+      }
       const offCtx = offscreen.getContext("2d");
       if (!offCtx) return;
 
-      const imgData = offCtx.createImageData(width, height);
+      let imgData = fftImageDataRef.current;
+      if (!imgData) {
+        imgData = offCtx.createImageData(width, height);
+        fftImageDataRef.current = imgData;
+      }
       const rgba = imgData.data;
       const range = max > min ? max - min : 1;
 
@@ -862,14 +930,26 @@ function Show4DSTEM() {
       return () => { isCancelled = true; };
     } else {
       // CPU fallback (sync)
-      const real = sourceData.slice();
-      const imag = new Float32Array(real.length);
+      const len = sourceData.length;
+      let real = fftWorkRealRef.current;
+      if (!real || real.length !== len) {
+        real = new Float32Array(len);
+        fftWorkRealRef.current = real;
+      }
+      real.set(sourceData);
+      let imag = fftWorkImagRef.current;
+      if (!imag || imag.length !== len) {
+        imag = new Float32Array(len);
+        fftWorkImagRef.current = imag;
+      } else {
+        imag.fill(0);
+      }
       fft2d(real, imag, width, height, false);
       fftshift(real, width, height);
       fftshift(imag, width, height);
       renderMagnitude(real, imag);
     }
-  }, [virtualImageBytes, shapeX, shapeY, colormap, fftZoom, fftPanX, fftPanY, gpuReady]);
+  }, [virtualImageBytes, shapeX, shapeY, colormap, fftZoom, fftPanX, fftPanY, gpuReady, showFft]);
 
   // Render FFT overlay with high-pass filter circle
   React.useEffect(() => {
@@ -878,6 +958,7 @@ function Show4DSTEM() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!showFft) return;
 
     // Draw band-pass filter circles (inner = HP, outer = LP)
     const centerX = (shapeY / 2) * fftZoom + fftPanX;
@@ -903,7 +984,7 @@ function Show4DSTEM() {
       ctx.stroke();
       ctx.setLineDash([]);
     }
-  }, [fftZoom, fftPanX, fftPanY, pixelSize, shapeX, shapeY, bpInner, bpOuter]);
+  }, [fftZoom, fftPanX, fftPanY, pixelSize, shapeX, shapeY, bpInner, bpOuter, showFft]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // High-DPI Scale Bar UI Overlays
@@ -1283,9 +1364,17 @@ function Show4DSTEM() {
           </Box>
 
           <Box>
-            <Typography variant="caption" sx={{ ...typography.label, mb: 0.5, display: "block" }}>
-              FFT
-            </Typography>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 0.5 }}>
+              <Typography variant="caption" sx={{ ...typography.label }}>
+                FFT
+              </Typography>
+              <Switch
+                checked={showFft}
+                onChange={(e) => setShowFft(e.target.checked)}
+                size="small"
+                sx={switchStyles.medium}
+              />
+            </Stack>
             <Box sx={{ ...container.imageBox, width: 300, height: 300 }}>
               <canvas ref={fftCanvasRef} width={shapeY} height={shapeX} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
               <canvas

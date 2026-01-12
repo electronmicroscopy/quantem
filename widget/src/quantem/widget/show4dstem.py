@@ -8,16 +8,12 @@ Features:
 """
 
 import pathlib
-from typing import TYPE_CHECKING
 
 import anywidget
 import numpy as np
 import traitlets
 
 from quantem.widget.array_utils import to_numpy
-
-if TYPE_CHECKING:
-    from quantem.core.datastructures import Dataset4dstem
 
 
 # Detector geometry constant
@@ -29,7 +25,7 @@ class Show4DSTEM(anywidget.AnyWidget):
     Fast interactive 4D-STEM viewer with advanced features.
 
     Optimized for speed with binary transfer and pre-normalization.
-    Works with NumPy and PyTorch arrays.
+    Works with NumPy and PyTorch arrays.``````
 
     Parameters
     ----------
@@ -49,6 +45,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         If not provided, defaults to detector center.
     bf_radius : float, optional
         Bright field disk radius in pixels. If not provided, estimated as 1/8 of detector size.
+    precompute_virtual_images : bool, default True
+        Precompute BF/ABF/LAADF/HAADF virtual images for preset switching.
     log_scale : bool, default False
         Use log scale for better dynamic range visualization.
 
@@ -142,6 +140,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         k_pixel_size: float | None = None,
         center: tuple[float, float] | None = None,
         bf_radius: float | None = None,
+        precompute_virtual_images: bool = True,
         log_scale: bool = False,
         **kwargs,
     ):
@@ -211,7 +210,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._cached_abf_virtual = None
         self._cached_laadf_virtual = None
         self._cached_haadf_virtual = None
-        self._precompute_common_virtual_images()
+        if precompute_virtual_images:
+            self._precompute_common_virtual_images()
 
         # Update frame when position or settings change
         self.observe(self._update_frame, names=["pos_x", "pos_y", "log_scale"])
@@ -617,40 +617,16 @@ class Show4DSTEM(anywidget.AnyWidget):
         return mask
 
     def _precompute_common_virtual_images(self):
-        """Pre-compute BF/ABF/LAADF/HAADF virtual images for instant mode switching."""
-        def _compute_and_normalize(mask):
-            if self._data.ndim == 4:
-                img = (self._data * mask).sum(axis=(-2, -1))
-            else:
-                img = (self._data * mask).sum(axis=(-2, -1)).reshape(self._scan_shape)
-            vmin, vmax = float(img.min()), float(img.max())
-            if vmax > vmin:
-                norm = np.clip((img - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
-            else:
-                norm = np.zeros(img.shape, dtype=np.uint8)
-            return norm.tobytes()
-        
-        # BF: circle at bf_radius
-        bf_mask = self._create_circular_mask(self.center_x, self.center_y, self.bf_radius)
-        self._cached_bf_virtual = _compute_and_normalize(bf_mask)
-        
-        # ABF: annular at 0.5*bf to bf (matches JS button)
-        abf_mask = self._create_annular_mask(
-            self.center_x, self.center_y, self.bf_radius * 0.5, self.bf_radius
-        )
-        self._cached_abf_virtual = _compute_and_normalize(abf_mask)
-        
-        # LAADF: annular at bf to 2*bf (matches JS button)
-        laadf_mask = self._create_annular_mask(
-            self.center_x, self.center_y, self.bf_radius, self.bf_radius * 2.0
-        )
-        self._cached_laadf_virtual = _compute_and_normalize(laadf_mask)
-        
-        # HAADF: annular at 2*bf to 4*bf (matches JS button)
-        haadf_mask = self._create_annular_mask(
-            self.center_x, self.center_y, self.bf_radius * 2.0, self.bf_radius * 4.0
-        )
-        self._cached_haadf_virtual = _compute_and_normalize(haadf_mask)
+        """Pre-compute BF/ABF/LAADF/HAADF virtual images for instant preset switching."""
+        cx, cy, bf = self.center_x, self.center_y, self.bf_radius
+        self._cached_bf_virtual = self._normalize_to_bytes(
+            self._fast_masked_sum(self._create_circular_mask(cx, cy, bf)))
+        self._cached_abf_virtual = self._normalize_to_bytes(
+            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 0.5, bf)))
+        self._cached_laadf_virtual = self._normalize_to_bytes(
+            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf, bf * 2.0)))
+        self._cached_haadf_virtual = self._normalize_to_bytes(
+            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 2.0, bf * 4.0)))
 
     def _get_cached_preset(self) -> bytes | None:
         """Check if current ROI matches a cached preset and return it."""
@@ -684,64 +660,47 @@ class Show4DSTEM(anywidget.AnyWidget):
         
         return None
 
-    def _fast_masked_sum(self, mask) -> 'np.ndarray':
-        """Fast masked sum using element-wise multiply (memory efficient)."""
-        # Handle both 3D and 4D data
+    def _fast_masked_sum(self, mask) -> "np.ndarray":
+        """Masked sum over detector dimensions."""
         if self._data.ndim == 4:
-            # (scan_x, scan_y, det_x, det_y) -> sum over detector dims
-            virtual_image = (self._data.astype(np.float32) * mask).sum(axis=(2, 3))
+            return (self._data.astype(np.float32) * mask).sum(axis=(2, 3))
+        return (self._data.astype(np.float32) * mask).sum(axis=(1, 2)).reshape(self._scan_shape)
+
+    def _normalize_to_bytes(self, arr: "np.ndarray") -> bytes:
+        """Normalize array to uint8 bytes."""
+        vmin, vmax = float(arr.min()), float(arr.max())
+        if vmax > vmin:
+            norm = np.clip((arr - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
         else:
-            # (N, det_x, det_y) -> sum over detector dims then reshape
-            virtual_image = (self._data.astype(np.float32) * mask).sum(axis=(1, 2))
-            virtual_image = virtual_image.reshape(self._scan_shape)
-        return virtual_image
+            norm = np.zeros(arr.shape, dtype=np.uint8)
+        return norm.tobytes()
 
     def _compute_virtual_image_from_roi(self):
-        """Compute virtual image based on ROI mode (point, circle, square, or annular)."""
-        
-        # Fast path: use cached images for presets (BF/ABF/LAADF/HAADF)
+        """Compute virtual image based on ROI mode."""
         cached = self._get_cached_preset()
         if cached is not None:
             self.virtual_image_bytes = cached
             return
-        
+
+        cx, cy = self.roi_center_x, self.roi_center_y
+
         if self.roi_mode == "circle" and self.roi_radius > 0:
-            mask = self._create_circular_mask(
-                self.roi_center_x, self.roi_center_y, self.roi_radius
-            )
-            virtual_image = self._fast_masked_sum(mask)
+            mask = self._create_circular_mask(cx, cy, self.roi_radius)
         elif self.roi_mode == "square" and self.roi_radius > 0:
-            mask = self._create_square_mask(
-                self.roi_center_x, self.roi_center_y, self.roi_radius
-            )
-            virtual_image = self._fast_masked_sum(mask)
-        elif self.roi_mode == "annular" and self.roi_radius > 0 and self.roi_radius_inner >= 0:
-            mask = self._create_annular_mask(
-                self.roi_center_x, self.roi_center_y, 
-                self.roi_radius_inner, self.roi_radius
-            )
-            virtual_image = self._fast_masked_sum(mask)
+            mask = self._create_square_mask(cx, cy, self.roi_radius)
+        elif self.roi_mode == "annular" and self.roi_radius > 0:
+            mask = self._create_annular_mask(cx, cy, self.roi_radius_inner, self.roi_radius)
         elif self.roi_mode == "rect" and self.roi_width > 0 and self.roi_height > 0:
-            mask = self._create_rect_mask(
-                self.roi_center_x, self.roi_center_y,
-                self.roi_width / 2, self.roi_height / 2
-            )
-            virtual_image = self._fast_masked_sum(mask)
+            mask = self._create_rect_mask(cx, cy, self.roi_width / 2, self.roi_height / 2)
         else:
             # Point mode: single-pixel indexing
-            # Array indexing: [row, col] where row=det_y, col=det_x in image coords
-            row = int(max(0, min(self._det_shape[0] - 1, round(self.roi_center_y))))
-            col = int(max(0, min(self._det_shape[1] - 1, round(self.roi_center_x))))
+            row = int(np.clip(round(cy), 0, self._det_shape[0] - 1))
+            col = int(np.clip(round(cx), 0, self._det_shape[1] - 1))
             if self._data.ndim == 4:
-                virtual_image = self._data[:, :, row, col]
+                vi = self._data[:, :, row, col]
             else:
-                virtual_image = self._data[:, row, col].reshape(self._scan_shape)
+                vi = self._data[:, row, col].reshape(self._scan_shape)
+            self.virtual_image_bytes = self._normalize_to_bytes(vi)
+            return
 
-        # Normalize to uint8
-        vmin, vmax = float(virtual_image.min()), float(virtual_image.max())
-        if vmax > vmin:
-            normalized = np.clip((virtual_image - vmin) / (vmax - vmin) * 255, 0, 255)
-            normalized = normalized.astype(np.uint8)
-        else:
-            normalized = np.zeros(virtual_image.shape, dtype=np.uint8)
-        self.virtual_image_bytes = normalized.tobytes()
+        self.virtual_image_bytes = self._normalize_to_bytes(self._fast_masked_sum(mask))
