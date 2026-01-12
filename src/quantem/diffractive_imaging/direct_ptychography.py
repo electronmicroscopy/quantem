@@ -1268,6 +1268,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def _fit_hyperparameters_least_squares_inner(
         self,
+        bf_mask: torch.Tensor,
         aberration_coefs: dict[str, int | float | torch.Tensor] = {},
         rotation_angle: float | None = None,
         cartesian_basis: str | list[str] = "low_order",
@@ -1307,8 +1308,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             device=device,
         )
 
-        kx = kxa[self.bf_mask]  # (N_k,)
-        ky = kya[self.bf_mask]  # (N_k,)
+        kx = kxa[bf_mask]  # (N_k,)
+        ky = kya[bf_mask]  # (N_k,)
 
         # reshape for broadcasting
         kx = kx[:, None]  # (N_k, 1)
@@ -1404,7 +1405,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 phi_plus_all[:, j] = unwrap_bf_overlap_phase_torch(
                     complex_data_bf=deconv[:, j],
                     mask_bf=plus_mask[:, j],
-                    bf_mask=self.bf_mask,
+                    bf_mask=bf_mask,
                     method=unwrap_method,
                     two_pass=two_pass_unwrapping,
                 )
@@ -1413,7 +1414,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 phi_minus_all[:, j] = unwrap_bf_overlap_phase_torch(
                     complex_data_bf=deconv[:, j],
                     mask_bf=minus_mask[:, j],
-                    bf_mask=self.bf_mask,
+                    bf_mask=bf_mask,
                     method=unwrap_method,
                     two_pass=two_pass_unwrapping,
                 )
@@ -1475,14 +1476,17 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     def fit_hyperparameters_least_squares(
         self,
-        aberration_coefs: dict[str, int | float | torch.Tensor] = {},
-        rotation_angle: float | None = None,
+        override_aberration_coefs: dict[str, int | float] | None = None,
+        override_rotation_angle: float | None = None,
         cartesian_basis: str | list[str] | list[list[str]] = "low_order",
         num_q_modes: int = 6,
         q_signal_weight: float = 0.5,
         fit_method: Literal["global", "recursive", "sequential"] = "recursive",
         unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
         two_pass_unwrapping: bool = True,
+        verbose=None,
+        use_optimized_state=True,
+        bf_mask=None,
     ):
         """
         Fit aberration coefficients using least squares.
@@ -1506,6 +1510,24 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         Returns:
             Updated aberration coefficients dictionary
         """
+
+        state = self.hyperparameter_state
+
+        if verbose is None:
+            verbose = self.verbose
+
+        if use_optimized_state:
+            aberration_coefs = state.current_aberrations(override_aberration_coefs)
+            rotation_angle = state.current_rotation_angle(override_rotation_angle)
+        else:
+            aberration_coefs = state.initial_aberrations
+            rotation_angle = state.initial_rotation_angle
+
+        if bf_mask is None:
+            bf_mask = self.bf_mask
+        bf = self._return_bf_context(bf_mask)
+        bf_mask = bf.bf_mask
+
         # Parse cartesian_basis into list of coefficient groups
         if isinstance(cartesian_basis, str):
             cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
@@ -1518,12 +1540,22 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 fit_method,
             )
 
+        state.clear_optimized()
         current_coefs = aberration_coefs.copy()
+        # Convert all values to tensors
+        current_coefs = {
+            k: torch.as_tensor(v, device=self.device, dtype=torch.float32)
+            for k, v in aberration_coefs.items()
+        }
 
         # Iterate through basis groups
-        for i, basis_group in enumerate(basis_groups):
-            # Run inner least squares fit
+        for i, basis_group in enumerate(
+            pbar := tqdm(basis_groups, desc="Fitting aberrations", unit="order")
+        ):
+            pbar.set_postfix_str(f"{basis_group}"[:50])
+
             current_coefs = self._fit_hyperparameters_least_squares_inner(
+                bf_mask,
                 aberration_coefs=current_coefs,
                 rotation_angle=rotation_angle,
                 cartesian_basis=basis_group,
@@ -1532,6 +1564,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 unwrap_method=unwrap_method,
                 two_pass_unwrapping=two_pass_unwrapping,
             )
+            state.optimized_aberrations = validate_aberration_coefficients(current_coefs)
+
+        if verbose:
+            print("Optimized state:\n\n", self.hyperparameter_state)
 
         return current_coefs
 
