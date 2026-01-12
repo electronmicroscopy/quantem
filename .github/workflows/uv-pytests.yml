@@ -4,17 +4,21 @@ on:
   pull_request:
     branches:
       - dev
+      - main
 
 jobs:
   uv-pytests:
-    name: python
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        # Test other OSs main branch PRs
+        os: ${{ github.base_ref == 'main' && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest", "macos-15-intel"]') || fromJSON('["ubuntu-latest"]') }}
         python-version:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
 
     steps:
       - uses: actions/checkout@v4
