@@ -17,12 +17,11 @@ if TYPE_CHECKING:
 
     TensorLike: TypeAlias = ArrayLike | torch.Tensor
 else:
+    TensorLike: TypeAlias = ArrayLike
     if config.get("has_torch"):
         import torch
     if config.get("has_cupy"):
         import cupy as cp
-
-    TensorLike: TypeAlias = Union[ArrayLike, "torch.Tensor"]
 
 
 # --- Dataset Validation Functions ---
