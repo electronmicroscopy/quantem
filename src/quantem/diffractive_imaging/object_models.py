@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Callable, Literal, Self, Sequence, cast
 from warnings import warn
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -1153,8 +1154,6 @@ class ObjectDIP(ObjectConstraints):
             self.visualize_pretrain(output)
 
     def visualize_pretrain(self, pred_obj: torch.Tensor):
-        import matplotlib.gridspec as gridspec
-
         fig = plt.figure(figsize=(12, 6))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax = fig.add_subplot(gs[0])
@@ -1432,7 +1431,7 @@ class ObjectINR(ObjectConstraints):
         coords = validate_tensor(
             patch_indices,
             name="coords_angstrom",
-            dtype=getattr(torch, config.get("dtype_real")),
+            dtype=self.dtype,
             ndim=5,
         )
         if coords.shape[-1] != 3:
@@ -1441,7 +1440,6 @@ class ObjectINR(ObjectConstraints):
             raise ValueError(
                 f"coords_angstrom.shape[1]={coords.shape[1]} does not match num_slices={self.num_slices}"
             )
-        B, D, H, W, _ = coords.shape
 
         pred = self._eval_inr(coords)  # (B, D, H, W) or complex
 
@@ -1585,6 +1583,8 @@ class ObjectINR(ObjectConstraints):
         )
         # Pretraining targets should never carry an autograd graph (common when passing obj_model.obj)
         target_t = target_t.detach()
+        if target_t.is_complex() and self.obj_type == "pure_phase":
+            target_t = target_t.angle()
         if self._obj_shape is not None:
             if tuple(int(x) for x in target_t.shape) != tuple(self._obj_shape):
                 raise ValueError(
@@ -1609,7 +1609,7 @@ class ObjectINR(ObjectConstraints):
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l2",
         show: bool = True,
-        batch_size_points: int = int(1e6),
+        batch_size_points: int = int(1e7),
     ) -> None:
         """
         Pretrain the INR model to fit a provided target object volume.
@@ -1661,9 +1661,7 @@ class ObjectINR(ObjectConstraints):
             )
         scheduler = self.scheduler
 
-        target = self.pretrain_target.detach().to(self.device)
-        if target.is_complex() and self.obj_type == "pure_phase":
-            target = target.angle()
+        target = self.pretrain_target.detach().to(self.device)  # shouldn't be needed
 
         coords = self.coords  # (1,D,H,W,3)
         D, H, W = target.shape
@@ -1698,13 +1696,16 @@ class ObjectINR(ObjectConstraints):
             self._pretrain_losses.append(float(loss_total))
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
             pbar.set_description(f"INR pretrain {a0 + 1}/{num_iters} loss={float(loss_total):.3e}")
+
         if show:
-            fpred = self.model(coords_flat).reshape(D, H, W)
+            fpred = self.model(coords_flat).reshape(
+                D, H, W
+            )  # TODO -- chunk this, method for gen obj chunks?
+            # and maybe self.obj should be with nograd to save memory?
             self.visualize_pretrain(fpred)
 
     def visualize_pretrain(self, pred_obj: torch.Tensor):
-        import matplotlib.gridspec as gridspec
-
+        # TODO cleanup, put in a separate function to be called by INR and DIP
         fig = plt.figure(figsize=(12, 6))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax = fig.add_subplot(gs[0])
@@ -1774,11 +1775,6 @@ class ObjectINR(ObjectConstraints):
         )
         plt.show()
 
-    ### here the forward call will take the batch indices and create the appropriate
-    ### input (which maybe is just the raw patch indices? tbd) for the implicit input
-    ### so it will be parallelized inference across the batches rather than inference once
-    ### and then patching that, like it will be for DIP
-
 
 # constraints are going to be tricky, specifically the TV and filtering if we want to allow
 # multiscale reconstructions
@@ -1788,4 +1784,4 @@ class ObjectINR(ObjectConstraints):
 # don't worry about constraints for now
 # dtype of input needs to match dtype of model, if potential or pure_phase then real, if complex then complex
 
-ObjectModelType = ObjectPixelated | ObjectDIP | ObjectINR  # | ObjectImplicit
+ObjectModelType = ObjectPixelated | ObjectDIP | ObjectINR
