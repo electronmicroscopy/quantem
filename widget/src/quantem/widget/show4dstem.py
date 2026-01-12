@@ -3,21 +3,21 @@ show4d: Fast interactive 4D-STEM viewer widget with advanced features.
 
 Features:
 - Binary transfer (no base64 overhead)
-- Live statistics panel (mean/max/min)
-- Virtual detector overlays (BF/ADF circles)
-- Linked scan view (side-by-side)
 - ROI drawing tools
 - Path animation (raster scan, custom paths)
 """
 
 import pathlib
+from typing import TYPE_CHECKING
 
 import anywidget
 import numpy as np
 import traitlets
 
 from quantem.widget.array_utils import to_numpy
-from quantem.core.datastructures import Dataset4dstem
+
+if TYPE_CHECKING:
+    from quantem.core.datastructures import Dataset4dstem
 
 
 # Detector geometry constant

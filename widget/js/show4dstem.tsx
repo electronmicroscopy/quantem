@@ -34,25 +34,18 @@ function roundToNiceValue(value: number): number {
 }
 
 /** Format scale bar label with appropriate unit */
-function formatScaleLabel(value: number, unit: string): string {
+function formatScaleLabel(value: number, unit: "Å" | "mrad"): string {
   const nice = roundToNiceValue(value);
 
   if (unit === "Å") {
     if (nice >= 10) return `${Math.round(nice / 10)} nm`;
     if (nice >= 1) return `${Math.round(nice)} Å`;
     return `${nice.toFixed(2)} Å`;
-  } else if (unit === "nm") {
-    if (nice >= 1000) return `${Math.round(nice / 1000)} µm`;
-    if (nice >= 1) return `${Math.round(nice)} nm`;
-    return `${nice.toFixed(2)} nm`;
-  } else if (unit === "mrad") {
+  }
+  if (unit === "mrad") {
     if (nice >= 1000) return `${Math.round(nice / 1000)} rad`;
     if (nice >= 1) return `${Math.round(nice)} mrad`;
     return `${nice.toFixed(2)} mrad`;
-  } else if (unit === "1/µm") {
-    if (nice >= 1000) return `${Math.round(nice / 1000)} 1/nm`;
-    if (nice >= 1) return `${Math.round(nice)} 1/µm`;
-    return `${nice.toFixed(2)} 1/µm`;
   }
   return `${Math.round(nice)} ${unit}`;
 }
@@ -607,7 +600,6 @@ function Show4DSTEM() {
   const viUiRef = React.useRef<HTMLCanvasElement>(null);  // High-DPI UI overlay for scale bar
   const fftCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const fftOverlayRef = React.useRef<HTMLCanvasElement>(null);
-  const fftUiRef = React.useRef<HTMLCanvasElement>(null);  // High-DPI UI overlay for scale bar
 
   // Display size for high-DPI UI overlays
   const UI_SIZE = 400;
@@ -944,13 +936,6 @@ function Show4DSTEM() {
     drawViCrosshairHiDPI(viUiRef.current, DPR, localPosX, localPosY, viZoom, viPanX, viPanY, shapeY, shapeX, isDraggingVI);
   }, [viZoom, viPanX, viPanY, pixelSize, shapeX, shapeY, localPosX, localPosY, isDraggingVI]);
   
-  // FFT - no scale bar (just clear canvas)
-  React.useEffect(() => {
-    if (!fftUiRef.current) return;
-    const ctx = fftUiRef.current.getContext("2d");
-    if (ctx) ctx.clearRect(0, 0, fftUiRef.current.width, fftUiRef.current.height);
-  }, [fftZoom, shapeX, shapeY]);
-
   // Generic zoom handler
   const createZoomHandler = (
     setZoom: React.Dispatch<React.SetStateAction<number>>,
@@ -1312,13 +1297,6 @@ function Show4DSTEM() {
                 onWheel={createZoomHandler(setFftZoom, setFftPanX, setFftPanY, fftZoom, fftPanX, fftPanY, fftOverlayRef)}
                 onDoubleClick={handleFftDoubleClick}
                 style={{ position: "absolute", width: "100%", height: "100%", cursor: isDraggingFFT ? "grabbing" : "grab" }}
-              />
-              {/* High-DPI UI overlay for crisp scale bar */}
-              <canvas
-                ref={fftUiRef}
-                width={300 * DPR}
-                height={300 * DPR}
-                style={{ position: "absolute", width: "100%", height: "100%", pointerEvents: "none" }}
               />
             </Box>
           </Box>
