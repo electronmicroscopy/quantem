@@ -55,6 +55,11 @@ dependencies = [
   "hdf5plugin>=6.0.0",
 ]
 
+[project.optional-dependencies]
+widgets = [
+    "quantem.widget",
+]
+
 [tool.hatch.build.targets.sdist]
 # hatchling always includes:
 # pyproject.toml, .gitignore, any README, any LICENSE, AUTHORS
