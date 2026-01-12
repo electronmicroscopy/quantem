@@ -896,6 +896,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         n_trials=50,
         sampler=None,
         verbose=None,
+        add_fixed_to_hyperparameter_state=True,
         **reconstruct_kwargs,
     ):
         """
@@ -915,6 +916,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             "minimize" or "maximize" (default: "minimize").
         show_progress_bar : bool
             Show progress bar during optimization.
+        add_fixed_to_hyperparameter_state: bool
+            fixed aberrations included will be passed on to hyperparameter state
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
         """
@@ -949,6 +952,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             for name, val in optimizable_aberrations.items():
                 trial_aberrations[name] = trial.suggest_float(name, val.low, val.high, log=val.log)
 
+            all_aberrations = dict(fixed_override_aberrations)
+            all_aberrations.update(trial_aberrations)
+
             if isinstance(rotation_angle, OptimizationParameter):
                 rot = trial.suggest_float(
                     "rotation_angle",
@@ -958,9 +964,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 )
             else:
                 rot = rotation_angle
-
             self.reconstruct(
-                override_aberration_coefs=trial_aberrations,
+                override_aberration_coefs=all_aberrations,
                 override_rotation_angle=rot,
                 verbose=False,
                 **reconstruct_kwargs,
@@ -973,6 +978,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # Write back optimized results
         best = study.best_params.copy()
         state.optimized_rotation_angle = best.pop("rotation_angle", None)
+
+        if add_fixed_to_hyperparameter_state:
+            best.update(fixed_override_aberrations)
+            if state.optimized_rotation_angle is None and rotation_angle is not None:
+                state.optimized_rotation_angle = rotation_angle
+
         state.optimized_aberrations = best
         state.study = study
 
