@@ -2607,6 +2607,11 @@ dependencies = [
     { name = "zarr" },
 ]
 
+[package.optional-dependencies]
+widgets = [
+    { name = "quantem-widget" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "jupyterlab" },
@@ -2630,6 +2635,7 @@ requires-dist = [
     { name = "matplotlib" },
     { name = "numpy", specifier = ">2" },
     { name = "optuna", specifier = ">=4.5.0" },
+    { name = "quantem-widget", marker = "extra == 'widgets'", editable = "widget" },
     { name = "rosettasciio", specifier = ">=0.8.0" },
     { name = "scikit-image", specifier = ">=0.25.2" },
     { name = "scipy" },
@@ -2640,6 +2646,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "zarr", specifier = ">3" },
 ]
+provides-extras = ["widgets"]
 
 [package.metadata.requires-dev]
 dev = [
