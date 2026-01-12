@@ -208,6 +208,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs: dict,
         semiangle_cutoff: float | None,
         soft_edges: bool,
+        crop_bf_mask: bool,
+        bf_mask_padding_px: int,
         rng: np.random.Generator | int | None,
         device: str | int,
         verbose: int | bool,
@@ -223,7 +225,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self.verbose = verbose
         self.vbf_stack = vbf_dataset.array  # ty:ignore[invalid-assignment]
         self.bf_mask = bf_mask_dataset.array  # ty:ignore[invalid-assignment]
-        self.bf_mask = _crop_corner_centered_mask(self.bf_mask)
+        if crop_bf_mask:
+            self.bf_mask = _crop_corner_centered_mask(self.bf_mask, bf_mask_padding_px)
 
         self.wavelength = electron_wavelength_angstrom(energy)
         self.scan_units = vbf_dataset.units[-2:]
@@ -258,6 +261,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs: dict = {},
         semiangle_cutoff: float | None = None,
         soft_edges: bool = True,
+        crop_bf_mask: bool = True,
+        bf_mask_padding_px: int = 1,
         rng: np.random.Generator | int | None = None,
         device: str | int = "cpu",
         verbose: int | bool = True,
@@ -272,6 +277,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
             soft_edges=soft_edges,
+            crop_bf_mask=crop_bf_mask,
+            bf_mask_padding_px=bf_mask_padding_px,
             rng=rng,
             device=device,
             verbose=verbose,
@@ -293,6 +300,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
         intensity_threshold: float = 0.5,
         soft_edges: bool = True,
+        crop_bf_mask: bool = True,
+        bf_mask_padding_px: int = 1,
         rng: np.random.Generator | int | None = None,
         device: str | int = "cpu",
         verbose: int | bool = True,
@@ -388,6 +397,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
             soft_edges=soft_edges,
+            crop_bf_mask=crop_bf_mask,
+            bf_mask_padding_px=bf_mask_padding_px,
             rng=rng,
             device=device,
             verbose=verbose,
@@ -474,18 +485,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def rotation_angle(self) -> float:
         return self.hyperparameter_state.current_rotation_angle()
 
-    # @rotation_angle.setter
-    # def rotation_angle(self, value: float):
-    #     self._rotation_angle = float(value)
-
     @property
     def aberration_coefs(self) -> dict:
         return self.hyperparameter_state.current_aberrations()
-
-    # @aberration_coefs.setter
-    # def aberration_coefs(self, value: dict):
-    #     value = validate_aberration_coefficients(value)
-    #     self._aberration_coefs = value
 
     @property
     def semiangle_cutoff(self) -> float:

@@ -627,9 +627,11 @@ def group_basis_by_method(
         raise ValueError(f"Unknown fit_method: {fit_method}")
 
 
-def _crop_corner_centered_mask(mask: torch.Tensor):
+def _crop_corner_centered_mask(mask: torch.Tensor, bf_mask_padding_px: int):
     mask_c = torch.fft.fftshift(mask)
     ys, xs = torch.where(mask_c)
-    y0, y1 = ys.min() - 1, ys.max() + 2
-    x0, x1 = xs.min() - 1, xs.max() + 2
+
+    px = bf_mask_padding_px
+    y0, y1 = ys.min() - px, ys.max() + px + 1
+    x0, x1 = xs.min() - px, xs.max() + px + 1
     return torch.fft.ifftshift(mask_c[y0:y1, x0:x1])
