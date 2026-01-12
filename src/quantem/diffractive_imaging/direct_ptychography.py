@@ -46,6 +46,7 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     align_vbf_stack_multiscale,
     create_edge_window,
     fit_aberrations_from_shifts,
+    group_basis_by_method,
     unwrap_bf_overlap_phase_torch,
 )
 
@@ -400,16 +401,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
-
-        # spatial-frequency power used to rank q-modes
         self._q_signal_power = self._vbf_fourier.abs().square().sum(dim=0)  # (N_qx, N_qy)
-
-        flat_inds = torch.argsort(
-            self._q_signal_power.flatten(),
-            descending=True,
-        )
-        self._q_sorted_inds_i = flat_inds // self._q_signal_power.shape[1]
-        self._q_sorted_inds_j = flat_inds % self._q_signal_power.shape[1]
 
         return self
 
@@ -1247,15 +1239,42 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         return self
 
+    def _select_q_modes(self, num_q_modes, signal_weight=0.5, proximity_sharpness=2.0):
+        """
+        Args:
+            signal_weight: 0 = pure proximity, 1 = pure signal, 0.5 = balanced
+            proximity_sharpness: higher = more concentrated around alpha_optimal
+        """
+        qxa, qya = self._return_upsampled_qgrid()
+        alpha = torch.sqrt(qxa**2 + qya**2) * self.wavelength
+        alpha_optimal = self.semiangle_cutoff * 1e-3
+
+        # Normalize both metrics to [0, 1]
+        signal_normalized = self._q_signal_power / self._q_signal_power.max()
+
+        distance_penalty = torch.abs(alpha - alpha_optimal) / alpha_optimal
+        proximity_score = torch.exp(-proximity_sharpness * distance_penalty**2)
+
+        # Weighted geometric mean (more robust than arithmetic)
+        selection_metric = (signal_normalized**signal_weight) * (
+            proximity_score ** (1 - signal_weight)
+        )
+
+        flat_inds = torch.argsort(selection_metric.flatten(), descending=True)
+        qi = flat_inds // selection_metric.shape[1]
+        qj = flat_inds % selection_metric.shape[1]
+
+        return qi[:num_q_modes], qj[:num_q_modes]
+
     def _fit_hyperparameters_least_squares_inner(
         self,
         aberration_coefs: dict[str, int | float | torch.Tensor] = {},
         rotation_angle: float | None = None,
         cartesian_basis: str | list[str] = "low_order",
         num_q_modes: int = 6,
+        q_signal_weight: float = 0.5,
         unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
         two_pass_unwrapping: bool = True,
-        **unwrap_kwargs,
     ):
         """
         Phase-only least-squares aberration fit from vBF Fourier data.
@@ -1270,14 +1289,13 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # ---------------------------------------------------------
         # Select strongest spatial frequencies
         # ---------------------------------------------------------
-        qi = self._q_sorted_inds_i[:num_q_modes]
-        qj = self._q_sorted_inds_j[:num_q_modes]
-
+        qi, qj = self._select_q_modes(num_q_modes, signal_weight=q_signal_weight)
         qxa, qya = self._return_upsampled_qgrid()
         qx = qxa[qi, qj]  # (N_q,)
         qy = qya[qi, qj]  # (N_q,)
 
         N_q = qx.numel()
+        P = len(cartesian_basis)
 
         # ---------------------------------------------------------
         # k-space BF pixels
@@ -1302,8 +1320,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # k, k+q, k−q coordinates
         # ---------------------------------------------------------
         k0, phi0 = polar_coordinates(kx, ky)
-        kp, phip = polar_coordinates(qx + kx, qy + ky)
-        km, phim = polar_coordinates(qx - kx, qy - ky)
+        kp, phip = polar_coordinates(kx + qx, ky + qy)
+        km, phim = polar_coordinates(kx - qx, ky - qy)
 
         # ---------------------------------------------------------
         # Aperture + chi (prior aberrations)
@@ -1353,17 +1371,37 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         deconv = measured * torch.exp(-1j * gamma_angle)
 
         # ---------------------------------------------------------
-        # Build LS system
+        # Pre-compute all basis functions (vectorized)
         # ---------------------------------------------------------
-        rows = []
-        rhs = []
+        chi_0_basis = aberration_surface_cartesian_basis(
+            k0[:, 0] * wavelength,
+            phi0[:, 0],
+            wavelength,
+            cartesian_basis,
+        )  # (N_k, P)
 
-        P = len(cartesian_basis)
+        # For k+q and k-q (depends on q)
+        chi_p_basis = aberration_surface_cartesian_basis(
+            kp.flatten() * wavelength,
+            phip.flatten(),
+            wavelength,
+            cartesian_basis,
+        ).reshape(kp.shape[0], kp.shape[1], P)  # (N_k, N_q, P)
+
+        chi_m_basis = aberration_surface_cartesian_basis(
+            km.flatten() * wavelength,
+            phim.flatten(),
+            wavelength,
+            cartesian_basis,
+        ).reshape(km.shape[0], km.shape[1], P)  # (N_k, N_q, P)
+
+        # Pre-allocate unwrapped phases
+        phi_plus_all = torch.zeros_like(deconv, dtype=torch.float32)
+        phi_minus_all = torch.zeros_like(deconv, dtype=torch.float32)
 
         for j in range(N_q):
-            # unwrap plus
             if plus_mask[:, j].any():
-                phi_plus = unwrap_bf_overlap_phase_torch(
+                phi_plus_all[:, j] = unwrap_bf_overlap_phase_torch(
                     complex_data_bf=deconv[:, j],
                     mask_bf=plus_mask[:, j],
                     bf_mask=self.bf_mask,
@@ -1371,31 +1409,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     two_pass=two_pass_unwrapping,
                 )
 
-                chi_p_basis = aberration_surface_cartesian_basis(
-                    kp[:, j] * wavelength,
-                    phip[:, j],
-                    wavelength,
-                    cartesian_basis,
-                )
-                chi_0_basis = aberration_surface_cartesian_basis(
-                    k0[:, 0] * wavelength,
-                    phi0[:, 0],
-                    wavelength,
-                    cartesian_basis,
-                )
-
-                dchi = chi_p_basis - chi_0_basis
-
-                for i in torch.where(plus_mask[:, j])[0]:
-                    row = torch.zeros(P + N_q, device=device)
-                    row[:P] = dchi[i]
-                    row[P + j] = 1.0
-                    rows.append(row)
-                    rhs.append(phi_plus[i])
-
-            # unwrap minus
             if minus_mask[:, j].any():
-                phi_minus = unwrap_bf_overlap_phase_torch(
+                phi_minus_all[:, j] = unwrap_bf_overlap_phase_torch(
                     complex_data_bf=deconv[:, j],
                     mask_bf=minus_mask[:, j],
                     bf_mask=self.bf_mask,
@@ -1403,39 +1418,122 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                     two_pass=two_pass_unwrapping,
                 )
 
-                chi_m_basis = aberration_surface_cartesian_basis(
-                    km[:, j] * wavelength,
-                    phim[:, j],
-                    wavelength,
-                    cartesian_basis,
-                )
-                chi_0_basis = aberration_surface_cartesian_basis(
-                    k0[:, 0] * wavelength,
-                    phi0[:, 0],
-                    wavelength,
-                    cartesian_basis,
-                )
+        # Count total number of equations
+        n_plus = plus_mask.sum().item()
+        n_minus = minus_mask.sum().item()
+        n_total = n_plus + n_minus
 
-                dchi = chi_0_basis - chi_m_basis
+        # Pre-allocate full matrices
+        A = torch.zeros((n_total, P + N_q), device=device, dtype=torch.float32)
+        b = torch.zeros(n_total, device=device, dtype=torch.float32)
 
-                for i in torch.where(minus_mask[:, j])[0]:
-                    row = torch.zeros(P + N_q, device=device)
-                    row[:P] = dchi[i]
-                    row[P + j] = 1.0
-                    rows.append(row)
-                    rhs.append(phi_minus[i])
+        # Fill in plus contributions
+        idx = 0
+        for j in range(N_q):
+            mask_j = plus_mask[:, j]
+            n_j = mask_j.sum().item()
 
-        A = torch.stack(rows, dim=0)
-        b = torch.stack(rhs, dim=0)
+            if n_j > 0:
+                # dchi for this q-mode
+                dchi = chi_p_basis[:, j, :] - chi_0_basis  # (N_k, P)
+
+                # Fill A matrix
+                A[idx : idx + n_j, :P] = dchi[mask_j]
+                A[idx : idx + n_j, P + j] = 1.0
+
+                # Fill b vector
+                b[idx : idx + n_j] = phi_plus_all[mask_j, j]
+
+                idx += n_j
+
+        # Fill in minus contributions
+        for j in range(N_q):
+            mask_j = minus_mask[:, j]
+            n_j = mask_j.sum().item()
+
+            if n_j > 0:
+                # dchi for this q-mode
+                dchi = chi_0_basis - chi_m_basis[:, j, :]  # (N_k, P)
+
+                # Fill A matrix
+                A[idx : idx + n_j, :P] = dchi[mask_j]
+                A[idx : idx + n_j, P + j] = 1.0
+
+                # Fill b vector
+                b[idx : idx + n_j] = phi_minus_all[mask_j, j]
+
+                idx += n_j
 
         # ---------------------------------------------------------
         # Solve LS
         # ---------------------------------------------------------
-        sol = torch.linalg.lstsq(A, b).solution
+        sol = torch.linalg.lstsq(A, b, driver="gelsd").solution
 
         delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
 
         return merge_aberration_coefficients(aberration_coefs, delta_cartesian)
+
+    def fit_hyperparameters_least_squares(
+        self,
+        aberration_coefs: dict[str, int | float | torch.Tensor] = {},
+        rotation_angle: float | None = None,
+        cartesian_basis: str | list[str] | list[list[str]] = "low_order",
+        num_q_modes: int = 6,
+        q_signal_weight: float = 0.5,
+        fit_method: Literal["global", "recursive", "sequential"] = "recursive",
+        unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
+        two_pass_unwrapping: bool = True,
+    ):
+        """
+        Fit aberration coefficients using least squares.
+
+        Args:
+            aberration_coefs: Initial aberration coefficients to deconvolve
+            rotation_angle: Rotation angle for basis functions
+            cartesian_basis: Aberration basis to fit. Can be:
+                - str: preset name like "low_order"
+                - list[str]: explicit list like ["C10", "C12_a", "C12_b", ...]
+                - list[list[str]]: custom grouping for sequential fitting
+            num_q_modes: Number of spatial frequency modes to use
+            q_signal_weight: Balance between signal (1.0) and proximity to α_optimal (0.0)
+            fit_method: How to iterate through basis functions:
+                - "global": fit all coefficients simultaneously
+                - "recursive": fit by radial order, accumulating previous orders
+                - "sequential": fit by radial order, only current order each pass
+            unwrap_method: Phase unwrapping algorithm
+            two_pass_unwrapping: Whether to use two-pass unwrapping
+
+        Returns:
+            Updated aberration coefficients dictionary
+        """
+        # Parse cartesian_basis into list of coefficient groups
+        if isinstance(cartesian_basis, str):
+            cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
+
+        if len(cartesian_basis) > 0 and isinstance(cartesian_basis[0], list):
+            basis_groups = cartesian_basis
+        else:
+            basis_groups = group_basis_by_method(
+                cartesian_basis,  # ty:ignore[invalid-argument-type]
+                fit_method,
+            )
+
+        current_coefs = aberration_coefs.copy()
+
+        # Iterate through basis groups
+        for i, basis_group in enumerate(basis_groups):
+            # Run inner least squares fit
+            current_coefs = self._fit_hyperparameters_least_squares_inner(
+                aberration_coefs=current_coefs,
+                rotation_angle=rotation_angle,
+                cartesian_basis=basis_group,
+                num_q_modes=num_q_modes,
+                q_signal_weight=q_signal_weight,
+                unwrap_method=unwrap_method,
+                two_pass_unwrapping=two_pass_unwrapping,
+            )
+
+        return current_coefs
 
     def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
         """ """

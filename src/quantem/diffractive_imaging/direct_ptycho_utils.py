@@ -1,3 +1,4 @@
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from quantem.core import config
@@ -578,3 +579,47 @@ def unwrap_bf_overlap_phase_torch(
         phase_grid = phase_grid * mask_grid
 
     return phase_grid[bf_mask]
+
+
+def group_basis_by_method(
+    basis_list: list[str],
+    fit_method: str,
+) -> list[list[str]]:
+    """
+    Group basis functions according to fit method.
+
+    Args:
+        basis_list: Flat list of basis function names
+        fit_method: "global", "recursive", or "sequential"
+
+    Returns:
+        List of basis groups for iterative fitting
+    """
+    if fit_method == "global":
+        return [basis_list]
+
+    radial_groups = defaultdict(list)
+
+    for basis_name in basis_list:
+        if basis_name.startswith("C"):
+            radial_order = int(basis_name[1])  # First digit after 'C'
+            radial_groups[radial_order].append(basis_name)
+        else:
+            raise ValueError()
+
+    # Sort by radial order
+    sorted_orders = sorted(radial_groups.keys())
+
+    if fit_method == "recursive":
+        groups = []
+        accumulated = []
+        for order in sorted_orders:
+            accumulated.extend(radial_groups[order])
+            groups.append(accumulated.copy())
+        return groups
+
+    elif fit_method == "sequential":
+        return [radial_groups[order] for order in sorted_orders]
+
+    else:
+        raise ValueError(f"Unknown fit_method: {fit_method}")
