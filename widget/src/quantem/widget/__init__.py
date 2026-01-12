@@ -1,24 +1,17 @@
-from importlib.metadata import version
-import pathlib
-import anywidget
-import traitlets
+"""
+quantem.widget: Interactive Jupyter widgets using anywidget + React.
+"""
 
-__version__ = version("quantem.widget")
+import importlib.metadata
 
-_static = pathlib.Path(__file__).parent / "static"
+try:
+    __version__ = importlib.metadata.version("quantem-widget")
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "unknown"
 
+from quantem.widget.show4dstem import Show4DSTEM
 
-class CounterWidget(anywidget.AnyWidget):
-    _esm = _static / "index.js"
+# Alias for convenience
+Show4D = Show4DSTEM
 
-    count = traitlets.Int(0).tag(sync=True)
-
-
-def show4dstem():
-    # TODO: Implement 4D-STEM visualization widget
-    print("show4dstem: not yet implemented")
-
-
-def counter():
-    """Create a minimal counter widget for testing."""
-    return CounterWidget()
+__all__ = ["Show4DSTEM", "Show4D"]

@@ -21,8 +21,10 @@ import "./show4dstem.css";
 const RESIZE_HANDLE_FRACTION = 0.05;  // Resize handle as fraction of detector size
 const RESIZE_HANDLE_MIN_PX = 5;       // Minimum resize handle radius
 const RESIZE_HANDLE_MAX_PX = 8;       // Maximum resize handle radius
+const RESIZE_HANDLE_RADIUS = 6;       // Fixed handle radius for drawing
 const RESIZE_HIT_AREA_FRACTION = 0.06; // Click tolerance as fraction of detector
 const RESIZE_HIT_AREA_MIN_PX = 6;     // Minimum click tolerance
+const RESIZE_HIT_AREA_PX = 10;        // Fixed hit area for click detection
 // Crosshair sizes: fixed pixel sizes for consistent appearance
 const CROSSHAIR_SIZE_PX = 18;         // Fixed crosshair size for point mode (CSS pixels on 400px canvas)
 const CROSSHAIR_SIZE_SMALL_PX = 10;   // Fixed small crosshair size for ROI center
@@ -260,8 +262,188 @@ function drawDpCrosshairHiDPI(
   ctx.restore();
 }
 
-// Legacy stub - scale bars now drawn on high-DPI UI canvases
-function drawScaleBar(..._args: unknown[]) { /* no-op, replaced by drawScaleBarHiDPI */ }
+/**
+ * Draw ROI overlay (circle, square, rect, annular) on high-DPI canvas
+ * Note: Does NOT clear canvas - should be called after drawScaleBarHiDPI
+ */
+function drawRoiOverlayHiDPI(
+  canvas: HTMLCanvasElement,
+  dpr: number,
+  roiMode: string,
+  centerX: number,
+  centerY: number,
+  radius: number,
+  radiusInner: number,
+  roiWidth: number,
+  roiHeight: number,
+  zoom: number,
+  panX: number,
+  panY: number,
+  detWidth: number,
+  detHeight: number,
+  isDragging: boolean,
+  isDraggingResize: boolean,
+  isDraggingResizeInner: boolean,
+  isHoveringResize: boolean,
+  isHoveringResizeInner: boolean
+) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  
+  const cssWidth = canvas.width / dpr;
+  const cssHeight = canvas.height / dpr;
+  const displayScale = Math.min(cssWidth / detWidth, cssHeight / detHeight);
+  
+  // Convert detector coordinates to CSS pixel coordinates
+  const screenX = centerX * zoom * displayScale + panX * displayScale;
+  const screenY = centerY * zoom * displayScale + panY * displayScale;
+  
+  // Fixed UI sizes in CSS pixels
+  const lineWidth = 2.5;
+  const crosshairSizeSmall = 10;
+  const handleRadius = 6;
+  
+  ctx.shadowColor = "rgba(0, 0, 0, 0.4)";
+  ctx.shadowBlur = 2;
+  ctx.shadowOffsetX = 1;
+  ctx.shadowOffsetY = 1;
+  
+  // Helper to draw resize handle
+  const drawResizeHandle = (handleX: number, handleY: number, isInner: boolean = false) => {
+    let handleFill: string;
+    let handleStroke: string;
+    const dragging = isInner ? isDraggingResizeInner : isDraggingResize;
+    const hovering = isInner ? isHoveringResizeInner : isHoveringResize;
+    
+    if (dragging) {
+      handleFill = "rgba(0, 200, 255, 1)";
+      handleStroke = "rgba(255, 255, 255, 1)";
+    } else if (hovering) {
+      handleFill = "rgba(255, 100, 100, 1)";
+      handleStroke = "rgba(255, 255, 255, 1)";
+    } else {
+      handleFill = isInner ? "rgba(0, 220, 255, 0.8)" : "rgba(0, 255, 0, 0.8)";
+      handleStroke = "rgba(255, 255, 255, 0.8)";
+    }
+    ctx.beginPath();
+    ctx.arc(handleX, handleY, handleRadius, 0, 2 * Math.PI);
+    ctx.fillStyle = handleFill;
+    ctx.fill();
+    ctx.strokeStyle = handleStroke;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  };
+  
+  // Helper to draw center crosshair
+  const drawCenterCrosshair = () => {
+    ctx.strokeStyle = isDragging ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.moveTo(screenX - crosshairSizeSmall, screenY);
+    ctx.lineTo(screenX + crosshairSizeSmall, screenY);
+    ctx.moveTo(screenX, screenY - crosshairSizeSmall);
+    ctx.lineTo(screenX, screenY + crosshairSizeSmall);
+    ctx.stroke();
+  };
+  
+  const HANDLE_ANGLE = 0.707; // cos(45°)
+  
+  if (roiMode === "circle" && radius > 0) {
+    const screenRadius = radius * zoom * displayScale;
+    
+    // Draw circle
+    ctx.strokeStyle = isDragging ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, screenRadius, 0, 2 * Math.PI);
+    ctx.stroke();
+    
+    // Semi-transparent fill
+    ctx.fillStyle = isDragging ? "rgba(255, 255, 0, 0.12)" : "rgba(0, 255, 0, 0.12)";
+    ctx.fill();
+    
+    drawCenterCrosshair();
+    
+    // Resize handle at 45°
+    const handleOffset = screenRadius * HANDLE_ANGLE;
+    drawResizeHandle(screenX + handleOffset, screenY + handleOffset);
+    
+  } else if (roiMode === "square" && radius > 0) {
+    const screenHalfSize = radius * zoom * displayScale;
+    const left = screenX - screenHalfSize;
+    const top = screenY - screenHalfSize;
+    const size = screenHalfSize * 2;
+    
+    ctx.strokeStyle = isDragging ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.rect(left, top, size, size);
+    ctx.stroke();
+    
+    ctx.fillStyle = isDragging ? "rgba(255, 255, 0, 0.12)" : "rgba(0, 255, 0, 0.12)";
+    ctx.fill();
+    
+    drawCenterCrosshair();
+    drawResizeHandle(screenX + screenHalfSize, screenY + screenHalfSize);
+    
+  } else if (roiMode === "rect" && roiWidth > 0 && roiHeight > 0) {
+    const screenHalfW = (roiWidth / 2) * zoom * displayScale;
+    const screenHalfH = (roiHeight / 2) * zoom * displayScale;
+    const left = screenX - screenHalfW;
+    const top = screenY - screenHalfH;
+    
+    ctx.strokeStyle = isDragging ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.rect(left, top, screenHalfW * 2, screenHalfH * 2);
+    ctx.stroke();
+    
+    ctx.fillStyle = isDragging ? "rgba(255, 255, 0, 0.12)" : "rgba(0, 255, 0, 0.12)";
+    ctx.fill();
+    
+    drawCenterCrosshair();
+    drawResizeHandle(screenX + screenHalfW, screenY + screenHalfH);
+    
+  } else if (roiMode === "annular" && radius > 0) {
+    const screenRadiusOuter = radius * zoom * displayScale;
+    const screenRadiusInner = (radiusInner || 0) * zoom * displayScale;
+    
+    // Outer circle (green)
+    ctx.strokeStyle = isDragging ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
+    ctx.lineWidth = lineWidth;
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, screenRadiusOuter, 0, 2 * Math.PI);
+    ctx.stroke();
+    
+    // Inner circle (cyan)
+    ctx.strokeStyle = isDragging ? "rgba(255, 200, 0, 0.9)" : "rgba(0, 220, 255, 0.9)";
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, screenRadiusInner, 0, 2 * Math.PI);
+    ctx.stroke();
+    
+    // Fill annular region
+    ctx.fillStyle = isDragging ? "rgba(255, 255, 0, 0.12)" : "rgba(0, 255, 0, 0.12)";
+    ctx.beginPath();
+    ctx.arc(screenX, screenY, screenRadiusOuter, 0, 2 * Math.PI);
+    ctx.arc(screenX, screenY, screenRadiusInner, 0, 2 * Math.PI, true);
+    ctx.fill();
+    
+    drawCenterCrosshair();
+    
+    // Outer handle
+    const handleOffsetOuter = screenRadiusOuter * HANDLE_ANGLE;
+    drawResizeHandle(screenX + handleOffsetOuter, screenY + handleOffsetOuter);
+    
+    // Inner handle
+    const handleOffsetInner = screenRadiusInner * HANDLE_ANGLE;
+    drawResizeHandle(screenX + handleOffsetInner, screenY + handleOffsetInner, true);
+  }
+  
+  ctx.restore();
+}
 
 // ============================================================================
 // Main Component
@@ -410,9 +592,6 @@ function Show4DSTEM() {
       if (fft) {
         gpuFFTRef.current = fft;
         setGpuReady(true);
-        console.log("WebGPU FFT ready - using GPU acceleration!");
-      } else {
-        console.log("⚠️ WebGPU not available - using CPU FFT");
       }
     });
   }, []);
@@ -517,175 +696,15 @@ function Show4DSTEM() {
     ctx.restore();
   }, [frameBytes, detX, detY, colormap, dpZoom, dpPanX, dpPanY]);
 
-  // Render DP overlay
+  // Render DP overlay - just clear (ROI shapes now drawn on high-DPI UI canvas)
   React.useEffect(() => {
     if (!dpOverlayRef.current) return;
     const canvas = dpOverlayRef.current;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const screenKx = localKx * dpZoom + dpPanX;
-    const screenKy = localKy * dpZoom + dpPanY;
-
-    // Convert fixed CSS pixel sizes to canvas pixels (canvas is detX x detY, displayed at 400x400)
-    const minDetSize = Math.min(detX, detY);
-    const canvasScale = minDetSize / 400;  // How many canvas pixels per CSS pixel
-    const crosshairSize = CROSSHAIR_SIZE_PX * canvasScale * dpZoom;
-    const crosshairSizeSmall = CROSSHAIR_SIZE_SMALL_PX * canvasScale * dpZoom;
-    const centerDotRadius = CENTER_DOT_RADIUS_PX * canvasScale * dpZoom;
-    const lineWidth = Math.max(LINE_WIDTH_MIN_PX, Math.min(LINE_WIDTH_MAX_PX, minDetSize * LINE_WIDTH_FRACTION));
-
-    ctx.strokeStyle = isDraggingDP ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
-    ctx.lineWidth = lineWidth;
-
-    // Helper to draw resize handle
-    const drawResizeHandle = (handleX: number, handleY: number) => {
-      let handleFill: string;
-      let handleStroke: string;
-      if (isDraggingResize) {
-        handleFill = "rgba(0, 200, 255, 1)";   // Cyan when dragging
-        handleStroke = "rgba(255, 255, 255, 1)";
-      } else if (isHoveringResize) {
-        handleFill = "rgba(255, 100, 100, 1)"; // Red when hovering
-        handleStroke = "rgba(255, 255, 255, 1)";
-      } else {
-        handleFill = "rgba(0, 255, 0, 0.8)";   // Green default
-        handleStroke = "rgba(255, 255, 255, 0.8)";
-      }
-      ctx.beginPath();
-      ctx.arc(handleX, handleY, RESIZE_HANDLE_RADIUS, 0, 2 * Math.PI);
-      ctx.fillStyle = handleFill;
-      ctx.fill();
-      ctx.strokeStyle = handleStroke;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    };
-
-    if (roiMode === "circle" && roiRadius > 0) {
-      // Circle mode: draw a filled circular ROI
-      const screenRadius = roiRadius * dpZoom;
-      ctx.beginPath();
-      ctx.arc(screenKx, screenKy, screenRadius, 0, 2 * Math.PI);
-      ctx.stroke();
-      // Semi-transparent fill
-      ctx.fillStyle = isDraggingDP ? "rgba(255, 255, 0, 0.15)" : "rgba(0, 255, 0, 0.15)";
-      ctx.fill();
-      // Draw center crosshair (smaller)
-      ctx.strokeStyle = isDraggingDP ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
-      ctx.lineWidth = lineWidth;
-      ctx.beginPath();
-      ctx.moveTo(screenKx - crosshairSizeSmall, screenKy); ctx.lineTo(screenKx + crosshairSizeSmall, screenKy);
-      ctx.moveTo(screenKx, screenKy - crosshairSizeSmall); ctx.lineTo(screenKx, screenKy + crosshairSizeSmall);
-      ctx.stroke();
-
-      // Draw resize handle at bottom-right of circle (45° position)
-      const handleOffset = screenRadius * CIRCLE_HANDLE_ANGLE;
-      drawResizeHandle(screenKx + handleOffset, screenKy + handleOffset);
-
-    } else if (roiMode === "square" && roiRadius > 0) {
-      // Square mode: draw a filled square ROI
-      const screenHalfSize = roiRadius * dpZoom;
-      const left = screenKx - screenHalfSize;
-      const top = screenKy - screenHalfSize;
-      const size = screenHalfSize * 2;
-
-      ctx.beginPath();
-      ctx.rect(left, top, size, size);
-      ctx.stroke();
-      // Semi-transparent fill
-      ctx.fillStyle = isDraggingDP ? "rgba(255, 255, 0, 0.15)" : "rgba(0, 255, 0, 0.15)";
-      ctx.fill();
-      // Draw center crosshair (smaller)
-      ctx.strokeStyle = isDraggingDP ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
-      ctx.lineWidth = lineWidth;
-      ctx.beginPath();
-      ctx.moveTo(screenKx - crosshairSizeSmall, screenKy); ctx.lineTo(screenKx + crosshairSizeSmall, screenKy);
-      ctx.moveTo(screenKx, screenKy - crosshairSizeSmall); ctx.lineTo(screenKx, screenKy + crosshairSizeSmall);
-      ctx.stroke();
-
-      // Draw resize handle at bottom-right corner of square
-      drawResizeHandle(screenKx + screenHalfSize, screenKy + screenHalfSize);
-
-    } else if (roiMode === "rect" && roiWidth > 0 && roiHeight > 0) {
-      // Rectangular mode: draw a filled rectangular ROI with independent width/height
-      const screenHalfW = (roiWidth / 2) * dpZoom;
-      const screenHalfH = (roiHeight / 2) * dpZoom;
-      const left = screenKx - screenHalfW;
-      const top = screenKy - screenHalfH;
-
-      ctx.beginPath();
-      ctx.rect(left, top, screenHalfW * 2, screenHalfH * 2);
-      ctx.stroke();
-      // Semi-transparent fill
-      ctx.fillStyle = isDraggingDP ? "rgba(255, 255, 0, 0.15)" : "rgba(0, 255, 0, 0.15)";
-      ctx.fill();
-      // Draw center crosshair (smaller)
-      ctx.strokeStyle = isDraggingDP ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
-      ctx.lineWidth = lineWidth;
-      ctx.beginPath();
-      ctx.moveTo(screenKx - crosshairSizeSmall, screenKy); ctx.lineTo(screenKx + crosshairSizeSmall, screenKy);
-      ctx.moveTo(screenKx, screenKy - crosshairSizeSmall); ctx.lineTo(screenKx, screenKy + crosshairSizeSmall);
-      ctx.stroke();
-
-      // Draw resize handle at bottom-right corner of rectangle
-      drawResizeHandle(screenKx + screenHalfW, screenKy + screenHalfH);
-
-    } else if (roiMode === "annular" && roiRadius > 0) {
-      // Annular mode: draw donut-shaped ROI (ADF/HAADF)
-      const screenRadiusOuter = roiRadius * dpZoom;
-      const screenRadiusInner = (roiRadiusInner || 0) * dpZoom;
-
-      // Draw outer circle
-      ctx.beginPath();
-      ctx.arc(screenKx, screenKy, screenRadiusOuter, 0, 2 * Math.PI);
-      ctx.stroke();
-
-      // Draw inner circle (different color for distinction)
-      ctx.save();
-      ctx.strokeStyle = isDraggingDP ? "rgba(255, 200, 0, 0.9)" : "rgba(0, 220, 255, 0.9)"; // Cyan/orange for inner
-      ctx.beginPath();
-      ctx.arc(screenKx, screenKy, screenRadiusInner, 0, 2 * Math.PI);
-      ctx.stroke();
-      ctx.restore();
-
-      // Fill the annular region (donut) using composite operation
-      ctx.save();
-      ctx.fillStyle = isDraggingDP ? "rgba(255, 255, 0, 0.15)" : "rgba(0, 255, 0, 0.15)";
-      ctx.beginPath();
-      ctx.arc(screenKx, screenKy, screenRadiusOuter, 0, 2 * Math.PI);
-      ctx.arc(screenKx, screenKy, screenRadiusInner, 0, 2 * Math.PI, true); // counter-clockwise to cut hole
-      ctx.fill();
-      ctx.restore();
-
-      // Draw center crosshair (smaller)
-      ctx.strokeStyle = isDraggingDP ? "rgba(255, 255, 0, 0.9)" : "rgba(0, 255, 0, 0.9)";
-      ctx.lineWidth = lineWidth;
-      ctx.beginPath();
-      ctx.moveTo(screenKx - crosshairSizeSmall, screenKy); ctx.lineTo(screenKx + crosshairSizeSmall, screenKy);
-      ctx.moveTo(screenKx, screenKy - crosshairSizeSmall); ctx.lineTo(screenKx, screenKy + crosshairSizeSmall);
-      ctx.stroke();
-
-      // Draw resize handle at outer circle's 45° position (green)
-      const handleOffsetOuter = screenRadiusOuter * CIRCLE_HANDLE_ANGLE;
-      drawResizeHandle(screenKx + handleOffsetOuter, screenKy + handleOffsetOuter);
-
-      // Draw resize handle at inner circle's 45° position (cyan)
-      ctx.save();
-      ctx.strokeStyle = isHoveringResizeInner ? "rgba(0, 220, 255, 1)" : "rgba(0, 220, 255, 0.8)";
-      ctx.fillStyle = "rgba(0, 40, 50, 0.8)";
-      const handleOffsetInner = screenRadiusInner * CIRCLE_HANDLE_ANGLE;
-      ctx.beginPath();
-      ctx.arc(screenKx + handleOffsetInner, screenKy + handleOffsetInner, RESIZE_HANDLE_RADIUS, 0, 2 * Math.PI);
-      ctx.fill();
-      ctx.stroke();
-      ctx.restore();
-
-    }
-    // Point mode crosshair is drawn on dpUiRef for crisp rendering
-
-    drawScaleBar(ctx, canvas.width, canvas.height, dpZoom, detPixelSize || 1, "mrad", Math.max(detX, detY));
-  }, [localKx, localKy, isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner, dpZoom, dpPanX, dpPanY, detPixelSize, roiMode, roiRadius, roiRadiusInner, roiWidth, roiHeight, detX, detY]);
+    // All visual overlays (crosshair, ROI shapes, scale bar) are now on dpUiRef for crisp rendering
+  }, [localKx, localKy, isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner, dpZoom, dpPanX, dpPanY, roiMode, roiRadius, roiRadiusInner, roiWidth, roiHeight, detX, detY]);
 
   // Render filtered virtual image
   React.useEffect(() => {
@@ -802,7 +821,7 @@ function Show4DSTEM() {
     // Crosshair and scale bar now drawn on high-DPI UI canvas (viUiRef)
   }, [localPosX, localPosY, isDraggingVI, viZoom, viPanX, viPanY, pixelSize, shapeX, shapeY]);
 
-  // Render FFT (computed in JS from filtered image)
+  // Render FFT (WebGPU when available, CPU fallback)
   React.useEffect(() => {
     if (!rawVirtualImageRef.current || !fftCanvasRef.current) return;
     const canvas = fftCanvasRef.current;
@@ -811,64 +830,83 @@ function Show4DSTEM() {
 
     const width = shapeY;
     const height = shapeX;
-
-    // Use raw or filtered data
-    let sourceData = rawVirtualImageRef.current;
-    if (bpInner > 0 || bpOuter > 0) {
-      sourceData = rawVirtualImageRef.current.slice();
-    }
-
-    const real = sourceData.slice();
-    const imag = new Float32Array(real.length);
-
-    // Forward FFT
-    fft2d(real, imag, width, height, false);
-    fftshift(real, width, height);
-    fftshift(imag, width, height);
-
-    // Compute log magnitude
-    const magnitude = new Float32Array(real.length);
-    for (let i = 0; i < real.length; i++) {
-      magnitude[i] = Math.log1p(Math.sqrt(real[i] * real[i] + imag[i] * imag[i]));
-    }
-
-    // Normalize
-    let min = Infinity, max = -Infinity;
-    for (let i = 0; i < magnitude.length; i++) {
-      if (magnitude[i] < min) min = magnitude[i];
-      if (magnitude[i] > max) max = magnitude[i];
-    }
-
+    const sourceData = rawVirtualImageRef.current;
     const lut = COLORMAPS[colormap] || COLORMAPS.inferno;
-    const offscreen = document.createElement("canvas");
-    offscreen.width = width;
-    offscreen.height = height;
-    const offCtx = offscreen.getContext("2d");
-    if (!offCtx) return;
 
-    const imgData = offCtx.createImageData(width, height);
-    const rgba = imgData.data;
-    const range = max > min ? max - min : 1;
+    // Helper to render magnitude to canvas
+    const renderMagnitude = (real: Float32Array, imag: Float32Array) => {
+      // Compute log magnitude
+      const magnitude = new Float32Array(real.length);
+      for (let i = 0; i < real.length; i++) {
+        magnitude[i] = Math.log1p(Math.sqrt(real[i] * real[i] + imag[i] * imag[i]));
+      }
 
-    for (let i = 0; i < magnitude.length; i++) {
-      const v = Math.round(((magnitude[i] - min) / range) * 255);
-      const j = i * 4;
-      const lutIdx = Math.max(0, Math.min(255, v)) * 3;
-      rgba[j] = lut[lutIdx];
-      rgba[j + 1] = lut[lutIdx + 1];
-      rgba[j + 2] = lut[lutIdx + 2];
-      rgba[j + 3] = 255;
+      // Normalize
+      let min = Infinity, max = -Infinity;
+      for (let i = 0; i < magnitude.length; i++) {
+        if (magnitude[i] < min) min = magnitude[i];
+        if (magnitude[i] > max) max = magnitude[i];
+      }
+
+      const offscreen = document.createElement("canvas");
+      offscreen.width = width;
+      offscreen.height = height;
+      const offCtx = offscreen.getContext("2d");
+      if (!offCtx) return;
+
+      const imgData = offCtx.createImageData(width, height);
+      const rgba = imgData.data;
+      const range = max > min ? max - min : 1;
+
+      for (let i = 0; i < magnitude.length; i++) {
+        const v = Math.round(((magnitude[i] - min) / range) * 255);
+        const j = i * 4;
+        const lutIdx = Math.max(0, Math.min(255, v)) * 3;
+        rgba[j] = lut[lutIdx];
+        rgba[j + 1] = lut[lutIdx + 1];
+        rgba[j + 2] = lut[lutIdx + 2];
+        rgba[j + 3] = 255;
+      }
+      offCtx.putImageData(imgData, 0, 0);
+
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.translate(fftPanX, fftPanY);
+      ctx.scale(fftZoom, fftZoom);
+      ctx.drawImage(offscreen, 0, 0);
+      ctx.restore();
+    };
+
+    // Try WebGPU first, fall back to CPU
+    if (gpuFFTRef.current && gpuReady) {
+      // WebGPU path (async)
+      let isCancelled = false;
+      const runGpuFFT = async () => {
+        const real = sourceData.slice();
+        const imag = new Float32Array(real.length);
+        
+        const { real: fReal, imag: fImag } = await gpuFFTRef.current!.fft2D(real, imag, width, height, false);
+        if (isCancelled) return;
+        
+        // Shift in CPU (TODO: move to GPU shader)
+        fftshift(fReal, width, height);
+        fftshift(fImag, width, height);
+        
+        renderMagnitude(fReal, fImag);
+      };
+      runGpuFFT();
+      return () => { isCancelled = true; };
+    } else {
+      // CPU fallback (sync)
+      const real = sourceData.slice();
+      const imag = new Float32Array(real.length);
+      fft2d(real, imag, width, height, false);
+      fftshift(real, width, height);
+      fftshift(imag, width, height);
+      renderMagnitude(real, imag);
     }
-    offCtx.putImageData(imgData, 0, 0);
-
-    ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.save();
-    ctx.translate(fftPanX, fftPanY);
-    ctx.scale(fftZoom, fftZoom);
-    ctx.drawImage(offscreen, 0, 0);
-    ctx.restore();
-  }, [virtualImageBytes, shapeX, shapeY, colormap, fftZoom, fftPanX, fftPanY, bpInner, bpOuter]);
+  }, [virtualImageBytes, shapeX, shapeY, colormap, fftZoom, fftPanX, fftPanY, gpuReady]);
 
   // Render FFT overlay with high-pass filter circle
   React.useEffect(() => {
@@ -902,25 +940,29 @@ function Show4DSTEM() {
       ctx.stroke();
       ctx.setLineDash([]);
     }
-
-    const fftPixelSize = pixelSize ? 1 / (shapeX * pixelSize) : 1;
-    drawScaleBar(ctx, canvas.width, canvas.height, fftZoom, fftPixelSize * 1000, "1/µm", Math.max(shapeX, shapeY));
   }, [fftZoom, fftPanX, fftPanY, pixelSize, shapeX, shapeY, bpInner, bpOuter]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // High-DPI Scale Bar UI Overlays
   // ─────────────────────────────────────────────────────────────────────────
   
-  // DP scale bar + crosshair (high-DPI)
+  // DP scale bar + crosshair + ROI overlay (high-DPI)
   React.useEffect(() => {
     if (!dpUiRef.current) return;
     // Draw scale bar first (clears canvas)
     drawScaleBarHiDPI(dpUiRef.current, DPR, dpZoom, detPixelSize || 1, "mrad", detY, detX);
-    // Draw crosshair (only for point mode - Python uses "point", not "crosshair")
+    // Draw ROI overlay (circle, square, rect, annular) or point crosshair
     if (roiMode === "point") {
       drawDpCrosshairHiDPI(dpUiRef.current, DPR, localKx, localKy, dpZoom, dpPanX, dpPanY, detY, detX, isDraggingDP);
+    } else {
+      drawRoiOverlayHiDPI(
+        dpUiRef.current, DPR, roiMode,
+        localKx, localKy, roiRadius, roiRadiusInner, roiWidth, roiHeight,
+        dpZoom, dpPanX, dpPanY, detY, detX,
+        isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner
+      );
     }
-  }, [dpZoom, dpPanX, dpPanY, detPixelSize, detX, detY, roiMode, localKx, localKy, isDraggingDP]);
+  }, [dpZoom, dpPanX, dpPanY, detPixelSize, detX, detY, roiMode, roiRadius, roiRadiusInner, roiWidth, roiHeight, localKx, localKy, isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner]);
   
   // VI scale bar + crosshair (high-DPI)
   React.useEffect(() => {
@@ -1407,23 +1449,18 @@ function Show4DSTEM() {
             )}
             {roiMode === "annular" && (
               <>
-                <Typography sx={{ color: "#0cf", fontSize: 11 }}>in:</Typography>
                 <Slider
-                  value={roiRadiusInner || 5}
-                  onChange={(_, v) => setRoiRadiusInner(v as number)}
+                  value={[roiRadiusInner || 5, roiRadius || 10]}
+                  onChange={(_, v) => {
+                    const [inner, outer] = v as number[];
+                    setRoiRadiusInner(inner);
+                    setRoiRadius(outer);
+                  }}
                   min={0}
                   max={Math.min(detX, detY) / 2}
                   size="small"
-                  sx={{ width: 60 }}
-                />
-                <Typography sx={{ color: "#0f0", fontSize: 11 }}>out:</Typography>
-                <Slider
-                  value={roiRadius || 10}
-                  onChange={(_, v) => setRoiRadius(v as number)}
-                  min={1}
-                  max={Math.min(detX, detY) / 2}
-                  size="small"
-                  sx={{ width: 60 }}
+                  sx={{ width: 120 }}
+                  valueLabelDisplay="auto"
                 />
                 <Typography sx={{ ...typography.value, minWidth: 50 }}>
                   {Math.round(roiRadiusInner || 5)}-{Math.round(roiRadius || 10)}px

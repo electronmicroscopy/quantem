@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, TypeAlias, Union, overload
@@ -12,13 +14,15 @@ from quantem.core.utils import array_funcs as af
 if TYPE_CHECKING:
     import cupy as cp
     import torch
+
+    TensorLike: TypeAlias = ArrayLike | torch.Tensor
 else:
     if config.get("has_torch"):
         import torch
     if config.get("has_cupy"):
         import cupy as cp
 
-TensorLike: TypeAlias = ArrayLike | "torch.Tensor"
+    TensorLike: TypeAlias = Union[ArrayLike, "torch.Tensor"]
 
 
 # --- Dataset Validation Functions ---
