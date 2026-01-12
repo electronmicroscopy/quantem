@@ -1,7 +1,7 @@
 import gc
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, Literal, Tuple
 
 import numpy as np
 import optuna
@@ -21,9 +21,12 @@ from quantem.core.utils.validators import (
 )
 from quantem.diffractive_imaging.complex_probe import (
     aberration_surface,
+    aberration_surface_cartesian_basis,
     aberration_surface_cartesian_gradients,
+    aperture,
     evaluate_probe,
     gamma_factor,
+    merge_aberration_coefficients,
     polar_coordinates,
     spatial_frequencies,
 )
@@ -39,13 +42,11 @@ else:
 from itertools import product
 
 from quantem.diffractive_imaging.direct_ptycho_utils import (
-    # ABERRATION_PRESETS,
+    ABERRATION_PRESETS,
     align_vbf_stack_multiscale,
-    # concentric_ring_wavevectors,
     create_edge_window,
-    # find_nearest_k_indices,
     fit_aberrations_from_shifts,
-    # fit_aberrations_using_least_squares,
+    unwrap_bf_overlap_phase_torch,
 )
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -395,10 +396,20 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         """ """
 
-        self._vbf_fourier = torch.fft.fft2(self.vbf_stack)
+        self._vbf_fourier = torch.fft.fft2(self.vbf_stack, dim=(-2, -1))
         self._dc_per_image = self._vbf_fourier[..., 0, 0].mean(0)
         self._vbf_fourier[..., 0, 0] = 0  # zero DC
         self._corrected_stack = None
+
+        # spatial-frequency power used to rank q-modes
+        self._q_signal_power = self._vbf_fourier.abs().square().sum(dim=0)  # (N_qx, N_qy)
+
+        flat_inds = torch.argsort(
+            self._q_signal_power.flatten(),
+            descending=True,
+        )
+        self._q_sorted_inds_i = flat_inds // self._q_signal_power.shape[1]
+        self._q_sorted_inds_j = flat_inds % self._q_signal_power.shape[1]
 
         return self
 
@@ -1236,67 +1247,195 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         return self
 
-    # def fit_hyperparameters_least_squares(
-    #     self,
-    #     cartesian_basis: str | list[str] = "low_order",
-    #     rotation_angle: float | None = None,
-    #     aberration_coefs: dict[str, int | float | torch.Tensor] | None = None,
-    #     num_bf_rings: int = 3,
-    #     num_bf_points_per_ring: int = 6,
-    # ):
-    #     if aberration_coefs is None:
-    #         aberration_coefs = self.aberration_coefs
-    #     else:
-    #         aberration_coefs = validate_aberration_coefficients(aberration_coefs)
+    def _fit_hyperparameters_least_squares_inner(
+        self,
+        aberration_coefs: dict[str, int | float | torch.Tensor] = {},
+        rotation_angle: float | None = None,
+        cartesian_basis: str | list[str] = "low_order",
+        num_q_modes: int = 6,
+        unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
+        two_pass_unwrapping: bool = True,
+        **unwrap_kwargs,
+    ):
+        """
+        Phase-only least-squares aberration fit from vBF Fourier data.
+        Returns delta aberrations in cartesian form.
+        """
+        if isinstance(cartesian_basis, str):
+            cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
 
-    #     if rotation_angle is None:
-    #         rotation_angle = self.rotation_angle
-    #     else:
-    #         rotation_angle = float(rotation_angle)
+        device = self.device
+        wavelength = self.wavelength
 
-    #     if isinstance(cartesian_basis, str):
-    #         cartesian_basis = ABERRATION_PRESETS[cartesian_basis]
+        # ---------------------------------------------------------
+        # Select strongest spatial frequencies
+        # ---------------------------------------------------------
+        qi = self._q_sorted_inds_i[:num_q_modes]
+        qj = self._q_sorted_inds_j[:num_q_modes]
 
-    #     # spatial frequencies
-    #     qxa, qya = self._return_upsampled_qgrid()
+        qxa, qya = self._return_upsampled_qgrid()
+        qx = qxa[qi, qj]  # (N_q,)
+        qy = qya[qi, qj]  # (N_q,)
 
-    #     # BF geometry
-    #     kxa, kya = spatial_frequencies(
-    #         self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
-    #     )
+        N_q = qx.numel()
 
-    #     k_bf_target = concentric_ring_wavevectors(
-    #         self.semiangle_cutoff * 0.95,
-    #         num_rings=num_bf_rings,
-    #         num_points_per_ring=num_bf_points_per_ring,
-    #         wavelength=self.wavelength,
-    #         include_center=False,
-    #         device=self.device,
-    #     )
+        # ---------------------------------------------------------
+        # k-space BF pixels
+        # ---------------------------------------------------------
+        kxa, kya = spatial_frequencies(
+            self.gpts,
+            self.sampling,
+            rotation_angle=rotation_angle,
+            device=device,
+        )
 
-    #     inds_i, inds_j = find_nearest_k_indices(k_bf_target, kxa, kya)
+        kx = kxa[self.bf_mask]  # (N_k,)
+        ky = kya[self.bf_mask]  # (N_k,)
 
-    #     k_bf = torch.stack((kxa[inds_i, inds_j], kya[inds_i, inds_j]), -1)
+        # reshape for broadcasting
+        kx = kx[:, None]  # (N_k, 1)
+        ky = ky[:, None]
+        qx = qx[None, :]  # (1, N_q)
+        qy = qy[None, :]
 
-    #     bf_mask = torch.zeros_like(self.bf_mask)
-    #     bf_mask[inds_i, inds_j] = True
-    #     vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
-    #     vbf_fourier = self._vbf_fourier[vbf_index_mapping]
+        # ---------------------------------------------------------
+        # k, k+q, k−q coordinates
+        # ---------------------------------------------------------
+        k0, phi0 = polar_coordinates(kx, ky)
+        kp, phip = polar_coordinates(qx + kx, qy + ky)
+        km, phim = polar_coordinates(qx - kx, qy - ky)
 
-    #     updated_aberrations_polar, delta_cartesian, phi_obj = fit_aberrations_using_least_squares(
-    #         vbf_fourier=vbf_fourier,
-    #         qxa=qxa,
-    #         qya=qya,
-    #         k_bf=k_bf,
-    #         cartesian_basis=cartesian_basis,
-    #         wavelength=self.wavelength,
-    #         semiangle_cutoff=self.semiangle_cutoff,
-    #         angular_sampling=self.angular_sampling,
-    #         soft_edges=True,
-    #         aberration_coefs_init=aberration_coefs,
-    #     )
+        # ---------------------------------------------------------
+        # Aperture + chi (prior aberrations)
+        # ---------------------------------------------------------
+        ap0 = aperture(
+            k0 * wavelength, phi0, self.semiangle_cutoff, self.angular_sampling, soft_edges=True
+        )
+        app = aperture(
+            kp * wavelength, phip, self.semiangle_cutoff, self.angular_sampling, soft_edges=True
+        )
+        apm = aperture(
+            km * wavelength, phim, self.semiangle_cutoff, self.angular_sampling, soft_edges=True
+        )
 
-    #     return updated_aberrations_polar
+        chi0 = aberration_surface(k0 * wavelength, phi0, wavelength, aberration_coefs)
+        chip = aberration_surface(kp * wavelength, phip, wavelength, aberration_coefs)
+        chim = aberration_surface(km * wavelength, phim, wavelength, aberration_coefs)
+
+        # ---------------------------------------------------------
+        # Overlap-only masks
+        # ---------------------------------------------------------
+        def ap_to_mask(ap, eps=1e-6):
+            return ap > eps
+
+        m0 = ap_to_mask(ap0)
+        mp = ap_to_mask(app)
+        mm = ap_to_mask(apm)
+
+        plus_mask = m0 & mp & ~mm
+        minus_mask = m0 & mm & ~mp
+
+        # ---------------------------------------------------------
+        # Gamma and phase deconvolution
+        # ---------------------------------------------------------
+        psi0 = ap0 * torch.exp(-1j * chi0)
+        psip = app * torch.exp(-1j * chip)
+        psim = apm * torch.exp(-1j * chim)
+
+        gamma = psim * psi0.conj() - psip.conj() * psi0
+
+        valid = gamma.abs() > 1e-6
+        plus_mask &= valid
+        minus_mask &= valid
+
+        gamma_angle = torch.angle(gamma)
+        measured = self._vbf_fourier[:, qi, qj]  # (N_k, N_q)
+        deconv = measured * torch.exp(-1j * gamma_angle)
+
+        # ---------------------------------------------------------
+        # Build LS system
+        # ---------------------------------------------------------
+        rows = []
+        rhs = []
+
+        P = len(cartesian_basis)
+
+        for j in range(N_q):
+            # unwrap plus
+            if plus_mask[:, j].any():
+                phi_plus = unwrap_bf_overlap_phase_torch(
+                    complex_data_bf=deconv[:, j],
+                    mask_bf=plus_mask[:, j],
+                    bf_mask=self.bf_mask,
+                    method=unwrap_method,
+                    two_pass=two_pass_unwrapping,
+                )
+
+                chi_p_basis = aberration_surface_cartesian_basis(
+                    kp[:, j] * wavelength,
+                    phip[:, j],
+                    wavelength,
+                    cartesian_basis,
+                )
+                chi_0_basis = aberration_surface_cartesian_basis(
+                    k0[:, 0] * wavelength,
+                    phi0[:, 0],
+                    wavelength,
+                    cartesian_basis,
+                )
+
+                dchi = chi_p_basis - chi_0_basis
+
+                for i in torch.where(plus_mask[:, j])[0]:
+                    row = torch.zeros(P + N_q, device=device)
+                    row[:P] = dchi[i]
+                    row[P + j] = 1.0
+                    rows.append(row)
+                    rhs.append(phi_plus[i])
+
+            # unwrap minus
+            if minus_mask[:, j].any():
+                phi_minus = unwrap_bf_overlap_phase_torch(
+                    complex_data_bf=deconv[:, j],
+                    mask_bf=minus_mask[:, j],
+                    bf_mask=self.bf_mask,
+                    method=unwrap_method,
+                    two_pass=two_pass_unwrapping,
+                )
+
+                chi_m_basis = aberration_surface_cartesian_basis(
+                    km[:, j] * wavelength,
+                    phim[:, j],
+                    wavelength,
+                    cartesian_basis,
+                )
+                chi_0_basis = aberration_surface_cartesian_basis(
+                    k0[:, 0] * wavelength,
+                    phi0[:, 0],
+                    wavelength,
+                    cartesian_basis,
+                )
+
+                dchi = chi_0_basis - chi_m_basis
+
+                for i in torch.where(minus_mask[:, j])[0]:
+                    row = torch.zeros(P + N_q, device=device)
+                    row[:P] = dchi[i]
+                    row[P + j] = 1.0
+                    rows.append(row)
+                    rhs.append(phi_minus[i])
+
+        A = torch.stack(rows, dim=0)
+        b = torch.stack(rhs, dim=0)
+
+        # ---------------------------------------------------------
+        # Solve LS
+        # ---------------------------------------------------------
+        sol = torch.linalg.lstsq(A, b).solution
+
+        delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
+
+        return merge_aberration_coefficients(aberration_coefs, delta_cartesian)
 
     def _reconstruct_all_permutations(self, verbose=None, **reconstruct_kwargs):
         """ """

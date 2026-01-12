@@ -12,12 +12,8 @@ import math
 
 from tqdm.auto import tqdm
 
-from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
+from quantem.core.utils.imaging_utils import cross_correlation_shift_torch, unwrap_phase_2d_torch
 from quantem.diffractive_imaging.complex_probe import (
-    aberration_surface_cartesian_basis,
-    # evaluate_probe,
-    merge_aberration_coefficients,
-    polar_coordinates,
     spatial_frequencies,
 )
 
@@ -548,235 +544,37 @@ def _torch_polar(m: torch.Tensor):
     return u, p
 
 
-def gamma_and_derivatives(A0, Am, Ap, chi0, chim, chip, basis):
-    """
-    Compute gamma and its derivatives wrt aberration coefficients.
-
-    Shapes
-    ------
-    A0, Am, Ap : (M, Nq)
-    chi*       : dict[label -> (M, Nq)]
-
-    Returns
-    -------
-    gamma0 : (M, Nq)
-    gamma_basis : (M, Nq, P)
-    """
-
-    C_minus = A0.conj() * Am
-    C_plus = A0 * Ap.conj()
-
-    gamma0 = C_minus - C_plus
-
-    gamma_terms = []
-    for label in basis:
-        dchi0 = chi0[label]
-        dchim = chim[label]
-        dchip = chip[label]
-
-        gamma_j = 1j * (C_minus * (dchi0 - dchim) + C_plus * (dchi0 - dchip))
-        gamma_terms.append(gamma_j)
-
-    gamma_basis = torch.stack(gamma_terms, dim=-1)
-
-    return gamma0, gamma_basis
-
-
-def fit_aberrations_using_least_squares(
-    vbf_fourier: torch.Tensor,
-    qxa: torch.Tensor,
-    qya: torch.Tensor,
-    k_bf: torch.Tensor,
-    cartesian_basis: list[str],
-    wavelength: float,
-    semiangle_cutoff: float,
-    angular_sampling,
-    soft_edges: bool,
-    aberration_coefs_init: dict,
+def unwrap_bf_overlap_phase_torch(
+    complex_data_bf,  # (N_k,)
+    mask_bf,  # (N_k,)
+    bf_mask,  # (N_kx, N_ky)
+    *,
+    method="reliability-sorting",
+    two_pass=True,
+    **unwrap_kwargs,
 ):
-    """
-    Phase-only least squares fit for aberration coefficients.
+    phase_bf = torch.angle(complex_data_bf)
+    phase_grid = torch.zeros_like(bf_mask, dtype=torch.float32)
+    mask_grid = torch.zeros_like(bf_mask, dtype=torch.bool)
 
-    Parameters
-    ----------
-    vbf_fourier : torch.Tensor
-        Fourier-transformed VBF stack, shape (Nk, Nq_y, Nq_x)
-    qxa, qya : torch.Tensor
-        Object reciprocal-space grids
-    k_bf : torch.Tensor
-        BF wavevectors, shape (Nk, 2)
-    cartesian_basis : list[str]
-        Aberration basis, e.g. ["C10", "C12a", "C12b"]
-    aberration_coefs_init : dict
-        Initial aberrations (polar)
+    phase_grid[bf_mask] = phase_bf
+    mask_grid[bf_mask] = mask_bf
 
-    Returns
-    -------
-    updated_aberrations_polar : dict
-    delta_cartesian : dict
-    """
-
-    device = qxa.device
-    dtype = qxa.dtype
-
-    Nk = k_bf.shape[0]
-    Nq = qxa.numel()
-
-    phase_meas = torch.angle(vbf_fourier)
-    phase_meas = phase_meas.reshape(Nk * Nq)
-
-    qx = qxa.reshape(1, -1)
-    qy = qya.reshape(1, -1)
-
-    kx = k_bf[:, 0:1]
-    ky = k_bf[:, 1:2]
-
-    kx0 = kx
-    ky0 = ky
-    kxp = kx + qx
-    kyp = ky + qy
-
-    k0, phi0 = polar_coordinates(kx0, ky0)
-    kp, phip = polar_coordinates(kxp, kyp)
-
-    chi0 = aberration_surface_cartesian_basis(k0 * wavelength, phi0, wavelength, cartesian_basis)
-    chip = aberration_surface_cartesian_basis(kp * wavelength, phip, wavelength, cartesian_basis)
-    dchi = chi0 - chip
-    dchi = dchi.reshape(Nk * Nq, -1)
-
-    I_q = torch.eye(Nq, device=device, dtype=dtype)
-    I_block = I_q.repeat(Nk, 1)  # (Nk*Nq, Nq)
-
-    A = torch.cat([I_block, dchi], dim=1)  # (Nk*Nq, Nq + P)
-    sol = torch.linalg.lstsq(A, phase_meas).solution
-
-    phi_obj = sol[:Nq]  # object phase
-    delta = sol[Nq:]  # aberration deltas
-
-    delta_cartesian = {name: delta[i] for i, name in enumerate(cartesian_basis)}
-
-    updated_aberrations_polar = merge_aberration_coefficients(
-        aberration_coefs_init,
-        delta_cartesian,
+    phase_grid = unwrap_phase_2d_torch(
+        phase_grid * mask_grid,
+        method=method,
+        mask=mask_grid,
+        **unwrap_kwargs,
     )
+    phase_grid = phase_grid * mask_grid
 
-    return updated_aberrations_polar, delta_cartesian, phi_obj
+    if two_pass:
+        phase_grid = unwrap_phase_2d_torch(
+            phase_grid,
+            method=method,
+            mask=mask_grid,
+            **unwrap_kwargs,
+        )
+        phase_grid = phase_grid * mask_grid
 
-
-def find_nearest_k_indices(
-    k_targets: torch.Tensor,
-    kxa: torch.Tensor,
-    kya: torch.Tensor,
-):
-    """
-    Find nearest (i, j) indices on a kx, ky grid for a set of target wavevectors.
-
-    Parameters
-    ----------
-    k_targets : torch.Tensor
-        Tensor of shape (N, 2) containing (kx, ky) target points.
-    kxa : torch.Tensor
-        2D tensor of kx coordinates (Ny, Nx).
-    kya : torch.Tensor
-        2D tensor of ky coordinates (Ny, Nx).
-
-    Returns
-    -------
-    inds_i : torch.Tensor
-        Tensor of shape (N,) with row indices.
-    inds_j : torch.Tensor
-        Tensor of shape (N,) with column indices.
-    """
-
-    assert k_targets.ndim == 2 and k_targets.shape[1] == 2
-    assert kxa.shape == kya.shape
-
-    # Flatten detector grid
-    kx_flat = kxa.reshape(-1)
-    ky_flat = kya.reshape(-1)
-
-    # (N, 1) - (1, M) → (N, M)
-    dx = k_targets[:, 0:1] - kx_flat[None, :]
-    dy = k_targets[:, 1:2] - ky_flat[None, :]
-
-    # Squared distance
-    dist2 = dx.square() + dy.square()
-
-    # Nearest grid point
-    flat_inds = torch.argmin(dist2, dim=1)
-
-    # Convert back to 2D indices
-    ny, nx = kxa.shape
-    inds_i = flat_inds // nx
-    inds_j = flat_inds % nx
-
-    return inds_i, inds_j
-
-
-def concentric_ring_wavevectors(
-    cutoff: float,
-    num_rings: int,
-    num_points_per_ring: int,
-    wavelength: float,
-    include_center: bool = True,
-    device: str | torch.device | None = None,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    """
-    Generate concentric-ring BF wavevectors in reciprocal space.
-
-    Parameters
-    ----------
-    cutoff : float
-        Maximum scattering angle (mrad).
-    num_rings : int
-        Number of rings (including the center if include_center=True).
-    num_points_per_ring : int
-        Initial number of points on the first non-zero ring.
-        Each subsequent ring increases this by num_points_per_ring.
-    wavelength : float
-        Electron wavelength (Angstroms).
-    include_center : bool, optional
-        Whether to include the (0,0) wavevector.
-    device : torch.device, optional
-        Torch device.
-    dtype : torch.dtype, optional
-        Torch dtype.
-
-    Returns
-    -------
-    k_bf : torch.Tensor
-        Tensor of shape (N, 2) with (kx, ky) wavevectors.
-        Units: reciprocal meters.
-    """
-
-    rings = []
-
-    # Optional (0,0) point
-    if include_center:
-        rings.append(torch.zeros((1, 2), device=device, dtype=dtype))
-    else:
-        num_rings = num_rings + 1
-
-    # Radial positions (exclude r=0)
-    radii = torch.linspace(
-        cutoff / (num_rings - 1),
-        cutoff,
-        num_rings - 1,
-        device=device,
-        dtype=dtype,
-    )
-
-    n = num_points_per_ring
-
-    for r in radii:
-        angles = torch.arange(n, device=device, dtype=dtype) * 2.0 * math.pi / n + math.pi / 2.0
-
-        # mrad → rad → reciprocal space
-        kx = r * torch.sin(angles) / 1000.0 / wavelength
-        ky = r * torch.cos(-angles) / 1000.0 / wavelength
-
-        rings.append(torch.stack((kx, ky), dim=1))
-        n += num_points_per_ring
-
-    return torch.cat(rings, dim=0)
+    return phase_grid[bf_mask]
