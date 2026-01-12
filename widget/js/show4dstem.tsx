@@ -9,35 +9,18 @@ import Slider from "@mui/material/Slider";
 import Button from "@mui/material/Button";
 import Switch from "@mui/material/Switch";
 import JSZip from "jszip";
-import { getWebGPUFFT, WebGPUFFT, getGPUInfo } from "./webgpu-fft";
-import { COLORMAPS, fft1d, fft2d, fftshift, applyBandPassFilter, MIN_ZOOM, MAX_ZOOM } from "./shared";
-import { colors, typography, controlPanel, container } from "./CONFIG";
+import { getWebGPUFFT, WebGPUFFT } from "./webgpu-fft";
+import { COLORMAPS, fft2d, fftshift, applyBandPassFilter, MIN_ZOOM, MAX_ZOOM } from "./shared";
+import { typography, controlPanel, container } from "./CONFIG";
 import { upwardMenuProps, switchStyles } from "./components";
 import "./show4dstem.css";
 
-// ============================================================================
-// Constants - Relative sizing for various detector sizes (64x64 to 256x256+)
-// ============================================================================
-const RESIZE_HANDLE_FRACTION = 0.05;  // Resize handle as fraction of detector size
-const RESIZE_HANDLE_MIN_PX = 5;       // Minimum resize handle radius
-const RESIZE_HANDLE_MAX_PX = 8;       // Maximum resize handle radius
-const RESIZE_HANDLE_RADIUS = 6;       // Fixed handle radius for drawing
-const RESIZE_HIT_AREA_FRACTION = 0.06; // Click tolerance as fraction of detector
-const RESIZE_HIT_AREA_MIN_PX = 6;     // Minimum click tolerance
-const RESIZE_HIT_AREA_PX = 10;        // Fixed hit area for click detection
-// Crosshair sizes: fixed pixel sizes for consistent appearance
-const CROSSHAIR_SIZE_PX = 18;         // Fixed crosshair size for point mode (CSS pixels on 400px canvas)
-const CROSSHAIR_SIZE_SMALL_PX = 10;   // Fixed small crosshair size for ROI center
-const CENTER_DOT_RADIUS_PX = 6;       // Center dot radius
-const CIRCLE_HANDLE_ANGLE = 0.707;    // cos(45°) for circle handle position
-// Line widths as fraction of size
-const LINE_WIDTH_FRACTION = 0.015;    // Line width as fraction of size
-const LINE_WIDTH_MIN_PX = 1.5;        // Minimum line width
-const LINE_WIDTH_MAX_PX = 3;          // Maximum line width
-
-// ============================================================================
-// Scale Bar (dynamic adjustment to nice values)
-// ============================================================================
+// Constants
+const RESIZE_HIT_AREA_PX = 10;
+const CIRCLE_HANDLE_ANGLE = 0.707;  // cos(45°)
+const LINE_WIDTH_FRACTION = 0.015;
+const LINE_WIDTH_MIN_PX = 1.5;
+const LINE_WIDTH_MAX_PX = 3;
 
 /** Round to a nice value (1, 2, 5, 10, 20, 50, etc.) */
 function roundToNiceValue(value: number): number {
@@ -53,8 +36,12 @@ function roundToNiceValue(value: number): number {
 /** Format scale bar label with appropriate unit */
 function formatScaleLabel(value: number, unit: string): string {
   const nice = roundToNiceValue(value);
-  
-  if (unit === "nm") {
+
+  if (unit === "Å") {
+    if (nice >= 10) return `${Math.round(nice / 10)} nm`;
+    if (nice >= 1) return `${Math.round(nice)} Å`;
+    return `${nice.toFixed(2)} Å`;
+  } else if (unit === "nm") {
     if (nice >= 1000) return `${Math.round(nice / 1000)} µm`;
     if (nice >= 1) return `${Math.round(nice)} nm`;
     return `${nice.toFixed(2)} nm`;
@@ -79,7 +66,7 @@ function drawScaleBarHiDPI(
   dpr: number,
   zoom: number,
   pixelSize: number,
-  unit: string = "nm",
+  unit: string = "Å",
   imageWidth: number,  // Original image width in pixels
   imageHeight: number  // Original image height in pixels
 ) {
@@ -349,8 +336,6 @@ function drawRoiOverlayHiDPI(
     ctx.stroke();
   };
   
-  const HANDLE_ANGLE = 0.707; // cos(45°)
-  
   if (roiMode === "circle" && radius > 0) {
     const screenRadius = radius * zoom * displayScale;
     
@@ -368,7 +353,7 @@ function drawRoiOverlayHiDPI(
     drawCenterCrosshair();
     
     // Resize handle at 45°
-    const handleOffset = screenRadius * HANDLE_ANGLE;
+    const handleOffset = screenRadius * CIRCLE_HANDLE_ANGLE;
     drawResizeHandle(screenX + handleOffset, screenY + handleOffset);
     
   } else if (roiMode === "square" && radius > 0) {
@@ -434,11 +419,11 @@ function drawRoiOverlayHiDPI(
     drawCenterCrosshair();
     
     // Outer handle
-    const handleOffsetOuter = screenRadiusOuter * HANDLE_ANGLE;
+    const handleOffsetOuter = screenRadiusOuter * CIRCLE_HANDLE_ANGLE;
     drawResizeHandle(screenX + handleOffsetOuter, screenY + handleOffsetOuter);
     
     // Inner handle
-    const handleOffsetInner = screenRadiusInner * HANDLE_ANGLE;
+    const handleOffsetInner = screenRadiusInner * CIRCLE_HANDLE_ANGLE;
     drawResizeHandle(screenX + handleOffsetInner, screenY + handleOffsetInner, true);
   }
   
@@ -464,7 +449,7 @@ function Show4DSTEM() {
   const [, setRoiActive] = useModelState<boolean>("roi_active");
 
   const [pixelSize] = useModelState<number>("pixel_size");
-  const [detPixelSize] = useModelState<number>("det_pixel_size");
+  const [kPixelSize] = useModelState<number>("k_pixel_size");
 
   const [frameBytes] = useModelState<DataView>("frame_bytes");
   const [virtualImageBytes] = useModelState<DataView>("virtual_image_bytes");
@@ -478,9 +463,6 @@ function Show4DSTEM() {
 
   // Display options
   const [logScale, setLogScale] = useModelState<boolean>("log_scale");
-  const [autoRange, setAutoRange] = useModelState<boolean>("auto_range");
-  const [percentileLow, setPercentileLow] = useModelState<number>("percentile_low");
-  const [percentileHigh, setPercentileHigh] = useModelState<number>("percentile_high");
 
   // Detector calibration (for presets)
   const [bfRadius] = useModelState<number>("bf_radius");
@@ -717,22 +699,11 @@ function Show4DSTEM() {
     const height = shapeX;
 
     const renderData = (filtered: Float32Array) => {
-      // Normalize and render (with optional percentile contrast)
+      // Normalize and render
       let min = Infinity, max = -Infinity;
-
-      if (autoRange) {
-        // Percentile-based contrast: sort a sample and pick percentile values
-        const sorted = Float32Array.from(filtered).sort((a, b) => a - b);
-        const lowIdx = Math.floor((percentileLow / 100) * sorted.length);
-        const highIdx = Math.floor((percentileHigh / 100) * sorted.length) - 1;
-        min = sorted[Math.max(0, lowIdx)];
-        max = sorted[Math.min(sorted.length - 1, highIdx)];
-      } else {
-        // Full range
-        for (let i = 0; i < filtered.length; i++) {
-          if (filtered[i] < min) min = filtered[i];
-          if (filtered[i] > max) max = filtered[i];
-        }
+      for (let i = 0; i < filtered.length; i++) {
+        if (filtered[i] < min) min = filtered[i];
+        if (filtered[i] > max) max = filtered[i];
       }
 
       const lut = COLORMAPS[colormap] || COLORMAPS.inferno;
@@ -809,7 +780,7 @@ function Show4DSTEM() {
     } else {
       renderData(rawVirtualImageRef.current);
     }
-  }, [virtualImageBytes, shapeX, shapeY, colormap, viZoom, viPanX, viPanY, bpInner, bpOuter, gpuReady, autoRange, percentileLow, percentileHigh]);
+  }, [virtualImageBytes, shapeX, shapeY, colormap, viZoom, viPanX, viPanY, bpInner, bpOuter, gpuReady]);
 
   // Render virtual image overlay (just clear - crosshair drawn on high-DPI UI canvas)
   React.useEffect(() => {
@@ -950,7 +921,7 @@ function Show4DSTEM() {
   React.useEffect(() => {
     if (!dpUiRef.current) return;
     // Draw scale bar first (clears canvas)
-    drawScaleBarHiDPI(dpUiRef.current, DPR, dpZoom, detPixelSize || 1, "mrad", detY, detX);
+    drawScaleBarHiDPI(dpUiRef.current, DPR, dpZoom, kPixelSize || 1, "mrad", detY, detX);
     // Draw ROI overlay (circle, square, rect, annular) or point crosshair
     if (roiMode === "point") {
       drawDpCrosshairHiDPI(dpUiRef.current, DPR, localKx, localKy, dpZoom, dpPanX, dpPanY, detY, detX, isDraggingDP);
@@ -962,13 +933,13 @@ function Show4DSTEM() {
         isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner
       );
     }
-  }, [dpZoom, dpPanX, dpPanY, detPixelSize, detX, detY, roiMode, roiRadius, roiRadiusInner, roiWidth, roiHeight, localKx, localKy, isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner]);
+  }, [dpZoom, dpPanX, dpPanY, kPixelSize, detX, detY, roiMode, roiRadius, roiRadiusInner, roiWidth, roiHeight, localKx, localKy, isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner]);
   
   // VI scale bar + crosshair (high-DPI)
   React.useEffect(() => {
     if (!viUiRef.current) return;
     // Draw scale bar first (clears canvas)
-    drawScaleBarHiDPI(viUiRef.current, DPR, viZoom, pixelSize || 1, "nm", shapeY, shapeX);
+    drawScaleBarHiDPI(viUiRef.current, DPR, viZoom, pixelSize || 1, "Å", shapeY, shapeX);
     // Then draw crosshair on top
     drawViCrosshairHiDPI(viUiRef.current, DPR, localPosX, localPosY, viZoom, viPanX, viPanY, shapeY, shapeX, isDraggingVI);
   }, [viZoom, viPanX, viPanY, pixelSize, shapeX, shapeY, localPosX, localPosY, isDraggingVI]);
@@ -1258,16 +1229,13 @@ function Show4DSTEM() {
                     display: {
                       colormap: colormap,
                       log_scale: logScale,
-                      auto_range: autoRange,
-                      percentile_low: percentileLow,
-                      percentile_high: percentileHigh,
                     },
                     calibration: {
                       bf_radius: bfRadius,
                       center_x: centerX,
                       center_y: centerY,
                       pixel_size: pixelSize,
-                      det_pixel_size: detPixelSize,
+                      k_pixel_size: kPixelSize,
                     },
                   };
                   zip.file("metadata.json", JSON.stringify(metadata, null, 2));
@@ -1528,37 +1496,6 @@ function Show4DSTEM() {
               size="small"
               sx={switchStyles.medium}
             />
-          </Stack>
-
-          <Stack direction="row" spacing={0.5} alignItems="center" sx={{ ...controlPanel.group }}>
-            <Typography sx={{ ...typography.label }}>Contrast:</Typography>
-            <Switch
-              checked={autoRange ?? false}
-              onChange={(e) => setAutoRange(e.target.checked)}
-              size="small"
-              sx={switchStyles.small}
-            />
-            {autoRange && (
-              <>
-                <Slider
-                  value={[percentileLow || 1, percentileHigh || 99]}
-                  onChange={(_, v) => {
-                    const [low, high] = v as number[];
-                    setPercentileLow(low);
-                    setPercentileHigh(high);
-                  }}
-                  min={0}
-                  max={100}
-                  size="small"
-                  sx={{ width: 80 }}
-                  valueLabelDisplay="auto"
-                  valueLabelFormat={(v) => `${v}%`}
-                />
-                <Typography sx={{ ...typography.value, minWidth: 45 }}>
-                  {Math.round(percentileLow || 1)}-{Math.round(percentileHigh || 99)}%
-                </Typography>
-              </>
-            )}
           </Stack>
         </Stack>
       </Stack>

@@ -37,26 +37,23 @@ export function renderWithColormap(
 }
 
 /**
- * Render float32 data to canvas with colormap and optional percentile contrast.
+ * Render float32 data to canvas with colormap.
  */
 export function renderFloat32WithColormap(
   ctx: CanvasRenderingContext2D,
   data: Float32Array,
   width: number,
   height: number,
-  cmapName: string = "inferno",
-  percentileLow: number = 0,
-  percentileHigh: number = 100
+  cmapName: string = "inferno"
 ): void {
   const lut = COLORMAPS[cmapName] || COLORMAPS.inferno;
 
-  // Calculate min/max using percentiles
-  const sorted = Float32Array.from(data).sort((a, b) => a - b);
-  const len = sorted.length;
-  const loIdx = Math.floor((percentileLow / 100) * (len - 1));
-  const hiIdx = Math.floor((percentileHigh / 100) * (len - 1));
-  const min = sorted[loIdx];
-  const max = sorted[hiIdx];
+  // Calculate min/max
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] < min) min = data[i];
+    if (data[i] > max) max = data[i];
+  }
   const range = max - min || 1;
   const scale = 255 / range;
 
@@ -119,7 +116,11 @@ export function roundToNiceValue(value: number): number {
 export function formatScaleLabel(value: number, unit: string): string {
   const nice = roundToNiceValue(value);
 
-  if (unit === "nm") {
+  if (unit === "Å") {
+    if (nice >= 10) return `${Math.round(nice / 10)} nm`;
+    if (nice >= 1) return `${Math.round(nice)} Å`;
+    return `${nice.toFixed(2)} Å`;
+  } else if (unit === "nm") {
     if (nice >= 1000) return `${Math.round(nice / 1000)} µm`;
     if (nice >= 1) return `${Math.round(nice)} nm`;
     return `${nice.toFixed(2)} nm`;

@@ -6,28 +6,22 @@ Features:
 - Live statistics panel (mean/max/min)
 - Virtual detector overlays (BF/ADF circles)
 - Linked scan view (side-by-side)
-- Auto-range with percentile scaling
 - ROI drawing tools
+- Path animation (raster scan, custom paths)
 """
 
 import pathlib
-from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import anywidget
 import numpy as np
 import traitlets
 
 from quantem.widget.array_utils import to_numpy
-
-if TYPE_CHECKING:
-    from quantem.detector import Detector
+from quantem.core.datastructures import Dataset4dstem
 
 
-# Detector geometry constants (ratios of detector size)
+# Detector geometry constant
 DEFAULT_BF_RATIO = 0.125  # 1/8 of detector size
-DEFAULT_ADF_INNER_RATIO = 0.1875  # 1.5 * BF = 3/16 of detector
-DEFAULT_ADF_OUTER_RATIO = 0.375  # 3 * BF = 3/8 of detector
 
 
 class Show4DSTEM(anywidget.AnyWidget):
@@ -39,58 +33,40 @@ class Show4DSTEM(anywidget.AnyWidget):
 
     Parameters
     ----------
-    data : array_like
-        4D array of shape (scan_x, scan_y, det_x, det_y).
-        Supports NumPy and PyTorch arrays.
+    data : Dataset4dstem or array_like
+        Dataset4dstem object (calibration auto-extracted) or 4D array
+        of shape (scan_x, scan_y, det_x, det_y).
     scan_shape : tuple, optional
         If data is flattened (N, det_x, det_y), provide scan dimensions.
-    detector : Detector, optional
-        Detector object from quantem.detector for automatic calibration.
-        If provided, center and bf_radius are extracted from the detector.
-    pixel_size : float, default 1.0
-        Pixel size in nm (real-space). Used for scale bar.
-    det_pixel_size : float, default 1.0
+    pixel_size : float, optional
+        Pixel size in Å (real-space). Used for scale bar.
+        Auto-extracted from Dataset4dstem if not provided.
+    k_pixel_size : float, optional
         Detector pixel size in mrad (k-space). Used for scale bar.
+        Auto-extracted from Dataset4dstem if not provided.
     center : tuple[float, float], optional
         (center_x, center_y) of the diffraction pattern in pixels.
         If not provided, defaults to detector center.
     bf_radius : float, optional
         Bright field disk radius in pixels. If not provided, estimated as 1/8 of detector size.
-    log_scale : bool, default True
+    log_scale : bool, default False
         Use log scale for better dynamic range visualization.
-    auto_range : bool, default False
-        Use percentile-based scaling instead of global min/max.
-    percentile_low : float, default 1.0
-        Lower percentile for auto-range (0-100).
-    percentile_high : float, default 99.0
-        Upper percentile for auto-range (0-100).
-    path_points : list[tuple[int, int]], optional
-        List of (x, y) scan positions for programmatic animation.
-        Use with play(), pause(), stop() methods.
-    path_interval_ms : int, default 100
-        Time between frames in path animation (milliseconds).
-    path_loop : bool, default True
-        Whether to loop when path animation reaches the end.
 
     Examples
     --------
-    >>> from quantem.widget import Show4DSTEM
+    >>> # From Dataset4dstem (calibration auto-extracted)
+    >>> from quantem.core.io.file_readers import read_emdfile_to_4dstem
+    >>> dataset = read_emdfile_to_4dstem("data.h5")
+    >>> Show4DSTEM(dataset)
+
+    >>> # From raw array with manual calibration
     >>> import numpy as np
     >>> data = np.random.rand(64, 64, 128, 128)
-    >>> Show4DSTEM(data)
+    >>> Show4DSTEM(data, pixel_size=2.39, k_pixel_size=0.46)
 
-    >>> # With manual calibration
-    >>> Show4DSTEM(data, pixel_size=0.5, det_pixel_size=0.1, bf_radius=20)
-
-    >>> # With Detector object (optional dependency)
-    >>> from quantem.detector import Detector
-    >>> det = Detector("data.h5")
-    >>> Show4DSTEM(det.data, detector=det)  # Uses det.center, det.bf_radius
-    
-    >>> # With path animation
-    >>> path = [(i, i) for i in range(64)]  # Diagonal path
-    >>> widget = Show4DSTEM(data, path_points=path, path_interval_ms=50)
-    >>> widget.play()  # Start animation
+    >>> # With raster animation
+    >>> widget = Show4DSTEM(dataset)
+    >>> widget.raster(step=2, interval_ms=50)
     """
 
     _esm = pathlib.Path(__file__).parent / "static" / "show4dstem.js"
@@ -112,66 +88,31 @@ class Show4DSTEM(anywidget.AnyWidget):
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
 
     # Log scale toggle
-    log_scale = traitlets.Bool(True).tag(sync=True)
+    log_scale = traitlets.Bool(False).tag(sync=True)
 
     # =========================================================================
-    # Stats Panel
+    # Detector Calibration (for presets and scale bar)
     # =========================================================================
-    stats_mean = traitlets.Float(0.0).tag(sync=True)
-    stats_max = traitlets.Float(0.0).tag(sync=True)
-    stats_min = traitlets.Float(0.0).tag(sync=True)
-    show_stats = traitlets.Bool(True).tag(sync=True)
-
-    # =========================================================================
-    # Detector Integration (BF/ADF overlays)
-    # =========================================================================
-    has_detector = traitlets.Bool(False).tag(sync=True)
-    center_x = traitlets.Float(0.0).tag(sync=True)
-    center_y = traitlets.Float(0.0).tag(sync=True)
-    bf_radius = traitlets.Float(0.0).tag(sync=True)
-    show_bf_overlay = traitlets.Bool(True).tag(sync=True)
-    show_adf_overlay = traitlets.Bool(False).tag(sync=True)
-    adf_inner_radius = traitlets.Float(0.0).tag(sync=True)
-    adf_outer_radius = traitlets.Float(0.0).tag(sync=True)
-
-    # =========================================================================
-    # Linked Scan View
-    # =========================================================================
-    show_scan_view = traitlets.Bool(False).tag(sync=True)
-    scan_mode = traitlets.Unicode("bf").tag(sync=True)  # 'bf', 'adf', 'custom'
-    scan_image_bytes = traitlets.Bytes(b"").tag(sync=True)
-
-    # =========================================================================
-    # Auto-Range (percentile scaling)
-    # =========================================================================
-    auto_range = traitlets.Bool(False).tag(sync=True)
-    percentile_low = traitlets.Float(1.0).tag(sync=True)
-    percentile_high = traitlets.Float(99.0).tag(sync=True)
+    center_x = traitlets.Float(0.0).tag(sync=True)  # Detector center X
+    center_y = traitlets.Float(0.0).tag(sync=True)  # Detector center Y
+    bf_radius = traitlets.Float(0.0).tag(sync=True)  # BF disk radius (pixels)
 
     # =========================================================================
     # ROI Drawing (for virtual imaging)
+    # roi_radius is multi-purpose by mode:
+    #   - circle: radius of circle
+    #   - square: half-size (distance from center to edge)
+    #   - annular: outer radius (roi_radius_inner = inner radius)
+    #   - rect: uses roi_width/roi_height instead
     # =========================================================================
     roi_active = traitlets.Bool(False).tag(sync=True)
-    roi_mode = traitlets.Unicode("point").tag(sync=True)  # 'point', 'circle', 'square', 'rect', or 'annular'
+    roi_mode = traitlets.Unicode("point").tag(sync=True)
     roi_center_x = traitlets.Float(0.0).tag(sync=True)
     roi_center_y = traitlets.Float(0.0).tag(sync=True)
-    roi_radius = traitlets.Float(10.0).tag(sync=True)  # Outer radius for circle/annular, half-width for square
-    roi_radius_inner = traitlets.Float(5.0).tag(sync=True)  # Inner radius for annular mode
-    roi_width = traitlets.Float(20.0).tag(sync=True)  # Width for rectangular mode
-    roi_height = traitlets.Float(10.0).tag(sync=True)  # Height for rectangular mode
-    roi_integrated_value = traitlets.Float(0.0).tag(sync=True)
-
-    # =========================================================================
-    # Mean Diffraction Pattern
-    # =========================================================================
-    mean_dp_bytes = traitlets.Bytes(b"").tag(sync=True)
-    show_mean_dp = traitlets.Bool(True).tag(sync=True)
-
-    # =========================================================================
-    # BF Image (Bright Field integrated image)
-    # =========================================================================
-    bf_image_bytes = traitlets.Bytes(b"").tag(sync=True)
-    show_bf_image = traitlets.Bool(True).tag(sync=True)
+    roi_radius = traitlets.Float(10.0).tag(sync=True)
+    roi_radius_inner = traitlets.Float(5.0).tag(sync=True)
+    roi_width = traitlets.Float(20.0).tag(sync=True)
+    roi_height = traitlets.Float(10.0).tag(sync=True)
 
     # =========================================================================
     # Virtual Image (ROI-based, updates as you drag ROI on DP)
@@ -181,8 +122,8 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     # Scale Bar
     # =========================================================================
-    pixel_size = traitlets.Float(1.0).tag(sync=True)  # nm per pixel (real-space)
-    det_pixel_size = traitlets.Float(1.0).tag(sync=True)  # mrad per pixel (k-space)
+    pixel_size = traitlets.Float(1.0).tag(sync=True)  # Å per pixel (real-space)
+    k_pixel_size = traitlets.Float(1.0).tag(sync=True)  # mrad per pixel (k-space)
 
     # =========================================================================
     # Path Animation (programmatic crosshair control)
@@ -195,43 +136,36 @@ class Show4DSTEM(anywidget.AnyWidget):
 
     def __init__(
         self,
-        data,
+        data: "Dataset4dstem | np.ndarray",
         scan_shape: tuple[int, int] | None = None,
-        detector: "Detector | None" = None,
-        pixel_size: float = 1.0,
-        det_pixel_size: float = 1.0,
+        pixel_size: float | None = None,
+        k_pixel_size: float | None = None,
         center: tuple[float, float] | None = None,
         bf_radius: float | None = None,
-        log_scale: bool = True,
-        auto_range: bool = False,
-        percentile_low: float = 1.0,
-        percentile_high: float = 99.0,
-        path_points: list[tuple[int, int]] | None = None,
-        path_interval_ms: int = 100,
-        path_loop: bool = True,
+        log_scale: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        self._log_scale = log_scale
         self.log_scale = log_scale
-        self.auto_range = auto_range
-        self.percentile_low = percentile_low
-        self.percentile_high = percentile_high
-        
-        # Store calibration values
-        self.pixel_size = pixel_size
-        self.det_pixel_size = det_pixel_size
-        
-        # Path animation settings
-        self._path_points: list[tuple[int, int]] = path_points or []
-        self.path_length = len(self._path_points)
-        self.path_interval_ms = path_interval_ms
-        self.path_loop = path_loop
 
+        # Extract calibration from Dataset4dstem if provided
+        if hasattr(data, "sampling") and hasattr(data, "array"):
+            # Dataset4dstem: extract calibration and array
+            # sampling = [scan_x, scan_y, det_x, det_y]
+            if pixel_size is None:
+                pixel_size = float(data.sampling[0])
+            if k_pixel_size is None:
+                k_pixel_size = float(data.sampling[2])
+            data = data.array
+
+        # Store calibration values (default to 1.0 if not provided)
+        self.pixel_size = pixel_size if pixel_size is not None else 1.0
+        self.k_pixel_size = k_pixel_size if k_pixel_size is not None else 1.0
+        # Path animation (configured via set_path() or raster())
+        self._path_points: list[tuple[int, int]] = []
         # Convert to NumPy
         self._data = to_numpy(data)
-
         # Handle flattened data
         if data.ndim == 3:
             if scan_shape is not None:
@@ -257,61 +191,34 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.shape_y = self._scan_shape[1]
         self.det_x = self._det_shape[0]
         self.det_y = self._det_shape[1]
-
         # Initial position at center
         self.pos_x = self.shape_x // 2
         self.pos_y = self.shape_y // 2
-
         # Precompute global range for consistent scaling
         self._compute_global_range()
-
-        # Setup center and BF radius: detector > user params > defaults
-        if detector is not None:
-            # Use Detector object for calibration
-            det_center = detector.center
-            self.center_x = float(det_center[0])
-            self.center_y = float(det_center[1])
-            self.bf_radius = float(detector.bf_radius)
-        elif center is not None:
-            # Use user-provided center
+        # Setup center and BF/ADF radii based on detector size
+        det_size = min(self.det_x, self.det_y)
+        if center is not None:
             self.center_x = float(center[0])
             self.center_y = float(center[1])
-            det_size = min(self.det_x, self.det_y)
-            self.bf_radius = float(bf_radius) if bf_radius is not None else det_size * DEFAULT_BF_RATIO
         else:
-            # Default to detector center
             self.center_x = float(self.det_y / 2)
             self.center_y = float(self.det_x / 2)
-            det_size = min(self.det_x, self.det_y)
-            self.bf_radius = float(bf_radius) if bf_radius is not None else det_size * DEFAULT_BF_RATIO
-        
-        # Set ADF defaults based on detector size
-        det_size = min(self.det_x, self.det_y)
-        self.adf_inner_radius = det_size * DEFAULT_ADF_INNER_RATIO
-        self.adf_outer_radius = det_size * DEFAULT_ADF_OUTER_RATIO
-        self.has_detector = True
+        self.bf_radius = float(bf_radius) if bf_radius is not None else det_size * DEFAULT_BF_RATIO
 
-        # Compute mean DP and BF image (sent once on init)
-        self._compute_mean_dp()
-        self._compute_bf_image()
-        
         # Pre-compute and cache common virtual images (BF, ABF, LAADF, HAADF)
         self._cached_bf_virtual = None
         self._cached_abf_virtual = None
         self._cached_laadf_virtual = None
         self._cached_haadf_virtual = None
         self._precompute_common_virtual_images()
-        
+
         # Update frame when position or settings change
-        self.observe(self._update_frame, names=[
-            "pos_x", "pos_y", "log_scale", "auto_range",
-            "percentile_low", "percentile_high"
-        ])
+        self.observe(self._update_frame, names=["pos_x", "pos_y", "log_scale"])
         self.observe(self._on_roi_change, names=[
-            "roi_center_x", "roi_center_y", "roi_radius", "roi_radius_inner", 
+            "roi_center_x", "roi_center_y", "roi_radius", "roi_radius_inner",
             "roi_active", "roi_mode", "roi_width", "roi_height"
         ])
-        self.observe(self._on_scan_mode_change, names=["scan_mode", "show_scan_view"])
         
         # Initialize default ROI at BF center
         self.roi_center_x = self.center_x
@@ -330,19 +237,36 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Path animation: observe index changes from frontend
         self.observe(self._on_path_index_change, names=["path_index"])
 
+    def __repr__(self) -> str:
+        return (
+            f"Show4DSTEM(shape=({self.shape_x}, {self.shape_y}, {self.det_x}, {self.det_y}), "
+            f"sampling=({self.pixel_size} Å, {self.k_pixel_size} mrad), "
+            f"pos=({self.pos_x}, {self.pos_y}))"
+        )
+
     # =========================================================================
-    # Array Utilities
+    # Convenience Properties
     # =========================================================================
-    
-    @staticmethod
-    def _to_cpu(arr):
-        """Convert array to CPU (NumPy)."""
-        return np.asarray(arr)
-    
-    @staticmethod
-    def _to_scalar(val):
-        """Convert scalar value to Python float."""
-        return float(val)
+
+    @property
+    def position(self) -> tuple[int, int]:
+        """Current scan position as (x, y) tuple."""
+        return (self.pos_x, self.pos_y)
+
+    @position.setter
+    def position(self, value: tuple[int, int]) -> None:
+        """Set scan position from (x, y) tuple."""
+        self.pos_x, self.pos_y = value
+
+    @property
+    def scan_shape(self) -> tuple[int, int]:
+        """Scan dimensions as (shape_x, shape_y) tuple."""
+        return (self.shape_x, self.shape_y)
+
+    @property
+    def detector_shape(self) -> tuple[int, int]:
+        """Detector dimensions as (det_x, det_y) tuple."""
+        return (self.det_x, self.det_y)
 
     # =========================================================================
     # Path Animation Methods
@@ -350,81 +274,42 @@ class Show4DSTEM(anywidget.AnyWidget):
     
     def set_path(
         self,
-        points: list[tuple[int, int]] | None = None,
-        generator: "Callable[[int, int, int], tuple[int, int]] | None" = None,
-        n_frames: int | None = None,
-        interval_ms: int | None = None,
-        loop: bool | None = None,
+        points: list[tuple[int, int]],
+        interval_ms: int = 100,
+        loop: bool = True,
         autoplay: bool = True,
     ) -> "Show4DSTEM":
         """
-        Set a path of scan positions to animate through.
-        
-        You can provide either a list of points OR a generator function.
-        
+        Set a custom path of scan positions to animate through.
+
         Parameters
         ----------
-        points : list[tuple[int, int]], optional
+        points : list[tuple[int, int]]
             List of (x, y) scan positions to visit.
-        generator : callable, optional
-            Custom function with signature `f(index, shape_x, shape_y) -> (x, y)`.
-            Called for each frame to get the next position.
-        n_frames : int, optional
-            Number of frames when using generator. Required if using generator.
-        interval_ms : int, optional
-            Time between frames in milliseconds. Default 100ms.
-        loop : bool, optional
-            Whether to loop when reaching end. Default True.
+        interval_ms : int, default 100
+            Time between frames in milliseconds.
+        loop : bool, default True
+            Whether to loop when reaching end.
         autoplay : bool, default True
             Start playing immediately.
-            
+
         Returns
         -------
         Show4DSTEM
             Self for method chaining.
-            
+
         Examples
         --------
-        >>> # Option 1: List of points
-        >>> path = [(0, 0), (10, 10), (20, 20), (30, 30)]
-        >>> widget.set_path(points=path)
-        
-        >>> # Option 2: Custom generator function
-        >>> def my_path(i, sx, sy):
-        ...     # Random walk
-        ...     import random
-        ...     return (random.randint(0, sx-1), random.randint(0, sy-1))
-        >>> widget.set_path(generator=my_path, n_frames=100)
-        
-        >>> # Option 3: Lambda for quick patterns
-        >>> widget.set_path(
-        ...     generator=lambda i, sx, sy: (i % sx, (i * 3) % sy),
-        ...     n_frames=200
-        ... )
+        >>> widget.set_path([(0, 0), (10, 10), (20, 20), (30, 30)])
+        >>> widget.set_path([(i, i) for i in range(48)], interval_ms=50)
         """
-        if generator is not None:
-            # Use generator function to create points
-            if n_frames is None:
-                n_frames = 100  # Default
-            self._path_points = [
-                generator(i, self.shape_x, self.shape_y) 
-                for i in range(n_frames)
-            ]
-        elif points is not None:
-            self._path_points = list(points)
-        else:
-            raise ValueError("Must provide either 'points' or 'generator'")
-            
+        self._path_points = list(points)
         self.path_length = len(self._path_points)
         self.path_index = 0
-        
-        if interval_ms is not None:
-            self.path_interval_ms = interval_ms
-        if loop is not None:
-            self.path_loop = loop
+        self.path_interval_ms = interval_ms
+        self.path_loop = loop
         if autoplay and self.path_length > 0:
             self.path_playing = True
-            
         return self
     
     def play(self) -> "Show4DSTEM":
@@ -462,13 +347,19 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     # Path Animation Patterns
     # =========================================================================
-    
-    def play_raster(self, step: int = 1, bidirectional: bool = False) -> "Show4DSTEM":
+
+    def raster(
+        self,
+        step: int = 1,
+        bidirectional: bool = False,
+        interval_ms: int = 100,
+        loop: bool = True,
+    ) -> "Show4DSTEM":
         """
         Play a raster scan path (row by row, left to right).
-        
+
         This mimics real STEM scanning: left→right, step down, left→right, etc.
-        
+
         Parameters
         ----------
         step : int, default 1
@@ -476,7 +367,11 @@ class Show4DSTEM(anywidget.AnyWidget):
         bidirectional : bool, default False
             If True, use snake/boustrophedon pattern (alternating direction).
             If False (default), always scan left→right like real STEM.
-            
+        interval_ms : int, default 100
+            Time between frames in milliseconds.
+        loop : bool, default True
+            Whether to loop when reaching the end.
+
         Returns
         -------
         Show4DSTEM
@@ -489,13 +384,13 @@ class Show4DSTEM(anywidget.AnyWidget):
                 row = row[::-1]  # Alternate direction for snake pattern
             for y in row:
                 points.append((x, y))
-        return self.set_path(points=points)
+        return self.set_path(points=points, interval_ms=interval_ms, loop=loop)
     
     # =========================================================================
     # ROI Mode Methods
     # =========================================================================
     
-    def set_roi_circle(self, radius: float | None = None) -> "Show4DSTEM":
+    def roi_circle(self, radius: float | None = None) -> "Show4DSTEM":
         """
         Switch to circle ROI mode for virtual imaging.
         
@@ -515,15 +410,15 @@ class Show4DSTEM(anywidget.AnyWidget):
             
         Examples
         --------
-        >>> widget.set_roi_circle(20)  # 20px radius circle
-        >>> widget.set_roi_circle()    # Use default radius
+        >>> widget.roi_circle(20)  # 20px radius circle
+        >>> widget.roi_circle()    # Use default radius
         """
         self.roi_mode = "circle"
         if radius is not None:
             self.roi_radius = float(radius)
         return self
     
-    def set_roi_point(self) -> "Show4DSTEM":
+    def roi_point(self) -> "Show4DSTEM":
         """
         Switch to point ROI mode (single-pixel indexing).
         
@@ -538,35 +433,36 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.roi_mode = "point"
         return self
 
-    def set_roi_square(self, size: float | None = None) -> "Show4DSTEM":
+    def roi_square(self, half_size: float | None = None) -> "Show4DSTEM":
         """
         Switch to square ROI mode for virtual imaging.
-        
+
         In square mode, the virtual image integrates over a square region
         centered at the current ROI position.
-        
+
         Parameters
         ----------
-        size : float, optional
+        half_size : float, optional
             Half-size of the square in pixels (distance from center to edge).
+            A half_size of 15 creates a 30x30 pixel square.
             If not provided, uses current roi_radius value.
-            
+
         Returns
         -------
         Show4DSTEM
             Self for method chaining.
-            
+
         Examples
         --------
-        >>> widget.set_roi_square(15)  # 30x30 pixel square
-        >>> widget.set_roi_square()    # Use default size
+        >>> widget.roi_square(15)  # 30x30 pixel square (half_size=15)
+        >>> widget.roi_square()    # Use default size
         """
         self.roi_mode = "square"
-        if size is not None:
-            self.roi_radius = float(size)
+        if half_size is not None:
+            self.roi_radius = float(half_size)
         return self
 
-    def set_roi_annular(
+    def roi_annular(
         self, inner_radius: float | None = None, outer_radius: float | None = None
     ) -> "Show4DSTEM":
         """
@@ -586,8 +482,8 @@ class Show4DSTEM(anywidget.AnyWidget):
             
         Examples
         --------
-        >>> widget.set_roi_annular(20, 50)  # ADF: inner=20px, outer=50px
-        >>> widget.set_roi_annular(30, 80)  # HAADF: larger angles
+        >>> widget.roi_annular(20, 50)  # ADF: inner=20px, outer=50px
+        >>> widget.roi_annular(30, 80)  # HAADF: larger angles
         """
         self.roi_mode = "annular"
         if inner_radius is not None:
@@ -596,7 +492,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             self.roi_radius = float(outer_radius)
         return self
 
-    def set_roi_rect(
+    def roi_rect(
         self, width: float | None = None, height: float | None = None
     ) -> "Show4DSTEM":
         """
@@ -616,8 +512,8 @@ class Show4DSTEM(anywidget.AnyWidget):
             
         Examples
         --------
-        >>> widget.set_roi_rect(30, 20)  # 30px wide, 20px tall
-        >>> widget.set_roi_rect(40, 40)  # 40x40 rectangle
+        >>> widget.roi_rect(30, 20)  # 30px wide, 20px tall
+        >>> widget.roi_rect(40, 40)  # 40x40 rectangle
         """
         self.roi_mode = "rect"
         if width is not None:
@@ -639,26 +535,19 @@ class Show4DSTEM(anywidget.AnyWidget):
         ]
         
         all_min, all_max = float("inf"), float("-inf")
-        all_values = []
         for x, y in samples:
             frame = self._get_frame(x, y)
             fmin = float(frame.min())
             fmax = float(frame.max())
             all_min = min(all_min, fmin)
             all_max = max(all_max, fmax)
-            
-            # Sample values for percentile estimation
-            all_values.append(self._to_cpu(frame).flatten()[::100])
-        
+
         self._global_min = max(all_min, 1e-10)
         self._global_max = all_max
-        
+
         # Precompute log range
         self._log_min = np.log1p(self._global_min)
         self._log_max = np.log1p(self._global_max)
-        
-        # Store sampled values for percentile computation
-        self._sampled_values = np.concatenate(all_values)
 
     def _get_frame(self, x: int, y: int):
         """Get single diffraction frame at position (x, y)."""
@@ -668,36 +557,15 @@ class Show4DSTEM(anywidget.AnyWidget):
         else:
             return self._data[x, y]
 
-    def _compute_percentile_range(self, frame):
-        """Compute percentile-based range for a frame."""
-        
-        # Use NumPy for percentile (faster for small arrays)
-        frame_np = self._to_cpu(frame).flatten()
-        
-        vmin = float(np.percentile(frame_np, self.percentile_low))
-        vmax = float(np.percentile(frame_np, self.percentile_high))
-        return max(vmin, 1e-10), vmax
-
     def _update_frame(self, change=None):
-        """Send pre-normalized uint8 frame to frontend with stats."""
+        """Send pre-normalized uint8 frame to frontend."""
         frame = self._get_frame(self.pos_x, self.pos_y)
 
-        # Compute stats
-        self.stats_mean = self._to_scalar(frame.mean())
-        self.stats_max = self._to_scalar(frame.max())
-        self.stats_min = self._to_scalar(frame.min())
-
         # Determine value range
-        if self.auto_range:
-            vmin, vmax = self._compute_percentile_range(frame)
-            if self.log_scale:
-                vmin = np.log1p(vmin)
-                vmax = np.log1p(vmax)
+        if self.log_scale:
+            vmin, vmax = self._log_min, self._log_max
         else:
-            if self.log_scale:
-                vmin, vmax = self._log_min, self._log_max
-            else:
-                vmin, vmax = self._global_min, self._global_max
+            vmin, vmax = self._global_min, self._global_max
 
         # Apply log scale if enabled
         if self.log_scale:
@@ -716,106 +584,10 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.frame_bytes = normalized.tobytes()
 
     def _on_roi_change(self, change=None):
-        """Compute integrated value when ROI changes."""
-        # Skip if ROI is not active or has no valid size
+        """Recompute virtual image when ROI changes."""
         if not self.roi_active:
-            self.roi_integrated_value = 0.0
             return
-        
-        # For circle/square/annular modes, need positive radius
-        if self.roi_mode in ("circle", "square", "annular") and self.roi_radius <= 0:
-            self.roi_integrated_value = 0.0
-            return
-        
-        frame = self._get_frame(self.pos_x, self.pos_y)
-        
-        # Create mask based on ROI mode
-        if self.roi_mode == "circle" and self.roi_radius > 0:
-            mask = self._create_circular_mask(
-                self.roi_center_x, self.roi_center_y, self.roi_radius
-            )
-        elif self.roi_mode == "square" and self.roi_radius > 0:
-            mask = self._create_square_mask(
-                self.roi_center_x, self.roi_center_y, self.roi_radius
-            )
-        elif self.roi_mode == "annular" and self.roi_radius > 0:
-            mask = self._create_annular_mask(
-                self.roi_center_x, self.roi_center_y,
-                self.roi_radius_inner, self.roi_radius
-            )
-        elif self.roi_mode == "rect" and self.roi_width > 0 and self.roi_height > 0:
-            mask = self._create_rect_mask(
-                self.roi_center_x, self.roi_center_y,
-                self.roi_width / 2, self.roi_height / 2
-            )
-        else:
-            # Point mode: no mask, just single pixel
-            self.roi_integrated_value = 0.0
-            self._compute_virtual_image_from_roi()
-            return
-        
-        # Compute integrated value (use multiplication to avoid indexing issues)
-        integrated = self._to_scalar((frame * mask).sum())
-        self.roi_integrated_value = integrated
-        
-        # Fast path: check if we can use cached preset
-        cached = self._get_cached_preset()
-        if cached is not None:
-            self.virtual_image_bytes = cached
-            return
-        
-        # Real-time update using fast masked sum
         self._compute_virtual_image_from_roi()
-
-    def _on_scan_mode_change(self, change=None):
-        """Recompute scan image when mode changes."""
-        if self.show_scan_view and self.has_detector:
-            self._compute_scan_image()
-
-    def _compute_scan_image(self):
-        """Compute virtual detector image (BF or ADF)."""
-        
-        # Get appropriate mask
-        if self.scan_mode == "bf":
-            mask = self._create_circular_mask(
-                self.center_x, self.center_y, self.bf_radius
-            )
-        elif self.scan_mode == "adf":
-            mask = self._create_annular_mask(
-                self.center_x, self.center_y,
-                self.adf_inner_radius, self.adf_outer_radius
-            )
-        else:
-            # Custom ROI mask
-            if self.roi_active and self.roi_radius > 0:
-                mask = self._create_circular_mask(
-                    self.roi_center_x, self.roi_center_y, self.roi_radius
-                )
-            else:
-                return
-        
-        # Compute integrated image
-        if self._data.ndim == 4:
-            # (Rx, Ry, Qx, Qy) -> Apply mask and sum
-            scan_image = (self._data * mask).sum(axis=(-2, -1))
-        else:
-            # (N, Qx, Qy) -> reshape and sum
-            scan_image = (self._data * mask).sum(axis=(-2, -1))
-            scan_image = scan_image.reshape(self._scan_shape)
-        
-        # Normalize to uint8
-        smin = self._to_scalar(scan_image.min())
-        smax = self._to_scalar(scan_image.max())
-        
-        if smax > smin:
-            normalized = np.clip((scan_image - smin) / (smax - smin) * 255, 0, 255)
-            normalized = normalized.astype(np.uint8)
-        else:
-            normalized = np.zeros(scan_image.shape, dtype=np.uint8)
-        
-        normalized = self._to_cpu(normalized)
-        
-        self.scan_image_bytes = normalized.tobytes()
 
     def _create_circular_mask(self, cx: float, cy: float, radius: float):
         """Create circular mask (boolean)."""
@@ -844,64 +616,19 @@ class Show4DSTEM(anywidget.AnyWidget):
         mask = (np.abs(x - cx) <= half_width) & (np.abs(y - cy) <= half_height)
         return mask
 
-    def _compute_mean_dp(self):
-        """Compute and send mean diffraction pattern."""
-        if self._data.ndim == 4:
-            mean_dp = self._data.mean(axis=(0, 1))
-        else:
-            mean_dp = self._data.mean(axis=0)
-        # Log scale
-        mean_dp = np.log1p(mean_dp)
-        # Normalize to uint8
-        mean_dp_cpu = self._to_cpu(mean_dp)
-        vmin, vmax = float(mean_dp_cpu.min()), float(mean_dp_cpu.max())
-        if vmax > vmin:
-            normalized = np.clip((mean_dp_cpu - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
-        else:
-            normalized = np.zeros(mean_dp_cpu.shape, dtype=np.uint8)
-        self.mean_dp_bytes = normalized.tobytes()
-
-    def _compute_bf_image(self):
-        """Compute BF integrated image using detected probe."""
-        
-        # Create BF mask
-        mask = self._create_circular_mask(self.center_x, self.center_y, self.bf_radius)
-        
-        # Compute integrated BF image
-        if self._data.ndim == 4:
-            bf_image = (self._data * mask).sum(axis=(-2, -1))
-        else:
-            bf_image = (self._data * mask).sum(axis=(-2, -1))
-            bf_image = bf_image.reshape(self._scan_shape)
-        
-        # Normalize to uint8
-        vmin = self._to_scalar(bf_image.min())
-        vmax = self._to_scalar(bf_image.max())
-        
-        if vmax > vmin:
-            normalized = np.clip((bf_image - vmin) / (vmax - vmin) * 255, 0, 255)
-            normalized = normalized.astype(np.uint8)
-        else:
-            normalized = np.zeros(bf_image.shape, dtype=np.uint8)
-        
-        normalized = self._to_cpu(normalized)
-        
-        self.bf_image_bytes = normalized.tobytes()
-
     def _precompute_common_virtual_images(self):
         """Pre-compute BF/ABF/LAADF/HAADF virtual images for instant mode switching."""
-        
         def _compute_and_normalize(mask):
             if self._data.ndim == 4:
                 img = (self._data * mask).sum(axis=(-2, -1))
             else:
                 img = (self._data * mask).sum(axis=(-2, -1)).reshape(self._scan_shape)
-            vmin, vmax = self._to_scalar(img.min()), self._to_scalar(img.max())
+            vmin, vmax = float(img.min()), float(img.max())
             if vmax > vmin:
                 norm = np.clip((img - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
             else:
                 norm = np.zeros(img.shape, dtype=np.uint8)
-            return self._to_cpu(norm).tobytes()
+            return norm.tobytes()
         
         # BF: circle at bf_radius
         bf_mask = self._create_circular_mask(self.center_x, self.center_y, self.bf_radius)
@@ -1001,25 +728,20 @@ class Show4DSTEM(anywidget.AnyWidget):
             )
             virtual_image = self._fast_masked_sum(mask)
         else:
-            # Point mode: single-pixel indexing - O(1) on GPU!
-            kx = int(max(0, min(self._det_shape[0] - 1, round(self.roi_center_y))))
-            ky = int(max(0, min(self._det_shape[1] - 1, round(self.roi_center_x))))
-            
+            # Point mode: single-pixel indexing
+            # Array indexing: [row, col] where row=det_y, col=det_x in image coords
+            row = int(max(0, min(self._det_shape[0] - 1, round(self.roi_center_y))))
+            col = int(max(0, min(self._det_shape[1] - 1, round(self.roi_center_x))))
             if self._data.ndim == 4:
-                virtual_image = self._data[:, :, kx, ky]
+                virtual_image = self._data[:, :, row, col]
             else:
-                virtual_image = self._data[:, kx, ky].reshape(self._scan_shape)
-        
+                virtual_image = self._data[:, row, col].reshape(self._scan_shape)
+
         # Normalize to uint8
-        vmin = self._to_scalar(virtual_image.min())
-        vmax = self._to_scalar(virtual_image.max())
-        
+        vmin, vmax = float(virtual_image.min()), float(virtual_image.max())
         if vmax > vmin:
             normalized = np.clip((virtual_image - vmin) / (vmax - vmin) * 255, 0, 255)
             normalized = normalized.astype(np.uint8)
         else:
             normalized = np.zeros(virtual_image.shape, dtype=np.uint8)
-        
-        normalized_cpu = self._to_cpu(normalized)
-        
-        self.virtual_image_bytes = normalized_cpu.tobytes()
+        self.virtual_image_bytes = normalized.tobytes()
