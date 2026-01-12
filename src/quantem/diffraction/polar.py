@@ -582,7 +582,7 @@ class PairDistributionFunction(AutoSerialize):
             similar to ⟨f⟩²(k)
         """
 
-        k = self.qq * 0.01488
+        k = self.qq
 
         int_mean = np.mean(Ik)
         k2 = k**2
@@ -742,8 +742,7 @@ class PairDistributionFunction(AutoSerialize):
         if k_width.size == 1:
             k_width = k_width * np.ones(2)
 
-        # BUG: make calibration automatic
-        k = self.qq * 0.01488
+        k = self.qq
         dk = k[1] - k[0]
 
         self.kmax = k_max if k_max is not None else k.max()
@@ -898,8 +897,7 @@ class PairDistributionFunction(AutoSerialize):
         if self.Sk is None or self.reduced_pdf is None or self.r is None:
             raise RuntimeError("Run calculate_pair_dist_function() before estimate_density().")
 
-        # BUG: make calibration automatic
-        k = self.qq * 0.01488  # convert from 1/Angstrom to Angstrom^-1
+        k = self.qq
         dk = k[1] - k[0]
         k_fit_mask = k >= self.kmin
         k_fit = k[k_fit_mask]
@@ -1093,7 +1091,7 @@ class PairDistributionFunction(AutoSerialize):
         if self.radial_mean is None:
             raise RuntimeError("Radial mean intensity has not been calculated yet.")
 
-        x = np.asarray(self.qq * 0.01488)
+        x = np.asarray(self.qq)
         y = np.asarray(self.radial_mean)
         x, y = self._apply_xrange(x, y, qmin, qmax)
 
@@ -1103,9 +1101,10 @@ class PairDistributionFunction(AutoSerialize):
         ax.set_ylabel("Intensity (a.u.)")
         ax.set_title("Radial Mean Intensity vs Scattering Vector")
         ax.legend()
-        ylim = self._auto_ylim_after_direct_beam_trough(self.radial_mean, scale=2.0)
-        if ylim is not None:
-            ax.set_ylim(*ylim)
+        ax.set_yscale("log")
+        # ylim = self._auto_ylim_after_direct_beam_trough(self.radial_mean, scale=2.0)
+        # if ylim is not None:
+        #     ax.set_ylim(*ylim)
         plt.tight_layout()
 
         if returnfig:
@@ -1138,10 +1137,10 @@ class PairDistributionFunction(AutoSerialize):
         if self.Ik is None or self.bg is None:
             raise RuntimeError("Radial mean intensity or background has not been calculated yet.")
 
-        x = np.asarray(self.qq * 0.01488)
+        x = np.asarray(self.qq)
         y1 = np.asarray(self.radial_mean)
         x, y1 = self._apply_xrange(x, y1, qmin, qmax)
-        x = np.asarray(self.qq * 0.01488)
+        x = np.asarray(self.qq)
         y2 = np.asarray(self.bg)
         x, y2 = self._apply_xrange(x, y2, qmin, qmax)
 
@@ -1152,10 +1151,11 @@ class PairDistributionFunction(AutoSerialize):
         ax.set_ylabel("Intensity (a.u.)")
         ax.set_title("Radial Mean Intensity and Background Fit")
         ax.legend()
+        ax.set_yscale("log")
         plt.tight_layout()
-        ylim = self._auto_ylim_after_direct_beam_trough(self.radial_mean, scale=2.0)
-        if ylim is not None:
-            ax.set_ylim(*ylim)
+        # ylim = self._auto_ylim_after_direct_beam_trough(self.radial_mean, scale=2.0)
+        # if ylim is not None:
+        #     ax.set_ylim(*ylim)
 
         if returnfig:
             return fig
@@ -1181,7 +1181,7 @@ class PairDistributionFunction(AutoSerialize):
         if Fk is None:
             Fk = self.Fk_masked
 
-        x = np.asarray(self.qq * 0.01488)
+        x = np.asarray(self.qq)
         y = np.asarray(Fk)
         x, y = self._apply_xrange(x, y, qmin, qmax)
 
@@ -1292,7 +1292,7 @@ class PairDistributionFunction(AutoSerialize):
         figsize: tuple[float, float] = (8, 4),
         returnfig: bool = False,
     ):
-        k = np.asarray(self.qq * 0.1488)
+        k = np.asarray(self.qq)
 
         fig, axes = plt.subplots(2, 2, figsize=figsize)
 
