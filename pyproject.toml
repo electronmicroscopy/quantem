@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 addopts = [
     "--import-mode=importlib",
 ]
-testpaths = "tests"
+testpaths = ["tests", "widget/tests"]
 
 [tool.ruff.lint]
 select = ["E4","E7","E9","F","I"]
@@ -20,6 +20,12 @@ line-length = 99
 
 [tool.uv]
 config-settings = { editable_mode = "compat" }
+
+[tool.uv.workspace]
+members = ["widget"]
+
+[tool.uv.sources]
+"quantem.widget" = { workspace = true }
 
 [project]
 name = "quantem"
@@ -45,10 +51,14 @@ dependencies = [
   "torchvision>=0.22.1",
   "tensorboard>=2.19.0",
   "torchmetrics>=1.7.3",
-  "torchsummary>=1.5.1",
   "optuna>=4.5.0",
   "hdf5plugin>=6.0.0",
   "torchinfo>=1.8.0",
+]
+
+[project.optional-dependencies]
+widgets = [
+    "quantem.widget",
 ]
 
 [tool.hatch.build.targets.sdist]
