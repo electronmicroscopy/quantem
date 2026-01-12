@@ -497,8 +497,10 @@ def show_2d(
     -------
     fig : Figure
         The matplotlib figure object.
-    axs : ndarray of Axes
-        The matplotlib axes objects. If multiple arrays are displayed, this is a 2D array.
+    axs : Axes | ndarray of Axes
+        - If a single image is shown, a single Axes instance.
+        - If a single row or column of images is shown, a 1D ndarray of Axes.
+        - If a grid of images is shown, a 2D ndarray of Axes.
 
     Raises
     ------
@@ -516,7 +518,6 @@ def show_2d(
             raise ValueError()
         fig, axs = _show_2d_combined(grid[0], figax=figax, **kwargs)  # TODO pass args here
     else:
-        # Normalize all arguments to grid format
         normalized_args = _normalize_show_args_to_grid(
             shape=(nrows, ncols),
             norm=norm,
@@ -542,31 +543,33 @@ def show_2d(
 
         for i, row in enumerate(grid):
             for j, array in enumerate(row):
-                figax = (fig, axs[i][j])
+                figax_local = (fig, axs[i][j])
                 _show_2d_array(
                     array,
-                    figax=figax,
-                    **normalized_args[i][j],  # Unpack the arguments for this subplot
+                    figax=figax_local,
+                    **normalized_args[i][j],
                     **kwargs,
                 )
 
-        # Hide unused axes in incomplete rows
         for i, row in enumerate(grid):
             for j in range(len(row), ncols):
                 axs[i][j].axis("off")  # type: ignore
 
-        if kwargs.get("tight_layout", True):
-            with warnings.catch_warnings():  # suppress warning about tight_layout
-                warnings.simplefilter("ignore")
-                fig.tight_layout()
-
-        # Squeeze the axes to the expected shape
-        if axs.shape == (1, 1):
-            axs = axs[0, 0]
-        elif axs.shape[0] == 1:
-            axs = axs[0]
-        elif axs.shape[1] == 1:
-            axs = axs[:, 0]
+        # Safe layout handling: only adjust layout if we created the figure
+        tight_layout = kwargs.get("tight_layout", True)
+        if figax is None and tight_layout:
+            only_subplots = all(
+                getattr(ax, "get_subplotspec", lambda: None)() is not None for ax in fig.axes
+            )
+            if only_subplots:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    fig.tight_layout()
+            else:
+                fig.subplots_adjust(
+                    wspace=kwargs.get("wspace", 0.25),
+                    hspace=kwargs.get("hspace", 0.25),
+                )
 
     if kwargs.get("force_show", False):
         plt.show()
@@ -580,4 +583,15 @@ def show_2d(
             dpi=kwargs.get("dpi", 300),
         )
 
-    return fig, axs
+    # Normalize axs return shape for easier downstream use
+    if isinstance(axs, np.ndarray):
+        if axs.size == 1:
+            axs_out: Any = axs[0, 0]
+        elif axs.ndim == 2 and (axs.shape[0] == 1 or axs.shape[1] == 1):
+            axs_out = axs.ravel()
+        else:
+            axs_out = axs
+    else:
+        axs_out = axs
+
+    return fig, axs_out

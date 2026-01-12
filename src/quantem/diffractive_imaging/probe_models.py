@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from typing import Any, Callable, Self, Union
+from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,7 +17,7 @@ from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.loss_functions import get_loss_function
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
-from quantem.core.utils.utils import to_numpy
+from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.core.utils.validators import (
     validate_arr_gt,
     validate_array,
@@ -57,6 +58,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self,
         num_probes: int = 1,
         probe_params: dict = {},
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         roi_shape: tuple[int, int] | np.ndarray | None = None,
         device: DeviceType = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -80,6 +83,14 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self.probe_params = probe_params
         self._constraints = {}
         self.rng = rng
+        self._probe_tilt = nn.Parameter(
+            torch.tensor(probe_tilt, dtype=getattr(torch, config.get("dtype_real"))),
+            requires_grad=learn_probe_tilt,
+        )
+        self.learn_probe_tilt = learn_probe_tilt
+        self._initial_probe_tilt = torch.tensor(
+            probe_tilt, dtype=getattr(torch, config.get("dtype_real"))
+        )
         if roi_shape is not None:
             self.roi_shape = roi_shape
 
@@ -93,6 +104,31 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         except NotImplementedError:
             # This happens when params is not implemented yet in abstract base
             return []
+
+    @property
+    def learn_probe_tilt(self) -> bool:
+        return self._learn_probe_tilt
+
+    @learn_probe_tilt.setter
+    def learn_probe_tilt(self, learn_probe_tilt: bool):
+        with torch.no_grad():
+            self._learn_probe_tilt = bool(learn_probe_tilt)
+            self._probe_tilt.requires_grad = learn_probe_tilt
+
+    @property
+    def probe_tilt(self) -> nn.Parameter:
+        """tilt of the probe in mrad"""
+        return self._probe_tilt
+
+    @probe_tilt.setter
+    def probe_tilt(self, tilt: torch.Tensor | tuple[float, float]):
+        tilt = validate_tensor(
+            tilt,
+            name="probe_tilt",
+            dtype=getattr(torch, config.get("dtype_real")),
+            shape=(2,),
+        )
+        self._probe_tilt.data = tilt.to(self.device)
 
     @property
     def shape(self) -> np.ndarray:
@@ -163,7 +199,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
             return polar_parameters
 
-        polar_parameters = set_aberrations(params.copy(), self._max_aberrations_order)
+        polar_parameters = set_aberrations(deepcopy(params), self._max_aberrations_order)
         params["aberration_coefs"] = polar_parameters
         self._probe_params = self.DEFAULT_PROBE_PARAMS | self._probe_params | params
 
@@ -260,9 +296,12 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         raise NotImplementedError()
 
     @property
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
-        raise NotImplementedError()
+        params = []
+        if self.learn_probe_tilt:
+            params.append(self.probe_tilt)
+        return params
 
     @property
     def model_input(self):
@@ -273,12 +312,11 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         """Get probe positions"""
         raise NotImplementedError()
 
-    @abstractmethod
     def reset(self):
         """Reset the probe"""
-        raise NotImplementedError()
+        self.probe_tilt = self._initial_probe_tilt.clone().to(self.device)
 
-    def _initialize_probe(
+    def set_initial_probe(
         self,
         roi_shape: np.ndarray | tuple,
         reciprocal_sampling: np.ndarray,
@@ -334,6 +372,59 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         raise NotImplementedError(
             f"Analytical gradients are not implemented for {Self}, use autograd=True"
         )
+
+    def _compute_propagator_arrays(
+        self,
+        sampling: tuple[float, float] | np.ndarray,
+        num_slices: int,
+        slice_thicknesses: torch.Tensor | np.ndarray,
+    ) -> torch.Tensor:
+        """
+        Precomputes propagator arrays complex wave-function will be convolved by,
+        for all slice thicknesses.
+
+        Parameters
+        ----------
+        sampling: tuple[float, float] | np.ndarray
+            sampling of the probe in pixels
+        num_slices: int
+            number of slices
+        slice_thicknesses: torch.Tensor | np.ndarray
+            thickness of each slice in angstrom
+
+        Returns
+        -------
+        propagators: torch.Tensor
+            (T,Sr,Sc) shape array storing propagator arrays
+        """
+
+        if num_slices == 1:
+            return torch.tensor([])
+
+        kr, kc = tuple(
+            torch.fft.fftfreq(n, d, device=self.device) for n, d in zip(self.roi_shape, sampling)
+        )
+        k2 = (kr[:, None] ** 2 + kc[None] ** 2).to(torch.complex64)  # broadcasting to (Sr, Sc)
+        probe_energy = self.probe_params["energy"]
+        if probe_energy is None:
+            raise ValueError("probe_model energy must be set to compute propagators.")
+        wavelength = electron_wavelength_angstrom(probe_energy)
+        propagators = torch.empty(
+            (num_slices - 1, kr.shape[0], kc.shape[0]), dtype=torch.complex64, device=self.device
+        )
+
+        theta_r, theta_c = self.probe_tilt
+        dz = torch.tensor(slice_thicknesses, device=self.device, dtype=k2.dtype)  # (T,)
+        phase_factor = -1.0j * torch.pi * wavelength * dz[:, None, None]  # (T,1,1)
+        propagators = torch.exp(phase_factor * k2)  # (T, Sr, Sc)
+        if theta_r != 0:
+            kr_term = 1.0j * (-2 * torch.pi * dz[:, None, None] * torch.tan(theta_r / 1e3))
+            propagators = propagators * torch.exp(kr_term * kr[None, :, None])
+        if theta_c != 0:
+            kc_term = 1.0j * (-2 * torch.pi * dz[:, None, None] * torch.tan(theta_c / 1e3))
+            propagators = propagators * torch.exp(kc_term * kc[None, None, :])
+
+        return propagators
 
 
 class ProbeConstraints(BaseConstraints, ProbeBase):
@@ -461,6 +552,8 @@ class ProbePixelated(ProbeConstraints):
         self,
         num_probes: int = 1,
         probe_params: dict = {},
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         roi_shape: tuple[int, int] | np.ndarray | None = None,
         dtype: torch.dtype = torch.complex64,
         device: str = "cpu",
@@ -474,6 +567,8 @@ class ProbePixelated(ProbeConstraints):
         super().__init__(
             num_probes=num_probes,
             probe_params=probe_params.copy(),
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
@@ -490,6 +585,8 @@ class ProbePixelated(ProbeConstraints):
         probe_array: np.ndarray | torch.Tensor,
         num_probes: int | None = None,
         probe_params: dict = {},  # not sure if necessary
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         dtype: torch.dtype = torch.complex64,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -507,13 +604,16 @@ class ProbePixelated(ProbeConstraints):
         else:
             num_probes = 1 if num_probes is None else num_probes
             probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
-            probe_array = torch.tile(probe_array, (num_probes, 1, 1))
+            # probe_array = torch.tile(probe_array, (num_probes, 1, 1))
+            probe_array = torch.cat([probe_array] * num_probes, dim=0)
 
         probe_model = cls(
             num_probes=num_probes,
             probe_params=probe_params.copy(),
             roi_shape=(int(probe_array.shape[-2]), int(probe_array.shape[-1])),
             dtype=dtype,
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
             device=device,
             rng=rng,
             initial_probe_weights=initial_probe_weights,
@@ -531,6 +631,8 @@ class ProbePixelated(ProbeConstraints):
         probe_params: dict,
         num_probes: int = 1,
         roi_shape: tuple[int, int] | None = None,  # can be set later when set_initial_probe
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         dtype: torch.dtype = torch.complex64,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -539,9 +641,11 @@ class ProbePixelated(ProbeConstraints):
     ):
         probe_model = cls(
             num_probes=num_probes,
-            probe_params=probe_params.copy(),
+            probe_params=deepcopy(probe_params),  # this seems to be needed for nested dicts
             roi_shape=roi_shape,
             dtype=dtype,
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
             device=device,
             rng=rng,
             initial_probe_weights=initial_probe_weights,
@@ -592,9 +696,11 @@ class ProbePixelated(ProbeConstraints):
             self._initial_probe_weights = w2 / torch.sum(w2)
 
     @property
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
-        return self._probe
+        params = super().params
+        params.extend([self._probe])
+        return params
 
     @property
     def initial_probe(self) -> torch.Tensor:
@@ -620,7 +726,7 @@ class ProbePixelated(ProbeConstraints):
         mean_diffraction_intensity: float,
         device: str | None = None,
     ):
-        super()._initialize_probe(
+        super().set_initial_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 
@@ -642,7 +748,8 @@ class ProbePixelated(ProbeConstraints):
         if probes.ndim != 3:
             probes = probes[None]
         if probes.shape[0] != self.num_probes:
-            probes = torch.tile(probes, (self.num_probes, 1, 1))
+            # probes = torch.tile(probes, (self.num_probes, 1, 1))
+            probes = torch.cat([probes] * self.num_probes, dim=0)
 
         probes = self._apply_random_phase_shifts(probes)
         probes = self._apply_weights(probes)
@@ -652,6 +759,7 @@ class ProbePixelated(ProbeConstraints):
         return
 
     def reset(self):
+        super().reset()
         self.probe = self._initial_probe.clone()
         self._probe = nn.Parameter(self._initial_probe.clone().to(self.device), requires_grad=True)
 
@@ -716,9 +824,7 @@ class ProbePixelated(ProbeConstraints):
             bilinear=True,
         )
 
-        self._vacuum_probe_intensity = torch.tensor(
-            vp2, dtype=config.get("dtype_real"), device=self.device
-        )
+        self._vacuum_probe_intensity = torch.tensor(vp2, dtype=torch.float32, device=self.device)
 
     def rescale_vacuum_probe(self, shape: tuple[int, int]):
         """hack, should be fixed"""
@@ -733,7 +839,7 @@ class ProbePixelated(ProbeConstraints):
                 self.vacuum_probe_intensity.cpu().detach().numpy(),
                 scale_output,
             ),
-            dtype=config.get("dtype_real"),
+            dtype=getattr(torch, config.get("dtype_real")),
             device=self.device,
         )
 
@@ -772,6 +878,8 @@ class ProbeParametric(ProbeConstraints):
         self,
         num_probes: int = 1,
         probe_params: dict = {},
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         roi_shape: tuple[int, int] | np.ndarray | None = None,
         dtype: torch.dtype = torch.complex64,
         device: str = "cpu",
@@ -788,6 +896,8 @@ class ProbeParametric(ProbeConstraints):
         super().__init__(
             num_probes=num_probes,
             probe_params=probe_params.copy(),
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
             max_aberrations_order=max_aberrations_order,
             roi_shape=roi_shape,
             dtype=dtype,
@@ -842,6 +952,8 @@ class ProbeParametric(ProbeConstraints):
         probe_params: dict,
         num_probes: int = 1,
         roi_shape: tuple[int, int] | None = None,
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         dtype: torch.dtype = torch.complex64,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -853,6 +965,8 @@ class ProbeParametric(ProbeConstraints):
         return cls(
             num_probes=num_probes,
             probe_params=probe_params.copy(),
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
             roi_shape=roi_shape,
             dtype=dtype,
             device=device,
@@ -890,12 +1004,12 @@ class ProbeParametric(ProbeConstraints):
         self._vacuum_probe_intensity = vp2
 
     @property
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         """Optimization parameters."""
-        params = []
+        params = super().params
         if isinstance(self.semiangle_cutoff, nn.Parameter):
             params.append(self.semiangle_cutoff)
-        params += list(self.aberration_coefs.values())
+        params.extend(list(self.aberration_coefs.values()))
         return params
 
     @property
@@ -940,6 +1054,7 @@ class ProbeParametric(ProbeConstraints):
 
     def reset(self):
         """Reset learnable parameters to their initial values."""
+        super().reset()
         with torch.no_grad():
             if hasattr(self, "semiangle_cutoff"):
                 self.semiangle_cutoff.copy_(self._initial_semiangle_cutoff.to(self.device))  # type:ignore
@@ -956,8 +1071,11 @@ class ProbeDIP(ProbeConstraints):
 
     def __init__(
         self,
+        model: "torch.nn.Module",
         num_probes: int = 1,
         probe_params: dict = {},
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         roi_shape: tuple[int, int] | np.ndarray | None = None,
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -966,6 +1084,8 @@ class ProbeDIP(ProbeConstraints):
         super().__init__(
             num_probes=num_probes,
             probe_params=probe_params.copy(),
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
             roi_shape=roi_shape,
             device=device,
             rng=rng,
@@ -973,6 +1093,10 @@ class ProbeDIP(ProbeConstraints):
         )
         self.register_buffer("_model_input", torch.tensor([]))
         self.register_buffer("_pretrain_target", torch.tensor([]))
+
+        self._model = model.to(self._device)
+        self._check_roi_shape()
+        self.set_pretrained_weights(self._model)
 
         self._optimizer = None
         self._scheduler = None
@@ -983,6 +1107,8 @@ class ProbeDIP(ProbeConstraints):
     def from_model(
         cls,
         model: "torch.nn.Module",
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
         model_input: torch.Tensor | None = None,
         num_probes: int = 1,
         probe_params: dict = {},
@@ -992,15 +1118,16 @@ class ProbeDIP(ProbeConstraints):
         rng: np.random.Generator | int | None = None,
     ):
         probe_model = cls(
+            model=model,
             num_probes=num_probes,
             probe_params=probe_params.copy(),
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
             roi_shape=roi_shape,
             device=device,
             rng=rng,
             _token=cls._token,
         )
-        probe_model._model = model.to(device)
-        probe_model.set_pretrained_weights(model)
 
         if model_input is None:
             # Create default model input - use roi_shape if provided, otherwise placeholder
@@ -1026,20 +1153,22 @@ class ProbeDIP(ProbeConstraints):
         input_noise_std: float = 0.025,
         device: str = "cpu",
     ) -> "ProbeDIP":
-        if not isinstance(pixelated, ProbePixelated):
-            raise ValueError(f"Pixelated must be an ObjectPixelated, got {type(pixelated)}")
+        if not isinstance(pixelated, ProbePixelated) and "ProbePixelated" not in str(
+            type(pixelated)
+        ):
+            raise TypeError(f"dset should be a ProbePixelated, got {type(pixelated)}")
 
         probe_model = cls(
+            model=model,
             num_probes=pixelated.num_probes,
             probe_params=pixelated.probe_params.copy(),
+            probe_tilt=tuple(pixelated.probe_tilt.detach().cpu().numpy()),
+            learn_probe_tilt=pixelated.learn_probe_tilt,
             roi_shape=pixelated.roi_shape,
             device=device,
             rng=pixelated._rng_seed,
             _token=cls._token,
         )
-
-        probe_model._model = model.to(device)
-        probe_model.set_pretrained_weights(model)
 
         probe_model.model_input = pixelated.probe.clone().detach()
         probe_model.pretrain_target = probe_model.model_input.clone().detach()
@@ -1186,7 +1315,7 @@ class ProbeDIP(ProbeConstraints):
         *args,
     ):
         """Set initial probe and create appropriate model input"""
-        super()._initialize_probe(
+        super().set_initial_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
 
@@ -1213,17 +1342,15 @@ class ProbeDIP(ProbeConstraints):
         return self
 
     @property
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
-        return self.model.parameters()
-
-    def get_optimization_parameters(self):
-        """Get the parameters that should be optimized for this model."""
-        # Return a fresh list of parameters each time to avoid generator exhaustion
-        return list(self.model.parameters())
+        params = super().params
+        params.extend(list(self.model.parameters()))
+        return params
 
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
+        super().reset()
         self.model.load_state_dict(self.pretrained_weights.copy())
 
     def pretrain(
@@ -1231,7 +1358,7 @@ class ProbeDIP(ProbeConstraints):
         model_input: torch.Tensor | None = None,
         pretrain_target: torch.Tensor | None = None,
         reset: bool = False,
-        num_epochs: int = 100,
+        num_iters: int = 100,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l2",
@@ -1246,7 +1373,7 @@ class ProbeDIP(ProbeConstraints):
             self.set_optimizer(optimizer_params)
 
         if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_epochs)
+            self.set_scheduler(scheduler_params, num_iters)
 
         if reset:
             self.model.apply(reset_weights)
@@ -1266,7 +1393,7 @@ class ProbeDIP(ProbeConstraints):
 
         loss_fn = get_loss_function(loss_fn, self.dtype)
         self._pretrain(
-            num_epochs=num_epochs,
+            num_iters=num_iters,
             loss_fn=loss_fn,
             apply_constraints=apply_constraints,
             show=show,
@@ -1275,7 +1402,7 @@ class ProbeDIP(ProbeConstraints):
 
     def _pretrain(
         self,
-        num_epochs: int,
+        num_iters: int,
         loss_fn: Callable,
         apply_constraints: bool = False,
         show: bool = False,
@@ -1290,7 +1417,7 @@ class ProbeDIP(ProbeConstraints):
             raise ValueError("Optimizer not set. Call set_optimizer() first.")
 
         sch = self.scheduler
-        pbar = tqdm(range(num_epochs))
+        pbar = tqdm(range(num_iters))
         output = self.probe
 
         for a0 in pbar:
@@ -1325,7 +1452,7 @@ class ProbeDIP(ProbeConstraints):
 
             self._pretrain_losses.append(loss.item())
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
-            pbar.set_description(f"Epoch {a0 + 1}/{num_epochs}, Loss: {loss.item():.3e}, ")
+            pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
 
         if show:
             self.visualize_pretrain(output)
@@ -1345,7 +1472,7 @@ class ProbeDIP(ProbeConstraints):
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
         ax.spines["left"].set_color("k")
-        ax.set_xlabel("Epochs")
+        ax.set_xlabel("Iterations")
         nx = ax.twinx()
         nx.spines["left"].set_visible(False)
         lines.extend(
@@ -1375,10 +1502,10 @@ class ProbeDIP(ProbeConstraints):
                 "Target Probe",
             ],
             cmap="magma",
-            cbar=True,
+            cbar=False,
         )
         plt.suptitle(
-            f"Final loss: {self._pretrain_losses[-1]:.3e} | Epochs: {len(self._pretrain_losses)}",
+            f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
             fontsize=14,
             y=0.94,
         )
@@ -1389,6 +1516,22 @@ class ProbeDIP(ProbeConstraints):
         raise NotImplementedError(
             f"Analytical gradients are not implemented for {self.name}, use autograd=True"
         )
+
+    def _check_roi_shape(self):
+        num_layers = getattr(self.model, "num_layers", None)
+        if num_layers is not None:
+            if not np.all(np.array(self.roi_shape) % 2**num_layers == 0):
+                raise ValueError(
+                    f"Model has {num_layers} layers, but ROI shape {self.roi_shape} is not "
+                    f"divisible by 2^{num_layers} for all dimensions.\nPlease crop or pad the "
+                    "dataset in reciprocal space to fix this error."
+                )
+        else:
+            warn(
+                "Model has no num_layers attribute, so cannot check if the ROI shape is "
+                "compatible with the model.\nIf using a ConvNet, ensure that the ROI shape is "
+                "divisble by 2^num_layers for all dimensions."
+            )
 
 
 ProbeModelType = ProbePixelated | ProbeDIP
