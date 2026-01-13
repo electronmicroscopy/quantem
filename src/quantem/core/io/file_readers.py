@@ -138,6 +138,41 @@ def read_2d(
     return dataset
 
 
+def _find_4d_dataset(group: h5py.Group, path: list[str] | None = None) -> tuple[list[str], h5py.Dataset] | None:
+    """Recursively search for a 4D dataset in an HDF5 group."""
+    if path is None:
+        path = []
+    for key in group.keys():
+        item = group[key]
+        current_path = path + [key]
+        if isinstance(item, h5py.Dataset):
+            if item.ndim == 4:
+                return current_path, item
+        elif isinstance(item, h5py.Group):
+            result = _find_4d_dataset(item, current_path)
+            if result is not None:
+                return result
+    return None
+
+
+def _find_calibration(group: h5py.Group, path: list[str] | None = None) -> tuple[list[str], h5py.Group] | None:
+    """Recursively search for a calibration group containing R_pixel_size and Q_pixel_size."""
+    if path is None:
+        path = []
+    for key in group.keys():
+        item = group[key]
+        current_path = path + [key]
+        if isinstance(item, h5py.Group):
+            # Check if this group has calibration keys
+            if "R_pixel_size" in item and "Q_pixel_size" in item:
+                return current_path, item
+            # Recurse into subgroups
+            result = _find_calibration(item, current_path)
+            if result is not None:
+                return result
+    return None
+
+
 def read_emdfile_to_4dstem(
     file_path: str | PathLike,
     data_keys: list[str] | None = None,
@@ -146,42 +181,73 @@ def read_emdfile_to_4dstem(
     """
     File reader for legacy `emdFile` / `py4DSTEM` files.
 
+    If data_keys and calibration_keys are not provided, the function will
+    automatically search for a 4D dataset and calibration metadata.
+
     Parameters
     ----------
     file_path: str | PathLike
         Path to data
+    data_keys: list[str], optional
+        List of keys to navigate to the data. If None, auto-detects.
+    calibration_keys: list[str], optional
+        List of keys to navigate to calibration. If None, auto-detects.
 
     Returns
     --------
     Dataset4dstem
     """
     with h5py.File(file_path, "r") as file:
-        # Access the data directly
-        data_keys = ["datacube_root", "datacube", "data"] if data_keys is None else data_keys
-        print("keys: ", data_keys)
-        try:
-            data = file
-            for key in data_keys:
-                data = data[key]  # type: ignore
-        except KeyError:
-            raise KeyError(f"Could not find key {data_keys} in {file_path}")
+        # Auto-detect or use provided data keys
+        if data_keys is None:
+            result = _find_4d_dataset(file)
+            if result is None:
+                raise KeyError(f"Could not find any 4D dataset in {file_path}")
+            data_keys, data = result
+        else:
+            try:
+                data = file
+                for key in data_keys:
+                    data = data[key]  # type: ignore
+            except KeyError:
+                raise KeyError(f"Could not find key {data_keys} in {file_path}")
 
-        # Access calibration values directly
-        calibration_keys = (
-            ["datacube_root", "metadatabundle", "calibration"]
-            if calibration_keys is None
-            else calibration_keys
-        )
-        try:
-            calibration = file
-            for key in calibration_keys:
-                calibration = calibration[key]  # type: ignore
-        except KeyError:
-            raise KeyError(f"Could not find calibration key {calibration_keys} in {file_path}")
-        r_pixel_size = calibration["R_pixel_size"][()]  # type: ignore
-        q_pixel_size = calibration["Q_pixel_size"][()]  # type: ignore
-        r_pixel_units = calibration["R_pixel_units"][()]  # type: ignore
-        q_pixel_units = calibration["Q_pixel_units"][()]  # type: ignore
+        # Auto-detect or use provided calibration keys
+        if calibration_keys is None:
+            result = _find_calibration(file)
+            if result is None:
+                # No calibration found, use defaults
+                r_pixel_size = 1.0
+                q_pixel_size = 1.0
+                r_pixel_units = "pixels"
+                q_pixel_units = "pixels"
+            else:
+                calibration_keys, calibration = result
+                r_pixel_size = calibration["R_pixel_size"][()]  # type: ignore
+                q_pixel_size = calibration["Q_pixel_size"][()]  # type: ignore
+                r_pixel_units = calibration.get("R_pixel_units", [()])
+                if hasattr(r_pixel_units, "__getitem__"):
+                    r_pixel_units = r_pixel_units[()]
+                q_pixel_units = calibration.get("Q_pixel_units", [()])
+                if hasattr(q_pixel_units, "__getitem__"):
+                    q_pixel_units = q_pixel_units[()]
+        else:
+            try:
+                calibration = file
+                for key in calibration_keys:
+                    calibration = calibration[key]  # type: ignore
+            except KeyError:
+                raise KeyError(f"Could not find calibration key {calibration_keys} in {file_path}")
+            r_pixel_size = calibration["R_pixel_size"][()]  # type: ignore
+            q_pixel_size = calibration["Q_pixel_size"][()]  # type: ignore
+            r_pixel_units = calibration["R_pixel_units"][()]  # type: ignore
+            q_pixel_units = calibration["Q_pixel_units"][()]  # type: ignore
+
+        # Decode bytes to string if needed
+        if isinstance(r_pixel_units, bytes):
+            r_pixel_units = r_pixel_units.decode("utf-8")
+        if isinstance(q_pixel_units, bytes):
+            q_pixel_units = q_pixel_units.decode("utf-8")
 
         dataset = Dataset4dstem.from_array(
             array=data,

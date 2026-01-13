@@ -10,13 +10,17 @@ export default defineConfig({
   build: {
     outDir: "src/quantem/widget/static",
     lib: {
-      entry: "js/index.jsx",
+      entry: {
+        show4dstem: "js/show4dstem.tsx",
+      },
       formats: ["es"],
-      fileName: "index",
     },
     rollupOptions: {
       output: {
-        inlineDynamicImports: true,
+        // Each entry gets its own file
+        entryFileNames: "[name].js",
+        // CSS is handled separately by anywidget
+        assetFileNames: "[name][extname]",
       },
     },
   },
