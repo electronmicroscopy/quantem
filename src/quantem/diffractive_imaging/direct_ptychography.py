@@ -128,6 +128,17 @@ class HyperparameterState:
         self.initial_rotation_angle = None
         self.clear_optimized()
 
+    def copy(self):
+        """ """
+        return HyperparameterState(
+            initial_aberrations=self.initial_aberrations,
+            optimized_aberrations=self.optimized_aberrations,
+            initial_rotation_angle=self.initial_rotation_angle,
+            optimized_rotation_angle=self.optimized_rotation_angle,
+            optimized_keys=self.optimized_keys,
+            study=self.study,
+        )
+
     def summarize(
         self,
         *,
@@ -653,7 +664,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         matched_filter_norm_epsilon=1e-1,
         parallax_flip_phase=True,
         verbose=None,
-        use_optimized_state=True,
+        use_initial_state=False,
     ):
         """
         Unified reconstruction method supporting multiple deconvolution techniques.
@@ -690,7 +701,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if verbose is None:
             verbose = self.verbose
 
-        if use_optimized_state:
+        if use_initial_state:
+            if verbose:
+                print("Reconstructing with:\n\n", state.summarize(which="initial"))
+            aberration_coefs = state.initial_aberrations
+            rotation_angle = state.initial_rotation_angle
+        else:
             if verbose:
                 print(
                     "Reconstructing with:\n\n",
@@ -702,11 +718,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 )
             aberration_coefs = state.current_aberrations(override_aberration_coefs)
             rotation_angle = state.current_rotation_angle(override_rotation_angle)
-        else:
-            if verbose:
-                print("Reconstructing with:\n\n", state.summarize(which="initial"))
-            aberration_coefs = state.initial_aberrations
-            rotation_angle = state.initial_rotation_angle
 
         if upsampling_factor is None:
             upsampling_factor = 1
@@ -1122,6 +1133,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         regularize_shifts: bool = True,
         dft_upsample_factor: int = 4,
         verbose=None,
+        use_initial_state=False,
         **reconstruct_kwargs,
     ):
         """
@@ -1191,6 +1203,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             deconvolution_kernel="parallax",
             parallax_flip_phase=False,
             verbose=False,
+            use_initial_state=use_initial_state,
             **safe_kwargs,
         )
 
@@ -1489,7 +1502,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
         two_pass_unwrapping: bool = False,
         verbose=None,
-        use_optimized_state=True,
+        use_initial_state=False,
         bf_mask=None,
         **reconstruct_kwargs,
     ):
@@ -1521,12 +1534,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if verbose is None:
             verbose = self.verbose
 
-        if use_optimized_state:
-            aberration_coefs = state.current_aberrations(aberration_coefs)
-            rotation_angle = state.current_rotation_angle(rotation_angle)
-        else:
+        if use_initial_state:
             aberration_coefs = state.initial_aberrations
             rotation_angle = state.initial_rotation_angle
+        else:
+            aberration_coefs = state.current_aberrations(aberration_coefs)
+            rotation_angle = state.current_rotation_angle(rotation_angle)
 
         if bf_mask is None:
             bf_mask = self.bf_mask
