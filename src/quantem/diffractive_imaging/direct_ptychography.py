@@ -1485,7 +1485,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # ---------------------------------------------------------
         # Solve LS
         # ---------------------------------------------------------
-        sol = torch.linalg.lstsq(A, b, driver="gelsd").solution
+        sol = torch.linalg.lstsq(A, b).solution
 
         delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
 
