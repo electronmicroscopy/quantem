@@ -25,7 +25,7 @@ class Show4DSTEM(anywidget.AnyWidget):
     Fast interactive 4D-STEM viewer with advanced features.
 
     Optimized for speed with binary transfer and pre-normalization.
-    Works with NumPy and PyTorch arrays.``````
+    Works with NumPy and PyTorch arrays.
 
     Parameters
     ----------
@@ -122,6 +122,7 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     pixel_size = traitlets.Float(1.0).tag(sync=True)  # Å per pixel (real-space)
     k_pixel_size = traitlets.Float(1.0).tag(sync=True)  # mrad per pixel (k-space)
+    k_calibrated = traitlets.Bool(False).tag(sync=True)  # True if k-space has mrad calibration
 
     # =========================================================================
     # Path Animation (programmatic crosshair control)
@@ -149,18 +150,24 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.log_scale = log_scale
 
         # Extract calibration from Dataset4dstem if provided
+        k_calibrated = False
         if hasattr(data, "sampling") and hasattr(data, "array"):
             # Dataset4dstem: extract calibration and array
             # sampling = [scan_x, scan_y, det_x, det_y]
-            if pixel_size is None:
+            units = getattr(data, "units", ["pixels"] * 4)
+            if pixel_size is None and units[0] in ("Å", "angstrom", "A", "nm"):
                 pixel_size = float(data.sampling[0])
-            if k_pixel_size is None:
+                if units[0] == "nm":
+                    pixel_size *= 10  # Convert nm to Å
+            if k_pixel_size is None and units[2] in ("mrad", "1/Å", "1/A"):
                 k_pixel_size = float(data.sampling[2])
+                k_calibrated = True
             data = data.array
 
         # Store calibration values (default to 1.0 if not provided)
         self.pixel_size = pixel_size if pixel_size is not None else 1.0
         self.k_pixel_size = k_pixel_size if k_pixel_size is not None else 1.0
+        self.k_calibrated = k_calibrated or (k_pixel_size is not None)
         # Path animation (configured via set_path() or raster())
         self._path_points: list[tuple[int, int]] = []
         # Convert to NumPy
@@ -226,21 +233,18 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.roi_radius = self.bf_radius * 0.5  # Start with half BF radius
         self.roi_active = True
         
-        # Compute initial virtual image
-        try:
-            self._compute_virtual_image_from_roi()
-        except Exception:
-            pass
-        
+        # Compute initial virtual image and frame
+        self._compute_virtual_image_from_roi()
         self._update_frame()
         
         # Path animation: observe index changes from frontend
         self.observe(self._on_path_index_change, names=["path_index"])
 
     def __repr__(self) -> str:
+        k_unit = "mrad" if self.k_calibrated else "px"
         return (
             f"Show4DSTEM(shape=({self.shape_x}, {self.shape_y}, {self.det_x}, {self.det_y}), "
-            f"sampling=({self.pixel_size} Å, {self.k_pixel_size} mrad), "
+            f"sampling=({self.pixel_size} Å, {self.k_pixel_size} {k_unit}), "
             f"pos=({self.pos_x}, {self.pos_y}))"
         )
 
@@ -697,10 +701,10 @@ class Show4DSTEM(anywidget.AnyWidget):
             row = int(np.clip(round(cy), 0, self._det_shape[0] - 1))
             col = int(np.clip(round(cx), 0, self._det_shape[1] - 1))
             if self._data.ndim == 4:
-                vi = self._data[:, :, row, col]
+                virtual_image = self._data[:, :, row, col]
             else:
-                vi = self._data[:, row, col].reshape(self._scan_shape)
-            self.virtual_image_bytes = self._normalize_to_bytes(vi)
+                virtual_image = self._data[:, row, col].reshape(self._scan_shape)
+            self.virtual_image_bytes = self._normalize_to_bytes(virtual_image)
             return
 
         self.virtual_image_bytes = self._normalize_to_bytes(self._fast_masked_sum(mask))

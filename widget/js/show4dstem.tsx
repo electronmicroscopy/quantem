@@ -34,11 +34,14 @@ function roundToNiceValue(value: number): number {
 }
 
 /** Format scale bar label with appropriate unit */
-function formatScaleLabel(value: number, unit: "Å" | "mrad"): string {
+function formatScaleLabel(value: number, unit: "Å" | "mrad" | "px"): string {
   const nice = roundToNiceValue(value);
   if (unit === "Å") {
     if (nice >= 10) return `${Math.round(nice / 10)} nm`;
     return nice >= 1 ? `${Math.round(nice)} Å` : `${nice.toFixed(2)} Å`;
+  }
+  if (unit === "px") {
+    return nice >= 1 ? `${Math.round(nice)} px` : `${nice.toFixed(1)} px`;
   }
   if (nice >= 1000) return `${Math.round(nice / 1000)} rad`;
   return nice >= 1 ? `${Math.round(nice)} mrad` : `${nice.toFixed(2)} mrad`;
@@ -53,7 +56,7 @@ function drawScaleBarHiDPI(
   dpr: number,
   zoom: number,
   pixelSize: number,
-  unit: "Å" | "mrad",
+  unit: "Å" | "mrad" | "px",
   imageWidth: number,
   imageHeight: number
 ) {
@@ -437,6 +440,7 @@ function Show4DSTEM() {
 
   const [pixelSize] = useModelState<number>("pixel_size");
   const [kPixelSize] = useModelState<number>("k_pixel_size");
+  const [kCalibrated] = useModelState<boolean>("k_calibrated");
 
   const [frameBytes] = useModelState<DataView>("frame_bytes");
   const [virtualImageBytes] = useModelState<DataView>("virtual_image_bytes");
@@ -564,6 +568,19 @@ function Show4DSTEM() {
         setGpuReady(true);
       }
     });
+  }, []);
+
+  // Fix VS Code Jupyter white background (traverse up and fix parent)
+  const rootRef = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    if (!rootRef.current) return;
+    let el: HTMLElement | null = rootRef.current;
+    while (el) {
+      if (el.classList.contains("cell-output-ipywidget-background")) {
+        el.style.setProperty("background-color", "#1a1a1a", "important");
+      }
+      el = el.parentElement;
+    }
   }, []);
 
   // Zoom state
@@ -994,7 +1011,8 @@ function Show4DSTEM() {
   React.useEffect(() => {
     if (!dpUiRef.current) return;
     // Draw scale bar first (clears canvas)
-    drawScaleBarHiDPI(dpUiRef.current, DPR, dpZoom, kPixelSize || 1, "mrad", detY, detX);
+    const kUnit = kCalibrated ? "mrad" : "px";
+    drawScaleBarHiDPI(dpUiRef.current, DPR, dpZoom, kPixelSize || 1, kUnit, detY, detX);
     // Draw ROI overlay (circle, square, rect, annular) or point crosshair
     if (roiMode === "point") {
       drawDpCrosshairHiDPI(dpUiRef.current, DPR, localKx, localKy, dpZoom, dpPanX, dpPanY, detY, detX, isDraggingDP);
@@ -1006,7 +1024,7 @@ function Show4DSTEM() {
         isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner
       );
     }
-  }, [dpZoom, dpPanX, dpPanY, kPixelSize, detX, detY, roiMode, roiRadius, roiRadiusInner, roiWidth, roiHeight, localKx, localKy, isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner]);
+  }, [dpZoom, dpPanX, dpPanY, kPixelSize, kCalibrated, detX, detY, roiMode, roiRadius, roiRadiusInner, roiWidth, roiHeight, localKx, localKy, isDraggingDP, isDraggingResize, isDraggingResizeInner, isHoveringResize, isHoveringResizeInner]);
   
   // VI scale bar + crosshair (high-DPI)
   React.useEffect(() => {
@@ -1207,7 +1225,7 @@ function Show4DSTEM() {
   // Render
   // ─────────────────────────────────────────────────────────────────────────
   return (
-    <Box className="show4dstem-root" sx={{ ...container.root, maxWidth: 1100 }}>
+    <Box ref={rootRef} className="show4dstem-root" sx={{ ...container.root, maxWidth: 1100 }}>
       {/* Wrapper to ensure header and content have same width */}
       <Box sx={{ display: "inline-block" }}>
         {/* Header */}
@@ -1222,11 +1240,21 @@ function Show4DSTEM() {
             <Typography
               component="span"
               onClick={() => {
-                setBandpass([0, 0]);
+                // Reset position to center
+                setPosX(Math.floor(shapeX / 2));
+                setPosY(Math.floor(shapeY / 2));
+                // Reset ROI to detector center, point mode
+                setRoiCenterX(centerX);
+                setRoiCenterY(centerY);
+                setRoiRadius(bfRadius * 0.5);
+                setRoiMode("point");
+                // Reset zoom/pan
                 setDpZoom(1); setDpPanX(0); setDpPanY(0);
                 setViZoom(1); setViPanX(0); setViPanY(0);
                 setFftZoom(1); setFftPanX(0); setFftPanY(0);
-                setRoiMode("point");
+                // Reset colormap and bandpass
+                setColormap("inferno");
+                setBandpass([0, 0]);
               }}
               sx={{ ...controlPanel.button }}
             >
