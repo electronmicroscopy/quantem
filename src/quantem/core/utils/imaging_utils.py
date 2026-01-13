@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
+from scipy.signal import convolve2d
 
 from quantem.core.utils.utils import generate_batches
 
@@ -548,6 +549,61 @@ def fourier_cropping(
     return result
 
 
+def edge_filter(
+    im: NDArray,
+    sigma_edge: int,
+    sf_val: int | tuple[int,int],
+    ):
+    """
+    Used to filter an image array to define and highlight edges using 2D convolution.
+    
+    Parameters
+    --------
+    im: NDArray
+        Input 2D image array.
+    sigma_edge: int
+        Standard deviation (sigma) of the 1D Gaussian kernel.
+    sf_val: int | tuple[int,int]
+        Scale factor(s) for the symmetric/asymmetric finite-difference gradient kernel.
+
+    Returns
+    -------
+    im_edge: NDArray
+        2D array containing the gradient magnitude (edge strength) of the input image.
+    """
+
+    sf_val = np.array(sf_val)
+    if sf_val.size == 1:
+        sf_val = np.array(
+            [sf_val, sf_val],
+            )
+
+    r = np.arange(
+        -np.ceil(2.0*sigma_edge),
+        np.ceil(2.0*sigma_edge+1),
+    )
+
+    k = np.exp(
+        (r[:,None]**2) / (-2*sigma_edge**2)
+    )
+
+    sf = np.array([
+        [-sf_val[0],0,sf_val[1]],
+    ])
+
+    im_x = convolve2d(im, sf, mode='same', boundary='symm')
+    im_x = convolve2d(im_x, k, mode='same', boundary='symm')
+    im_x = convolve2d(im_x, k.T, mode='same', boundary='symm')
+
+    im_y = convolve2d(im, sf.T, mode='same', boundary='symm')
+    im_y = convolve2d(im_y, k, mode='same', boundary='symm')
+    im_y = convolve2d(im_y, k.T, mode='same', boundary='symm')
+
+    im_edge = np.sqrt(im_x**2 + im_y**2)
+
+    return im_edge
+  
+  
 def compute_fsc_from_halfsets(
     halfset_recons: list[torch.Tensor],
     sampling: tuple[float, float],
