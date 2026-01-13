@@ -549,13 +549,11 @@ def fourier_cropping(
     return result
 
 
-def edge_filter_single(
-        im,
-        sigma_edge,
-        sf_val,
-        # modify_in_place: bool = True,
-        # filter_stack: bool = True,
-        ):
+def edge_filter(
+    im: NDArray,
+    sigma_edge: int,
+    sf_val: int | Tuple[int,int],
+    ):
     """
     """
 

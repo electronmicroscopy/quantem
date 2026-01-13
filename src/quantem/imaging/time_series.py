@@ -1,36 +1,48 @@
-from typing import Any, Literal, overload
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal import convolve2d
 from scipy.signal.windows import tukey
 
-from quantem.core.datastructures.dataset import Dataset
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.utils.imaging_utils import edge_filter_single
+from quantem.core.utils.imaging_utils import edge_filter
 
-# add autoserialize from quantem
-
-# from quantem.core.utils.imaging_utils import ImagingUtils
 
 class TimeSeries(AutoSerialize):
     """
     TimeSeries is for aligning sequential 2D time series (in situ) data.
 
-    This class supports Dataset3d input arrays (time, x, y).
+    This class supports Dataset3d input arrays (time, rows, columns).
     """
 
     _token = object()
 
     def __init__(
         self,
-        data,
-        pad_shape,
-        pad_val,
-        blend_shape,
+        data: NDArray,
+        pad_shape: int | tuple[int,int],
+        pad_val: str | int | float,
+        blend_shape: int | tuple[int,int],
         _token: object | None = None,
     ):
+        """
+        Initialize a preprocessed (padded and edge_blended) 3D dataset (time, rows, columns).
+
+        Parameters
+        ----------
+        data: NDArray
+            The initial image stack 3D dataset (time, rows, columns) 
+        pad_shape: int | tuple[int,int]
+            Amount of padding for each row and column to apply to an image stack.
+        pad_val: str | int | float
+            Value for the padding background. If str is `mean`, `median`, `max`, 
+            or `min`, the padding value will be calculated.
+        blend_shape: int | tuple[int,int]
+            Amount of edge blending in each row and column to apply to an image stack.
+        _token: object | None = None
+            Token to prevent direct instantiation, by default None.
+        """
         if _token is not self._token:
             raise RuntimeError(
                 "Use TimeSeries.from_array() or .from_data() to instantiate this class."
@@ -46,11 +58,33 @@ class TimeSeries(AutoSerialize):
     @classmethod
     def from_array(
         cls, 
-        data: NDArray, 
-        pad_shape,
-        pad_val,
-        blend_shape,
+        data: NDArray,
+        pad_shape: int | tuple[int,int],
+        pad_val: str | int | float,
+        blend_shape: int | tuple[int,int],
     ):
+        """
+        Creates a time series Dataset3D from a 3D array.
+
+        Parameters
+        ----------
+        data: NDArray
+            The initial image stack 3D dataset (time, rows, columns) 
+        pad_shape: int | tuple[int,int]
+            Amount of padding for each row and column to apply to an image stack.
+        pad_val: str | int | float
+            Value for the padding background. If str is `mean`, `median`, `max`, 
+            or `min`, the padding value will be calculated.
+        blend_shape: int | tuple[int,int]
+            Amount of edge blending in each row and column to apply to an image stack.
+
+        Returns
+        ----------
+        series: cls
+        A new instance of the class containing the preprocessed
+        time-series dataset.
+        """
+
         if not isinstance(data, np.ndarray):
             raise TypeError(f'Data should be numpy array, got type {type(data)}')
         
@@ -59,7 +93,6 @@ class TimeSeries(AutoSerialize):
         if arr.ndim != 3:
             raise ValueError('Data must be a 3D array with shape 3 (time, rows, columns).') # probably wrong
         
-        # creating a Dataset3d from array (calls dataset3d.py)
         ds = Dataset3d.from_array(
             array = arr,
             name = 'TimeSeries.stack',
@@ -68,7 +101,6 @@ class TimeSeries(AutoSerialize):
             units = ['index','pixels','pixels'],
         )
 
-        # creating a series class with the newly created Dataset3d (calls _init_)
         series = cls(
             data=ds,
             pad_shape = pad_shape,
@@ -81,14 +113,11 @@ class TimeSeries(AutoSerialize):
         series.pad_val = pad_val
         series.blend_shape = blend_shape
 
-        # apply preprocessing
         series.preprocess()
         
         return series
     
-    # @classmethod
-    # def from_file():
-
+    #TODO @ classmethod ... def from_file():
 
     @property
     def data(self) -> Dataset3d:
@@ -111,19 +140,15 @@ class TimeSeries(AutoSerialize):
         return int(self.shape[0])
     
     @property
-    def filtered(self):
-        return self._filtered
-    
-    @property
     def pad_shape(self) -> int | tuple[int, int]:
         return self._pad_shape
     
     @property
-    def align_coords(self):
+    def align_coords(self) -> NDArray:
         return self._align_coords
     
     @property
-    def align_im(self):
+    def align_im(self) -> NDArray:
         return self._align_im
 
     @pad_shape.setter
@@ -139,8 +164,7 @@ class TimeSeries(AutoSerialize):
                 raise TypeError('pad_shape int sequence should have length 2.')
             
             pad_r = int(value[0])
-            pad_c = int(value[1])
-            
+            pad_c = int(value[1]) 
             
         if pad_r < 0 or pad_c < 0:
             raise TypeError('pad_shape should have non-negative int values.')
@@ -153,7 +177,6 @@ class TimeSeries(AutoSerialize):
 
     @pad_val.setter
     def pad_val(self, value: str | int | float ):
-
         if isinstance(value, (float, int)):
             value_flt = float(value)
 
@@ -175,11 +198,12 @@ class TimeSeries(AutoSerialize):
                     value_flt = float(value)
                 
                 except ValueError:
-                    raise ValueError('pad_val should be a float, int, or str (supported modes include mean, median, max, min).')
+                    raise ValueError('pad_val should be a float, int, or str (supported ' \
+                    'modes include mean, median, max, min).')
         
         else:
-            raise TypeError('pad_val should be a float, int, or str (supported modes include mean, median, max, min).')
-
+            raise TypeError('pad_val should be a float, int, or str (supported modes ' \
+            'include mean, median, max, min).')
 
         if value_flt < 0:
             raise ValueError('pad_val should be a non-negative value.')
@@ -212,9 +236,18 @@ class TimeSeries(AutoSerialize):
         modify_in_place: bool = True,
         **kwargs: Any,
         ):
-        # call from imaging_utils.pad and imaging_utils.blend_shape
+        """
+        Applies padding and edge blending to an image stack.
+
+        Parameters
+        ----------
+        modify_in_place: bool = True
+            If True, modifies the dataset directly. If False, returns a new dataset.
         
-        print(self.pad_shape)
+        Returns
+        ----------
+
+        """
 
         pad_width = ((0,0),(0,2 * self.pad_shape[0]),(0,2 * self.pad_shape[1]))
 
@@ -225,9 +258,9 @@ class TimeSeries(AutoSerialize):
         # Edge blend values
         if self.blend_shape is not None:
             # Create tukey window function for blending
-            wx = tukey(self.shape[1],alpha=2*self.blend_shape[0]/self.shape[1])[None,:,None]
-            wy = tukey(self.shape[2],alpha=2*self.blend_shape[1]/self.shape[2])[None,None,:]
-            window = wx * wy
+            wr = tukey(self.shape[1],alpha=2*self.blend_shape[0]/self.shape[1])[None,:,None]
+            wc = tukey(self.shape[2],alpha=2*self.blend_shape[1]/self.shape[2])[None,None,:]
+            window = wr * wc
 
             # Combine tukey window and images
             stack_pad[
@@ -246,72 +279,52 @@ class TimeSeries(AutoSerialize):
         if modify_in_place is True:
             self._data.array = stack_pad
 
-
         return self.array
-
-
-    def edge_filtering_stack(
-        self,
-        sigma_edge,
-        sf_val,
-        modify_in_place: bool = True,
-    ):
-        
-        edge_stack = np.zeros_like(self.array)
-        edge_stack[0] = self.array[0]
-
-        for i in range(len(self.array)):
-
-            im_edge = edge_filter_single(
-                im = self.array[i],
-                sigma_edge=sigma_edge,
-                sf_val=sf_val,
-            )
-
-            edge_stack[i] = im_edge
-
-        if modify_in_place is True:
-            self._filtered = edge_stack
-
 
 
     def align_stack(
         self,
         running_average_frames: float | int = 20.0,
-        correlation_power = 1.0,
-        # edge_prefilter = False,
-        sigma_edge = 0.7, 
-        sf_val = 0.5,
-        # edge_width = 1.0,
-        # upsample_factor: int = 1,
+        correlation_power: int | None = 1.0,
+        sigma_edge: int = 0.7,
+        sf_val: int | tuple[int,int] = 0.5,
     ) -> NDArray:
         """
-        """
+        Calculates all alignment coordinate shifts for an edge-filtered image 
+        stack and applies the shifts to the unfiltered stack.
 
+        running_average_frames: float | int = 20.0,
+            Maximum number of images for the running average applied to the 
+            reference. If None, default to 20.0.
+        correlation_power: int | None = 1.0
+            Option for either cross correlation (1.0) or phase correlation (0.0). 
+            If None, defaults to 1.0 (cross correlation).
+        sigma_edge: int = 0.7
+            Standard deviation (sigma) of the 1D Gaussian kernel.
+        sf_val: int | Tuple[int,int] = 0.5
+            Scale factor(s) for the symmetric/asymmetric finite-difference gradient kernel.
+        """
+        
         stack_aligned = np.zeros_like(self.array)
         stack_aligned[0] = self.array[0]
 
-        # filtered stack
-
-        # # same for both original and filtered stack
         nframes, nx, ny = self.shape 
-        kx_shift = -2 * np.pi * np.fft.fftfreq(nx)
-        ky_shift = -2 * np.pi * np.fft.fftfreq(ny)
-        xy_shift = np.zeros((nframes, 2))
+        kr_shift = -2 * np.pi * np.fft.fftfreq(nx)
+        kc_shift = -2 * np.pi * np.fft.fftfreq(ny)
+        rc_shift = np.zeros((nframes, 2))
 
-        filtered_im_0 = edge_filter_single(
-                im = self.array[0],
-                sigma_edge = sigma_edge, 
-                sf_val = sf_val,    
-            )
+        for a0 in range(0, nframes - 1):
+            if a0 == 0:
+                filtered_im_0 = edge_filter(
+                    im = self.array[0],
+                    sigma_edge = sigma_edge, 
+                    sf_val = sf_val,    
+                )
 
-        G_filter_ref = np.fft.fft2(filtered_im_0)
-
-        for a0 in range(1, nframes):
-
-            # all done with filtered image
-            filtered_im = edge_filter_single(
-                im = self.array[a0],
+                G_filter_ref = np.fft.fft2(filtered_im_0)
+            
+            filtered_im = edge_filter(
+                im = self.array[a0 + 1],
                 sigma_edge = sigma_edge, 
                 sf_val = sf_val,    
             )
@@ -328,429 +341,39 @@ class TimeSeries(AutoSerialize):
             
             # Coarse peak
             peak = np.unravel_index(np.argmax(im_corr), im_corr.shape)
-            x0, y0 = peak
+            r0, c0 = peak
 
             # Parabolic refinement
-            x_inds = np.mod(x0 + np.arange(-1, 2), m.shape[0]).astype(int)
-            y_inds = np.mod(y0 + np.arange(-1, 2), m.shape[1]).astype(int)
+            r_inds = np.mod(r0 + np.arange(-1, 2), m.shape[0]).astype(int)
+            c_inds = np.mod(c0 + np.arange(-1, 2), m.shape[1]).astype(int)
 
-            vx = im_corr[x_inds, y0]
-            vy = im_corr[x0, y_inds]
+            vr = im_corr[r_inds, c0]
+            vc = im_corr[r0, c_inds]
 
             def parabolic_peak(v):
                 return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0])
 
-            dx = parabolic_peak(vx)
-            dy = parabolic_peak(vy)
+            dr = parabolic_peak(vr)
+            dc = parabolic_peak(vc)
 
-            x0 = (x0 + dx) % m.shape[0]
-            y0 = (y0 + dy) % m.shape[1]
+            r0 = (r0 + dr) % m.shape[0]
+            c0 = (c0 + dc) % m.shape[1]
 
-            shifts = (x0, y0)
+            shifts = (r0, c0)
             shifts = (shifts + 0.5 * np.array(m.shape)) % m.shape - 0.5 * np.array(m.shape)
-            xy_shift[a0] = shifts
+            rc_shift[a0 + 1] = shifts
 
-            phase = np.exp(1j * (kx_shift[:, None] * shifts[0] + ky_shift[None, :] * shifts[1]))
+            phase = np.exp(1j * (kr_shift[:, None] * shifts[0] + kc_shift[None, :] * shifts[1]))
 
-
-            # apply shift to original image
-            G_a0 = np.fft.fft2(self.array[a0])
+            # Apply shift to original image
+            G_a0 = np.fft.fft2(self.array[a0 + 1])
 
             im_shift = np.real(np.fft.ifft2(G_a0 * phase))
-            stack_aligned[a0] = im_shift
+            stack_aligned[a0 + 1] = im_shift
 
             # Updating reference using running average
             weight = max(1 / (a0 + 1), 1 / running_average_frames)
             G_filter_ref = G_filter_ref * (1 - weight) + G_filter_a0 * phase * weight
             
-        self._align_coords = xy_shift
+        self._align_coords = rc_shift
         self._align_im = stack_aligned
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # def align_stack_coords(
-    #     self,
-    #     running_average_frames: float | int = 20.0,
-    #     correlation_power = 1.0,
-    #     edge_prefilter = False,
-    #     # edge_width = 1.0,
-    #     # upsample_factor: int = 1,
-    # ) -> NDArray:
-    #     """
-    #     """
-        
-    #     if edge_prefilter is True:
-    #         self.array = self.filtered
-    #     else:
-    #         self.array = self.array
-        
-
-
-    #     # Initializing aligned stack and shifts
-    #     nframes, nx, ny = self.array.shape
-    #     # stack_aligned = np.zeros_like(self.array)
-    #     # stack_aligned[0] = self.array[0]
-    #     xy_shift = np.zeros((nframes, 2))
-
-    #     # Angular frequencies
-    #     kx_shift = -2 * np.pi * np.fft.fftfreq(nx)
-    #     ky_shift = -2 * np.pi * np.fft.fftfreq(ny)
-
-    #     # Precomputing FFTs for all frames
-    #     G_all = np.fft.fft2(self.array, axes=(1, 2))
-    #     G_ref = G_all[0].copy()
-
-    #     #filtering image > FFT both images iteratively (within for loop)
-
-    #     for a0 in range(1, nframes):
-    #         G_a0 = G_all[a0]
-    #         m = G_ref * np.conj(G_a0)
-    #         if correlation_power < 1.0:
-    #             im_corr = np.real(np.fft.ifft2(
-    #                 (np.abs(m)**correlation_power) * np.exp(1j*np.angle(m))
-    #             ))
-    #         else:
-    #             im_corr = np.real(np.fft.ifft2(m))
-
-    #         # Coarse peak
-    #         peak = np.unravel_index(np.argmax(im_corr), im_corr.shape)
-    #         x0, y0 = peak
-
-    #         # Parabolic refinement
-    #         x_inds = np.mod(x0 + np.arange(-1, 2), m.shape[0]).astype(int)
-    #         y_inds = np.mod(y0 + np.arange(-1, 2), m.shape[1]).astype(int)
-
-    #         vx = im_corr[x_inds, y0]
-    #         vy = im_corr[x0, y_inds]
-
-    #         def parabolic_peak(v):
-    #             return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0])
-
-    #         dx = parabolic_peak(vx)
-    #         dy = parabolic_peak(vy)
-
-    #         # print(dx,dy)
-
-    #         x0 = (x0 + dx) % m.shape[0]
-    #         y0 = (y0 + dy) % m.shape[1]
-
-    #         # print('x0,y0', x0, y0)
-
-    #         shifts = (x0, y0)
-    #         shifts = (shifts + 0.5 * np.array(m.shape)) % m.shape - 0.5 * np.array(m.shape)
-
-    #         xy_shift[a0] = shifts
-
-    #         # Apply shift
-    #         phase = np.exp(1j * (kx_shift[:, None] * shifts[0] + ky_shift[None, :] * shifts[1]))
-    #         # im_shift = np.real(np.fft.ifft2(G_a0 * phase))
-    #         # stack_aligned[a0] = im_shift
-
-    #         # Updating reference using running average
-    #         weight = max(1 / (a0 + 1), 1 / running_average_frames)
-    #         G_ref = G_ref * (1 - weight) + G_a0 * phase * weight
-
-    #     # say time series with you edge pad it... if you know all shifts, then you can center after knowing all the shifts from edge belending of actual image
-    #     # separate finding dxy shifts from applying them
-    #     #all sigma edge for alignment and for centering (separately)
-
-    #     self._align_coords = xy_shift
-    #     # self._align_im = stack_aligned
-
-    
-    # def align_stack_im(
-    #     self,
-    #     # running_average_frames: float | int = 20.0,
-    #     align_coords = True,
-    # ):
-        
-    #     if align_coords is True:
-    #         xy_shifts = self.align_coords
-    #         # print(shifts)
-
-    #     self.array = self.array
-    #     nframes, nx, ny = self.array.shape
-
-    #     stack_aligned = np.zeros_like(self.array)
-    #     stack_aligned[0] = self.array[0]
-
-    #     # Angular frequencies
-    #     kx_shift = -2 * np.pi * np.fft.fftfreq(nx)
-    #     ky_shift = -2 * np.pi * np.fft.fftfreq(ny)
-
-    #     G_all = np.fft.fft2(self.array, axes=(1, 2))
-    #     # G_ref = G_all[0].copy()
-        
-
-    #     for a0 in range(1, nframes):
-    #         G_a0 = G_all[a0]
-    #         shifts = xy_shifts[a0]
-
-    #         # Apply shift
-    #         phase = np.exp(1j * (kx_shift[:, None] * shifts[0] + ky_shift[None, :] * shifts[1])) # shifts from filtered
-
-    #         im_shift = np.real(np.fft.ifft2(G_a0 * phase))
-    #         stack_aligned[a0] = im_shift
-
-    #         # # Updating reference using running average
-    #         # weight = max(1 / (a0 + 1), 1 / running_average_frames)
-    #         # G_ref = G_ref * (1 - weight) + G_a0 * phase * weight
-
-    #     self._align_im = stack_aligned
-
-
-    
-
-
-
-
-
-
-    
-    #TODO use coordinates from edge filtered stack to real stack
-    
-    
-    
-    # def edge_filter_single(
-    #         self,
-    #         im,
-    #         sigma_edge,
-    #         sf_val,
-    #         modify_in_place: bool = True,
-    #         filter_stack: bool = True,
-    #         ):
-    #     """
-    #     """
-
-    #     sf_val = np.array(sf_val)
-    #     if sf_val.size == 1:
-    #         sf_val = np.array(
-    #             [sf_val, sf_val],
-    #             )
-
-    #     r = np.arange(
-    #         -np.ceil(2.0*sigma_edge),
-    #         np.ceil(2.0*sigma_edge+1),
-    #     )
-
-    #     k = np.exp(
-    #         (r[:,None]**2) / (-2*sigma_edge**2)
-    #     )
-
-    #     sf = np.array([
-    #         [-sf_val[0],0,sf_val[1]],
-    #     ])
-
-    #     im_x = convolve2d(im, sf, mode='same', boundary='symm')
-    #     im_x = convolve2d(im_x, k, mode='same', boundary='symm')
-    #     im_x = convolve2d(im_x, k.T, mode='same', boundary='symm')
-
-    #     im_y = convolve2d(im, sf.T, mode='same', boundary='symm')
-    #     im_y = convolve2d(im_y, k, mode='same', boundary='symm')
-    #     im_y = convolve2d(im_y, k.T, mode='same', boundary='symm')
-
-    #     im_edge = np.sqrt(im_x**2 + im_y**2)
-
-    #     return im_edge
-
-
-
-
-
-
-
-        # edge_stack = np.zeros_like(self.array)
-        # edge_stack[0] = self.array[0]
-        
-        # sf_val = np.array(sf_val)
-        # if sf_val.size == 1:
-        #     sf_val = np.array(
-        #         [sf_val, sf_val],
-        #         )
-
-        # r = np.arange(
-        #     -np.ceil(2.0*sigma_edge),
-        #     np.ceil(2.0*sigma_edge+1),
-        # )
-
-        # k = np.exp(
-        #     (r[:,None]**2) / (-2*sigma_edge**2)
-        # )
-
-        # sf = np.array([
-        #     [-sf_val[0],0,sf_val[1]],
-        # ])
-
-        # for i in range(len(self.array)):
-
-        #     im_x = convolve2d(self.array[i], sf, mode='same', boundary='symm')
-        #     im_x = convolve2d(im_x, k, mode='same', boundary='symm')
-        #     im_x = convolve2d(im_x, k.T, mode='same', boundary='symm')
-
-        #     im_y = convolve2d(self.array[i], sf.T, mode='same', boundary='symm')
-        #     im_y = convolve2d(im_y, k, mode='same', boundary='symm')
-        #     im_y = convolve2d(im_y, k.T, mode='same', boundary='symm')
-
-        #     im_edge = np.sqrt(im_x**2 + im_y**2)
-
-        #     edge_stack[i] = im_edge
-
-        # if modify_in_place is True:
-        #     self._filtered = edge_stack
-
-        # return im_edge
-
-    
-    
-    
-    
-    
-    
-    
-    
-    # def align_stack(
-    #     self,
-    #     window_size: int | None = 7,
-    #     running_average_frames: float | int = 20.0,
-    #     correlation_power = 1.0,
-    #     edge_prefilter = False,
-    #     edge_width = 1.0,
-    #     # upsample_factor: int = 1,
-    # ) -> NDArray:
-    #     """
-    #     Use 2D DFT cross correlation alignment on an entire image stack.
-
-    #     Parameters
-    #     ----------
-    #     self.array: NDArray | Any
-    #         Unaligned image stack data (time, x, y).
-    #     window_size: int| None = 7
-    #         Size of the window around the subpixel position. If None, defaults to 7.
-    #     running_average_frames: float | int = 20.0
-    #         Maximum number of images for the running average applied to the reference. If None, default is 20.0.
-    #     correlation_power: int | None = 1.0
-    #         Option for either cross correlation (1.0) or phase correlation (0.0). If None, defaults to 1.0 (cross correlation)
-            
-    #     Returns
-    #     -------
-    #     stack_aligned: NDArray
-    #         Aligned image stack data (time, x, y).
-    #     xy_shift: NDArray
-    #         Shifted coordinates (x, y) for all images.
-    #     """
-    #     # Initializing aligned stack and shifts
-    #     nframes, nx, ny = self.array.shape
-    #     stack_aligned = np.zeros_like(self.array)
-    #     stack_aligned[0] = self.array[0]
-    #     xy_shift = np.zeros((nframes, 2))
-
-    #     # Angular frequencies
-    #     kx_shift = -2 * np.pi * np.fft.fftfreq(nx)
-    #     ky_shift = -2 * np.pi * np.fft.fftfreq(ny)
-
-    #     # Precomputing FFTs for all frames
-    #     G_all = np.fft.fft2(self.array, axes=(1, 2))
-    #     G_ref = G_all[0].copy()
-
-    #     # Constants
-    #     half = window_size // 2
-    #     nrows, ncols = nx, ny
-
-    #     for a0 in range(1, nframes):
-    #         G_a0 = G_all[a0]
-    #         m = G_ref * np.conj(G_a0)
-    #         if correlation_power < 1.0:
-    #             im_corr = np.real(np.fft.ifft2(
-    #                 (np.abs(m)**correlation_power) * np.exp(1j*np.angle(m))
-    #             ))
-    #         else:
-    #             im_corr = np.real(np.fft.ifft2(m))
-
-    #         # Coarse peak
-    #         peak = np.unravel_index(np.argmax(im_corr), im_corr.shape)
-    #         x0, y0 = peak
-
-    #         # Parabolic refinement
-    #         x_inds = np.mod(x0 + np.arange(-1, 2), m.shape[0]).astype(int)
-    #         y_inds = np.mod(y0 + np.arange(-1, 2), m.shape[1]).astype(int)
-
-    #         vx = im_corr[x_inds, y0]
-    #         vy = im_corr[x0, y_inds]
-
-    #         def parabolic_peak(v):
-    #             return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0])
-
-    #         dx = parabolic_peak(vx)
-    #         dy = parabolic_peak(vy)
-
-    #         # print(dx,dy)
-
-    #         x0 = (x0 + dx) % m.shape[0]
-    #         y0 = (y0 + dy) % m.shape[1]
-
-    #         # print('x0,y0', x0, y0)
-
-    #         shifts = (x0, y0)
-    #         shifts = (shifts + 0.5 * np.array(m.shape)) % m.shape - 0.5 * np.array(m.shape)
-
-    #         xy_shift[a0] = shifts
-
-    #         # Apply shift
-    #         phase = np.exp(1j * (kx_shift[:, None] * shifts[0] + ky_shift[None, :] * shifts[1]))
-    #         im_shift = np.real(np.fft.ifft2(G_a0 * phase))
-    #         stack_aligned[a0] = im_shift
-
-    #         # Updating reference using running average
-    #         weight = max(1 / (a0 + 1), 1 / running_average_frames)
-    #         G_ref = G_ref * (1 - weight) + G_a0 * phase * weight
-
-    #     return stack_aligned, xy_shift
-
-
-
-    # def align(
-    #     self,
-    #     window_size,
-    #     running_average_frames,
-    #     correlation_power,
-    #     ):
-    #     # call from imaging_utils.edge_filtering and imaging_utils.cross_correlation_shift
-    #     raise NotImplementedError
-
-
-
-
-
-        # if dataset is already loaded in as an array
-
-        # validate all pad arguments
-
-        # series = cls(...)
-
-    # @classmethod
-    # def from_file(cls, file_path, file_type, *pad_args):
-    #     # if loading dataset directly from a file (.h5, .png stack, video stack, etc.)
-    #     # make Dataset3D.from_file(), similar to Dataset2D.from_file > add to quantem.core.io.file_readers for stacks, videos, etc.
-
-    #     # validate all pad arguments
-
-    #     # series = cls(...)
-
-
-
