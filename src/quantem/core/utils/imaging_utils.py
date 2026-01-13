@@ -552,9 +552,24 @@ def fourier_cropping(
 def edge_filter(
     im: NDArray,
     sigma_edge: int,
-    sf_val: int | Tuple[int,int],
+    sf_val: int | tuple[int,int],
     ):
     """
+    Used to filter an image array to define and highlight edges using 2D convolution.
+    
+    Parameters
+    --------
+    im: NDArray
+        Input 2D image array.
+    sigma_edge: int
+        Standard deviation (sigma) of the 1D Gaussian kernel.
+    sf_val: int | tuple[int,int]
+        Scale factor(s) for the symmetric/asymmetric finite-difference gradient kernel.
+
+    Returns
+    -------
+    im_edge: NDArray
+        2D array containing the gradient magnitude (edge strength) of the input image.
     """
 
     sf_val = np.array(sf_val)
@@ -587,11 +602,3 @@ def edge_filter(
     im_edge = np.sqrt(im_x**2 + im_y**2)
 
     return im_edge
-
-
-
-
-
-
-
-
