@@ -1,3 +1,4 @@
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from quantem.core import config
@@ -12,8 +13,28 @@ import math
 
 from tqdm.auto import tqdm
 
-from quantem.core.utils.imaging_utils import cross_correlation_shift_torch
-from quantem.diffractive_imaging.complex_probe import spatial_frequencies
+from quantem.core.utils.imaging_utils import cross_correlation_shift_torch, unwrap_phase_2d_torch
+from quantem.diffractive_imaging.complex_probe import (
+    spatial_frequencies,
+)
+
+# fmt: off
+ABERRATION_PRESETS = {
+    "defocus": ["C10"],
+    "quadratic": ["C10", "C12_a", "C12_b"],
+    "low_order": [
+        "C10", "C12_a", "C12_b",
+        "C21_a", "C21_b", "C30",
+    ],
+    "all": [
+        "C10", "C12_a", "C12_b",
+        "C21_a", "C21_b", "C23_a", "C23_b",
+        "C30", "C32_a", "C32_b", "C34_a", "C34_b",
+        "C41_a", "C41_b", "C43_a", "C43_b", "C45_a", "C45_b",
+        "C50", "C52_a", "C52_b", "C54_a", "C54_b", "C56_a", "C56_b",
+    ],
+}
+# fmt: on
 
 
 def create_edge_window(shape, edge_blend_pixels, device="cpu"):
@@ -469,7 +490,7 @@ def align_vbf_stack_multiscale(
 
 def fit_aberrations_from_shifts(
     shifts_ang: torch.Tensor,
-    bf_mask: torch.BoolTensor,
+    bf_mask: torch.Tensor,
     wavelength: float,
     gpts: tuple[int, int],
     sampling: tuple[float, float],
@@ -522,3 +543,95 @@ def _torch_polar(m: torch.Tensor):
     u = U @ Vh
     p = Vh.T.conj() @ S.diag().to(dtype=m.dtype) @ Vh
     return u, p
+
+
+def unwrap_bf_overlap_phase_torch(
+    complex_data_bf,  # (N_k,)
+    mask_bf,  # (N_k,)
+    bf_mask,  # (N_kx, N_ky)
+    *,
+    method="reliability-sorting",
+    two_pass=True,
+    **unwrap_kwargs,
+):
+    phase_bf = torch.angle(complex_data_bf)
+    phase_grid = torch.zeros_like(bf_mask, dtype=torch.float32)
+    mask_grid = torch.zeros_like(bf_mask, dtype=torch.bool)
+
+    phase_grid[bf_mask] = phase_bf
+    mask_grid[bf_mask] = mask_bf
+
+    if mask_grid.any():
+        if phase_grid.max() - phase_grid.min() > math.pi:
+            phase_grid = unwrap_phase_2d_torch(
+                phase_grid * mask_grid,
+                method=method,
+                mask=mask_grid,
+                **unwrap_kwargs,
+            )
+            phase_grid = phase_grid * mask_grid
+
+            if two_pass:
+                phase_grid = unwrap_phase_2d_torch(
+                    phase_grid,
+                    method=method,
+                    mask=mask_grid,
+                    **unwrap_kwargs,
+                )
+                phase_grid = phase_grid * mask_grid
+
+    return phase_grid[bf_mask]
+
+
+def group_basis_by_method(
+    basis_list: list[str],
+    fit_method: str,
+) -> list[list[str]]:
+    """
+    Group basis functions according to fit method.
+
+    Args:
+        basis_list: Flat list of basis function names
+        fit_method: "global", "recursive", or "sequential"
+
+    Returns:
+        List of basis groups for iterative fitting
+    """
+    if fit_method == "global":
+        return [basis_list]
+
+    radial_groups = defaultdict(list)
+
+    for basis_name in basis_list:
+        if basis_name.startswith("C"):
+            radial_order = int(basis_name[1])  # First digit after 'C'
+            radial_groups[radial_order].append(basis_name)
+        else:
+            raise ValueError()
+
+    # Sort by radial order
+    sorted_orders = sorted(radial_groups.keys())
+
+    if fit_method == "recursive":
+        groups = []
+        accumulated = []
+        for order in sorted_orders:
+            accumulated.extend(radial_groups[order])
+            groups.append(accumulated.copy())
+        return groups
+
+    elif fit_method == "sequential":
+        return [radial_groups[order] for order in sorted_orders]
+
+    else:
+        raise ValueError(f"Unknown fit_method: {fit_method}")
+
+
+def _crop_corner_centered_mask(mask: torch.Tensor, bf_mask_padding_px: int):
+    mask_c = torch.fft.fftshift(mask)
+    ys, xs = torch.where(mask_c)
+
+    px = bf_mask_padding_px
+    y0, y1 = ys.min() - px, ys.max() + px + 1
+    x0, x1 = xs.min() - px, xs.max() + px + 1
+    return torch.fft.ifftshift(mask_c[y0:y1, x0:x1])
