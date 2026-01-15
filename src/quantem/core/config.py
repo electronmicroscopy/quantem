@@ -270,6 +270,7 @@ def update(
 
     """
     for k, v in new.items():
+        k, v = check_key_val(k, v)
         k = canonical_name(k, old)
 
         if isinstance(v, Mapping):
@@ -560,7 +561,7 @@ def write(path: Path | str = PATH / "config.yaml") -> None:
         yaml.dump(config, f)
 
 
-def set_device(dev: str | int) -> None:
+def set_device(dev: str | int | "torch.device") -> None:
     set({"device": dev})
 
 
