@@ -128,6 +128,17 @@ class HyperparameterState:
         self.initial_rotation_angle = None
         self.clear_optimized()
 
+    def copy(self):
+        """ """
+        return HyperparameterState(
+            initial_aberrations=self.initial_aberrations,
+            optimized_aberrations=self.optimized_aberrations,
+            initial_rotation_angle=self.initial_rotation_angle,
+            optimized_rotation_angle=self.optimized_rotation_angle,
+            optimized_keys=self.optimized_keys,
+            study=self.study,
+        )
+
     def summarize(
         self,
         *,
@@ -653,7 +664,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         matched_filter_norm_epsilon=1e-1,
         parallax_flip_phase=True,
         verbose=None,
-        use_optimized_state=True,
+        use_initial_state=False,
     ):
         """
         Unified reconstruction method supporting multiple deconvolution techniques.
@@ -690,7 +701,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if verbose is None:
             verbose = self.verbose
 
-        if use_optimized_state:
+        if use_initial_state:
+            if verbose:
+                print("Reconstructing with:\n\n", state.summarize(which="initial"))
+            aberration_coefs = state.initial_aberrations
+            rotation_angle = state.initial_rotation_angle
+        else:
             if verbose:
                 print(
                     "Reconstructing with:\n\n",
@@ -702,11 +718,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 )
             aberration_coefs = state.current_aberrations(override_aberration_coefs)
             rotation_angle = state.current_rotation_angle(override_rotation_angle)
-        else:
-            if verbose:
-                print("Reconstructing with:\n\n", state.summarize(which="initial"))
-            aberration_coefs = state.initial_aberrations
-            rotation_angle = state.initial_rotation_angle
 
         if upsampling_factor is None:
             upsampling_factor = 1
@@ -915,6 +926,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             "minimize" or "maximize" (default: "minimize").
         show_progress_bar : bool
             Show progress bar during optimization.
+        add_fixed_to_hyperparameter_state: bool
+            fixed aberrations included will be passed on to hyperparameter state
         **reconstruct_kwargs :
             Extra arguments passed to reconstruct().
         """
@@ -949,6 +962,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             for name, val in optimizable_aberrations.items():
                 trial_aberrations[name] = trial.suggest_float(name, val.low, val.high, log=val.log)
 
+            trial_aberrations |= fixed_override_aberrations
+
             if isinstance(rotation_angle, OptimizationParameter):
                 rot = trial.suggest_float(
                     "rotation_angle",
@@ -973,7 +988,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # Write back optimized results
         best = study.best_params.copy()
         state.optimized_rotation_angle = best.pop("rotation_angle", None)
+
+        if state.optimized_rotation_angle is None and rotation_angle is not None:
+            state.optimized_rotation_angle = rotation_angle  # ty:ignore[invalid-assignment]
+
         state.optimized_aberrations = best
+        state.optimized_aberrations = state.current_aberrations(fixed_override_aberrations)
         state.study = study
 
         if verbose:
@@ -1067,6 +1087,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             state.optimized_rotation_angle = best_params.pop("rotation_angle", None)
             state.optimized_aberrations = best_params
 
+        if state.optimized_rotation_angle is None and rotation_angle is not None:
+            state.optimized_rotation_angle = rotation_angle  # ty:ignore[invalid-assignment]
+
+        state.optimized_aberrations = state.current_aberrations(fixed_override_aberrations)
+
         if verbose:
             print("Optimized state:\n\n", self.hyperparameter_state)
 
@@ -1108,6 +1133,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         regularize_shifts: bool = True,
         dft_upsample_factor: int = 4,
         verbose=None,
+        use_initial_state=False,
         **reconstruct_kwargs,
     ):
         """
@@ -1177,6 +1203,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             deconvolution_kernel="parallax",
             parallax_flip_phase=False,
             verbose=False,
+            use_initial_state=use_initial_state,
             **safe_kwargs,
         )
 
@@ -1458,7 +1485,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # ---------------------------------------------------------
         # Solve LS
         # ---------------------------------------------------------
-        sol = torch.linalg.lstsq(A, b, driver="gelsd").solution
+        sol = torch.linalg.lstsq(A, b).solution
 
         delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
 
@@ -1475,7 +1502,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         unwrap_method: Literal["reliability-sorting", "poisson"] = "reliability-sorting",
         two_pass_unwrapping: bool = False,
         verbose=None,
-        use_optimized_state=True,
+        use_initial_state=False,
         bf_mask=None,
         **reconstruct_kwargs,
     ):
@@ -1507,12 +1534,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if verbose is None:
             verbose = self.verbose
 
-        if use_optimized_state:
-            aberration_coefs = state.current_aberrations(aberration_coefs)
-            rotation_angle = state.current_rotation_angle(rotation_angle)
-        else:
+        if use_initial_state:
             aberration_coefs = state.initial_aberrations
             rotation_angle = state.initial_rotation_angle
+        else:
+            aberration_coefs = state.current_aberrations(aberration_coefs)
+            rotation_angle = state.current_rotation_angle(rotation_angle)
 
         if bf_mask is None:
             bf_mask = self.bf_mask
