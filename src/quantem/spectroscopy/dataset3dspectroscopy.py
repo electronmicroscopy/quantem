@@ -60,6 +60,7 @@ class Dataset3dspectroscopy(Dataset3d):
         
         # Initialize model elements storage
         self.model_elements = None
+
     
     def add_elements_to_model(self, elements):
         """
@@ -696,6 +697,8 @@ class Dataset3dspectroscopy(Dataset3d):
         
         return score
 
+# BACKGROUND SUBTRACTION
+
     def _subtract_background_eds(self, spectrum, energy_axis):
         """
         Subtract power-law background typical for EDS Bremsstrahlung.
@@ -738,7 +741,7 @@ class Dataset3dspectroscopy(Dataset3d):
         background = np.minimum(background, spectrum * 0.9)
         
         return np.maximum(spectrum - background, 0)
-    
+
     def _subtract_background_eels(self, spectrum, energy_axis):
         """
         Subtract background typical for EELS using iterative Gaussian fitting.
@@ -782,6 +785,7 @@ class Dataset3dspectroscopy(Dataset3d):
         # Subtract the estimated background level
         background_fit = mu
         return np.maximum(spectrum - background_fit, 0)
+        
 
     def show_mean_spectrum(self, roi=None, energy_range=None, elements=None, ignore_range=None, threshold=5.0, tolerance=0.15, mask=None, show_lines=True, show_text=True, snr_min=None, snr_threshold=None, distance_threshold_for_sample=0.05, contamination_elements=None, grid_peaks=None, background_subtraction='none', data_type='eds',peaks=15):
         """
@@ -1333,6 +1337,50 @@ class Dataset3dspectroscopy(Dataset3d):
         fig.tight_layout()
         plt.show()
         return fig, (ax_img, ax_spec)
+
+
+
+    def subtract_background(self, roi=None, energy_range=None, ignore_range=None, mask=None, data_type='eds'):
+
+        from quantem.spectroscopy import (
+            Dataset3deds as Dataset3deds,
+        )
+        from quantem.spectroscopy import (
+            Dataset3deels as Dataset3deels,
+        )
+
+        """
+        Perform appropriate background subtraction routine on mean spectrum from a 3D spectroscopy dataset.
+        """
+        
+        if data_type == 'eds':
+            background = self.calculate_background_powerlaw(roi, energy_range, ignore_range, mask)
+        elif data_type == 'eels':
+            background = self.calculate_background_iterative(roi, energy_range, ignore_range, mask)
+
+        spec3D_subtracted = np.empty(self.shape, dtype=float)
+
+
+        for p in range(self.shape[1]):
+            for q in range(self.shape[2]):
+                spec3D_subtracted[:,p,q] = np.maximum(self.array[:,p,q] - background, 0)
+
+
+        if data_type == 'eds':
+            return Dataset3deds.from_array(
+                array = spec3D_subtracted,
+                sampling = self.sampling,
+                origin = self.origin,
+                units = self.units)
+
+        elif data_type == 'eels':
+            return Dataset3deels.from_array(
+                array = spec3D_subtracted,
+                sampling = self.sampling,
+                origin = self.origin,
+                units = self.units)
+
+
 
 
 Dataset3dspectroscopy.load_element_info()
