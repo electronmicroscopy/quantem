@@ -1,5 +1,6 @@
 from quantem.core.io.file_readers import read_2d as read_2d
 from quantem.core.io.file_readers import read_4dstem as read_4dstem
+from quantem.core.io.file_readers import read_5dstem as read_5dstem
 from quantem.core.io.file_readers import (
     read_emdfile_to_4dstem as read_emdfile_to_4dstem,
 )

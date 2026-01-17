@@ -1,13 +1,16 @@
 import importlib
+import json
 from os import PathLike
 from pathlib import Path
 
 import h5py
+import numpy as np
 
 from quantem.core.datastructures import Dataset as Dataset
 from quantem.core.datastructures import Dataset2d as Dataset2d
 from quantem.core.datastructures import Dataset3d as Dataset3d
 from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
+from quantem.core.datastructures import Dataset5dstem as Dataset5dstem
 
 
 def read_4dstem(
@@ -87,6 +90,166 @@ def read_4dstem(
         sampling=sampling,
         origin=origin,
         units=units,
+        **kwargs,
+    )
+
+    return dataset
+
+
+def read_5dstem(
+    file_path: str | PathLike,
+    file_type: str | None = None,
+    stack_type: str = "auto",
+    **kwargs,
+) -> Dataset5dstem:
+    """
+    File reader for 5D-STEM data.
+
+    Supports:
+    - Nion Swift h5 files (auto-detected from 'properties' attribute)
+    - rosettasciio formats with 5D data
+
+    Parameters
+    ----------
+    file_path : str | PathLike
+        Path to data
+    file_type : str | None, optional
+        The type of file reader needed. If None, auto-detect.
+    stack_type : str, optional
+        Stack type ("sequence", "tilt", etc.) or "auto" to detect from metadata.
+    **kwargs : dict
+        Additional keyword arguments to pass to Dataset5dstem constructor.
+
+    Returns
+    -------
+    Dataset5dstem
+    """
+    file_path = Path(file_path)
+
+    # Try Nion Swift h5 format first
+    if file_path.suffix.lower() in [".h5", ".hdf5"]:
+        try:
+            with h5py.File(file_path, "r") as f:
+                if "data" in f and "properties" in f["data"].attrs:
+                    # Nion Swift format detected
+                    return _read_nion_swift_5dstem(file_path, stack_type, **kwargs)
+        except Exception:
+            pass  # Fall through to rsciio
+
+    # Fall back to rosettasciio
+    if file_type is None:
+        file_type = file_path.suffix.lower().lstrip(".")
+
+    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
+    data_list = file_reader(file_path)
+
+    # Find first 5D dataset
+    five_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 5]
+
+    if len(five_d_datasets) == 0:
+        print(f"No 5D datasets found in {file_path}. Available datasets:")
+        for i, d in enumerate(data_list):
+            print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+        raise ValueError("No 5D dataset found in file")
+
+    dataset_index, imported_data = five_d_datasets[0]
+
+    if len(data_list) > 1:
+        print(
+            f"File contains {len(data_list)} dataset(s). Using dataset {dataset_index} "
+            f"with shape {imported_data['data'].shape}"
+        )
+
+    imported_axes = imported_data["axes"]
+
+    sampling = kwargs.pop(
+        "sampling",
+        [ax["scale"] for ax in imported_axes],
+    )
+    origin = kwargs.pop(
+        "origin",
+        [ax["offset"] for ax in imported_axes],
+    )
+    units = kwargs.pop(
+        "units",
+        ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes],
+    )
+
+    # Determine stack type
+    if stack_type == "auto":
+        stack_type = "generic"
+
+    dataset = Dataset5dstem.from_array(
+        array=imported_data["data"],
+        sampling=sampling,
+        origin=origin,
+        units=units,
+        stack_type=stack_type,
+        **kwargs,
+    )
+
+    return dataset
+
+
+def _read_nion_swift_5dstem(
+    file_path: str | PathLike,
+    stack_type: str = "auto",
+    **kwargs,
+) -> Dataset5dstem:
+    """
+    Read Nion Swift 5D-STEM h5 file.
+
+    Nion Swift stores data with:
+    - f['data'] containing the array
+    - f['data'].attrs['properties'] containing JSON metadata
+
+    Parameters
+    ----------
+    file_path : str | PathLike
+        Path to Nion Swift h5 file
+    stack_type : str, optional
+        Stack type or "auto" to detect from metadata
+
+    Returns
+    -------
+    Dataset5dstem
+    """
+    with h5py.File(file_path, "r") as f:
+        data = f["data"][:]
+        props = json.loads(f["data"].attrs["properties"])
+
+    if data.ndim != 5:
+        raise ValueError(f"Expected 5D data, got {data.ndim}D with shape {data.shape}")
+
+    # Extract calibrations
+    cals = props.get("dimensional_calibrations", [])
+    if len(cals) == 5:
+        origin = np.array([c.get("offset", 0.0) for c in cals])
+        sampling = np.array([c.get("scale", 1.0) for c in cals])
+        units = [c.get("units", "") or "pixels" for c in cals]
+    else:
+        origin = np.zeros(5)
+        sampling = np.ones(5)
+        units = ["pixels"] * 5
+
+    # Determine stack type from metadata
+    if stack_type == "auto":
+        if props.get("is_sequence", False):
+            stack_type = "time"
+        else:
+            stack_type = "generic"
+
+    # Get intensity calibration
+    intensity_cal = props.get("intensity_calibration", {})
+    signal_units = intensity_cal.get("units", "arb. units") or "arb. units"
+
+    dataset = Dataset5dstem.from_array(
+        array=data,
+        origin=origin,
+        sampling=sampling,
+        units=units,
+        signal_units=signal_units,
+        stack_type=stack_type,
         **kwargs,
     )
 
