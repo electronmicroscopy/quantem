@@ -30,13 +30,26 @@ class Dataset5dstem(Dataset5d):
 
     Examples
     --------
-    >>> data = read_5dstem("path/to/file.h5")
-    >>> len(data)                    # number of frames
-    10
-    >>> frame = data[0]              # get first frame as Dataset4dstem
-    >>> mean_4d = data.stack_mean()  # average over stack -> Dataset4dstem
-    >>> for frame in data:           # iterate over frames
-    ...     process(frame)
+    >>> data = read_5dstem("path/to/file.h5")  # shape (4, 6, 7, 3, 5)
+    >>> len(data)                              # number of frames -> 4
+
+    Indexing (integer removes dimension, slice keeps it):
+
+    >>> data[2]           # -> Dataset4dstem (6, 7, 3, 5) one frame
+    >>> data[1:3]         # -> Dataset5dstem (2, 6, 7, 3, 5) substack
+    >>> data[:, 4, 1]     # -> Dataset3d (4, 3, 5) one scan position, all frames
+    >>> data[:, 1:5, 2:6] # -> Dataset5dstem (4, 4, 4, 3, 5) scan region crop
+    >>> data[..., 0:2, 1:4]  # -> Dataset5dstem (4, 6, 7, 2, 3) k-space crop
+
+    Stack operations (reduce over stack axis):
+
+    >>> data.stack_mean()  # -> Dataset4dstem
+    >>> data.stack_std()   # -> Dataset4dstem
+
+    Virtual imaging:
+
+    >>> vi = data.get_virtual_image(mode="circle", geometry=((1, 2), 1))
+    >>> vi.shape  # -> (4, 6, 7) = (frames, scan_row, scan_col)
     """
 
     def __init__(
