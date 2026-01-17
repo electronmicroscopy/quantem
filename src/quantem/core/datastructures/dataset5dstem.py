@@ -240,6 +240,26 @@ class Dataset5dstem(Dataset5d):
         Returns
         -------
         Dataset5dstem
+
+        Examples
+        --------
+        Basic usage:
+
+        >>> import numpy as np
+        >>> arr = np.random.rand(10, 256, 256, 64, 64)
+        >>> data = Dataset5dstem.from_array(arr, stack_type="time")
+        >>> data.shape
+        (10, 256, 256, 64, 64)
+
+        With calibrations:
+
+        >>> data = Dataset5dstem.from_array(
+        ...     arr,
+        ...     stack_type="tilt",
+        ...     stack_values=np.linspace(-60, 60, 10),  # tilt angles in degrees
+        ...     sampling=[1, 0.5, 0.5, 0.01, 0.01],
+        ...     units=["deg", "nm", "nm", "1/nm", "1/nm"],
+        ... )
         """
         array = ensure_valid_array(array, ndim=5)
 
@@ -283,6 +303,25 @@ class Dataset5dstem(Dataset5d):
         Returns
         -------
         Dataset5dstem
+
+        Examples
+        --------
+        Stack multiple 4D-STEM datasets into a tilt series:
+
+        >>> from quantem.core.io import read_4dstem
+        >>> frames = [read_4dstem(f"tilt_{i:02d}.h5") for i in range(10)]
+        >>> tilt_series = Dataset5dstem.from_4dstem(
+        ...     frames,
+        ...     stack_type="tilt",
+        ...     stack_values=np.linspace(-60, 60, 10),
+        ... )
+        >>> tilt_series.shape
+        (10, 256, 256, 128, 128)
+
+        Stack synthetic data:
+
+        >>> datasets = [Dataset4dstem.from_array(np.random.rand(64, 64, 32, 32)) for _ in range(5)]
+        >>> data = Dataset5dstem.from_4dstem(datasets, stack_type="time")
         """
         if not datasets:
             raise ValueError("datasets list cannot be empty")

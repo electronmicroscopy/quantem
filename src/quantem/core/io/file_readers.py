@@ -112,17 +112,42 @@ def read_5dstem(
     Parameters
     ----------
     file_path : str | PathLike
-        Path to data
+        Path to data file (.h5, .hdf5, or rosettasciio-supported formats).
     file_type : str | None, optional
-        The type of file reader needed. If None, auto-detect.
+        File reader type (e.g., "hdf5", "emd"). If None, auto-detects from extension.
     stack_type : str, optional
-        Stack type ("sequence", "tilt", etc.) or "auto" to detect from metadata.
+        Type of stack dimension. Options: "time", "tilt", "energy", "dose", "focus", "generic".
+        Default "auto" detects from metadata (Nion Swift is_sequence=True -> "time").
     **kwargs : dict
-        Additional keyword arguments to pass to Dataset5dstem constructor.
+        Additional keyword arguments passed to Dataset5dstem constructor.
 
     Returns
     -------
     Dataset5dstem
+        5D dataset with shape (stack, scan_row, scan_col, k_row, k_col).
+
+    Examples
+    --------
+    Load Nion Swift time series (auto-detects stack_type from is_sequence):
+
+    >>> data = read_5dstem("time_series.h5")
+    >>> data.shape
+    (10, 512, 512, 12, 12)
+    >>> data.stack_type
+    'time'
+
+    Load as tilt series (override auto-detection):
+
+    >>> data = read_5dstem("tilt_series.h5", stack_type="tilt")
+    >>> data.stack_type
+    'tilt'
+
+    Access calibrations extracted from file metadata:
+
+    >>> data.sampling  # [stack, scan_row, scan_col, k_row, k_col]
+    array([1.0, 0.5, 0.5, 0.006, 0.006])
+    >>> data.units
+    ['pixels', 'nm', 'nm', 'rad', 'rad']
     """
     file_path = Path(file_path)
 
