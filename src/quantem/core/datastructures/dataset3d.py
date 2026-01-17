@@ -107,24 +107,62 @@ class Dataset3d(Dataset):
 
     def show(
         self,
-        index: int = 0,
+        index: int | None = None,
         scalebar: ScalebarConfig | bool = True,
         title: str | None = None,
+        ncols: int = 4,
+        returnfig: bool = False,
         **kwargs,
     ):
         """
-        Display a 2D slice of the 3D dataset.
+        Display 2D slices of the 3D dataset.
 
         Parameters
         ----------
-        index : int
-            Index of the 2D slice to display (along axis 0).
-        scalebar: ScalebarConfig or bool
-            If True, displays scalebar
-        title: str
-            Title of Dataset
-        **kwargs: dict
-            Keyword arguments for show_2d
-        """
+        index : int | None
+            Index of the 2D slice to display. If None, shows all slices in a grid.
+        scalebar : ScalebarConfig or bool
+            If True, displays scalebar.
+        title : str | None
+            Title for the plot. If None and showing all, uses "Frame 0", "Frame 1", etc.
+        ncols : int
+            Maximum columns when showing all slices. Default: 4.
+        returnfig : bool
+            If True, returns (fig, axes). Default: False.
+        **kwargs : dict
+            Keyword arguments for show_2d (cmap, cbar, norm, etc.).
 
-        return self[index].show(scalebar=scalebar, title=title, **kwargs)
+        Examples
+        --------
+        >>> data.show()           # show all frames in grid
+        >>> data.show(index=0)    # show single frame
+        >>> data.show(ncols=3)    # 3 columns
+        >>> fig, axes = data.show(returnfig=True)  # get figure for customization
+        """
+        from quantem.core.visualization import show_2d
+
+        if index is not None:
+            result = self[index].show(scalebar=scalebar, title=title, **kwargs)
+            return result if returnfig else None
+
+        # Show all frames in a grid
+        n = self.shape[0]
+        nrows = (n + ncols - 1) // ncols
+        arrays = []
+        titles = []
+        for row in range(nrows):
+            row_arrays = []
+            row_titles = []
+            for col in range(ncols):
+                i = row * ncols + col
+                if i < n:
+                    row_arrays.append(self.array[i])
+                    row_titles.append(f"Frame {i}" if title is None else f"{title} {i}")
+                else:
+                    row_arrays.append(np.zeros_like(self.array[0]))
+                    row_titles.append("")
+            arrays.append(row_arrays)
+            titles.append(row_titles)
+
+        result = show_2d(arrays, scalebar=scalebar, title=titles, **kwargs)
+        return result if returnfig else None
