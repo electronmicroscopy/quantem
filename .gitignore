@@ -191,3 +191,4 @@ ipynb-playground/
 # widget (JS build artifacts)
 node_modules/
 widget/src/quantem/widget/static/
+*.ipynb
