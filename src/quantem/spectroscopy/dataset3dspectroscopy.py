@@ -696,95 +696,6 @@ class Dataset3dspectroscopy(Dataset3d):
                 score -= len(matches) * 2.0
         
         return score
-
-# BACKGROUND SUBTRACTION
-
-    def _subtract_background_eds(self, spectrum, energy_axis):
-        """
-        Subtract power-law background typical for EDS Bremsstrahlung.
-        Uses a conservative approach with heavy smoothing to avoid creating artifacts.
-        
-        Parameters
-        ----------
-        spectrum : ndarray
-            1D spectrum
-        energy_axis : ndarray
-            Energy axis corresponding to spectrum
-            
-        Returns
-        -------
-        ndarray
-            Background-subtracted spectrum
-        """
-        from scipy.ndimage import gaussian_filter
-        
-        # Use a larger window for more conservative background estimation
-        window_size = 15  # Larger window = smoother, less aggressive
-        background = np.zeros_like(spectrum)
-        half_window = window_size // 2
-        
-        # Estimate background from sliding minimum
-        for i in range(len(spectrum)):
-            start = max(0, i - half_window)
-            end = min(len(spectrum), i + half_window + 1)
-            # Use percentile instead of minimum for more robustness
-            background[i] = np.percentile(spectrum[start:end], 10)
-        
-        # Apply heavy smoothing to avoid creating artificial features
-        background = gaussian_filter(background, sigma=5.0)
-        
-        # Be very conservative - only subtract 80% of estimated background
-        # This prevents over-subtraction that creates artificial peaks
-        background = background * 0.8
-        
-        # Ensure background doesn't exceed spectrum
-        background = np.minimum(background, spectrum * 0.9)
-        
-        return np.maximum(spectrum - background, 0)
-
-    def _subtract_background_eels(self, spectrum, energy_axis):
-        """
-        Subtract background typical for EELS using iterative Gaussian fitting.
-        This method isolates the continuum background from the low-loss region.
-        
-        WARNING: Only use with EELS data! Will remove peaks if used with EDS.
-        
-        Parameters
-        ----------
-        spectrum : ndarray
-            1D EELS spectrum
-        energy_axis : ndarray
-            Energy axis corresponding to spectrum
-            
-        Returns
-        -------
-        ndarray
-            Background-subtracted spectrum
-        """
-        from scipy.stats import norm
-        from scipy.ndimage import gaussian_filter
-        
-        # Smooth for better fitting
-        spec_smooth = gaussian_filter(spectrum, sigma=1.0)
-        pixel_vals = spec_smooth.copy()
-        
-        # Iteratively fit Gaussian to low-intensity values (the continuum)
-        # Remove outliers (edge peaks) iteratively
-        num_iterations = 10
-        cutoff = 3  # +/- 3 sigma
-        
-        for _ in range(num_iterations):
-            mu, std = norm.fit(pixel_vals)
-            if std == 0:
-                break
-            # Keep only values within +/- 3 sigma (removes edge contributions)
-            lower = mu - cutoff * std
-            upper = mu + cutoff * std
-            pixel_vals = pixel_vals[(pixel_vals >= lower) & (pixel_vals <= upper)]
-        
-        # Subtract the estimated background level
-        background_fit = mu
-        return np.maximum(spectrum - background_fit, 0)
         
 
     def show_mean_spectrum(self, roi=None, energy_range=None, elements=None, ignore_range=None, threshold=5.0, tolerance=0.15, mask=None, show_lines=True, show_text=True, snr_min=None, snr_threshold=None, distance_threshold_for_sample=0.05, contamination_elements=None, grid_peaks=None, background_subtraction='none', data_type='eds',peaks=15):
@@ -1338,7 +1249,7 @@ class Dataset3dspectroscopy(Dataset3d):
         plt.show()
         return fig, (ax_img, ax_spec)
 
-
+# BACKGROND SUBTRACTION
 
     def subtract_background(self, roi=None, energy_range=None, ignore_range=None, mask=None, data_type='eds'):
 

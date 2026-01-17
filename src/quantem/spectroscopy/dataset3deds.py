@@ -222,7 +222,8 @@ class Dataset3deds(Dataset3dspectroscopy):
             subtracted_mean_spectrum = np.maximum(spec - background, 0)
             
     #TEMP- PORT OF SPECTRUM PLOTTING CODE FROM SHOW_MEAN_SPECTRUM
-        # PLOTTING ---------------------------------------------------------------------------
+    
+        # PLOT MEAN BACKGROUND-SUBTRACTED SPECTRUM ---------------------------------------------------------------------------
             
             # Create subplot layout: image on left, spectrum on right
             fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
