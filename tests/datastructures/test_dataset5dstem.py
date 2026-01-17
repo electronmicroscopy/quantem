@@ -40,7 +40,7 @@ class TestDataset5dstem:
 
     def test_indexing(self, sample_dataset):
         """Test data[i] returns Dataset4dstem."""
-        frame = sample_dataset[0]
+        frame = sample_dataset[0]  # -> Dataset4dstem
 
         assert isinstance(frame, Dataset4dstem)
         assert frame.shape == (5, 5, 10, 10)
@@ -83,50 +83,58 @@ class TestDataset5dstem:
         assert isinstance(maximum, Dataset4dstem)
         assert maximum.shape == (5, 5, 10, 10)
 
+    def test_stack_std(self, sample_dataset):
+        """Test stack_std returns Dataset4dstem."""
+        std = sample_dataset.stack_std()
+
+        assert isinstance(std, Dataset4dstem)
+        assert std.shape == (5, 5, 10, 10)
+        assert np.allclose(std.array, np.std(sample_dataset.array, axis=0))
+
     def test_slicing(self, sample_dataset):
         """Test data[1:3] returns Dataset5dstem with correct data."""
-        sliced = sample_dataset[1:3]
+        sliced = sample_dataset[1:3]  # -> Dataset5dstem
         assert isinstance(sliced, Dataset5dstem)
         assert sliced.stack_type == "time"
         assert np.array_equal(sliced.array, sample_dataset.array[1:3])
 
     def test_slicing_ellipsis(self, sample_dataset):
         """Test data[1:3, ...] returns Dataset5dstem with correct data."""
-        sliced = sample_dataset[1:3, ...]
+        sliced = sample_dataset[1:3, ...]  # -> Dataset5dstem
         assert isinstance(sliced, Dataset5dstem)
         assert np.array_equal(sliced.array, sample_dataset.array[1:3, ...])
 
     def test_slicing_scan_position(self, sample_dataset):
         """Test data[:, 2, 2] returns Dataset3d with correct data."""
-        sliced = sample_dataset[:, 2, 2]
+        sliced = sample_dataset[:, 2, 2]  # -> Dataset3d
         assert isinstance(sliced, Dataset3d)
         assert np.array_equal(sliced.array, sample_dataset.array[:, 2, 2])
 
     def test_slicing_k_roi(self, sample_dataset):
         """Test data[:, :, :, 2:8, 2:8] returns Dataset5dstem with correct data."""
-        sliced = sample_dataset[:, :, :, 2:8, 2:8]
+        sliced = sample_dataset[:, :, :, 2:8, 2:8]  # -> Dataset5dstem
         assert isinstance(sliced, Dataset5dstem)
         assert np.array_equal(sliced.array, sample_dataset.array[:, :, :, 2:8, 2:8])
 
     def test_slicing_frame_ellipsis(self, sample_dataset):
         """Test data[0, ...] same as data[0] with correct data."""
-        sliced = sample_dataset[0, ...]
+        sliced = sample_dataset[0, ...]  # -> Dataset4dstem
         assert isinstance(sliced, Dataset4dstem)
         assert np.array_equal(sliced.array, sample_dataset.array[0, ...])
 
     def test_slicing_last_axis(self, sample_dataset):
         """Test data[..., 0] slices last axis with correct data."""
-        sliced = sample_dataset[..., 0]
+        sliced = sample_dataset[..., 0]  # -> Dataset4d
         assert np.array_equal(sliced.array, sample_dataset.array[..., 0])
 
     def test_slicing_scan_k_roi(self, sample_dataset):
         """Test data[:, 2, 2, 2:8, 2:8] with correct data."""
-        sliced = sample_dataset[:, 2, 2, 2:8, 2:8]
+        sliced = sample_dataset[:, 2, 2, 2:8, 2:8]  # -> Dataset3d
         assert np.array_equal(sliced.array, sample_dataset.array[:, 2, 2, 2:8, 2:8])
 
     def test_slicing_substack_k_roi(self, sample_dataset):
         """Test data[1:3, :, :, 2:8, 2:8] with correct data."""
-        sliced = sample_dataset[1:3, :, :, 2:8, 2:8]
+        sliced = sample_dataset[1:3, :, :, 2:8, 2:8]  # -> Dataset5dstem
         assert isinstance(sliced, Dataset5dstem)
         assert np.array_equal(sliced.array, sample_dataset.array[1:3, :, :, 2:8, 2:8])
 
@@ -150,7 +158,7 @@ class TestDataset5dstem:
 
     def test_get_virtual_image(self, sample_dataset):
         """Test virtual image creation."""
-        vi = sample_dataset.get_virtual_image(
+        vi = sample_dataset.get_virtual_image(  # -> Dataset3d
             mode="circle",
             geometry=((5, 5), 3),
             name="bf",

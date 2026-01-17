@@ -3,7 +3,7 @@
 from typing import Iterator, Self
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
@@ -41,15 +41,15 @@ class Dataset5dstem(Dataset5d):
 
     def __init__(
         self,
-        array: NDArray,
+        array: ArrayLike,
         name: str,
-        origin: NDArray,
-        sampling: NDArray,
+        origin: ArrayLike,
+        sampling: ArrayLike,
         units: list[str],
         signal_units: str = "arb. units",
         metadata: dict | None = None,
         stack_type: str = "generic",
-        stack_values: NDArray | None = None,
+        stack_values: ArrayLike | None = None,
         _token: object | None = None,
     ):
         metadata = metadata or {}
@@ -106,29 +106,66 @@ class Dataset5dstem(Dataset5d):
             yield self._get_frame(i)
 
     def __getitem__(self, idx) -> "Dataset4dstem | Dataset5dstem":
-        if isinstance(idx, int):
-            return self._get_frame(idx)
+        # Handle integer indexing (including numpy integers)
+        if isinstance(idx, (int, np.integer)):
+            return self._get_frame(int(idx))
 
         # Handle tuple where first element is int (e.g., data[0, ...])
-        if isinstance(idx, tuple) and len(idx) > 0 and isinstance(idx[0], int):
-            return self._get_frame(idx[0])[idx[1:]]
+        if isinstance(idx, tuple) and len(idx) > 0 and isinstance(idx[0], (int, np.integer)):
+            return self._get_frame(int(idx[0]))[idx[1:]]
 
-        # Slicing returns Dataset5dstem with preserved stack_type
-        if isinstance(idx, slice):
-            sliced_array = self.array[idx]
-            sliced_values = self._stack_values[idx] if self._stack_values is not None else None
+        # Reject advanced indexing on stack axis (lists, arrays, boolean masks)
+        if isinstance(idx, (list, np.ndarray)):
+            raise TypeError(
+                "Advanced indexing with lists/arrays on stack axis is not supported. "
+                "Use integer indexing or slices instead."
+            )
+        if isinstance(idx, tuple) and len(idx) > 0 and isinstance(idx[0], (list, np.ndarray)):
+            raise TypeError(
+                "Advanced indexing with lists/arrays on stack axis is not supported. "
+                "Use integer indexing or slices instead."
+            )
+
+        # Get result from base class slicing
+        result = super().__getitem__(idx)
+
+        # If result is still 5D, wrap back into Dataset5dstem with preserved metadata
+        if result.array.ndim == 5:
+            # Figure out how stack_values should be sliced
+            sliced_values = self._slice_stack_values(idx)
             return self.from_array(
-                array=sliced_array,
-                name=self.name,
-                origin=self.origin,
-                sampling=self.sampling,
-                units=self.units,
-                signal_units=self.signal_units,
+                array=result.array,
+                name=result.name,
+                origin=result.origin,
+                sampling=result.sampling,
+                units=result.units,
+                signal_units=result.signal_units,
                 stack_type=self._stack_type,
                 stack_values=sliced_values,
             )
 
-        return super().__getitem__(idx)
+        return result
+
+    def _slice_stack_values(self, idx):
+        """Slice stack_values based on how the stack axis is indexed."""
+        if self._stack_values is None:
+            return None
+
+        # Simple slice on first axis
+        if isinstance(idx, slice):
+            return self._stack_values[idx]
+
+        # Tuple indexing - check first element
+        if isinstance(idx, tuple) and len(idx) > 0:
+            first = idx[0]
+            if isinstance(first, slice):
+                return self._stack_values[first]
+            if first is Ellipsis:
+                # Ellipsis at start means stack axis not sliced
+                return self._stack_values
+
+        # Default: preserve all stack_values
+        return self._stack_values
 
     @property
     def stack_type(self) -> str:
@@ -157,34 +194,34 @@ class Dataset5dstem(Dataset5d):
     @classmethod
     def from_array(
         cls,
-        array: NDArray,
+        array: ArrayLike,
         name: str | None = None,
-        origin: NDArray | tuple | list | None = None,
-        sampling: NDArray | tuple | list | None = None,
+        origin: ArrayLike | None = None,
+        sampling: ArrayLike | None = None,
         units: list[str] | None = None,
         signal_units: str = "arb. units",
         stack_type: str = "generic",
-        stack_values: NDArray | None = None,
+        stack_values: ArrayLike | None = None,
     ) -> Self:
         """Create Dataset5dstem from a 5D array.
 
         Parameters
         ----------
-        array : NDArray
+        array : array-like
             5D array with shape (stack, scan_row, scan_col, k_row, k_col).
         name : str, optional
             Dataset name. Default: "5D-STEM dataset".
         origin : array-like, optional
-            Origin for each dimension (4 or 5 elements). Default: zeros.
+            Origin for each dimension (5 elements). Default: zeros.
         sampling : array-like, optional
-            Sampling for each dimension (4 or 5 elements). Default: ones.
+            Sampling for each dimension (5 elements). Default: ones.
         units : list[str], optional
-            Units for each dimension (4 or 5 elements). Default: ["pixels", ...].
+            Units for each dimension (5 elements). Default: ["pixels", ...].
         signal_units : str, optional
             Units for intensity values. Default: "arb. units".
         stack_type : str, optional
             Type of stack dimension. Default: "generic".
-        stack_values : NDArray, optional
+        stack_values : array-like, optional
             Explicit values for stack positions (e.g., times, angles).
 
         Returns
@@ -193,24 +230,9 @@ class Dataset5dstem(Dataset5d):
         """
         array = ensure_valid_array(array, ndim=5)
 
-        # Accept 4-element inputs (scan + k dims); prepend stack defaults
-        def expand_to_5d(arr, default):
-            if arr is None:
-                return default
-            arr = np.asarray(arr)
-            if arr.size == 4:
-                return np.concatenate([[default[0]], arr])
-            return arr
-
-        origin_5d = expand_to_5d(origin, np.zeros(5))
-        sampling_5d = expand_to_5d(sampling, np.ones(5))
-
-        if units is None:
-            units_5d = ["pixels"] * 5
-        elif len(units) == 4:
-            units_5d = ["index"] + list(units)
-        else:
-            units_5d = list(units)
+        origin_5d = np.zeros(5) if origin is None else np.asarray(origin)
+        sampling_5d = np.ones(5) if sampling is None else np.asarray(sampling)
+        units_5d = ["pixels"] * 5 if units is None else list(units)
 
         return cls(
             array=array,
@@ -302,6 +324,10 @@ class Dataset5dstem(Dataset5d):
         """Minimum over the stack axis. Returns Dataset4dstem."""
         return self._reduce_stack(np.min, "min")
 
+    def stack_std(self) -> Dataset4dstem:
+        """Standard deviation over the stack axis. Returns Dataset4dstem."""
+        return self._reduce_stack(np.std, "std")
+
     def _reduce_stack(self, func, suffix: str) -> Dataset4dstem:
         """Apply reduction function over stack axis."""
         return Dataset4dstem.from_array(
@@ -349,7 +375,7 @@ class Dataset5dstem(Dataset5d):
 
     def get_virtual_image(
         self,
-        mask: np.ndarray | None = None,
+        mask: ArrayLike | None = None,
         mode: str | None = None,
         geometry: tuple | None = None,
         name: str = "virtual_image",

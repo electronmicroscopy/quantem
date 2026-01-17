@@ -1,4 +1,4 @@
-from typing import Any, Self, Union
+from typing import Any, Self
 
 import numpy as np
 from numpy.typing import NDArray
@@ -117,8 +117,8 @@ class Dataset5d(Dataset):
         shape: tuple[int, int, int, int, int],
         name: str = "constant 5D dataset",
         fill_value: float = 0.0,
-        origin: Union[NDArray, tuple, list, float, int] | None = None,
-        sampling: Union[NDArray, tuple, list, float, int] | None = None,
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
         units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
     ) -> Self:
