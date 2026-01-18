@@ -81,12 +81,9 @@ class Dataset5dstem(Dataset5d):
             metadata=metadata,
             _token=_token,
         )
-
         if stack_type not in STACK_TYPES:
             raise ValueError(f"stack_type must be one of {STACK_TYPES}, got '{stack_type}'")
-
         self._stack_type = stack_type
-
         if stack_values is not None:
             stack_values = np.asarray(stack_values)
             if len(stack_values) != self.shape[0]:
@@ -124,11 +121,9 @@ class Dataset5dstem(Dataset5d):
         # Handle integer indexing (including numpy integers)
         if isinstance(idx, (int, np.integer)):
             return self._get_frame(int(idx))
-
         # Handle tuple where first element is int (e.g., data[0, ...])
         if isinstance(idx, tuple) and len(idx) > 0 and isinstance(idx[0], (int, np.integer)):
             return self._get_frame(int(idx[0]))[idx[1:]]
-
         # Reject advanced indexing on stack axis (lists, arrays, boolean masks)
         if isinstance(idx, (list, np.ndarray)):
             raise TypeError(
@@ -140,10 +135,8 @@ class Dataset5dstem(Dataset5d):
                 "Advanced indexing with lists/arrays on stack axis is not supported. "
                 "Use integer indexing or slices instead."
             )
-
         # Get result from base class slicing
         result = super().__getitem__(idx)
-
         # If result is still 5D, wrap back into Dataset5dstem with preserved metadata
         if result.array.ndim == 5:
             return self.from_array(
@@ -208,7 +201,6 @@ class Dataset5dstem(Dataset5d):
     # -------------------------------------------------------------------------
     # Construction
     # -------------------------------------------------------------------------
-
     @classmethod
     def from_array(
         cls,
@@ -364,7 +356,6 @@ class Dataset5dstem(Dataset5d):
     # -------------------------------------------------------------------------
     # Stack operations
     # -------------------------------------------------------------------------
-
     def stack_mean(self) -> Dataset4dstem:
         """Average over the stack axis. Returns Dataset4dstem."""
         return self._reduce_stack(np.mean, "mean")
@@ -421,7 +412,6 @@ class Dataset5dstem(Dataset5d):
     # -------------------------------------------------------------------------
     # Virtual imaging
     # -------------------------------------------------------------------------
-
     def get_virtual_image(
         self,
         mask: ArrayLike | None = None,
@@ -675,7 +665,6 @@ class Dataset5dstem(Dataset5d):
     # -------------------------------------------------------------------------
     # Copy
     # -------------------------------------------------------------------------
-
     def _copy_custom_attributes(self, new_dataset) -> None:
         """Copy Dataset5dstem-specific attributes."""
         super()._copy_custom_attributes(new_dataset)
