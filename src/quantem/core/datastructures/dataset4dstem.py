@@ -91,6 +91,17 @@ class Dataset4dstem(Dataset4d):
         self._virtual_images = {}
         self._virtual_detectors = {}  # Store detector information for regeneration
 
+    def __repr__(self) -> str:
+        return f"Dataset4dstem(shape={self.shape}, dtype={self.array.dtype})"
+
+    def __str__(self) -> str:
+        return (
+            f"Dataset4dstem '{self.name}'\n"
+            f"  shape: {self.shape}\n"
+            f"  scan sampling: {self.sampling[:2]} {self.units[:2]}\n"
+            f"  k sampling: {self.sampling[2:]} {self.units[2:]}"
+        )
+
     @classmethod
     def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
         """

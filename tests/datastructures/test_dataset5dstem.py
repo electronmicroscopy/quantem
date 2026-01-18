@@ -81,3 +81,58 @@ class TestDataset5dstem:
         ds2 = Dataset4dstem.from_array(np.random.rand(8, 9, 3, 5))
         with pytest.raises(ValueError, match="shape"):
             Dataset5dstem.from_4dstem([ds1, ds2])
+
+    def test_virtual_image_management(self, sample_dataset):
+        """Test virtual image clear, regenerate, update methods."""
+        # Create virtual images
+        sample_dataset.get_virtual_image(mode="circle", geometry=((1, 2), 1), name="bf")
+        sample_dataset.get_virtual_image(mode="annular", geometry=((1, 2), (1, 2)), name="adf")
+        assert len(sample_dataset.virtual_images) == 2
+
+        # Clear images only
+        sample_dataset.clear_virtual_images()
+        assert len(sample_dataset.virtual_images) == 0
+        assert len(sample_dataset.virtual_detectors) == 2
+
+        # Regenerate
+        sample_dataset.regenerate_virtual_images()
+        assert len(sample_dataset.virtual_images) == 2
+
+        # Update detector
+        sample_dataset.update_virtual_detector("bf", mode="circle", geometry=((1, 2), 2))
+        assert sample_dataset.virtual_detectors["bf"]["geometry"] == ((1, 2), 2)
+
+        # Clear all
+        sample_dataset.clear_all_virtual_data()
+        assert len(sample_dataset.virtual_images) == 0
+        assert len(sample_dataset.virtual_detectors) == 0
+
+    def test_virtual_image_per_frame_geometry(self, sample_dataset):
+        """Test virtual image with per-frame geometry."""
+        geometries = [((1, 2), 1) for _ in range(4)]
+        vi = sample_dataset.get_virtual_image(mode="circle", geometry=geometries, name="bf_perframe")
+        assert vi.shape == (4, 6, 7)
+        assert len(sample_dataset.virtual_detectors["bf_perframe"]["geometry"]) == 4
+
+    def test_virtual_image_auto_fit_center(self):
+        """Test virtual image with auto-fit center (requires realistic DP)."""
+        # Create data with a clear probe pattern
+        n_frames, scan_r, scan_c, k_r, k_c = 3, 4, 4, 32, 32
+        array = np.zeros((n_frames, scan_r, scan_c, k_r, k_c), dtype=np.float32)
+        # Add circular probe at center
+        cy, cx = k_r // 2, k_c // 2
+        y, x = np.ogrid[:k_r, :k_c]
+        mask = (y - cy) ** 2 + (x - cx) ** 2 <= 8 ** 2
+        array[:, :, :, mask] = 1.0
+
+        data = Dataset5dstem.from_array(array, stack_type="time")
+        vi = data.get_virtual_image(mode="circle", geometry=(None, 5), name="bf_auto")
+        assert vi.shape == (3, 4, 4)
+        assert isinstance(data.virtual_detectors["bf_auto"]["geometry"], list)
+        assert len(data.virtual_detectors["bf_auto"]["geometry"]) == 3
+
+    def test_show_raises_error(self, sample_dataset):
+        """Test that show() raises NotImplementedError with helpful message."""
+        with pytest.raises(NotImplementedError, match="not meaningful for 5D"):
+            sample_dataset.show()
+

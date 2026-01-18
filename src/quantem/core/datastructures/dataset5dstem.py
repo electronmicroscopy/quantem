@@ -8,8 +8,10 @@ from numpy.typing import ArrayLike, NDArray
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.dataset5d import Dataset5d
+from quantem.core.utils.diffractive_imaging_utils import fit_probe_circle
 from quantem.core.utils.masks import create_annular_mask, create_circle_mask
 from quantem.core.utils.validators import ensure_valid_array
+from quantem.core.visualization import show_2d
 
 STACK_TYPES = ("time", "tilt", "energy", "dose", "focus", "generic")
 
@@ -144,8 +146,6 @@ class Dataset5dstem(Dataset5d):
 
         # If result is still 5D, wrap back into Dataset5dstem with preserved metadata
         if result.array.ndim == 5:
-            # Figure out how stack_values should be sliced
-            sliced_values = self._slice_stack_values(idx)
             return self.from_array(
                 array=result.array,
                 name=result.name,
@@ -154,31 +154,10 @@ class Dataset5dstem(Dataset5d):
                 units=result.units,
                 signal_units=result.signal_units,
                 stack_type=self._stack_type,
-                stack_values=sliced_values,
+                stack_values=None,  # Don't try to slice stack_values
             )
 
         return result
-
-    def _slice_stack_values(self, idx):
-        """Slice stack_values based on how the stack axis is indexed."""
-        if self._stack_values is None:
-            return None
-
-        # Simple slice on first axis
-        if isinstance(idx, slice):
-            return self._stack_values[idx]
-
-        # Tuple indexing - check first element
-        if isinstance(idx, tuple) and len(idx) > 0:
-            first = idx[0]
-            if isinstance(first, slice):
-                return self._stack_values[first]
-            if first is Ellipsis:
-                # Ellipsis at start means stack axis not sliced
-                return self._stack_values
-
-        # Default: preserve all stack_values
-        return self._stack_values
 
     @property
     def stack_type(self) -> str:
@@ -199,6 +178,32 @@ class Dataset5dstem(Dataset5d):
     def virtual_detectors(self) -> dict[str, dict]:
         """Virtual detector configurations for regenerating images."""
         return self._virtual_detectors
+
+    @classmethod
+    def from_file(cls, file_path: str, file_type: str | None = None, **kwargs) -> "Dataset5dstem":
+        """Load Dataset5dstem from a file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to data file.
+        file_type : str | None
+            File type hint. If None, auto-detect from extension.
+        **kwargs
+            Additional arguments passed to read_5dstem (e.g., stack_type).
+
+        Returns
+        -------
+        Dataset5dstem
+
+        Examples
+        --------
+        >>> data = Dataset5dstem.from_file("path/to/data.h5")
+        >>> data = Dataset5dstem.from_file("path/to/data.h5", stack_type="tilt")
+        """
+        from quantem.core.io.file_readers import read_5dstem
+
+        return read_5dstem(file_path, file_type=file_type, **kwargs)
 
     # -------------------------------------------------------------------------
     # Construction
@@ -411,14 +416,6 @@ class Dataset5dstem(Dataset5d):
         frame.metadata["r_to_q_rotation_cw_deg"] = self.metadata.get("r_to_q_rotation_cw_deg")
         frame.metadata["ellipticity"] = self.metadata.get("ellipticity")
 
-        # Inherit virtual detector definitions
-        for name, info in self._virtual_detectors.items():
-            frame._virtual_detectors[name] = {
-                "mask": None,
-                "mode": info["mode"],
-                "geometry": info["geometry"],
-            }
-
         return frame
 
     # -------------------------------------------------------------------------
@@ -429,7 +426,7 @@ class Dataset5dstem(Dataset5d):
         self,
         mask: ArrayLike | None = None,
         mode: str | None = None,
-        geometry: tuple | None = None,
+        geometry: tuple | list | None = None,
         name: str = "virtual_image",
         attach: bool = True,
     ) -> Dataset3d:
@@ -438,12 +435,22 @@ class Dataset5dstem(Dataset5d):
         Parameters
         ----------
         mask : np.ndarray, optional
-            Custom mask matching diffraction pattern shape.
+            Custom mask matching diffraction pattern shape (k_row, k_col).
         mode : str, optional
             Mask mode: "circle" or "annular".
-        geometry : tuple, optional
-            For "circle": ((cy, cx), radius).
-            For "annular": ((cy, cx), (r_inner, r_outer)).
+        geometry : tuple or list, optional
+            Detector geometry in pixels. Format depends on mode:
+
+            For "circle" mode:
+                - ``(None, radius)`` : Auto-fit center per frame.
+                - ``((cy, cx), radius)`` : Fixed center for all frames.
+                - ``[((cy0, cx0), r0), ...]`` : Per-frame geometry list.
+
+            For "annular" mode:
+                - ``(None, (r_inner, r_outer))`` : Auto-fit center per frame.
+                - ``((cy, cx), (r_inner, r_outer))`` : Fixed center.
+                - ``[((cy0, cx0), (r0_in, r0_out)), ...]`` : Per-frame list.
+
         name : str, optional
             Name for the virtual image. Default: "virtual_image".
         attach : bool, optional
@@ -453,26 +460,65 @@ class Dataset5dstem(Dataset5d):
         -------
         Dataset3d
             Virtual image stack with shape (n_frames, scan_row, scan_col).
+
+        Notes
+        -----
+        All geometry values are in pixels. To convert from mrad:
+
+            >>> radius_px = radius_mrad / data.sampling[-1]
+
+        Examples
+        --------
+        Auto-fit center per frame:
+
+        >>> bf = data.get_virtual_image(mode="circle", geometry=(None, 20))
+        >>> adf = data.get_virtual_image(mode="annular", geometry=(None, (30, 80)))
+
+        Fixed center for all frames:
+
+        >>> k_center = (data.shape[-2] // 2, data.shape[-1] // 2)
+        >>> bf = data.get_virtual_image(mode="circle", geometry=(k_center, 20))
+
+        Per-frame geometry:
+
+        >>> geometries = [(center, 20) for center in fitted_centers]
+        >>> bf = data.get_virtual_image(mode="circle", geometry=geometries)
         """
         dp_shape = self.array.shape[-2:]
+        n_frames = len(self)
 
         if mask is not None:
             if mask.shape != dp_shape:
                 raise ValueError(f"Mask shape {mask.shape} != diffraction pattern shape {dp_shape}")
-            final_mask = mask
-        elif mode and geometry:
-            if mode == "circle":
-                center, radius = geometry
-                final_mask = create_circle_mask(dp_shape, center, radius)
-            elif mode == "annular":
-                center, radii = geometry
-                final_mask = create_annular_mask(dp_shape, center, radii)
+            virtual_stack = np.sum(self.array * mask, axis=(-1, -2))
+        elif mode and geometry is not None:
+            # Per-frame geometry list
+            if isinstance(geometry, list):
+                if len(geometry) != n_frames:
+                    raise ValueError(
+                        f"geometry list length ({len(geometry)}) must match "
+                        f"number of frames ({n_frames})"
+                    )
+                virtual_stack = self._compute_per_frame_virtual(mode, geometry, dp_shape)
             else:
-                raise ValueError(f"Unknown mode '{mode}'. Use 'circle' or 'annular'.")
+                # Single geometry tuple: (center_or_none, radius_or_radii)
+                center, radius_or_radii = geometry
+                if center is None:
+                    # Auto-fit center per frame
+                    geometries = self._auto_fit_centers(mode, radius_or_radii)
+                    virtual_stack = self._compute_per_frame_virtual(mode, geometries, dp_shape)
+                    geometry = geometries  # Store fitted geometries
+                else:
+                    # Fixed center for all frames
+                    if mode == "circle":
+                        final_mask = create_circle_mask(dp_shape, center, radius_or_radii)
+                    elif mode == "annular":
+                        final_mask = create_annular_mask(dp_shape, center, radius_or_radii)
+                    else:
+                        raise ValueError(f"Unknown mode '{mode}'. Use 'circle' or 'annular'.")
+                    virtual_stack = np.sum(self.array * final_mask, axis=(-1, -2))
         else:
             raise ValueError("Provide either mask or both mode and geometry")
-
-        virtual_stack = np.sum(self.array * final_mask, axis=(-1, -2))
 
         vi = Dataset3d.from_array(
             array=virtual_stack,
@@ -486,12 +532,145 @@ class Dataset5dstem(Dataset5d):
         if attach:
             self._virtual_images[name] = vi
             self._virtual_detectors[name] = {
-                "mask": final_mask.copy() if mask is not None else None,
+                "mask": mask.copy() if mask is not None else None,
                 "mode": mode,
                 "geometry": geometry,
             }
 
         return vi
+
+    def _auto_fit_centers(self, mode: str, radius_or_radii) -> list:
+        """Fit probe center for each frame and return list of geometries."""
+        geometries = []
+        for i in range(len(self)):
+            dp_mean = np.mean(self.array[i], axis=(0, 1))
+            cy, cx, _ = fit_probe_circle(dp_mean, show=False)
+            geometries.append(((cy, cx), radius_or_radii))
+        return geometries
+
+    def _compute_per_frame_virtual(self, mode: str, geometries: list, dp_shape: tuple) -> np.ndarray:
+        """Compute virtual images with per-frame geometry."""
+        virtual_stack = np.zeros((len(self), self.shape[1], self.shape[2]), dtype=self.array.dtype)
+        for i, geom in enumerate(geometries):
+            center, radius_or_radii = geom
+            if mode == "circle":
+                mask = create_circle_mask(dp_shape, center, radius_or_radii)
+            elif mode == "annular":
+                mask = create_annular_mask(dp_shape, center, radius_or_radii)
+            else:
+                raise ValueError(f"Unknown mode '{mode}'")
+            virtual_stack[i] = np.sum(self.array[i] * mask, axis=(-1, -2))
+        return virtual_stack
+
+    def show_virtual_images(self, figsize: tuple[int, int] | None = None, **kwargs) -> tuple:
+        """Display all virtual images stored in the dataset.
+
+        Parameters
+        ----------
+        figsize : tuple[int, int] | None
+            Figure size. If None, auto-calculated.
+        **kwargs
+            Arguments passed to show_2d (cmap, norm, cbar, etc.)
+
+        Returns
+        -------
+        tuple
+            (fig, axs) from matplotlib.
+        """
+        if not self.virtual_images:
+            print("No virtual images. Create with get_virtual_image().")
+            return None, None
+
+        # Each virtual image is Dataset3d - show first frame of each
+        arrays = [vi.array[0] for vi in self.virtual_images.values()]
+        titles = [f"{name} (frame 0)" for name in self.virtual_images.keys()]
+
+        n = len(arrays)
+        if figsize is None:
+            figsize = (4 * min(n, 4), 4 * ((n + 3) // 4))
+
+        return show_2d(arrays, title=titles, figax_size=figsize, **kwargs)
+
+    def regenerate_virtual_images(self) -> None:
+        """Regenerate virtual images from stored detector information."""
+        if not self._virtual_detectors:
+            return
+
+        self._virtual_images.clear()
+
+        for name, info in self._virtual_detectors.items():
+            try:
+                if info["mode"] is not None and info["geometry"] is not None:
+                    self.get_virtual_image(
+                        mode=info["mode"],
+                        geometry=info["geometry"],
+                        name=name,
+                        attach=True,
+                    )
+                else:
+                    print(f"Warning: Cannot regenerate '{name}' - insufficient detector info.")
+            except Exception as e:
+                print(f"Warning: Failed to regenerate '{name}': {e}")
+
+    def update_virtual_detector(
+        self,
+        name: str,
+        mask: np.ndarray | None = None,
+        mode: str | None = None,
+        geometry: tuple | None = None,
+    ) -> None:
+        """Update virtual detector and regenerate the corresponding image.
+
+        Parameters
+        ----------
+        name : str
+            Name of virtual detector to update.
+        mask : np.ndarray | None
+            New mask (must match DP dimensions).
+        mode : str | None
+            New mode ("circle" or "annular").
+        geometry : tuple | None
+            New geometry.
+        """
+        if name not in self._virtual_detectors:
+            raise ValueError(f"Detector '{name}' not found. Available: {list(self._virtual_detectors.keys())}")
+
+        self._virtual_detectors[name]["mask"] = mask.copy() if mask is not None else None
+        self._virtual_detectors[name]["mode"] = mode
+        self._virtual_detectors[name]["geometry"] = geometry
+
+        self.get_virtual_image(mask=mask, mode=mode, geometry=geometry, name=name, attach=True)
+
+    def clear_virtual_images(self) -> None:
+        """Clear virtual images while keeping detector information."""
+        self._virtual_images.clear()
+
+    def clear_all_virtual_data(self) -> None:
+        """Clear both virtual images and detector information."""
+        self._virtual_images.clear()
+        self._virtual_detectors.clear()
+
+    def show(self, *args, **kwargs):
+        """Not implemented for 5D data.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised. Use alternative methods for visualization.
+
+        See Also
+        --------
+        show_virtual_images : Display virtual images.
+        data[i].show() : Show a single 4D frame.
+        data[i].dp_mean.show() : Show mean diffraction pattern.
+        """
+        raise NotImplementedError(
+            "show() is not meaningful for 5D data. Use:\n"
+            "  - data[i].show() for a single frame\n"
+            "  - data[i].dp_mean.show() for mean DP\n"
+            "  - data.show_virtual_images() for virtual images\n"
+            "  - data.get_virtual_image(...).show() for virtual image stack"
+        )
 
     # -------------------------------------------------------------------------
     # Copy
