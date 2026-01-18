@@ -131,6 +131,28 @@ class TestDataset5dstem:
         assert isinstance(data.virtual_detectors["bf_auto"]["geometry"], list)
         assert len(data.virtual_detectors["bf_auto"]["geometry"]) == 3
 
+    def test_virtual_image_full_auto(self):
+        """Test virtual image with full auto-detection (center and radius)."""
+        # Create data with a clear probe pattern
+        n_frames, scan_r, scan_c, k_r, k_c = 3, 4, 4, 32, 32
+        array = np.zeros((n_frames, scan_r, scan_c, k_r, k_c), dtype=np.float32)
+        # Add circular probe at center with radius 8
+        cy, cx = k_r // 2, k_c // 2
+        y, x = np.ogrid[:k_r, :k_c]
+        mask = (y - cy) ** 2 + (x - cx) ** 2 <= 8 ** 2
+        array[:, :, :, mask] = 1.0
+
+        data = Dataset5dstem.from_array(array, stack_type="time")
+        # geometry=None triggers full auto-detection
+        vi = data.get_virtual_image(mode="circle", geometry=None, name="bf_full_auto")
+        assert vi.shape == (3, 4, 4)
+        geoms = data.virtual_detectors["bf_full_auto"]["geometry"]
+        assert isinstance(geoms, list)
+        assert len(geoms) == 3
+        # Check that radius was auto-detected (should be close to 8)
+        for center, radius in geoms:
+            assert 6 < radius < 10  # Allow some tolerance
+
     def test_show_raises_error(self, sample_dataset):
         """Test that show() raises NotImplementedError with helpful message."""
         with pytest.raises(NotImplementedError, match="not meaningful for 5D"):

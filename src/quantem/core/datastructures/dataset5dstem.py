@@ -481,9 +481,14 @@ class Dataset5dstem(Dataset5d):
             if mask.shape != dp_shape:
                 raise ValueError(f"Mask shape {mask.shape} != diffraction pattern shape {dp_shape}")
             virtual_stack = np.sum(self.array * mask, axis=(-1, -2))
-        elif mode and geometry is not None:
+        elif mode is not None:
+            # Full auto-detection: geometry=None
+            if geometry is None:
+                geometries = self._auto_fit_centers(mode, None)
+                virtual_stack = self._compute_per_frame_virtual(mode, geometries, dp_shape)
+                geometry = geometries
             # Per-frame geometry list
-            if isinstance(geometry, list):
+            elif isinstance(geometry, list):
                 if len(geometry) != n_frames:
                     raise ValueError(
                         f"geometry list length ({len(geometry)}) must match "
@@ -494,7 +499,7 @@ class Dataset5dstem(Dataset5d):
                 # Single geometry tuple: (center_or_none, radius_or_radii)
                 center, radius_or_radii = geometry
                 if center is None:
-                    # Auto-fit center per frame
+                    # Auto-fit center per frame (radius may also be None for auto)
                     geometries = self._auto_fit_centers(mode, radius_or_radii)
                     virtual_stack = self._compute_per_frame_virtual(mode, geometries, dp_shape)
                     geometry = geometries  # Store fitted geometries
@@ -530,12 +535,16 @@ class Dataset5dstem(Dataset5d):
         return vi
 
     def _auto_fit_centers(self, mode: str, radius_or_radii) -> list:
-        """Fit probe center for each frame and return list of geometries."""
+        """Fit probe center for each frame and return list of geometries.
+
+        If radius_or_radii is None, also auto-detect the radius.
+        """
         geometries = []
         for i in range(len(self)):
             dp_mean = np.mean(self.array[i], axis=(0, 1))
-            cy, cx, _ = fit_probe_circle(dp_mean, show=False)
-            geometries.append(((cy, cx), radius_or_radii))
+            cy, cx, detected_radius = fit_probe_circle(dp_mean, show=False)
+            radius = detected_radius if radius_or_radii is None else radius_or_radii
+            geometries.append(((cy, cx), radius))
         return geometries
 
     def _compute_per_frame_virtual(self, mode: str, geometries: list, dp_shape: tuple) -> np.ndarray:

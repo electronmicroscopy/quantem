@@ -17,7 +17,7 @@ class Dataset4dstem(Dataset4d):
     """A 4D-STEM dataset class that inherits from Dataset4d.
 
     This class represents a 4D scanning transmission electron microscopy (STEM) dataset,
-    where the data consists of a 4D array with dimensions (scan_y, scan_x, dp_y, dp_x).
+    where the data consists of a 4D array with dimensions (scan_row, scan_col, k_row, k_col).
     The first two dimensions represent real space scanning positions, while the latter
     two dimensions represent reciprocal space diffraction patterns.
 
