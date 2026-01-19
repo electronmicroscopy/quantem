@@ -1049,3 +1049,68 @@ def unwrap_phase_2d_torch(
         raise ValueError(
             f'`method` must be one of {{"reliability-sorting", "poisson"}}, got {method!r}'
         )
+
+
+
+def rotate_image(
+    im,
+    rotation_deg: float,
+    origin: tuple[float, float] | None = None,
+    clockwise: bool = True,
+    interpolation: str = "bilinear",
+    mode: str = "constant",
+    cval: float = 0.0,
+):
+    """Rotate an array about a pixel origin using bilinear/bicubic interpolation."""
+    im = np.asarray(im)
+    if im.ndim < 2:
+        raise ValueError("im must have at least 2 dimensions")
+
+    H, W = im.shape[-2], im.shape[-1]
+    if origin is None:
+        r0 = float(H // 2)
+        c0 = float(W // 2)
+    else:
+        r0 = float(origin[0])
+        c0 = float(origin[1])
+
+    interp = str(interpolation).lower()
+    if interp in {"bilinear", "linear"}:
+        order = 1
+    elif interp in {"bicubic", "cubic"}:
+        order = 3
+    else:
+        raise ValueError("interpolation must be 'bilinear' or 'bicubic'")
+
+    theta = float(np.deg2rad(rotation_deg))
+    if not clockwise:
+        theta = -theta
+
+    ct = float(np.cos(theta))
+    st = float(np.sin(theta))
+
+    r_out, c_out = np.meshgrid(
+        np.arange(H, dtype=np.float64),
+        np.arange(W, dtype=np.float64),
+        indexing="ij",
+    )
+
+    c_rel = c_out - c0
+    r_rel = r_out - r0
+
+    c_in = ct * c_rel + st * r_rel + c0
+    r_in = -st * c_rel + ct * r_rel + r0
+
+    coords = np.vstack((r_in.ravel(), c_in.ravel()))
+
+    if im.ndim == 2:
+        out = map_coordinates(im, coords, order=order, mode=mode, cval=cval)
+        return out.reshape(H, W)
+
+    prefix = im.shape[:-2]
+    n = int(np.prod(prefix)) if prefix else 1
+    im_flat = im.reshape(n, H, W)
+    out_flat = np.empty((n, H * W), dtype=np.result_type(im_flat.dtype, np.float64))
+    for i in range(n):
+        out_flat[i] = map_coordinates(im_flat[i], coords, order=order, mode=mode, cval=cval)
+    return out_flat.reshape(*prefix, H, W)
