@@ -626,7 +626,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         strain_range_percent=(-3.0, 3.0),
         rotation_range_degrees=(-2.0, 2.0),
         plot_rotation=True,
-        cmap_strain="PiYG_r",
+        cmap_strain="RdBu_r",
         cmap_rotation=None,
         layout="horizontal",
         figsize=(6, 6),
@@ -885,17 +885,17 @@ def _display_vec_to_raw(vec_rc: NDArray, *, rotation_ccw_deg: float, transpose: 
     return np.array((dr2, dc2), dtype=float)
 
 
-# def _plot_lattice_vectors(ax: Any, center_rc: tuple[float, float], u_rc: NDArray, v_rc: NDArray) -> None:
-#     r0, c0 = center_rc
+def _plot_lattice_vectors(ax: Any, center_rc: tuple[float, float], u_rc: NDArray, v_rc: NDArray) -> None:
+    r0, c0 = center_rc
 
-#     def _draw(vec: NDArray, label: str, color: tuple[float, float, float]) -> None:
-#         dr, dc = vec[0], vec[1]
-#         ax.plot([c0, c0 + dc], [r0, r0 + dr], linewidth=2.75, color=color)
-#         ax.plot([c0 + dc], [r0 + dr], marker="o", markersize=6.0, color=color)
-#         ax.text(c0 + dc, r0 + dr, f" {label}", color=color, fontsize=18, va="center")
+    def _draw(vec: NDArray, label: str, color: tuple[float, float, float]) -> None:
+        dr, dc = vec[0], vec[1]
+        ax.plot([c0, c0 + dc], [r0, r0 + dr], linewidth=2.75, color=color)
+        ax.plot([c0 + dc], [r0 + dr], marker="o", markersize=6.0, color=color)
+        ax.text(c0 + dc, r0 + dr, f" {label}", color=color, fontsize=18, va="center")
 
-#     _draw(np.asarray(u_rc, dtype=float).reshape(2), "u", (1.0, 0.0, 0.0))
-#     _draw(np.asarray(v_rc, dtype=float).reshape(2), "v", (0.0, 0.7, 1.0))
+    _draw(np.asarray(u_rc, dtype=float).reshape(2), "u", (1.0, 0.0, 0.0))
+    _draw(np.asarray(v_rc, dtype=float).reshape(2), "v", (0.0, 0.7, 1.0))
 
 
 def _overlay_lattice_vectors(
