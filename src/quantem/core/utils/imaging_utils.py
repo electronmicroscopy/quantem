@@ -359,7 +359,7 @@ def bilinear_kde(
     lowpass_filter: bool = False,
     max_batch_size: Optional[int] = None,
     return_pix_count: bool = False,
-) -> NDArray:
+) -> NDArray | tuple[NDArray, NDArray]:
     """
     Compute a bilinear kernel density estimate (KDE) with smooth threshold masking.
 
@@ -548,3 +548,504 @@ def fourier_cropping(
 
     return result
 
+
+def compute_fsc_from_halfsets(
+    halfset_recons: list[torch.Tensor],
+    sampling: tuple[float, float],
+    epsilon: float = 1e-12,
+):
+    """
+    Compute radially averaged Fourier Shell Correlation (FSC)
+    from two half-set reconstructions.
+
+    Parameters
+    ----------
+    halfset_recons : list[torch.Tensor]
+        Two statistically-independent reconstructions, using half the dataset.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+    epsilon: float, optional
+        Small number to avoid dividing by zero
+
+    Returns
+    -------
+    q_bins: NDarray
+        Spatial frequency bins
+    fsc : NDarray
+        Fourier shell correlation as function of spatial frequency
+    """
+    r1, r2 = halfset_recons
+
+    F1 = torch.fft.fft2(r1)
+    F2 = torch.fft.fft2(r2)
+
+    cross = (F1 * F2.conj()).real
+    p1 = F1.abs().square()
+    p2 = F2.abs().square()
+
+    device = F1.device
+    nx, ny = F1.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    cross = cross.reshape(-1)
+    p1 = p1.reshape(-1)
+    p2 = p2.reshape(-1)
+
+    # Accumulate
+    cross_b = torch.bincount(inds_f, weights=cross * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=cross * w1, minlength=num_bins
+    )
+
+    p1_b = torch.bincount(inds_f, weights=p1 * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=p1 * w1, minlength=num_bins
+    )
+
+    p2_b = torch.bincount(inds_f, weights=p2 * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=p2 * w1, minlength=num_bins
+    )
+
+    denom = torch.sqrt(p1_b * p2_b).clamp_min(epsilon)
+    fsc = cross_b / denom
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), fsc[valid].cpu().numpy()
+
+
+def compute_spectral_snr_from_halfsets(
+    halfset_recons: list[torch.Tensor],
+    sampling: tuple[float, float],
+    total_dose: float,
+    epsilon: float = 1e-12,
+):
+    """
+    Compute spectral SNR from two half-set reconstructions using symmetric/antisymmetric decomposition.
+
+    The method decomposes the Fourier transforms into:
+    - Symmetric: (F₁ + F₂)/2  → signal + correlated noise
+    - Antisymmetric: (F₁ - F₂)/2  → uncorrelated noise only
+
+    SSNR(q) = sqrt(signal_power / noise_power)
+
+    where:
+    - signal_power = (|symmetric|² - |antisymmetric|²)₊
+    - noise_power = |antisymmetric|²
+
+    Parameters
+    ----------
+    halfset_recons : list[torch.Tensor]
+        Two statistically-independent reconstructions, using half the dataset.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+    total_dose: float
+        Total _normalized_ electron dose, e.g. in DirectPtychography this is ~self.num_bf
+    epsilon: float, optional
+        Small number to avoid dividing by zero
+
+    Returns
+    -------
+    q_bins: NDarray
+        Spatial frequency bins
+    ssnr : NDarray
+        Radially averaged spectral SNR as function of spatial frequency
+    """
+    # Compute Fourier transforms
+    halfset_1, halfset_2 = halfset_recons
+    F1 = torch.fft.fft2(halfset_1)
+    F2 = torch.fft.fft2(halfset_2)
+
+    # Symmetric and antisymmetric decomposition
+    symmetric = (F1 + F2) / 2
+    antisymmetric = (F1 - F2) / 2
+
+    # Power spectra
+    noise_power = antisymmetric.abs()
+    total_power = symmetric.abs()
+    signal_power = (total_power - noise_power).clamp_min(0)
+
+    device = F1.device
+    nx, ny = F1.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    signal = signal_power.reshape(-1)
+    noise = noise_power.reshape(-1)
+
+    # Accumulate
+    signal_b = torch.bincount(inds_f, weights=signal * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=signal * w1, minlength=num_bins
+    )
+
+    noise_b = torch.bincount(inds_f, weights=noise * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=noise * w1, minlength=num_bins
+    )
+
+    ssnr = torch.sqrt(signal_b / noise_b.clamp_min(epsilon)) / (math.sqrt(total_dose) / 2)
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), ssnr[valid].cpu().numpy()
+
+
+def radially_average_fourier_array(
+    corner_centered_array: torch.Tensor,
+    sampling: tuple[float, float],
+):
+    """
+    Radially average a corner-centered Fourier array.
+
+    Parameters
+    ----------
+    corner_centered_array : list[torch.Tensor]
+        Fourier array to average radially.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+
+    Returns
+    -------
+    q_bins: NDarray
+        Spatial frequency bins
+    array_1d : NDarray
+        Radially averaged Fourier array as function of spatial frequency
+    """
+    device = corner_centered_array.device
+    nx, ny = corner_centered_array.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    array = corner_centered_array.reshape(-1)
+
+    # Accumulate
+    array_b = torch.bincount(inds_f, weights=array * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=array * w1, minlength=num_bins
+    )
+
+    counts_b = (
+        torch.bincount(inds_f, weights=w0, minlength=num_bins)
+        + torch.bincount(inds_f + 1, weights=w1, minlength=num_bins)
+    ).clamp_min(1)
+
+    array_b = array_b / counts_b
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), array_b[valid].cpu().numpy()
+
+
+def _wrap_to_pi(x):
+    return (x + math.pi) % (2 * math.pi) - math.pi
+
+
+def _find_wrap(a, b):
+    d = a - b
+    return torch.where(d > math.pi, -1, torch.where(d < -math.pi, 1, 0))
+
+
+def _pixel_reliability(phi, mask=None):
+    """
+    phi: (H, W) wrapped phase (CPU tensor)
+    mask: optional boolean mask
+    """
+    c = phi
+    left = torch.roll(c, 1, 1)
+    right = torch.roll(c, -1, 1)
+    up = torch.roll(c, 1, 0)
+    down = torch.roll(c, -1, 0)
+
+    ul = torch.roll(left, 1, 0)
+    dr = torch.roll(right, -1, 0)
+    ur = torch.roll(right, 1, 0)
+    dl = torch.roll(left, -1, 0)
+
+    Hterm = _wrap_to_pi(left - c) - _wrap_to_pi(c - right)
+    Vterm = _wrap_to_pi(up - c) - _wrap_to_pi(c - down)
+    D1term = _wrap_to_pi(ul - c) - _wrap_to_pi(c - dr)
+    D2term = _wrap_to_pi(ur - c) - _wrap_to_pi(c - dl)
+
+    R = Hterm**2 + Vterm**2 + D1term**2 + D2term**2
+
+    if mask is not None:
+        R = torch.where(mask, R, torch.full_like(R, float("inf")))
+
+    return R
+
+
+def _build_edges(phi, reliability, mask=None, wrap_around=True):
+    """
+    Returns edges as CPU tensors:
+        i1, i2, inc sorted by reliability
+    """
+    H, W = phi.shape
+    N = H * W
+
+    idx = torch.arange(N).reshape(H, W)
+    edges = []
+
+    phi_f = phi.flatten()
+    rel_f = reliability.flatten()
+    mask_f = mask.flatten() if mask is not None else None
+
+    def add_edges(i1, i2):
+        if mask_f is not None:
+            valid = mask_f[i1] & mask_f[i2]
+            i1, i2 = i1[valid], i2[valid]
+
+        inc = _find_wrap(phi_f[i1], phi_f[i2])
+        rel = rel_f[i1] + rel_f[i2]
+
+        edges.append(  # ty:ignore[possibly-missing-attribute]
+            torch.stack([i1, i2, rel, inc], dim=1)
+        )
+
+    if wrap_around:
+        add_edges(idx.flatten(), torch.roll(idx, -1, 1).flatten())
+        add_edges(idx.flatten(), torch.roll(idx, -1, 0).flatten())
+    else:
+        add_edges(idx[:, :-1].flatten(), idx[:, 1:].flatten())
+        add_edges(idx[:-1, :].flatten(), idx[1:, :].flatten())
+
+    edges = torch.cat(edges, dim=0)
+    edges = edges[edges[:, 2].argsort()]
+
+    # return integer tensors only (CPU)
+    return (
+        edges[:, 0].long(),
+        edges[:, 1].long(),
+        edges[:, 3].long(),
+    )
+
+
+class UnionFindPhase:
+    def __init__(self, n):
+        self.parent = torch.arange(n)
+        self.rank = torch.zeros(n, dtype=torch.int32)
+        self.offset = torch.zeros(n)
+
+    def find_root_and_offset(self, x):
+        root = x
+        total = 0.0
+        while self.parent[root] != root:
+            total += self.offset[root]
+            root = self.parent[root]
+        return root, total
+
+    def union(self, x, y, inc_xy):
+        rx, ox = self.find_root_and_offset(x)
+        ry, oy = self.find_root_and_offset(y)
+
+        if rx == ry:
+            return
+
+        # phase(y) + oy + inc = phase(x) + ox
+        delta = ox - oy - inc_xy
+
+        if self.rank[rx] < self.rank[ry]:
+            self.parent[rx] = ry
+            self.offset[rx] = -delta
+        else:
+            self.parent[ry] = rx
+            self.offset[ry] = delta
+            if self.rank[rx] == self.rank[ry]:
+                self.rank[rx] += 1
+
+
+def _final_offsets(uf):
+    """
+    Single-pass offset computation (no path compression).
+    """
+    N = uf.parent.numel()
+    incs = torch.zeros(N)
+
+    for i in range(N):
+        root = i
+        total = 0.0
+        while uf.parent[root] != root:
+            total += uf.offset[root]
+            root = uf.parent[root]
+        incs[i] = total
+
+    return incs
+
+
+def _unwrap_phase_2d_torch_reliability_sorting(
+    phi,
+    mask=None,
+    wrap_around=True,
+):
+    """
+    Herráez 2D phase unwrapping.
+    Runs on CPU by design.
+    """
+    with torch.no_grad():
+        orig_device = phi.device
+        phi = phi.detach().cpu()
+        if mask is not None:
+            mask = mask.detach().cpu().to(torch.bool)
+
+        H, W = phi.shape
+        N = H * W
+
+        reliability = _pixel_reliability(phi, mask)
+
+        i1, i2, inc = _build_edges(
+            phi,
+            reliability,
+            mask,
+            wrap_around=wrap_around,
+        )
+
+        uf = UnionFindPhase(N)
+
+        for k in range(i1.numel()):
+            uf.union(i1[k].item(), i2[k].item(), inc[k].item())
+
+        incs = _final_offsets(uf)
+
+        out = (phi.flatten() + 2 * math.pi * incs).reshape(H, W)
+        out -= out.mean()
+        return out.to(orig_device)
+
+
+def _unwrap_phase_2d_torch_poisson(
+    phi_wrapped,
+    mask=None,
+    wrap_around=True,
+    regularization_lambda=None,
+):
+    """
+    Least-squares / Poisson phase unwrapping with optional mask.
+
+    Parameters
+    ----------
+    phi_wrapped : (H, W) tensor
+        Wrapped phase in (-pi, pi], any device
+    mask : (H, W) bool tensor, optional
+        True = valid pixel
+
+    Returns
+    -------
+    phi_unwrapped : (H, W) tensor
+        Unwrapped phase (same device as input)
+    """
+    device = phi_wrapped.device
+    dtype = phi_wrapped.dtype
+    H, W = phi_wrapped.shape
+
+    if not wrap_around:
+        raise NotImplementedError()
+
+    if mask is not None:
+        mask = mask.to(device=device, dtype=torch.bool)
+
+    dx = torch.roll(phi_wrapped, -1, dims=1) - phi_wrapped
+    dy = torch.roll(phi_wrapped, -1, dims=0) - phi_wrapped
+
+    dx = (dx + math.pi) % (2 * math.pi) - math.pi
+    dy = (dy + math.pi) % (2 * math.pi) - math.pi
+
+    if mask is not None:
+        mask_x = mask & torch.roll(mask, -1, dims=1)
+        mask_y = mask & torch.roll(mask, -1, dims=0)
+
+        dx = torch.where(mask_x, dx, torch.zeros_like(dx))
+        dy = torch.where(mask_y, dy, torch.zeros_like(dy))
+
+    div = dx - torch.roll(dx, 1, dims=1) + dy - torch.roll(dy, 1, dims=0)
+
+    if mask is not None:
+        div = torch.where(mask, div, torch.zeros_like(div))
+
+    div_hat = torch.fft.fftn(div)
+
+    ky = torch.fft.fftfreq(H, device=device, dtype=dtype) * 2 * math.pi
+    kx = torch.fft.fftfreq(W, device=device, dtype=dtype) * 2 * math.pi
+    ky, kx = torch.meshgrid(ky, kx, indexing="ij")
+
+    if regularization_lambda is not None:
+        denom = kx**2 + ky**2 + regularization_lambda
+    else:
+        denom = kx**2 + ky**2
+    denom[0, 0] = 1.0  # avoid divide by zero
+
+    phi_hat = -div_hat / denom
+    phi_hat[0, 0] = 0.0  # fix piston
+
+    phi = torch.fft.ifftn(phi_hat).real
+
+    if mask is not None:
+        phi = torch.where(mask, phi, torch.zeros_like(phi))
+
+    return phi
+
+
+def unwrap_phase_2d_torch(
+    phi_wrapped,
+    method="reliability-sorting",
+    mask=None,
+    wrap_around=True,
+    regularization_lambda=None,
+):
+    if method == "reliability-sorting":
+        return _unwrap_phase_2d_torch_reliability_sorting(
+            phi_wrapped, mask, wrap_around=wrap_around
+        )
+    elif method == "poisson":
+        return _unwrap_phase_2d_torch_poisson(
+            phi_wrapped,
+            mask,
+            wrap_around=wrap_around,
+            regularization_lambda=regularization_lambda,
+        )
+    else:
+        raise ValueError(
+            f'`method` must be one of {{"reliability-sorting", "poisson"}}, got {method!r}'
+        )
