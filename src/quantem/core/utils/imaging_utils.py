@@ -1,21 +1,14 @@
 # Utilities for processing images
-from __future__ import annotations
 
-from typing import Any, Optional, Tuple, TypeVar
+import math
+from typing import Optional, Tuple
 
 import numpy as np
-from matplotlib import cm
+import torch
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
-from scipy.special import comb
 
-from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.utils.utils import generate_batches
-from quantem.core.visualization import show_2d
-
-# single TypeVar: works for both numpy and Dataset2d
-ImageType = TypeVar("ImageType", NDArray[Any], Dataset2d)
-BoolArray = NDArray[np.bool_]
 
 
 def dft_upsample(
@@ -170,6 +163,190 @@ def cross_correlation_shift(
     return shifts, image_shifted
 
 
+def cross_correlation_shift_torch(
+    im_ref: torch.Tensor, im: torch.Tensor, upsample_factor: int = 2
+) -> torch.Tensor:
+    """
+    Align two real images using Fourier cross-correlation and DFT upsampling.
+    Returns dx, dy in pixel units (signed shifts).
+    """
+    G1 = torch.fft.fft2(im_ref)
+    G2 = torch.fft.fft2(im)
+
+    xy_shift = align_images_fourier_torch(G1, G2, upsample_factor)
+
+    # convert to centered signed shifts as original code
+    M, N = im_ref.shape
+    dx = ((xy_shift[0] + M / 2) % M) - M / 2
+    dy = ((xy_shift[1] + N / 2) % N) - N / 2
+
+    return torch.tensor([dx, dy], device=G1.device)
+
+
+def align_images_fourier_torch(
+    G1: torch.Tensor,
+    G2: torch.Tensor,
+    upsample_factor: int,
+) -> torch.Tensor:
+    """
+    Alignment using DFT upsampling of cross correlation.
+    G1, G2: torch tensors representing FTs of images (complex)
+    Returns: xy_shift (tensor length 2)
+    """
+    device = G1.device
+    cc = G1 * G2.conj()
+    cc_real = torch.fft.ifft2(cc).real
+
+    # local max (integer)
+    flat_idx = torch.argmax(cc_real)
+    x0 = (flat_idx // cc_real.shape[1]).to(torch.long).item()
+    y0 = (flat_idx % cc_real.shape[1]).to(torch.long).item()
+
+    # half pixel shifts: pick ±1 indices with wrap (mod)
+    M, N = cc_real.shape
+    x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
+    y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
+
+    vx = cc_real[x_inds, y0]
+    vy = cc_real[x0, y_inds]
+
+    # parabolic half-pixel refine
+    # dx = (vx[2] - vx[0]) / (4*vx[1] - 2*vx[2] - 2*vx[0])
+    denom_x = 4.0 * vx[1] - 2.0 * vx[2] - 2.0 * vx[0]
+    denom_y = 4.0 * vy[1] - 2.0 * vy[2] - 2.0 * vy[0]
+    dx = (vx[2] - vx[0]) / denom_x if denom_x != 0 else torch.tensor(0.0, device=device)
+    dy = (vy[2] - vy[0]) / denom_y if denom_y != 0 else torch.tensor(0.0, device=device)
+
+    # round to nearest half-pixel
+    x0 = torch.round((x0 + dx) * 2.0) / 2.0
+    y0 = torch.round((y0 + dy) * 2.0) / 2.0
+
+    xy_shift = torch.tensor([x0, y0])
+
+    if upsample_factor > 2:
+        xy_shift = upsampled_correlation_torch(cc, upsample_factor, xy_shift)
+
+    return xy_shift
+
+
+def upsampled_correlation_torch(
+    imageCorr: torch.Tensor,
+    upsampleFactor: int,
+    xyShift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Refine the correlation peak of imageCorr around xyShift by DFT upsampling.
+
+    imageCorr: complex-valued FT-domain cross-correlation (G1 * conj(G2))
+    upsampleFactor: integer > 2
+    xyShift: 2-element tensor (x,y) in image coords; must be half-pixel precision as described.
+    Returns refined xyShift (tensor length 2).
+    """
+
+    assert upsampleFactor > 2
+
+    xyShift = torch.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
+    globalShift = torch.floor(torch.ceil(torch.tensor(upsampleFactor * 1.5)) / 2.0)
+    upsampleCenter = globalShift - (upsampleFactor * xyShift)
+
+    conj_input = imageCorr.conj()
+    im_up = dftUpsample_torch(conj_input, upsampleFactor, upsampleCenter)
+    imageCorrUpsample = im_up.conj()
+
+    # find maximum
+    # flatten argmax -> unravel to 2D
+    flat_idx = torch.argmax(imageCorrUpsample.real)
+    # unravel_index
+    xySubShift0 = (flat_idx // imageCorrUpsample.shape[1]).to(torch.long)
+    xySubShift1 = (flat_idx % imageCorrUpsample.shape[1]).to(torch.long)
+    xySubShift = torch.tensor([xySubShift0.item(), xySubShift1.item()])
+
+    # parabolic subpixel refinement
+    dx = 0.0
+    dy = 0.0
+    try:
+        # extract 3x3 patch around found peak
+        r = xySubShift[0].item()
+        c = xySubShift[1].item()
+        patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
+        # if patch is incomplete (near edge) this will raise / have wrong shape -> except
+        if patch.shape == (3, 3):
+            icc = patch
+            # dx corresponds to row direction (vertical axis) as in original code:
+            dx = (icc[2, 1] - icc[0, 1]) / (4.0 * icc[1, 1] - 2.0 * icc[2, 1] - 2.0 * icc[0, 1])
+            dy = (icc[1, 2] - icc[1, 0]) / (4.0 * icc[1, 1] - 2.0 * icc[1, 2] - 2.0 * icc[1, 0])
+            dx = dx.item()
+            dy = dy.item()
+        else:
+            dx, dy = 0.0, 0.0
+    except Exception:
+        dx, dy = 0.0, 0.0
+
+    # convert xySubShift to zero-centered by subtracting globalShift
+    xySubShift = xySubShift.to(dtype=torch.get_default_dtype())
+    xySubShift = xySubShift - globalShift.to(xySubShift.dtype)
+
+    xyShift = xyShift + (xySubShift + torch.tensor([dx, dy])) / float(upsampleFactor)
+
+    return xyShift
+
+
+def dftUpsample_torch(
+    imageCorr: torch.Tensor,
+    upsampleFactor: int,
+    xyShift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Corrected matrix-multiply DFT upsampling (matches the original numpy dftups).
+    Returns the real-valued upsampled correlation patch.
+
+    imageCorr: (M, N) complex tensor (FT-domain cross-correlation)
+    upsampleFactor: int > 2
+    xyShift: 2-element tensor [x0, y0] giving the (half-pixel-rounded) peak location
+             in the UPSAMPLED grid (same convention used elsewhere).
+    """
+    device = imageCorr.device
+    M, N = imageCorr.shape
+    pixelRadius = 1.5
+    numRow = int(math.ceil(pixelRadius * upsampleFactor))
+    numCol = numRow
+
+    # prepare the vectors exactly like the numpy version
+    # col: frequency indices (centered) for N
+    col_freq = torch.fft.ifftshift(torch.arange(N, device=device)) - math.floor(N / 2)
+    # row: frequency indices (centered) for M
+    row_freq = torch.fft.ifftshift(torch.arange(M, device=device)) - math.floor(M / 2)
+
+    # small upsample grid coordinates (integer positions in the UPSAMPLED GRID)
+    col_coords = torch.arange(numCol, device=device, dtype=torch.get_default_dtype()) - float(
+        xyShift[1]
+    )
+    row_coords = torch.arange(numRow, device=device, dtype=torch.get_default_dtype()) - float(
+        xyShift[0]
+    )
+
+    # build kernels: note factor signs and denominators match original numpy code
+    # colKern: shape (N, numCol)
+    factor_col = -2j * math.pi / (N * float(upsampleFactor))
+    # outer(col_freq, col_coords) -> shape (N, numCol)
+    colKern = torch.exp(factor_col * (col_freq.unsqueeze(1) * col_coords.unsqueeze(0))).to(
+        imageCorr.dtype
+    )
+
+    # rowKern: shape (numRow, M)
+    factor_row = -2j * math.pi / (M * float(upsampleFactor))
+    # outer(row_coords, row_freq) -> shape (numRow, M)
+    rowKern = torch.exp(factor_row * (row_coords.unsqueeze(1) * row_freq.unsqueeze(0))).to(
+        imageCorr.dtype
+    )
+
+    # perform the small-matrix DFT: (numRow, M) @ (M, N) @ (N, numCol) -> (numRow, numCol)
+    imageUpsample = rowKern @ imageCorr @ colKern
+
+    # original code took xp.real(...) before returning
+    return imageUpsample.real
+
+
 def bilinear_kde(
     xa: NDArray,
     ya: NDArray,
@@ -181,7 +358,7 @@ def bilinear_kde(
     lowpass_filter: bool = False,
     max_batch_size: Optional[int] = None,
     return_pix_count: bool = False,
-) -> NDArray:
+) -> NDArray | tuple[NDArray, NDArray]:
     """
     Compute a bilinear kernel density estimate (KDE) with smooth threshold masking.
 
@@ -371,144 +548,503 @@ def fourier_cropping(
     return result
 
 
-def _as_array(x: ImageType) -> NDArray[Any]:
-    return x.array if isinstance(x, Dataset2d) else np.asarray(x)
-
-
-def _bernstein_basis_1d(n: int, t: NDArray[Any]) -> NDArray[Any]:
-    k = np.arange(n + 1, dtype=int)
-    return (
-        comb(n, k)[None, :] * (t[:, None] ** k[None, :]) * ((1.0 - t)[:, None] ** (n - k)[None, :])
-    )
-
-
-def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> NDArray[Any]:
-    H, W = im_shape
-    ou, ov = int(order[0]), int(order[1])
-    u = np.linspace(0.0, 1.0, H)
-    v = np.linspace(0.0, 1.0, W)
-    Bu = _bernstein_basis_1d(ou, u)
-    Bv = _bernstein_basis_1d(ov, v)
-    basis_cube = np.einsum("ik,jl->ijkl", Bu, Bv)
-    return basis_cube.reshape(H * W, (ou + 1) * (ov + 1))
-
-
-def background_subtract(
-    image: ImageType,
-    mask: Optional[BoolArray] = None,
-    thresh_bg: Optional[float] = None,
-    order: Tuple[int, int] = (1, 1),
-    sigma: Optional[float] = None,
-    num_iter: int = 10,
-    plot_result: bool = True,
-    axsize: Tuple[int, int] = (3.1, 3),
-    cmap: str = "turbo",
-    return_background_and_mask: bool = False,
-    **show_kwargs,
-) -> ImageType | Tuple[ImageType, NDArray[Any], BoolArray]:
+def compute_fsc_from_halfsets(
+    halfset_recons: list[torch.Tensor],
+    sampling: tuple[float, float],
+    epsilon: float = 1e-12,
+):
     """
-    Background subtraction via bivariate Bernstein polynomial fitting.
+    Compute radially averaged Fourier Shell Correlation (FSC)
+    from two half-set reconstructions.
+
+    Parameters
+    ----------
+    halfset_recons : list[torch.Tensor]
+        Two statistically-independent reconstructions, using half the dataset.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+    epsilon: float, optional
+        Small number to avoid dividing by zero
 
     Returns
     -------
-    - If `return_background_and_mask=False`: ImageType (same as input)
-    - If `True`: (ImageType, numpy.ndarray, numpy.ndarray[bool])
-      where background and mask are always NumPy.
+    q_bins: NDarray
+        Spatial frequency bins
+    fsc : NDarray
+        Fourier shell correlation as function of spatial frequency
     """
-    im = _as_array(image).astype(float, copy=True)
-    if im.ndim != 2:
-        raise ValueError("`image` must be 2D")
+    r1, r2 = halfset_recons
 
-    mask_arr: BoolArray = (
-        np.ones_like(im, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    F1 = torch.fft.fft2(r1)
+    F2 = torch.fft.fft2(r2)
+
+    cross = (F1 * F2.conj()).real
+    p1 = F1.abs().square()
+    p2 = F2.abs().square()
+
+    device = F1.device
+    nx, ny = F1.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    cross = cross.reshape(-1)
+    p1 = p1.reshape(-1)
+    p2 = p2.reshape(-1)
+
+    # Accumulate
+    cross_b = torch.bincount(inds_f, weights=cross * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=cross * w1, minlength=num_bins
     )
-    if mask_arr.shape != im.shape:
-        raise ValueError("`mask` must match `image` shape")
 
-    order = (int(order[0]), int(order[1]))
-    A_full = _build_basis_matrix(im.shape, order)
-    H, W = im.shape
-    im_flat = im.ravel()
+    p1_b = torch.bincount(inds_f, weights=p1 * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=p1 * w1, minlength=num_bins
+    )
 
-    im_bg = np.zeros_like(im)
-    thresh_val = np.median(im[mask_arr]) if thresh_bg is None else float(thresh_bg)
+    p2_b = torch.bincount(inds_f, weights=p2 * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=p2 * w1, minlength=num_bins
+    )
 
-    resid = im - im_bg
-    if sigma and sigma > 0:
-        resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
-    mask_bg: BoolArray = (resid < thresh_val) & mask_arr
+    denom = torch.sqrt(p1_b * p2_b).clamp_min(epsilon)
+    fsc = cross_b / denom
 
-    for _ in range(int(num_iter)):
-        idx = mask_bg.ravel()
-        if not np.any(idx):
-            idx = mask_arr.ravel()
-        coefs, *_ = np.linalg.lstsq(A_full[idx, :], im_flat[idx], rcond=None)
-        im_bg = (A_full @ coefs).reshape(H, W)
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
 
-        resid = im - im_bg
-        if sigma and sigma > 0:
-            resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
+    return k_bins[valid].cpu().numpy(), fsc[valid].cpu().numpy()
 
-        thr = thresh_val if thresh_bg is None else float(thresh_bg)
-        mask_bg = (resid < thr) & mask_arr
 
-    im_sub_np = im - im_bg
+def compute_spectral_snr_from_halfsets(
+    halfset_recons: list[torch.Tensor],
+    sampling: tuple[float, float],
+    total_dose: float,
+    epsilon: float = 1e-12,
+):
+    """
+    Compute spectral SNR from two half-set reconstructions using symmetric/antisymmetric decomposition.
 
-    if plot_result:
-        vals = im_sub_np[mask_arr]
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            vals = np.array([0.0])
-        vmin_sub = float(np.min(vals))
-        vmax_sub = float(np.max(vals))
-        vrange = float(max(abs(vmin_sub), abs(vmax_sub))) or 1e-12
+    The method decomposes the Fourier transforms into:
+    - Symmetric: (F₁ + F₂)/2  → signal + correlated noise
+    - Antisymmetric: (F₁ - F₂)/2  → uncorrelated noise only
 
-        bg_disp = (im_bg - np.mean(im_bg)).copy()
-        bg_disp[~mask_bg] = np.nan
+    SSNR(q) = sqrt(signal_power / noise_power)
 
-        cmap_base = cm.get_cmap(cmap).with_extremes(bad="black")
-        cmap_div = "RdBu_r"
+    where:
+    - signal_power = (|symmetric|² - |antisymmetric|²)₊
+    - noise_power = |antisymmetric|²
 
-        disp = [im - np.mean(im_bg), bg_disp, im_sub_np]
-        norm = [
-            {
-                "interval_type": "manual",
-                "stretch_type": "linear",
-                "vmin": vmin_sub,
-                "vmax": vmax_sub,
-            },
-            {
-                "interval_type": "manual",
-                "stretch_type": "linear",
-                "vmin": vmin_sub,
-                "vmax": vmax_sub,
-            },
-            {
-                "interval_type": "centered",
-                "stretch_type": "linear",
-                "vcenter": 0.0,
-                "half_range": vrange,
-            },
-        ]
+    Parameters
+    ----------
+    halfset_recons : list[torch.Tensor]
+        Two statistically-independent reconstructions, using half the dataset.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+    total_dose: float
+        Total _normalized_ electron dose, e.g. in DirectPtychography this is ~self.num_bf
+    epsilon: float, optional
+        Small number to avoid dividing by zero
 
-        show_2d(
-            disp,
-            cmap=[cmap_base, cmap_base, cmap_div],
-            norm=norm,
-            cbar=[False, False, True],
-            title=["Input Image", "Background (fit region)", "Background Subtracted"],
-            axsize=axsize,
-            **show_kwargs,
+    Returns
+    -------
+    q_bins: NDarray
+        Spatial frequency bins
+    ssnr : NDarray
+        Radially averaged spectral SNR as function of spatial frequency
+    """
+    # Compute Fourier transforms
+    halfset_1, halfset_2 = halfset_recons
+    F1 = torch.fft.fft2(halfset_1)
+    F2 = torch.fft.fft2(halfset_2)
+
+    # Symmetric and antisymmetric decomposition
+    symmetric = (F1 + F2) / 2
+    antisymmetric = (F1 - F2) / 2
+
+    # Power spectra
+    noise_power = antisymmetric.abs()
+    total_power = symmetric.abs()
+    signal_power = (total_power - noise_power).clamp_min(0)
+
+    device = F1.device
+    nx, ny = F1.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    signal = signal_power.reshape(-1)
+    noise = noise_power.reshape(-1)
+
+    # Accumulate
+    signal_b = torch.bincount(inds_f, weights=signal * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=signal * w1, minlength=num_bins
+    )
+
+    noise_b = torch.bincount(inds_f, weights=noise * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=noise * w1, minlength=num_bins
+    )
+
+    ssnr = torch.sqrt(signal_b / noise_b.clamp_min(epsilon)) / (math.sqrt(total_dose) / 2)
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), ssnr[valid].cpu().numpy()
+
+
+def radially_average_fourier_array(
+    corner_centered_array: torch.Tensor,
+    sampling: tuple[float, float],
+):
+    """
+    Radially average a corner-centered Fourier array.
+
+    Parameters
+    ----------
+    corner_centered_array : list[torch.Tensor]
+        Fourier array to average radially.
+    sampling: tuple[float,float]
+        Reconstruction sampling in Angstroms.
+
+    Returns
+    -------
+    q_bins: NDarray
+        Spatial frequency bins
+    array_1d : NDarray
+        Radially averaged Fourier array as function of spatial frequency
+    """
+    device = corner_centered_array.device
+    nx, ny = corner_centered_array.shape
+    sx, sy = sampling
+
+    kx = torch.fft.fftfreq(nx, d=sx, device=device)
+    ky = torch.fft.fftfreq(ny, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    bin_size = kx[1] - kx[0]
+    max_k = k.max()
+    num_bins = int(torch.floor(max_k / bin_size).item()) + 2
+
+    inds = k / bin_size
+    inds_f = torch.floor(inds).long()
+    d_ind = inds - inds_f
+
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # Flatten arrays
+    array = corner_centered_array.reshape(-1)
+
+    # Accumulate
+    array_b = torch.bincount(inds_f, weights=array * w0, minlength=num_bins) + torch.bincount(
+        inds_f + 1, weights=array * w1, minlength=num_bins
+    )
+
+    counts_b = (
+        torch.bincount(inds_f, weights=w0, minlength=num_bins)
+        + torch.bincount(inds_f + 1, weights=w1, minlength=num_bins)
+    ).clamp_min(1)
+
+    array_b = array_b / counts_b
+
+    k_bins = torch.arange(num_bins, device=device, dtype=torch.float32) * bin_size
+    valid = k_bins <= kx.abs().max()
+
+    return k_bins[valid].cpu().numpy(), array_b[valid].cpu().numpy()
+
+
+def _wrap_to_pi(x):
+    return (x + math.pi) % (2 * math.pi) - math.pi
+
+
+def _find_wrap(a, b):
+    d = a - b
+    return torch.where(d > math.pi, -1, torch.where(d < -math.pi, 1, 0))
+
+
+def _pixel_reliability(phi, mask=None):
+    """
+    phi: (H, W) wrapped phase (CPU tensor)
+    mask: optional boolean mask
+    """
+    c = phi
+    left = torch.roll(c, 1, 1)
+    right = torch.roll(c, -1, 1)
+    up = torch.roll(c, 1, 0)
+    down = torch.roll(c, -1, 0)
+
+    ul = torch.roll(left, 1, 0)
+    dr = torch.roll(right, -1, 0)
+    ur = torch.roll(right, 1, 0)
+    dl = torch.roll(left, -1, 0)
+
+    Hterm = _wrap_to_pi(left - c) - _wrap_to_pi(c - right)
+    Vterm = _wrap_to_pi(up - c) - _wrap_to_pi(c - down)
+    D1term = _wrap_to_pi(ul - c) - _wrap_to_pi(c - dr)
+    D2term = _wrap_to_pi(ur - c) - _wrap_to_pi(c - dl)
+
+    R = Hterm**2 + Vterm**2 + D1term**2 + D2term**2
+
+    if mask is not None:
+        R = torch.where(mask, R, torch.full_like(R, float("inf")))
+
+    return R
+
+
+def _build_edges(phi, reliability, mask=None, wrap_around=True):
+    """
+    Returns edges as CPU tensors:
+        i1, i2, inc sorted by reliability
+    """
+    H, W = phi.shape
+    N = H * W
+
+    idx = torch.arange(N).reshape(H, W)
+    edges = []
+
+    phi_f = phi.flatten()
+    rel_f = reliability.flatten()
+    mask_f = mask.flatten() if mask is not None else None
+
+    def add_edges(i1, i2):
+        if mask_f is not None:
+            valid = mask_f[i1] & mask_f[i2]
+            i1, i2 = i1[valid], i2[valid]
+
+        inc = _find_wrap(phi_f[i1], phi_f[i2])
+        rel = rel_f[i1] + rel_f[i2]
+
+        edges.append(  # ty:ignore[possibly-missing-attribute]
+            torch.stack([i1, i2, rel, inc], dim=1)
         )
 
-    # preserve Dataset2d if needed
-    if isinstance(image, Dataset2d):
-        meta = dict(origin=image.origin, sampling=image.sampling, units=image.units)
-        name_base = getattr(image, "name", "image")
-        im_sub: ImageType = Dataset2d.from_array(im_sub_np, name=f"{name_base} (bg-sub)", **meta)  # type: ignore[assignment]
+    if wrap_around:
+        add_edges(idx.flatten(), torch.roll(idx, -1, 1).flatten())
+        add_edges(idx.flatten(), torch.roll(idx, -1, 0).flatten())
     else:
-        im_sub = im_sub_np  # type: ignore[assignment]
+        add_edges(idx[:, :-1].flatten(), idx[:, 1:].flatten())
+        add_edges(idx[:-1, :].flatten(), idx[1:, :].flatten())
 
-    if return_background_and_mask:
-        return im_sub, im_bg, mask_bg
-    return im_sub
+    edges = torch.cat(edges, dim=0)
+    edges = edges[edges[:, 2].argsort()]
+
+    # return integer tensors only (CPU)
+    return (
+        edges[:, 0].long(),
+        edges[:, 1].long(),
+        edges[:, 3].long(),
+    )
+
+
+class UnionFindPhase:
+    def __init__(self, n):
+        self.parent = torch.arange(n)
+        self.rank = torch.zeros(n, dtype=torch.int32)
+        self.offset = torch.zeros(n)
+
+    def find_root_and_offset(self, x):
+        root = x
+        total = 0.0
+        while self.parent[root] != root:
+            total += self.offset[root]
+            root = self.parent[root]
+        return root, total
+
+    def union(self, x, y, inc_xy):
+        rx, ox = self.find_root_and_offset(x)
+        ry, oy = self.find_root_and_offset(y)
+
+        if rx == ry:
+            return
+
+        # phase(y) + oy + inc = phase(x) + ox
+        delta = ox - oy - inc_xy
+
+        if self.rank[rx] < self.rank[ry]:
+            self.parent[rx] = ry
+            self.offset[rx] = -delta
+        else:
+            self.parent[ry] = rx
+            self.offset[ry] = delta
+            if self.rank[rx] == self.rank[ry]:
+                self.rank[rx] += 1
+
+
+def _final_offsets(uf):
+    """
+    Single-pass offset computation (no path compression).
+    """
+    N = uf.parent.numel()
+    incs = torch.zeros(N)
+
+    for i in range(N):
+        root = i
+        total = 0.0
+        while uf.parent[root] != root:
+            total += uf.offset[root]
+            root = uf.parent[root]
+        incs[i] = total
+
+    return incs
+
+
+def _unwrap_phase_2d_torch_reliability_sorting(
+    phi,
+    mask=None,
+    wrap_around=True,
+):
+    """
+    Herráez 2D phase unwrapping.
+    Runs on CPU by design.
+    """
+    with torch.no_grad():
+        orig_device = phi.device
+        phi = phi.detach().cpu()
+        if mask is not None:
+            mask = mask.detach().cpu().to(torch.bool)
+
+        H, W = phi.shape
+        N = H * W
+
+        reliability = _pixel_reliability(phi, mask)
+
+        i1, i2, inc = _build_edges(
+            phi,
+            reliability,
+            mask,
+            wrap_around=wrap_around,
+        )
+
+        uf = UnionFindPhase(N)
+
+        for k in range(i1.numel()):
+            uf.union(i1[k].item(), i2[k].item(), inc[k].item())
+
+        incs = _final_offsets(uf)
+
+        out = (phi.flatten() + 2 * math.pi * incs).reshape(H, W)
+        out -= out.mean()
+        return out.to(orig_device)
+
+
+def _unwrap_phase_2d_torch_poisson(
+    phi_wrapped,
+    mask=None,
+    wrap_around=True,
+    regularization_lambda=None,
+):
+    """
+    Least-squares / Poisson phase unwrapping with optional mask.
+
+    Parameters
+    ----------
+    phi_wrapped : (H, W) tensor
+        Wrapped phase in (-pi, pi], any device
+    mask : (H, W) bool tensor, optional
+        True = valid pixel
+
+    Returns
+    -------
+    phi_unwrapped : (H, W) tensor
+        Unwrapped phase (same device as input)
+    """
+    device = phi_wrapped.device
+    dtype = phi_wrapped.dtype
+    H, W = phi_wrapped.shape
+
+    if not wrap_around:
+        raise NotImplementedError()
+
+    if mask is not None:
+        mask = mask.to(device=device, dtype=torch.bool)
+
+    dx = torch.roll(phi_wrapped, -1, dims=1) - phi_wrapped
+    dy = torch.roll(phi_wrapped, -1, dims=0) - phi_wrapped
+
+    dx = (dx + math.pi) % (2 * math.pi) - math.pi
+    dy = (dy + math.pi) % (2 * math.pi) - math.pi
+
+    if mask is not None:
+        mask_x = mask & torch.roll(mask, -1, dims=1)
+        mask_y = mask & torch.roll(mask, -1, dims=0)
+
+        dx = torch.where(mask_x, dx, torch.zeros_like(dx))
+        dy = torch.where(mask_y, dy, torch.zeros_like(dy))
+
+    div = dx - torch.roll(dx, 1, dims=1) + dy - torch.roll(dy, 1, dims=0)
+
+    if mask is not None:
+        div = torch.where(mask, div, torch.zeros_like(div))
+
+    div_hat = torch.fft.fftn(div)
+
+    ky = torch.fft.fftfreq(H, device=device, dtype=dtype) * 2 * math.pi
+    kx = torch.fft.fftfreq(W, device=device, dtype=dtype) * 2 * math.pi
+    ky, kx = torch.meshgrid(ky, kx, indexing="ij")
+
+    if regularization_lambda is not None:
+        denom = kx**2 + ky**2 + regularization_lambda
+    else:
+        denom = kx**2 + ky**2
+    denom[0, 0] = 1.0  # avoid divide by zero
+
+    phi_hat = -div_hat / denom
+    phi_hat[0, 0] = 0.0  # fix piston
+
+    phi = torch.fft.ifftn(phi_hat).real
+
+    if mask is not None:
+        phi = torch.where(mask, phi, torch.zeros_like(phi))
+
+    return phi
+
+
+def unwrap_phase_2d_torch(
+    phi_wrapped,
+    method="reliability-sorting",
+    mask=None,
+    wrap_around=True,
+    regularization_lambda=None,
+):
+    if method == "reliability-sorting":
+        return _unwrap_phase_2d_torch_reliability_sorting(
+            phi_wrapped, mask, wrap_around=wrap_around
+        )
+    elif method == "poisson":
+        return _unwrap_phase_2d_torch_poisson(
+            phi_wrapped,
+            mask,
+            wrap_around=wrap_around,
+            regularization_lambda=regularization_lambda,
+        )
+    else:
+        raise ValueError(
+            f'`method` must be one of {{"reliability-sorting", "poisson"}}, got {method!r}'
+        )

@@ -12,14 +12,13 @@ from quantem.core.utils import array_funcs as af
 if TYPE_CHECKING:
     import cupy as cp
     import torch
+    TensorLike: TypeAlias = ArrayLike | torch.Tensor
 else:
+    TensorLike: TypeAlias = ArrayLike
     if config.get("has_torch"):
         import torch
     if config.get("has_cupy"):
         import cupy as cp
-
-TensorLike: TypeAlias = ArrayLike | "torch.Tensor"
-
 
 # --- Dataset Validation Functions ---
 def ensure_valid_array(
@@ -537,11 +536,61 @@ def validate_tens_shape(
     return value
 
 
-def validate_dict_keys(dict: dict, valid_keys: list):
-    keys = list(dict.keys())
+def validate_dict_keys(value: dict, valid_keys: list):
+    keys = list(value.keys())
     invalid_keys = list(set(keys) - set(valid_keys))
     if invalid_keys:
         raise ValueError(f"Invalid keys: {invalid_keys}")
+
+
+def validate_aberration_coefficients(value: dict):
+    """ """
+    # fmt: off
+    POLAR_ALIASES = {
+        "defocus": "C10",
+        "astigmatism": "C12",
+        "astigmatism_angle": "phi12",
+        "coma": "C21",
+        "coma_angle": "phi21",
+        "Cs": "C30",
+        "C5": "C50",
+    }
+
+    POLAR_SYMBOLS = (
+        "C10", "C12", "phi12",
+        "C21", "phi21", "C23", "phi23",
+        "C30", "C32", "phi32", "C34", "phi34",
+        "C41", "phi41", "C43", "phi43", "C45", "phi45",
+        "C50", "C52", "phi52", "C54", "phi54", "C56", "phi56",
+    )
+    # fmt: on
+
+    validate_dict_keys(
+        value,
+        [*POLAR_SYMBOLS, *POLAR_ALIASES.keys()],
+    )
+
+    def set_aberrations(params):
+        """Standardize aberration coefficients."""
+
+        def process_polar_params(p: dict):
+            for symbol, value in p.items():
+                if value is None:
+                    continue
+                elif symbol in POLAR_SYMBOLS:
+                    polar_parameters[symbol] = float(value)
+                elif symbol == "defocus":
+                    polar_parameters["C10"] = -float(value)
+                elif symbol in POLAR_ALIASES:
+                    polar_parameters[POLAR_ALIASES[symbol]] = float(value)
+
+        # Start only with explicitly passed aberrations
+        polar_parameters = {}
+        process_polar_params(params)
+        return polar_parameters
+
+    polar_parameters = set_aberrations(value.copy())
+    return polar_parameters
 
 
 # def validate_dtype(value: Any, dtype: DTypeLike, name: str) -> DTypeLike:

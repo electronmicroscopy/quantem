@@ -10,6 +10,7 @@ from quantem.core.visualization.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
 
 
+@Dataset.register_dimension(2)
 class Dataset2d(Dataset):
     """2D dataset class that inherits from Dataset.
 

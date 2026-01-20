@@ -20,6 +20,8 @@ else:
 
 ArrayLike = Union[np.ndarray, "cp.ndarray", "torch.Tensor"]
 
+# TODO -- replace overloading with TypeVar implementation (if it works)
+
 # https://github.com/pytorch/pytorch/blob/main/torch/testing/_internal/common_utils.py#L1791
 numpy_to_torch_dtype_dict = {
     np.bool_: torch.bool,

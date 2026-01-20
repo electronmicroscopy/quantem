@@ -38,6 +38,8 @@ class AutoSerialize:
     and recreated as new instances during deserialization.
     """
 
+    __autoserialize_marker__ = ("AutoSerialize", __module__)
+
     # ---- Helpers to reduce casting noise ----
     @staticmethod
     def _get_group(parent: zarr.Group, key: str) -> zarr.Group:
@@ -168,6 +170,17 @@ class AutoSerialize:
                 # If Path creation fails, keep as string
                 return val
         return val
+
+    @staticmethod
+    def _is_autoserialize_instance(value: Any) -> bool:
+        """Return True if value behaves like an AutoSerialize instance, even across autoreloads."""
+        if isinstance(value, AutoSerialize):
+            return True
+        cls = getattr(value, "__class__", None)
+        if cls is None:
+            return False
+        marker = getattr(cls, "__autoserialize_marker__", None)
+        return marker == AutoSerialize.__autoserialize_marker__
 
     def save(
         self,
@@ -365,7 +378,9 @@ class AutoSerialize:
             if hasattr(value, "level"):
                 subgroup.attrs["logger_level"] = int(value.level)
 
-        elif isinstance(value, torch.nn.Module):
+        elif isinstance(value, torch.nn.Module) or (
+            hasattr(value, "__module__") and ("torch" in str(value.__module__))
+        ):
             # Save entire torch module with torch.save for robustness
             subgroup = group.require_group(name)
             subgroup.attrs["_torch_whole_module"] = True
@@ -391,7 +406,7 @@ class AutoSerialize:
             group.attrs[name] = str(value)
             group.attrs[f"{name}.is_path"] = True
 
-        elif isinstance(value, AutoSerialize):
+        elif self._is_autoserialize_instance(value):
             # Nested AutoSerialize subtree
             subgroup = group.require_group(name)
             self._recursive_save(value, subgroup, skip_names, skip_types, compressors)
@@ -1182,7 +1197,7 @@ class AutoSerialize:
                 return ("└── ", "    ") if last else ("├── ", "│   ")
 
             # Handle objects using AutoSerialize
-            if isinstance(val, AutoSerialize):
+            if AutoSerialize._is_autoserialize_instance(val):
                 # Filter out metadata keys unless user wants to see them
                 keys = [
                     k
@@ -1198,7 +1213,7 @@ class AutoSerialize:
                     if show_autoserialize_types and hasattr(subval, "_container_type"):
                         suffix = f" (_container_type = '{getattr(subval, '_container_type', '')}')"
                     # Branch: nested class, tensor, ndarray, container, or primitive
-                    if isinstance(subval, AutoSerialize):
+                    if AutoSerialize._is_autoserialize_instance(subval):
                         # Optionally show full class path
                         s = (
                             f"{key}: class {subval.__class__.__name__}{suffix}"

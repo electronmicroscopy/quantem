@@ -71,10 +71,12 @@ class PtychographyOpt(PtychographyBase):
         if isinstance(d, (tuple, list)):
             d = {k: {} for k in d}
 
-        for key in self.OPTIMIZABLE_VALS:
-            # if not specified, remove the scheduler for that model
-            if key not in d:
-                d[key] = {"type": "none"}
+        ## previously removed unspecified optimizers, but I think its better to keep them
+        ## and only remove if type is none
+        # for key in self.OPTIMIZABLE_VALS:
+        #     # if not specified, remove the scheduler for that model
+        #     if key not in d:
+        #         d[key] = {"type": "none"}
 
         for k, v in d.items():
             if "type" not in v.keys():

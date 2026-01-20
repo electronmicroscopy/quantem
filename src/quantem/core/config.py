@@ -43,7 +43,8 @@ config_lock = threading.Lock()
 PATH = Path(os.getenv("QUANTEM_CONFIG", "~/.config/quantem")).expanduser().resolve()
 
 config: dict = {}
-aliases: dict[str, dict[str, str]] = {"device": {"gpu": "cuda:0"}}
+# aliases: dict[str, dict[str, str]] = {"device": {"gpu": "cuda:0"}}
+aliases: dict[str, dict[str, str]] = {}
 deprecations: dict[str, str | None] = {}
 
 
@@ -269,6 +270,7 @@ def update(
 
     """
     for k, v in new.items():
+        k, v = check_key_val(k, v)
         k = canonical_name(k, old)
 
         if isinstance(v, Mapping):
@@ -479,54 +481,69 @@ def check_key_val(key: str, val: Any, deprecations: dict = deprecations) -> tupl
             new_val = "cpu"
         else:
             new_val, gpu_id = validate_device(new_val)
-            if config["has_torch"]:
-                torch.cuda.set_device(f"cuda:{gpu_id}")
-            if config["has_cupy"]:
-                cp.cuda.runtime.setDevice(gpu_id)
+            if "cuda" in new_val:
+                torch.cuda.set_device(gpu_id)
+                if config["has_cupy"]:
+                    cp.cuda.runtime.setDevice(gpu_id)
     return key, new_val
 
 
-# TODO clean this up
-def validate_device(dev: "str | int | torch.device") -> tuple[str, int]:
-    """validate the input device given as a string or int, and return the torch formatted
-    string of the device id and the device id int. Checks to make sure cupy and or torch are available if a gpu
-    device is chosen, but does not actually set the device."""
-    if isinstance(dev, str):
-        if dev.lower() == "cpu":
-            return "cpu", -1
-        elif dev.lower() in ["cuda", "gpu"]:
-            current_device = get_device()
-            if current_device.startswith("cuda:"):
-                id = int(current_device[5:])  # use currently set device
-            else:
-                id = 0  # default device is 0 if currently on cpu
-        elif dev.startswith("cuda:"):
-            id = int(dev[5:])
-        elif dev.startswith("<CUDA"):
-            id = int(dev.split(" ")[-1][:-1])
-        elif dev.isnumeric():
-            id = int(dev)
-        else:
-            raise NotImplementedError(f"new case for string device id: {dev}")
-    elif isinstance(dev, int):
-        id = dev
-    elif config["has_torch"]:
-        if isinstance(dev, torch.device):
-            id = dev.index
-            dev = dev.type
-            if dev == "cpu":
-                return "cpu", -1
-        else:
-            raise NotImplementedError(f"new case for device id: {dev} of type {type(dev)}")
-    else:
-        raise NotImplementedError(f"new case for device id: {dev} of type {type(dev)}")
+def validate_device(dev: str | int | torch.device | None = None) -> tuple[str, int]:
+    """Return a normalized (device_str, device_id) tuple for torch.
 
-    if id > NUM_DEVICES - 1:
-        raise ValueError(
-            f"Trying to set device {dev} but found {NUM_DEVICES} GPUs | "
-            + f"has_cupy: {config['has_cupy']} | has_torch: {config['has_torch']}"
+    Examples
+    --------
+    >>> validate_device("cpu")       # ('cpu', -1)
+    >>> validate_device("cuda:1")    # ('cuda:1', 1)
+    >>> validate_device(0)           # ('cuda:0', 0) if CUDA available
+    >>> validate_device("mps")       # ('mps', 0) if MPS available
+    >>> validate_device(None)        # current default device
+    """
+    if dev is None:
+        dev = torch.device(
+            "cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu"
         )
-    return f"cuda:{id}", id
+    elif isinstance(dev, str):
+        if "cuda" in dev.lower():
+            dev = torch.device(dev)
+        elif dev.lower() == "mps":
+            dev = torch.device("mps")
+        elif dev.lower() == "cpu":
+            dev = torch.device("cpu")
+        else:
+            raise ValueError(
+                f"Requested unknown device type: {dev} (must be 'cuda', 'mps', or 'cpu')"
+            )
+    elif isinstance(dev, int):
+        if dev < 0:
+            raise ValueError(f"Requested negative GPU index: {dev} (must be >= 0)")
+        if torch.cuda.is_available():
+            dev = torch.device(f"cuda:{dev}")
+        else:
+            raise RuntimeError(f"Requested GPU index '{dev}' device, but cuda is not available.")
+    elif not isinstance(dev, torch.device):
+        raise TypeError(f"Unsupported device type: {type(dev)} ({dev})")
+
+    if dev.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested but not available.")
+        index = dev.index if dev.index is not None else torch.cuda.current_device()
+        if index >= NUM_DEVICES:
+            raise RuntimeError(
+                f"CUDA device index {index} is out of range for {NUM_DEVICES} available devices."
+            )
+        return f"cuda:{index}", index
+
+    elif dev.type == "mps":
+        if not torch.mps.is_available():
+            raise RuntimeError("MPS device requested but not available.")
+        return "mps", 0
+
+    elif dev.type == "cpu":
+        return "cpu", -1
+
+    else:
+        raise ValueError(f"Unsupported torch device type: {dev.type}")
 
 
 def write(path: Path | str = PATH / "config.yaml") -> None:
@@ -545,7 +562,17 @@ def write(path: Path | str = PATH / "config.yaml") -> None:
         yaml.dump(config, f)
 
 
-def set_device(dev: str | int) -> None:
+def set_device(dev: str | int | "torch.device") -> None:
+    """Set the current device. Accepts a torch-style string, an integer index, or a
+    torch.device object.
+    Examples
+    --------
+    >>> set_device("cuda:0")
+    >>> set_device(0)
+    >>> set_device(torch.device("cuda:0"))
+    >>> set_device("mps")
+    >>> set_device("cpu")
+    """
     set({"device": dev})
 
 
