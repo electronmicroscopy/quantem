@@ -16,6 +16,85 @@ import { upwardMenuProps, switchStyles } from "./components";
 import "./show4dstem.css";
 
 // ============================================================================
+// Theme Detection - detect environment and light/dark mode
+// ============================================================================
+type Environment = "jupyterlab" | "vscode" | "colab" | "jupyter-classic" | "unknown";
+type Theme = "light" | "dark";
+
+interface ThemeInfo {
+  environment: Environment;
+  theme: Theme;
+}
+
+function detectTheme(): ThemeInfo {
+  // 1. JupyterLab - has data-jp-theme-light attribute
+  const jpThemeLight = document.body.dataset.jpThemeLight;
+  if (jpThemeLight !== undefined) {
+    return {
+      environment: "jupyterlab",
+      theme: jpThemeLight === "true" ? "light" : "dark",
+    };
+  }
+
+  // 2. VS Code - has vscode-* classes on body or html
+  const bodyClasses = document.body.className;
+  const htmlClasses = document.documentElement.className;
+  if (bodyClasses.includes("vscode-") || htmlClasses.includes("vscode-")) {
+    const isDark = bodyClasses.includes("vscode-dark") || htmlClasses.includes("vscode-dark");
+    return {
+      environment: "vscode",
+      theme: isDark ? "dark" : "light",
+    };
+  }
+
+  // 3. Google Colab - has specific markers
+  if (document.querySelector('colab-shaded-scroller') || document.body.classList.contains('colaboratory')) {
+    // Colab: check computed background color
+    const bg = getComputedStyle(document.body).backgroundColor;
+    return {
+      environment: "colab",
+      theme: isColorDark(bg) ? "dark" : "light",
+    };
+  }
+
+  // 4. Classic Jupyter Notebook - has #notebook element
+  if (document.getElementById('notebook')) {
+    const bodyBg = getComputedStyle(document.body).backgroundColor;
+    return {
+      environment: "jupyter-classic",
+      theme: isColorDark(bodyBg) ? "dark" : "light",
+    };
+  }
+
+  // 5. Fallback: check OS preference, then computed background
+  const prefersDark = window.matchMedia?.('(prefers-color-scheme: dark)')?.matches;
+  if (prefersDark !== undefined) {
+    return {
+      environment: "unknown",
+      theme: prefersDark ? "dark" : "light",
+    };
+  }
+
+  // Final fallback: check body background luminance
+  const bg = getComputedStyle(document.body).backgroundColor;
+  return {
+    environment: "unknown",
+    theme: isColorDark(bg) ? "dark" : "light",
+  };
+}
+
+/** Check if a CSS color string is dark (luminance < 0.5) */
+function isColorDark(color: string): boolean {
+  // Parse rgb(r, g, b) or rgba(r, g, b, a)
+  const match = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (!match) return true; // Default to dark if can't parse
+  const [, r, g, b] = match.map(Number);
+  // Relative luminance formula (simplified)
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance < 0.5;
+}
+
+// ============================================================================
 // Layout Constants - consistent spacing throughout
 // ============================================================================
 const SPACING = {
@@ -47,11 +126,9 @@ const controlRow = {
   display: "flex",
   alignItems: "center",
   gap: `${SPACING.SM}px`,
-  border: "1px solid #3a3a3a",
   borderRadius: "2px",
   px: 1,
   py: 0.5,
-  bgcolor: "#252525",
   width: "fit-content",
 };
 
@@ -686,6 +763,7 @@ interface HistogramProps {
   onRangeChange: (min: number, max: number) => void;
   width?: number;
   height?: number;
+  theme?: "light" | "dark";
 }
 
 /**
@@ -699,10 +777,24 @@ function Histogram({
   vmaxPct,
   onRangeChange,
   width = 120,
-  height = 40
+  height = 40,
+  theme = "dark"
 }: HistogramProps) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
   const bins = React.useMemo(() => computeHistogramFromBytes(data), [data]);
+
+  // Theme-aware colors
+  const colors = theme === "dark" ? {
+    bg: "#1a1a1a",
+    barActive: "#888",
+    barInactive: "#444",
+    border: "#333",
+  } : {
+    bg: "#f0f0f0",
+    barActive: "#666",
+    barInactive: "#bbb",
+    border: "#ccc",
+  };
 
   // Draw histogram (vertical gray bars)
   React.useEffect(() => {
@@ -717,8 +809,8 @@ function Histogram({
     canvas.height = height * dpr;
     ctx.scale(dpr, dpr);
 
-    // Clear with dark background
-    ctx.fillStyle = "#1a1a1a";
+    // Clear with theme background
+    ctx.fillStyle = colors.bg;
     ctx.fillRect(0, 0, width, height);
 
     // Reduce to fewer bins for cleaner display
@@ -741,24 +833,24 @@ function Histogram({
     const vminBin = Math.floor((vminPct / 100) * displayBins);
     const vmaxBin = Math.floor((vmaxPct / 100) * displayBins);
 
-    // Draw histogram bars (gray)
+    // Draw histogram bars
     for (let i = 0; i < displayBins; i++) {
       const barHeight = (reducedBins[i] / maxVal) * (height - 2);
       const x = i * barWidth;
 
-      // Bars inside range are lighter gray, outside are darker
+      // Bars inside range are highlighted, outside are dimmed
       const inRange = i >= vminBin && i <= vmaxBin;
-      ctx.fillStyle = inRange ? "#888" : "#444";
+      ctx.fillStyle = inRange ? colors.barActive : colors.barInactive;
       ctx.fillRect(x + 0.5, height - barHeight, Math.max(1, barWidth - 1), barHeight);
     }
 
-  }, [bins, colormap, vminPct, vmaxPct, width, height]);
+  }, [bins, colormap, vminPct, vmaxPct, width, height, colors]);
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 0.25 }}>
       <canvas
         ref={canvasRef}
-        style={{ width, height, borderRadius: 2, border: "1px solid #333" }}
+        style={{ width, height, borderRadius: 2, border: `1px solid ${colors.border}` }}
       />
       <Slider
         value={[vminPct, vmaxPct]}
@@ -884,6 +976,47 @@ function Show4DSTEM() {
   const [dpStats] = useModelState<number[]>("dp_stats");  // [mean, min, max, std]
   const [viStats] = useModelState<number[]>("vi_stats");  // [mean, min, max, std]
   const [showFft, setShowFft] = React.useState(false);  // Hidden by default per feedback
+
+  // Theme detection - detect environment and light/dark mode
+  const [themeInfo, setThemeInfo] = React.useState<ThemeInfo>(() => detectTheme());
+
+  // Re-detect theme on mount and when OS preference changes
+  React.useEffect(() => {
+    setThemeInfo(detectTheme());
+
+    // Listen for OS preference changes
+    const mediaQuery = window.matchMedia?.('(prefers-color-scheme: dark)');
+    const handleChange = () => setThemeInfo(detectTheme());
+    mediaQuery?.addEventListener?.('change', handleChange);
+
+    // Also observe body attributes for JupyterLab theme changes
+    const observer = new MutationObserver(() => setThemeInfo(detectTheme()));
+    observer.observe(document.body, { attributes: true, attributeFilter: ['data-jp-theme-light', 'class'] });
+
+    return () => {
+      mediaQuery?.removeEventListener?.('change', handleChange);
+      observer.disconnect();
+    };
+  }, []);
+
+  // Theme colors based on detected theme
+  const themeColors = themeInfo.theme === "dark" ? {
+    bg: "#1e1e1e",
+    bgAlt: "#1a1a1a",
+    text: "#e0e0e0",
+    textMuted: "#888",
+    border: "#3a3a3a",
+    controlBg: "#252525",
+    accent: "#5af",
+  } : {
+    bg: "#ffffff",
+    bgAlt: "#f5f5f5",
+    text: "#1e1e1e",
+    textMuted: "#666",
+    border: "#ccc",
+    controlBg: "#f0f0f0",
+    accent: "#0066cc",
+  };
 
   // Histogram data - use state to ensure re-renders (both are Float32Array now)
   const [dpHistogramData, setDpHistogramData] = React.useState<Float32Array | null>(null);
@@ -1899,8 +2032,18 @@ function Show4DSTEM() {
     boxSizing: "border-box",
   };
 
+  // Theme-aware select style
+  const themedSelect = {
+    ...controlPanel.select,
+    bgcolor: themeColors.controlBg,
+    color: themeColors.text,
+    "& .MuiSelect-select": { py: 0.5 },
+    "& .MuiOutlinedInput-notchedOutline": { borderColor: themeColors.border },
+    "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: themeColors.accent },
+  };
+
   return (
-    <Box ref={rootRef} className="show4dstem-root" sx={{ p: `${SPACING.LG}px`, bgcolor: "#1e1e1e", color: "#e0e0e0" }}>
+    <Box ref={rootRef} className="show4dstem-root" sx={{ p: `${SPACING.LG}px`, bgcolor: themeColors.bg, color: themeColors.text }}>
       {/* HEADER */}
       <Typography variant="h6" sx={{ ...typography.title, mb: `${SPACING.SM}px` }}>
         4D-STEM Explorer
@@ -1938,11 +2081,11 @@ function Show4DSTEM() {
 
           {/* DP Stats Bar */}
           {dpStats && dpStats.length === 4 && (
-            <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: "#1a1a1a", borderRadius: "2px", display: "flex", gap: 2 }}>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Mean <Box component="span" sx={{ color: "#5af" }}>{formatStat(dpStats[0])}</Box></Typography>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Min <Box component="span" sx={{ color: "#5af" }}>{formatStat(dpStats[1])}</Box></Typography>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Max <Box component="span" sx={{ color: "#5af" }}>{formatStat(dpStats[2])}</Box></Typography>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Std <Box component="span" sx={{ color: "#5af" }}>{formatStat(dpStats[3])}</Box></Typography>
+            <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, borderRadius: "2px", display: "flex", gap: 2 }}>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Mean <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[0])}</Box></Typography>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[1])}</Box></Typography>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[2])}</Box></Typography>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Std <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[3])}</Box></Typography>
             </Box>
           )}
 
@@ -1951,9 +2094,9 @@ function Show4DSTEM() {
             {/* Left: two rows of controls */}
             <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
               {/* Row 1: Detector + slider */}
-              <Box sx={controlRow}>
+              <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Detector:</Typography>
-                <Select value={roiMode || "point"} onChange={(e) => setRoiMode(e.target.value)} size="small" sx={{ ...controlPanel.select, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                <Select value={roiMode || "point"} onChange={(e) => setRoiMode(e.target.value)} size="small" sx={{ ...themedSelect, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="point">Point</MenuItem>
                   <MenuItem value="circle">Circle</MenuItem>
                   <MenuItem value="square">Square</MenuItem>
@@ -1989,12 +2132,12 @@ function Show4DSTEM() {
                 )}
               </Box>
               {/* Row 2: Presets + Color + Scale */}
-              <Box sx={controlRow}>
+              <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                 <Typography component="span" onClick={() => { setRoiMode("circle"); setRoiRadius(bfRadius || 10); setRoiCenterX(centerX); setRoiCenterY(centerY); }} sx={{ color: "#4f4", fontSize: 11, fontWeight: "bold", cursor: "pointer", "&:hover": { textDecoration: "underline" } }}>BF</Typography>
                 <Typography component="span" onClick={() => { setRoiMode("annular"); setRoiRadiusInner((bfRadius || 10) * 0.5); setRoiRadius(bfRadius || 10); setRoiCenterX(centerX); setRoiCenterY(centerY); }} sx={{ color: "#4af", fontSize: 11, fontWeight: "bold", cursor: "pointer", "&:hover": { textDecoration: "underline" } }}>ABF</Typography>
                 <Typography component="span" onClick={() => { setRoiMode("annular"); setRoiRadiusInner(bfRadius || 10); setRoiRadius(Math.min((bfRadius || 10) * 3, Math.min(detX, detY) / 2 - 2)); setRoiCenterX(centerX); setRoiCenterY(centerY); }} sx={{ color: "#fa4", fontSize: 11, fontWeight: "bold", cursor: "pointer", "&:hover": { textDecoration: "underline" } }}>ADF</Typography>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Color:</Typography>
-                <Select value={dpColormap} onChange={(e) => setDpColormap(String(e.target.value))} size="small" sx={{ ...controlPanel.select, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                <Select value={dpColormap} onChange={(e) => setDpColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="inferno">Inferno</MenuItem>
                   <MenuItem value="viridis">Viridis</MenuItem>
                   <MenuItem value="plasma">Plasma</MenuItem>
@@ -2003,7 +2146,7 @@ function Show4DSTEM() {
                   <MenuItem value="gray">Gray</MenuItem>
                 </Select>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Scale:</Typography>
-                <Select value={dpScaleMode} onChange={(e) => setDpScaleMode(e.target.value as "linear" | "log" | "power")} size="small" sx={{ ...controlPanel.select, minWidth: 50, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                <Select value={dpScaleMode} onChange={(e) => setDpScaleMode(e.target.value as "linear" | "log" | "power")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="linear">Lin</MenuItem>
                   <MenuItem value="log">Log</MenuItem>
                   <MenuItem value="power">Pow</MenuItem>
@@ -2012,7 +2155,7 @@ function Show4DSTEM() {
             </Box>
             {/* Right: Histogram spanning both rows */}
             <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-              <Histogram data={dpHistogramData} colormap={dpColormap} vminPct={dpVminPct} vmaxPct={dpVmaxPct} onRangeChange={(min, max) => { setDpVminPct(min); setDpVmaxPct(max); }} width={110} height={58} />
+              <Histogram data={dpHistogramData} colormap={dpColormap} vminPct={dpVminPct} vmaxPct={dpVmaxPct} onRangeChange={(min, max) => { setDpVminPct(min); setDpVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} />
             </Box>
           </Box>
         </Box>
@@ -2023,7 +2166,7 @@ function Show4DSTEM() {
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
             <Typography variant="caption" sx={{ ...typography.label }}>Virtual Image</Typography>
             <Stack direction="row" spacing={`${SPACING.SM}px`} alignItems="center">
-              <Typography sx={{ ...typography.label, color: "#666", fontSize: 10 }}>
+              <Typography sx={{ ...typography.label, color: themeColors.textMuted, fontSize: 10 }}>
                 {shapeX}×{shapeY} | {detX}×{detY}
               </Typography>
               <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT:</Typography>
@@ -2049,11 +2192,11 @@ function Show4DSTEM() {
 
           {/* VI Stats Bar */}
           {viStats && viStats.length === 4 && (
-            <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: "#1a1a1a", borderRadius: "2px", display: "flex", gap: 2 }}>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Mean <Box component="span" sx={{ color: "#5af" }}>{formatStat(viStats[0])}</Box></Typography>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Min <Box component="span" sx={{ color: "#5af" }}>{formatStat(viStats[1])}</Box></Typography>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Max <Box component="span" sx={{ color: "#5af" }}>{formatStat(viStats[2])}</Box></Typography>
-              <Typography sx={{ fontSize: 11, color: "#888" }}>Std <Box component="span" sx={{ color: "#5af" }}>{formatStat(viStats[3])}</Box></Typography>
+            <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, borderRadius: "2px", display: "flex", gap: 2 }}>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Mean <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(viStats[0])}</Box></Typography>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(viStats[1])}</Box></Typography>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(viStats[2])}</Box></Typography>
+              <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Std <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(viStats[3])}</Box></Typography>
             </Box>
           )}
 
@@ -2062,9 +2205,9 @@ function Show4DSTEM() {
             {/* Left: Two rows of controls */}
             <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
               {/* Row 1: ROI selector */}
-              <Box sx={controlRow}>
+              <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>ROI:</Typography>
-                <Select value={viRoiMode || "off"} onChange={(e) => setViRoiMode(e.target.value)} size="small" sx={{ ...controlPanel.select, minWidth: 60, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                <Select value={viRoiMode || "off"} onChange={(e) => setViRoiMode(e.target.value)} size="small" sx={{ ...themedSelect, minWidth: 60, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="off">Off</MenuItem>
                   <MenuItem value="circle">Circle</MenuItem>
                   <MenuItem value="square">Square</MenuItem>
@@ -2096,9 +2239,9 @@ function Show4DSTEM() {
                 )}
               </Box>
               {/* Row 2: Color + Scale */}
-              <Box sx={controlRow}>
+              <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Color:</Typography>
-                <Select value={viColormap} onChange={(e) => setViColormap(String(e.target.value))} size="small" sx={{ ...controlPanel.select, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                <Select value={viColormap} onChange={(e) => setViColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="inferno">Inferno</MenuItem>
                   <MenuItem value="viridis">Viridis</MenuItem>
                   <MenuItem value="plasma">Plasma</MenuItem>
@@ -2107,7 +2250,7 @@ function Show4DSTEM() {
                   <MenuItem value="gray">Gray</MenuItem>
                 </Select>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Scale:</Typography>
-                <Select value={viScaleMode} onChange={(e) => setViScaleMode(e.target.value as "linear" | "log" | "power")} size="small" sx={{ ...controlPanel.select, minWidth: 50, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                <Select value={viScaleMode} onChange={(e) => setViScaleMode(e.target.value as "linear" | "log" | "power")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="linear">Lin</MenuItem>
                   <MenuItem value="log">Log</MenuItem>
                   <MenuItem value="power">Pow</MenuItem>
@@ -2116,7 +2259,7 @@ function Show4DSTEM() {
             </Box>
             {/* Right: Histogram spanning both rows */}
             <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-              <Histogram data={viHistogramData} colormap={viColormap} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} />
+              <Histogram data={viHistogramData} colormap={viColormap} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} />
             </Box>
           </Box>
 
@@ -2148,7 +2291,7 @@ function Show4DSTEM() {
         <Stack direction="row" spacing={`${SPACING.MD}px`} sx={{ mt: `${SPACING.LG}px` }}>
           <Box className="show4dstem-control-group" sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
             <Typography sx={{ ...typography.label }}>Path:</Typography>
-            <Typography component="span" onClick={() => { setPathPlaying(false); setPathIndex(0); }} sx={{ color: "#888", fontSize: 14, cursor: "pointer", "&:hover": { color: "#fff" }, px: 0.5 }} title="Stop">⏹</Typography>
+            <Typography component="span" onClick={() => { setPathPlaying(false); setPathIndex(0); }} sx={{ color: themeColors.textMuted, fontSize: 14, cursor: "pointer", "&:hover": { color: "#fff" }, px: 0.5 }} title="Stop">⏹</Typography>
             <Typography component="span" onClick={() => setPathPlaying(!pathPlaying)} sx={{ color: pathPlaying ? "#0f0" : "#888", fontSize: 14, cursor: "pointer", "&:hover": { color: "#fff" }, px: 0.5 }} title={pathPlaying ? "Pause" : "Play"}>{pathPlaying ? "⏸" : "▶"}</Typography>
             <Typography sx={{ ...typography.value, minWidth: 60 }}>{pathIndex + 1}/{pathLength}</Typography>
             <Slider value={pathIndex} onChange={(_, v) => { setPathPlaying(false); setPathIndex(v as number); }} min={0} max={Math.max(0, pathLength - 1)} size="small" sx={{ width: 100 }} />
