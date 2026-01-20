@@ -1,10 +1,11 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Callable, Self
+from typing import Any, Callable, Self
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from quantem.core.io.serialize import AutoSerialize
@@ -130,14 +131,19 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
             """
             raise NotImplementedError
 
+        @property
+        def params(self) -> list[nn.Parameter]:
+            """
+            Get the parameters that should be optimized for this model.
+            """
+            raise NotImplementedError
+
         # --- Helper Functions ---
         def get_optimization_parameters(self) -> list[nn.Parameter]:
             """
             Get the parameters that should be optimized for this model.
-
-            TODO: I have no idea what this does.
             """
-            return list[nn.Parameter](self.parameters())
+            return list[nn.Parameter](self.params())
 
         @abstractmethod  # Each subclass should implement this.
         def to(self, *args, **kwargs):
@@ -278,12 +284,19 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
     ):
-        pass
+        super().__init__(
+            shape=volume_shape,
+            device=device,
+            rng=rng,
+            _token=self._token,
+        )
+        self._pretrain_losses = []
+        self._pretrain_lrs = []
 
     @classmethod
     def from_model(
         cls,
-        model: "torch.nn.Module",
+        model: "nn.Module",
         volume_shape: tuple[int, int, int],
         device: str = None,  # Have to make device a requirement here in distinguishing GPU vs CPU training
         rng: np.random.Generator | int | None = None,
@@ -293,7 +306,6 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
             volume_shape=volume_shape,
             device=device,
             rng=rng,
-            _token=cls._token,
         )
 
         # Initialize DDP params and build the model. TODO: Not sure if this is the best way to do this? But to pretrain we need the model to be wrapped in DDP.
@@ -320,6 +332,10 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
         For now, upon initialization private variable `._model` is set to the built model.
         """
         raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
+
+    @property
+    def params(self):
+        return self.model.parameters()
 
     # Pretraining
     @property
@@ -352,6 +368,9 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
             self._model, self._pretrained_weights
         )  # Since loading the pretrained weights needs to be done in build_model.
 
+    def get_optimization_parameters(self):
+        return self.params
+
     # --- Forward Method ---
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
@@ -382,6 +401,7 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l1",
+        apply_constraints: bool = False,
         show: bool = True,
     ):
         """
@@ -400,6 +420,128 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
             self.set_optimizer(optimizer_params)
         if scheduler_params is not None:
             self.set_scheduler(scheduler_params, num_iters)
+
+        if reset:
+            raise NotImplementedError(
+                "TODO: Resseting the model to the pretrained weights is not implemented yet. To make this work I would have to reinstantiate the model I think."
+            )
+
+        if loss_fn == "l1":
+            loss_fn = nn.functional.l1_loss
+
+        self._pretrain(
+            num_iters=num_iters,
+            loss_fn=loss_fn,
+            apply_constraints=apply_constraints,
+        )
+
+    def _pretrain(
+        self,
+        num_iters: int,
+        loss_fn: Callable,
+        apply_constraints: bool,
+    ):
+        self.model.train()
+        optimizer = self.optimizer
+        scheduler = self.scheduler
+
+        for a0 in range(num_iters):
+            for batch_idx, batch in enumerate[Any](self.pretraining_dataloader):
+                coords = batch["coords"].to(self.device, non_blocking=True)
+                target = batch["target"].to(self.device, non_blocking=True)
+
+                with torch.autocast(
+                    device_type=self.device.type, dtype=torch.bfloat16, enabled=True
+                ):
+                    outputs = self.forward(coords)
+                    loss = loss_fn(outputs, target)
+
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+
+                if scheduler is not None:
+                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        scheduler.step(loss.item())
+                    else:
+                        scheduler.step()
+
+            self._pretrain_losses.append(loss.item())
+            print(f"Pretrain Loss: {loss.item():.4f}")
+            self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
+
+    def create_volume(
+        self,
+    ):
+        N = max(self._shape)
+        with torch.no_grad():
+            coords_1d = torch.linspace(-1, 1, N)
+            x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
+            inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+
+            model = self.model.module if hasattr(self.model, "module") else self.model
+
+            inference_batch_size = 5 * N * N
+            total_samples = N**3
+            samples_per_gpu = total_samples // self.world_size
+            remainder = total_samples % self.world_size
+            if self.global_rank < remainder:
+                start_idx = self.global_rank * (samples_per_gpu + 1)
+                end_idx = start_idx + samples_per_gpu + 1
+            else:
+                start_idx = self.global_rank * samples_per_gpu + remainder
+                end_idx = start_idx + samples_per_gpu
+            inputs_subset = inputs[start_idx:end_idx]
+            num_samples = inputs_subset.shape[0]
+            outputs_list = []
+            for batch_start in range(0, num_samples, inference_batch_size):
+                batch_end = min(batch_start + inference_batch_size, num_samples)
+                batch_coords = inputs_subset[batch_start:batch_end].to(
+                    self.device, non_blocking=True
+                )
+                batch_outputs = model(batch_coords)
+                if batch_outputs.dim() > 1:
+                    batch_outputs = batch_outputs.squeeze(-1)
+                outputs_list.append(batch_outputs.cpu())
+
+            outputs = torch.cat(outputs_list, dim=0)
+
+            if self.world_size > 1:
+                output_size = torch.tensor(outputs.shape[0], device=self.device, dtype=torch.long)
+                all_sizes = [
+                    torch.zeros(1, device=self.device, dtype=torch.long)
+                    for _ in range(self.world_size)
+                ]
+                dist.all_gather(all_sizes, output_size)
+
+                max_size = max(size.item() for size in all_sizes)
+
+                if outputs.shape[0] < max_size:
+                    padding = torch.zeros(
+                        max_size - outputs.shape[0], device=outputs.device, dtype=outputs.dtype
+                    )
+                    outputs_padded = torch.cat([outputs, padding], dim=0).to(self.device)
+                else:
+                    outputs_padded = outputs.to(self.device)
+
+                gathered_outputs = [
+                    torch.empty(max_size, device=self.device, dtype=outputs.dtype)
+                    for _ in range(self.world_size)
+                ]
+                dist.all_gather(gathered_outputs, outputs_padded.contiguous())
+
+                trimmed_outputs = []
+                for rank, size in enumerate(all_sizes):
+                    trimmed_outputs.append(gathered_outputs[rank][: size.item()])
+
+                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(N, N, N).float()
+            else:
+                pred_full = outputs.reshape(N, N, N).float()
+
+            self._obj = pred_full.detach().cpu()
+
+    def get_tv_loss(self):
+        pass
 
 
 ObjectModelType = ObjectPixelated | ObjectINR

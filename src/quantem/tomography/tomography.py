@@ -13,7 +13,7 @@ from quantem.tomography.tomography_opt import TomographyOpt
 from quantem.tomography.utils import torch_phase_cross_correlation
 
 
-class Tomography(TomographyBase, TomographyOpt):
+class Tomography(TomographyOpt, TomographyBase):
     """
     Class for handling all ML tomography reconstruction methods.
     Automatic handling between AD and INR-based tomography.
@@ -88,7 +88,8 @@ class TomographyConventional(TomographyBase):
             proj_forward = torch.zeros_like(self.dset.tilt_stack).permute(2, 0, 1)
         else:
             proj_forward = torch.zeros_like(self.dset.tilt_stack)
-
+        print("proj_forward.shape", proj_forward.shape)
+        print("self.dset.tilt_stack.shape", self.dset.tilt_stack.shape)
         for iter in pbar:
             proj_forward, loss = self._reconstruction_epoch(
                 inline_alignment=inline_alignment,
