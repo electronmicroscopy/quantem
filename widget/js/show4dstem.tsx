@@ -1870,7 +1870,7 @@ function Show4DSTEM() {
           {/* DP Controls - two rows with histogram on right */}
           <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, border: "1px solid #3a3a3a", borderRadius: "2px", px: 1, py: 0.5, bgcolor: "#252525", width: "100%", boxSizing: "border-box" }}>
             {/* Left: two rows of controls */}
-            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1 }}>
+            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
               {/* Row 1: Detector + slider */}
               <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Detector:</Typography>
@@ -1981,7 +1981,7 @@ function Show4DSTEM() {
           {/* VI Controls - Two rows with histogram on right */}
           <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.MD}px`, border: "1px solid #3a3a3a", borderRadius: "2px", px: 1, py: 0.5, bgcolor: "#252525", width: "100%", boxSizing: "border-box" }}>
             {/* Left: Two rows of controls */}
-            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1 }}>
+            <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
               {/* Row 1: ROI selector */}
               <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>ROI:</Typography>
