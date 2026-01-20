@@ -16,12 +16,12 @@ from torch.utils.tensorboard.writer import SummaryWriter
 
 from quantem.core.io.serialize import AutoSerialize, load
 
-"""
-Tensorboard logger class for AD/ML reconstruction methods
-"""
+"""Tensorboard logger class for AD/ML reconstruction methods."""
 
 
 class LoggerBase(AutoSerialize):
+    """Tensorboard logger for AD/ML reconstruction methods."""
+
     def __init__(
         self,
         base_log_dir: os.PathLike | str,
@@ -29,6 +29,19 @@ class LoggerBase(AutoSerialize):
         run_suffix: str = "",
         log_images_every: int = 10,
     ) -> None:
+        """Initialize LoggerBase.
+
+        Parameters
+        ----------
+        base_log_dir : os.PathLike or str
+            Base directory for log files.
+        run_prefix : str
+            Prefix for run directory name.
+        run_suffix : str, optional
+            Suffix for run directory name, by default ""
+        log_images_every : int, optional
+            Frequency for logging images, by default 10
+        """
         self._timestamp = datetime.datetime.now().strftime(
             "%Y%m%d_%H%M%S"
         )  # This should never be reinstantiated.
@@ -49,13 +62,33 @@ class LoggerBase(AutoSerialize):
         self.writer.add_figure(tag, fig, step)
 
     def log_histogram(self, tag: str, values: NDArray | Tensor, step: int) -> None:
-        """Log histogram of values for monitoring distributions."""
+        """Log histogram of values for monitoring distributions.
+
+        Parameters
+        ----------
+        tag : str
+            Tag for the histogram.
+        values : NDArray or Tensor
+            Values to create histogram from.
+        step : int
+            Step number.
+        """
         if isinstance(values, Tensor):
             values = values.detach().cpu().numpy()
         self.writer.add_histogram(tag, values, step)
 
     def log_text(self, tag: str, text: str, step: int) -> None:
-        """Log text for configuration, hyperparameters, or notes."""
+        """Log text for configuration, hyperparameters, or notes.
+
+        Parameters
+        ----------
+        tag : str
+            Tag for the text.
+        text : str
+            Text to log.
+        step : int
+            Step number.
+        """
         self.writer.add_text(tag, text, step)
 
     def flush(self) -> None:
@@ -66,6 +99,7 @@ class LoggerBase(AutoSerialize):
         self.writer.close()
 
     def new_timestamp(self) -> None:
+        """Create new timestamp and reinitialize writer with new log directory."""
         self.close()
         self._timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         name = self.run_prefix + "_" + self._timestamp
@@ -77,6 +111,13 @@ class LoggerBase(AutoSerialize):
         self.writer = SummaryWriter(str(self.log_dir))
 
     def clone(self) -> Self:
+        """Create a cloned logger with new timestamp.
+
+        Returns
+        -------
+        Self
+            Cloned logger instance.
+        """
         try:
             cloned: Self = copy.deepcopy(self)
         except Exception:
@@ -155,8 +196,19 @@ class LoggerBase(AutoSerialize):
 
     @staticmethod
     def apply_colormap(tensor_2d: Tensor | NDArray, cmap_name: str = "turbo") -> NDArray:
-        """
-        Apply colormap to a 2D tensor and return a [3, H, W] NumPy float32 array in [0, 1].
+        """Apply colormap to a 2D tensor and return a [3, H, W] NumPy float32 array in [0, 1].
+
+        Parameters
+        ----------
+        tensor_2d : Tensor or NDArray
+            2D tensor to apply colormap to.
+        cmap_name : str, optional
+            Colormap name, by default "turbo"
+
+        Returns
+        -------
+        NDArray
+            Colored array with shape [3, H, W] and dtype float32 in range [0, 1].
         """
         if isinstance(tensor_2d, Tensor):
             tensor_2d = tensor_2d.detach().cpu().numpy()
