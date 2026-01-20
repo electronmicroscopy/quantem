@@ -34,6 +34,14 @@ const LINE_WIDTH_FRACTION = 0.015;
 const LINE_WIDTH_MIN_PX = 1.5;
 const LINE_WIDTH_MAX_PX = 3;
 
+// Compact button style for Reset/Export
+const compactButton = {
+  fontSize: 10,
+  py: 0.25,
+  px: 1,
+  minWidth: 0,
+};
+
 /** Round to a nice value (1, 2, 5, 10, 20, 50, etc.) */
 function roundToNiceValue(value: number): number {
   if (value <= 0) return 1;
@@ -1830,8 +1838,8 @@ function Show4DSTEM() {
               <span style={{ color: "#0f0", marginLeft: SPACING.SM }}>k: ({Math.round(localKx)}, {Math.round(localKy)})</span>
             </Typography>
             <Stack direction="row" spacing={`${SPACING.SM}px`}>
-              <Button size="small" onClick={() => { setDpZoom(1); setDpPanX(0); setDpPanY(0); setRoiCenterX(centerX); setRoiCenterY(centerY); }}>Reset</Button>
-              <Button size="small" onClick={handleExportDP}>Export</Button>
+              <Button size="small" sx={compactButton} onClick={() => { setDpZoom(1); setDpPanX(0); setDpPanY(0); setRoiCenterX(centerX); setRoiCenterY(centerY); }}>Reset</Button>
+              <Button size="small" sx={compactButton} onClick={handleExportDP}>Export</Button>
             </Stack>
           </Stack>
 
@@ -1941,8 +1949,8 @@ function Show4DSTEM() {
               </Typography>
               <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT:</Typography>
               <Switch checked={showFft} onChange={(e) => setShowFft(e.target.checked)} size="small" sx={switchStyles.small} />
-              <Button size="small" onClick={() => { setViZoom(1); setViPanX(0); setViPanY(0); }}>Reset</Button>
-              <Button size="small" onClick={handleExportVI}>Export</Button>
+              <Button size="small" sx={compactButton} onClick={() => { setViZoom(1); setViPanX(0); setViPanY(0); }}>Reset</Button>
+              <Button size="small" sx={compactButton} onClick={handleExportVI}>Export</Button>
             </Stack>
           </Stack>
 
@@ -2038,7 +2046,7 @@ function Show4DSTEM() {
             <Box sx={{ mt: `${SPACING.LG}px` }}>
               <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
                 <Typography variant="caption" sx={{ ...typography.label }}>FFT</Typography>
-                <Button size="small" onClick={() => { setFftZoom(1); setFftPanX(0); setFftPanY(0); }}>Reset</Button>
+                <Button size="small" sx={compactButton} onClick={() => { setFftZoom(1); setFftPanX(0); setFftPanY(0); }}>Reset</Button>
               </Stack>
               <Box sx={{ ...container.imageBox, width: CANVAS_SIZE, height: CANVAS_SIZE }}>
                 <canvas ref={fftCanvasRef} width={shapeY} height={shapeX} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
