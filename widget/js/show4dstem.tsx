@@ -1,3 +1,4 @@
+/// <reference types="@webgpu/types" />
 import * as React from "react";
 import { createRender, useModelState } from "@anywidget/react";
 import Box from "@mui/material/Box";
@@ -9,10 +10,6 @@ import Slider from "@mui/material/Slider";
 import Button from "@mui/material/Button";
 import Switch from "@mui/material/Switch";
 import JSZip from "jszip";
-import { getWebGPUFFT, WebGPUFFT } from "./webgpu-fft";
-import { COLORMAPS, fft2d, fftshift, applyBandPassFilter, MIN_ZOOM, MAX_ZOOM } from "./shared";
-import { typography, controlPanel, container } from "./CONFIG";
-import { upwardMenuProps, switchStyles } from "./components";
 import "./show4dstem.css";
 
 // ============================================================================
@@ -93,6 +90,270 @@ function isColorDark(color: string): boolean {
   const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
   return luminance < 0.5;
 }
+
+// ============================================================================
+// Colormaps - pre-computed LUTs for image display
+// ============================================================================
+const COLORMAP_POINTS: Record<string, number[][]> = {
+  inferno: [[0,0,4],[40,11,84],[101,21,110],[159,42,99],[212,72,66],[245,125,21],[252,193,57],[252,255,164]],
+  viridis: [[68,1,84],[72,36,117],[65,68,135],[53,95,141],[42,120,142],[33,145,140],[34,168,132],[68,191,112],[122,209,81],[189,223,38],[253,231,37]],
+  plasma: [[13,8,135],[75,3,161],[126,3,168],[168,34,150],[203,70,121],[229,107,93],[248,148,65],[253,195,40],[240,249,33]],
+  magma: [[0,0,4],[28,16,68],[79,18,123],[129,37,129],[181,54,122],[229,80,100],[251,135,97],[254,194,135],[252,253,191]],
+  hot: [[0,0,0],[87,0,0],[173,0,0],[255,0,0],[255,87,0],[255,173,0],[255,255,0],[255,255,128],[255,255,255]],
+  gray: [[0,0,0],[255,255,255]],
+};
+
+function createColormapLUT(points: number[][]): Uint8Array {
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = (i / 255) * (points.length - 1);
+    const idx = Math.floor(t);
+    const frac = t - idx;
+    const p0 = points[Math.min(idx, points.length - 1)];
+    const p1 = points[Math.min(idx + 1, points.length - 1)];
+    lut[i * 3] = Math.round(p0[0] + frac * (p1[0] - p0[0]));
+    lut[i * 3 + 1] = Math.round(p0[1] + frac * (p1[1] - p0[1]));
+    lut[i * 3 + 2] = Math.round(p0[2] + frac * (p1[2] - p0[2]));
+  }
+  return lut;
+}
+
+const COLORMAPS: Record<string, Uint8Array> = Object.fromEntries(
+  Object.entries(COLORMAP_POINTS).map(([name, points]) => [name, createColormapLUT(points)])
+);
+
+// ============================================================================
+// FFT Utilities - CPU implementation with WebGPU acceleration
+// ============================================================================
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 10;
+
+function nextPow2(n: number): number { return Math.pow(2, Math.ceil(Math.log2(n))); }
+function isPow2(n: number): boolean { return n > 0 && (n & (n - 1)) === 0; }
+
+function fft1dPow2(real: Float32Array, imag: Float32Array, inverse: boolean = false) {
+  const n = real.length;
+  if (n <= 1) return;
+  let j = 0;
+  for (let i = 0; i < n - 1; i++) {
+    if (i < j) { [real[i], real[j]] = [real[j], real[i]]; [imag[i], imag[j]] = [imag[j], imag[i]]; }
+    let k = n >> 1;
+    while (k <= j) { j -= k; k >>= 1; }
+    j += k;
+  }
+  const sign = inverse ? 1 : -1;
+  for (let len = 2; len <= n; len <<= 1) {
+    const halfLen = len >> 1;
+    const angle = (sign * 2 * Math.PI) / len;
+    const wReal = Math.cos(angle), wImag = Math.sin(angle);
+    for (let i = 0; i < n; i += len) {
+      let curReal = 1, curImag = 0;
+      for (let k = 0; k < halfLen; k++) {
+        const evenIdx = i + k, oddIdx = i + k + halfLen;
+        const tReal = curReal * real[oddIdx] - curImag * imag[oddIdx];
+        const tImag = curReal * imag[oddIdx] + curImag * real[oddIdx];
+        real[oddIdx] = real[evenIdx] - tReal; imag[oddIdx] = imag[evenIdx] - tImag;
+        real[evenIdx] += tReal; imag[evenIdx] += tImag;
+        const newReal = curReal * wReal - curImag * wImag;
+        curImag = curReal * wImag + curImag * wReal; curReal = newReal;
+      }
+    }
+  }
+  if (inverse) { for (let i = 0; i < n; i++) { real[i] /= n; imag[i] /= n; } }
+}
+
+function fft2d(real: Float32Array, imag: Float32Array, width: number, height: number, inverse: boolean = false) {
+  const paddedW = nextPow2(width), paddedH = nextPow2(height);
+  const needsPadding = paddedW !== width || paddedH !== height;
+  let workReal: Float32Array, workImag: Float32Array;
+  if (needsPadding) {
+    workReal = new Float32Array(paddedW * paddedH); workImag = new Float32Array(paddedW * paddedH);
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      workReal[y * paddedW + x] = real[y * width + x]; workImag[y * paddedW + x] = imag[y * width + x];
+    }
+  } else { workReal = real; workImag = imag; }
+  const rowReal = new Float32Array(paddedW), rowImag = new Float32Array(paddedW);
+  for (let y = 0; y < paddedH; y++) {
+    const offset = y * paddedW;
+    for (let x = 0; x < paddedW; x++) { rowReal[x] = workReal[offset + x]; rowImag[x] = workImag[offset + x]; }
+    fft1dPow2(rowReal, rowImag, inverse);
+    for (let x = 0; x < paddedW; x++) { workReal[offset + x] = rowReal[x]; workImag[offset + x] = rowImag[x]; }
+  }
+  const colReal = new Float32Array(paddedH), colImag = new Float32Array(paddedH);
+  for (let x = 0; x < paddedW; x++) {
+    for (let y = 0; y < paddedH; y++) { colReal[y] = workReal[y * paddedW + x]; colImag[y] = workImag[y * paddedW + x]; }
+    fft1dPow2(colReal, colImag, inverse);
+    for (let y = 0; y < paddedH; y++) { workReal[y * paddedW + x] = colReal[y]; workImag[y * paddedW + x] = colImag[y]; }
+  }
+  if (needsPadding) {
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      real[y * width + x] = workReal[y * paddedW + x]; imag[y * width + x] = workImag[y * paddedW + x];
+    }
+  }
+}
+
+function fftshift(data: Float32Array, width: number, height: number): void {
+  const halfW = width >> 1, halfH = height >> 1;
+  const temp = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    temp[((y + halfH) % height) * width + ((x + halfW) % width)] = data[y * width + x];
+  }
+  data.set(temp);
+}
+
+function applyBandPassFilter(real: Float32Array, imag: Float32Array, width: number, height: number, innerRadius: number, outerRadius: number) {
+  const centerX = width >> 1, centerY = height >> 1;
+  const innerSq = innerRadius * innerRadius, outerSq = outerRadius * outerRadius;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const distSq = (x - centerX) ** 2 + (y - centerY) ** 2;
+    if (distSq < innerSq || (outerRadius > 0 && distSq > outerSq)) { real[y * width + x] = 0; imag[y * width + x] = 0; }
+  }
+}
+
+// ============================================================================
+// WebGPU FFT - GPU-accelerated FFT when available
+// ============================================================================
+const FFT_SHADER = `fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x); }
+fn twiddle(k: u32, N: u32, inverse: f32) -> vec2<f32> { let angle = inverse * 2.0 * 3.14159265359 * f32(k) / f32(N); return vec2<f32>(cos(angle), sin(angle)); }
+fn bitReverse(x: u32, log2N: u32) -> u32 { var result: u32 = 0u; var val = x; for (var i: u32 = 0u; i < log2N; i = i + 1u) { result = (result << 1u) | (val & 1u); val = val >> 1u; } return result; }
+struct FFTParams { N: u32, log2N: u32, stage: u32, inverse: f32, }
+@group(0) @binding(0) var<uniform> params: FFTParams;
+@group(0) @binding(1) var<storage, read_write> data: array<vec2<f32>>;
+@compute @workgroup_size(256) fn bitReversePermute(@builtin(global_invocation_id) gid: vec3<u32>) { let idx = gid.x; if (idx >= params.N) { return; } let rev = bitReverse(idx, params.log2N); if (idx < rev) { let temp = data[idx]; data[idx] = data[rev]; data[rev] = temp; } }
+@compute @workgroup_size(256) fn butterflyStage(@builtin(global_invocation_id) gid: vec3<u32>) { let idx = gid.x; if (idx >= params.N / 2u) { return; } let stage = params.stage; let halfSize = 1u << stage; let fullSize = halfSize << 1u; let group = idx / halfSize; let pos = idx % halfSize; let i = group * fullSize + pos; let j = i + halfSize; let w = twiddle(pos, fullSize, params.inverse); let u = data[i]; let t = cmul(w, data[j]); data[i] = u + t; data[j] = u - t; }
+@compute @workgroup_size(256) fn normalize(@builtin(global_invocation_id) gid: vec3<u32>) { let idx = gid.x; if (idx >= params.N) { return; } let scale = 1.0 / f32(params.N); data[idx] = data[idx] * scale; }`;
+
+const FFT_2D_SHADER = `fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> { return vec2<f32>(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x); }
+fn twiddle(k: u32, N: u32, inverse: f32) -> vec2<f32> { let angle = inverse * 2.0 * 3.14159265359 * f32(k) / f32(N); return vec2<f32>(cos(angle), sin(angle)); }
+fn bitReverse(x: u32, log2N: u32) -> u32 { var result: u32 = 0u; var val = x; for (var i: u32 = 0u; i < log2N; i = i + 1u) { result = (result << 1u) | (val & 1u); val = val >> 1u; } return result; }
+struct FFT2DParams { width: u32, height: u32, log2Size: u32, stage: u32, inverse: f32, isRowWise: u32, }
+@group(0) @binding(0) var<uniform> params: FFT2DParams;
+@group(0) @binding(1) var<storage, read_write> data: array<vec2<f32>>;
+fn getIndex(row: u32, col: u32) -> u32 { return row * params.width + col; }
+@compute @workgroup_size(16, 16) fn bitReverseRows(@builtin(global_invocation_id) gid: vec3<u32>) { let row = gid.y; let col = gid.x; if (row >= params.height || col >= params.width) { return; } let rev = bitReverse(col, params.log2Size); if (col < rev) { let idx1 = getIndex(row, col); let idx2 = getIndex(row, rev); let temp = data[idx1]; data[idx1] = data[idx2]; data[idx2] = temp; } }
+@compute @workgroup_size(16, 16) fn bitReverseCols(@builtin(global_invocation_id) gid: vec3<u32>) { let row = gid.y; let col = gid.x; if (row >= params.height || col >= params.width) { return; } let rev = bitReverse(row, params.log2Size); if (row < rev) { let idx1 = getIndex(row, col); let idx2 = getIndex(rev, col); let temp = data[idx1]; data[idx1] = data[idx2]; data[idx2] = temp; } }
+@compute @workgroup_size(16, 16) fn butterflyRows(@builtin(global_invocation_id) gid: vec3<u32>) { let row = gid.y; let idx = gid.x; if (row >= params.height || idx >= params.width / 2u) { return; } let stage = params.stage; let halfSize = 1u << stage; let fullSize = halfSize << 1u; let group = idx / halfSize; let pos = idx % halfSize; let col_i = group * fullSize + pos; let col_j = col_i + halfSize; if (col_j >= params.width) { return; } let w = twiddle(pos, fullSize, params.inverse); let i = getIndex(row, col_i); let j = getIndex(row, col_j); let u = data[i]; let t = cmul(w, data[j]); data[i] = u + t; data[j] = u - t; }
+@compute @workgroup_size(16, 16) fn butterflyCols(@builtin(global_invocation_id) gid: vec3<u32>) { let col = gid.x; let idx = gid.y; if (col >= params.width || idx >= params.height / 2u) { return; } let stage = params.stage; let halfSize = 1u << stage; let fullSize = halfSize << 1u; let group = idx / halfSize; let pos = idx % halfSize; let row_i = group * fullSize + pos; let row_j = row_i + halfSize; if (row_j >= params.height) { return; } let w = twiddle(pos, fullSize, params.inverse); let i = getIndex(row_i, col); let j = getIndex(row_j, col); let u = data[i]; let t = cmul(w, data[j]); data[i] = u + t; data[j] = u - t; }
+@compute @workgroup_size(16, 16) fn normalize2D(@builtin(global_invocation_id) gid: vec3<u32>) { let row = gid.y; let col = gid.x; if (row >= params.height || col >= params.width) { return; } let idx = getIndex(row, col); let scale = 1.0 / f32(params.width * params.height); data[idx] = data[idx] * scale; }`;
+
+class WebGPUFFT {
+  private device: GPUDevice;
+  private pipelines1D: { bitReverse: GPUComputePipeline; butterfly: GPUComputePipeline; normalize: GPUComputePipeline } | null = null;
+  private pipelines2D: { bitReverseRows: GPUComputePipeline; bitReverseCols: GPUComputePipeline; butterflyRows: GPUComputePipeline; butterflyCols: GPUComputePipeline; normalize: GPUComputePipeline } | null = null;
+  private initialized = false;
+  constructor(device: GPUDevice) { this.device = device; }
+  async init(): Promise<void> {
+    if (this.initialized) return;
+    const module1D = this.device.createShaderModule({ code: FFT_SHADER });
+    this.pipelines1D = {
+      bitReverse: this.device.createComputePipeline({ layout: 'auto', compute: { module: module1D, entryPoint: 'bitReversePermute' } }),
+      butterfly: this.device.createComputePipeline({ layout: 'auto', compute: { module: module1D, entryPoint: 'butterflyStage' } }),
+      normalize: this.device.createComputePipeline({ layout: 'auto', compute: { module: module1D, entryPoint: 'normalize' } })
+    };
+    const module2D = this.device.createShaderModule({ code: FFT_2D_SHADER });
+    this.pipelines2D = {
+      bitReverseRows: this.device.createComputePipeline({ layout: 'auto', compute: { module: module2D, entryPoint: 'bitReverseRows' } }),
+      bitReverseCols: this.device.createComputePipeline({ layout: 'auto', compute: { module: module2D, entryPoint: 'bitReverseCols' } }),
+      butterflyRows: this.device.createComputePipeline({ layout: 'auto', compute: { module: module2D, entryPoint: 'butterflyRows' } }),
+      butterflyCols: this.device.createComputePipeline({ layout: 'auto', compute: { module: module2D, entryPoint: 'butterflyCols' } }),
+      normalize: this.device.createComputePipeline({ layout: 'auto', compute: { module: module2D, entryPoint: 'normalize2D' } })
+    };
+    this.initialized = true;
+  }
+  async fft2D(realData: Float32Array, imagData: Float32Array, width: number, height: number, inverse: boolean = false): Promise<{ real: Float32Array, imag: Float32Array }> {
+    await this.init();
+    const paddedWidth = nextPow2(width), paddedHeight = nextPow2(height);
+    const needsPadding = paddedWidth !== width || paddedHeight !== height;
+    const log2Width = Math.log2(paddedWidth), log2Height = Math.log2(paddedHeight);
+    const paddedSize = paddedWidth * paddedHeight, originalSize = width * height;
+    let workReal: Float32Array, workImag: Float32Array;
+    if (needsPadding) {
+      workReal = new Float32Array(paddedSize); workImag = new Float32Array(paddedSize);
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) { workReal[y * paddedWidth + x] = realData[y * width + x]; workImag[y * paddedWidth + x] = imagData[y * width + x]; }
+    } else { workReal = realData; workImag = imagData; }
+    const complexData = new Float32Array(paddedSize * 2);
+    for (let i = 0; i < paddedSize; i++) { complexData[i * 2] = workReal[i]; complexData[i * 2 + 1] = workImag[i]; }
+    const dataBuffer = this.device.createBuffer({ size: complexData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(dataBuffer, 0, complexData);
+    const paramsBuffer = this.device.createBuffer({ size: 24, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const readBuffer = this.device.createBuffer({ size: complexData.byteLength, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const inverseVal = inverse ? 1.0 : -1.0;
+    const workgroupsX = Math.ceil(paddedWidth / 16), workgroupsY = Math.ceil(paddedHeight / 16);
+    const runPass = (pipeline: GPUComputePipeline) => {
+      const bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: dataBuffer } }] });
+      const encoder = this.device.createCommandEncoder(); const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(workgroupsX, workgroupsY); pass.end();
+      this.device.queue.submit([encoder.finish()]);
+    };
+    const params = new ArrayBuffer(24); const paramsU32 = new Uint32Array(params); const paramsF32 = new Float32Array(params);
+    paramsU32[0] = paddedWidth; paramsU32[1] = paddedHeight; paramsU32[2] = log2Width; paramsU32[3] = 0; paramsF32[4] = inverseVal; paramsU32[5] = 1;
+    this.device.queue.writeBuffer(paramsBuffer, 0, params); runPass(this.pipelines2D!.bitReverseRows);
+    for (let stage = 0; stage < log2Width; stage++) { paramsU32[3] = stage; this.device.queue.writeBuffer(paramsBuffer, 0, params); runPass(this.pipelines2D!.butterflyRows); }
+    paramsU32[2] = log2Height; paramsU32[3] = 0; paramsU32[5] = 0;
+    this.device.queue.writeBuffer(paramsBuffer, 0, params); runPass(this.pipelines2D!.bitReverseCols);
+    for (let stage = 0; stage < log2Height; stage++) { paramsU32[3] = stage; this.device.queue.writeBuffer(paramsBuffer, 0, params); runPass(this.pipelines2D!.butterflyCols); }
+    if (inverse) runPass(this.pipelines2D!.normalize);
+    const encoder = this.device.createCommandEncoder(); encoder.copyBufferToBuffer(dataBuffer, 0, readBuffer, 0, complexData.byteLength);
+    this.device.queue.submit([encoder.finish()]); await readBuffer.mapAsync(GPUMapMode.READ);
+    const result = new Float32Array(readBuffer.getMappedRange().slice(0)); readBuffer.unmap();
+    dataBuffer.destroy(); paramsBuffer.destroy(); readBuffer.destroy();
+    if (needsPadding) {
+      const realResult = new Float32Array(originalSize), imagResult = new Float32Array(originalSize);
+      for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) { realResult[y * width + x] = result[(y * paddedWidth + x) * 2]; imagResult[y * width + x] = result[(y * paddedWidth + x) * 2 + 1]; }
+      return { real: realResult, imag: imagResult };
+    }
+    const realResult = new Float32Array(paddedSize), imagResult = new Float32Array(paddedSize);
+    for (let i = 0; i < paddedSize; i++) { realResult[i] = result[i * 2]; imagResult[i] = result[i * 2 + 1]; }
+    return { real: realResult, imag: imagResult };
+  }
+  destroy(): void { this.initialized = false; }
+}
+
+let gpuFFT: WebGPUFFT | null = null;
+async function getWebGPUFFT(): Promise<WebGPUFFT | null> {
+  if (gpuFFT) return gpuFFT;
+  if (!navigator.gpu) { console.warn('WebGPU not supported, using CPU FFT'); return null; }
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return null;
+    const device = await adapter.requestDevice();
+    gpuFFT = new WebGPUFFT(device); await gpuFFT.init();
+    console.log('🚀 WebGPU FFT ready');
+    return gpuFFT;
+  } catch (e) { console.warn('WebGPU init failed:', e); return null; }
+}
+
+// ============================================================================
+// UI Styles - component styling helpers
+// ============================================================================
+const typography = {
+  label: { color: "#aaa", fontSize: 11 },
+  labelSmall: { color: "#888", fontSize: 10 },
+  value: { color: "#888", fontSize: 10, fontFamily: "monospace" },
+  title: { color: "#0af", fontWeight: "bold" as const },
+};
+
+const controlPanel = {
+  group: { bgcolor: "#222", px: 1.5, py: 0.5, borderRadius: 1, border: "1px solid #444", height: 32 },
+  button: { color: "#888", fontSize: 10, cursor: "pointer", "&:hover": { color: "#fff" }, bgcolor: "#222", px: 1, py: 0.25, borderRadius: 0.5, border: "1px solid #444" },
+  select: { minWidth: 90, bgcolor: "#333", color: "#fff", fontSize: 11, "& .MuiSelect-select": { py: 0.5 } },
+};
+
+const container = {
+  root: { p: 2, bgcolor: "transparent", color: "inherit", fontFamily: "monospace", borderRadius: 1, overflow: "visible" },
+  imageBox: { bgcolor: "#000", border: "1px solid #444", overflow: "hidden", position: "relative" as const },
+};
+
+const upwardMenuProps = {
+  anchorOrigin: { vertical: "top" as const, horizontal: "left" as const },
+  transformOrigin: { vertical: "bottom" as const, horizontal: "left" as const },
+  sx: { zIndex: 9999 },
+};
+
+const switchStyles = {
+  small: { '& .MuiSwitch-thumb': { width: 12, height: 12 }, '& .MuiSwitch-switchBase': { padding: '4px' } },
+  medium: { '& .MuiSwitch-thumb': { width: 14, height: 14 }, '& .MuiSwitch-switchBase': { padding: '4px' } },
+};
 
 // ============================================================================
 // Layout Constants - consistent spacing throughout
