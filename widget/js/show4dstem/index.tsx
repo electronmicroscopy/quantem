@@ -10,7 +10,7 @@ import Slider from "@mui/material/Slider";
 import Button from "@mui/material/Button";
 import Switch from "@mui/material/Switch";
 import JSZip from "jszip";
-import "./show4dstem.css";
+import "./styles.css";
 
 // ============================================================================
 // Theme Detection - detect environment and light/dark mode
