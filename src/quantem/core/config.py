@@ -507,7 +507,12 @@ def validate_device(dev: str | int | torch.device | None = None) -> tuple[str, i
         if "cuda" in dev.lower():
             dev = torch.device(dev)
         elif "gpu" in dev.lower():
-            dev = torch.device("cuda")
+            if torch.cuda.is_available():
+                dev = torch.device("cuda")
+            elif torch.mps.is_available():
+                dev = torch.device("mps")
+            else:
+                raise RuntimeError("gpu requested but cuda and mps are not available.")
         elif dev.lower() == "mps":
             dev = torch.device("mps")
         elif dev.lower() == "cpu":

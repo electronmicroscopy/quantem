@@ -27,6 +27,10 @@ def test_config_set_device():
     if torch.mps.is_available():
         config.set_device("mps")
         assert config.get_device() == "mps"
+        config.set_device("gpu")
+        assert config.get_device() == "mps"
+        config.set_device("GPU")
+        assert config.get_device() == "mps"
     else:
         with pytest.raises(RuntimeError):
             config.set_device("mps")
