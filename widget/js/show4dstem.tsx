@@ -42,6 +42,18 @@ const compactButton = {
   minWidth: 0,
 };
 
+// Control row style - bordered container for each row
+const controlRow = {
+  display: "flex",
+  alignItems: "center",
+  gap: `${SPACING.SM}px`,
+  border: "1px solid #3a3a3a",
+  borderRadius: "2px",
+  px: 1,
+  py: 0.5,
+  bgcolor: "#252525",
+};
+
 /** Round to a nice value (1, 2, 5, 10, 20, 50, etc.) */
 function roundToNiceValue(value: number): number {
   if (value <= 0) return 1;
@@ -1868,11 +1880,11 @@ function Show4DSTEM() {
           )}
 
           {/* DP Controls - two rows with histogram on right */}
-          <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, border: "1px solid #3a3a3a", borderRadius: "2px", px: 1, py: 0.5, bgcolor: "#252525", width: "100%", boxSizing: "border-box" }}>
+          <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, width: "100%", boxSizing: "border-box" }}>
             {/* Left: two rows of controls */}
             <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
               {/* Row 1: Detector + slider */}
-              <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
+              <Box sx={controlRow}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Detector:</Typography>
                 <Select value={roiMode || "point"} onChange={(e) => setRoiMode(e.target.value)} size="small" sx={{ ...controlPanel.select, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="point">Point</MenuItem>
@@ -1910,7 +1922,7 @@ function Show4DSTEM() {
                 )}
               </Box>
               {/* Row 2: Presets + Color + Scale */}
-              <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
+              <Box sx={controlRow}>
                 <Typography component="span" onClick={() => { setRoiMode("circle"); setRoiRadius(bfRadius || 10); setRoiCenterX(centerX); setRoiCenterY(centerY); }} sx={{ color: "#4f4", fontSize: 11, fontWeight: "bold", cursor: "pointer", "&:hover": { textDecoration: "underline" } }}>BF</Typography>
                 <Typography component="span" onClick={() => { setRoiMode("annular"); setRoiRadiusInner((bfRadius || 10) * 0.5); setRoiRadius(bfRadius || 10); setRoiCenterX(centerX); setRoiCenterY(centerY); }} sx={{ color: "#4af", fontSize: 11, fontWeight: "bold", cursor: "pointer", "&:hover": { textDecoration: "underline" } }}>ABF</Typography>
                 <Typography component="span" onClick={() => { setRoiMode("annular"); setRoiRadiusInner(bfRadius || 10); setRoiRadius(Math.min((bfRadius || 10) * 3, Math.min(detX, detY) / 2 - 2)); setRoiCenterX(centerX); setRoiCenterY(centerY); }} sx={{ color: "#fa4", fontSize: 11, fontWeight: "bold", cursor: "pointer", "&:hover": { textDecoration: "underline" } }}>ADF</Typography>
@@ -1979,11 +1991,11 @@ function Show4DSTEM() {
           )}
 
           {/* VI Controls - Two rows with histogram on right */}
-          <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.MD}px`, border: "1px solid #3a3a3a", borderRadius: "2px", px: 1, py: 0.5, bgcolor: "#252525", width: "100%", boxSizing: "border-box" }}>
+          <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, width: "100%", boxSizing: "border-box" }}>
             {/* Left: Two rows of controls */}
             <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
               {/* Row 1: ROI selector */}
-              <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
+              <Box sx={controlRow}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>ROI:</Typography>
                 <Select value={viRoiMode || "off"} onChange={(e) => setViRoiMode(e.target.value)} size="small" sx={{ ...controlPanel.select, minWidth: 60, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="off">Off</MenuItem>
@@ -2017,7 +2029,7 @@ function Show4DSTEM() {
                 )}
               </Box>
               {/* Row 2: Color + Scale */}
-              <Box sx={{ display: "flex", alignItems: "center", gap: `${SPACING.SM}px` }}>
+              <Box sx={controlRow}>
                 <Typography sx={{ ...typography.label, fontSize: 10 }}>Color:</Typography>
                 <Select value={viColormap} onChange={(e) => setViColormap(String(e.target.value))} size="small" sx={{ ...controlPanel.select, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
                   <MenuItem value="inferno">Inferno</MenuItem>
