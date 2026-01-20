@@ -1049,21 +1049,35 @@ function Show4DSTEM() {
   const fftWorkImagRef = React.useRef<Float32Array | null>(null);
   const fftMagnitudeRef = React.useRef<Float32Array | null>(null);
 
-  // Parse virtual image bytes into Float32Array
+  // Parse virtual image bytes into Float32Array and apply scale for histogram
   React.useEffect(() => {
     if (!virtualImageBytes) return;
     const bytes = new Uint8Array(virtualImageBytes.buffer, virtualImageBytes.byteOffset, virtualImageBytes.byteLength);
-    let floatData = rawVirtualImageRef.current;
-    if (!floatData || floatData.length !== bytes.length) {
-      floatData = new Float32Array(bytes.length);
-      rawVirtualImageRef.current = floatData;
+    // Store raw data
+    let rawData = rawVirtualImageRef.current;
+    if (!rawData || rawData.length !== bytes.length) {
+      rawData = new Float32Array(bytes.length);
+      rawVirtualImageRef.current = rawData;
     }
     for (let i = 0; i < bytes.length; i++) {
-      floatData[i] = bytes[i];
+      rawData[i] = bytes[i];
+    }
+    // Apply scale transformation for histogram display
+    const scaledData = new Float32Array(bytes.length);
+    if (viScaleMode === "log") {
+      for (let i = 0; i < bytes.length; i++) {
+        scaledData[i] = Math.log1p(rawData[i]);
+      }
+    } else if (viScaleMode === "power") {
+      for (let i = 0; i < bytes.length; i++) {
+        scaledData[i] = Math.pow(Math.max(0, rawData[i]), viPowerExp);
+      }
+    } else {
+      scaledData.set(rawData);
     }
     // Update histogram state (triggers re-render)
-    setViHistogramData(floatData);
-  }, [virtualImageBytes]);
+    setViHistogramData(scaledData);
+  }, [virtualImageBytes, viScaleMode, viPowerExp]);
 
   // Render DP with zoom (use summed DP when VI ROI is active)
   React.useEffect(() => {
