@@ -813,9 +813,13 @@ function Show4DSTEM() {
   const [roiWidth, setRoiWidth] = useModelState<number>("roi_width");
   const [roiHeight, setRoiHeight] = useModelState<number>("roi_height");
 
-  // Display options
-  const [dpScaleMode, setDpScaleMode] = useModelState<string>("dp_scale_mode");
-  const [dpPowerExp, setDpPowerExp] = useModelState<number>("dp_power_exp");
+  // Global min/max for DP normalization (from Python)
+  const [dpGlobalMin] = useModelState<number>("dp_global_min");
+  const [dpGlobalMax] = useModelState<number>("dp_global_max");
+
+  // VI min/max for normalization (from Python)
+  const [viDataMin] = useModelState<number>("vi_data_min");
+  const [viDataMax] = useModelState<number>("vi_data_max");
 
   // Detector calibration (for presets)
   const [bfRadius] = useModelState<number>("bf_radius");
@@ -860,6 +864,8 @@ function Show4DSTEM() {
   const [viVminPct, setViVminPct] = React.useState(0);
   const [viVmaxPct, setViVmaxPct] = React.useState(100);
   // Scale mode: "linear" | "log" | "power"
+  const [dpScaleMode, setDpScaleMode] = React.useState<"linear" | "log" | "power">("linear");
+  const [dpPowerExp, setDpPowerExp] = React.useState(0.5);
   const [viScaleMode, setViScaleMode] = React.useState<"linear" | "log" | "power">("linear");
   const [viPowerExp, setViPowerExp] = React.useState(0.5);
 
@@ -879,19 +885,30 @@ function Show4DSTEM() {
   const [viStats] = useModelState<number[]>("vi_stats");  // [mean, min, max, std]
   const [showFft, setShowFft] = React.useState(false);  // Hidden by default per feedback
 
-  // Histogram data - use state to ensure re-renders
-  const [dpHistogramData, setDpHistogramData] = React.useState<Uint8Array | null>(null);
+  // Histogram data - use state to ensure re-renders (both are Float32Array now)
+  const [dpHistogramData, setDpHistogramData] = React.useState<Float32Array | null>(null);
   const [viHistogramData, setViHistogramData] = React.useState<Float32Array | null>(null);
 
-  // Parse DP frame bytes for histogram
+  // Parse DP frame bytes for histogram (float32 now)
   React.useEffect(() => {
     if (!frameBytes) return;
-    const bytes = new Uint8Array(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength);
-    // Create a copy to ensure state update triggers re-render
-    const copy = new Uint8Array(bytes.length);
-    copy.set(bytes);
-    setDpHistogramData(copy);
-  }, [frameBytes]);
+    // Parse as Float32Array since Python now sends raw float32
+    const rawData = new Float32Array(frameBytes.buffer, frameBytes.byteOffset, frameBytes.byteLength / 4);
+    // Apply scale transformation for histogram display
+    const scaledData = new Float32Array(rawData.length);
+    if (dpScaleMode === "log") {
+      for (let i = 0; i < rawData.length; i++) {
+        scaledData[i] = Math.log1p(Math.max(0, rawData[i]));
+      }
+    } else if (dpScaleMode === "power") {
+      for (let i = 0; i < rawData.length; i++) {
+        scaledData[i] = Math.pow(Math.max(0, rawData[i]), dpPowerExp);
+      }
+    } else {
+      scaledData.set(rawData);
+    }
+    setDpHistogramData(scaledData);
+  }, [frameBytes, dpScaleMode, dpPowerExp]);
 
   // Band-pass filter range [innerCutoff, outerCutoff] in pixels - [0, 0] means disabled
   const [bandpass, setBandpass] = React.useState<number[]>([0, 0]);
@@ -1033,15 +1050,15 @@ function Show4DSTEM() {
   // ─────────────────────────────────────────────────────────────────────────
 
   // Prevent page scroll when scrolling on canvases
+  // Re-run when showFft changes since FFT canvas is conditionally rendered
   React.useEffect(() => {
     const preventDefault = (e: WheelEvent) => e.preventDefault();
     const overlays = [dpOverlayRef.current, virtualOverlayRef.current, fftOverlayRef.current];
     overlays.forEach(el => el?.addEventListener("wheel", preventDefault, { passive: false }));
     return () => overlays.forEach(el => el?.removeEventListener("wheel", preventDefault));
-  }, []);
+  }, [showFft]);
 
-  // Store raw data for histogram visualization
-  const dpBytesRef = React.useRef<Uint8Array | null>(null);
+  // Store raw data for filtering/FFT
   const rawVirtualImageRef = React.useRef<Float32Array | null>(null);
   const viWorkRealRef = React.useRef<Float32Array | null>(null);
   const viWorkImagRef = React.useRef<Float32Array | null>(null);
@@ -1052,24 +1069,26 @@ function Show4DSTEM() {
   // Parse virtual image bytes into Float32Array and apply scale for histogram
   React.useEffect(() => {
     if (!virtualImageBytes) return;
-    const bytes = new Uint8Array(virtualImageBytes.buffer, virtualImageBytes.byteOffset, virtualImageBytes.byteLength);
-    // Store raw data
-    let rawData = rawVirtualImageRef.current;
-    if (!rawData || rawData.length !== bytes.length) {
-      rawData = new Float32Array(bytes.length);
-      rawVirtualImageRef.current = rawData;
+    // Parse as Float32Array since Python now sends raw float32
+    const numFloats = virtualImageBytes.byteLength / 4;
+    const rawData = new Float32Array(virtualImageBytes.buffer, virtualImageBytes.byteOffset, numFloats);
+
+    // Store a copy for filtering/FFT (rawData is a view, we need a copy)
+    let storedData = rawVirtualImageRef.current;
+    if (!storedData || storedData.length !== numFloats) {
+      storedData = new Float32Array(numFloats);
+      rawVirtualImageRef.current = storedData;
     }
-    for (let i = 0; i < bytes.length; i++) {
-      rawData[i] = bytes[i];
-    }
+    storedData.set(rawData);
+
     // Apply scale transformation for histogram display
-    const scaledData = new Float32Array(bytes.length);
+    const scaledData = new Float32Array(numFloats);
     if (viScaleMode === "log") {
-      for (let i = 0; i < bytes.length; i++) {
-        scaledData[i] = Math.log1p(rawData[i]);
+      for (let i = 0; i < numFloats; i++) {
+        scaledData[i] = Math.log1p(Math.max(0, rawData[i]));
       }
     } else if (viScaleMode === "power") {
-      for (let i = 0; i < bytes.length; i++) {
+      for (let i = 0; i < numFloats; i++) {
         scaledData[i] = Math.pow(Math.max(0, rawData[i]), viPowerExp);
       }
     } else {
@@ -1092,13 +1111,46 @@ function Show4DSTEM() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const bytes = new Uint8Array(sourceBytes.buffer, sourceBytes.byteOffset, sourceBytes.byteLength);
-    dpBytesRef.current = bytes;  // Store for histogram
     const lut = COLORMAPS[dpColormap] || COLORMAPS.inferno;
 
+    // Parse data based on source (summedDp is still uint8, frame is now float32)
+    let scaled: Float32Array;
+    if (usesSummedDp) {
+      // Summed DP is still uint8 from Python
+      const bytes = new Uint8Array(sourceBytes.buffer, sourceBytes.byteOffset, sourceBytes.byteLength);
+      scaled = new Float32Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) {
+        scaled[i] = bytes[i];
+      }
+    } else {
+      // Frame is now float32 from Python - parse and apply scale transformation
+      const rawData = new Float32Array(sourceBytes.buffer, sourceBytes.byteOffset, sourceBytes.byteLength / 4);
+      scaled = new Float32Array(rawData.length);
+
+      if (dpScaleMode === "log") {
+        for (let i = 0; i < rawData.length; i++) {
+          scaled[i] = Math.log1p(Math.max(0, rawData[i]));
+        }
+      } else if (dpScaleMode === "power") {
+        for (let i = 0; i < rawData.length; i++) {
+          scaled[i] = Math.pow(Math.max(0, rawData[i]), dpPowerExp);
+        }
+      } else {
+        scaled.set(rawData);
+      }
+    }
+
+    // Compute actual min/max of scaled data for normalization
+    let dataMin = Infinity, dataMax = -Infinity;
+    for (let i = 0; i < scaled.length; i++) {
+      if (scaled[i] < dataMin) dataMin = scaled[i];
+      if (scaled[i] > dataMax) dataMax = scaled[i];
+    }
+
     // Apply vmin/vmax percentile clipping
-    const vmin = Math.floor(255 * dpVminPct / 100);
-    const vmax = Math.ceil(255 * dpVmaxPct / 100);
+    const dataRange = dataMax - dataMin;
+    const vmin = dataMin + dataRange * dpVminPct / 100;
+    const vmax = dataMin + dataRange * dpVmaxPct / 100;
     const range = vmax > vmin ? vmax - vmin : 1;
 
     let offscreen = dpOffscreenRef.current;
@@ -1122,12 +1174,12 @@ function Show4DSTEM() {
     }
     const rgba = imgData.data;
 
-    for (let i = 0; i < bytes.length; i++) {
-      // Apply vmin/vmax clipping and rescaling
-      const clamped = Math.max(vmin, Math.min(vmax, bytes[i]));
-      const v = Math.round(((clamped - vmin) / range) * 255);
+    for (let i = 0; i < scaled.length; i++) {
+      // Clamp to vmin/vmax and rescale to 0-255 for colormap lookup
+      const clamped = Math.max(vmin, Math.min(vmax, scaled[i]));
+      const v = Math.floor(((clamped - vmin) / range) * 255);
       const j = i * 4;
-      const lutIdx = v * 3;
+      const lutIdx = Math.max(0, Math.min(255, v)) * 3;
       rgba[j] = lut[lutIdx];
       rgba[j + 1] = lut[lutIdx + 1];
       rgba[j + 2] = lut[lutIdx + 2];
@@ -1142,7 +1194,7 @@ function Show4DSTEM() {
     ctx.scale(dpZoom, dpZoom);
     ctx.drawImage(offscreen, 0, 0);
     ctx.restore();
-  }, [frameBytes, summedDpBytes, viRoiMode, detX, detY, dpColormap, dpVminPct, dpVmaxPct, dpZoom, dpPanX, dpPanY]);
+  }, [frameBytes, summedDpBytes, viRoiMode, detX, detY, dpColormap, dpVminPct, dpVmaxPct, dpScaleMode, dpPowerExp, dpZoom, dpPanX, dpPanY]);
 
   // Render DP overlay - just clear (ROI shapes now drawn on high-DPI UI canvas)
   React.useEffect(() => {

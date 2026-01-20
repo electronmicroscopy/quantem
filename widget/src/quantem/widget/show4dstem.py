@@ -82,15 +82,12 @@ class Show4DSTEM(anywidget.AnyWidget):
     det_x = traitlets.Int(1).tag(sync=True)
     det_y = traitlets.Int(1).tag(sync=True)
 
-    # Pre-normalized uint8 frame as bytes (no base64!)
+    # Raw float32 frame as bytes (JS handles scale/colormap for real-time interactivity)
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
 
-    # Scale mode for DP: "linear", "log", or "power"
-    dp_scale_mode = traitlets.Unicode("linear").tag(sync=True)
-    dp_power_exp = traitlets.Float(0.5).tag(sync=True)  # Power exponent (e.g., 0.5 = sqrt)
-
-    # Legacy log_scale (kept for backward compatibility, syncs with dp_scale_mode)
-    log_scale = traitlets.Bool(False).tag(sync=True)
+    # Global min/max for DP normalization (computed once from sampled frames)
+    dp_global_min = traitlets.Float(0.0).tag(sync=True)
+    dp_global_max = traitlets.Float(1.0).tag(sync=True)
 
     # =========================================================================
     # Detector Calibration (for presets and scale bar)
@@ -119,7 +116,9 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     # Virtual Image (ROI-based, updates as you drag ROI on DP)
     # =========================================================================
-    virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)
+    virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)  # Raw float32
+    vi_data_min = traitlets.Float(0.0).tag(sync=True)  # Min of current VI for normalization
+    vi_data_max = traitlets.Float(1.0).tag(sync=True)  # Max of current VI for normalization
 
     # =========================================================================
     # VI ROI (real-space region selection for summed DP)
@@ -266,8 +265,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         if precompute_virtual_images:
             self._precompute_common_virtual_images()
 
-        # Update frame when position or settings change
-        self.observe(self._update_frame, names=["pos_x", "pos_y", "dp_scale_mode", "dp_power_exp"])
+        # Update frame when position changes (scale/colormap handled in JS)
+        self.observe(self._update_frame, names=["pos_x", "pos_y"])
         self.observe(self._on_roi_change, names=[
             "roi_center_x", "roi_center_y", "roi_radius", "roi_radius_inner",
             "roi_active", "roi_mode", "roi_width", "roi_height"
@@ -688,7 +687,7 @@ class Show4DSTEM(anywidget.AnyWidget):
 
     def _compute_global_range(self):
         """Compute global min/max from sampled frames for consistent scaling."""
-        
+
         # Sample corners and center
         samples = [
             (0, 0),
@@ -697,7 +696,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             (self.shape_x - 1, self.shape_y - 1),
             (self.shape_x // 2, self.shape_y // 2),
         ]
-        
+
         all_min, all_max = float("inf"), float("-inf")
         for x, y in samples:
             frame = self._get_frame(x, y)
@@ -706,12 +705,9 @@ class Show4DSTEM(anywidget.AnyWidget):
             all_min = min(all_min, fmin)
             all_max = max(all_max, fmax)
 
-        self._global_min = max(all_min, 1e-10)
-        self._global_max = all_max
-
-        # Precompute log range
-        self._log_min = np.log1p(self._global_min)
-        self._log_max = np.log1p(self._global_max)
+        # Set traits for JS-side normalization
+        self.dp_global_min = max(all_min, 1e-10)
+        self.dp_global_max = all_max
 
     def _get_frame(self, x: int, y: int):
         """Get single diffraction frame at position (x, y)."""
@@ -722,7 +718,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             return self._data[x, y]
 
     def _update_frame(self, change=None):
-        """Send pre-normalized uint8 frame to frontend."""
+        """Send raw float32 frame to frontend (JS handles scale/colormap)."""
         frame = self._get_frame(self.pos_x, self.pos_y)
         frame = frame.astype(np.float32)
 
@@ -746,27 +742,8 @@ class Show4DSTEM(anywidget.AnyWidget):
                 float(frame.std()),
             ]
 
-        # Apply scale transformation
-        if self.dp_scale_mode == "log":
-            frame = np.log1p(frame)
-            vmin, vmax = self._log_min, self._log_max
-        elif self.dp_scale_mode == "power":
-            # Power scaling (e.g., sqrt when exp=0.5)
-            frame = np.power(np.maximum(frame, 0), self.dp_power_exp)
-            vmin = np.power(max(self._global_min, 0), self.dp_power_exp)
-            vmax = np.power(max(self._global_max, 0), self.dp_power_exp)
-        else:  # linear
-            vmin, vmax = self._global_min, self._global_max
-
-        # Normalize to 0-255
-        if vmax > vmin:
-            normalized = np.clip((frame - vmin) / (vmax - vmin) * 255, 0, 255)
-            normalized = normalized.astype(np.uint8)
-        else:
-            normalized = np.zeros(frame.shape, dtype=np.uint8)
-
-        # Send as raw bytes (no base64 encoding!)
-        self.frame_bytes = normalized.tobytes()
+        # Send raw float32 bytes (JS handles scale/normalization/colormap)
+        self.frame_bytes = frame.tobytes()
 
     def _on_roi_change(self, change=None):
         """Recompute virtual image when ROI changes."""
@@ -859,26 +836,29 @@ class Show4DSTEM(anywidget.AnyWidget):
     def _precompute_common_virtual_images(self):
         """Pre-compute BF/ABF/ADF virtual images for instant preset switching."""
         cx, cy, bf = self.center_x, self.center_y, self.bf_radius
-        # Cache both bytes and stats for each preset
+        # Cache (bytes, stats, min, max) for each preset
         bf_arr = self._fast_masked_sum(self._create_circular_mask(cx, cy, bf))
         abf_arr = self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 0.5, bf))
         adf_arr = self._fast_masked_sum(self._create_annular_mask(cx, cy, bf, bf * 4.0))
 
         self._cached_bf_virtual = (
-            self._normalize_to_bytes(bf_arr, update_vi_stats=False),
-            [float(bf_arr.mean()), float(bf_arr.min()), float(bf_arr.max()), float(bf_arr.std())]
+            self._to_float32_bytes(bf_arr, update_vi_stats=False),
+            [float(bf_arr.mean()), float(bf_arr.min()), float(bf_arr.max()), float(bf_arr.std())],
+            float(bf_arr.min()), float(bf_arr.max())
         )
         self._cached_abf_virtual = (
-            self._normalize_to_bytes(abf_arr, update_vi_stats=False),
-            [float(abf_arr.mean()), float(abf_arr.min()), float(abf_arr.max()), float(abf_arr.std())]
+            self._to_float32_bytes(abf_arr, update_vi_stats=False),
+            [float(abf_arr.mean()), float(abf_arr.min()), float(abf_arr.max()), float(abf_arr.std())],
+            float(abf_arr.min()), float(abf_arr.max())
         )
         self._cached_adf_virtual = (
-            self._normalize_to_bytes(adf_arr, update_vi_stats=False),
-            [float(adf_arr.mean()), float(adf_arr.min()), float(adf_arr.max()), float(adf_arr.std())]
+            self._to_float32_bytes(adf_arr, update_vi_stats=False),
+            [float(adf_arr.mean()), float(adf_arr.min()), float(adf_arr.max()), float(adf_arr.std())],
+            float(adf_arr.min()), float(adf_arr.max())
         )
 
-    def _get_cached_preset(self) -> tuple[bytes, list[float]] | None:
-        """Check if current ROI matches a cached preset and return (bytes, stats) tuple."""
+    def _get_cached_preset(self) -> tuple[bytes, list[float], float, float] | None:
+        """Check if current ROI matches a cached preset and return (bytes, stats, min, max) tuple."""
         # Must be centered on detector center
         if abs(self.roi_center_x - self.center_x) >= 1 or abs(self.roi_center_y - self.center_y) >= 1:
             return None
@@ -909,10 +889,14 @@ class Show4DSTEM(anywidget.AnyWidget):
             return (self._data.astype(np.float32) * mask).sum(axis=(2, 3))
         return (self._data.astype(np.float32) * mask).sum(axis=(1, 2)).reshape(self._scan_shape)
 
-    def _normalize_to_bytes(self, arr: "np.ndarray", update_vi_stats: bool = True) -> bytes:
-        """Normalize array to uint8 bytes."""
-        # Compute VI stats from raw data
+    def _to_float32_bytes(self, arr: "np.ndarray", update_vi_stats: bool = True) -> bytes:
+        """Convert array to float32 bytes (JS handles scale/colormap)."""
+        arr = arr.astype(np.float32)
+
+        # Set min/max for JS-side normalization
         if update_vi_stats:
+            self.vi_data_min = float(arr.min())
+            self.vi_data_max = float(arr.max())
             self.vi_stats = [
                 float(arr.mean()),
                 float(arr.min()),
@@ -920,21 +904,18 @@ class Show4DSTEM(anywidget.AnyWidget):
                 float(arr.std()),
             ]
 
-        vmin, vmax = float(arr.min()), float(arr.max())
-        if vmax > vmin:
-            norm = np.clip((arr - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
-        else:
-            norm = np.zeros(arr.shape, dtype=np.uint8)
-        return norm.tobytes()
+        return arr.tobytes()
 
     def _compute_virtual_image_from_roi(self):
         """Compute virtual image based on ROI mode."""
         cached = self._get_cached_preset()
         if cached is not None:
-            # Cached preset returns (bytes, stats) tuple
-            vi_bytes, vi_stats = cached
+            # Cached preset returns (bytes, stats, min, max) tuple
+            vi_bytes, vi_stats, vi_min, vi_max = cached
             self.virtual_image_bytes = vi_bytes
             self.vi_stats = vi_stats
+            self.vi_data_min = vi_min
+            self.vi_data_max = vi_max
             return
 
         cx, cy = self.roi_center_x, self.roi_center_y
@@ -955,7 +936,7 @@ class Show4DSTEM(anywidget.AnyWidget):
                 virtual_image = self._data[:, :, row, col]
             else:
                 virtual_image = self._data[:, row, col].reshape(self._scan_shape)
-            self.virtual_image_bytes = self._normalize_to_bytes(virtual_image)
+            self.virtual_image_bytes = self._to_float32_bytes(virtual_image)
             return
 
-        self.virtual_image_bytes = self._normalize_to_bytes(self._fast_masked_sum(mask))
+        self.virtual_image_bytes = self._to_float32_bytes(self._fast_masked_sum(mask))
