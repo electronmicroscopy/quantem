@@ -431,14 +431,14 @@ def bilinear_kde(
         f_img = np.fft.fft2(image)
         fx = np.fft.fftfreq(rows)
         fy = np.fft.fftfreq(cols)
-        f_img /= np.sinc(fx)[:, None]  # type: ignore
-        f_img /= np.sinc(fy)[None, :]  # type: ignore
+        f_img /= np.sinc(fx)[:, None]
+        f_img /= np.sinc(fy)[None, :]
         image = np.real(np.fft.ifft2(f_img))
 
         if return_pix_count:
             f_img = np.fft.fft2(pix_count)
-            f_img /= np.sinc(fx)[:, None]  # type: ignore
-            f_img /= np.sinc(fy)[None, :]  # type: ignore
+            f_img /= np.sinc(fx)[:, None]
+            f_img /= np.sinc(fy)[None, :]
             pix_count = np.real(np.fft.ifft2(f_img))
 
     if return_pix_count:
@@ -1048,3 +1048,120 @@ def unwrap_phase_2d_torch(
         raise ValueError(
             f'`method` must be one of {{"reliability-sorting", "poisson"}}, got {method!r}'
         )
+
+
+def radially_project_fourier_tensor(
+    corner_centered_array: torch.Tensor,
+    sampling: Tuple[float, float],
+    q_bins: torch.Tensor | None = None,
+):
+    """
+    Radially project a corner-centered Fourier array onto radial bins.
+
+    Supports:
+    - single array: (kx, ky)
+    - batched arrays: (n, kx, ky)
+    - implicit bins (from grid) or explicit external bins
+
+    Parameters
+    ----------
+    corner_centered_array : torch.Tensor
+        Shape (kx, ky) or (n, kx, ky)
+    sampling : (float, float)
+        Real-space sampling (sx, sy)
+    q_bins : torch.Tensor, optional
+        1D tensor of radial bin centers
+
+    Returns
+    -------
+    q_bins_out : torch.Tensor
+        Radial bin centers
+    array_1d : torch.Tensor
+        Shape (n, nq) or (nq,)
+    """
+
+    if corner_centered_array.is_complex():
+        q, real_part = radially_project_fourier_tensor(
+            corner_centered_array.real, sampling, q_bins
+        )
+        # zero by symmetry
+        # _, imag_part = radially_project_fourier_tensor(
+        #     corner_centered_array.imag, sampling, q_bins
+        # )
+        return q, real_part  # + 1j * imag_part
+
+    device = corner_centered_array.device
+    sx, sy = sampling
+
+    # --- normalize shape to (batch, kx, ky)
+    if corner_centered_array.ndim == 2:
+        array = corner_centered_array[None, ...]
+        squeeze_output = True
+    elif corner_centered_array.ndim == 3:
+        array = corner_centered_array
+        squeeze_output = False
+    else:
+        raise ValueError("Input must be 2D or 3D tensor")
+
+    n_batch, nkx, nky = array.shape
+
+    # --- build k-grid
+    kx = torch.fft.fftfreq(nkx, d=sx, device=device)
+    ky = torch.fft.fftfreq(nky, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    # --- determine radial bins
+    k_max = min(0.5 / sx, 0.5 / sy)
+
+    if q_bins is None:
+        dk = kx[1] - kx[0]
+        num_bins = int(torch.floor(k_max / dk).item()) + 1
+        dq = dk
+        q_bins_out = torch.arange(num_bins, device=device, dtype=k.dtype) * dk
+    else:
+        q_bins = q_bins.to(device)
+        dq = q_bins[1] - q_bins[0]
+        q_bins_out = q_bins[q_bins <= k_max]
+        num_bins = q_bins_out.numel()
+
+    # ---- INTERNAL padding (key change)
+    num_bins_internal = num_bins + 2
+
+    # --- map k -> bin indices (NO CLIPPING)
+    inds = k / dq
+    inds_f = torch.floor(inds).long()
+    inds_f = torch.clamp(inds_f, 0, num_bins_internal - 2)
+
+    d_ind = inds - inds_f
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    # --- flatten spatial dims
+    array_f = array.reshape(n_batch, -1)
+
+    # --- accumulate per batch
+    out = []
+    for b in range(n_batch):
+        a = array_f[b]
+
+        num = torch.bincount(inds_f, weights=a * w0, minlength=num_bins_internal) + torch.bincount(
+            inds_f + 1, weights=a * w1, minlength=num_bins_internal
+        )
+
+        den = (
+            torch.bincount(inds_f, weights=w0, minlength=num_bins_internal)
+            + torch.bincount(inds_f + 1, weights=w1, minlength=num_bins_internal)
+        ).clamp_min(1)
+
+        out.append(num / den)
+
+    array_1d = torch.stack(out, dim=0)
+
+    # ---- truncate to physical bins (key change)
+    array_1d = array_1d[..., :num_bins]
+    q_bins_out = q_bins_out[:num_bins]
+
+    if squeeze_output:
+        array_1d = array_1d[0]
+
+    return q_bins_out, array_1d
