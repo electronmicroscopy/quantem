@@ -1279,6 +1279,11 @@ function Show4DSTEM() {
     accent: "#0066cc",
   };
 
+  // Compute VI canvas dimensions to respect aspect ratio of rectangular scans
+  // The longer dimension gets CANVAS_SIZE, the shorter scales proportionally
+  const viCanvasWidth = shapeX > shapeY ? Math.round(CANVAS_SIZE * (shapeY / shapeX)) : CANVAS_SIZE;
+  const viCanvasHeight = shapeY > shapeX ? Math.round(CANVAS_SIZE * (shapeX / shapeY)) : CANVAS_SIZE;
+
   // Histogram data - use state to ensure re-renders (both are Float32Array now)
   const [dpHistogramData, setDpHistogramData] = React.useState<Float32Array | null>(null);
   const [viHistogramData, setViHistogramData] = React.useState<Float32Array | null>(null);
@@ -2422,7 +2427,7 @@ function Show4DSTEM() {
         </Box>
 
         {/* RIGHT COLUMN: VI Panel + FFT (when shown) */}
-        <Box sx={{ width: CANVAS_SIZE }}>
+        <Box sx={{ width: viCanvasWidth }}>
           {/* VI Header */}
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
             <Typography variant="caption" sx={{ ...typography.label }}>Virtual Image</Typography>
@@ -2438,7 +2443,7 @@ function Show4DSTEM() {
           </Stack>
 
           {/* VI Canvas */}
-          <Box sx={{ ...container.imageBox, width: CANVAS_SIZE, height: CANVAS_SIZE }}>
+          <Box sx={{ ...container.imageBox, width: viCanvasWidth, height: viCanvasHeight }}>
             <canvas ref={virtualCanvasRef} width={shapeY} height={shapeX} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
             <canvas
               ref={virtualOverlayRef} width={shapeY} height={shapeX}
@@ -2448,7 +2453,7 @@ function Show4DSTEM() {
               onDoubleClick={handleViDoubleClick}
               style={{ position: "absolute", width: "100%", height: "100%", cursor: "crosshair" }}
             />
-            <canvas ref={viUiRef} width={CANVAS_SIZE * DPR} height={CANVAS_SIZE * DPR} style={{ position: "absolute", width: "100%", height: "100%", pointerEvents: "none" }} />
+            <canvas ref={viUiRef} width={viCanvasWidth * DPR} height={viCanvasHeight * DPR} style={{ position: "absolute", width: "100%", height: "100%", pointerEvents: "none" }} />
           </Box>
 
           {/* VI Stats Bar */}
@@ -2531,7 +2536,7 @@ function Show4DSTEM() {
                 <Typography variant="caption" sx={{ ...typography.label }}>FFT</Typography>
                 <Button size="small" sx={compactButton} onClick={() => { setFftZoom(1); setFftPanX(0); setFftPanY(0); }}>Reset</Button>
               </Stack>
-              <Box sx={{ ...container.imageBox, width: CANVAS_SIZE, height: CANVAS_SIZE }}>
+              <Box sx={{ ...container.imageBox, width: viCanvasWidth, height: viCanvasHeight }}>
                 <canvas ref={fftCanvasRef} width={shapeY} height={shapeX} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
                 <canvas
                   ref={fftOverlayRef} width={shapeY} height={shapeX}
