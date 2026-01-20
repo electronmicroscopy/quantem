@@ -82,11 +82,12 @@ class Show4DSTEM(anywidget.AnyWidget):
     det_x = traitlets.Int(1).tag(sync=True)
     det_y = traitlets.Int(1).tag(sync=True)
 
-    # Pre-normalized uint8 frame as bytes (no base64!)
+    # Raw float32 frame as bytes (JS handles scale/colormap for real-time interactivity)
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
 
-    # Log scale toggle
-    log_scale = traitlets.Bool(False).tag(sync=True)
+    # Global min/max for DP normalization (computed once from sampled frames)
+    dp_global_min = traitlets.Float(0.0).tag(sync=True)
+    dp_global_max = traitlets.Float(1.0).tag(sync=True)
 
     # =========================================================================
     # Detector Calibration (for presets and scale bar)
@@ -115,7 +116,21 @@ class Show4DSTEM(anywidget.AnyWidget):
     # =========================================================================
     # Virtual Image (ROI-based, updates as you drag ROI on DP)
     # =========================================================================
-    virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)
+    virtual_image_bytes = traitlets.Bytes(b"").tag(sync=True)  # Raw float32
+    vi_data_min = traitlets.Float(0.0).tag(sync=True)  # Min of current VI for normalization
+    vi_data_max = traitlets.Float(1.0).tag(sync=True)  # Max of current VI for normalization
+
+    # =========================================================================
+    # VI ROI (real-space region selection for summed DP)
+    # =========================================================================
+    vi_roi_mode = traitlets.Unicode("off").tag(sync=True)  # "off", "circle", "rect"
+    vi_roi_center_x = traitlets.Float(0.0).tag(sync=True)
+    vi_roi_center_y = traitlets.Float(0.0).tag(sync=True)
+    vi_roi_radius = traitlets.Float(5.0).tag(sync=True)
+    vi_roi_width = traitlets.Float(10.0).tag(sync=True)
+    vi_roi_height = traitlets.Float(10.0).tag(sync=True)
+    summed_dp_bytes = traitlets.Bytes(b"").tag(sync=True)  # Summed DP from VI ROI
+    summed_dp_count = traitlets.Int(0).tag(sync=True)  # Number of positions summed
 
     # =========================================================================
     # Scale Bar
@@ -132,6 +147,18 @@ class Show4DSTEM(anywidget.AnyWidget):
     path_length = traitlets.Int(0).tag(sync=True)
     path_interval_ms = traitlets.Int(100).tag(sync=True)  # ms between frames
     path_loop = traitlets.Bool(True).tag(sync=True)  # loop when reaching end
+
+    # =========================================================================
+    # Auto-detection trigger (frontend sets to True, backend resets to False)
+    # =========================================================================
+    auto_detect_trigger = traitlets.Bool(False).tag(sync=True)
+
+    # =========================================================================
+    # Statistics for display (mean, min, max, std)
+    # =========================================================================
+    dp_stats = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0, 0.0, 0.0]).tag(sync=True)
+    vi_stats = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0, 0.0, 0.0]).tag(sync=True)
+    mask_dc = traitlets.Bool(True).tag(sync=True)  # Mask center pixel for DP stats
 
     def __init__(
         self,
@@ -202,26 +229,44 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.pos_y = self.shape_y // 2
         # Precompute global range for consistent scaling
         self._compute_global_range()
-        # Setup center and BF/ADF radii based on detector size
+        # Setup center and BF radius
+        # If user provides explicit values, use them
+        # Otherwise, auto-detect from the data for accurate presets
         det_size = min(self.det_x, self.det_y)
-        if center is not None:
+        if center is not None and bf_radius is not None:
+            # User provided both - use explicit values
             self.center_x = float(center[0])
             self.center_y = float(center[1])
-        else:
+            self.bf_radius = float(bf_radius)
+        elif center is not None:
+            # User provided center only - use it with default bf_radius
+            self.center_x = float(center[0])
+            self.center_y = float(center[1])
+            self.bf_radius = det_size * DEFAULT_BF_RATIO
+        elif bf_radius is not None:
+            # User provided bf_radius only - use detector center
             self.center_x = float(self.det_y / 2)
             self.center_y = float(self.det_x / 2)
-        self.bf_radius = float(bf_radius) if bf_radius is not None else det_size * DEFAULT_BF_RATIO
+            self.bf_radius = float(bf_radius)
+        else:
+            # Neither provided - auto-detect from data
+            # Set defaults first (will be overwritten by auto-detect)
+            self.center_x = float(self.det_y / 2)
+            self.center_y = float(self.det_x / 2)
+            self.bf_radius = det_size * DEFAULT_BF_RATIO
+            # Auto-detect center and bf_radius from the data
+            self._auto_detect_center_silent()
 
-        # Pre-compute and cache common virtual images (BF, ABF, LAADF, HAADF)
+        # Pre-compute and cache common virtual images (BF, ABF, ADF)
+        # Each cache stores (bytes, stats) tuple
         self._cached_bf_virtual = None
         self._cached_abf_virtual = None
-        self._cached_laadf_virtual = None
-        self._cached_haadf_virtual = None
+        self._cached_adf_virtual = None
         if precompute_virtual_images:
             self._precompute_common_virtual_images()
 
-        # Update frame when position or settings change
-        self.observe(self._update_frame, names=["pos_x", "pos_y", "log_scale"])
+        # Update frame when position changes (scale/colormap handled in JS)
+        self.observe(self._update_frame, names=["pos_x", "pos_y"])
         self.observe(self._on_roi_change, names=[
             "roi_center_x", "roi_center_y", "roi_radius", "roi_radius_inner",
             "roi_active", "roi_mode", "roi_width", "roi_height"
@@ -239,6 +284,23 @@ class Show4DSTEM(anywidget.AnyWidget):
         
         # Path animation: observe index changes from frontend
         self.observe(self._on_path_index_change, names=["path_index"])
+
+        # Auto-detect trigger: observe changes from frontend
+        self.observe(self._on_auto_detect_trigger, names=["auto_detect_trigger"])
+
+        # VI ROI: observe changes for summed DP computation
+        # Initialize VI ROI center to scan center with reasonable default sizes
+        self.vi_roi_center_x = float(self.shape_x / 2)
+        self.vi_roi_center_y = float(self.shape_y / 2)
+        # Set initial ROI size to ~15% of minimum scan dimension
+        default_roi_size = max(3, min(self.shape_x, self.shape_y) * 0.15)
+        self.vi_roi_radius = float(default_roi_size)
+        self.vi_roi_width = float(default_roi_size * 2)
+        self.vi_roi_height = float(default_roi_size)
+        self.observe(self._on_vi_roi_change, names=[
+            "vi_roi_mode", "vi_roi_center_x", "vi_roi_center_y",
+            "vi_roi_radius", "vi_roi_width", "vi_roi_height"
+        ])
 
     def __repr__(self) -> str:
         k_unit = "mrad" if self.k_calibrated else "px"
@@ -347,6 +409,13 @@ class Show4DSTEM(anywidget.AnyWidget):
             # Clamp to valid range
             self.pos_x = max(0, min(self.shape_x - 1, x))
             self.pos_y = max(0, min(self.shape_y - 1, y))
+
+    def _on_auto_detect_trigger(self, change):
+        """Called when auto_detect_trigger is set to True from frontend."""
+        if change["new"]:
+            self.auto_detect_center()
+            # Reset trigger to allow re-triggering
+            self.auto_detect_trigger = False
 
     # =========================================================================
     # Path Animation Patterns
@@ -526,9 +595,99 @@ class Show4DSTEM(anywidget.AnyWidget):
             self.roi_height = float(height)
         return self
 
+    def auto_detect_center(self) -> "Show4DSTEM":
+        """
+        Automatically detect BF disk center and radius using centroid.
+
+        This method analyzes the summed diffraction pattern to find the
+        bright field disk center and estimate its radius. The detected
+        values are applied to the widget's calibration (center_x, center_y,
+        bf_radius).
+
+        Returns
+        -------
+        Show4DSTEM
+            Self for method chaining.
+
+        Examples
+        --------
+        >>> widget = Show4DSTEM(data)
+        >>> widget.auto_detect_center()  # Auto-detect and apply
+        """
+        # Sum all diffraction patterns to get average
+        if self._data.ndim == 4:
+            summed_dp = self._data.sum(axis=(0, 1)).astype(np.float64)
+        else:
+            summed_dp = self._data.sum(axis=0).astype(np.float64)
+
+        # Threshold at mean + std to isolate BF disk
+        threshold = summed_dp.mean() + summed_dp.std()
+        mask = summed_dp > threshold
+
+        # Avoid division by zero
+        total = mask.sum()
+        if total == 0:
+            return self
+
+        # Calculate centroid using meshgrid
+        y_coords, x_coords = np.meshgrid(
+            np.arange(self.det_x), np.arange(self.det_y), indexing='ij'
+        )
+        cx = float((x_coords * mask).sum() / total)
+        cy = float((y_coords * mask).sum() / total)
+
+        # Estimate radius from mask area (A = pi*r^2)
+        radius = float(np.sqrt(total / np.pi))
+
+        # Apply detected values
+        self.center_x = cx
+        self.center_y = cy
+        self.bf_radius = radius
+
+        # Also update ROI to center
+        self.roi_center_x = cx
+        self.roi_center_y = cy
+
+        # Recompute cached virtual images with new calibration
+        self._precompute_common_virtual_images()
+
+        return self
+
+    def _auto_detect_center_silent(self):
+        """Auto-detect center without updating ROI (used during __init__)."""
+        # Sum all diffraction patterns to get average
+        if self._data.ndim == 4:
+            summed_dp = self._data.sum(axis=(0, 1)).astype(np.float64)
+        else:
+            summed_dp = self._data.sum(axis=0).astype(np.float64)
+
+        # Threshold at mean + std to isolate BF disk
+        threshold = summed_dp.mean() + summed_dp.std()
+        mask = summed_dp > threshold
+
+        # Avoid division by zero
+        total = mask.sum()
+        if total == 0:
+            return
+
+        # Calculate centroid using meshgrid
+        y_coords, x_coords = np.meshgrid(
+            np.arange(self.det_x), np.arange(self.det_y), indexing='ij'
+        )
+        cx = float((x_coords * mask).sum() / total)
+        cy = float((y_coords * mask).sum() / total)
+
+        # Estimate radius from mask area (A = pi*r^2)
+        radius = float(np.sqrt(total / np.pi))
+
+        # Apply detected values (don't update ROI - that happens later in __init__)
+        self.center_x = cx
+        self.center_y = cy
+        self.bf_radius = radius
+
     def _compute_global_range(self):
         """Compute global min/max from sampled frames for consistent scaling."""
-        
+
         # Sample corners and center
         samples = [
             (0, 0),
@@ -537,7 +696,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             (self.shape_x - 1, self.shape_y - 1),
             (self.shape_x // 2, self.shape_y // 2),
         ]
-        
+
         all_min, all_max = float("inf"), float("-inf")
         for x, y in samples:
             frame = self._get_frame(x, y)
@@ -546,12 +705,9 @@ class Show4DSTEM(anywidget.AnyWidget):
             all_min = min(all_min, fmin)
             all_max = max(all_max, fmax)
 
-        self._global_min = max(all_min, 1e-10)
-        self._global_max = all_max
-
-        # Precompute log range
-        self._log_min = np.log1p(self._global_min)
-        self._log_max = np.log1p(self._global_max)
+        # Set traits for JS-side normalization
+        self.dp_global_min = max(all_min, 1e-10)
+        self.dp_global_max = all_max
 
     def _get_frame(self, x: int, y: int):
         """Get single diffraction frame at position (x, y)."""
@@ -562,36 +718,93 @@ class Show4DSTEM(anywidget.AnyWidget):
             return self._data[x, y]
 
     def _update_frame(self, change=None):
-        """Send pre-normalized uint8 frame to frontend."""
+        """Send raw float32 frame to frontend (JS handles scale/colormap)."""
         frame = self._get_frame(self.pos_x, self.pos_y)
+        frame = frame.astype(np.float32)
 
-        # Determine value range
-        if self.log_scale:
-            vmin, vmax = self._log_min, self._log_max
+        # Compute stats from raw frame (optionally mask DC component)
+        if self.mask_dc:
+            # Mask center 3x3 region for stats
+            cx, cy = self.det_x // 2, self.det_y // 2
+            stats_frame = frame.copy()
+            stats_frame[max(0, cx-1):cx+2, max(0, cy-1):cy+2] = np.nan
+            self.dp_stats = [
+                float(np.nanmean(stats_frame)),
+                float(np.nanmin(stats_frame)),
+                float(np.nanmax(stats_frame)),
+                float(np.nanstd(stats_frame)),
+            ]
         else:
-            vmin, vmax = self._global_min, self._global_max
+            self.dp_stats = [
+                float(frame.mean()),
+                float(frame.min()),
+                float(frame.max()),
+                float(frame.std()),
+            ]
 
-        # Apply log scale if enabled
-        if self.log_scale:
-            frame = np.log1p(frame.astype(np.float32))
-        else:
-            frame = frame.astype(np.float32)
-
-        # Normalize to 0-255
-        if vmax > vmin:
-            normalized = np.clip((frame - vmin) / (vmax - vmin) * 255, 0, 255)
-            normalized = normalized.astype(np.uint8)
-        else:
-            normalized = np.zeros(frame.shape, dtype=np.uint8)
-
-        # Send as raw bytes (no base64 encoding!)
-        self.frame_bytes = normalized.tobytes()
+        # Send raw float32 bytes (JS handles scale/normalization/colormap)
+        self.frame_bytes = frame.tobytes()
 
     def _on_roi_change(self, change=None):
         """Recompute virtual image when ROI changes."""
         if not self.roi_active:
             return
         self._compute_virtual_image_from_roi()
+
+    def _on_vi_roi_change(self, change=None):
+        """Compute summed DP when VI ROI changes."""
+        if self.vi_roi_mode == "off":
+            self.summed_dp_bytes = b""
+            self.summed_dp_count = 0
+            return
+        self._compute_summed_dp_from_vi_roi()
+
+    def _compute_summed_dp_from_vi_roi(self):
+        """Sum diffraction patterns from positions inside VI ROI."""
+        # Create mask in scan space
+        # y (rows) corresponds to vi_roi_center_x, x (cols) corresponds to vi_roi_center_y
+        rows, cols = np.ogrid[:self.shape_x, :self.shape_y]
+
+        if self.vi_roi_mode == "circle":
+            mask = (rows - self.vi_roi_center_x) ** 2 + (cols - self.vi_roi_center_y) ** 2 <= self.vi_roi_radius ** 2
+        elif self.vi_roi_mode == "square":
+            # Square uses vi_roi_radius as half-size
+            half_size = self.vi_roi_radius
+            mask = (np.abs(rows - self.vi_roi_center_x) <= half_size) & (np.abs(cols - self.vi_roi_center_y) <= half_size)
+        elif self.vi_roi_mode == "rect":
+            half_w = self.vi_roi_width / 2
+            half_h = self.vi_roi_height / 2
+            mask = (np.abs(rows - self.vi_roi_center_x) <= half_h) & (np.abs(cols - self.vi_roi_center_y) <= half_w)
+        else:
+            return
+
+        # Get positions inside mask
+        positions = np.argwhere(mask)
+        if len(positions) == 0:
+            self.summed_dp_bytes = b""
+            self.summed_dp_count = 0
+            return
+
+        # Average DPs from all positions (average is more useful than sum)
+        # positions from argwhere are (row, col) = (x_idx, y_idx) in our naming
+        summed_dp = np.zeros((self.det_x, self.det_y), dtype=np.float64)
+        for row_idx, col_idx in positions:
+            summed_dp += self._get_frame(row_idx, col_idx).astype(np.float64)
+
+        self.summed_dp_count = len(positions)
+
+        # Convert to average
+        avg_dp = summed_dp / len(positions)
+
+        # Normalize to 0-255 for display
+        vmin, vmax = avg_dp.min(), avg_dp.max()
+        if vmax > vmin:
+            normalized = np.clip((avg_dp - vmin) / (vmax - vmin) * 255, 0, 255)
+            normalized = normalized.astype(np.uint8)
+        else:
+            normalized = np.zeros(avg_dp.shape, dtype=np.uint8)
+
+        self.summed_dp_bytes = normalized.tobytes()
 
     def _create_circular_mask(self, cx: float, cy: float, radius: float):
         """Create circular mask (boolean)."""
@@ -621,47 +834,53 @@ class Show4DSTEM(anywidget.AnyWidget):
         return mask
 
     def _precompute_common_virtual_images(self):
-        """Pre-compute BF/ABF/LAADF/HAADF virtual images for instant preset switching."""
+        """Pre-compute BF/ABF/ADF virtual images for instant preset switching."""
         cx, cy, bf = self.center_x, self.center_y, self.bf_radius
-        self._cached_bf_virtual = self._normalize_to_bytes(
-            self._fast_masked_sum(self._create_circular_mask(cx, cy, bf)))
-        self._cached_abf_virtual = self._normalize_to_bytes(
-            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 0.5, bf)))
-        self._cached_laadf_virtual = self._normalize_to_bytes(
-            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf, bf * 2.0)))
-        self._cached_haadf_virtual = self._normalize_to_bytes(
-            self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 2.0, bf * 4.0)))
+        # Cache (bytes, stats, min, max) for each preset
+        bf_arr = self._fast_masked_sum(self._create_circular_mask(cx, cy, bf))
+        abf_arr = self._fast_masked_sum(self._create_annular_mask(cx, cy, bf * 0.5, bf))
+        adf_arr = self._fast_masked_sum(self._create_annular_mask(cx, cy, bf, bf * 4.0))
 
-    def _get_cached_preset(self) -> bytes | None:
-        """Check if current ROI matches a cached preset and return it."""
+        self._cached_bf_virtual = (
+            self._to_float32_bytes(bf_arr, update_vi_stats=False),
+            [float(bf_arr.mean()), float(bf_arr.min()), float(bf_arr.max()), float(bf_arr.std())],
+            float(bf_arr.min()), float(bf_arr.max())
+        )
+        self._cached_abf_virtual = (
+            self._to_float32_bytes(abf_arr, update_vi_stats=False),
+            [float(abf_arr.mean()), float(abf_arr.min()), float(abf_arr.max()), float(abf_arr.std())],
+            float(abf_arr.min()), float(abf_arr.max())
+        )
+        self._cached_adf_virtual = (
+            self._to_float32_bytes(adf_arr, update_vi_stats=False),
+            [float(adf_arr.mean()), float(adf_arr.min()), float(adf_arr.max()), float(adf_arr.std())],
+            float(adf_arr.min()), float(adf_arr.max())
+        )
+
+    def _get_cached_preset(self) -> tuple[bytes, list[float], float, float] | None:
+        """Check if current ROI matches a cached preset and return (bytes, stats, min, max) tuple."""
         # Must be centered on detector center
         if abs(self.roi_center_x - self.center_x) >= 1 or abs(self.roi_center_y - self.center_y) >= 1:
             return None
-        
+
         bf = self.bf_radius
-        
+
         # BF: circle at bf_radius
         if (self.roi_mode == "circle" and abs(self.roi_radius - bf) < 1):
             return self._cached_bf_virtual
-        
+
         # ABF: annular at 0.5*bf to bf
-        if (self.roi_mode == "annular" and 
-            abs(self.roi_radius_inner - bf * 0.5) < 1 and 
+        if (self.roi_mode == "annular" and
+            abs(self.roi_radius_inner - bf * 0.5) < 1 and
             abs(self.roi_radius - bf) < 1):
             return self._cached_abf_virtual
-        
-        # LAADF: annular at bf to 2*bf
-        if (self.roi_mode == "annular" and 
-            abs(self.roi_radius_inner - bf) < 1 and 
-            abs(self.roi_radius - bf * 2.0) < 1):
-            return self._cached_laadf_virtual
-        
-        # HAADF: annular at 2*bf to 4*bf
-        if (self.roi_mode == "annular" and 
-            abs(self.roi_radius_inner - bf * 2.0) < 1 and 
+
+        # ADF: annular at bf to 4*bf (combines LAADF + HAADF)
+        if (self.roi_mode == "annular" and
+            abs(self.roi_radius_inner - bf) < 1 and
             abs(self.roi_radius - bf * 4.0) < 1):
-            return self._cached_haadf_virtual
-        
+            return self._cached_adf_virtual
+
         return None
 
     def _fast_masked_sum(self, mask) -> "np.ndarray":
@@ -670,20 +889,33 @@ class Show4DSTEM(anywidget.AnyWidget):
             return (self._data.astype(np.float32) * mask).sum(axis=(2, 3))
         return (self._data.astype(np.float32) * mask).sum(axis=(1, 2)).reshape(self._scan_shape)
 
-    def _normalize_to_bytes(self, arr: "np.ndarray") -> bytes:
-        """Normalize array to uint8 bytes."""
-        vmin, vmax = float(arr.min()), float(arr.max())
-        if vmax > vmin:
-            norm = np.clip((arr - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
-        else:
-            norm = np.zeros(arr.shape, dtype=np.uint8)
-        return norm.tobytes()
+    def _to_float32_bytes(self, arr: "np.ndarray", update_vi_stats: bool = True) -> bytes:
+        """Convert array to float32 bytes (JS handles scale/colormap)."""
+        arr = arr.astype(np.float32)
+
+        # Set min/max for JS-side normalization
+        if update_vi_stats:
+            self.vi_data_min = float(arr.min())
+            self.vi_data_max = float(arr.max())
+            self.vi_stats = [
+                float(arr.mean()),
+                float(arr.min()),
+                float(arr.max()),
+                float(arr.std()),
+            ]
+
+        return arr.tobytes()
 
     def _compute_virtual_image_from_roi(self):
         """Compute virtual image based on ROI mode."""
         cached = self._get_cached_preset()
         if cached is not None:
-            self.virtual_image_bytes = cached
+            # Cached preset returns (bytes, stats, min, max) tuple
+            vi_bytes, vi_stats, vi_min, vi_max = cached
+            self.virtual_image_bytes = vi_bytes
+            self.vi_stats = vi_stats
+            self.vi_data_min = vi_min
+            self.vi_data_max = vi_max
             return
 
         cx, cy = self.roi_center_x, self.roi_center_y
@@ -704,7 +936,7 @@ class Show4DSTEM(anywidget.AnyWidget):
                 virtual_image = self._data[:, :, row, col]
             else:
                 virtual_image = self._data[:, row, col].reshape(self._scan_shape)
-            self.virtual_image_bytes = self._normalize_to_bytes(virtual_image)
+            self.virtual_image_bytes = self._to_float32_bytes(virtual_image)
             return
 
-        self.virtual_image_bytes = self._normalize_to_bytes(self._fast_masked_sum(mask))
+        self.virtual_image_bytes = self._to_float32_bytes(self._fast_masked_sum(mask))
