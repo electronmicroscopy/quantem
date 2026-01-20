@@ -223,4 +223,45 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return self._mode
 
 
+class TomographyINRPretrainDataset(Dataset):
+    """
+    Dataset class for pretraining INR models.
+    """
+
+    def __init__(
+        self,
+        pretrain_target: torch.Tensor,
+    ):
+        data = pretrain_target.float()
+
+        total_elements = data.numel()
+        if total_elements > 1e6:
+            sample_size = min(int(1e6), total_elements)
+            flat_data = data.flatten()
+            indices = torch.randperm(total_elements)[:sample_size]
+            sampled_data = flat_data[indices]
+            data_quantile = torch.quantile(sampled_data, 0.95)
+        else:
+            data_quantile = torch.quantile(data, 0.95)
+
+        data = data / data_quantile
+        data = torch.permute(data, (2, 1, 0))
+        # data = torch.flip(data, dims=(2,))
+
+        self.volume = data.cpu()
+        self.N = pretrain_target.shape[0]  # Assumes cubic volume.
+        self.total_samples = pretrain_target.shape[0] ** 3
+
+        coords_1d = torch.linspace(-1, 1, self.N)
+        x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
+        self.coords = torch.stack([x, y, z], dim=-1).reshape(-1, 3).cpu()
+        self.targets = self.volume.reshape(-1).cpu()
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx):
+        return {"coords": self.coords[idx], "target": self.targets[idx]}
+
+
 DatasetModelType = TomographyINRDataset | TomographyPixDataset

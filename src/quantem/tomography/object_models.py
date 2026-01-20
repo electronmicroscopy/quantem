@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Self
+from typing import Callable, Self
 
 import numpy as np
 import torch
@@ -11,6 +11,8 @@ from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
+from quantem.tomography.dataset_models import TomographyINRPretrainDataset
+from quantem.tomography.tomography_ddp import TomographyDDP
 
 
 @dataclass
@@ -264,8 +266,140 @@ class ObjectPixelated(ObjectConstraints):
         self._obj = self._obj.to(device)
 
 
-class ObjectINR(ObjectConstraints):
-    pass
+class ObjectINR(ObjectConstraints, TomographyDDP):
+    """
+    Object model for INR objects.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        volume_shape: tuple[int, int, int],
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ):
+        pass
+
+    @classmethod
+    def from_model(
+        cls,
+        model: "torch.nn.Module",
+        volume_shape: tuple[int, int, int],
+        device: str = None,  # Have to make device a requirement here in distinguishing GPU vs CPU training
+        rng: np.random.Generator | int | None = None,
+    ):
+        obj_model = cls(
+            model=model,
+            volume_shape=volume_shape,
+            device=device,
+            rng=rng,
+            _token=cls._token,
+        )
+
+        # Initialize DDP params and build the model. TODO: Not sure if this is the best way to do this? But to pretrain we need the model to be wrapped in DDP.
+        obj_model.setup_distributed(device=device)
+        obj_model._model = obj_model.build_model(model)
+
+        return obj_model
+
+    # --- Properties ---
+
+    @property
+    def model(self) -> "nn.Module":
+        """
+        Returns the INR model.
+        """
+        return self._model
+
+    @model.setter
+    def model(self, model: "nn.Module"):
+        """
+        This doesn't work -- can't have setters for torch sub modules
+        https://github.com/pytorch/pytorch/issues/52664
+
+        For now, upon initialization private variable `._model` is set to the built model.
+        """
+        raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
+
+    # Pretraining
+    @property
+    def pretrained_weights(self) -> dict[str, torch.Tensor]:
+        """get the pretrained weights of the INR model"""
+        return self._pretrained_weights
+
+    def _set_pretrained_weights(self, model: "torch.nn.Module"):
+        """set the pretrained weights of the INR model"""
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError(f"Pretrained model must be a torch.nn.Module, got {type(model)}")
+        self._pretrained_weights = deepcopy(model.state_dict())
+
+    @property
+    def pretrain_target(self) -> TomographyINRPretrainDataset:
+        """get the pretrain target"""
+        return self._pretrain_target
+
+    @pretrain_target.setter
+    def pretrain_target(self, target: TomographyINRPretrainDataset):
+        """set the pretrain target"""
+        self._pretrain_target = target
+
+    # --- Helper Functions ---
+
+    # Reset method that goes back to the pretrained weights.
+    def reset(self):
+        """reset the model to the pretrained weights"""
+        self._model = self.build_model(
+            self._model, self._pretrained_weights
+        )  # Since loading the pretrained weights needs to be done in build_model.
+
+    # --- Forward Method ---
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """forward pass for the INR model"""
+
+        all_densities = self.model(coords)
+
+        if all_densities.dim() > 1:
+            all_densities = all_densities.squeeze(-1)
+
+        valid_mask = (
+            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
+        ).float()
+
+        all_densities = all_densities * valid_mask
+
+        return all_densities
+
+    # Pretrain Loop
+
+    def pretrain(
+        self,
+        pretrain_dataset: TomographyINRPretrainDataset,
+        batch_size: int,
+        reset: bool = False,
+        num_iters: int = 10,
+        num_workers: int = 0,
+        optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        loss_fn: Callable | str = "l1",
+        show: bool = True,
+    ):
+        """
+        Pretrain the INR model to fit target volume.
+        """
+
+        if (
+            pretrain_dataset is not None
+        ):  # Need to make a check if there's already a pretrain dataset to not go through with the setup again.
+            self.pretrain_dataset = pretrain_dataset
+            self.pretraining_dataloader = self.setup_dataloader(
+                pretrain_dataset, batch_size, num_workers=num_workers
+            )
+
+        if optimizer_params is not None:
+            self.set_optimizer(optimizer_params)
+        if scheduler_params is not None:
+            self.set_scheduler(scheduler_params, num_iters)
 
 
 ObjectModelType = ObjectPixelated | ObjectINR
