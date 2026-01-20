@@ -94,20 +94,20 @@ class DenseNN(nn.Module):
             in_dim = dims[i]
             out_dim = dims[i + 1]
 
-            block = []
-            block.append(nn.Linear(in_dim, out_dim, dtype=self.dtype))
-            block.append(self.activation)
+            layer = []
+            layer.append(nn.Linear(in_dim, out_dim, dtype=self.dtype))
+            layer.append(self.activation)
 
             if self._use_batchnorm:
                 if self.dtype.is_complex:
-                    block.append(ComplexBatchNorm1D(out_dim))
+                    layer.append(ComplexBatchNorm1D(out_dim))
                 else:
-                    block.append(nn.BatchNorm1d(out_dim, dtype=self.dtype))
+                    layer.append(nn.BatchNorm1d(out_dim, dtype=self.dtype))
 
             if self.dropout > 0:
-                block.append(nn.Dropout(self.dropout))
+                layer.append(nn.Dropout(self.dropout))
 
-            self.layers.append(nn.Sequential(*block))
+            self.layers.append(nn.Sequential(*layer))
 
         self.layers.append(
             nn.Linear(
