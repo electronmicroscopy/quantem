@@ -506,6 +506,8 @@ def validate_device(dev: str | int | torch.device | None = None) -> tuple[str, i
     elif isinstance(dev, str):
         if "cuda" in dev.lower():
             dev = torch.device(dev)
+        elif "gpu" in dev.lower():
+            dev = torch.device("cuda")
         elif dev.lower() == "mps":
             dev = torch.device("mps")
         elif dev.lower() == "cpu":
@@ -572,6 +574,7 @@ def set_device(dev: str | int | "torch.device") -> None:
     >>> set_device(torch.device("cuda:0"))
     >>> set_device("mps")
     >>> set_device("cpu")
+    >>> set_device("gpu")
     """
     set({"device": dev})
 
