@@ -73,8 +73,10 @@ export const CONTROL_PANEL = {
 export const CONTAINER = {
     ROOT: {
         p: 2,
-        bgcolor: COLORS.BG,
-        color: COLORS.TEXT_PRIMARY,
+        // Use transparent background to inherit from parent (light/dark mode aware)
+        bgcolor: "transparent",
+        // Inherit text color from parent for theme awareness
+        color: "inherit",
         fontFamily: "monospace",
         borderRadius: 1,
         // CRITICAL: Allow dropdowns to overflow
