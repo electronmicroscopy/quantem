@@ -52,6 +52,7 @@ const controlRow = {
   px: 1,
   py: 0.5,
   bgcolor: "#252525",
+  width: "fit-content",
 };
 
 /** Round to a nice value (1, 2, 5, 10, 20, 50, etc.) */
@@ -1945,7 +1946,7 @@ function Show4DSTEM() {
             </Box>
             {/* Right: Histogram spanning both rows */}
             <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-              <Histogram data={dpHistogramData} colormap={dpColormap} vminPct={dpVminPct} vmaxPct={dpVmaxPct} onRangeChange={(min, max) => { setDpVminPct(min); setDpVmaxPct(max); }} width={100} height={50} />
+              <Histogram data={dpHistogramData} colormap={dpColormap} vminPct={dpVminPct} vmaxPct={dpVmaxPct} onRangeChange={(min, max) => { setDpVminPct(min); setDpVmaxPct(max); }} width={110} height={58} />
             </Box>
           </Box>
         </Box>
@@ -2049,7 +2050,7 @@ function Show4DSTEM() {
             </Box>
             {/* Right: Histogram spanning both rows */}
             <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-              <Histogram data={viHistogramData} colormap={viColormap} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { setViVminPct(min); setViVmaxPct(max); }} width={100} height={50} />
+              <Histogram data={viHistogramData} colormap={viColormap} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} />
             </Box>
           </Box>
 
