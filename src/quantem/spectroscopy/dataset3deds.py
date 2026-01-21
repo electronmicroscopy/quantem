@@ -136,6 +136,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             ax[0].set_title("loss")
             ax[0].set_xlabel("iterations")
             ax[0].set_ylabel("loss")
+            ax[0].set_yscale("log")
 
             ax[1].plot(energy_axis, spectrum_raw.numpy(), "k-", label="Data", linewidth=1)
             ax[1].plot(energy_axis, final_pred, "r-", label="Fit", linewidth=2)
