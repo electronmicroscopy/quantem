@@ -1114,7 +1114,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         dx, dy = aberration_surface_cartesian_gradients(
             k * self.wavelength,
             phi,
-            aberration_coefs=aberration_coefs,  # ty:ignore[invalid-argument-type]
+            aberration_coefs=aberration_coefs,
         )
         grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
         lateral_shifts = grad_k / 2 / np.pi

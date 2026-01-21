@@ -82,8 +82,12 @@ class StreamingParallax(AutoSerialize):
                 raise ValueError(
                     "Only one of reciprocal_sampling / angular_sampling can be specified"
                 )
-            reciprocal_sampling = tuple(a / wavelength / 1e3 for a in angular_sampling)
+            reciprocal_sampling = (
+                angular_sampling[0] / wavelength / 1e3,
+                angular_sampling[1] / wavelength / 1e3,
+            )
 
+        assert reciprocal_sampling is not None
         return cls(
             gpts,
             reciprocal_sampling,
