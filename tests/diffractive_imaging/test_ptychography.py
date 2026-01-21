@@ -15,7 +15,7 @@ from quantem.diffractive_imaging.probe_models import ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 
 if config.NUM_DEVICES > 0:
-    config.set_device("gpu")
+    config.set_device("cuda:0")
 
 N = 64
 Q_MAX = 0.5  # inverse Angstroms
