@@ -22,7 +22,7 @@ def test_config_set_device():
         assert config.get_device() == "cpu"
     else:
         with pytest.raises(RuntimeError):
-            config.set_device("gpu")
+            config.set_device("cuda:0")
 
     if torch.mps.is_available():
         config.set_device("mps")
