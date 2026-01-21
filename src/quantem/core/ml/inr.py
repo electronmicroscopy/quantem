@@ -23,6 +23,7 @@ class Siren(nn.Module):
         hsiren: bool = False,
         dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
+        winner_initialization: bool = False,
     ) -> None:
         """Initialize Siren.
 
@@ -59,7 +60,7 @@ class Siren(nn.Module):
         self.alpha = alpha
         self.hsiren = hsiren
         self.dtype = dtype
-
+        self.winner_initialization = winner_initialization
         self.final_activation = final_activation
 
         self._build()
@@ -108,6 +109,15 @@ class Siren(nn.Module):
         net_list.append(final_linear)
         net_list.append(self._final_activation)
         self.net = nn.Sequential(*net_list)
+
+        if self.winner_initialization:
+            with torch.no_grad():
+                self.net[0].linear.weight += (
+                    torch.randn_like(self.net[0].linear.weight) * 1 / self.first_omega_0
+                )
+                self.net[1].linear.weight += (
+                    torch.randn_like(self.net[1].linear.weight) * 0.01 / self.hidden_omega_0
+                )
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         output = self.net(coords)
@@ -182,6 +192,7 @@ class HSiren(Siren):
         alpha: float = 1.0,
         dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
+        winner_initialization: bool = False,
     ) -> None:
         """Initialize HSiren.
 
@@ -217,4 +228,5 @@ class HSiren(Siren):
             hsiren=True,
             dtype=dtype,
             final_activation=final_activation,
+            winner_initialization=winner_initialization,
         )

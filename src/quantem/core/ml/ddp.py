@@ -6,7 +6,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 
-class TomographyDDP:
+# Rename DDPMixin
+class DDPMixin:
     """
     Class for setting up all distributed training.
 

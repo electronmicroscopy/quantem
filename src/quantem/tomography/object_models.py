@@ -10,10 +10,10 @@ import torch.nn as nn
 
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
+from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
-from quantem.tomography.tomography_ddp import TomographyDDP
 
 
 @dataclass
@@ -272,7 +272,7 @@ class ObjectPixelated(ObjectConstraints):
         self._obj = self._obj.to(device)
 
 
-class ObjectINR(ObjectConstraints, TomographyDDP):
+class ObjectINR(ObjectConstraints, DDPMixin):
     """
     Object model for INR objects.
     """
@@ -428,6 +428,8 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
 
         if loss_fn == "l1":
             loss_fn = nn.functional.l1_loss
+        elif loss_fn == "l2":
+            loss_fn = nn.functional.mse_loss
 
         self._pretrain(
             num_iters=num_iters,
@@ -446,6 +448,7 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
         scheduler = self.scheduler
 
         for a0 in range(num_iters):
+            epoch_loss = 0
             for batch_idx, batch in enumerate[Any](self.pretraining_dataloader):
                 coords = batch["coords"].to(self.device, non_blocking=True)
                 target = batch["target"].to(self.device, non_blocking=True)
@@ -457,17 +460,20 @@ class ObjectINR(ObjectConstraints, TomographyDDP):
                     loss = loss_fn(outputs, target)
 
                 loss.backward()
+                epoch_loss += loss.item()
                 optimizer.step()
                 optimizer.zero_grad()
 
-                if scheduler is not None:
-                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        scheduler.step(loss.item())
-                    else:
-                        scheduler.step()
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(epoch_loss)
+                else:
+                    scheduler.step()
 
-            self._pretrain_losses.append(loss.item())
-            print(f"Pretrain Loss: {loss.item():.4f}")
+            self._pretrain_losses.append(epoch_loss / len(self.pretraining_dataloader))
+            print(
+                f"Epoch {a0 + 1}/{num_iters}, Pretrain Loss: {epoch_loss / len(self.pretraining_dataloader):.4f}"
+            )
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
 
     def create_volume(

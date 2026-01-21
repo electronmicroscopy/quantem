@@ -11,6 +11,7 @@ from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_opt import TomographyOpt
 from quantem.tomography.utils import torch_phase_cross_correlation
+from quantem.tomography_old.utils import gaussian_filter_2d_stack, gaussian_kernel_1d
 
 
 class Tomography(TomographyOpt, TomographyBase):
@@ -82,6 +83,7 @@ class TomographyConventional(TomographyBase):
         mode: Literal["sirt", "fbp"] = "sirt",
         reset: bool = False,
         inline_alignment: bool = False,
+        smoothing_sigma: float | None = None,
     ):
         pbar = tqdm(range(num_iter), desc=f"{mode} Reconstruction")
         if mode == "sirt" or mode == "fbp":
@@ -90,11 +92,18 @@ class TomographyConventional(TomographyBase):
             proj_forward = torch.zeros_like(self.dset.tilt_stack)
         print("proj_forward.shape", proj_forward.shape)
         print("self.dset.tilt_stack.shape", self.dset.tilt_stack.shape)
+
+        if smoothing_sigma is not None:
+            gaussian_kernel = gaussian_kernel_1d(smoothing_sigma).to(self.device)
+        else:
+            gaussian_kernel = None
+
         for iter in pbar:
             proj_forward, loss = self._reconstruction_epoch(
                 inline_alignment=inline_alignment,
                 mode=mode,
                 proj_forward=proj_forward,
+                gaussian_kernel=gaussian_kernel,
             )
 
             pbar.set_description(f"{mode} Reconstruction | Loss: {loss.item():.4f}")
@@ -111,6 +120,7 @@ class TomographyConventional(TomographyBase):
         inline_alignment: bool,
         mode: Literal["sirt", "fbp"],
         proj_forward: torch.Tensor,
+        gaussian_kernel: torch.Tensor | None = None,
     ):
         loss = 0
 
@@ -168,6 +178,10 @@ class TomographyConventional(TomographyBase):
             correction /= normalization
 
             self.obj_model.obj += correction
+
+            if gaussian_kernel is not None:
+                print(self.obj_model.obj.shape)
+                self.obj_model.obj = gaussian_filter_2d_stack(self.obj_model.obj, gaussian_kernel)
 
         loss = torch.mean(torch.abs(error))
 
