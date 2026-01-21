@@ -1,3 +1,6 @@
+from typing import Any
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from numpy.typing import NDArray
@@ -1059,6 +1062,7 @@ class Lattice(AutoSerialize):
         min_neighbours: int | None = 2,
         max_neighbours: int | None = None,
         plot_polarization_vectors: bool = False,
+        plot_legend: bool = False,
         **plot_kwargs,
     ) -> "Vector":
         """
@@ -1087,8 +1091,14 @@ class Lattice(AutoSerialize):
             Maximum number of nearest neighbors to use. Required when `reference_radius` is None.
         plot_polarization_vectors : bool, default=False
             If True, plots the polarization vectors using `self.plot_polarization_vectors(...)`.
-        **plot_kwargs
+        **plot_kwargs : optional
             Additional keyword arguments forwarded to the plotting function.
+            - figsize : tuple, default (12,6)
+                Figure size in inches.
+            - width_ratios : list, default [8,3]
+                Width ratios of the polarization vector plot and the legend.
+            - wspace : float, default 0.0
+                Width space between the two subplots.
 
         Returns
         -------
@@ -1155,6 +1165,8 @@ class Lattice(AutoSerialize):
         fields = ["x", "y", "a", "b", "da", "db"]
         units = ["px", "px", "ind", "ind", "ind", "ind"]
 
+        # Return an empty Vector object if either cell is empty.
+        # Doing this avoids errors with zero-length Vectors.
         def empty_vector():
             out = Vector.from_shape(
                 shape=(1,),
@@ -1376,7 +1388,26 @@ class Lattice(AutoSerialize):
         out.set_data(arr, 0)
 
         if plot_polarization_vectors:
-            self.plot_polarization_vectors(out, **plot_kwargs)
+            if plot_legend:
+                figsize = plot_kwargs.get("figsize", (12, 6))
+                width_ratios = plot_kwargs.get("width_ratios", [8, 3])
+                wspace = plot_kwargs.get("wspace", 0.0)
+                fig, (ax1, ax2) = plt.subplots(
+                    1,
+                    2,
+                    figsize=figsize,
+                    gridspec_kw={"width_ratios": width_ratios, "wspace": wspace},
+                )
+
+                ax1.set_aspect("equal")
+                ax2.set_aspect("equal")
+
+                fig, ax1 = self.plot_polarization_vectors(out, figax=(fig, ax1), **plot_kwargs)
+                fig, ax2 = self.plot_polarization_legend(figax=(fig, ax2), **plot_kwargs)
+            else:
+                fig, ax = self.plot_polarization_vectors(out, **plot_kwargs)
+            plt.show()
+            plt.close(fig)
 
         return out
 
@@ -1565,7 +1596,6 @@ class Lattice(AutoSerialize):
         """
         # Imports
         import matplotlib.colors as mcolors
-        import matplotlib.pyplot as plt
         from matplotlib.patches import Ellipse
         from scipy.stats import gaussian_kde
 
@@ -2008,6 +2038,36 @@ class Lattice(AutoSerialize):
             plt.show()
 
         if plot_order_parameter:
+            if not plot_gmm_visualization:
+                preset_scatter_colours = site_colors
+                if "scatter_colours" in kwargs:
+                    scatter_colours_input = kwargs["scatter_colours"]
+
+                    # Try to convert to RGB format
+                    scatter_colours_rgb = convert_colors_to_rgb(scatter_colours_input, num_phases)
+
+                    if scatter_colours_rgb is not None:
+                        # Successfully converted to (num_phases, 3) RGB array
+                        scatter_colours = scatter_colours_rgb
+                    else:
+                        # Check if it's a single valid color
+                        if is_valid_color(scatter_colours_input):
+                            # Convert single color to repeated array for indexing
+                            single_color_rgb = mcolors.to_rgb(scatter_colours_input)
+                            scatter_colours = np.tile(single_color_rgb, (num_phases, 1))
+                            print(
+                                f"Warning: Using single color '{scatter_colours_input}' for all {num_phases} phases"
+                            )
+                        else:
+                            print(
+                                "Warning: scatter_colours invalid (must be (num_phases, 3) array, list of valid colors, or callable), using preset"
+                            )
+                            scatter_colours = convert_colors_to_rgb(
+                                preset_scatter_colours, num_phases
+                            )
+                else:
+                    scatter_colours = convert_colors_to_rgb(preset_scatter_colours, num_phases)
+
             # Create colors from full probability distribution with custom scatter_colours
             colors = create_colors_from_probabilities(
                 best_probabilities, num_phases, scatter_colours
@@ -2053,6 +2113,7 @@ class Lattice(AutoSerialize):
         show_image: bool = True,
         figsize=(6, 6),
         subtract_median: bool = False,
+        figax: tuple[Any, Any] | None = None,
         linewidth: float = 1.0,
         tail_width: float = 1.0,
         headwidth: float = 4.0,
@@ -2075,8 +2136,6 @@ class Lattice(AutoSerialize):
         **kwargs,
     ):
         import matplotlib.patheffects as pe
-        import matplotlib.pyplot as plt
-        import numpy as np
         from matplotlib.patches import ArrowStyle, Circle, FancyArrowPatch
         from mpl_toolkits.axes_grid1 import make_axes_locatable
 
@@ -2085,9 +2144,14 @@ class Lattice(AutoSerialize):
         data = pol_vec.get_data(0)
         if isinstance(data, list) or data is None or data.size == 0:
             if show_image:
-                fig, ax = show_2d(self._image.array, returnfig=True, figsize=figsize, **kwargs)
+                fig, ax = show_2d(
+                    self._image.array, returnfig=True, figax=figax, figsize=figsize, **kwargs
+                )
             else:
-                fig, ax = plt.subplots(1, 1, figsize=figsize)
+                if figax is not None:
+                    fig, ax = figax
+                else:
+                    fig, ax = plt.subplots(1, 1, figsize=figsize)
             H, W = self._image.shape
             ax.set_xlim(-0.5, W - 0.5)
             ax.set_ylim(H - 0.5, -0.5)
@@ -2134,11 +2198,16 @@ class Lattice(AutoSerialize):
 
         # Background
         if show_image:
-            fig, ax = show_2d(self._image.array, returnfig=True, figsize=figsize, **kwargs)
+            fig, ax = show_2d(
+                self._image.array, returnfig=True, figax=figax, figsize=figsize, **kwargs
+            )
             if ax.images:
                 ax.images[-1].set_zorder(0)
         else:
-            fig, ax = plt.subplots(1, 1, figsize=figsize)
+            if figax is not None:
+                fig, ax = figax
+            else:
+                fig, ax = plt.subplots(1, 1, figsize=figsize)
 
         # Draw arrows (colored patch with black stroke beneath via path effects)
         arrowstyle = ArrowStyle.Simple(
@@ -2273,6 +2342,7 @@ class Lattice(AutoSerialize):
         padding: int = 8,
         spacing: int = 2,
         subtract_median: bool = False,
+        figax: tuple[Any, Any] | None = None,
         chroma_boost: float = 2.0,
         use_magnitude_lightness: bool = True,
         disp_color_max: float | None = None,
@@ -2320,7 +2390,7 @@ class Lattice(AutoSerialize):
             W = padding * 2 + pixel_size
             img_rgb = np.zeros((H, W, 3), dtype=float)
             if plot:
-                fig, ax = show_2d(img_rgb, returnfig=True, figsize=figsize, **kwargs)
+                fig, ax = show_2d(img_rgb, returnfig=True, figax=figax, figsize=figsize, **kwargs)
                 ax.set_title(
                     "polarization image" + (" (median subtracted)" if subtract_median else "")
                 )
@@ -2430,7 +2500,7 @@ class Lattice(AutoSerialize):
 
         # --- Optional rendering with legend ---
         if plot:
-            fig, ax = show_2d(img_rgb, returnfig=True, figsize=figsize, **kwargs)
+            fig, ax = show_2d(img_rgb, returnfig=True, figax=figax, figsize=figsize, **kwargs)
             ax.set_title(
                 "polarization image" + (" (median subtracted)" if subtract_median else "")
             )
@@ -2517,6 +2587,764 @@ class Lattice(AutoSerialize):
 
         return img_rgb
 
+    def visualize_order_parameter(self, **kwargs):
+        """
+        For start point, use 2 indices as follows:
+        (index of direction of line [u=0,v=1],
+        complementary index of start point [if i1 = 0, then v value of sp; if i1 = 1, then u value of sp]).
+        So a line between (0,1) to (1,1) would be represented as (0,1).
+        0 as it is drawn along u direction (v=constant), and 1 as the start value of v is 1.
+
+        Customizable parameters via kwargs:
+        - alpha_unit_cell: alpha for unit cell boundary (default: 1.0)
+        - alpha_shadow_boundary: alpha for shadow boundaries (default: 0.3)
+        - alpha_shadow_atom: alpha for shadow atoms (default: 0.3)
+        - alpha_shadow_arrow: alpha for shadow arrows (default: 0.3)
+        - alpha_phase_boundary: alpha for phase boundaries (default: 1.0)
+        - alpha_reference_boundary: alpha for reference boundaries (default: 1.0)
+        - alpha_phase_atom: alpha for phase atoms (default: 1.0)
+        - alpha_phase_arrow: alpha for phase arrows (default: 1.0)
+
+        - zorder_unit_cell: zorder for unit cell boundary (default: 1)
+        - zorder_shadow_boundary: zorder for shadow boundaries (default: 2)
+        - zorder_shadow_atom: zorder for shadow atoms (default: 3)
+        - zorder_shadow_arrow: zorder for shadow arrows (default: 4)
+        - zorder_phase_boundary: zorder for phase boundaries (default: 5)
+        - zorder_reference_atoms: zorder for reference atoms (default: 6)
+        - zorder_phase_atom: zorder for phase atoms (default: 7)
+        - zorder_phase_arrow: zorder for phase arrows (default: 8)
+
+        - atom_size: size of atoms (default: 150)
+        - linewidth: width of cell boundary lines (default: 2.0)
+        - phase_arrow_headlength: length of phase arrow head (default: 8.0)
+        - phase_arrow_headwidth: width of phase arrow head (default: 8.0)
+        - phase_arrow_tail_width: width of phase arrow tail (default: 3.0)
+        - shadow_arrow_headlength: length of shadow arrow head (default: 8.0)
+        - shadow_arrow_headwidth: width of shadow arrow head (default: 8.0)
+        - shadow_arrow_tail_width: width of shadow arrow tail (default: 3.0)
+
+        - scatter_colours: Colors for phase atoms. Accepted forms:
+            • callable f(i) -> RGB(A) (first 3 components used),
+            • numpy array of shape (num_phases, 3) with RGB in [0, 1],
+            • list/tuple of valid color names/values of length num_phases,
+            • single valid color (applied to all phases with warning).
+            Default: site_colors function
+        - reference_atom_colour: Color for reference atoms (default: site_colors(-1))
+        - unit_cell_boundary_colour: Color for unit cell boundary lines (default: site_colors(-1))
+        """
+        import matplotlib.colors as mcolors
+        from matplotlib.patches import ArrowStyle, FancyArrowPatch, Rectangle
+
+        # Helper function to convert colors to RGB
+        def convert_colors_to_rgb(colors, num_phases):
+            """
+            Convert colors to RGB array format.
+            Args:
+                colors: either a callable function, array of colors, or list of color names
+                num_phases: number of phases/clusters
+            Returns:
+                numpy array of shape (num_phases, 3) with RGB values
+            """
+            # If it's a function (like site_colors), call it for each index
+            if callable(colors):
+                rgb_array = np.array([colors(i)[:3] for i in range(num_phases)])
+                return rgb_array
+
+            # If it's already an array, validate dimensions
+            if isinstance(colors, np.ndarray):
+                if colors.shape == (num_phases, 3):
+                    return colors
+                else:
+                    return None
+
+            # If it's a list/tuple of color names or values
+            if isinstance(colors, (list, tuple)):
+                try:
+                    rgb_array = np.array([mcolors.to_rgb(c) for c in colors])
+                    if rgb_array.shape == (num_phases, 3):
+                        return rgb_array
+                    else:
+                        return None
+                except (ValueError, TypeError):
+                    return None
+
+            return None
+
+        # Helper function to validate color
+        def is_valid_color(color):
+            """Check if a color is valid in matplotlib"""
+            try:
+                mcolors.to_rgba(color)
+                return True
+            except (ValueError, TypeError):
+                return False
+
+        # Extract alpha values from kwargs with defaults
+        alpha_unit_cell = kwargs.get("alpha_unit_cell", 1.0)
+        alpha_shadow_boundary = kwargs.get("alpha_shadow_boundary", 0.0)
+        alpha_shadow_atom = kwargs.get("alpha_shadow_atom", 0.3)
+        alpha_shadow_arrow = kwargs.get("alpha_shadow_arrow", 0.0)
+        alpha_phase_boundary = kwargs.get("alpha_phase_boundary", 0.0)
+        alpha_reference_boundary = kwargs.get("alpha_reference_boundary", 1.0)
+        alpha_phase_atom = kwargs.get("alpha_phase_atom", 1.0)
+        alpha_phase_arrow = kwargs.get("alpha_phase_arrow", 1.0)
+
+        # Extract zorder values from kwargs with defaults
+        zorder_unit_cell = kwargs.get("zorder_unit_cell", 1)
+        zorder_shadow_boundary = kwargs.get("zorder_shadow_boundary", 2)
+        zorder_shadow_atom = kwargs.get("zorder_shadow_atom", 3)
+        zorder_shadow_arrow = kwargs.get("zorder_shadow_arrow", 4)
+        zorder_phase_boundary = kwargs.get("zorder_phase_boundary", 5)
+        zorder_reference_atoms = kwargs.get("zorder_reference_atoms", 6)
+        zorder_phase_atom = kwargs.get("zorder_phase_atom", 7)
+        zorder_phase_arrow = kwargs.get("zorder_phase_arrow", 8)
+
+        # Extract size and linewidth parameters
+        atom_size = kwargs.get("atom_size", 150)
+        linewidth = kwargs.get("linewidth", 2.0)
+
+        # Extract phase arrow parameters
+        phase_arrow_headlength = kwargs.get("phase_arrow_headlength", 8.0)
+        phase_arrow_headwidth = kwargs.get("phase_arrow_headwidth", 8.0)
+        phase_arrow_tail_width = kwargs.get("phase_arrow_tail_width", 3.0)
+
+        # Extract shadow arrow parameters
+        shadow_arrow_headlength = kwargs.get("shadow_arrow_headlength", 8.0)
+        shadow_arrow_headwidth = kwargs.get("shadow_arrow_headwidth", 8.0)
+        shadow_arrow_tail_width = kwargs.get("shadow_arrow_tail_width", 3.0)
+
+        # First get all the stored information
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        frac_positions = self._positions_frac
+        measure_ind = self._pol_meas_ref_ind[0]
+        pol_means = self._polarization_means
+
+        A = np.column_stack((u, v))
+        corner_ind = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+
+        # Step 1: Check if the lattice site atoms are polarised. If yes, then shift all others.
+        if measure_ind == 0:
+            reference_atom_ind = frac_positions[np.arange(len(frac_positions)) == measure_ind]
+            measured_atom_ind = frac_positions[np.arange(len(frac_positions)) != measure_ind]
+            pol_means = -pol_means
+        else:
+            reference_atom_ind = frac_positions[np.arange(len(frac_positions)) != measure_ind]
+            measured_atom_ind = frac_positions[np.arange(len(frac_positions)) == measure_ind]
+
+        # Step 2: Tile to get all possible sites in 1 unit cell.
+        reference_atom_ind = (reference_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
+            -1, 2
+        )
+        measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+
+        # Step 3: Remove all outside unit cell
+        reference_atom_ind = reference_atom_ind[
+            ~np.any((reference_atom_ind < -0.1) | (reference_atom_ind > 1.1), axis=1)
+        ]
+        measured_atom_ind = measured_atom_ind[
+            ~np.any((measured_atom_ind < -0.1) | (measured_atom_ind > 1.1), axis=1)
+        ]
+
+        # Step 4: Plot the corner_pos and draw the edges
+        corner_pos = corner_ind @ A.T
+        reference_atom_pos = reference_atom_ind @ A.T
+        edges = [
+            (0, 1),  # bottom edge
+            (0, 2),  # left edge
+            (1, 3),  # right edge
+            (2, 3),  # top edge
+        ]
+
+        # Determine number of phases
+        num_phases = pol_means.shape[0]
+
+        # Extract and validate color parameters
+        # Default presets
+        preset_scatter_colours = site_colors
+        preset_reference_atom_colour = site_colors(-1)
+        preset_unit_cell_boundary_colour = site_colors(-1)
+
+        # Check and assign scatter_colours (for phase atoms)
+        if "scatter_colours" in kwargs:
+            scatter_colours_input = kwargs["scatter_colours"]
+
+            # Try to convert to RGB format
+            scatter_colours_rgb = convert_colors_to_rgb(scatter_colours_input, num_phases)
+
+            if scatter_colours_rgb is not None:
+                # Successfully converted to (num_phases, 3) RGB array
+                scatter_colours = scatter_colours_rgb
+            else:
+                # Check if it's a single valid color
+                if is_valid_color(scatter_colours_input):
+                    # Convert single color to repeated array
+                    single_color_rgb = mcolors.to_rgb(scatter_colours_input)
+                    scatter_colours = np.tile(single_color_rgb, (num_phases, 1))
+                    print(
+                        f"Warning: Using single color '{scatter_colours_input}' for all {num_phases} phases"
+                    )
+                else:
+                    print("Warning: scatter_colours invalid, using preset (site_colors)")
+                    scatter_colours = convert_colors_to_rgb(preset_scatter_colours, num_phases)
+        else:
+            scatter_colours = convert_colors_to_rgb(preset_scatter_colours, num_phases)
+
+        # Check and assign reference_atom_colour
+        if "reference_atom_colour" in kwargs:
+            if is_valid_color(kwargs["reference_atom_colour"]):
+                reference_atom_colour = kwargs["reference_atom_colour"]
+            else:
+                print(
+                    f"Warning: '{kwargs['reference_atom_colour']}' is not a valid color, using preset"
+                )
+                reference_atom_colour = preset_reference_atom_colour
+        else:
+            reference_atom_colour = preset_reference_atom_colour
+
+        # Check and assign unit_cell_boundary_colour
+        if "unit_cell_boundary_colour" in kwargs:
+            if is_valid_color(kwargs["unit_cell_boundary_colour"]):
+                unit_cell_boundary_colour = kwargs["unit_cell_boundary_colour"]
+            else:
+                print(
+                    f"Warning: '{kwargs['unit_cell_boundary_colour']}' is not a valid color, using preset"
+                )
+                unit_cell_boundary_colour = preset_unit_cell_boundary_colour
+        else:
+            unit_cell_boundary_colour = preset_unit_cell_boundary_colour
+
+        # Convert reference_atom_colour to RGB tuple for color_override
+        reference_atom_colour_rgb = np.array(mcolors.to_rgb(reference_atom_colour))
+
+        # Create figure with vertical subplots
+        fig, axes = plt.subplots(num_phases, 1, figsize=(6, 6 * num_phases))
+
+        # Arrow style parameters for phase arrows
+        phase_arrowstyle = ArrowStyle.Simple(
+            head_length=phase_arrow_headlength,
+            head_width=phase_arrow_headwidth,
+            tail_width=phase_arrow_tail_width,
+        )
+
+        # Arrow style parameters for shadow arrows
+        shadow_arrowstyle = ArrowStyle.Simple(
+            head_length=shadow_arrow_headlength,
+            head_width=shadow_arrow_headwidth,
+            tail_width=shadow_arrow_tail_width,
+        )
+
+        # Handle case of single phase
+        if num_phases == 1:
+            axes = [axes]
+
+        # Step 5: Check if any measured atoms are on edges.
+        edge_tol = 0.1
+        on_edge = np.any(
+            (np.abs(measured_atom_ind) < edge_tol) | (np.abs(measured_atom_ind - 1) < edge_tol)
+        )
+
+        # Calculate measured atom positions (same for all phases)
+        measured_atom_pos = measured_atom_ind @ A.T
+        pol_atom_pos = (pol_means @ A.T)[None, :, :] + measured_atom_pos[:, None, :]
+
+        # Loop through each phase and create subplot
+        for phase_idx in range(num_phases):
+            ax = axes[phase_idx]
+
+            # Plot reference atoms using color_override
+            fig, ax = plot_atoms_2d(
+                reference_atom_pos,
+                site_number=-1,
+                fig=fig,
+                ax=ax,
+                size=atom_size,
+                alpha=alpha_phase_atom,
+                zorder=zorder_reference_atoms,
+                color_override=reference_atom_colour_rgb,
+            )
+
+            # Plot unit cell edges with unit_cell_boundary_colour
+            for i, j in edges:
+                ax.plot(
+                    [corner_pos[i, 1], corner_pos[j, 1]],
+                    [corner_pos[i, 0], corner_pos[j, 0]],
+                    color=unit_cell_boundary_colour,
+                    linewidth=linewidth,
+                    alpha=alpha_unit_cell,
+                    zorder=zorder_unit_cell,
+                )
+
+            if on_edge:
+                # Handle edge case
+                for i in range(len(measured_atom_pos)):
+                    ind = measured_atom_ind[i]
+                    pos = measured_atom_pos[i]
+
+                    corner_indices = None
+
+                    if ind[0] < edge_tol:
+                        corner_indices = edges[1]
+                    elif ind[0] > 1 - edge_tol:
+                        corner_indices = edges[2]
+                    elif ind[1] < edge_tol:
+                        corner_indices = edges[0]
+                    elif ind[1] > 1 - edge_tol:
+                        corner_indices = edges[3]
+
+                    if corner_indices is not None:
+                        c1_idx, c2_idx = corner_indices
+                        corner1 = corner_pos[c1_idx]
+                        corner2 = corner_pos[c2_idx]
+
+                        # Plot measured position with reference_atom_colour
+                        pos_2d = np.array([[pos[0], pos[1]]])
+                        fig, ax = plot_atoms_2d(
+                            pos_2d,
+                            site_number=-1,
+                            fig=fig,
+                            ax=ax,
+                            size=atom_size,
+                            alpha=alpha_phase_atom,
+                            zorder=zorder_reference_atoms,
+                            color_override=reference_atom_colour_rgb,
+                        )
+
+                        # Draw lines from corners to measured position
+                        ax.plot(
+                            [corner1[1], pos[1]],
+                            [corner1[0], pos[0]],
+                            color=reference_atom_colour,
+                            linewidth=linewidth,
+                            alpha=alpha_reference_boundary,
+                            zorder=zorder_reference_atoms,
+                        )
+                        ax.plot(
+                            [corner2[1], pos[1]],
+                            [corner2[0], pos[0]],
+                            color=reference_atom_colour,
+                            linewidth=linewidth,
+                            alpha=alpha_reference_boundary,
+                            zorder=zorder_reference_atoms,
+                        )
+
+                        # FIRST: Plot all OTHER phases as gray shadows
+                        for other_phase_idx in range(num_phases):
+                            if other_phase_idx == phase_idx:
+                                continue  # Skip the current phase
+
+                            pol_pos_other = pol_atom_pos[i, other_phase_idx, :]
+
+                            # Plot shadow atom in gray
+                            pol_pos_2d_other = np.array([[pol_pos_other[0], pol_pos_other[1]]])
+                            ax.scatter(
+                                pol_pos_2d_other[:, 1],
+                                pol_pos_2d_other[:, 0],
+                                c="gray",
+                                s=atom_size,
+                                alpha=alpha_shadow_atom,
+                                zorder=zorder_shadow_atom,
+                                edgecolor="darkgray",
+                                linewidth=0.5,
+                            )
+
+                            # Draw shadow lines
+                            ax.plot(
+                                [corner1[1], pol_pos_other[1]],
+                                [corner1[0], pol_pos_other[0]],
+                                color="gray",
+                                linewidth=linewidth,
+                                alpha=alpha_shadow_boundary,
+                                zorder=zorder_shadow_boundary,
+                            )
+                            ax.plot(
+                                [corner2[1], pol_pos_other[1]],
+                                [corner2[0], pol_pos_other[0]],
+                                color="gray",
+                                linewidth=linewidth,
+                                alpha=alpha_shadow_boundary,
+                                zorder=zorder_shadow_boundary,
+                            )
+
+                            # Draw shadow arrow using FancyArrowPatch
+                            shadow_arrow = FancyArrowPatch(
+                                (pos[1], pos[0]),  # Start point
+                                (pol_pos_other[1], pol_pos_other[0]),  # End point
+                                arrowstyle=shadow_arrowstyle,
+                                mutation_scale=1.0,
+                                facecolor="gray",
+                                edgecolor="gray",
+                                alpha=alpha_shadow_arrow,
+                                zorder=zorder_shadow_arrow,
+                                capstyle="round",
+                                joinstyle="round",
+                                shrinkA=0.0,
+                                shrinkB=0.0,
+                            )
+                            ax.add_patch(shadow_arrow)
+
+                        # THEN: Plot this phase (highlighted)
+                        pol_pos = pol_atom_pos[i, phase_idx, :]
+                        phase_color = scatter_colours[phase_idx]
+
+                        pol_pos_2d = np.array([[pol_pos[0], pol_pos[1]]])
+                        fig, ax = plot_atoms_2d(
+                            pol_pos_2d,
+                            site_number=phase_idx,
+                            fig=fig,
+                            ax=ax,
+                            size=atom_size,
+                            alpha=alpha_phase_atom,
+                            zorder=zorder_phase_atom,
+                            color_override=phase_color,
+                        )
+
+                        ax.plot(
+                            [corner1[1], pol_pos[1]],
+                            [corner1[0], pol_pos[0]],
+                            color=phase_color,
+                            linewidth=linewidth,
+                            alpha=alpha_phase_boundary,
+                            zorder=zorder_phase_boundary,
+                        )
+                        ax.plot(
+                            [corner2[1], pol_pos[1]],
+                            [corner2[0], pol_pos[0]],
+                            color=phase_color,
+                            linewidth=linewidth,
+                            alpha=alpha_phase_boundary,
+                            zorder=zorder_phase_boundary,
+                        )
+
+                        # Use FancyArrowPatch for highlighted arrow
+                        arrow = FancyArrowPatch(
+                            (pos[1], pos[0]),  # Start point
+                            (pol_pos[1], pol_pos[0]),  # End point
+                            arrowstyle=phase_arrowstyle,
+                            mutation_scale=1.0,
+                            facecolor=phase_color,
+                            edgecolor=reference_atom_colour,
+                            alpha=alpha_phase_arrow,
+                            zorder=zorder_phase_arrow,
+                            capstyle="round",
+                            joinstyle="round",
+                            shrinkA=0.0,
+                            shrinkB=0.0,
+                        )
+                        ax.add_patch(arrow)
+            else:
+                # Handle non-edge case
+                # Plot measured atoms with reference_atom_colour
+                fig, ax = plot_atoms_2d(
+                    measured_atom_pos,
+                    site_number=-1,
+                    fig=fig,
+                    ax=ax,
+                    size=atom_size,
+                    alpha=alpha_phase_atom,
+                    zorder=zorder_reference_atoms,
+                    color_override=reference_atom_colour_rgb,
+                )
+
+                for corner in corner_pos:
+                    for atom in measured_atom_pos:
+                        ax.plot(
+                            [corner[1], atom[1]],
+                            [corner[0], atom[0]],
+                            color=reference_atom_colour,
+                            linewidth=linewidth,
+                            alpha=alpha_reference_boundary,
+                            zorder=zorder_reference_atoms,
+                        )
+
+                # FIRST: Plot all OTHER phases as gray shadows
+                for other_phase_idx in range(num_phases):
+                    if other_phase_idx == phase_idx:
+                        continue  # Skip the current phase
+
+                    phase_positions_other = pol_atom_pos[:, other_phase_idx, :]
+
+                    # Plot shadow atoms
+                    ax.scatter(
+                        phase_positions_other[:, 1],
+                        phase_positions_other[:, 0],
+                        c="gray",
+                        s=atom_size,
+                        alpha=alpha_shadow_atom,
+                        zorder=zorder_shadow_atom,
+                        edgecolor="darkgray",
+                        linewidth=0.5,
+                    )
+
+                    # Draw shadow lines to corners
+                    for corner in corner_pos:
+                        for phase_atom in phase_positions_other:
+                            ax.plot(
+                                [corner[1], phase_atom[1]],
+                                [corner[0], phase_atom[0]],
+                                color="gray",
+                                linewidth=linewidth,
+                                alpha=alpha_shadow_boundary,
+                                zorder=zorder_shadow_boundary,
+                            )
+
+                    # Draw shadow arrows using FancyArrowPatch
+                    for j in range(measured_atom_pos.shape[0]):
+                        shadow_arrow = FancyArrowPatch(
+                            (measured_atom_pos[j, 1], measured_atom_pos[j, 0]),  # Start point
+                            (
+                                phase_positions_other[j, 1],
+                                phase_positions_other[j, 0],
+                            ),  # End point
+                            arrowstyle=shadow_arrowstyle,
+                            mutation_scale=1.0,
+                            facecolor="gray",
+                            edgecolor="gray",
+                            alpha=alpha_shadow_arrow,
+                            zorder=zorder_shadow_arrow,
+                            capstyle="round",
+                            joinstyle="round",
+                            shrinkA=0.0,
+                            shrinkB=0.0,
+                        )
+                        ax.add_patch(shadow_arrow)
+
+                # THEN: Plot only this phase (highlighted)
+                phase_positions = pol_atom_pos[:, phase_idx, :]
+                phase_color = scatter_colours[phase_idx]
+
+                # Plot phase atoms with scatter_colours using color_override
+                fig, ax = plot_atoms_2d(
+                    phase_positions,
+                    site_number=phase_idx,
+                    fig=fig,
+                    ax=ax,
+                    size=atom_size,
+                    alpha=alpha_phase_atom,
+                    zorder=zorder_phase_atom,
+                    color_override=phase_color,
+                )
+
+                for corner in corner_pos:
+                    for phase_atom in phase_positions:
+                        ax.plot(
+                            [corner[1], phase_atom[1]],
+                            [corner[0], phase_atom[0]],
+                            color=phase_color,
+                            linewidth=linewidth,
+                            alpha=alpha_phase_boundary,
+                            zorder=zorder_phase_boundary,
+                        )
+
+                # Draw arrows using FancyArrowPatch
+                for j in range(measured_atom_pos.shape[0]):
+                    arrow = FancyArrowPatch(
+                        (measured_atom_pos[j, 1], measured_atom_pos[j, 0]),  # Start point
+                        (phase_positions[j, 1], phase_positions[j, 0]),  # End point
+                        arrowstyle=phase_arrowstyle,
+                        mutation_scale=1.0,
+                        facecolor=phase_color,
+                        edgecolor=reference_atom_colour,
+                        alpha=alpha_phase_arrow,
+                        zorder=zorder_phase_arrow,
+                        capstyle="round",
+                        joinstyle="round",
+                        shrinkA=0.0,
+                        shrinkB=0.0,
+                    )
+                    ax.add_patch(arrow)
+
+            # Get the axis limits
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+
+            # Draw rectangle border
+            rect = Rectangle(
+                (xlim[0], ylim[0]),
+                xlim[1] - xlim[0],
+                ylim[1] - ylim[0],
+                linewidth=linewidth,
+                edgecolor="black",
+                facecolor="none",
+                zorder=100,
+            )
+            ax.add_patch(rect)
+
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f"Phase {phase_idx}", fontsize=14, fontweight="bold")
+
+        # plt.tight_layout()
+        for ax in axes:
+            ax.invert_xaxis()  # Flip horizontally
+        plt.show()
+
+    def plot_polarization_legend(self, figax: tuple[Any, Any] | None = None, **kwargs):
+        """
+        Simple visualization showing measured, reference, and other positions.
+
+        Parameters:
+        -----------
+        figax : tuple, optional
+            (fig, axs) tuple to use for plotting. If None, a new figure and axes are created.
+        **kwargs : optional
+            atom_size : float
+                Size of atoms (default: 150)
+            linewidth : float
+                Width of cell boundary lines (default: 2.0)
+            measured_color : str or tuple
+                Color for measured atoms (default: 'red')
+            reference_color : str or tuple
+                Color for reference atoms (default: 'blue')
+            other_color : str or tuple
+                Color for other atoms (default: 'gray')
+            alpha : float
+                Transparency (default: 0.8)
+            figsize : tuple
+                Figure size (default: (4, 4))
+        """
+        from matplotlib.patches import Patch, Rectangle
+
+        # Extract parameters
+        atom_size = kwargs.get("atom_size", 150)
+        linewidth = kwargs.get("linewidth", 2.0)
+        measured_color = kwargs.get("measured_color", (1.00, 0.00, 0.00))
+        reference_color = kwargs.get("reference_color", (0.00, 0.70, 1.00))
+        other_color = kwargs.get("other_color", (1.00, 1.00, 1.00))
+        alpha = kwargs.get("alpha", 0.8)
+        figsize = kwargs.get("figsize", (4, 4))
+
+        # Get stored information
+        r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
+        frac_positions = self._positions_frac
+        measure_ind = self._pol_meas_ref_ind[0]
+        reference_ind = self._pol_meas_ref_ind[1]
+
+        A = np.column_stack((u, v))
+        corner_ind = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+
+        # Get reference, measured, and other atoms
+        reference_atom_ind = frac_positions[np.arange(len(frac_positions)) == reference_ind]
+        measured_atom_ind = frac_positions[np.arange(len(frac_positions)) == measure_ind]
+        other_atom_ind = frac_positions[
+            (np.arange(len(frac_positions)) != measure_ind)
+            & (np.arange(len(frac_positions)) != reference_ind)
+        ]
+
+        # Tile to get all sites in 1 unit cell
+        reference_atom_ind = (reference_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
+            -1, 2
+        )
+        measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+        other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+
+        # Remove atoms outside unit cell
+        reference_atom_ind = reference_atom_ind[
+            ~np.any((reference_atom_ind < -0.1) | (reference_atom_ind > 1.1), axis=1)
+        ]
+        measured_atom_ind = measured_atom_ind[
+            ~np.any((measured_atom_ind < -0.1) | (measured_atom_ind > 1.1), axis=1)
+        ]
+        other_atom_ind = other_atom_ind[
+            ~np.any((other_atom_ind < -0.1) | (other_atom_ind > 1.1), axis=1)
+        ]
+
+        # Convert to Cartesian coordinates
+        reference_atom_pos = reference_atom_ind @ A.T
+        measured_atom_pos = measured_atom_ind @ A.T
+        other_atom_pos = other_atom_ind @ A.T
+
+        # Create figure
+        if figax is not None:
+            fig, ax = figax
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+
+        # Plot the three sets of positions using plot_atoms_2d
+        if len(other_atom_pos) > 0:
+            fig, ax = plot_atoms_2d(
+                other_atom_pos,
+                site_number=-1,
+                fig=fig,
+                ax=ax,
+                size=atom_size,
+                alpha=alpha * 0.5,
+                zorder=1,
+                color_override=other_color,
+            )
+
+        fig, ax = plot_atoms_2d(
+            reference_atom_pos,
+            site_number=1,
+            fig=fig,
+            ax=ax,
+            size=atom_size,
+            alpha=alpha,
+            zorder=2,
+            color_override=reference_color,
+        )
+
+        fig, ax = plot_atoms_2d(
+            measured_atom_pos,
+            site_number=0,
+            fig=fig,
+            ax=ax,
+            size=atom_size,
+            alpha=alpha,
+            zorder=3,
+            color_override=measured_color,
+        )
+
+        # Plot unit cell boundary
+        corner_pos = corner_ind @ A.T
+        edges = [(0, 1), (0, 2), (1, 3), (2, 3)]
+        for i, j in edges:
+            ax.plot(
+                [corner_pos[i, 1], corner_pos[j, 1]],
+                [corner_pos[i, 0], corner_pos[j, 0]],
+                "k-",
+                linewidth=2,
+                zorder=0,
+            )
+
+        # Add legend
+        legend_elements = [
+            Patch(facecolor=measured_color, edgecolor="black", label="Measured"),
+            Patch(facecolor=reference_color, edgecolor="black", label="Reference"),
+        ]
+        if len(other_atom_pos) > 0:
+            legend_elements.append(Patch(facecolor=other_color, edgecolor="black", label="Other"))
+
+        ax.legend(handles=legend_elements, loc="best", fontsize=12, framealpha=0.9)
+
+        # Formatting
+        ax.set_aspect("equal")
+        ax.invert_xaxis()
+
+        # Get the axis limits
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+
+        # Draw rectangle border
+        rect = Rectangle(
+            (xlim[0], ylim[0]),
+            xlim[1] - xlim[0],
+            ylim[1] - ylim[0],
+            linewidth=linewidth,
+            edgecolor="black",
+            facecolor="none",
+            zorder=100,
+        )
+        ax.add_patch(rect)
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title("Atom Positions", fontsize=14, fontweight="bold")
+
+        plt.tight_layout()
+        plt.show()
+
+        return fig, ax
+
 
 # Implementing GMM using Torch (don't want skimage as a dependency)
 class TorchGMM:
@@ -2532,6 +3360,7 @@ class TorchGMM:
         n_components,
         covariance_type="full",
         means_init=None,
+        fix_means_mask=None,
         tol=1e-4,
         max_iter=200,
         reg_covar=1e-6,
@@ -2549,6 +3378,7 @@ class TorchGMM:
 
         self.covariance_type = covariance_type
         self.means_init = None if means_init is None else np.asarray(means_init, dtype=np.float32)
+        self.fix_means_mask = fix_means_mask
         self.tol = abs(float(tol))  # Also handle negative tolerance
         self.reg_covar = float(reg_covar)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -3097,3 +3927,223 @@ def add_3phase_color_triangle(fig, ax, scatter_colours):
     triangle_ax.set_title("Probability Map", fontsize=11, pad=10)
 
     return triangle_ax
+
+
+def plot_atoms_2d(
+    coords,
+    site_number,
+    fig=None,
+    ax=None,
+    size=150,
+    zorder=5,
+    alpha=1.0,
+    coords_in_xy: bool = False,
+    **kwargs,
+):
+    """
+    2D version of plot_atoms that can be called multiple times on the same figure.
+
+    Parameters:
+    -----------
+    coords : array
+        Atom coordinates as N x 2 array (row, col positions)
+    site_number : int or array
+        Site number(s) to pass to site_colors() for coloring.
+        If int, all atoms use the same color.
+        If array, must have length N (one color per atom).
+    fig : matplotlib.figure.Figure, optional
+        Existing figure to plot on. If None, creates new figure.
+    ax : matplotlib.axes.Axes, optional
+        Existing axes to plot on. If None, creates new axes.
+    size : float, optional
+        Base size for atoms. All layer sizes are scaled by this factor. Default is 150.
+    zorder : int, optional
+        Drawing order for layering. Higher values draw on top. Default is 5.
+    alpha : float, optional
+        Transparency of markers. Default is 1.0.
+    coords_in_xy : bool, optional
+        If True, input coords are in (x,y) format;
+        If False, input coords are in (row,col) format. Default is False.
+    **kwargs : optional keyword arguments
+        color_override : tuple or array, optional
+            If provided, overrides site_colors. Can be:
+            - Single RGB tuple (r, g, b) to apply to all atoms
+            - Array of shape (3,) for single color
+            - Array of shape (N, 3) for per-atom colors
+        bg_color : array-like, default (1.0, 1.0, 1.0)
+            Background color for depth cueing as RGB tuple
+        bg_power_law : float, default 1.5
+            Power law exponent for depth cueing falloff
+        bg_scale : float, default 0.15
+            Scale factor for depth cueing effect (0 = no effect, 1 = full effect)
+        cam_pos : array-like, default (0.0, 0.0, 1000.0)
+            Camera position for depth calculation
+        layer_offsets : array-like, default [[0.00, 0.0], [0.05, 0.0], ...]
+            XY offsets for each layer (first 2 columns of data array)
+        layer_shading : array-like, default [0.00, 0.25, 0.50, 0.75, 1.00, 0.00]
+            Shading values for each layer
+        layer_tinting : array-like, default [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+            Tinting values for each layer
+        layer_sizes : array-like, default [100, 80, 60, 40, 20, 4]
+            Relative marker sizes for each layer (scaled by 'size' parameter)
+        layer_linewidths : array-like, default [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            Edge linewidths for each layer
+        tint_color : array-like, default (1.0, 1.0, 1.0)
+            Color used for tinting (white highlights)
+        edge_color : tuple, default (0, 0, 0)
+            Color of marker edges
+        figsize : tuple, default (8, 8)
+            Figure size if creating new figure
+
+    Returns:
+    --------
+    fig, ax : tuple
+        The figure and axes objects for reuse
+    """
+    # Convert to numpy array and ensure correct shape
+    coords = np.asarray(coords)
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError(f"coords must be an N x 2 array, got shape {coords.shape}")
+
+    num_atoms = coords.shape[0]
+
+    # Extract customizable parameters from kwargs with defaults
+    bg_color = np.array(kwargs.get("bg_color", (1.0, 1.0, 1.0)))
+    bg_power_law = kwargs.get("bg_power_law", 1.5)
+    bg_scale = kwargs.get("bg_scale", 0.15)
+    cam_pos = np.array(kwargs.get("cam_pos", (0.0, 0.0, 1000.0)))
+
+    # Layer appearance parameters
+    layer_offsets = kwargs.get(
+        "layer_offsets",
+        [
+            [0.00, 0.0],
+            [0.05, 0.0],
+            [0.10, 0.0],
+            [0.15, 0.0],
+            [0.20, 0.0],
+            [0.25, 0.0],
+        ],
+    )
+    layer_shading = kwargs.get("layer_shading", [0.00, 0.25, 0.50, 0.75, 1.00, 0.00])
+    layer_tinting = kwargs.get("layer_tinting", [0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    layer_sizes = kwargs.get("layer_sizes", [100, 80, 60, 40, 20, 4])
+    layer_linewidths = kwargs.get("layer_linewidths", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    tint_color = np.array(kwargs.get("tint_color", (1.0, 1.0, 1.0)))
+    edge_color = kwargs.get("edge_color", (0, 0, 0))
+    figsize = kwargs.get("figsize", (8, 8))
+
+    # Check for color override
+    color_override = kwargs.get("color_override", None)
+
+    # Build data array from layer parameters
+    num_layers = len(layer_sizes)
+    data = np.zeros((num_layers, 7))
+
+    for i in range(num_layers):
+        data[i, 0:2] = layer_offsets[i] if i < len(layer_offsets) else [0.0, 0.0]
+        data[i, 2] = 0.0  # dz (always 0 for 2D)
+        data[i, 3] = layer_shading[i] if i < len(layer_shading) else 0.0
+        data[i, 4] = layer_tinting[i] if i < len(layer_tinting) else 0.0
+        # Scale layer sizes by base_size (now using 'size' parameter)
+        data[i, 5] = (layer_sizes[i] if i < len(layer_sizes) else 100) * (size / 100.0)
+        data[i, 6] = layer_linewidths[i] if i < len(layer_linewidths) else 0.0
+
+    # atoms_rgb_size stores: [x, y, z, r, g, b, size, linewidth]
+    atoms_rgb_size = np.zeros((8, num_atoms * data.shape[0]))
+
+    # Get colors - use override if provided, otherwise use site_colors
+    if color_override is not None:
+        color_override = np.asarray(color_override)
+
+        # Handle different shapes of color_override
+        if color_override.ndim == 1 and len(color_override) == 3:
+            # Single RGB color for all atoms
+            base_colors = np.tile(color_override[:, None], (1, num_atoms))
+        elif color_override.shape == (num_atoms, 3):
+            # Per-atom colors
+            base_colors = color_override.T  # Shape: (3, num_atoms)
+        elif color_override.shape == (3, num_atoms):
+            # Already in correct shape
+            base_colors = color_override
+        else:
+            raise ValueError(
+                f"color_override must be shape (3,), (num_atoms, 3), or (3, num_atoms), got {color_override.shape}"
+            )
+    else:
+        # Use site_colors function
+        base_colors = site_colors(site_number)
+
+        # If site_number is a single value, expand to match all atoms
+        if isinstance(site_number, (int, np.integer)) or (
+            isinstance(site_number, np.ndarray) and site_number.ndim == 0
+        ):
+            base_colors = np.tile(np.array(base_colors)[:, None], (1, num_atoms))
+        else:
+            # site_number is an array
+            site_number = np.asarray(site_number)
+            if len(site_number) != num_atoms:
+                raise ValueError(
+                    f"site_number array length ({len(site_number)}) must match number of atoms ({num_atoms})"
+                )
+            base_colors = base_colors.T  # Shape: (3, num_atoms)
+
+    for a0 in range(data.shape[0]):
+        inds = np.arange(num_atoms) + a0 * num_atoms
+
+        # Set x, y coordinates (with offset from data)
+        atoms_rgb_size[0, inds] = coords[:, 0] + data[a0, 0]
+        atoms_rgb_size[1, inds] = coords[:, 1] + data[a0, 1]
+        atoms_rgb_size[2, inds] = 0.0 + data[a0, 2]  # z = 0 for 2D
+
+        atoms_rgb_size[6, inds] = data[a0, 5]  # size
+        atoms_rgb_size[7, inds] = data[a0, 6]  # linewidth
+
+        # Coloring logic using base_colors (either from site_colors or color_override)
+        c = base_colors * data[a0, 3] + tint_color[:, None] * data[a0, 4]
+        atoms_rgb_size[3:6, inds] = c
+
+    # Apply depth cueing
+    dist = np.sqrt(np.sum((atoms_rgb_size[0:3, :] - cam_pos[:, None]) ** 2, axis=0))
+    dist -= np.min(dist)
+    if np.max(dist) > 0:  # Avoid division by zero
+        dist /= np.max(dist)  # scale to be 0 to 1
+    dist **= bg_power_law
+    dist *= bg_scale
+    atoms_rgb_size[3:6, :] = atoms_rgb_size[3:6, :] * (1 - dist) + bg_color[:, None] * dist
+
+    # Create figure and axes if not provided
+    if fig is None or ax is None:
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111)
+
+    # Atomic sites - 2D scatter plot
+    if coords_in_xy:
+        ax.scatter(
+            atoms_rgb_size[0, :],
+            atoms_rgb_size[1, :],
+            c=atoms_rgb_size[3:6, :].T,
+            s=atoms_rgb_size[6, :],
+            linewidth=atoms_rgb_size[7, :],
+            edgecolor=edge_color,
+            alpha=alpha,
+            zorder=zorder,
+        )
+    else:
+        ax.scatter(
+            atoms_rgb_size[1, :],
+            atoms_rgb_size[0, :],
+            c=atoms_rgb_size[3:6, :].T,
+            s=atoms_rgb_size[6, :],
+            linewidth=atoms_rgb_size[7, :],
+            edgecolor=edge_color,
+            alpha=alpha,
+            zorder=zorder,
+        )
+
+    # Plot appearance
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    return fig, ax
