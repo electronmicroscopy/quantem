@@ -179,6 +179,12 @@ class OptimizerMixin:
                 end_factor=params.get("end_factor", 1.0),
                 total_iters=params.get("total_iters", num_iter),
             )
+        elif sched_type == "cosine_annealing":
+            self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=params.get("T_max", num_iter),
+                eta_min=params.get("eta_min", base_LR),
+            )
         else:
             raise ValueError(f"Unknown scheduler type: {sched_type}")
 

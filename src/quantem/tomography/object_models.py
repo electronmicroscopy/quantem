@@ -11,6 +11,7 @@ import torch.nn as nn
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
+from quantem.core.ml.loss_functions import get_loss_function
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
@@ -113,6 +114,13 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
         def obj(self) -> torch.Tensor:
             """
             Returns the object, should be implemented in subclasses.
+            """
+            raise NotImplementedError
+
+        @abstractmethod
+        def dtype(self) -> torch.dtype:
+            """
+            Returns the dtype of the object.
             """
             raise NotImplementedError
 
@@ -359,6 +367,14 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """set the pretrain target"""
         self._pretrain_target = target
 
+    @property
+    def dtype(self) -> torch.dtype:
+        """
+        Returns the dtype of the object.
+        """
+        # TODO: This is a temporary solution to get the dtype of the object.
+        return torch.float32
+
     # --- Helper Functions ---
 
     # Reset method that goes back to the pretrained weights.
@@ -426,10 +442,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 "TODO: Resseting the model to the pretrained weights is not implemented yet. To make this work I would have to reinstantiate the model I think."
             )
 
-        if loss_fn == "l1":
-            loss_fn = nn.functional.l1_loss
-        elif loss_fn == "l2":
-            loss_fn = nn.functional.mse_loss
+        loss_fn = get_loss_function(loss_fn, self.dtype)
 
         self._pretrain(
             num_iters=num_iters,
