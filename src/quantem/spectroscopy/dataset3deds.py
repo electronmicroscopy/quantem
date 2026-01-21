@@ -64,6 +64,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         self,
         energy_range=None,
         elements_to_fit=None,
+        peak_width=0.1,
         num_iters=1000,
         lr=0.01,
         polynomial_background_degree=3,
@@ -90,12 +91,11 @@ class Dataset3deds(Dataset3dspectroscopy):
         # initialize
         background = PolynomialBackground(energy_axis, degree=polynomial_background_degree)
 
-        peaks = GaussianPeaks(energy_axis, elements_to_fit=elements_to_fit)
+        peaks = GaussianPeaks(energy_axis, peak_width=peak_width, elements_to_fit=elements_to_fit)
         model = EDSModel(peaks, background, energy_axis=energy_axis)
 
         with torch.no_grad():
             model.peak_model.concentrations.fill_((1))
-            model.peak_model.peak_width.fill_(0.1)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         loss_fn = nn.MSELoss()
@@ -119,7 +119,16 @@ class Dataset3deds(Dataset3dspectroscopy):
             final_pred = model().detach().numpy() * spectrum_max.numpy() + spectrum_min.numpy()
             concs = nn.functional.softplus(model.peak_model.concentrations).detach().numpy()
 
-            print(f"\nFinal: width={model.peak_model.peak_width.item():.3f} keV")
+            final_fwhm = (
+                torch.nn.functional.softplus(model.peak_model.peak_width_by_peak)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            print(
+                f"\nFinal: width median={np.median(final_fwhm):.3f} keV, "
+                f"min={final_fwhm.min():.3f}, max={final_fwhm.max():.3f}"
+            )
 
             # Sort and show top N
             top_n = np.max((10, len(elements_to_fit)))

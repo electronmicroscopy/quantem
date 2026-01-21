@@ -24,14 +24,18 @@ class EDSModel(nn.Module):
 class GaussianPeaks(nn.Module):
     """Generate Gaussian peaks from peak library"""
 
-    def __init__(self, energy_axis, elements_to_fit=None):
+    def __init__(self, energy_axis, peak_width, elements_to_fit=None):
         super().__init__()
 
         current_dir = Path(__file__).parent
         with open(current_dir / "xray_lines.json", "r") as f:
             data = json.load(f)
 
-        self.energy_axis = torch.tensor(energy_axis, dtype=torch.float32)
+        self.energy_axis = (
+            energy_axis.float()
+            if torch.is_tensor(energy_axis)
+            else torch.tensor(energy_axis, dtype=torch.float32)
+        )
         self.energy_min = self.energy_axis.min().item()
         self.energy_max = self.energy_axis.max().item()
 
@@ -84,19 +88,23 @@ class GaussianPeaks(nn.Module):
         self.peak_weights = torch.tensor(all_peak_weights, dtype=torch.float32)
         self.peak_element_indices = torch.tensor(all_peak_element_indices, dtype=torch.long)
         self.n_peaks = len(all_peak_energies)
+        init_fwhm = torch.tensor(peak_width, dtype=torch.float32)
+        self.peak_width_by_peak = nn.Parameter(
+            torch.log(torch.expm1(init_fwhm)) * torch.ones(self.n_peaks)
+        )
 
         print(f"Fitting {n_elements} elements with {self.n_peaks} total peaks")
 
         # Learnable parameters
         self.concentrations = nn.Parameter((torch.ones(n_elements)))
-        self.peak_width = nn.Parameter(torch.tensor(0.13))
 
     def forward(self):
         """Vectorized forward pass"""
         centers = self.peak_energies.unsqueeze(1)
         energies = self.energy_axis.unsqueeze(0)
 
-        sigma = self.peak_width / 2.355
+        fwhm = nn.functional.softplus(self.peak_width_by_peak)  # (n_peaks,)
+        sigma = (fwhm / 2.355).unsqueeze(1)
 
         all_peaks = torch.exp(-0.5 * ((energies - centers) / sigma) ** 2)
 
@@ -117,7 +125,11 @@ class PolynomialBackground(nn.Module):
 
     def __init__(self, energy_axis, degree=3):
         super().__init__()
-        self.energy_axis = torch.tensor(energy_axis, dtype=torch.float32)
+        self.energy_axis = (
+            energy_axis.float()
+            if torch.is_tensor(energy_axis)
+            else torch.tensor(energy_axis, dtype=torch.float32)
+        )
         self.degree = degree
 
         # Normalize energy axis to [0, 1] for numerical stability
@@ -139,7 +151,11 @@ class ExponentialBackground(nn.Module):
 
     def __init__(self, energy_axis):
         super().__init__()
-        self.energy_axis = torch.tensor(energy_axis, dtype=torch.float32)
+        self.energy_axis = (
+            energy_axis.float()
+            if torch.is_tensor(energy_axis)
+            else torch.tensor(energy_axis, dtype=torch.float32)
+        )
 
         self.amplitude = nn.Parameter(torch.tensor(1.0))
         self.decay = nn.Parameter(torch.tensor(0.5))
