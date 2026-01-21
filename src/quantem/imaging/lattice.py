@@ -729,8 +729,8 @@ class Lattice(AutoSerialize):
 
         self.atoms = Vector.from_shape(
             shape=(self._num_sites,),
-            fields=("x", "y", "a", "b", "int_peak"),
-            units=("px", "px", "ind", "ind", "counts"),
+            fields=["x", "y", "a", "b", "int_peak"],
+            units=["px", "px", "ind", "ind", "counts"],
         )
 
         for a0 in range(self._num_sites):
@@ -1152,8 +1152,8 @@ class Lattice(AutoSerialize):
         self._pol_meas_ref_ind = (measure_ind, reference_ind)
 
         # Prepare a Vector with structured dtype (even for empty data)
-        fields = ("x", "y", "a", "b", "da", "db")
-        units = ("px", "px", "ind", "ind", "ind", "ind")
+        fields = ["x", "y", "a", "b", "da", "db"]
+        units = ["px", "px", "ind", "ind", "ind", "ind"]
 
         def empty_vector():
             out = Vector.from_shape(
@@ -1362,8 +1362,8 @@ class Lattice(AutoSerialize):
 
         out = Vector.from_shape(
             shape=(1,),
-            fields=("x", "y", "a", "b", "da", "db"),
-            units=("px", "px", "ind", "ind", "ind", "ind"),
+            fields=["x", "y", "a", "b", "da", "db"],
+            units=["px", "px", "ind", "ind", "ind", "ind"],
             name="polarization",
         )
 
