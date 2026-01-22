@@ -79,6 +79,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._reference_tilt_angle_idx = torch.argmin(torch.abs(self.tilt_angles))
         # TODO: Implement AuxParams from old tomography_dataset.py here.
 
+        self.z1_param = torch
+
     @abstractmethod
     def forward(
         self,
@@ -86,6 +88,32 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     ):
         """
         Forward pass should be implemented in subclasses.
+        """
+        raise NotImplementedError("This method should be implemented in subclasses.")
+
+    # --- Properties ---
+    @property
+    def reference_tilt_idx(self) -> int:
+        return self._reference_tilt_angle_idx
+
+    @reference_tilt_idx.setter
+    def reference_tilt_idx(self, reference_tilt_idx: int):
+        self._reference_tilt_angle_idx = reference_tilt_idx
+
+    @property
+    def learnable_tilts(self) -> int:
+        return self.tilt_angles.shape[0] - 1
+
+    @learnable_tilts.setter
+    def learnable_tilts(self, learnable_tilts: int):
+        self._learnable_tilts = learnable_tilts
+
+    @property
+    def params(self) -> dict[str, torch.nn.Parameter]:
+        """
+        Returns the parameters that should be optimized for this dataset.
+
+        Should be implemented in subclasses.
         """
         raise NotImplementedError("This method should be implemented in subclasses.")
 
@@ -148,6 +176,8 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
 
     The two main methods here are that the `forward` call will return the relative pose parameters,
     while `__getitem__` will actually return the pixel values of the tilt stack.
+
+    TODO: I think TomographyINRDataset shouldn't handle the train/val split and will be handled later? Yea this is handled in setup_dataloader in DDP
     """
 
     def __init__(
@@ -155,26 +185,12 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
         learn_pose: bool = True,
-        val_ratio: float = 0.0,
-        mode: Literal["train", "val"] = "train",
         seed: int = 42,
         token: object | None = None,
     ):
         super().__init__(tilt_stack, tilt_angles, learn_pose, token)
 
-        self._total_pixels = self.volume_size[0] * self.volume_size[1] * self.volume_size[2]
-
-        # Create train/val split
-        torch.manual_seed(seed)
-        all_indices = torch.randperm(self.total_pixels)
-
-        num_val = int(self.total_pixels * val_ratio)
-        if mode == "val":
-            self.indices = all_indices[:num_val]
-        else:  # train
-            self.indices = all_indices[num_val:]
-
-        self._mode = mode
+        self.z1_param = torch.nn.Parameter(torch.zeros(self.learnable_tilts))
 
     def forward(self, dummy_input: Any = None):
         """

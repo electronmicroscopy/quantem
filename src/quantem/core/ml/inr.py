@@ -116,7 +116,7 @@ class Siren(nn.Module):
                     torch.randn_like(self.net[0].linear.weight) * 1 / self.first_omega_0
                 )
                 self.net[1].linear.weight += (
-                    torch.randn_like(self.net[1].linear.weight) * 0.01 / self.hidden_omega_0
+                    torch.randn_like(self.net[1].linear.weight) * 0.1 / self.hidden_omega_0
                 )
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:

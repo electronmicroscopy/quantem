@@ -559,8 +559,33 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
             self._obj = pred_full.detach().cpu()
 
-    def get_tv_loss(self):
-        pass
+    def get_tv_loss(
+        self,
+        coords: torch.Tensor,
+    ):
+        tv_loss = torch.tensor(0.0, device=coords.device)
+
+        num_tv_samples = min(10000, coords.shape[0])
+        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+
+        tv_coords = coords[tv_indices].detach().requires_grad_(True)
+
+        tv_densities_recomputed = self.forward(tv_coords)
+
+        if tv_densities_recomputed.dim() > 1:
+            tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+
+        grad_outputs = torch.autograd.grad(
+            outputs=tv_densities_recomputed,
+            inputs=tv_coords,
+            grad_outputs=torch.ones_like(tv_densities_recomputed),
+            create_graph=True,
+        )[0]
+
+        grad_norm = torch.norm(grad_outputs, dim=1)
+
+        tv_loss += self.constraints.tv_vol * grad_norm.mean()
+        return tv_loss
 
 
 ObjectModelType = ObjectPixelated | ObjectINR
