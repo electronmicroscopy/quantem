@@ -9,6 +9,7 @@ import MenuItem from "@mui/material/MenuItem";
 import Slider from "@mui/material/Slider";
 import Button from "@mui/material/Button";
 import Switch from "@mui/material/Switch";
+import Tooltip from "@mui/material/Tooltip";
 import JSZip from "jszip";
 import "./styles.css";
 
@@ -201,15 +202,6 @@ function fftshift(data: Float32Array, width: number, height: number): void {
   data.set(temp);
 }
 
-function applyBandPassFilter(real: Float32Array, imag: Float32Array, width: number, height: number, innerRadius: number, outerRadius: number) {
-  const centerX = width >> 1, centerY = height >> 1;
-  const innerSq = innerRadius * innerRadius, outerSq = outerRadius * outerRadius;
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-    const distSq = (x - centerX) ** 2 + (y - centerY) ** 2;
-    if (distSq < innerSq || (outerRadius > 0 && distSq > outerSq)) { real[y * width + x] = 0; imag[y * width + x] = 0; }
-  }
-}
-
 // ============================================================================
 // WebGPU FFT - GPU-accelerated FFT when available
 // ============================================================================
@@ -380,6 +372,10 @@ const compactButton = {
   py: 0.25,
   px: 1,
   minWidth: 0,
+  "&.Mui-disabled": {
+    color: "#666",
+    borderColor: "#444",
+  },
 };
 
 // Control row style - bordered container for each row
@@ -1025,6 +1021,52 @@ interface HistogramProps {
   width?: number;
   height?: number;
   theme?: "light" | "dark";
+  dataMin?: number;
+  dataMax?: number;
+}
+
+/**
+ * Info tooltip component - small ⓘ icon with hover tooltip
+ */
+function InfoTooltip({ text, theme = "dark" }: { text: string; theme?: "light" | "dark" }) {
+  const isDark = theme === "dark";
+  return (
+    <Tooltip
+      title={<Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>{text}</Typography>}
+      arrow
+      placement="bottom"
+      componentsProps={{
+        tooltip: {
+          sx: {
+            bgcolor: isDark ? "#333" : "#fff",
+            color: isDark ? "#ddd" : "#333",
+            border: `1px solid ${isDark ? "#555" : "#ccc"}`,
+            maxWidth: 280,
+            p: 1,
+          },
+        },
+        arrow: {
+          sx: {
+            color: isDark ? "#333" : "#fff",
+            "&::before": { border: `1px solid ${isDark ? "#555" : "#ccc"}` },
+          },
+        },
+      }}
+    >
+      <Typography
+        component="span"
+        sx={{
+          fontSize: 12,
+          color: isDark ? "#888" : "#666",
+          cursor: "help",
+          ml: 0.5,
+          "&:hover": { color: isDark ? "#aaa" : "#444" },
+        }}
+      >
+        ⓘ
+      </Typography>
+    </Tooltip>
+  );
 }
 
 /**
@@ -1039,7 +1081,9 @@ function Histogram({
   onRangeChange,
   width = 120,
   height = 40,
-  theme = "dark"
+  theme = "dark",
+  dataMin = 0,
+  dataMax = 1,
 }: HistogramProps) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
   const bins = React.useMemo(() => computeHistogramFromBytes(data), [data]);
@@ -1122,12 +1166,18 @@ function Histogram({
         min={0}
         max={100}
         size="small"
+        valueLabelDisplay="auto"
+        valueLabelFormat={(pct) => {
+          const val = dataMin + (pct / 100) * (dataMax - dataMin);
+          return val >= 1000 ? val.toExponential(1) : val.toFixed(1);
+        }}
         sx={{
           width,
           py: 0,
           "& .MuiSlider-thumb": { width: 8, height: 8 },
           "& .MuiSlider-rail": { height: 2 },
           "& .MuiSlider-track": { height: 2 },
+          "& .MuiSlider-valueLabel": { fontSize: 10, padding: "2px 4px" },
         }}
       />
     </Box>
@@ -1218,9 +1268,9 @@ function Show4DSTEM() {
   const [viVmaxPct, setViVmaxPct] = React.useState(100);
   // Scale mode: "linear" | "log" | "power"
   const [dpScaleMode, setDpScaleMode] = React.useState<"linear" | "log" | "power">("linear");
-  const [dpPowerExp, setDpPowerExp] = React.useState(0.5);
+  const dpPowerExp = 0.5;
   const [viScaleMode, setViScaleMode] = React.useState<"linear" | "log" | "power">("linear");
-  const [viPowerExp, setViPowerExp] = React.useState(0.5);
+  const viPowerExp = 0.5;
 
   // VI ROI state (real-space region selection for summed DP) - synced with Python
   const [viRoiMode, setViRoiMode] = useModelState<string>("vi_roi_mode");
@@ -1236,6 +1286,7 @@ function Show4DSTEM() {
   const [summedDpCount] = useModelState<number>("summed_dp_count");
   const [dpStats] = useModelState<number[]>("dp_stats");  // [mean, min, max, std]
   const [viStats] = useModelState<number[]>("vi_stats");  // [mean, min, max, std]
+  const [hotPixelFilter, setHotPixelFilter] = useModelState<boolean>("hot_pixel_filter");
   const [showFft, setShowFft] = React.useState(false);  // Hidden by default per feedback
 
   // Theme detection - detect environment and light/dark mode
@@ -1308,11 +1359,6 @@ function Show4DSTEM() {
     }
     setDpHistogramData(scaledData);
   }, [frameBytes, dpScaleMode, dpPowerExp]);
-
-  // Band-pass filter range [innerCutoff, outerCutoff] in pixels - [0, 0] means disabled
-  const [bandpass, setBandpass] = React.useState<number[]>([0, 0]);
-  const bpInner = bandpass[0];
-  const bpOuter = bandpass[1];
 
   // GPU FFT state
   const gpuFFTRef = React.useRef<WebGPUFFT | null>(null);
@@ -1407,6 +1453,15 @@ function Show4DSTEM() {
   const [fftZoom, setFftZoom] = React.useState(1);
   const [fftPanX, setFftPanX] = React.useState(0);
   const [fftPanY, setFftPanY] = React.useState(0);
+  const [fftScaleMode, setFftScaleMode] = React.useState<"linear" | "log" | "power">("linear");
+  const [fftColormap, setFftColormap] = React.useState("inferno");
+  const [fftAuto, setFftAuto] = React.useState(true);  // Auto: mask DC + 99.9% clipping
+  const [fftVminPct, setFftVminPct] = React.useState(0);
+  const [fftVmaxPct, setFftVmaxPct] = React.useState(100);
+  const [fftStats, setFftStats] = React.useState<number[] | null>(null);  // [mean, min, max, std]
+  const [fftHistogramData, setFftHistogramData] = React.useState<Float32Array | null>(null);
+  const [fftDataMin, setFftDataMin] = React.useState(0);
+  const [fftDataMax, setFftDataMax] = React.useState(1);
 
   // Sync local state
   React.useEffect(() => {
@@ -1459,8 +1514,6 @@ function Show4DSTEM() {
 
   // Store raw data for filtering/FFT
   const rawVirtualImageRef = React.useRef<Float32Array | null>(null);
-  const viWorkRealRef = React.useRef<Float32Array | null>(null);
-  const viWorkImagRef = React.useRef<Float32Array | null>(null);
   const fftWorkRealRef = React.useRef<Float32Array | null>(null);
   const fftWorkImagRef = React.useRef<Float32Array | null>(null);
   const fftMagnitudeRef = React.useRef<Float32Array | null>(null);
@@ -1684,70 +1737,9 @@ function Show4DSTEM() {
       ctx.restore();
     };
 
-    if (bpInner > 0 || bpOuter > 0) {
-      if (gpuFFTRef.current && gpuReady) {
-        // GPU filtering (Async)
-        const real = rawVirtualImageRef.current.slice();
-        const imag = new Float32Array(real.length);
-
-        // We use a local flag to prevent state updates if the effect has already re-run
-        let isCancelled = false;
-
-        const runGpuFilter = async () => {
-          // WebGPU version of: Forward -> Filter -> Inverse
-          // Note: The provided WebGPUFFT doesn't have shift/unshift built-in yet, 
-          // but we can apply the filter in shifted coordinates or modify it.
-          // For now, let's keep it simple: Forward -> Filter -> Inverse.
-          const { real: fReal, imag: fImag } = await gpuFFTRef.current!.fft2D(real, imag, width, height, false);
-
-          if (isCancelled) return;
-
-          // Shift in CPU for now (future: do this in WGSL)
-          fftshift(fReal, width, height);
-          fftshift(fImag, width, height);
-          applyBandPassFilter(fReal, fImag, width, height, bpInner, bpOuter);
-          fftshift(fReal, width, height);
-          fftshift(fImag, width, height);
-
-          const { real: invReal } = await gpuFFTRef.current!.fft2D(fReal, fImag, width, height, true);
-
-          if (!isCancelled) renderData(invReal);
-        };
-
-        runGpuFilter();
-        return () => { isCancelled = true; };
-      } else {
-        // CPU Fallback (Sync)
-        const source = rawVirtualImageRef.current;
-        if (!source) return;
-        const len = source.length;
-        let real = viWorkRealRef.current;
-        if (!real || real.length !== len) {
-          real = new Float32Array(len);
-          viWorkRealRef.current = real;
-        }
-        real.set(source);
-        let imag = viWorkImagRef.current;
-        if (!imag || imag.length !== len) {
-          imag = new Float32Array(len);
-          viWorkImagRef.current = imag;
-        } else {
-          imag.fill(0);
-        }
-        fft2d(real, imag, width, height, false);
-        fftshift(real, width, height);
-        fftshift(imag, width, height);
-        applyBandPassFilter(real, imag, width, height, bpInner, bpOuter);
-        fftshift(real, width, height);
-        fftshift(imag, width, height);
-        fft2d(real, imag, width, height, true);
-        renderData(real);
-      }
-    } else {
-      if (!rawVirtualImageRef.current) return;
-      renderData(rawVirtualImageRef.current);
-    }
-  }, [virtualImageBytes, shapeX, shapeY, viColormap, viVminPct, viVmaxPct, viScaleMode, viPowerExp, viZoom, viPanX, viPanY, bpInner, bpOuter, gpuReady]);
+    if (!rawVirtualImageRef.current) return;
+    renderData(rawVirtualImageRef.current);
+  }, [virtualImageBytes, shapeX, shapeY, viColormap, viVminPct, viVmaxPct, viScaleMode, viPowerExp, viZoom, viPanX, viPanY]);
 
   // Render virtual image overlay (just clear - crosshair drawn on high-DPI UI canvas)
   React.useEffect(() => {
@@ -1773,26 +1765,74 @@ function Show4DSTEM() {
     const width = shapeY;
     const height = shapeX;
     const sourceData = rawVirtualImageRef.current;
-    const lut = COLORMAPS[viColormap] || COLORMAPS.inferno;
+    const lut = COLORMAPS[fftColormap] || COLORMAPS.inferno;
 
     // Helper to render magnitude to canvas
     const renderMagnitude = (real: Float32Array, imag: Float32Array) => {
-      // Compute log magnitude
+      // Compute magnitude (log or linear)
       let magnitude = fftMagnitudeRef.current;
       if (!magnitude || magnitude.length !== real.length) {
         magnitude = new Float32Array(real.length);
         fftMagnitudeRef.current = magnitude;
       }
       for (let i = 0; i < real.length; i++) {
-        magnitude[i] = Math.log1p(Math.sqrt(real[i] * real[i] + imag[i] * imag[i]));
+        const mag = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]);
+        if (fftScaleMode === "log") {
+          magnitude[i] = Math.log1p(mag);
+        } else if (fftScaleMode === "power") {
+          magnitude[i] = Math.pow(mag, 0.5);  // gamma = 0.5
+        } else {
+          magnitude[i] = mag;
+        }
       }
 
-      // Normalize
-      let min = Infinity, max = -Infinity;
-      for (let i = 0; i < magnitude.length; i++) {
-        if (magnitude[i] < min) min = magnitude[i];
-        if (magnitude[i] > max) max = magnitude[i];
+      // Auto mode: mask DC component + 99.9% percentile clipping
+      let displayMin: number, displayMax: number;
+      if (fftAuto) {
+        // Mask DC (center pixel) by replacing with neighbor average
+        const centerIdx = Math.floor(height / 2) * width + Math.floor(width / 2);
+        const neighbors = [
+          magnitude[centerIdx - 1],
+          magnitude[centerIdx + 1],
+          magnitude[centerIdx - width],
+          magnitude[centerIdx + width]
+        ];
+        magnitude[centerIdx] = neighbors.reduce((a, b) => a + b, 0) / 4;
+
+        // Apply 99.9% percentile clipping for display range
+        const sorted = magnitude.slice().sort((a, b) => a - b);
+        displayMin = sorted[0];
+        displayMax = sorted[Math.floor(sorted.length * 0.999)];
+      } else {
+        // No auto: use actual min/max
+        displayMin = Infinity;
+        displayMax = -Infinity;
+        for (let i = 0; i < magnitude.length; i++) {
+          if (magnitude[i] < displayMin) displayMin = magnitude[i];
+          if (magnitude[i] > displayMax) displayMax = magnitude[i];
+        }
       }
+      setFftDataMin(displayMin);
+      setFftDataMax(displayMax);
+
+      // Stats use same values
+      const actualMin = displayMin;
+      const actualMax = displayMax;
+      let sum = 0;
+      for (let i = 0; i < magnitude.length; i++) {
+        sum += magnitude[i];
+      }
+      const mean = sum / magnitude.length;
+      let sumSq = 0;
+      for (let i = 0; i < magnitude.length; i++) {
+        const diff = magnitude[i] - mean;
+        sumSq += diff * diff;
+      }
+      const std = Math.sqrt(sumSq / magnitude.length);
+      setFftStats([mean, actualMin, actualMax, std]);
+
+      // Store histogram data (copy of magnitude for histogram component)
+      setFftHistogramData(magnitude.slice());
 
       let offscreen = fftOffscreenRef.current;
       if (!offscreen) {
@@ -1814,10 +1854,15 @@ function Show4DSTEM() {
         fftImageDataRef.current = imgData;
       }
       const rgba = imgData.data;
-      const range = max > min ? max - min : 1;
+
+      // Apply histogram slider range on top of percentile clipping
+      const dataRange = displayMax - displayMin;
+      const vmin = displayMin + (fftVminPct / 100) * dataRange;
+      const vmax = displayMin + (fftVmaxPct / 100) * dataRange;
+      const range = vmax > vmin ? vmax - vmin : 1;
 
       for (let i = 0; i < magnitude.length; i++) {
-        const v = Math.round(((magnitude[i] - min) / range) * 255);
+        const v = Math.round(((magnitude[i] - vmin) / range) * 255);
         const j = i * 4;
         const lutIdx = Math.max(0, Math.min(255, v)) * 3;
         rgba[j] = lut[lutIdx];
@@ -1876,7 +1921,7 @@ function Show4DSTEM() {
       fftshift(imag, width, height);
       renderMagnitude(real, imag);
     }
-  }, [virtualImageBytes, shapeX, shapeY, viColormap, fftZoom, fftPanX, fftPanY, gpuReady, showFft]);
+  }, [virtualImageBytes, shapeX, shapeY, fftColormap, fftZoom, fftPanX, fftPanY, gpuReady, showFft, fftScaleMode, fftAuto, fftVminPct, fftVmaxPct]);
 
   // Render FFT overlay with high-pass filter circle
   React.useEffect(() => {
@@ -1885,33 +1930,7 @@ function Show4DSTEM() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!showFft) return;
-
-    // Draw band-pass filter circles (inner = HP, outer = LP)
-    const centerX = (shapeY / 2) * fftZoom + fftPanX;
-    const centerY = (shapeX / 2) * fftZoom + fftPanY;
-    const minScanSize = Math.min(shapeX, shapeY);
-    const fftLineWidth = Math.max(LINE_WIDTH_MIN_PX, Math.min(LINE_WIDTH_MAX_PX, minScanSize * LINE_WIDTH_FRACTION));
-
-    if (bpInner > 0) {
-      ctx.strokeStyle = "rgba(255, 0, 0, 0.8)";
-      ctx.lineWidth = fftLineWidth;
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
-      ctx.arc(centerX, centerY, bpInner * fftZoom, 0, 2 * Math.PI);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    if (bpOuter > 0) {
-      ctx.strokeStyle = "rgba(0, 150, 255, 0.8)";
-      ctx.lineWidth = fftLineWidth;
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
-      ctx.arc(centerX, centerY, bpOuter * fftZoom, 0, 2 * Math.PI);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-  }, [fftZoom, fftPanX, fftPanY, pixelSize, shapeX, shapeY, bpInner, bpOuter, showFft]);
+  }, [fftZoom, fftPanX, fftPanY, showFft]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // High-DPI Scale Bar UI Overlays
@@ -2315,7 +2334,7 @@ function Show4DSTEM() {
         4D-STEM Explorer
       </Typography>
 
-      {/* MAIN CONTENT: Two columns */}
+      {/* MAIN CONTENT: DP | VI | FFT (three columns when FFT shown) */}
       <Stack direction="row" spacing={`${SPACING.LG}px`}>
         {/* LEFT COLUMN: DP Panel */}
         <Box sx={{ width: CANVAS_SIZE }}>
@@ -2324,9 +2343,10 @@ function Show4DSTEM() {
             <Typography variant="caption" sx={{ ...typography.label }}>
               DP at ({Math.round(localPosX)}, {Math.round(localPosY)})
               <span style={{ color: "#0f0", marginLeft: SPACING.SM }}>k: ({Math.round(localKx)}, {Math.round(localKy)})</span>
+              <InfoTooltip text="Diffraction Pattern: 2D detector image I(kx,ky) at scan position (x,y). The ROI mask M(kx,ky) defines which pixels are integrated for the virtual image. Drag to move ROI center, scroll to zoom, double-click to reset." theme={themeInfo.theme} />
             </Typography>
             <Stack direction="row" spacing={`${SPACING.SM}px`}>
-              <Button size="small" sx={compactButton} onClick={() => { setDpZoom(1); setDpPanX(0); setDpPanY(0); setRoiCenterX(centerX); setRoiCenterY(centerY); }}>Reset</Button>
+              <Button size="small" sx={compactButton} disabled={dpZoom === 1 && dpPanX === 0 && dpPanY === 0 && roiCenterX === centerX && roiCenterY === centerY} onClick={() => { setDpZoom(1); setDpPanX(0); setDpPanY(0); setRoiCenterX(centerX); setRoiCenterY(centerY); }}>Reset</Button>
               <Button size="small" sx={compactButton} onClick={handleExportDP}>Export</Button>
             </Stack>
           </Stack>
@@ -2347,11 +2367,15 @@ function Show4DSTEM() {
 
           {/* DP Stats Bar */}
           {dpStats && dpStats.length === 4 && (
-            <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, borderRadius: "2px", display: "flex", gap: 2 }}>
+            <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, borderRadius: "2px", display: "flex", gap: 2, alignItems: "center" }}>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Mean <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[0])}</Box></Typography>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[1])}</Box></Typography>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[2])}</Box></Typography>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Std <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[3])}</Box></Typography>
+              <Box sx={{ display: "flex", alignItems: "center", ml: "auto" }}>
+                <Typography sx={{ fontSize: 10, color: themeColors.textMuted }}>Show hot px:<InfoTooltip text="Toggle hot pixel display. When OFF, clips display range to 99.99 percentile to exclude outlier pixels. Hot pixels are defective detector elements that show abnormally high values." theme={themeInfo.theme} /></Typography>
+                <Switch checked={!(hotPixelFilter ?? true)} onChange={(e) => setHotPixelFilter(!e.target.checked)} size="small" sx={switchStyles.small} />
+              </Box>
             </Box>
           )}
 
@@ -2421,23 +2445,23 @@ function Show4DSTEM() {
             </Box>
             {/* Right: Histogram spanning both rows */}
             <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-              <Histogram data={dpHistogramData} colormap={dpColormap} vminPct={dpVminPct} vmaxPct={dpVmaxPct} onRangeChange={(min, max) => { setDpVminPct(min); setDpVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} />
+              <Histogram data={dpHistogramData} colormap={dpColormap} vminPct={dpVminPct} vmaxPct={dpVmaxPct} onRangeChange={(min, max) => { setDpVminPct(min); setDpVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} dataMin={dpGlobalMin} dataMax={dpGlobalMax} />
             </Box>
           </Box>
         </Box>
 
-        {/* RIGHT COLUMN: VI Panel + FFT (when shown) */}
+        {/* SECOND COLUMN: VI Panel */}
         <Box sx={{ width: viCanvasWidth }}>
           {/* VI Header */}
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
-            <Typography variant="caption" sx={{ ...typography.label }}>Virtual Image</Typography>
+            <Typography variant="caption" sx={{ ...typography.label }}>Virtual Image<InfoTooltip text="Virtual Image: Integrated intensity within detector ROI at each scan position. Computed as Σ(DP × mask) for each (x,y). Double-click to select position." theme={themeInfo.theme} /></Typography>
             <Stack direction="row" spacing={`${SPACING.SM}px`} alignItems="center">
               <Typography sx={{ ...typography.label, color: themeColors.textMuted, fontSize: 10 }}>
                 {shapeX}×{shapeY} | {detX}×{detY}
               </Typography>
               <Typography sx={{ ...typography.label, fontSize: 10 }}>FFT:</Typography>
               <Switch checked={showFft} onChange={(e) => setShowFft(e.target.checked)} size="small" sx={switchStyles.small} />
-              <Button size="small" sx={compactButton} onClick={() => { setViZoom(1); setViPanX(0); setViPanY(0); }}>Reset</Button>
+              <Button size="small" sx={compactButton} disabled={viZoom === 1 && viPanX === 0 && viPanY === 0} onClick={() => { setViZoom(1); setViPanX(0); setViPanY(0); }}>Reset</Button>
               <Button size="small" sx={compactButton} onClick={handleExportVI}>Export</Button>
             </Stack>
           </Stack>
@@ -2525,31 +2549,82 @@ function Show4DSTEM() {
             </Box>
             {/* Right: Histogram spanning both rows */}
             <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-              <Histogram data={viHistogramData} colormap={viColormap} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} />
+              <Histogram data={viHistogramData} colormap={viColormap} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} dataMin={viDataMin} dataMax={viDataMax} />
             </Box>
           </Box>
+        </Box>
 
-          {/* FFT Panel (conditionally shown) */}
-          {showFft && (
-            <Box sx={{ mt: `${SPACING.LG}px` }}>
-              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
-                <Typography variant="caption" sx={{ ...typography.label }}>FFT</Typography>
-                <Button size="small" sx={compactButton} onClick={() => { setFftZoom(1); setFftPanX(0); setFftPanY(0); }}>Reset</Button>
+        {/* THIRD COLUMN: FFT Panel (conditionally shown) */}
+        {showFft && (
+          <Box sx={{ width: viCanvasWidth }}>
+            {/* FFT Header */}
+            <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
+              <Typography variant="caption" sx={{ ...typography.label }}>FFT<InfoTooltip text="Fast Fourier Transform: Shows spatial frequency content of the virtual image. Center = low frequencies (large features), edges = high frequencies (fine detail). Useful for detecting periodic structures and scan artifacts." theme={themeInfo.theme} /></Typography>
+              <Stack direction="row" spacing={`${SPACING.SM}px`} alignItems="center">
+                <Button size="small" sx={compactButton} disabled={fftZoom === 1 && fftPanX === 0 && fftPanY === 0} onClick={() => { setFftZoom(1); setFftPanX(0); setFftPanY(0); }}>Reset</Button>
               </Stack>
-              <Box sx={{ ...container.imageBox, width: viCanvasWidth, height: viCanvasHeight }}>
-                <canvas ref={fftCanvasRef} width={shapeY} height={shapeX} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
-                <canvas
-                  ref={fftOverlayRef} width={shapeY} height={shapeX}
-                  onMouseDown={handleFftMouseDown} onMouseMove={handleFftMouseMove}
-                  onMouseUp={handleFftMouseUp} onMouseLeave={handleFftMouseLeave}
-                  onWheel={createZoomHandler(setFftZoom, setFftPanX, setFftPanY, fftZoom, fftPanX, fftPanY, fftOverlayRef)}
-                  onDoubleClick={handleFftDoubleClick}
-                  style={{ position: "absolute", width: "100%", height: "100%", cursor: isDraggingFFT ? "grabbing" : "grab" }}
-                />
+            </Stack>
+
+            {/* FFT Canvas */}
+            <Box sx={{ ...container.imageBox, width: viCanvasWidth, height: viCanvasHeight }}>
+              <canvas ref={fftCanvasRef} width={shapeY} height={shapeX} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
+              <canvas
+                ref={fftOverlayRef} width={shapeY} height={shapeX}
+                onMouseDown={handleFftMouseDown} onMouseMove={handleFftMouseMove}
+                onMouseUp={handleFftMouseUp} onMouseLeave={handleFftMouseLeave}
+                onWheel={createZoomHandler(setFftZoom, setFftPanX, setFftPanY, fftZoom, fftPanX, fftPanY, fftOverlayRef)}
+                onDoubleClick={handleFftDoubleClick}
+                style={{ position: "absolute", width: "100%", height: "100%", cursor: isDraggingFFT ? "grabbing" : "grab" }}
+              />
+            </Box>
+
+            {/* FFT Stats Bar */}
+            {fftStats && fftStats.length === 4 && (
+              <Box sx={{ mt: `${SPACING.XS}px`, px: 1, py: 0.5, bgcolor: themeColors.bgAlt, borderRadius: "2px", display: "flex", gap: 2 }}>
+                <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Mean <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(fftStats[0])}</Box></Typography>
+                <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(fftStats[1])}</Box></Typography>
+                <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(fftStats[2])}</Box></Typography>
+                <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Std <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(fftStats[3])}</Box></Typography>
+              </Box>
+            )}
+
+            {/* FFT Controls - Two rows with histogram on right */}
+            <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, width: "100%", boxSizing: "border-box" }}>
+              {/* Left: Two rows of controls */}
+              <Box sx={{ display: "flex", flexDirection: "column", gap: `${SPACING.XS}px`, flex: 1, justifyContent: "center" }}>
+                {/* Row 1: Scale + Clip */}
+                <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
+                  <Typography sx={{ ...typography.label, fontSize: 10 }}>Scale:</Typography>
+                  <Select value={fftScaleMode} onChange={(e) => setFftScaleMode(e.target.value as "linear" | "log" | "power")} size="small" sx={{ ...themedSelect, minWidth: 50, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                    <MenuItem value="linear">Lin</MenuItem>
+                    <MenuItem value="log">Log</MenuItem>
+                    <MenuItem value="power">Pow</MenuItem>
+                  </Select>
+                  <Typography sx={{ ...typography.label, fontSize: 10 }}>Auto:<InfoTooltip text="Auto-enhance FFT display. When ON: (1) Masks DC component at center - DC = F(0,0) = Σ(image), replaced with average of 4 neighbors. (2) Clips display to 99.9 percentile to exclude outliers. When OFF: shows raw FFT with full dynamic range." theme={themeInfo.theme} /></Typography>
+                  <Switch checked={fftAuto} onChange={(e) => setFftAuto(e.target.checked)} size="small" sx={switchStyles.small} />
+                </Box>
+                {/* Row 2: Color */}
+                <Box sx={{ ...controlRow, border: `1px solid ${themeColors.border}`, bgcolor: themeColors.controlBg }}>
+                  <Typography sx={{ ...typography.label, fontSize: 10 }}>Color:</Typography>
+                  <Select value={fftColormap} onChange={(e) => setFftColormap(String(e.target.value))} size="small" sx={{ ...themedSelect, minWidth: 65, fontSize: 10 }} MenuProps={upwardMenuProps}>
+                    <MenuItem value="inferno">Inferno</MenuItem>
+                    <MenuItem value="viridis">Viridis</MenuItem>
+                    <MenuItem value="plasma">Plasma</MenuItem>
+                    <MenuItem value="magma">Magma</MenuItem>
+                    <MenuItem value="hot">Hot</MenuItem>
+                    <MenuItem value="gray">Gray</MenuItem>
+                  </Select>
+                </Box>
+              </Box>
+              {/* Right: Histogram spanning both rows */}
+              <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
+                {fftHistogramData && (
+                  <Histogram data={fftHistogramData} colormap={fftColormap} vminPct={fftVminPct} vmaxPct={fftVmaxPct} onRangeChange={(min, max) => { setFftVminPct(min); setFftVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} dataMin={fftDataMin} dataMax={fftDataMax} />
+                )}
               </Box>
             </Box>
-          )}
-        </Box>
+          </Box>
+        )}
       </Stack>
 
       {/* BOTTOM CONTROLS - Path only (FFT toggle moved to VI panel) */}
