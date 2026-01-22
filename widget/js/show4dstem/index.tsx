@@ -202,15 +202,6 @@ function fftshift(data: Float32Array, width: number, height: number): void {
   data.set(temp);
 }
 
-function applyBandPassFilter(real: Float32Array, imag: Float32Array, width: number, height: number, innerRadius: number, outerRadius: number) {
-  const centerX = width >> 1, centerY = height >> 1;
-  const innerSq = innerRadius * innerRadius, outerSq = outerRadius * outerRadius;
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-    const distSq = (x - centerX) ** 2 + (y - centerY) ** 2;
-    if (distSq < innerSq || (outerRadius > 0 && distSq > outerSq)) { real[y * width + x] = 0; imag[y * width + x] = 0; }
-  }
-}
-
 // ============================================================================
 // WebGPU FFT - GPU-accelerated FFT when available
 // ============================================================================
@@ -1277,9 +1268,9 @@ function Show4DSTEM() {
   const [viVmaxPct, setViVmaxPct] = React.useState(100);
   // Scale mode: "linear" | "log" | "power"
   const [dpScaleMode, setDpScaleMode] = React.useState<"linear" | "log" | "power">("linear");
-  const [dpPowerExp, setDpPowerExp] = React.useState(0.5);
+  const dpPowerExp = 0.5;
   const [viScaleMode, setViScaleMode] = React.useState<"linear" | "log" | "power">("linear");
-  const [viPowerExp, setViPowerExp] = React.useState(0.5);
+  const viPowerExp = 0.5;
 
   // VI ROI state (real-space region selection for summed DP) - synced with Python
   const [viRoiMode, setViRoiMode] = useModelState<string>("vi_roi_mode");
@@ -1368,11 +1359,6 @@ function Show4DSTEM() {
     }
     setDpHistogramData(scaledData);
   }, [frameBytes, dpScaleMode, dpPowerExp]);
-
-  // Band-pass filter range [innerCutoff, outerCutoff] in pixels - [0, 0] means disabled
-  const [bandpass, setBandpass] = React.useState<number[]>([0, 0]);
-  const bpInner = bandpass[0];
-  const bpOuter = bandpass[1];
 
   // GPU FFT state
   const gpuFFTRef = React.useRef<WebGPUFFT | null>(null);
@@ -1528,8 +1514,6 @@ function Show4DSTEM() {
 
   // Store raw data for filtering/FFT
   const rawVirtualImageRef = React.useRef<Float32Array | null>(null);
-  const viWorkRealRef = React.useRef<Float32Array | null>(null);
-  const viWorkImagRef = React.useRef<Float32Array | null>(null);
   const fftWorkRealRef = React.useRef<Float32Array | null>(null);
   const fftWorkImagRef = React.useRef<Float32Array | null>(null);
   const fftMagnitudeRef = React.useRef<Float32Array | null>(null);
@@ -1753,70 +1737,9 @@ function Show4DSTEM() {
       ctx.restore();
     };
 
-    if (bpInner > 0 || bpOuter > 0) {
-      if (gpuFFTRef.current && gpuReady) {
-        // GPU filtering (Async)
-        const real = rawVirtualImageRef.current.slice();
-        const imag = new Float32Array(real.length);
-
-        // We use a local flag to prevent state updates if the effect has already re-run
-        let isCancelled = false;
-
-        const runGpuFilter = async () => {
-          // WebGPU version of: Forward -> Filter -> Inverse
-          // Note: The provided WebGPUFFT doesn't have shift/unshift built-in yet, 
-          // but we can apply the filter in shifted coordinates or modify it.
-          // For now, let's keep it simple: Forward -> Filter -> Inverse.
-          const { real: fReal, imag: fImag } = await gpuFFTRef.current!.fft2D(real, imag, width, height, false);
-
-          if (isCancelled) return;
-
-          // Shift in CPU for now (future: do this in WGSL)
-          fftshift(fReal, width, height);
-          fftshift(fImag, width, height);
-          applyBandPassFilter(fReal, fImag, width, height, bpInner, bpOuter);
-          fftshift(fReal, width, height);
-          fftshift(fImag, width, height);
-
-          const { real: invReal } = await gpuFFTRef.current!.fft2D(fReal, fImag, width, height, true);
-
-          if (!isCancelled) renderData(invReal);
-        };
-
-        runGpuFilter();
-        return () => { isCancelled = true; };
-      } else {
-        // CPU Fallback (Sync)
-        const source = rawVirtualImageRef.current;
-        if (!source) return;
-        const len = source.length;
-        let real = viWorkRealRef.current;
-        if (!real || real.length !== len) {
-          real = new Float32Array(len);
-          viWorkRealRef.current = real;
-        }
-        real.set(source);
-        let imag = viWorkImagRef.current;
-        if (!imag || imag.length !== len) {
-          imag = new Float32Array(len);
-          viWorkImagRef.current = imag;
-        } else {
-          imag.fill(0);
-        }
-        fft2d(real, imag, width, height, false);
-        fftshift(real, width, height);
-        fftshift(imag, width, height);
-        applyBandPassFilter(real, imag, width, height, bpInner, bpOuter);
-        fftshift(real, width, height);
-        fftshift(imag, width, height);
-        fft2d(real, imag, width, height, true);
-        renderData(real);
-      }
-    } else {
-      if (!rawVirtualImageRef.current) return;
-      renderData(rawVirtualImageRef.current);
-    }
-  }, [virtualImageBytes, shapeX, shapeY, viColormap, viVminPct, viVmaxPct, viScaleMode, viPowerExp, viZoom, viPanX, viPanY, bpInner, bpOuter, gpuReady]);
+    if (!rawVirtualImageRef.current) return;
+    renderData(rawVirtualImageRef.current);
+  }, [virtualImageBytes, shapeX, shapeY, viColormap, viVminPct, viVmaxPct, viScaleMode, viPowerExp, viZoom, viPanX, viPanY]);
 
   // Render virtual image overlay (just clear - crosshair drawn on high-DPI UI canvas)
   React.useEffect(() => {
@@ -2007,33 +1930,7 @@ function Show4DSTEM() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    if (!showFft) return;
-
-    // Draw band-pass filter circles (inner = HP, outer = LP)
-    const centerX = (shapeY / 2) * fftZoom + fftPanX;
-    const centerY = (shapeX / 2) * fftZoom + fftPanY;
-    const minScanSize = Math.min(shapeX, shapeY);
-    const fftLineWidth = Math.max(LINE_WIDTH_MIN_PX, Math.min(LINE_WIDTH_MAX_PX, minScanSize * LINE_WIDTH_FRACTION));
-
-    if (bpInner > 0) {
-      ctx.strokeStyle = "rgba(255, 0, 0, 0.8)";
-      ctx.lineWidth = fftLineWidth;
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
-      ctx.arc(centerX, centerY, bpInner * fftZoom, 0, 2 * Math.PI);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    if (bpOuter > 0) {
-      ctx.strokeStyle = "rgba(0, 150, 255, 0.8)";
-      ctx.lineWidth = fftLineWidth;
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
-      ctx.arc(centerX, centerY, bpOuter * fftZoom, 0, 2 * Math.PI);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-  }, [fftZoom, fftPanX, fftPanY, pixelSize, shapeX, shapeY, bpInner, bpOuter, showFft]);
+  }, [fftZoom, fftPanX, fftPanY, showFft]);
 
   // ─────────────────────────────────────────────────────────────────────────
   // High-DPI Scale Bar UI Overlays
