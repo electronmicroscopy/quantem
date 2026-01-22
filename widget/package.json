@@ -11,8 +11,7 @@
     "@mui/material": "^7.3.6",
     "jszip": "^3.10.1",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "webfft": "^1.0.3"
+    "react-dom": "^19.1.0"
   },
   "devDependencies": {
     "@types/react": "^19.1.3",
