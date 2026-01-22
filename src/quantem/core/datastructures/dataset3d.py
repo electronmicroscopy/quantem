@@ -5,6 +5,7 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
 from quantem.core.utils.validators import ensure_valid_array
+from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
 
 
@@ -217,15 +218,12 @@ class Dataset3d(Dataset):
         >>> data.show(suptitle="Diffraction patterns")  # with super title
         >>> fig, axes = data.show(returnfig=True)  # get figure for customization
         """
-        from quantem.core.visualization import show_2d
-
         if index is not None:
             # Handle negative index
             actual_index = index if index >= 0 else self.shape[0] + index
             default_title = title if title is not None else f"Frame {actual_index}"
             result = self[index].show(scalebar=scalebar, title=default_title, **kwargs)
             return result if returnfig else None
-
         # Show all frames in a grid
         n = self.shape[0]
         nrows = (n + ncols - 1) // ncols
@@ -244,7 +242,6 @@ class Dataset3d(Dataset):
                     row_titles.append("")
             arrays.append(row_arrays)
             titles.append(row_titles)
-
         fig, axes = show_2d(arrays, scalebar=scalebar, title=titles, **kwargs)
         if suptitle is not None:
             fig.suptitle(suptitle, fontsize=14)
