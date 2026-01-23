@@ -221,7 +221,7 @@ class Dataset3d(Dataset):
         returnfig : bool, default False
             If True, returns (fig, axes).
         **kwargs : dict
-            Keyword arguments for show_2d (cmap, cbar, norm, etc.).
+            Keyword arguments for show_2d (cmap, cbar, vmin, vmax, norm, etc.).
 
         Returns
         -------
@@ -287,15 +287,26 @@ class Dataset3d(Dataset):
                 f"Start {start} is out of bounds for dataset with {total_frames} frames. "
                 f"Please use start in range [0, {total_frames - 1}]."
             )
-        # Compute frame indices (avoid creating huge intermediate list)
-        end_idx = end if end is not None else (total_frames if step > 0 else -1)
+
+        # Compute frame indices
+        # Default end: go forward to total_frames, or backward to -1 (before index 0)
+        if end is not None:
+            end_idx = end
+        else:
+            end_idx = total_frames if step > 0 else -1
+
+        # Clamp to valid range (only needed for positive step)
         if step > 0:
             end_idx = min(end_idx, total_frames)
-            if max is not None:
-                end_idx = min(end_idx, start + max * step)
-        else:
-            if max is not None:
-                end_idx = max(end_idx, start + max * step)
+
+        # Apply max limit to avoid creating huge list
+        if max is not None:
+            max_end = start + max * step
+            if step > 0:
+                end_idx = min(end_idx, max_end)
+            elif max_end > end_idx:
+                end_idx = max_end
+
         frame_idx = list(range(start, end_idx, step))
         if len(frame_idx) == 0:
             raise ValueError(
@@ -311,7 +322,8 @@ class Dataset3d(Dataset):
             for i in frame_idx
         ]
         # Pad last row to complete the grid (show_2d requires rectangular input)
-        pad_count = (-n_frames) % ncols
+        remainder = n_frames % ncols
+        pad_count = 0 if remainder == 0 else ncols - remainder
         if pad_count > 0:
             images.extend([np.zeros_like(self.array[0])] * pad_count)
             labels.extend([""] * pad_count)
