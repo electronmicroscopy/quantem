@@ -287,35 +287,45 @@ class Dataset3d(Dataset):
                 f"Start {start} is out of bounds for dataset with {total_frames} frames. "
                 f"Please use start in range [0, {total_frames - 1}]."
             )
-
-        # Compute frame indices
+        # Compute frame indices (avoid creating huge intermediate list)
         end_idx = end if end is not None else (total_frames if step > 0 else -1)
         if step > 0:
             end_idx = min(end_idx, total_frames)
+            if max is not None:
+                end_idx = min(end_idx, start + max * step)
+        else:
+            if max is not None:
+                end_idx = max(end_idx, start + max * step)
         frame_idx = list(range(start, end_idx, step))
-        if max is not None:
-            frame_idx = frame_idx[:max]
         if len(frame_idx) == 0:
             raise ValueError(
                 f"No frames to display with start={start}, end={end}, step={step}. "
                 "Please check your range parameters."
             )
-
         # Build grid
+        n_frames = len(frame_idx)
+        ncols = min(ncols, n_frames)  # Don't create more columns than frames
         images = [self.array[i] for i in frame_idx]
         labels = [
             f"Frame {i}" if title_prefix is None else f"{title_prefix} {i}"
             for i in frame_idx
         ]
-        pad_count = (-len(frame_idx)) % ncols
+        # Pad last row to complete the grid (show_2d requires rectangular input)
+        pad_count = (-n_frames) % ncols
         if pad_count > 0:
             images.extend([np.zeros_like(self.array[0])] * pad_count)
             labels.extend([""] * pad_count)
         image_grid = [images[i : i + ncols] for i in range(0, len(images), ncols)]
         label_grid = [labels[i : i + ncols] for i in range(0, len(labels), ncols)]
-
         fig, axes = show_2d(image_grid, scalebar=scalebar, title=label_grid, **kwargs)
-        if suptitle is not None:
-            fig.suptitle(suptitle, fontsize=14)
-            fig.subplots_adjust(top=0.92)
+        if pad_count > 0:
+            for ax in np.array(axes).flat[-pad_count:]:
+                ax.clear()
+                ax.axis("off")
+        if suptitle:
+            # Reserve fixed space for suptitle (absolute, not proportional)
+            suptitle_margin = 0.7
+            fig_height = fig.get_figheight()
+            fig.subplots_adjust(top=1 - suptitle_margin / fig_height)
+            fig.suptitle(suptitle, fontsize=14, y=1 - 0.2 / fig_height)
         return (fig, axes) if returnfig else None
