@@ -117,6 +117,8 @@ class TomographyOpt(TomographyBase):
                 self.obj_model.set_scheduler(scheduler_params, num_iter)
             elif key == "pose":
                 self.dset.set_scheduler(scheduler_params, num_iter)
+            else:
+                raise ValueError(f"Unknown optimization key: {key}")
 
     def step_optimizers(self):
         for key in self.optimizer_params.keys():

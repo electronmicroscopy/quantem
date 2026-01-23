@@ -189,6 +189,14 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     def shifts_params(self, shifts: torch.Tensor, device: str):
         self._shifts_params = nn.Parameter(shifts.to(device))
 
+    @property
+    def device(self) -> str:
+        return self._device
+
+    @device.setter
+    def device(self, device: str):
+        self._device = device
+
     # --- Helper Functions ---
     def to(self, device: str):
         """
@@ -204,6 +212,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)
         self._shifts_ref = self._shifts_ref.to(device)
+
+        self.device = device
 
 
 class TomographyPixDataset(TomographyDatasetBase):
@@ -281,12 +291,13 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         second_half_z3 = self.z3_params[self.reference_tilt_idx :]
         z3 = torch.cat([first_half_z3, self._z3_ref, second_half_z3], dim=0)
 
-        return DatasetValue(
-            target=None,
-            tilt_angle=None,
-            pixel_loc=None,
-            pose=(shifts, z1, z3),
-        )
+        # return DatasetValue(
+        #     target=None,
+        #     tilt_angle=None,
+        #     pixel_loc=None,
+        #     pose=(shifts, z1, z3),
+        # )
+        return shifts, z1, z3
 
     @property
     def params(self):
@@ -385,10 +396,16 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return transformed_rays
 
     @staticmethod
-    def integrate_rays(rays: torch.Tensor, num_samples_per_ray: int) -> torch.Tensor:
+    def integrate_rays(
+        rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
+    ) -> torch.Tensor:
+        ray_densities = rays.view(
+            target_values_len,
+            num_samples_per_ray,
+        )
         step_size = 2.0 / (num_samples_per_ray - 1)
 
-        predicted_values = rays.sum(dim=1) * step_size
+        predicted_values = ray_densities.sum(dim=1) * step_size
 
         return predicted_values
 
@@ -409,12 +426,19 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         pixel_i = remaining // self.tilt_stack.shape[1]
         pixel_j = remaining % self.tilt_stack.shape[1]
 
-        return DatasetValue(
-            target=self.tilt_stack[projection_idx, pixel_i, pixel_j],
-            tilt_angle=self.tilt_angles[projection_idx],
-            projection_idx=projection_idx,
-            pixel_loc=(pixel_i, pixel_j),
-        )
+        # return DatasetValue(
+        #     target=self.tilt_stack[projection_idx, pixel_i, pixel_j],
+        #     tilt_angle=self.tilt_angles[projection_idx],
+        #     projection_idx=projection_idx,
+        #     pixel_loc=(pixel_i, pixel_j),
+        # )
+        return {
+            "projection_idx": torch.tensor(projection_idx),
+            "pixel_i": torch.tensor(pixel_i),
+            "pixel_j": torch.tensor(pixel_j),
+            "phi": self.tilt_angles[projection_idx],  # tensor
+            "target_value": self.tilt_stack[projection_idx, pixel_i, pixel_j],  # tensor
+        }
 
     def __len__(
         self,
@@ -422,8 +446,19 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         """
         Returns the number of pixels in the tilt stack.
         """
+        N = max(self.tilt_stack.shape)
+        return self.tilt_stack.shape[0] * N * N
 
-        return self._total_pixels
+    def to(self, device: str):
+        self._z1_params = nn.Parameter(self._z1_angles.to(device))
+        self._z3_params = nn.Parameter(self._z3_angles.to(device))
+        self._shifts_params = nn.Parameter(self._shifts.to(device))
+
+        self._z1_ref = self._z1_ref.to(device)
+        self._z3_ref = self._z3_ref.to(device)
+        self._shifts_ref = self._shifts_ref.to(device)
+
+        self.device = device
 
 
 class TomographyINRPretrainDataset(Dataset):

@@ -57,10 +57,10 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
         # TODO: Prior to reconstruction, it is assumed that object + dataset are both in the correct devices. Need to implement a way to check this.
 
-        if self.obj_model.device != self.dset.device:
-            raise ValueError(
-                f"Should never happen! obj_model and dset must be on the same device, got {self.obj_model.device} and {self.dset.device}"
-            )
+        # if self.obj_model.device != self.dset.device:
+        #     raise ValueError(
+        #         f"Should never happen! obj_model and dset must be on the same device, got {self.obj_model.device} and {self.dset.device}"
+        #     )
 
         if reset:
             raise NotImplementedError("Reset is not implemented yet.")
@@ -71,7 +71,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
         if scheduler_params is not None:
             self.scheduler_params = scheduler_params
-            self.set_schedulers()
+            self.set_schedulers(scheduler_params)
 
         new_scheduler = reset
         if new_scheduler:
@@ -85,8 +85,8 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
         self.obj_model.model.train()
 
-        N = max(self.obj_model.obj.shape)
-        num_samples_per_ray = max(self.obj_model.obj.shape)
+        N = max(self.obj_model.shape)
+        num_samples_per_ray = max(self.obj_model.shape)
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
 
         for a0 in range(num_iter):
@@ -105,20 +105,23 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                     enabled=True,
                 ):
                     all_coords = self.dset.get_coords(batch, N, num_samples_per_ray)
+                    all_coords = all_coords.to(
+                        device=self.device, dtype=torch.float32, non_blocking=True
+                    )
 
                     all_densities = self.obj_model.forward(all_coords)
 
                     integrated_densities = self.dset.integrate_rays(
-                        all_densities, num_samples_per_ray
+                        all_densities, num_samples_per_ray, len(batch["target_value"])
                     )
 
                     # batch_consistency_loss = loss_func(integrated_densities, batch["target_value"])
-                    batch_consistency_loss = torch.nn.functional.mse_loss(
-                        integrated_densities, batch["target_value"]
-                    )
+                pred = integrated_densities.float()
+                target = batch["target_value"].to(self.device, non_blocking=True).float()
+                batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
 
-                    # soft_constraints_loss = self._soft_constraints()
-                    batch_loss = batch_consistency_loss  # + soft_constraints_loss
+                # soft_constraints_loss = self._soft_constraints()
+                batch_loss = batch_consistency_loss.float()  # + soft_constraints_loss
                 batch_loss.backward()
                 self.step_optimizers()
                 total_loss += batch_loss.item()

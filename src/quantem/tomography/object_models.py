@@ -283,13 +283,13 @@ class ObjectPixelated(ObjectConstraints):
 class ObjectINR(ObjectConstraints, DDPMixin):
     def __init__(
         self,
-        volume_shape: tuple[int, int, int],
+        shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
         model: nn.Module | None = None,
     ):
         super().__init__(
-            shape=volume_shape,
+            shape=shape,
             device=device,
             rng=rng,
             _token=self._token,
@@ -307,12 +307,12 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     def from_model(
         cls,
         model: nn.Module,
-        volume_shape: tuple[int, int, int],
+        shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
     ):
         obj_model = cls(
-            volume_shape=volume_shape,
+            shape=shape,
             device=device,
             rng=rng,
             model=model,  # ✅ build/register in __init__
@@ -374,6 +374,14 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """
         # TODO: This is a temporary solution to get the dtype of the object.
         return torch.float32
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return self._shape
+
+    @shape.setter
+    def shape(self, shape: tuple[int, int, int]):
+        self._shape = shape
 
     # --- Helper Functions ---
 
