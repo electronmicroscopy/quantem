@@ -17,16 +17,24 @@ jobs:
 
     steps:
       - name: Checkout PR branch (head)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
+
+      - name: Ensure uv.lock is up to date
+        run: |
+          if ! uv lock --check; then
+            echo "❌ uv.lock is out of date."
+            echo "Please update uv.lock before versioning can proceed."
+            exit 1
+          fi
 
       - name: Install the project
-        run: uv sync --all-extras --dev --no-editable
+        run: uv sync --locked --group test
 
       - name: Get PR branch version
         id: pr_version
@@ -86,7 +94,7 @@ jobs:
             echo "Version matches — bumping version and creating new release branch"
 
             uv version --bump patch
-            uv sync
+            uv sync --locked --group test
             NEXT_VERSION=$(uv version --short)
 
             if [[ "$NEXT_VERSION" == "$PR_VERSION" ]]; then
