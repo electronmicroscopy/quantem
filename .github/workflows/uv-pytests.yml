@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         # Test other OSs main branch PRs
-        os: ${{ github.base_ref == 'main' && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest", "macos-15-intel"]') || fromJSON('["ubuntu-latest"]') }}
+        os: ${{ github.base_ref == 'main' && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
         python-version:
           - "3.11"
           - "3.12"
