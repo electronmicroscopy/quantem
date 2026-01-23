@@ -246,6 +246,8 @@ class TimeSeries(AutoSerialize):
         
         Returns
         ----------
+        self.array: NDArray
+            Padded and edge blended image stack.
 
         """
 
@@ -287,12 +289,14 @@ class TimeSeries(AutoSerialize):
         running_average_frames: float | int = 20.0,
         correlation_power: int | None = 1.0,
         sigma_edge: int = 0.7,
-        sf_val: int | tuple[int,int] = 0.5,
+        sobel_filter_val: int | tuple[int,int] = 0.5,
     ) -> NDArray:
         """
         Calculates all alignment coordinate shifts for an edge-filtered image 
         stack and applies the shifts to the unfiltered stack.
 
+        Parameters:
+        ----------
         running_average_frames: float | int = 20.0,
             Maximum number of images for the running average applied to the 
             reference. If None, default to 20.0.
@@ -301,8 +305,16 @@ class TimeSeries(AutoSerialize):
             If None, defaults to 1.0 (cross correlation).
         sigma_edge: int = 0.7
             Standard deviation (sigma) of the 1D Gaussian kernel.
-        sf_val: int | Tuple[int,int] = 0.5
-            Scale factor(s) for the symmetric/asymmetric finite-difference gradient kernel.
+        sobel_filter_val: int | Tuple[int,int] = 0.5
+            Value for the Sobel filter gradient kernel coefficient(s).
+        
+        Returns
+        ----------
+        rc_shift: NDArray
+            2D array of row and column frame shifts from reference.
+
+        stack_aligned: NDArray
+            Aligned image stack.
         """
         
         stack_aligned = np.zeros_like(self.array)
@@ -318,7 +330,7 @@ class TimeSeries(AutoSerialize):
                 filtered_im_0 = edge_filter(
                     im = self.array[0],
                     sigma_edge = sigma_edge, 
-                    sf_val = sf_val,    
+                    sobel_filter_val = sobel_filter_val,    
                 )
 
                 G_filter_ref = np.fft.fft2(filtered_im_0)
@@ -326,7 +338,7 @@ class TimeSeries(AutoSerialize):
             filtered_im = edge_filter(
                 im = self.array[a0 + 1],
                 sigma_edge = sigma_edge, 
-                sf_val = sf_val,    
+                sobel_filter_val = sobel_filter_val,    
             )
 
             G_filter_a0 = np.fft.fft2(filtered_im)
@@ -377,3 +389,5 @@ class TimeSeries(AutoSerialize):
             
         self._align_coords = rc_shift
         self._align_im = stack_aligned
+
+        return rc_shift, stack_aligned

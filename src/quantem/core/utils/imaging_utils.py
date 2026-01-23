@@ -552,7 +552,7 @@ def fourier_cropping(
 def edge_filter(
     im: NDArray,
     sigma_edge: int,
-    sf_val: int | tuple[int,int],
+    sobel_filter_val: int | tuple[int,int],
     ):
     """
     Used to filter an image array to define and highlight edges using 2D convolution.
@@ -563,8 +563,8 @@ def edge_filter(
         Input 2D image array.
     sigma_edge: int
         Standard deviation (sigma) of the 1D Gaussian kernel.
-    sf_val: int | tuple[int,int]
-        Scale factor(s) for the symmetric/asymmetric finite-difference gradient kernel.
+    sobel_filter_val: int | tuple[int,int]
+        Value for the Sobel filter gradient kernel coefficient(s).
 
     Returns
     -------
@@ -572,24 +572,15 @@ def edge_filter(
         2D array containing the gradient magnitude (edge strength) of the input image.
     """
 
-    sf_val = np.array(sf_val)
-    if sf_val.size == 1:
-        sf_val = np.array(
-            [sf_val, sf_val],
-            )
+    sobel_filter_val = np.array(sobel_filter_val)
+    if sobel_filter_val.size == 1:
+        sobel_filter_val = np.array([sobel_filter_val, sobel_filter_val])
 
-    r = np.arange(
-        -np.ceil(2.0*sigma_edge),
-        np.ceil(2.0*sigma_edge+1),
-    )
+    r = np.arange(-np.ceil(2.0*sigma_edge), np.ceil(2.0*sigma_edge+1))
 
-    k = np.exp(
-        (r[:,None]**2) / (-2*sigma_edge**2)
-    )
+    k = np.exp((r[:,None]**2) / (-2*sigma_edge**2))
 
-    sf = np.array([
-        [-sf_val[0],0,sf_val[1]],
-    ])
+    sf = np.array([[-sobel_filter_val[0],0,sobel_filter_val[1]]])
 
     im_x = convolve2d(im, sf, mode='same', boundary='symm')
     im_x = convolve2d(im_x, k, mode='same', boundary='symm')
