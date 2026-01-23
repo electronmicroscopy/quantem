@@ -1,0 +1,83 @@
+name: Check uv.lock is up to date
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-uv-lock:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Check lock file
+        id: lockcheck
+        run: |
+          if uv lock --check; then
+            echo "up_to_date=true" >> $GITHUB_OUTPUT
+          else
+            echo "up_to_date=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exit early if lock is up to date
+        if: steps.lockcheck.outputs.up_to_date == 'true'
+        run: echo "uv.lock is up to date ✔"
+
+      - name: Regenerate lock file
+        if: steps.lockcheck.outputs.up_to_date == 'false'
+        run: |
+          if [[ "${GITHUB_HEAD_REF}" == release/* ]]; then
+            echo "❌ Release branch — uv.lock must already be up to date."
+            exit 1
+          fi
+
+          uv lock
+
+      - name: Commit updated lock file
+        if: steps.lockcheck.outputs.up_to_date == 'false'
+        run: |
+          SAFE_REF=$(echo "${GITHUB_HEAD_REF}" | tr '/' '-')
+
+          git config user.name "quantem-bot"
+          git config user.email "quantembot@gmail.com"
+
+          git checkout -b lockfix/${SAFE_REF}
+          git commit -am "Update uv.lock"
+          git push origin lockfix/${SAFE_REF}
+
+      - name: Create PR for updated lock file
+        if: steps.lockcheck.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.QUANTEM_BOT_PAT }}
+        run: |
+          SAFE_REF=$(echo "${GITHUB_HEAD_REF}" | tr '/' '-')
+
+          if gh pr list --head "lockfix/${SAFE_REF}" --json number --jq 'length > 0'; then
+            echo "Lockfix PR already exists — skipping."
+            exit 1
+          fi
+
+          gh pr create \
+            --base "${{ github.base_ref }}" \
+            --head "lockfix/${SAFE_REF}" \
+            --title "Update uv.lock" \
+            --body "This PR updates \`uv.lock\` to match the current dependency specification."
+
+      - name: Fail original PR
+        if: steps.lockcheck.outputs.up_to_date == 'false'
+        run: |
+          echo "❌ uv.lock was out of date — a fix PR has been opened."
+          exit 1
