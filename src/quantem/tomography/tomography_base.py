@@ -2,13 +2,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.ddp import DDPMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import DatasetModelType, TomographyDatasetBase
 from quantem.tomography.logger_tomography import LoggerTomography
-from quantem.tomography.object_models import ConstraintsTomography, ObjectModelType
+from quantem.tomography.object_models import ConstraintsTomography, ObjectBase, ObjectPixelated
 
 
-class TomographyBase(AutoSerialize, RNGMixin):
+class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
     """
     A base class for performing electron tomography reconstructions.
 
@@ -20,7 +21,7 @@ class TomographyBase(AutoSerialize, RNGMixin):
     def __init__(
         self,
         dset: DatasetModelType,
-        obj_model: ObjectModelType,
+        obj_model: ObjectBase,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         rng: np.random.Generator | int | None = None,
@@ -30,15 +31,25 @@ class TomographyBase(AutoSerialize, RNGMixin):
         #     raise RuntimeError("Use Dataset.from_* to instantiate this class.")
 
         super().__init__()
+        self.obj_model = obj_model
 
         self.dset = dset
-        self.obj_model = obj_model
         self.rng = rng
         self.device = device
         self.logger = logger
 
         # Loss
         self._epoch_losses: list[float] = []
+        # DDP Initialization
+        # print("Checking if obj_model is a ObjectPixelated: ", not isinstance(obj_model, ObjectPixelated))
+        if not isinstance(obj_model, ObjectPixelated):
+            print("Setting up DDP for obj_model")
+            self.setup_distributed(device=device)
+            # self._obj_model._model = self.build_model(obj_model) # Assuming when object is initialized it's already wrapped in DDP?
+            print("After DDP Setup", self._obj_model)
+
+        self.dset = dset
+        self.dset.to(device)
 
     # --- Properties ---
     @property
@@ -58,14 +69,15 @@ class TomographyBase(AutoSerialize, RNGMixin):
         return self.obj_model.obj_type
 
     @property
-    def obj_model(self) -> ObjectModelType:
+    def obj_model(self) -> ObjectBase:
         return self._obj_model
 
     @obj_model.setter
-    def obj_model(self, obj_model: ObjectModelType):
-        if not isinstance(obj_model, ObjectModelType):
-            raise TypeError(f"obj_model should be a ObjectModelType, got {type(obj_model)}")
+    def obj_model(self, obj_model: ObjectBase):
+        if not isinstance(obj_model, ObjectBase):
+            raise TypeError(f"obj_model should be a ObjectBase, got {type(obj_model)}")
         self._obj_model = obj_model
+        print(self._obj_model)
 
     @property
     def constraints(self) -> ConstraintsTomography:
@@ -95,8 +107,9 @@ class TomographyBase(AutoSerialize, RNGMixin):
 
     @device.setter
     def device(self, device: str):
-        if not isinstance(device, str):
-            raise TypeError(f"device should be a str, got {type(device)}")
+        print("Device trying to set: ", device)
+        # if not isinstance(device, str):
+        #     raise TypeError(f"device should be a str, got {type(device)}")
         self._device = device
         self.to(device)
 

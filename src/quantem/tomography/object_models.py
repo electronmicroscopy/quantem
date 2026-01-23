@@ -281,16 +281,12 @@ class ObjectPixelated(ObjectConstraints):
 
 
 class ObjectINR(ObjectConstraints, DDPMixin):
-    """
-    Object model for INR objects.
-    """
-
     def __init__(
         self,
-        model: nn.Module,
         volume_shape: tuple[int, int, int],
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
+        model: nn.Module | None = None,
     ):
         super().__init__(
             shape=volume_shape,
@@ -300,26 +296,30 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         )
         self._pretrain_losses = []
         self._pretrain_lrs = []
+        self.device = device
+
+        # Register the network submodule (important: real nn.Module attribute)
+        if model is not None:
+            self.setup_distributed(device=device)
+            self._model = self.build_model(model)
 
     @classmethod
     def from_model(
         cls,
-        model: "nn.Module",
+        model: nn.Module,
         volume_shape: tuple[int, int, int],
-        device: str = None,  # Have to make device a requirement here in distinguishing GPU vs CPU training
+        device: str = "cpu",
         rng: np.random.Generator | int | None = None,
     ):
         obj_model = cls(
-            model=model,
             volume_shape=volume_shape,
             device=device,
             rng=rng,
+            model=model,  # ✅ build/register in __init__
         )
 
-        # Initialize DDP params and build the model. TODO: Not sure if this is the best way to do this? But to pretrain we need the model to be wrapped in DDP.
         obj_model.setup_distributed(device=device)
-        obj_model._model = obj_model.build_model(model)
-
+        obj_model.to(device)
         return obj_model
 
     # --- Properties ---
@@ -331,15 +331,15 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         """
         return self._model
 
-    @model.setter
-    def model(self, model: "nn.Module"):
-        """
-        This doesn't work -- can't have setters for torch sub modules
-        https://github.com/pytorch/pytorch/issues/52664
+    # @model.setter
+    # def model(self, model: "nn.Module"):
+    #     """
+    #     This doesn't work -- can't have setters for torch sub modules
+    #     https://github.com/pytorch/pytorch/issues/52664
 
-        For now, upon initialization private variable `._model` is set to the built model.
-        """
-        raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
+    #     For now, upon initialization private variable `._model` is set to the built model.
+    #     """
+    #     raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
 
     @property
     def params(self):
@@ -428,7 +428,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             pretrain_dataset is not None
         ):  # Need to make a check if there's already a pretrain dataset to not go through with the setup again.
             self.pretrain_dataset = pretrain_dataset
-            self.pretraining_dataloader = self.setup_dataloader(
+            self.pretraining_dataloader, self.pretraining_sampler = self.setup_dataloader(
                 pretrain_dataset, batch_size, num_workers=num_workers
             )
 
@@ -586,6 +586,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         tv_loss += self.constraints.tv_vol * grad_norm.mean()
         return tv_loss
+
+    def to(self, device: str):
+        # self._model = self._model.to(device)
+        self._obj = self._obj.to(device)
 
 
 ObjectModelType = ObjectPixelated | ObjectINR

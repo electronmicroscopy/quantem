@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import torch
@@ -22,8 +22,9 @@ class DatasetValue:
     target: torch.Tensor
     tilt_angle: int | float
     pixel_loc: tuple[int, int] | None = None  # Only for INRDataset
+    projection_idx: int | None = None  # Only for INRDataset
     pose: tuple[torch.nn.Parameter, torch.nn.Parameter, torch.nn.Parameter] | None = (
-        None  # If there is pose optimization.
+        None  # If there is pose optimization.  # Pose is tuple (shifts, z1, z3)
     )
 
 
@@ -58,8 +59,6 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
 
-        self.volume_size = (int(max(tilt_stack.shape)), tilt_stack.shape[1], tilt_stack.shape[2])
-
         # TODO: Maybe have the validation in here too.
         max_val = np.quantile(tilt_stack, 0.95)
         if type(tilt_stack) is not torch.Tensor:
@@ -79,8 +78,33 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._reference_tilt_angle_idx = torch.argmin(torch.abs(self.tilt_angles))
         # TODO: Implement AuxParams from old tomography_dataset.py here.
 
-        self.z1_param = torch
+        # TODO: The parameters won't be initialized unless .to(device) is called.
+        self._z1_angles = torch.zeros(self.learnable_tilts)
+        self._z3_angles = torch.zeros(self.learnable_tilts)
+        self._shifts = torch.zeros(self.learnable_tilts, 2)
 
+        # Fixed zeros for reference tilt
+        self._z1_ref = torch.zeros(1)
+        self._z3_ref = torch.zeros(1)
+        self._shifts_ref = torch.zeros(1, 2)
+
+    # --- Class methods ---
+    @classmethod
+    def from_data(
+        cls,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        learn_pose: bool = False,
+    ):
+        return cls(tilt_stack=tilt_stack, tilt_angles=tilt_angles, learn_pose=learn_pose)
+
+    # --- Optimization Parameters ---
+    # @property
+    # def params(self):
+    #     # TODO: Need to double check if this is correct way, also need to implement get_optimization_parameters @Arthur!!
+    #     return self.parameters()
+
+    # --- Forward pass ---
     @abstractmethod
     def forward(
         self,
@@ -92,6 +116,30 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         raise NotImplementedError("This method should be implemented in subclasses.")
 
     # --- Properties ---
+    @property
+    def tilt_stack(self) -> torch.Tensor:
+        return self._tilt_stack
+
+    @tilt_stack.setter
+    def tilt_stack(self, tilt_stack: torch.Tensor):
+        self._tilt_stack = tilt_stack
+
+    @property
+    def tilt_angles(self) -> torch.Tensor:
+        return self._tilt_angles
+
+    @tilt_angles.setter
+    def tilt_angles(self, tilt_angles: torch.Tensor):
+        self._tilt_angles = tilt_angles
+
+    @property
+    def learn_pose(self) -> bool:
+        return self._learn_pose
+
+    @learn_pose.setter
+    def learn_pose(self, learn_pose: bool):
+        self._learn_pose = learn_pose
+
     @property
     def reference_tilt_idx(self) -> int:
         return self._reference_tilt_angle_idx
@@ -117,15 +165,48 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         """
         raise NotImplementedError("This method should be implemented in subclasses.")
 
+    @property
+    def z1_params(self) -> torch.nn.Parameter:
+        return self._z1_params
+
+    @z1_params.setter
+    def z1_params(self, z1_angles: torch.Tensor, device: str):
+        self._z1_params = nn.Parameter(z1_angles.to(device))
+
+    @property
+    def z3_params(self) -> torch.nn.Parameter:
+        return self._z3_params
+
+    @z3_params.setter
+    def z3_params(self, z3_angles: torch.Tensor, device: str):
+        self._z3_params = nn.Parameter(z3_angles.to(device))
+
+    @property
+    def shifts_params(self) -> torch.nn.Parameter:
+        return self._shifts_params
+
+    @shifts_params.setter
+    def shifts_params(self, shifts: torch.Tensor, device: str):
+        self._shifts_params = nn.Parameter(shifts.to(device))
+
     # --- Helper Functions ---
     def to(self, device: str):
+        """
+        Moves the dataset to the device, and also insantiates the aux params to the device.
+        """
         self.tilt_stack = self.tilt_stack.to(device)
         self.tilt_angles = self.tilt_angles.to(device)
 
+        self._z1_params = nn.Parameter(self._z1_angles.to(device))
+        self._z3_params = nn.Parameter(self._z3_angles.to(device))
+        self._shifts_params = nn.Parameter(self._shifts.to(device))
 
-class TomographyPixDataset(
-    TomographyDatasetBase
-):  # Dataset): TODO: Does this need to be a dataset?
+        self._z1_ref = self._z1_ref.to(device)
+        self._z3_ref = self._z3_ref.to(device)
+        self._shifts_ref = self._shifts_ref.to(device)
+
+
+class TomographyPixDataset(TomographyDatasetBase):
     """
     Dataset class for pixel-based tomography, i.e AD, SIRT, WBP, etc...
 
@@ -160,15 +241,6 @@ class TomographyPixDataset(
             pixel_loc=None,
         )
 
-    @classmethod
-    def from_data(
-        cls,
-        tilt_stack: Dataset3d | NDArray | torch.Tensor,
-        tilt_angles: NDArray | torch.Tensor,
-        learn_pose: bool = False,
-    ):
-        return cls(tilt_stack=tilt_stack, tilt_angles=tilt_angles, learn_pose=learn_pose)
-
 
 class TomographyINRDataset(TomographyDatasetBase, Dataset):
     """
@@ -190,15 +262,137 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
     ):
         super().__init__(tilt_stack, tilt_angles, learn_pose, token)
 
-        self.z1_param = torch.nn.Parameter(torch.zeros(self.learnable_tilts))
-
+    # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):
         """
         Forward pass for INR-based tomography. In the forward pass, the only parameters that
         are passed will be the shifts, z1 and z3 Euler angles.
         """
-        pass
 
+        first_half_shifts = self.shifts_params[: self.reference_tilt_idx]
+        second_half_shifts = self.shifts_params[self.reference_tilt_idx :]
+        shifts = torch.cat([first_half_shifts, self._shifts_ref, second_half_shifts], dim=0)
+
+        first_half_z1 = self.z1_params[: self.reference_tilt_idx]
+        second_half_z1 = self.z1_params[self.reference_tilt_idx :]
+        z1 = torch.cat([first_half_z1, self._z1_ref, second_half_z1], dim=0)
+
+        first_half_z3 = self.z3_params[: self.reference_tilt_idx]
+        second_half_z3 = self.z3_params[self.reference_tilt_idx :]
+        z3 = torch.cat([first_half_z3, self._z3_ref, second_half_z3], dim=0)
+
+        return DatasetValue(
+            target=None,
+            tilt_angle=None,
+            pixel_loc=None,
+            pose=(shifts, z1, z3),
+        )
+
+    @property
+    def params(self):
+        return self.parameters()
+
+    def get_coords(
+        self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int
+    ) -> torch.Tensor:
+        pixel_i = batch["pixel_i"].float().to(self.device, non_blocking=True)
+        pixel_j = batch["pixel_j"].float().to(self.device, non_blocking=True)
+        # target_values = batch["target_value"].to(self.device, non_blocking=True)
+        phis = batch["phi"].to(self.device, non_blocking=True)
+        projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
+
+        with torch.no_grad():
+            batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
+
+        shifts, z1_params, z3_params = self.forward(None)
+        batch_shifts = torch.index_select(shifts, 0, projection_indices)
+        batch_z1 = torch.index_select(z1_params, 0, projection_indices)
+        batch_z3 = torch.index_select(z3_params, 0, projection_indices)
+
+        transformed_rays = self.transform_batch_rays(
+            batch_ray_coords,
+            z1=batch_z1,
+            x=phis,
+            z3=batch_z3,
+            shifts=batch_shifts,
+            N=N,
+            sampling_rate=1.0,
+        )
+        all_coords = transformed_rays.view(-1, 3)
+        return all_coords
+
+    @staticmethod
+    def create_batch_rays(
+        pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int
+    ) -> torch.Tensor:
+        batch_size = len(pixel_i)
+        x_coords = (pixel_j / (N - 1)) * 2 - 1
+        y_coords = (pixel_i / (N - 1)) * 2 - 1
+        z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
+
+        rays = torch.zeros(batch_size, num_samples_per_ray, 3, device=pixel_i.device)
+
+        rays[:, :, 0] = x_coords.unsqueeze(1)
+        rays[:, :, 1] = y_coords.unsqueeze(1)
+        rays[:, :, 2] = z_coords.unsqueeze(0)
+
+        return rays
+
+    @staticmethod
+    @torch.compile(mode="reduce-overhead")
+    def transform_batch_rays(
+        rays: torch.Tensor,
+        z1: torch.Tensor,
+        x: torch.Tensor,
+        z3: torch.Tensor,
+        shifts: torch.Tensor,
+        N: int,
+        sampling_rate: float,
+    ) -> torch.Tensor:
+        shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
+        shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
+
+        rays_x = rays[:, :, 0] - shift_x_norm
+        rays_y = rays[:, :, 1] - shift_y_norm
+        rays_z = rays[:, :, 2]
+
+        theta = torch.deg2rad(-z3).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_rot1 = cos_t * rays_x - sin_t * rays_y
+        rays_y_rot1 = sin_t * rays_x + cos_t * rays_y
+        rays_z_rot1 = rays_z
+
+        theta = torch.deg2rad(x).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_rot2 = rays_x_rot1
+        rays_y_rot2 = cos_t * rays_y_rot1 - sin_t * rays_z_rot1
+        rays_z_rot2 = sin_t * rays_y_rot1 + cos_t * rays_z_rot1
+
+        theta = torch.deg2rad(-z1).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_final = cos_t * rays_x_rot2 - sin_t * rays_y_rot2
+        rays_y_final = sin_t * rays_x_rot2 + cos_t * rays_y_rot2
+        rays_z_final = rays_z_rot2
+
+        transformed_rays = torch.stack([rays_x_final, rays_y_final, rays_z_final], dim=2)
+
+        return transformed_rays
+
+    @staticmethod
+    def integrate_rays(rays: torch.Tensor, num_samples_per_ray: int) -> torch.Tensor:
+        step_size = 2.0 / (num_samples_per_ray - 1)
+
+        predicted_values = rays.sum(dim=1) * step_size
+
+        return predicted_values
+
+    # --- Torch Dataset Methods ---
     def __getitem__(
         self,
         idx: int,
@@ -206,7 +400,6 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         """
         Gets the item for INR i.e, the project index, pixel value at (i, j), and the tilt angle.
         """
-        pass
 
         actual_idx = idx
 
@@ -219,6 +412,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return DatasetValue(
             target=self.tilt_stack[projection_idx, pixel_i, pixel_j],
             tilt_angle=self.tilt_angles[projection_idx],
+            projection_idx=projection_idx,
             pixel_loc=(pixel_i, pixel_j),
         )
 
@@ -230,13 +424,6 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         """
 
         return self._total_pixels
-
-    @property
-    def mode(self) -> Literal["train", "val"]:
-        """
-        Returns the mode of the dataset.
-        """
-        return self._mode
 
 
 class TomographyINRPretrainDataset(Dataset):

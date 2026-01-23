@@ -34,24 +34,26 @@ class DDPMixin:
             self.local_rank = int(os.environ["LOCAL_RANK"])
 
             torch.cuda.set_device(self.local_rank)
-            self.device = torch.device("cuda", self.local_rank)
+            device = torch.device("cuda", self.local_rank)
         else:
             self.world_size = 1
             self.global_rank = 0
             self.local_rank = 0
 
             if torch.cuda.is_available():
-                self.device = torch.device("cuda:0" if device is None else device)
-                torch.cuda.set_device(self.device.index)
+                device = torch.device("cuda:0" if device is None else device)
+                torch.cuda.set_device(device.index)
                 print("Single GPU training")
             else:
-                self.device = torch.device("cpu")
+                device = torch.device("cpu")
                 print("CPU training")
 
-        if self.device.type == "cuda":
+        if device.type == "cuda":
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+
+        self.device = device
 
     def setup_dataloader(
         self,
@@ -95,7 +97,7 @@ class DDPMixin:
             print(f"  Global batch size: {batch_size * self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(train_dataloader)}")
 
-        return train_dataloader
+        return train_dataloader, train_sampler
 
     def build_model(
         self,
