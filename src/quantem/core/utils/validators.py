@@ -49,6 +49,14 @@ def ensure_valid_array(
     TypeError
         If the input could not be converted to a NumPy array
     """
+    # Check for torch GPU tensors and provide helpful error
+    if config.get("has_torch"):
+        if isinstance(array, torch.Tensor) and array.is_cuda:
+            raise TypeError(
+                f"Cannot convert torch GPU tensor (device={array.device}) to numpy array. "
+                "Use .cpu() to move to CPU first: Dataset.from_array(tensor.cpu())"
+            )
+
     is_cupy = False
     if config.get("has_cupy"):
         if isinstance(array, cp.ndarray):

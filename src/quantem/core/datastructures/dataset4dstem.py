@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.utils.masks import create_annular_mask, create_circle_mask
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -16,7 +17,7 @@ class Dataset4dstem(Dataset4d):
     """A 4D-STEM dataset class that inherits from Dataset4d.
 
     This class represents a 4D scanning transmission electron microscopy (STEM) dataset,
-    where the data consists of a 4D array with dimensions (scan_y, scan_x, dp_y, dp_x).
+    where the data consists of a 4D array with dimensions (scan_row, scan_col, k_row, k_col).
     The first two dimensions represent real space scanning positions, while the latter
     two dimensions represent reciprocal space diffraction patterns.
 
@@ -89,6 +90,17 @@ class Dataset4dstem(Dataset4d):
         )
         self._virtual_images = {}
         self._virtual_detectors = {}  # Store detector information for regeneration
+
+    def __repr__(self) -> str:
+        return f"Dataset4dstem(shape={self.shape}, dtype={self.array.dtype})"
+
+    def __str__(self) -> str:
+        return (
+            f"Dataset4dstem '{self.name}'\n"
+            f"  shape: {self.shape}\n"
+            f"  scan sampling: {self.sampling[:2]} {self.units[:2]}\n"
+            f"  k sampling: {self.sampling[2:]} {self.units[2:]}"
+        )
 
     @classmethod
     def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
@@ -365,6 +377,7 @@ class Dataset4dstem(Dataset4d):
             final_mask = mask
         elif mode is not None and geometry is not None:
             # Create mask from mode and geometry
+            dp_shape = self.array.shape[-2:]
             if mode == "circle":
                 if (
                     len(geometry) != 2
@@ -373,14 +386,14 @@ class Dataset4dstem(Dataset4d):
                 ):
                     raise ValueError("For circle mode, geometry must be ((cy, cx), r)")
                 center, radius = geometry
-                final_mask = self._create_circle_mask(center, radius)
+                final_mask = create_circle_mask(dp_shape, center, radius)
             elif mode == "annular":
                 if len(geometry) != 2 or len(geometry[0]) != 2 or len(geometry[1]) != 2:
                     raise ValueError(
                         "For annular mode, geometry must be ((cy, cx), (r_inner, r_outer))"
                     )
                 center, radii = geometry
-                final_mask = self._create_annular_mask(center, radii)
+                final_mask = create_annular_mask(dp_shape, center, radii)
             else:
                 raise ValueError(
                     f"Unknown mode '{mode}'. Supported modes are 'circle' and 'annular'"
@@ -465,59 +478,6 @@ class Dataset4dstem(Dataset4d):
             plt.show()
 
         return virtual_image_dataset
-
-    def _create_circle_mask(self, center: tuple[float, float], radius: float) -> np.ndarray:
-        """
-        Create a circular mask for virtual image formation.
-
-        Parameters
-        ----------
-        center : tuple[float, float]
-            Center coordinates (cy, cx) of the circle
-        radius : float
-            Radius of the circle
-
-        Returns
-        -------
-        np.ndarray
-            Boolean mask with True inside the circle
-        """
-        cy, cx = center
-        dp_shape = self.array.shape[-2:]  # Get diffraction pattern dimensions
-        y, x = np.ogrid[: dp_shape[0], : dp_shape[1]]
-
-        # Calculate distance from center
-        distance = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-
-        return distance <= radius
-
-    def _create_annular_mask(
-        self, center: tuple[float, float], radii: tuple[float, float]
-    ) -> np.ndarray:
-        """
-        Create an annular (ring-shaped) mask for virtual image formation.
-
-        Parameters
-        ----------
-        center : tuple[float, float]
-            Center coordinates (cy, cx) of the annulus
-        radii : tuple[float, float]
-            Inner and outer radii (r_inner, r_outer) of the annulus
-
-        Returns
-        -------
-        np.ndarray
-            Boolean mask with True inside the annular region
-        """
-        cy, cx = center
-        r_inner, r_outer = radii
-        dp_shape = self.array.shape[-2:]  # Get diffraction pattern dimensions
-        y, x = np.ogrid[: dp_shape[0], : dp_shape[1]]
-
-        # Calculate distance from center
-        distance = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-
-        return (distance >= r_inner) & (distance <= r_outer)
 
     def show_virtual_images(self, figsize: tuple[int, int] | None = None, **kwargs) -> tuple:
         """
