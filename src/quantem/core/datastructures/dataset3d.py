@@ -1,6 +1,8 @@
-from typing import Any, Self, Union
+from typing import Self
 
 import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
@@ -22,7 +24,7 @@ class Dataset3d(Dataset):
 
     def __init__(
         self,
-        array: NDArray | Any,
+        array: NDArray,
         name: str,
         origin: NDArray | tuple | list | float | int,
         sampling: NDArray | tuple | list | float | int,
@@ -34,7 +36,7 @@ class Dataset3d(Dataset):
 
         Parameters
         ----------
-        array : NDArray | Any
+        array : NDArray
             The underlying 3D array data
         name : str
             A descriptive name for the dataset
@@ -62,7 +64,7 @@ class Dataset3d(Dataset):
     @classmethod
     def from_array(
         cls,
-        array: NDArray | Any,
+        array: NDArray,
         name: str | None = None,
         origin: NDArray | tuple | list | float | int | None = None,
         sampling: NDArray | tuple | list | float | int | None = None,
@@ -73,7 +75,7 @@ class Dataset3d(Dataset):
 
         Parameters
         ----------
-        array : NDArray | Any
+        array : NDArray
             3D array with shape (n_frames, height, width)
         name : str | None
             Dataset name. Default: "3D dataset"
@@ -130,8 +132,8 @@ class Dataset3d(Dataset):
         shape: tuple[int, int, int],
         name: str = "constant 3D dataset",
         fill_value: float = 0.0,
-        origin: Union[NDArray, tuple, list, float, int] | None = None,
-        sampling: Union[NDArray, tuple, list, float, int] | None = None,
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
         units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
     ) -> Self:
@@ -182,67 +184,137 @@ class Dataset3d(Dataset):
 
     def show(
         self,
-        index: int | None = None,
-        scalebar: ScalebarConfig | bool = True,
-        title: str | None = None,
-        suptitle: str | None = None,
+        start: int = 0,
+        end: int | None = None,
+        step: int = 1,
+        max: int | None = 20,
         ncols: int = 4,
+        scalebar: ScalebarConfig | bool = False,
+        title_prefix: str | None = None,
+        suptitle: str | None = None,
         returnfig: bool = False,
         **kwargs,
-    ):
+    ) -> tuple[Figure, Axes] | None:
         """
         Display 2D slices of the 3D dataset.
 
         Parameters
         ----------
-        index : int | None
-            Index of the 2D slice to display. If None, shows all slices in a grid.
-        scalebar : ScalebarConfig or bool
-            If True, displays scalebar.
-        title : str | None
-            Title for the plot. If None, uses "Frame 0", "Frame 1", etc.
-        suptitle : str | None
+        start : int, default 0
+            First frame index. Supports negative indexing.
+        end : int or None, optional
+            End frame index (exclusive). If None, determined by max.
+        step : int, default 1
+            Step between frames. Negative step shows frames in reverse order.
+        max : int or None, default 20
+            Maximum number of frames to show. Prevents memory issues.
+            Set to None to show all frames.
+        ncols : int, default 4
+            Number of columns in grid.
+        scalebar : ScalebarConfig or bool, default False
+            If True, displays scalebar on each frame.
+        title_prefix : str or None, optional
+            Prefix for frame titles. If None, uses "Frame 0", "Frame 1", etc.
+            If set to "DP", generates "DP 0", "DP 1", etc.
+        suptitle : str or None, optional
             Figure super title displayed above all subplots.
-        ncols : int
-            Maximum columns when showing all slices. Default: 4.
-        returnfig : bool
-            If True, returns (fig, axes). Default: False.
+        returnfig : bool, default False
+            If True, returns (fig, axes).
         **kwargs : dict
             Keyword arguments for show_2d (cmap, cbar, norm, etc.).
 
+        Returns
+        -------
+        tuple[Figure, Axes] or None
+            If returnfig=True, returns (fig, axes) tuple for further customization.
+            If returnfig=False, returns None.
+
+        Raises
+        ------
+        ValueError
+            If step is zero, ncols < 1, max < 1, start is out of bounds,
+            or the specified range has no frames to display.
+
         Examples
         --------
-        >>> data.show()           # show all frames in grid
-        >>> data.show(index=0)    # show single frame
-        >>> data.show(ncols=3)    # 3 columns
-        >>> data.show(suptitle="Diffraction patterns")  # with super title
-        >>> fig, axes = data.show(returnfig=True)  # get figure for customization
+        Basic usage:
+
+        >>> data.show()                    # first 20 frames
+        >>> data.show(max=None)            # all frames (use with caution)
+
+        Single frame:
+
+        >>> data.show(start=5, max=1)      # frame 5
+        >>> data.show(start=-1, max=1)     # last frame
+
+        Frame range:
+
+        >>> data.show(start=10, end=50)    # frames 10-49
+        >>> data.show(step=5)              # frames 0,5,10,15,...
+        >>> data.show(start=0, end=100, step=10)  # every 10th frame
+        >>> data.show(start=9, step=-1)    # reverse order: 9,8,7,...,0
+
+        Grid layout:
+
+        >>> data.show(ncols=2)             # 2 columns
+        >>> data.show(ncols=5, max=10)     # 5x2 grid
+
+        Titles:
+
+        >>> data.show(title_prefix="DP")           # "DP 0", "DP 1", ...
+        >>> data.show(suptitle="Time Series")      # figure title
+        >>> data.show(title_prefix="T", suptitle="Tomography Slices")
+
+        Customization:
+
+        >>> data.show(cmap="viridis")              # colormap
+        >>> data.show(scalebar=True)               # show scalebar
+        >>> fig, axes = data.show(returnfig=True)  # get figure for further customization
         """
-        if index is not None:
-            # Handle negative index
-            actual_index = index if index >= 0 else self.shape[0] + index
-            default_title = title if title is not None else f"Frame {actual_index}"
-            result = self[index].show(scalebar=scalebar, title=default_title, **kwargs)
-            return result if returnfig else None
-        # Show all frames in a grid
-        n = self.shape[0]
-        nrows = (n + ncols - 1) // ncols
-        arrays = []
-        titles = []
-        for row in range(nrows):
-            row_arrays = []
-            row_titles = []
-            for col in range(ncols):
-                i = row * ncols + col
-                if i < n:
-                    row_arrays.append(self.array[i])
-                    row_titles.append(f"Frame {i}" if title is None else f"{title} {i}")
-                else:
-                    row_arrays.append(np.zeros_like(self.array[0]))
-                    row_titles.append("")
-            arrays.append(row_arrays)
-            titles.append(row_titles)
-        fig, axes = show_2d(arrays, scalebar=scalebar, title=titles, **kwargs)
+        total_frames = self.shape[0]
+
+        # Validate inputs
+        if step == 0:
+            raise ValueError("Step cannot be zero.")
+        if ncols < 1:
+            raise ValueError(f"ncols must be >= 1, got {ncols}.")
+        if max is not None and max < 1:
+            raise ValueError(f"max must be >= 1 or None, got {max}.")
+        if start < 0:
+            start = total_frames + start
+        if start < 0 or start >= total_frames:
+            raise ValueError(
+                f"Start {start} is out of bounds for dataset with {total_frames} frames. "
+                f"Please use start in range [0, {total_frames - 1}]."
+            )
+
+        # Compute frame indices
+        end_idx = end if end is not None else (total_frames if step > 0 else -1)
+        if step > 0:
+            end_idx = min(end_idx, total_frames)
+        frame_idx = list(range(start, end_idx, step))
+        if max is not None:
+            frame_idx = frame_idx[:max]
+        if len(frame_idx) == 0:
+            raise ValueError(
+                f"No frames to display with start={start}, end={end}, step={step}. "
+                "Please check your range parameters."
+            )
+
+        # Build grid
+        images = [self.array[i] for i in frame_idx]
+        labels = [
+            f"Frame {i}" if title_prefix is None else f"{title_prefix} {i}"
+            for i in frame_idx
+        ]
+        pad_count = (-len(frame_idx)) % ncols
+        if pad_count > 0:
+            images.extend([np.zeros_like(self.array[0])] * pad_count)
+            labels.extend([""] * pad_count)
+        image_grid = [images[i : i + ncols] for i in range(0, len(images), ncols)]
+        label_grid = [labels[i : i + ncols] for i in range(0, len(labels), ncols)]
+
+        fig, axes = show_2d(image_grid, scalebar=scalebar, title=label_grid, **kwargs)
         if suptitle is not None:
             fig.suptitle(suptitle, fontsize=14)
             fig.subplots_adjust(top=0.92)
