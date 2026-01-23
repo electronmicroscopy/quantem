@@ -32,9 +32,9 @@ jobs:
             echo "Please update uv.lock before versioning can proceed."
             exit 1
           fi
-          
+
       - name: Install the project
-        run: uv sync --all-extras --dev --locked
+        run: uv sync --locked --group test --no-workspace
 
       - name: Get PR branch version
         id: pr_version
@@ -94,7 +94,7 @@ jobs:
             echo "Version matches — bumping version and creating new release branch"
 
             uv version --bump patch
-            uv sync --locked
+            uv sync --locked --group test --no-workspace
             NEXT_VERSION=$(uv version --short)
 
             if [[ "$NEXT_VERSION" == "$PR_VERSION" ]]; then
