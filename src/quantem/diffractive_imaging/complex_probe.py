@@ -383,9 +383,14 @@ def _passively_rotate_grid(
     rotation_angle: float,
 ):
     """ """
+
     cos_a = math.cos(-rotation_angle)
     sin_a = math.sin(-rotation_angle)
-    kxa, kya = kxa * cos_a + kya * sin_a, -kxa * sin_a + kya * cos_a
+    kxa, kya = (
+        kxa * cos_a + kya * sin_a,
+        -kxa * sin_a + kya * cos_a,
+    )
+
     return kxa, kya
 
 
