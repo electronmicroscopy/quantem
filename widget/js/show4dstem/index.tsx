@@ -2130,8 +2130,13 @@ function Show4DSTEM() {
     setRoiCenterY(Math.round(Math.max(0, Math.min(detX - 1, imgY))));
   };
 
-  const handleDpMouseUp = () => { setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false); };
-  const handleDpMouseLeave = () => { setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false); setIsHoveringResize(false); setIsHoveringResizeInner(false); };
+  const handleDpMouseUp = () => {
+    setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+  };
+  const handleDpMouseLeave = () => {
+    setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+    setIsHoveringResize(false); setIsHoveringResizeInner(false);
+  };
   const handleDpDoubleClick = () => { setDpZoom(1); setDpPanX(0); setDpPanY(0); };
 
   const handleViMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
