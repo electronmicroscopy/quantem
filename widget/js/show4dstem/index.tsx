@@ -1286,7 +1286,6 @@ function Show4DSTEM() {
   const [summedDpCount] = useModelState<number>("summed_dp_count");
   const [dpStats] = useModelState<number[]>("dp_stats");  // [mean, min, max, std]
   const [viStats] = useModelState<number[]>("vi_stats");  // [mean, min, max, std]
-  const [hotPixelFilter, setHotPixelFilter] = useModelState<boolean>("hot_pixel_filter");
   const [showFft, setShowFft] = React.useState(false);  // Hidden by default per feedback
 
   // Theme detection - detect environment and light/dark mode
@@ -2372,10 +2371,6 @@ function Show4DSTEM() {
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[1])}</Box></Typography>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[2])}</Box></Typography>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Std <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[3])}</Box></Typography>
-              <Box sx={{ display: "flex", alignItems: "center", ml: "auto" }}>
-                <Typography sx={{ fontSize: 10, color: themeColors.textMuted }}>Show hot px:<InfoTooltip text="Toggle hot pixel display. When OFF, clips display range to 99.99 percentile to exclude outlier pixels. Hot pixels are defective detector elements that show abnormally high values." theme={themeInfo.theme} /></Typography>
-                <Switch checked={!(hotPixelFilter ?? true)} onChange={(e) => setHotPixelFilter(!e.target.checked)} size="small" sx={switchStyles.small} />
-              </Box>
             </Box>
           )}
 
