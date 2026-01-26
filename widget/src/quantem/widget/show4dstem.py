@@ -115,6 +115,8 @@ class Show4DSTEM(anywidget.AnyWidget):
     roi_mode = traitlets.Unicode("point").tag(sync=True)
     roi_center_x = traitlets.Float(0.0).tag(sync=True)
     roi_center_y = traitlets.Float(0.0).tag(sync=True)
+    # Compound trait for batched X+Y updates (JS sends both at once, 1 observer fires)
+    roi_center = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0]).tag(sync=True)
     roi_radius = traitlets.Float(10.0).tag(sync=True)
     roi_radius_inner = traitlets.Float(5.0).tag(sync=True)
     roi_width = traitlets.Float(20.0).tag(sync=True)
@@ -241,8 +243,14 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Initial position at center
         self.pos_x = self.shape_x // 2
         self.pos_y = self.shape_y // 2
-        # Precompute global range for consistent scaling
-        self._compute_global_range()
+        # Precompute global range for consistent scaling (hot pixels already removed)
+        self.dp_global_min = max(float(self._data.min()), MIN_LOG_VALUE)
+        self.dp_global_max = float(self._data.max())
+        # Cache coordinate tensors for mask creation (avoid repeated torch.arange)
+        self._det_row_coords = torch.arange(self.det_x, device=self._device, dtype=torch.float32)[:, None]
+        self._det_col_coords = torch.arange(self.det_y, device=self._device, dtype=torch.float32)[None, :]
+        self._scan_row_coords = torch.arange(self.shape_x, device=self._device, dtype=torch.float32)[:, None]
+        self._scan_col_coords = torch.arange(self.shape_y, device=self._device, dtype=torch.float32)[None, :]
         # Setup center and BF radius
         # If user provides explicit values, use them
         # Otherwise, auto-detect from the data for accurate presets
@@ -271,16 +279,6 @@ class Show4DSTEM(anywidget.AnyWidget):
             # Auto-detect center and bf_radius from the data
             self.auto_detect_center(update_roi=False)
 
-        # Cache coordinate tensors for mask creation (avoid repeated torch.arange)
-        # det_row_coords: (det_x, 1), det_col_coords: (1, det_y)
-        self._det_row_coords = torch.arange(self.det_x, device=self._device, dtype=torch.float32)[:, None]
-        self._det_col_coords = torch.arange(self.det_y, device=self._device, dtype=torch.float32)[None, :]
-        self._scan_row_coords = torch.arange(self.shape_x, device=self._device, dtype=torch.float32)[:, None]
-        self._scan_col_coords = torch.arange(self.shape_y, device=self._device, dtype=torch.float32)[None, :]
-
-        # Batching flag for ROI updates (prevents double computation when X and Y change together)
-        self._roi_update_pending = False
-
         # Pre-compute and cache common virtual images (BF, ABF, ADF)
         # Each cache stores (bytes, stats) tuple
         self._cached_bf_virtual = None
@@ -291,14 +289,18 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         # Update frame when position changes (scale/colormap handled in JS)
         self.observe(self._update_frame, names=["pos_x", "pos_y"])
+        # Observe individual ROI params (for backward compatibility)
         self.observe(self._on_roi_change, names=[
             "roi_center_x", "roi_center_y", "roi_radius", "roi_radius_inner",
             "roi_active", "roi_mode", "roi_width", "roi_height"
         ])
-        
+        # Observe compound roi_center for batched updates from JS
+        self.observe(self._on_roi_center_change, names=["roi_center"])
+
         # Initialize default ROI at BF center
         self.roi_center_x = self.center_x
         self.roi_center_y = self.center_y
+        self.roi_center = [self.center_x, self.center_y]
         self.roi_radius = self.bf_radius * 0.5  # Start with half BF radius
         self.roi_active = True
         
@@ -659,17 +661,9 @@ class Show4DSTEM(anywidget.AnyWidget):
         if total == 0:
             return self
 
-        # Calculate centroid using coordinate grids
-        # Note: During __init__, cached coords may not exist yet, so create them
-        if hasattr(self, '_det_col_coords'):
-            col_coords = self._det_col_coords
-            row_coords = self._det_row_coords
-        else:
-            row_coords = torch.arange(self.det_x, device=self._device, dtype=torch.float32)[:, None]
-            col_coords = torch.arange(self.det_y, device=self._device, dtype=torch.float32)[None, :]
-
-        cx = float((col_coords * mask).sum() / total)
-        cy = float((row_coords * mask).sum() / total)
+        # Calculate centroid using cached coordinate grids
+        cx = float((self._det_col_coords * mask).sum() / total)
+        cy = float((self._det_row_coords * mask).sum() / total)
 
         # Estimate radius from mask area (A = pi*r^2)
         radius = float(torch.sqrt(total / torch.pi))
@@ -687,11 +681,6 @@ class Show4DSTEM(anywidget.AnyWidget):
             self._precompute_common_virtual_images()
 
         return self
-
-    def _compute_global_range(self, change=None):
-        """Compute min/max for histogram range. Hot pixels already removed at init."""
-        self.dp_global_min = max(float(self._data.min()), MIN_LOG_VALUE)
-        self.dp_global_max = float(self._data.max())
 
     def _get_frame(self, x: int, y: int) -> np.ndarray:
         """Get single diffraction frame at position (x, y) as numpy array."""
@@ -739,28 +728,30 @@ class Show4DSTEM(anywidget.AnyWidget):
         self.frame_bytes = frame.cpu().numpy().astype(np.float32).tobytes()
 
     def _on_roi_change(self, change=None):
-        """Recompute virtual image when ROI changes.
+        """Recompute virtual image when individual ROI params change.
 
-        Uses batching to prevent double computation when X and Y change together.
-        Multiple rapid changes within the same event loop tick are combined.
+        This handles legacy setters (setRoiCenterX/Y) from button handlers.
+        High-frequency updates use the compound roi_center trait instead.
         """
         if not self.roi_active:
             return
-        if self._roi_update_pending:
-            return  # Already scheduled, will pick up new values
-        self._roi_update_pending = True
-        # Schedule for next event loop tick to batch X and Y changes
-        try:
-            import asyncio
-            loop = asyncio.get_running_loop()
-            loop.call_soon(self._do_roi_update)
-        except RuntimeError:
-            # No running event loop (e.g., during init or testing)
-            self._do_roi_update()
+        self._compute_virtual_image_from_roi()
 
-    def _do_roi_update(self):
-        """Execute the batched ROI update."""
-        self._roi_update_pending = False
+    def _on_roi_center_change(self, change=None):
+        """Handle batched roi_center updates from JS (single observer for X+Y).
+
+        This is the fast path for drag operations. JS sends [x, y] as a single
+        compound trait, so only one observer fires per mouse move.
+        """
+        if not self.roi_active:
+            return
+        if change and "new" in change:
+            x, y = change["new"]
+            # Sync to individual traits (without triggering _on_roi_change observers)
+            self.unobserve(self._on_roi_change, names=["roi_center_x", "roi_center_y"])
+            self.roi_center_x = x
+            self.roi_center_y = y
+            self.observe(self._on_roi_change, names=["roi_center_x", "roi_center_y"])
         self._compute_virtual_image_from_roi()
 
     def _on_vi_roi_change(self, change=None):
@@ -915,19 +906,17 @@ class Show4DSTEM(anywidget.AnyWidget):
         return result
 
     def _to_float32_bytes(self, arr: torch.Tensor, update_vi_stats: bool = True) -> bytes:
-        """Convert tensor to float32 bytes (JS handles scale/colormap)."""
-        # Compute stats using PyTorch (on GPU)
-        if update_vi_stats:
-            self.vi_data_min = float(arr.min())
-            self.vi_data_max = float(arr.max())
-            self.vi_stats = [
-                float(arr.mean()),
-                float(arr.min()),
-                float(arr.max()),
-                float(arr.std()),
-            ]
+        """Convert tensor to float32 bytes."""
+        # Compute min/max (fast on GPU)
+        vmin = float(arr.min())
+        vmax = float(arr.max())
+        self.vi_data_min = vmin
+        self.vi_data_max = vmax
 
-        # Convert to numpy only for sending bytes to frontend
+        # Compute full stats if requested
+        if update_vi_stats:
+            self.vi_stats = [float(arr.mean()), vmin, vmax, float(arr.std())]
+
         return arr.cpu().numpy().astype(np.float32).tobytes()
 
     def _compute_virtual_image_from_roi(self):

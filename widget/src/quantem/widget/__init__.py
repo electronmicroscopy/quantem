@@ -11,7 +11,4 @@ except importlib.metadata.PackageNotFoundError:
 
 from quantem.widget.show4dstem import Show4DSTEM
 
-# Alias for convenience
-Show4D = Show4DSTEM
-
 __all__ = ["Show4DSTEM"]
