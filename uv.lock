@@ -2619,10 +2619,16 @@ version = "0.0.1"
 source = { editable = "widget" }
 dependencies = [
     { name = "anywidget" },
+    { name = "numpy" },
+    { name = "traitlets" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "anywidget", specifier = ">=0.9.0" }]
+requires-dist = [
+    { name = "anywidget", specifier = ">=0.9.0" },
+    { name = "numpy", specifier = ">=2.0.0" },
+    { name = "traitlets", specifier = ">=5.0.0" },
+]
 
 [[package]]
 name = "referencing"
