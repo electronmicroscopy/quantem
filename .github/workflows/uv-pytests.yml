@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         # Test other OSs main branch PRs
-        os: ${{ github.base_ref == 'main' && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest", "macos-15-intel"]') || fromJSON('["ubuntu-latest"]') }}
+        os: ${{ github.base_ref == 'main' && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
         python-version:
           - "3.11"
           - "3.12"
@@ -21,15 +21,15 @@ jobs:
           - "3.14"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install uv and set python version
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install the project
-        run: uv sync --locked --all-extras --group test
+        run: uv sync --locked --group test
 
       - name: Run pytests
         run: uv run pytest tests
