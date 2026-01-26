@@ -102,7 +102,7 @@ def read_4dstem(
 
 def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset_index: int | None = None) -> Dataset3dspectroscopy:
     """
-    File reader for 3D spectroscopy data data
+    File reader for 3D spectroscopy data
 
     Parameters
     ----------
@@ -139,10 +139,15 @@ def read_3d_spectroscopy(file_path: str, file_type: str, data_type: str, dataset
             raise ValueError("No 3D dataset found in file")
 
         dataset_index, imported_data = three_d_datasets[0]
+        
+        dataset_indices = []
+        for entry in three_d_datasets:
+            dataset_indices.append(entry[0])
+
 
         if len(data_list) > 1:
             print(
-                f"File contains {len(data_list)} dataset(s). Using dataset {dataset_index} with shape {imported_data['data'].shape}"
+                f"File contains {len(data_list)} dataset(s) and {len(three_d_datasets)} 3D dataset(s) at indices {', '.join(map(str, dataset_indices))}. Using dataset {dataset_index} with shape {imported_data['data'].shape}"
             )
 
     imported_axes = imported_data["axes"]
