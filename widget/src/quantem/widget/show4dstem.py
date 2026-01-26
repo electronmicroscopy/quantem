@@ -18,8 +18,13 @@ from quantem.core.config import validate_device
 from quantem.widget.array_utils import to_numpy
 
 
-# Detector geometry constant
-DEFAULT_BF_RATIO = 0.125  # 1/8 of detector size
+# ============================================================================
+# Constants
+# ============================================================================
+DEFAULT_BF_RATIO = 0.125  # BF disk radius as fraction of detector size (1/8)
+SPARSE_MASK_THRESHOLD = 0.2  # Use sparse indexing below this mask coverage
+MIN_LOG_VALUE = 1e-10  # Minimum value for log scale to avoid log(0)
+DEFAULT_VI_ROI_RATIO = 0.15  # Default VI ROI size as fraction of scan dimension
 
 
 class Show4DSTEM(anywidget.AnyWidget):
@@ -110,6 +115,8 @@ class Show4DSTEM(anywidget.AnyWidget):
     roi_mode = traitlets.Unicode("point").tag(sync=True)
     roi_center_x = traitlets.Float(0.0).tag(sync=True)
     roi_center_y = traitlets.Float(0.0).tag(sync=True)
+    # Compound trait for batched X+Y updates (JS sends both at once, 1 observer fires)
+    roi_center = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0]).tag(sync=True)
     roi_radius = traitlets.Float(10.0).tag(sync=True)
     roi_radius_inner = traitlets.Float(5.0).tag(sync=True)
     roi_width = traitlets.Float(20.0).tag(sync=True)
@@ -161,7 +168,6 @@ class Show4DSTEM(anywidget.AnyWidget):
     dp_stats = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0, 0.0, 0.0]).tag(sync=True)
     vi_stats = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0, 0.0, 0.0]).tag(sync=True)
     mask_dc = traitlets.Bool(True).tag(sync=True)  # Mask center pixel for DP stats
-    hot_pixel_filter = traitlets.Bool(True).tag(sync=True)  # Filter hot pixels (default on)
 
     def __init__(
         self,
@@ -205,6 +211,10 @@ class Show4DSTEM(anywidget.AnyWidget):
         device_str, _ = validate_device(None)  # Get device from quantem config
         self._device = torch.device(device_str)
         self._data = torch.from_numpy(data_np.astype(np.float32)).to(self._device)
+        # Remove saturated hot pixels (65535 for uint16, 255 for uint8)
+        saturated_value = 65535.0 if data_np.dtype == np.uint16 else 255.0 if data_np.dtype == np.uint8 else None
+        if saturated_value is not None:
+            self._data[self._data >= saturated_value] = 0
         # Handle flattened data
         if data.ndim == 3:
             if scan_shape is not None:
@@ -233,8 +243,14 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Initial position at center
         self.pos_x = self.shape_x // 2
         self.pos_y = self.shape_y // 2
-        # Precompute global range for consistent scaling
-        self._compute_global_range()
+        # Precompute global range for consistent scaling (hot pixels already removed)
+        self.dp_global_min = max(float(self._data.min()), MIN_LOG_VALUE)
+        self.dp_global_max = float(self._data.max())
+        # Cache coordinate tensors for mask creation (avoid repeated torch.arange)
+        self._det_row_coords = torch.arange(self.det_x, device=self._device, dtype=torch.float32)[:, None]
+        self._det_col_coords = torch.arange(self.det_y, device=self._device, dtype=torch.float32)[None, :]
+        self._scan_row_coords = torch.arange(self.shape_x, device=self._device, dtype=torch.float32)[:, None]
+        self._scan_col_coords = torch.arange(self.shape_y, device=self._device, dtype=torch.float32)[None, :]
         # Setup center and BF radius
         # If user provides explicit values, use them
         # Otherwise, auto-detect from the data for accurate presets
@@ -261,7 +277,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             self.center_y = float(self.det_x / 2)
             self.bf_radius = det_size * DEFAULT_BF_RATIO
             # Auto-detect center and bf_radius from the data
-            self._auto_detect_center_silent()
+            self.auto_detect_center(update_roi=False)
 
         # Pre-compute and cache common virtual images (BF, ABF, ADF)
         # Each cache stores (bytes, stats) tuple
@@ -272,16 +288,19 @@ class Show4DSTEM(anywidget.AnyWidget):
             self._precompute_common_virtual_images()
 
         # Update frame when position changes (scale/colormap handled in JS)
-        self.observe(self._update_frame, names=["pos_x", "pos_y", "hot_pixel_filter"])
-        self.observe(self._compute_global_range, names=["hot_pixel_filter"])
+        self.observe(self._update_frame, names=["pos_x", "pos_y"])
+        # Observe individual ROI params (for backward compatibility)
         self.observe(self._on_roi_change, names=[
             "roi_center_x", "roi_center_y", "roi_radius", "roi_radius_inner",
             "roi_active", "roi_mode", "roi_width", "roi_height"
         ])
-        
+        # Observe compound roi_center for batched updates from JS
+        self.observe(self._on_roi_center_change, names=["roi_center"])
+
         # Initialize default ROI at BF center
         self.roi_center_x = self.center_x
         self.roi_center_y = self.center_y
+        self.roi_center = [self.center_x, self.center_y]
         self.roi_radius = self.bf_radius * 0.5  # Start with half BF radius
         self.roi_active = True
         
@@ -299,8 +318,8 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Initialize VI ROI center to scan center with reasonable default sizes
         self.vi_roi_center_x = float(self.shape_x / 2)
         self.vi_roi_center_y = float(self.shape_y / 2)
-        # Set initial ROI size to ~15% of minimum scan dimension
-        default_roi_size = max(3, min(self.shape_x, self.shape_y) * 0.15)
+        # Set initial ROI size based on scan dimension
+        default_roi_size = max(3, min(self.shape_x, self.shape_y) * DEFAULT_VI_ROI_RATIO)
         self.vi_roi_radius = float(default_roi_size)
         self.vi_roi_width = float(default_roi_size * 2)
         self.vi_roi_height = float(default_roi_size)
@@ -602,7 +621,7 @@ class Show4DSTEM(anywidget.AnyWidget):
             self.roi_height = float(height)
         return self
 
-    def auto_detect_center(self) -> "Show4DSTEM":
+    def auto_detect_center(self, update_roi: bool = True) -> "Show4DSTEM":
         """
         Automatically detect BF disk center and radius using centroid.
 
@@ -610,6 +629,12 @@ class Show4DSTEM(anywidget.AnyWidget):
         bright field disk center and estimate its radius. The detected
         values are applied to the widget's calibration (center_x, center_y,
         bf_radius).
+
+        Parameters
+        ----------
+        update_roi : bool, default True
+            If True, also update ROI center and recompute cached virtual images.
+            Set to False during __init__ when ROI is not yet initialized.
 
         Returns
         -------
@@ -621,48 +646,7 @@ class Show4DSTEM(anywidget.AnyWidget):
         >>> widget = Show4DSTEM(data)
         >>> widget.auto_detect_center()  # Auto-detect and apply
         """
-        # Sum all diffraction patterns to get average
-        if self._data.ndim == 4:
-            summed_dp = self._data.sum(axis=(0, 1)).astype(np.float64)
-        else:
-            summed_dp = self._data.sum(axis=0).astype(np.float64)
-
-        # Threshold at mean + std to isolate BF disk
-        threshold = summed_dp.mean() + summed_dp.std()
-        mask = summed_dp > threshold
-
-        # Avoid division by zero
-        total = mask.sum()
-        if total == 0:
-            return self
-
-        # Calculate centroid using meshgrid
-        y_coords, x_coords = np.meshgrid(
-            np.arange(self.det_x), np.arange(self.det_y), indexing='ij'
-        )
-        cx = float((x_coords * mask).sum() / total)
-        cy = float((y_coords * mask).sum() / total)
-
-        # Estimate radius from mask area (A = pi*r^2)
-        radius = float(np.sqrt(total / np.pi))
-
-        # Apply detected values
-        self.center_x = cx
-        self.center_y = cy
-        self.bf_radius = radius
-
-        # Also update ROI to center
-        self.roi_center_x = cx
-        self.roi_center_y = cy
-
-        # Recompute cached virtual images with new calibration
-        self._precompute_common_virtual_images()
-
-        return self
-
-    def _auto_detect_center_silent(self):
-        """Auto-detect center without updating ROI (used during __init__)."""
-        # Sum all frames (fast on GPU)
+        # Sum all diffraction patterns to get average (PyTorch)
         if self._data.ndim == 4:
             summed_dp = self._data.sum(dim=(0, 1))
         else:
@@ -675,54 +659,28 @@ class Show4DSTEM(anywidget.AnyWidget):
         # Avoid division by zero
         total = mask.sum()
         if total == 0:
-            return
+            return self
 
-        # Calculate centroid
-        y_coords, x_coords = torch.meshgrid(
-            torch.arange(self.det_x, device=self._device),
-            torch.arange(self.det_y, device=self._device),
-            indexing='ij'
-        )
-        cx = float((x_coords * mask).sum() / total)
-        cy = float((y_coords * mask).sum() / total)
+        # Calculate centroid using cached coordinate grids
+        cx = float((self._det_col_coords * mask).sum() / total)
+        cy = float((self._det_row_coords * mask).sum() / total)
 
         # Estimate radius from mask area (A = pi*r^2)
         radius = float(torch.sqrt(total / torch.pi))
 
-        # Apply detected values (don't update ROI - that happens later in __init__)
+        # Apply detected values
         self.center_x = cx
         self.center_y = cy
         self.bf_radius = radius
 
-    def _compute_global_range(self, change=None):
-        """Compute min/max for histogram range. Uses percentiles when hot_pixel_filter is ON."""
+        if update_roi:
+            # Also update ROI to center
+            self.roi_center_x = cx
+            self.roi_center_y = cy
+            # Recompute cached virtual images with new calibration
+            self._precompute_common_virtual_images()
 
-        # Sample corners and center
-        samples = [
-            (0, 0),
-            (0, self.shape_y - 1),
-            (self.shape_x - 1, 0),
-            (self.shape_x - 1, self.shape_y - 1),
-            (self.shape_x // 2, self.shape_y // 2),
-        ]
-
-        # Collect all pixel values from sampled frames
-        all_values = []
-        for x, y in samples:
-            frame = self._get_frame(x, y)
-            all_values.append(frame.ravel())
-
-        all_values = np.concatenate(all_values)
-
-        if self.hot_pixel_filter:
-            # Use 99.99 percentile to exclude hot pixels
-            p_high = np.percentile(all_values, 99.99)
-            self.dp_global_min = max(float(all_values.min()), 1e-10)
-            self.dp_global_max = float(p_high)
-        else:
-            # Use actual min/max (show hot pixels)
-            self.dp_global_min = max(float(all_values.min()), 1e-10)
-            self.dp_global_max = float(all_values.max())
+        return self
 
     def _get_frame(self, x: int, y: int) -> np.ndarray:
         """Get single diffraction frame at position (x, y) as numpy array."""
@@ -732,31 +690,31 @@ class Show4DSTEM(anywidget.AnyWidget):
         else:
             return self._data[x, y].cpu().numpy()
 
-    def _filter_hot_pixels(self, frame: np.ndarray) -> np.ndarray:
-        """Filter hot pixels by clipping to 99.99th percentile."""
-        threshold = np.percentile(frame, 99.99)
-        return np.clip(frame, None, threshold)
-
     def _update_frame(self, change=None):
         """Send raw float32 frame to frontend (JS handles scale/colormap)."""
-        frame = self._get_frame(self.pos_x, self.pos_y)
-        frame = frame.astype(np.float32)
+        # Get frame as tensor (stays on device)
+        if self._data.ndim == 3:
+            idx = self.pos_x * self.shape_y + self.pos_y
+            frame = self._data[idx]
+        else:
+            frame = self._data[self.pos_x, self.pos_y]
 
-        # Apply hot pixel filtering if enabled
-        if self.hot_pixel_filter:
-            frame = self._filter_hot_pixels(frame)
+        # Apply log scale if enabled
+        if self.log_scale:
+            frame = torch.log1p(frame)
 
         # Compute stats from frame (optionally mask DC component)
-        if self.mask_dc:
-            # Mask center 3x3 region for stats
+        if self.mask_dc and self.det_x > 3 and self.det_y > 3:
+            # Mask center 3x3 region for stats (only for detectors > 3x3)
             cx, cy = self.det_x // 2, self.det_y // 2
-            stats_frame = frame.copy()
-            stats_frame[max(0, cx-1):cx+2, max(0, cy-1):cy+2] = np.nan
+            mask = torch.ones_like(frame, dtype=torch.bool)
+            mask[max(0, cx-1):cx+2, max(0, cy-1):cy+2] = False
+            masked_vals = frame[mask]
             self.dp_stats = [
-                float(np.nanmean(stats_frame)),
-                float(np.nanmin(stats_frame)),
-                float(np.nanmax(stats_frame)),
-                float(np.nanstd(stats_frame)),
+                float(masked_vals.mean()),
+                float(masked_vals.min()),
+                float(masked_vals.max()),
+                float(masked_vals.std()),
             ]
         else:
             self.dp_stats = [
@@ -766,13 +724,34 @@ class Show4DSTEM(anywidget.AnyWidget):
                 float(frame.std()),
             ]
 
-        # Send raw float32 bytes (JS handles scale/normalization/colormap)
-        self.frame_bytes = frame.tobytes()
+        # Convert to numpy only for sending bytes to frontend
+        self.frame_bytes = frame.cpu().numpy().astype(np.float32).tobytes()
 
     def _on_roi_change(self, change=None):
-        """Recompute virtual image when ROI changes."""
+        """Recompute virtual image when individual ROI params change.
+
+        This handles legacy setters (setRoiCenterX/Y) from button handlers.
+        High-frequency updates use the compound roi_center trait instead.
+        """
         if not self.roi_active:
             return
+        self._compute_virtual_image_from_roi()
+
+    def _on_roi_center_change(self, change=None):
+        """Handle batched roi_center updates from JS (single observer for X+Y).
+
+        This is the fast path for drag operations. JS sends [x, y] as a single
+        compound trait, so only one observer fires per mouse move.
+        """
+        if not self.roi_active:
+            return
+        if change and "new" in change:
+            x, y = change["new"]
+            # Sync to individual traits (without triggering _on_roi_change observers)
+            self.unobserve(self._on_roi_change, names=["roi_center_x", "roi_center_y"])
+            self.roi_center_x = x
+            self.roi_center_y = y
+            self.observe(self._on_roi_change, names=["roi_center_x", "roi_center_y"])
         self._compute_virtual_image_from_roi()
 
     def _on_vi_roi_change(self, change=None):
@@ -784,77 +763,69 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._compute_summed_dp_from_vi_roi()
 
     def _compute_summed_dp_from_vi_roi(self):
-        """Sum diffraction patterns from positions inside VI ROI."""
-        # Create mask in scan space
-        # y (rows) corresponds to vi_roi_center_x, x (cols) corresponds to vi_roi_center_y
-        rows, cols = np.ogrid[:self.shape_x, :self.shape_y]
-
+        """Sum diffraction patterns from positions inside VI ROI (PyTorch)."""
+        # Create mask in scan space using cached coordinates
         if self.vi_roi_mode == "circle":
-            mask = (rows - self.vi_roi_center_x) ** 2 + (cols - self.vi_roi_center_y) ** 2 <= self.vi_roi_radius ** 2
+            mask = (self._scan_row_coords - self.vi_roi_center_x) ** 2 + (self._scan_col_coords - self.vi_roi_center_y) ** 2 <= self.vi_roi_radius ** 2
         elif self.vi_roi_mode == "square":
-            # Square uses vi_roi_radius as half-size
             half_size = self.vi_roi_radius
-            mask = (np.abs(rows - self.vi_roi_center_x) <= half_size) & (np.abs(cols - self.vi_roi_center_y) <= half_size)
+            mask = (torch.abs(self._scan_row_coords - self.vi_roi_center_x) <= half_size) & (torch.abs(self._scan_col_coords - self.vi_roi_center_y) <= half_size)
         elif self.vi_roi_mode == "rect":
             half_w = self.vi_roi_width / 2
             half_h = self.vi_roi_height / 2
-            mask = (np.abs(rows - self.vi_roi_center_x) <= half_h) & (np.abs(cols - self.vi_roi_center_y) <= half_w)
+            mask = (torch.abs(self._scan_row_coords - self.vi_roi_center_x) <= half_h) & (torch.abs(self._scan_col_coords - self.vi_roi_center_y) <= half_w)
         else:
             return
 
-        # Get positions inside mask
-        positions = np.argwhere(mask)
-        if len(positions) == 0:
+        # Count positions in mask
+        n_positions = int(mask.sum())
+        if n_positions == 0:
             self.summed_dp_bytes = b""
             self.summed_dp_count = 0
             return
 
-        # Average DPs from all positions (average is more useful than sum)
-        # positions from argwhere are (row, col) = (x_idx, y_idx) in our naming
-        summed_dp = np.zeros((self.det_x, self.det_y), dtype=np.float64)
-        for row_idx, col_idx in positions:
-            summed_dp += self._get_frame(row_idx, col_idx).astype(np.float64)
+        self.summed_dp_count = n_positions
 
-        self.summed_dp_count = len(positions)
-
-        # Convert to average
-        avg_dp = summed_dp / len(positions)
+        # Compute average DP using masked sum (vectorized)
+        if self._data.ndim == 4:
+            # (scan_x, scan_y, det_x, det_y) - sum over masked scan positions
+            avg_dp = self._data[mask].mean(dim=0)
+        else:
+            # Flattened: (N, det_x, det_y) - need to convert mask indices
+            flat_indices = torch.nonzero(mask.flatten(), as_tuple=True)[0]
+            avg_dp = self._data[flat_indices].mean(dim=0)
 
         # Normalize to 0-255 for display
-        vmin, vmax = avg_dp.min(), avg_dp.max()
+        vmin, vmax = float(avg_dp.min()), float(avg_dp.max())
         if vmax > vmin:
-            normalized = np.clip((avg_dp - vmin) / (vmax - vmin) * 255, 0, 255)
-            normalized = normalized.astype(np.uint8)
+            normalized = torch.clamp((avg_dp - vmin) / (vmax - vmin) * 255, 0, 255)
+            normalized = normalized.cpu().numpy().astype(np.uint8)
         else:
-            normalized = np.zeros(avg_dp.shape, dtype=np.uint8)
+            normalized = np.zeros((self.det_x, self.det_y), dtype=np.uint8)
 
         self.summed_dp_bytes = normalized.tobytes()
 
     def _create_circular_mask(self, cx: float, cy: float, radius: float):
-        """Create circular mask (boolean)."""
-        y, x = np.ogrid[:self.det_x, :self.det_y]
-        mask = (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2
+        """Create circular mask (boolean tensor on device)."""
+        mask = (self._det_col_coords - cx) ** 2 + (self._det_row_coords - cy) ** 2 <= radius ** 2
         return mask
 
     def _create_square_mask(self, cx: float, cy: float, half_size: float):
-        """Create square mask (boolean)."""
-        y, x = np.ogrid[:self.det_x, :self.det_y]
-        mask = (np.abs(x - cx) <= half_size) & (np.abs(y - cy) <= half_size)
+        """Create square mask (boolean tensor on device)."""
+        mask = (torch.abs(self._det_col_coords - cx) <= half_size) & (torch.abs(self._det_row_coords - cy) <= half_size)
         return mask
 
     def _create_annular_mask(
         self, cx: float, cy: float, inner: float, outer: float
     ):
-        """Create annular (donut) mask (boolean)."""
-        y, x = np.ogrid[:self.det_x, :self.det_y]
-        dist_sq = (x - cx) ** 2 + (y - cy) ** 2
+        """Create annular (donut) mask (boolean tensor on device)."""
+        dist_sq = (self._det_col_coords - cx) ** 2 + (self._det_row_coords - cy) ** 2
         mask = (dist_sq >= inner ** 2) & (dist_sq <= outer ** 2)
         return mask
 
     def _create_rect_mask(self, cx: float, cy: float, half_width: float, half_height: float):
-        """Create rectangular mask (boolean)."""
-        y, x = np.ogrid[:self.det_x, :self.det_y]
-        mask = (np.abs(x - cx) <= half_width) & (np.abs(y - cy) <= half_height)
+        """Create rectangular mask (boolean tensor on device)."""
+        mask = (torch.abs(self._det_col_coords - cx) <= half_width) & (torch.abs(self._det_row_coords - cy) <= half_height)
         return mask
 
     def _precompute_common_virtual_images(self):
@@ -907,7 +878,7 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         return None
 
-    def _fast_masked_sum(self, mask) -> "np.ndarray":
+    def _fast_masked_sum(self, mask: torch.Tensor) -> torch.Tensor:
         """Compute masked sum using PyTorch.
 
         Uses sparse indexing for small masks (<20% coverage) which is faster
@@ -917,41 +888,36 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         For large masks (≥20%), uses full tensordot which has constant ~13ms.
         """
-        mask_tensor = torch.from_numpy(mask.astype(np.float32)).to(self._device)
+        mask_float = mask.float()
         n_det = self._det_shape[0] * self._det_shape[1]
-        n_nonzero = int(mask_tensor.sum())
+        n_nonzero = int(mask.sum())
         coverage = n_nonzero / n_det
 
-        if coverage < 0.2:
+        if coverage < SPARSE_MASK_THRESHOLD:
             # Sparse: faster for small masks
-            indices = torch.nonzero(mask_tensor.flatten(), as_tuple=True)[0]
+            indices = torch.nonzero(mask_float.flatten(), as_tuple=True)[0]
             n_scan = self._scan_shape[0] * self._scan_shape[1]
             data_flat = self._data.reshape(n_scan, n_det)
             result = data_flat[:, indices].sum(dim=1).reshape(self._scan_shape)
         else:
             # Tensordot: faster for large masks
-            result = torch.tensordot(self._data, mask_tensor, dims=([2, 3], [0, 1]))
+            result = torch.tensordot(self._data, mask_float, dims=([2, 3], [0, 1]))
 
-        return result.cpu().numpy()
+        return result
 
-    def _to_float32_bytes(self, arr, update_vi_stats: bool = True) -> bytes:
-        """Convert array to float32 bytes (JS handles scale/colormap)."""
-        if isinstance(arr, torch.Tensor):
-            arr = arr.cpu().numpy()
-        arr = arr.astype(np.float32)
+    def _to_float32_bytes(self, arr: torch.Tensor, update_vi_stats: bool = True) -> bytes:
+        """Convert tensor to float32 bytes."""
+        # Compute min/max (fast on GPU)
+        vmin = float(arr.min())
+        vmax = float(arr.max())
+        self.vi_data_min = vmin
+        self.vi_data_max = vmax
 
-        # Set min/max for JS-side normalization
+        # Compute full stats if requested
         if update_vi_stats:
-            self.vi_data_min = float(arr.min())
-            self.vi_data_max = float(arr.max())
-            self.vi_stats = [
-                float(arr.mean()),
-                float(arr.min()),
-                float(arr.max()),
-                float(arr.std()),
-            ]
+            self.vi_stats = [float(arr.mean()), vmin, vmax, float(arr.std())]
 
-        return arr.tobytes()
+        return arr.cpu().numpy().astype(np.float32).tobytes()
 
     def _compute_virtual_image_from_roi(self):
         """Compute virtual image based on ROI mode."""
@@ -977,8 +943,8 @@ class Show4DSTEM(anywidget.AnyWidget):
             mask = self._create_rect_mask(cx, cy, self.roi_width / 2, self.roi_height / 2)
         else:
             # Point mode: single-pixel indexing
-            row = int(np.clip(round(cy), 0, self._det_shape[0] - 1))
-            col = int(np.clip(round(cx), 0, self._det_shape[1] - 1))
+            row = int(max(0, min(round(cy), self._det_shape[0] - 1)))
+            col = int(max(0, min(round(cx), self._det_shape[1] - 1)))
             if self._data.ndim == 4:
                 virtual_image = self._data[:, :, row, col]
             else:

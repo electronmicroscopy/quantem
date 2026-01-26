@@ -1,6 +1,6 @@
 /// <reference types="@webgpu/types" />
 import * as React from "react";
-import { createRender, useModelState } from "@anywidget/react";
+import { createRender, useModelState, useModel } from "@anywidget/react";
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 import Stack from "@mui/material/Stack";
@@ -130,7 +130,6 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 10;
 
 function nextPow2(n: number): number { return Math.pow(2, Math.ceil(Math.log2(n))); }
-function isPow2(n: number): boolean { return n > 0 && (n & (n - 1)) === 0; }
 
 function fft1dPow2(real: Float32Array, imag: Float32Array, inverse: boolean = false) {
   const n = real.length;
@@ -310,7 +309,6 @@ async function getWebGPUFFT(): Promise<WebGPUFFT | null> {
     if (!adapter) return null;
     const device = await adapter.requestDevice();
     gpuFFT = new WebGPUFFT(device); await gpuFFT.init();
-    console.log('🚀 WebGPU FFT ready');
     return gpuFFT;
   } catch (e) { console.warn('WebGPU init failed:', e); return null; }
 }
@@ -1188,6 +1186,9 @@ function Histogram({
 // Main Component
 // ============================================================================
 function Show4DSTEM() {
+  // Direct model access for batched updates
+  const model = useModel();
+
   // ─────────────────────────────────────────────────────────────────────────
   // Model State (synced with Python)
   // ─────────────────────────────────────────────────────────────────────────
@@ -1286,7 +1287,6 @@ function Show4DSTEM() {
   const [summedDpCount] = useModelState<number>("summed_dp_count");
   const [dpStats] = useModelState<number[]>("dp_stats");  // [mean, min, max, std]
   const [viStats] = useModelState<number[]>("vi_stats");  // [mean, min, max, std]
-  const [hotPixelFilter, setHotPixelFilter] = useModelState<boolean>("hot_pixel_filter");
   const [showFft, setShowFft] = React.useState(false);  // Hidden by default per feedback
 
   // Theme detection - detect environment and light/dark mode
@@ -1521,7 +1521,7 @@ function Show4DSTEM() {
   // Parse virtual image bytes into Float32Array and apply scale for histogram
   React.useEffect(() => {
     if (!virtualImageBytes) return;
-    // Parse as Float32Array since Python now sends raw float32
+    // Parse as Float32Array
     const numFloats = virtualImageBytes.byteLength / 4;
     const rawData = new Float32Array(virtualImageBytes.buffer, virtualImageBytes.byteOffset, numFloats);
 
@@ -1546,7 +1546,6 @@ function Show4DSTEM() {
     } else {
       scaledData.set(rawData);
     }
-    // Update histogram state (triggers re-render)
     setViHistogramData(scaledData);
   }, [virtualImageBytes, viScaleMode, viPowerExp]);
 
@@ -1684,11 +1683,28 @@ function Show4DSTEM() {
         }
       }
 
-      // Compute actual min/max of scaled data
-      let dataMin = Infinity, dataMax = -Infinity;
-      for (let i = 0; i < scaled.length; i++) {
-        if (scaled[i] < dataMin) dataMin = scaled[i];
-        if (scaled[i] > dataMax) dataMax = scaled[i];
+      // Use Python's pre-computed min/max when valid, fallback to computing from data
+      let dataMin: number, dataMax: number;
+      const hasValidMinMax = viDataMin !== undefined && viDataMax !== undefined && viDataMax > viDataMin;
+      if (hasValidMinMax) {
+        // Apply scale transform to Python's values
+        if (viScaleMode === "log") {
+          dataMin = Math.log1p(Math.max(0, viDataMin));
+          dataMax = Math.log1p(Math.max(0, viDataMax));
+        } else if (viScaleMode === "power") {
+          dataMin = Math.pow(Math.max(0, viDataMin), viPowerExp);
+          dataMax = Math.pow(Math.max(0, viDataMax), viPowerExp);
+        } else {
+          dataMin = viDataMin;
+          dataMax = viDataMax;
+        }
+      } else {
+        // Fallback: compute from scaled data
+        dataMin = Infinity; dataMax = -Infinity;
+        for (let i = 0; i < scaled.length; i++) {
+          if (scaled[i] < dataMin) dataMin = scaled[i];
+          if (scaled[i] > dataMax) dataMax = scaled[i];
+        }
       }
 
       // Apply vmin/vmax percentile clipping
@@ -1739,6 +1755,8 @@ function Show4DSTEM() {
 
     if (!rawVirtualImageRef.current) return;
     renderData(rawVirtualImageRef.current);
+    // Note: viDataMin/viDataMax intentionally not in deps - they arrive with virtualImageBytes
+    // and we have a fallback if they're stale
   }, [virtualImageBytes, shapeX, shapeY, viColormap, viVminPct, viVmaxPct, viScaleMode, viPowerExp, viZoom, viPanX, viPanY]);
 
   // Render virtual image overlay (just clear - crosshair drawn on high-DPI UI canvas)
@@ -2078,9 +2096,12 @@ function Show4DSTEM() {
 
     setIsDraggingDP(true);
     setLocalKx(imgX); setLocalKy(imgY);
-    setRoiActive(true);
-    setRoiCenterX(Math.round(Math.max(0, Math.min(detY - 1, imgX))));
-    setRoiCenterY(Math.round(Math.max(0, Math.min(detX - 1, imgY))));
+    // Use compound roi_center trait - single observer fires in Python
+    const newX = Math.round(Math.max(0, Math.min(detY - 1, imgX)));
+    const newY = Math.round(Math.max(0, Math.min(detX - 1, imgY)));
+    model.set("roi_active", true);
+    model.set("roi_center", [newX, newY]);
+    model.save_changes();
   };
 
   const handleDpMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -2127,12 +2148,20 @@ function Show4DSTEM() {
     }
 
     setLocalKx(imgX); setLocalKy(imgY);
-    setRoiCenterX(Math.round(Math.max(0, Math.min(detY - 1, imgX))));
-    setRoiCenterY(Math.round(Math.max(0, Math.min(detX - 1, imgY))));
+    // Use compound roi_center trait - single observer fires in Python
+    const newX = Math.round(Math.max(0, Math.min(detY - 1, imgX)));
+    const newY = Math.round(Math.max(0, Math.min(detX - 1, imgY)));
+    model.set("roi_center", [newX, newY]);
+    model.save_changes();
   };
 
-  const handleDpMouseUp = () => { setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false); };
-  const handleDpMouseLeave = () => { setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false); setIsHoveringResize(false); setIsHoveringResizeInner(false); };
+  const handleDpMouseUp = () => {
+    setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+  };
+  const handleDpMouseLeave = () => {
+    setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+    setIsHoveringResize(false); setIsHoveringResizeInner(false);
+  };
   const handleDpDoubleClick = () => { setDpZoom(1); setDpPanX(0); setDpPanY(0); };
 
   const handleViMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -2164,8 +2193,12 @@ function Show4DSTEM() {
     // Regular position selection (when ROI is off)
     setIsDraggingVI(true);
     setLocalPosX(imgX); setLocalPosY(imgY);
-    setPosX(Math.round(Math.max(0, Math.min(shapeX - 1, imgX))));
-    setPosY(Math.round(Math.max(0, Math.min(shapeY - 1, imgY))));
+    // Batch X and Y updates into a single sync
+    const newX = Math.round(Math.max(0, Math.min(shapeX - 1, imgX)));
+    const newY = Math.round(Math.max(0, Math.min(shapeY - 1, imgY)));
+    model.set("pos_x", newX);
+    model.set("pos_y", newY);
+    model.save_changes();
   };
 
   const handleViMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -2205,16 +2238,24 @@ function Show4DSTEM() {
     if (isDraggingViRoi) {
       setLocalViRoiCenterX(imgX);
       setLocalViRoiCenterY(imgY);
-      setViRoiCenterX(Math.round(Math.max(0, Math.min(shapeX - 1, imgX))));
-      setViRoiCenterY(Math.round(Math.max(0, Math.min(shapeY - 1, imgY))));
+      // Batch VI ROI center updates
+      const newViX = Math.round(Math.max(0, Math.min(shapeX - 1, imgX)));
+      const newViY = Math.round(Math.max(0, Math.min(shapeY - 1, imgY)));
+      model.set("vi_roi_center_x", newViX);
+      model.set("vi_roi_center_y", newViY);
+      model.save_changes();
       return;
     }
 
     // Handle regular position dragging (when ROI is off)
     if (!isDraggingVI) return;
     setLocalPosX(imgX); setLocalPosY(imgY);
-    setPosX(Math.round(Math.max(0, Math.min(shapeX - 1, imgX))));
-    setPosY(Math.round(Math.max(0, Math.min(shapeY - 1, imgY))));
+    // Batch position updates into a single sync
+    const newX = Math.round(Math.max(0, Math.min(shapeX - 1, imgX)));
+    const newY = Math.round(Math.max(0, Math.min(shapeY - 1, imgY)));
+    model.set("pos_x", newX);
+    model.set("pos_y", newY);
+    model.save_changes();
   };
 
   const handleViMouseUp = () => {
@@ -2372,10 +2413,6 @@ function Show4DSTEM() {
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Min <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[1])}</Box></Typography>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Max <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[2])}</Box></Typography>
               <Typography sx={{ fontSize: 11, color: themeColors.textMuted }}>Std <Box component="span" sx={{ color: themeColors.accent }}>{formatStat(dpStats[3])}</Box></Typography>
-              <Box sx={{ display: "flex", alignItems: "center", ml: "auto" }}>
-                <Typography sx={{ fontSize: 10, color: themeColors.textMuted }}>Show hot px:<InfoTooltip text="Toggle hot pixel display. When OFF, clips display range to 99.99 percentile to exclude outlier pixels. Hot pixels are defective detector elements that show abnormally high values." theme={themeInfo.theme} /></Typography>
-                <Switch checked={!(hotPixelFilter ?? true)} onChange={(e) => setHotPixelFilter(!e.target.checked)} size="small" sx={switchStyles.small} />
-              </Box>
             </Box>
           )}
 
@@ -2454,7 +2491,7 @@ function Show4DSTEM() {
         <Box sx={{ width: viCanvasWidth }}>
           {/* VI Header */}
           <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
-            <Typography variant="caption" sx={{ ...typography.label }}>Virtual Image<InfoTooltip text="Virtual Image: Integrated intensity within detector ROI at each scan position. Computed as Σ(DP × mask) for each (x,y). Double-click to select position." theme={themeInfo.theme} /></Typography>
+            <Typography variant="caption" sx={{ ...typography.label }}>Image<InfoTooltip text="Virtual image: Integrated intensity within detector ROI at each scan position. Computed as Σ(DP × mask) for each (x,y). Double-click to select position." theme={themeInfo.theme} /></Typography>
             <Stack direction="row" spacing={`${SPACING.SM}px`} alignItems="center">
               <Typography sx={{ ...typography.label, color: themeColors.textMuted, fontSize: 10 }}>
                 {shapeX}×{shapeY} | {detX}×{detY}
