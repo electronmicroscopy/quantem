@@ -30,7 +30,7 @@ def read_4dstem(
         Index of the dataset to load if file contains multiple datasets.
         If None, automatically selects the first 4D dataset found.
     **kwargs: dict
-        Additional keyword arguments to pass to the Dataset4dstem constructor.
+        Additional keyword arguments to pass to the file reader.
 
     Returns
     --------
@@ -39,8 +39,12 @@ def read_4dstem(
     if file_type is None:
         file_type = Path(file_path).suffix.lower().lstrip(".")
 
+    sampling_override = kwargs.pop("sampling", None)
+    origin_override = kwargs.pop("origin", None)
+    units_override = kwargs.pop("units", None)
+
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
-    data_list = file_reader(file_path)
+    data_list = file_reader(file_path, **kwargs)
 
     # If specific index provided, use it
     if dataset_index is not None:
@@ -69,17 +73,18 @@ def read_4dstem(
 
     imported_axes = imported_data["axes"]
 
-    sampling = kwargs.pop(
-        "sampling",
-        [ax["scale"] for ax in imported_axes],
+    sampling = (
+        sampling_override
+        if sampling_override is not None
+        else [ax["scale"] for ax in imported_axes]
     )
-    origin = kwargs.pop(
-        "origin",
-        [ax["offset"] for ax in imported_axes],
+    origin = (
+        origin_override if origin_override is not None else [ax["offset"] for ax in imported_axes]
     )
-    units = kwargs.pop(
-        "units",
-        ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes],
+    units = (
+        units_override
+        if units_override is not None
+        else ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes]
     )
 
     dataset = Dataset4dstem.from_array(
@@ -87,7 +92,6 @@ def read_4dstem(
         sampling=sampling,
         origin=origin,
         units=units,
-        **kwargs,
     )
 
     return dataset
