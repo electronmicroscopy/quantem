@@ -102,7 +102,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     # @property
     # def params(self):
     #     # TODO: Need to double check if this is correct way, also need to implement get_optimization_parameters @Arthur!!
-    #     return self.parameters()
+    #     raise NotImplementedError("This method should be implemented in subclasses.")
 
     # --- Forward pass ---
     @abstractmethod
@@ -214,6 +214,12 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._shifts_ref = self._shifts_ref.to(device)
 
         self.device = device
+
+    def get_optimization_parameters(self) -> list[nn.Parameter]:
+        """
+        Get the parameters that should be optimized for this model.
+        """
+        return list[nn.Parameter](self.params)
 
 
 class TomographyPixDataset(TomographyDatasetBase):
@@ -330,6 +336,8 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
             sampling_rate=1.0,
         )
         all_coords = transformed_rays.view(-1, 3)
+
+        all_coords = all_coords.to(self.device, dtype=torch.float32, non_blocking=True)
         return all_coords
 
     @staticmethod

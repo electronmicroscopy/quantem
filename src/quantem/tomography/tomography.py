@@ -1,4 +1,4 @@
-from typing import Literal, Optional, Self, Tuple
+from typing import List, Literal, Optional, Self, Tuple
 
 import numpy as np
 import torch
@@ -49,6 +49,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         scheduler_params: dict | None = None,
         constraints: dict = {},  # TODO: What to pass into the constraints?
         loss_func: Tuple[str, Optional[float]] = ("smooth_l1", 0.07),
+        num_samples_per_ray: int | List[Tuple[int, int]] = None,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -73,6 +74,9 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
             self.scheduler_params = scheduler_params
             self.set_schedulers(scheduler_params)
 
+        if constraints is not None:
+            self.obj_model.constraints = constraints
+
         new_scheduler = reset
         if new_scheduler:
             raise NotImplementedError("New schedulers are not implemented yet.")
@@ -86,7 +90,15 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         self.obj_model.model.train()
 
         N = max(self.obj_model.shape)
-        num_samples_per_ray = max(self.obj_model.shape)
+
+        if num_samples_per_ray is None:
+            num_samples_per_ray = max(self.obj_model.shape)
+        else:
+            if isinstance(num_samples_per_ray, int):
+                num_samples_per_ray = num_samples_per_ray
+            else:
+                print("num_samples_per_ray schedule provided.")
+
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
 
         for a0 in range(num_iter):
@@ -97,6 +109,12 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
             if self.sampler is not None:
                 self.sampler.set_epoch(a0)
 
+            if isinstance(num_samples_per_ray, list):
+                print(f"num_samples_per_ray[a0][1]: {num_samples_per_ray[a0][1]}")
+                curr_num_samples_per_ray = num_samples_per_ray[a0][1]
+            else:
+                curr_num_samples_per_ray = num_samples_per_ray
+            print(f"curr_num_samples_per_ray: {curr_num_samples_per_ray}")
             for batch_idx, batch in enumerate(self.dataloader):
                 self.zero_grad_all()
                 with torch.autocast(
@@ -104,15 +122,15 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                     dtype=torch.bfloat16,
                     enabled=True,
                 ):
-                    all_coords = self.dset.get_coords(batch, N, num_samples_per_ray)
-                    all_coords = all_coords.to(
-                        device=self.device, dtype=torch.float32, non_blocking=True
-                    )
+                    all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
+                    # all_coords = all_coords.to(
+                    #     device=self.device, dtype=torch.float32, non_blocking=True
+                    # )
 
                     all_densities = self.obj_model.forward(all_coords)
 
                     integrated_densities = self.dset.integrate_rays(
-                        all_densities, num_samples_per_ray, len(batch["target_value"])
+                        all_densities, curr_num_samples_per_ray, len(batch["target_value"])
                     )
 
                     # batch_consistency_loss = loss_func(integrated_densities, batch["target_value"])
@@ -120,9 +138,14 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
                 batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
 
-                # soft_constraints_loss = self._soft_constraints()
-                batch_loss = batch_consistency_loss.float()  # + soft_constraints_loss
+                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords)
+                print(f"soft_constraints_loss: {soft_constraints_loss.item()}")
+                batch_loss = batch_consistency_loss.float() + soft_constraints_loss
                 batch_loss.backward()
+
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
+
                 self.step_optimizers()
                 total_loss += batch_loss.item()
                 consistency_loss += batch_consistency_loss.item()

@@ -46,7 +46,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
             print("Setting up DDP for obj_model")
             self.setup_distributed(device=device)
             # self._obj_model._model = self.build_model(obj_model) # Assuming when object is initialized it's already wrapped in DDP?
-            print("After DDP Setup", self._obj_model)
+            # print("After DDP Setup", self._obj_model)
 
         self.dset = dset
         self.dset.to(device)
@@ -74,10 +74,9 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
 
     @obj_model.setter
     def obj_model(self, obj_model: ObjectBase):
-        if not isinstance(obj_model, ObjectBase):
-            raise TypeError(f"obj_model should be a ObjectBase, got {type(obj_model)}")
+        # if not isinstance(obj_model, ObjectBase):
+        #     raise TypeError(f"obj_model should be a ObjectBase, got {type(obj_model)}")
         self._obj_model = obj_model
-        print(self._obj_model)
 
     @property
     def constraints(self) -> ConstraintsTomography:

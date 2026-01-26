@@ -187,23 +187,17 @@ class ObjectConstraints(ObjectBase, BaseConstraints):
         # TODO: Need to implement the other hard constraints: Fourier Filter and Circular Mask.
         return obj2
 
-    def apply_soft_constraints(
-        self,
-        obj: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Apply soft constraints to the object model.
+    # def apply_soft_constraints(
+    #     self,
+    #     obj: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     """
+    # TODO: Already in BaseConstraints class.
+    #     Apply soft constraints to the object model.
 
-        Only soft constraint here is the TV loss.
-        """
-
-        soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
-        if self.constraints.tv_vol > 0:
-            tv_loss = self.get_tv_loss(
-                obj.unsqueeze(0).unsqueeze(0), factor=self.constraints.tv_vol
-            )
-            soft_loss += tv_loss
-        return soft_loss
+    #     Only soft constraint here is the TV loss.
+    #     """
+    #     return NotImplementedError("Subclasses must implement this method.")
 
     @abstractmethod
     def get_tv_loss(self, obj: torch.Tensor, tv_weight: float = 0.0) -> torch.Tensor:
@@ -261,6 +255,15 @@ class ObjectPixelated(ObjectConstraints):
     @property
     def obj_type(self) -> str:
         return "pixelated"
+
+    def apply_soft_constraints(self, obj: torch.Tensor) -> torch.Tensor:
+        soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
+        if self.constraints.tv_vol > 0:
+            tv_loss = self.get_tv_loss(
+                obj.unsqueeze(0).unsqueeze(0), factor=self.constraints.tv_vol
+            )
+            soft_loss += tv_loss
+        return soft_loss
 
     # --- Forward method ---
     def forward(self, dummy_input=None) -> torch.Tensor:
@@ -340,6 +343,33 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     #     For now, upon initialization private variable `._model` is set to the built model.
     #     """
     #     raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
+
+    def apply_soft_constraints(
+        self,
+        coords: torch.Tensor,
+    ) -> torch.Tensor:
+        soft_loss = torch.tensor(0.0, device=coords.device)
+        if self.constraints.tv_vol > 0:
+            num_tv_samples = min(10000, coords.shape[0])
+            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+
+            tv_coords = coords[tv_indices].detach().requires_grad_(True)
+
+            tv_densities_recomputed = self.model(tv_coords)
+            if tv_densities_recomputed.dim() > 1:
+                tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+
+            grad_outputs = torch.autograd.grad(
+                outputs=tv_densities_recomputed,
+                inputs=tv_coords,
+                grad_outputs=torch.ones_like(tv_densities_recomputed),
+                create_graph=True,
+            )[0]
+
+            grad_norm = torch.norm(grad_outputs, dim=1)
+            soft_loss += self.constraints.tv_vol * grad_norm.mean()
+
+        return soft_loss
 
     @property
     def params(self):
@@ -482,6 +512,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
                 loss.backward()
                 epoch_loss += loss.item()
+
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
                 optimizer.step()
                 optimizer.zero_grad()
 
