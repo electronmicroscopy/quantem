@@ -1,17 +1,45 @@
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
+import numpy as np
 import torch
 
 
-@dataclass
+@dataclass(slots=True)
 class Constraints(ABC):
     """
     Needs to be implemented in all object models that inherit from BaseConstraints.
     """
 
-    pass
+    soft_constraint_keys = []
+    hard_constraint_keys = []
+
+    @property
+    def allowed_keys(self) -> list[str]:
+        """
+        List of all allowed keys.
+        """
+        return self.hard_constraint_keys + self.soft_constraint_keys
+
+    def copy(self) -> Self:
+        """
+        Copy the constraints.
+        """
+        return deepcopy(self)
+
+    def __str__(self) -> str:
+        hard = "\n".join(f"{key}: {getattr(self, key)}" for key in self.hard_constraint_keys)
+        soft = "\n".join(f"{key}: {getattr(self, key)}" for key in self.soft_constraint_keys)
+
+        return (
+            "Constraints:\n"
+            "  Hard constraints:\n"
+            f"    {hard.replace('\n', '\n    ')}\n"
+            "  Soft constraints:\n"
+            f"    {soft.replace('\n', '\n    ')}"
+        )
 
 
 class BaseConstraints(ABC):
@@ -24,9 +52,12 @@ class BaseConstraints(ABC):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._soft_constraint_loss = {}
-        self._epoch_constraint_losses = {}
+        self._soft_constraint_losses = []
         self.constraints = self.DEFAULT_CONSTRAINTS.copy()
+
+    @property
+    def soft_constraint_losses(self) -> list[float]:
+        return np.array(self._soft_constraint_losses)
 
     @property
     def constraints(self) -> Constraints:
@@ -44,20 +75,9 @@ class BaseConstraints(ABC):
             self._constraints = constraints
         elif isinstance(constraints, dict):
             for key, value in constraints.items():
-                if key not in self._constraints.allowed_keys:
-                    raise ValueError(f"Invalid constraint key: {key}")
                 setattr(self._constraints, key, value)
         else:
             raise ValueError(f"Invalid constraints type: {type(constraints)}")
-
-    def add_constraint(self, key: str, value: Any):
-        """
-        Add a constraint to the constraints class.
-        Note the allowed keys should be implemented for each constraint subclass.
-        """
-        if key not in self._constraints.allowed_keys:
-            raise ValueError(f"Invalid constraint key: {key}")
-        setattr(self._constraints, key, value)
 
     # --- Required methods tha tneeds to implemented in subclasses ---
     @abstractmethod

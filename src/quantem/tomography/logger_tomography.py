@@ -1,4 +1,9 @@
+import matplotlib.pyplot as plt
+import torch
+
 from quantem.core.ml.logger import LoggerBase
+from quantem.tomography.dataset_models import DatasetModelType
+from quantem.tomography.object_models import ObjectModelType
 
 
 class LoggerTomography(LoggerBase):
@@ -19,3 +24,55 @@ class LoggerTomography(LoggerBase):
         self.log_scalar("loss/total", loss, epoch)
         self.log_scalar("loss/tilt_series", tilt_series_loss, epoch)
         self.log_scalar("loss/soft", soft_loss, epoch)
+
+    def log_iter(
+        self,
+        object_model: ObjectModelType,
+        iter: int,
+        consistency_loss: float,
+        total_loss: float,
+        num_samples_per_ray: int | None = None,
+    ):
+        self.log_scalar("loss/consistency", consistency_loss, iter)
+        self.log_scalar("loss/total", total_loss, iter)
+        self.log_scalar("loss/soft", object_model._soft_constraint_losses[-1], iter)
+        self.log_scalar("num_samples_per_ray", num_samples_per_ray, iter)
+
+    def log_iter_images(
+        self,
+        object_model: ObjectModelType,
+        dataset_model: DatasetModelType,
+        iter: int,
+        logger_cmap: str = "turbo",
+    ):
+        with torch.no_grad():
+            vol = object_model.create_volume(return_vol=True)
+            z1_vals = dataset_model.z1_params.cpu().numpy()
+            z3_vals = dataset_model.z3_params.cpu().numpy()
+            shifts_vals = dataset_model.shifts_params.cpu().numpy()
+
+        self.log_image("volume/sum_z", vol.sum(axis=0), iter, logger_cmap)
+        self.log_image("volume/sum_y", vol.sum(axis=1), iter, logger_cmap)
+        self.log_image("volume/sum_x", vol.sum(axis=2), iter, logger_cmap)
+
+        # Plotting z1 and z3 vals
+        fig, ax = plt.subplots()
+        ax.plot(z1_vals, label="Z1")
+        ax.plot(z3_vals, label="Z3")
+        ax.legend()
+        ax.set_title("Z1 and Z3 Angles")
+        ax.set_xlabel("Tilt Image")
+        ax.set_ylabel("Degree")
+        self.log_figure("z1_z3_angles", fig, iter)
+        plt.close(fig)
+
+        # Plotting shifts
+        fig, ax = plt.subplots()
+        ax.plot(shifts_vals[:, 0], label="Shifts X")
+        ax.plot(shifts_vals[:, 1], label="Shifts Y")
+        ax.legend()
+        ax.set_title("Shifts")
+        ax.set_xlabel("Tilt Image")
+        ax.set_ylabel("Pixel")
+        self.log_figure("shifts", fig, iter)
+        plt.close(fig)

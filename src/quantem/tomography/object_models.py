@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Self
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -17,8 +17,8 @@ from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 
 
-@dataclass
-class ConstraintsTomography(Constraints):
+@dataclass(slots=True)
+class DefaultConstraintsTomography(Constraints):
     """
     Data class for all constraints that can be applied to the object model.
     """
@@ -32,41 +32,8 @@ class ConstraintsTomography(Constraints):
     # Soft Constraints
     tv_vol: float = 0.0
 
-    @property
-    def hard_constraint_keys(self) -> list[str]:
-        """
-        List of hard constraint keys.
-        """
-        return ["positivity", "shrinkage", "circular_mask", "fourier_filter"]
-
-    @property
-    def soft_constraint_keys(self) -> list[str]:
-        """
-        List of soft constraint keys.
-        """
-        return ["tv_vol"]
-
-    @property
-    def allowed_keys(self) -> list[str]:
-        """
-        List of all allowed keys.
-        """
-        return self.hard_constraint_keys + self.soft_constraint_keys
-
-    def copy(self) -> Self:
-        """
-        Copy the constraints.
-        """
-        return deepcopy(self)
-
-    def __str__(self) -> str:
-        return f"""Constraints:
-        Positivity: {self.positivity}
-        Shrinkage: {self.shrinkage}
-        Circular Mask: {self.circular_mask}
-        Fourier Filter: {self.fourier_filter}
-        TV Volume: {self.tv_vol}
-        """
+    soft_constraint_keys = ["tv_vol"]
+    hard_constraint_keys = ["positivity", "shrinkage", "circular_mask", "fourier_filter"]
 
 
 class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
@@ -162,8 +129,8 @@ class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
             raise NotImplementedError
 
 
-class ObjectConstraints(ObjectBase, BaseConstraints):
-    DEFAULT_CONSTRAINTS = ConstraintsTomography()
+class ObjectConstraints(BaseConstraints, ObjectBase):
+    DEFAULT_CONSTRAINTS = DefaultConstraintsTomography()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -533,6 +500,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
     def create_volume(
         self,
+        return_vol: bool = False,
     ):
         N = max(self._shape)
         with torch.no_grad():
@@ -599,7 +567,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             else:
                 pred_full = outputs.reshape(N, N, N).float()
 
-            self._obj = pred_full.detach().cpu()
+            if return_vol:
+                return pred_full.detach().cpu()
+            else:
+                self._obj = pred_full.detach().cpu()
 
     def get_tv_loss(
         self,

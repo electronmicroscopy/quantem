@@ -6,7 +6,11 @@ from quantem.core.ml.ddp import DDPMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import DatasetModelType, TomographyDatasetBase
 from quantem.tomography.logger_tomography import LoggerTomography
-from quantem.tomography.object_models import ConstraintsTomography, ObjectBase, ObjectPixelated
+from quantem.tomography.object_models import (
+    DefaultConstraintsTomography,
+    ObjectBase,
+    ObjectPixelated,
+)
 
 
 class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
@@ -40,6 +44,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
 
         # Loss
         self._epoch_losses: list[float] = []
+        self._consistency_losses: list[float] = []
         # DDP Initialization
         # print("Checking if obj_model is a ObjectPixelated: ", not isinstance(obj_model, ObjectPixelated))
         if not isinstance(obj_model, ObjectPixelated):
@@ -79,14 +84,14 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._obj_model = obj_model
 
     @property
-    def constraints(self) -> ConstraintsTomography:
+    def constraints(self) -> DefaultConstraintsTomography:
         return self.obj_model.constraints
 
     @constraints.setter
-    def constraints(self, constraints: ConstraintsTomography):
-        if not isinstance(constraints, ConstraintsTomography):
+    def constraints(self, constraints: DefaultConstraintsTomography):
+        if not isinstance(constraints, DefaultConstraintsTomography):
             raise TypeError(
-                f"constraints should be a ConstraintsTomography, got {type(constraints)}"
+                f"constraints should be a DefaultConstraintsTomography, got {type(constraints)}"
             )
         self.obj_model.constraints = constraints
 
@@ -118,6 +123,13 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         Returns the fidelity loss for each epoch ran.
         """
         return np.array(self._epoch_losses)
+
+    @property
+    def consistency_losses(self) -> NDArray:
+        """
+        Returns the consistency loss for each epoch ran.
+        """
+        return np.array(self._consistency_losses)
 
     @property
     def num_epochs(self) -> int:

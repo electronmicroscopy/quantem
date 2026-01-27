@@ -104,13 +104,13 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         for a0 in range(num_iter):
             consistency_loss = 0.0
             total_loss = 0.0
+            epoch_soft_constraint_loss = 0.0
             # self._reset_iter_constraints()
 
             if self.sampler is not None:
                 self.sampler.set_epoch(a0)
 
             if isinstance(num_samples_per_ray, list):
-                print(f"num_samples_per_ray[a0][1]: {num_samples_per_ray[a0][1]}")
                 curr_num_samples_per_ray = num_samples_per_ray[a0][1]
             else:
                 curr_num_samples_per_ray = num_samples_per_ray
@@ -136,10 +136,10 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                     # batch_consistency_loss = loss_func(integrated_densities, batch["target_value"])
                 pred = integrated_densities.float()
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
-                batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
 
+                batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
                 soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords)
-                print(f"soft_constraints_loss: {soft_constraints_loss.item()}")
+                epoch_soft_constraint_loss += soft_constraints_loss.item()
                 batch_loss = batch_consistency_loss.float() + soft_constraints_loss
                 batch_loss.backward()
 
@@ -150,9 +150,32 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 total_loss += batch_loss.item()
                 consistency_loss += batch_consistency_loss.item()
 
+            # TODO: Maybe reorganize the losses so that the order makes sense lol.
             total_loss = total_loss / len(self.dataloader)
             consistency_loss = consistency_loss / len(self.dataloader)
+            epoch_soft_constraint_loss = epoch_soft_constraint_loss / len(self.dataloader)
             print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}")
+
+            self._epoch_losses.append(total_loss)
+            self._consistency_losses.append(consistency_loss)
+            self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
+
+            if self.logger is not None and self.global_rank == 0:
+                self.logger.log_iter(
+                    object_model=self.obj_model,
+                    iter=a0,
+                    consistency_loss=consistency_loss,
+                    total_loss=total_loss,
+                    num_samples_per_ray=curr_num_samples_per_ray,
+                )
+                if self.logger.log_images_every > 0 and a0 % self.logger.log_images_every == 0:
+                    self.logger.log_iter_images(
+                        object_model=self.obj_model,
+                        dataset_model=self.dset,
+                        iter=a0,
+                    )
+
+                self.logger.flush()
 
 
 class TomographyConventional(TomographyBase):
@@ -281,7 +304,6 @@ class TomographyConventional(TomographyBase):
             self.obj_model.obj += correction
 
             if gaussian_kernel is not None:
-                print(self.obj_model.obj.shape)
                 self.obj_model.obj = gaussian_filter_2d_stack(self.obj_model.obj, gaussian_kernel)
 
         loss = torch.mean(torch.abs(error))
