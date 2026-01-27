@@ -1,1 +1,2 @@
 from quantem.diffraction.polar import PairDistributionFunction as PairDistributionFunction
+from quantem.diffraction.bragg_peaks import BraggPeaksPolymer
