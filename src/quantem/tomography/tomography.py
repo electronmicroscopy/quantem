@@ -13,6 +13,7 @@ from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_opt import TomographyOpt
 from quantem.tomography.utils import torch_phase_cross_correlation
 from quantem.tomography_old.utils import gaussian_filter_2d_stack, gaussian_kernel_1d
+import torch.distributed as dist
 
 
 class Tomography(TomographyOpt, TomographyBase, DDPMixin):
@@ -100,6 +101,8 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 print("num_samples_per_ray schedule provided.")
 
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
+        
+
 
         for a0 in range(num_iter):
             consistency_loss = 0.0
@@ -114,7 +117,9 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 curr_num_samples_per_ray = num_samples_per_ray[a0][1]
             else:
                 curr_num_samples_per_ray = num_samples_per_ray
-            print(f"curr_num_samples_per_ray: {curr_num_samples_per_ray}")
+
+            if self.global_rank == 0:
+                print(f"curr_num_samples_per_ray: {curr_num_samples_per_ray}")
             for batch_idx, batch in enumerate(self.dataloader):
                 self.zero_grad_all()
                 with torch.autocast(
@@ -123,9 +128,6 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                     enabled=True,
                 ):
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
-                    # all_coords = all_coords.to(
-                    #     device=self.device, dtype=torch.float32, non_blocking=True
-                    # )
 
                     all_densities = self.obj_model.forward(all_coords)
 
@@ -133,7 +135,6 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                         all_densities, curr_num_samples_per_ray, len(batch["target_value"])
                     )
 
-                    # batch_consistency_loss = loss_func(integrated_densities, batch["target_value"])
                 pred = integrated_densities.float()
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 
@@ -151,29 +152,50 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 consistency_loss += batch_consistency_loss.item()
 
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
+
             total_loss = total_loss / len(self.dataloader)
             consistency_loss = consistency_loss / len(self.dataloader)
             epoch_soft_constraint_loss = epoch_soft_constraint_loss / len(self.dataloader)
-            print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}")
+
+            metrics = torch.tensor(
+                [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
+            )
+
+            if self.world_size > 1:
+                dist.all_reduce(metrics, dist.ReduceOp.AVG)
+
+            total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
+
+            if self.global_rank == 0:
+                print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}")
 
             self._epoch_losses.append(total_loss)
             self._consistency_losses.append(consistency_loss)
             self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
 
-            if self.logger is not None and self.global_rank == 0:
-                self.logger.log_iter(
-                    object_model=self.obj_model,
-                    iter=a0,
-                    consistency_loss=consistency_loss,
-                    total_loss=total_loss,
-                    num_samples_per_ray=curr_num_samples_per_ray,
-                )
-                if self.logger.log_images_every > 0 and a0 % self.logger.log_images_every == 0:
-                    self.logger.log_iter_images(
+            if self.logger is not None:
+                if self.logger.log_images_every > 0 and self.num_epochs % self.logger.log_images_every == 0:
+                    print("Creating volume...")
+                    pred_full = self.obj_model.create_volume(return_vol=True)
+
+                    if self.global_rank == 0:
+                        print("Logging images...")
+                        self.logger.log_iter_images(
+                            pred_volume=pred_full,
+                            dataset_model=self.dset,
+                            iter=self.num_epochs,
+                        )
+
+
+                if self.global_rank == 0:
+                    self.logger.log_iter(
                         object_model=self.obj_model,
-                        dataset_model=self.dset,
-                        iter=a0,
+                        iter=self.num_epochs,
+                        consistency_loss=consistency_loss,
+                        total_loss=total_loss,
+                        num_samples_per_ray=curr_num_samples_per_ray,
                     )
+
 
                 self.logger.flush()
 

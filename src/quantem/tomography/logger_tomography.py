@@ -40,22 +40,24 @@ class LoggerTomography(LoggerBase):
 
     def log_iter_images(
         self,
-        object_model: ObjectModelType,
+        pred_volume: torch.Tensor,
         dataset_model: DatasetModelType,
         iter: int,
         logger_cmap: str = "turbo",
     ):
-        with torch.no_grad():
-            vol = object_model.create_volume(return_vol=True)
-            z1_vals = dataset_model.z1_params.cpu().numpy()
-            z3_vals = dataset_model.z3_params.cpu().numpy()
-            shifts_vals = dataset_model.shifts_params.cpu().numpy()
 
-        self.log_image("volume/sum_z", vol.sum(axis=0), iter, logger_cmap)
-        self.log_image("volume/sum_y", vol.sum(axis=1), iter, logger_cmap)
-        self.log_image("volume/sum_x", vol.sum(axis=2), iter, logger_cmap)
+        with torch.no_grad():
+            z1_vals = dataset_model.z1_params.detach().cpu().numpy()
+            z3_vals = dataset_model.z3_params.detach().cpu().numpy()
+            shifts_vals = dataset_model.shifts_params.detach().cpu().numpy()
+
+        print("Logging volume...")
+        self.log_image("volume/sum_z", pred_volume.sum(axis=0), iter, logger_cmap)
+        self.log_image("volume/sum_y", pred_volume.sum(axis=1), iter, logger_cmap)
+        self.log_image("volume/sum_x", pred_volume.sum(axis=2), iter, logger_cmap)
 
         # Plotting z1 and z3 vals
+        print("Plotting z1 and z3 angles...")
         fig, ax = plt.subplots()
         ax.plot(z1_vals, label="Z1")
         ax.plot(z3_vals, label="Z3")
@@ -67,6 +69,7 @@ class LoggerTomography(LoggerBase):
         plt.close(fig)
 
         # Plotting shifts
+        print("Plotting shifts...")
         fig, ax = plt.subplots()
         ax.plot(shifts_vals[:, 0], label="Shifts X")
         ax.plot(shifts_vals[:, 1], label="Shifts Y")

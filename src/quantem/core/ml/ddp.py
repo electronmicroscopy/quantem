@@ -68,12 +68,14 @@ class DDPMixin:
         # TODO: Implement validation dataloader
 
         if self.world_size > 1:
+            shuffle = True
             train_sampler = DistributedSampler(
                 dataset,
                 num_replicas=self.world_size,
                 rank=self.global_rank,
-                shuffle=True,
+                shuffle=shuffle,
             )
+            shuffle = False
 
         else:
             train_sampler = None

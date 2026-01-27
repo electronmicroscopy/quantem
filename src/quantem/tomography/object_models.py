@@ -542,7 +542,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                     for _ in range(self.world_size)
                 ]
                 dist.all_gather(all_sizes, output_size)
-
                 max_size = max(size.item() for size in all_sizes)
 
                 if outputs.shape[0] < max_size:
@@ -558,7 +557,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                     for _ in range(self.world_size)
                 ]
                 dist.all_gather(gathered_outputs, outputs_padded.contiguous())
-
                 trimmed_outputs = []
                 for rank, size in enumerate(all_sizes):
                     trimmed_outputs.append(gathered_outputs[rank][: size.item()])
