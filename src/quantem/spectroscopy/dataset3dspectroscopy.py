@@ -506,41 +506,41 @@ class Dataset3dspectroscopy(Dataset3d):
                 # Prioritize K-lines, then L-lines, then M-lines
                 if has_k_lines and k_factor_data[element]["K"] > 0:
                     k_factors[element] = k_factor_data[element]["K"]
-                    line_type = "K"
+                    # line_type = "K"
                 elif has_l_lines and k_factor_data[element]["L"] > 0:
                     k_factors[element] = k_factor_data[element]["L"]
-                    line_type = "L"
+                    # line_type = "L"
                 elif has_m_lines and k_factor_data[element]["M"] > 0:
                     k_factors[element] = k_factor_data[element]["M"]
-                    line_type = "M"
+                    # line_type = "M"
                 else:
                     # Default to K-line k-factor if available
                     if k_factor_data[element]["K"] > 0:
                         k_factors[element] = k_factor_data[element]["K"]
-                        line_type = "K"
+                        # line_type = "K"
                     elif k_factor_data[element]["L"] > 0:
                         k_factors[element] = k_factor_data[element]["L"]
-                        line_type = "L"
+                        # line_type = "L"
                     elif k_factor_data[element]["M"] > 0:
                         k_factors[element] = k_factor_data[element]["M"]
-                        line_type = "M"
+                        # line_type = "M"
                     else:
                         k_factors[element] = 1.0
-                        line_type = "default"
+                        # line_type = "default"
             else:
                 # Element not in database, use K-line if available
                 if k_factor_data[element]["K"] > 0:
                     k_factors[element] = k_factor_data[element]["K"]
-                    line_type = "K"
+                    # line_type = "K"
                 elif k_factor_data[element]["L"] > 0:
                     k_factors[element] = k_factor_data[element]["L"]
-                    line_type = "L"
+                    # line_type = "L"
                 elif k_factor_data[element]["M"] > 0:
                     k_factors[element] = k_factor_data[element]["M"]
-                    line_type = "M"
+                    # line_type = "M"
                 else:
                     k_factors[element] = 1.0
-                    line_type = "default"
+                    # line_type = "default"
 
         print(f"Using k-factors from Titan 300 keV database: {csv_path}")
         for elem in elements:
@@ -1096,9 +1096,6 @@ class Dataset3dspectroscopy(Dataset3d):
         ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
         ax_spec.grid(True, alpha=0.1)
 
-        # Use ax_spec for all subsequent peak/line plotting
-        ax = ax_spec
-
         # HANDLE SHOW_LINES FLAG AND MODEL ELEMENTS ------------------------------------
         # Auto-enable show_lines if elements are specified or if auto-detection is needed
         if show_lines is None:
@@ -1130,7 +1127,6 @@ class Dataset3dspectroscopy(Dataset3d):
 
                 # Step 2: Calculate background statistics
                 # Use nanpercentile to handle any NaN values in the spectrum
-                background_level = np.nanpercentile(spec, 25)
                 background_std = np.nanstd(spec[spec <= np.nanpercentile(spec, 50)])
 
                 # Step 3: Determine dynamic SNR thresholds if not provided
@@ -1144,12 +1140,10 @@ class Dataset3dspectroscopy(Dataset3d):
                 if len(initial_snrs) > 0:
                     snr_median = np.nanmedian(initial_snrs)
                     snr_75th = np.nanpercentile(initial_snrs, 75)
-                    snr_95th = np.nanpercentile(initial_snrs, 95)
                     num_high_snr_peaks = np.sum(np.array(initial_snrs) > 50)
                 else:
                     snr_median = 0
                     snr_75th = 0
-                    snr_95th = 0
                     num_high_snr_peaks = 0
 
                 # Set snr_min (detection threshold) if not provided
@@ -1425,6 +1419,10 @@ class Dataset3dspectroscopy(Dataset3d):
                                     )
                                     is_grid_peak = True
                                     break
+                            if is_grid_peak:
+                                print(
+                                    f"Peak at {peak_energy} keV may come from the grid or contamination."
+                                )
 
                     # If elements were detected, use them for element identification only (not for line plotting)
                     if detected_elements:
