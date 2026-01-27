@@ -901,6 +901,18 @@ class Dataset3dspectroscopy(Dataset3d):
         # APPLY ENERGY RANGE ---------------------------------------------------------------
 
         if energy_range is not None:
+            # Check for errors in energy_range input
+            if energy_range[0] >= energy_range[1]:
+                raise ValueError("Invalid energy range parameter.")
+
+            # If the entire energy range specified is outside the original energy range of the data, raise an error.
+            if energy_range[1] < E[0] or energy_range[0] > E[-1]:
+                raise ValueError("Energy range parameter is outside of data bounds.")
+
+            # If either side of input energy_range is beyond the original energy range of the data, default to the limit of the data instead.
+            energy_range[0] = np.maximum(energy_range[0], E[0])
+            energy_range[1] = np.minimum(energy_range[1], E[-1])
+
             indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
             spec = spec[indices]
             E = E[indices]
@@ -1538,6 +1550,9 @@ class Dataset3dspectroscopy(Dataset3d):
         E = E0 + dE * np.arange(self.shape[0])
 
         if energy_range is not None:
+            energy_range[0] = np.maximum(energy_range[0], E[0])
+            energy_range[1] = np.minimum(energy_range[1], E[-1])
+
             indices = np.where((E >= energy_range[0]) & (E <= energy_range[1]))[0]
             E = E[indices]
         else:
