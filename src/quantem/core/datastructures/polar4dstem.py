@@ -1,6 +1,7 @@
+from typing import TYPE_CHECKING, Any
+
 import numpy as np
 from numpy.typing import NDArray
-from typing import Any, TYPE_CHECKING
 from scipy.ndimage import map_coordinates
 
 if TYPE_CHECKING:
@@ -149,10 +150,115 @@ def _precompute_polar_coords(
     return coords, phi_bins, radial_bins, radial_max_eff
 
 
+def find_origin(
+    data,
+    *,
+    ellipse_params=None,
+    num_annular_bins=180,
+    radial_min=0.0,
+    radial_max=None,
+    radial_step=1.0,
+    two_fold_rotation_symmetry=False,
+):
+    """
+    Placeholder for future automatic diffraction center finding method.
+    """
+    if len(data.array.shape) == 2:
+        ny, nx = data.array.shape
+        scan_y, scan_x = 1, 1
+    elif len(data.array.shape) == 4:
+        scan_y, scan_x, ny, nx = data.array.shape
+    else:
+        raise ValueError("find_origin only supports 2D or 4D-STEM datasets for now.")
+
+    origin_array = np.zeros((scan_y, scan_x, 2), dtype=float)
+
+    max_steps = 1000  # prevent infinite loops
+
+    # start with center of image for now
+    estimated_origin_row = (ny - 1) / 2.0
+    estimated_origin_col = (nx - 1) / 2.0
+
+    for y_pos in range(scan_y):
+        for x_pos in range(scan_x):
+            print(f"Finding origin for scan pos ({y_pos}, {x_pos})")
+
+            coords_cache = {}
+
+            polar = data.polar_transform(
+                origin_array=[estimated_origin_row, estimated_origin_col],
+                ellipse_params=ellipse_params,
+                num_annular_bins=num_annular_bins,
+                radial_min=radial_min,
+                radial_max=radial_max,
+                radial_step=radial_step,
+                two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                scan_pos=(y_pos, x_pos),
+            )
+
+            min_r = int(np.floor(0.1 * polar.shape[1]))
+            max_r = int(np.ceil(0.9 * polar.shape[1]))
+            std_est_origin = polar[:, min_r:max_r].std(axis=0)
+            std_est_origin_sum = std_est_origin.sum()
+
+            origin_row = int(round(estimated_origin_row))
+            origin_col = int(round(estimated_origin_col))
+            coords_cache[(origin_row, origin_col)] = std_est_origin_sum
+
+            if y_pos == 0 and x_pos == 0:
+                print(f"Initial std sum at estimated origin: {std_est_origin_sum}")
+
+            converged = False
+            best = std_est_origin_sum
+            steps = 0
+            while not converged and steps < max_steps:
+                steps += 1
+                moved = False
+
+                neighbors = [
+                    (origin_row + dr, origin_col + dc)
+                    for dr in (-1, 0, 1)
+                    for dc in (-1, 0, 1)
+                    if not (dr == 0 and dc == 0)
+                ]
+                neighbors = [(r, c) for (r, c) in neighbors if 0 <= r < ny and 0 <= c < nx]
+
+                for origin_r, origin_c in neighbors:
+                    if (origin_r, origin_c) not in coords_cache:
+                        polar = data.polar_transform(
+                            origin_array=[origin_r, origin_c],
+                            ellipse_params=ellipse_params,
+                            num_annular_bins=num_annular_bins,
+                            radial_min=radial_min,
+                            radial_max=radial_max,
+                            radial_step=radial_step,
+                            two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                            scan_pos=(y_pos, x_pos),
+                        )
+                        std_test = polar[:, min_r:max_r].std(axis=0)
+                        coords_cache[(origin_r, origin_c)] = std_test.sum()
+
+                    if coords_cache[(origin_r, origin_c)] < best:
+                        origin_row = origin_r
+                        origin_col = origin_c
+                        best = coords_cache[(origin_r, origin_c)]
+                        moved = True
+                        print(f"Moved to ({origin_row}, {origin_col}) with std sum {best}")
+
+                if not moved:
+                    converged = True
+
+            if y_pos == 0 and x_pos == 0:
+                print(f"Final std sum at found origin ({origin_row}, {origin_col}): {best}")
+            origin_array[y_pos, x_pos, 0] = origin_row
+            origin_array[y_pos, x_pos, 1] = origin_col
+
+    return origin_array
+
+
 def dataset4dstem_polar_transform(
     self: "Dataset4dstem",
-    origin_row: float | int | NDArray,
-    origin_col: float | int | NDArray,
+    origin_array: NDArray | None = None,
     ellipse_params: tuple[float, float, float] | None = None,
     num_annular_bins: int = 180,
     radial_min: float = 0.0,
@@ -161,24 +267,63 @@ def dataset4dstem_polar_transform(
     two_fold_rotation_symmetry: bool = False,
     name: str | None = None,
     signal_units: str | None = None,
+    scan_pos: tuple[int, int] | None = None,
 ) -> Polar4dstem:
     if self.array.ndim != 4:
         raise ValueError("polar_transform requires a 4D-STEM dataset (ndim=4).")
     scan_y, scan_x, ny, nx = self.array.shape
 
-    # Handle single origin for all DP or an array listing origins for each DP
-    origin_row_arr = np.asarray(origin_row)
-    origin_col_arr = np.asarray(origin_col)
-    is_array = origin_row_arr.ndim > 0 or origin_col_arr.ndim > 0
-    
-    if is_array:
-        # Re-cast to scan shape
-        origin_row_arr = np.broadcast_to(origin_row_arr, (scan_y, scan_x))
-        origin_col_arr = np.broadcast_to(origin_col_arr, (scan_y, scan_x))
+    # Standardize origin_array input
+    origin_array = np.asarray(origin_array) if origin_array is not None else None
+    if origin_array is None:
+        center = np.array([(ny - 1) / 2.0, (nx - 1) / 2.0], dtype=float)
+        origins = np.broadcast_to(center, (scan_y, scan_x, 2)).copy()
+    elif origin_array.shape == (2,):
+        origins = np.empty((scan_y, scan_x, 2), dtype=float)
+        origins[...] = origin_array
+    elif origin_array.shape == (scan_y, scan_x, 2):
+        origins = origin_array
+    else:
+        raise ValueError(
+            "origin_array must have shape None, (2,) or (scan_y, scan_x, 2)."
+            f" Got {origin_array.shape}."
+        )
 
-    # Take first value as default, as if float will be array of length 1
-    origin_row_f = float(origin_row_arr.flat[0]) if is_array else float(origin_row)
-    origin_col_f = float(origin_col_arr.flat[0]) if is_array else float(origin_col)
+    # If scan_pos is provided, compute polar transform only for that position
+    if scan_pos is not None:
+        iy, ix = scan_pos
+        dp = self.array[iy, ix]  # (ny, nx) view
+        r0 = float(origins[iy, ix, 0])
+        c0 = float(origins[iy, ix, 1])
+
+        coords, phi_bins, radial_bins, radial_max_eff = _precompute_polar_coords(
+            ny=ny,
+            nx=nx,
+            origin_row=r0,
+            origin_col=c0,
+            ellipse_params=ellipse_params,
+            num_annular_bins=num_annular_bins,
+            radial_min=radial_min,
+            radial_max=radial_max,
+            radial_step=radial_step,
+            two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+        )
+        polar2d = map_coordinates(dp, coords, order=1, mode="constant", cval=0.0)  # (phi, r)
+        return polar2d
+
+    # Otherwise, compute polar transform for all scan positions
+    # Determine one overall radial_max if not provided
+    if radial_max is None:
+        r_row_pos = origins[:, :, 0]
+        r_row_neg = (ny - 1) - origins[:, :, 0]
+        r_col_pos = origins[:, :, 1]
+        r_col_neg = (nx - 1) - origins[:, :, 1]
+        radial_max_eff_array = np.minimum.reduce([r_row_pos, r_row_neg, r_col_pos, r_col_neg])
+        radial_max = float(max(radial_max_eff_array.min(), radial_min + radial_step))
+
+    # Precompute polar coords only once, using the origin from the first probe position
+    origin_row_f = float(origins[0, 0, 0])
+    origin_col_f = float(origins[0, 0, 1])
     coords, phi_bins, radial_bins, radial_max_eff = _precompute_polar_coords(
         ny=ny,
         nx=nx,
@@ -195,23 +340,25 @@ def dataset4dstem_polar_transform(
     n_r = radial_bins.size
     result_dtype = np.result_type(self.array.dtype, np.float32)
     out = np.empty((scan_y, scan_x, n_phi, n_r), dtype=result_dtype)
+
     for iy in range(scan_y):
         for ix in range(scan_x):
-            # Recompute coords if varying origins
-            if is_array:
-                coords, _, _, _ = _precompute_polar_coords(
-                    ny=ny,
-                    nx=nx,
-                    origin_row=float(origin_row_arr[iy, ix]),
-                    origin_col=float(origin_col_arr[iy, ix]),
-                    ellipse_params=ellipse_params,
-                    num_annular_bins=num_annular_bins,
-                    radial_min=radial_min,
-                    radial_max=radial_max,
-                    radial_step=radial_step,
-                    two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                )
             dp = self.array[iy, ix]
+            r0 = float(origins[iy, ix, 0])
+            c0 = float(origins[iy, ix, 1])
+
+            coords, _, _, radial_max_eff = _precompute_polar_coords(
+                ny=ny,
+                nx=nx,
+                origin_row=r0,
+                origin_col=c0,
+                ellipse_params=ellipse_params,
+                num_annular_bins=num_annular_bins,
+                radial_min=radial_min,
+                radial_max=radial_max,
+                radial_step=radial_step,
+                two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+            )
             out[iy, ix] = map_coordinates(
                 dp,
                 coords,
@@ -219,10 +366,8 @@ def dataset4dstem_polar_transform(
                 mode="constant",
                 cval=0.0,
             )
-    if two_fold_rotation_symmetry:
-        phi_range = np.pi
-    else:
-        phi_range = 2.0 * np.pi
+
+    phi_range = np.pi if two_fold_rotation_symmetry else 2.0 * np.pi
     phi_step_deg = (phi_range / float(n_phi)) * (180.0 / np.pi)
     sampling = np.zeros(4, dtype=float)
     origin = np.zeros(4, dtype=float)
@@ -246,8 +391,8 @@ def dataset4dstem_polar_transform(
             "polar_radial_step": float(radial_step),
             "polar_num_annular_bins": int(n_phi),
             "polar_two_fold_rotation_symmetry": bool(two_fold_rotation_symmetry),
-            "polar_origin_row": origin_row_f,
-            "polar_origin_col": origin_col_f,
+            "polar_origin_row": float(origins[0, 0, 0]),
+            "polar_origin_col": float(origins[0, 0, 1]),
             "polar_ellipse_params": tuple(ellipse_params) if ellipse_params is not None else None,
         }
     )
