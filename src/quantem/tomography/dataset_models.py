@@ -317,7 +317,6 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         # target_values = batch["target_value"].to(self.device, non_blocking=True)
         phis = batch["phi"].to(self.device, non_blocking=True)
         projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
-        print(f"projection_indices: {projection_indices}")
         with torch.no_grad():
             batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
 

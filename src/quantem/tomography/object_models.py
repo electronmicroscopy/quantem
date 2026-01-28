@@ -338,6 +338,19 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         return soft_loss
 
+    def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
+        """
+        Apply hard constraints to the predicted values of the INR model.
+        """
+
+        if self.constraints.positivity:
+            pred = torch.clamp(pred, min=0.0, max=None)
+        if self.constraints.shrinkage:
+            pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
+
+
+        return pred
+
     @property
     def params(self):
         return self.model.parameters()
@@ -408,6 +421,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         all_densities = all_densities * valid_mask
 
+        all_densities = self.apply_hard_constraints(all_densities)
         return all_densities
 
     # Pretrain Loop
@@ -529,6 +543,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                     self.device, non_blocking=True
                 )
                 batch_outputs = model(batch_coords)
+                batch_outputs = self.apply_hard_constraints(batch_outputs)
                 if batch_outputs.dim() > 1:
                     batch_outputs = batch_outputs.squeeze(-1)
                 outputs_list.append(batch_outputs.cpu())
@@ -566,6 +581,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 pred_full = outputs.reshape(N, N, N).float()
 
             if return_vol:
+
                 return pred_full.detach().cpu()
             else:
                 self._obj = pred_full.detach().cpu()
