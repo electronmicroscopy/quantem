@@ -1,7 +1,9 @@
+from contextlib import contextmanager
 from typing import List, Literal, Optional, Self, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from tqdm.auto import tqdm
 
 from quantem.core.ml.ddp import DDPMixin
@@ -13,7 +15,6 @@ from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_opt import TomographyOpt
 from quantem.tomography.utils import torch_phase_cross_correlation
 from quantem.tomography_old.utils import gaussian_filter_2d_stack, gaussian_kernel_1d
-import torch.distributed as dist
 
 
 class Tomography(TomographyOpt, TomographyBase, DDPMixin):
@@ -51,6 +52,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         constraints: dict = {},  # TODO: What to pass into the constraints?
         loss_func: Tuple[str, Optional[float]] = ("smooth_l1", 0.07),
         num_samples_per_ray: int | List[Tuple[int, int]] = None,
+        profiling_mode: bool = False,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -64,16 +66,33 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         #         f"Should never happen! obj_model and dset must be on the same device, got {self.obj_model.device} and {self.dset.device}"
         #     )
 
+        if profiling_mode:
+            if self.global_rank == 0:
+                print("Profiling mode enabled.")
+            import torch.cuda.nvtx as nvtx
+
+            @contextmanager
+            def nvtx_range(enabled: bool, name: str):
+                if enabled:
+                    nvtx.range_push(name)
+                try:
+                    yield
+                finally:
+                    if enabled:
+                        nvtx.range_pop()
+
         if reset:
             raise NotImplementedError("Reset is not implemented yet.")
 
         if optimizer_params is not None:
-            self.optimizer_params = optimizer_params
-            self.set_optimizers()
+            with nvtx_range(profiling_mode, "Setting Optimizer Params"):
+                self.optimizer_params = optimizer_params
+                self.set_optimizers()
 
         if scheduler_params is not None:
-            self.scheduler_params = scheduler_params
-            self.set_schedulers(scheduler_params)
+            with nvtx_range(profiling_mode, "Setting Scheduler Params"):
+                self.scheduler_params = scheduler_params
+                self.set_schedulers(scheduler_params)
 
         if constraints is not None:
             self.obj_model.constraints = constraints
@@ -84,9 +103,10 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
         # Setting up DDP
         if not hasattr(self, "dataloader"):
-            self.dataloader, self.sampler = self.setup_dataloader(
-                self.dset, batch_size, num_workers=num_workers
-            )
+            with nvtx_range(profiling_mode, "Setting Dataloader"):
+                self.dataloader, self.sampler = self.setup_dataloader(
+                    self.dset, batch_size, num_workers=num_workers
+                )
 
         self.obj_model.model.train()
 
@@ -101,103 +121,129 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 print("num_samples_per_ray schedule provided.")
 
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
-        
-
 
         for a0 in range(num_iter):
-            consistency_loss = 0.0
-            total_loss = 0.0
-            epoch_soft_constraint_loss = 0.0
-            # self._reset_iter_constraints()
+            with nvtx_range(profiling_mode, f"Epoch {a0}"):
+                consistency_loss = 0.0
+                total_loss = 0.0
+                epoch_soft_constraint_loss = 0.0
+                # self._reset_iter_constraints()
 
-            if self.sampler is not None:
-                self.sampler.set_epoch(a0)
+                if self.sampler is not None:
+                    self.sampler.set_epoch(a0)
 
-            if isinstance(num_samples_per_ray, list):
-                curr_num_samples_per_ray = num_samples_per_ray[a0][1]
-            else:
-                curr_num_samples_per_ray = num_samples_per_ray
-
-            if self.global_rank == 0:
-                print(f"curr_num_samples_per_ray: {curr_num_samples_per_ray}")
-            for batch_idx, batch in enumerate(self.dataloader):
-                self.zero_grad_all()
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=True,
-                ):
-                    all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
-
-                    all_densities = self.obj_model.forward(all_coords)
-
-                    integrated_densities = self.dset.integrate_rays(
-                        all_densities, curr_num_samples_per_ray, len(batch["target_value"])
-                    )
-
-                pred = integrated_densities.float()
-                target = batch["target_value"].to(self.device, non_blocking=True).float()
-
-                batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
-                soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords)
-                epoch_soft_constraint_loss += soft_constraints_loss.item()
-                batch_loss = batch_consistency_loss.float() + soft_constraints_loss
-                batch_loss.backward()
-
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(self.obj_model.model.parameters(), max_norm=1.0)
-
-                self.step_optimizers()
-                total_loss += batch_loss.item()
-                consistency_loss += batch_consistency_loss.item()
-
-            # TODO: Maybe reorganize the losses so that the order makes sense lol.
-
-            total_loss = total_loss / len(self.dataloader)
-            consistency_loss = consistency_loss / len(self.dataloader)
-            epoch_soft_constraint_loss = epoch_soft_constraint_loss / len(self.dataloader)
-
-            metrics = torch.tensor(
-                [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
-            )
-
-            if self.world_size > 1:
-                dist.all_reduce(metrics, dist.ReduceOp.AVG)
-
-            total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
-
-            if self.global_rank == 0:
-                print(f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}")
-
-            self._epoch_losses.append(total_loss)
-            self._consistency_losses.append(consistency_loss)
-            self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
-
-            if self.logger is not None:
-                if self.logger.log_images_every > 0 and self.num_epochs % self.logger.log_images_every == 0:
-                    print("Creating volume...")
-                    pred_full = self.obj_model.create_volume(return_vol=True)
-
-                    if self.global_rank == 0:
-                        print("Logging images...")
-                        self.logger.log_iter_images(
-                            pred_volume=pred_full,
-                            dataset_model=self.dset,
-                            iter=self.num_epochs,
-                        )
-
+                if isinstance(num_samples_per_ray, list):
+                    curr_num_samples_per_ray = num_samples_per_ray[a0][1]
+                else:
+                    curr_num_samples_per_ray = num_samples_per_ray
 
                 if self.global_rank == 0:
-                    self.logger.log_iter(
-                        object_model=self.obj_model,
-                        iter=self.num_epochs,
-                        consistency_loss=consistency_loss,
-                        total_loss=total_loss,
-                        num_samples_per_ray=curr_num_samples_per_ray,
+                    print(f"curr_num_samples_per_ray: {curr_num_samples_per_ray}")
+                for batch_idx, batch in enumerate(self.dataloader):
+                    with nvtx_range(profiling_mode, f"batch_{batch_idx}"):
+                        self.zero_grad_all()
+                        with torch.autocast(
+                            device_type=self.device.type,
+                            dtype=torch.bfloat16,
+                            enabled=True,
+                        ):
+                            with nvtx_range(profiling_mode, "Getting Coords"):
+                                all_coords = self.dset.get_coords(
+                                    batch, N, curr_num_samples_per_ray
+                                )
+
+                            with nvtx_range(profiling_mode, "Forwarding"):
+                                all_densities = self.obj_model.forward(all_coords)
+
+                            with nvtx_range(profiling_mode, "Integrating"):
+                                integrated_densities = self.dset.integrate_rays(
+                                    all_densities,
+                                    curr_num_samples_per_ray,
+                                    len(batch["target_value"]),
+                                )
+
+                        pred = integrated_densities.float()
+
+                        with nvtx_range(profiling_mode, "Getting Target"):
+                            target = (
+                                batch["target_value"].to(self.device, non_blocking=True).float()
+                            )
+
+                        with nvtx_range(profiling_mode, "Calculating Loss"):
+                            batch_consistency_loss = torch.nn.functional.mse_loss(pred, target)
+
+                        with nvtx_range(profiling_mode, "Applying Soft Constraints"):
+                            soft_constraints_loss = self.obj_model.apply_soft_constraints(
+                                all_coords
+                            )
+
+                        epoch_soft_constraint_loss += soft_constraints_loss.item()
+
+                        with nvtx_range(profiling_mode, "Calculating Batch Loss"):
+                            batch_loss = batch_consistency_loss.float() + soft_constraints_loss
+
+                        batch_loss.backward()
+
+                        # Clip gradients
+                        torch.nn.utils.clip_grad_norm_(
+                            self.obj_model.model.parameters(), max_norm=1.0
+                        )
+
+                        self.step_optimizers()
+                        total_loss += batch_loss.item()
+                        consistency_loss += batch_consistency_loss.item()
+
+                # TODO: Maybe reorganize the losses so that the order makes sense lol.
+
+                total_loss = total_loss / len(self.dataloader)
+                consistency_loss = consistency_loss / len(self.dataloader)
+                epoch_soft_constraint_loss = epoch_soft_constraint_loss / len(self.dataloader)
+
+                metrics = torch.tensor(
+                    [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
+                )
+
+                if self.world_size > 1:
+                    dist.all_reduce(metrics, dist.ReduceOp.AVG)
+
+                total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
+
+                if self.global_rank == 0:
+                    print(
+                        f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}"
                     )
 
+                self._epoch_losses.append(total_loss)
+                self._consistency_losses.append(consistency_loss)
+                self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
 
-                self.logger.flush()
+                with nvtx_range(profiling_mode, "Logging"):
+                    if self.logger is not None:
+                        if (
+                            self.logger.log_images_every > 0
+                            and self.num_epochs % self.logger.log_images_every == 0
+                        ):
+                            print("Creating volume...")
+                            pred_full = self.obj_model.create_volume(return_vol=True)
+
+                            if self.global_rank == 0:
+                                print("Logging images...")
+                                self.logger.log_iter_images(
+                                    pred_volume=pred_full,
+                                    dataset_model=self.dset,
+                                    iter=self.num_epochs,
+                                )
+
+                        if self.global_rank == 0:
+                            self.logger.log_iter(
+                                object_model=self.obj_model,
+                                iter=self.num_epochs,
+                                consistency_loss=consistency_loss,
+                                total_loss=total_loss,
+                                num_samples_per_ray=curr_num_samples_per_ray,
+                            )
+
+                        self.logger.flush()
 
 
 class TomographyConventional(TomographyBase):
