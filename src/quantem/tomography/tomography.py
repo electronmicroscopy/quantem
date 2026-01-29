@@ -177,27 +177,39 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                                 all_coords
                             )
 
-                        epoch_soft_constraint_loss += soft_constraints_loss.item()
+                        with nvtx_range(
+                            profiling_mode, "Adding soft constraint loss to epoch loss"
+                        ):
+                            epoch_soft_constraint_loss += soft_constraints_loss.detach()
 
                         with nvtx_range(profiling_mode, "Calculating Batch Loss"):
-                            batch_loss = batch_consistency_loss.float() + soft_constraints_loss
+                            batch_loss = (
+                                batch_consistency_loss.float() + soft_constraints_loss.detach()
+                            )
 
-                        batch_loss.backward()
-
-                        # Clip gradients
-                        torch.nn.utils.clip_grad_norm_(
-                            self.obj_model.model.parameters(), max_norm=1.0
-                        )
-
-                        self.step_optimizers()
-                        total_loss += batch_loss.item()
-                        consistency_loss += batch_consistency_loss.item()
+                        with nvtx_range(profiling_mode, "Backwarding"):
+                            batch_loss.backward()
+                        with nvtx_range(profiling_mode, "Clipping Gradients"):
+                            # Clip gradients
+                            torch.nn.utils.clip_grad_norm_(
+                                self.obj_model.model.parameters(), max_norm=1.0
+                            )
+                        with nvtx_range(profiling_mode, "Stepping Optimizers"):
+                            self.step_optimizers()
+                        with nvtx_range(profiling_mode, "Adding batch loss to total loss"):
+                            total_loss += batch_loss.detach()
+                        with nvtx_range(
+                            profiling_mode, "Adding batch consistency loss to consistency loss"
+                        ):
+                            consistency_loss += batch_consistency_loss.detach()
 
                 # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
-                total_loss = total_loss / len(self.dataloader)
-                consistency_loss = consistency_loss / len(self.dataloader)
-                epoch_soft_constraint_loss = epoch_soft_constraint_loss / len(self.dataloader)
+                total_loss = total_loss.item() / len(self.dataloader)
+                consistency_loss = consistency_loss.item() / len(self.dataloader)
+                epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(
+                    self.dataloader
+                )
 
                 metrics = torch.tensor(
                     [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device

@@ -340,6 +340,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return all_coords
 
     @staticmethod
+    @torch.compile(mode="reduce-overhead")
     def create_batch_rays(
         pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int
     ) -> torch.Tensor:
@@ -357,7 +358,6 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return rays
 
     @staticmethod
-    @torch.compile(mode="reduce-overhead")
     def transform_batch_rays(
         rays: torch.Tensor,
         z1: torch.Tensor,
@@ -403,6 +403,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         return transformed_rays
 
     @staticmethod
+    @torch.compile(mode="reduce-overhead")
     def integrate_rays(
         rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
     ) -> torch.Tensor:
