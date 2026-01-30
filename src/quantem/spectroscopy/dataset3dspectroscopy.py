@@ -71,6 +71,8 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # Initialize model elements storage
         self.model_elements = None
+        # Initialize spectra storage
+        self.attached_spectra = None
 
     def add_elements_to_model(self, elements):
         """
@@ -917,6 +919,11 @@ class Dataset3dspectroscopy(Dataset3d):
             spec = spec[indices]
             E = E[indices]
 
+        mean_spectrum = np.vstack((spec, E))
+
+        self.attached_spectra = []
+        self.attached_spectra.append(mean_spectrum)
+
         return spec
 
     def show_mean_spectrum(
@@ -1512,8 +1519,41 @@ class Dataset3dspectroscopy(Dataset3d):
 
     # BACKGROND SUBTRACTION
 
+    def add_spectrum_to_data(self, spectrum, energy_axis):
+        """
+        Store processed spectra in the 3D spectroscopy dataset structure, in a 1D array of 2D arrays. By default, calculate_mean_spectrum will
+        """
+        two_d_spectrum = np.vstack((spectrum, energy_axis))
+        self.attached_spectra.append(two_d_spectrum)
+
+    def clear_attached_spectra(self):
+        self.attached_spectra = []
+
+    def plot_attached_spectrum(self, spectrum_index=0):
+        fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
+
+        ax_spec.plot(
+            self.attached_spectra[spectrum_index][1],
+            self.attached_spectra[spectrum_index][0],
+            linewidth=1.5,
+        )
+        ax_spec.set_xlabel("Energy (keV)")
+        ax_spec.set_ylabel("Intensity")
+        ax_spec.set_title("Background-subtracted spectrum from ROI")
+        ax_spec.grid(True, alpha=0.1)
+
+        fig.tight_layout()
+        plt.show()
+
     def subtract_background(
-        self, roi=None, energy_range=None, ignore_range=None, mask=None, data_type="eds"
+        self,
+        roi=None,
+        energy_range=None,
+        ignore_range=None,
+        mask=None,
+        data_type="eds",
+        return_dataset=True,
+        attach_subtracted_spectrum=True,
     ):
         """
         Perform appropriate background subtraction routine on mean spectrum from a 3D spectroscopy dataset.
@@ -1580,21 +1620,27 @@ class Dataset3dspectroscopy(Dataset3d):
             for q in range(self.shape[2]):
                 spec3D_subtracted[:, p, q] = np.maximum(self.array[indices, p, q] - background, 0)
 
-        if data_type == "eds":
-            return Dataset3deds.from_array(
-                array=spec3D_subtracted,
-                sampling=self.sampling,
-                origin=self.origin,
-                units=self.units,
-            )
+        if return_dataset:
+            if data_type == "eds":
+                return Dataset3deds.from_array(
+                    array=spec3D_subtracted,
+                    sampling=self.sampling,
+                    origin=self.origin,
+                    units=self.units,
+                )
 
-        elif data_type == "eels":
-            return Dataset3deels.from_array(
-                array=spec3D_subtracted,
-                sampling=self.sampling,
-                origin=self.origin,
-                units=self.units,
-            )
+            elif data_type == "eels":
+                return Dataset3deels.from_array(
+                    array=spec3D_subtracted,
+                    sampling=self.sampling,
+                    origin=self.origin,
+                    units=self.units,
+                )
+        else:
+            print("Notice: no 3D dataset was returned")
+
+        if attach_subtracted_spectrum:
+            self.add_spectrum_to_data(subtracted_mean_spectrum, E)
 
 
 Dataset3dspectroscopy.load_element_info()
