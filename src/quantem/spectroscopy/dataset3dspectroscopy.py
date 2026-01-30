@@ -109,6 +109,39 @@ class Dataset3dspectroscopy(Dataset3d):
             """Clear all elements from the model."""
             self.model_elements = None
 
+    # Storage of spectra alongside dataset
+
+    def add_spectrum_to_data(self, spectrum, energy_axis):
+        """
+        Store processed spectra in the 3D spectroscopy dataset structure, in a 1D array of 2D arrays. By default, calculate_mean_spectrum will
+        """
+        two_d_spectrum = np.vstack((spectrum, energy_axis))
+
+        if self.attached_spectra is not None:
+            self.attached_spectra.append(two_d_spectrum)
+        else:
+            self.attached_spectra = []
+            self.attached_spectra.append(two_d_spectrum)
+
+    def clear_attached_spectra(self):
+        self.attached_spectra = None
+
+    def plot_attached_spectrum(self, spectrum_index=0):
+        fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
+
+        ax_spec.plot(
+            self.attached_spectra[spectrum_index][1],
+            self.attached_spectra[spectrum_index][0],
+            linewidth=1.5,
+        )
+        ax_spec.set_xlabel("Energy (keV)")
+        ax_spec.set_ylabel("Intensity")
+        ax_spec.set_title(f"Spectrum in index {spectrum_index}")
+        ax_spec.grid(True, alpha=0.1)
+
+        fig.tight_layout()
+        plt.show()
+
     ## PCA ANALYSIS METHODS
 
     def perform_pca(
@@ -784,11 +817,7 @@ class Dataset3dspectroscopy(Dataset3d):
         return score
 
     def calculate_mean_spectrum(
-        self,
-        roi=None,
-        energy_range=None,
-        ignore_range=None,
-        mask=None,
+        self, roi=None, energy_range=None, ignore_range=None, mask=None, attach_mean_spectrum=True
     ):
         # ADJUST ROI BASED ON GIVEN FLAGS -----------------------------------------------
         # Parse ROI parameter
@@ -919,10 +948,8 @@ class Dataset3dspectroscopy(Dataset3d):
             spec = spec[indices]
             E = E[indices]
 
-        mean_spectrum = np.vstack((spec, E))
-
-        self.attached_spectra = []
-        self.attached_spectra.append(mean_spectrum)
+        if attach_mean_spectrum:
+            self.add_spectrum_to_data(spec, E)
 
         return spec
 
@@ -1519,32 +1546,6 @@ class Dataset3dspectroscopy(Dataset3d):
 
     # BACKGROND SUBTRACTION
 
-    def add_spectrum_to_data(self, spectrum, energy_axis):
-        """
-        Store processed spectra in the 3D spectroscopy dataset structure, in a 1D array of 2D arrays. By default, calculate_mean_spectrum will
-        """
-        two_d_spectrum = np.vstack((spectrum, energy_axis))
-        self.attached_spectra.append(two_d_spectrum)
-
-    def clear_attached_spectra(self):
-        self.attached_spectra = []
-
-    def plot_attached_spectrum(self, spectrum_index=0):
-        fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
-
-        ax_spec.plot(
-            self.attached_spectra[spectrum_index][1],
-            self.attached_spectra[spectrum_index][0],
-            linewidth=1.5,
-        )
-        ax_spec.set_xlabel("Energy (keV)")
-        ax_spec.set_ylabel("Intensity")
-        ax_spec.set_title("Background-subtracted spectrum from ROI")
-        ax_spec.grid(True, alpha=0.1)
-
-        fig.tight_layout()
-        plt.show()
-
     def subtract_background(
         self,
         roi=None,
@@ -1553,7 +1554,7 @@ class Dataset3dspectroscopy(Dataset3d):
         mask=None,
         data_type="eds",
         return_dataset=True,
-        attach_subtracted_spectrum=True,
+        attach_spectrum=True,
     ):
         """
         Perform appropriate background subtraction routine on mean spectrum from a 3D spectroscopy dataset.
@@ -1639,8 +1640,13 @@ class Dataset3dspectroscopy(Dataset3d):
         else:
             print("Notice: no 3D dataset was returned")
 
-        if attach_subtracted_spectrum:
+        if attach_spectrum:
+            print(
+                f"Spectrum recorded to index {len(self.attached_spectra) - 1} of attached_spectra in {self}"
+            )
             self.add_spectrum_to_data(subtracted_mean_spectrum, E)
+        else:
+            print(f"Notice: no spectrum recorded to attached_spectra in {self}")
 
 
 Dataset3dspectroscopy.load_element_info()
