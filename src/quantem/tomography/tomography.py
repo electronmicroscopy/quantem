@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from typing import List, Literal, Optional, Self, Tuple
 
 import numpy as np
@@ -7,6 +6,7 @@ import torch.distributed as dist
 from tqdm.auto import tqdm
 
 from quantem.core.ml.ddp import DDPMixin
+from quantem.core.ml.profiling import nvtx_range
 from quantem.tomography.dataset_models import DatasetModelType
 from quantem.tomography.logger_tomography import LoggerTomography
 from quantem.tomography.object_models import ObjectModelType
@@ -41,8 +41,6 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
 
     def reconstruct(
         self,
-        # obj_model: ObjectModelType,
-        # dset: DatasetModelType,
         num_iter: int = 10,
         batch_size: int = 1024,
         num_workers: int = 32,
@@ -53,6 +51,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         loss_func: Tuple[str, Optional[float]] = ("smooth_l1", 0.07),
         num_samples_per_ray: int | List[Tuple[int, int]] = None,
         profiling_mode: bool = False,
+        val_fraction: float = 0.0,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -65,51 +64,45 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         #     raise ValueError(
         #         f"Should never happen! obj_model and dset must be on the same device, got {self.obj_model.device} and {self.dset.device}"
         #     )
-
         if profiling_mode:
             if self.global_rank == 0:
                 print("Profiling mode enabled.")
-            import torch.cuda.nvtx as nvtx
-
-            @contextmanager
-            def nvtx_range(enabled: bool, name: str):
-                if enabled:
-                    nvtx.range_push(name)
-                try:
-                    yield
-                finally:
-                    if enabled:
-                        nvtx.range_pop()
 
         if reset:
             raise NotImplementedError("Reset is not implemented yet.")
+
+        new_scheduler = reset
 
         if optimizer_params is not None:
             with nvtx_range(profiling_mode, "Setting Optimizer Params"):
                 self.optimizer_params = optimizer_params
                 self.set_optimizers()
+            new_scheduler = True
 
         if scheduler_params is not None:
             with nvtx_range(profiling_mode, "Setting Scheduler Params"):
                 self.scheduler_params = scheduler_params
-                self.set_schedulers(scheduler_params)
+            new_scheduler = True
 
         if constraints is not None:
-            self.obj_model.constraints = constraints
+            with nvtx_range(profiling_mode, "Setting Constraints"):
+                self.obj_model.constraints = constraints
 
-        new_scheduler = reset
         if new_scheduler:
-            raise NotImplementedError("New schedulers are not implemented yet.")
+            with nvtx_range(profiling_mode, "Setting Schedulers"):
+                self.set_schedulers(scheduler_params, num_iter=num_iter)
 
         # Setting up DDP
         if not hasattr(self, "dataloader"):
             with nvtx_range(profiling_mode, "Setting Dataloader"):
-                self.dataloader, self.sampler = self.setup_dataloader(
-                    self.dset, batch_size, num_workers=num_workers
+                self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
+                    self.setup_dataloader(
+                        self.dset,
+                        batch_size,
+                        num_workers=num_workers,
+                        val_fraction=val_fraction,
+                    )
                 )
-
-        self.obj_model.model.train()
-
         N = max(self.obj_model.shape)
 
         if num_samples_per_ray is None:
@@ -121,12 +114,13 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 print("num_samples_per_ray schedule provided.")
 
         print(f"N: {N}, num_samples_per_ray: {num_samples_per_ray}")
-
         for a0 in range(num_iter):
             with nvtx_range(profiling_mode, f"Epoch {a0}"):
                 consistency_loss = 0.0
                 total_loss = 0.0
                 epoch_soft_constraint_loss = 0.0
+                self.obj_model.model.train()
+                self.dset.train()
                 # self._reset_iter_constraints()
 
                 if self.sampler is not None:
@@ -151,7 +145,6 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                                 all_coords = self.dset.get_coords(
                                     batch, N, curr_num_samples_per_ray
                                 )
-
                             with nvtx_range(profiling_mode, "Forwarding"):
                                 all_densities = self.obj_model.forward(all_coords)
 
@@ -203,6 +196,8 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                         ):
                             consistency_loss += batch_consistency_loss.detach()
 
+                with nvtx_range(profiling_mode, "Stepping Schedulers"):
+                    self.step_schedulers(loss=total_loss)
                 # TODO: Maybe reorganize the losses so that the order makes sense lol.
 
                 total_loss = total_loss.item() / len(self.dataloader)
@@ -210,6 +205,53 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(
                     self.dataloader
                 )
+
+                if self.val_dataloader is not None:
+                    print("Validating...")
+                    self.obj_model.model.eval()
+                    self.dset.eval()
+                    with torch.no_grad():
+                        val_loss = 0.0
+
+                        for batch in self.val_dataloader:
+                            with torch.autocast(
+                                device_type=self.device.type,
+                                dtype=torch.bfloat16,
+                                enabled=True,
+                            ):
+                                with nvtx_range(profiling_mode, "Getting Coords"):
+                                    all_coords = self.dset.get_coords(
+                                        batch, N, curr_num_samples_per_ray
+                                    )
+
+                                with nvtx_range(profiling_mode, "Forwarding"):
+                                    all_densities = self.obj_model.forward(all_coords)
+
+                                with nvtx_range(profiling_mode, "Integrating"):
+                                    integrated_densities = self.dset.integrate_rays(
+                                        all_densities,
+                                        curr_num_samples_per_ray,
+                                        len(batch["target_value"]),
+                                    )
+
+                                with nvtx_range(profiling_mode, "Getting Target"):
+                                    target = (
+                                        batch["target_value"]
+                                        .to(self.device, non_blocking=True)
+                                        .float()
+                                    )
+
+                                with nvtx_range(profiling_mode, "Calculating Loss"):
+                                    batch_val_loss = torch.nn.functional.mse_loss(
+                                        integrated_densities, target
+                                    )
+
+                                with nvtx_range(profiling_mode, "Adding batch loss to total loss"):
+                                    val_loss += (
+                                        batch_val_loss.detach() + soft_constraints_loss.detach()
+                                    )
+
+                        avg_val_loss = val_loss.item() / len(self.val_dataloader)
 
                 metrics = torch.tensor(
                     [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
@@ -225,9 +267,14 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                         f"Total Loss: {total_loss:.4f}, Consistency Loss: {consistency_loss:.4f}"
                     )
 
+                    if self.val_dataloader:
+                        print(f"Validation loss: {avg_val_loss:4f}")
+
                 self._epoch_losses.append(total_loss)
                 self._consistency_losses.append(consistency_loss)
                 self.obj_model._soft_constraint_losses.append(epoch_soft_constraint_loss)
+                if self.val_dataloader is not None:
+                    self._val_losses.append(avg_val_loss)
 
                 with nvtx_range(profiling_mode, "Logging"):
                     if self.logger is not None:
@@ -252,10 +299,23 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                                 iter=self.num_epochs,
                                 consistency_loss=consistency_loss,
                                 total_loss=total_loss,
+                                learning_rates=self.get_current_lrs(),
                                 num_samples_per_ray=curr_num_samples_per_ray,
+                                val_loss=avg_val_loss if self.val_dataloader is not None else None,
                             )
 
                         self.logger.flush()
+
+    # --- Helper Functions ---
+
+    def save_volume(self, path: str = "recon_volume.npz"):
+        # TODO: Temporary, need to talk to Arthur what the correct way of saving results is.
+        if self.global_rank == 0:
+            print(f"Saving volume to {path}")
+
+            self.obj_model.create_volume()
+
+            np.savez(path, volume=self.obj_model.obj.detach().cpu().numpy())
 
 
 class TomographyConventional(TomographyBase):

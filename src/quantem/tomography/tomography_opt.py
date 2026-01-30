@@ -37,11 +37,8 @@ class TomographyOpt(TomographyBase):
     @optimizer_params.setter
     def optimizer_params(self, d: dict):
         """Set the optimizer parameters."""
-        self._optimizer_params = d.copy() if d else {}
-
-        for key in self.OPTIMIZABLE_VALS:
-            if key not in d:
-                d[key] = {"type": "none"}
+        if isinstance(d, (tuple, list)):
+            d = {k: {} for k in d}
 
         for k, v in d.items():
             if "type" not in v.keys():
@@ -70,6 +67,20 @@ class TomographyOpt(TomographyBase):
                 self.dset.set_optimizer(params)
             else:
                 raise ValueError(f"Unknown optimization key: {key}")
+
+    def get_current_lrs(self) -> dict[str, float]:
+        if self.obj_model.has_optimizer():
+            obj_lr = self.obj_model.get_current_lr()
+        else:
+            obj_lr = 0.0
+        if self.dset.has_optimizer():
+            pose_lr = self.dset.get_current_lr()
+        else:
+            pose_lr = 0.0
+        return {
+            "object": obj_lr,
+            "pose": pose_lr,
+        }
 
     def remove_optimizer(self, key: str):
         if key == "object":
@@ -106,10 +117,14 @@ class TomographyOpt(TomographyBase):
 
     @property
     def schedulers(self) -> dict[str, torch.optim.lr_scheduler._LRScheduler]:
-        return {
-            "object": self.obj_model.scheduler,
-            "pose": self.dset.scheduler,
-        }
+        schedulers = {}
+
+        if self.obj_model.scheduler is not None:
+            schedulers["object"] = self.obj_model.scheduler
+        if self.dset.scheduler is not None:
+            schedulers["pose"] = self.dset.scheduler
+
+        return schedulers
 
     def set_schedulers(self, params: dict[str, dict], num_iter: int | None = None):
         for key, scheduler_params in params.items():
@@ -142,7 +157,5 @@ class TomographyOpt(TomographyBase):
         for key in self.scheduler_params.keys():
             if key == "object" and self.obj_model.scheduler is not None:
                 self.obj_model.step_scheduler(loss)
-            elif key == "pose" and self.dset.scheduler is not None:
+            elif self.dset.scheduler is not None and key == "pose":
                 self.dset.step_scheduler(loss)
-            else:
-                raise ValueError(f"Unknown optimization key: {key}")

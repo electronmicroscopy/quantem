@@ -31,12 +31,18 @@ class LoggerTomography(LoggerBase):
         iter: int,
         consistency_loss: float,
         total_loss: float,
-        num_samples_per_ray: int | None = None,
+        learning_rates: dict[str, float],
+        num_samples_per_ray: int,
+        val_loss: float | None = None,
     ):
         self.log_scalar("loss/consistency", consistency_loss, iter)
         self.log_scalar("loss/total", total_loss, iter)
         self.log_scalar("loss/soft", object_model._soft_constraint_losses[-1], iter)
         self.log_scalar("num_samples_per_ray", num_samples_per_ray, iter)
+        for param_name, lr_value in learning_rates.items():
+            self.log_scalar(f"learning_rate/{param_name}", float(lr_value), iter)
+        if val_loss is not None:
+            self.log_scalar("loss/val", val_loss, iter)
 
     def log_iter_images(
         self,
@@ -45,7 +51,6 @@ class LoggerTomography(LoggerBase):
         iter: int,
         logger_cmap: str = "turbo",
     ):
-
         with torch.no_grad():
             z1_vals = dataset_model.z1_params.detach().cpu().numpy()
             z3_vals = dataset_model.z3_params.detach().cpu().numpy()

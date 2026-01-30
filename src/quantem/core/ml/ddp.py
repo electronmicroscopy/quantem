@@ -3,7 +3,7 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_split
 
 
 # Rename DDPMixin
@@ -60,29 +60,42 @@ class DDPMixin:
         dataset: Dataset,
         batch_size: int,
         num_workers: int = 0,
-        # val_fraction: float = 0.0,
+        val_fraction: float = 0.0,
     ):
         pin_mem = self.device.type == "cuda"
         persist = num_workers > 0
 
-        # TODO: Implement validation dataloader
+        if val_fraction > 0.0:
+            train_dataset, val_dataset = random_split(dataset, [1 - val_fraction, val_fraction])
+        else:
+            train_dataset = dataset
+            val_dataset = None
 
         if self.world_size > 1:
             shuffle = True
             train_sampler = DistributedSampler(
-                dataset,
+                train_dataset,
                 num_replicas=self.world_size,
                 rank=self.global_rank,
                 shuffle=shuffle,
             )
+
+            if val_dataset:
+                val_sampler = DistributedSampler(
+                    val_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.global_rank,
+                    shuffle=False,
+                )
             shuffle = False
 
         else:
             train_sampler = None
+            val_sampler = None
             shuffle = True
 
         train_dataloader = DataLoader(
-            dataset,
+            train_dataset,
             batch_size=batch_size,
             num_workers=num_workers,
             sampler=train_sampler,
@@ -92,14 +105,33 @@ class DDPMixin:
             persistent_workers=persist,
         )
 
+        if val_dataset:
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=batch_size * 4,
+                num_workers=num_workers,
+                sampler=val_sampler,
+                shuffle=False,
+                pin_memory=pin_mem,
+                drop_last=False,
+                persistent_workers=persist,
+            )
+            val_dataloader = val_dataloader
+        else:
+            val_dataloader = None
+
         if self.global_rank == 0:
             print("Dataloader setup complete:")
-            print(f"  Total samples: {len(dataset)}")
+            print(f"  Total train samples: {len(train_dataset)}")
             print(f"  Local batch size: {batch_size}")
             print(f"  Global batch size: {batch_size * self.world_size}")
             print(f"  Train batches per GPU per epoch: {len(train_dataloader)}")
 
-        return train_dataloader, train_sampler
+            if val_dataset:
+                print(f"  Total val samples: {len(val_dataset)}")
+                print(f"  Val batches per GPU per epoch: {len(val_dataloader)}")
+
+        return train_dataloader, train_sampler, val_dataloader, val_sampler
 
     def build_model(
         self,

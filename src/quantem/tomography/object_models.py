@@ -311,13 +311,17 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     #     """
     #     raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
 
+    @property
+    def obj(self) -> torch.Tensor:
+        return self._obj
+
     def apply_soft_constraints(
         self,
         coords: torch.Tensor,
     ) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=coords.device)
         if self.constraints.tv_vol > 0:
-            num_tv_samples = min(10000, coords.shape[0])
+            num_tv_samples = min(1000, coords.shape[0])
             tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
 
             tv_coords = coords[tv_indices].detach().requires_grad_(True)
@@ -347,7 +351,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             pred = torch.clamp(pred, min=0.0, max=None)
         if self.constraints.shrinkage:
             pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
-
 
         return pred
 
@@ -581,10 +584,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 pred_full = outputs.reshape(N, N, N).float()
 
             if return_vol:
-
                 return pred_full.detach().cpu()
-            else:
-                self._obj = pred_full.detach().cpu()
+
+            self._obj = pred_full.detach().cpu()
 
     def get_tv_loss(
         self,

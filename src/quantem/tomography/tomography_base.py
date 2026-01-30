@@ -45,6 +45,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         # Loss
         self._epoch_losses: list[float] = []
         self._consistency_losses: list[float] = []
+        self._val_losses: list[float] = []
         # DDP Initialization
         # print("Checking if obj_model is a ObjectPixelated: ", not isinstance(obj_model, ObjectPixelated))
         if not isinstance(obj_model, ObjectPixelated):
