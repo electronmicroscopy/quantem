@@ -321,7 +321,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
     ) -> torch.Tensor:
         soft_loss = torch.tensor(0.0, device=coords.device)
         if self.constraints.tv_vol > 0:
-            num_tv_samples = min(1000, coords.shape[0])
+            num_tv_samples = min(10000, coords.shape[0])
             tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
 
             tv_coords = coords[tv_indices].detach().requires_grad_(True)
