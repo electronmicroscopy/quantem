@@ -13,8 +13,11 @@ from quantem.tomography.object_models import ObjectModelType
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
 from quantem.tomography.tomography_opt import TomographyOpt
-from quantem.tomography.utils import torch_phase_cross_correlation
-from quantem.tomography_old.utils import gaussian_filter_2d_stack, gaussian_kernel_1d
+from quantem.tomography.utils import (
+    gaussian_filter_2d_stack,
+    gaussian_kernel_1d,
+    torch_phase_cross_correlation,
+)
 
 
 class Tomography(TomographyOpt, TomographyBase, DDPMixin):

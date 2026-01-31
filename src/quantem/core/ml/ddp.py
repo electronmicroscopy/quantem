@@ -6,7 +6,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_split
 
 
-# Rename DDPMixin
 class DDPMixin:
     """
     Class for setting up all distributed training.
