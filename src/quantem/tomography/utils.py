@@ -249,7 +249,7 @@ def estimate_background(
     return mu
 
 
-def cross_correlation_align_stack(ref_img, stack):
+def cross_correlation_align_stack(ref_img, stack, print_pred=False):
     """
     Aligns a stack of images to a reference image using cross-correlation.
 
@@ -264,6 +264,8 @@ def cross_correlation_align_stack(ref_img, stack):
     prev_img = ref_img
     for img in tqdm(stack):
         shift_pred = cross_correlation_shift(prev_img, img)
+        if print_pred:
+            print(f"Shift prediction: {shift_pred}")
         shifted_image = shift(img, shift=shift_pred, mode="constant", cval=0.0)
 
         pred_shifts.append(shift_pred)
