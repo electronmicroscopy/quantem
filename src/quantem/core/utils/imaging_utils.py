@@ -1,7 +1,7 @@
 # Utilities for processing images
 
 import math
-from typing import Any, Optional, Tuple, TypeVar
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +15,7 @@ from scipy.special import comb
 from quantem.core.utils.utils import generate_batches
 from quantem.core.visualization import show_2d
 
-ImageType = TypeVar("ImageType", NDArray[Any])
+ImageType = NDArray[Any]
 BoolArray = NDArray[np.bool_]
 
 
