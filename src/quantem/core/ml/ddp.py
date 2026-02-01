@@ -86,7 +86,10 @@ class DDPMixin:
                     rank=self.global_rank,
                     shuffle=False,
                 )
+            else:
+                val_sampler = None
             shuffle = False
+      
 
         else:
             train_sampler = None
