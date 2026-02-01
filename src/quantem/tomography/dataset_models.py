@@ -43,7 +43,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self,
         tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
-        learn_pose: bool = True,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
         _token: object | None = None,
     ):
         AutoSerialize.__init__(self)
@@ -71,7 +72,8 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
         self.tilt_stack = tilt_stack
         self.tilt_angles = tilt_angles
-        self.learn_pose = learn_pose
+        self.learn_shift = learn_shift
+        self.learn_tilt_axis = learn_tilt_axis
 
         # The reference tilt angle is the one with the smallest absolute tilt angle.
         # I.e, the pose will not be optimized for the reference tilt angle.
@@ -94,9 +96,15 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         cls,
         tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
-        learn_pose: bool = False,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
     ):
-        return cls(tilt_stack=tilt_stack, tilt_angles=tilt_angles, learn_pose=learn_pose)
+        return cls(
+            tilt_stack=tilt_stack,
+            tilt_angles=tilt_angles,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+        )
 
     # --- Optimization Parameters ---
     # @property
@@ -133,12 +141,20 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         self._tilt_angles = tilt_angles
 
     @property
-    def learn_pose(self) -> bool:
-        return self._learn_pose
+    def learn_shift(self) -> bool:
+        return self._learn_shift
 
-    @learn_pose.setter
-    def learn_pose(self, learn_pose: bool):
-        self._learn_pose = learn_pose
+    @learn_shift.setter
+    def learn_shift(self, learn_shift: bool):
+        self._learn_shift = learn_shift
+
+    @property
+    def learn_tilt_axis(self) -> bool:
+        return self._learn_tilt_axis
+
+    @learn_tilt_axis.setter
+    def learn_tilt_axis(self, learn_tilt_axis: bool):
+        self._learn_tilt_axis = learn_tilt_axis
 
     @property
     def reference_tilt_idx(self) -> int:
@@ -235,11 +251,16 @@ class TomographyPixDataset(TomographyDatasetBase):
         self,
         tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
-        learn_pose: bool = False,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
         _token: object | None = None,
     ):
         super().__init__(
-            tilt_stack=tilt_stack, tilt_angles=tilt_angles, learn_pose=learn_pose, _token=_token
+            tilt_stack=tilt_stack,
+            tilt_angles=tilt_angles,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+            _token=_token,
         )
 
     def forward(
@@ -272,11 +293,12 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         self,
         tilt_stack: Dataset3d | NDArray | torch.Tensor,
         tilt_angles: NDArray | torch.Tensor,
-        learn_pose: bool = True,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
         seed: int = 42,
         token: object | None = None,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_pose, token)
+        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, token)
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):
@@ -297,13 +319,16 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         second_half_z3 = self.z3_params[self.reference_tilt_idx :]
         z3 = torch.cat([first_half_z3, self._z3_ref, second_half_z3], dim=0)
 
-        # return DatasetValue(
-        #     target=None,
-        #     tilt_angle=None,
-        #     pixel_loc=None,
-        #     pose=(shifts, z1, z3),
-        # )
-        return shifts, z1, z3
+        if self.learn_shift and self.learn_tilt_axis:
+            return shifts, z1, z3
+        elif self.learn_shift:
+            return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
+        elif self.learn_tilt_axis:
+            return torch.zeros_like(shifts), z1, z3
+        elif self.learn_shift and self.learn_tilt_axis:
+            return shifts, z1, z3
+        else:
+            return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
 
     @property
     def params(self):
