@@ -3,16 +3,16 @@ Tests for imaging utilities in quantem.core.utils.imaging_utils
 """
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from quantem.core.utils.imaging_utils import cross_correlation_shift, cross_correlation_shift_torch
+from quantem.core.utils.imaging_utils import cross_correlation_shift, cross_correlation_shift_torch, weighted_cross_correlation_shift
 
 
 @pytest.fixture
 def spot_image():
-    from scipy.ndimage import gaussian_filter
 
     im = np.zeros((64, 64), dtype=np.float64)
     im[32, 32] = 1.0
@@ -73,3 +73,55 @@ def test_cross_correlation_shift_torch_matches_expected(spot_image, shift_true, 
 
     assert float(meas[0]) == pytest.approx(expected[0], abs=atol)
     assert float(meas[1]) == pytest.approx(expected[1], abs=atol)
+
+import numpy as np
+import pytest
+
+from quantem.core.utils.imaging_utils import weighted_cross_correlation_shift
+
+
+@pytest.fixture
+def peak_grid_images():
+    im_ref = np.zeros((80, 80), dtype=float)
+    im = np.zeros_like(im_ref)
+
+    r_ref = np.array([17, 27, 37, 47], dtype=int)
+    r_im  = np.array([27, 37, 47, 57], dtype=int)  # shifted +10 rows
+    c = np.array([17, 27, 37, 47], dtype=int)
+
+    for rr in r_ref:
+        for cc in c:
+            im_ref[rr, cc] = 1.0
+
+    for rr in r_im:
+        for cc in c:
+            im[rr, cc] = 1.0
+
+    im_ref[37,27] = 3.0
+    im[27,27] = 3.0
+
+    im_ref = gaussian_filter(im_ref,1.0)
+    im = gaussian_filter(im,1.0)
+
+    # Smooth wrapped radial weight centered at 0 shift
+    M, N = im_ref.shape
+    fr = np.fft.fftfreq(M) * M
+    fc = np.fft.fftfreq(N) * N
+    dr2 = fr[:, None] ** 2 + fc[None, :] ** 2
+
+    sigma = 3.0
+    weight = np.exp(dr2 / (-2.0*sigma**2))
+
+    return im_ref, im, weight
+
+
+def test_weighted_cross_correlation_shift_unweighted_prefers_full_overlap(peak_grid_images):
+    im_ref, im, weight = peak_grid_images
+    shift = weighted_cross_correlation_shift(im_ref, im, upsample_factor=1000)
+    assert np.allclose(shift, (-10.0, 0.0), atol=1e-3)
+
+
+def test_weighted_cross_correlation_shift_weighted_prefers_near_zero(peak_grid_images):
+    im_ref, im, weight = peak_grid_images
+    shift = weighted_cross_correlation_shift(im_ref, im, weight_real=weight, upsample_factor=1000)
+    assert np.allclose(shift, (0.0, 0.0), atol=1e-3)

@@ -337,6 +337,136 @@ def dftUpsample_torch(
     return imageUpsample.real
 
 
+def weighted_cross_correlation_shift(
+    im_ref=None,
+    im=None,
+    *,
+    cc=None,
+    weight_real=None,
+    upsample_factor: int = 1,
+    max_shift=None,
+    fft_input: bool = False,
+    return_shifted: bool = False,
+    shifted_output: str = "real",
+):
+    """
+    Weighted peak selection + DFT subpixel refinement for Fourier cross-correlation.
+
+    You can provide either:
+      - im_ref and im (real-space images, or Fourier-domain if fft_input=True), OR
+      - cc (the Fourier-domain cross-spectrum), where cc = F_ref * conj(F_im)
+
+    The weight is applied ONLY in real-space correlation to choose the peak location,
+    but the subpixel refinement uses the true (unweighted) cross-spectrum `cc`.
+
+    Parameters
+    ----------
+    im_ref, im : ndarray or None
+        Input images (real space) or their FFTs (if fft_input=True).
+    cc : ndarray or None
+        Fourier-domain cross-spectrum cc = F_ref * conj(F_im). If provided, im_ref/im are ignored.
+    weight_real : ndarray or None
+        Real-space weight image (same shape as correlation). Used only for peak selection.
+        If None, peak selection is unweighted.
+    upsample_factor : int
+        <= 2: half-pixel refinement (parabolic then rounded to nearest 0.5 px)
+        > 2 : additional DFT upsample refinement via _upsampled_correlation_numpy
+    max_shift : float or None
+        Optional radial cutoff (in pixels) applied to the (weighted) real correlation during peak pick.
+    fft_input : bool
+        If True, im_ref and im are already Fourier-domain arrays.
+    return_shifted : bool
+        If True, also return shifted version of `im` (or its FFT) aligned to `im_ref`.
+        Requires im to be provided (or fft_input=True with im as FFT). If only cc is provided,
+        shifted output is unavailable.
+    shifted_output : {"real","fft"}
+        Output type for the shifted image.
+
+    Returns
+    -------
+    shift_rc : tuple[float, float]
+        (d_row, d_col) shift to apply to `im` to align it to `im_ref`.
+    shifted : ndarray (optional)
+        Shifted image (real) or FFT (corner-centered) depending on shifted_output.
+    """
+    import numpy as np
+
+    from quantem.core.utils.imaging_utils import _parabolic_peak, _upsampled_correlation_numpy
+
+    if cc is None:
+        if im_ref is None or im is None:
+            raise ValueError("Provide either `cc` or both `im_ref` and `im`.")
+        F_ref = np.asarray(im_ref) if fft_input else np.fft.fft2(np.asarray(im_ref))
+        F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
+        cc = F_ref * np.conj(F_im)
+    else:
+        cc = np.asarray(cc)
+        F_im = None
+
+    cc_real = np.fft.ifft2(cc).real
+    M, N = cc_real.shape
+
+    if weight_real is not None:
+        w = np.asarray(weight_real)
+        if w.shape != cc_real.shape:
+            raise ValueError(f"weight_real.shape={w.shape} must match correlation shape {cc_real.shape}.")
+        cc_pick = cc_real * w
+    else:
+        cc_pick = cc_real
+
+    if max_shift is not None:
+        x = np.fft.fftfreq(M) * M
+        y = np.fft.fftfreq(N) * N
+        mask = x[:, None] ** 2 + y[None, :] ** 2 > float(max_shift) ** 2
+        cc_pick = cc_pick.copy()
+        cc_pick[mask] = -np.inf
+
+    flat_idx = int(np.argmax(cc_pick))
+    x0 = flat_idx // N
+    y0 = flat_idx % N
+
+    x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
+    y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
+    vx = cc_pick[x_inds, y0]
+    vy = cc_pick[x0, y_inds]
+
+    dx = _parabolic_peak(vx)
+    dy = _parabolic_peak(vy)
+
+    x0 = np.round((float(x0) + float(dx)) * 2.0) / 2.0
+    y0 = np.round((float(y0) + float(dy)) * 2.0) / 2.0
+    xy_shift = np.array([x0, y0], dtype=float)
+
+    if upsample_factor > 2:
+        xy_shift = _upsampled_correlation_numpy(cc, int(upsample_factor), xy_shift)
+
+    dr = ((xy_shift[0] + M / 2) % M) - M / 2
+    dc = ((xy_shift[1] + N / 2) % N) - N / 2
+    shift_rc = (float(dr), float(dc))
+
+    if not return_shifted:
+        return shift_rc
+
+    if im is None:
+        raise ValueError("return_shifted=True requires `im` (or its FFT via fft_input=True).")
+
+    if F_im is None:
+        F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
+
+    kr = np.fft.fftfreq(M)[:, None]
+    kc = np.fft.fftfreq(N)[None, :]
+    phase_ramp = np.exp(-2j * np.pi * (kr * shift_rc[0] + kc * shift_rc[1]))
+    F_im_shifted = F_im * phase_ramp
+
+    out_mode = str(shifted_output).lower()
+    if out_mode in {"fft", "fourier"}:
+        return shift_rc, F_im_shifted
+    if out_mode in {"real", "image"}:
+        return shift_rc, np.fft.ifft2(F_im_shifted).real
+
+    raise ValueError("shifted_output must be 'real' or 'fft'.")
+
+
 def bilinear_kde(
     xa: NDArray,
     ya: NDArray,

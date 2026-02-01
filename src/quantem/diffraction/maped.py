@@ -8,6 +8,10 @@ from scipy.signal.windows import tukey
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.visualization import show_2d
+# from quantem.core.utils.imaging_utils import cross_correlation_shift
+# from quantem.core.utils.imaging_utils import dft_upsample
+# from quantem.core.utils.imaging_utils import correlation_peak_shift_from_real
+from quantem.core.utils.imaging_utils import cross_correlation_shift
 
 
 class MAPED(AutoSerialize):
@@ -216,8 +220,23 @@ class MAPED(AutoSerialize):
             im_weight = np.clip(1 - np.sqrt(dr2)/np.mean(self.dp_mean[0].shape)/weight_scale, 0.0, 1.0)
             im_weight = np.sin(im_weight*np.pi/2)**2
 
-            im_corr = np.real(np.fft.ifft2(G_ref * G)) * im_weight
+            # im_corr = np.real(np.fft.ifft2(G_ref * G)) * im_weight
+            # cc_weighted = 
 
+            cc = G_ref * G
+            cc_weighted = np.fft.fft2(np.fft.ifft2(cc)) * im_weight
+
+
+            shift_rc = cross_correlation_shift(
+                cc_weighted,
+                np.ones_like(cc_weighted),   # identity: cc = cc_weighted * conj(1) = cc_weighted
+                fft_input=True,              # treat inputs as Fourier-domain
+                upsample_factor=100,         # or whatever you want
+            )
+
+            shift = correlation_peak_shift_from_real(im_corr, upsample_factor=100)
+
+            print(shift)
 
 
         if plot_aligned:
