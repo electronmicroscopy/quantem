@@ -346,53 +346,27 @@ def weighted_cross_correlation_shift(
     upsample_factor: int = 1,
     max_shift=None,
     fft_input: bool = False,
-    return_shifted: bool = False,
-    shifted_output: str = "real",
+    fft_output: bool = False,
+    return_shifted_image: bool = False,
 ):
     """
     Weighted peak selection + DFT subpixel refinement for Fourier cross-correlation.
 
-    You can provide either:
+    Provide either:
       - im_ref and im (real-space images, or Fourier-domain if fft_input=True), OR
       - cc (the Fourier-domain cross-spectrum), where cc = F_ref * conj(F_im)
 
     The weight is applied ONLY in real-space correlation to choose the peak location,
     but the subpixel refinement uses the true (unweighted) cross-spectrum `cc`.
 
-    Parameters
-    ----------
-    im_ref, im : ndarray or None
-        Input images (real space) or their FFTs (if fft_input=True).
-    cc : ndarray or None
-        Fourier-domain cross-spectrum cc = F_ref * conj(F_im). If provided, im_ref/im are ignored.
-    weight_real : ndarray or None
-        Real-space weight image (same shape as correlation). Used only for peak selection.
-        If None, peak selection is unweighted.
-    upsample_factor : int
-        <= 2: half-pixel refinement (parabolic then rounded to nearest 0.5 px)
-        > 2 : additional DFT upsample refinement via _upsampled_correlation_numpy
-    max_shift : float or None
-        Optional radial cutoff (in pixels) applied to the (weighted) real correlation during peak pick.
-    fft_input : bool
-        If True, im_ref and im are already Fourier-domain arrays.
-    return_shifted : bool
-        If True, also return shifted version of `im` (or its FFT) aligned to `im_ref`.
-        Requires im to be provided (or fft_input=True with im as FFT). If only cc is provided,
-        shifted output is unavailable.
-    shifted_output : {"real","fft"}
-        Output type for the shifted image.
-
     Returns
     -------
     shift_rc : tuple[float, float]
         (d_row, d_col) shift to apply to `im` to align it to `im_ref`.
     shifted : ndarray (optional)
-        Shifted image (real) or FFT (corner-centered) depending on shifted_output.
+        If return_shifted=True: shifted image. If fft_output=True returns FFT (corner-centered),
+        else returns real-space image.
     """
-    import numpy as np
-
-    from quantem.core.utils.imaging_utils import _parabolic_peak, _upsampled_correlation_numpy
-
     if cc is None:
         if im_ref is None or im is None:
             raise ValueError("Provide either `cc` or both `im_ref` and `im`.")
@@ -415,9 +389,9 @@ def weighted_cross_correlation_shift(
         cc_pick = cc_real
 
     if max_shift is not None:
-        x = np.fft.fftfreq(M) * M
-        y = np.fft.fftfreq(N) * N
-        mask = x[:, None] ** 2 + y[None, :] ** 2 > float(max_shift) ** 2
+        fr = np.fft.fftfreq(M) * M
+        fc = np.fft.fftfreq(N) * N
+        mask = fr[:, None] ** 2 + fc[None, :] ** 2 > float(max_shift) ** 2
         cc_pick = cc_pick.copy()
         cc_pick[mask] = -np.inf
 
@@ -444,11 +418,11 @@ def weighted_cross_correlation_shift(
     dc = ((xy_shift[1] + N / 2) % N) - N / 2
     shift_rc = (float(dr), float(dc))
 
-    if not return_shifted:
+    if not return_shifted_image:
         return shift_rc
 
     if im is None:
-        raise ValueError("return_shifted=True requires `im` (or its FFT via fft_input=True).")
+        raise ValueError("return_shifted_image=True requires `im` (or its FFT via fft_input=True).")
 
     if F_im is None:
         F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
@@ -458,13 +432,9 @@ def weighted_cross_correlation_shift(
     phase_ramp = np.exp(-2j * np.pi * (kr * shift_rc[0] + kc * shift_rc[1]))
     F_im_shifted = F_im * phase_ramp
 
-    out_mode = str(shifted_output).lower()
-    if out_mode in {"fft", "fourier"}:
+    if fft_output:
         return shift_rc, F_im_shifted
-    if out_mode in {"real", "image"}:
-        return shift_rc, np.fft.ifft2(F_im_shifted).real
-
-    raise ValueError("shifted_output must be 'real' or 'fft'.")
+    return shift_rc, np.fft.ifft2(F_im_shifted).real
 
 
 def bilinear_kde(
