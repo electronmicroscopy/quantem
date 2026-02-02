@@ -6,8 +6,8 @@ import numpy as np
 from quantem.core.ml.inr import HSiren
 from quantem.tomography.dataset_models import DatasetModelType
 from quantem.tomography.logger_tomography import LoggerTomography
-from quantem.tomography.object_models import ObjectINR
-from quantem.tomography.tomography import Tomography
+from quantem.tomography.object_models import ObjectINR, ObjectPixelated
+from quantem.tomography.tomography import Tomography, TomographyConventional
 
 
 class TomographyLiteINR(Tomography):
@@ -119,3 +119,33 @@ class TomographyLiteINR(Tomography):
             scheduler_params=scheduler_params,
             constraints=constraints,
         )
+
+
+class TomographyLiteConv(TomographyConventional):
+    @classmethod
+    def from_dataset(
+        cls,
+        dset: DatasetModelType,
+        device: str = "cuda",
+        rng: np.random.Generator | int | None = None,
+    ) -> Self:
+        dset_model = dset
+
+        obj_model = ObjectPixelated(
+            shape=(
+                max(dset_model.tilt_stack.shape),
+                max(dset_model.tilt_stack.shape),
+                max(dset_model.tilt_stack.shape),
+            ),
+            device=device,
+            rng=rng,
+        )
+
+        tomography = cls.from_models(
+            dset=dset_model,
+            obj_model=obj_model,
+            device=device,
+            rng=rng,
+        )
+
+        return tomography

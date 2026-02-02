@@ -450,9 +450,12 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             pretrain_dataset is not None
         ):  # Need to make a check if there's already a pretrain dataset to not go through with the setup again.
             self.pretrain_dataset = pretrain_dataset
-            self.pretraining_dataloader, self.pretraining_sampler = self.setup_dataloader(
-                pretrain_dataset, batch_size, num_workers=num_workers
-            )
+            (
+                self.pretraining_dataloader,
+                self.pretraining_sampler,
+                self.pretraining_val_dataloader,
+                self.pretraining_val_sampler,
+            ) = self.setup_dataloader(pretrain_dataset, batch_size, num_workers=num_workers)
 
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)
