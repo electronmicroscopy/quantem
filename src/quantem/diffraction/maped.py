@@ -406,9 +406,13 @@ class MAPED(AutoSerialize):
         diffraction_edge_blend=0.0,
         diffraction_pad_val="min",
         shift_method: str = "bilinear",
+        dtype=None,
+        scale_output: bool = False,
         plot_result: bool = True,
         **kwargs,
     ):
+        import warnings
+
         import numpy as np
         from scipy.ndimage import shift as ndi_shift
         from scipy.signal.windows import tukey
@@ -419,18 +423,15 @@ class MAPED(AutoSerialize):
         if not hasattr(self, "diffraction_shifts"):
             raise RuntimeError("Run diffraction_align() first so self.diffraction_shifts exists.")
 
-        n = len(self.datasets)
+        arrays = [np.asarray(d.array) for d in self.datasets]
+        n = len(arrays)
         if n == 0:
             raise RuntimeError("No datasets found in self.datasets.")
 
-        arrays = [np.asarray(d.array, dtype=float) for d in self.datasets]
-        shape0 = arrays[0].shape
-        if len(shape0) != 4:
-            raise ValueError("Expected Dataset4dstem arrays with shape (R, C, H, W).")
-        Rs, Cs, H, W = shape0
+        Rs, Cs, H, W = arrays[0].shape
         for a in arrays:
             if a.shape != (Rs, Cs, H, W):
-                raise ValueError("All datasets must have the same shape (R, C, H, W).")
+                raise ValueError("All dataset arrays must have the same shape (Rs, Cs, H, W).")
 
         rs_shifts = np.asarray(self.real_space_shifts, dtype=float)
         dp_shifts = np.asarray(self.diffraction_shifts, dtype=float)
@@ -439,48 +440,48 @@ class MAPED(AutoSerialize):
         if dp_shifts.shape != (n, 2):
             raise ValueError("self.diffraction_shifts must have shape (n, 2).")
 
+        if dtype is None:
+            dtype_out = np.asarray(arrays[0]).dtype
+            warnings.warn(f"dtype=None; using parent dtype {dtype_out}.", RuntimeWarning)
+        else:
+            dtype_out = np.dtype(dtype)
+
         real_space_padding = int(real_space_padding)
-        if real_space_padding < 0:
-            raise ValueError("real_space_padding must be >= 0.")
+        diffraction_padding = int(diffraction_padding)
+
+        Rout = Rs + 2 * real_space_padding
+        Cout = Cs + 2 * real_space_padding
+
+        Hp = H + 2 * diffraction_padding
+        Wp = W + 2 * diffraction_padding
+        rp0 = diffraction_padding
+        cp0 = diffraction_padding
 
         method = str(shift_method).strip().lower()
         if method not in {"bilinear", "fourier"}:
             raise ValueError("shift_method must be 'bilinear' or 'fourier'.")
 
-        # Real-space taper window (used to weight contributions)
-        alpha_r = min(1.0, 2.0 * float(real_space_edge_blend) / float(Rs)) if real_space_edge_blend > 0 else 0.0
-        alpha_c = min(1.0, 2.0 * float(real_space_edge_blend) / float(Cs)) if real_space_edge_blend > 0 else 0.0
-        w_rs = tukey(Rs, alpha=alpha_r)[:, None] * tukey(Cs, alpha=alpha_c)[None, :]
+        if real_space_edge_blend and float(real_space_edge_blend) > 0:
+            alpha_r = min(1.0, 2.0 * float(real_space_edge_blend) / float(Rs))
+            alpha_c = min(1.0, 2.0 * float(real_space_edge_blend) / float(Cs))
+            w_rs = tukey(Rs, alpha=alpha_r)[:, None] * tukey(Cs, alpha=alpha_c)[None, :]
+        else:
+            w_rs = np.ones((Rs, Cs), dtype=float)
         w_rs = w_rs.astype(float, copy=False)
 
-        # Diffraction padding (must be large enough to prevent wrap for Fourier shifts)
-        diffraction_padding = int(diffraction_padding)
-        if diffraction_padding < 0:
-            raise ValueError("diffraction_padding must be >= 0.")
-        max_abs_dp = float(np.max(np.abs(dp_shifts))) if dp_shifts.size else 0.0
-        pad_dp_min = int(np.ceil(max_abs_dp)) + 2
-        pad_dp = max(diffraction_padding, pad_dp_min)
-
-        Hp = H + 2 * pad_dp
-        Wp = W + 2 * pad_dp
-        rp0 = pad_dp
-        cp0 = pad_dp
-
-        # Diffraction taper window
-        alpha_hr = min(1.0, 2.0 * float(diffraction_edge_blend) / float(H)) if diffraction_edge_blend > 0 else 0.0
-        alpha_hc = min(1.0, 2.0 * float(diffraction_edge_blend) / float(W)) if diffraction_edge_blend > 0 else 0.0
-        w_dp = tukey(H, alpha=alpha_hr)[:, None] * tukey(W, alpha=alpha_hc)[None, :]
+        if diffraction_edge_blend and float(diffraction_edge_blend) > 0:
+            alpha_dr = min(1.0, 2.0 * float(diffraction_edge_blend) / float(H))
+            alpha_dc = min(1.0, 2.0 * float(diffraction_edge_blend) / float(W))
+            w_dp = tukey(H, alpha=alpha_dr)[:, None] * tukey(W, alpha=alpha_dc)[None, :]
+        else:
+            w_dp = np.ones((H, W), dtype=float)
         w_dp = w_dp.astype(float, copy=False)
 
-        # Padded diffraction window (unshifted)
-        w_dp_pad = np.zeros((Hp, Wp))
-        w_dp_pad[rp0 : rp0 + H, cp0 : cp0 + W] = w_dp
+        dp_means = [np.mean(a, axis=(0, 1), dtype=np.float64) for a in arrays]
+        v = np.stack(dp_means, axis=0).reshape(-1)
 
-        # Pad value in diffraction space (computed from dp_means for speed)
         if isinstance(diffraction_pad_val, str):
             s = diffraction_pad_val.strip().lower()
-            dp_means = [np.mean(a, axis=(0, 1)) for a in arrays]
-            v = np.stack(dp_means, axis=0).reshape(-1)
             if s == "min":
                 pad_val_dp = float(np.min(v))
             elif s == "max":
@@ -494,47 +495,44 @@ class MAPED(AutoSerialize):
         else:
             pad_val_dp = float(diffraction_pad_val)
 
-        # Precompute diffraction window shifts per dataset
+        wdp_pad = np.zeros((Hp, Wp), dtype=float)
+        wdp_pad[rp0 : rp0 + H, cp0 : cp0 + W] = w_dp
+
+        wdp_shifted = np.zeros((n, Hp, Wp), dtype=float)
         if method == "fourier":
             kr = np.fft.fftfreq(Hp)[:, None]
             kc = np.fft.fftfreq(Wp)[None, :]
-            ramps = [
-                np.exp(-2j * np.pi * (kr * float(dp_shifts[i, 0]) + kc * float(dp_shifts[i, 1])))
-                for i in range(n)
-            ]
-            wdp_shifted = np.empty((n, Hp, Wp))
-            Fw0 = np.fft.fft2(w_dp_pad)
+            ramps = []
+            Fw = np.fft.fft2(wdp_pad)
             for i in range(n):
-                wtmp = np.fft.ifft2(Fw0 * ramps[i]).real
-                wtmp = np.clip(wtmp, 0.0, 1.0)
-                wdp_shifted[i] = wtmp
+                dr, dc = float(dp_shifts[i, 0]), float(dp_shifts[i, 1])
+                ramp = np.exp(-2j * np.pi * (kr * dr + kc * dc))
+                ramps.append(ramp)
+                w_i = np.fft.ifft2(Fw * ramp).real
+                wdp_shifted[i] = np.clip(w_i, 0.0, 1.0)
         else:
-            wdp_shifted = np.empty((n, Hp, Wp))
             for i in range(n):
-                wtmp = ndi_shift(
-                    w_dp_pad,
+                w_i = ndi_shift(
+                    wdp_pad,
                     shift=(float(dp_shifts[i, 0]), float(dp_shifts[i, 1])),
                     order=1,
                     mode="constant",
                     cval=0.0,
                     prefilter=False,
                 )
-                wtmp = np.clip(wtmp, 0.0, 1.0)
-                wdp_shifted[i] = wtmp
+                wdp_shifted[i] = np.clip(w_i, 0.0, 1.0)
+            ramps = None
 
-        # Edge blend weight for pad value (diffraction space)
-        edge_w_dp = 1.0 - np.clip(np.max(wdp_shifted, axis=0), 0.0, 1.0)
+        edge_w_dp = 1.0 - np.max(wdp_shifted, axis=0)
+        edge_w_dp = np.clip(edge_w_dp, 0.0, 1.0)
 
-        Rout = Rs + 2 * real_space_padding
-        Cout = Cs + 2 * real_space_padding
-        merged = np.zeros((Rout, Cout, Hp, Wp))
+        merged = np.zeros((Rout, Cout, Hp, Wp), dtype=np.float64)
 
-        dp_local = np.empty((H, W))
-        dp_pad = np.zeros((Hp, Wp))
-        dp_shifted_tmp = np.empty((Hp, Wp))
-        num_tmp = np.zeros((Hp, Wp))
-        den_tmp = np.zeros((Hp, Wp))
-        out_tmp = np.empty((Hp, Wp))
+        dp_local = np.zeros((H, W), dtype=np.float64)
+        dp_pad = np.zeros((Hp, Wp), dtype=np.float64)
+        dp_shifted_tmp = np.zeros((Hp, Wp), dtype=np.float64)
+        num_tmp = np.zeros((Hp, Wp), dtype=np.float64)
+        den_tmp = np.zeros((Hp, Wp), dtype=np.float64)
 
         for ro in tqdm(range(Rout), desc="Merging (rows)"):
             r_base = float(ro - real_space_padding)
@@ -606,21 +604,69 @@ class MAPED(AutoSerialize):
                 num = num_tmp + edge_w_dp * pad_val_dp
                 den = den_tmp + edge_w_dp
 
-                np.divide(num, den, out=out_tmp, where=(den > 0.0))
-                out_tmp[den <= 0.0] = pad_val_dp
-                merged[ro, co] = out_tmp
+                out = np.empty_like(num)
+                np.divide(num, den, out=out, where=den != 0.0)
+                out[den == 0.0] = 0.0
+                merged[ro, co] = out
 
-        dataset_merged = Dataset4dstem.from_array(merged)
+        self.im_bf_merged = np.mean(merged, axis=(2, 3), dtype=np.float64)
+        self.dp_mean_merged = np.mean(merged, axis=(0, 1), dtype=np.float64)
 
-        self.im_bf_merged = np.mean(merged, axis=(2, 3))
-        self.dp_mean_merged = np.mean(merged, axis=(0, 1))
+        if np.issubdtype(dtype_out, np.integer):
+            info = np.iinfo(dtype_out)
+            dmin = float(info.min)
+            dmax = float(info.max)
+
+            merged_f = merged  # float64
+
+            if scale_output:
+                peak = float(np.max(merged_f))
+                if peak <= 0.0:
+                    scale = 1.0
+                    merged_scaled = merged_f
+                else:
+                    scale = dmax / peak
+                    merged_scaled = merged_f * scale
+
+                if np.issubdtype(dtype_out, np.unsignedinteger):
+                    if float(np.min(merged_scaled)) < 0.0:
+                        warnings.warn(
+                            f"scale_output=True with unsigned dtype {dtype_out}: "
+                            "negative values present; they will be clipped to 0.",
+                            RuntimeWarning,
+                        )
+                    lo, hi = 0.0, dmax
+                else:
+                    lo, hi = dmin, dmax
+
+                if float(np.min(merged_scaled)) < lo or float(np.max(merged_scaled)) > hi:
+                    warnings.warn(
+                        f"Output overflow for dtype {dtype_out} after scaling: "
+                        f"data range [{float(np.min(merged_scaled))}, {float(np.max(merged_scaled))}] exceeds "
+                        f"[{lo}, {hi}]. Values will be clipped.",
+                        RuntimeWarning,
+                    )
+
+                merged_out = np.rint(np.clip(merged_scaled, lo, hi)).astype(dtype_out)
+
+            else:
+                below = float(np.min(merged_f))
+                above = float(np.max(merged_f))
+                if below < dmin or above > dmax:
+                    warnings.warn(
+                        f"Output overflow for dtype {dtype_out}: data range [{below}, {above}] exceeds "
+                        f"[{dmin}, {dmax}]. Values will be clipped.",
+                        RuntimeWarning,
+                    )
+                merged_out = np.rint(np.clip(merged_f, dmin, dmax)).astype(dtype_out)
+        else:
+            merged_out = merged.astype(dtype_out, copy=False)
+
+
+        dataset_merged = Dataset4dstem.from_array(array=merged_out)
 
         dataset_merged.im_bf_merged = self.im_bf_merged
         dataset_merged.dp_mean_merged = self.dp_mean_merged
-        dataset_merged.metadata["im_bf_merged"] = self.im_bf_merged
-        dataset_merged.metadata["dp_mean_merged"] = self.dp_mean_merged
-        dataset_merged.metadata["real_space_shifts_rc"] = rs_shifts.copy()
-        dataset_merged.metadata["diffraction_shifts_rc"] = dp_shifts.copy()
 
         if plot_result:
             show_2d(
