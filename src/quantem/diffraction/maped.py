@@ -1,28 +1,55 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any, Sequence
 
 import numpy as np
+from scipy.ndimage import gaussian_filter, shift as ndi_shift
+from scipy.signal import convolve2d
 from scipy.signal.windows import tukey
+from tqdm import tqdm
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.visualization import show_2d
 from quantem.core.utils.imaging_utils import weighted_cross_correlation_shift
+from quantem.core.visualization import show_2d
 
 
 class MAPED(AutoSerialize):
+    """
+    Merge-Averaged Precession Electron Diffraction (MAPED) helper.
+
+    This class manages a set of 4D-STEM datasets and provides utilities to:
+    - compute mean BF and mean DP summaries,
+    - choose/find diffraction origins,
+    - align diffraction space and real space,
+    - merge datasets into a single composite Dataset4dstem.
+    """
+
     _token = object()
 
     def __init__(self, datasets: list[Dataset4dstem], _token: object | None = None):
         if _token is not self._token:
             raise RuntimeError("Use MAPED.from_datasets() to instantiate this class.")
-        AutoSerialize.__init__(self)
+        super().__init__()
         self.datasets = datasets
         self.metadata: dict[str, Any] = {}
 
     @classmethod
-    def from_datasets(cls, datasets: Sequence[Dataset4dstem]) -> "MAPED":
+    def from_datasets(cls, datasets: Sequence[Dataset4dstem]) -> MAPED:
+        """
+        Construct a MAPED instance from a non-empty sequence of Dataset4dstem.
+
+        Parameters
+        ----------
+        datasets
+            Sequence of Dataset4dstem instances.
+
+        Returns
+        -------
+        MAPED
+            New MAPED instance.
+        """
         if not isinstance(datasets, Sequence) or isinstance(datasets, (str, bytes)):
             raise TypeError("MAPED.from_datasets expects a sequence of Dataset4dstem instances.")
         ds_list: list[Dataset4dstem] = []
@@ -30,7 +57,7 @@ class MAPED(AutoSerialize):
             if not isinstance(d, Dataset4dstem):
                 raise TypeError("MAPED.from_datasets expects a sequence of Dataset4dstem instances.")
             ds_list.append(d)
-        if len(ds_list) == 0:
+        if not ds_list:
             raise ValueError("MAPED.from_datasets expects a non-empty sequence of Dataset4dstem instances.")
         return cls(datasets=ds_list, _token=cls._token)
 
@@ -39,7 +66,19 @@ class MAPED(AutoSerialize):
         plot_summary: bool = True,
         scale: float | Sequence[float] | None = None,
         **plot_kwargs: Any,
-    ) -> "MAPED":
+    ) -> MAPED:
+        """
+        Compute dataset summary images.
+
+        Stores
+        ------
+        self.scales : np.ndarray
+            Per-dataset scaling factors (n,).
+        self.dp_mean : list[np.ndarray]
+            Mean diffraction patterns (H, W), one per dataset.
+        self.im_bf : list[np.ndarray]
+            Mean bright-field images (R, C), one per dataset.
+        """
         n = len(self.datasets)
         if scale is None:
             self.scales = np.ones(n, dtype=float)
@@ -52,8 +91,8 @@ class MAPED(AutoSerialize):
         if np.any(self.scales == 0):
             raise ValueError("scale entries must be nonzero.")
 
-        self.dp_mean = []
-        self.im_bf = []
+        self.dp_mean: list[np.ndarray] = []
+        self.im_bf: list[np.ndarray] = []
 
         for d in self.datasets:
             if hasattr(d, "get_dp_mean"):
@@ -67,11 +106,13 @@ class MAPED(AutoSerialize):
 
             dp = getattr(d, "dp_mean", None)
             if dp is None:
-                dp_arr = np.mean(np.asarray(d.array), axis=(0, 1))
+                arr = np.asarray(d.array)
+                dp_arr = np.mean(arr, axis=(0, 1))
             else:
                 dp_arr = np.asarray(dp.array if hasattr(dp, "array") else dp)
 
-            im_bf_arr = np.mean(np.asarray(d.array), axis=(2, 3))
+            arr = np.asarray(d.array)
+            im_bf_arr = np.mean(arr, axis=(2, 3))
 
             self.dp_mean.append(np.asarray(dp_arr))
             self.im_bf.append(np.asarray(im_bf_arr))
@@ -79,22 +120,18 @@ class MAPED(AutoSerialize):
         if plot_summary:
             tiles = [[(self.im_bf[i] / self.scales[i]), self.dp_mean[i]] for i in range(n)]
             titles = [[f"{i} - Mean Bright Field", f"{i} - Mean Diffraction Pattern"] for i in range(n)]
-            show_2d(
-                tiles,
-                titles=titles,
-                **plot_kwargs,
-            )
+            show_2d(tiles, title=titles, **plot_kwargs)
 
         return self
 
-
-    def diffraction_find_origin(
+    def diffraction_origin(
         self,
         origins=None,
         sigma=None,
         plot_origins: bool = True,
         plot_indices=None,
-    ):
+        **plot_kwargs: Any,
+    ) -> MAPED:
         """
         Choose or automatically find the origin in diffraction space.
 
@@ -104,26 +141,20 @@ class MAPED(AutoSerialize):
             Optional manual origins. Can be:
             - a single (row, col) tuple, applied to all datasets
             - a list of (row, col) tuples of length n (one per dataset)
-            - a list of (row, col) tuples shorter than n, used for plot/inspection only (will error if not broadcastable)
         sigma
             Optional low-pass smoothing sigma (pixels) applied to each mean DP prior to peak finding.
         plot_origins
             If True, plot mean diffraction patterns with overlaid origin markers.
         plot_indices
             Optional indices to plot. If None, plots all datasets.
+        **plot_kwargs
+            Passed to show_2d.
 
         Stores
         ------
         self.diffraction_origins : np.ndarray
             Array of shape (n, 2) with integer (row, col) origins.
         """
-        import numpy as _np
-
-        try:
-            from scipy.ndimage import gaussian_filter as _gaussian_filter
-        except Exception:  # pragma: no cover
-            _gaussian_filter = None
-
         n = len(self.datasets)
         if not hasattr(self, "dp_mean"):
             raise RuntimeError("Run preprocess() first so self.dp_mean exists.")
@@ -137,119 +168,133 @@ class MAPED(AutoSerialize):
                     raise IndexError("plot_indices contains an out-of-range index.")
 
         if origins is None:
-            origins_arr = _np.zeros((n, 2), dtype=int)
+            origins_arr = np.zeros((n, 2), dtype=int)
             for i in range(n):
-                dp = _np.asarray(self.dp_mean[i])
+                dp = np.asarray(self.dp_mean[i])
                 if sigma is not None and float(sigma) > 0:
-                    if _gaussian_filter is None:
-                        raise ImportError("scipy is required for sigma smoothing (gaussian_filter).")
-                    dp_use = _gaussian_filter(dp.astype(float, copy=False), float(sigma))
+                    dp_use = gaussian_filter(dp.astype(float, copy=False), float(sigma), mode="nearest")
                 else:
                     dp_use = dp
-                ind = int(_np.argmax(dp_use))
-                r, c = _np.unravel_index(ind, dp_use.shape)
+                r, c = np.unravel_index(int(np.argmax(dp_use)), dp_use.shape)
                 origins_arr[i, 0] = int(r)
                 origins_arr[i, 1] = int(c)
         else:
             if isinstance(origins, tuple) and len(origins) == 2:
-                origins_arr = _np.tile(_np.asarray(origins, dtype=int)[None, :], (n, 1))
+                origins_arr = np.tile(np.asarray(origins, dtype=int)[None, :], (n, 1))
             else:
                 origins_list = list(origins)
                 if len(origins_list) != n:
                     raise ValueError("origins must be a single (row,col) tuple or a list of length n.")
-                origins_arr = _np.asarray(origins_list, dtype=int)
+                origins_arr = np.asarray(origins_list, dtype=int)
                 if origins_arr.shape != (n, 2):
                     raise ValueError("origins must have shape (n, 2) after conversion.")
 
         self.diffraction_origins = origins_arr
 
         if plot_origins:
-            dp_tiles = [[_np.asarray(self.dp_mean[i]) for i in plot_indices_list]]
-            titles = [[f"{i} - Mean Diffraction Pattern" for i in plot_indices_list]]
-            fig, axs = show_2d(dp_tiles, titles=titles, returnfig=True, **{})
-            if not isinstance(axs, (list, _np.ndarray)):
-                axs = [axs]
-            axs_flat = _np.ravel(axs)
+            arrays = [np.asarray(self.dp_mean[i]) for i in plot_indices_list]
+            titles = [f"{i} - Mean Diffraction Pattern" for i in plot_indices_list]
+            fig, ax = show_2d(arrays, title=titles, returnfig=True, **plot_kwargs)
+            axs = np.ravel(np.asarray(ax, dtype=object))
             for j, i in enumerate(plot_indices_list):
-                ax = axs_flat[j]
                 r, c = self.diffraction_origins[i]
-                ax.plot([c], [r], marker="+", color="red", markersize=16, markeredgewidth=2)
-            return fig, axs
+                axs[j].plot([c], [r], marker="+", color="red", markersize=16, markeredgewidth=2)
 
         return self
 
-
     def diffraction_align(
         self,
-        edge_blend = 16.0,
-        padding = None,
-        pad_val = 'min',
-        upsample_factor = 100,
-        weight_scale = 1/8,
-        plot_aligned = True,
-        linewidth = 2,
-        **kwargs,
-    ):
+        edge_blend: float = 16.0,
+        padding=None,
+        pad_val: str | float = "min",
+        upsample_factor: int = 100,
+        weight_scale: float = 1 / 8,
+        plot_aligned: bool = True,
+        **plot_kwargs: Any,
+    ) -> MAPED:
         """
-        Refine the diffraction space origins, set padding, align images
+        Align mean diffraction patterns using weighted cross-correlation in Fourier space.
 
+        Parameters
+        ----------
+        edge_blend
+            Tukey window edge taper (pixels).
+        padding
+            Passed to shift_images for plotting.
+        pad_val
+            Passed to shift_images for plotting.
+        upsample_factor
+            Subpixel upsampling factor for correlation peak estimation.
+        weight_scale
+            Radial weight falloff scale (fraction of mean DP size).
+        plot_aligned
+            If True, plot aligned mean diffraction patterns.
+        **plot_kwargs
+            Passed to show_2d when plotting.
+
+        Stores
+        ------
+        self.diffraction_shifts : np.ndarray
+            Array of shape (n, 2) with (row, col) shifts to align diffraction patterns.
         """
+        if not hasattr(self, "dp_mean"):
+            raise RuntimeError("Run preprocess() first so self.dp_mean exists.")
+        if not hasattr(self, "diffraction_origins"):
+            raise RuntimeError("Run diffraction_origin() first so self.diffraction_origins exists.")
 
-        # window function
-        from scipy.signal.windows import tukey
-        w = tukey(self.dp_mean[0].shape[0], alpha=2.0*edge_blend/self.dp_mean[0].shape[0])[:,None] * \
-            tukey(self.dp_mean[0].shape[1], alpha=2.0*edge_blend/self.dp_mean[0].shape[1])[None,:]
+        H, W = np.asarray(self.dp_mean[0]).shape
 
-        # coordinates
-        r = np.fft.fftfreq(self.dp_mean[0].shape[0],1/self.dp_mean[0].shape[0])[:,None]
-        c = np.fft.fftfreq(self.dp_mean[0].shape[1],1/self.dp_mean[0].shape[1])[None,:]
+        w = tukey(H, alpha=2.0 * float(edge_blend) / float(H))[:, None] * tukey(
+            W, alpha=2.0 * float(edge_blend) / float(W)
+        )[None, :]
 
-        # init
-        self.diffraction_shifts = np.zeros((len(self.dp_mean),2))
+        r = np.fft.fftfreq(H, 1.0 / float(H))[:, None]
+        c = np.fft.fftfreq(W, 1.0 / float(W))[None, :]
 
-        # correlation alignment
-        G_ref = np.fft.fft2(w * self.dp_mean[0])
-        xy0 = self.diffraction_origins[0]
-        for ind in range(1,len(self.dp_mean)):
-            G = np.fft.fft2(w * self.dp_mean[ind])
-            xy = self.diffraction_origins[ind]
+        n = len(self.dp_mean)
+        self.diffraction_shifts = np.zeros((n, 2), dtype=float)
 
-            dr2 = (r - xy0[0] + xy[0])**2 \
-                + (c - xy0[1] + xy[1])**2
-            im_weight = np.clip(1 - np.sqrt(dr2)/np.mean(self.dp_mean[0].shape)/weight_scale, 0.0, 1.0)
-            im_weight = np.sin(im_weight*np.pi/2)**2
+        G_ref = np.fft.fft2(w * np.asarray(self.dp_mean[0]))
+        xy0 = np.asarray(self.diffraction_origins[0], dtype=float)
 
-            shift, G_shift = weighted_cross_correlation_shift(
+        for ind in range(1, n):
+            G = np.fft.fft2(w * np.asarray(self.dp_mean[ind]))
+            xy = np.asarray(self.diffraction_origins[ind], dtype=float)
+
+            dr2 = (r - xy0[0] + xy[0]) ** 2 + (c - xy0[1] + xy[1]) ** 2
+            im_weight = np.clip(
+                1.0 - np.sqrt(dr2) / float(np.mean((H, W))) / float(weight_scale),
+                0.0,
+                1.0,
+            )
+            im_weight = np.sin(im_weight * np.pi / 2.0) ** 2
+
+            shift_rc, G_shift = weighted_cross_correlation_shift(
                 im_ref=G_ref,
                 im=G,
-                weight_real=im_weight*0+1.0,
-                upsample_factor = upsample_factor,
-                fft_input = True,
-                fft_output = True,
-                return_shifted_image = True,
+                weight_real=im_weight * 0.0 + 1.0,
+                upsample_factor=int(upsample_factor),
+                fft_input=True,
+                fft_output=True,
+                return_shifted_image=True,
             )
-            self.diffraction_shifts[ind,:] = shift
+            self.diffraction_shifts[ind, :] = np.asarray(shift_rc, dtype=float)
 
-            # update reference
-            G_ref = G_ref*(ind/(ind+1)) + G_shift/(ind+1)
+            G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
 
-        # Center shifts
-        self.diffraction_shifts -= np.mean(self.diffraction_shifts,axis=0)[None,:]
-
-        # Generate output image 
+        self.diffraction_shifts -= np.mean(self.diffraction_shifts, axis=0)[None, :]
 
         if plot_aligned:
             im_aligned = shift_images(
-                images = self.dp_mean,
-                shifts_rc = self.diffraction_shifts,
-                edge_blend = edge_blend,
-                padding = padding,
-                pad_val = pad_val,
+                images=self.dp_mean,
+                shifts_rc=self.diffraction_shifts,
+                edge_blend=float(edge_blend),
+                padding=padding,
+                pad_val=pad_val,
             )
-            show_2d(
-                im_aligned,
-                **kwargs,
-            )
+            show_2d(im_aligned, **plot_kwargs)
+
+        return self
 
 
     def real_space_align(
@@ -266,16 +311,45 @@ class MAPED(AutoSerialize):
         edge_sigma: float = 2.0,
         hanning_filter: bool = False,
         plot_aligned: bool = True,
-        **kwargs,
-    ):
-        import numpy as np
-        from scipy.ndimage import gaussian_filter, shift as ndi_shift
-        from scipy.signal import convolve2d
-        from scipy.signal.windows import tukey
+        **plot_kwargs: Any,
+    ) -> MAPED:
+        """
+        Align real-space mean BF images using iterative average-reference correlation.
 
-        from quantem.core.utils.imaging_utils import weighted_cross_correlation_shift
-        from quantem.core.visualization import show_2d
+        Parameters
+        ----------
+        num_images
+            If provided, align only the first num_images images.
+        num_iter
+            Number of refinement iterations.
+        edge_blend
+            Used to set default correlation padding when max_shift is None.
+        padding
+            Passed to shift_images for plotting.
+        pad_val
+            Passed to shift_images for plotting.
+        upsample_factor
+            Subpixel upsampling factor for correlation peak estimation.
+        max_shift
+            Optional maximum shift constraint passed to weighted_cross_correlation_shift.
+        shift_method
+            Passed to shift_images for plotting ('bilinear' or 'fourier').
+        edge_filter
+            If True, correlate on gradient magnitude instead of raw intensity.
+        edge_sigma
+            Gaussian sigma applied to gradients when edge_filter is True.
+        hanning_filter
+            If True, apply a Hanning window prior to FFT.
+        plot_aligned
+            If True, plot aligned mean BF images.
+        **plot_kwargs
+            Passed to show_2d when plotting.
 
+        Stores
+        ------
+        self.real_space_shifts : np.ndarray
+            Array of shape (n_total, 2) with (row, col) shifts for aligned datasets.
+        """
         if not hasattr(self, "im_bf"):
             raise RuntimeError("Run preprocess() first so self.im_bf exists.")
         if len(self.im_bf) == 0:
@@ -317,16 +391,13 @@ class MAPED(AutoSerialize):
         if w_h_sum <= 0:
             raise RuntimeError("hanning window sum is zero")
 
-        wx = None
         if edge_filter:
             wx = np.array(
-                [
-                    [-1.0, -2.0, -1.0],
-                    [ 0.0,  0.0,  0.0],
-                    [ 1.0,  2.0,  1.0],
-                ],
+                [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
                 dtype=float,
             )
+        else:
+            wx = None
 
         base_pad = np.zeros((n, Hp, Wp), dtype=float)
         for i in range(n):
@@ -351,7 +422,7 @@ class MAPED(AutoSerialize):
             for i in range(n):
                 im_a = ndi_shift(
                     base_pad[i],
-                    shift=(float(shifts[i, 0]), float(shifts[i, 1])),
+                    shift=(shifts[i, 0], shifts[i, 1]),
                     order=1,
                     mode="constant",
                     cval=0.0,
@@ -391,12 +462,11 @@ class MAPED(AutoSerialize):
                 edge_blend=float(edge_blend),
                 padding=padding,
                 pad_val=pad_val,
-                shift_method=str(shift_method),
+                shift_method=shift_method,
             )
-            show_2d(im_aligned, **kwargs)
+            show_2d(im_aligned, **plot_kwargs)
 
         return self
-
 
     def merge_datasets(
         self,
@@ -409,15 +479,46 @@ class MAPED(AutoSerialize):
         dtype=None,
         scale_output: bool = False,
         plot_result: bool = True,
-        **kwargs,
-    ):
-        import warnings
+        **plot_kwargs: Any,
+    ) -> Dataset4dstem:
+        """
+        Merge aligned datasets into a single Dataset4dstem.
 
-        import numpy as np
-        from scipy.ndimage import shift as ndi_shift
-        from scipy.signal.windows import tukey
-        from tqdm import tqdm
+        Requires
+        --------
+        self.real_space_shifts
+            From real_space_align().
+        self.diffraction_shifts
+            From diffraction_align().
 
+        Parameters
+        ----------
+        real_space_padding
+            Output scan padding in pixels (adds border to scan grid).
+        real_space_edge_blend
+            Tukey taper width for scan-space interpolation weights.
+        diffraction_padding
+            Output diffraction padding in pixels (adds border around DPs).
+        diffraction_edge_blend
+            Tukey taper width for diffraction-space weights.
+        diffraction_pad_val
+            Pad value for diffraction padding ('min','max','mean','median' or float).
+        shift_method
+            Diffraction shift method: 'bilinear' or 'fourier'.
+        dtype
+            Output dtype. If None, uses parent dtype.
+        scale_output
+            If True and dtype is integer, scale to full dynamic range using global max.
+        plot_result
+            If True, plot merged BF and merged mean DP.
+        **plot_kwargs
+            Passed to show_2d.
+
+        Returns
+        -------
+        Dataset4dstem
+            Merged dataset.
+        """
         if not hasattr(self, "real_space_shifts"):
             raise RuntimeError("Run real_space_align() first so self.real_space_shifts exists.")
         if not hasattr(self, "diffraction_shifts"):
@@ -502,10 +603,10 @@ class MAPED(AutoSerialize):
         if method == "fourier":
             kr = np.fft.fftfreq(Hp)[:, None]
             kc = np.fft.fftfreq(Wp)[None, :]
-            ramps = []
             Fw = np.fft.fft2(wdp_pad)
+            ramps: list[np.ndarray] = []
             for i in range(n):
-                dr, dc = float(dp_shifts[i, 0]), float(dp_shifts[i, 1])
+                dr, dc = dp_shifts[i, 0], dp_shifts[i, 1]
                 ramp = np.exp(-2j * np.pi * (kr * dr + kc * dc))
                 ramps.append(ramp)
                 w_i = np.fft.ifft2(Fw * ramp).real
@@ -514,17 +615,17 @@ class MAPED(AutoSerialize):
             for i in range(n):
                 w_i = ndi_shift(
                     wdp_pad,
-                    shift=(float(dp_shifts[i, 0]), float(dp_shifts[i, 1])),
+                    shift=(dp_shifts[i, 0], dp_shifts[i, 1]),
                     order=1,
                     mode="constant",
                     cval=0.0,
                     prefilter=False,
                 )
                 wdp_shifted[i] = np.clip(w_i, 0.0, 1.0)
-            ramps = None
+            ramps = []
 
-        edge_w_dp = 1.0 - np.max(wdp_shifted, axis=0)
-        edge_w_dp = np.clip(edge_w_dp, 0.0, 1.0)
+        coverage = np.clip(np.sum(wdp_shifted, axis=0), 0.0, 1.0)
+        edge_w_dp = 1.0 - coverage
 
         merged = np.zeros((Rout, Cout, Hp, Wp), dtype=np.float64)
 
@@ -535,25 +636,25 @@ class MAPED(AutoSerialize):
         den_tmp = np.zeros((Hp, Wp), dtype=np.float64)
 
         for ro in tqdm(range(Rout), desc="Merging (rows)"):
-            r_base = float(ro - real_space_padding)
+            r_base = ro - real_space_padding
             for co in range(Cout):
-                c_base = float(co - real_space_padding)
+                c_base = co - real_space_padding
 
                 num_tmp.fill(0.0)
                 den_tmp.fill(0.0)
                 max_wi = 0.0
 
                 for i in range(n):
-                    r_in = r_base - float(rs_shifts[i, 0])
-                    c_in = c_base - float(rs_shifts[i, 1])
+                    r_in = r_base - rs_shifts[i, 0]
+                    c_in = c_base - rs_shifts[i, 1]
 
                     r0 = int(np.floor(r_in))
                     c0 = int(np.floor(c_in))
                     if r0 < 0 or r0 >= Rs - 1 or c0 < 0 or c0 >= Cs - 1:
                         continue
 
-                    dr = float(r_in - r0)
-                    dc = float(c_in - c0)
+                    dr = r_in - r0
+                    dc = c_in - c0
 
                     w00 = (1.0 - dr) * (1.0 - dc)
                     w10 = dr * (1.0 - dc)
@@ -583,11 +684,12 @@ class MAPED(AutoSerialize):
                     dp_pad[rp0 : rp0 + H, cp0 : cp0 + W] = dp_local * w_dp
 
                     if method == "fourier":
-                        dp_shifted_tmp[:] = np.fft.ifft2(np.fft.fft2(dp_pad) * ramps[i]).real
+                        ramp = ramps[i]
+                        dp_shifted_tmp[:] = np.fft.ifft2(np.fft.fft2(dp_pad) * ramp).real
                     else:
                         dp_shifted_tmp[:] = ndi_shift(
                             dp_pad,
-                            shift=(float(dp_shifts[i, 0]), float(dp_shifts[i, 1])),
+                            shift=(dp_shifts[i, 0], dp_shifts[i, 1]),
                             order=1,
                             mode="constant",
                             cval=0.0,
@@ -617,38 +719,21 @@ class MAPED(AutoSerialize):
             dmin = float(info.min)
             dmax = float(info.max)
 
-            merged_f = merged  # float64
+            merged_f = merged
 
             if scale_output:
                 peak = float(np.max(merged_f))
                 if peak <= 0.0:
-                    scale = 1.0
                     merged_scaled = merged_f
                 else:
-                    scale = dmax / peak
-                    merged_scaled = merged_f * scale
+                    merged_scaled = merged_f * (dmax / peak)
 
                 if np.issubdtype(dtype_out, np.unsignedinteger):
-                    if float(np.min(merged_scaled)) < 0.0:
-                        warnings.warn(
-                            f"scale_output=True with unsigned dtype {dtype_out}: "
-                            "negative values present; they will be clipped to 0.",
-                            RuntimeWarning,
-                        )
                     lo, hi = 0.0, dmax
                 else:
                     lo, hi = dmin, dmax
 
-                if float(np.min(merged_scaled)) < lo or float(np.max(merged_scaled)) > hi:
-                    warnings.warn(
-                        f"Output overflow for dtype {dtype_out} after scaling: "
-                        f"data range [{float(np.min(merged_scaled))}, {float(np.max(merged_scaled))}] exceeds "
-                        f"[{lo}, {hi}]. Values will be clipped.",
-                        RuntimeWarning,
-                    )
-
                 merged_out = np.rint(np.clip(merged_scaled, lo, hi)).astype(dtype_out)
-
             else:
                 below = float(np.min(merged_f))
                 above = float(np.max(merged_f))
@@ -662,17 +747,15 @@ class MAPED(AutoSerialize):
         else:
             merged_out = merged.astype(dtype_out, copy=False)
 
-
         dataset_merged = Dataset4dstem.from_array(array=merged_out)
-
         dataset_merged.im_bf_merged = self.im_bf_merged
         dataset_merged.dp_mean_merged = self.dp_mean_merged
 
         if plot_result:
             show_2d(
                 [[self.im_bf_merged, self.dp_mean_merged]],
-                titles=[["Merged Bright Field", "Merged Mean Diffraction Pattern"]],
-                **kwargs,
+                title=[["Merged Bright Field", "Merged Mean Diffraction Pattern"]],
+                **plot_kwargs,
             )
 
         return dataset_merged
@@ -683,13 +766,32 @@ def shift_images(
     shifts_rc,
     edge_blend: float = 8.0,
     padding=None,
-    pad_val=0.0,
+    pad_val: str | float = 0.0,
     shift_method: str = "bilinear",
 ):
-    import numpy as np
-    from scipy.ndimage import shift as ndi_shift
-    from scipy.signal.windows import tukey
+    """
+    Shift and blend a stack of 2D images into a common padded canvas.
 
+    Parameters
+    ----------
+    images
+        Sequence of (H, W) arrays.
+    shifts_rc
+        Array-like of shape (n, 2) with (row, col) shifts for each image.
+    edge_blend
+        Tukey taper width in pixels for image blending.
+    padding
+        Output padding. If None, set from max shift and edge_blend.
+    pad_val
+        Fill value outside support ('min','max','mean','median' or float).
+    shift_method
+        'bilinear' or 'fourier'.
+
+    Returns
+    -------
+    np.ndarray
+        Blended image of shape (H + 2*padding, W + 2*padding).
+    """
     images = [np.asarray(im, dtype=float) for im in images]
     if len(images) == 0:
         raise ValueError("images must be non-empty")
@@ -707,17 +809,17 @@ def shift_images(
         s = pad_val.strip().lower()
         v = np.stack(images, axis=0).reshape(-1)
         if s == "min":
-            pad_val = float(np.min(v))
+            pad_val_f = float(np.min(v))
         elif s == "max":
-            pad_val = float(np.max(v))
+            pad_val_f = float(np.max(v))
         elif s == "mean":
-            pad_val = float(np.mean(v))
+            pad_val_f = float(np.mean(v))
         elif s == "median":
-            pad_val = float(np.median(v))
+            pad_val_f = float(np.median(v))
         else:
             raise ValueError("pad_val must be a float or one of {'min','max','mean','median'}")
     else:
-        pad_val = float(pad_val)
+        pad_val_f = float(pad_val)
 
     if padding is None:
         max_shift = float(np.max(np.abs(shifts_rc))) if shifts_rc.size else 0.0
@@ -749,7 +851,7 @@ def shift_images(
         kr = np.fft.fftfreq(Hp)[:, None]
         kc = np.fft.fftfreq(Wp)[None, :]
         for ind in range(len(images)):
-            dr, dc = float(shifts_rc[ind, 0]), float(shifts_rc[ind, 1])
+            dr, dc = shifts_rc[ind, 0], shifts_rc[ind, 1]
             ramp = np.exp(-2j * np.pi * (kr * dr + kc * dc))
 
             F = np.fft.fft2(stack[ind])
@@ -762,7 +864,7 @@ def shift_images(
         for ind in range(len(images)):
             stack[ind] = ndi_shift(
                 stack[ind],
-                shift=(float(shifts_rc[ind, 0]), float(shifts_rc[ind, 1])),
+                shift=(shifts_rc[ind, 0], shifts_rc[ind, 1]),
                 order=1,
                 mode="constant",
                 cval=0.0,
@@ -770,7 +872,7 @@ def shift_images(
             )
             stack_w[ind] = ndi_shift(
                 stack_w[ind],
-                shift=(float(shifts_rc[ind, 0]), float(shifts_rc[ind, 1])),
+                shift=(shifts_rc[ind, 0], shifts_rc[ind, 1]),
                 order=1,
                 mode="constant",
                 cval=0.0,
@@ -778,11 +880,13 @@ def shift_images(
             )
             stack_w[ind] = np.clip(stack_w[ind], 0.0, 1.0)
 
-    # edge_w = 1.0 - np.clip(np.max(stack_w, axis=0), 0.0, 1.0)
-    edge_w = len(images) - np.sum(stack_w, axis=0)
+    edge_w = np.clip(1.0 - np.sum(stack_w, axis=0), 0.0, 1.0)
 
-    num = np.sum(stack, axis=0) + edge_w * pad_val
+    num = np.sum(stack, axis=0) + edge_w * pad_val_f
     den = np.sum(stack_w, axis=0) + edge_w
-    out = num / den
+
+    out = np.empty_like(num)
+    np.divide(num, den, out=out, where=den != 0.0)
+    out[den == 0.0] = 0.0
 
     return out
