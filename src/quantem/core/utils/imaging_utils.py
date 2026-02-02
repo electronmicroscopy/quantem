@@ -439,14 +439,14 @@ def bilinear_kde(
         f_img = np.fft.fft2(image)
         fx = np.fft.fftfreq(rows)
         fy = np.fft.fftfreq(cols)
-        f_img /= np.sinc(fx)[:, None]  # type: ignore
-        f_img /= np.sinc(fy)[None, :]  # type: ignore
+        f_img /= np.sinc(fx)[:, None]
+        f_img /= np.sinc(fy)[None, :]
         image = np.real(np.fft.ifft2(f_img))
 
         if return_pix_count:
             f_img = np.fft.fft2(pix_count)
-            f_img /= np.sinc(fx)[:, None]  # type: ignore
-            f_img /= np.sinc(fy)[None, :]  # type: ignore
+            f_img /= np.sinc(fx)[:, None]
+            f_img /= np.sinc(fy)[None, :]
             pix_count = np.real(np.fft.ifft2(f_img))
 
     if return_pix_count:

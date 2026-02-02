@@ -1,4 +1,7 @@
+import matplotlib
 import pytest
+
+matplotlib.use("Agg")
 
 
 def pytest_addoption(parser):
