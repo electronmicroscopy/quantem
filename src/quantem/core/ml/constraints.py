@@ -33,12 +33,16 @@ class Constraints(ABC):
         hard = "\n".join(f"{key}: {getattr(self, key)}" for key in self.hard_constraint_keys)
         soft = "\n".join(f"{key}: {getattr(self, key)}" for key in self.soft_constraint_keys)
 
+        # Fix: Move the replace operations outside the f-string or assign to variables
+        hard_indented = hard.replace('\n', '\n    ')
+        soft_indented = soft.replace('\n', '\n    ')
+        
         return (
             "Constraints:\n"
             "  Hard constraints:\n"
-            f"    {hard.replace('\n', '\n    ')}\n"
+            f"    {hard_indented}\n"
             "  Soft constraints:\n"
-            f"    {soft.replace('\n', '\n    ')}"
+            f"    {soft_indented}"
         )
 
 

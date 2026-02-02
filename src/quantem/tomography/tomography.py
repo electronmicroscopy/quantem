@@ -315,11 +315,11 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         # TODO: Temporary, need to talk to Arthur what the correct way of saving results is.
         if self.global_rank == 0:
             print(f"Saving volume to {path}")
-
-            self.obj_model.create_volume()
-
             np.savez(path, volume=self.obj_model.obj.detach().cpu().numpy())
 
+        if torch.distributed.is_initialized():
+            print("Barrier")
+            torch.distributed.barrier()
 
 class TomographyConventional(TomographyBase):
     """
