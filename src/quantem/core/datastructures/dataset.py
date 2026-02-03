@@ -1,5 +1,5 @@
-import os
 import numbers
+import os
 from pathlib import Path
 from typing import Any, Literal, Optional, Self, Union, overload
 
@@ -52,7 +52,9 @@ class Dataset(AutoSerialize):
         super().__init__()
         arr = ensure_valid_array(array)
         if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         self._array = arr
         self.name = name
         self.origin = origin
@@ -97,7 +99,9 @@ class Dataset(AutoSerialize):
         """
         validated_array = ensure_valid_array(array)
         if not isinstance(validated_array, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         _ndim = validated_array.ndim
 
         # Set defaults if None
@@ -126,7 +130,9 @@ class Dataset(AutoSerialize):
     def array(self, value: NDArray) -> None:
         arr = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
         if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         self._array = arr
         # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
 
@@ -350,8 +356,9 @@ class Dataset(AutoSerialize):
     @overload
     def pad(
         self,
-        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None,
-        output_shape: tuple[int, ...] | None,
+        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None = None,
+        output_shape: tuple[int, ...] | None = None,
+        *,
         modify_in_place: Literal[True],
         **kwargs: Any,
     ) -> None: ...
@@ -363,7 +370,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: Literal[False] = False,
         **kwargs: Any,
-    ) -> "Dataset": ...
+    ) -> Self: ...
 
     def pad(
         self,
@@ -371,7 +378,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
         **kwargs: Any,
-    ) -> "Dataset | None":
+    ) -> Self | None:
         """
         Pads Dataset data array using numpy.pad.
         Metadata (origin, sampling) is not modified.
@@ -426,7 +433,8 @@ class Dataset(AutoSerialize):
     def crop(
         self,
         crop_widths: tuple[tuple[int, int], ...],
-        axes: tuple | None,
+        axes: tuple | None = None,
+        *,
         modify_in_place: Literal[True],
     ) -> None: ...
 
@@ -464,7 +472,7 @@ class Dataset(AutoSerialize):
             if len(crop_widths) != self.ndim:
                 raise ValueError("crop_widths must match number of dimensions when axes is None.")
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
             crop_widths = (crop_widths[0],)  # Take first crop_width for single axis
         else:
@@ -496,7 +504,8 @@ class Dataset(AutoSerialize):
     def bin(
         self,
         bin_factors,
-        axes,
+        axes=None,
+        *,
         modify_in_place: Literal[True],
         reducer: str = "sum",
     ) -> None: ...
@@ -545,7 +554,7 @@ class Dataset(AutoSerialize):
 
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(ax) for ax in axes)
@@ -660,7 +669,7 @@ class Dataset(AutoSerialize):
         """
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(a0) for a0 in axes)
@@ -670,14 +679,17 @@ class Dataset(AutoSerialize):
 
         # Resolve out_shape & factors
         if factors is not None:
-            if np.isscalar(factors):
+            if isinstance(factors, int | float):
                 factors = (float(factors),) * len(axes)
             else:
                 factors = tuple(float(f) for f in factors)
                 if len(factors) != len(axes):
                     raise ValueError("factors length must match number of axes.")
-            out_shape = tuple(max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors))
+            out_shape = tuple(
+                max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors)
+            )
         else:
+            assert out_shape is not None  # Guaranteed by check above
             if len(out_shape) != len(axes):
                 raise ValueError("out_shape length must match number of axes.")
             out_shape = tuple(int(nl) for nl in out_shape)
@@ -806,7 +818,9 @@ class Dataset(AutoSerialize):
         kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
 
         # Slice/reduce metadata accordingly
-        new_origin = np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        new_origin = (
+            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        )
         new_sampling = (
             np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
         )
