@@ -1,3 +1,4 @@
+import warnings
 from typing import Any, Literal
 
 import matplotlib.gridspec as gridspec
@@ -128,8 +129,6 @@ class PtychographyVisualizations(PtychographyBase):
         obj_iter = "Final"
         if obj is None:
             if snapshot_iter is not None:
-                if snapshot_iter < 0:
-                    snapshot_iter = len(self.snapshots) + snapshot_iter
                 snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
                 obj_np = snp["obj"]
                 obj_iter = snp["iteration"]
@@ -379,8 +378,8 @@ class PtychographyVisualizations(PtychographyBase):
             if obj.ndim == 2:
                 obj = obj[None, ...]
 
-        t_parts = [f"0/{len(obj)} | 0 Å"]
-        for i in range(1, len(obj)):
+        t_parts = []
+        for i in range(len(obj)):
             t_parts.append(f"{i + 1}/{len(obj)} | {self.slice_thicknesses[i - 1]:.1f} Å")
 
         if self.obj_type == "potential":
@@ -403,6 +402,10 @@ class PtychographyVisualizations(PtychographyBase):
         if interval_type == "quantile":
             norm = {"interval_type": "quantile"}
             # TODO -- make this work with interval_scaling
+            if interval_scaling == "all":
+                warnings.warn(
+                    "interval_scaling='all' is not yet supported for quantile normalization"
+                )
         elif interval_type in ["manual", "minmax", "abs"]:
             norm: dict[str, Any] = {"interval_type": "manual"}
             if interval_scaling == "all":
