@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from tqdm.auto import tqdm
 
+from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.profiling import nvtx_range
 from quantem.tomography.dataset_models import DatasetModelType
@@ -330,6 +331,21 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         if torch.distributed.is_initialized():
             print("Barrier")
             torch.distributed.barrier()
+
+    # Loading and Saving
+    @classmethod
+    def _recursive_load_from_path(cls, path: str):
+        return autoserialize_load(path)
+
+    @classmethod
+    def from_file(
+        cls,
+        path: str,
+        device: str = "cpu",
+    ) -> Self:
+        tomography = cls._recursive_load_from_path(path)
+        tomography.to(device)
+        return tomography
 
 
 class TomographyConventional(TomographyBase):

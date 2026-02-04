@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from numpy.typing import NDArray
 
 from quantem.core.io.serialize import AutoSerialize
@@ -108,7 +109,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
 
     @property
     def device(self) -> str:
-        return self._device
+        return torch.device(self._device)
 
     @device.setter
     def device(self, device: str):
@@ -116,7 +117,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         # if not isinstance(device, str):
         #     raise TypeError(f"device should be a str, got {type(device)}")
         self._device = device
-        self.to(device)
+        # self.to(device)
 
     @property
     def epoch_losses(self) -> NDArray:
@@ -141,3 +142,4 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
     def to(self, device: str):
         self.obj_model.to(device)
         self.dset.to(device)
+        self.device = device

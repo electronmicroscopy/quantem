@@ -89,7 +89,6 @@ class DDPMixin:
             else:
                 val_sampler = None
             shuffle = False
-      
 
         else:
             train_sampler = None
@@ -145,7 +144,7 @@ class DDPMixin:
 
         Returns the model.
         """
-
+        print("Building Model on device: ", self.device)
         model = model.to(self.device)
         if pretrained_weights is not None:
             model.load_state_dict(pretrained_weights.copy())
@@ -172,3 +171,13 @@ class DDPMixin:
             print("Model built, compiled successfully")
 
         return model
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @device.setter
+    def device(self, device: torch.device):
+        if isinstance(device, str):
+            device = torch.device(device)
+        self._device = device

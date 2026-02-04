@@ -500,6 +500,7 @@ class TomographyINRDataset(TomographyDatasetBase, Dataset):
         self._shifts_ref = self._shifts_ref.to(device)
 
         self.device = device
+        self.reconnect_optimizer_to_parameters()
 
 
 class TomographyINRPretrainDataset(Dataset):

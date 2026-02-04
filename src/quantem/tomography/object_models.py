@@ -397,6 +397,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         self._shape = shape
 
     # --- Helper Functions ---
+    def rebuild_model(self):
+        self._model = self.build_model(self._model)
 
     # Reset method that goes back to the pretrained weights.
     def reset(self):
@@ -412,7 +414,6 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         """forward pass for the INR model"""
-
         all_densities = self.model(coords)
 
         if all_densities.dim() > 1:
@@ -621,7 +622,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
     def to(self, device: str):
         # self._model = self._model.to(device)
-        self._obj = self._obj.to(device)
+        self.device = device
+        self._obj = self._obj.to(self.device)
+        self.reconnect_optimizer_to_parameters()
 
 
 ObjectModelType = ObjectPixelated | ObjectINR
