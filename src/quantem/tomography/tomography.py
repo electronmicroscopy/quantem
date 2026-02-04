@@ -49,12 +49,14 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         num_workers: int = 32,
         reset: bool = False,
         optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
+        scheduler_params: dict | None = {},
         constraints: dict = {},  # TODO: What to pass into the constraints?
         loss_func: Tuple[str, Optional[float]] = ("smooth_l1", 0.07),
         num_samples_per_ray: int | List[Tuple[int, int]] = None,
         profiling_mode: bool = False,
         val_fraction: float = 0.0,
+        # reset_dset: bool = False,
+        reset_dset: DatasetModelType | None = None,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -96,8 +98,16 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
                 self.set_schedulers(scheduler_params, num_iter=num_iter)
 
         # Setting up DDP
-        if not hasattr(self, "dataloader"):
+        if not hasattr(self, "dataloader") or reset_dset is not None:
             with nvtx_range(profiling_mode, "Setting Dataloader"):
+                if reset_dset is not None:
+                    print("Resetting Dataloader")
+                    print("Putting in params from previous dataset.")
+
+                    self.dset = reset_dset
+                    self.dset.to(self.device)
+                    self.optimizer_params = optimizer_params
+                    self.set_optimizers()
                 self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
                     self.setup_dataloader(
                         self.dset,
@@ -320,6 +330,7 @@ class Tomography(TomographyOpt, TomographyBase, DDPMixin):
         if torch.distributed.is_initialized():
             print("Barrier")
             torch.distributed.barrier()
+
 
 class TomographyConventional(TomographyBase):
     """

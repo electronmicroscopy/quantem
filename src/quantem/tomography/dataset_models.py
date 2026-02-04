@@ -130,6 +130,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     @tilt_stack.setter
     def tilt_stack(self, tilt_stack: torch.Tensor):
+        if type(tilt_stack) is not torch.Tensor:
+            print("Converting tilt stack to torch.Tensor")
+            tilt_stack = torch.from_numpy(tilt_stack)
+
         self._tilt_stack = tilt_stack
 
     @property
@@ -138,6 +142,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     @tilt_angles.setter
     def tilt_angles(self, tilt_angles: torch.Tensor):
+        if type(tilt_angles) is not torch.Tensor:
+            print("Converting tilt angles to torch.Tensor")
+            tilt_angles = torch.from_numpy(tilt_angles)
+
         self._tilt_angles = tilt_angles
 
     @property
