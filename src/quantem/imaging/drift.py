@@ -1,9 +1,9 @@
+import warnings
 from collections.abc import Sequence
 from typing import List, Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
-import warnings
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import distance_transform_edt, gaussian_filter
