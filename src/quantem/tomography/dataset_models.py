@@ -543,5 +543,387 @@ class TomographyINRPretrainDataset(Dataset):
     def __getitem__(self, idx):
         return {"coords": self.coords[idx], "target": self.targets[idx]}
 
+class TomographyThroughFocalINRDataset(TomographyINRDataset):
+    """
+    Dataset class for INR-based tomography that assumes non-parallel illumination condition.
+    Inherits from TomographyINRDataset.
+    """
 
-DatasetModelType = TomographyINRDataset | TomographyPixDataset
+    def __init__(
+        self,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        ## Through focal parameters:
+        convergence_angle: float | torch.Tensor,
+        z_focus: float | torch.Tensor = 0.0,
+        num_rays: int = 1,
+        learn_z_focus: bool = False,
+        ## optional parameters
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        seed: int = 42,
+        token: object | None = None,
+    ):
+        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, token)
+        self.num_rays = int(num_rays)
+
+        self._convergence_angle = torch.tensor(convergence_angle, dtype = torch.float32)
+        z_focus_tensor = torch.tensor(z_focus, dtype=torch.float32)
+
+        if learn_z_focus:
+            self._z_focus = torch.nn.Parameter(z_focus_tensor)
+        else:
+            self._z_focus = z_focus_tensor
+
+    @property
+    def convergence_angle(self) -> torch.Tensor:
+        return self._convergence_angle
+
+    @property
+    def z_focus(self) -> torch.Tensor:
+        return self._z_focus
+
+    def get_coords(
+        self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int,
+    ) -> torch.Tensor:
+        num_rays = self.num_rays
+        z_focus = self._z_focus
+        convergence_angle = self._convergence_angle,
+        pixel_i = batch["pixel_i"].float().to(self.device, non_blocking=True)
+        pixel_j = batch["pixel_j"].float().to(self.device, non_blocking=True)
+        # target_values = batch["target_value"].to(self.device, non_blocking=True)
+        phis = batch["phi"].to(self.device, non_blocking=True)
+        projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
+        with torch.no_grad():
+            batch_ray_coords = self.create_batch_rays(
+                pixel_i,
+                pixel_j,
+                N,
+                num_samples_per_ray,
+                num_rays,
+                z_focus,
+                convergence_angle,
+                )
+
+        shifts, z1_params, z3_params = self.forward(None)
+        batch_shifts = torch.index_select(shifts, 0, projection_indices)
+        batch_z1 = torch.index_select(z1_params, 0, projection_indices)
+        batch_z3 = torch.index_select(z3_params, 0, projection_indices)
+
+        transformed_rays = self.transform_batch_rays(
+            batch_ray_coords,
+            z1=batch_z1,
+            x=phis,
+            z3=batch_z3,
+            shifts=batch_shifts,
+            N=N,
+            sampling_rate=1.0,
+        )
+        all_coords = transformed_rays.view(-1, 3)
+
+        all_coords = all_coords.to(self.device, dtype=torch.float32, non_blocking=True)
+        return all_coords
+
+    @staticmethod
+    @torch.compile(mode="reduce-overhead")
+    def create_batch_rays(
+        pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int,
+        
+    ) -> torch.Tensor:
+        # num_rays = self._num_rays
+        # z_focus = self._z_focus
+        # convergence_angle = self._convergence_angle,
+        batch_size = len(pixel_i)
+        x_coords_0 = (pixel_j / (N - 1)) * 2 - 1
+        y_coords_0 = (pixel_i / (N - 1)) * 2 - 1
+        z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
+
+        def get_theta_phi(
+            convergence_angle: float,
+            num_rays: int,
+            device: torch.device | None = None,
+        ):
+            if device is None:
+                device = torch.device("cpu")
+
+            num_rays = int(num_rays)
+
+            # 1 ray: single central ray
+            if num_rays == 1:
+                theta = torch.zeros(1, device=device)
+                phi = torch.zeros(1, device=device)
+
+            # 2 or 3 rays: single ring
+            elif num_rays == 2 or num_rays == 3:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta = (
+                    torch.linspace(0, 2 * torch.pi, num_rays + 1, device=device)[:-1]
+                    + rand_offset
+                )
+                phi = torch.full((num_rays,), 0.5 * convergence_angle, device=device)
+
+            # 4–8 rays: central + ring
+            elif 3 < num_rays < 9:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta0 = torch.zeros(1, device=device)
+                phi0 = torch.zeros(1, device=device)
+                theta_ring = (
+                    torch.linspace(0, 2 * torch.pi, num_rays, device=device)[:-1]
+                    + rand_offset
+                )
+                phi_ring = torch.full(
+                    (num_rays - 1,), 0.5 * convergence_angle, device=device
+                )
+                theta = torch.cat((theta0, theta_ring))
+                phi = torch.cat((phi0, phi_ring))
+
+            # 9 rays: two rings
+            elif num_rays == 9:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta_inner = (
+                    torch.linspace(0, 2 * torch.pi, 4, device=device)[:-1]
+                    + rand_offset
+                )
+                phi_inner = torch.full((3,), convergence_angle / 3, device=device)
+                theta_outer = (
+                    torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1]
+                    + rand_offset
+                )
+                phi_outer = torch.full((6,), 2 * convergence_angle / 3, device=device)
+                theta = torch.cat((theta_inner, theta_outer))
+                phi = torch.cat((phi_inner, phi_outer))
+
+            # 19 rays: central + two rings
+            elif num_rays == 19:
+                rand_offset = torch.rand(1, device=device) * 2 * torch.pi
+                theta0 = torch.zeros(1, device=device)
+                phi0 = torch.zeros(1, device=device)
+                theta_inner = (
+                    torch.linspace(0, 2 * torch.pi, 7, device=device)[:-1]
+                    + rand_offset
+                )
+                phi_inner = torch.full((6,), convergence_angle / 3, device=device)
+                theta_outer = (
+                    torch.linspace(0, 2 * torch.pi, 13, device=device)[:-1]
+                    + rand_offset
+                )
+                phi_outer = torch.full((12,), 2 * convergence_angle / 3, device=device)
+                theta = torch.cat((theta0, theta_inner, theta_outer))
+                phi = torch.cat((phi0, phi_inner, phi_outer))
+
+            # Unsupported ray counts
+            else:
+                raise ValueError(
+                    f"Unsupported num_rays={num_rays}. "
+                    "Supported values are: 1, 2, 3, 4–8, 9, 19."
+                )
+
+            return theta, phi
+
+        theta, phi = get_theta_phi(
+            convergence_angle = convergence_angle,
+            num_rays = num_rays,
+            device = pixel_i.device,
+        )
+
+        z_focus_tensor = torch.tensor(z_focus, device = pixel_i.device)
+        dz = z_coords[None, :] - z_focus_tensor
+        dx = torch.tan(phi)[:, None] * torch.cos(theta)[:, None] * dz
+        dy = torch.tan(phi)[:, None] * torch.sin(theta)[:, None] * dz
+
+
+        # x_coords = x_coords_0[:, None, None] + dx[None, :, :]
+        # y_coords = y_coords_0[:, None, None] + dy[None, :, :]
+        # z_coords = z_coords[None, None, :].expand(batch_size, num_rays, num_samples_per_ray)
+
+        # rays = torch.stack([x_coords, y_coords, z_coords], dim=-1)
+
+        x_coords = x_coords_0[:, None, None] + dx[None, :, :]
+        y_coords = y_coords_0[:, None, None] + dy[None, :, :]
+        z_coords = z_coords[None, None, :].expand(
+            batch_size, num_rays, num_samples_per_ray
+        )
+
+        x_coords = x_coords.reshape(batch_size, num_rays * num_samples_per_ray)
+        y_coords = y_coords.reshape(batch_size, num_rays * num_samples_per_ray)
+        z_coords = z_coords.reshape(batch_size, num_rays * num_samples_per_ray)
+
+        rays = torch.zeros(
+            batch_size,
+            num_rays * num_samples_per_ray,
+            3,
+            device=x_coords.device,
+        )
+
+        rays[:, :, 0] = x_coords
+        rays[:, :, 1] = y_coords
+        rays[:, :, 2] = z_coords
+
+        # rays = torch.zeros(batch_size, num_samples_per_ray * num_rays, 3, device=pixel_i.device)
+
+        # rays[:, :, 0] = x_coords.unsqueeze(1)
+        # rays[:, :, 1] = y_coords.unsqueeze(1)
+        # rays[:, :, 2] = z_coords.unsqueeze(0)
+
+        return rays
+
+
+
+
+
+    # @staticmethod
+    # @torch.compile(mode="reduce-overhead")
+    # def create_batch_rays_real_probe(
+    #     pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int,
+    #     num_rays: int, convergence_angle: float,
+    #     z_focus = 0,
+    # ) -> torch.Tensor:
+    #     batch_size = len(pixel_i)
+    #     x_coords_0 = (pixel_j / (N - 1)) * 2 - 1
+    #     y_coords_0 = (pixel_i / (N - 1)) * 2 - 1
+    #     z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
+
+    #     theta, phi = _get_theta_phi(
+    #         convergence_angle = convergence_angle,
+    #         num_rays = num_rays,
+    #         device = pixel_i.device,
+    #     )
+
+    #     z_focus = torch.tensor(z_focus, device = pixel_i.device)
+    #     dz = z_coords[None, :] - z_focus
+    #     dx = torch.tan(phi)[:, None] * torch.cos(theta)[:, None] * dz
+    #     dy = torch.tan(phi)[:, None] * torch.sin(theta)[:, None] * dz
+
+
+    #     x_coords = x_coords_0[:, None, None] + dx[None, :, :]
+    #     y_coords = y_coords_0[:, None, None] + dy[None, :, :]
+    #     z_coords = z_coords[None, None, :].expand(batch_size, num_rays, num_samples_per_ray)
+
+    #     # rays = torch.stack([x, y, z], dim=-1)
+
+    #     rays = torch.zeros(batch_size, num_samples_per_ray * num_rays, 3, device=pixel_i.device)
+
+    #     rays[:, :, 0] = x_coords.unsqueeze(1)
+    #     rays[:, :, 1] = y_coords.unsqueeze(1)
+    #     rays[:, :, 2] = z_coords.unsqueeze(0)
+
+    #     return rays
+
+
+
+
+    @staticmethod
+    @torch.compile(mode="reduce-overhead")
+    def integrate_rays(
+        rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int,
+        num_rays: int,
+    ) -> torch.Tensor:
+        ray_densities = rays.view(
+            target_values_len,
+            num_samples_per_ray,
+            num_samples_per_ray * num_rays,
+        )
+        step_size = 2.0 / (num_samples_per_ray - 1)
+
+        predicted_values = ray_densities.sum(dim=1) * step_size
+
+        return predicted_values
+
+
+    @staticmethod
+    def transform_batch_rays(
+        rays: torch.Tensor,
+        z1: torch.Tensor,
+        x: torch.Tensor,
+        z3: torch.Tensor,
+        shifts: torch.Tensor,
+        N: int,
+        sampling_rate: float,
+    ) -> torch.Tensor:
+        # rays_x = rays[:, :, 0] - shift_x_norm
+        # rays_y = rays[:, :, 1] - shift_y_norm
+        # rays_z = rays[:, :, 2]
+
+        shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
+        shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
+
+        shift_x_norm = shift_x_norm.expand(-1, rays.shape[1])
+        shift_y_norm = shift_y_norm.expand(-1, rays.shape[1])
+
+        rays_x = rays[:, :, 0] - shift_x_norm
+        rays_y = rays[:, :, 1] - shift_y_norm
+        rays_z = rays[:, :, 2]
+
+        theta = torch.deg2rad(-z3).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_rot1 = cos_t * rays_x - sin_t * rays_y
+        rays_y_rot1 = sin_t * rays_x + cos_t * rays_y
+        rays_z_rot1 = rays_z
+
+        theta = torch.deg2rad(x).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_rot2 = rays_x_rot1
+        rays_y_rot2 = cos_t * rays_y_rot1 - sin_t * rays_z_rot1
+        rays_z_rot2 = sin_t * rays_y_rot1 + cos_t * rays_z_rot1
+
+        theta = torch.deg2rad(-z1).view(-1, 1)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        rays_x_final = cos_t * rays_x_rot2 - sin_t * rays_y_rot2
+        rays_y_final = sin_t * rays_x_rot2 + cos_t * rays_y_rot2
+        rays_z_final = rays_z_rot2
+
+        transformed_rays = torch.stack([rays_x_final, rays_y_final, rays_z_final], dim=2)
+
+        return transformed_rays
+
+
+DatasetModelType = TomographyINRDataset | TomographyPixDataset | TomographyThroughFocalINRDataset
+
+
+
+# sandbox:
+
+
+    # @staticmethod
+    # @torch.compile(mode="reduce-overhead")
+    # def create_batch_rays_real_probe(
+    #     pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int,
+    #     num_rays: int, convergence_angle: float,
+    #     z_focus = 0,
+    # ) -> torch.Tensor:
+    #     batch_size = len(pixel_i)
+    #     x_coords_0 = (pixel_j / (N - 1)) * 2 - 1
+    #     y_coords_0 = (pixel_i / (N - 1)) * 2 - 1
+    #     z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
+
+    #     theta, phi = _get_theta_phi(
+    #         convergence_angle = convergence_angle,
+    #         num_rays = num_rays,
+    #         device = pixel_i.device,
+    #     )
+
+    #     z_focus = torch.tensor(z_focus, device = pixel_i.device)
+    #     dz = z_coords[None, :] - z_focus
+    #     dx = torch.tan(phi)[:, None] * torch.cos(theta)[:, None] * dz
+    #     dy = torch.tan(phi)[:, None] * torch.sin(theta)[:, None] * dz
+
+
+    #     x_coords = x_coords_0[:, None, None] + dx[None, :, :]
+    #     y_coords = y_coords_0[:, None, None] + dy[None, :, :]
+    #     z_coords = z_coords[None, None, :].expand(batch_size, num_rays, num_samples_per_ray)
+
+    #     # rays = torch.stack([x, y, z], dim=-1)
+
+    #     rays = torch.zeros(batch_size, num_samples_per_ray * num_rays, 3, device=pixel_i.device)
+
+    #     rays[:, :, 0] = x_coords.unsqueeze(1)
+    #     rays[:, :, 1] = y_coords.unsqueeze(1)
+    #     rays[:, :, 2] = z_coords.unsqueeze(0)
+
+    #     return rays
