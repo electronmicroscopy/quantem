@@ -1239,6 +1239,7 @@ class ObjectINR(ObjectConstraints):
         device: str = "cpu",
         obj_type: object_type = "complex",
         coord_normalization: Literal["none", "centered_unit_box"] = "centered_unit_box",
+        batch_size: int = 32768,
         rng: np.random.Generator | int | None = None,
         _token: object | None = None,
     ):
@@ -1268,6 +1269,7 @@ class ObjectINR(ObjectConstraints):
         self._pretrain_losses: list[float] = []
         self._pretrain_lrs: list[float] = []
         self._coord_normalization: Literal["none", "centered_unit_box"] = coord_normalization
+        self.batch_size: int = batch_size  # for batched evaluation in .obj property
 
     @classmethod
     def from_model(
@@ -1277,13 +1279,15 @@ class ObjectINR(ObjectConstraints):
         slice_thicknesses: float | Sequence | torch.Tensor | None = None,
         device: str = "cpu",
         obj_type: object_type = "complex",
+        batch_size: int = 32768,
         rng: np.random.Generator | int | None = None,
     ) -> "ObjectINR":
         """
         Create an ObjectINR from an implicit neural representation (INR) model.
 
-        The INR model is expected to accept coordinates shaped (B, N, 3) with channels (z, y, x)
-        in Angstrom, and output either:
+        The INR model is expected to accept coordinates shaped (B, N, 3) with channels (z, y, x).
+        Coordinates are normalized to [-1, 1] range before being passed to the model.
+        Output should be either:
         - complex tensor shaped (B, N) (or (B, N, 1)), OR
         - real tensor shaped (B, N, 2) interpreted as (real, imag), OR
         - real tensor shaped (B, N) for potential / phase-only parameterizations.
@@ -1294,6 +1298,7 @@ class ObjectINR(ObjectConstraints):
             slice_thicknesses=slice_thicknesses,
             device=device,
             obj_type=obj_type,
+            batch_size=batch_size,
             rng=rng,
             _token=cls._token,
         )
@@ -1306,14 +1311,53 @@ class ObjectINR(ObjectConstraints):
 
     @property
     def obj(self) -> torch.Tensor:
-        coords = self.coords
-        # Evaluate full object (B=1) and apply hard constraints on the full volume
-        obj = self._eval_inr(coords)[0]  # (D, H, W)
-        if bool(self.constraints.get("apply_fov_mask", False)):
-            raise NotImplementedError("ObjectINR apply_fov_mask is not implemented yet.")
-        if self.obj_type == "potential":
-            raise NotImplementedError("ObjectINR potential objects are not implemented yet.")
-        return self.apply_hard_constraints(obj, mask=None)
+        """
+        Evaluate the full object using batched forward passes to avoid OOM.
+        Uses torch.no_grad() for efficiency since this is typically called for visualization.
+        """
+        with torch.no_grad():
+            coords = self.coords  # (1, D, H, W, 3)
+            _, D, H, W, _ = coords.shape
+            N = D * H * W
+
+            # Flatten and normalize coordinates
+            coords_flat = coords.reshape(1, N, 3)
+            coords_in = self._coords_to_model_input(coords_flat).squeeze(0)  # (N, 3)
+
+            # Evaluate in batches
+            all_vals = []
+            for start in range(0, N, self.batch_size):
+                end = min(N, start + self.batch_size)
+                batch_coords = coords_in[start:end].unsqueeze(0)  # (1, batch_size, 3)
+                out = self.model(batch_coords)
+
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+                batch_vals = out.squeeze()
+                all_vals.append(batch_vals)
+
+            vals = torch.cat(all_vals, dim=0)
+
+            # Apply object-type conventions
+            if self.obj_type == "potential":
+                raise NotImplementedError("ObjectINR potential objects are not implemented yet.")
+            elif self.obj_type == "pure_phase":
+                if not vals.is_complex():
+                    vals = torch.exp(
+                        1.0j * vals.to(dtype=getattr(torch, config.get("dtype_real")))
+                    )
+            else:  # complex
+                if not vals.is_complex():
+                    vals = torch.exp(
+                        1.0j * vals.to(dtype=getattr(torch, config.get("dtype_real")))
+                    )
+
+            obj = vals.reshape(D, H, W)
+
+            if bool(self.constraints.get("apply_fov_mask", False)):
+                raise NotImplementedError("ObjectINR apply_fov_mask is not implemented yet.")
+
+            return self.apply_hard_constraints(obj, mask=None)
 
     @property
     def coords(self) -> torch.Tensor:
@@ -1486,7 +1530,7 @@ class ObjectINR(ObjectConstraints):
     def _coords_to_model_input(self, coords_flat_ang: torch.Tensor) -> torch.Tensor:
         """
         Convert (B,N,3) coords in Angstrom (z,y,x) into the model input coordinate space.
-        Scale to [0, 1] for numerical stability.
+        Scale to [-1, 1] for numerical stability.
         """
         if getattr(self, "_coord_normalization", "centered_unit_box") == "none":
             return coords_flat_ang
@@ -1516,7 +1560,8 @@ class ObjectINR(ObjectConstraints):
         ).clamp_min(1e-12)
 
         scale = torch.stack([z_max, y_max, x_max])[None, None, :].clamp_min(1e-12)
-        return coords_flat_ang / scale
+        # Normalize to [0, 1] then map to [-1, 1]
+        return (coords_flat_ang / scale) * 2.0 - 1.0
 
     def _apply_hard_constraints_patches(self, obj_patches: torch.Tensor) -> torch.Tensor:
         """Apply hard constraints in a patch-wise way. Expects (D,B,H,W) tensor."""
@@ -1609,13 +1654,32 @@ class ObjectINR(ObjectConstraints):
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l2",
         show: bool = True,
-        batch_size_points: int = int(1e7),
+        batch_size_points: int = 32768,
     ) -> None:
         """
         Pretrain the INR model to fit a provided target object volume.
 
         This is strongly recommended before running `Ptychography.reconstruct()` to avoid
         unstable INR outputs early in optimization.
+
+        Parameters
+        ----------
+        pretrain_target : torch.Tensor | np.ndarray | None
+            Target object to fit (D, H, W)
+        reset : bool
+            If True, reset model weights before pretraining
+        num_iters : int
+            Number of training iterations (each iteration sees all coordinates once with random batching)
+        optimizer_params : dict | None
+            Optimizer parameters
+        scheduler_params : dict | None
+            Scheduler parameters
+        loss_fn : Callable | str
+            Loss function to use
+        show : bool
+            If True, visualize results after pretraining
+        batch_size_points : int
+            Number of coordinate points per batch
         """
         if self.obj_type == "potential":
             raise NotImplementedError("ObjectINR potential objects are not implemented yet.")
@@ -1653,7 +1717,9 @@ class ObjectINR(ObjectConstraints):
     def _pretrain(
         self, num_iters: int, loss_fn: Callable, batch_size_points: int, show: bool = False
     ) -> None:
-        # self.model.train()
+        """
+        Pretrain using mini-batches with random coordinate sampling per iteration.
+        """
         optimizer = self.optimizer
         if optimizer is None:
             raise ValueError(
@@ -1667,42 +1733,73 @@ class ObjectINR(ObjectConstraints):
         D, H, W = target.shape
         N = int(D * H * W)
         coords_flat = coords.reshape(1, N, 3)
-        coords_flat = self._coords_to_model_input(coords_flat)
+        coords_flat = self._coords_to_model_input(coords_flat).squeeze(0)
         target_flat = target.reshape(N)
 
-        pbar = tqdm(range(int(num_iters)))
-        for a0 in pbar:
-            loss_total = self._get_zero_loss_tensor()
-            # chunk over points to control memory
-            for start in range(0, N, int(batch_size_points)):
-                end = min(N, start + int(batch_size_points))
-                out = self.model(coords_flat[:, start:end, :])
+        # Calculate number of batches per iteration
+        num_batches = N // batch_size_points
+        if N % batch_size_points != 0:
+            num_batches += 1
+
+        pbar = tqdm(range(num_iters), desc="INR pretrain")
+        for iteration in pbar:
+            iter_loss = 0.0
+            batch_inds = torch.randperm(N, generator=self._rng_torch, device=self.device)
+
+            for batch_start in range(0, N, batch_size_points):
+                batch_end = min(N, batch_start + batch_size_points)
+                batch_indices = batch_inds[batch_start:batch_end]
+
+                batch_coords = coords_flat[batch_indices].unsqueeze(0)  # (1, batch_size, 3)
+                batch_target = target_flat[batch_indices]
+
+                # Forward pass
+                out = self.model(batch_coords)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-                pred_patch = out.squeeze()
-                tgt = target_flat[start:end]
-                loss = loss_fn(pred_patch, tgt)
-                loss.backward()
-                loss_total = loss_total + loss.detach()
+                batch_pred = out.squeeze()
 
-            optimizer.step()
-            optimizer.zero_grad()
+                # Compute loss and backprop
+                loss = loss_fn(batch_pred, batch_target)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+
+                iter_loss += loss.item()
+
+            # Average loss over batches
+            avg_loss = iter_loss / num_batches
+
+            # Update scheduler
             if scheduler is not None:
                 if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(float(loss_total))
+                    scheduler.step(avg_loss)
                 else:
                     scheduler.step()
 
-            self._pretrain_losses.append(float(loss_total))
+            # Record metrics
+            self._pretrain_losses.append(avg_loss)
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
-            pbar.set_description(f"INR pretrain {a0 + 1}/{num_iters} loss={float(loss_total):.3e}")
+            pbar.set_description(
+                f"INR pretrain iter {iteration + 1}/{num_iters} loss={avg_loss:.3e}"
+            )
 
+        # Visualize final result
         if show:
-            fpred = self.model(coords_flat).reshape(
-                D, H, W
-            )  # TODO -- chunk this, method for gen obj chunks?
-            # and maybe self.obj should be with nograd to save memory?
-            self.visualize_pretrain(fpred)
+            with torch.no_grad():
+                # Predict in batches to avoid OOM
+                flat_pred = []
+                for start in range(0, N, batch_size_points):
+                    end = min(N, start + batch_size_points)
+                    batch_coords = coords_flat[start:end].unsqueeze(0)
+                    out = self.model(batch_coords)
+                    if isinstance(out, (tuple, list)):
+                        out = out[0]
+                    pred_patch = out.squeeze()
+                    flat_pred.append(pred_patch)
+                pred_flat = torch.cat(flat_pred, dim=0)
+                pred_obj = pred_flat.reshape(D, H, W)
+                self.visualize_pretrain(pred_obj)
 
     def visualize_pretrain(self, pred_obj: torch.Tensor):
         # TODO cleanup, put in a separate function to be called by INR and DIP
