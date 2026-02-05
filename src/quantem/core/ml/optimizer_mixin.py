@@ -61,10 +61,11 @@ class OptimizerMixin:
                 "exp",
                 "gamma",
                 "linear",
+                "cosine_annealing",
                 "none",
             ]:
                 raise ValueError(
-                    f"Unknown scheduler type: {params['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'none']"
+                    f"Unknown scheduler type: {params['type']}, expected one of ['cyclic', 'plateau', 'exp', 'gamma', 'linear', 'cosine_annealing', 'none']"
                 )
             self._scheduler_params = params.copy()
         else:
@@ -178,6 +179,12 @@ class OptimizerMixin:
                 start_factor=params.get("start_factor", 0.1),
                 end_factor=params.get("end_factor", 1.0),
                 total_iters=params.get("total_iters", num_iter),
+            )
+        elif sched_type == "cosine_annealing":
+            self._scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=params.get("T_max", num_iter),
+                eta_min=params.get("eta_min", 1e-7),
             )
         else:
             raise ValueError(f"Unknown scheduler type: {sched_type}")

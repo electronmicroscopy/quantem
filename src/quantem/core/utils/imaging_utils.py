@@ -1,14 +1,22 @@
 # Utilities for processing images
 
 import math
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
+
+# TODO: Temporary
+from matplotlib import cm
 from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter
+from scipy.special import comb
 
 from quantem.core.utils.utils import generate_batches
+from quantem.core.visualization import show_2d
+
+ImageType = NDArray[Any]
+BoolArray = NDArray[np.bool_]
 
 
 def dft_upsample(
@@ -1050,118 +1058,157 @@ def unwrap_phase_2d_torch(
         )
 
 
-def radially_project_fourier_tensor(
-    corner_centered_array: torch.Tensor,
-    sampling: Tuple[float, float],
-    q_bins: torch.Tensor | None = None,
-):
+# Background subtraction
+
+# single TypeVar: works for both numpy and
+
+
+def _as_array(x: ImageType) -> NDArray[Any]:
+    return (
+        x.array
+        if isinstance(
+            x,
+        )
+        else np.asarray(x)
+    )
+
+
+def _bernstein_basis_1d(n: int, t: NDArray[Any]) -> NDArray[Any]:
+    k = np.arange(n + 1, dtype=int)
+    return (
+        comb(n, k)[None, :] * (t[:, None] ** k[None, :]) * ((1.0 - t)[:, None] ** (n - k)[None, :])
+    )
+
+
+def _build_basis_matrix(im_shape: Tuple[int, int], order: Tuple[int, int]) -> NDArray[Any]:
+    H, W = im_shape
+    ou, ov = int(order[0]), int(order[1])
+    u = np.linspace(0.0, 1.0, H)
+    v = np.linspace(0.0, 1.0, W)
+    Bu = _bernstein_basis_1d(ou, u)
+    Bv = _bernstein_basis_1d(ov, v)
+    basis_cube = np.einsum("ik,jl->ijkl", Bu, Bv)
+    return basis_cube.reshape(H * W, (ou + 1) * (ov + 1))
+
+
+def background_subtract(
+    image: ImageType,
+    mask: Optional[BoolArray] = None,
+    thresh_bg: Optional[float] = None,
+    order: Tuple[int, int] = (1, 1),
+    sigma: Optional[float] = None,
+    num_iter: int = 10,
+    plot_result: bool = True,
+    axsize: Tuple[int, int] = (3.1, 3),
+    cmap: str = "turbo",
+    return_background_and_mask: bool = False,
+    **show_kwargs,
+) -> ImageType | Tuple[ImageType, NDArray[Any], BoolArray]:
     """
-    Radially project a corner-centered Fourier array onto radial bins.
-
-    Supports:
-    - single array: (kx, ky)
-    - batched arrays: (n, kx, ky)
-    - implicit bins (from grid) or explicit external bins
-
-    Parameters
-    ----------
-    corner_centered_array : torch.Tensor
-        Shape (kx, ky) or (n, kx, ky)
-    sampling : (float, float)
-        Real-space sampling (sx, sy)
-    q_bins : torch.Tensor, optional
-        1D tensor of radial bin centers
+    Background subtraction via bivariate Bernstein polynomial fitting.
 
     Returns
     -------
-    q_bins_out : torch.Tensor
-        Radial bin centers
-    array_1d : torch.Tensor
-        Shape (n, nq) or (nq,)
+    - If `return_background_and_mask=False`: ImageType (same as input)
+    - If `True`: (ImageType, numpy.ndarray, numpy.ndarray[bool])
+      where background and mask are always NumPy.
     """
+    im = _as_array(image).astype(float, copy=True)
+    if im.ndim != 2:
+        raise ValueError("`image` must be 2D")
 
-    if corner_centered_array.is_complex():
-        q, real_part = radially_project_fourier_tensor(
-            corner_centered_array.real, sampling, q_bins
+    mask_arr: BoolArray = (
+        np.ones_like(im, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    )
+    if mask_arr.shape != im.shape:
+        raise ValueError("`mask` must match `image` shape")
+
+    order = (int(order[0]), int(order[1]))
+    A_full = _build_basis_matrix(im.shape, order)
+    H, W = im.shape
+    im_flat = im.ravel()
+
+    im_bg = np.zeros_like(im)
+    thresh_val = np.median(im[mask_arr]) if thresh_bg is None else float(thresh_bg)
+
+    resid = im - im_bg
+    if sigma and sigma > 0:
+        resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
+    mask_bg: BoolArray = (resid < thresh_val) & mask_arr
+
+    for _ in range(int(num_iter)):
+        idx = mask_bg.ravel()
+        if not np.any(idx):
+            idx = mask_arr.ravel()
+        coefs, *_ = np.linalg.lstsq(A_full[idx, :], im_flat[idx], rcond=None)
+        im_bg = (A_full @ coefs).reshape(H, W)
+
+        resid = im - im_bg
+        if sigma and sigma > 0:
+            resid = gaussian_filter(resid, sigma=sigma, mode="nearest")
+
+        thr = thresh_val if thresh_bg is None else float(thresh_bg)
+        mask_bg = (resid < thr) & mask_arr
+
+    im_sub_np = im - im_bg
+
+    if plot_result:
+        vals = im_sub_np[mask_arr]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            vals = np.array([0.0])
+        vmin_sub = float(np.min(vals))
+        vmax_sub = float(np.max(vals))
+        vrange = float(max(abs(vmin_sub), abs(vmax_sub))) or 1e-12
+
+        bg_disp = (im_bg - np.mean(im_bg)).copy()
+        bg_disp[~mask_bg] = np.nan
+
+        cmap_base = cm.get_cmap(cmap).with_extremes(bad="black")
+        cmap_div = "RdBu_r"
+
+        disp = [im - np.mean(im_bg), bg_disp, im_sub_np]
+        norm = [
+            {
+                "interval_type": "manual",
+                "stretch_type": "linear",
+                "vmin": vmin_sub,
+                "vmax": vmax_sub,
+            },
+            {
+                "interval_type": "manual",
+                "stretch_type": "linear",
+                "vmin": vmin_sub,
+                "vmax": vmax_sub,
+            },
+            {
+                "interval_type": "centered",
+                "stretch_type": "linear",
+                "vcenter": 0.0,
+                "half_range": vrange,
+            },
+        ]
+
+        show_2d(
+            disp,
+            cmap=[cmap_base, cmap_base, cmap_div],
+            norm=norm,
+            cbar=[False, False, True],
+            title=["Input Image", "Background (fit region)", "Background Subtracted"],
+            axsize=axsize,
+            **show_kwargs,
         )
-        # zero by symmetry
-        # _, imag_part = radially_project_fourier_tensor(
-        #     corner_centered_array.imag, sampling, q_bins
-        # )
-        return q, real_part  # + 1j * imag_part
 
-    device = corner_centered_array.device
-    sx, sy = sampling
+    # # preserve  if needed
+    # if isinstance(
+    #     image,
+    # ):
+    #     meta = dict(origin=image.origin, sampling=image.sampling, units=image.units)
+    #     name_base = getattr(image, "name", "image")
+    # im_sub: ImageType = .from_array(im_sub_np, name=f"{name_base} (bg-sub)", **meta)  # type: ignore[assignment]
+    # else:
+    im_sub = im_sub_np  # type: ignore[assignment]
 
-    # --- normalize shape to (batch, kx, ky)
-    if corner_centered_array.ndim == 2:
-        array = corner_centered_array[None, ...]
-        squeeze_output = True
-    elif corner_centered_array.ndim == 3:
-        array = corner_centered_array
-        squeeze_output = False
-    else:
-        raise ValueError("Input must be 2D or 3D tensor")
-
-    n_batch, nkx, nky = array.shape
-
-    # --- build k-grid
-    kx = torch.fft.fftfreq(nkx, d=sx, device=device)
-    ky = torch.fft.fftfreq(nky, d=sy, device=device)
-    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
-
-    # --- determine radial bins
-    k_max = min(0.5 / sx, 0.5 / sy)
-
-    if q_bins is None:
-        dk = kx[1] - kx[0]
-        num_bins = int(torch.floor(k_max / dk).item()) + 1
-        dq = dk
-        q_bins_out = torch.arange(num_bins, device=device, dtype=k.dtype) * dk
-    else:
-        q_bins = q_bins.to(device)
-        dq = q_bins[1] - q_bins[0]
-        q_bins_out = q_bins[q_bins <= k_max]
-        num_bins = q_bins_out.numel()
-
-    # ---- INTERNAL padding (key change)
-    num_bins_internal = num_bins + 2
-
-    # --- map k -> bin indices (NO CLIPPING)
-    inds = k / dq
-    inds_f = torch.floor(inds).long()
-    inds_f = torch.clamp(inds_f, 0, num_bins_internal - 2)
-
-    d_ind = inds - inds_f
-    w0 = 1.0 - d_ind
-    w1 = d_ind
-
-    # --- flatten spatial dims
-    array_f = array.reshape(n_batch, -1)
-
-    # --- accumulate per batch
-    out = []
-    for b in range(n_batch):
-        a = array_f[b]
-
-        num = torch.bincount(inds_f, weights=a * w0, minlength=num_bins_internal) + torch.bincount(
-            inds_f + 1, weights=a * w1, minlength=num_bins_internal
-        )
-
-        den = (
-            torch.bincount(inds_f, weights=w0, minlength=num_bins_internal)
-            + torch.bincount(inds_f + 1, weights=w1, minlength=num_bins_internal)
-        ).clamp_min(1)
-
-        out.append(num / den)
-
-    array_1d = torch.stack(out, dim=0)
-
-    # ---- truncate to physical bins (key change)
-    array_1d = array_1d[..., :num_bins]
-    q_bins_out = q_bins_out[:num_bins]
-
-    if squeeze_output:
-        array_1d = array_1d[0]
-
-    return q_bins_out, array_1d
+    if return_background_and_mask:
+        return im_sub, im_bg, mask_bg
+    return im_sub

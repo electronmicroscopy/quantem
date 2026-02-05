@@ -1,35 +1,207 @@
 from abc import abstractmethod
 from copy import deepcopy
-from typing import Any, Callable, Union
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
+import torch.distributed as dist
+import torch.nn as nn
 
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.ml.blocks import reset_weights
-from quantem.core.utils.validators import validate_gt, validate_tensor
-from quantem.tomography.utils import get_TV_loss
+from quantem.core.ml.constraints import BaseConstraints, Constraints
+from quantem.core.ml.ddp import DDPMixin
+from quantem.core.ml.loss_functions import get_loss_function
+from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.utils.rng import RNGMixin
+from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 
 
-class ObjectBase(AutoSerialize):
+@dataclass(slots=True)
+class DefaultConstraintsTomography(Constraints):
+    """
+    Data class for all constraints that can be applied to the object model.
+    """
+
+    # Hard Constraints
+    positivity: bool = True
+    shrinkage: float = 0.0
+    circular_mask: bool = False
+    fourier_filter: str | None = None  # Hamming, etc...
+
+    # Soft Constraints
+    tv_vol: float = 0.0
+
+    soft_constraint_keys = ["tv_vol"]
+    hard_constraint_keys = ["positivity", "shrinkage", "circular_mask", "fourier_filter"]
+
+
+class ObjectBase(AutoSerialize, nn.Module, RNGMixin, OptimizerMixin):
+    DEFAULT_LRS = {
+        "object": 8e-6,
+    }
+    _token = object()
     """
     Base class for all ObjectModels to inherit from.
     """
 
     def __init__(
         self,
-        volume_shape: tuple[int, int, int],
-        device: str,
-        offset_obj: float = 1e-5,
+        shape: tuple[int, int, int],
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        _token: object | None = None,
     ):
-        self._shape = volume_shape
+        if _token is not self._token:
+            raise RuntimeError("Use a factory method to instantiate this class.")
 
-        self._obj = torch.zeros(self._shape, device=device, dtype=torch.float32) + offset_obj
-        self._offset_obj = offset_obj
-        self._device = device
-        self._hard_constraints = {}
-        self._soft_constraints = {}  # One big dicitonary
+        self._shape = shape
+
+        # Initialize dependencies
+        nn.Module.__init__(self)
+        RNGMixin.__init__(self, rng=rng, device=device)
+        OptimizerMixin.__init__(self)
+
+        # Initialize a torch.zeros volume with the given shape
+        self._obj = torch.zeros(self._shape, device=device, dtype=torch.float32)
+
+        # --- Properties ---
+        @property
+        def shape(self) -> tuple[int, int, int]:
+            """
+            Shape of the object (x, y, z).
+            """
+            return self._shape
+
+        @shape.setter
+        def shape(self, shape: tuple[int, int, int]):
+            self._shape = shape
+
+        @property
+        def obj(self) -> torch.Tensor:
+            """
+            Returns the object, should be implemented in subclasses.
+            """
+            raise NotImplementedError
+
+        @abstractmethod
+        def dtype(self) -> torch.dtype:
+            """
+            Returns the dtype of the object.
+            """
+            raise NotImplementedError
+
+        @abstractmethod
+        def forward(self, *args, **kwargs) -> torch.Tensor:
+            """
+            Forward pass, should be implemented in subclasses. Note for any nn.Module this is
+            a required method.
+            """
+            raise NotImplementedError
+
+        @abstractmethod
+        def reset(self) -> None:
+            """
+            Reset the object, should be implemented in subclasses.
+            """
+            raise NotImplementedError
+
+        @property
+        def params(self) -> list[nn.Parameter]:
+            """
+            Get the parameters that should be optimized for this model.
+            """
+            raise NotImplementedError
+
+        # --- Helper Functions ---
+        def get_optimization_parameters(self) -> list[nn.Parameter]:
+            """
+            Get the parameters that should be optimized for this model.
+            """
+            return list[nn.Parameter](self.params())
+
+        @abstractmethod  # Each subclass should implement this.
+        def to(self, *args, **kwargs):
+            """
+            Move the object to a device
+            """
+
+            raise NotImplementedError
+
+
+class ObjectConstraints(BaseConstraints, ObjectBase):
+    DEFAULT_CONSTRAINTS = DefaultConstraintsTomography()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.constraints = self.DEFAULT_CONSTRAINTS.copy()
+
+    def apply_hard_constraints(
+        self,
+        obj: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply hard constraints to the object model.
+
+        Only hard constraint here is the positivity and shrinkage. TODO: Add the other hard constraints.
+        """
+        obj2 = obj.clone()
+        if self.constraints.positivity:
+            obj2 = torch.clamp(obj2, min=0.0, max=None)
+        if self.constraints.shrinkage:
+            obj2 = torch.max(obj2 - self.constraints.shrinkage, torch.zeros_like(obj2))
+
+        # TODO: Need to implement the other hard constraints: Fourier Filter and Circular Mask.
+        return obj2
+
+    # def apply_soft_constraints(
+    #     self,
+    #     obj: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     """
+    # TODO: Already in BaseConstraints class.
+    #     Apply soft constraints to the object model.
+
+    #     Only soft constraint here is the TV loss.
+    #     """
+    #     return NotImplementedError("Subclasses must implement this method.")
+
+    @abstractmethod
+    def get_tv_loss(self, obj: torch.Tensor, tv_weight: float = 0.0) -> torch.Tensor:
+        """
+        Get the TV loss for the object model. Must be implemented in each subclass.
+        """
+        raise NotImplementedError
+
+
+class ObjectPixelated(ObjectConstraints):
+    """
+    Object model for pixelated objects.
+
+    Supports: Conventional algorithms (SIRT, FBP), and AD-based reconstructions.
+    """
+
+    def __init__(
+        self,
+        shape: tuple[int, int, int],
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ):
+        super().__init__(
+            shape=shape,
+            device=device,
+            rng=rng,
+            _token=self._token,
+        )
+
+    # --- Properties ----
+    @property
+    def obj(self) -> torch.Tensor:
+        return self.apply_hard_constraints(self._obj)
+
+    @obj.setter
+    def obj(self, obj: torch.Tensor):
+        self._obj = obj
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -40,501 +212,419 @@ class ObjectBase(AutoSerialize):
         self._shape = shape
 
     @property
-    def offset_obj(self) -> float:
-        return self._offset_obj
-
-    @offset_obj.setter
-    def offset_obj(self, offset_obj: float):
-        self._offset_obj = offset_obj
-
-    @property
-    def obj(self) -> torch.Tensor:
-        pass
-
-    @obj.setter
-    def obj(self, obj: torch.Tensor):
-        self._obj = obj
-
-    @property
-    def device(self) -> str:
-        return self._device
-
-    @device.setter
-    def device(self, device: str):
-        self._device = device
-
-    @abstractmethod
-    def forward(
-        self, z1: torch.Tensor, z3: torch.Tensor, shift_x: torch.Tensor, shift_y: torch.Tensor
-    ):
-        pass
-
-    @abstractmethod
-    def obj(self):
-        pass
-
-    @abstractmethod
-    def reset(self):
-        pass
-
-    @abstractmethod
-    def to(self, device: str):
-        pass
-
-    @abstractmethod
-    def name(self) -> str:
-        pass
-
-    @abstractmethod
-    def params(self) -> torch.Tensor:
-        pass
-
-
-class ObjectConstraints(ObjectBase):
-    DEFAULT_HARD_CONSTRAINTS = {
-        "fourier_filter": False,
-        "positivity": False,
-        "shrinkage": False,
-        "circular_mask": False,
-    }
-
-    DEFAULT_SOFT_CONSTRAINTS = {
-        "tv_vol": 0,
-    }
-
-    @property
-    def hard_constraints(self) -> dict[str, Any]:
-        return self._hard_constraints
-
-    @hard_constraints.setter
-    def hard_constraints(self, hard_constraints: dict[str, Any]):
-        gkeys = self.DEFAULT_HARD_CONSTRAINTS.keys()
-        for key, value in hard_constraints.items():
-            if key not in gkeys:  # This might be redundant since add_constraint is checking.
-                raise KeyError(f"Invalid object constraint key '{key}', allowed keys are {gkeys}")
-            self._hard_constraints[key] = value
-
-    @property
-    def soft_constraints(self) -> dict[str, Any]:
-        return self._soft_constraints
-
-    @soft_constraints.setter
-    def soft_constraints(self, soft_constraints: dict[str, Any]):
-        gkeys = self.DEFAULT_SOFT_CONSTRAINTS.keys()
-        for key, value in soft_constraints.items():
-            if key not in gkeys:
-                raise KeyError(f"Invalid object constraint key '{key}', allowed keys are {gkeys}")
-            self._soft_constraints[key] = value
-
-    def add_hard_constraint(self, constraint: str, value: Any):
-        """Add constraints to the object model."""
-        gkeys = self.DEFAULT_HARD_CONSTRAINTS.keys()
-        if constraint not in gkeys:
-            raise KeyError(
-                f"Invalid object constraint key '{constraint}', allowed keys are {gkeys}"
-            )
-        self._hard_constraints[constraint] = value
-
-    def add_soft_constraint(self, constraint: str, value: Any):
-        """Add constraints to the object model."""
-        gkeys = self.DEFAULT_SOFT_CONSTRAINTS.keys()
-        if constraint not in gkeys:
-            raise KeyError(
-                f"Invalid object constraint key '{constraint}', allowed keys are {gkeys}"
-            )
-        self._soft_constraints[constraint] = value
-
-    def apply_hard_constraints(
-        self,
-        obj: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Apply constraints to the object model.
-        """
-        obj2 = obj.clone()
-        if self.hard_constraints["positivity"]:
-            obj2 = torch.clamp(obj, min=0.0, max=None)
-        if self.hard_constraints["shrinkage"]:
-            obj2 = torch.max(obj2 - self.hard_constraints["shrinkage"], torch.zeros_like(obj2))
-
-        return obj2
-
-    def apply_soft_constraints(
-        self,
-        obj: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        'Applies' soft constraints to the object model. This will return additional loss terms.
-        """
-        soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
-        if self.soft_constraints["tv_vol"] > 0:
-            tv_loss = get_TV_loss(
-                obj.unsqueeze(0).unsqueeze(0), factor=self.soft_constraints["tv_vol"]
-            )
-
-            soft_loss += tv_loss
-
-        return soft_loss
-
-
-class ObjectVoxelwise(ObjectConstraints):
-    """
-    Object model for voxelwise objects.
-    """
-
-    def __init__(
-        self,
-        volume_shape: tuple[int, int, int],
-        device: str,
-        initial_volume: torch.Tensor | None = None,
-    ):
-        super().__init__(
-            volume_shape=volume_shape,
-            device=device,
-        )
-        self.hard_constraints = self.DEFAULT_HARD_CONSTRAINTS.copy()
-        self.soft_constraints = self.DEFAULT_SOFT_CONSTRAINTS.copy()
-
-        if initial_volume is not None:
-            self._initial_obj = initial_volume
-        else:
-            self.initial_obj = (
-                torch.zeros(self._shape, device=self._device, dtype=torch.float32)
-                + self.offset_obj
-            )
-
-    @property
-    def obj(self):
-        return self.apply_hard_constraints(self._obj)
-
-    @obj.setter
-    def obj(self, obj: torch.Tensor):
-        self._obj = obj
-
-    @property
-    def initial_obj(self):
-        return self._initial_obj
-
-    @initial_obj.setter
-    def initial_obj(self, initial_obj: torch.Tensor):
-        if not isinstance(initial_obj, torch.Tensor):
-            raise ValueError("initial_obj must be a torch.Tensor")
-
-        self._initial_obj = initial_obj
-
-    def forward(self):
-        return self.obj
-
-    def reset(self):
-        self._obj = (
-            torch.zeros(self._shape, device=self._device, dtype=torch.float32) + self.offset_obj
-        )
-
-    def to(self, device: str):
-        self._device = device
-        self._obj = self._obj.to(self._device)
-
-    @property
-    def name(self) -> str:
-        return "ObjectVoxelwise"
-
-    @property
-    def params(self) -> torch.Tensor:
-        return self._obj
-
-    @property
     def soft_loss(self) -> torch.Tensor:
         return self.apply_soft_constraints(self._obj)
 
-
-class ObjectDIP(ObjectConstraints):
-    """
-    Object model for DIP objects.
-    """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        volume_shape: tuple[int, int, int],
-        model_input: torch.Tensor
-        | None = None,  # Determines output size, model input pretraining target
-        input_noise_std: float = 0.0,
-        device: str = "cpu",
-    ):
-        super().__init__(
-            volume_shape=volume_shape,
-            device=device,
-        )
-        self.hard_constraints = self.DEFAULT_HARD_CONSTRAINTS.copy()
-        self.soft_constraints = self.DEFAULT_SOFT_CONSTRAINTS.copy()
-
-        if model_input is None:
-            self.model_input = torch.randn(1, 1, volume_shape[0], volume_shape[1], volume_shape[2])
-        else:
-            self.model_input = model_input.clone().detach()
-
-        self.pretrain_target = model_input.clone().detach()
-
-        self._model = model
-        self._optimizer = None
-        self._scheduler = None
-        self._pretrain_losses = []
-        self._pretrain_lrs = []
-        self._model_input_noise_std = input_noise_std
-
     @property
     def name(self) -> str:
-        return "ObjectDIP"
+        return "ObjectPixelated"
 
     @property
-    def model(self) -> torch.nn.Module:
+    def obj_type(self) -> str:
+        return "pixelated"
+
+    def apply_soft_constraints(self, obj: torch.Tensor) -> torch.Tensor:
+        soft_loss = torch.tensor(0.0, device=obj.device, dtype=obj.dtype, requires_grad=True)
+        if self.constraints.tv_vol > 0:
+            tv_loss = self.get_tv_loss(
+                obj.unsqueeze(0).unsqueeze(0), factor=self.constraints.tv_vol
+            )
+            soft_loss += tv_loss
+        return soft_loss
+
+    # --- Forward method ---
+    def forward(self, dummy_input=None) -> torch.Tensor:
+        return self.obj
+
+    # --- Defining the TV loss ---
+    def get_tv_loss(self, obj: torch.Tensor, tv_weight: float = 1e-3) -> torch.Tensor:
+        tv_d = torch.pow(obj[:, :, 1:, :, :] - obj[:, :, :-1, :, :], 2).sum()
+        tv_h = torch.pow(obj[:, :, :, 1:, :] - obj[:, :, :, :-1, :], 2).sum()
+        tv_w = torch.pow(obj[:, :, :, :, 1:] - obj[:, :, :, :, :-1], 2).sum()
+        tv_loss = tv_d + tv_h + tv_w
+
+        return tv_loss * tv_weight / (torch.prod(torch.tensor(obj.shape)))
+
+    # --- Helper Functions ---
+    def to(self, device: str):
+        self._obj = self._obj.to(device)
+
+
+class ObjectINR(ObjectConstraints, DDPMixin):
+    def __init__(
+        self,
+        shape: tuple[int, int, int],
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        model: nn.Module | None = None,
+    ):
+        super().__init__(
+            shape=shape,
+            device=device,
+            rng=rng,
+            _token=self._token,
+        )
+        self._pretrain_losses = []
+        self._pretrain_lrs = []
+        self.device = device
+
+        # Register the network submodule (important: real nn.Module attribute)
+        if model is not None:
+            self.setup_distributed(device=device)
+            self._model = self.build_model(model)
+
+    @classmethod
+    def from_model(
+        cls,
+        model: nn.Module,
+        shape: tuple[int, int, int],
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ):
+        obj_model = cls(
+            shape=shape,
+            device=device,
+            rng=rng,
+            model=model,  # ✅ build/register in __init__
+        )
+
+        obj_model.setup_distributed(device=device)
+        obj_model.to(device)
+        return obj_model
+
+    # --- Properties ---
+
+    @property
+    def model(self) -> "nn.Module":
+        """
+        Returns the INR model.
+        """
         return self._model
 
-    @model.setter
-    def model(self, model: torch.nn.Module):
-        if not isinstance(model, torch.nn.Module):
-            raise TypeError(f"Model must be a torch.nn.Module, got {type(model)}")
-        self._model = model.to(self._device)
-        self.set_pretrained_weights(self._model)
+    # @model.setter
+    # def model(self, model: "nn.Module"):
+    #     """
+    #     This doesn't work -- can't have setters for torch sub modules
+    #     https://github.com/pytorch/pytorch/issues/52664
+
+    #     For now, upon initialization private variable `._model` is set to the built model.
+    #     """
+    #     raise RuntimeError("\n\n\nsetting model, this shouldn't be reachable???\n\n\n")
 
     @property
+    def obj(self) -> torch.Tensor:
+        return self._obj
+
+    def apply_soft_constraints(
+        self,
+        coords: torch.Tensor,
+    ) -> torch.Tensor:
+        soft_loss = torch.tensor(0.0, device=coords.device)
+        if self.constraints.tv_vol > 0:
+            num_tv_samples = min(10000, coords.shape[0])
+            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+
+            tv_coords = coords[tv_indices].detach().requires_grad_(True)
+
+            tv_densities_recomputed = self.model(tv_coords)
+            if tv_densities_recomputed.dim() > 1:
+                tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+
+            grad_outputs = torch.autograd.grad(
+                outputs=tv_densities_recomputed,
+                inputs=tv_coords,
+                grad_outputs=torch.ones_like(tv_densities_recomputed),
+                create_graph=True,
+            )[0]
+
+            grad_norm = torch.norm(grad_outputs, dim=1)
+            soft_loss += self.constraints.tv_vol * grad_norm.mean()
+
+        return soft_loss
+
+    def apply_hard_constraints(self, pred: torch.Tensor) -> torch.Tensor:
+        """
+        Apply hard constraints to the predicted values of the INR model.
+        """
+
+        if self.constraints.positivity:
+            pred = torch.clamp(pred, min=0.0, max=None)
+        if self.constraints.shrinkage:
+            pred = torch.max(pred - self.constraints.shrinkage, torch.zeros_like(pred))
+
+        return pred
+
+    @property
+    def params(self):
+        return self.model.parameters()
+
+    # Pretraining
+    @property
     def pretrained_weights(self) -> dict[str, torch.Tensor]:
+        """get the pretrained weights of the INR model"""
         return self._pretrained_weights
 
-    def set_pretrained_weights(self, model: torch.nn.Module):
+    def _set_pretrained_weights(self, model: "torch.nn.Module"):
+        """set the pretrained weights of the INR model"""
         if not isinstance(model, torch.nn.Module):
             raise TypeError(f"Pretrained model must be a torch.nn.Module, got {type(model)}")
         self._pretrained_weights = deepcopy(model.state_dict())
 
     @property
-    def model_input(self) -> torch.Tensor:
-        return self._model_input
-
-    @model_input.setter
-    def model_input(self, input_tensor: torch.Tensor):
-        inp = validate_tensor(
-            input_tensor,
-            name="model_input",
-            dtype=torch.float32,
-            ndim=5,
-            expand_dims=True,
-        )
-        self._model_input = inp.to(self._device)
-
-    @property
-    def pretrain_target(self) -> torch.Tensor:
+    def pretrain_target(self) -> TomographyINRPretrainDataset:
+        """get the pretrain target"""
         return self._pretrain_target
 
     @pretrain_target.setter
-    def pretrain_target(self, target: torch.Tensor):
-        if target.ndim == 5:
-            target = target.squeeze(0).squeeze(0)
-
-        target = validate_tensor(
-            target,
-            name="pretrain_target",
-            ndim=3,
-            dtype=torch.float32,
-            expand_dims=True,
-        )
-        if target.shape[-3:] != self.model_input.shape[-3:]:
-            raise ValueError(
-                f"Pretrain target shape {target.shape} does not match model input shape {self.model_input.shape}"
-            )
-        self._pretrain_target = target.to(self._device)
+    def pretrain_target(self, target: TomographyINRPretrainDataset):
+        """set the pretrain target"""
+        self._pretrain_target = target
 
     @property
-    def _model_input_noise_std(self) -> float:
-        """standard deviation of the gaussian noise added to the model input each forward call"""
-        return self._input_noise_std
-
-    @_model_input_noise_std.setter
-    def _model_input_noise_std(self, std: float):
-        validate_gt(std, 0.0, "input_noise_std", geq=True)
-        self._input_noise_std = std
+    def dtype(self) -> torch.dtype:
+        """
+        Returns the dtype of the object.
+        """
+        # TODO: This is a temporary solution to get the dtype of the object.
+        return torch.float32
 
     @property
-    def optimizer(self) -> torch.optim.Optimizer:
-        """get the optimizer for the DIP model"""
-        if self._optimizer is None:
-            raise ValueError("Optimizer is not set. Use set_optimizer() to set it.")
-        return self._optimizer
+    def shape(self) -> tuple[int, int, int]:
+        return self._shape
 
-    def set_optimizer(self, opt_params: dict):
-        opt_type = opt_params.pop("type")
-        if isinstance(opt_type, torch.optim.Optimizer):
-            self._optimizer = opt_type
-        elif isinstance(opt_type, type):
-            self._optimizer = opt_type(self.model.parameters(), **opt_params)
-        elif opt_type == "adam":
-            self._optimizer = torch.optim.Adam(self.model.parameters(), **opt_params)
-        elif opt_type == "adamw":
-            self._optimizer = torch.optim.AdamW(self.model.parameters(), **opt_params)
-        elif opt_type == "sgd":
-            self._optimizer = torch.optim.SGD(self.model.parameters(), **opt_params)
-        else:
-            raise NotImplementedError(f"Unknown optimizer type: {opt_params['type']}")
+    @shape.setter
+    def shape(self, shape: tuple[int, int, int]):
+        self._shape = shape
 
-    @property
-    def scheduler(
-        self,
-    ) -> (
-        torch.optim.lr_scheduler._LRScheduler
-        | torch.optim.lr_scheduler.CyclicLR
-        | torch.optim.lr_scheduler.ReduceLROnPlateau
-        | torch.optim.lr_scheduler.ExponentialLR
-        | None
-    ):
-        return self._scheduler
+    # --- Helper Functions ---
+    def rebuild_model(self):
+        self._model = self.build_model(self._model)
 
-    def set_scheduler(self, params: dict, num_iter: int | None = None) -> None:
-        sched_type: str = params["type"].lower()
-        optimizer = self.optimizer
-        base_LR = optimizer.param_groups[0]["lr"]
-        if sched_type == "none":
-            scheduler = None
-        elif sched_type == "cyclic":
-            scheduler = torch.optim.lr_scheduler.CyclicLR(
-                optimizer,
-                base_lr=params.get("base_lr", base_LR / 4),
-                max_lr=params.get("max_lr", base_LR * 4),
-                step_size_up=params.get("step_size_up", 100),
-                mode=params.get("mode", "triangular2"),
-                cycle_momentum=params.get("momentum", False),
-            )
-        elif sched_type.startswith(("plat", "reducelronplat")):
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=params.get("factor", 0.5),
-                patience=params.get("patience", 10),
-                threshold=params.get("threshold", 1e-3),
-                min_lr=params.get("min_lr", base_LR / 20),
-                cooldown=params.get("cooldown", 20),
-            )
-        elif sched_type in ["exp", "gamma", "exponential"]:
-            if "gamma" in params.keys():
-                gamma = params["gamma"]
-            elif num_iter is not None:
-                fac = params.get("factor", 0.01)
-                gamma = fac ** (1.0 / num_iter)
-            else:
-                gamma = 0.999
-            scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
-        else:
-            raise ValueError(f"Unknown scheduler type: {sched_type}")
-        self._scheduler = scheduler
-
-    @property
-    def pretrain_losses(self) -> np.ndarray:
-        return np.array(self._pretrain_losses)
-
-    @property
-    def pretrain_lrs(self) -> np.ndarray:
-        return np.array(self._pretrain_lrs)
-
-    @property
-    def obj(self):
-        obj = self.model(self._model_input)[0]
-        return self.apply_hard_constraints(obj)
-
-    def forward(self):
-        return self.model(self._model_input)
-
-    def to(self, device: str):
-        self.device = device
-        self._model = self._model.to(self.device)
-        self._model_input = self._model_input.to(self.device)
-        self._pretrain_target = self._pretrain_target.to(self.device)
-
-    @property
-    def params(self):
-        return self._model.parameters()
-
+    # Reset method that goes back to the pretrained weights.
     def reset(self):
-        self.model.load_state_dict(self.pretrained_weights.copy())
+        """reset the model to the pretrained weights"""
+        self._model = self.build_model(
+            self._model, self._pretrained_weights
+        )  # Since loading the pretrained weights needs to be done in build_model.
+
+    def get_optimization_parameters(self):
+        return self.params
+
+    # --- Forward Method ---
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """forward pass for the INR model"""
+        all_densities = self.model(coords)
+
+        if all_densities.dim() > 1:
+            all_densities = all_densities.squeeze(-1)
+
+        valid_mask = (
+            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
+        ).float()
+
+        all_densities = all_densities * valid_mask
+
+        all_densities = self.apply_hard_constraints(all_densities)
+        return all_densities
+
+    # Pretrain Loop
 
     def pretrain(
         self,
-        model_input: torch.Tensor,
-        pretrain_target: torch.Tensor,
-        reset: bool = True,
-        num_epochs: int = 100,
+        pretrain_dataset: TomographyINRPretrainDataset,
+        batch_size: int,
+        reset: bool = False,
+        num_iters: int = 10,
+        num_workers: int = 0,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
-        loss_fn: Callable | str = "l2",
+        loss_fn: Callable | str = "l1",
         apply_constraints: bool = False,
         show: bool = True,
     ):
-        model_input.to(self.device)
-        pretrain_target.to(self.device)
+        """
+        Pretrain the INR model to fit target volume.
+        """
+
+        if (
+            pretrain_dataset is not None
+        ):  # Need to make a check if there's already a pretrain dataset to not go through with the setup again.
+            self.pretrain_dataset = pretrain_dataset
+            (
+                self.pretraining_dataloader,
+                self.pretraining_sampler,
+                self.pretraining_val_dataloader,
+                self.pretraining_val_sampler,
+            ) = self.setup_dataloader(pretrain_dataset, batch_size, num_workers=num_workers)
 
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)
-
         if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_epochs)
+            self.set_scheduler(scheduler_params, num_iters)
 
         if reset:
-            self._model.apply(reset_weights)
-            self._pretrain_losses = []
-            self._pretrain_lrs = []
-
-        if model_input is not None:
-            self.model_input = model_input
-
-        if pretrain_target.shape[-3:] != self.model_input.shape[-3:]:
-            raise ValueError(
-                f"Pretrain target shape {pretrain_target.shape} does not match model input shape {self.model_input.shape}"
+            raise NotImplementedError(
+                "TODO: Resseting the model to the pretrained weights is not implemented yet. To make this work I would have to reinstantiate the model I think."
             )
-        self.pretrain_target = pretrain_target.clone().detach().to(self.device)
 
-        loss_fn = torch.nn.functional.mse_loss
+        loss_fn = get_loss_function(loss_fn, self.dtype)
 
         self._pretrain(
-            num_epochs=num_epochs,
+            num_iters=num_iters,
             loss_fn=loss_fn,
             apply_constraints=apply_constraints,
-            show=show,
         )
-        self.set_pretrained_weights(self.model)
 
     def _pretrain(
         self,
-        num_epochs: int,
+        num_iters: int,
         loss_fn: Callable,
-        apply_constraints: bool = False,
-        show: bool = False,
+        apply_constraints: bool,
     ):
-        if not hasattr(self, "pretrain_target"):
-            raise ValueError("Pretrain target is not set. Use pretrain_target to set it.")
-
         self.model.train()
         optimizer = self.optimizer
-        sch = self.scheduler
-        pbar = tqdm(range(num_epochs))
-        output = self.obj
+        scheduler = self.scheduler
 
-        for a0 in pbar:
-            if apply_constraints:
-                output = self.obj
-            else:
-                output = self.model(self.model_input).squeeze(0).squeeze(0)
+        for a0 in range(num_iters):
+            epoch_loss = 0
+            for batch_idx, batch in enumerate[Any](self.pretraining_dataloader):
+                coords = batch["coords"].to(self.device, non_blocking=True)
+                target = batch["target"].to(self.device, non_blocking=True)
 
-            loss = loss_fn(output, self.pretrain_target)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+                with torch.autocast(
+                    device_type=self.device.type, dtype=torch.bfloat16, enabled=True
+                ):
+                    outputs = self.forward(coords)
+                    loss = loss_fn(outputs, target)
 
-            if sch is not None:
-                if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    sch.step(loss.item())
+                loss.backward()
+                epoch_loss += loss.item()
+
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+                optimizer.zero_grad()
+
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(epoch_loss)
                 else:
-                    sch.step()
+                    scheduler.step()
 
-            self._pretrain_losses.append(loss.item())
+            self._pretrain_losses.append(epoch_loss / len(self.pretraining_dataloader))
+            print(
+                f"Epoch {a0 + 1}/{num_iters}, Pretrain Loss: {epoch_loss / len(self.pretraining_dataloader):.4f}"
+            )
             self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
-            pbar.set_description(f"Epoch {a0 + 1}/{num_epochs}, Loss: {loss.item():.4f}, ")
+
+    def create_volume(
+        self,
+        return_vol: bool = False,
+    ):
+        N = max(self._shape)
+        with torch.no_grad():
+            coords_1d = torch.linspace(-1, 1, N)
+            x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
+            inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
+
+            model = self.model.module if hasattr(self.model, "module") else self.model
+
+            inference_batch_size = 5 * N * N
+            total_samples = N**3
+            samples_per_gpu = total_samples // self.world_size
+            remainder = total_samples % self.world_size
+            if self.global_rank < remainder:
+                start_idx = self.global_rank * (samples_per_gpu + 1)
+                end_idx = start_idx + samples_per_gpu + 1
+            else:
+                start_idx = self.global_rank * samples_per_gpu + remainder
+                end_idx = start_idx + samples_per_gpu
+            inputs_subset = inputs[start_idx:end_idx]
+            num_samples = inputs_subset.shape[0]
+            outputs_list = []
+            for batch_start in range(0, num_samples, inference_batch_size):
+                batch_end = min(batch_start + inference_batch_size, num_samples)
+                batch_coords = inputs_subset[batch_start:batch_end].to(
+                    self.device, non_blocking=True
+                )
+                batch_outputs = model(batch_coords)
+                batch_outputs = self.apply_hard_constraints(batch_outputs)
+                if batch_outputs.dim() > 1:
+                    batch_outputs = batch_outputs.squeeze(-1)
+                outputs_list.append(batch_outputs.cpu())
+
+            outputs = torch.cat(outputs_list, dim=0)
+
+            if self.world_size > 1:
+                output_size = torch.tensor(outputs.shape[0], device=self.device, dtype=torch.long)
+                all_sizes = [
+                    torch.zeros(1, device=self.device, dtype=torch.long)
+                    for _ in range(self.world_size)
+                ]
+                dist.all_gather(all_sizes, output_size)
+                max_size = max(size.item() for size in all_sizes)
+
+                if outputs.shape[0] < max_size:
+                    padding = torch.zeros(
+                        max_size - outputs.shape[0], device=outputs.device, dtype=outputs.dtype
+                    )
+                    outputs_padded = torch.cat([outputs, padding], dim=0).to(self.device)
+                else:
+                    outputs_padded = outputs.to(self.device)
+
+                gathered_outputs = [
+                    torch.empty(max_size, device=self.device, dtype=outputs.dtype)
+                    for _ in range(self.world_size)
+                ]
+                dist.all_gather(gathered_outputs, outputs_padded.contiguous())
+                trimmed_outputs = []
+                for rank, size in enumerate(all_sizes):
+                    trimmed_outputs.append(gathered_outputs[rank][: size.item()])
+
+                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(N, N, N).float()
+            else:
+                pred_full = outputs.reshape(N, N, N).float()
+
+            if return_vol:
+                return pred_full.detach().cpu()
+
+            self._obj = pred_full.detach().cpu()
+
+    def get_tv_loss(
+        self,
+        coords: torch.Tensor,
+    ):
+        tv_loss = torch.tensor(0.0, device=coords.device)
+
+        num_tv_samples = min(10000, coords.shape[0])
+        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+
+        tv_coords = coords[tv_indices].detach().requires_grad_(True)
+
+        tv_densities_recomputed = self.forward(tv_coords)
+
+        if tv_densities_recomputed.dim() > 1:
+            tv_densities_recomputed = tv_densities_recomputed.squeeze(-1)
+
+        grad_outputs = torch.autograd.grad(
+            outputs=tv_densities_recomputed,
+            inputs=tv_coords,
+            grad_outputs=torch.ones_like(tv_densities_recomputed),
+            create_graph=True,
+        )[0]
+
+        grad_norm = torch.norm(grad_outputs, dim=1)
+
+        tv_loss += self.constraints.tv_vol * grad_norm.mean()
+        return tv_loss
+
+    def to(self, device: str):
+        # self._model = self._model.to(device)
+        self.device = device
+        self._obj = self._obj.to(self.device)
+        self.reconnect_optimizer_to_parameters()
 
 
-ObjectModelType = Union[ObjectVoxelwise]  # | ObjectDIP | ObjectImplicit (ObjectFFN?)
+ObjectModelType = ObjectPixelated | ObjectINR
