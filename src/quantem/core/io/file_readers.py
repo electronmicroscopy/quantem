@@ -90,7 +90,7 @@ name_override = kwargs.pop("name", None)
         else [ax.get("scale", 1) for ax in imported_axes]
     )
     origin = (
-        origin_override if origin_override is not None else [ax["offset"] for ax in imported_axes]
+        origin_override if origin_override is not None else [ax.get("offset", 0) for ax in imported_axes]
     )
     units = (
         units_override
