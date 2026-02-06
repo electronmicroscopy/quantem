@@ -103,6 +103,7 @@ name_override = kwargs.pop("name", None)
         sampling=sampling,
         origin=origin,
         units=units,
+        name = name,
     )
 
     return dataset
