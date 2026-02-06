@@ -31,7 +31,18 @@ def read_4dstem(
         If None, automatically selects the first 4D dataset found.
     **kwargs: dict
         Additional keyword arguments to pass to the file reader.
-
+Other Parameters
+----------------
+name : str | None, optional
+    A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
+origin : NDArray | tuple | list | float | int | None, optional
+    The origin coordinates for each dimension. If None, defaults to zeros
+sampling : NDArray | tuple | list | float | int | None, optional
+    The sampling rate/spacing for each dimension. If None, defaults to ones
+units : list[str] | tuple | list | None, optional
+    Units for each dimension. If None, defaults to ["pixels"] * 4
+signal_units : str, optional
+    Units for the array values, by default "arb. units"
     Returns
     --------
     Dataset4dstem
