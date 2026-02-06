@@ -87,7 +87,7 @@ name_override = kwargs.pop("name", None)
     sampling = (
         sampling_override
         if sampling_override is not None
-        else [ax["scale"] for ax in imported_axes]
+        else [ax.get("scale", 1) for ax in imported_axes]
     )
     origin = (
         origin_override if origin_override is not None else [ax["offset"] for ax in imported_axes]
