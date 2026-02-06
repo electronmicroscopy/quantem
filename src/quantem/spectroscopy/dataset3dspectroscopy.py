@@ -1122,7 +1122,10 @@ class Dataset3dspectroscopy(Dataset3d):
             title_suffix = ""
 
         im = ax_img.imshow(sum_img, cmap="viridis", origin="lower")
-        ax_img.set_title(f"EDS Sum Image{title_suffix}")
+        if data_type == "eds":
+            ax_img.set_title(f"EDS Sum Image{title_suffix}")
+        else:
+            ax_img.set_title(f"EELS Sum Image{title_suffix}")
         ax_img.set_xlabel("X (pixels)")
         ax_img.set_ylabel("Y (pixels)")
 
@@ -1137,7 +1140,10 @@ class Dataset3dspectroscopy(Dataset3d):
 
         # RIGHT PLOT: Show spectrum
         ax_spec.plot(E, spec, linewidth=1.5)
-        ax_spec.set_xlabel("Energy (keV)")
+        if data_type == "eds":
+            ax_spec.set_xlabel("Energy (keV)")
+        else:
+            ax_spec.set_xlabel("Energy (eV)")
         ax_spec.set_ylabel("Intensity")
         ax_spec.set_title(f"Spectrum from ROI [{y}:{y + dy}, {x}:{x + dx}]")
         ax_spec.grid(True, alpha=0.1)
@@ -1603,7 +1609,10 @@ class Dataset3dspectroscopy(Dataset3d):
         fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
 
         ax_specbacksub.plot(E, subtracted_mean_spectrum, linewidth=1.5)
-        ax_specbacksub.set_xlabel("Energy (keV)")
+        if data_type == "eds":
+            ax_specbacksub.set_xlabel("Energy (keV)")
+        else:
+            ax_specbacksub.set_xlabel("Energy (eV)")
         ax_specbacksub.set_ylabel("Intensity")
         ax_specbacksub.set_title("Background-subtracted spectrum from ROI")
         ax_specbacksub.grid(True, alpha=0.1)
