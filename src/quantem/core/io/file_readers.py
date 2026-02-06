@@ -53,7 +53,7 @@ signal_units : str, optional
     sampling_override = kwargs.pop("sampling", None)
     origin_override = kwargs.pop("origin", None)
     units_override = kwargs.pop("units", None)
-
+name_override = kwargs.pop("name", None)
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
     data_list = file_reader(file_path, **kwargs)
 
