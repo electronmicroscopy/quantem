@@ -31,18 +31,20 @@ def read_4dstem(
         If None, automatically selects the first 4D dataset found.
     **kwargs: dict
         Additional keyword arguments to pass to the file reader.
-Other Parameters
-----------------
-name : str | None, optional
-    A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
-origin : NDArray | tuple | list | float | int | None, optional
-    The origin coordinates for each dimension. If None, defaults to zeros
-sampling : NDArray | tuple | list | float | int | None, optional
-    The sampling rate/spacing for each dimension. If None, defaults to ones
-units : list[str] | tuple | list | None, optional
-    Units for each dimension. If None, defaults to ["pixels"] * 4
-signal_units : str, optional
-    Units for the array values, by default "arb. units"
+
+    Other Parameters
+    ----------------
+    name : str | None, optional
+        A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
+    origin : NDArray | tuple | list | float | int | None, optional
+        The origin coordinates for each dimension. If None, defaults to zeros
+    sampling : NDArray | tuple | list | float | int | None, optional
+        The sampling rate/spacing for each dimension. If None, defaults to ones
+    units : list[str] | tuple | list | None, optional
+        Units for each dimension. If None, defaults to ["pixels"] * 4
+    signal_units : str, optional
+        Units for the array values, by default "arb. units"
+
     Returns
     --------
     Dataset4dstem
@@ -53,7 +55,8 @@ signal_units : str, optional
     sampling_override = kwargs.pop("sampling", None)
     origin_override = kwargs.pop("origin", None)
     units_override = kwargs.pop("units", None)
-name_override = kwargs.pop("name", None)
+    name_override = kwargs.pop("name", None)
+
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
     data_list = file_reader(file_path, **kwargs)
 
@@ -90,7 +93,9 @@ name_override = kwargs.pop("name", None)
         else [ax.get("scale", 1) for ax in imported_axes]
     )
     origin = (
-        origin_override if origin_override is not None else [ax.get("offset", 0) for ax in imported_axes]
+        origin_override
+        if origin_override is not None
+        else [ax.get("offset", 0) for ax in imported_axes]
     )
     units = (
         units_override
@@ -103,7 +108,7 @@ name_override = kwargs.pop("name", None)
         sampling=sampling,
         origin=origin,
         units=units,
-        name = name,
+        name=name_override,
     )
 
     return dataset
