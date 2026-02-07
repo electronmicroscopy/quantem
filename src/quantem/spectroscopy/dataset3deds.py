@@ -66,8 +66,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         elements_to_fit=None,
         peak_width=0.1,
         num_iters=1000,
-        lr=0.01,
+        lr=None,
         polynomial_background_degree=3,
+        optimizer="lbfgs",
     ):
         energy_axis = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
         energy_axis = torch.tensor(energy_axis, dtype=torch.float32)
@@ -97,21 +98,49 @@ class Dataset3deds(Dataset3dspectroscopy):
         with torch.no_grad():
             model.peak_model.concentrations.fill_((1))
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer_name = optimizer.lower()
+        if optimizer_name == "adam":
+            if lr is None:
+                lr = 1e-3
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        elif optimizer_name == "lbfgs":
+            # Keep each outer-loop iteration comparable to Adam by limiting each LBFGS
+            # step to a single internal iteration.
+            if lr is None:
+                lr = 1
+            optimizer = torch.optim.LBFGS(
+                model.parameters(),
+                lr=lr,
+                max_iter=1,
+                line_search_fn="strong_wolfe",
+            )
+        else:
+            raise ValueError("optimizer must be 'lbfgs' or 'adam'")
         loss_fn = nn.MSELoss()
 
         loss_iter = []
-        for iters in range(num_iters):
-            optimizer.zero_grad()
+        for _ in range(num_iters):
+            if optimizer_name == "lbfgs":
 
-            predicted = model()
+                def closure():
+                    optimizer.zero_grad()
+                    predicted = model()
+                    loss = loss_fn(predicted, spectrum)
+                    loss.backward()
+                    return loss
 
-            loss = loss_fn(predicted, spectrum)
+                loss = optimizer.step(closure)
+                if not torch.is_tensor(loss):
+                    with torch.no_grad():
+                        loss = loss_fn(model(), spectrum)
+            else:
+                optimizer.zero_grad()
+                predicted = model()
+                loss = loss_fn(predicted, spectrum)
+                loss.backward()
+                optimizer.step()
 
-            loss.backward()
-            optimizer.step()
-
-            loss_iter.append(loss.detach().numpy())
+            loss_iter.append(float(loss.detach().cpu().item()))
 
         loss_iter = np.asarray(loss_iter)
         # plot_results
