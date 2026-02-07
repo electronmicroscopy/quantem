@@ -245,7 +245,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         if optimizer is None:
             optimizer = "lbfgs"
         if loss is None:
-            loss = "mse"
+            loss = "mse" if fit_mean_only else "poisson"
 
         optimizer_name = optimizer.lower()
         if optimizer_name not in {"adam", "lbfgs"}:
