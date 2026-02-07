@@ -507,11 +507,26 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         if show_plot:
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+            global_x = np.arange(global_loss_history.shape[0])
+            local_x = np.arange(loss_history_array.shape[0]) + global_loss_history.shape[0]
             ax.plot(
-                np.arange(global_loss_history.shape[0]), global_loss_history, "b-", label="global"
+                global_x,
+                global_loss_history,
+                "b-",
+                label="global",
             )
             ax.plot(
-                np.arange(loss_history_array.shape[0]), loss_history_array, "k-", label="local"
+                local_x,
+                loss_history_array,
+                "r-",
+                label="local",
+            )
+            ax.axvline(
+                x=global_loss_history.shape[0] - 0.5,
+                color="gray",
+                linestyle="--",
+                linewidth=1.0,
+                label="switch",
             )
             ax.set_title("loss")
             ax.set_xlabel("iterations")
