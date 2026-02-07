@@ -6,6 +6,75 @@ import torch
 import torch.nn as nn
 
 
+def inverse_softplus(x: torch.Tensor, min_value: float = 1e-8) -> torch.Tensor:
+    """Numerically stable inverse of softplus for positive initialization values."""
+    x = torch.clamp(x, min=min_value)
+    return torch.log(torch.expm1(x))
+
+
+def eds_data_loss(
+    predicted: torch.Tensor, target: torch.Tensor, loss: str = "poisson", min_value: float = 1e-8
+) -> torch.Tensor:
+    """Compute EDS fit loss with clamped positive predictions."""
+    pred_safe = torch.clamp(predicted, min=min_value)
+    if loss == "poisson":
+        return torch.mean(pred_safe - target * torch.log(pred_safe))
+    if loss == "mse":
+        return nn.functional.mse_loss(pred_safe, target)
+    raise ValueError("loss must be 'poisson' or 'mse'")
+
+
+def polynomial_energy_basis(energy_axis: torch.Tensor, degree: int) -> torch.Tensor:
+    """Return polynomial basis in normalized energy coordinates."""
+    energy_norm = (energy_axis - energy_axis.min()) / (
+        energy_axis.max() - energy_axis.min() + 1e-12
+    )
+    return torch.stack([energy_norm**i for i in range(degree + 1)], dim=0)
+
+
+def build_element_basis(
+    energy_axis: torch.Tensor,
+    peak_energies: torch.Tensor,
+    peak_weights: torch.Tensor,
+    peak_element_indices: torch.Tensor,
+    peak_width_by_peak: torch.Tensor,
+    n_elements: int,
+    energy_step: float,
+) -> torch.Tensor:
+    """Build matrix mapping per-element concentrations to spectral intensity."""
+    fwhm = nn.functional.softplus(peak_width_by_peak)
+    sigma = (fwhm / 2.355).unsqueeze(1)
+    centers = peak_energies.unsqueeze(1)
+    energies = energy_axis.unsqueeze(0)
+    all_peaks = torch.exp(-0.5 * ((energies - centers) / sigma) ** 2)
+    sqrt_2pi = torch.sqrt(torch.tensor(2 * np.pi, dtype=all_peaks.dtype, device=all_peaks.device))
+    all_peaks = all_peaks * energy_step / (sqrt_2pi * sigma)
+    weighted_peaks = all_peaks * peak_weights.unsqueeze(1)
+
+    basis = torch.zeros(
+        (n_elements, energy_axis.shape[0]),
+        dtype=weighted_peaks.dtype,
+        device=weighted_peaks.device,
+    )
+    basis.index_add_(0, peak_element_indices.to(weighted_peaks.device), weighted_peaks)
+    return basis.t()
+
+
+def abundance_smoothness_l2(abundance_maps: torch.Tensor) -> torch.Tensor:
+    """Spatial L2 smoothness for abundance maps shaped (n_elements, y, x)."""
+    if abundance_maps.ndim != 3:
+        raise ValueError("abundance_maps must have shape (n_elements, y, x)")
+
+    loss = abundance_maps.new_tensor(0.0)
+    if abundance_maps.shape[2] > 1:
+        dx = abundance_maps[:, :, 1:] - abundance_maps[:, :, :-1]
+        loss = loss + dx.pow(2).mean()
+    if abundance_maps.shape[1] > 1:
+        dy = abundance_maps[:, 1:, :] - abundance_maps[:, :-1, :]
+        loss = loss + dy.pow(2).mean()
+    return loss
+
+
 class EDSModel(nn.Module):
     """Complete EDS forward model with optional fit range"""
 
@@ -90,7 +159,7 @@ class GaussianPeaks(nn.Module):
         self.n_peaks = len(all_peak_energies)
         init_fwhm = torch.tensor(peak_width, dtype=torch.float32)
         self.peak_width_by_peak = nn.Parameter(
-            torch.log(torch.expm1(init_fwhm)) * torch.ones(self.n_peaks)
+            inverse_softplus(init_fwhm) * torch.ones(self.n_peaks)
         )
 
         print(f"Fitting {n_elements} elements with {self.n_peaks} total peaks")
