@@ -89,6 +89,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         normalize_target,
         default_lr_adam,
         default_lr_lbfgs,
+        verbose=False,
     ):
         target = spectrum_raw
         spectrum_offset = torch.tensor(0.0, dtype=spectrum_raw.dtype, device=spectrum_raw.device)
@@ -125,7 +126,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             raise ValueError("optimizer must be 'lbfgs' or 'adam'")
 
         loss_iter = []
-        for _ in range(num_iters):
+        for i in range(num_iters):
             if optimizer_name == "lbfgs":
 
                 def closure():
@@ -147,6 +148,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                 optimizer_obj.step()
 
             loss_iter.append(float(loss.detach().cpu().item()))
+            if verbose and ((i + 1) % max(1, num_iters // 10) == 0 or i == 0):
+                print(f"iter {i + 1:4d}/{num_iters}: loss={loss_iter[-1]:.6g}")
 
         with torch.no_grad():
             final_pred_target = model()
@@ -203,6 +206,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         verbose=True,
         fit_mean_only=False,
         show_plot=True,
+        lr_global=None,
+        lr_local=None,
     ):
         """Fit EDS spectra with one entrypoint for mean-only or full-cube fitting.
 
@@ -219,12 +224,17 @@ class Dataset3deds(Dataset3dspectroscopy):
         num_iters_global : int, optional
             Number of mean-spectrum iterations used to initialize local fitting (3D mode).
         lr : float, optional
-            Learning rate. If None, sensible mode-specific defaults are used.
+            Backward-compatible shared learning rate fallback. Used for global/local
+            fitting only when lr_global/lr_local are not provided.
+        lr_global : float, optional
+            Learning rate for the global mean-spectrum stage. In mean-only mode, this
+            is the learning rate used for that fit.
+        lr_local : float, optional
+            Learning rate for the position-by-position stage (3D mode).
         polynomial_background_degree : int, optional
             Degree of per-pixel polynomial background.
         optimizer : str | None, optional
-            Optimizer, "adam" or "lbfgs". If None, defaults to "lbfgs" for mean-only
-            and "adam" for 3D fitting.
+            Optimizer, "adam" or "lbfgs". If None, defaults to "lbfgs".
         loss : str | None, optional
             Data term, "poisson" or "mse". If None, defaults to "mse" for mean-only
             and "poisson" for 3D fitting.
@@ -263,6 +273,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         if spatial_lambda < 0:
             raise ValueError("spatial_lambda must be >= 0")
 
+        effective_lr_global = lr if lr_global is None else lr_global
+        effective_lr_local = lr if lr_local is None else lr_local
+
         energy_axis_np = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
         energy_axis = torch.tensor(energy_axis_np, dtype=torch.float32)
         spectra = torch.tensor(self.array, dtype=torch.float32)  # (E, Y, X)
@@ -275,6 +288,8 @@ class Dataset3deds(Dataset3dspectroscopy):
             energy_range = [float(energy_axis.min().numpy()), float(energy_axis.max().numpy())]
 
         if fit_mean_only:
+            if verbose:
+                print("fitting spectrum globally")
             spectrum_raw = spectra.sum((-1, -2))
             mean_fit = self._fit_mean_model_pytorch(
                 energy_axis=energy_axis,
@@ -284,11 +299,12 @@ class Dataset3deds(Dataset3dspectroscopy):
                 polynomial_background_degree=polynomial_background_degree,
                 num_iters=num_iters,
                 optimizer=optimizer_name,
-                lr=lr,
+                lr=effective_lr_global,
                 loss_name=loss_name,
                 normalize_target=True,
                 default_lr_adam=1e-3,
                 default_lr_lbfgs=1.0,
+                verbose=verbose,
             )
 
             model = mean_fit["model"]
@@ -368,6 +384,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         mean_spectrum = spectra_flat[valid_pixel_mask].mean(dim=0)
 
         # Stage 1: global mean-spectrum fit to initialize per-pixel parameters.
+        if verbose:
+            print("fitting spectrum globally")
         global_fit = self._fit_mean_model_pytorch(
             energy_axis=energy_axis,
             spectrum_raw=mean_spectrum,
@@ -376,11 +394,12 @@ class Dataset3deds(Dataset3dspectroscopy):
             polynomial_background_degree=polynomial_background_degree,
             num_iters=num_iters_global,
             optimizer="lbfgs",
-            lr=1.0,
+            lr=effective_lr_global,
             loss_name=loss_name,
             normalize_target=False,
             default_lr_adam=1e-3,
             default_lr_lbfgs=1.0,
+            verbose=verbose,
         )
         global_model = global_fit["model"]
         global_loss_history = global_fit["loss_history"]
@@ -427,7 +446,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         if not freeze_peak_width:
             trainable_params.append(peak_width_params)
 
-        local_lr = lr
+        local_lr = effective_lr_local
         if local_lr is None:
             local_lr = 0.05 if optimizer_name == "adam" else 1.0
 
@@ -478,6 +497,8 @@ class Dataset3deds(Dataset3dspectroscopy):
             loss_smooth = abundance_smoothness_l2(conc_maps)
             return loss_data + spatial_lambda * loss_smooth
 
+        if verbose:
+            print("fitting spectrum position-by-position")
         for i in range(num_iters):
             if optimizer_name == "lbfgs":
 
