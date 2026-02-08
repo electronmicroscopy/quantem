@@ -1,7 +1,7 @@
 import csv
 import json
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,10 +16,48 @@ from quantem.core.datastructures.dataset3d import Dataset3d
 class Dataset3dspectroscopy(Dataset3d):
     # stores the element line info so you don't need to reload each time
     element_info = None
+    element_info_path = "xray_lines.json"
+    dataset_type = "EDS"
 
-    # loads the xray lines dataset
+    def __init__(
+        self,
+        array: NDArray | Any,
+        name: str,
+        origin: NDArray | tuple | list | float | int,
+        sampling: NDArray | tuple | list | float | int,
+        units: list[str] | tuple | list,
+        signal_units: str = "arb. units",
+        _token: object | None = None,
+    ):
+        super().__init__(
+            array=array,
+            name=name,
+            origin=origin,
+            sampling=sampling,
+            units=units,
+            signal_units=signal_units,
+            _token=type(self)._token if _token is None else _token,
+        )
+
+        # Initialize model elements storage
+        self.model_elements = None
+        # Initialize spectra storage
+        self.attached_spectra = None
+
+    # loads elemental information
     @classmethod
-    def load_element_info(cls, path="xray_lines.json"):
+    def load_element_info(
+        cls,
+    ):
+        """Load element database for EDS (X-ray lines) or EELS (binding energies)."""
+        class_type = str(getattr(cls, "dataset_type", "")).strip().lower()
+        if class_type == "eels":
+            path = "eels_binding_energies.json"
+        elif class_type == "eds":
+            path = "xray_lines.json"
+        else:
+            path = getattr(cls, "element_info_path", "xray_lines.json")
+
         if cls.element_info is not None:
             # don't reload if already loaded
             return
@@ -28,51 +66,161 @@ class Dataset3dspectroscopy(Dataset3d):
         with open(full_path, "r") as f:
             cls.element_info = json.load(f)["elements"]
 
-    def __init__(
+    def format_spectral_features_table(
         self,
-        array,
-        name=None,
-        origin=None,
-        sampling=None,
-        units=None,
-        signal_units="arb. units",
-        _token=None,
-    ):
-        if (
-            name is None
-            and origin is None
-            and sampling is None
-            and units is None
-            and hasattr(array, "array")
-            and hasattr(array, "name")
-            and hasattr(array, "origin")
-            and hasattr(array, "sampling")
-            and hasattr(array, "units")
-        ):
-            super().__init__(
-                array=array.array,
-                name=array.name,
-                origin=getattr(array, "origin", np.zeros(3)),
-                sampling=array.sampling,
-                units=array.units,
-                signal_units=getattr(array, "signal_units", signal_units),
-                _token=type(self)._token if _token is None else _token,
-            )
-        else:
-            super().__init__(
-                array=array,
-                name=name,
-                origin=origin,
-                sampling=sampling,
-                units=units,
-                signal_units=signal_units,
-                _token=type(self)._token if _token is None else _token,
-            )
+        element: str,
+        source: str = "auto",
+        sort_by: str = "energy",
+        ascending: bool = True,
+        precision: int = 4,
+    ) -> str:
+        """Format X-ray lines or EELS edges for one element as a simple text table."""
+        if type(self).element_info is None:
+            type(self).load_element_info()
 
-        # Initialize model elements storage
-        self.model_elements = None
-        # Initialize spectra storage
-        self.attached_spectra = None
+        all_info = type(self).element_info or {}
+        if element not in all_info:
+            available = sorted(all_info.keys())
+            msg = f"Element '{element}' not found."
+            if available:
+                msg += f" Available examples: {', '.join(available[:10])}"
+            raise ValueError(msg)
+
+        source_norm = source.strip().lower()
+        if source_norm not in {"auto", "xray", "eels"}:
+            raise ValueError("source must be one of: 'auto', 'xray', 'eels'")
+
+        if source_norm == "auto":
+            class_type = str(getattr(type(self), "dataset_type", "")).strip().lower()
+            source_norm = "eels" if class_type == "eels" else "xray"
+
+        energy_keys = (
+            ("energy (eV)", "onset (eV)", "edge (eV)", "energy")
+            if source_norm == "eels"
+            else ("energy (keV)", "energy_keV", "energy")
+        )
+        rows = []
+        for feature_name, info in all_info[element].items():
+            if isinstance(info, dict):
+                energy_raw = next(
+                    (info.get(k) for k in energy_keys if info.get(k) is not None), None
+                )
+                weight_raw = info.get("weight", info.get("strength"))
+            else:
+                energy_raw = info
+                weight_raw = None
+
+            try:
+                energy = float(energy_raw)
+            except (TypeError, ValueError):
+                continue
+
+            try:
+                weight = float(weight_raw) if weight_raw is not None else np.nan
+            except (TypeError, ValueError):
+                weight = np.nan
+
+            rows.append((str(feature_name), energy, weight))
+
+        if not rows:
+            return f"{element}: no spectral features found."
+
+        sort_index = {
+            "feature": 0,
+            "line": 0,
+            "edge": 0,
+            "energy": 1,
+            "weight": 2,
+            "strength": 2,
+        }.get(sort_by.strip().lower())
+        if sort_index is None:
+            raise ValueError("sort_by must be one of: feature/line/edge, energy, weight/strength")
+        rows.sort(key=lambda r: r[sort_index], reverse=not ascending)
+
+        unit = "eV" if source_norm == "eels" else "keV"
+        show_weight = any(np.isfinite(r[2]) for r in rows)
+        feature_w = max(len("Feature"), *(len(r[0]) for r in rows))
+        energy_vals = [f"{r[1]:.{precision}f}" for r in rows]
+        energy_w = max(len(f"Energy ({unit})"), *(len(v) for v in energy_vals))
+
+        if show_weight:
+            weight_vals = [f"{r[2]:.{precision}f}" if np.isfinite(r[2]) else "" for r in rows]
+            weight_w = max(len("Weight"), *(len(v) for v in weight_vals))
+            header = f"{'Feature':<{feature_w}}  {'Energy (' + unit + ')':>{energy_w}}  {'Weight':>{weight_w}}"
+            lines = [
+                f"{element} {'EELS edges' if source_norm == 'eels' else 'X-ray lines'}",
+                header,
+                "-" * len(header),
+            ]
+            for (feature, _, _), e, w in zip(rows, energy_vals, weight_vals):
+                lines.append(f"{feature:<{feature_w}}  {e:>{energy_w}}  {w:>{weight_w}}")
+        else:
+            header = f"{'Feature':<{feature_w}}  {'Energy (' + unit + ')':>{energy_w}}"
+            lines = [
+                f"{element} {'EELS edges' if source_norm == 'eels' else 'X-ray lines'}",
+                header,
+                "-" * len(header),
+            ]
+            for (feature, _, _), e in zip(rows, energy_vals):
+                lines.append(f"{feature:<{feature_w}}  {e:>{energy_w}}")
+
+        return "\n".join(lines)
+
+    def format_xray_lines_table(
+        self,
+        element: str,
+        sort_by: str = "energy",
+        ascending: bool = True,
+        precision: int = 4,
+    ) -> str:
+        """Backward-compatible wrapper for X-ray lines."""
+        return self.format_spectral_features_table(
+            element=element,
+            source="xray",
+            sort_by=sort_by,
+            ascending=ascending,
+            precision=precision,
+        )
+
+    def format_eels_edges_table(
+        self,
+        element: str,
+        sort_by: str = "energy",
+        ascending: bool = True,
+        precision: int = 4,
+    ) -> str:
+        """Format EELS edge entries for one element."""
+        return self.format_spectral_features_table(
+            element=element,
+            source="eels",
+            sort_by=sort_by,
+            ascending=ascending,
+            precision=precision,
+        )
+
+    def print_xray_lines(
+        self,
+        element: str,
+        sort_by: str = "energy",
+        ascending: bool = True,
+        precision: int = 4,
+    ) -> str:
+        """Print and return a formatted table of X-ray lines for one element."""
+        table = self.format_xray_lines_table(element, sort_by, ascending, precision)
+        print(table)
+        return table
+
+    def print_eels_edges(
+        self,
+        element: str,
+        sort_by: str = "energy",
+        ascending: bool = True,
+        precision: int = 4,
+    ) -> str:
+        """Print and return a formatted table of EELS edges for one element."""
+        table = self.format_eels_edges_table(element, sort_by, ascending, precision)
+        print(table)
+        return table
 
     def add_elements_to_model(self, elements):
         """

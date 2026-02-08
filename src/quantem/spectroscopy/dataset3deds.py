@@ -30,6 +30,10 @@ class Dataset3deds(Dataset3dspectroscopy):
 
     """
 
+    element_info = None
+    element_info_path = "xray_lines.json"
+    dataset_type = "EDS"
+
     def __init__(
         self,
         array: NDArray | Any,
@@ -69,6 +73,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             _token=_token,
         )
         self._virtual_images = {}
+        self.dataset_type = "EDS"
 
     def _fit_mean_model_pytorch(
         self,
