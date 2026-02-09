@@ -9,18 +9,35 @@ import torch.nn as nn
 def inverse_softplus(x: torch.Tensor, min_value: float = 1e-8) -> torch.Tensor:
     """Numerically stable inverse of softplus for positive initialization values."""
     x = torch.clamp(x, min=min_value)
-    return torch.log(torch.expm1(x))
+    # For large x, log(expm1(x)) can overflow in float32. Use a stable branch.
+    return torch.where(
+        x > 20.0,
+        x + torch.log1p(-torch.exp(-x)),
+        torch.log(torch.expm1(x)),
+    )
 
 
 def eds_data_loss(
     predicted: torch.Tensor, target: torch.Tensor, loss: str = "poisson", min_value: float = 1e-8
 ) -> torch.Tensor:
     """Compute EDS fit loss with clamped positive predictions."""
-    pred_safe = torch.clamp(predicted, min=min_value)
+    pred_safe = torch.nan_to_num(predicted, nan=min_value, posinf=1e8, neginf=min_value)
+    pred_safe = torch.clamp(pred_safe, min=min_value, max=1e8)
     if loss == "poisson":
-        return torch.mean(pred_safe - target * torch.log(pred_safe))
+        target_safe = torch.nan_to_num(target, nan=0.0, posinf=1e8, neginf=0.0)
+        target_safe = torch.clamp(target_safe, min=0.0, max=1e8)
+        if hasattr(torch, "xlogy"):
+            log_term = torch.xlogy(target_safe, pred_safe)
+        elif hasattr(torch.special, "xlogy"):
+            log_term = torch.special.xlogy(target_safe, pred_safe)
+        else:
+            log_term = target_safe * torch.log(pred_safe)
+            log_term = torch.nan_to_num(log_term, nan=0.0, posinf=1e8, neginf=-1e8)
+        loss_terms = pred_safe - log_term
+        return torch.mean(torch.nan_to_num(loss_terms, nan=1e8, posinf=1e8, neginf=-1e8))
     if loss == "mse":
-        return nn.functional.mse_loss(pred_safe, target)
+        target_safe = torch.nan_to_num(target, nan=0.0, posinf=1e8, neginf=-1e8)
+        return nn.functional.mse_loss(pred_safe, target_safe)
     raise ValueError("loss must be 'poisson' or 'mse'")
 
 

@@ -200,6 +200,11 @@ class Dataset3deds(Dataset3dspectroscopy):
         polynomial_background_degree=3,
         optimizer=None,
         loss=None,
+        optimizer_global=None,
+        optimizer_local=None,
+        loss_global=None,
+        loss_local=None,
+        normalize_local_target=True,
         freeze_peak_width=True,
         spatial_lambda=0.0,
         min_total_counts=0.0,
@@ -234,10 +239,24 @@ class Dataset3deds(Dataset3dspectroscopy):
         polynomial_background_degree : int, optional
             Degree of per-pixel polynomial background.
         optimizer : str | None, optional
-            Optimizer, "adam" or "lbfgs". If None, defaults to "lbfgs".
+            Backward-compatible optimizer selector. In mean-only mode it controls
+            the global stage. In 3D mode it controls the local stage.
+        optimizer_global : str | None, optional
+            Global/mean-stage optimizer, "adam" or "lbfgs". In 3D mode, defaults
+            to "lbfgs" unless explicitly set.
+        optimizer_local : str | None, optional
+            Local position-by-position optimizer, "adam" or "lbfgs". In 3D mode,
+            defaults to optimizer if provided, otherwise "lbfgs".
         loss : str | None, optional
-            Data term, "poisson" or "mse". If None, defaults to "mse" for mean-only
-            and "poisson" for 3D fitting.
+            Backward-compatible shared data term, "poisson" or "mse". If provided,
+            it applies to both stages unless stage-specific losses are set.
+        loss_global : str | None, optional
+            Global/mean-stage data term, "poisson" or "mse".
+        loss_local : str | None, optional
+            Local position-by-position data term, "poisson" or "mse".
+        normalize_local_target : bool, optional
+            If True, normalize each local pixel spectrum by its own target scale
+            (max channel value) before evaluating the local data loss.
         freeze_peak_width : bool, optional
             If True, lock peak widths after global fit (3D mode).
         spatial_lambda : float, optional
@@ -257,21 +276,47 @@ class Dataset3deds(Dataset3dspectroscopy):
             Mean-only mode keys include concentrations, fit, and diagnostics.
             3D mode keys include abundance maps and fit diagnostics.
         """
-        if optimizer is None:
-            optimizer = "lbfgs"
-        if loss is None:
-            loss = "mse" if fit_mean_only else "poisson"
 
-        optimizer_name = optimizer.lower()
-        if optimizer_name not in {"adam", "lbfgs"}:
-            raise ValueError("optimizer must be 'adam' or 'lbfgs'")
+        def _normalize_optimizer(name, param_name):
+            if name is None:
+                return None
+            name_norm = name.lower()
+            if name_norm not in {"adam", "lbfgs"}:
+                raise ValueError(f"{param_name} must be 'adam' or 'lbfgs'")
+            return name_norm
 
-        loss_name = loss.lower()
-        if loss_name not in {"poisson", "mse"}:
-            raise ValueError("loss must be 'poisson' or 'mse'")
+        def _normalize_loss(name, param_name):
+            if name is None:
+                return None
+            name_norm = name.lower()
+            if name_norm not in {"poisson", "mse"}:
+                raise ValueError(f"{param_name} must be 'poisson' or 'mse'")
+            return name_norm
+
+        optimizer_name = _normalize_optimizer(optimizer, "optimizer")
+        optimizer_global_name = _normalize_optimizer(optimizer_global, "optimizer_global")
+        optimizer_local_name = _normalize_optimizer(optimizer_local, "optimizer_local")
+
+        loss_name = _normalize_loss(loss, "loss")
+        loss_global_name = _normalize_loss(loss_global, "loss_global")
+        loss_local_name = _normalize_loss(loss_local, "loss_local")
+
+        if fit_mean_only:
+            effective_optimizer_global = optimizer_global_name or optimizer_name or "lbfgs"
+            effective_loss_global = loss_global_name or loss_name or "mse"
+            effective_optimizer_local = None
+            effective_loss_local = None
+        else:
+            # Preserve historical behavior: global stage defaults to LBFGS.
+            effective_optimizer_global = optimizer_global_name or "lbfgs"
+            effective_optimizer_local = optimizer_local_name or optimizer_name or "lbfgs"
+            effective_loss_global = loss_global_name or loss_name or "poisson"
+            effective_loss_local = loss_local_name or loss_name or "poisson"
 
         if spatial_lambda < 0:
             raise ValueError("spatial_lambda must be >= 0")
+        if not isinstance(normalize_local_target, bool):
+            raise ValueError("normalize_local_target must be a bool")
 
         effective_lr_global = lr if lr_global is None else lr_global
         effective_lr_local = lr if lr_local is None else lr_local
@@ -298,9 +343,9 @@ class Dataset3deds(Dataset3dspectroscopy):
                 peak_width=peak_width,
                 polynomial_background_degree=polynomial_background_degree,
                 num_iters=num_iters,
-                optimizer=optimizer_name,
+                optimizer=effective_optimizer_global,
                 lr=effective_lr_global,
-                loss_name=loss_name,
+                loss_name=effective_loss_global,
                 normalize_target=True,
                 default_lr_adam=1e-3,
                 default_lr_lbfgs=1.0,
@@ -393,20 +438,30 @@ class Dataset3deds(Dataset3dspectroscopy):
             peak_width=peak_width,
             polynomial_background_degree=polynomial_background_degree,
             num_iters=num_iters_global,
-            optimizer="lbfgs",
+            optimizer=effective_optimizer_global,
             lr=effective_lr_global,
-            loss_name=loss_name,
-            normalize_target=False,
+            loss_name=effective_loss_global,
+            normalize_target=True,
             default_lr_adam=1e-3,
             default_lr_lbfgs=1.0,
             verbose=verbose,
         )
         global_model = global_fit["model"]
         global_loss_history = global_fit["loss_history"]
+        global_scale = global_fit["spectrum_scale"].detach()
+        global_offset = global_fit["spectrum_offset"].detach()
 
         with torch.no_grad():
-            global_conc = nn.functional.softplus(global_model.peak_model.concentrations).detach()
-            global_bg_coeffs = global_model.background_model.coeffs.detach()
+            # If the global stage fit a normalized target, convert amplitude-like
+            # parameters back to raw-count scale for local initialization.
+            global_conc = (
+                nn.functional.softplus(global_model.peak_model.concentrations).detach()
+                * global_scale
+            )
+            global_bg_coeffs = global_model.background_model.coeffs.detach() * global_scale
+            if global_bg_coeffs.numel() > 0:
+                global_bg_coeffs = global_bg_coeffs.clone()
+                global_bg_coeffs[0] = global_bg_coeffs[0] + global_offset
             global_peak_width_params = global_model.peak_model.peak_width_by_peak.detach().clone()
 
         # Stage 2: vectorized per-pixel fit with shared peak shapes.
@@ -422,7 +477,13 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         mean_total = torch.clamp(mean_spectrum.sum(), min=1e-8)
         pixel_scales = (total_counts / mean_total).unsqueeze(1)
-        conc_init = torch.clamp(global_conc.unsqueeze(0) * pixel_scales, min=1e-6)
+        if normalize_local_target:
+            # When local loss is normalized per pixel, amplitude scaling from total
+            # counts is no longer part of the objective and can destabilize LBFGS.
+            pixel_scales = torch.ones_like(pixel_scales)
+        # Avoid near-zero concentration initialization that can cause vanishing
+        # softplus gradients in local optimization (especially on normalized data).
+        conc_init = torch.clamp(global_conc.unsqueeze(0) * pixel_scales, min=1e-3, max=50.0)
         conc_logits = nn.Parameter(inverse_softplus(conc_init))
         bg_coeffs = nn.Parameter(global_bg_coeffs.unsqueeze(0).repeat(n_pixels, 1) * pixel_scales)
 
@@ -448,9 +509,9 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         local_lr = effective_lr_local
         if local_lr is None:
-            local_lr = 0.05 if optimizer_name == "adam" else 1.0
+            local_lr = 0.05 if effective_optimizer_local == "adam" else 1.0
 
-        if optimizer_name == "adam":
+        if effective_optimizer_local == "adam":
             local_opt = torch.optim.Adam(trainable_params, lr=local_lr)
         else:
             local_opt = torch.optim.LBFGS(
@@ -480,15 +541,26 @@ class Dataset3deds(Dataset3dspectroscopy):
             conc = nn.functional.softplus(conc_logits)  # (P, n_elements)
             peaks_pred = conc @ basis.t()  # (P, E)
             bg_raw = bg_coeffs @ background_basis  # (P, E)
-            bg_pred = nn.functional.softplus(bg_raw)
-            predicted = torch.clamp(peaks_pred + bg_pred, min=1e-8)
+            # Keep local background parameterization consistent with global initialization.
+            bg_pred = bg_raw
+            predicted = torch.clamp(peaks_pred + bg_pred, min=1e-8, max=1e8)
             return predicted, conc
 
         def _local_loss(pred_local, conc_local):
+            pred_eval = pred_local[valid_pixel_mask]
+            target_eval = spectra_flat[valid_pixel_mask]
+            if normalize_local_target:
+                local_scale = torch.clamp(
+                    target_eval.max(dim=1, keepdim=True).values,
+                    min=1e-6,
+                )
+                pred_eval = pred_eval / local_scale
+                target_eval = target_eval / local_scale
+
             loss_data = eds_data_loss(
-                pred_local[valid_pixel_mask],
-                spectra_flat[valid_pixel_mask],
-                loss=loss_name,
+                pred_eval,
+                target_eval,
+                loss=effective_loss_local,
             )
             if spatial_lambda <= 0:
                 return loss_data
@@ -500,7 +572,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         if verbose:
             print("fitting spectrum position-by-position")
         for i in range(num_iters):
-            if optimizer_name == "lbfgs":
+            if effective_optimizer_local == "lbfgs":
 
                 def _local_closure():
                     local_opt.zero_grad()
