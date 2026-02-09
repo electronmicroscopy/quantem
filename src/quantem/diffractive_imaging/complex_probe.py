@@ -1,7 +1,9 @@
 import math
+from collections import defaultdict
 from typing import Mapping, Tuple
 
 import torch
+from numpy.typing import NDArray
 
 from quantem.core.utils.utils import electron_wavelength_angstrom
 
@@ -123,7 +125,7 @@ def aperture(
         return hard_aperture(alpha, semiangle_cutoff)
 
 
-def standardize_aberration_coefs(aberration_coefs: Mapping[str, float]) -> dict[str, float]:
+def standardize_aberration_coefs(aberration_coefs: Mapping[str, float]) -> dict[str, torch.Tensor]:
     """
     Convert user-supplied aberration coefficient dictionary into canonical
     polar-aberration symbols (C_nm, phi_nm), resolving aliases and conventions.
@@ -351,7 +353,7 @@ def gamma_factor(
         gamma = probe_m * cmplx_probe_at_k.conj() + probe_p.conj() * cmplx_probe_at_k
     if normalize:
         gamma /= gamma.abs().clamp(min=1e-8)
-    return gamma.conj()
+    return gamma
 
 
 def evaluate_probe(
@@ -381,15 +383,20 @@ def _passively_rotate_grid(
     rotation_angle: float,
 ):
     """ """
+
     cos_a = math.cos(-rotation_angle)
     sin_a = math.sin(-rotation_angle)
-    kxa, kya = kxa * cos_a + kya * sin_a, -kxa * sin_a + kya * cos_a
+    kxa, kya = (
+        kxa * cos_a + kya * sin_a,
+        -kxa * sin_a + kya * cos_a,
+    )
+
     return kxa, kya
 
 
 def spatial_frequencies(
     gpts: Tuple[int, int],
-    sampling: Tuple[float, float],
+    sampling: Tuple[float, float] | NDArray,
     rotation_angle: float | None = None,
     device: str | torch.device = "cpu",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -517,3 +524,130 @@ def aberration_surface_grad(
 
     dx, dy = aberration_surface_cartesian_gradients(alpha, phi, aberration_coefs)
     return dx, dy
+
+
+def polar_to_cartesian_aberrations(polar, max_order=5, device=None, dtype=None):
+    polar = defaultdict(lambda: torch.tensor(0.0, device=device, dtype=dtype), polar)
+    cart = {}
+
+    for n in range(1, max_order + 1):
+        for s in range(0, n + 2):
+            m = 2 * s - n - 1
+            if m < 0:
+                continue
+            name = f"C{n}{m}"
+            if m == 0:
+                cart[name] = polar[name]
+            else:
+                phi = polar[f"phi{n}{m}"]
+                C = polar[name]
+                cart[f"{name}_a"] = C * torch.cos(m * phi)
+                cart[f"{name}_b"] = C * torch.sin(m * phi)
+
+    return cart
+
+
+def cartesian_to_polar_aberrations(cart, max_order=5):
+    cart = defaultdict(lambda: torch.tensor(0.0), cart)
+    polar = {}
+
+    for n in range(1, max_order + 1):
+        for s in range(0, n + 2):
+            m = 2 * s - n - 1
+            if m < 0:
+                continue
+            name = f"C{n}{m}"
+            if m == 0:
+                polar[name] = cart[name]
+            else:
+                Ca = cart[f"{name}_a"]
+                Cb = cart[f"{name}_b"]
+                polar[name] = torch.sqrt(Ca**2 + Cb**2)
+                polar[f"phi{n}{m}"] = torch.atan2(Cb, Ca) / m
+
+    return polar
+
+
+def merge_aberration_coefficients(
+    init_coefs_polar: dict,
+    delta_coefs_cartesian: dict,
+):
+    """
+    Convert cartesian aberration deltas to polar and merge with initial coefficients.
+
+    Parameters
+    ----------
+    aberration_coefs_init : dict
+        Polar aberration coefficients (e.g. C10, C12, phi12, ...)
+    delta_cartesian : dict
+        Fitted cartesian deltas (Cnm_a, Cnm_b)
+
+    Returns
+    -------
+    dict
+        Updated polar aberration coefficients
+    """
+    updated_coefs_cartesian = polar_to_cartesian_aberrations(init_coefs_polar)
+
+    for k, v in delta_coefs_cartesian.items():
+        if k in updated_coefs_cartesian:
+            updated_coefs_cartesian[k] = updated_coefs_cartesian[k] + v
+        else:
+            updated_coefs_cartesian[k] = v
+
+    updated_coefs_polar = cartesian_to_polar_aberrations(updated_coefs_cartesian)
+
+    return updated_coefs_polar
+
+
+def parse_cartesian_aberration_label(label: str) -> tuple[int, int, str | None]:
+    """
+    Parse 'Cnm', 'Cnm_a', 'Cnm_b'
+    Returns (n, m, kind) where kind ∈ {None, 'a', 'b'}
+    """
+
+    base, *rest = label.split("_")
+    kind = rest[0] if rest else None
+    n = int(base[1])
+    m = int(base[2])
+
+    return n, m, kind
+
+
+def aberration_surface_cartesian_basis(
+    alpha: torch.Tensor, phi: torch.Tensor, wavelength: float, cartesian_basis: list[str]
+) -> torch.Tensor:
+    """
+    Cartesian aberration chi basis.
+
+    Parameters
+    ----------
+    alpha, phi : torch.Tensor
+        Polar k-space coordinates
+    wavelength : float
+    cartesian_basis : list[str]
+        e.g. ['C10', 'C12_a', 'C12_b', 'C21_a', 'C21_b']
+
+    Returns
+    -------
+    dict[str, torch.Tensor]
+        chi basis functions
+    """
+    k = 2 * math.pi / wavelength
+    out = []
+
+    for label in cartesian_basis:
+        n, m, kind = parse_cartesian_aberration_label(label)
+        pref = k / (n + 1)
+        radial = alpha ** (n + 1)
+
+        if kind is None:
+            out.append(pref * radial)
+        elif kind == "a":
+            out.append(pref * radial * torch.cos(m * phi))
+        elif kind == "b":
+            out.append(pref * radial * torch.sin(m * phi))
+        else:
+            raise ValueError(f"Invalid aberration label: {label}")
+
+    return torch.stack(out, dim=-1)

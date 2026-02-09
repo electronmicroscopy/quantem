@@ -3,9 +3,10 @@ from typing import List, Optional, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
+import warnings
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.optimize import minimize
 from tqdm import tqdm
 
@@ -283,9 +284,6 @@ class DriftCorrection(AutoSerialize):
         kwargs.pop("title", None)
         if show_merged:
             self.plot_merged_images(show_knots=show_knots, title="Merged: initial", **kwargs)
-
-            self.plot_merged_images(show_knots=show_knots, title="Merged: initial", **kwargs)
-
         if show_images:
             self.plot_transformed_images(
                 show_knots=show_knots,
@@ -359,9 +357,6 @@ class DriftCorrection(AutoSerialize):
         kwargs.pop("title", None)
         if show_merged:
             self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)
-
-            self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)
-
         if show_images:
             self.plot_transformed_images(
                 show_knots=show_knots,
@@ -452,7 +447,7 @@ class DriftCorrection(AutoSerialize):
 
         # Regenerate images
         for ind in range(self.shape[0]):
-            self.images_warped.array[a0], self.weights_warped.array[ind] = self.interpolator[
+            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
                 ind
             ].warp_image(
                 self.images[ind].array,
@@ -740,9 +735,12 @@ class DriftCorrection(AutoSerialize):
         self,
         upsample_factor: int = 2,
         output_original_shape: bool = True,
+        mask_output: bool = True,
+        mask_edge_blend: float = 8.0,
         fourier_filter: bool = True,
         filter_midpoint: float = 0.5,
         kde_sigma: float = 0.5,
+        weight_thresh=0.1,
         show_image: bool = True,
         **kwargs,
     ):
@@ -755,6 +753,10 @@ class DriftCorrection(AutoSerialize):
             Factor to upsample the output image for enhanced interpolation accuracy.
         output_original_shape : bool, default True
             If True, crop the output image back to the original input dimensions after processing.
+        mask_output : bool, default True
+            If true, mask the output using the probe position weights
+        mask_edge_blend : float, default 8.0
+            Value in pixels to blend from the edge of the mask (where we have data)
         fourier_filter : bool, default True
             Whether to apply Fourier-based directional filtering to merge corrected images.
         filter_midpoint : float, default 0.5
@@ -765,6 +767,9 @@ class DriftCorrection(AutoSerialize):
         kde_sigma : float, default 0.5
             Standard deviation for kernel density estimation used during image interpolation. Defaults
             to the object's stored kde_sigma if set to None.
+        weight_thresh: float, default 0.1
+            This value sets the threshold for masking the outputs.
+            For very large jitter artifacts this value can be lowered.
         show_image : bool, default True
             Whether to display the final corrected image after processing.
         **kwargs : dict
@@ -792,13 +797,20 @@ class DriftCorrection(AutoSerialize):
                 np.round(self.shape[2] * upsample_factor).astype("int"),
             )
         )
+        weight_corr = np.zeros(
+            (
+                self.shape[0],
+                np.round(self.shape[1] * upsample_factor).astype("int"),
+                np.round(self.shape[2] * upsample_factor).astype("int"),
+            )
+        )
 
         if kde_sigma is None:
             kde_sigma = self.kde_sigma
 
         # Update images
         for ind in range(self.shape[0]):
-            stack_corr[ind], _ = self.interpolator[ind].warp_image(
+            stack_corr[ind], weight_corr[ind] = self.interpolator[ind].warp_image(
                 self.images[ind].array,
                 self.knots[ind],
                 kde_sigma=kde_sigma,
@@ -809,7 +821,6 @@ class DriftCorrection(AutoSerialize):
             # Apply fourier filtering
             kx = np.fft.fftfreq(stack_corr.shape[1])[:, None]
             ky = np.fft.fftfreq(stack_corr.shape[2])[None, :]
-            # kr = np.sqrt(kx**2 + ky**2)
             kt = np.arctan2(ky, kx)
 
             stack_fft = np.fft.fft2(stack_corr)
@@ -841,9 +852,44 @@ class DriftCorrection(AutoSerialize):
         else:
             image_corr_fft = np.fft.fft2(np.mean(stack_corr, axis=0))
 
+        if mask_output:
+            # Note that we compute 2 boolean masks to round off the corners of image blending
+
+            # calculate mask from product of individual image masks
+            # scale weights by upsample factor to normalize to mean value of 1.0
+            mask_edge = np.prod(weight_corr >= (weight_thresh / upsample_factor**2), axis=0)
+
+            # Set outermost pixels to False to define the boundary for edge blending
+            mask_edge[:, 0] = False
+            mask_edge[:, -1] = False
+            mask_edge[0, :] = False
+            mask_edge[-1, :] = False
+
+            # Find inner boundary mask
+            mask_inner = distance_transform_edt(mask_edge) <= mask_edge_blend
+
+            # compute mask using edge blending value
+            mask = (
+                np.cos(
+                    (np.pi / 2)
+                    * np.clip(distance_transform_edt(mask_inner) / mask_edge_blend, 0.0, 1.0)
+                )
+                ** 2
+            )
+
+            # Mean pad value
+            pad_value_mean = np.mean([ind.pad_value for ind in self.interpolator])
+
+            # apply mask
+            image_corr_fft = np.fft.fft2(
+                np.fft.ifft2(image_corr_fft) * mask + pad_value_mean * (1 - mask)
+            )
+
         if output_original_shape:
             image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
 
+        # TODO - adjust origin / sampling if output sampling is different from input
+        # i.e. if output_original_shape is False, and upsample_factor > 1
         image_corr = Dataset2d.from_array(
             np.real(np.fft.ifft2(image_corr_fft)),
             name="drift corrected image",
@@ -853,7 +899,21 @@ class DriftCorrection(AutoSerialize):
         )
 
         if show_image:
-            fig, ax = image_corr.show(**kwargs)
+            fig, ax = show_2d(image_corr.array, **kwargs)
+
+            # Force a render whether we're drawing into a provided Axes or a fresh Figure
+            ax_to_draw = kwargs.get("ax", ax)
+            try:
+                ax_to_draw.figure.canvas.draw_idle()
+                # If we're not drawing into a caller-provided Axes, also pop the window
+                if "ax" not in kwargs:
+                    plt.show()
+            except Exception:
+                # Fallback: if backend is odd, try a blocking show
+                plt.show()
+
+        # if show_image:
+        #     fig, ax = image_corr.show(**kwargs)
 
         return image_corr
 
@@ -861,15 +921,9 @@ class DriftCorrection(AutoSerialize):
         self,
         mode,
     ):
-        # Mask for error estimate
-        mask = np.prod(self.weights_warped.array, axis=0)
-
         # Estimate current error
         images_mean = np.mean(self.images_warped.array, axis=0)
-        sig_diff = np.mean(
-            mask[None, :, :] * np.abs(self.images_warped.array - images_mean[None, :, :]),
-            axis=(1, 2),
-        ) / np.sum(mask)
+        sig_diff = np.mean(np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2))
 
         # Error vector
         error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
@@ -1103,9 +1157,20 @@ def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
     left_max = midpoint - width / 2
     right_min = midpoint + width / 2
     if left_max < 0:
-        width = 2 * midpoint  # can't start below zero
+        warnings.warn(
+            f"width={width} is too large for midpoint={midpoint}, "
+            f"clamping width to {2 * midpoint}.",
+            RuntimeWarning,
+        )
+        width = 2 * midpoint
+
     if right_min > 1:
-        width = 2 * (1 - midpoint)  # can't extend above one
+        warnings.warn(
+            f"width={width} is too large for midpoint={midpoint}, "
+            f"clamping width to {2 * (1 - midpoint)}.",
+            RuntimeWarning,
+        )
+        width = 2 * (1 - midpoint)
     # Recalculate edges
     left = midpoint - width / 2
     right = midpoint + width / 2
