@@ -24,7 +24,11 @@ from emdfile import tqdmnd
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
 import ipywidgets as widgets
-from ipywidgets import interact, IntSlider
+from ipywidgets import interact, IntSlider, Button, Text, HBox, VBox, Output, interactive_output
+from IPython.display import clear_output
+import matplotlib.cm as cm
+from pathlib import Path
+
 
 # TODO: Likely dataset4dSTEM rather than dataset4d input class
 # Bragg peaks from crystalline vs polymer
@@ -482,10 +486,10 @@ class BraggPeaksPolymer(AutoSerialize):
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
 
-    def save_peaks(self, filepath):
+    def save_cartesian_peaks(self, filepath):
         np.save(filepath, self.peak_coordinates_cartesian)
 
-    def load_peaks(self, filepath):
+    def load_cartesian_peaks(self, filepath):
         peak_coordinates_cartesian = np.load(filepath, allow_pickle=True)
         if isinstance(peak_coordinates_cartesian, np.ndarray) and peak_coordinates_cartesian.dtype == object and peak_coordinates_cartesian.size == 1:
             peak_coordinates_cartesian = peak_coordinates_cartesian.item()
@@ -504,11 +508,35 @@ class BraggPeaksPolymer(AutoSerialize):
         self.polar_peaks = polar_peaks
 
     def load_polar_data(self, filepath):
-        polar_data = np.load(filepath, allow_pickle=True)
-        if isinstance(polar_data, np.ndarray) and polar_data.dtype == object and polar_data.size == 1:
-            polar_data = polar_data.item()
-        self.polar_data = np.load(filepath, allow_pickle=True)
+        obj = np.load(filepath, allow_pickle=True)
+        if isinstance(obj, np.ndarray) and obj.dtype == object and obj.shape == ():
+            obj = obj.item()
+        self.polar_data = obj
+    
+        # Populate attributes expected elsewhere
+        r_grid = self.polar_data['r_invA']
+        self.max_radius_invA = float(np.max(r_grid))
+        self.num_radial_bins = int(r_grid.shape[0])
+        self.num_annular_bins = int(r_grid.shape[1])
 
+    def save_peak_intensities(self, filepath):
+        np.save(filepath, self.peak_intensities)
+
+    def load_peak_intensities(self, filepath):
+        peak_intensities = np.load(filepath, allow_pickle=True)
+        if isinstance(peak_intensities, np.ndarray) and peak_intensities.dtype == object and peak_intensities.size == 1:
+            peak_intensities = peak_intensities.item()
+        self.peak_intensities = peak_intensities
+
+    def save_image_centers(self, filepath):
+        np.save(filepath, self.image_centers)
+
+    def load_image_centers(self, filepath):
+        iamge_centers = np.load(filepath, allow_pickle=True)
+        if isinstance(iamge_centers, np.ndarray) and iamge_centers.dtype == object and iamge_centers.size == 1:
+            iamge_centers = iamge_centers.item()
+        self.iamge_centers = iamge_centers
+    
     def process_polar(self, scan_mask: ArrayLike = None, two_fold_symmetry: bool = True):
         """ Find center of image through brightest peak, return polar transform of data and peaks"""
         self.image_centers = self.find_central_beams_4d(scan_mask=scan_mask)
@@ -529,7 +557,7 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # rdf_new = RDF_new.from_data(data=self.dataset_cartesian, origin_row=self.image_centers[1], origin_col=self.image_centers[0])
         # self.polar_data = self.polar_transform_4d(self.resized_cartesian_data, centers=self.image_centers)
-
+    
     def find_central_beams_4d(self, scan_mask: ArrayLike = None, intensity_threshold=0.3, distance_weight=0.5, sampling_radius=2, debug=False, use_tqdm=True):
         """
         Fast central beam finding for entire 4D dataset.
@@ -727,7 +755,7 @@ class BraggPeaksPolymer(AutoSerialize):
         
         return polar_data
 
-    def visualize_peak_detection(self, n_images=10, indices=None, images_per_row=5, figsize_per_image=(3.2, 3), vmax_polar=20, vmax_cartesian=1):
+    def visualize_peak_detection(self, n_images=10, indices=None, images_per_row=5, figsize_per_image=(3.2, 3), vmax_polar=20, vmax_cartesian=None):
         """
         Visualize peak detection results for multiple diffraction patterns.
         
@@ -822,8 +850,15 @@ class BraggPeaksPolymer(AutoSerialize):
             ax.set_axis_off()
             
             # 3. Cartesian with Peaks and Center
+            img = self.dataset_cartesian[ind_y, ind_x].array
+            lower_q = 0.01
+            upper_q = 0.99
+            vmin, vmax = np.quantile(img[np.isfinite(img)], [lower_q, upper_q])
+            if vmax_cartesian is None:
+                vmax_cartesian = vmax
             ax = axes[row, col_offset + 2]
-            ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
+            ax.matshow(img, cmap="gray", vmin=vmin, vmax=vmax_cartesian)
+            # ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
             # ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
             if has_peaks:
                 ax.scatter(self.peak_coordinates_cartesian[ind_y, ind_x][:, 1], 
@@ -838,7 +873,8 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # 4. Original Cartesian
             ax = axes[row, col_offset + 3]
-            im = ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
+            im = ax.matshow(img, cmap="gray", vmin=vmin, vmax=vmax_cartesian)
+            # im = ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
             # im = ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
             if row == 0:
                 ax.set_title(col_titles[3], fontsize=10, pad=10)
@@ -1675,10 +1711,10 @@ class BraggPeaksPolymer(AutoSerialize):
     
         return orient_hist
 
-    def plot_interactive_image_map(self, intensity_map=None, vmax_cartesian=7, 
-                                    map_cmap='viridis', map_title='Intensity Map',
+    def plot_interactive_image_map(self, intensity_map=None, vmax_cartesian=None, vmin_cartesian=None, 
+                                    map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
                                     norm_upper_quantile=None, norm_power=1.0,
-                                    show_polar=True, vmax_polar=7):
+                                    show_polar=True, vmax_polar=None):
         """
         Interactive plot for browsing diffraction patterns with optional intensity map.
         
@@ -1690,10 +1726,14 @@ class BraggPeaksPolymer(AutoSerialize):
             Upsample factor is automatically detected from array dimensions.
         vmax_cartesian : float
             Maximum value for diffraction pattern display
+        vmin_cartesian : float
+            Minimum value for diffraction pattern display
         map_cmap : str
             Colormap for the intensity map
         map_title : str
             Title for the intensity map panel
+        dp_cmap : str
+            Colormap for diffraction patterns
         norm_upper_quantile : float, optional
             Upper quantile for normalization (0-1). If None, not used.
         norm_power : float
@@ -1706,476 +1746,733 @@ class BraggPeaksPolymer(AutoSerialize):
         
         Ry, Rx = self.dataset_cartesian.shape[:2]
         
-        # Check if polar data exists
-        has_polar = hasattr(self, 'polar_data') and self.polar_data is not None
-        if show_polar and not has_polar:
+        # Check polar data availability
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
             print("Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first.")
             show_polar = False
         
-        # Create default intensity map if none provided
+        # Create or validate intensity map
         if intensity_map is None:
-            intensity_map = np.zeros((Ry, Rx))
-            for i in range(Ry):
-                for j in range(Rx):
-                    intensity_map[i, j] = np.mean(self.dataset_cartesian[i, j].array)
+            intensity_map = np.array([[np.mean(self.dataset_cartesian[i, j].array) 
+                                       for j in range(Rx)] for i in range(Ry)])
             upsample_factor = 1
         else:
-            # Auto-detect upsample factor from dimensions
-            map_Ry, map_Rx = intensity_map.shape
-            upsample_factor_y = map_Ry // Ry
-            upsample_factor_x = map_Rx // Rx
-            
-            if upsample_factor_y != upsample_factor_x:
-                raise ValueError(f"Inconsistent upsample factors: Y={upsample_factor_y}, X={upsample_factor_x}")
-            
-            if map_Ry % Ry != 0 or map_Rx % Rx != 0:
-                raise ValueError(f"intensity_map shape {intensity_map.shape} is not an integer multiple "
-                               f"of dataset shape ({Ry}, {Rx})")
-            
-            upsample_factor = upsample_factor_y
+            map_shape = intensity_map.shape[:2]
+            upsample_factor = map_shape[0] // Ry
+            if upsample_factor != map_shape[1] // Rx:
+                raise ValueError(f"Inconsistent upsample factors")
+            if map_shape[0] % Ry != 0 or map_shape[1] % Rx != 0:
+                raise ValueError(f"intensity_map shape {intensity_map.shape} not integer multiple of ({Ry}, {Rx})")
             print(f"Auto-detected upsample_factor: {upsample_factor}")
         
-        # Set vmax_polar default
-        if vmax_polar is None:
-            vmax_polar = vmax_cartesian
+        # Compute intensity map display limits
+        is_rgb_map = intensity_map.ndim == 3 and intensity_map.shape[2] in (3, 4)
+        if is_rgb_map:
+            vmin_intensity_map, vmax_intensity_map = None, None
+        else:
+            finite = np.isfinite(intensity_map)
+            vmin_intensity_map, vmax_intensity_map = (0.0, 1.0) if not np.any(finite) else \
+                np.quantile(intensity_map[finite], [0.01, 0.99])
         
-        # Calculate slider ranges based on upsampled map
-        slider_Ry = Ry * upsample_factor
-        slider_Rx = Rx * upsample_factor
+        vmax_polar = vmax_polar or vmax_cartesian
+        slider_Ry, slider_Rx = Ry * upsample_factor, Rx * upsample_factor
         
+        # ---- Shared normalization ----
+        def get_normalized_dp(ry_data, rx_data):
+            dp_data = self.dataset_cartesian[ry_data, rx_data].array
+            
+            if norm_upper_quantile is not None:
+                dp_data = np.clip(dp_data, 0, np.quantile(dp_data, norm_upper_quantile))
+            
+            if norm_power != 1.0:
+                m = np.nanmax(dp_data)
+                if np.isfinite(m) and m > 0:
+                    dp_data = (dp_data / m) ** norm_power * m
+            
+            return dp_data
+        
+        # ---- Create figure and axes once ----
+        if show_polar:
+            fig, (ax_map, ax_diff, ax_polar) = plt.subplots(1, 3, figsize=(15, 4))
+        else:
+            fig, (ax_map, ax_diff) = plt.subplots(1, 2, figsize=(12, 5))
+            ax_polar = None
+        
+        # Initialize image objects
+        if vmin_intensity_map is None:
+            im_map = ax_map.imshow(intensity_map, cmap=map_cmap)
+        else:
+            im_map = ax_map.imshow(intensity_map, cmap=map_cmap, 
+                                  vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+        line_marker, = ax_map.plot([], [], 'r+', markersize=15, markeredgewidth=2)
+        ax_map.set_title(map_title)
+        ax_map.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+        ax_map.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+        cbar_map = plt.colorbar(im_map, ax=ax_map)
+        
+        # Diffraction pattern (initialize with zeros)
+        im_diff = ax_diff.imshow(np.zeros((10, 10)), cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+        ax_diff.set_title('Diffraction Pattern')
+        ax_diff.set_xticks([])
+        ax_diff.set_yticks([])
+        cbar_diff = plt.colorbar(im_diff, ax=ax_diff)
+        
+        # Polar transform
+        if show_polar:
+            im_polar = ax_polar.imshow(np.zeros((10, 10)), cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+            ax_polar.set_title('Polar Transform')
+            ax_polar.set_xlabel('Radius (bins)')
+            ax_polar.set_ylabel('Theta (bins)')
+            cbar_polar = plt.colorbar(im_polar, ax=ax_polar)
+        
+        plt.tight_layout()
+        plt.close(fig)
+        
+        # ---- Interactive display callback (updates only) ----
         def show_pattern(ry_slider, rx_slider):
-            # Map slider position to original data indices
             ry_data = ry_slider // upsample_factor
             rx_data = rx_slider // upsample_factor
             
-            # Calculate marker position in upsampled coordinates
-            marker_ry = ry_slider
-            marker_rx = rx_slider
+            # Update marker
+            line_marker.set_data([rx_slider], [ry_slider])
             
-            # Create figure
+            # Update diffraction pattern
+            dp_data = get_normalized_dp(ry_data, rx_data)
+            im_diff.set_data(dp_data)
+            ax_diff.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})')
+            
+            # Update polar transform
             if show_polar:
-                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
-            else:
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                im_polar.set_data(self.polar_data['intensity'][ry_data, rx_data].T)
+                ax_polar.set_title(f'Polar Transform (Ry={ry_data}, Rx={rx_data})')
             
-            # Plot intensity map (no normalization)
-            im1 = ax1.imshow(intensity_map, cmap=map_cmap)
-            ax1.plot(marker_rx, marker_ry, 'r+', markersize=15, markeredgewidth=2)
-            ax1.set_title(map_title)
-            ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
-            ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-            plt.colorbar(im1, ax=ax1)
-            
-            # Get diffraction pattern data
-            dp_data = self.dataset_cartesian[ry_data, rx_data].array
-            
-            # Apply normalization
-            if norm_upper_quantile is not None:
-                vmax_norm = np.quantile(dp_data, norm_upper_quantile)
-                dp_data_normalized = np.clip(dp_data, 0, vmax_norm)
-            else:
-                dp_data_normalized = dp_data.copy()
-            
-            # Apply power law normalization
-            if norm_power != 1.0:
-                dp_data_normalized = np.power(dp_data_normalized / np.max(dp_data_normalized), norm_power) * np.max(dp_data_normalized)
-                
-            # Plot diffraction pattern (with vmax)
-            # im2 = ax2.imshow(self.dataset_cartesian[ry_data, rx_data].array, cmap='gray', vmax=vmax_cartesian)
-            # Plot diffraction pattern (with vmax)
-            print(f"Data range: {np.min(dp_data_normalized):.2e} to {np.max(dp_data_normalized):.2e}")
-            print(f"vmax_cartesian: {vmax_cartesian}")
-            im2 = ax2.imshow(dp_data_normalized, cmap='gray', vmin=0, vmax=vmax_cartesian)
-            ax2.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})')
-            ax2.set_xticks([])
-            ax2.set_yticks([])
-            plt.colorbar(im2, ax=ax2)
-            
-            # Plot polar transform if requested
-            if show_polar:
-                im3 = ax3.imshow(self.polar_data['intensity'][ry_data, rx_data].T, cmap='gray', vmax=vmax_polar, aspect='auto')
-                ax3.set_title(f'Polar Transform (Ry={ry_data}, Rx={rx_data})')
-                ax3.set_xlabel('Radius (bins)')
-                ax3.set_ylabel('Theta (bins)')
-                plt.colorbar(im3, ax=ax3)
-            
-            plt.tight_layout()
-            plt.show()
+            clear_output(wait=True)
+            display(fig)
         
-        interact(show_pattern,
-                 ry_slider=IntSlider(min=0, max=slider_Ry-1, step=1, value=slider_Ry//2, 
-                             description='Ry:', continuous_update=False),
-                 rx_slider=IntSlider(min=0, max=slider_Rx-1, step=1, value=slider_Rx//2, 
-                             description='Rx:', continuous_update=False))
+        # Create widgets
+        ry_slider = IntSlider(min=0, max=slider_Ry-1, value=slider_Ry//2, description='Ry:', continuous_update=False)
+        rx_slider = IntSlider(min=0, max=slider_Rx-1, value=slider_Rx//2, description='Rx:', continuous_update=False)
         
-    def plot_interactive_peak_map(self, radial_range=None, intensity_map_override=None,
-                                  vmax_cartesian=7, show_all_peaks=True, 
-                                  show_center=True, selected_peak_color='red', 
-                                  other_peak_color='gray', center_color='cyan', 
-                                  norm_upper_quantile=None, norm_power=1.0, 
-                                  peak_intensity_mode='size', peak_size_range=(30, 300), 
-                                  peak_cmap='hot', peak_vmin=None, peak_vmax=None,
-                                  show_polar=True, vmax_polar=None, two_fold_symmetry=True):
+        controls = VBox([HBox([ry_slider, rx_slider])])
+        interactive_plot = interactive_output(show_pattern, {'ry_slider': ry_slider, 'rx_slider': rx_slider})
+        display(controls, interactive_plot)
+
+    def save_diffraction_figures(self, ry, rx, intensity_map=None, prefix='diffraction', save_dir='.', 
+                                vmax_cartesian=None, vmin_cartesian=None,
+                                map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
+                                norm_upper_quantile=None, norm_power=1.0,
+                                show_polar=True, vmax_polar=None):
         """
-        Interactive plot for browsing diffraction patterns with peak overlay.
+        Save diffraction pattern figures for a specific scan position.
         
         Parameters
         ----------
-        radial_range : tuple, optional
-            (q_min, q_max) in 1/Å to filter peaks. If None, shows all peaks.
-        intensity_map_override : array, optional
-            If provided, uses this 2D array instead of calculating peak intensity map.
-            Can be upsampled relative to dataset_cartesian.
-            Upsample factor is automatically detected from array dimensions.
+        ry : int
+            Y position in original dataset coordinates
+        rx : int
+            X position in original dataset coordinates
+        intensity_map : array, optional
+            2D array to display as reference map. If None, shows mean intensity.
+        prefix : str
+            Filename prefix for saved files
+        save_dir : str
+            Directory path for saving files
         vmax_cartesian : float
             Maximum value for diffraction pattern display
-        show_all_peaks : bool
-            If True and radial_range is set, show non-selected peaks in gray
-        show_center : bool
-            Whether to show the beam center marker
-        selected_peak_color : str or color
-            Color for selected peaks (within radial_range) when peak_intensity_mode is None
-        other_peak_color : str or color
-            Color for non-selected peaks (outside radial_range)
-        center_color : str or color
-            Color for beam center marker
+        vmin_cartesian : float
+            Minimum value for diffraction pattern display
+        map_cmap : str
+            Colormap for the intensity map
+        map_title : str
+            Title for the intensity map panel
+        dp_cmap : str
+            Colormap for diffraction patterns
         norm_upper_quantile : float, optional
             Upper quantile for normalization (0-1). If None, not used.
         norm_power : float
             Power law normalization exponent
-        peak_intensity_mode : str or None
-            How to represent peak intensity: 'size', 'color', 'both', or None (fixed)
-        peak_size_range : tuple
-            (min_size, max_size) for marker sizes when using intensity-based sizing
-        peak_cmap : str
-            Colormap name for peak intensity coloring
-        peak_vmin : float, optional
-            Minimum intensity value for peak colormap normalization. If None, uses data min.
-        peak_vmax : float, optional
-            Maximum intensity value for peak colormap normalization. If None, uses data max.
         show_polar : bool
-            Whether to show the polar transformed data panel
+            Whether to save the polar transformed data
         vmax_polar : float, optional
             Maximum value for polar pattern display. If None, uses vmax_cartesian.
         """
         
-        Ry, Rx = self.peak_coordinates_cartesian.shape
+        from pathlib import Path
         
-        # Check if polar data exists
-        has_polar = hasattr(self, 'polar_data') and self.polar_data is not None
-        if show_polar and not has_polar:
-            print("Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first.")
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Validate coordinates
+        if not (0 <= ry < Ry and 0 <= rx < Rx):
+            raise ValueError(f"Coordinates ({ry}, {rx}) out of bounds for dataset shape ({Ry}, {Rx})")
+        
+        # Check polar data availability
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
+            print("Warning: polar_data not found. Skipping polar transform save.")
             show_polar = False
         
-        # Check if polar peaks exist
-        has_polar_peaks = hasattr(self, 'polar_peaks') and self.polar_peaks is not None
-        
-        # Use override if provided, otherwise create intensity map based on selected radial range
-        if intensity_map_override is not None:
-            intensity_map = intensity_map_override
-            
-            # Auto-detect upsample factor from dimensions
-            map_Ry, map_Rx = intensity_map.shape
-            upsample_factor_y = map_Ry // Ry
-            upsample_factor_x = map_Rx // Rx
-            
-            if upsample_factor_y != upsample_factor_x:
-                raise ValueError(f"Inconsistent upsample factors: Y={upsample_factor_y}, X={upsample_factor_x}")
-            
-            if map_Ry % Ry != 0 or map_Rx % Rx != 0:
-                raise ValueError(f"intensity_map_override shape {intensity_map.shape} is not an integer multiple "
-                               f"of dataset shape ({Ry}, {Rx})")
-            
-            upsample_factor = upsample_factor_y
-            print(f"Auto-detected upsample_factor: {upsample_factor}")
-            
-            # Determine map title for override case
-            if radial_range is not None:
-                map_title = f'Custom Intensity Map\n({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)'
-            else:
-                map_title = 'Custom Intensity Map'
-        else:
-            # Calculate at original resolution
-            intensity_map = np.zeros((Ry, Rx))
-            for i in range(Ry):
-                for j in range(Rx):
-                    intensity_map[i, j] = np.mean(self.dataset_cartesian[i, j].array)
-                    # peaks_r_invA = self.polar_peaks['r_invA'][i, j]
-                    # if peaks_r_invA is not None and len(peaks_r_invA) > 0:
-                    #     if radial_range is not None:
-                    #         mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
-                    #     else:
-                    #         mask = np.ones(len(peaks_r_invA), dtype=bool)
-                        
-                    #     intensities = self.peak_intensities['intensities_sampled_from_dp'][i, j]
-                    #     if intensities is not None and len(intensities) > 0:
-                    #         intensity_map[i, j] = np.sum(intensities[mask])
-            
+        # Create or validate intensity map
+        if intensity_map is None:
+            intensity_map = np.array([[np.mean(self.dataset_cartesian[i, j].array) 
+                                       for j in range(Rx)] for i in range(Ry)])
             upsample_factor = 1
+        else:
+            map_shape = intensity_map.shape[:2]
+            upsample_factor = map_shape[0] // Ry
+            if upsample_factor != map_shape[1] // Rx:
+                raise ValueError(f"Inconsistent upsample factors")
+            if map_shape[0] % Ry != 0 or map_shape[1] % Rx != 0:
+                raise ValueError(f"intensity_map shape {intensity_map.shape} not integer multiple of ({Ry}, {Rx})")
+        
+        # Compute intensity map display limits
+        is_rgb_map = intensity_map.ndim == 3 and intensity_map.shape[2] in (3, 4)
+        if is_rgb_map:
+            vmin_intensity_map, vmax_intensity_map = None, None
+        else:
+            finite = np.isfinite(intensity_map)
+            vmin_intensity_map, vmax_intensity_map = (0.0, 1.0) if not np.any(finite) else \
+                np.quantile(intensity_map[finite], [0.01, 0.99])
+        
+        vmax_polar = vmax_polar or vmax_cartesian
+        
+        # ---- Normalization function ----
+        def get_normalized_dp(ry_data, rx_data):
+            dp_data = self.dataset_cartesian[ry_data, rx_data].array.copy()
             
-            # Determine map title for calculated case
-            if radial_range is not None:
-                map_title = f'Peak Intensity Map\n({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)'
+            if norm_upper_quantile is not None:
+                dp_data = np.clip(dp_data, 0, np.quantile(dp_data, norm_upper_quantile))
+            
+            if norm_power != 1.0:
+                m = np.nanmax(dp_data)
+                if np.isfinite(m) and m > 0:
+                    dp_data = (dp_data / m) ** norm_power * m
+            
+            return dp_data
+        
+        # Create save directory
+        save_path = Path(save_dir)
+        try:
+            save_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"Error creating directory: {e}")
+            return
+        
+        # Calculate marker positions
+        marker_ry = ry * upsample_factor
+        marker_rx = rx * upsample_factor
+        
+        try:
+            # Save intensity map
+            fig_map, ax = plt.subplots(figsize=(6, 6))
+            if vmin_intensity_map is None:
+                im = ax.imshow(intensity_map, cmap=map_cmap)
             else:
-                map_title = 'Peak Intensity Map (All Peaks)'
-        
-        # Set vmax_polar default
-        if vmax_polar is None:
-            vmax_polar = vmax_cartesian
-        
-        # Calculate slider ranges based on upsampled map
-        slider_Ry = Ry * upsample_factor
-        slider_Rx = Rx * upsample_factor
-        
-        def show_pattern(ry_slider, rx_slider):
-            # Map slider position to original data indices
-            ry_data = ry_slider // upsample_factor
-            rx_data = rx_slider // upsample_factor
+                im = ax.imshow(intensity_map, cmap=map_cmap, 
+                              vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+            ax.plot(marker_rx, marker_ry, 'r+', markersize=15, markeredgewidth=2)
+            ax.set_title(map_title)
+            ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            if not is_rgb_map:
+                plt.colorbar(im, ax=ax)
+            filename = save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf'
+            fig_map.savefig(filename)
+            plt.close(fig_map)
+            print(f'✓ Saved: {filename}')
             
-            # Calculate marker position in upsampled coordinates
-            marker_ry = ry_slider
-            marker_rx = rx_slider
+            # Save diffraction pattern
+            fig_diff, ax = plt.subplots(figsize=(6, 6))
+            dp_data = get_normalized_dp(ry, rx)
+            im = ax.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+            ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            plt.colorbar(im, ax=ax)
+            filename = save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf'
+            fig_diff.savefig(filename)
+            plt.close(fig_diff)
+            print(f'✓ Saved: {filename}')
             
-            # Create figure
+            # Save polar transform
             if show_polar:
-                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
-            else:
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                fig_polar, ax = plt.subplots(figsize=(6, 6))
+                im = ax.imshow(self.polar_data['intensity'][ry, rx].T, 
+                              cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+                ax.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
+                ax.set_xlabel('Radius (bins)')
+                ax.set_ylabel('Theta (bins)')
+                plt.colorbar(im, ax=ax)
+                filename = save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf'
+                fig_polar.savefig(filename)
+                plt.close(fig_polar)
+                print(f'✓ Saved: {filename}')
             
-            # Plot intensity map (no normalization)
-            im1 = ax1.imshow(intensity_map, cmap='viridis')
+            # Save combined figure
+            if show_polar:
+                fig_combined, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
+            else:
+                fig_combined, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                ax3 = None
+            
+            # Plot intensity map
+            if vmin_intensity_map is None:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap)
+            else:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap, 
+                                vmin=vmin_intensity_map, vmax=vmax_intensity_map)
             ax1.plot(marker_rx, marker_ry, 'r+', markersize=15, markeredgewidth=2)
             ax1.set_title(map_title)
             ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-            plt.colorbar(im1, ax=ax1)
-
-            # Get diffraction pattern data
-            dp_data = self.dataset_cartesian[ry_data, rx_data].array
+            if not is_rgb_map:
+                plt.colorbar(im1, ax=ax1)
             
-            # Apply normalization
-            if norm_upper_quantile is not None:
-                vmax_norm = np.quantile(dp_data, norm_upper_quantile)
-                dp_data_normalized = np.clip(dp_data, 0, vmax_norm)
-            else:
-                dp_data_normalized = dp_data.copy()
-            
-            # Apply power law normalization
-            if norm_power != 1.0:
-                dp_data_normalized = np.power(dp_data_normalized / np.max(dp_data_normalized), norm_power) * np.max(dp_data_normalized)
-                
-            # Plot diffraction pattern (with vmax)
-            # im2 = ax2.imshow(self.dataset_cartesian[ry_data, rx_data].array, cmap='gray', vmax=vmax_cartesian)
-            im2 = ax2.imshow(dp_data_normalized, cmap='gray', vmax=vmax_cartesian)
-            ax2.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})')
+            # Plot diffraction pattern
+            im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+            ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
             ax2.set_xticks([])
             ax2.set_yticks([])
+            plt.colorbar(im2, ax=ax2)
             
-            # Overlay peaks on diffraction pattern
-            peaks_r_invA = self.polar_peaks['r_invA'][ry_data, rx_data]
-            peaks_y_pixels = self.peak_coordinates_cartesian['y_pixels'][ry_data, rx_data]
-            peaks_x_pixels = self.peak_coordinates_cartesian['x_pixels'][ry_data, rx_data]
-            peak_intensities = self.peak_intensities['intensities_sampled_from_dp'][ry_data, rx_data]
-            
-            if peaks_r_invA is not None and len(peaks_r_invA) > 0:
-                if radial_range is not None:
-                    mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
-                    
-                    if show_all_peaks and np.any(~mask):
-                        ax2.scatter(peaks_x_pixels[~mask], peaks_y_pixels[~mask], 
-                                   c=other_peak_color, s=30, alpha=0.5, marker='x',
-                                   linewidths=1.5, label='Other peaks')
-                    
-                    if np.any(mask):
-                        selected_x = peaks_x_pixels[mask]
-                        selected_y = peaks_y_pixels[mask]
-                        selected_intensities = peak_intensities[mask] if peak_intensities is not None else None
-                        
-                        if selected_intensities is not None and peak_intensity_mode is not None:
-                            int_min = peak_vmin if peak_vmin is not None else np.min(selected_intensities)
-                            int_max = peak_vmax if peak_vmax is not None else np.max(selected_intensities)
-                            
-                            if int_max > int_min:
-                                norm_intensities = (selected_intensities - int_min) / (int_max - int_min)
-                            else:
-                                norm_intensities = np.ones_like(selected_intensities)
-                            
-                            if peak_intensity_mode == 'color':
-                                colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                                sizes = np.full(len(selected_intensities), 100)
-                            elif peak_intensity_mode == 'size':
-                                colors = selected_peak_color
-                                sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                            elif peak_intensity_mode == 'both':
-                                colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                                sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                            else:
-                                colors = selected_peak_color
-                                sizes = np.full(len(selected_intensities), 100)
-                            
-                            ax2.scatter(selected_x, selected_y, c=colors, s=sizes, alpha=0.8, 
-                                       marker='x', linewidths=2, label=f'Selected ({np.sum(mask)} peaks)')
-                            
-                            if peak_intensity_mode in ['color', 'both']:
-                                sm = plt.cm.ScalarMappable(cmap=peak_cmap, 
-                                                           norm=plt.Normalize(vmin=int_min, vmax=int_max))
-                                sm.set_array([])
-                                cbar = plt.colorbar(sm, ax=ax2, pad=0.02, fraction=0.046)
-                                cbar.set_label('Peak Intensity', fontsize=8)
-                        else:
-                            ax2.scatter(selected_x, selected_y, c=selected_peak_color, s=100, 
-                                       alpha=0.8, marker='x', linewidths=2, 
-                                       label=f'Selected ({np.sum(mask)} peaks)')
-                else:
-                    if peak_intensities is not None and peak_intensity_mode is not None:
-                        int_min = peak_vmin if peak_vmin is not None else np.min(peak_intensities)
-                        int_max = peak_vmax if peak_vmax is not None else np.max(peak_intensities)
-                        
-                        if int_max > int_min:
-                            norm_intensities = (peak_intensities - int_min) / (int_max - int_min)
-                        else:
-                            norm_intensities = np.ones_like(peak_intensities)
-                        
-                        if peak_intensity_mode == 'color':
-                            colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                            sizes = np.full(len(peak_intensities), 100)
-                        elif peak_intensity_mode == 'size':
-                            colors = selected_peak_color
-                            sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                        elif peak_intensity_mode == 'both':
-                            colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                            sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                        else:
-                            colors = selected_peak_color
-                            sizes = np.full(len(peak_intensities), 100)
-                        
-                        ax2.scatter(peaks_x_pixels, peaks_y_pixels, c=colors, s=sizes, 
-                                   alpha=0.8, marker='x', linewidths=2, 
-                                   label=f'All peaks ({len(peaks_r_invA)})')
-                        
-                        if peak_intensity_mode in ['color', 'both']:
-                            sm = plt.cm.ScalarMappable(cmap=peak_cmap, 
-                                                       norm=plt.Normalize(vmin=int_min, vmax=int_max))
-                            sm.set_array([])
-                            cbar = plt.colorbar(sm, ax=ax2, pad=0.02, fraction=0.046)
-                            cbar.set_label('Peak Intensity', fontsize=8)
-                    else:
-                        ax2.scatter(peaks_x_pixels, peaks_y_pixels, c=selected_peak_color, 
-                                   s=100, alpha=0.8, marker='x', linewidths=2, 
-                                   label=f'All peaks ({len(peaks_r_invA)})')
-            
-            if show_center and hasattr(self, 'image_centers') and self.image_centers is not None:
-                ax2.scatter(self.image_centers[1, ry_data, rx_data], 
-                           self.image_centers[0, ry_data, rx_data],
-                           c=center_color, s=500, marker='x', linewidths=2, 
-                           label='Center', zorder=10)
-            
-            handles, labels = ax2.get_legend_handles_labels()
-            if labels:
-                ax2.legend(fontsize=8, loc='upper right')
-            
-            if radial_range is not None:
-                ax2.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})\nRange: {radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å')
-            
-            # Plot polar transform if requested
+            # Plot polar transform
             if show_polar:
-                im3 = ax3.imshow(self.polar_data['intensity'][ry_data, rx_data].T, cmap='gray', vmax=vmax_polar, aspect='auto')
-                ax3.set_title(f'Polar Transform (Ry={ry_data}, Rx={rx_data})')
+                im3 = ax3.imshow(self.polar_data['intensity'][ry, rx].T, 
+                                cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+                ax3.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
                 ax3.set_xlabel('Radius (bins)')
                 ax3.set_ylabel('Theta (bins)')
                 plt.colorbar(im3, ax=ax3)
+            
+            plt.tight_layout()
+            filename = save_path / f'{prefix}_ry{ry}_rx{rx}_combined.pdf'
+            fig_combined.savefig(filename)
+            plt.close(fig_combined)
+            print(f'✓ Saved: {filename}')
+            
+            print(f'\nAll figures saved successfully to: {save_path}')
+            
+        except Exception as e:
+            print(f"Error saving figures: {e}")
+            
+    def plot_interactive_peak_map(self, radial_range=None, intensity_map_override=None,
+                                    vmax_cartesian=7, show_all_peaks=True,
+                                    selected_peak_color='red', other_peak_color='gray',
+                                    central_beam_color='red',
+                                    norm_upper_quantile=None, norm_power=1.0,
+                                    peak_intensity_mode='size', peak_size_range=(30, 300),
+                                    peak_cmap='hot', peak_vmin=None, peak_vmax=None,
+                                    show_polar=True, vmax_polar=None, two_fold_symmetry=True,
+                                    map_cmap="viridis", dp_cmap="gray"):
+        """
+        Interactive plot for browsing diffraction patterns with peak overlay.
+        Central beam (closest to image center) plotted in blue.
+        """
+        
+        Ry, Rx = self.peak_coordinates_cartesian.shape
+        
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
+            print("Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first.")
+            show_polar = False
+        
+        # Setup intensity map
+        if intensity_map_override is not None:
+            intensity_map = intensity_map_override
+            upsample_factor = intensity_map.shape[0] // Ry
+            map_title = f'Custom Map ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else 'Custom Map'
+        else:
+            intensity_map = np.array([[np.mean(self.dataset_cartesian[i, j].array) 
+                                       for j in range(Rx)] for i in range(Ry)])
+            upsample_factor = 1
+            map_title = f'Peak Map ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else 'Peak Map'
+        
+        is_rgb_map = intensity_map.ndim == 3 and intensity_map.shape[2] in (3, 4)
+        if is_rgb_map:
+            vmin_intensity_map, vmax_intensity_map = None, None
+        else:
+            finite = np.isfinite(intensity_map)
+            vmin_intensity_map, vmax_intensity_map = (0.0, 1.0) if not np.any(finite) else \
+                np.quantile(intensity_map[finite], [0.01, 0.99])
+        
+        vmax_polar = vmax_polar or vmax_cartesian
+        
+        # Normalization function
+        def get_normalized_dp(ry_data, rx_data):
+            dp_data = self.dataset_cartesian[ry_data, rx_data].array.copy()
+            if norm_upper_quantile is not None:
+                dp_data = np.clip(dp_data, 0, np.quantile(dp_data, norm_upper_quantile))
+            if norm_power != 1.0:
+                m = np.nanmax(dp_data)
+                if np.isfinite(m) and m > 0:
+                    dp_data = (dp_data / m) ** norm_power * m
+            return dp_data
+        
+        # Peak plotting function
+        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, ry_data, rx_data, is_polar=False):
+            if peaks_r_invA is None or len(peaks_r_invA) == 0:
+                return
+            
+            # Find central beam index before filtering
+            if is_polar:
+                central_idx = np.argmin(peaks_r_invA)
+            else:
+                center_y = self.image_centers[0, ry_data, rx_data]
+                center_x = self.image_centers[1, ry_data, rx_data]
+                distances = np.sqrt((peaks_x - center_x)**2 + (peaks_y - center_y)**2)
+                central_idx = np.argmin(distances)
+            
+            # Apply radial range filter
+            if radial_range is not None:
+                mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
                 
-                ## Overlay polar peaks if available
-                if has_polar_peaks:
-                    polar_r_invA = self.polar_peaks['r_invA'][ry_data, rx_data]
-                    polar_theta = self.polar_peaks['theta'][ry_data, rx_data]
-                    polar_peak_intensities = self.peak_intensities['intensities_sampled_from_dp'][ry_data, rx_data]
+                # Plot out-of-range peaks
+                if show_all_peaks and np.any(~mask):
+                    out_indices = np.where(~mask)[0]
+                    is_central_out = central_idx in out_indices
                     
-                    if polar_r_invA is not None and len(polar_r_invA) > 0:
-                        # Convert polar coordinates to bin indices for plotting
-                        # r_invA -> radius bins
-                        r_bin_coords = polar_r_invA / self.max_radius_invA * self.num_radial_bins
-                        # theta -> angular bins
-                        theta_bin_coords = polar_theta / ((2-two_fold_symmetry) * np.pi) * self.num_annular_bins
-                        
-                        if radial_range is not None:
-                            mask = (polar_r_invA >= radial_range[0]) & (polar_r_invA < radial_range[1])
-                            
-                            if show_all_peaks and np.any(~mask):
-                                ax3.scatter(r_bin_coords[~mask], theta_bin_coords[~mask],
-                                           c=other_peak_color, s=30, alpha=0.5, marker='x',
-                                           linewidths=1.5)
-                            
-                            if np.any(mask):
-                                selected_r = r_bin_coords[mask]
-                                selected_theta = theta_bin_coords[mask]
-                                selected_intensities = polar_peak_intensities[mask] if polar_peak_intensities is not None else None
-                                
-                                if selected_intensities is not None and peak_intensity_mode is not None:
-                                    int_min = peak_vmin if peak_vmin is not None else np.min(selected_intensities)
-                                    int_max = peak_vmax if peak_vmax is not None else np.max(selected_intensities)
-                                    
-                                    if int_max > int_min:
-                                        norm_intensities = (selected_intensities - int_min) / (int_max - int_min)
-                                    else:
-                                        norm_intensities = np.ones_like(selected_intensities)
-                                    
-                                    if peak_intensity_mode == 'color':
-                                        colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                                        sizes = np.full(len(selected_intensities), 100)
-                                    elif peak_intensity_mode == 'size':
-                                        colors = selected_peak_color
-                                        sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                                    elif peak_intensity_mode == 'both':
-                                        colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                                        sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                                    else:
-                                        colors = selected_peak_color
-                                        sizes = np.full(len(selected_intensities), 100)
-                                    
-                                    ax3.scatter(selected_r, selected_theta, c=colors, s=sizes, alpha=0.8,
-                                               marker='x', linewidths=2)
-                                else:
-                                    ax3.scatter(selected_r, selected_theta, c=selected_peak_color, s=100,
-                                               alpha=0.8, marker='x', linewidths=2)
-                        else:
-                            if polar_peak_intensities is not None and peak_intensity_mode is not None:
-                                int_min = peak_vmin if peak_vmin is not None else np.min(polar_peak_intensities)
-                                int_max = peak_vmax if peak_vmax is not None else np.max(polar_peak_intensities)
-                                
-                                if int_max > int_min:
-                                    norm_intensities = (polar_peak_intensities - int_min) / (int_max - int_min)
-                                else:
-                                    norm_intensities = np.ones_like(polar_peak_intensities)
-                                
-                                if peak_intensity_mode == 'color':
-                                    colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                                    sizes = np.full(len(polar_peak_intensities), 100)
-                                elif peak_intensity_mode == 'size':
-                                    colors = selected_peak_color
-                                    sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                                elif peak_intensity_mode == 'both':
-                                    colors = plt.cm.get_cmap(peak_cmap)(norm_intensities)
-                                    sizes = peak_size_range[0] + norm_intensities * (peak_size_range[1] - peak_size_range[0])
-                                else:
-                                    colors = selected_peak_color
-                                    sizes = np.full(len(polar_peak_intensities), 100)
-                                
-                                ax3.scatter(r_bin_coords, theta_bin_coords, c=colors, s=sizes,
-                                           alpha=0.8, marker='x', linewidths=2)
-                            else:
-                                ax3.scatter(r_bin_coords, theta_bin_coords, c=selected_peak_color,
-                                           s=100, alpha=0.8, marker='x', linewidths=2)
+                    # Plot central beam if out of range
+                    if is_central_out:
+                        ax.scatter(peaks_x[central_idx], peaks_y[central_idx], 
+                                  edgecolors='k', facecolors=central_beam_color, s=30, alpha=0.95, marker='o', linewidths=2, zorder=10)
+                    
+                    # Plot other out-of-range peaks
+                    other_out_mask = out_indices != central_idx
+                    if np.any(other_out_mask):
+                        ax.scatter(peaks_x[out_indices[other_out_mask]], peaks_y[out_indices[other_out_mask]], 
+                                  c=other_peak_color, s=30, alpha=0.5, marker='x', linewidths=1.5)
+                
+                if not np.any(mask):
+                    return
+                
+                # Update central index for filtered array
+                in_range_indices = np.where(mask)[0]
+                if central_idx in in_range_indices:
+                    central_idx = np.where(in_range_indices == central_idx)[0][0]
+                else:
+                    central_idx = None
+                
+                peaks_x, peaks_y = peaks_x[mask], peaks_y[mask]
+                peak_intensities = peak_intensities[mask] if peak_intensities is not None else None
+            
+            # Plot central beam if in range
+            if central_idx is not None:
+                ax.scatter(peaks_x[central_idx], peaks_y[central_idx], 
+                          edgecolors='k', facecolors=central_beam_color, s=30, alpha=0.95, marker='o', linewidths=2, zorder=10)
+                non_central = np.ones(len(peaks_x), dtype=bool)
+                non_central[central_idx] = False
+            else:
+                non_central = np.ones(len(peaks_x), dtype=bool)
+            
+            if not np.any(non_central):
+                return
+            
+            # Plot non-central peaks with intensity encoding
+            if peak_intensities is not None and peak_intensity_mode is not None:
+                int_subset = peak_intensities[non_central]
+                int_min = peak_vmin if peak_vmin is not None else np.min(int_subset)
+                int_max = peak_vmax if peak_vmax is not None else np.max(int_subset)
+                norm_int = (int_subset - int_min) / (int_max - int_min) if int_max > int_min else np.ones_like(int_subset)
+                
+                if peak_intensity_mode == 'color':
+                    colors, sizes = plt.cm.get_cmap(peak_cmap)(norm_int), 100
+                elif peak_intensity_mode == 'size':
+                    colors, sizes = selected_peak_color, peak_size_range[0] + norm_int * (peak_size_range[1] - peak_size_range[0])
+                elif peak_intensity_mode == 'both':
+                    colors = plt.cm.get_cmap(peak_cmap)(norm_int)
+                    sizes = peak_size_range[0] + norm_int * (peak_size_range[1] - peak_size_range[0])
+                else:
+                    colors, sizes = selected_peak_color, 100
+                
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes, 
+                          alpha=0.8, marker='x', linewidths=2, zorder=5)
+                
+                if peak_intensity_mode in ['color', 'both']:
+                    sm = plt.cm.ScalarMappable(cmap=peak_cmap, norm=plt.Normalize(vmin=int_min, vmax=int_max))
+                    sm.set_array([])
+                    plt.colorbar(sm, ax=ax, pad=0.02, fraction=0.046).set_label('Peak Intensity', fontsize=8)
+            else:
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=selected_peak_color, 
+                          s=100, alpha=0.8, marker='x', linewidths=2, zorder=5)
+        
+        # Interactive callback
+        def show_pattern(ry_slider, rx_slider):
+            ry_data = ry_slider // upsample_factor
+            rx_data = rx_slider // upsample_factor
+            
+            fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=(15, 4) if show_polar else (12, 5))
+            ax1, ax2 = axes[0], axes[1]
+            ax3 = axes[2] if show_polar else None
+            
+            # Intensity map
+            if vmin_intensity_map is None:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap)
+            else:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+            ax1.plot(rx_slider, ry_slider, 'r+', markersize=15, markeredgewidth=2)
+            ax1.set_title(map_title)
+            ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            if not is_rgb_map:
+                plt.colorbar(im1, ax=ax1)
+            
+            # Diffraction pattern
+            dp_data = get_normalized_dp(ry_data, rx_data)
+            im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian)
+            ax2.set_xticks([])
+            ax2.set_yticks([])
+            plt.colorbar(im2, ax=ax2)
+            
+            peaks_r_invA = self.polar_peaks['r_invA'][ry_data, rx_data]
+            peaks_y = self.peak_coordinates_cartesian['y_pixels'][ry_data, rx_data]
+            peaks_x = self.peak_coordinates_cartesian['x_pixels'][ry_data, rx_data]
+            peak_ints = self.peak_intensities['intensities_sampled_from_dp'][ry_data, rx_data]
+            
+            plot_peaks_on_ax(ax2, peaks_x, peaks_y, peaks_r_invA, peak_ints, ry_data, rx_data, is_polar=False)
+            
+            title = f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})'
+            if radial_range:
+                title += f'\n{radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å'
+            ax2.set_title(title)
+            
+            # Polar transform
+            if show_polar:
+                im3 = ax3.imshow(self.polar_data['intensity'][ry_data, rx_data].T, 
+                                cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+                ax3.set_xlabel('Radius (bins)')
+                ax3.set_ylabel('Theta (bins)')
+                ax3.set_title(f'Polar (Ry={ry_data}, Rx={rx_data})')
+                plt.colorbar(im3, ax=ax3)
+                
+                if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
+                    polar_r = self.polar_peaks['r_invA'][ry_data, rx_data]
+                    polar_theta = self.polar_peaks['theta'][ry_data, rx_data]
+                    if polar_r is not None and len(polar_r) > 0:
+                        r_bins = polar_r / self.max_radius_invA * self.num_radial_bins
+                        theta_bins = polar_theta / ((2 - two_fold_symmetry) * np.pi) * self.num_annular_bins
+                        plot_peaks_on_ax(ax3, r_bins, theta_bins, polar_r, peak_ints, ry_data, rx_data, is_polar=True)
             
             plt.tight_layout()
             plt.show()
         
-        interact(show_pattern,
-                 ry_slider=IntSlider(min=0, max=slider_Ry-1, step=1, value=slider_Ry//2, 
-                             description='Ry:', continuous_update=False),
-                 rx_slider=IntSlider(min=0, max=slider_Rx-1, step=1, value=slider_Rx//2, 
-                             description='Rx:', continuous_update=False))
-
+        # Widgets
+        ry_slider = IntSlider(min=0, max=Ry*upsample_factor-1, value=Ry*upsample_factor//2, description='Ry:', continuous_update=False)
+        rx_slider = IntSlider(min=0, max=Rx*upsample_factor-1, value=Rx*upsample_factor//2, description='Rx:', continuous_update=False)
+        interactive_plot = interactive_output(show_pattern, {'ry_slider': ry_slider, 'rx_slider': rx_slider})
+        display(VBox([HBox([ry_slider, rx_slider]), interactive_plot]))
+        
+    def save_peak_figures(self, ry, rx, intensity_map_override=None,
+                         map_title="", prefix='peaks', save_dir='.',
+                         vmax_cartesian=7,
+                         selected_peak_color='red',
+                         central_beam_color='red',
+                         norm_upper_quantile=None, norm_power=1.0,
+                         peak_intensity_mode='size', peak_size_range=(30, 300),
+                         peak_cmap='hot', peak_vmin=None, peak_vmax=None,
+                         show_polar=True, vmax_polar=None, two_fold_symmetry=True,
+                         map_cmap="viridis", dp_cmap="gray"):
+        """
+        Save peak-annotated diffraction figures for a specific scan position.
+        Central beam (closest to image center) plotted in blue.
+        """
+        
+        Ry, Rx = self.peak_coordinates_cartesian.shape
+        
+        if not (0 <= ry < Ry and 0 <= rx < Rx):
+            raise ValueError(f"Coordinates ({ry}, {rx}) out of bounds")
+        
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
+            print("Warning: polar_data not found. Skipping polar save.")
+            show_polar = False
+        
+        # Setup intensity map
+        if intensity_map_override is not None:
+            intensity_map = intensity_map_override
+            upsample_factor = intensity_map.shape[0] // Ry
+        else:
+            intensity_map = np.array([[np.mean(self.dataset_cartesian[i, j].array) 
+                                       for j in range(Rx)] for i in range(Ry)])
+            upsample_factor = 1
+        
+        is_rgb_map = intensity_map.ndim == 3 and intensity_map.shape[2] in (3, 4)
+        if is_rgb_map:
+            vmin_intensity_map, vmax_intensity_map = None, None
+        else:
+            finite = np.isfinite(intensity_map)
+            vmin_intensity_map, vmax_intensity_map = (0.0, 1.0) if not np.any(finite) else \
+                np.quantile(intensity_map[finite], [0.01, 0.99])
+        
+        vmax_polar = vmax_polar or vmax_cartesian
+        
+        # Normalization function
+        def get_normalized_dp(ry_data, rx_data):
+            dp_data = self.dataset_cartesian[ry_data, rx_data].array.copy()
+            if norm_upper_quantile is not None:
+                dp_data = np.clip(dp_data, 0, np.quantile(dp_data, norm_upper_quantile))
+            if norm_power != 1.0:
+                m = np.nanmax(dp_data)
+                if np.isfinite(m) and m > 0:
+                    dp_data = (dp_data / m) ** norm_power * m
+            return dp_data
+        
+        # Peak plotting function
+        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, is_polar=False):
+            if peaks_r_invA is None or len(peaks_r_invA) == 0:
+                return
+            
+            # Find central beam index
+            if is_polar:
+                central_idx = np.argmin(peaks_r_invA)
+            else:
+                center_y = self.image_centers[0, ry, rx]
+                center_x = self.image_centers[1, ry, rx]
+                distances = np.sqrt((peaks_x - center_x)**2 + (peaks_y - center_y)**2)
+                central_idx = np.argmin(distances)
+            
+            # Plot central beam
+            ax.scatter(peaks_x[central_idx], peaks_y[central_idx], 
+                      edgecolors='k', facecolors=central_beam_color, s=30, alpha=0.95, marker='o', linewidths=2, zorder=10)
+            
+            # Create non-central mask
+            non_central = np.ones(len(peaks_x), dtype=bool)
+            non_central[central_idx] = False
+            
+            if not np.any(non_central):
+                return
+            
+            # Plot non-central peaks with intensity encoding
+            if peak_intensities is not None and peak_intensity_mode is not None:
+                int_subset = peak_intensities[non_central]
+                int_min = peak_vmin if peak_vmin is not None else np.min(int_subset)
+                int_max = peak_vmax if peak_vmax is not None else np.max(int_subset)
+                norm_int = (int_subset - int_min) / (int_max - int_min) if int_max > int_min else np.ones_like(int_subset)
+                
+                if peak_intensity_mode == 'color':
+                    colors, sizes = plt.cm.get_cmap(peak_cmap)(norm_int), 100
+                elif peak_intensity_mode == 'size':
+                    colors, sizes = selected_peak_color, peak_size_range[0] + norm_int * (peak_size_range[1] - peak_size_range[0])
+                elif peak_intensity_mode == 'both':
+                    colors = plt.cm.get_cmap(peak_cmap)(norm_int)
+                    sizes = peak_size_range[0] + norm_int * (peak_size_range[1] - peak_size_range[0])
+                else:
+                    colors, sizes = selected_peak_color, 100
+                
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes, 
+                          alpha=0.8, marker='x', linewidths=2, zorder=5)
+                
+                if peak_intensity_mode in ['color', 'both']:
+                    sm = plt.cm.ScalarMappable(cmap=peak_cmap, norm=plt.Normalize(vmin=int_min, vmax=int_max))
+                    sm.set_array([])
+                    plt.colorbar(sm, ax=ax, pad=0.02, fraction=0.046).set_label('Peak Intensity', fontsize=8)
+            else:
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=selected_peak_color, 
+                          s=100, alpha=0.8, marker='x', linewidths=2, zorder=5)
+        
+        # Create save directory
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Get peaks data once
+        peaks_r_invA = self.polar_peaks['r_invA'][ry, rx]
+        peaks_y = self.peak_coordinates_cartesian['y_pixels'][ry, rx]
+        peaks_x = self.peak_coordinates_cartesian['x_pixels'][ry, rx]
+        peak_ints = self.peak_intensities['intensities_sampled_from_dp'][ry, rx]
+        dp_data = get_normalized_dp(ry, rx)
+        
+        # Save intensity map
+        fig_map, ax = plt.subplots(figsize=(6, 6))
+        if vmin_intensity_map is None:
+            im = ax.imshow(intensity_map, cmap=map_cmap)
+        else:
+            im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+        ax.plot(rx * upsample_factor, ry * upsample_factor, 'r+', markersize=15, markeredgewidth=2)
+        ax.set_title(map_title)
+        ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+        ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+        if not is_rgb_map:
+            plt.colorbar(im, ax=ax)
+        fig_map.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf')
+        plt.close(fig_map)
+        print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_intensity_map.pdf')
+        
+        # Save diffraction pattern with peaks
+        fig_diff, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.colorbar(im, ax=ax)
+        plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, is_polar=False)
+        ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+        fig_diff.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf')
+        plt.close(fig_diff)
+        print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_diffraction.pdf')
+        
+        # Save polar transform with peaks
+        if show_polar:
+            fig_polar, ax = plt.subplots(figsize=(6, 6))
+            im = ax.imshow(self.polar_data['intensity'][ry, rx].T, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+            ax.set_title(f'Polar (Ry={ry}, Rx={rx})')
+            ax.set_xlabel('Radius (bins)')
+            ax.set_ylabel('Theta (bins)')
+            plt.colorbar(im, ax=ax)
+            
+            if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
+                polar_r = self.polar_peaks['r_invA'][ry, rx]
+                polar_theta = self.polar_peaks['theta'][ry, rx]
+                if polar_r is not None and len(polar_r) > 0:
+                    r_bins = polar_r / self.max_radius_invA * self.num_radial_bins
+                    theta_bins = polar_theta / ((2 - two_fold_symmetry) * np.pi) * self.num_annular_bins
+                    plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, peak_ints, is_polar=True)
+            
+            fig_polar.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf')
+            plt.close(fig_polar)
+            print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_polar.pdf')
+        
+        # Save combined figure
+        fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=(15, 4) if show_polar else (12, 5))
+        ax1, ax2 = axes[0], axes[1]
+        ax3 = axes[2] if show_polar else None
+        
+        # Intensity map
+        if vmin_intensity_map is None:
+            im1 = ax1.imshow(intensity_map, cmap=map_cmap)
+        else:
+            im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+        ax1.plot(rx * upsample_factor, ry * upsample_factor, 'r+', markersize=15, markeredgewidth=2)
+        ax1.set_title(map_title)
+        ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+        ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+        if not is_rgb_map:
+            plt.colorbar(im1, ax=ax1)
+        
+        # Diffraction pattern
+        im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian)
+        ax2.set_xticks([])
+        ax2.set_yticks([])
+        plt.colorbar(im2, ax=ax2)
+        plot_peaks_on_ax(ax2, peaks_x, peaks_y, peaks_r_invA, peak_ints, is_polar=False)
+        ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+        
+        # Polar transform
+        if show_polar:
+            im3 = ax3.imshow(self.polar_data['intensity'][ry, rx].T, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+            ax3.set_xlabel('Radius (bins)')
+            ax3.set_ylabel('Theta (bins)')
+            ax3.set_title(f'Polar (Ry={ry}, Rx={rx})')
+            plt.colorbar(im3, ax=ax3)
+            
+            if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
+                polar_r = self.polar_peaks['r_invA'][ry, rx]
+                polar_theta = self.polar_peaks['theta'][ry, rx]
+                if polar_r is not None and len(polar_r) > 0:
+                    r_bins = polar_r / self.max_radius_invA * self.num_radial_bins
+                    theta_bins = polar_theta / ((2 - two_fold_symmetry) * np.pi) * self.num_annular_bins
+                    plot_peaks_on_ax(ax3, r_bins, theta_bins, polar_r, peak_ints, is_polar=True)
+        
+        plt.tight_layout()
+        fig.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_combined.pdf')
+        plt.close(fig)
+        print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_combined.pdf')
+        
+        print(f'\nAll figures saved to: {save_path}')
+    
     def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,
                                          reference_image=None, overlay_alpha=0.3):
         """
@@ -2792,7 +3089,8 @@ class BraggPeaksPolymer(AutoSerialize):
                         )
                         theta_crop = theta[inds_theta]
                         t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop)
-                        v = np.array((np.sin(t), np.cos(t))) * step_size
+                        # v = np.array((np.cos(t), np.sin(t))) * step_size
+                        # v = np.array((np.sin(t), np.cos(t))) * step_size
                         # v = np.array((-np.sin(t), np.cos(t))) * step_size
     
                         xy_t_int[count, 0:2] = xy
@@ -2862,6 +3160,7 @@ class BraggPeaksPolymer(AutoSerialize):
                         )
                         theta_crop = theta[inds_theta]
                         t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop) + np.pi
+                        v = np.array((np.sin(t), np.cos(t))) * step_size
                         v = np.array((np.sin(t), np.cos(t))) * step_size
                         # v = np.array((-np.sin(t), np.cos(t))) * step_size
     

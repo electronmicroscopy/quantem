@@ -201,7 +201,8 @@ def polar_transform_vector(
             dx = x_coords - center_x
             dy = y_coords - center_y
             r_pixels = np.sqrt(dx**2 + dy**2)
-            theta = np.arctan2(dy, dx)
+            theta = np.arctan2(dx, dy)
+            # theta = np.arctan2(dy, dx)
             
             # Normalize theta and apply two-fold symmetry if requested
             if two_fold_symmetry:
