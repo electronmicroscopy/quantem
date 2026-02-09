@@ -154,91 +154,7 @@ class DPAugmentor(RNGMixin):
         self._setup_device(device)
         self.log_file = log_file
 
-        self.set_params(
-            add_bkg,
-            bkg_weight,
-            bkg_q,
-            apply_background_to_label,
-            add_shot,
-            e_dose,
-            add_shift,
-            xshift,
-            yshift,
-            add_ellipticity,
-            ellipticity_scale,
-            add_ellipticity_to_label,
-            add_salt_and_pepper,
-            salt_and_pepper,
-            add_gaussian_noise,
-            gaussian_noise_mu,
-            gaussian_noise_std,
-            add_scale,
-            scale_factor,
-            add_blur,
-            blur_sigma,
-            add_flipshift,
-            free_rotation,
-            rotation_range,
-            add_aperture,
-            radius_factor,
-            aperture_shift,
-        )
-        self.generate_params()
-        self._init_log_file()
-
-    def _setup_device(self, device: str) -> None:
-        if device == "gpu" or device.startswith("cuda"):
-            if not config.get("has_torch"):
-                raise RuntimeError("torch required for GPU operations but not available")
-            self.device = device if device.startswith("cuda") else "cuda"
-            self.use_torch = True
-        else:
-            self.device = "cpu"
-            self.use_torch = False
-
-        if hasattr(self, "_rng_seed") and self._rng_seed is not None:
-            self._rng_to_device(self.device)
-
-    def _init_log_file(self) -> None:
-        if self.log_file is not None:
-            with open(self.log_file, "a") as f:
-                f.write(
-                    "bkg_weight,bkg_q,apply_background_to_label,e_dose,xshift,yshift,exx,eyy,exy,"
-                    "gaussian_noise_mu,gaussian_noise_std,scale_factor,flip_horizontal,flip_vertical,"
-                    "rotation_angle,blur_sigma,salt_and_pepper,rng_seed\n"
-                )
-
-
-    def set_params(
-        self,
-        add_bkg: bool = False,
-        bkg_weight: list[float] | float = [0.01, 0.1],
-        bkg_q: list[float] | float = [0.01, 0.1],
-        apply_background_to_label: list[bool] | None = None,
-        add_shot: bool = False,
-        e_dose: list[float] | float = [1e5, 1e10],
-        add_shift: bool = False,
-        xshift: list[float] | float = [0, 10],
-        yshift: list[float] | float = [0, 10],
-        add_ellipticity: bool = False,
-        ellipticity_scale: list[float] | float = [0, 0.15],
-        add_ellipticity_to_label: bool = True,
-        add_salt_and_pepper: bool = False,
-        salt_and_pepper: list[float] | float = [0, 1e-3],
-        add_gaussian_noise: bool = False,
-        gaussian_noise_mu: list[float] | float = 0.0,
-        gaussian_noise_std: list[float] | float = 1e-5,
-        add_scale: bool = False,
-        scale_factor: list[float] | float = [0.9, 1.1],
-        add_blur: bool = False,
-        blur_sigma: list[float] | float = [0.0, 1.5],
-        add_flipshift: bool = False,
-        free_rotation: bool = False,
-        rotation_range: list[float] | float = [-180, 180],
-        add_aperture: bool = False,
-        radius_factor: list[float] | float = [0.8, 1],
-        aperture_shift: list[float] | float = [0, 10],
-    ) -> None:
+        # Setting parameters
         self.add_bkg = add_bkg
         self.add_shot = add_shot
         self.add_shift = add_shift
@@ -273,6 +189,32 @@ class DPAugmentor(RNGMixin):
 
         self._radius_range = self._check_input(radius_factor) if add_aperture else [0, 0]
         self._aptshift_range = self._check_input(aperture_shift) if add_aperture else [0, 0]
+
+        # Generate parameters from set parameters
+        self.generate_params()
+        self._init_log_file()
+
+    def _setup_device(self, device: str) -> None:
+        if device == "gpu" or device.startswith("cuda"):
+            if not config.get("has_torch"):
+                raise RuntimeError("torch required for GPU operations but not available")
+            self.device = device if device.startswith("cuda") else "cuda"
+            self.use_torch = True
+        else:
+            self.device = "cpu"
+            self.use_torch = False
+
+        if hasattr(self, "_rng_seed") and self._rng_seed is not None:
+            self._rng_to_device(self.device)
+
+    def _init_log_file(self) -> None:
+        if self.log_file is not None:
+            with open(self.log_file, "a") as f:
+                f.write(
+                    "bkg_weight,bkg_q,apply_background_to_label,e_dose,xshift,yshift,exx,eyy,exy,"
+                    "gaussian_noise_mu,gaussian_noise_std,scale_factor,flip_horizontal,flip_vertical,"
+                    "rotation_angle,blur_sigma,salt_and_pepper,rng_seed\n"
+                )
 
     def generate_params(self) -> None:
         self.bkg_weight = self._uniform_or_zero(self._bkg_weight_range, self.add_bkg)
