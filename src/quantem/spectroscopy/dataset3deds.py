@@ -216,6 +216,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         lr_global=None,
         lr_local=None,
         device=None,
+        constrain_background=True,
     ):
         """Fit EDS spectra with one entrypoint for mean-only or full-cube fitting.
 
@@ -272,6 +273,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         device : str | torch.device | None, optional
             Compute device to run fitting on. If None, uses CUDA when available,
             otherwise CPU.
+        constrain_background : bool, optional
+            If True (3D mode), regularize local backgrounds using the global fit as
+            a prior and soft physical constraints with built-in weights.
 
         Returns
         -------
@@ -525,7 +529,8 @@ class Dataset3deds(Dataset3dspectroscopy):
         )
 
         conc_logits = nn.Parameter(inverse_softplus(conc_init))
-        bg_coeffs = nn.Parameter(global_bg_coeffs.unsqueeze(0).repeat(n_pixels, 1) * pixel_scales)
+        bg_coeffs_init = global_bg_coeffs.unsqueeze(0).repeat(n_pixels, 1) * pixel_scales
+        bg_coeffs = nn.Parameter(bg_coeffs_init.clone())
 
         if freeze_peak_width:
             peak_width_params = global_peak_width_params
@@ -586,7 +591,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             # Keep local background parameterization consistent with global initialization.
             bg_pred = bg_raw
             predicted = torch.clamp(peaks_pred + bg_pred, min=1e-8, max=1e8)
-            return predicted, conc
+            return predicted, conc, bg_pred
 
         def _prepare_local_loss_inputs(pred_local):
             pred_eval = pred_local[valid_pixel_mask]
@@ -596,7 +601,44 @@ class Dataset3deds(Dataset3dspectroscopy):
             target_eval = target_eval / local_scale
             return pred_eval, target_eval
 
-        def _local_loss(pred_local, conc_local):
+        def _background_regularization(bg_local):
+            if not constrain_background:
+                return bg_local.new_tensor(0.0)
+
+            prior_lambda = 0.1
+            nonneg_lambda = 0.5
+            monotonic_lambda = 0.05
+            smoothness_lambda = 0.01
+
+            reg_loss = bg_local.new_tensor(0.0)
+            local_scale = torch.clamp(global_scale, min=1e-8)
+
+            if prior_lambda > 0:
+                coeff_init_eval = bg_coeffs_init[valid_pixel_mask]
+                coeff_eval = bg_coeffs[valid_pixel_mask]
+                coeff_scale = torch.clamp(coeff_init_eval.abs().mean(), min=1e-8)
+                reg_prior = ((coeff_eval - coeff_init_eval) / coeff_scale).pow(2).mean()
+                reg_loss = reg_loss + prior_lambda * reg_prior
+
+            bg_eval = bg_local[valid_pixel_mask] / local_scale
+
+            if nonneg_lambda > 0:
+                reg_nonneg = torch.relu(-bg_eval).pow(2).mean()
+                reg_loss = reg_loss + nonneg_lambda * reg_nonneg
+
+            if monotonic_lambda > 0 and bg_eval.shape[1] > 1:
+                slope = bg_eval[:, 1:] - bg_eval[:, :-1]
+                reg_monotonic = torch.relu(slope).pow(2).mean()
+                reg_loss = reg_loss + monotonic_lambda * reg_monotonic
+
+            if smoothness_lambda > 0 and bg_eval.shape[1] > 2:
+                curvature = bg_eval[:, 2:] - 2.0 * bg_eval[:, 1:-1] + bg_eval[:, :-2]
+                reg_smooth = curvature.pow(2).mean()
+                reg_loss = reg_loss + smoothness_lambda * reg_smooth
+
+            return reg_loss
+
+        def _local_loss(pred_local, conc_local, bg_local):
             pred_eval, target_eval = _prepare_local_loss_inputs(pred_local)
 
             loss_data = eds_data_loss(
@@ -604,13 +646,15 @@ class Dataset3deds(Dataset3dspectroscopy):
                 target_eval,
                 loss=effective_loss_local,
             )
+            loss_total = loss_data + _background_regularization(bg_local)
+
             if spatial_lambda <= 0:
-                return loss_data
+                return loss_total
 
             conc_maps = conc_local.view(n_y, n_x, n_elements).permute(2, 0, 1)
             conc_maps = conc_maps / torch.clamp(global_scale, min=1e-8)
             loss_smooth = abundance_smoothness_l2(conc_maps)
-            return loss_data + spatial_lambda * loss_smooth
+            return loss_total + spatial_lambda * loss_smooth
 
         if verbose:
             print("fitting spectrum position-by-position")
@@ -619,20 +663,20 @@ class Dataset3deds(Dataset3dspectroscopy):
 
                 def _local_closure():
                     local_opt.zero_grad()
-                    pred_local, conc_local = _forward_model()
-                    loss_total = _local_loss(pred_local, conc_local)
+                    pred_local, conc_local, bg_local = _forward_model()
+                    loss_total = _local_loss(pred_local, conc_local, bg_local)
                     loss_total.backward()
                     return loss_total
 
                 loss_value = local_opt.step(_local_closure)
                 if not torch.is_tensor(loss_value):
                     with torch.no_grad():
-                        pred_local, conc_local = _forward_model()
-                        loss_value = _local_loss(pred_local, conc_local)
+                        pred_local, conc_local, bg_local = _forward_model()
+                        loss_value = _local_loss(pred_local, conc_local, bg_local)
             else:
                 local_opt.zero_grad()
-                pred_local, conc_local = _forward_model()
-                loss_value = _local_loss(pred_local, conc_local)
+                pred_local, conc_local, bg_local = _forward_model()
+                loss_value = _local_loss(pred_local, conc_local, bg_local)
                 loss_value.backward()
                 local_opt.step()
 
@@ -641,12 +685,18 @@ class Dataset3deds(Dataset3dspectroscopy):
                 print(f"iter {i + 1:4d}/{num_iters}: loss={loss_history[-1]:.6g}")
 
         with torch.no_grad():
-            pred_final, conc_final = _forward_model()
-            bg_final = bg_coeffs @ background_basis
+            pred_final, conc_final, bg_final = _forward_model()
 
-            mean_input_spectrum = spectra_flat.mean(dim=0).cpu().numpy()
-            mean_fitted_spectrum = pred_final.mean(dim=0).cpu().numpy()
-            mean_background_spectrum = bg_final.mean(dim=0).cpu().numpy()
+            # Keep global/local/data comparison on equal footing by averaging
+            # over the same valid-pixel mask used in the global stage.
+            mean_input_spectrum = spectra_flat[valid_pixel_mask].mean(dim=0).cpu().numpy()
+            mean_fitted_spectrum = pred_final[valid_pixel_mask].mean(dim=0).cpu().numpy()
+            mean_background_spectrum = bg_final[valid_pixel_mask].mean(dim=0).cpu().numpy()
+
+            # Also provide all-pixel aggregates for diagnostics.
+            mean_input_spectrum_all = spectra_flat.mean(dim=0).cpu().numpy()
+            mean_fitted_spectrum_all = pred_final.mean(dim=0).cpu().numpy()
+            mean_background_spectrum_all = bg_final.mean(dim=0).cpu().numpy()
 
             abundance_maps = conc_final.view(n_y, n_x, n_elements).permute(2, 0, 1).cpu().numpy()
             peak_widths = nn.functional.softplus(peak_width_params).detach().cpu().numpy()
@@ -703,7 +753,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             )
             ax.set_xlim(energy_range[0], energy_range[1])
             ax.legend()
-            ax.set_title("fit spectrum after local fitting (x/y-averaged)")
+            ax.set_title("fit spectrum after local fitting (valid-pixel averaged)")
             ax.set_xlabel("Energy (keV)")
             ax.set_ylabel("Counts")
             plt.tight_layout()
@@ -723,6 +773,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             "input_spectrum": mean_input_spectrum,
             "fitted_spectrum": mean_fitted_spectrum,
             "background_spectrum": mean_background_spectrum,
+            "input_spectrum_all_pixels": mean_input_spectrum_all,
+            "fitted_spectrum_all_pixels": mean_fitted_spectrum_all,
+            "background_spectrum_all_pixels": mean_background_spectrum_all,
             "fit_range": energy_range,
         }
 
