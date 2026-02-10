@@ -204,7 +204,6 @@ class Dataset3deds(Dataset3dspectroscopy):
         optimizer_local=None,
         loss_global=None,
         loss_local=None,
-        normalize_local_target=True,
         freeze_peak_width=True,
         spatial_lambda=0.0,
         min_total_counts=0.0,
@@ -254,9 +253,6 @@ class Dataset3deds(Dataset3dspectroscopy):
             Global/mean-stage data term, "poisson" or "mse".
         loss_local : str | None, optional
             Local position-by-position data term, "poisson" or "mse".
-        normalize_local_target : bool, optional
-            If True, normalize each local pixel spectrum by its own target scale
-            (max channel value) before evaluating the local data loss.
         freeze_peak_width : bool, optional
             If True, lock peak widths after global fit (3D mode).
         spatial_lambda : float, optional
@@ -333,8 +329,6 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         if spatial_lambda < 0:
             raise ValueError("spatial_lambda must be >= 0")
-        if not isinstance(normalize_local_target, bool):
-            raise ValueError("normalize_local_target must be a bool")
 
         effective_lr_global = lr if lr_global is None else lr_global
         effective_lr_local = lr if lr_local is None else lr_local
@@ -468,6 +462,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         global_loss_history = global_fit["loss_history"]
         global_scale = global_fit["spectrum_scale"].detach()
         global_offset = global_fit["spectrum_offset"].detach()
+        global_fitted_spectrum = global_fit["final_pred_raw"].detach().cpu().numpy()
 
         with torch.no_grad():
             # If the global stage fit a normalized target, convert amplitude-like
@@ -495,13 +490,18 @@ class Dataset3deds(Dataset3dspectroscopy):
 
         mean_total = torch.clamp(mean_spectrum.sum(), min=1e-8)
         pixel_scales = (total_counts / mean_total).unsqueeze(1)
-        if normalize_local_target:
-            # When local loss is normalized per pixel, amplitude scaling from total
-            # counts is no longer part of the objective and can destabilize LBFGS.
-            pixel_scales = torch.ones_like(pixel_scales)
         # Avoid near-zero concentration initialization that can cause vanishing
         # softplus gradients in local optimization (especially on normalized data).
-        conc_init = torch.clamp(global_conc.unsqueeze(0) * pixel_scales, min=1e-3, max=50.0)
+        conc_init = torch.clamp(
+            global_conc.unsqueeze(0) * pixel_scales,
+            min=1e-3,
+        )
+        # Small random perturbation helps break symmetry across pixels.
+        conc_init = torch.clamp(
+            conc_init * (1.0 + 0.02 * torch.randn_like(conc_init)),
+            min=1e-3,
+        )
+
         conc_logits = nn.Parameter(inverse_softplus(conc_init))
         bg_coeffs = nn.Parameter(global_bg_coeffs.unsqueeze(0).repeat(n_pixels, 1) * pixel_scales)
 
@@ -569,13 +569,9 @@ class Dataset3deds(Dataset3dspectroscopy):
         def _prepare_local_loss_inputs(pred_local):
             pred_eval = pred_local[valid_pixel_mask]
             target_eval = spectra_flat[valid_pixel_mask]
-            if normalize_local_target:
-                local_scale = torch.clamp(
-                    target_eval.max(dim=1, keepdim=True).values,
-                    min=1e-6,
-                )
-                pred_eval = pred_eval / local_scale
-                target_eval = target_eval / local_scale
+            local_scale = torch.clamp(global_scale, min=1e-8)
+            pred_eval = pred_eval / local_scale
+            target_eval = target_eval / local_scale
             return pred_eval, target_eval
 
         def _local_loss(pred_local, conc_local):
@@ -590,6 +586,7 @@ class Dataset3deds(Dataset3dspectroscopy):
                 return loss_data
 
             conc_maps = conc_local.view(n_y, n_x, n_elements).permute(2, 0, 1)
+            conc_maps = conc_maps / torch.clamp(global_scale, min=1e-8)
             loss_smooth = abundance_smoothness_l2(conc_maps)
             return loss_data + spatial_lambda * loss_smooth
 
@@ -622,10 +619,17 @@ class Dataset3deds(Dataset3dspectroscopy):
                 print(f"iter {i + 1:4d}/{num_iters}: loss={loss_history[-1]:.6g}")
 
         with torch.no_grad():
-            _, conc_final = _forward_model()
+            pred_final, conc_final = _forward_model()
+            bg_final = bg_coeffs @ background_basis
+
+            mean_input_spectrum = spectra_flat.mean(dim=0).cpu().numpy()
+            mean_fitted_spectrum = pred_final.mean(dim=0).cpu().numpy()
+            mean_background_spectrum = bg_final.mean(dim=0).cpu().numpy()
+
             abundance_maps = conc_final.view(n_y, n_x, n_elements).permute(2, 0, 1).cpu().numpy()
             peak_widths = nn.functional.softplus(peak_width_params).detach().cpu().numpy()
         loss_history_array = np.asarray(loss_history)
+        energy_axis_np = energy_axis.cpu().numpy()
 
         if show_plot:
             fig, ax = plt.subplots(1, 1, figsize=(8, 4))
@@ -658,6 +662,31 @@ class Dataset3deds(Dataset3dspectroscopy):
             plt.tight_layout()
             plt.show()
 
+            fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+            ax.plot(energy_axis_np, mean_input_spectrum, "k-", label="Data", linewidth=1)
+            ax.plot(
+                energy_axis_np,
+                global_fitted_spectrum,
+                color="cyan",
+                label="Global fit",
+                linewidth=2.5,
+            )
+            ax.plot(energy_axis_np, mean_fitted_spectrum, "r-", label="Fit", linewidth=2.5)
+            ax.plot(
+                energy_axis_np,
+                mean_background_spectrum,
+                "b--",
+                label="Background",
+                linewidth=2.5,
+            )
+            ax.set_xlim(energy_range[0], energy_range[1])
+            ax.legend()
+            ax.set_title("fit spectrum after local fitting (x/y-averaged)")
+            ax.set_xlabel("Energy (keV)")
+            ax.set_ylabel("Counts")
+            plt.tight_layout()
+            plt.show()
+
             map_titles = [f"{name}" for name in global_model.peak_model.element_names]
             show_2d(list(abundance_maps), title=map_titles)
 
@@ -668,7 +697,10 @@ class Dataset3deds(Dataset3dspectroscopy):
             "loss_history": loss_history_array,
             "global_loss_history": np.asarray(global_loss_history),
             "valid_pixel_mask": valid_pixel_mask.view(n_y, n_x).cpu().numpy(),
-            "energy_axis": energy_axis.cpu().numpy(),
+            "energy_axis": energy_axis_np,
+            "input_spectrum": mean_input_spectrum,
+            "fitted_spectrum": mean_fitted_spectrum,
+            "background_spectrum": mean_background_spectrum,
             "fit_range": energy_range,
         }
 
