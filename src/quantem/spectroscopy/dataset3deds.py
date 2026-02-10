@@ -102,6 +102,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         background = PolynomialBackground(energy_axis, degree=polynomial_background_degree)
         peaks = GaussianPeaks(energy_axis, peak_width=peak_width, elements_to_fit=elements_to_fit)
         model = EDSModel(peaks, background, energy_axis=energy_axis)
+        model = model.to(device=energy_axis.device, dtype=energy_axis.dtype)
         if len(model.peak_model.element_names) == 0:
             raise ValueError("No elements found in the selected energy range/elements_to_fit.")
 
@@ -175,6 +176,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         lr=None,
         polynomial_background_degree=3,
         optimizer="lbfgs",
+        device=None,
     ):
         return self.fit_spectrum_pytorch(
             energy_range=energy_range,
@@ -187,6 +189,7 @@ class Dataset3deds(Dataset3dspectroscopy):
             loss="mse",
             fit_mean_only=True,
             show_plot=True,
+            device=device,
         )
 
     def fit_spectrum_pytorch(
@@ -212,6 +215,7 @@ class Dataset3deds(Dataset3dspectroscopy):
         show_plot=True,
         lr_global=None,
         lr_local=None,
+        device=None,
     ):
         """Fit EDS spectra with one entrypoint for mean-only or full-cube fitting.
 
@@ -265,6 +269,9 @@ class Dataset3deds(Dataset3dspectroscopy):
             If True, fit only the summed spectrum over (x, y).
         show_plot : bool, optional
             Plot fit diagnostics in mean-only mode.
+        device : str | torch.device | None, optional
+            Compute device to run fitting on. If None, uses CUDA when available,
+            otherwise CPU.
 
         Returns
         -------
@@ -330,19 +337,26 @@ class Dataset3deds(Dataset3dspectroscopy):
         if spatial_lambda < 0:
             raise ValueError("spatial_lambda must be >= 0")
 
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            device = torch.device(device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but torch.cuda.is_available() is False.")
+
         effective_lr_global = lr if lr_global is None else lr_global
         effective_lr_local = lr if lr_local is None else lr_local
 
         energy_axis_np = np.arange(self.shape[0]) * self.sampling[0] + self.origin[0]
-        energy_axis = torch.tensor(energy_axis_np, dtype=torch.float32)
-        spectra = torch.tensor(self.array, dtype=torch.float32)  # (E, Y, X)
+        energy_axis = torch.tensor(energy_axis_np, dtype=torch.float32, device=device)
+        spectra = torch.tensor(self.array, dtype=torch.float32, device=device)  # (E, Y, X)
 
         if energy_range is not None:
             ind = (energy_axis >= energy_range[0]) & (energy_axis <= energy_range[1])
             energy_axis = energy_axis[ind]
             spectra = spectra[ind]
         else:
-            energy_range = [float(energy_axis.min().numpy()), float(energy_axis.max().numpy())]
+            energy_range = [float(energy_axis.min().item()), float(energy_axis.max().item())]
 
         if fit_mean_only:
             if verbose:
@@ -399,6 +413,8 @@ class Dataset3deds(Dataset3dspectroscopy):
                 print(f"{i:2d}. {elem:2s}: {conc:.3f}")
 
             if show_plot:
+                energy_axis_plot = energy_axis.detach().cpu().numpy()
+                spectrum_raw_plot = spectrum_raw.detach().cpu().numpy()
                 fig, ax = plt.subplots(2, 1, figsize=(10, 6))
                 ax[0].plot(np.arange(loss_history.shape[0]), loss_history, color="k")
                 ax[0].set_title("loss")
@@ -406,9 +422,15 @@ class Dataset3deds(Dataset3dspectroscopy):
                 ax[0].set_ylabel("loss")
                 ax[0].set_yscale("log")
 
-                ax[1].plot(energy_axis, spectrum_raw.numpy(), "k-", label="Data", linewidth=1)
-                ax[1].plot(energy_axis, final_pred, "r-", label="Fit", linewidth=2)
-                ax[1].plot(energy_axis, background_fit, "b--", label="Background", linewidth=1.5)
+                ax[1].plot(energy_axis_plot, spectrum_raw_plot, "k-", label="Data", linewidth=1)
+                ax[1].plot(energy_axis_plot, final_pred, "r-", label="Fit", linewidth=2)
+                ax[1].plot(
+                    energy_axis_plot,
+                    background_fit,
+                    "b--",
+                    label="Background",
+                    linewidth=1.5,
+                )
                 ax[1].set_xlim(energy_range[0], energy_range[1])
                 ax[1].legend()
                 ax[1].set_title("fit spectrum")
