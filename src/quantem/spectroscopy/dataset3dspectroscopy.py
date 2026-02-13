@@ -274,7 +274,7 @@ class Dataset3dspectroscopy(Dataset3d):
     def clear_attached_spectra(self):
         self.attached_spectra = None
 
-    def plot_attached_spectrum(self, spectrum_index=0):
+    def plot_attached_spectrum(self, data_type='eds',spectrum_index=0):
         fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
 
         ax_spec.plot(
@@ -282,7 +282,10 @@ class Dataset3dspectroscopy(Dataset3d):
             self.attached_spectra[spectrum_index][0],
             linewidth=1.5,
         )
-        ax_spec.set_xlabel("Energy (keV)")
+        if data_type =='eds':            
+            ax_spec.set_xlabel("Energy (keV)")
+        elif data_type == 'eels':
+            ax_spec.set_xlabel("Energy (eV)")
         ax_spec.set_ylabel("Intensity")
         ax_spec.set_title(f"Spectrum in index {spectrum_index}")
         ax_spec.grid(True, alpha=0.1)
@@ -1098,6 +1101,9 @@ class Dataset3dspectroscopy(Dataset3d):
 
         if attach_mean_spectrum:
             self.add_spectrum_to_data(spec, E)
+            print(
+                f"Spectrum recorded to index {len(self.attached_spectra) - 1} of attached_spectra in {self}"
+            )
 
         return spec
 
