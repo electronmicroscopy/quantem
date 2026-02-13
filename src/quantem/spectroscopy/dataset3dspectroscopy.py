@@ -1,4 +1,3 @@
-import csv
 import json
 import os
 from typing import Any, Optional
@@ -17,6 +16,8 @@ class Dataset3dspectroscopy(Dataset3d):
     # stores the element line info so you don't need to reload each time
     element_info = None
     element_info_path = "xray_lines.json"
+    atomic_weights = None
+    atomic_weights_path = "atomic_weights.json"
     dataset_type = "EDS"
 
     def __init__(
@@ -65,6 +66,25 @@ class Dataset3dspectroscopy(Dataset3d):
         full_path = os.path.join(base_dir, path)
         with open(full_path, "r") as f:
             cls.element_info = json.load(f)["elements"]
+
+    @classmethod
+    def load_atomic_weights(cls):
+        """Load atomic weights table from JSON once per class."""
+        if cls.atomic_weights is not None:
+            return
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        full_path = os.path.join(base_dir, cls.atomic_weights_path)
+        with open(full_path, "r") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict) and "atomic_weights" in data:
+            data = data["atomic_weights"]
+
+        if not isinstance(data, dict):
+            raise ValueError("atomic_weights.json must contain a JSON object")
+
+        cls.atomic_weights = data
 
     def format_spectral_features_table(
         self,
@@ -253,9 +273,32 @@ class Dataset3dspectroscopy(Dataset3d):
                     if el in all_info:
                         self.model_elements[el] = all_info[el]
 
-        def clear_model_elements(self):
-            """Clear all elements from the model."""
+    def remove_elements_from_model(self, elements):
+        """
+        Remove element(s) from the persistent model used in show_mean_spectrum.
+
+        Parameters
+        ----------
+        elements : list or str
+            Element symbol(s) to remove. Can be a single string (e.g., 'Al')
+            or list of symbols (e.g., ['Au', 'Cu']).
+        """
+        if self.model_elements is None:
+            return
+
+        if isinstance(elements, str):
+            elements = [elements]
+
+        if isinstance(elements, list):
+            for el in elements:
+                self.model_elements.pop(el, None)
+
+        if len(self.model_elements) == 0:
             self.model_elements = None
+
+    def clear_model_elements(self):
+        """Clear all elements from the model."""
+        self.model_elements = None
 
     # Storage of spectra alongside dataset
 
@@ -496,10 +539,13 @@ class Dataset3dspectroscopy(Dataset3d):
             Region of interest as [y, x, dy, dx]. If None, uses full image.
         elements : list, required
             List of element symbols to quantify (e.g., ['Pt', 'Co']).
-        k_factors : dict, optional
-            K-factors for element pairs relative to first element.
-            Format: {'Pt': 1.0, 'Co': 1.23} where first element = 1.0
-            If None, uses theoretical k-factors from element database.
+        k_factors : dict or array-like, required
+            K-factors for the quantified elements.
+            - dict format: {'Pt': 1.0, 'Co': 1.23}
+            - array/list format: [1.0, 1.23] mapped in the same order as ``elements``
+                        - per-shell dict format:
+                            {'Pt': {'K': 0, 'L': 1.12, 'M': 0}, 'Co': {'K': 1.23, 'L': 0, 'M': 0}}
+                            where 0 means shell unavailable.
         method : str, optional
             Quantification method. Currently supports 'cliff_lorimer'.
         mask : array, optional
@@ -515,12 +561,19 @@ class Dataset3dspectroscopy(Dataset3d):
 
         Examples
         --------
-        # Basic quantification with theoretical k-factors
-        comp = dataset.quantify_composition(elements=['Pt', 'Co'])
-
-        # With experimental k-factors
+        # With dictionary k-factors
         k_factors = {'Pt': 1.0, 'Co': 1.23}
         comp = dataset.quantify_composition(elements=['Pt', 'Co'], k_factors=k_factors)
+
+        # With array-like k-factors (same order as elements)
+        comp = dataset.quantify_composition(elements=['Pt', 'Co'], k_factors=[1.0, 1.23])
+
+        # With per-shell k-factors (0 means unavailable shell)
+        shell_kf = {
+            'Pt': {'K': 0, 'L': 1.12, 'M': 0},
+            'Co': {'K': 1.23, 'L': 0, 'M': 0},
+        }
+        comp = dataset.quantify_composition(elements=['Pt', 'Co'], k_factors=shell_kf)
 
         # Access results
         print(f"Pt: {comp['atomic_percent']['Pt']:.1f} at%")
@@ -539,20 +592,23 @@ class Dataset3dspectroscopy(Dataset3d):
         spectrum_data = self._extract_spectrum_for_quantification(roi, mask)
         spec = spectrum_data["spectrum"]
         E = spectrum_data["energy"]
+        
+        # Determine max usable energy from the actual dataset
+        max_energy = float(E.max()) if len(E) > 0 else 20.0
 
-        # Get X-ray line intensities for each element
+        # Determine shell for each element and validate/normalize k-factors
+        if k_factors is None:
+            raise ValueError("Must provide k_factors as a dict or array-like")
+
+        element_shells = self._determine_element_shells(elements, max_energy)
+        k_factors = self._normalize_k_factors(elements, k_factors, element_shells)
+
+        # Get X-ray line intensities for each element using the correct shell
         intensities = {}
         for element in elements:
-            intensity = self._integrate_element_intensity(element, spec, E)
+            shell = element_shells.get(element, "K")  # Default to K if not determined
+            intensity = self._integrate_element_intensity(element, spec, E, shell)
             intensities[element] = intensity
-
-        # Handle k-factors
-        if k_factors is None:  # if they arent provided, calculate from kfacs_Titan_300_keV.csv
-            k_factors = self._calculate_theoretical_k_factors(elements)
-        else:
-            # Validate k-factors
-            if not all(elem in k_factors for elem in elements):
-                raise ValueError("k_factors must include all elements")
 
         # Apply Cliff-Lorimer quantification
         if method == "cliff_lorimer":
@@ -606,8 +662,20 @@ class Dataset3dspectroscopy(Dataset3d):
 
         return {"spectrum": spec, "energy": E}
 
-    def _integrate_element_intensity(self, element, spectrum, energy):
-        """Integrate X-ray intensity for a specific element using its characteristic lines."""
+    def _integrate_element_intensity(self, element, spectrum, energy, shell="K"):
+        """Integrate X-ray intensity for a specific element using characteristic lines from the specified shell.
+        
+        Parameters
+        ----------
+        element : str
+            Element symbol
+        spectrum : array
+            Spectrum intensities
+        energy : array
+            Energy axis in keV
+        shell : str
+            X-ray shell to use: 'K', 'L', or 'M'
+        """
         all_info = type(self).element_info
         if element not in all_info:
             raise ValueError(f"Element {element} not found in database")
@@ -615,16 +683,29 @@ class Dataset3dspectroscopy(Dataset3d):
         total_intensity = 0.0
         element_lines = all_info[element]
 
-        # Get the most intense lines (K-alpha, L-alpha, etc.)
-        weighted_lines = [
-            (info["weight"], info["energy (keV)"], line_name)
-            for line_name, info in element_lines.items()
-            if info["energy (keV)"] <= 12.0
-        ]  # Ignore high energy lines
-        weighted_lines.sort(reverse=True)  # Sort by weight (highest first)
+        # Filter lines by the specified shell (K, L, or M)
+        # For K-shell: Ka, Kb lines
+        # For L-shell: La, Lb, Lg lines  
+        # For M-shell: Ma, Mb lines
+        shell_lines = []
+        for line_name, info in element_lines.items():
+            line_energy = info["energy (keV)"]
+            line_weight = info["weight"]
+            
+            # Check if line belongs to the specified shell
+            if shell == "K" and ("Ka" in line_name or "Kb" in line_name):
+                shell_lines.append((line_weight, line_energy, line_name))
+            elif shell == "L" and ("La" in line_name or "Lb" in line_name or "Lg" in line_name):
+                shell_lines.append((line_weight, line_energy, line_name))
+            elif shell == "M" and ("Ma" in line_name or "Mb" in line_name):
+                shell_lines.append((line_weight, line_energy, line_name))
+        
+        # Sort by weight (highest first) and ignore lines beyond detector range
+        shell_lines = [(w, e, n) for w, e, n in shell_lines if e <= 12.0]
+        shell_lines.sort(reverse=True)
 
-        # Use top 3 most intense lines for integration
-        for weight, line_energy, line_name in weighted_lines[:3]:
+        # Use top 3 most intense lines from the specified shell for integration
+        for weight, line_energy, line_name in shell_lines[:3]:
             if weight > 0.1:  # Only significant lines
                 # Find integration window around the line
                 # Use +/- 0.1 keV window or adaptive based on energy resolution
@@ -647,92 +728,143 @@ class Dataset3dspectroscopy(Dataset3d):
 
         return total_intensity
 
-    def _calculate_theoretical_k_factors(self, elements):
-        """Load k-factors from Titan 300 keV CSV file."""
-        # Get the path to the CSV file (same directory as this Python file)
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        csv_path = os.path.join(current_dir, "kfacs_Titan_300_keV.csv")
-
-        # Load k-factors from CSV
-        k_factor_data = {}
-        try:
-            with open(csv_path, "r") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    element = row["Element"]
-                    k_factor_data[element] = {
-                        "K": float(row["K"]),
-                        "L": float(row["L"]),
-                        "M": float(row["M"]),
-                    }
-        except FileNotFoundError:
-            print(f"Warning: K-factor CSV file not found at {csv_path}")
-            print("Using simplified k-factors (all set to 1.0)")
-            return {elem: 1.0 for elem in elements}
-
-        # Get element info database to determine which X-ray line to use
+    def _determine_element_shells(self, elements, max_energy):
+        """Determine the appropriate X-ray shell (K, L, or M) for each element based on available lines.
+        
+        Parameters
+        ----------
+        elements : list
+            List of element symbols
+        max_energy : float
+            Maximum energy in keV from the dataset
+        """
         all_info = type(self).element_info
-
-        k_factors = {}
+        element_shells = {}
+        
         for element in elements:
-            if element not in k_factor_data:
-                print(f"Warning: Element {element} not found in k-factor database, using 1.0")
-                k_factors[element] = 1.0
+            if element not in all_info:
+                element_shells[element] = "K"  # Default
                 continue
-
-            # Determine which X-ray line (K, L, or M) to use based on the element's primary lines
-            if element in all_info:
-                element_lines = all_info[element]
-
-                # Check which X-ray series is most prominent for this element
-                has_k_lines = any("Ka" in line or "Kb" in line for line in element_lines.keys())
-                has_l_lines = any("La" in line or "Lb" in line for line in element_lines.keys())
-                has_m_lines = any("Ma" in line or "Mb" in line for line in element_lines.keys())
-
-                # Prioritize K-lines, then L-lines, then M-lines
-                if has_k_lines and k_factor_data[element]["K"] > 0:
-                    k_factors[element] = k_factor_data[element]["K"]
-                    # line_type = "K"
-                elif has_l_lines and k_factor_data[element]["L"] > 0:
-                    k_factors[element] = k_factor_data[element]["L"]
-                    # line_type = "L"
-                elif has_m_lines and k_factor_data[element]["M"] > 0:
-                    k_factors[element] = k_factor_data[element]["M"]
-                    # line_type = "M"
-                else:
-                    # Default to K-line k-factor if available
-                    if k_factor_data[element]["K"] > 0:
-                        k_factors[element] = k_factor_data[element]["K"]
-                        # line_type = "K"
-                    elif k_factor_data[element]["L"] > 0:
-                        k_factors[element] = k_factor_data[element]["L"]
-                        # line_type = "L"
-                    elif k_factor_data[element]["M"] > 0:
-                        k_factors[element] = k_factor_data[element]["M"]
-                        # line_type = "M"
-                    else:
-                        k_factors[element] = 1.0
-                        # line_type = "default"
+                
+            element_lines = all_info[element]
+            
+            # Check which X-ray series is present AND within usable energy range
+            has_usable_k_lines = any(
+                ("Ka" in line or "Kb" in line) and info["energy (keV)"] <= max_energy
+                for line, info in element_lines.items()
+            )
+            has_usable_l_lines = any(
+                ("La" in line or "Lb" in line or "Lg" in line) and info["energy (keV)"] <= max_energy
+                for line, info in element_lines.items()
+            )
+            has_usable_m_lines = any(
+                ("Ma" in line or "Mb" in line) and info["energy (keV)"] <= max_energy
+                for line, info in element_lines.items()
+            )
+            
+            # Prioritize K-lines, then L-lines, then M-lines (only if within usable range)
+            if has_usable_k_lines:
+                element_shells[element] = "K"
+            elif has_usable_l_lines:
+                element_shells[element] = "L"
+            elif has_usable_m_lines:
+                element_shells[element] = "M"
             else:
-                # Element not in database, use K-line if available
-                if k_factor_data[element]["K"] > 0:
-                    k_factors[element] = k_factor_data[element]["K"]
-                    # line_type = "K"
-                elif k_factor_data[element]["L"] > 0:
-                    k_factors[element] = k_factor_data[element]["L"]
-                    # line_type = "L"
-                elif k_factor_data[element]["M"] > 0:
-                    k_factors[element] = k_factor_data[element]["M"]
-                    # line_type = "M"
+                element_shells[element] = "K"  # Default fallback
+        
+        return element_shells
+
+    def _normalize_k_factors(self, elements, k_factors, element_shells=None):
+        """Normalize k-factors input to a dict keyed by element symbol.
+
+        Supports:
+        - scalar dict per element, e.g. {'Pt': 1.0, 'Co': 1.23}
+        - array-like values aligned with ``elements`` order
+        - per-shell dict per element, e.g. {'Pt': {'K': 0, 'L': 1.1, 'M': 0}}
+          where non-positive values are treated as unavailable shell entries.
+        """
+        shell_order = ("K", "L", "M")
+        if element_shells is None:
+            element_shells = {}
+
+        def _to_positive_float_or_none(value):
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not np.isfinite(parsed) or parsed <= 0:
+                return None
+            return parsed
+
+        def _extract_shell_value(elem, shell_values):
+            preferred_shell = str(element_shells.get(elem, "K")).upper()
+            candidate_order = [preferred_shell] + [s for s in shell_order if s != preferred_shell]
+
+            normalized_shell_values = {}
+            for shell in shell_order:
+                raw_value = shell_values.get(shell)
+                if raw_value is None:
+                    raw_value = shell_values.get(shell.lower())
+                normalized_shell_values[shell] = _to_positive_float_or_none(raw_value)
+
+            for shell in candidate_order:
+                value = normalized_shell_values.get(shell)
+                if value is not None:
+                    return value
+
+            raise ValueError(
+                f"k_factors['{elem}'] has no usable positive shell value in K/L/M"
+            )
+
+        if isinstance(k_factors, dict):
+            missing = [elem for elem in elements if elem not in k_factors]
+            if missing:
+                raise ValueError(f"k_factors is missing elements: {missing}")
+
+            normalized = {}
+            for elem in elements:
+                raw_entry = k_factors[elem]
+
+                if isinstance(raw_entry, dict):
+                    value = _extract_shell_value(elem, raw_entry)
                 else:
-                    k_factors[element] = 1.0
-                    # line_type = "default"
+                    try:
+                        value = float(raw_entry)
+                    except (TypeError, ValueError):
+                        raise TypeError(
+                            f"k_factors['{elem}'] must be numeric or a dict with K/L/M entries"
+                        )
+                    if not np.isfinite(value) or value <= 0:
+                        raise ValueError(f"k_factors['{elem}'] must be a positive finite number")
 
-        print(f"Using k-factors from Titan 300 keV database: {csv_path}")
-        for elem in elements:
-            print(f"  {elem}: {k_factors[elem]:.3f}")
+                normalized[elem] = value
+            return normalized
 
-        return k_factors
+        if isinstance(k_factors, (str, bytes)):
+            raise TypeError("k_factors must be a dict or array-like of numeric values")
+
+        try:
+            values = list(k_factors)
+        except TypeError:
+            raise TypeError("k_factors must be a dict or array-like of numeric values")
+
+        if len(values) != len(elements):
+            raise ValueError(
+                "Array-like k_factors length must match elements length "
+                f"({len(values)} != {len(elements)})"
+            )
+
+        normalized = {}
+        for elem, raw_value in zip(elements, values):
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                raise TypeError(f"k_factors value for '{elem}' must be numeric")
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"k_factors value for '{elem}' must be a positive finite number")
+            normalized[elem] = value
+
+        return normalized
 
     def _cliff_lorimer_quantification(self, elements, intensities, k_factors, method, roi):
         """Apply Cliff-Lorimer quantification method."""
@@ -757,43 +889,27 @@ class Dataset3dspectroscopy(Dataset3d):
                 atomic_percent[element] = 0.0
 
         # Calculate weight percentages (requires atomic weights)
-        atomic_weights = {
-            "C": 12.01,
-            "N": 14.01,
-            "O": 16.00,
-            "F": 19.00,
-            "Na": 22.99,
-            "Mg": 24.31,
-            "Al": 26.98,
-            "Si": 28.09,
-            "P": 30.97,
-            "S": 32.07,
-            "Cl": 35.45,
-            "K": 39.10,
-            "Ca": 40.08,
-            "Ti": 47.87,
-            "Cr": 52.00,
-            "Mn": 54.94,
-            "Fe": 55.85,
-            "Co": 58.93,
-            "Ni": 58.69,
-            "Cu": 63.55,
-            "Zn": 65.38,
-            "Ag": 107.87,
-            "Pt": 195.08,
-            "Au": 196.97,
-        }
+        if type(self).atomic_weights is None:
+            type(self).load_atomic_weights()
+        atomic_weights = type(self).atomic_weights or {}
+
+        missing_weights = [element for element in elements if element not in atomic_weights]
+        if missing_weights:
+            raise ValueError(
+                f"Atomic weights not found for elements: {missing_weights}. "
+                "Use valid element symbols (e.g., 'Fe', 'Au', 'Te')."
+            )
 
         # Convert atomic % to weight %
         weight_sum = 0.0
         for element in elements:
-            atomic_wt = atomic_weights.get(element, 55.85)  # Default to Fe
+            atomic_wt = atomic_weights[element]
             weight_sum += (atomic_percent[element] / 100.0) * atomic_wt
 
         weight_percent = {}
         for element in elements:
             if weight_sum > 0:
-                atomic_wt = atomic_weights.get(element, 55.85)
+                atomic_wt = atomic_weights[element]
                 weight_percent[element] = (
                     (atomic_percent[element] / 100.0) * atomic_wt / weight_sum
                 ) * 100.0
@@ -1121,7 +1237,6 @@ class Dataset3dspectroscopy(Dataset3d):
         snr_min=None,
         snr_threshold=None,
         distance_threshold_for_sample=0.05,
-        contamination_elements=None,
         grid_peaks=None,
         data_type="eds",
         peaks=15,
@@ -1165,7 +1280,7 @@ class Dataset3dspectroscopy(Dataset3d):
             from peak distribution (typically 20-30 based on data characteristics).
             Lower values detect more peaks, higher values are more selective.
         snr_threshold : float, optional
-            Minimum SNR for identifying a peak as a sample element (not contamination).
+            Minimum SNR for identifying a peak as a sample element.
             If None, automatically determined based on peak statistics. For sparse spectra
             (few strong peaks), uses lower threshold (~30). For dense spectra (many peaks),
             uses higher threshold (~50-80) to filter noise.
@@ -1173,13 +1288,9 @@ class Dataset3dspectroscopy(Dataset3d):
             Maximum energy distance (keV) between detected peak and characteristic line
             for identifying as a sample element. Default: 0.05. Stricter values (smaller)
             reduce false positives.
-        contamination_elements : set or list, optional
-            Element symbols to exclude from sample detection (e.g., {'C', 'Cu', 'O'}).
-            Default: {'C', 'N', 'O', 'Cu', 'Si', 'K', 'Kr', 'Po', 'Pb', 'Os', 'Ir', 'At', 'Do', 'Po'}
-            These are common TEM support materials and artifacts.
         grid_peaks : dict, optional
             Dictionary of known grid/support peaks for labeling, e.g., {'C': 0.260, 'Cu': 8.020}.
-            Default: {'C': 0.260, 'Cu': 8.020} for carbon support film and copper TEM grid.
+            Default: {} (empty). Provide grid materials as needed.
         background_subtraction : str, optional
             Background subtraction method. Options:
             - 'none' (default): No background subtraction
@@ -1200,28 +1311,13 @@ class Dataset3dspectroscopy(Dataset3d):
         """
 
         # Set defaults for detection parameters
-        if contamination_elements is None:
-            contamination_elements = {
-                "C",
-                "N",
-                "O",
-                "Cu",
-                "Si",
-                "K",
-                "Kr",
-                "Po",
-                "Pb",
-                "Os",
-                "Ir",
-                "At",
-                "Do",
-                "Po",
-            }
-        else:
-            contamination_elements = set(contamination_elements)
+
+        # Ensure spectral line database is available for peak matching
+        if type(self).element_info is None:
+            type(self).load_element_info()
 
         if grid_peaks is None:
-            grid_peaks = {"C": 0.260, "Cu": 8.020}
+            grid_peaks = {}
 
         # ADJUST ROI BASED ON GIVEN FLAGS -----------------------------------------------
         # Parse ROI parameter
@@ -1496,7 +1592,6 @@ class Dataset3dspectroscopy(Dataset3d):
                     # Strategy: keep only peaks that:
                     # 1. Match a characteristic line within distance_threshold_for_sample (very tight tolerance)
                     # 2. Have SNR > snr_threshold_for_sample (strong peaks)
-                    # 3. Are from non-contamination elements (or requested elements if specified)
                     detected_elements = set()
                     detected_sample_peaks = {}  # Map peak_energy -> is_sample_element for line styling
 
@@ -1514,17 +1609,14 @@ class Dataset3dspectroscopy(Dataset3d):
                             snr > snr_threshold_for_sample  # Strong peak
                             and distance < distance_threshold_for_sample
                         ):  # Very close match to characteristic line
-                            # If specific elements requested, only keep those; otherwise exclude contamination
+                            # If specific elements requested, only keep those
                             if search_elements is not None:
                                 if element in search_elements:
                                     detected_elements.add(element)
                                     detected_sample_peaks[peak_energy] = True
                             else:
-                                if (
-                                    element not in contamination_elements
-                                ):  # Not a known contamination
-                                    detected_elements.add(element)
-                                    detected_sample_peaks[peak_energy] = True
+                                detected_elements.add(element)
+                                detected_sample_peaks[peak_energy] = True
 
                     # MULTI-PEAK COHERENCE CHECK: Filter out elements with only single weak matches
                     # Count DISTINCT characteristic lines for each element (Ka vs Kb, La vs Lb, etc.)
@@ -1627,7 +1719,7 @@ class Dataset3dspectroscopy(Dataset3d):
                                     break
                             if is_grid_peak:
                                 print(
-                                    f"Peak at {peak_energy} keV may come from the grid or contamination."
+                                    f"Peak at {peak_energy} keV may come from the grid."
                                 )
 
                     # If elements were detected, use them for element identification only (not for line plotting)
