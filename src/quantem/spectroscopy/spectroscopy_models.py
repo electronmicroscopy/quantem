@@ -6,6 +6,92 @@ import torch
 import torch.nn as nn
 
 
+def inverse_softplus(x: torch.Tensor, min_value: float = 1e-8) -> torch.Tensor:
+    """Numerically stable inverse of softplus for positive initialization values."""
+    x = torch.clamp(x, min=min_value)
+    # For large x, log(expm1(x)) can overflow in float32. Use a stable branch.
+    return torch.where(
+        x > 20.0,
+        x + torch.log1p(-torch.exp(-x)),
+        torch.log(torch.expm1(x)),
+    )
+
+
+def eds_data_loss(
+    predicted: torch.Tensor, target: torch.Tensor, loss: str = "poisson", min_value: float = 1e-8
+) -> torch.Tensor:
+    """Compute EDS fit loss with clamped positive predictions."""
+    pred_safe = torch.nan_to_num(predicted, nan=min_value, posinf=1e8, neginf=min_value)
+    pred_safe = torch.clamp(pred_safe, min=min_value, max=1e8)
+    if loss == "poisson":
+        target_safe = torch.nan_to_num(target, nan=0.0, posinf=1e8, neginf=0.0)
+        target_safe = torch.clamp(target_safe, min=0.0, max=1e8)
+        if hasattr(torch, "xlogy"):
+            log_term = torch.xlogy(target_safe, pred_safe)
+        elif hasattr(torch.special, "xlogy"):
+            log_term = torch.special.xlogy(target_safe, pred_safe)
+        else:
+            log_term = target_safe * torch.log(pred_safe)
+            log_term = torch.nan_to_num(log_term, nan=0.0, posinf=1e8, neginf=-1e8)
+        loss_terms = pred_safe - log_term
+        return torch.mean(torch.nan_to_num(loss_terms, nan=1e8, posinf=1e8, neginf=-1e8))
+    if loss == "mse":
+        target_safe = torch.nan_to_num(target, nan=0.0, posinf=1e8, neginf=-1e8)
+        return nn.functional.mse_loss(pred_safe, target_safe)
+    raise ValueError("loss must be 'poisson' or 'mse'")
+
+
+def polynomial_energy_basis(energy_axis: torch.Tensor, degree: int) -> torch.Tensor:
+    """Return polynomial basis in normalized energy coordinates."""
+    energy_norm = (energy_axis - energy_axis.min()) / (
+        energy_axis.max() - energy_axis.min() + 1e-12
+    )
+    return torch.stack([energy_norm**i for i in range(degree + 1)], dim=0)
+
+
+def build_element_basis(
+    energy_axis: torch.Tensor,
+    peak_energies: torch.Tensor,
+    peak_weights: torch.Tensor,
+    peak_element_indices: torch.Tensor,
+    peak_width_by_peak: torch.Tensor,
+    n_elements: int,
+    energy_step: float,
+) -> torch.Tensor:
+    """Build matrix mapping per-element concentrations to spectral intensity."""
+    fwhm = nn.functional.softplus(peak_width_by_peak)
+    sigma = (fwhm / 2.355).unsqueeze(1)
+    centers = peak_energies.unsqueeze(1)
+    energies = energy_axis.unsqueeze(0)
+    all_peaks = torch.exp(-0.5 * ((energies - centers) / sigma) ** 2)
+    sqrt_2pi = torch.sqrt(torch.tensor(2 * np.pi, dtype=all_peaks.dtype, device=all_peaks.device))
+    all_peaks = all_peaks * energy_step / (sqrt_2pi * sigma)
+    weighted_peaks = all_peaks * peak_weights.unsqueeze(1)
+
+    basis = torch.zeros(
+        (n_elements, energy_axis.shape[0]),
+        dtype=weighted_peaks.dtype,
+        device=weighted_peaks.device,
+    )
+    basis.index_add_(0, peak_element_indices.to(weighted_peaks.device), weighted_peaks)
+    return basis.t()
+
+
+def abundance_smoothness_l2(abundance_maps: torch.Tensor) -> torch.Tensor:
+    """Spatial L2 smoothness for abundance maps shaped (n_elements, y, x)."""
+    if abundance_maps.ndim != 3:
+        raise ValueError("abundance_maps must have shape (n_elements, y, x)")
+
+    loss = abundance_maps.new_tensor(0.0)
+    if abundance_maps.shape[2] > 1:
+        dx = abundance_maps[:, :, 1:] - abundance_maps[:, :, :-1]
+        loss = loss + dx.pow(2).mean()
+    if abundance_maps.shape[1] > 1:
+        dy = abundance_maps[:, 1:, :] - abundance_maps[:, :-1, :]
+        loss = loss + dy.pow(2).mean()
+    return loss
+
+
 class EDSModel(nn.Module):
     """Complete EDS forward model with optional fit range"""
 
@@ -31,11 +117,12 @@ class GaussianPeaks(nn.Module):
         with open(current_dir / "xray_lines.json", "r") as f:
             data = json.load(f)
 
-        self.energy_axis = (
+        energy_axis_tensor = (
             energy_axis.float()
             if torch.is_tensor(energy_axis)
             else torch.tensor(energy_axis, dtype=torch.float32)
         )
+        self.register_buffer("energy_axis", energy_axis_tensor)
         self.energy_min = self.energy_axis.min().item()
         self.energy_max = self.energy_axis.max().item()
 
@@ -84,19 +171,55 @@ class GaussianPeaks(nn.Module):
             all_peak_element_indices.extend([elem_idx] * len(energies))
 
         # Store as tensors for fast computation
-        self.peak_energies = torch.tensor(all_peak_energies, dtype=torch.float32)
-        self.peak_weights = torch.tensor(all_peak_weights, dtype=torch.float32)
-        self.peak_element_indices = torch.tensor(all_peak_element_indices, dtype=torch.long)
+        self.register_buffer(
+            "peak_energies",
+            torch.tensor(
+                all_peak_energies,
+                dtype=self.energy_axis.dtype,
+                device=self.energy_axis.device,
+            ),
+        )
+        self.register_buffer(
+            "peak_weights",
+            torch.tensor(
+                all_peak_weights,
+                dtype=self.energy_axis.dtype,
+                device=self.energy_axis.device,
+            ),
+        )
+        self.register_buffer(
+            "peak_element_indices",
+            torch.tensor(
+                all_peak_element_indices,
+                dtype=torch.long,
+                device=self.energy_axis.device,
+            ),
+        )
         self.n_peaks = len(all_peak_energies)
-        init_fwhm = torch.tensor(peak_width, dtype=torch.float32)
+        init_fwhm = torch.tensor(
+            peak_width,
+            dtype=self.energy_axis.dtype,
+            device=self.energy_axis.device,
+        )
         self.peak_width_by_peak = nn.Parameter(
-            torch.log(torch.expm1(init_fwhm)) * torch.ones(self.n_peaks)
+            inverse_softplus(init_fwhm)
+            * torch.ones(
+                self.n_peaks,
+                dtype=self.energy_axis.dtype,
+                device=self.energy_axis.device,
+            )
         )
 
         print(f"Fitting {n_elements} elements with {self.n_peaks} total peaks")
 
         # Learnable parameters
-        self.concentrations = nn.Parameter((torch.ones(n_elements)))
+        self.concentrations = nn.Parameter(
+            torch.ones(
+                n_elements,
+                dtype=self.energy_axis.dtype,
+                device=self.energy_axis.device,
+            )
+        )
 
     def forward(self):
         """Vectorized forward pass"""
@@ -108,7 +231,14 @@ class GaussianPeaks(nn.Module):
 
         all_peaks = torch.exp(-0.5 * ((energies - centers) / sigma) ** 2)
 
-        all_peaks = all_peaks * self.energy_step / (torch.sqrt(torch.tensor(2 * np.pi)) * sigma)
+        sqrt_2pi = torch.sqrt(
+            torch.tensor(
+                2 * np.pi,
+                dtype=all_peaks.dtype,
+                device=all_peaks.device,
+            )
+        )
+        all_peaks = all_peaks * self.energy_step / (sqrt_2pi * sigma)
 
         peak_concentrations = nn.functional.softplus(
             self.concentrations[self.peak_element_indices]
@@ -125,19 +255,28 @@ class PolynomialBackground(nn.Module):
 
     def __init__(self, energy_axis, degree=3):
         super().__init__()
-        self.energy_axis = (
+        energy_axis_tensor = (
             energy_axis.float()
             if torch.is_tensor(energy_axis)
             else torch.tensor(energy_axis, dtype=torch.float32)
         )
+        self.register_buffer("energy_axis", energy_axis_tensor)
         self.degree = degree
 
         # Normalize energy axis to [0, 1] for numerical stability
-        self.energy_norm = (self.energy_axis - self.energy_axis.min()) / (
+        energy_norm = (self.energy_axis - self.energy_axis.min()) / (
             self.energy_axis.max() - self.energy_axis.min()
         )
+        self.register_buffer("energy_norm", energy_norm)
 
-        self.coeffs = nn.Parameter(torch.randn(degree + 1) * 0.1)
+        self.coeffs = nn.Parameter(
+            torch.randn(
+                degree + 1,
+                dtype=self.energy_axis.dtype,
+                device=self.energy_axis.device,
+            )
+            * 0.1
+        )
 
     def forward(self):
         background = torch.zeros_like(self.energy_axis)
@@ -151,15 +290,18 @@ class ExponentialBackground(nn.Module):
 
     def __init__(self, energy_axis):
         super().__init__()
-        self.energy_axis = (
+        energy_axis_tensor = (
             energy_axis.float()
             if torch.is_tensor(energy_axis)
             else torch.tensor(energy_axis, dtype=torch.float32)
         )
+        self.register_buffer("energy_axis", energy_axis_tensor)
+        dtype = self.energy_axis.dtype
+        device = self.energy_axis.device
 
-        self.amplitude = nn.Parameter(torch.tensor(1.0))
-        self.decay = nn.Parameter(torch.tensor(0.5))
-        self.offset = nn.Parameter(torch.tensor(0.1))
+        self.amplitude = nn.Parameter(torch.tensor(1.0, dtype=dtype, device=device))
+        self.decay = nn.Parameter(torch.tensor(0.5, dtype=dtype, device=device))
+        self.offset = nn.Parameter(torch.tensor(0.1, dtype=dtype, device=device))
 
     def forward(self):
         return self.amplitude * torch.exp(-self.decay * self.energy_axis) + self.offset

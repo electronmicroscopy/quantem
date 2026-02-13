@@ -21,6 +21,10 @@ class Dataset3deels(Dataset3dspectroscopy):
 
     """
 
+    element_info = None
+    element_info_path = "eels_binding_energies.json"
+    dataset_type = "EELS"
+
     def __init__(
         self,
         array: NDArray | Any,
@@ -60,6 +64,7 @@ class Dataset3deels(Dataset3dspectroscopy):
             _token=_token,
         )
         self._virtual_images = {}
+        self.dataset_type = "EELS"
 
     def calculate_background_iterative(self, spectrum):
         """
