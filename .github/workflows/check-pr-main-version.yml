@@ -84,10 +84,6 @@ jobs:
               echo "New version is greater — creating release branch"
               git checkout -b release/$PR_VERSION
               git push origin release/$PR_VERSION
-
-              echo "Tagging release v$PR_VERSION"
-              git tag -a v$PR_VERSION -m "Release v$PR_VERSION"
-              git push origin v$PR_VERSION
             fi
 
           elif [[ "$RESULT" -eq 0 ]]; then
@@ -107,10 +103,6 @@ jobs:
 
             git checkout -b release/$NEXT_VERSION
             git push origin release/$NEXT_VERSION
-
-            echo "Tagging release v$NEXT_VERSION"
-            git tag -a v$NEXT_VERSION -m "Release v$NEXT_VERSION"
-            git push origin v$NEXT_VERSION
 
             PR_BODY=$(printf "This PR was automatically created because the submitted version \`%s\` matched the current release on \`main\`.\n\nIt bumps the patch version to \`%s\` and starts a new release process." "$PR_VERSION" "$NEXT_VERSION")
             gh pr create \
