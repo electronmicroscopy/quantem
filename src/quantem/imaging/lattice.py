@@ -1,5 +1,6 @@
 from typing import Any
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -1095,10 +1096,14 @@ class Lattice(AutoSerialize):
             Additional keyword arguments forwarded to the plotting function.
             - figsize : tuple, default (12,6)
                 Figure size in inches.
-            - width_ratios : list, default [8,3]
+            - width_ratios : list, default [8,4]
                 Width ratios of the polarization vector plot and the legend.
-            - wspace : float, default 0.0
+            - height_ratios : list, default [1,2]
+                Height ratios of the polarization vector plot and the legend.
+            - wspace : float, default 0.1
                 Width space between the two subplots.
+            - hspace : float, default 0.3
+                Height space between the two subplots.
 
         Returns
         -------
@@ -1138,6 +1143,8 @@ class Lattice(AutoSerialize):
         Cartesian displacement back to fractional coordinates using L^{-1}.
         - If either the measure or reference site is empty, an empty Vector (with zero rows) is returned.
         """
+        from collections import Counter
+
         from scipy.spatial import cKDTree
 
         measure_ind = int(measure_ind)
@@ -1317,8 +1324,9 @@ class Lattice(AutoSerialize):
             )
 
         # Pre-allocate arrays for better performance
-        da_arr = np.zeros(len(query_coords))
-        db_arr = np.zeros(len(query_coords))
+        dr_arr = np.zeros(len(query_coords))
+        dc_arr = np.zeros(len(query_coords))
+        neighbours_found_idxs = []
 
         # Calculate displacements with optimizations
         for i, (atom_dists, atom_idxs) in enumerate(zip(dists, idxs)):
@@ -1358,6 +1366,9 @@ class Lattice(AutoSerialize):
             xi, yi = Bx[nbr_idx], By[nbr_idx]
 
             fractional_diff = np.array([a - ai, b - bi])  # (2, n_neighbors)
+            neighbours_found_idxs.append(
+                fractional_diff.T
+            )  # List[i] = np.array(shape = (n_neighbors, 2))
             neighbor_positions = np.array([xi, yi])  # (2, n_neighbors)
 
             expected_positions = neighbor_positions + L @ fractional_diff  # (2, n_neighbors)
@@ -1367,10 +1378,14 @@ class Lattice(AutoSerialize):
 
             # Difference between actual and expected positions gives us polarization.
             displacement_cartesian = actual_pos - expected_position
-            displacement_fractional = L_inv @ displacement_cartesian
 
-            da_arr[i] = displacement_fractional[0]
-            db_arr[i] = displacement_fractional[1]
+            dr_arr[i] = displacement_cartesian[0]
+            dc_arr[i] = displacement_cartesian[1]
+
+        # Convert displacements to fractional coordinates
+        displacement_fractional = (L_inv @ np.vstack((dr_arr, dc_arr))).T
+        da_arr = displacement_fractional[:, 0]
+        db_arr = displacement_fractional[:, 1]
 
         out = Vector.from_shape(
             shape=(1,),
@@ -1387,23 +1402,58 @@ class Lattice(AutoSerialize):
 
         out.set_data(arr, 0)
 
+        # Find the indices of the most common neighbours found.
+
+        # Step 1 : Calculate the max number of neighbours found.
+        max_neighbours_found = max(len(arr) for arr in neighbours_found_idxs)
+
+        # Step 2: Collect all pairs as bytes
+        pair_bytes = []
+        dtype = neighbours_found_idxs[0].dtype  # Get dtype from first array
+        for arr in neighbours_found_idxs:
+            for i in range(arr.shape[0]):
+                pair_bytes.append(arr[i].tobytes())
+
+        # Step 3: Count frequencies
+        counter = Counter(pair_bytes)
+
+        # Step 4: Get top max_neighbours_found most common
+        top = counter.most_common(max_neighbours_found)
+
+        # Step 5: Convert back to array
+        most_common_neighbours = np.array(
+            [np.frombuffer(pair_b, dtype=dtype) for pair_b, count in top]
+        )
+
+        self.most_common_neighbours = most_common_neighbours
+
         if plot_polarization_vectors:
             if plot_legend:
-                figsize = plot_kwargs.get("figsize", (12, 6))
-                width_ratios = plot_kwargs.get("width_ratios", [8, 3])
-                wspace = plot_kwargs.get("wspace", 0.0)
-                fig, (ax1, ax2) = plt.subplots(
-                    1,
+                figsize = plot_kwargs.get("figsize", (12, 10))
+                width_ratios = plot_kwargs.get("width_ratios", [8, 2])
+                height_ratios = plot_kwargs.get("height_ratios", [1, 1])
+                wspace = plot_kwargs.get("wspace", 0.1)
+                hspace = plot_kwargs.get("hspace", 0.0)
+                assert len(width_ratios) == 2, "width_ratios must have length 2"
+                assert len(height_ratios) == 2, "height_ratios must have length 2"
+                fig = plt.figure(figsize=figsize)
+                gs = gridspec.GridSpec(
                     2,
-                    figsize=figsize,
-                    gridspec_kw={"width_ratios": width_ratios, "wspace": wspace},
+                    2,
+                    width_ratios=width_ratios,
+                    height_ratios=height_ratios,
+                    hspace=hspace,
+                    wspace=wspace,
                 )
+                ax_main = fig.add_subplot(gs[:, 0])
 
-                ax1.set_aspect("equal")
-                ax2.set_aspect("equal")
+                ax_ref1 = fig.add_subplot(gs[0, 1])
+                ax_ref2 = fig.add_subplot(gs[1, 1])
 
-                fig, ax1 = self.plot_polarization_vectors(out, figax=(fig, ax1), **plot_kwargs)
-                fig, ax2 = self.plot_polarization_legend(figax=(fig, ax2), **plot_kwargs)
+                fig, ax1 = self.plot_polarization_vectors(
+                    out, figax=(fig, ax_main), reference_axis=ax_ref1, **plot_kwargs
+                )
+                fig, ax2 = self._plot_polarization_legend(figax=(fig, ax_ref2), **plot_kwargs)
             else:
                 fig, ax = self.plot_polarization_vectors(out, **plot_kwargs)
             plt.show()
@@ -1422,6 +1472,8 @@ class Lattice(AutoSerialize):
         verbose: bool = False,
         plot_order_parameter: bool = True,
         plot_gmm_visualization: bool = True,
+        visualize_order_parameter: bool = True,
+        tight_layout: bool = True,
         torch_device: str = "cpu",
         **kwargs,
     ) -> "Lattice":
@@ -1488,6 +1540,13 @@ class Lattice(AutoSerialize):
                 - Scatter of points colored by mixture probabilities.
                 - GMM centers (means) and ~95% confidence ellipses (2 standard deviations).
 
+        visualize_order_parameter : bool, default=True
+            If True, plots a reference figure showing the polarization of each phase
+
+        tight_layout: bool = True,
+            If True, applies plt.tight_layout() to the generated figure.
+            Can cause issues with legends in some cases; set to False to disable.
+
         torch_device : str, default='cpu'
             Torch device used by the TorchGMM backend. Examples: 'cpu', 'cuda',
             'cuda:0'. If a CUDA device is requested but unavailable, the underlying
@@ -1519,6 +1578,21 @@ class Lattice(AutoSerialize):
                 Invalid inputs fall back to a preset (site_colors) with a warning.
                 When plot_order_parameter=True,
                 scatter_colours is used to color points by phase probabilities.
+
+            - figsize : tuple, default (12,8)
+                Figure size in inches.
+
+            - width_ratios : list, default [8,3]
+                Width ratios of the order parameter plot and the legend.
+
+            - height_ratios : list, default [1,1]
+                Height ratios of the order parameter plot and the legend.
+
+            - wspace : float, default 0.1
+                Width space between the two subplots.
+
+            - hspace : float, default 0.3
+                Height space between the two subplots.
 
         Returns
         -------
@@ -1839,7 +1913,7 @@ class Lattice(AutoSerialize):
         elif verbose:
             print("GMM fitting results:")
             print(f"    Means: \n{gmm.means_}")
-            print(f"    Error: {i - probabilities.max(axis=1).mean():.4f}")
+            print(f"    Error: {1 - probabilities.max(axis=1).mean():.4f}")
 
         # Create grid for contour - use max_bound to cover entire plot area
         max_bound = max(abs(da_arr).max(), abs(db_arr).max())
@@ -2023,18 +2097,42 @@ class Lattice(AutoSerialize):
             ax.set_ylabel("dv")
             ax.set_title("Classification & Contour Overlay")
 
-            # Add colorbar for contour (density)
-            # plt.colorbar(contour, ax=ax, label="Density")
+            # Calculate position for colorbar axis
+            # Position it to the right of ax with some spacing
+            pos_main = ax.get_position()
 
             # Add appropriate color reference based on number of phases
             if num_phases == 2:
-                add_2phase_colorbar(ax, scatter_colours)
+                # Define colorbar parameters
+                cbar_width_ratio = 0.02  # Width of colorbar relative to figure
+                cbar_gap = 0.02  # Gap between main plot and colorbar
+
+                # Calculate colorbar position
+                cbar_left = pos_main.x0 + pos_main.width + cbar_gap
+                cbar_width = cbar_width_ratio
+                cbar_bottom = pos_main.y0
+                cbar_height = pos_main.height
+
+                ax_cbar_gmm = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
+
+                add_2phase_colorbar(ax_cbar_gmm, scatter_colours)
             elif num_phases == 3:
-                add_3phase_color_triangle(fig, ax, scatter_colours)
+                # Define colorbar parameters
+                cbar_width_ratio = 0.2  # Width of colorbar relative to figure
+                cbar_gap = 0.02  # Gap between main plot and colorbar
+
+                # Calculate colorbar position
+                cbar_left = pos_main.x0 + pos_main.width + cbar_gap
+                cbar_width = cbar_width_ratio
+                cbar_bottom = pos_main.y0
+                cbar_height = pos_main.height
+
+                ax_cbar_gmm = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
+
+                add_3phase_color_triangle(ax_cbar_gmm, scatter_colours)
             # For num_phases > 3 or == 1, don't add any color reference
 
             ax.legend(loc="best")
-            # plt.tight_layout()
             plt.show()
 
         if plot_order_parameter:
@@ -2073,10 +2171,205 @@ class Lattice(AutoSerialize):
                 best_probabilities, num_phases, scatter_colours
             )
 
+            if visualize_order_parameter:
+                # Common parameters extracted once
+                figsize = kwargs.get("figsize", (12, 10))
+                main_width = kwargs.get("main_width", 10)
+
+                fig = plt.figure(figsize=figsize)
+
+                # Common margin and position calculations (done once)
+                left_margin = 0.1
+                right_margin = 0.05
+                bottom_margin = 0.1
+                top_margin = 0.1
+                available_width = 1.0 - left_margin - right_margin
+                available_height = 1.0 - bottom_margin - top_margin
+
+                # Helper function to create reference axes from top to bottom
+                def create_ref_axes(left_pos, width, height_ratios, hspace):
+                    num_refs = len(height_ratios)
+                    total_height_ratio = sum(height_ratios)
+
+                    # Clamp hspace so total gap space never exceeds 80% of available height
+                    max_total_gap = 0.8 * available_height
+                    total_gap_space = min((num_refs - 1) * hspace, max_total_gap)
+                    effective_hspace = total_gap_space / (num_refs - 1) if num_refs > 1 else 0
+
+                    # Calculate individual heights (guaranteed non-negative)
+                    ref_heights = [
+                        (ratio / total_height_ratio) * (available_height - total_gap_space)
+                        for ratio in height_ratios
+                    ]
+
+                    # Create reference axes from top to bottom
+                    axes = []
+                    current_top = bottom_margin + available_height
+
+                    for i in range(num_refs):
+                        current_bottom = current_top - ref_heights[i]
+                        ax_ref = fig.add_axes([left_pos, current_bottom, width, ref_heights[i]])
+                        axes.append(ax_ref)
+                        current_top = current_bottom - effective_hspace
+
+                    return axes
+
+                if num_phases == 2:
+                    # Parameters specific to 2-phase
+                    cbar_width = kwargs.get("cbar_width", 0.5)
+                    refs_width = kwargs.get("refs_width", 4)
+                    height_ratios = kwargs.get("height_ratios", [1, 1])
+                    hspace = kwargs.get("hspace", 0.25)
+                    wspace_main_cbar = kwargs.get("wspace_main_cbar", 0.05)
+                    wspace_cbar_refs = kwargs.get("wspace_cbar_refs", 0.4)
+
+                    assert len(height_ratios) == num_phases, (
+                        f"height_ratios must have {num_phases} elements"
+                    )
+
+                    # Calculate positions
+                    total_width = (
+                        main_width + cbar_width + refs_width + wspace_main_cbar + wspace_cbar_refs
+                    )
+                    width_main = main_width / total_width * available_width
+                    width_cbar = cbar_width / total_width * available_width
+                    width_refs = refs_width / total_width * available_width
+                    gap1 = wspace_main_cbar / total_width * available_width
+                    gap2 = wspace_cbar_refs / total_width * available_width
+
+                    left_main = left_margin
+                    left_cbar = left_main + width_main + gap1
+                    left_refs = left_cbar + width_cbar + gap2
+
+                    # Create axes
+                    ax_main = fig.add_axes(
+                        [left_main, bottom_margin, width_main, available_height]
+                    )
+                    ax_cbar = fig.add_axes(
+                        [left_cbar, bottom_margin, width_cbar, available_height]
+                    )
+                    ref_axes = create_ref_axes(left_refs, width_refs, height_ratios, hspace)
+
+                elif num_phases == 3:
+                    # Parameters specific to 3-phase
+                    refs_width = kwargs.get("refs_width", 4)
+                    height_ratios = kwargs.get(
+                        "height_ratios", [1, 1, 1, 1]
+                    )  # 4 refs: triangle + 3 phases
+                    hspace = kwargs.get("hspace", 0.065)
+                    wspace_main_refs = kwargs.get("wspace_main_refs", 0.2)
+
+                    assert len(height_ratios) == 4, (
+                        "height_ratios must have 4 elements for 3-phase visualization"
+                    )
+
+                    # Calculate positions
+                    total_width = main_width + refs_width + wspace_main_refs
+                    width_main = main_width / total_width * available_width
+                    width_refs = refs_width / total_width * available_width
+                    gap = wspace_main_refs / total_width * available_width
+
+                    left_main = left_margin
+                    left_refs = left_main + width_main + gap
+
+                    # Create axes
+                    ax_main = fig.add_axes(
+                        [left_main, bottom_margin, width_main, available_height]
+                    )
+                    ref_axes = create_ref_axes(left_refs, width_refs, height_ratios, hspace)
+
+                    # No separate ax_cbar for 3-phase
+                    ax_cbar = None
+
+                else:
+                    # Parameters for n-phase (general case)
+                    refs_width = kwargs.get("refs_width", 4)
+                    height_ratios = kwargs.get("height_ratios", [1] * num_phases)
+                    wspace_main_refs = kwargs.get("wspace_main_refs", 0.05)
+
+                    # Scale hspace down as num_phases increases to prevent negative heights.
+                    # Reserve at most 30% of available_height for gaps total.
+                    max_gap_fraction = 0.3
+                    default_hspace = (
+                        (max_gap_fraction * available_height) / (num_phases - 1)
+                        if num_phases > 1
+                        else 0
+                    )
+                    hspace = kwargs.get("hspace", default_hspace)
+
+                    assert len(height_ratios) == num_phases, (
+                        f"height_ratios must have {num_phases} elements"
+                    )
+
+                    # Calculate positions
+                    total_width = main_width + refs_width + wspace_main_refs
+                    width_main = main_width / total_width * available_width
+                    width_refs = refs_width / total_width * available_width
+                    gap = wspace_main_refs / total_width * available_width
+
+                    left_main = left_margin
+                    left_refs = left_main + width_main + gap
+
+                    # Create axes
+                    ax_main = fig.add_axes(
+                        [left_main, bottom_margin, width_main, available_height]
+                    )
+                    ref_axes = create_ref_axes(left_refs, width_refs, height_ratios, hspace)
+
+                    # No colorbar for num_phases > 3
+                    ax_cbar = None
+
+            else:
+                # Extract parameters with defaults
+                figsize = kwargs.get("figsize", (10, 8))
+                main_width = kwargs.get("main_width", 10)
+
+                fig = plt.figure(figsize=figsize)
+
+                # Common margin and position calculations
+                left_margin = 0.2
+                right_margin = 0.2
+                bottom_margin = 0.1
+                top_margin = 0.1
+                available_width = 1.0 - left_margin - right_margin
+                available_height = 1.0 - bottom_margin - top_margin
+
+                if num_phases <= 3:
+                    cbar_width = kwargs.get("cbar_width", 4.0 if num_phases == 3 else 0.5)
+                    wspace_main_cbar = kwargs.get(
+                        "wspace_main_cbar", 0.3 if num_phases == 3 else 0.1
+                    )
+
+                    total_width = main_width + cbar_width + wspace_main_cbar
+                    width_main = main_width / total_width * available_width
+                    width_cbar = cbar_width / total_width * available_width
+                    gap = wspace_main_cbar / total_width * available_width
+
+                    left_main = left_margin
+                    left_cbar = left_main + width_main + gap
+
+                    ax_main = fig.add_axes(
+                        [left_main, bottom_margin, width_main, available_height]
+                    )
+                    ax_cbar = fig.add_axes(
+                        [left_cbar, bottom_margin, width_cbar, available_height]
+                    )
+
+                else:
+                    # No colorbar for num_phases > 3
+                    width_main = available_width
+                    left_main = left_margin
+
+                    ax_main = fig.add_axes(
+                        [left_main, bottom_margin, width_main, available_height]
+                    )
+                    ax_cbar = None
+
             fig, ax = show_2d(
                 self._image.array,
-                axsize=(8, 7),
                 cmap="gray",
+                figax=(fig, ax_main),
+                returnfig=True,
             )
 
             # Plot points with colormap
@@ -2091,18 +2384,82 @@ class Lattice(AutoSerialize):
             )
 
             ax.set_title("Spatial phase probability map")
+            ax.axis("off")
 
             # Add appropriate color reference based on number of phases
-            if num_phases == 2:
-                add_2phase_colorbar(ax, scatter_colours)
+            if num_phases == 2 and ax_cbar is not None:
+                # For 2 phases: colorbar next to main figure
+                add_2phase_colorbar(ax_cbar, scatter_colours, match_ax=ax_main)
             elif num_phases == 3:
-                add_3phase_color_triangle(fig, ax, scatter_colours)
+                if visualize_order_parameter:
+                    # For 3 phases: color triangle is the first reference plot (ref_axes[0])
+                    add_3phase_color_triangle(ref_axes[0], scatter_colours, match_ax=ax_main)
+                else:
+                    # If not visualize_order_parameter, use ax_cbar for color triangle
+                    add_3phase_color_triangle(ax_cbar, scatter_colours)
             # For num_phases > 3 or == 1, don't add any color reference
 
-            ax.axis("off")
-            fig.tight_layout()
-            fig.show()
+            if visualize_order_parameter:
+                # Force a draw so get_position() reflects actual rendered sizes
+                fig.canvas.draw()
+                pos_main = ax_main.get_position()
 
+                if num_phases == 2:
+                    for i in range(len(ref_axes)):
+                        plot_kwargs = kwargs.copy()
+                        fig, ref_axes[i] = self._visualize_order_parameter(
+                            figax=(fig, ref_axes[i]),
+                            phase_vector=self._polarization_means[i],
+                            phase_index=i,
+                            num_phases=num_phases,
+                            **plot_kwargs,
+                        )
+
+                elif num_phases == 3:
+                    # ref_axes[0] = triangle (already handled above)
+                    # ref_axes[1..3] = phase 0, 1, 2
+                    for i in range(1, 4):
+                        plot_kwargs = kwargs.copy()
+                        phase_idx = i - 1
+                        fig, ref_axes[i] = self._visualize_order_parameter(
+                            figax=(fig, ref_axes[i]),
+                            phase_vector=self._polarization_means[phase_idx],
+                            phase_index=phase_idx,
+                            num_phases=num_phases,
+                            **plot_kwargs,
+                        )
+
+                else:
+                    # For num_phases > 3: plot n reference figures
+                    for i in range(len(ref_axes)):
+                        plot_kwargs = kwargs.copy()
+                        fig, ref_axes[i] = self._visualize_order_parameter(
+                            figax=(fig, ref_axes[i]),
+                            phase_vector=self._polarization_means[i],
+                            phase_index=i,
+                            num_phases=num_phases,
+                            **plot_kwargs,
+                        )
+
+                # After all plotting is done, reposition all ref_axes uniformly.
+                # Recalculate heights fresh (plotting may have resized axes),
+                # then redistribute evenly across the main plot's vertical span.
+                fig.canvas.draw()
+                heights = [ax.get_position().height for ax in ref_axes]
+                total_height = sum(heights)
+                n = len(ref_axes)
+                gap = max(0, (pos_main.height - total_height) / (n - 1)) if n > 1 else 0
+
+                current_top = pos_main.y0 + pos_main.height
+                for ax, h in zip(ref_axes, heights):
+                    pos_ref = ax.get_position()
+                    current_bottom = current_top - h
+                    ax.set_position([pos_ref.x0, current_bottom, pos_ref.width, h])
+                    current_top = current_bottom - gap
+
+            if tight_layout:
+                fig.tight_layout()
+            fig.show()
         return self
 
     # --- Plotting Functions ---
@@ -2114,6 +2471,7 @@ class Lattice(AutoSerialize):
         figsize=(6, 6),
         subtract_median: bool = False,
         figax: tuple[Any, Any] | None = None,
+        reference_axis: Any | None = None,
         linewidth: float = 1.0,
         tail_width: float = 1.0,
         headwidth: float = 4.0,
@@ -2133,6 +2491,8 @@ class Lattice(AutoSerialize):
         disp_color_max: float | None = None,
         phase_offset_deg: float = 180.0,  # red = down
         phase_dir_flip: bool = False,  # flip color direction if desired
+        adaptive_head: bool = True,  # Enable adaptive arrow head sizing
+        max_head_ratio: float = 0.5,  # Maximum head size as ratio of arrow length
         **kwargs,
     ):
         import matplotlib.patheffects as pe
@@ -2209,14 +2569,43 @@ class Lattice(AutoSerialize):
             else:
                 fig, ax = plt.subplots(1, 1, figsize=figsize)
 
+        # --- Vectorized calculation of arrow lengths for adaptive head sizing ---
+        if adaptive_head:
+            # Calculate scaled displacements
+            dr_scaled = dr * length_scale
+            dc_scaled = dc * length_scale
+
+            # Vectorized arrow lengths
+            arrow_lengths = np.sqrt(dr_scaled**2 + dc_scaled**2)
+
+            # Calculate adaptive head dimensions
+            # Head size should not exceed max_head_ratio of arrow length
+            adaptive_headlength = np.minimum(headlength, arrow_lengths * max_head_ratio)
+            adaptive_headwidth = np.minimum(headwidth, arrow_lengths * max_head_ratio)
+
+            # Ensure minimum visibility
+            min_headlength = 0.5
+            min_headwidth = 0.5
+            adaptive_headlength = np.maximum(adaptive_headlength, min_headlength)
+            adaptive_headwidth = np.maximum(adaptive_headwidth, min_headwidth)
+
         # Draw arrows (colored patch with black stroke beneath via path effects)
-        arrowstyle = ArrowStyle.Simple(
-            head_length=headlength, head_width=headwidth, tail_width=tail_width
-        )
         for i in range(xA.size):
             x0, y0 = float(xA[i]), float(yA[i])
             x1 = x0 + float(dr[i]) * float(length_scale)
             y1 = y0 + float(dc[i]) * float(length_scale)
+
+            # Use adaptive or fixed head dimensions
+            if adaptive_head:
+                current_headlength = float(adaptive_headlength[i])
+                current_headwidth = float(adaptive_headwidth[i])
+            else:
+                current_headlength = headlength
+                current_headwidth = headwidth
+
+            arrowstyle = ArrowStyle.Simple(
+                head_length=current_headlength, head_width=current_headwidth, tail_width=tail_width
+            )
 
             arrow = FancyArrowPatch(
                 (y0, x0),
@@ -2263,8 +2652,13 @@ class Lattice(AutoSerialize):
 
         # Circular legend (same mapping and label)
         if show_colorbar:
-            divider = make_axes_locatable(ax)
-            ax_c = divider.append_axes("right", size="28%", pad="6%")
+            # figax has the figure and main axis
+            # reference_axis is for the colorbar (if None, create a new one to the right)
+            if not reference_axis:
+                divider = make_axes_locatable(ax)
+                ax_c = divider.append_axes("right", size="28%", pad="6%")
+            else:
+                ax_c = reference_axis
 
             N = 256
             yy = np.linspace(-1, 1, N)
@@ -2587,7 +2981,50 @@ class Lattice(AutoSerialize):
 
         return img_rgb
 
-    def visualize_order_parameter(self, **kwargs):
+    def visualize_order_parameter(self, return_fig: bool = False, **kwargs):
+        assert hasattr(self, "_polarization_means"), (
+            "Order parameter must be computed before visualization."
+        )
+        pol_means = self._polarization_means
+        num_phases = pol_means.shape[0]
+
+        figsize = kwargs.get("figsize", (12, 10))
+        hspace = kwargs.get("hspace", 0.1)
+
+        fig = plt.figure(figsize=figsize)
+
+        height_ratios = kwargs.get("height_ratios", [1] * num_phases)
+        assert len(height_ratios) == num_phases, f"height_ratios must have length {num_phases}"
+        hspace = kwargs.get("hspace", 0.3)
+
+        # Create grid: n_refs rows, 1 column
+        gs = gridspec.GridSpec(num_phases, 1, height_ratios=height_ratios, hspace=hspace)
+
+        # Create reference axes
+        ax_refs = [fig.add_subplot(gs[i, 0]) for i in range(num_phases)]
+
+        for i in range(num_phases):
+            fig, ax_refs[i] = self._visualize_order_parameter(
+                figax=(fig, ax_refs[i]),
+                phase_vector=pol_means[i],
+                phase_index=i,
+                num_phases=num_phases,
+                **kwargs,
+            )
+
+        fig.tight_layout()
+        if return_fig:
+            return fig
+        fig.show()
+
+    def _visualize_order_parameter(
+        self,
+        figax: tuple[Any, Any] | None = None,
+        phase_vector: np.ndarray | None = None,
+        phase_index: int | None = None,
+        num_phases: int | None = None,
+        **kwargs,
+    ):
         """
         For start point, use 2 indices as follows:
         (index of direction of line [u=0,v=1],
@@ -2595,20 +3032,17 @@ class Lattice(AutoSerialize):
         So a line between (0,1) to (1,1) would be represented as (0,1).
         0 as it is drawn along u direction (v=constant), and 1 as the start value of v is 1.
 
+        Parameters:
+        - axes_list: List of matplotlib axes to plot on. If None, a new figure and axes will be created.
+
         Customizable parameters via kwargs:
         - alpha_unit_cell: alpha for unit cell boundary (default: 1.0)
-        - alpha_shadow_boundary: alpha for shadow boundaries (default: 0.3)
-        - alpha_shadow_atom: alpha for shadow atoms (default: 0.3)
-        - alpha_shadow_arrow: alpha for shadow arrows (default: 0.3)
         - alpha_phase_boundary: alpha for phase boundaries (default: 1.0)
         - alpha_reference_boundary: alpha for reference boundaries (default: 1.0)
         - alpha_phase_atom: alpha for phase atoms (default: 1.0)
         - alpha_phase_arrow: alpha for phase arrows (default: 1.0)
 
         - zorder_unit_cell: zorder for unit cell boundary (default: 1)
-        - zorder_shadow_boundary: zorder for shadow boundaries (default: 2)
-        - zorder_shadow_atom: zorder for shadow atoms (default: 3)
-        - zorder_shadow_arrow: zorder for shadow arrows (default: 4)
         - zorder_phase_boundary: zorder for phase boundaries (default: 5)
         - zorder_reference_atoms: zorder for reference atoms (default: 6)
         - zorder_phase_atom: zorder for phase atoms (default: 7)
@@ -2619,9 +3053,8 @@ class Lattice(AutoSerialize):
         - phase_arrow_headlength: length of phase arrow head (default: 8.0)
         - phase_arrow_headwidth: width of phase arrow head (default: 8.0)
         - phase_arrow_tail_width: width of phase arrow tail (default: 3.0)
-        - shadow_arrow_headlength: length of shadow arrow head (default: 8.0)
-        - shadow_arrow_headwidth: width of shadow arrow head (default: 8.0)
-        - shadow_arrow_tail_width: width of shadow arrow tail (default: 3.0)
+        - adaptive_head: enable adaptive arrow head sizing (default: True)
+        - max_head_ratio: maximum head size as ratio of arrow length (default: 0.5)
 
         - scatter_colours: Colors for phase atoms. Accepted forms:
             • callable f(i) -> RGB(A) (first 3 components used),
@@ -2680,27 +3113,21 @@ class Lattice(AutoSerialize):
                 return False
 
         # Extract alpha values from kwargs with defaults
-        alpha_unit_cell = kwargs.get("alpha_unit_cell", 1.0)
-        alpha_shadow_boundary = kwargs.get("alpha_shadow_boundary", 0.0)
-        alpha_shadow_atom = kwargs.get("alpha_shadow_atom", 0.3)
-        alpha_shadow_arrow = kwargs.get("alpha_shadow_arrow", 0.0)
-        alpha_phase_boundary = kwargs.get("alpha_phase_boundary", 0.0)
-        alpha_reference_boundary = kwargs.get("alpha_reference_boundary", 1.0)
+        alpha_pol_measurement = kwargs.get("alpha_pol_measurement", 1.0)
         alpha_phase_atom = kwargs.get("alpha_phase_atom", 1.0)
+        alpha_reference_atom = kwargs.get("alpha_reference_atom", 1.0)
         alpha_phase_arrow = kwargs.get("alpha_phase_arrow", 1.0)
+        alpha_other_atom = kwargs.get("alpha_other_atom", 1.0)
 
         # Extract zorder values from kwargs with defaults
-        zorder_unit_cell = kwargs.get("zorder_unit_cell", 1)
-        zorder_shadow_boundary = kwargs.get("zorder_shadow_boundary", 2)
-        zorder_shadow_atom = kwargs.get("zorder_shadow_atom", 3)
-        zorder_shadow_arrow = kwargs.get("zorder_shadow_arrow", 4)
-        zorder_phase_boundary = kwargs.get("zorder_phase_boundary", 5)
+        zorder_pol_measurement = kwargs.get("zorder_pol_measurement", 1)
+        zorder_other_atom = kwargs.get("zorder_other_atom", 5)
         zorder_reference_atoms = kwargs.get("zorder_reference_atoms", 6)
         zorder_phase_atom = kwargs.get("zorder_phase_atom", 7)
         zorder_phase_arrow = kwargs.get("zorder_phase_arrow", 8)
 
         # Extract size and linewidth parameters
-        atom_size = kwargs.get("atom_size", 150)
+        atom_size = kwargs.get("atom_size", 100)
         linewidth = kwargs.get("linewidth", 2.0)
 
         # Extract phase arrow parameters
@@ -2708,61 +3135,68 @@ class Lattice(AutoSerialize):
         phase_arrow_headwidth = kwargs.get("phase_arrow_headwidth", 8.0)
         phase_arrow_tail_width = kwargs.get("phase_arrow_tail_width", 3.0)
 
-        # Extract shadow arrow parameters
-        shadow_arrow_headlength = kwargs.get("shadow_arrow_headlength", 8.0)
-        shadow_arrow_headwidth = kwargs.get("shadow_arrow_headwidth", 8.0)
-        shadow_arrow_tail_width = kwargs.get("shadow_arrow_tail_width", 3.0)
+        # Extract adaptive arrow head parameters
+        adaptive_head = kwargs.get("adaptive_head", True)
+        max_head_ratio = kwargs.get("max_head_ratio", 3.5)
+        arrow_scale_factor = kwargs.get("arrow_scale_factor", 2.0)
 
-        # First get all the stored information
+        # Get stored information
         r0, u, v = (np.asarray(x, dtype=float) for x in self._lat)
         frac_positions = self._positions_frac
         measure_ind = self._pol_meas_ref_ind[0]
-        pol_means = self._polarization_means
+        reference_ind = self._pol_meas_ref_ind[1]
+        assert phase_vector is not None and phase_vector.shape == (2,), (
+            "phase_vector must be of shape (2,)"
+        )
+        assert phase_index is not None, "phase_index must be provided."
 
         A = np.column_stack((u, v))
-        corner_ind = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        corner_ind = np.array([[i, j] for i in [1.0, 0.0, -1.0] for j in [1.0, 0.0, -1.0]])
 
-        # Step 1: Check if the lattice site atoms are polarised. If yes, then shift all others.
-        if measure_ind == 0:
-            reference_atom_ind = frac_positions[np.arange(len(frac_positions)) == measure_ind]
-            measured_atom_ind = frac_positions[np.arange(len(frac_positions)) != measure_ind]
-            pol_means = -pol_means
-        else:
-            reference_atom_ind = frac_positions[np.arange(len(frac_positions)) != measure_ind]
-            measured_atom_ind = frac_positions[np.arange(len(frac_positions)) == measure_ind]
-
-        # Step 2: Tile to get all possible sites in 1 unit cell.
-        reference_atom_ind = (reference_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
-            -1, 2
-        )
-        measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
-
-        # Step 3: Remove all outside unit cell
-        reference_atom_ind = reference_atom_ind[
-            ~np.any((reference_atom_ind < -0.1) | (reference_atom_ind > 1.1), axis=1)
+        # Get reference, measured, and other atoms
+        measured_atom_ind = np.array([[0.0, 0.0]])
+        reference_atom_ind = self.most_common_neighbours.copy()
+        other_atom_ind = frac_positions[
+            (np.arange(len(frac_positions)) != measure_ind)
+            & (np.arange(len(frac_positions)) != reference_ind)
         ]
+        if other_atom_ind.size > 0:
+            other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
+
+        # Get the polarization of each phase
+        pol_vector = phase_vector @ A.T  # (2,)
+
+        # Tile to get all sites within the distanceof the max neighbours considered
+        max_dist_ref_ind = reference_atom_ind[
+            np.argmax(np.linalg.norm(reference_atom_ind @ A.T, axis=1))
+        ]
+        max_dist = np.linalg.norm(max_dist_ref_ind @ A.T)
+        for i in range(int(np.ceil(np.max(np.abs(max_dist_ref_ind))))):
+            measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
+                -1, 2
+            )
+            if other_atom_ind.size > 0:
+                other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
+                    -1, 2
+                )
         measured_atom_ind = measured_atom_ind[
-            ~np.any((measured_atom_ind < -0.1) | (measured_atom_ind > 1.1), axis=1)
+            np.where(np.linalg.norm(measured_atom_ind @ A.T, axis=1) < max_dist)
+        ]
+        other_atom_ind = other_atom_ind[
+            np.where(np.linalg.norm(other_atom_ind @ A.T, axis=1) < max_dist)
         ]
 
-        # Step 4: Plot the corner_pos and draw the edges
-        corner_pos = corner_ind @ A.T
+        # Convert to Cartesian coordinates
         reference_atom_pos = reference_atom_ind @ A.T
-        edges = [
-            (0, 1),  # bottom edge
-            (0, 2),  # left edge
-            (1, 3),  # right edge
-            (2, 3),  # top edge
-        ]
-
-        # Determine number of phases
-        num_phases = pol_means.shape[0]
+        measured_atom_pos = measured_atom_ind @ A.T
+        if other_atom_ind.size > 0:
+            other_atom_pos = other_atom_ind @ A.T
 
         # Extract and validate color parameters
         # Default presets
         preset_scatter_colours = site_colors
         preset_reference_atom_colour = site_colors(-1)
-        preset_unit_cell_boundary_colour = site_colors(-1)
+        preset_other_atom_colour = site_colors(-2)
 
         # Check and assign scatter_colours (for phase atoms)
         if "scatter_colours" in kwargs:
@@ -2801,384 +3235,144 @@ class Lattice(AutoSerialize):
         else:
             reference_atom_colour = preset_reference_atom_colour
 
-        # Check and assign unit_cell_boundary_colour
-        if "unit_cell_boundary_colour" in kwargs:
-            if is_valid_color(kwargs["unit_cell_boundary_colour"]):
-                unit_cell_boundary_colour = kwargs["unit_cell_boundary_colour"]
+        # Check and assign other_atom_colour
+        if "other_atom_colour" in kwargs:
+            if is_valid_color(kwargs["other_atom_colour"]):
+                other_atom_colour = kwargs["other_atom_colour"]
             else:
                 print(
-                    f"Warning: '{kwargs['unit_cell_boundary_colour']}' is not a valid color, using preset"
+                    f"Warning: '{kwargs['other_atom_colour']}' is not a valid color, using preset"
                 )
-                unit_cell_boundary_colour = preset_unit_cell_boundary_colour
+                other_atom_colour = preset_other_atom_colour
         else:
-            unit_cell_boundary_colour = preset_unit_cell_boundary_colour
+            other_atom_colour = preset_other_atom_colour
 
         # Convert reference_atom_colour to RGB tuple for color_override
         reference_atom_colour_rgb = np.array(mcolors.to_rgb(reference_atom_colour))
+        other_atom_colour_rgb = np.array(mcolors.to_rgb(other_atom_colour))
+        phase_color = scatter_colours[phase_index]
 
         # Create figure with vertical subplots
-        fig, axes = plt.subplots(num_phases, 1, figsize=(6, 6 * num_phases))
+        assert figax is not None, "figax must be provided."
+        fig, ax = figax
+        plt.figure(fig.number)
+        plt.sca(ax)
+
+        # --- Calculate adaptive arrow head dimensions ---
+        if adaptive_head:
+            # Calculate arrow length
+            arrow_length = np.linalg.norm(pol_vector)
+
+            # Calculate adaptive head dimensions
+            adaptive_headlength = min(phase_arrow_headlength, arrow_length * max_head_ratio)
+            adaptive_headwidth = min(phase_arrow_headwidth, arrow_length * max_head_ratio)
+
+            # Ensure minimum visibility
+            min_headlength = 0.5
+            min_headwidth = 0.5
+            adaptive_headlength = max(adaptive_headlength, min_headlength)
+            adaptive_headwidth = max(adaptive_headwidth, min_headwidth)
+
+            # Use adaptive dimensions
+            current_headlength = adaptive_headlength
+            current_headwidth = adaptive_headwidth
+        else:
+            # Use fixed dimensions
+            current_headlength = phase_arrow_headlength
+            current_headwidth = phase_arrow_headwidth
 
         # Arrow style parameters for phase arrows
         phase_arrowstyle = ArrowStyle.Simple(
-            head_length=phase_arrow_headlength,
-            head_width=phase_arrow_headwidth,
+            head_length=current_headlength,
+            head_width=current_headwidth,
             tail_width=phase_arrow_tail_width,
         )
 
-        # Arrow style parameters for shadow arrows
-        shadow_arrowstyle = ArrowStyle.Simple(
-            head_length=shadow_arrow_headlength,
-            head_width=shadow_arrow_headwidth,
-            tail_width=shadow_arrow_tail_width,
-        )
-
-        # Handle case of single phase
-        if num_phases == 1:
-            axes = [axes]
-
-        # Step 5: Check if any measured atoms are on edges.
-        edge_tol = 0.1
-        on_edge = np.any(
-            (np.abs(measured_atom_ind) < edge_tol) | (np.abs(measured_atom_ind - 1) < edge_tol)
-        )
-
-        # Calculate measured atom positions (same for all phases)
-        measured_atom_pos = measured_atom_ind @ A.T
-        pol_atom_pos = (pol_means @ A.T)[None, :, :] + measured_atom_pos[:, None, :]
-
-        # Loop through each phase and create subplot
-        for phase_idx in range(num_phases):
-            ax = axes[phase_idx]
-
-            # Plot reference atoms using color_override
+        # Plot other atoms if they exist
+        if other_atom_ind.size > 0:
             fig, ax = plot_atoms_2d(
-                reference_atom_pos,
-                site_number=-1,
-                fig=fig,
-                ax=ax,
+                other_atom_pos,
+                site_number=-2,
+                figax=(fig, ax),
                 size=atom_size,
-                alpha=alpha_phase_atom,
-                zorder=zorder_reference_atoms,
-                color_override=reference_atom_colour_rgb,
+                alpha=alpha_other_atom,
+                zorder=zorder_other_atom,
+                color_override=other_atom_colour_rgb,
+            )
+        # Plot reference atoms
+        fig, ax = plot_atoms_2d(
+            reference_atom_pos,
+            site_number=-1,
+            figax=(fig, ax),
+            size=atom_size,
+            alpha=alpha_reference_atom,
+            zorder=zorder_reference_atoms,
+            color_override=reference_atom_colour_rgb,
+        )
+
+        # Plot expected value of phase atoms
+        fig, ax = plot_atoms_2d(
+            measured_atom_pos,
+            site_number=phase_index,
+            figax=(fig, ax),
+            size=atom_size,
+            alpha=alpha_phase_atom,
+            zorder=zorder_phase_atom,
+            color_override=phase_color,
+        )
+
+        # Draw arrow from expected to measured
+        arrow = FancyArrowPatch(
+            (0, 0),  # Start point
+            (pol_vector[1] * arrow_scale_factor, pol_vector[0] * arrow_scale_factor),
+            arrowstyle=phase_arrowstyle,
+            mutation_scale=1.0,
+            facecolor=phase_color,
+            edgecolor=reference_atom_colour,
+            alpha=alpha_phase_arrow,
+            zorder=zorder_phase_arrow,
+            capstyle="round",
+            joinstyle="round",
+            shrinkA=0.0,
+            shrinkB=0.0,
+        )
+        ax.add_patch(arrow)
+
+        for ref_atom in reference_atom_pos:
+            ax.plot(
+                [ref_atom[1], 0],
+                [ref_atom[0], 0],
+                linestyle="--",
+                linewidth=2,
+                color="black",
+                alpha=alpha_pol_measurement,
+                zorder=zorder_pol_measurement,
             )
 
-            # Plot unit cell edges with unit_cell_boundary_colour
-            for i, j in edges:
-                ax.plot(
-                    [corner_pos[i, 1], corner_pos[j, 1]],
-                    [corner_pos[i, 0], corner_pos[j, 0]],
-                    color=unit_cell_boundary_colour,
-                    linewidth=linewidth,
-                    alpha=alpha_unit_cell,
-                    zorder=zorder_unit_cell,
-                )
+        # Get the axis limits
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
 
-            if on_edge:
-                # Handle edge case
-                for i in range(len(measured_atom_pos)):
-                    ind = measured_atom_ind[i]
-                    pos = measured_atom_pos[i]
+        # Draw rectangle border
+        rect = Rectangle(
+            (xlim[0], ylim[0]),
+            xlim[1] - xlim[0],
+            ylim[1] - ylim[0],
+            linewidth=linewidth,
+            edgecolor="black",
+            facecolor="none",
+            zorder=100,
+        )
+        ax.add_patch(rect)
 
-                    corner_indices = None
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.invert_yaxis()
+        ax.set_title(f"Phase {phase_index}", fontsize=14, fontweight="bold")
 
-                    if ind[0] < edge_tol:
-                        corner_indices = edges[1]
-                    elif ind[0] > 1 - edge_tol:
-                        corner_indices = edges[2]
-                    elif ind[1] < edge_tol:
-                        corner_indices = edges[0]
-                    elif ind[1] > 1 - edge_tol:
-                        corner_indices = edges[3]
+        return fig, ax
 
-                    if corner_indices is not None:
-                        c1_idx, c2_idx = corner_indices
-                        corner1 = corner_pos[c1_idx]
-                        corner2 = corner_pos[c2_idx]
-
-                        # Plot measured position with reference_atom_colour
-                        pos_2d = np.array([[pos[0], pos[1]]])
-                        fig, ax = plot_atoms_2d(
-                            pos_2d,
-                            site_number=-1,
-                            fig=fig,
-                            ax=ax,
-                            size=atom_size,
-                            alpha=alpha_phase_atom,
-                            zorder=zorder_reference_atoms,
-                            color_override=reference_atom_colour_rgb,
-                        )
-
-                        # Draw lines from corners to measured position
-                        ax.plot(
-                            [corner1[1], pos[1]],
-                            [corner1[0], pos[0]],
-                            color=reference_atom_colour,
-                            linewidth=linewidth,
-                            alpha=alpha_reference_boundary,
-                            zorder=zorder_reference_atoms,
-                        )
-                        ax.plot(
-                            [corner2[1], pos[1]],
-                            [corner2[0], pos[0]],
-                            color=reference_atom_colour,
-                            linewidth=linewidth,
-                            alpha=alpha_reference_boundary,
-                            zorder=zorder_reference_atoms,
-                        )
-
-                        # FIRST: Plot all OTHER phases as gray shadows
-                        for other_phase_idx in range(num_phases):
-                            if other_phase_idx == phase_idx:
-                                continue  # Skip the current phase
-
-                            pol_pos_other = pol_atom_pos[i, other_phase_idx, :]
-
-                            # Plot shadow atom in gray
-                            pol_pos_2d_other = np.array([[pol_pos_other[0], pol_pos_other[1]]])
-                            ax.scatter(
-                                pol_pos_2d_other[:, 1],
-                                pol_pos_2d_other[:, 0],
-                                c="gray",
-                                s=atom_size,
-                                alpha=alpha_shadow_atom,
-                                zorder=zorder_shadow_atom,
-                                edgecolor="darkgray",
-                                linewidth=0.5,
-                            )
-
-                            # Draw shadow lines
-                            ax.plot(
-                                [corner1[1], pol_pos_other[1]],
-                                [corner1[0], pol_pos_other[0]],
-                                color="gray",
-                                linewidth=linewidth,
-                                alpha=alpha_shadow_boundary,
-                                zorder=zorder_shadow_boundary,
-                            )
-                            ax.plot(
-                                [corner2[1], pol_pos_other[1]],
-                                [corner2[0], pol_pos_other[0]],
-                                color="gray",
-                                linewidth=linewidth,
-                                alpha=alpha_shadow_boundary,
-                                zorder=zorder_shadow_boundary,
-                            )
-
-                            # Draw shadow arrow using FancyArrowPatch
-                            shadow_arrow = FancyArrowPatch(
-                                (pos[1], pos[0]),  # Start point
-                                (pol_pos_other[1], pol_pos_other[0]),  # End point
-                                arrowstyle=shadow_arrowstyle,
-                                mutation_scale=1.0,
-                                facecolor="gray",
-                                edgecolor="gray",
-                                alpha=alpha_shadow_arrow,
-                                zorder=zorder_shadow_arrow,
-                                capstyle="round",
-                                joinstyle="round",
-                                shrinkA=0.0,
-                                shrinkB=0.0,
-                            )
-                            ax.add_patch(shadow_arrow)
-
-                        # THEN: Plot this phase (highlighted)
-                        pol_pos = pol_atom_pos[i, phase_idx, :]
-                        phase_color = scatter_colours[phase_idx]
-
-                        pol_pos_2d = np.array([[pol_pos[0], pol_pos[1]]])
-                        fig, ax = plot_atoms_2d(
-                            pol_pos_2d,
-                            site_number=phase_idx,
-                            fig=fig,
-                            ax=ax,
-                            size=atom_size,
-                            alpha=alpha_phase_atom,
-                            zorder=zorder_phase_atom,
-                            color_override=phase_color,
-                        )
-
-                        ax.plot(
-                            [corner1[1], pol_pos[1]],
-                            [corner1[0], pol_pos[0]],
-                            color=phase_color,
-                            linewidth=linewidth,
-                            alpha=alpha_phase_boundary,
-                            zorder=zorder_phase_boundary,
-                        )
-                        ax.plot(
-                            [corner2[1], pol_pos[1]],
-                            [corner2[0], pol_pos[0]],
-                            color=phase_color,
-                            linewidth=linewidth,
-                            alpha=alpha_phase_boundary,
-                            zorder=zorder_phase_boundary,
-                        )
-
-                        # Use FancyArrowPatch for highlighted arrow
-                        arrow = FancyArrowPatch(
-                            (pos[1], pos[0]),  # Start point
-                            (pol_pos[1], pol_pos[0]),  # End point
-                            arrowstyle=phase_arrowstyle,
-                            mutation_scale=1.0,
-                            facecolor=phase_color,
-                            edgecolor=reference_atom_colour,
-                            alpha=alpha_phase_arrow,
-                            zorder=zorder_phase_arrow,
-                            capstyle="round",
-                            joinstyle="round",
-                            shrinkA=0.0,
-                            shrinkB=0.0,
-                        )
-                        ax.add_patch(arrow)
-            else:
-                # Handle non-edge case
-                # Plot measured atoms with reference_atom_colour
-                fig, ax = plot_atoms_2d(
-                    measured_atom_pos,
-                    site_number=-1,
-                    fig=fig,
-                    ax=ax,
-                    size=atom_size,
-                    alpha=alpha_phase_atom,
-                    zorder=zorder_reference_atoms,
-                    color_override=reference_atom_colour_rgb,
-                )
-
-                for corner in corner_pos:
-                    for atom in measured_atom_pos:
-                        ax.plot(
-                            [corner[1], atom[1]],
-                            [corner[0], atom[0]],
-                            color=reference_atom_colour,
-                            linewidth=linewidth,
-                            alpha=alpha_reference_boundary,
-                            zorder=zorder_reference_atoms,
-                        )
-
-                # FIRST: Plot all OTHER phases as gray shadows
-                for other_phase_idx in range(num_phases):
-                    if other_phase_idx == phase_idx:
-                        continue  # Skip the current phase
-
-                    phase_positions_other = pol_atom_pos[:, other_phase_idx, :]
-
-                    # Plot shadow atoms
-                    ax.scatter(
-                        phase_positions_other[:, 1],
-                        phase_positions_other[:, 0],
-                        c="gray",
-                        s=atom_size,
-                        alpha=alpha_shadow_atom,
-                        zorder=zorder_shadow_atom,
-                        edgecolor="darkgray",
-                        linewidth=0.5,
-                    )
-
-                    # Draw shadow lines to corners
-                    for corner in corner_pos:
-                        for phase_atom in phase_positions_other:
-                            ax.plot(
-                                [corner[1], phase_atom[1]],
-                                [corner[0], phase_atom[0]],
-                                color="gray",
-                                linewidth=linewidth,
-                                alpha=alpha_shadow_boundary,
-                                zorder=zorder_shadow_boundary,
-                            )
-
-                    # Draw shadow arrows using FancyArrowPatch
-                    for j in range(measured_atom_pos.shape[0]):
-                        shadow_arrow = FancyArrowPatch(
-                            (measured_atom_pos[j, 1], measured_atom_pos[j, 0]),  # Start point
-                            (
-                                phase_positions_other[j, 1],
-                                phase_positions_other[j, 0],
-                            ),  # End point
-                            arrowstyle=shadow_arrowstyle,
-                            mutation_scale=1.0,
-                            facecolor="gray",
-                            edgecolor="gray",
-                            alpha=alpha_shadow_arrow,
-                            zorder=zorder_shadow_arrow,
-                            capstyle="round",
-                            joinstyle="round",
-                            shrinkA=0.0,
-                            shrinkB=0.0,
-                        )
-                        ax.add_patch(shadow_arrow)
-
-                # THEN: Plot only this phase (highlighted)
-                phase_positions = pol_atom_pos[:, phase_idx, :]
-                phase_color = scatter_colours[phase_idx]
-
-                # Plot phase atoms with scatter_colours using color_override
-                fig, ax = plot_atoms_2d(
-                    phase_positions,
-                    site_number=phase_idx,
-                    fig=fig,
-                    ax=ax,
-                    size=atom_size,
-                    alpha=alpha_phase_atom,
-                    zorder=zorder_phase_atom,
-                    color_override=phase_color,
-                )
-
-                for corner in corner_pos:
-                    for phase_atom in phase_positions:
-                        ax.plot(
-                            [corner[1], phase_atom[1]],
-                            [corner[0], phase_atom[0]],
-                            color=phase_color,
-                            linewidth=linewidth,
-                            alpha=alpha_phase_boundary,
-                            zorder=zorder_phase_boundary,
-                        )
-
-                # Draw arrows using FancyArrowPatch
-                for j in range(measured_atom_pos.shape[0]):
-                    arrow = FancyArrowPatch(
-                        (measured_atom_pos[j, 1], measured_atom_pos[j, 0]),  # Start point
-                        (phase_positions[j, 1], phase_positions[j, 0]),  # End point
-                        arrowstyle=phase_arrowstyle,
-                        mutation_scale=1.0,
-                        facecolor=phase_color,
-                        edgecolor=reference_atom_colour,
-                        alpha=alpha_phase_arrow,
-                        zorder=zorder_phase_arrow,
-                        capstyle="round",
-                        joinstyle="round",
-                        shrinkA=0.0,
-                        shrinkB=0.0,
-                    )
-                    ax.add_patch(arrow)
-
-            # Get the axis limits
-            xlim = ax.get_xlim()
-            ylim = ax.get_ylim()
-
-            # Draw rectangle border
-            rect = Rectangle(
-                (xlim[0], ylim[0]),
-                xlim[1] - xlim[0],
-                ylim[1] - ylim[0],
-                linewidth=linewidth,
-                edgecolor="black",
-                facecolor="none",
-                zorder=100,
-            )
-            ax.add_patch(rect)
-
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_title(f"Phase {phase_idx}", fontsize=14, fontweight="bold")
-
-        # plt.tight_layout()
-        for ax in axes:
-            ax.invert_xaxis()  # Flip horizontally
-        plt.show()
-
-    def plot_polarization_legend(self, figax: tuple[Any, Any] | None = None, **kwargs):
+    def _plot_polarization_legend(self, figax: tuple[Any, Any] | None = None, **kwargs):
         """
         Simple visualization showing measured, reference, and other positions.
 
@@ -3202,11 +3396,11 @@ class Lattice(AutoSerialize):
             figsize : tuple
                 Figure size (default: (4, 4))
         """
-        from matplotlib.patches import Patch, Rectangle
+        from matplotlib.patches import Rectangle
 
         # Extract parameters
-        atom_size = kwargs.get("atom_size", 150)
-        linewidth = kwargs.get("linewidth", 2.0)
+        atom_size = kwargs.get("atom_size", 100)
+        linewidth = kwargs.get("linewidth", 1.5)
         measured_color = kwargs.get("measured_color", (1.00, 0.00, 0.00))
         reference_color = kwargs.get("reference_color", (0.00, 0.70, 1.00))
         other_color = kwargs.get("other_color", (1.00, 1.00, 1.00))
@@ -3220,32 +3414,36 @@ class Lattice(AutoSerialize):
         reference_ind = self._pol_meas_ref_ind[1]
 
         A = np.column_stack((u, v))
-        corner_ind = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        corner_ind = np.array([[i, j] for i in [1.0, 0.0, -1.0] for j in [1.0, 0.0, -1.0]])
 
         # Get reference, measured, and other atoms
-        reference_atom_ind = frac_positions[np.arange(len(frac_positions)) == reference_ind]
-        measured_atom_ind = frac_positions[np.arange(len(frac_positions)) == measure_ind]
+        measured_atom_ind = np.array([[0.0, 0.0]])
+        reference_atom_ind = self.most_common_neighbours.copy()
         other_atom_ind = frac_positions[
             (np.arange(len(frac_positions)) != measure_ind)
             & (np.arange(len(frac_positions)) != reference_ind)
         ]
+        if other_atom_ind.size > 0:
+            other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
 
-        # Tile to get all sites in 1 unit cell
-        reference_atom_ind = (reference_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
-            -1, 2
-        )
-        measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
-        other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(-1, 2)
-
-        # Remove atoms outside unit cell
-        reference_atom_ind = reference_atom_ind[
-            ~np.any((reference_atom_ind < -0.1) | (reference_atom_ind > 1.1), axis=1)
+        # Tile to get all sites within the distanceof the max neighbours considered
+        max_dist_ref_ind = reference_atom_ind[
+            np.argmax(np.linalg.norm(reference_atom_ind @ A.T, axis=1))
         ]
+        max_dist = np.linalg.norm(max_dist_ref_ind @ A.T)
+        for i in range(int(np.ceil(np.max(np.abs(max_dist_ref_ind))))):
+            measured_atom_ind = (measured_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
+                -1, 2
+            )
+            if other_atom_ind.size > 0:
+                other_atom_ind = (other_atom_ind[:, None, :] + corner_ind[None, :, :]).reshape(
+                    -1, 2
+                )
         measured_atom_ind = measured_atom_ind[
-            ~np.any((measured_atom_ind < -0.1) | (measured_atom_ind > 1.1), axis=1)
+            np.where(np.linalg.norm(measured_atom_ind @ A.T, axis=1) < max_dist)
         ]
         other_atom_ind = other_atom_ind[
-            ~np.any((other_atom_ind < -0.1) | (other_atom_ind > 1.1), axis=1)
+            np.where(np.linalg.norm(other_atom_ind @ A.T, axis=1) < max_dist)
         ]
 
         # Convert to Cartesian coordinates
@@ -3258,14 +3456,15 @@ class Lattice(AutoSerialize):
             fig, ax = figax
         else:
             fig, ax = plt.subplots(figsize=figsize)
+            plt.figure(fig.number)
+            plt.sca(ax)
 
         # Plot the three sets of positions using plot_atoms_2d
         if len(other_atom_pos) > 0:
             fig, ax = plot_atoms_2d(
                 other_atom_pos,
                 site_number=-1,
-                fig=fig,
-                ax=ax,
+                figax=(fig, ax),
                 size=atom_size,
                 alpha=alpha * 0.5,
                 zorder=1,
@@ -3275,8 +3474,7 @@ class Lattice(AutoSerialize):
         fig, ax = plot_atoms_2d(
             reference_atom_pos,
             site_number=1,
-            fig=fig,
-            ax=ax,
+            figax=(fig, ax),
             size=atom_size,
             alpha=alpha,
             zorder=2,
@@ -3286,35 +3484,23 @@ class Lattice(AutoSerialize):
         fig, ax = plot_atoms_2d(
             measured_atom_pos,
             site_number=0,
-            fig=fig,
-            ax=ax,
+            figax=(fig, ax),
             size=atom_size,
             alpha=alpha,
             zorder=3,
             color_override=measured_color,
         )
 
-        # Plot unit cell boundary
-        corner_pos = corner_ind @ A.T
-        edges = [(0, 1), (0, 2), (1, 3), (2, 3)]
-        for i, j in edges:
+        # Plot dashed lines to show polarization calculation
+        for ref_atom in reference_atom_pos:
             ax.plot(
-                [corner_pos[i, 1], corner_pos[j, 1]],
-                [corner_pos[i, 0], corner_pos[j, 0]],
-                "k-",
+                [ref_atom[1], 0],
+                [ref_atom[0], 0],
+                linestyle="--",
                 linewidth=2,
+                color="black",
                 zorder=0,
             )
-
-        # Add legend
-        legend_elements = [
-            Patch(facecolor=measured_color, edgecolor="black", label="Measured"),
-            Patch(facecolor=reference_color, edgecolor="black", label="Reference"),
-        ]
-        if len(other_atom_pos) > 0:
-            legend_elements.append(Patch(facecolor=other_color, edgecolor="black", label="Other"))
-
-        ax.legend(handles=legend_elements, loc="best", fontsize=12, framealpha=0.9)
 
         # Formatting
         ax.set_aspect("equal")
@@ -3339,9 +3525,6 @@ class Lattice(AutoSerialize):
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_title("Atom Positions", fontsize=14, fontweight="bold")
-
-        plt.tight_layout()
-        plt.show()
 
         return fig, ax
 
@@ -3646,6 +3829,7 @@ def site_colors(number):
         (0.80, 0.40, 0.00),
         (0.20, 0.60, 0.20),
         (0.70, 0.70, 0.00),
+        (1.00, 1.00, 1.00),  # -2: white
         (0.00, 0.00, 0.00),  # -1: black
         # ENSURE BLACK IS ALWAYS LAST IF ADDING NEW COLORS
     ]
@@ -3743,38 +3927,26 @@ def create_colors_from_probabilities(probabilities, num_phases, category_colors=
     return final_colors
 
 
-def add_2phase_colorbar(ax, scatter_colours):
+def add_2phase_colorbar(ax_cbar, scatter_colours, match_ax=None):
     """
-    Add a 1D colorbar for 2-phase system
-    Creates a colormap that goes: color0 -> white (center) -> color1
+    Add a 1D colorbar for 2-phase system to a given axes
+    Creates a colormap that goes: color1 -> white (center) -> color0 (vertically inverted)
 
     Parameters:
     -----------
-    ax : matplotlib axes
-        The main plot axes
+    ax_cbar : matplotlib axes
+        The axes where the colorbar should be plotted
     scatter_colours : array of shape (2, 3)
         RGB colors for the two phases
+    match_ax : matplotlib axes, optional
+        If provided, the colorbar height will match this axes
+
+    Returns:
+    --------
+    ax_cbar : matplotlib axes
+        The colorbar axes (same as input, for consistency)
     """
     from matplotlib.colors import LinearSegmentedColormap
-
-    fig = ax.get_figure()
-
-    # Find the rightmost edge of all existing axes
-    max_right = ax.get_position().x1
-    for fig_ax in fig.get_axes():
-        if fig_ax != ax:
-            max_right = max(max_right, fig_ax.get_position().x1)
-
-    # Calculate the position for the colorbar
-    ax_pos = ax.get_position()
-    cbar_width = 0.035
-    cbar_pad = 0.05
-    cbar_left = max_right + cbar_pad
-    cbar_bottom = ax_pos.y0
-    cbar_height = ax_pos.height
-
-    # Create new axes for colorbar
-    cax = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
 
     # Get the two phase colors from scatter_colours
     color0 = scatter_colours[0]
@@ -3784,59 +3956,50 @@ def add_2phase_colorbar(ax, scatter_colours):
     colors_list = [color0, (1, 1, 1), color1]
     n_bins = 256
     cmap = LinearSegmentedColormap.from_list("two_phase", colors_list, N=n_bins)
-    # Create gradient
-    gradient = np.linspace(0, 1, 256).reshape(256, 1)
 
-    # Display the colorbar
-    cax.imshow(gradient, aspect="auto", cmap=cmap, origin="lower")
+    # Create gradient (inverted: from 1 to 0)
+    gradient = np.linspace(1, 0, 256).reshape(256, 1)
 
-    # Configure ticks and labels
-    cax.set_xticks([])
-    cax.set_yticks([0, 128, 255])
-    cax.set_yticklabels(["Phase 0", "Uncertain", "Phase 1"])
-    cax.yaxis.tick_right()
+    plt.sca(ax_cbar)
 
-    return cax
+    # Display the colorbar in the provided axes
+    ax_cbar.imshow(gradient, aspect="auto", cmap=cmap, origin="lower")
+
+    # If match_ax is provided, align the colorbar position
+    if match_ax is not None:
+        pos_match = match_ax.get_position()
+        pos_cbar = ax_cbar.get_position()
+
+        # Set colorbar to match the height and vertical position of match_ax
+        ax_cbar.set_position([pos_cbar.x0, pos_match.y0, pos_cbar.width, pos_match.height])
+
+    # Configure ticks and labels (inverted positions and labels)
+    ax_cbar.set_xticks([])
+    ax_cbar.set_yticks([0, 128, 255])
+    ax_cbar.set_yticklabels(["Phase 1", "Uncertain", "Phase 0"])
+    ax_cbar.yaxis.tick_right()
+
+    return ax_cbar
 
 
-def add_3phase_color_triangle(fig, ax, scatter_colours):
+def add_3phase_color_triangle(ax_triangle, scatter_colours, match_ax=None):
     """
-    Add a ternary color triangle for 3-phase system
+    Add a ternary color triangle for 3-phase system to a given axes
 
     Parameters:
     -----------
-    fig : matplotlib figure
-        The figure object
-    ax : matplotlib axes
-        The main plot axes
+    ax_triangle : matplotlib axes
+        The axes where the color triangle should be plotted
     scatter_colours : array of shape (3, 3)
         RGB colors for the three phases
+    match_ax : matplotlib axes, optional
+        If provided, the triangle's top will align with this axes' top
+
+    Returns:
+    --------
+    ax_triangle : matplotlib axes
+        The triangle axes (same as input, for consistency)
     """
-
-    # Check if there are existing colorbars/triangles attached to the figure
-    box = ax.get_position()
-    existing_elements = []
-
-    # Find all axes that might be colorbars or previous triangles
-    for fig_ax in fig.get_axes():
-        if fig_ax != ax:
-            pos = fig_ax.get_position()
-            # Check if it's positioned to the right of the main axes
-            if pos.x0 >= box.x1:
-                existing_elements.append(fig_ax)
-
-    # Calculate horizontal offset based on existing elements
-    if existing_elements:
-        # Find the rightmost existing element
-        rightmost_x = max(elem.get_position().x1 for elem in existing_elements)
-        x_offset = rightmost_x + 0.02  # Add spacing after the rightmost element
-    else:
-        x_offset = box.x1 + 0.02
-
-    # Create a new axes for the triangle
-    # Adjust position to account for existing colorbars
-    triangle_width = box.height * 0.8
-    triangle_ax = fig.add_axes([x_offset, box.y0, triangle_width, box.height * 0.8])
 
     # Get the three phase colors from scatter_colours
     color0 = scatter_colours[0]
@@ -3867,35 +4030,37 @@ def add_3phase_color_triangle(fig, ax, scatter_colours):
     # Get colors with custom scatter_colours
     colors = create_colors_from_probabilities(probabilities_array, 3, scatter_colours)
 
+    plt.sca(ax_triangle)
+
     # Plot the triangle
-    triangle_ax.scatter(
+    ax_triangle.scatter(
         positions[:, 0], positions[:, 1], c=colors, s=20, marker="s", edgecolors="none"
     )
 
     # Draw triangle edges
     triangle_vertices = np.array([[0, 0], [1, 0], [0.5, np.sqrt(3) / 2], [0, 0]])
-    triangle_ax.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], "k-", linewidth=2)
+    ax_triangle.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], "k-", linewidth=2)
 
     # Add vertex markers and labels
     vertex_size = 150
 
     # Vertex 0 (bottom left) - Phase 0
-    triangle_ax.scatter(
+    ax_triangle.scatter(
         0, 0, s=vertex_size, c=[color0], edgecolors="black", linewidths=2, zorder=10
     )
-    triangle_ax.text(0, -0.1, "Phase 0", ha="center", va="top", fontsize=10, fontweight="bold")
+    ax_triangle.text(0, -0.1, "Phase 0", ha="center", va="top", fontsize=10, fontweight="bold")
 
     # Vertex 1 (bottom right) - Phase 1
-    triangle_ax.scatter(
+    ax_triangle.scatter(
         1, 0, s=vertex_size, c=[color1], edgecolors="black", linewidths=2, zorder=10
     )
-    triangle_ax.text(1, -0.1, "Phase 1", ha="center", va="top", fontsize=10, fontweight="bold")
+    ax_triangle.text(1, -0.1, "Phase 1", ha="center", va="top", fontsize=10, fontweight="bold")
 
     # Vertex 2 (top) - Phase 2
-    triangle_ax.scatter(
+    ax_triangle.scatter(
         0.5, np.sqrt(3) / 2, s=vertex_size, c=[color2], edgecolors="black", linewidths=2, zorder=10
     )
-    triangle_ax.text(
+    ax_triangle.text(
         0.5,
         np.sqrt(3) / 2 + 0.1,
         "Phase 2",
@@ -3906,10 +4071,10 @@ def add_3phase_color_triangle(fig, ax, scatter_colours):
     )
 
     # Mark center (maximum uncertainty) - white
-    triangle_ax.scatter(
+    ax_triangle.scatter(
         0.5, np.sqrt(3) / 6, s=vertex_size, c="white", edgecolors="black", linewidths=2, zorder=10
     )
-    triangle_ax.text(
+    ax_triangle.text(
         0.65,
         np.sqrt(3) / 6,
         "Uncertain\n(Equal)",
@@ -3920,20 +4085,34 @@ def add_3phase_color_triangle(fig, ax, scatter_colours):
     )
 
     # Set limits and styling
-    triangle_ax.set_xlim(-0.15, 1.15)
-    triangle_ax.set_ylim(-0.2, np.sqrt(3) / 2 + 0.15)
-    triangle_ax.set_aspect("equal")
-    triangle_ax.axis("off")
-    triangle_ax.set_title("Probability Map", fontsize=11, pad=10)
+    ax_triangle.set_xlim(-0.15, 1.15)
+    ax_triangle.set_ylim(-0.2, np.sqrt(3) / 2 + 0.15)
+    ax_triangle.set_aspect("equal")
+    ax_triangle.axis("off")
+    ax_triangle.set_title("Probability Map", fontsize=11, pad=10)
 
-    return triangle_ax
+    # If match_ax is provided, align the triangle's top to match_ax's top
+    if match_ax is not None:
+        pos_match = match_ax.get_position()
+        pos_triangle = ax_triangle.get_position()
+
+        # Set triangle to align its top with the top of match_ax
+        ax_triangle.set_position(
+            [
+                pos_triangle.x0,
+                pos_match.y0 + pos_match.height - pos_triangle.height,
+                pos_triangle.width,
+                pos_triangle.height,
+            ]
+        )
+
+    return ax_triangle
 
 
 def plot_atoms_2d(
     coords,
     site_number,
-    fig=None,
-    ax=None,
+    figax=None,
     size=150,
     zorder=5,
     alpha=1.0,
@@ -3951,10 +4130,8 @@ def plot_atoms_2d(
         Site number(s) to pass to site_colors() for coloring.
         If int, all atoms use the same color.
         If array, must have length N (one color per atom).
-    fig : matplotlib.figure.Figure, optional
-        Existing figure to plot on. If None, creates new figure.
-    ax : matplotlib.axes.Axes, optional
-        Existing axes to plot on. If None, creates new axes.
+    figax : tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes), optional
+        Existing (figure, axes) tuple to plot on. If None, creates new figure and axes.
     size : float, optional
         Base size for atoms. All layer sizes are scaled by this factor. Default is 150.
     zorder : int, optional
@@ -4113,10 +4290,16 @@ def plot_atoms_2d(
     dist *= bg_scale
     atoms_rgb_size[3:6, :] = atoms_rgb_size[3:6, :] * (1 - dist) + bg_color[:, None] * dist
 
-    # Create figure and axes if not provided
-    if fig is None or ax is None:
+    # Handle figure and axes
+    if figax is None:
+        # Create new figure and axes
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111)
+    else:
+        # Use provided figure and axes
+        fig, ax = figax
+        plt.figure(fig.number)
+        plt.sca(ax)
 
     # Atomic sites - 2D scatter plot
     if coords_in_xy:
