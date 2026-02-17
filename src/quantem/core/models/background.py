@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Background components for diffraction model fitting."""
+
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -10,6 +12,17 @@ from quantem.core.models.diffraction import _origin_indices
 
 
 class DCBackground(Component):
+    """
+    Uniform additive background with nonnegative intensity.
+
+    Parameters
+    ----------
+    intensity
+        Constant background intensity parameter specification.
+    name
+        Component name.
+    """
+
     def __init__(
         self,
         *,
@@ -37,6 +50,21 @@ class DCBackground(Component):
 
 
 class GaussianBackground(Component):
+    """
+    Radial Gaussian background centered at a named model origin.
+
+    Parameters
+    ----------
+    sigma
+        Gaussian width parameter specification (constrained to `>= 1e-6`).
+    intensity
+        Nonnegative Gaussian amplitude parameter specification.
+    origin_key
+        Name of the origin to use from `ModelContext.fields["origins"]`.
+    name
+        Component name.
+    """
+
     def __init__(
         self,
         *,

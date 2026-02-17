@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Composable model primitives for diffraction-style forward models."""
+
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -9,11 +11,34 @@ import torch
 
 @dataclass(frozen=True)
 class Overlay:
+    """Lightweight plotting overlay emitted by prepared components."""
+
     kind: str
     data: dict[str, Any]
 
 
 class Parameter:
+    """
+    Scalar model parameter with optional bounds and metadata tags.
+
+    Parameters
+    ----------
+    value
+        Initial parameter specification. Supported forms:
+        - scalar: `v0`
+        - 2-sequence: `(v0, dev)` interpreted as bounds `(v0-dev, v0+dev)`
+        - 3-sequence: `(v0, lb, ub)` where either bound can be None
+    lower_bound, upper_bound
+        Optional explicit overrides for lower/upper bound.
+    tags
+        Optional metadata dictionary used by higher-level fitting code for
+        grouping/freezing/selecting parameters.
+
+    Notes
+    -----
+    Parameter indices are assigned during `Model.compile(...)`.
+    """
+
     def __init__(
         self,
         value: float | Sequence[float],
@@ -66,6 +91,22 @@ class Parameter:
 
 
 class ModelContext:
+    """
+    Execution context shared by components during preparation and rendering.
+
+    Parameters
+    ----------
+    H, W
+        Output image height and width.
+    device, dtype
+        Torch device and dtype for parameter tensors/rendering.
+    mask
+        Optional per-pixel mask used by fitting loss functions.
+    fields
+        Mutable shared dictionary used by components to publish/consume
+        prepared state (for example origins or template metadata).
+    """
+
     def __init__(
         self,
         *,
@@ -90,6 +131,14 @@ class ModelContext:
 
 
 class Component:
+    """
+    Abstract base class for additive model components.
+
+    Subclasses implement:
+    - `parameters()` to expose fit parameters
+    - `prepare(ctx)` to build prepared render objects
+    """
+
     def __init__(self, *, name: str):
         self.name = str(name)
 
@@ -101,6 +150,17 @@ class Component:
 
 
 class PreparedModel:
+    """
+    Compiled model bundle with bound parameter vectors and render helpers.
+
+    Attributes
+    ----------
+    x0, lb, ub
+        Initial parameter vector and bound vectors, all on `ctx.device`.
+    components
+        Prepared component objects called in sequence during `render`.
+    """
+
     def __init__(
         self,
         *,
@@ -119,15 +179,18 @@ class PreparedModel:
         self.ub = ub
 
     def render(self, x: torch.Tensor) -> torch.Tensor:
+        """Render a model image for parameter vector ``x``."""
         out = torch.zeros((self.ctx.H, self.ctx.W), device=self.ctx.device, dtype=self.ctx.dtype)
         for c in self.components:
             c.render(out, x, self.ctx)
         return out
 
     def render_initial(self) -> torch.Tensor:
+        """Render the model using the compile-time initial parameter vector."""
         return self.render(self.x0)
 
     def overlays(self, x: torch.Tensor | None = None) -> list[Overlay]:
+        """Collect component overlays for plotting/debugging."""
         out: list[Overlay] = []
         for c in self.components:
             fn = getattr(c, "overlays", None)
@@ -140,10 +203,27 @@ class PreparedModel:
 
 
 class Model:
+    """
+    Container for additive components that compiles to a `PreparedModel`.
+
+    Notes
+    -----
+    Component order defines render order and can also define dependency order
+    when components share prepared state through `ModelContext.fields`.
+    """
+
     def __init__(self):
         self._components: list[Component] = []
 
     def add(self, items: Iterable[Component]) -> "Model":
+        """
+        Append components to the model in render order.
+
+        Parameters
+        ----------
+        items
+            Iterable of `Component` instances.
+        """
         for obj in items:
             if not isinstance(obj, Component):
                 raise TypeError("Model.add expects Component objects.")
@@ -151,12 +231,26 @@ class Model:
         return self
 
     def parameter_list(self) -> list[Parameter]:
+        """Return the flattened parameter list across all components."""
         params: list[Parameter] = []
         for c in self._components:
             params.extend(c.parameters())
         return params
 
     def compile(self, ctx: ModelContext) -> PreparedModel:
+        """
+        Bind parameter indices and prepare components for fast rendering.
+
+        Parameters
+        ----------
+        ctx
+            Model execution context.
+
+        Returns
+        -------
+        PreparedModel
+            Compiled model with `x0`, bounds, and prepared component state.
+        """
         params = self.parameter_list()
         for i, p in enumerate(params):
             p.bind(i)

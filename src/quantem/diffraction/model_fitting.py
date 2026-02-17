@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""High-level diffraction model fitting workflow utilities."""
+
 import warnings
 from typing import Any, Sequence
 
@@ -20,6 +22,7 @@ from quantem.core.visualization import show_2d
 
 
 def _to_numpy(x: Any) -> np.ndarray:
+    """Convert arrays/tensors to NumPy arrays."""
     if isinstance(x, np.ndarray):
         return x
     if torch.is_tensor(x):
@@ -28,6 +31,31 @@ def _to_numpy(x: Any) -> np.ndarray:
 
 
 class ModelDiffraction(AutoSerialize):
+    """
+    End-to-end helper for defining and fitting additive diffraction forward models.
+
+    This class wraps a diffraction dataset, builds an average reference image
+    (`image_ref`), compiles a composable component model, and provides optimization
+    routines for:
+    - fitting to the mean reference image,
+    - fitting selected individual diffraction patterns.
+
+    Features
+    --------
+    - Build a mean reference image with optional stack alignment.
+    - Define a composable model from origin/background/template/lattice components.
+    - Refine a mean model with Adam or L-BFGS.
+    - Fit all or selected patterns with optional progress bars.
+    - Plot reference/model comparisons and component overlays.
+
+    Typical workflow
+    ----------------
+    >>> md = ModelDiffraction.from_dataset(ds).preprocess().define_model(...)
+    >>> md.refine_mean_model(...)
+    >>> md.fit_all_patterns(...)
+    >>> md.plot_mean_model(...)
+    """
+
     _token = object()
 
     def __init__(self, dataset: Any, _token: object | None = None):
@@ -68,6 +96,19 @@ class ModelDiffraction(AutoSerialize):
 
     @classmethod
     def from_dataset(cls, dataset: Dataset2d | Dataset3d | Dataset4d | Dataset4dstem | Any) -> "ModelDiffraction":
+        """
+        Construct a ModelDiffraction object from a QuantEM dataset container.
+
+        Parameters
+        ----------
+        dataset
+            Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance.
+
+        Returns
+        -------
+        ModelDiffraction
+            New model-fitting helper bound to the provided dataset.
+        """
         if isinstance(dataset, (Dataset2d, Dataset3d, Dataset4d, Dataset4dstem)):
             return cls(dataset=dataset, _token=cls._token)
         raise TypeError("from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance.")
@@ -81,6 +122,34 @@ class ModelDiffraction(AutoSerialize):
         max_shift: float | None = None,
         shift_order: int = 1,
     ) -> "ModelDiffraction":
+        """
+        Precompute the mean reference image used for model fitting.
+
+        Parameters
+        ----------
+        align
+            If True, align the flattened pattern stack before averaging.
+        edge_blend
+            Tukey edge taper width (pixels) used for robust FFT alignment.
+        upsample_factor
+            Sub-pixel alignment upsampling factor for cross-correlation shift.
+        max_shift
+            Optional maximum shift magnitude during alignment.
+        shift_order
+            Interpolation order used when applying shifts to patterns.
+
+        Returns
+        -------
+        ModelDiffraction
+            Returns self.
+
+        Notes
+        -----
+        - `dataset.array` is interpreted as `(..., H, W)`, where leading dimensions
+          are flattened into a pattern stack.
+        - The computed stack-average is stored in `self.image_ref`.
+        - If `align=False`, preprocessing is a direct mean over stack elements.
+        """
         arr = np.asarray(self.dataset.array)
         if arr.ndim < 2:
             raise ValueError("dataset.array must have at least 2 dimensions.")
@@ -145,6 +214,43 @@ class ModelDiffraction(AutoSerialize):
         mask: np.ndarray | torch.Tensor | None = None,
         origin_key: str = "origin",
     ) -> "ModelDiffraction":
+        """
+        Define and compile a diffraction model against `image_ref`.
+
+        Parameters
+        ----------
+        origin_row, origin_col
+            Initial origin parameter specification. Supported forms are:
+            - scalar: fixed initial value with no explicit bounds
+            - `(value, deviation)`: symmetric bounds `(value - deviation, value + deviation)`
+            - `(value, lower_bound, upper_bound)`: explicit bounds
+        components
+            Sequence of model components (e.g. `DiskTemplate`, backgrounds, lattice).
+            Components are rendered additively in the provided order.
+        device
+            Torch device used for compiled parameters and rendering.
+        dtype
+            Torch dtype used for compiled parameters and rendering.
+        mask
+            Optional `(H, W)` mask for weighted loss during optimization.
+        origin_key
+            Name used to register/retrieve the origin component in context fields.
+
+        Returns
+        -------
+        ModelDiffraction
+            Returns self with compiled model state.
+
+        Notes
+        -----
+        - If `image_ref` is missing, `preprocess()` is run automatically.
+        - `Origin2D` is inserted automatically before user components.
+        - Component dependency ordering still matters for shared context fields:
+          for example, `DiskTemplate` should appear before `SyntheticDiskLattice`
+          when the lattice references that template.
+        - This method resets fit state (`x_defined`, `x_initial`, `x_mean`,
+          `x_patterns`, and pattern-fit metadata).
+        """
         if self.image_ref is None:
             self.preprocess()
 
@@ -349,6 +455,43 @@ class ModelDiffraction(AutoSerialize):
         weak_softplus_scale: float = 1e-3,
         progress: bool = False,
     ) -> "ModelDiffraction":
+        """
+        Refine model parameters against the mean reference image.
+
+        Parameters
+        ----------
+        n_steps
+            Number of optimization steps/iterations for the main phase.
+        lr
+            Optimizer learning rate.
+        method
+            Optimizer name: `"adam"` or `"lbfgs"`.
+        power
+            Optional power-law transform applied to both target and prediction
+            before computing MSE loss.
+        fit_disk_pixels
+            Controls whether `disk_pixel` parameters are trainable. If None,
+            inferred from model parameters.
+        fit_only_disk_pixels
+            If True, freeze all non-disk parameters.
+        warmup_disk_steps
+            Optional number of disk-only warmup steps run before the main phase.
+        overwrite_initial
+            If True, store refined parameters as new initial parameters for
+            subsequent per-pattern fitting.
+        intensity_transform
+            Optional intensity transform (`"none"` or `"weak_softplus"`) applied
+            before the power transform and loss evaluation.
+        weak_softplus_scale
+            Scale parameter used when `intensity_transform="weak_softplus"`.
+        progress
+            If True, show a tqdm progress bar (when tqdm is available).
+
+        Returns
+        -------
+        ModelDiffraction
+            Returns self with updated `x_mean` (and optionally `x_initial`).
+        """
         method = str(method).lower()
 
         if self.image_ref is None:
@@ -411,6 +554,35 @@ class ModelDiffraction(AutoSerialize):
         weak_softplus_scale: float = 1e-3,
         progress: bool = False,
     ) -> "ModelDiffraction":
+        """
+        Fit selected diffraction patterns using the compiled model.
+
+        Parameters
+        ----------
+        indices
+            Pattern selector. Supported forms include None (all patterns),
+            integer, slice, tuple indexing, list of linear indices, list of
+            multi-indices, or boolean mask shaped like scan dimensions.
+        use_refined_init
+            If True, initialize per-pattern fitting from `x_initial`.
+        strict_refined_init
+            If True, raise when refined init is requested before mean refinement.
+            If False, emit warning and fall back to defined initialization.
+        n_steps, lr, method, power, fit_disk_pixels, fit_only_disk_pixels
+            Optimization settings analogous to `refine_mean_model`.
+        intensity_transform, weak_softplus_scale
+            Prediction/target intensity transform options.
+        progress
+            If True, show a tqdm progress bar over selected patterns.
+
+        Returns
+        -------
+        ModelDiffraction
+            Returns self with:
+            - `x_patterns`: fitted parameter vectors `(n_selected, n_params)`
+            - `pattern_fit_losses`: per-pattern final losses
+            - index bookkeeping for selected patterns.
+        """
         method = str(method).lower()
 
         if self.prepared is None or self.x_defined is None or self.x_initial is None:
@@ -507,6 +679,25 @@ class ModelDiffraction(AutoSerialize):
         show_overlays: bool = True,
         axsize: tuple[int, int] = (6, 6),
     ) -> tuple[Any, Any] | None:
+        """
+        Plot `image_ref` and the current mean-model prediction side-by-side.
+
+        Parameters
+        ----------
+        power
+            Display transform exponent applied to both reference and model images.
+        returnfig
+            If True, return `(fig, ax)` from `show_2d`.
+        show_overlays
+            If True, draw component overlays (e.g., origin and lattice markers).
+        axsize
+            Base axis size passed to the plotting helper.
+
+        Returns
+        -------
+        tuple[Any, Any] | None
+            `(fig, ax)` if `returnfig=True`, else None.
+        """
         if self.image_ref is None:
             self.preprocess()
         if self.image_ref is None or self.prepared is None:
