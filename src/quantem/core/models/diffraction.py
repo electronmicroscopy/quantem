@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Diffraction-specific model components and low-level rendering helpers."""
+
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -10,6 +12,16 @@ from quantem.core.models.base import Component, ModelContext, Overlay, Parameter
 
 
 def _as_t(x: Any, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Convert values to tensors on the requested device/dtype.
+
+    Parameters
+    ----------
+    x
+        Input scalar/array/tensor.
+    device, dtype
+        Target torch device and dtype.
+    """
     if torch.is_tensor(x):
         return x.to(device=device, dtype=dtype)
     return torch.as_tensor(x, device=device, dtype=dtype)
@@ -25,6 +37,22 @@ def _splat_patch(
     dc: torch.Tensor,
     scale: torch.Tensor,
 ) -> None:
+    """
+    Render a shifted patch into ``out`` with bilinear interpolation.
+
+    Parameters
+    ----------
+    out
+        Destination image `(H, W)` updated in-place.
+    r0, c0
+        Patch center coordinates in output-image row/column space.
+    patch_vals
+        Flattened patch intensities.
+    dr, dc
+        Flattened local row/column offsets for each patch sample.
+    scale
+        Scalar or vector multiplier applied to `patch_vals`.
+    """
     H = out.shape[0]
     W = out.shape[1]
 
@@ -59,6 +87,16 @@ def _splat_patch(
 
 
 def _origin_indices(ctx: ModelContext, origin_key: str) -> tuple[int, int]:
+    """
+    Resolve origin parameter indices from ``ModelContext``.
+
+    Parameters
+    ----------
+    ctx
+        Model context with an `origins` registry in `ctx.fields`.
+    origin_key
+        Origin name to resolve.
+    """
     origins: dict[str, Any] = ctx.fields.get("origins", {})
     o = origins.get(origin_key)
     if o is None or "row_param" not in o or "col_param" not in o:
@@ -67,6 +105,19 @@ def _origin_indices(ctx: ModelContext, origin_key: str) -> tuple[int, int]:
 
 
 class Origin2D(Component):
+    """
+    Named 2D origin component that exposes row/column fit parameters.
+
+    Parameters
+    ----------
+    name
+        Component name.
+    origin_key
+        Key used to publish this origin into `ctx.fields["origins"]`.
+    row, col
+        Parameter specifications for origin row/column.
+    """
+
     def __init__(
         self,
         *,
@@ -113,6 +164,33 @@ class Origin2D(Component):
 
 
 class DiskTemplate(Component):
+    """
+    Template patch component used for central disks and lattice motifs.
+
+    Parameters
+    ----------
+    name
+        Template name used for registry lookup by dependent components.
+    array
+        2D template image.
+    refine_all_pixels
+        If True, every template pixel is exposed as a fit parameter.
+    place_at_origin
+        If True, render this template once at the named origin with a
+        separate nonnegative intensity parameter.
+    normalize
+        Optional array normalization mode: `"none"`, `"max"`, `"mean"`.
+    origin_key
+        Origin key used when `place_at_origin=True`.
+    intensity
+        Intensity parameter specification used when `place_at_origin=True`.
+
+    Notes
+    -----
+    The template is also published into `ctx.fields["disk_templates"]` so
+    lattice components can reuse its prepared sampling offsets.
+    """
+
     def __init__(
         self,
         *,
@@ -248,6 +326,47 @@ class DiskTemplate(Component):
 
 
 class SyntheticDiskLattice(Component):
+    """
+    Lattice of shifted ``DiskTemplate`` patches around a shared origin.
+
+    Parameters
+    ----------
+    name
+        Component name.
+    disk
+        `DiskTemplate` used as the motif for each lattice spot.
+    u_row, u_col, v_row, v_col
+        Basis vector parameter specifications in row/column coordinates.
+    u_max, v_max
+        Inclusive lattice index extents.
+    intensity_0, intensity_row, intensity_col
+        Intensity parameter specifications. Interpretation depends on
+        `per_disk_intensity` and `per_disk_slopes`.
+    per_disk_intensity
+        If True, allocate independent base intensities per lattice disk.
+    per_disk_slopes
+        If True and `per_disk_intensity=True`, also allocate per-disk local
+        slope parameters for template-local coordinates.
+    center_intensity_0
+        Optional override for the `(u, v) == (0, 0)` disk base intensity.
+    exclude_indices
+        Optional set/list of lattice indices to skip.
+    boundary_px
+        Keep only lattice centers within `[boundary_px, size-1-boundary_px]`.
+    origin_key
+        Origin key used for center placement.
+
+    Notes
+    -----
+    Intensity models:
+    - shared mode (`per_disk_intensity=False`):
+      `max(i0 + ir*row_center + ic*col_center, 0)`
+    - per-disk scalar mode (`per_disk_intensity=True`, `per_disk_slopes=False`):
+      `max(i0_i, 0)`
+    - per-disk local affine mode (`per_disk_intensity=True`, `per_disk_slopes=True`):
+      `max(i0_i + ir_i*dr + ic_i*dc, 0)` where `dr/dc` are template-local offsets.
+    """
+
     def __init__(
         self,
         *,
