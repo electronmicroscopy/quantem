@@ -356,8 +356,9 @@ class Dataset(AutoSerialize):
     @overload
     def pad(
         self,
-        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None,
-        output_shape: tuple[int, ...] | None,
+        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None = None,
+        output_shape: tuple[int, ...] | None = None,
+        *,
         modify_in_place: Literal[True],
         **kwargs: Any,
     ) -> None: ...
@@ -369,7 +370,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: Literal[False] = False,
         **kwargs: Any,
-    ) -> "Dataset": ...
+    ) -> Self: ...
 
     def pad(
         self,
@@ -377,7 +378,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
         **kwargs: Any,
-    ) -> "Dataset | None":
+    ) -> Self | None:
         """
         Pads Dataset data array using numpy.pad.
         Metadata (origin, sampling) is not modified.
@@ -432,7 +433,8 @@ class Dataset(AutoSerialize):
     def crop(
         self,
         crop_widths: tuple[tuple[int, int], ...],
-        axes: tuple | None,
+        axes: tuple | None = None,
+        *,
         modify_in_place: Literal[True],
     ) -> None: ...
 
@@ -470,7 +472,7 @@ class Dataset(AutoSerialize):
             if len(crop_widths) != self.ndim:
                 raise ValueError("crop_widths must match number of dimensions when axes is None.")
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
             crop_widths = (crop_widths[0],)  # Take first crop_width for single axis
         else:
@@ -502,7 +504,8 @@ class Dataset(AutoSerialize):
     def bin(
         self,
         bin_factors,
-        axes,
+        axes=None,
+        *,
         modify_in_place: Literal[True],
         reducer: str = "sum",
     ) -> None: ...
@@ -551,7 +554,7 @@ class Dataset(AutoSerialize):
 
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(ax) for ax in axes)
@@ -667,7 +670,7 @@ class Dataset(AutoSerialize):
         """
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(a0) for a0 in axes)
@@ -677,7 +680,7 @@ class Dataset(AutoSerialize):
 
         # Resolve out_shape & factors
         if factors is not None:
-            if np.isscalar(factors):
+            if isinstance(factors, int | float):
                 factors = (float(factors),) * len(axes)
             else:
                 factors = tuple(float(f) for f in factors)
@@ -687,6 +690,7 @@ class Dataset(AutoSerialize):
                 max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors)
             )
         else:
+            assert out_shape is not None  # Guaranteed by check above
             if len(out_shape) != len(axes):
                 raise ValueError("out_shape length must match number of axes.")
             out_shape = tuple(int(nl) for nl in out_shape)
