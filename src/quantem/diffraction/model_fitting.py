@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
 
@@ -299,6 +300,8 @@ class ModelDiffraction(AutoSerialize):
         power: float | None,
         fit_disk_pixels: bool | None,
         fit_only_disk_pixels: bool,
+        enforce_disk_max_one: bool,
+        enforce_disk_center_of_mass: bool,
         intensity_transform: str,
         weak_softplus_scale: float,
         progress: bool = False,
@@ -323,6 +326,40 @@ class ModelDiffraction(AutoSerialize):
             if p.tags.get("role") == "disk_pixel":
                 disk_mask[p.index] = True
 
+        # Cache template groups for optional per-step projection constraints.
+        disk_templates = self.prepared.ctx.fields.get("disk_templates", {})
+        disk_param_groups: list[dict[str, Any]] = []
+        if enforce_disk_max_one or enforce_disk_center_of_mass:
+            grouped: dict[str, list[tuple[int, int]]] = {}
+            for p in self.prepared.params:
+                if p.tags.get("role") != "disk_pixel":
+                    continue
+                name = str(p.tags.get("disk"))
+                i_flat = int(p.tags.get("i"))
+                grouped.setdefault(name, []).append((i_flat, int(p.index)))
+
+            for name, pairs in grouped.items():
+                if name not in disk_templates:
+                    continue
+                dmeta = disk_templates[name]
+                shape = dmeta.get("shape", None)
+                if shape is None:
+                    continue
+                Ht, Wt = int(shape[0]), int(shape[1])
+                order = sorted(pairs, key=lambda t: t[0])
+                flat_i = torch.as_tensor([t[0] for t in order], device=ctx.device, dtype=torch.long)
+                p_idx = torch.as_tensor([t[1] for t in order], device=ctx.device, dtype=torch.long)
+                dr = dmeta["dr"][flat_i]
+                dc = dmeta["dc"][flat_i]
+                disk_param_groups.append(
+                    {
+                        "param_idx": p_idx,
+                        "shape": (Ht, Wt),
+                        "dr": dr,
+                        "dc": dc,
+                    }
+                )
+
         if fit_only_disk_pixels:
             if not fit_disk_pixels:
                 raise ValueError("fit_only_disk_pixels=True requires fit_disk_pixels=True.")
@@ -344,6 +381,43 @@ class ModelDiffraction(AutoSerialize):
                 x.data = torch.max(torch.min(x.data, ub), lb)
                 if torch.any(freeze):
                     x.data[freeze] = x_frozen[freeze]
+                if (enforce_disk_max_one or enforce_disk_center_of_mass) and disk_param_groups:
+                    eps = torch.as_tensor(1e-12, device=ctx.device, dtype=ctx.dtype)
+                    for g in disk_param_groups:
+                        p_idx = g["param_idx"]
+                        if torch.all(freeze[p_idx]):
+                            continue
+                        vals = x.data[p_idx]
+                        vals = torch.clamp(vals, min=0.0)
+
+                        if enforce_disk_center_of_mass:
+                            mass = torch.sum(vals)
+                            if mass > eps:
+                                r_com = torch.sum(vals * g["dr"]) / mass
+                                c_com = torch.sum(vals * g["dc"]) / mass
+                                Ht, Wt = g["shape"]
+                                img = vals.reshape(Ht, Wt)[None, None, :, :]
+                                yy = torch.linspace(-1.0, 1.0, Ht, device=ctx.device, dtype=ctx.dtype)
+                                xx = torch.linspace(-1.0, 1.0, Wt, device=ctx.device, dtype=ctx.dtype)
+                                gy, gx = torch.meshgrid(yy, xx, indexing="ij")
+                                sx = gx + (2.0 * c_com / max(Wt - 1, 1))
+                                sy = gy + (2.0 * r_com / max(Ht - 1, 1))
+                                grid = torch.stack((sx, sy), dim=-1)[None, :, :, :]
+                                img_shift = F.grid_sample(
+                                    img,
+                                    grid,
+                                    mode="bilinear",
+                                    padding_mode="zeros",
+                                    align_corners=True,
+                                )
+                                vals = torch.clamp(img_shift[0, 0].reshape(-1), min=0.0)
+
+                        if enforce_disk_max_one:
+                            vmax = torch.max(vals)
+                            if vmax > eps:
+                                vals = vals / vmax
+
+                        x.data[p_idx] = vals
 
         def loss_fn() -> torch.Tensor:
             clamp_inplace()
@@ -449,6 +523,8 @@ class ModelDiffraction(AutoSerialize):
         power: float | None = 1.0,
         fit_disk_pixels: bool | None = None,
         fit_only_disk_pixels: bool = False,
+        enforce_disk_max_one: bool = True,
+        enforce_disk_center_of_mass: bool = True,
         warmup_disk_steps: int = 0,
         overwrite_initial: bool = True,
         intensity_transform: str = "none",
@@ -512,6 +588,8 @@ class ModelDiffraction(AutoSerialize):
                 power=power,
                 fit_disk_pixels=True,
                 fit_only_disk_pixels=True,
+                enforce_disk_max_one=bool(enforce_disk_max_one),
+                enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
                 intensity_transform=intensity_transform,
                 weak_softplus_scale=float(weak_softplus_scale),
                 progress=bool(progress),
@@ -526,6 +604,8 @@ class ModelDiffraction(AutoSerialize):
             power=power,
             fit_disk_pixels=fit_disk_pixels,
             fit_only_disk_pixels=bool(fit_only_disk_pixels),
+            enforce_disk_max_one=bool(enforce_disk_max_one),
+            enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
             intensity_transform=intensity_transform,
             weak_softplus_scale=float(weak_softplus_scale),
             progress=bool(progress),
@@ -550,6 +630,8 @@ class ModelDiffraction(AutoSerialize):
         power: float | None = 1.0,
         fit_disk_pixels: bool | None = None,
         fit_only_disk_pixels: bool = False,
+        enforce_disk_max_one: bool = True,
+        enforce_disk_center_of_mass: bool = True,
         intensity_transform: str = "none",
         weak_softplus_scale: float = 1e-3,
         progress: bool = False,
@@ -640,6 +722,8 @@ class ModelDiffraction(AutoSerialize):
                 power=power,
                 fit_disk_pixels=fit_disk_pixels,
                 fit_only_disk_pixels=bool(fit_only_disk_pixels),
+                enforce_disk_max_one=bool(enforce_disk_max_one),
+                enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
                 intensity_transform=intensity_transform,
                 weak_softplus_scale=float(weak_softplus_scale),
                 progress=False,

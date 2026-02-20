@@ -294,6 +294,7 @@ class DiskTemplate(Component):
             "dc": dc,
             "pix_idx": pix_idx,
             "base": base_vals,
+            "shape": (int(Ht), int(Wt)),
         }
 
         i_int = None if self.p_intensity is None else self.p_intensity.index
