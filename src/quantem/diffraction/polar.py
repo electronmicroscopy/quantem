@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from pathlib import Path
-from typing import Any, Literal, Tuple, Union
+from typing import Any, Literal
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.nn.functional as F
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter1d
-from scipy.optimize import curve_fit
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
-from quantem.core.datastructures.polar4dstem import Polar4dstem
+from quantem.core.datastructures.polar4dstem import (
+    Polar4dstem,
+    auto_origin_id,
+    dataset4dstem_polar_transform,
+)
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import ensure_valid_array
 
-KIRKLAND_PARAMS_PATH = Path(__file__).with_name("kirkland_params.json")
+# TODO: subpixel origin finding (auto_origin_id currently uses integer pixel search)
+# TODO: elliptical distortion correction in origin finding
+# TODO: beamstop mask support (mask diffraction-space pixels before azimuthal averaging)
 
 
 class PairDistributionFunction(AutoSerialize):
@@ -42,6 +47,7 @@ class PairDistributionFunction(AutoSerialize):
         self,
         polar: Polar4dstem,
         input_data: Any | None = None,
+        device: str = "cpu",
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -52,21 +58,18 @@ class PairDistributionFunction(AutoSerialize):
         super().__init__()
         self.polar = polar
         self.input_data = input_data
+        self.device = device
 
-        # Placeholders for analysis results (to be populated by future methods)
-        self.radial_mean: NDArray | None = None
-        self.radial_var: NDArray | None = None
-        self.radial_var_norm: NDArray | None = None
-
-        self.pdf_r: NDArray | None = None
-        self.reduced_pdf: NDArray | None = None
-        self.pdf: NDArray | None = None
-
-        self.Sk: NDArray | None = None
-        self.fk: NDArray | None = None
-        self.bg: NDArray | None = None
-        self.offset: float | None = None
-        self.Sk_mask: NDArray | None = None
+        self._polar_tensor: torch.Tensor | None = None
+        self._r: torch.Tensor | None = None
+        self._reduced_pdf: torch.Tensor | None = None
+        self._pdf: torch.Tensor | None = None
+        self.radial_mean: torch.Tensor | None = None
+        self.Sk: torch.Tensor | None = None
+        self.Fk: torch.Tensor | None = None
+        self.bg: torch.Tensor | None = None
+        self.Fk_mask: torch.Tensor | None = None
+        self.rho0: float | None = None
 
     # ------------------------------------------------------------------
     # Constructors
@@ -74,7 +77,7 @@ class PairDistributionFunction(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        data: Union[NDArray, Dataset2d, Dataset3d, Dataset4dstem, Polar4dstem],
+        data: NDArray | Dataset2d | Dataset3d | Dataset4dstem | Polar4dstem,
         *,
         find_origin: bool = True,
         origin_row: float | None = None,
@@ -85,6 +88,7 @@ class PairDistributionFunction(AutoSerialize):
         radial_max: float | None = None,
         radial_step: float = 1.0,
         two_fold_rotation_symmetry: bool = False,
+        device: str = "cpu",
     ):
         """
          -> "PairDistributionFunction"
@@ -115,49 +119,16 @@ class PairDistributionFunction(AutoSerialize):
         # Polar input: use directly
         if isinstance(data, Polar4dstem):
             polar = data
-            return cls(polar=polar, input_data=data, _token=cls._token)
+            return cls(polar=polar, input_data=data, device=device, _token=cls._token)
 
-        # Dataset4dstem input: polar-transform it
-        if isinstance(data, Dataset4dstem):
-            scan_y, scan_x, ny, nx = data.array.shape
-            if find_origin:
-                origin_array = cls.find_origin(
-                    data,
-                    ellipse_params=ellipse_params,
-                    num_annular_bins=num_annular_bins,
-                    radial_min=radial_min,
-                    radial_max=radial_max,
-                    radial_step=radial_step,
-                    two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                )
-            else:
-                if origin_row is None:
-                    origin_row = (ny - 1) / 2.0
-                if origin_col is None:
-                    origin_col = (nx - 1) / 2.0
-                origin_array = np.zeros((scan_y, scan_x, 2), dtype=float)
-                origin_array[..., 0] = origin_row
-                origin_array[..., 1] = origin_col
-
-            polar = data.polar_transform(
-                origin_array=origin_array,
-                ellipse_params=ellipse_params,
-                num_annular_bins=num_annular_bins,
-                radial_min=radial_min,
-                radial_max=radial_max,
-                radial_step=radial_step,
-                two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-            )
-            return cls(polar=polar, input_data=data, _token=cls._token)
-
-        # Dataset2d input: wrap as a trivial 4D-STEM (1x1 scan) then polar-transform
+        # Dataset2d input: wrap as a trivial 4D-STEM (1x1 scan) and fall through
         if isinstance(data, Dataset2d):
             arr2d = data.array
             if arr2d.ndim != 2:
                 raise ValueError("Dataset2d for PairDistributionFunction must be 2D.")
             arr4 = arr2d[None, None, ...]  # (1, 1, ky, kx)
 
-            ds4 = Dataset4dstem.from_array(
+            data = Dataset4dstem.from_array(
                 array=arr4,
                 name=f"{data.name}_as4dstem"
                 if getattr(data, "name", None)
@@ -171,27 +142,32 @@ class PairDistributionFunction(AutoSerialize):
                 units=["pixels", "pixels"] + list(data.units),
                 signal_units=data.signal_units,
             )
-            ny, nx = ds4.array.shape[-2:]
 
+        # Dataset4dstem input: polar-transform it
+        if isinstance(data, Dataset4dstem):
+            scan_y, scan_x, ny, nx = data.array.shape
             if find_origin:
-                origin_array = cls.find_origin(
-                    ds4,
+                origin_array = auto_origin_id(
+                    data,
                     ellipse_params=ellipse_params,
                     num_annular_bins=num_annular_bins,
                     radial_min=radial_min,
                     radial_max=radial_max,
                     radial_step=radial_step,
                     two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                    device=device,
                 )
             else:
                 if origin_row is None:
                     origin_row = (ny - 1) / 2.0
                 if origin_col is None:
                     origin_col = (nx - 1) / 2.0
-                origin_array = np.zeros((1, 1, 2), dtype=float)
-                origin_array[0, 0] = [origin_row, origin_col]
+                origin_array = np.zeros((scan_y, scan_x, 2), dtype=float)
+                origin_array[..., 0] = origin_row
+                origin_array[..., 1] = origin_col
 
-            polar = ds4.polar_transform(
+            polar = dataset4dstem_polar_transform(
+                data,
                 origin_array=origin_array,
                 ellipse_params=ellipse_params,
                 num_annular_bins=num_annular_bins,
@@ -199,8 +175,9 @@ class PairDistributionFunction(AutoSerialize):
                 radial_max=radial_max,
                 radial_step=radial_step,
                 two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                device=device,
             )
-            return cls(polar=polar, input_data=data, _token=cls._token)
+            return cls(polar=polar, input_data=data, device=device, _token=cls._token)
 
         # Dataset3d input: not yet specified how to interpret
         if isinstance(data, Dataset3d):
@@ -215,153 +192,34 @@ class PairDistributionFunction(AutoSerialize):
 
             return cls.from_data(
                 ds2,
+                find_origin=find_origin,
+                origin_row=origin_row,
+                origin_col=origin_col,
                 ellipse_params=ellipse_params,
                 num_annular_bins=num_annular_bins,
                 radial_min=radial_min,
                 radial_max=radial_max,
                 radial_step=radial_step,
                 two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                device=device,
             )
         elif arr.ndim == 4:
             ds4 = Dataset4dstem.from_array(arr, name="rdf_input_4dstem")
             return cls.from_data(
                 ds4,
+                find_origin=find_origin,
+                origin_row=origin_row,
+                origin_col=origin_col,
                 ellipse_params=ellipse_params,
                 num_annular_bins=num_annular_bins,
                 radial_min=radial_min,
                 radial_max=radial_max,
                 radial_step=radial_step,
                 two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                device=device,
             )
         else:
             raise ValueError("PairDistributionFunction.from_data only supports 2D or 4D arrays.")
-
-    @staticmethod
-    def find_origin(
-        data,
-        *,
-        ellipse_params=None,
-        num_annular_bins=180,
-        radial_min=0.0,
-        radial_max=None,
-        radial_step=1.0,
-        two_fold_rotation_symmetry=False,
-    ):
-        """
-        Automatic diffraction center finding by minmizing the standard deviation along the annular direction.
-
-        For each scan position, this routine:
-        1) Computes a polar transform at an initial origin (image center).
-        2) Evaluates the sum of the standard deviation across angle (phi) over a mid-radius band.
-        3) Performs a local search over neighboring pixel origins until the
-        objective no longer improves.
-
-        Parameters
-        ----------
-        data
-            A :class:`Dataset4dstem` object
-        ellipse_params, num_annular_bins, radial_min, radial_max, radial_step, two_fold_rotation_symmetry
-            Forwarded to the polar transform call.
-
-        Returns
-        -------
-        origin_array : np.ndarray
-            Array of shape (scan_y, scan_x, 2) containing (row, col) origin estimates in pixels.
-
-        """
-        if len(data.array.shape) == 2:
-            ny, nx = data.array.shape
-            scan_y, scan_x = 1, 1
-        elif len(data.array.shape) == 4:
-            scan_y, scan_x, ny, nx = data.array.shape
-        else:
-            raise ValueError("find_origin only supports 2D or 4D-STEM datasets for now.")
-
-        origin_array = np.zeros((scan_y, scan_x, 2), dtype=float)
-
-        max_steps = 1000  # prevent infinite loops
-
-        # start with center of image for now
-        estimated_origin_row = (ny - 1) / 2.0
-        estimated_origin_col = (nx - 1) / 2.0
-        test_origin = np.array([[[estimated_origin_row, estimated_origin_col]]], dtype=float)
-
-        for y_pos in range(scan_y):
-            for x_pos in range(scan_x):
-                # print(f"Finding origin for scan pos ({y_pos}, {x_pos})")
-
-                coords_cache = {}
-
-                polar = data.polar_transform(
-                    origin_array=test_origin,
-                    ellipse_params=ellipse_params,
-                    num_annular_bins=num_annular_bins,
-                    radial_min=radial_min,
-                    radial_max=radial_max,
-                    radial_step=radial_step,
-                    two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                    scan_pos=(y_pos, x_pos),
-                )
-
-                min_r = int(np.floor(0.1 * polar.shape[1]))
-                max_r = int(np.ceil(0.9 * polar.shape[1]))
-                std_est_origin = polar[:, min_r:max_r].std(axis=0)
-                std_est_origin_sum = std_est_origin.sum()
-
-                origin_row = int(round(estimated_origin_row))
-                origin_col = int(round(estimated_origin_col))
-                coords_cache[(origin_row, origin_col)] = std_est_origin_sum
-
-                if y_pos == 0 and x_pos == 0:
-                    print(f"Initial std sum at estimated origin: {std_est_origin_sum}")
-
-                converged = False
-                best = std_est_origin_sum
-                steps = 0
-                while not converged and steps < max_steps:
-                    steps += 1
-                    moved = False
-
-                    neighbors = [
-                        (origin_row + dr, origin_col + dc)
-                        for dr in (-1, 0, 1)
-                        for dc in (-1, 0, 1)
-                        if not (dr == 0 and dc == 0)
-                    ]
-                    neighbors = [(r, c) for (r, c) in neighbors if 0 <= r < ny and 0 <= c < nx]
-
-                    for origin_r, origin_c in neighbors:
-                        if (origin_r, origin_c) not in coords_cache:
-                            test_origin = np.array([[[origin_r, origin_c]]], dtype=float)
-                            polar = data.polar_transform(
-                                origin_array=test_origin,
-                                ellipse_params=ellipse_params,
-                                num_annular_bins=num_annular_bins,
-                                radial_min=radial_min,
-                                radial_max=radial_max,
-                                radial_step=radial_step,
-                                two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                                scan_pos=(y_pos, x_pos),
-                            )
-                            std_test = polar[:, min_r:max_r].std(axis=0)
-                            coords_cache[(origin_r, origin_c)] = std_test.sum()
-
-                        if coords_cache[(origin_r, origin_c)] < best:
-                            origin_row = origin_r
-                            origin_col = origin_c
-                            best = coords_cache[(origin_r, origin_c)]
-                            moved = True
-                            print(f"Moved to ({origin_row}, {origin_col}) with std sum {best}")
-
-                    if not moved:
-                        converged = True
-
-                if y_pos == 0 and x_pos == 0:
-                    print(f"Final std sum at found origin ({origin_row}, {origin_col}): {best}")
-                origin_array[y_pos, x_pos, 0] = origin_row
-                origin_array[y_pos, x_pos, 1] = origin_col
-
-        return origin_array
 
     # ------------------------------------------------------------------
     # Convenience accessors
@@ -383,19 +241,33 @@ class PairDistributionFunction(AutoSerialize):
         """
         return self.polar.coords(3)
 
+    @property
+    def r(self) -> NDArray | None:
+        """Real-space radial grid as a numpy array."""
+        if self._r is None:
+            return None
+        return self._to_numpy(self._r)
+
+    @property
+    def reduced_pdf(self) -> NDArray | None:
+        """Reduced pair distribution function G(r) as a numpy array."""
+        if self._reduced_pdf is None:
+            return None
+        return self._to_numpy(self._reduced_pdf)
+
+    @property
+    def pdf(self) -> NDArray | None:
+        """Pair distribution function g(r) as a numpy array."""
+        if self._pdf is None:
+            return None
+        return self._to_numpy(self._pdf)
+
     # ------------------------------------------------------------------
     # Helper functions
     # ------------------------------------------------------------------
     def _get_mask_bool(self, mask_realspace):
         """
         Normalize a real-space mask specification to a boolean (rx, ry) mask.
-
-        Parameters
-        ----------
-        mask_realspace
-            - None: no masking
-            - bool ndarray of shape (rx, ry): True indicates included probe positions
-            - array-like of shape (2, 2): two opposite (rx, ry) corners defining a rectangle
 
         Returns
         -------
@@ -407,104 +279,210 @@ class PairDistributionFunction(AutoSerialize):
             rx, ry = self.polar.array.shape[:2]
             mask_realspace = np.asarray(mask_realspace)
 
-            # mask given as boolean array
             if mask_realspace.dtype == bool and mask_realspace.shape == (rx, ry):
                 mask_bool = mask_realspace
-
-            # mask given as list of corners
-            elif mask_realspace.shape == (2, 2):
-                (rx1, ry1), (rx2, ry2) = mask_realspace.astype(int)
-                rx_min, rx_max = sorted((rx1, rx2))
-                ry_min, ry_max = sorted((ry1, ry2))
-
-                # vectorized bounds check
-                bad = (rx_min < 0) | (rx_max >= rx) | (ry_min < 0) | (ry_max >= ry)
-                if bad:
-                    raise ValueError(f"Mask points outside valid range {(rx, ry)}")
-
-                mask_bool = np.zeros((rx, ry), dtype=bool)
-                mask_bool[rx_min : rx_max + 1, ry_min : ry_max + 1] = True
             else:
-                raise ValueError(
-                    "mask_realspace must be boolean array or two opposite (rx, ry) corner points."
-                )
+                raise ValueError("mask_realspace must be boolean array.")
         return mask_bool
 
-    @staticmethod
-    def _scattering_model(k2, c, i0, s0, i1, s1):
-        """
-        Background model used for fitting I(k).
-        Model form (using k^2 as input):
-            c + i0 * exp(-k^2 / (2 s0^2)) + i1 * exp(-k^4 / (2 s1^4))
+    # ------------------------------------------------------------------
+    # Torch conversion utilities
+    # ------------------------------------------------------------------
+    @property
+    def polar_tensor(self) -> torch.Tensor:
+        if self._polar_tensor is None:
+            self._polar_tensor = torch.from_numpy(self.polar.array.astype(np.float32)).to(
+                device=self.device
+            )
+        return self._polar_tensor
 
-        Parameters
-        ----------
-        k2
-            Array of k^2 values.
-        c, i0, s0, i1, s1
-            Model parameters.
+    def _to_torch(self, arr: NDArray) -> torch.Tensor:
+        return torch.from_numpy(arr.astype(np.float32)).to(device=self.device)
+
+    def _to_numpy(self, tensor: torch.Tensor) -> NDArray:
+        return tensor.detach().cpu().numpy()
+
+    @staticmethod
+    def _gaussian_kernel_1d(
+        sigma: float, device: str = "cpu", num_sigmas: float = 3.0
+    ) -> torch.Tensor:
+        """Create 1D Gaussian kernel for torch convolution."""
+        radius = int(np.ceil(num_sigmas * sigma))
+        support = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
+        kernel = torch.exp(-0.5 * (support / sigma) ** 2)
+        kernel = kernel / kernel.sum()
+        return kernel
+
+    def _gaussian_filter1d_torch(
+        self,
+        Fk: torch.Tensor,
+        sigma: float,
+        mode: str = "nearest",
+    ) -> torch.Tensor:
         """
-        return (
-            c
-            + i0 * np.exp(k2 / (-2.0 * s0**2))
-            + i1 * np.exp((k2**2) / (-2.0 * s1**4))  # k2**2 = k^4
+        Apply 1D Gaussian filter, replaces scipy.ndimage.gaussian_filter1d.
+        """
+        kernel = self._gaussian_kernel_1d(sigma, device=self.device)
+        padding = len(kernel) // 2
+        x = Fk.unsqueeze(0).unsqueeze(0)  # reshape to (batch, channels, length)
+        kernel_w = kernel.view(1, 1, -1)
+        if mode == "nearest":
+            x = F.pad(x, (padding, padding), mode="replicate")
+            result = F.conv1d(x, kernel_w)
+        else:
+            result = F.conv1d(x, kernel_w, padding=padding)
+        return result.squeeze(0).squeeze(0)  # reshape to (length)
+
+    @staticmethod
+    def _scattering_model_torch(
+        k2: torch.Tensor,
+        c: torch.Tensor,
+        i0: torch.Tensor,
+        s0: torch.Tensor,
+        i1: torch.Tensor,
+        s1: torch.Tensor,
+    ) -> torch.Tensor:
+        """Torch version of the scattering model."""
+        # Add small epsilon to denominators to prevent division by zero during backprop
+        # while still allowing s0/s1 to vary freely
+        eps = 1e-10
+        exp1 = torch.clamp(k2 / (-2.0 * (s0**2 + eps)), min=-100, max=0)
+        exp2 = torch.clamp((k2**2) / (-2.0 * (s1**4 + eps)), min=-100, max=0)
+        return c + i0 * torch.exp(exp1) + i1 * torch.exp(exp2)
+
+    def _compute_fit_weights(self, k: torch.Tensor, kmin: float, kmax: float) -> torch.Tensor:
+        """
+        Compute weighting tensor for background fitting.
+        Weights downweight low-k region (using sin² taper) and emphasize high-k values.
+        """
+        dk = k[1] - k[0]
+        k_width = kmax - kmin
+
+        # sin² taper for low-k suppression
+        mask_low = torch.sin(torch.clamp((k - kmin) / k_width, 0.0, 1.0) * (torch.pi / 2.0)) ** 2
+        # high weight where mask_low is small
+        # later used to divide, so large weights mean small contribution
+        weights = torch.where(
+            mask_low > 1e-4,
+            1.0 / mask_low,
+            torch.tensor(1e6, device=self.device, dtype=k.dtype),
         )
+        # emphasize high-k values
+        weights = weights * (k[-1] - 0.9 * k + dk)
+        return weights
 
-    @staticmethod
-    def _lorch_window(k, kmin, kmax):
+    def _closure(self, optimizer, theta, k2, Ik_norm, weights):
+        """match scipy curve_fit behavior"""
+        optimizer.zero_grad()
+        # Map from unconstrained to constrained (positive) space via softplus
+        c = F.softplus(theta[0])
+        i0 = F.softplus(theta[1])
+        s0 = F.softplus(theta[2])
+        i1 = F.softplus(theta[3])
+        s1 = F.softplus(theta[4])
+
+        pred = self._scattering_model_torch(k2, c, i0, s0, i1, s1)
+        residuals = (pred - Ik_norm) ** 2
+        loss = (residuals / (weights**2)).sum()
+        loss.backward()
+        return loss
+
+    def _frequency_filtering(
+        self,
+        Fk: torch.Tensor,
+        k_lowpass: float | None,
+        k_highpass: float | None,
+        dk: torch.Tensor,
+    ) -> torch.Tensor:
+        """Band pass filtering using torch"""
+        if (
+            k_lowpass is not None
+            and k_lowpass > 0.0
+            and k_highpass is not None
+            and k_highpass > 0.0
+        ):
+            if k_highpass > k_lowpass:
+                raise ValueError("Gaussian band-pass filtering requires k_highpass < k_lowpass.")
+            Fk_low = self._gaussian_filter1d_torch(Fk, sigma=k_lowpass / dk.item(), mode="nearest")
+            Fk_high = self._gaussian_filter1d_torch(
+                Fk, sigma=k_highpass / dk.item(), mode="nearest"
+            )
+            Fk = Fk_high - Fk_low
+        elif k_lowpass is not None and k_lowpass > 0.0:
+            Fk = self._gaussian_filter1d_torch(Fk, sigma=k_lowpass / dk.item(), mode="nearest")
+        elif k_highpass is not None and k_highpass > 0.0:
+            Fk_high = self._gaussian_filter1d_torch(
+                Fk, sigma=k_highpass / dk.item(), mode="nearest"
+            )
+            Fk = Fk - Fk_high
+        return Fk
+
+    def _lorch_window(self, k: torch.Tensor, kmin: float, kmax: float) -> torch.Tensor:
         """
         Construct a combined low-q taper and high-q Lorch window.
 
         The returned window is:
         - zero outside [kmin, kmax]
-        - smoothly rises from 0→1 near kmin using a sin^2 ramp over 10% of the band
+        - smoothly rises from 0->1 near kmin using a sin^2 ramp over 10% of the band
         - applies a Lorch-style sinc factor over the full in-band region:
             sin(pi * k/kmax) / (pi * k/kmax)
         """
         # low q taper
         edge_frac_low = 0.1  # 10% of range at low-q
         edge_width_low = edge_frac_low * (kmax - kmin)
-
-        wk = np.ones_like(k, dtype=float)
         low = (k >= kmin) & (k < kmin + edge_width_low)
-        t = (k[low] - kmin) / edge_width_low
-        wk[low] = np.sin(0.5 * np.pi * t) ** 2
-        wk[k < kmin] = 0.0
-        wk[k > kmax] = 0.0
+        t = (k - kmin) / edge_width_low
+        wk = torch.ones_like(k)
+        wk = torch.where(low, torch.sin(0.5 * torch.pi * t) ** 2, wk)
+        wk = torch.where(k < kmin, torch.zeros_like(wk), wk)
+        wk = torch.where(k > kmax, torch.zeros_like(wk), wk)
 
-        # high q taper with Lorch window: w(k) = sin(pi*k/kmax)/(pi*k/kmax)
-        lorch = np.zeros_like(k, dtype=float)
+        # High q taper with Lorch window: w(k) = sin(pi*k/kmax)/(pi*k/kmax)
+        x = k / kmax
         inband = (k >= kmin) & (k <= kmax)
-        x = k[inband] / kmax
-        lorch[inband] = np.where(x == 0, 1.0, np.sin(np.pi * x) / (np.pi * x))
-
-        wk *= lorch
-
+        # sinc function: sin(pi*x)/(pi*x) with limit 1 at x=0
+        sinc_val = torch.where(
+            x == 0,
+            torch.ones_like(x),
+            torch.sin(torch.pi * x) / (torch.pi * x),
+        )
+        lorch = torch.where(inband, sinc_val, torch.zeros_like(k))
+        wk = wk * lorch
         return wk
 
-    @staticmethod
-    def _compute_alpha_beta(Q2d, r2d, G_beta, r_1d):
+    def _compute_alpha_beta(
+        self,
+        Q2d: torch.Tensor,
+        r2d: torch.Tensor,
+        G_beta: torch.Tensor,
+        r_1d: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Yoshimoto-Omote alpha(Q) and beta(Q) integrals used for density estimation.
-        This is an internal helper that performs the r-integrals via trapezoidal integration.
         """
-        Qsafe = np.where(Q2d == 0.0, 1e-12, Q2d)
-        alpha_int = -4 * np.pi * r2d * np.sin(Qsafe * r2d) / Qsafe
-        beta_int = G_beta[None, :] * np.sin(Qsafe * r2d) / Qsafe
-        alpha = np.trapz(alpha_int, x=r_1d, axis=1)
-        beta = np.trapz(beta_int, x=r_1d, axis=1)
+        Qsafe = torch.where(
+            Q2d == 0.0,
+            torch.tensor(1e-12, device=self.device, dtype=torch.float32),
+            Q2d,
+        )
+        alpha_int = -4 * torch.pi * r2d * torch.sin(Qsafe * r2d) / Qsafe
+        beta_int = G_beta.unsqueeze(0) * torch.sin(Qsafe * r2d) / Qsafe
+        alpha = torch.trapezoid(alpha_int, x=r_1d, dim=1)
+        beta = torch.trapezoid(beta_int, x=r_1d, dim=1)
         return alpha, beta
 
     # ------------------------------------------------------------------
-    # Analysis method stubs (py4DSTEM-style API)
+    # Analysis method stubs
     # ------------------------------------------------------------------
 
-    # TODO: linting and docstrings
+    # TODO: add beamstop mask support (mask diffraction-space pixels before
+    #       azimuthal averaging, e.g. to exclude a beam stop shadow)
+
     def calculate_radial_mean(
         self,
         mask_realspace: NDArray | None = None,
         returnval: bool = False,
-    ):
+    ) -> torch.Tensor | None:
         """
         Calculate the radial mean intensity from the Polar4dSTEM dataset.
 
@@ -522,43 +500,46 @@ class PairDistributionFunction(AutoSerialize):
             Boolean mask in real space used to select probe positions.
             If ``None``, all probe positions are used.
             Must have shape (scan_y, scan_x) where True means "include".
-            (If using rectangle-corner inputs, pass them through
-            `_get_mask_bool` before calling this method.)
         returnval : bool, optional
-            If True, return the computed 1D radial mean array.
+            If True, return the computed 1D radial mean tensor.
 
         Returns
         -------
-        radial_mean : np.ndarray or None
+        radial_mean : torch.Tensor or None
             If `returnval=True`, returns the 1D radial mean intensity (Nk,).
-            Otherwise returns None unless `returnfig=True`.
+            Otherwise returns None.
         """
+        polar_data = self.polar_tensor  # shape: (scan_y, scan_x, phi, k)
 
-        # init radial data array
         if mask_realspace is None:
-            # calculate intensity over q-range for each probe position
-            radial_probe = self.polar.array.mean(axis=2)  # axis 0: ry, 1: rx, 2: theta, 3: q
-            # average over all probe positions
-            self.radial_mean = np.mean(radial_probe, axis=(0, 1))
-
-        elif mask_realspace is not None:
-            masked_polar = self.polar.array[mask_realspace]  # (N_valid, N_theta, N_k)
-            radial_probe = masked_polar.mean(axis=1)
-            # average over all probe positions, only those unmasked
-            self.radial_mean = radial_probe.mean(axis=0)
+            # intensity over q-range for each probe position then average
+            radial_probe = polar_data.mean(dim=2)  # dim 2: theta
+            self.radial_mean = radial_probe.mean(dim=(0, 1))
+        else:
+            mask_torch = torch.from_numpy(mask_realspace).to(device=self.device)
+            masked_polar = polar_data[mask_torch]  # (N_valid, N_theta, N_k)
+            # intensity over q-range of each unmasked probe position
+            radial_probe = masked_polar.mean(dim=1)
+            # average over unmasked probe positions
+            self.radial_mean = radial_probe.mean(dim=0)
 
         if returnval:
             return self.radial_mean
         else:
-            return
+            return None
 
-    def fit_bg(self, Ik, kmin, kmax):
+    def fit_bg(
+        self,
+        Ik: torch.Tensor,
+        kmin: float,
+        kmax: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Fit a smooth background B(k) to a radial intensity curve I(k) using
-        non-linear least squares (SciPy `curve_fit`), with a weighting that
-        downweights the low-k region and emphasizes higher k.
+        PyTorch LBFGS optimizer, with weighting that downweights the low-k
+        region and emphasizes higher k.
 
-        The fitted function uses the following form:
+        The fitted function uses the following form (adopted from py4dstem):
             B(k) = c
                 + i0 * exp(-k^2 / (2 s0^2))
                 + i1 * exp(-k^4 / (2 s1^4))
@@ -566,306 +547,297 @@ class PairDistributionFunction(AutoSerialize):
         Parameters
         ----------
         Ik
-            1D radial intensity array (Nk,). Typically produced by
+            1D radial intensity tensor (Nk,). Produced by
             :meth:`calculate_radial_mean`.
         kmin, kmax
             k-range (in the same units as the internally constructed `k` grid)
-            used to build the low-k weighting mask. (Currently k is derived from
-            `self.qq` with a calibration factor.)
+            used to build the low-k weighting mask.
 
         Returns
         -------
-        bg : np.ndarray
+        bg : torch.Tensor
             Fitted background curve B(k), shape (Nk,).
-        f : np.ndarray
+        f : torch.Tensor
             Background minus the constant offset, f(k) = B(k) - c, or functionally
-            similar to ⟨f⟩²(k)
+            similar to <f>^2(k)
         """
-
-        k = self.qq
-
-        int_mean = np.mean(Ik)
+        k = self._to_torch(np.asarray(self.qq))
         k2 = k**2
 
+        # normalize intensity
+        int_mean = Ik.mean()
+        Ik_norm = Ik / int_mean
         # initial guesses
-        const_bg = np.min(Ik) / int_mean
-        int0 = np.median(Ik) / int_mean - const_bg
-        sigma0 = np.mean(k)
-        p0 = [const_bg, int0, sigma0, int0, sigma0]
+        const_bg = float(Ik_norm.min())
+        int0 = float(Ik_norm.median()) - const_bg
+        sigma0 = float(k.mean())
+        # ensure positive values
+        const_bg = max(const_bg, 1e-6)
+        int0 = max(int0, 1e-6)
+        sigma0 = max(sigma0, 1e-6)
 
-        dk = k[1] - k[0]
-        k_width = kmax - kmin
-        mask_low = (
-            np.sin(
-                np.clip(
-                    (k - kmin) / k_width,
-                    0,
-                    1,
-                )
-                * np.pi
-                / 2.0,
-            )
-            ** 2
+        init_vals = torch.tensor(
+            [const_bg, int0, sigma0, int0, sigma0],
+            device=self.device,
+            dtype=torch.float32,
         )
-        # weighting function for fitting atomic scattering factors
-        weights_fit = np.divide(
-            1,
-            mask_low,
-            where=mask_low > 1e-4,
+        # Map to unconstrained space via inverse softplus: x = y + log(1 - exp(-y))
+        # For numerical stability, clamp init_vals away from zero
+        init_vals = torch.clamp(init_vals, min=1e-6)
+        theta = init_vals + torch.log(-torch.expm1(-init_vals))
+        theta = theta.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.LBFGS(
+            [theta],
+            lr=1.0,
+            max_iter=20,
+            tolerance_grad=1e-7,
+            tolerance_change=1e-9,
+            line_search_fn="strong_wolfe",
         )
-        weights_fit[mask_low <= 1e-4] = np.inf
-        # Scale weighting to favour high k values
-        weights_fit *= k[-1] - 0.9 * k + dk
 
-        # bounds
-        lb = [0, 0, 0, 0, 0]
-        ub = [np.inf, np.inf, np.inf, np.inf, np.inf]
+        # k-dependent fitting weights
+        weights = self._compute_fit_weights(k, kmin, kmax)
 
-        # fit normalized data
-        kwargs = dict(sigma=weights_fit, p0=p0, bounds=(lb, ub), xtol=1e-8, maxfev=10000)
+        prev_loss = torch.tensor(float("inf"))
+        max_outer_iter = 100
+        tol = 1e-8
+        for step in range(max_outer_iter):
+            loss = optimizer.step(lambda: self._closure(optimizer, theta, k2, Ik_norm, weights))
+            if torch.abs(prev_loss - loss) < tol:
+                break
+            prev_loss = loss
 
-        coefs, pcov = curve_fit(self._scattering_model, k2, Ik / int_mean, **kwargs)
-
-        # rescale back to original intensity units (same as script)
-        coefs = np.array(coefs, float)
-        coefs[0] *= int_mean
-        coefs[1] *= int_mean
-        coefs[3] *= int_mean
-
-        bg = self._scattering_model(k2, *coefs)
-        f = bg - coefs[0]  # "form factor" without constant offset, like the script
-
+        # final params
+        with torch.no_grad():
+            c = F.softplus(theta[0])
+            i0 = F.softplus(theta[1])
+            s0 = F.softplus(theta[2])
+            i1 = F.softplus(theta[3])
+            s1 = F.softplus(theta[4])
+            # undo normalization
+            c_scaled = c * int_mean
+            i0_scaled = i0 * int_mean
+            i1_scaled = i1 * int_mean
+            # compute bg
+            bg = self._scattering_model_torch(k2, c_scaled, i0_scaled, s0, i1_scaled, s1)
+            f = bg - c_scaled
         return bg, f
 
-    def calculate_pair_dist_function(
+    def calculate_Gr(
         self,
-        k_min: float = 0.05,
+        k_min: float | None = None,
         k_max: float | None = None,
-        k_width: float = 0.25,
         k_lowpass: float | None = None,
         k_highpass: float | None = None,
         r_min: float = 0.0,
         r_max: float = 20.0,
         r_step: float = 0.02,
         mask_realspace: NDArray | None = None,
-        calculate_pdf: bool = False,
-        density: float | None = None,
         damp_origin_oscillations: bool = False,
-        set_pdf_positive: bool = False,
+        r_cut: float = 0.8,
         returnval: bool = False,
-    ):
+    ) -> list[NDArray] | None:
         """
-        Calculate the (reduced) pair distribution function from a 4D-STEM dataset.
+        Calculate the reduced pair distribution function G(r) from a 4D-STEM dataset.
 
         This routine:
         * Computes the radial mean intensity I(k) from self.polar (optionally
             restricted to a real-space mask).
-        * Fit a smooth background B(k) and associated f(k) using :meth:`fit_bg`.
-        * Estimates and subtracts a background from I(k).
+        * Fits a smooth background B(k) and associated f(k) using :meth:`fit_bg`.
         * Constructs the reduced structure factor F(k) with optional low/highpass filtering.
-        * Apply a window in k (low-k sin^2 ramp × Lorch high-k taper)
-        * Compute the reduced PDF using a discrete sine transform:
-           G(r) = sum_k sin(2π k r) * F_windowed(k)
-        * If `calculate_pdf=True`, g(r) is computed from G(r) using:
-           g(r) = 1 + G(r) / (4π r ρ0)
-           with ρ0 either provided by the user (`density`) or estimated via
-           :meth:`estimate_density`.
+        * Applies a window in k (low-k sin^2 ramp x Lorch high-k taper).
+        * Computes the reduced PDF using a discrete sine transform:
+           G(r) = sum_k sin(2*pi*k*r) * F_windowed(k)
 
-        The computed quantities are also stored on the instance as:
-        * self.radial_mean     – radial mean intensity I(k)  (via calculate_radial_mean)
-        * self.bg              – background bg(k)
-        * self.Sk              – structure factor (computed as 1 + (Ik - bg)/f)
-        * self.Fk              – unwindowed reduced structure function F(k)
-        * self.Fk_masked       – windowed reduced structure function F(k)
-        * self.r               – r grid (in angstroms)
-        * self.reduced_pdf     – reduced PDF G(r)
-        * self.pdf             – PDF g(r)  (if computed)
+        If ``damp_origin_oscillations=True``, :meth:`estimate_density` is called
+        and the corrected F(k)/G(r) are stored as ``self.Fk_damped`` and
+        ``self.reduced_pdf_damped``. The estimated density is cached in
+        ``self.rho0`` so that a subsequent :meth:`calculate_gr` call can reuse it.
+
+        Stored attributes:
+        * self.radial_mean, self.Ik, self.bg, self.Fk, self.Fk_masked
+        * self.Sk, self.r, self.reduced_pdf
+        * self.rho0, self.Fk_damped, self.reduced_pdf_damped (if damping)
 
         Parameters
         ----------
         k_min : float, optional
-            Minimum k (Å⁻¹) to use when building masks and transforms. If None,
-            `self.kmin` is set to `k.min()`.
+            Minimum k (A^-1) for masks and transforms.
         k_max : float or None, optional
-            Maximum k (Å⁻¹) to use when building masks and transforms. If None,
-            `self.kmax` is set to `k.max()`.
-        k_width : float, optional
-            Width parameter (in Å⁻¹) intended for edge masks. Note: in the current implementation
-            this parameter is not yet used as a true "width"; the code uses `k_width = kmax-kmin`.
+            Maximum k (A^-1) for masks and transforms.
         k_lowpass : float or None, optional
-            If provided and > 0, applies a low-pass Gaussian filter to F(k) with
-            sigma = k_lowpass / dk, where dk is the k-grid spacing.
+            Low-pass Gaussian filter sigma in k-space.
         k_highpass : float or None, optional
-            If provided and > 0, constructs a low-pass filtered copy of F(k) with
-            sigma = k_highpass / dk and subtracts it from F(k), effectively
-            applying a high-pass filter.
+            High-pass Gaussian filter sigma in k-space.
         r_min : float, optional
-            Minimum r (Å) for the real-space grid used to compute G(r).
+            Minimum r (A) for the real-space grid.
         r_max : float, optional
-            Maximum r (Å) for the real-space grid used to compute G(r).
+            Maximum r (A) for the real-space grid.
         r_step : float, optional
-            Step size in r (Å) for the real-space grid.
+            Step size in r (A) for the real-space grid.
         mask_realspace : NDArray or None, optional
-            Real-space mask specifying which probe positions (rx, ry) to include.
-            Either:
-            * A boolean array of shape (rx, ry) where True means “include this
-                probe position”, or
-            * An array-like of shape (2, 2) giving two opposite (rx, ry) corner
-                points that define a rectangular region of interest.
-            If None, all probe positions are used.
-        calculate_pdf
-            If True, compute g(r) and store it to `self.pdf`.
-        density
-            If provided, use this number density (atoms/Å^3) when computing g(r).
-            If None and `calculate_pdf=True`, density is estimated using :meth:`estimate_density`.
-        damp_origin_oscillations
-            If True, compute a density correction and replace the stored F(k)/G(r) with the
-            corrected versions returned by :meth:`estimate_density`.
-        set_pdf_positive
-            If True, sets negative values to 0.
+            Boolean real-space mask selecting probe positions.
+        damp_origin_oscillations : bool, optional
+            If True, run :meth:`estimate_density` and store corrected F(k)/G(r).
+        r_cut : float, optional
+            Minimum radial distance (A) for peak search in density estimation.
+            Forwarded to :meth:`estimate_density`.
         returnval : bool, optional
-            If True, the function returns (r, G(r), g(r)). If
-            False, no numerical results are returned (but attributes on `self`
-            are still updated).
-
+            If True, return ``[r, G(r)]`` as numpy arrays.
 
         Returns
         -------
-        results : list[np.ndarray] or None
-            If `returnval=True`, returns [r, reduced_pdf, pdf] where:
-            - r is the real-space grid (Nr,)
-            - reduced_pdf is G(r) (Nr,)
-            - pdf is g(r) (Nr,) or None if `calculate_pdf=False`
-            Otherwise returns None.
+        list[np.ndarray] or None
         """
-        k_width = np.array(k_width)
-        if k_width.size == 1:
-            k_width = k_width * np.ones(2)
-
-        k = self.qq
+        # this is missing a 2pi term that we add back during the pdf calc later
+        k_np = np.asarray(self.qq)
+        k = self._to_torch(k_np)
         dk = k[1] - k[0]
-
-        self.kmax = k_max if k_max is not None else k.max()
-        self.kmin = k_min if k_min is not None else k.min()
-        # BUG: implement k_width properly
-        k_width = self.kmax - self.kmin
+        # small epsilon to avoid division by very small k values
+        k_safe = torch.clamp(k, min=1e-10)
+        self.kmax = k_max if k_max is not None else float(k.max())
+        self.kmin = k_min if k_min is not None else float(k.min())
 
         mask_bool = self._get_mask_bool(mask_realspace)
-
         Ik = self.calculate_radial_mean(mask_realspace=mask_bool, returnval=True)
-
         bg, f = self.fit_bg(Ik, self.kmin, self.kmax)
+        # prevent division by near-zero values which cause NaNs at high k
+        f_safe = torch.clamp(f, min=1e-10 * f.max())
 
-        Fk = (Ik - bg) * k / f
-
-        # band pass filtering
-        if (
-            k_lowpass is not None
-            and k_lowpass > 0.0
-            and k_highpass is not None
-            and k_highpass > 0.0
-        ):
-            if k_highpass > k_lowpass:
-                raise ValueError(
-                    "Invalid band-pass parameters: k_highpass > k_lowpass. "
-                    "Gaussian band-pass filtering requires k_highpass < k_lowpass "
-                    "because these parameters are smoothing widths."
-                )
-            Fk_low = gaussian_filter1d(Fk, sigma=k_lowpass / dk, mode="nearest")
-            Fk_high = gaussian_filter1d(Fk, sigma=k_highpass / dk, mode="nearest")
-            Fk = Fk_high - Fk_low
-        elif k_lowpass is not None and k_lowpass > 0.0:
-            Fk = gaussian_filter1d(Fk, sigma=k_lowpass / dk, mode="nearest")
-        elif k_highpass is not None and k_highpass > 0.0:
-            Fk_low = gaussian_filter1d(Fk, sigma=k_highpass / dk, mode="nearest")
-            Fk = Fk - Fk_low
-
-        # Apply wk to F(Q) and rescale
+        Fk = (Ik - bg) * k_safe / f_safe
+        Fk = self._frequency_filtering(Fk, k_lowpass, k_highpass, dk)
+        # Compute Sk from Fk BEFORE applying the 2pi scaling,
+        # so that estimate_density corrections are on the same scale
+        self.Sk = torch.ones_like(k)
+        mask = k > 0
+        self.Sk = torch.where(mask, 1.0 + (Fk / k_safe), self.Sk)
+        # apply that missing 2pi factor
+        Fk = Fk * 2 * torch.pi
+        # damp edges with lorch window
         wk = self._lorch_window(k, self.kmin, self.kmax)
-        Fk_win = Fk * wk * 2 * np.pi
+        Fk_win = Fk * wk
 
-        r = np.arange(r_min, r_max, r_step)
-        ra, ka = np.meshgrid(r, k)
-        # incorrectly scaled in py4dstem , should include 2pi factor in dk and Fk like below
+        r = torch.arange(r_min, r_max, r_step, device=self.device, dtype=torch.float32)
+        ka, ra = torch.meshgrid(k, r, indexing="ij")
+        # compute reduced PDF using discrete sine transform
         reduced_pdf = (
-            (2 / np.pi)
+            (2 / torch.pi)
             * dk
             * 2
-            * np.pi
-            * np.sum(
-                np.sin(2 * np.pi * ra * ka) * Fk_win[:, None],
-                axis=0,
+            * torch.pi
+            * torch.sum(
+                torch.sin(2 * torch.pi * ra * ka) * Fk_win[:, None],
+                dim=0,
             )
         )
         reduced_pdf[0] = 0  # physically must be at 0 when r = 0
 
         self.Ik = Ik
         self.bg = bg
-        self.Fk = Fk * 2 * np.pi
+        self.Fk = Fk
         self.Fk_masked = Fk_win
-        self.r = r
-        self.reduced_pdf = reduced_pdf
+        self._r = r
+        self._reduced_pdf = reduced_pdf
 
-        denscorr = None
-        if damp_origin_oscillations or (calculate_pdf and density is None):
-            self.Sk = np.ones_like(k, dtype=float)
-            mask = k > 0
-            self.Sk[mask] = 1.0 + (Fk[mask] / k[mask])
-            self.Sk[~mask] = 1.0  # or np.nan, depending on preference
+        # Sk was already computed above (before 2pi scaling)
 
-            denscorr = self.estimate_density(
+        if damp_origin_oscillations:
+            density_est = self.estimate_density(
+                r_cut=r_cut,
                 max_iter=20,
                 tol_percent=1e-1,
             )
-
-        if damp_origin_oscillations:
-            self.Fk_damped = denscorr[1]
-            self.reduced_pdf_damped = denscorr[2]
-        else:
-            self.reduced_pdf_damped = self.reduced_pdf
+            self.rho0 = density_est[0]
+            self.Fk_damped = density_est[1]
+            self.reduced_pdf_damped = density_est[2]
 
         if returnval:
             Gr = getattr(self, "reduced_pdf_damped", None)
             if Gr is None:
-                Gr = self.reduced_pdf
-            results = [self.r, Gr]
+                Gr = self._reduced_pdf
+            return [self._to_numpy(self._r), self._to_numpy(Gr)]
+        return None
 
-        # option to return pdf also using the density calculation method
-        # from Yoshimoto and Omote, 2022.
-        if calculate_pdf:
-            if density is None:
-                rho0 = denscorr[0]
-                # print(f"Estimated density: rho0 = {rho0:.4f} atoms / Å³")
-            else:
-                print(f"Using provided density rho0 = {density:.4f} atoms / Angstrom^3")
-                rho0 = density
+    def calculate_gr(
+        self,
+        density: float | None = None,
+        r_cut: float = 0.8,
+        set_pdf_positive: bool = False,
+        returnval: bool = False,
+    ) -> list[NDArray] | None:
+        """
+        Calculate the pair distribution function g(r) from G(r).
 
-            mask = r > 0
-            pdf = np.ones_like(self.reduced_pdf_damped)
+        Requires :meth:`calculate_Gr` to have been run first. The density
+        rho0 is determined by (in priority order):
 
-            pdf[mask] = 1 + self.reduced_pdf_damped[mask] / (4 * np.pi * r[mask] * rho0)
-            pdf[~mask] = 0.0
+        1. The ``density`` argument, if provided.
+        2. ``self.rho0``, if already cached from a prior :meth:`estimate_density` call
+           (e.g. via ``calculate_Gr(damp_origin_oscillations=True)``).
+        3. A fresh call to :meth:`estimate_density` (result cached in ``self.rho0``).
 
-            if set_pdf_positive:
-                pdf = np.maximum(pdf, 0.0)
+        The G(r) used is ``self.reduced_pdf_damped`` if it exists (i.e. the user
+        chose damping in :meth:`calculate_Gr`), otherwise ``self.reduced_pdf``.
 
-            self.pdf = pdf
+        Parameters
+        ----------
+        density : float or None, optional
+            Number density (atoms/A^3). If None, uses cached or estimated value.
+        r_cut : float, optional
+            Minimum radial distance (A) for peak search in density estimation.
+            Only used when density must be estimated. Forwarded to
+            :meth:`estimate_density`.
+        set_pdf_positive : bool, optional
+            If True, clamp negative g(r) values to 0.
+        returnval : bool, optional
+            If True, return ``[r, g(r)]`` as numpy arrays.
 
-            if returnval:
-                results.append(self.pdf)
+        Returns
+        -------
+        list[np.ndarray] or None
+        """
+        if self._reduced_pdf is None or self._r is None:
+            raise RuntimeError("Run calculate_Gr() before calculate_gr().")
 
-        if returnval:
-            return results
+        # Determine density
+        if density is not None:
+            rho0 = density
+        elif self.rho0 is not None:
+            rho0 = self.rho0
         else:
-            return
+            density_est = self.estimate_density(
+                r_cut=r_cut,
+                max_iter=20,
+                tol_percent=1e-1,
+            )
+            self.rho0 = density_est[0]
+            rho0 = self.rho0
+
+        # Use damped G(r) if the user opted into damping, otherwise undamped
+        Gr = getattr(self, "reduced_pdf_damped", None)
+        if Gr is None:
+            Gr = self._reduced_pdf
+
+        r = self._r
+        mask = r > 0
+        pdf = torch.ones_like(Gr)
+        pdf = torch.where(mask, 1 + Gr / (4 * torch.pi * r * rho0), torch.zeros_like(pdf))
+        if set_pdf_positive:  # negative values are unphysical
+            pdf = torch.maximum(pdf, torch.zeros_like(pdf))
+
+        self._pdf = pdf
+        if returnval:
+            return [self._to_numpy(self._r), self._to_numpy(self._pdf)]
+        return None
 
     def estimate_density(
         self,
-        max_iter: int = 20,
+        r_cut: float = 0.8,
+        max_iter: int = 40,
         tol_percent: float = 1e-4,
-    ) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[float, torch.Tensor, torch.Tensor]:
         """
-        Estimate number density rho0 (atoms/Å^3) and compute a corrected G(r).
+        Estimate number density rho0 (atoms/A^3) and compute a corrected G(r).
 
         This method implements an iterative Q-space density estimation by
         Yoshimoto & Omote (2022). It uses the structure factor `self.Sk` and
@@ -873,12 +845,15 @@ class PairDistributionFunction(AutoSerialize):
         corrected S(k) so that the implied G(r) is more physically consistent
         at low r.
 
-        This method requires that :meth:`calculate_pair_dist_function` has already
-        been run, because it depends on `self.Sk`, `self.reduced_pdf`, `self.r`,
+        This method requires that :meth:`calculate_Gr` has already been run,
+        because it depends on `self.Sk`, `self.reduced_pdf`, `self.r`,
         and the k-window bounds (`self.kmin`, `self.kmax`).
 
         Parameters
         ----------
+        r_cut : float, optional
+            Minimum radial distance (A) for the peak search used to determine
+            the correction interval. Peaks below this distance are ignored.
         max_iter : int, optional
             Maximum number of Q-space iterations.
         tol_percent : float, optional
@@ -888,89 +863,84 @@ class PairDistributionFunction(AutoSerialize):
         Returns
         -------
         rho0 : float
-            Estimated microscopic number density (atoms/Å^3).
-        Fk_win_damped : np.ndarray
+            Estimated microscopic number density (atoms/A^3).
+        Fk_win_damped : torch.Tensor
             Windowed corrected reduced structure function used for the transform.
-        G_cor : np.ndarray
+        G_cor : torch.Tensor
             Reduced PDF G(r) with dampened oscillations near origin.
         """
-        if self.Sk is None or self.reduced_pdf is None or self.r is None:
-            raise RuntimeError("Run calculate_pair_dist_function() before estimate_density().")
+        if self.Sk is None or self._reduced_pdf is None or self._r is None:
+            raise RuntimeError("Run calculate_Gr() before estimate_density().")
 
-        k = self.qq
+        k = self._to_torch(np.asarray(self.qq))
         dk = k[1] - k[0]
         k_fit_mask = k >= self.kmin
         k_fit = k[k_fit_mask]
-        ra, ka = np.meshgrid(self.r, k)
+        ka, ra = torch.meshgrid(k, self._r, indexing="ij")
 
-        r_cut = 0.8  # Angstrom
-        mask_search = self.r >= r_cut
-        r_search = self.r[mask_search]
-        G_search = self.reduced_pdf[mask_search]
+        mask_search = self._r >= r_cut
+        r_search = self._r[mask_search]
+        G_search = self._reduced_pdf[mask_search]
 
-        # find primary peak
-        ind_max = np.argmax(G_search)
+        # find tallest peak and first local minimum to the left of r_peak
+        ind_max = torch.argmax(G_search)
         r_max = r_search[ind_max]
-
-        # find first local minimum to the left of r_peak
-        left = self.r < r_max
-        if not np.any(left):
-            # fallback: if peak is immediately at cutoff, just use cutoff as rmin
+        left = self._r < r_max
+        if not torch.any(left):
+            # If peak is immediately at cutoff, just use cutoff as rmin
             rmin = r_cut
         else:
-            r_left = self.r[left]
-            G_left = self.reduced_pdf[left]
-
-            mins = np.where((G_left[1:-1] < G_left[:-2]) & (G_left[1:-1] < G_left[2:]))[0] + 1
+            r_left = self._r[left]
+            G_left = self._reduced_pdf[left]
+            mins_cond = (G_left[1:-1] < G_left[:-2]) & (G_left[1:-1] < G_left[2:])
+            # fix indexing from slicing with +1
+            mins_indices = torch.where(mins_cond)[0] + 1
             # minimum closest to the peak, else global min in left interval
-            rmin = r_left[mins[-1]] if mins.size else r_left[np.argmin(G_left)]
+            if mins_indices.numel() > 0:
+                rmin = float(r_left[mins_indices[-1]])
+            else:
+                rmin = float(r_left[torch.argmin(G_left)])
 
-        # restrict r to [0, rmin] for alpha/beta integrals
-        r_mask = (self.r >= 0.0) & (self.r <= rmin)
-        r_short = self.r[r_mask]
-        G_short = self.reduced_pdf[r_mask]
+        # Restrict r to [0, rmin] for the correction
+        r_mask = (self._r >= 0.0) & (self._r <= rmin)
+        r_short = self._r[r_mask]
+        G_short = self._reduced_pdf[r_mask]
+        k_fit_scaled = k_fit * 2 * torch.pi
+        k2d_fit, r2d_fit = torch.meshgrid(k_fit_scaled, r_short, indexing="ij")
 
-        # iterative refinement of rho0 and S(k)
+        # Iterative refinement of rho0 and S(k)
+        rho0 = 0.0
         rho0_prev = None
-        Sk_cor = self.Sk.copy()
-        G_cor = self.reduced_pdf.copy()
-
-        # use current G(r) (from Sk_cor) in beta(Q)
+        Sk_cor = self.Sk.clone()
+        G_cor = self._reduced_pdf.clone()
+        Fk_win_damped = self.Fk_masked.clone()
+        # start with uncorrected Gr
         G_beta = G_short
-        k_fit = k_fit * 2 * np.pi
+        wk = self._lorch_window(k, self.kmin, self.kmax)
         for j in range(max_iter):
             if j > 0:
                 G_beta = G_cor[r_mask]
 
-            k2d_fit, r2d_fit = np.meshgrid(k_fit, r_short, indexing="ij")
+            # calculate alpha/beta for S(k) adjustment
             alpha, beta = self._compute_alpha_beta(k2d_fit, r2d_fit, G_beta, r_short)
-            rho0 = np.sum(alpha * beta) / np.sum(alpha**2)
-
+            rho0 = float(torch.sum(alpha * beta) / torch.sum(alpha**2))
             if rho0_prev is not None:
                 Rj = np.sqrt(((rho0_prev - rho0) ** 2) / (rho0**2)) * 100.0
                 if Rj < tol_percent:
-                    # print(
-                    #     f"Converged after {j} iterations: rho0 = {rho0:.4f} atoms / Å³, Rj = {Rj:.4f}%"
-                    # )
                     break
 
-            # update S_cor(Q)
+            # Update S_cor(k) and G_cor
             Sk_cor[k_fit_mask] = Sk_cor[k_fit_mask] - beta + rho0 * alpha
             Fk_cor = k * (Sk_cor - 1.0)
-
-            wk = self._lorch_window(k, self.kmin, self.kmax)
-
-            Fk_win_damped = Fk_cor * wk * 2 * np.pi
-
+            Fk_win_damped = Fk_cor * wk * 2 * torch.pi
             G_cor = (
-                (2.0 / np.pi)
+                (2.0 / torch.pi)
                 * dk
                 * 2
-                * np.pi
-                * np.sum(np.sin(2 * np.pi * ka * ra) * Fk_win_damped[:, None], axis=0)
+                * torch.pi
+                * torch.sum(torch.sin(2 * torch.pi * ka * ra) * Fk_win_damped[:, None], dim=0)
             )
             G_cor[0] = 0.0
-
             rho0_prev = rho0
 
         return rho0, Fk_win_damped, G_cor
@@ -981,13 +951,12 @@ class PairDistributionFunction(AutoSerialize):
 
     PlotName = Literal[
         "radial_mean",
-        "background",
+        "background_fits",
         "reduced_sf",
         "reduced_pdf",
         "pdf",
+        "oscillation_damping",
     ]
-
-    from typing import Optional, Tuple
 
     def _apply_xrange(
         self,
@@ -1016,7 +985,7 @@ class PairDistributionFunction(AutoSerialize):
         qmax: float | None = None,
         rmin: float | None = None,
         rmax: float | None = None,
-        figsize: tuple[float, float] = (8, 4),
+        figsize: tuple[float, float] = (6, 4),
         returnfigs: bool = False,
     ):
         """
@@ -1024,7 +993,7 @@ class PairDistributionFunction(AutoSerialize):
 
         Examples
         --------
-        pdfc.calculate_pair_dist_function(...)
+        pdfc.calculate_Gr(...)
         pdfc.plot(["radial_mean", "background", "reduced_pdf"])
         """
         mapping = {
@@ -1048,33 +1017,6 @@ class PairDistributionFunction(AutoSerialize):
 
         return figs if returnfigs else None
 
-    def _auto_ylim_after_direct_beam_trough(self, y, *, scale=2.0, smooth_sigma=2.0):
-        y = np.asarray(y, dtype=float)
-        if y.size < 10:
-            return None
-
-        # direct beam peak is usually the first big max; assume it's at/near index 0
-        # find first local minimum after index 0
-        dy = np.diff(y)
-        mins = np.where((dy[:-1] < 0) & (dy[1:] > 0))[0] + 1
-
-        if mins.size == 0:
-            # fallback: ignore first 5% if we can't find a trough
-            start = max(1, int(0.05 * y.size))
-        else:
-            start = int(mins[0])
-
-        y_use = y[start:]
-        y_use = y_use[np.isfinite(y_use)]
-        if y_use.size == 0:
-            return None
-
-        ymax = np.max(y_use)
-        if not np.isfinite(ymax) or ymax <= 0:
-            return None
-
-        return (0.0, scale * ymax)
-
     def plot_radial_mean(
         self,
         qmin: float | None = None,
@@ -1092,7 +1034,7 @@ class PairDistributionFunction(AutoSerialize):
             raise RuntimeError("Radial mean intensity has not been calculated yet.")
 
         x = np.asarray(self.qq)
-        y = np.asarray(self.radial_mean)
+        y = self._to_numpy(self.radial_mean)
         x, y = self._apply_xrange(x, y, qmin, qmax)
 
         fig, ax = plt.subplots(figsize=figsize)
@@ -1102,25 +1044,12 @@ class PairDistributionFunction(AutoSerialize):
         ax.set_title("Radial Mean Intensity vs Scattering Vector")
         ax.legend()
         ax.set_yscale("log")
-        # ylim = self._auto_ylim_after_direct_beam_trough(self.radial_mean, scale=2.0)
-        # if ylim is not None:
-        #     ax.set_ylim(*ylim)
         plt.tight_layout()
 
         if returnfig:
             return fig
         else:
             plt.show()
-
-    def plot_radial_var_norm(
-        self,
-        figsize: tuple[float, float] = (8, 4),
-        returnfig: bool = False,
-    ):
-        """
-        Stub for plotting normalized radial variance vs scattering vector.
-        """
-        raise NotImplementedError("plot_radial_var_norm is not implemented yet.")
 
     def plot_background_fits(
         self,
@@ -1138,10 +1067,10 @@ class PairDistributionFunction(AutoSerialize):
             raise RuntimeError("Radial mean intensity or background has not been calculated yet.")
 
         x = np.asarray(self.qq)
-        y1 = np.asarray(self.radial_mean)
+        y1 = self._to_numpy(self.radial_mean)
         x, y1 = self._apply_xrange(x, y1, qmin, qmax)
         x = np.asarray(self.qq)
-        y2 = np.asarray(self.bg)
+        y2 = self._to_numpy(self.bg)
         x, y2 = self._apply_xrange(x, y2, qmin, qmax)
 
         fig, ax = plt.subplots(figsize=figsize)
@@ -1153,9 +1082,6 @@ class PairDistributionFunction(AutoSerialize):
         ax.legend()
         ax.set_yscale("log")
         plt.tight_layout()
-        # ylim = self._auto_ylim_after_direct_beam_trough(self.radial_mean, scale=2.0)
-        # if ylim is not None:
-        #     ax.set_ylim(*ylim)
 
         if returnfig:
             return fig
@@ -1182,7 +1108,7 @@ class PairDistributionFunction(AutoSerialize):
             Fk = self.Fk_masked
 
         x = np.asarray(self.qq)
-        y = np.asarray(Fk)
+        y = self._to_numpy(Fk)
         x, y = self._apply_xrange(x, y, qmin, qmax)
 
         fig, ax = plt.subplots(figsize=figsize)
@@ -1209,22 +1135,27 @@ class PairDistributionFunction(AutoSerialize):
         """
         Plotting reduced PDF g(r).
         """
-        if self.reduced_pdf is None:
+        if self._reduced_pdf is None:
             raise RuntimeError("Reduced PDF has not been calculated yet.")
         Gr = getattr(self, "reduced_pdf_damped", None)
         if Gr is None:
-            Gr = self.reduced_pdf
+            Gr = self._reduced_pdf
 
-        x = np.asarray(self.r)
-        y = np.asarray(Gr)
-        x, y = self._apply_xrange(x, y, qmin, qmax)
+        x = self._to_numpy(self._r)
+        y = self._to_numpy(Gr)
+        x, y = self._apply_xrange(x, y, rmin, rmax)
 
         # Find radial value of primary peak and trough for y-limits
-        ind_max = np.argmax(y)
-        y_max = y[ind_max]
-
-        ind_min = np.argmin(y)
-        y_min = y[ind_min]
+        # Filter out NaN and Inf values to avoid plot errors
+        valid_mask = np.isfinite(y)
+        if np.any(valid_mask):
+            y_valid = y[valid_mask]
+            y_max = np.max(y_valid)
+            y_min = np.min(y_valid)
+        else:
+            # Fallback if all values are invalid
+            y_max = 1.0
+            y_min = -1.0
         yrange = y_max - y_min
         pad = padding_frac * yrange
 
@@ -1253,20 +1184,24 @@ class PairDistributionFunction(AutoSerialize):
         """
         Plotting pair distribution function g(r).
         """
-        if self.reduced_pdf is None or self.pdf is None:
+        if self._reduced_pdf is None or self._pdf is None:
             raise RuntimeError("Reduced PDF or PDF has not been calculated yet.")
 
-        x = np.asarray(self.r)
-        y = np.asarray(self.pdf)
-        x, y = self._apply_xrange(x, y, qmin, qmax)
+        x = self._to_numpy(self._r)
+        y = self._to_numpy(self._pdf)
+        x, y = self._apply_xrange(x, y, rmin, rmax)
 
         # Find radial value of primary peak
-        ind_max = np.argmax(y)
-        y_max = y[ind_max]
-
-        ind_min = np.argmin(y)
-        y_min = y[ind_min]
-
+        # Filter out NaN and Inf values to avoid plot errors
+        valid_mask = np.isfinite(y)
+        if np.any(valid_mask):
+            y_valid = y[valid_mask]
+            y_max = np.max(y_valid)
+            y_min = np.min(y_valid)
+        else:
+            # Fallback if all values are invalid
+            y_max = 1.0
+            y_min = -1.0
         yrange = y_max - y_min
         pad = padding_frac * yrange
 
@@ -1292,34 +1227,51 @@ class PairDistributionFunction(AutoSerialize):
         figsize: tuple[float, float] = (8, 4),
         returnfig: bool = False,
     ):
+        if (
+            self.Fk_masked is None
+            or not hasattr(self, "Fk_damped")
+            or not hasattr(self, "reduced_pdf_damped")
+        ):
+            raise RuntimeError(
+                "Oscillation damping data not available. "
+                "Run calculate_Gr(damp_origin_oscillations=True) first."
+            )
+
         k = np.asarray(self.qq)
+
+        # Convert torch tensors to numpy for plotting
+        Fk_masked = self._to_numpy(self.Fk_masked)
+        Fk_damped = self._to_numpy(self.Fk_damped)
+        r = self._to_numpy(self._r)
+        reduced_pdf = self._to_numpy(self._reduced_pdf)
+        reduced_pdf_damped = self._to_numpy(self.reduced_pdf_damped)
 
         fig, axes = plt.subplots(2, 2, figsize=figsize)
 
         # F(k)
         axS_top = axes[0, 0]
         axS_res = axes[1, 0]
-        axS_top.plot(k, self.Fk_masked, label="F_obs(k)", color="gray")
-        axS_top.plot(k, self.Fk_damped, label="F_cor(k)", color="red")
-        axS_top.set_xlabel("k (Å$^{-1}$)")
+        axS_top.plot(k, Fk_masked, label="F_obs(k)", color="gray")
+        axS_top.plot(k, Fk_damped, label="F_cor(k)", color="red")
+        axS_top.set_xlabel("k (A$^{-1}$)")
         axS_top.set_ylabel("F(k)")
         axS_top.legend()
 
-        axS_res.plot(k, self.Fk_damped - self.Fk_masked, color="blue")
-        axS_res.set_xlabel("k (Å$^{-1}$)")
+        axS_res.plot(k, Fk_damped - Fk_masked, color="blue")
+        axS_res.set_xlabel("k (A$^{-1}$)")
         axS_res.set_ylabel("F_cor - F_obs")
 
         # G(r)
         axG_top = axes[0, 1]
         axG_res = axes[1, 1]
-        axG_top.plot(self.r, self.reduced_pdf, label="G_obs(r)", color="gray")
-        axG_top.plot(self.r, self.reduced_pdf_damped, label="G_cor(r)", color="red")
-        axG_top.set_xlabel("r (Å)")
+        axG_top.plot(r, reduced_pdf, label="G_obs(r)", color="gray")
+        axG_top.plot(r, reduced_pdf_damped, label="G_cor(r)", color="red")
+        axG_top.set_xlabel("r (A)")
         axG_top.set_ylabel("G(r)")
         axG_top.legend()
 
-        axG_res.plot(self.r, self.reduced_pdf_damped - self.reduced_pdf, color="blue")
-        axG_res.set_xlabel("r (Å)")
+        axG_res.plot(r, reduced_pdf_damped - reduced_pdf, color="blue")
+        axG_res.set_xlabel("r (A)")
         axG_res.set_ylabel("G_cor - G_obs")
 
         fig.tight_layout()
