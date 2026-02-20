@@ -8,7 +8,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import torch
 
-from quantem.core.models.base import Component, ModelContext, Overlay, Parameter
+from quantem.core.fitting.base import Component, ModelContext, Overlay, Parameter
 
 
 def _as_t(x: Any, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -342,12 +342,19 @@ class SyntheticDiskLattice(Component):
         Inclusive lattice index extents.
     intensity_0, intensity_row, intensity_col
         Intensity parameter specifications. Interpretation depends on
-        `per_disk_intensity` and `per_disk_slopes`.
+        `per_disk_intensity` and intensity-order settings.
+    intensity_row_row, intensity_col_col, intensity_row_col
+        Optional quadratic intensity terms for order-2 models.
     per_disk_intensity
         If True, allocate independent base intensities per lattice disk.
     per_disk_slopes
-        If True and `per_disk_intensity=True`, also allocate per-disk local
-        slope parameters for template-local coordinates.
+        Backward-compatible switch controlling whether linear terms are included
+        when `max_intensity_order` is not explicitly provided.
+    max_intensity_order
+        Maximum polynomial order used by this component (`0`, `1`, or `2`).
+    default_pattern_intensity_order
+        Default active intensity order used during rendering unless overridden
+        in `ctx.fields["lattice_intensity_order_override"]`.
     center_intensity_0
         Optional override for the `(u, v) == (0, 0)` disk base intensity.
     exclude_indices
@@ -362,10 +369,12 @@ class SyntheticDiskLattice(Component):
     Intensity models:
     - shared mode (`per_disk_intensity=False`):
       `max(i0 + ir*row_center + ic*col_center, 0)`
-    - per-disk scalar mode (`per_disk_intensity=True`, `per_disk_slopes=False`):
+    - per-disk scalar mode (`per_disk_intensity=True`, order=0):
       `max(i0_i, 0)`
-    - per-disk local affine mode (`per_disk_intensity=True`, `per_disk_slopes=True`):
+    - per-disk local affine mode (`per_disk_intensity=True`, order=1):
       `max(i0_i + ir_i*dr + ic_i*dc, 0)` where `dr/dc` are template-local offsets.
+    - per-disk local quadratic mode (`per_disk_intensity=True`, order=2):
+      `max(i0_i + ir_i*dr + ic_i*dc + irr_i*dr^2 + icc_i*dc^2 + irc_i*dr*dc, 0)`.
     """
 
     def __init__(
@@ -382,8 +391,13 @@ class SyntheticDiskLattice(Component):
         intensity_0: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
         intensity_row: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
         intensity_col: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
+        intensity_row_row: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
+        intensity_col_col: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
+        intensity_row_col: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
         per_disk_intensity: bool = False,
         per_disk_slopes: bool = True,
+        max_intensity_order: int | None = None,
+        default_pattern_intensity_order: int | None = None,
         center_intensity_0: float | tuple[float, float] | tuple[float, float, float | None] | None = None,
         exclude_indices: Iterable[tuple[int, int]] | None = None,
         boundary_px: float = 0.0,
@@ -396,7 +410,18 @@ class SyntheticDiskLattice(Component):
         self.boundary_px = float(boundary_px)
         self.origin_key = str(origin_key)
         self.per_disk_intensity = bool(per_disk_intensity)
-        self.per_disk_slopes = bool(per_disk_slopes)
+        if max_intensity_order is None:
+            self.max_intensity_order = 1 if bool(per_disk_slopes) else 0
+        else:
+            self.max_intensity_order = int(max_intensity_order)
+        if self.max_intensity_order < 0 or self.max_intensity_order > 2:
+            raise ValueError("max_intensity_order must be 0, 1, or 2.")
+        if default_pattern_intensity_order is None:
+            self.default_pattern_intensity_order = int(self.max_intensity_order)
+        else:
+            self.default_pattern_intensity_order = int(default_pattern_intensity_order)
+        if self.default_pattern_intensity_order < 0 or self.default_pattern_intensity_order > self.max_intensity_order:
+            raise ValueError("default_pattern_intensity_order must be in [0, max_intensity_order].")
 
         if exclude_indices is None:
             self.exclude_indices = {(0, 0)} if bool(getattr(disk, "place_at_origin", False)) else set()
@@ -421,27 +446,57 @@ class SyntheticDiskLattice(Component):
         self.p_i0_list: list[Parameter] = []
         self.p_ir_list: list[Parameter] = []
         self.p_ic_list: list[Parameter] = []
+        self.p_irr_list: list[Parameter] = []
+        self.p_icc_list: list[Parameter] = []
+        self.p_irc_list: list[Parameter] = []
         if self.per_disk_intensity:
             for u, v in self.uv_indices:
                 i0_val = center_intensity_0 if (center_intensity_0 is not None and (u, v) == (0, 0)) else intensity_0
-                self.p_i0_list.append(Parameter(i0_val, lower_bound=0.0, tags={"role": "lat_int0", "u": u, "v": v}))
-                if self.per_disk_slopes:
-                    self.p_ir_list.append(Parameter(intensity_row, tags={"role": "lat_int_row", "u": u, "v": v}))
-                    self.p_ic_list.append(Parameter(intensity_col, tags={"role": "lat_int_col", "u": u, "v": v}))
+                self.p_i0_list.append(
+                    Parameter(i0_val, lower_bound=0.0, tags={"role": "lat_int0", "u": u, "v": v, "intensity_order": 0})
+                )
+                if self.max_intensity_order >= 1:
+                    self.p_ir_list.append(
+                        Parameter(intensity_row, tags={"role": "lat_int_row", "u": u, "v": v, "intensity_order": 1})
+                    )
+                    self.p_ic_list.append(
+                        Parameter(intensity_col, tags={"role": "lat_int_col", "u": u, "v": v, "intensity_order": 1})
+                    )
+                if self.max_intensity_order >= 2:
+                    self.p_irr_list.append(
+                        Parameter(intensity_row_row, tags={"role": "lat_int_rr", "u": u, "v": v, "intensity_order": 2})
+                    )
+                    self.p_icc_list.append(
+                        Parameter(intensity_col_col, tags={"role": "lat_int_cc", "u": u, "v": v, "intensity_order": 2})
+                    )
+                    self.p_irc_list.append(
+                        Parameter(intensity_row_col, tags={"role": "lat_int_rc", "u": u, "v": v, "intensity_order": 2})
+                    )
         else:
-            self.p_i0 = Parameter(intensity_0, lower_bound=0.0, tags={"role": "lat_int0"})
-            self.p_ir = Parameter(intensity_row, tags={"role": "lat_int_row"})
-            self.p_ic = Parameter(intensity_col, tags={"role": "lat_int_col"})
+            self.p_i0 = Parameter(intensity_0, lower_bound=0.0, tags={"role": "lat_int0", "intensity_order": 0})
+            self.p_ir = Parameter(intensity_row, tags={"role": "lat_int_row", "intensity_order": 1})
+            self.p_ic = Parameter(intensity_col, tags={"role": "lat_int_col", "intensity_order": 1})
+            self.p_irr = Parameter(intensity_row_row, tags={"role": "lat_int_rr", "intensity_order": 2})
+            self.p_icc = Parameter(intensity_col_col, tags={"role": "lat_int_cc", "intensity_order": 2})
+            self.p_irc = Parameter(intensity_row_col, tags={"role": "lat_int_rc", "intensity_order": 2})
 
     def parameters(self) -> list[Parameter]:
         out = [self.p_u_row, self.p_u_col, self.p_v_row, self.p_v_col]
         if self.per_disk_intensity:
             out.extend(self.p_i0_list)
-            if self.per_disk_slopes:
+            if self.max_intensity_order >= 1:
                 out.extend(self.p_ir_list)
                 out.extend(self.p_ic_list)
+            if self.max_intensity_order >= 2:
+                out.extend(self.p_irr_list)
+                out.extend(self.p_icc_list)
+                out.extend(self.p_irc_list)
         else:
-            out.extend([self.p_i0, self.p_ir, self.p_ic])
+            out.append(self.p_i0)
+            if self.max_intensity_order >= 1:
+                out.extend([self.p_ir, self.p_ic])
+            if self.max_intensity_order >= 2:
+                out.extend([self.p_irr, self.p_icc, self.p_irc])
         return out
 
     def prepare(self, ctx: ModelContext) -> Any:
@@ -461,11 +516,14 @@ class SyntheticDiskLattice(Component):
         i_vr = self.p_v_row.index
         i_vc = self.p_v_col.index
         if self.per_disk_intensity:
-            i_i0 = i_ir = i_ic = None
+            i_i0 = i_ir = i_ic = i_irr = i_icc = i_irc = None
         else:
             i_i0 = self.p_i0.index
-            i_ir = self.p_ir.index
-            i_ic = self.p_ic.index
+            i_ir = None if self.max_intensity_order < 1 else self.p_ir.index
+            i_ic = None if self.max_intensity_order < 1 else self.p_ic.index
+            i_irr = None if self.max_intensity_order < 2 else self.p_irr.index
+            i_icc = None if self.max_intensity_order < 2 else self.p_icc.index
+            i_irc = None if self.max_intensity_order < 2 else self.p_irc.index
 
         uv = self.uv_indices
         uv_t = torch.as_tensor(uv, device=ctx.device, dtype=torch.long) if uv else None
@@ -474,15 +532,23 @@ class SyntheticDiskLattice(Component):
 
         if self.per_disk_intensity:
             i0_idx = torch.as_tensor([p.index for p in self.p_i0_list], device=ctx.device, dtype=torch.long)
-            if self.per_disk_slopes:
+            if self.max_intensity_order >= 1:
                 ir_idx = torch.as_tensor([p.index for p in self.p_ir_list], device=ctx.device, dtype=torch.long)
                 ic_idx = torch.as_tensor([p.index for p in self.p_ic_list], device=ctx.device, dtype=torch.long)
             else:
                 ir_idx = ic_idx = None
+            if self.max_intensity_order >= 2:
+                irr_idx = torch.as_tensor([p.index for p in self.p_irr_list], device=ctx.device, dtype=torch.long)
+                icc_idx = torch.as_tensor([p.index for p in self.p_icc_list], device=ctx.device, dtype=torch.long)
+                irc_idx = torch.as_tensor([p.index for p in self.p_irc_list], device=ctx.device, dtype=torch.long)
+            else:
+                irr_idx = icc_idx = irc_idx = None
         else:
-            i0_idx = ir_idx = ic_idx = None
+            i0_idx = ir_idx = ic_idx = irr_idx = icc_idx = irc_idx = None
         per_disk_intensity = self.per_disk_intensity
-        per_disk_slopes = self.per_disk_slopes
+        max_intensity_order = self.max_intensity_order
+        default_pattern_intensity_order = self.default_pattern_intensity_order
+        comp_name = self.name
 
         @dataclass
         class Prepared:
@@ -525,26 +591,46 @@ class SyntheticDiskLattice(Component):
                     return
 
                 vals = self._patch(x)
+                dr2 = dr * dr
+                dc2 = dc * dc
+                drdc = dr * dc
+
+                order_override = ctx.fields.get("lattice_intensity_order_override", None)
+                if isinstance(order_override, dict):
+                    active_order = int(order_override.get(comp_name, default_pattern_intensity_order))
+                elif order_override is None:
+                    active_order = int(default_pattern_intensity_order)
+                else:
+                    active_order = int(order_override)
+                active_order = max(0, min(active_order, int(max_intensity_order)))
 
                 if per_disk_intensity:
                     keep_idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
                     i0_keep = x[i0_idx[keep_idx]]
-                    if per_disk_slopes:
+                    if active_order >= 1:
                         ir_keep = x[ir_idx[keep_idx]]
                         ic_keep = x[ic_idx[keep_idx]]
-                        for j, (rr0, cc0) in enumerate(zip(centers_r, centers_c)):
-                            inten_local = torch.clamp(i0_keep[j] + ir_keep[j] * dr + ic_keep[j] * dc, min=0.0)
-                            _splat_patch(out, r0=rr0, c0=cc0, patch_vals=vals, dr=dr, dc=dc, scale=inten_local)
-                    else:
-                        for j, (rr0, cc0) in enumerate(zip(centers_r, centers_c)):
-                            inten_local = torch.clamp(i0_keep[j], min=0.0)
-                            _splat_patch(out, r0=rr0, c0=cc0, patch_vals=vals, dr=dr, dc=dc, scale=inten_local)
+                    if active_order >= 2:
+                        irr_keep = x[irr_idx[keep_idx]]
+                        icc_keep = x[icc_idx[keep_idx]]
+                        irc_keep = x[irc_idx[keep_idx]]
+                    for j, (rr0, cc0) in enumerate(zip(centers_r, centers_c)):
+                        inten_local = i0_keep[j]
+                        if active_order >= 1:
+                            inten_local = inten_local + ir_keep[j] * dr + ic_keep[j] * dc
+                        if active_order >= 2:
+                            inten_local = inten_local + irr_keep[j] * dr2 + icc_keep[j] * dc2 + irc_keep[j] * drdc
+                        inten_local = torch.clamp(inten_local, min=0.0)
+                        _splat_patch(out, r0=rr0, c0=cc0, patch_vals=vals, dr=dr, dc=dc, scale=inten_local)
                 else:
                     i0 = x[i_i0]
-                    ir = x[i_ir]
-                    ic = x[i_ic]
                     for rr0, cc0 in zip(centers_r, centers_c):
-                        inten = torch.clamp(i0 + ir * rr0 + ic * cc0, min=0.0)
+                        inten = i0
+                        if active_order >= 1:
+                            inten = inten + x[i_ir] * rr0 + x[i_ic] * cc0
+                        if active_order >= 2:
+                            inten = inten + x[i_irr] * rr0 * rr0 + x[i_icc] * cc0 * cc0 + x[i_irc] * rr0 * cc0
+                        inten = torch.clamp(inten, min=0.0)
                         _splat_patch(out, r0=rr0, c0=cc0, patch_vals=vals, dr=dr, dc=dc, scale=inten)
 
             def overlays(self, x: torch.Tensor, ctx: ModelContext) -> Iterable[Overlay]:
