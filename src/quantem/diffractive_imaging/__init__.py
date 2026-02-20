@@ -28,7 +28,3 @@ from quantem.diffractive_imaging.direct_ptychography import (
 from quantem.diffractive_imaging.origin_models import (
     CenterOfMassOriginModel as CenterOfMassOriginModel,
 )
-
-from quantem.diffractive_imaging.streaming_parallax import (
-    StreamingParallax as StreamingParallax,
-)

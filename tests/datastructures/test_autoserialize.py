@@ -85,6 +85,8 @@ class subClass(AutoSerialize):
 
 
 class TestingClass(AutoSerialize):
+    __test__ = False  # tell pytest this is not a test class despite name starting with Test
+
     def __init__(self):
         self.data = np.random.rand(104, 100)
 
@@ -245,6 +247,8 @@ def test_torch_tensor_and_optimizer(tmp_path, store):
 
 
 class TestModule(torch.nn.Module, AutoSerialize):
+    __test__ = False
+
     def __init__(self):
         super().__init__()
         self.linear = torch.nn.Linear(10, 5)
@@ -270,6 +274,8 @@ def test_torch_nn_module_roundtrip(tmp_path, store):
 
 
 class TestHybrid(AutoSerialize, nn.Module):
+    __test__ = False
+
     def __init__(self):
         nn.Module.__init__(self)
         super().__init__()
