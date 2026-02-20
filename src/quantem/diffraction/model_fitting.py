@@ -7,7 +7,6 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
 
@@ -16,8 +15,8 @@ from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.models.base import Model, ModelContext, Overlay, PreparedModel
-from quantem.core.models.diffraction import Origin2D
+from quantem.core.fitting.base import Model, ModelContext, Overlay, PreparedModel
+from quantem.core.fitting.diffraction import Origin2D
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.core.visualization import show_2d
 
@@ -300,8 +299,9 @@ class ModelDiffraction(AutoSerialize):
         power: float | None,
         fit_disk_pixels: bool | None,
         fit_only_disk_pixels: bool,
-        enforce_disk_max_one: bool,
+        intensity_order: int | None,
         enforce_disk_center_of_mass: bool,
+        normalize_disk_template_max: bool,
         intensity_transform: str,
         weak_softplus_scale: float,
         progress: bool = False,
@@ -325,11 +325,15 @@ class ModelDiffraction(AutoSerialize):
         for p in self.prepared.params:
             if p.tags.get("role") == "disk_pixel":
                 disk_mask[p.index] = True
+            if intensity_order is not None and str(p.tags.get("role", "")).startswith("lat_int"):
+                p_ord = int(p.tags.get("intensity_order", 0))
+                if p_ord > int(intensity_order):
+                    freeze[p.index] = True
 
-        # Cache template groups for optional per-step projection constraints.
-        disk_templates = self.prepared.ctx.fields.get("disk_templates", {})
+        # Group disk pixel parameters by disk template for optional projection.
         disk_param_groups: list[dict[str, Any]] = []
-        if enforce_disk_max_one or enforce_disk_center_of_mass:
+        if enforce_disk_center_of_mass or normalize_disk_template_max:
+            disk_templates = self.prepared.ctx.fields.get("disk_templates", {})
             grouped: dict[str, list[tuple[int, int]]] = {}
             for p in self.prepared.params:
                 if p.tags.get("role") != "disk_pixel":
@@ -337,28 +341,18 @@ class ModelDiffraction(AutoSerialize):
                 name = str(p.tags.get("disk"))
                 i_flat = int(p.tags.get("i"))
                 grouped.setdefault(name, []).append((i_flat, int(p.index)))
-
             for name, pairs in grouped.items():
-                if name not in disk_templates:
+                dmeta = disk_templates.get(name)
+                if dmeta is None:
                     continue
-                dmeta = disk_templates[name]
-                shape = dmeta.get("shape", None)
-                if shape is None:
-                    continue
-                Ht, Wt = int(shape[0]), int(shape[1])
                 order = sorted(pairs, key=lambda t: t[0])
-                flat_i = torch.as_tensor([t[0] for t in order], device=ctx.device, dtype=torch.long)
                 p_idx = torch.as_tensor([t[1] for t in order], device=ctx.device, dtype=torch.long)
-                dr = dmeta["dr"][flat_i]
-                dc = dmeta["dc"][flat_i]
-                disk_param_groups.append(
-                    {
-                        "param_idx": p_idx,
-                        "shape": (Ht, Wt),
-                        "dr": dr,
-                        "dc": dc,
-                    }
-                )
+                g: dict[str, Any] = {"param_idx": p_idx}
+                if enforce_disk_center_of_mass:
+                    flat_i = torch.as_tensor([t[0] for t in order], device=ctx.device, dtype=torch.long)
+                    g["dr"] = dmeta["dr"][flat_i]
+                    g["dc"] = dmeta["dc"][flat_i]
+                disk_param_groups.append(g)
 
         if fit_only_disk_pixels:
             if not fit_disk_pixels:
@@ -368,6 +362,10 @@ class ModelDiffraction(AutoSerialize):
         elif not fit_disk_pixels:
             freeze[disk_mask] = True
         x_frozen = x.detach().clone()
+
+        old_order_override = ctx.fields.get("lattice_intensity_order_override", None)
+        if intensity_order is not None:
+            ctx.fields["lattice_intensity_order_override"] = int(intensity_order)
 
         target_t = target.to(device=ctx.device, dtype=ctx.dtype)
         target_t = self._apply_intensity_transform(
@@ -381,42 +379,33 @@ class ModelDiffraction(AutoSerialize):
                 x.data = torch.max(torch.min(x.data, ub), lb)
                 if torch.any(freeze):
                     x.data[freeze] = x_frozen[freeze]
-                if (enforce_disk_max_one or enforce_disk_center_of_mass) and disk_param_groups:
+                if (enforce_disk_center_of_mass or normalize_disk_template_max) and disk_param_groups:
                     eps = torch.as_tensor(1e-12, device=ctx.device, dtype=ctx.dtype)
                     for g in disk_param_groups:
                         p_idx = g["param_idx"]
                         if torch.all(freeze[p_idx]):
                             continue
-                        vals = x.data[p_idx]
-                        vals = torch.clamp(vals, min=0.0)
-
+                        vals = torch.clamp(x.data[p_idx], min=0.0)
                         if enforce_disk_center_of_mass:
-                            mass = torch.sum(vals)
-                            if mass > eps:
-                                r_com = torch.sum(vals * g["dr"]) / mass
-                                c_com = torch.sum(vals * g["dc"]) / mass
-                                Ht, Wt = g["shape"]
-                                img = vals.reshape(Ht, Wt)[None, None, :, :]
-                                yy = torch.linspace(-1.0, 1.0, Ht, device=ctx.device, dtype=ctx.dtype)
-                                xx = torch.linspace(-1.0, 1.0, Wt, device=ctx.device, dtype=ctx.dtype)
-                                gy, gx = torch.meshgrid(yy, xx, indexing="ij")
-                                sx = gx + (2.0 * c_com / max(Wt - 1, 1))
-                                sy = gy + (2.0 * r_com / max(Ht - 1, 1))
-                                grid = torch.stack((sx, sy), dim=-1)[None, :, :, :]
-                                img_shift = F.grid_sample(
-                                    img,
-                                    grid,
-                                    mode="bilinear",
-                                    padding_mode="zeros",
-                                    align_corners=True,
-                                )
-                                vals = torch.clamp(img_shift[0, 0].reshape(-1), min=0.0)
-
-                        if enforce_disk_max_one:
+                            dr = g["dr"]
+                            dc = g["dc"]
+                            # Project template moments toward zero COM by iterative multiplicative reweighting.
+                            for _ in range(12):
+                                mass = torch.sum(vals)
+                                if mass <= eps:
+                                    break
+                                r_com = torch.sum(vals * dr) / mass
+                                c_com = torch.sum(vals * dc) / mass
+                                if torch.abs(r_com) <= 1e-5 and torch.abs(c_com) <= 1e-5:
+                                    break
+                                var_r = torch.sum(vals * dr * dr) / mass + eps
+                                var_c = torch.sum(vals * dc * dc) / mass + eps
+                                vals = vals * torch.exp(-(r_com / var_r) * dr - (c_com / var_c) * dc)
+                                vals = torch.clamp(vals, min=0.0)
+                        if normalize_disk_template_max:
                             vmax = torch.max(vals)
                             if vmax > eps:
                                 vals = vals / vmax
-
                         x.data[p_idx] = vals
 
         def loss_fn() -> torch.Tensor:
@@ -435,39 +424,46 @@ class ModelDiffraction(AutoSerialize):
             diff = pred - target_t
             return torch.mean(diff * diff)
 
-        if method == "adam":
-            opt = torch.optim.Adam([x], lr=lr)
-            step_iter: Any = range(int(n_steps))
-            if progress:
-                try:
-                    from tqdm.auto import trange
+        try:
+            if method == "adam":
+                opt = torch.optim.Adam([x], lr=lr)
+                step_iter: Any = range(int(n_steps))
+                if progress:
+                    try:
+                        from tqdm.auto import trange
 
-                    step_iter = trange(int(n_steps), desc=progress_desc or "Refining", leave=False)
-                except Exception:
-                    warnings.warn("progress=True requested but tqdm is unavailable.", stacklevel=2)
-            for _ in step_iter:
-                opt.zero_grad(set_to_none=True)
-                loss = loss_fn()
-                loss.backward()
-                opt.step()
+                        step_iter = trange(int(n_steps), desc=progress_desc or "Refining", leave=False)
+                    except Exception:
+                        warnings.warn("progress=True requested but tqdm is unavailable.", stacklevel=2)
+                for _ in step_iter:
+                    opt.zero_grad(set_to_none=True)
+                    loss = loss_fn()
+                    loss.backward()
+                    opt.step()
+                    clamp_inplace()
+            elif method == "lbfgs":
+                opt = torch.optim.LBFGS([x], lr=lr, max_iter=int(n_steps), line_search_fn="strong_wolfe")
+
+                def closure() -> torch.Tensor:
+                    opt.zero_grad(set_to_none=True)
+                    loss = loss_fn()
+                    loss.backward()
+                    return loss
+
+                opt.step(closure)
                 clamp_inplace()
-        elif method == "lbfgs":
-            opt = torch.optim.LBFGS([x], lr=lr, max_iter=int(n_steps), line_search_fn="strong_wolfe")
+            else:
+                raise ValueError("method must be one of: 'lbfgs', 'adam'.")
 
-            def closure() -> torch.Tensor:
-                opt.zero_grad(set_to_none=True)
-                loss = loss_fn()
-                loss.backward()
-                return loss
-
-            opt.step(closure)
-            clamp_inplace()
-        else:
-            raise ValueError("method must be one of: 'lbfgs', 'adam'.")
-
-        with torch.no_grad():
-            final_loss = float(loss_fn().detach().cpu())
-        return x.detach().clone(), final_loss
+            with torch.no_grad():
+                final_loss = float(loss_fn().detach().cpu())
+            return x.detach().clone(), final_loss
+        finally:
+            if intensity_order is not None:
+                if old_order_override is None:
+                    ctx.fields.pop("lattice_intensity_order_override", None)
+                else:
+                    ctx.fields["lattice_intensity_order_override"] = old_order_override
 
     def _resolve_pattern_indices(self, indices: Any, n: int, index_shape: tuple[int, ...]) -> np.ndarray:
         if indices is None:
@@ -523,8 +519,9 @@ class ModelDiffraction(AutoSerialize):
         power: float | None = 1.0,
         fit_disk_pixels: bool | None = None,
         fit_only_disk_pixels: bool = False,
-        enforce_disk_max_one: bool = True,
+        intensity_order: int = 0,
         enforce_disk_center_of_mass: bool = True,
+        normalize_disk_template_max: bool = True,
         warmup_disk_steps: int = 0,
         overwrite_initial: bool = True,
         intensity_transform: str = "none",
@@ -588,8 +585,9 @@ class ModelDiffraction(AutoSerialize):
                 power=power,
                 fit_disk_pixels=True,
                 fit_only_disk_pixels=True,
-                enforce_disk_max_one=bool(enforce_disk_max_one),
+                intensity_order=int(intensity_order),
                 enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
+                normalize_disk_template_max=bool(normalize_disk_template_max),
                 intensity_transform=intensity_transform,
                 weak_softplus_scale=float(weak_softplus_scale),
                 progress=bool(progress),
@@ -604,8 +602,9 @@ class ModelDiffraction(AutoSerialize):
             power=power,
             fit_disk_pixels=fit_disk_pixels,
             fit_only_disk_pixels=bool(fit_only_disk_pixels),
-            enforce_disk_max_one=bool(enforce_disk_max_one),
+            intensity_order=int(intensity_order),
             enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
+            normalize_disk_template_max=bool(normalize_disk_template_max),
             intensity_transform=intensity_transform,
             weak_softplus_scale=float(weak_softplus_scale),
             progress=bool(progress),
@@ -630,8 +629,9 @@ class ModelDiffraction(AutoSerialize):
         power: float | None = 1.0,
         fit_disk_pixels: bool | None = None,
         fit_only_disk_pixels: bool = False,
-        enforce_disk_max_one: bool = True,
+        intensity_order: int | None = None,
         enforce_disk_center_of_mass: bool = True,
+        normalize_disk_template_max: bool = False,
         intensity_transform: str = "none",
         weak_softplus_scale: float = 1e-3,
         progress: bool = False,
@@ -722,8 +722,9 @@ class ModelDiffraction(AutoSerialize):
                 power=power,
                 fit_disk_pixels=fit_disk_pixels,
                 fit_only_disk_pixels=bool(fit_only_disk_pixels),
-                enforce_disk_max_one=bool(enforce_disk_max_one),
+                intensity_order=None if intensity_order is None else int(intensity_order),
                 enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
+                normalize_disk_template_max=bool(normalize_disk_template_max),
                 intensity_transform=intensity_transform,
                 weak_softplus_scale=float(weak_softplus_scale),
                 progress=False,
@@ -830,8 +831,9 @@ class ModelDiffraction(AutoSerialize):
             axes = [ax]
 
         for a in axes[:2]:
-            a.set_xlim(-pad, (W - 1) + pad)
-            a.set_ylim((H - 1) + pad, -pad)
+            # Match imshow's pixel-edge convention so overlay markers land on pixel centers.
+            a.set_xlim(-0.5 - pad, (W - 0.5) + pad)
+            a.set_ylim((H - 0.5) + pad, -0.5 - pad)
 
         if show_overlays:
             ovs = self.prepared.overlays(self.x_mean)

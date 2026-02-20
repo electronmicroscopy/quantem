@@ -7,8 +7,8 @@ from typing import Any, Iterable
 
 import torch
 
-from quantem.core.models.base import Component, ModelContext, Overlay, Parameter
-from quantem.core.models.diffraction import _origin_indices
+from quantem.core.fitting.base import Component, ModelContext, Overlay, Parameter
+from quantem.core.fitting.diffraction import _origin_indices
 
 
 class DCBackground(Component):
