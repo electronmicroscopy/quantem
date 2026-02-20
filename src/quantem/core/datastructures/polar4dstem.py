@@ -51,7 +51,6 @@ class Polar4dstem(Dataset4d):
             metadata=metadata,
             _token=_token,
         )
-        self._xp = np  # workaround: Dataset.coords() references _xp
         self.origin_array = origin_array
 
     @classmethod

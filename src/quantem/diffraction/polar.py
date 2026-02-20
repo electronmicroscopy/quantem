@@ -232,14 +232,19 @@ class PairDistributionFunction(AutoSerialize):
         """
         # Polar4dstem dims: (scan_y, scan_x, phi, r)
         # radial axis is 3
-        return self.polar.coords_units(3)
+        n = self.polar.shape[3]
+        origin_r = float(np.asarray(self.polar.origin)[3])
+        sampling_r = float(np.asarray(self.polar.sampling)[3])
+        return (np.arange(n, dtype=float) - origin_r) * sampling_r
 
     @property
     def radial_bins(self) -> Any:
         """
         Radial bin centers in pixel units (convenience alias).
         """
-        return self.polar.coords(3)
+        n = self.polar.shape[3]
+        origin_r = float(np.asarray(self.polar.origin)[3])
+        return np.arange(n, dtype=float) - origin_r
 
     @property
     def r(self) -> NDArray | None:

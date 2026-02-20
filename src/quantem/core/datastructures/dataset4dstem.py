@@ -73,7 +73,6 @@ class Dataset4dstem(Dataset4d):
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
-        print("array.shape:", array.shape)
         mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
