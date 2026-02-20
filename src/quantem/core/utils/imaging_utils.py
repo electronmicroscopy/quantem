@@ -48,6 +48,35 @@ def dft_upsample(
     return (kern_row @ F @ kern_col)
 
 
+def _upsampled_correlation_numpy(
+    imageCorr: NDArray,
+    upsampleFactor: int,
+    xyShift: NDArray,
+) -> NDArray:
+    xyShift = np.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
+    globalShift = math.floor(math.ceil(upsampleFactor * 1.5) / 2.0)
+    upsampleCenter = float(globalShift) - (float(upsampleFactor) * xyShift)
+
+    im_up = dft_upsample(np.conj(imageCorr), upsampleFactor, (float(upsampleCenter[0]), float(upsampleCenter[1])))
+    imageCorrUpsample = np.conj(im_up)
+
+    flat_idx = int(np.argmax(imageCorrUpsample.real))
+    r = flat_idx // imageCorrUpsample.shape[1]
+    c = flat_idx % imageCorrUpsample.shape[1]
+
+    dx = 0.0
+    dy = 0.0
+    patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
+    if patch.shape == (3, 3):
+        dx = _parabolic_peak(patch[:, 1])
+        dy = _parabolic_peak(patch[1, :])
+
+    xySubShift = np.array([float(r), float(c)], dtype=float) - float(globalShift)
+    xyShift = xyShift + (xySubShift + np.array([dx, dy], dtype=float)) / float(upsampleFactor)
+
+    return xyShift
+
+
 def cross_correlation_shift(
     im_ref,
     im,

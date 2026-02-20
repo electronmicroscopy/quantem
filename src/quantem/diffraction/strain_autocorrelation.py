@@ -16,7 +16,7 @@ from quantem.core.utils.imaging_utils import dft_upsample, rotate_image
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import ScalebarConfig, show_2d
-
+import torch
 
 class StrainMapAutocorrelation(AutoSerialize):
     _token = object()
@@ -44,6 +44,8 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         self.u_fit: Dataset3d | None = None
         self.v_fit: Dataset3d | None = None
+        self.mean_img_peaks: NDArray | None = None
+        self.mean_img_weights: NDArray | None = None
         self.u_peak_fit: Dataset3d | None = None
         self.v_peak_fit: Dataset3d | None = None
 
@@ -301,9 +303,11 @@ class StrainMapAutocorrelation(AutoSerialize):
         define_in_rotated: bool = False,
         refine_gaussian: bool = True,
         refine_dft: bool = False,
+        refine_all_peaks: bool = False,
         refine_radius_px: float = 2.0,
         upsample: int = 16,
         gaussian_maxfev: int = 100,
+        threshold_percentile: float = 0.9975,
         plot: bool = True,
         cropping_factor: float = 0.25,
         **plot_kwargs: Any,
@@ -321,29 +325,35 @@ class StrainMapAutocorrelation(AutoSerialize):
             u_rc = _display_vec_to_raw(u_rc, rotation_ccw_deg=rot_ccw, transpose=q_transpose)
             v_rc = _display_vec_to_raw(v_rc, rotation_ccw_deg=rot_ccw, transpose=q_transpose)
 
-        u_fit_abs, v_fit_abs = _refine_lattice_vectors(
+        u_fit_abs, v_fit_abs, peaks, weights = _refine_lattice_vectors(
             self.transform.array,
             u_rc=u_rc,
             v_rc=v_rc,
             radius_px=refine_radius_px,
             refine_gaussian=refine_gaussian,
             refine_dft=refine_dft,
+            refine_all_peaks=refine_all_peaks,
+            peaks=None,
+            weights=None,
             upsample=upsample,
             maxfev=gaussian_maxfev,
+            threshold_percentile=threshold_percentile,
         )
 
-        H, W = self.transform.array.shape
-        center = np.array((H // 2, W // 2), dtype=float)
-
-        self.u = u_fit_abs[:2] - center
-        self.v = v_fit_abs[:2] - center
+        self.u = u_fit_abs[:2]
+        self.v = v_fit_abs[:2]
+        if refine_all_peaks:
+            self.mean_img_peaks = peaks
+            self.mean_img_weights = weights
 
         self.metadata["choose_define_in_rotated"] = define_in_rotated
         self.metadata["choose_refine_gaussian"] = refine_gaussian
         self.metadata["choose_refine_dft"] = refine_dft
+        self.metadata["choose_refine_all_peaks"] = refine_all_peaks
         self.metadata["choose_refine_radius_px"] = refine_radius_px
         self.metadata["choose_upsample"] = upsample
         self.metadata["choose_gaussian_maxfev"] = gaussian_maxfev
+        self.metadata["choose_threshold_percentile"] = threshold_percentile
 
         if plot:
             fig, ax = self.plot_transform(cropping_factor=cropping_factor, **plot_kwargs)
@@ -354,6 +364,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 v_rc=self.v,
                 rot_ccw_deg=rot_ccw,
                 q_transpose=q_transpose,
+                peaks_plot=self.mean_img_peaks,
             )
             return self
 
@@ -363,6 +374,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         self,
         refine_gaussian: bool = True,
         refine_dft: bool = False,
+        refine_all_peaks: bool = False,
         refine_radius_px: float = 2.0,
         upsample: int = 16,
         gaussian_maxfev: int = 100,
@@ -370,6 +382,9 @@ class StrainMapAutocorrelation(AutoSerialize):
     ) -> "StrainMapAutocorrelation":
         if self.u is None or self.v is None:
             raise ValueError("Run choose_lattice_vector() first to set initial lattice vectors (self.u, self.v).")
+        if refine_all_peaks:
+            if self.mean_img_peaks is None or self.mean_img_weights is None:
+                raise ValueError("Run choose_lattice_vector() with refine_all_peaks=True to determine which peaks to fit")
 
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
@@ -428,13 +443,16 @@ class StrainMapAutocorrelation(AutoSerialize):
             else:
                 raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
 
-            u_fit_abs, v_fit_abs = _refine_lattice_vectors(
+            u_fit_abs, v_fit_abs,_ ,_ = _refine_lattice_vectors(
                 im,
                 u_rc=u0,
                 v_rc=v0,
                 radius_px=refine_radius_px,
                 refine_gaussian=refine_gaussian,
                 refine_dft=refine_dft,
+                refine_all_peaks=refine_all_peaks,
+                peaks=self.mean_img_peaks,
+                weights=self.mean_img_weights,
                 upsample=upsample,
                 maxfev=gaussian_maxfev,
             )
@@ -442,13 +460,14 @@ class StrainMapAutocorrelation(AutoSerialize):
             self.u_peak_fit.array[r, c, :] = u_fit_abs
             self.v_peak_fit.array[r, c, :] = v_fit_abs
 
-            self.u_fit.array[r, c, 0] = u_fit_abs[0] - r_center
-            self.u_fit.array[r, c, 1] = u_fit_abs[1] - c_center
-            self.v_fit.array[r, c, 0] = v_fit_abs[0] - r_center
-            self.v_fit.array[r, c, 1] = v_fit_abs[1] - c_center
+            self.u_fit.array[r, c, 0] = u_fit_abs[0]
+            self.u_fit.array[r, c, 1] = u_fit_abs[1]
+            self.v_fit.array[r, c, 0] = v_fit_abs[0]
+            self.v_fit.array[r, c, 1] = v_fit_abs[1]
 
         self.metadata["fit_refine_gaussian"] = refine_gaussian
         self.metadata["fit_refine_dft"] = refine_dft
+        self.metadata["fit_refine_all_peaks"] = refine_all_peaks
         self.metadata["fit_refine_radius_px"] = refine_radius_px
         self.metadata["fit_upsample"] = upsample
         self.metadata["fit_gaussian_maxfev"] = gaussian_maxfev
@@ -1006,6 +1025,15 @@ def _plot_lattice_vectors(ax: Any, center_rc: tuple[float, float], u_rc: NDArray
     _draw(np.asarray(u_rc, dtype=float).reshape(2), "u", (1.0, 0.0, 0.0))
     _draw(np.asarray(v_rc, dtype=float).reshape(2), "v", (0.0, 0.7, 1.0))
 
+def _plot_peaks(ax: Any, center_rc: tuple[float, float], peaks_plot: NDArray) -> None:
+    r0, c0 = center_rc
+
+    def _draw(vec: NDArray, color: tuple[float, float, float]) -> None:
+        dr, dc = vec[0], vec[1]
+        ax.plot([c0 + dc], [r0 + dr], marker="o", markersize=6.0, color=color)
+
+    for p in peaks_plot:
+        _draw(np.asarray(p, dtype=float).reshape(2), (0.0, 1.0, 0.0))
 
 def _overlay_lattice_vectors(
     *,
@@ -1015,6 +1043,7 @@ def _overlay_lattice_vectors(
     v_rc: NDArray,
     rot_ccw_deg: float,
     q_transpose: bool,
+    peaks_plot: NDArray | None = None,
 ) -> None:
     axs = _flatten_axes(ax)
     if not axs:
@@ -1024,6 +1053,8 @@ def _overlay_lattice_vectors(
     center_rc = (H // 2, W // 2)
 
     _plot_lattice_vectors(axs[0], center_rc, u_rc, v_rc)
+    if peaks_plot is not None:
+        _plot_peaks(ax[0], center_rc, peaks_plot)
 
     if len(axs) >= 2:
         u_disp = _raw_vec_to_display(u_rc, rotation_ccw_deg=rot_ccw_deg, transpose=q_transpose)
@@ -1094,12 +1125,16 @@ def _refine_peak_subpixel_dft(
         return r0, c0
 
     im = np.asarray(im, dtype=float)
-    F = np.fft.fft2(im)
+    if torch.is_tensor(r0):
+        r0 = float(r0.item())
+    if torch.is_tensor(c0):
+        c0 = float(c0.item())
+    F = np.fft.fft2(np.fft.fftshift(im))
 
     up = upsample
-    du = int(np.ceil(1.5 * up))
+    du = int(np.fix(np.ceil(1.5 * up)))
 
-    patch = dft_upsample(F, up=up, shift=(r0, c0), device="cpu")
+    patch = np.abs(dft_upsample(F, up=up, shift=(r0, c0), device="cpu"))    
     patch = np.asarray(patch, dtype=float)
 
     i0, j0 = np.unravel_index(np.argmax(patch), patch.shape)
@@ -1116,8 +1151,9 @@ def _refine_peak_subpixel_dft(
     else:
         dj = 0.0
 
-    dr = (i0 - du + di) / up
-    dc = (j0 - du + dj) / up
+    M, N = im.shape
+    dr = ((float(i0) - du + di)) / up
+    dc = ((float(j0) - du + dj)) / up
 
     return r0 + dr, c0 + dc
 
@@ -1130,9 +1166,13 @@ def _refine_lattice_vectors(
     radius_px: float = 2.0,
     refine_gaussian: bool = True,
     refine_dft: bool = False,
+    refine_all_peaks: bool = False,
+    peaks: NDArray | None = None,
+    weights: NDArray | None = None,
     upsample: int = 16,
     maxfev: int = 100,
-) -> tuple[NDArray, NDArray]:
+    threshold_percentile: float = 0.9975,
+) -> tuple[NDArray, NDArray, NDArray, NDArray]:
     from scipy.optimize import curve_fit
 
     im = np.asarray(im, dtype=float)
@@ -1276,8 +1316,36 @@ def _refine_lattice_vectors(
                 upsample=upsample,
             )
             r_fit, c_fit = r_dft, c_dft
+        return np.array((r_fit - r_center, c_fit - c_center, amp, sig, bg), dtype=float)
 
-        return np.array((r_fit, c_fit, amp, sig, bg), dtype=float)
+    def _find_initial_peaks_weights(initial_peaks: NDArray) -> tuple[NDArray, NDArray, NDArray]:
+        if initial_peaks is None:
+            threshold = np.percentile(im, threshold_percentile*100)
+            p = np.logical_and.reduce((
+                im>np.roll(im,(-1,-1),axis = (0,1)),
+                im>np.roll(im,(-1, 0),axis = (0,1)),
+                im>np.roll(im,(-1, 1),axis = (0,1)),
+                im>np.roll(im,( 0,-1),axis = (0,1)),
+                im>np.roll(im,( 0, 1),axis = (0,1)),
+                im>np.roll(im,( 1,-1),axis = (0,1)),
+                im>np.roll(im,( 1, 0),axis = (0,1)),
+                im>np.roll(im,( 1, 1),axis = (0,1)),
+                im>threshold,
+                ) )
+            initial_peaks = np.argwhere(p)
+            r0 = (r_center, c_center)
+            initial_peaks = initial_peaks - r0
+        
+        peak_sp = np.zeros(initial_peaks.shape)
+        weights = np.zeros((initial_peaks.shape[0], 1))
+        it = 0
+        for peak in initial_peaks:
+            refined_peak = _refine_one(peak)
+            peak_sp[it, :] = refined_peak[:2]
+            weights[it] = refined_peak[2]
+            it += 1
+        return peak_sp, weights
+    
 
     if refine_all_peaks:
         if peaks is None or weights is None:
