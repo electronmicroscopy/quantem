@@ -1026,7 +1026,7 @@ def _refine_peak_subpixel_dft(
     up = upsample
     du = int(np.fix(np.ceil(1.5 * up)))
 
-    patch = np.abs(dft_upsample(F, up=up, shift=(r0, c0), device="cpu"))    
+    patch = (dft_upsample(F, up=up, shift=(r0, c0), device="cpu"))    
     patch = np.asarray(patch, dtype=float)
 
     i0, j0 = np.unravel_index(np.argmax(patch), patch.shape)

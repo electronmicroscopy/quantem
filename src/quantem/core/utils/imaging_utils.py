@@ -45,7 +45,7 @@ def dft_upsample(
     kern_col = np.exp(
         -2j * np.pi / (N * up) * np.outer(xp.fft.ifftshift(xp.arange(N)) - N // 2 + c_shift, col)
     )
-    return (kern_row @ F @ kern_col)
+    return xp.real(kern_row @ F @ kern_col)
 
 
 
