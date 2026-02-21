@@ -431,3 +431,39 @@ class TestVector:
 
         with pytest.raises(ValueError):
             v.set_data(np.array([[1.0]]), 0, 0)  # Wrong number of fields
+
+    def test_cell_view(self):
+        """Test the _CellView class for cell-level access."""
+
+        # Create test data
+        data = [
+            np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            np.array([[7.0, 8.0, 9.0]]),
+            np.array([[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [16.0, 17.0, 18.0]]),
+        ]
+
+        # Create a Vector from the data
+        v = Vector.from_data(
+            data=data,
+            fields=["field0", "field1", "field2"],
+            name="test_vector",
+            units=["unit0", "unit1", "unit2"],
+        )
+
+        # Test cell view access
+        cell_data = v[0]
+        cell_data_array = cell_data.__array__()
+        np.testing.assert_array_equal(cell_data_array, data[0])
+        assert isinstance(cell_data_array, np.ndarray)
+
+        # Test field access through cell view
+        cell0_field0 = cell_data["field0"]
+        cell0_field0_direct = v[0]["field0"]
+        cell0_field0_data = np.array([1.0, 4.0])
+        np.testing.assert_array_equal(cell0_field0, cell0_field0_direct)
+        np.testing.assert_array_equal(cell0_field0, cell0_field0_data)
+
+        with pytest.raises(KeyError):
+            cell_data["nonexistent_field"]
+        with pytest.raises(IndexError):
+            v[3]["field0"]
