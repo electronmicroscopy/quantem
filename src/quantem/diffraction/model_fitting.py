@@ -302,6 +302,8 @@ class ModelDiffraction(AutoSerialize):
         intensity_order: int | None,
         enforce_disk_center_of_mass: bool,
         normalize_disk_template_max: bool,
+        template_binary_weight: float,
+        template_binary_power: float,
         intensity_transform: str,
         weak_softplus_scale: float,
         progress: bool = False,
@@ -332,7 +334,11 @@ class ModelDiffraction(AutoSerialize):
 
         # Group disk pixel parameters by disk template for optional projection.
         disk_param_groups: list[dict[str, Any]] = []
-        if enforce_disk_center_of_mass or normalize_disk_template_max:
+        if (
+            enforce_disk_center_of_mass
+            or normalize_disk_template_max
+            or float(template_binary_weight) > 0.0
+        ):
             disk_templates = self.prepared.ctx.fields.get("disk_templates", {})
             grouped: dict[str, list[tuple[int, int]]] = {}
             for p in self.prepared.params:
@@ -348,6 +354,9 @@ class ModelDiffraction(AutoSerialize):
                 order = sorted(pairs, key=lambda t: t[0])
                 p_idx = torch.as_tensor([t[1] for t in order], device=ctx.device, dtype=torch.long)
                 g: dict[str, Any] = {"param_idx": p_idx}
+                shape = dmeta.get("shape", None)
+                if shape is not None:
+                    g["shape"] = (int(shape[0]), int(shape[1]))
                 if enforce_disk_center_of_mass:
                     flat_i = torch.as_tensor([t[0] for t in order], device=ctx.device, dtype=torch.long)
                     g["dr"] = dmeta["dr"][flat_i]
@@ -379,7 +388,10 @@ class ModelDiffraction(AutoSerialize):
                 x.data = torch.max(torch.min(x.data, ub), lb)
                 if torch.any(freeze):
                     x.data[freeze] = x_frozen[freeze]
-                if (enforce_disk_center_of_mass or normalize_disk_template_max) and disk_param_groups:
+                if (
+                    enforce_disk_center_of_mass
+                    or normalize_disk_template_max
+                ) and disk_param_groups:
                     eps = torch.as_tensor(1e-12, device=ctx.device, dtype=ctx.dtype)
                     for g in disk_param_groups:
                         p_idx = g["param_idx"]
@@ -420,9 +432,32 @@ class ModelDiffraction(AutoSerialize):
                 m = ctx.mask
                 diff = (pred - target_t) * m
                 denom = torch.clamp(torch.sum(m), min=1.0)
-                return torch.sum(diff * diff) / denom
-            diff = pred - target_t
-            return torch.mean(diff * diff)
+                loss = torch.sum(diff * diff) / denom
+            else:
+                diff = pred - target_t
+                loss = torch.mean(diff * diff)
+
+            if float(template_binary_weight) > 0.0 and disk_param_groups:
+                bp = torch.as_tensor(0.0, device=ctx.device, dtype=ctx.dtype)
+                n_bp = 0
+                eps = torch.as_tensor(1e-12, device=ctx.device, dtype=ctx.dtype)
+                pwr = float(template_binary_power)
+                for g in disk_param_groups:
+                    p_idx = g["param_idx"]
+                    vals = torch.clamp(x[p_idx], min=0.0)
+                    vmax = torch.max(vals)
+                    if vmax <= eps:
+                        continue
+                    vals_n = vals / (vmax + eps)
+                    core = vals_n * (1.0 - vals_n)
+                    if pwr != 1.0:
+                        core = torch.pow(core + eps, pwr)
+                    bp = bp + torch.mean(core)
+                    n_bp += 1
+                if n_bp > 0:
+                    loss = loss + float(template_binary_weight) * (bp / n_bp)
+
+            return loss
 
         try:
             if method == "adam":
@@ -521,7 +556,9 @@ class ModelDiffraction(AutoSerialize):
         fit_only_disk_pixels: bool = False,
         intensity_order: int = 0,
         enforce_disk_center_of_mass: bool = True,
-        normalize_disk_template_max: bool = True,
+        normalize_disk_template_max: bool = False,
+        template_binary_weight: float = 0.0,
+        template_binary_power: float = 1.0,
         warmup_disk_steps: int = 0,
         overwrite_initial: bool = True,
         intensity_transform: str = "none",
@@ -588,6 +625,8 @@ class ModelDiffraction(AutoSerialize):
                 intensity_order=int(intensity_order),
                 enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
                 normalize_disk_template_max=bool(normalize_disk_template_max),
+                template_binary_weight=float(template_binary_weight),
+                template_binary_power=float(template_binary_power),
                 intensity_transform=intensity_transform,
                 weak_softplus_scale=float(weak_softplus_scale),
                 progress=bool(progress),
@@ -605,6 +644,8 @@ class ModelDiffraction(AutoSerialize):
             intensity_order=int(intensity_order),
             enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
             normalize_disk_template_max=bool(normalize_disk_template_max),
+            template_binary_weight=float(template_binary_weight),
+            template_binary_power=float(template_binary_power),
             intensity_transform=intensity_transform,
             weak_softplus_scale=float(weak_softplus_scale),
             progress=bool(progress),
@@ -632,6 +673,8 @@ class ModelDiffraction(AutoSerialize):
         intensity_order: int | None = None,
         enforce_disk_center_of_mass: bool = True,
         normalize_disk_template_max: bool = False,
+        template_binary_weight: float = 0.0,
+        template_binary_power: float = 1.0,
         intensity_transform: str = "none",
         weak_softplus_scale: float = 1e-3,
         progress: bool = False,
@@ -725,6 +768,8 @@ class ModelDiffraction(AutoSerialize):
                 intensity_order=None if intensity_order is None else int(intensity_order),
                 enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
                 normalize_disk_template_max=bool(normalize_disk_template_max),
+                template_binary_weight=float(template_binary_weight),
+                template_binary_power=float(template_binary_power),
                 intensity_transform=intensity_transform,
                 weak_softplus_scale=float(weak_softplus_scale),
                 progress=False,
