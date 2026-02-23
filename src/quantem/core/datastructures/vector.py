@@ -102,7 +102,7 @@ class Vector(AutoSerialize):
     cell_data = v[0] # Returns a CellView object for the first cell with all fields
 
     # Access a specific field in a cell
-    cell_field_data = v[0]['field0'] # Returns a 1-D array ofthe field0 value for the first row
+    cell_field_data = v[0]['field0'] # Returns a 1-D array of the field0 value for the first row
 
     Advanced Operations:
     -------------------
@@ -183,11 +183,8 @@ class Vector(AutoSerialize):
         ----------
         shape
             The fixed indexed dimensions of the ragged vector.
-            Accepts:
-              - int / np.integer  -> treated as (int,)
-              - tuple[int, ...]   -> used as-is
-              - sequence[int]     -> converted to tuple[int, ...]
-              - ()                 -> 0-D (no indexed dims)
+            Accepts any array-like input that can be converted to a tuple of integers
+            Including single integers for 1D vectors and empty shapes for 0D vectors.
         num_fields
             Number of fields in the vector (ignored if `fields` is provided).
         fields
