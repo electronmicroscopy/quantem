@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
-from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
 from quantem.core.fitting.base import AdditiveRenderModel, RenderComponent, RenderContext
@@ -48,9 +47,9 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         self.model: AdditiveRenderModel | None = None
         self.target_mean: torch.Tensor | None = None
 
-        self.state_initialized: torch.Tensor | None = None
-        self.state_mean_refined: torch.Tensor | None = None
-        self.state_current: torch.Tensor | None = None
+        self.state_initialized: dict[str, torch.Tensor] | None = None
+        self.state_mean_refined: dict[str, torch.Tensor] | None = None
+        self.state_current: dict[str, torch.Tensor] | None = None
         self.mean_refined: bool = False
         self.mean_fit_history: list[float] = []
         self.mean_fit_lrs: list[float] = []
@@ -70,19 +69,18 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
             return []
         return self.model.parameters()
 
-    def _get_model_state_vector(self) -> torch.Tensor:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        return parameters_to_vector(self.model.parameters()).detach().clone()
+    def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {k: v.detach().clone() for k, v in state.items()}
 
-    def _load_model_state_vector(self, state: torch.Tensor) -> None:
+    def _get_model_state_dict_copy(self) -> dict[str, torch.Tensor]:
         if self.model is None:
             raise RuntimeError("Call .define_model(...) first.")
-        dst = next(self.model.parameters(), None)
-        if dst is None:
-            raise RuntimeError("Model has no parameters.")
-        vec = state.detach().clone().to(device=dst.device, dtype=dst.dtype)
-        vector_to_parameters(vec, self.model.parameters())
+        return self._clone_state_dict(self.model.state_dict())
+
+    def _load_model_state_dict_copy(self, state: dict[str, torch.Tensor]) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        self.model.load_state_dict(self._clone_state_dict(state), strict=True)
 
     def _clear_histories(self) -> None:
         for name in ("mean_fit_history", "mean_fit_lrs", "fit_history", "fit_lrs"):
@@ -91,16 +89,15 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
                 if isinstance(val, list):
                     val.clear()
 
-    def _render_state_array(self, state: torch.Tensor) -> np.ndarray:
+    def _render_state_array(self, state: dict[str, torch.Tensor]) -> np.ndarray:
         if self.model is None or self.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
-        live = self._get_model_state_vector()
+        live = self._get_model_state_dict_copy()
         try:
-            self._load_model_state_vector(state)
+            self._load_model_state_dict_copy(state)
             arr = self.model(self.ctx).cpu().detach().numpy()
-            # arr = to_numpy(self.model(self.ctx)).astype(np.float32, copy=False)
         finally:
-            self._load_model_state_vector(live)
+            self._load_model_state_dict_copy(live)
         return arr
 
     @property
@@ -119,9 +116,10 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
 
     @property
     def render_current(self) -> np.ndarray:
-        if self.state_current is None:
-            raise RuntimeError("current state is unavailable. Call .define_model(...) first.")
-        return self._render_state_array(self.state_current)
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        # Current render follows live module parameters by design.
+        return self.model(self.ctx).cpu().detach().numpy()
 
     def reset(
         self, reset_to: Literal["initialized", "mean_refined"] = "mean_refined"
@@ -141,8 +139,8 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         else:
             raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
 
-        self._load_model_state_vector(state)
-        self.state_current = self._get_model_state_vector()
+        self._load_model_state_dict_copy(state)
+        self.state_current = self._get_model_state_dict_copy()
         self._clear_histories()
         return self
 
@@ -258,9 +256,9 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         self.ctx = RenderContext(shape=(h, w), device=dev, dtype=dt, mask=mask_t, fields={})
         self.target_mean = torch.as_tensor(self.image_ref, device=dev, dtype=dt)
 
-        x0 = parameters_to_vector(self.model.parameters()).detach().clone()
-        self.state_initialized = x0.detach().clone()
-        self.state_current = x0.detach().clone()
+        s0 = self._get_model_state_dict_copy()
+        self.state_initialized = s0
+        self.state_current = self._clone_state_dict(s0)
         self.state_mean_refined = None
         self.mean_refined = False
         self._clear_histories()
@@ -335,9 +333,9 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
             self.mean_fit_history.append(loss_value)
             self.mean_fit_lrs.append(float(self.get_current_lr()))
 
-        x_fit = self._get_model_state_vector()
-        self.state_current = x_fit.detach().clone()
-        self.state_mean_refined = x_fit.detach().clone()
+        s_fit = self._get_model_state_dict_copy()
+        self.state_current = s_fit
+        self.state_mean_refined = self._clone_state_dict(s_fit)
         self.mean_refined = True
         return self
 
