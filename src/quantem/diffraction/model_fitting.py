@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any, Sequence, cast
+from typing import Any, Literal, Sequence, cast
 
 import numpy as np
 import torch
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
-from torch.nn.utils import parameters_to_vector
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
 from quantem.core.fitting.base import AdditiveRenderModel, RenderComponent, RenderContext
@@ -15,7 +15,6 @@ from quantem.core.fitting.diffraction import OriginND
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.imaging_utils import cross_correlation_shift
-from quantem.core.utils.utils import to_numpy
 from quantem.core.visualization import show_2d
 
 
@@ -49,9 +48,9 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         self.model: AdditiveRenderModel | None = None
         self.target_mean: torch.Tensor | None = None
 
-        self.x_defined: torch.Tensor | None = None
-        self.x_initial: torch.Tensor | None = None
-        self.x_mean: torch.Tensor | None = None
+        self.state_initialized: torch.Tensor | None = None
+        self.state_mean_refined: torch.Tensor | None = None
+        self.state_current: torch.Tensor | None = None
         self.mean_refined: bool = False
         self.mean_fit_history: list[float] = []
         self.mean_fit_lrs: list[float] = []
@@ -70,6 +69,82 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         if self.model is None:
             return []
         return self.model.parameters()
+
+    def _get_model_state_vector(self) -> torch.Tensor:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return parameters_to_vector(self.model.parameters()).detach().clone()
+
+    def _load_model_state_vector(self, state: torch.Tensor) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        dst = next(self.model.parameters(), None)
+        if dst is None:
+            raise RuntimeError("Model has no parameters.")
+        vec = state.detach().clone().to(device=dst.device, dtype=dst.dtype)
+        vector_to_parameters(vec, self.model.parameters())
+
+    def _clear_histories(self) -> None:
+        for name in ("mean_fit_history", "mean_fit_lrs", "fit_history", "fit_lrs"):
+            if hasattr(self, name):
+                val = getattr(self, name)
+                if isinstance(val, list):
+                    val.clear()
+
+    def _render_state_array(self, state: torch.Tensor) -> np.ndarray:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        live = self._get_model_state_vector()
+        try:
+            self._load_model_state_vector(state)
+            arr = self.model(self.ctx).cpu().detach().numpy()
+            # arr = to_numpy(self.model(self.ctx)).astype(np.float32, copy=False)
+        finally:
+            self._load_model_state_vector(live)
+        return arr
+
+    @property
+    def render_initialized(self) -> np.ndarray:
+        if self.state_initialized is None:
+            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
+        return self._render_state_array(self.state_initialized)
+
+    @property
+    def render_mean_refined(self) -> np.ndarray:
+        if self.state_mean_refined is None:
+            raise RuntimeError(
+                "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
+            )
+        return self._render_state_array(self.state_mean_refined)
+
+    @property
+    def render_current(self) -> np.ndarray:
+        if self.state_current is None:
+            raise RuntimeError("current state is unavailable. Call .define_model(...) first.")
+        return self._render_state_array(self.state_current)
+
+    def reset(
+        self, reset_to: Literal["initialized", "mean_refined"] = "mean_refined"
+    ) -> "ModelDiffraction":
+        if reset_to == "initialized":
+            state = self.state_initialized
+            if state is None:
+                raise RuntimeError(
+                    "initialized state is unavailable. Call .define_model(...) first."
+                )
+        elif reset_to == "mean_refined":
+            state = self.state_mean_refined
+            if state is None:
+                raise RuntimeError(
+                    "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
+                )
+        else:
+            raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
+
+        self._load_model_state_vector(state)
+        self.state_current = self._get_model_state_vector()
+        self._clear_histories()
+        return self
 
     def preprocess(
         self,
@@ -184,12 +259,11 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         self.target_mean = torch.as_tensor(self.image_ref, device=dev, dtype=dt)
 
         x0 = parameters_to_vector(self.model.parameters()).detach().clone()
-        self.x_defined = x0.detach().clone()
-        self.x_initial = x0.detach().clone()
-        self.x_mean = x0.detach().clone()
+        self.state_initialized = x0.detach().clone()
+        self.state_current = x0.detach().clone()
+        self.state_mean_refined = None
         self.mean_refined = False
-        self.mean_fit_history = []
-        self.mean_fit_lrs = []
+        self._clear_histories()
         self.remove_optimizer()
         return self
 
@@ -197,15 +271,23 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         self,
         *,
         n_steps: int = 200,
+        reset: bool | Literal["initialized", "mean_refined"] = False,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
-        overwrite_initial: bool = True,
         progress: bool = False,
         **kwargs: Any,
     ) -> "ModelDiffraction":
         if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
+        if reset is True:
+            self.reset("initialized")
+        elif isinstance(reset, str):
+            if reset not in ("initialized", "mean_refined"):
+                raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
+            self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset))
+        elif reset not in (False,):
+            raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
 
         optimizer_rebuilt = False
         if optimizer_params is not None:
@@ -234,8 +316,6 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
             except Exception:
                 warnings.warn("progress=True requested but tqdm is unavailable.", stacklevel=2)
 
-        self.mean_fit_history = []
-        self.mean_fit_lrs = []
         for _ in iterator:
             self.zero_optimizer_grad()
             pred = self.model(self.ctx)
@@ -255,11 +335,10 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
             self.mean_fit_history.append(loss_value)
             self.mean_fit_lrs.append(float(self.get_current_lr()))
 
-        x_fit = parameters_to_vector(self.model.parameters()).detach().clone()
-        self.x_mean = x_fit
+        x_fit = self._get_model_state_vector()
+        self.state_current = x_fit.detach().clone()
+        self.state_mean_refined = x_fit.detach().clone()
         self.mean_refined = True
-        if overwrite_initial:
-            self.x_initial = x_fit.detach().clone()
         return self
 
     def plot_losses(
@@ -343,7 +422,7 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         self.plot_losses(figax=(fig, ax_top), plot_lrs=True)
 
         ref = np.asarray(self.image_ref, dtype=np.float32)
-        pred = to_numpy(self.model.forward(self.ctx)).astype(np.float32, copy=False)
+        pred = self.render_current
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
         vmin = float(min(refp.min(), predp.min()))
@@ -388,7 +467,7 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
             raise RuntimeError("Call .define_model(...) first.")
 
         ref = np.asarray(self.image_ref, dtype=np.float32)
-        pred = self.model.forward(self.ctx).detach().cpu().numpy()
+        pred = self.render_current
 
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
