@@ -52,6 +52,7 @@ class PairDistributionFunction(AutoSerialize):
     ):
         if _token is not self._token:
             raise RuntimeError(
+                "Direct instantiation of PairDistributionFunction is not allowed. "
                 "Use PairDistributionFunction.from_data() to instantiate this class."
             )
 
@@ -125,7 +126,10 @@ class PairDistributionFunction(AutoSerialize):
         if isinstance(data, Dataset2d):
             arr2d = data.array
             if arr2d.ndim != 2:
-                raise ValueError("Dataset2d for PairDistributionFunction must be 2D.")
+                raise ValueError(
+                    f"Found array with shape: {arr2d.shape}. "
+                    "Dataset2d for PairDistributionFunction must be 2D."
+                )
             arr4 = arr2d[None, None, ...]  # (1, 1, ky, kx)
 
             data = Dataset4dstem.from_array(
@@ -182,7 +186,8 @@ class PairDistributionFunction(AutoSerialize):
         # Dataset3d input: not yet specified how to interpret
         if isinstance(data, Dataset3d):
             raise NotImplementedError(
-                "PairDistributionFunction.from_data does not yet support Dataset3d inputs."
+                "PairDistributionFunction.from_data does not yet support Dataset3d inputs. "
+                "Please provide a 4D-STEM dataset or a 2D diffraction pattern."
             )
 
         # Numpy array input
@@ -219,7 +224,10 @@ class PairDistributionFunction(AutoSerialize):
                 device=device,
             )
         else:
-            raise ValueError("PairDistributionFunction.from_data only supports 2D or 4D arrays.")
+            raise ValueError(
+                f"Found array with shape: {arr.shape}. "
+                "PairDistributionFunction.from_data only supports 2D or 4D arrays."
+            )
 
     # ------------------------------------------------------------------
     # Convenience accessors
@@ -287,7 +295,10 @@ class PairDistributionFunction(AutoSerialize):
             if mask_realspace.dtype == bool and mask_realspace.shape == (rx, ry):
                 mask_bool = mask_realspace
             else:
-                raise ValueError("mask_realspace must be boolean array.")
+                raise ValueError(
+                    f"Got shape {mask_realspace.shape}. "
+                    f"mask_realspace must be boolean array of shape ({rx}, {ry})."
+                )
         return mask_bool
 
     # ------------------------------------------------------------------
@@ -353,6 +364,7 @@ class PairDistributionFunction(AutoSerialize):
         eps = 1e-10
         exp1 = torch.clamp(k2 / (-2.0 * (s0**2 + eps)), min=-100, max=0)
         exp2 = torch.clamp((k2**2) / (-2.0 * (s1**4 + eps)), min=-100, max=0)
+        # scattering model is monotonic, as is physically expected for backgrounds scattering
         return c + i0 * torch.exp(exp1) + i1 * torch.exp(exp2)
 
     def _compute_fit_weights(self, k: torch.Tensor, kmin: float, kmax: float) -> torch.Tensor:
@@ -407,7 +419,10 @@ class PairDistributionFunction(AutoSerialize):
             and k_highpass > 0.0
         ):
             if k_highpass > k_lowpass:
-                raise ValueError("Gaussian band-pass filtering requires k_highpass < k_lowpass.")
+                raise ValueError(
+                    "k_highpass is greater than k_lowpass."
+                    "Gaussian band-pass filtering requires k_highpass < k_lowpass."
+                )
             Fk_low = self._gaussian_filter1d_torch(Fk, sigma=k_lowpass / dk.item(), mode="nearest")
             Fk_high = self._gaussian_filter1d_torch(
                 Fk, sigma=k_highpass / dk.item(), mode="nearest"
@@ -515,9 +530,8 @@ class PairDistributionFunction(AutoSerialize):
             Otherwise returns None.
         """
         polar_data = self.polar_tensor  # shape: (scan_y, scan_x, phi, k)
-
         if mask_realspace is None:
-            # intensity over q-range for each probe position then average
+            # get intensity over q-range for each probe position then average
             radial_probe = polar_data.mean(dim=2)  # dim 2: theta
             self.radial_mean = radial_probe.mean(dim=(0, 1))
         else:
@@ -588,6 +602,7 @@ class PairDistributionFunction(AutoSerialize):
         )
         # Map to unconstrained space via inverse softplus: x = y + log(1 - exp(-y))
         # For numerical stability, clamp init_vals away from zero
+        # final values must be positive for a physical model of background scattering
         init_vals = torch.clamp(init_vals, min=1e-6)
         theta = init_vals + torch.log(-torch.expm1(-init_vals))
         theta = theta.clone().detach().requires_grad_(True)
@@ -600,7 +615,8 @@ class PairDistributionFunction(AutoSerialize):
             line_search_fn="strong_wolfe",
         )
 
-        # k-dependent fitting weights
+        # fitting weights (high-k range is emphasized for better bg estimation)
+        # this monotonic model means we don't need parameterized scattering factors
         weights = self._compute_fit_weights(k, kmin, kmax)
 
         prev_loss = torch.tensor(float("inf"))
@@ -612,7 +628,7 @@ class PairDistributionFunction(AutoSerialize):
                 break
             prev_loss = loss
 
-        # final params
+        # final params (ensure positivity via softplus)
         with torch.no_grad():
             c = F.softplus(theta[0])
             i0 = F.softplus(theta[1])
@@ -623,7 +639,7 @@ class PairDistributionFunction(AutoSerialize):
             c_scaled = c * int_mean
             i0_scaled = i0 * int_mean
             i1_scaled = i1 * int_mean
-            # compute bg
+            # compute bg and the average scattering factor f(k)
             bg = self._scattering_model_torch(k2, c_scaled, i0_scaled, s0, i1_scaled, s1)
             f = bg - c_scaled
         return bg, f
@@ -704,12 +720,16 @@ class PairDistributionFunction(AutoSerialize):
         self.kmin = k_min if k_min is not None else float(k.min())
 
         mask_bool = self._get_mask_bool(mask_realspace)
+        # get the radial mean intensity on the entire unmasked region
         Ik = self.calculate_radial_mean(mask_realspace=mask_bool, returnval=True)
+        # background fitting on Ik
         bg, f = self.fit_bg(Ik, self.kmin, self.kmax)
         # prevent division by near-zero values which cause NaNs at high k
         f_safe = torch.clamp(f, min=1e-10 * f.max())
 
+        # below is the standard definition of F(k) used in PDF analysis, except for missing 2pi factor
         Fk = (Ik - bg) * k_safe / f_safe
+        # apply optional frequency filtering for noise reduction
         Fk = self._frequency_filtering(Fk, k_lowpass, k_highpass, dk)
         # Compute Sk from Fk BEFORE applying the 2pi scaling,
         # so that estimate_density corrections are on the same scale
@@ -744,8 +764,7 @@ class PairDistributionFunction(AutoSerialize):
         self._r = r
         self._reduced_pdf = reduced_pdf
 
-        # Sk was already computed above (before 2pi scaling)
-
+        # optionally damped unphysical oscillations near the origin by iteratively estimating density and correcting F(k)
         if damp_origin_oscillations:
             density_est = self.estimate_density(
                 r_cut=r_cut,
@@ -802,7 +821,10 @@ class PairDistributionFunction(AutoSerialize):
         list[np.ndarray] or None
         """
         if self._reduced_pdf is None or self._r is None:
-            raise RuntimeError("Run calculate_Gr() before calculate_gr().")
+            raise RuntimeError(
+                "Reduced PDF not computed."
+                "Run PairDistributionFunction.calculate_Gr() before calculate_gr()."
+            )
 
         # Determine density
         if density is not None:
@@ -810,6 +832,8 @@ class PairDistributionFunction(AutoSerialize):
         elif self.rho0 is not None:
             rho0 = self.rho0
         else:
+            # the oscillation correction simultaneously produces a density estimate
+            # if the user didn't run damping in calculate_Gr, we can still run the density estimation without using the corrected Fk/G(r)
             density_est = self.estimate_density(
                 r_cut=r_cut,
                 max_iter=20,
@@ -826,6 +850,7 @@ class PairDistributionFunction(AutoSerialize):
         r = self._r
         mask = r > 0
         pdf = torch.ones_like(Gr)
+        # the formula for g(r) from G(r) is: g(r) = 1 + G(r) / (4 * pi * r * rho0)
         pdf = torch.where(mask, 1 + Gr / (4 * torch.pi * r * rho0), torch.zeros_like(pdf))
         if set_pdf_positive:  # negative values are unphysical
             pdf = torch.maximum(pdf, torch.zeros_like(pdf))
@@ -874,8 +899,13 @@ class PairDistributionFunction(AutoSerialize):
         G_cor : torch.Tensor
             Reduced PDF G(r) with dampened oscillations near origin.
         """
+        # we need the non-reduced structure factor (S(k) = 1 + F(k)/k) for the density estimation correction,
+        # so we compute it here from the Fk we already have
         if self.Sk is None or self._reduced_pdf is None or self._r is None:
-            raise RuntimeError("Run calculate_Gr() before estimate_density().")
+            raise RuntimeError(
+                "This method depends on Sk, reduced_pdf, and r from calculate_Gr. "
+                "Run PairDistributionFunction.calculate_Gr() before estimate_density()."
+            )
 
         k = self._to_torch(np.asarray(self.qq))
         dk = k[1] - k[0]
@@ -883,10 +913,10 @@ class PairDistributionFunction(AutoSerialize):
         k_fit = k[k_fit_mask]
         ka, ra = torch.meshgrid(k, self._r, indexing="ij")
 
+        # r_cut sets the minimum r for the peak search used to determine the correction interval
         mask_search = self._r >= r_cut
         r_search = self._r[mask_search]
         G_search = self._reduced_pdf[mask_search]
-
         # find tallest peak and first local minimum to the left of r_peak
         ind_max = torch.argmax(G_search)
         r_max = r_search[ind_max]
@@ -921,19 +951,21 @@ class PairDistributionFunction(AutoSerialize):
         Fk_win_damped = self.Fk_masked.clone()
         # start with uncorrected Gr
         G_beta = G_short
+        # calculate the lorch window once
         wk = self._lorch_window(k, self.kmin, self.kmax)
         for j in range(max_iter):
             if j > 0:
                 G_beta = G_cor[r_mask]
 
             # calculate alpha/beta for S(k) adjustment
+            # alpha and beta are the ideal and actual contributions to G(r) in the short-r range
+            # from the current S(k) and G(r)
             alpha, beta = self._compute_alpha_beta(k2d_fit, r2d_fit, G_beta, r_short)
             rho0 = float(torch.sum(alpha * beta) / torch.sum(alpha**2))
             if rho0_prev is not None:
                 Rj = np.sqrt(((rho0_prev - rho0) ** 2) / (rho0**2)) * 100.0
                 if Rj < tol_percent:
                     break
-
             # Update S_cor(k) and G_cor
             Sk_cor[k_fit_mask] = Sk_cor[k_fit_mask] - beta + rho0 * alpha
             Fk_cor = k * (Sk_cor - 1.0)
@@ -1036,7 +1068,10 @@ class PairDistributionFunction(AutoSerialize):
         """
 
         if self.radial_mean is None:
-            raise RuntimeError("Radial mean intensity has not been calculated yet.")
+            raise RuntimeError(
+                "Radial mean intensity has not been calculated yet."
+                "Run PairDistributionFunction.calculate_Gr() or PairDistributionFunction.calculate_radial_mean() before plotting."
+            )
 
         x = np.asarray(self.qq)
         y = self._to_numpy(self.radial_mean)
@@ -1069,7 +1104,10 @@ class PairDistributionFunction(AutoSerialize):
         Plotting background fit vs radial mean intensity.
         """
         if self.Ik is None or self.bg is None:
-            raise RuntimeError("Radial mean intensity or background has not been calculated yet.")
+            raise RuntimeError(
+                "Radial mean intensity or background has not been calculated yet."
+                "Run PairDistributionFunction.calculate_Gr() or both calculate_radial_mean() and calculate_background() before plotting."
+            )
 
         x = np.asarray(self.qq)
         y1 = self._to_numpy(self.radial_mean)
@@ -1106,7 +1144,10 @@ class PairDistributionFunction(AutoSerialize):
         Plotting reduced structure factor F(k).
         """
         if self.Fk_masked is None:
-            raise RuntimeError("Reduced structure factor F(k) has not been calculated yet.")
+            raise RuntimeError(
+                "Reduced structure factor F(k) has not been calculated yet."
+                "Run PairDistributionFunction.calculate_Gr() before plotting."
+            )
 
         Fk = getattr(self, "Fk_damped", None)
         if Fk is None:
@@ -1141,7 +1182,10 @@ class PairDistributionFunction(AutoSerialize):
         Plotting reduced PDF g(r).
         """
         if self._reduced_pdf is None:
-            raise RuntimeError("Reduced PDF has not been calculated yet.")
+            raise RuntimeError(
+                "Reduced PDF has not been calculated yet."
+                "Run PairDistributionFunction.calculate_Gr() before plotting."
+            )
         Gr = getattr(self, "reduced_pdf_damped", None)
         if Gr is None:
             Gr = self._reduced_pdf
@@ -1190,7 +1234,10 @@ class PairDistributionFunction(AutoSerialize):
         Plotting pair distribution function g(r).
         """
         if self._reduced_pdf is None or self._pdf is None:
-            raise RuntimeError("Reduced PDF or PDF has not been calculated yet.")
+            raise RuntimeError(
+                "PDF has not been calculated yet."
+                "Run PairDistributionFunction.calculate_gr() before plotting."
+            )
 
         x = self._to_numpy(self._r)
         y = self._to_numpy(self._pdf)

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from numpy.typing import NDArray
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from .dataset4dstem import Dataset4dstem
@@ -66,7 +67,10 @@ class Polar4dstem(Dataset4d):
     ) -> "Polar4dstem":
         array = np.asarray(array)
         if array.ndim != 4:
-            raise ValueError("Polar4dstem.from_array expects a 4D array.")
+            raise ValueError(
+                f"Found array with shape: {array.shape}. "
+                "Polar4dstem.from_array expects a 4D array."
+            )
         if origin is None:
             origin = np.zeros(4, dtype=float)
         if sampling is None:
@@ -108,7 +112,6 @@ def _normalize_coords_for_grid_sample(
 ) -> torch.Tensor:
     """
     Convert pixel coordinates to normalized [-1, 1] coordinates for grid_sample.
-
     grid_sample expects x_norm = 2*x/(W-1) - 1, y_norm = 2*y/(H-1) - 1,
     stacked as (..., 2) in [x, y] order.
     """
@@ -133,9 +136,11 @@ def _precompute_polar_coords(
     origin_row = float(origin_row)
     origin_col = float(origin_col)
     if radial_step <= 0:
-        raise ValueError("radial_step must be > 0.")
+        raise ValueError(f"Got radial_step = {radial_step}. radial_step must be > 0.")
     if num_annular_bins < 1:
         raise ValueError("num_annular_bins must be >= 1.")
+    # Use the shortest distance from the origin to any image edge so the
+    # polar grid never samples outside the image bounds.
     if radial_max is None:
         r_row_pos = origin_row
         r_row_neg = (ny - 1) - origin_row
@@ -144,18 +149,25 @@ def _precompute_polar_coords(
         radial_max_eff = float(min(r_row_pos, r_row_neg, r_col_pos, r_col_neg))
     else:
         radial_max_eff = float(radial_max)
+    # Guarantee at least one radial bin so downstream code never gets an empty array
     if radial_max_eff <= radial_min:
         radial_max_eff = radial_min + radial_step
+
+    #  create radial bins and phi bins, then create the grid of (phi, r) coordinates
     radial_bins = torch.arange(
         radial_min, radial_max_eff, radial_step, dtype=torch.float32, device=device
     )
     if radial_bins.numel() == 0:
         radial_bins = torch.tensor([radial_min], dtype=torch.float32, device=device)
     phi_range = torch.pi if two_fold_rotation_symmetry else 2.0 * torch.pi
+    # Drop the last endpoint because 0 and 2pi (or pi) are the same angle
     phi_bins = torch.linspace(
         0.0, phi_range, num_annular_bins + 1, dtype=torch.float32, device=device
     )[:-1]
     phi_grid, r_grid = torch.meshgrid(phi_bins, radial_bins, indexing="ij")
+
+    # apply ellipse distortion correction if requested
+    # TODO: implement method to estimate ellipse_params from data
     if ellipse_params is None:
         x = r_grid * torch.cos(phi_grid)
         y = r_grid * torch.sin(phi_grid)
@@ -164,6 +176,8 @@ def _precompute_polar_coords(
             raise ValueError("ellipse_params must be (a, b, theta_deg).")
         a, b, theta_deg = ellipse_params
         theta = torch.deg2rad(torch.tensor(theta_deg, dtype=torch.float32, device=device))
+        # Rotate into the ellipse frame, scale by a/b to undo the distortion,
+        # then rotate back so sampling follows the true circular rings
         alpha = phi_grid - theta
         u = (a / b) * r_grid * torch.cos(alpha)
         v_prime = r_grid * torch.sin(alpha)
@@ -173,6 +187,7 @@ def _precompute_polar_coords(
         y = u * sin_t + v_prime * cos_t
     coords_y = y + origin_row
     coords_x = x + origin_col
+    # convert to normalized coordinates for grid_sample
     grid = _normalize_coords_for_grid_sample(coords_y, coords_x, ny, nx)
     grid = grid.unsqueeze(0)  # (1, n_phi, n_r, 2)
     return grid, phi_bins, radial_bins, radial_max_eff
@@ -232,16 +247,22 @@ def auto_origin_id(
     elif len(data.array.shape) == 4:
         scan_y, scan_x, ny, nx = data.array.shape
     else:
-        raise ValueError("auto_origin_id only supports 2D or 4D-STEM datasets.")
+        raise ValueError(
+            f" Got array with shape {data.array.shape}."
+            "To use auto_origin_id, pass a 2D or 4DSTEM dataset."
+        )
 
     origin_array = np.zeros((scan_y, scan_x, 2), dtype=float)
     max_steps = 1000
+    total_positions = scan_y * scan_x
     # start with center but subsequent positions warm-start from the previous result
     estimated_origin_row = (ny - 1) / 2.0
     estimated_origin_col = (nx - 1) / 2.0
+    pbar = tqdm(total=total_positions, desc="Origin of each scan position")
     for y_pos in range(scan_y):
         for x_pos in range(scan_x):
             test_origin = np.array([estimated_origin_row, estimated_origin_col], dtype=float)
+            # Cache avoids redundant polar transforms when neighbors are revisited across iterations
             coords_cache: dict[tuple[int, int], float] = {}
             polar = data.polar_transform(
                 origin_array=test_origin,
@@ -254,8 +275,12 @@ def auto_origin_id(
                 scan_pos=(y_pos, x_pos),
                 device=device,
             )
+            # Exclude inner 10% (central beam) and outer 10% (edge artifacts)
+            # to focus on the diffraction ring region
             min_r = int(np.floor(0.1 * polar.shape[1]))
             max_r = int(np.ceil(0.9 * polar.shape[1]))
+            # A correctly centered pattern has uniform intensity along each ring,
+            # so minimizing angular std finds the true center
             std_est_origin = polar[:, min_r:max_r].std(dim=0)
             std_est_origin_sum = std_est_origin.sum()
             origin_row = int(round(estimated_origin_row))
@@ -304,6 +329,8 @@ def auto_origin_id(
             # start next scan position from this result
             estimated_origin_row = float(origin_row)
             estimated_origin_col = float(origin_col)
+            pbar.update(1)
+    pbar.close()
 
     return origin_array
 
@@ -323,7 +350,10 @@ def dataset4dstem_polar_transform(
     device: str = "cpu",
 ) -> Polar4dstem | torch.Tensor:
     if self.array.ndim != 4:
-        raise ValueError("polar_transform requires a 4D-STEM dataset (ndim=4).")
+        raise ValueError(
+            f"Found array with shape: {self.array.shape}. "
+            "polar_transform requires a 4D-STEM dataset (ndim=4)."
+        )
     scan_y, scan_x, ny, nx = self.array.shape
 
     # Standardize origin_array input
@@ -340,8 +370,8 @@ def dataset4dstem_polar_transform(
         origins = origin_array
     else:
         raise ValueError(
+            f" Got {origin_array.shape}. "
             "origin_array must have shape None, (2,) or (scan_y, scan_x, 2)."
-            f" Got {origin_array.shape}."
         )
 
     # If scan_pos is provided, compute polar transform only for that position
@@ -373,7 +403,8 @@ def dataset4dstem_polar_transform(
         )
         return polar2d.squeeze(0).squeeze(0)  # (n_phi, n_r)
 
-    # Compute radial_max from all origins if not provided
+    # Use the global minimum safe radius across all origins so every scan
+    # position maps to the same-size polar grid (required for a uniform 4D output)
     if radial_max is None:
         r_row_pos = origins[:, :, 0]
         r_row_neg = (ny - 1) - origins[:, :, 0]
@@ -428,6 +459,7 @@ def dataset4dstem_polar_transform(
             )
             out[iy, ix] = _to_numpy(polar2d.squeeze(0).squeeze(0))
 
+    # Express polar axes in physical units matching the input dataset's calibration
     phi_range = np.pi if two_fold_rotation_symmetry else 2.0 * np.pi
     phi_step_deg = (phi_range / float(n_phi)) * (180.0 / np.pi)
     sampling = np.zeros(4, dtype=float)
