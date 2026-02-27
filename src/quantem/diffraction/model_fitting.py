@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from typing import Any, Literal, Sequence, cast
 
 import numpy as np
@@ -9,10 +8,14 @@ from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
-from quantem.core.fitting.base import AdditiveRenderModel, RenderComponent, RenderContext
+from quantem.core.fitting.base import (
+    AdditiveRenderModel,
+    FitBase,
+    RenderComponent,
+    RenderContext,
+)
 from quantem.core.fitting.diffraction import OriginND
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.core.visualization import show_2d
 
@@ -27,16 +30,16 @@ def _parse_init(value: float | int | Sequence[float | int | None], *, name: str)
     return float(cast(float | int, value))
 
 
-class ModelDiffraction(OptimizerMixin, AutoSerialize):
+class ModelDiffraction(FitBase, AutoSerialize):
     _token = object()
-    DEFAULT_LR = 1e-3
-    DEFAULT_OPTIMIZER_TYPE = "adamw"
+    DEFAULT_LR = 5e-2
+    DEFAULT_OPTIMIZER_TYPE = "adam"
 
     def __init__(self, dataset: Any, _token: object | None = None):
         if _token is not self._token:
             raise RuntimeError("Use ModelDiffraction.from_dataset() or .from_file().")
         AutoSerialize.__init__(self)
-        OptimizerMixin.__init__(self)
+        FitBase.__init__(self)
         self.dataset = dataset
         self.metadata: dict[str, Any] = {}
         self.image_ref: np.ndarray | None = None
@@ -68,6 +71,30 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         if self.model is None:
             return []
         return self.model.parameters()
+
+    def _forward_for_fit(self, *, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model(self.ctx)
+
+    def _fidelity_loss(
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        if self.ctx is not None and self.ctx.mask is not None:
+            diff = (pred - target) * self.ctx.mask
+            denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
+            return torch.sum(diff * diff) / denom
+        return torch.mean((pred - target) ** 2)
+
+    def _soft_constraints(
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> dict[str, torch.Tensor]:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        constraint_weight = float(kwargs.get("constraint_weight", 1.0))
+        if constraint_weight == 0.0:
+            return {}
+        return {"constraint": constraint_weight * self.model.total_constraint_loss(self.ctx)}
 
     def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {k: v.detach().clone() for k, v in state.items()}
@@ -287,51 +314,17 @@ class ModelDiffraction(OptimizerMixin, AutoSerialize):
         elif reset not in (False,):
             raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
 
-        optimizer_rebuilt = False
-        if optimizer_params is not None:
-            self.set_optimizer(optimizer_params)
-            optimizer_rebuilt = True
-        elif self.optimizer is None:
-            if self.optimizer_params:
-                self.set_optimizer(self.optimizer_params)
-            else:
-                self.set_optimizer({"type": self.DEFAULT_OPTIMIZER_TYPE, "lr": self.DEFAULT_LR})
-            optimizer_rebuilt = True
-
-        if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_iter=int(n_steps))
-        elif self.scheduler is None and self.scheduler_params:
-            self.set_scheduler(self.scheduler_params, num_iter=int(n_steps))
-        elif optimizer_rebuilt and self.scheduler is not None and self.optimizer is not None:
-            self.scheduler.optimizer = self.optimizer
-
-        iterator: Any = range(int(n_steps))
-        if progress:
-            try:
-                from tqdm.auto import trange
-
-                iterator = trange(int(n_steps), desc="Fit mean diffraction", leave=False)
-            except Exception:
-                warnings.warn("progress=True requested but tqdm is unavailable.", stacklevel=2)
-
-        for _ in iterator:
-            self.zero_optimizer_grad()
-            pred = self.model(self.ctx)
-            if self.ctx.mask is not None:
-                diff = (pred - self.target_mean) * self.ctx.mask
-                denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
-                loss_data = torch.sum(diff * diff) / denom
-            else:
-                loss_data = torch.mean((pred - self.target_mean) ** 2)
-            loss = loss_data + float(constraint_weight) * self.model.total_constraint_loss(
-                self.ctx
-            )
-            loss.backward()
-            self.step_optimizer()
-            loss_value = float(loss.detach().cpu())
-            self.step_scheduler(loss_value)
-            self.mean_fit_history.append(loss_value)
-            self.mean_fit_lrs.append(float(self.get_current_lr()))
+        fit_result = self.fit_render(
+            target=self.target_mean,
+            n_steps=int(n_steps),
+            optimizer_params=optimizer_params,
+            scheduler_params=scheduler_params,
+            progress=bool(progress),
+            run_key="mean",
+            constraint_weight=float(constraint_weight),
+        )
+        self.mean_fit_history.extend(fit_result.losses)
+        self.mean_fit_lrs.extend(fit_result.lrs)
 
         s_fit = self._get_model_state_dict_copy()
         self.state_current = s_fit
