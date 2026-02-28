@@ -61,30 +61,6 @@ class ModelDiffraction(FitBase, AutoSerialize):
             "from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance."
         )
 
-    def _data_loss(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        if self.ctx is not None and self.ctx.mask is not None:
-            diff = (pred - target) * self.ctx.mask
-            denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
-            return torch.sum(diff * diff) / denom
-        return torch.mean((pred - target) ** 2)
-
-    def _render_state_array(self, state: dict[str, torch.Tensor]) -> np.ndarray:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        live = self._get_model_state_dict_copy()
-        try:
-            self._load_model_state_dict_copy(state)
-            arr = self.model(self.ctx).cpu().detach().numpy()
-        finally:
-            self._load_model_state_dict_copy(live)
-        return arr
-
-    @property
-    def render_initialized(self) -> np.ndarray:
-        if self.state_initialized is None:
-            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
-        return self._render_state_array(self.state_initialized)
-
     @property
     def render_mean_refined(self) -> np.ndarray:
         if self.state_mean_refined is None:
@@ -93,15 +69,9 @@ class ModelDiffraction(FitBase, AutoSerialize):
             )
         return self._render_state_array(self.state_mean_refined)
 
-    @property
-    def render_current(self) -> np.ndarray:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        # Current render follows live module parameters by design.
-        return self.model(self.ctx).cpu().detach().numpy()
-
     def reset(
-        self, reset_to: Literal["initialized", "mean_refined"] = "mean_refined"
+        self,
+        reset_to: Literal["initialized", "mean_refined"] = "mean_refined",
     ) -> "ModelDiffraction":
         if reset_to == "initialized":
             state = self.state_initialized

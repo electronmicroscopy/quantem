@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence, cast
+from typing import Any, Literal, Self, Sequence, cast
 
+import numpy as np
 import torch
 from torch import nn
 from tqdm.auto import tqdm
@@ -79,6 +80,7 @@ class FitBase(OptimizerMixin):
         self.ctx: RenderContext | None = None
         self.fit_history: dict[str, FitResult] = {}
         self.state_initialized: dict[str, torch.Tensor] | None = None
+        self.loss_fn = torch.nn.MSELoss(reduction="mean")
 
     def get_optimization_parameters(self) -> Any:
         if self.model is None:
@@ -110,13 +112,56 @@ class FitBase(OptimizerMixin):
     def _clear_fit_history_run(self, run_key: str) -> None:
         self.fit_history.pop(str(run_key), None)
 
+    def _render_state_array(self, state: dict[str, torch.Tensor]) -> np.ndarray:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        live = self._get_model_state_dict_copy()
+        try:
+            self._load_model_state_dict_copy(state)
+            arr = self.model(self.ctx).detach().cpu().numpy()
+        finally:
+            self._load_model_state_dict_copy(live)
+        return arr
+
+    @property
+    def render_initialized(self) -> np.ndarray:
+        if self.state_initialized is None:
+            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
+        return self._render_state_array(self.state_initialized)
+
+    @property
+    def render_current(self) -> np.ndarray:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model(self.ctx).detach().cpu().numpy()
+
+    def reset(
+        self,
+        reset_to: Literal["initialized"] = "initialized",
+    ) -> Self:
+        if reset_to != "initialized":
+            raise ValueError("FitBase.reset only supports reset_to='initialized'.")
+        if self.state_initialized is None:
+            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
+        self._load_model_state_dict_copy(self.state_initialized)
+        self._clear_fit_history_all()
+        return self
+
     def _forward_for_fit(self, *, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         if self.model is None or self.ctx is None:
             raise RuntimeError("Model and context are not defined for fitting.")
         return self.model(self.ctx)
 
-    def _data_loss(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        raise NotImplementedError
+    def _fidelity_loss(
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        if self.ctx is not None and self.ctx.mask is not None:
+            # TODO -- use loss modules (currently implemented in tomo branch)
+            # and update them to allow for masking at module level
+            diff = (pred - target) * self.ctx.mask
+            denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
+            return torch.sum(diff * diff) / denom
+        return self.loss_fn(pred, target)
 
     def _constraint_loss(
         self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
@@ -168,7 +213,7 @@ class FitBase(OptimizerMixin):
         for _ in pbar:
             self.zero_optimizer_grad()
             pred = self._forward_for_fit(target=target, **kwargs)
-            data_loss = self._data_loss(pred, target, **kwargs)
+            data_loss = self._fidelity_loss(pred, target, **kwargs)
             constraint_loss = self._constraint_loss(pred, target, **kwargs)
             total_loss = data_loss + constraint_weight * constraint_loss
             total_loss.backward()
