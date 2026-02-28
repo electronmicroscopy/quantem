@@ -40,16 +40,20 @@ class ModelDiffraction(FitBase, AutoSerialize):
             raise RuntimeError("Use ModelDiffraction.from_dataset() or .from_file().")
         AutoSerialize.__init__(self)
         FitBase.__init__(self)
+
+        # Dataset/input references
         self.dataset = dataset
-        self.metadata: dict[str, Any] = {}
         self.image_ref: np.ndarray | None = None
         self.preprocess_shifts: np.ndarray | None = None
         self.index_shape: tuple[int, ...] | None = None
-
         self.target_mean: torch.Tensor | None = None
 
+        # Diffraction-specific state/checkpoints
         self.state_mean_refined: dict[str, torch.Tensor] | None = None
         self.mean_refined: bool = False
+
+        # Misc metadata
+        self.metadata: dict[str, Any] = {}
 
     @classmethod
     def from_dataset(
@@ -60,41 +64,6 @@ class ModelDiffraction(FitBase, AutoSerialize):
         raise TypeError(
             "from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance."
         )
-
-    @property
-    def render_mean_refined(self) -> np.ndarray:
-        if self.state_mean_refined is None:
-            raise RuntimeError(
-                "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
-            )
-        return self._render_state_array(self.state_mean_refined)
-
-    def reset(
-        self,
-        reset_to: Literal["initialized", "mean_refined"] = "mean_refined",
-    ) -> "ModelDiffraction":
-        if reset_to == "initialized":
-            state = self.state_initialized
-            if state is None:
-                raise RuntimeError(
-                    "initialized state is unavailable. Call .define_model(...) first."
-                )
-            self._clear_fit_history_all()
-        elif reset_to == "mean_refined":
-            state = self.state_mean_refined
-            if state is None:
-                raise RuntimeError(
-                    "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
-                )
-            mean_hist = self.fit_history.get("mean")
-            self._clear_fit_history_all()
-            if mean_hist is not None:
-                self.fit_history["mean"] = mean_hist
-        else:
-            raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
-
-        self._load_model_state_dict_copy(state)
-        return self
 
     def preprocess(
         self,
@@ -252,6 +221,41 @@ class ModelDiffraction(FitBase, AutoSerialize):
         self.state_mean_refined = self._clone_state_dict(s_fit)
         self.mean_refined = True
         return self
+
+    def reset(
+        self,
+        reset_to: Literal["initialized", "mean_refined"] = "mean_refined",
+    ) -> "ModelDiffraction":
+        if reset_to == "initialized":
+            state = self.state_initialized
+            if state is None:
+                raise RuntimeError(
+                    "initialized state is unavailable. Call .define_model(...) first."
+                )
+            self._clear_fit_history_all()
+        elif reset_to == "mean_refined":
+            state = self.state_mean_refined
+            if state is None:
+                raise RuntimeError(
+                    "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
+                )
+            mean_hist = self.fit_history.get("mean")
+            self._clear_fit_history_all()
+            if mean_hist is not None:
+                self.fit_history["mean"] = mean_hist
+        else:
+            raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
+
+        self._load_model_state_dict_copy(state)
+        return self
+
+    @property
+    def render_mean_refined(self) -> np.ndarray:
+        if self.state_mean_refined is None:
+            raise RuntimeError(
+                "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
+            )
+        return self._render_state_array(self.state_mean_refined)
 
     def plot_losses(
         self, figax: tuple[Any, Any] | None = None, plot_lrs: bool = True

@@ -76,52 +76,27 @@ class FitBase(OptimizerMixin):
 
     def __init__(self):
         super().__init__()
+        # Core wiring
+        self.loss_fn = torch.nn.MSELoss(reduction="mean")
         self.model: AdditiveRenderModel | None = None
         self.ctx: RenderContext | None = None
-        self.fit_history: dict[str, FitResult] = {}
+
+        # State/checkpoints
         self.state_initialized: dict[str, torch.Tensor] | None = None
-        self.loss_fn = torch.nn.MSELoss(reduction="mean")
+
+        # Histories/results
+        self.fit_history: dict[str, FitResult] = {}
 
     def get_optimization_parameters(self) -> Any:
         if self.model is None:
             return []
         return self.model.parameters()
 
-    def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return {k: v.detach().clone() for k, v in state.items()}
-
-    def _get_model_state_dict_copy(self) -> dict[str, torch.Tensor]:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        return self._clone_state_dict(self.model.state_dict())
-
-    def _load_model_state_dict_copy(self, state: dict[str, torch.Tensor]) -> None:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        self.model.load_state_dict(self._clone_state_dict(state), strict=True)
-
     @property
     def state_current(self) -> dict[str, torch.Tensor] | None:
         if self.model is None:
             return None
         return self._get_model_state_dict_copy()
-
-    def _clear_fit_history_all(self) -> None:
-        self.fit_history.clear()
-
-    def _clear_fit_history_run(self, run_key: str) -> None:
-        self.fit_history.pop(str(run_key), None)
-
-    def _render_state_array(self, state: dict[str, torch.Tensor]) -> np.ndarray:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        live = self._get_model_state_dict_copy()
-        try:
-            self._load_model_state_dict_copy(state)
-            arr = self.model(self.ctx).detach().cpu().numpy()
-        finally:
-            self._load_model_state_dict_copy(live)
-        return arr
 
     @property
     def render_initialized(self) -> np.ndarray:
@@ -146,29 +121,6 @@ class FitBase(OptimizerMixin):
         self._load_model_state_dict_copy(self.state_initialized)
         self._clear_fit_history_all()
         return self
-
-    def _forward_for_fit(self, *, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Model and context are not defined for fitting.")
-        return self.model(self.ctx)
-
-    def _fidelity_loss(
-        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
-    ) -> torch.Tensor:
-        if self.ctx is not None and self.ctx.mask is not None:
-            # TODO -- use loss modules (currently implemented in tomo branch)
-            # and update them to allow for masking at module level
-            diff = (pred - target) * self.ctx.mask
-            denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
-            return torch.sum(diff * diff) / denom
-        return self.loss_fn(pred, target)
-
-    def _constraint_loss(
-        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
-    ) -> torch.Tensor:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Model and context are not defined for fitting.")
-        return self.model.total_constraint_loss(self.ctx)
 
     def fit_render(
         self,
@@ -240,6 +192,59 @@ class FitBase(OptimizerMixin):
             )
             self.fit_history[key] = result
         return result
+
+    def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {k: v.detach().clone() for k, v in state.items()}
+
+    def _get_model_state_dict_copy(self) -> dict[str, torch.Tensor]:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self._clone_state_dict(self.model.state_dict())
+
+    def _load_model_state_dict_copy(self, state: dict[str, torch.Tensor]) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        self.model.load_state_dict(self._clone_state_dict(state), strict=True)
+
+    def _clear_fit_history_all(self) -> None:
+        self.fit_history.clear()
+
+    def _clear_fit_history_run(self, run_key: str) -> None:
+        self.fit_history.pop(str(run_key), None)
+
+    def _render_state_array(self, state: dict[str, torch.Tensor]) -> np.ndarray:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        live = self._get_model_state_dict_copy()
+        try:
+            self._load_model_state_dict_copy(state)
+            arr = self.model(self.ctx).detach().cpu().numpy()
+        finally:
+            self._load_model_state_dict_copy(live)
+        return arr
+
+    def _forward_for_fit(self, *, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Model and context are not defined for fitting.")
+        return self.model(self.ctx)
+
+    def _fidelity_loss(
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        if self.ctx is not None and self.ctx.mask is not None:
+            # TODO -- use loss modules (currently implemented in tomo branch)
+            # and update them to allow for masking at module level
+            diff = (pred - target) * self.ctx.mask
+            denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
+            return torch.sum(diff * diff) / denom
+        return self.loss_fn(pred, target)
+
+    def _constraint_loss(
+        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Model and context are not defined for fitting.")
+        return self.model.total_constraint_loss(self.ctx)
 
 
 Component = RenderComponent
