@@ -12,11 +12,17 @@ from scipy.ndimage import map_coordinates
 from quantem.core.utils.utils import generate_batches
 
 
+def _parabolic_peak(v) -> float:
+    denom = 4.0 * v[1] - 2.0 * v[2] - 2.0 * v[0]
+    if denom == 0:
+        return 0.0
+    return float((v[2] - v[0]) / denom)
+
+
 def dft_upsample(
     F: NDArray,
     up: int,
     shift: Tuple[float, float],
-    device: str = "cpu",
 ):
     """
     Matrix multiplication DFT, from:
@@ -25,27 +31,53 @@ def dft_upsample(
     image registration algorithms," Opt. Lett. 33, 156-158 (2008).
     http://www.sciencedirect.com/science/article/pii/S0045790612000778
     """
-    if device == "gpu":
-        import cupy as cp  # type: ignore
-
-        xp = cp
-    else:
-        xp = np
-
     M, N = F.shape
-    du = np.ceil(1.5 * up).astype(int)
-    row = np.arange(-du, du + 1)
-    col = np.arange(-du, du + 1)
-    r_shift = shift[0] - M // 2
-    c_shift = shift[1] - N // 2
+    pixel_radius = 1.5
+    num_row = int(math.ceil(pixel_radius * up))
+    num_col = num_row
 
-    kern_row = np.exp(
-        -2j * np.pi / (M * up) * np.outer(row, xp.fft.ifftshift(xp.arange(M)) - M // 2 + r_shift)
-    )
-    kern_col = np.exp(
-        -2j * np.pi / (N * up) * np.outer(xp.fft.ifftshift(xp.arange(N)) - N // 2 + c_shift, col)
-    )
-    return xp.real(kern_row @ F @ kern_col)
+    col_freq = np.fft.ifftshift(np.arange(N)) - math.floor(N / 2)
+    row_freq = np.fft.ifftshift(np.arange(M)) - math.floor(M / 2)
+
+    row_coords = np.arange(num_row, dtype=float) - float(shift[0])
+    col_coords = np.arange(num_col, dtype=float) - float(shift[1])
+
+    factor_row = -2j * math.pi / (M * float(up))
+    factor_col = -2j * math.pi / (N * float(up))
+
+    row_kern = np.exp(factor_row * (row_coords[:, None] * row_freq[None, :])).astype(F.dtype)
+    col_kern = np.exp(factor_col * (col_freq[:, None] * col_coords[None, :])).astype(F.dtype)
+
+    return (row_kern @ F @ col_kern).real
+
+
+def _upsampled_correlation_numpy(
+    imageCorr: NDArray,
+    upsampleFactor: int,
+    xyShift: NDArray,
+) -> NDArray:
+    xyShift = np.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
+    globalShift = math.floor(math.ceil(upsampleFactor * 1.5) / 2.0)
+    upsampleCenter = float(globalShift) - (float(upsampleFactor) * xyShift)
+
+    im_up = dft_upsample(np.conj(imageCorr), upsampleFactor, (float(upsampleCenter[0]), float(upsampleCenter[1])))
+    imageCorrUpsample = np.conj(im_up)
+
+    flat_idx = int(np.argmax(imageCorrUpsample.real))
+    r = flat_idx // imageCorrUpsample.shape[1]
+    c = flat_idx % imageCorrUpsample.shape[1]
+
+    dx = 0.0
+    dy = 0.0
+    patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
+    if patch.shape == (3, 3):
+        dx = _parabolic_peak(patch[:, 1])
+        dy = _parabolic_peak(patch[1, :])
+
+    xySubShift = np.array([float(r), float(c)], dtype=float) - float(globalShift)
+    xyShift = xyShift + (xySubShift + np.array([dx, dy], dtype=float)) / float(upsampleFactor)
+
+    return xyShift
 
 
 def cross_correlation_shift(
@@ -56,7 +88,6 @@ def cross_correlation_shift(
     return_shifted_image: bool = False,
     fft_input: bool = False,
     fft_output: bool = False,
-    device: str = "cpu",
 ):
     """
     Estimate subpixel shift between two 2D images using Fourier cross-correlation.
@@ -68,98 +99,78 @@ def cross_correlation_shift(
     im : ndarray
         Image to align or its FFT if fft_input=True
     upsample_factor : int
-        Subpixel upsampling factor (must be > 1 for subpixel accuracy)
-    fft_input : bool
-        If True, assumes im_ref and im are already in Fourier space
+        Subpixel upsampling factor (torch-equivalent behavior):
+        - <= 2 : half-pixel refinement (parabolic, then rounded to nearest 0.5 px)
+        - > 2  : additional DFT upsample refinement
+    max_shift : float or None
+        Optional radial cutoff in pixel-shift units (keeps only shifts with |shift| <= max_shift)
     return_shifted_image : bool
         If True, return the shifted version of `im` aligned to `im_ref`
-    device : str
-        'cpu' or 'gpu' (requires CuPy)
+    fft_input : bool
+        If True, assumes im_ref and im are already in Fourier space
+    fft_output : bool
+        If True and return_shifted_image=True, return the shifted image in Fourier space
 
     Returns
     -------
     shifts : tuple of float
         (row_shift, col_shift) to align `im` to `im_ref`
     image_shifted : ndarray (optional)
-        Shifted image in real space, only returned if return_shifted_image=True
+        Shifted image in real space (or Fourier space if fft_output=True)
     """
-    if device == "gpu":
-        import cupy as cp  # type: ignore
+    F_ref = np.asarray(im_ref) if fft_input else np.fft.fft2(np.asarray(im_ref))
+    F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
 
-        xp = cp
-    else:
-        xp = np
+    cc = F_ref * np.conj(F_im)
+    cc_real = np.fft.ifft2(cc).real
 
-    # Fourier transforms
-    F_ref = im_ref if fft_input else xp.fft.fft2(im_ref)
-    F_im = im if fft_input else xp.fft.fft2(im)
-
-    # Correlation
-    cc = F_ref * xp.conj(F_im)
-    cc_real = xp.real(xp.fft.ifft2(cc))
+    M, N = cc_real.shape
 
     if max_shift is not None:
-        x = np.fft.fftfreq(cc.shape[0], 1 / cc.shape[0])
-        y = np.fft.fftfreq(cc.shape[1], 1 / cc.shape[1])
-        mask = x[:, None] ** 2 + y[None, :] ** 2 >= max_shift**2
-        cc_real[mask] = 0.0
+        x = np.fft.fftfreq(M) * M
+        y = np.fft.fftfreq(N) * N
+        mask = x[:, None] ** 2 + y[None, :] ** 2 > float(max_shift) ** 2
+        cc_real = cc_real.copy()
+        cc_real[mask] = -np.inf
 
-    # Coarse peak
-    peak = xp.unravel_index(xp.argmax(cc_real), cc_real.shape)
-    x0, y0 = peak
+    flat_idx = int(np.argmax(cc_real))
+    x0 = flat_idx // N
+    y0 = flat_idx % N
 
-    # Parabolic refinement
-    x_inds = xp.mod(x0 + xp.arange(-1, 2), cc.shape[0]).astype(int)
-    y_inds = xp.mod(y0 + xp.arange(-1, 2), cc.shape[1]).astype(int)
+    x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
+    y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
 
     vx = cc_real[x_inds, y0]
     vy = cc_real[x0, y_inds]
 
-    def parabolic_peak(v):
-        return (v[2] - v[0]) / (4 * v[1] - 2 * v[2] - 2 * v[0])
+    dx = _parabolic_peak(vx)
+    dy = _parabolic_peak(vy)
 
-    dx = parabolic_peak(vx)
-    dy = parabolic_peak(vy)
+    x0 = np.round((float(x0) + float(dx)) * 2.0) / 2.0
+    y0 = np.round((float(y0) + float(dy)) * 2.0) / 2.0
 
-    x0 = (x0 + dx) % cc.shape[0]
-    y0 = (y0 + dy) % cc.shape[1]
+    xy_shift = np.array([x0, y0], dtype=float)
 
-    if upsample_factor <= 1:
-        shifts = (x0, y0)
-    else:
-        # Local DFT upsampling
+    if upsample_factor > 2:
+        xy_shift = _upsampled_correlation_numpy(cc, int(upsample_factor), xy_shift)
 
-        local = dft_upsample(cc, upsample_factor, (x0, y0), device=device)
-        peak = np.unravel_index(xp.argmax(local), local.shape)
-
-        try:
-            lx, ly = peak
-            icc = local[lx - 1 : lx + 2, ly - 1 : ly + 2]
-            if icc.shape == (3, 3):
-                dxf = parabolic_peak(icc[:, 1])
-                dyf = parabolic_peak(icc[1, :])
-            else:
-                raise ValueError("Subarray too close to edge")
-        except (IndexError, ValueError):
-            dxf = dyf = 0.0
-
-        shifts = np.array([x0, y0]) + (np.array(peak) - upsample_factor) / upsample_factor
-        shifts += np.array([dxf, dyf]) / upsample_factor
-
-    shifts = (shifts + 0.5 * np.array(cc.shape)) % cc.shape - 0.5 * np.array(cc.shape)
+    shifts = np.empty(2, dtype=float)
+    shifts[0] = ((xy_shift[0] + M / 2) % M) - M / 2
+    shifts[1] = ((xy_shift[1] + N / 2) % N) - N / 2
+    shifts = (float(shifts[0]), float(shifts[1]))
 
     if not return_shifted_image:
         return shifts
 
-    # Fourier shift image (F_im assumed to be FFT)
-    kx = xp.fft.fftfreq(F_im.shape[0])[:, None]
-    ky = xp.fft.fftfreq(F_im.shape[1])[None, :]
-    phase_ramp = xp.exp(-2j * np.pi * (kx * shifts[0] + ky * shifts[1]))
+    kx = np.fft.fftfreq(F_im.shape[0])[:, None]
+    ky = np.fft.fftfreq(F_im.shape[1])[None, :]
+    phase_ramp = np.exp(-2j * np.pi * (kx * shifts[0] + ky * shifts[1]))
     F_im_shifted = F_im * phase_ramp
+
     if fft_output:
         image_shifted = F_im_shifted
     else:
-        image_shifted = xp.real(xp.fft.ifft2(F_im_shifted))
+        image_shifted = np.fft.ifft2(F_im_shifted).real
 
     return shifts, image_shifted
 
@@ -176,7 +187,6 @@ def cross_correlation_shift_torch(
 
     xy_shift = align_images_fourier_torch(G1, G2, upsample_factor)
 
-    # convert to centered signed shifts as original code
     M, N = im_ref.shape
     dx = ((xy_shift[0] + M / 2) % M) - M / 2
     dy = ((xy_shift[1] + N / 2) % N) - N / 2
@@ -198,12 +208,10 @@ def align_images_fourier_torch(
     cc = G1 * G2.conj()
     cc_real = torch.fft.ifft2(cc).real
 
-    # local max (integer)
     flat_idx = torch.argmax(cc_real)
     x0 = (flat_idx // cc_real.shape[1]).to(torch.long).item()
     y0 = (flat_idx % cc_real.shape[1]).to(torch.long).item()
 
-    # half pixel shifts: pick ±1 indices with wrap (mod)
     M, N = cc_real.shape
     x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
     y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
@@ -211,14 +219,11 @@ def align_images_fourier_torch(
     vx = cc_real[x_inds, y0]
     vy = cc_real[x0, y_inds]
 
-    # parabolic half-pixel refine
-    # dx = (vx[2] - vx[0]) / (4*vx[1] - 2*vx[2] - 2*vx[0])
     denom_x = 4.0 * vx[1] - 2.0 * vx[2] - 2.0 * vx[0]
     denom_y = 4.0 * vy[1] - 2.0 * vy[2] - 2.0 * vy[0]
     dx = (vx[2] - vx[0]) / denom_x if denom_x != 0 else torch.tensor(0.0, device=device)
     dy = (vy[2] - vy[0]) / denom_y if denom_y != 0 else torch.tensor(0.0, device=device)
 
-    # round to nearest half-pixel
     x0 = torch.round((x0 + dx) * 2.0) / 2.0
     y0 = torch.round((y0 + dy) * 2.0) / 2.0
 
@@ -243,7 +248,6 @@ def upsampled_correlation_torch(
     xyShift: 2-element tensor (x,y) in image coords; must be half-pixel precision as described.
     Returns refined xyShift (tensor length 2).
     """
-
     assert upsampleFactor > 2
 
     xyShift = torch.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
@@ -254,28 +258,25 @@ def upsampled_correlation_torch(
     im_up = dftUpsample_torch(conj_input, upsampleFactor, upsampleCenter)
     imageCorrUpsample = im_up.conj()
 
-    # find maximum
-    # flatten argmax -> unravel to 2D
     flat_idx = torch.argmax(imageCorrUpsample.real)
-    # unravel_index
     xySubShift0 = (flat_idx // imageCorrUpsample.shape[1]).to(torch.long)
     xySubShift1 = (flat_idx % imageCorrUpsample.shape[1]).to(torch.long)
     xySubShift = torch.tensor([xySubShift0.item(), xySubShift1.item()])
 
-    # parabolic subpixel refinement
     dx = 0.0
     dy = 0.0
     try:
-        # extract 3x3 patch around found peak
         r = xySubShift[0].item()
         c = xySubShift[1].item()
         patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
-        # if patch is incomplete (near edge) this will raise / have wrong shape -> except
         if patch.shape == (3, 3):
             icc = patch
-            # dx corresponds to row direction (vertical axis) as in original code:
-            dx = (icc[2, 1] - icc[0, 1]) / (4.0 * icc[1, 1] - 2.0 * icc[2, 1] - 2.0 * icc[0, 1])
-            dy = (icc[1, 2] - icc[1, 0]) / (4.0 * icc[1, 1] - 2.0 * icc[1, 2] - 2.0 * icc[1, 0])
+            dx = (icc[2, 1] - icc[0, 1]) / (
+                4.0 * icc[1, 1] - 2.0 * icc[2, 1] - 2.0 * icc[0, 1]
+            )
+            dy = (icc[1, 2] - icc[1, 0]) / (
+                4.0 * icc[1, 1] - 2.0 * icc[1, 2] - 2.0 * icc[1, 0]
+            )
             dx = dx.item()
             dy = dy.item()
         else:
@@ -283,7 +284,6 @@ def upsampled_correlation_torch(
     except Exception:
         dx, dy = 0.0, 0.0
 
-    # convert xySubShift to zero-centered by subtracting globalShift
     xySubShift = xySubShift.to(dtype=torch.get_default_dtype())
     xySubShift = xySubShift - globalShift.to(xySubShift.dtype)
 
@@ -312,13 +312,9 @@ def dftUpsample_torch(
     numRow = int(math.ceil(pixelRadius * upsampleFactor))
     numCol = numRow
 
-    # prepare the vectors exactly like the numpy version
-    # col: frequency indices (centered) for N
     col_freq = torch.fft.ifftshift(torch.arange(N, device=device)) - math.floor(N / 2)
-    # row: frequency indices (centered) for M
     row_freq = torch.fft.ifftshift(torch.arange(M, device=device)) - math.floor(M / 2)
 
-    # small upsample grid coordinates (integer positions in the UPSAMPLED GRID)
     col_coords = torch.arange(numCol, device=device, dtype=torch.get_default_dtype()) - float(
         xyShift[1]
     )
@@ -326,26 +322,119 @@ def dftUpsample_torch(
         xyShift[0]
     )
 
-    # build kernels: note factor signs and denominators match original numpy code
-    # colKern: shape (N, numCol)
     factor_col = -2j * math.pi / (N * float(upsampleFactor))
-    # outer(col_freq, col_coords) -> shape (N, numCol)
     colKern = torch.exp(factor_col * (col_freq.unsqueeze(1) * col_coords.unsqueeze(0))).to(
         imageCorr.dtype
     )
 
-    # rowKern: shape (numRow, M)
     factor_row = -2j * math.pi / (M * float(upsampleFactor))
-    # outer(row_coords, row_freq) -> shape (numRow, M)
     rowKern = torch.exp(factor_row * (row_coords.unsqueeze(1) * row_freq.unsqueeze(0))).to(
         imageCorr.dtype
     )
 
-    # perform the small-matrix DFT: (numRow, M) @ (M, N) @ (N, numCol) -> (numRow, numCol)
     imageUpsample = rowKern @ imageCorr @ colKern
 
-    # original code took xp.real(...) before returning
     return imageUpsample.real
+
+
+def weighted_cross_correlation_shift(
+    im_ref=None,
+    im=None,
+    *,
+    cc=None,
+    weight_real=None,
+    upsample_factor: int = 1,
+    max_shift=None,
+    fft_input: bool = False,
+    fft_output: bool = False,
+    return_shifted_image: bool = False,
+):
+    """
+    Weighted peak selection + DFT subpixel refinement for Fourier cross-correlation.
+
+    Provide either:
+      - im_ref and im (real-space images, or Fourier-domain if fft_input=True), OR
+      - cc (the Fourier-domain cross-spectrum), where cc = F_ref * conj(F_im)
+
+    The weight is applied ONLY in real-space correlation to choose the peak location,
+    but the subpixel refinement uses the true (unweighted) cross-spectrum `cc`.
+
+    Returns
+    -------
+    shift_rc : tuple[float, float]
+        (d_row, d_col) shift to apply to `im` to align it to `im_ref`.
+    shifted : ndarray (optional)
+        If return_shifted=True: shifted image. If fft_output=True returns FFT (corner-centered),
+        else returns real-space image.
+    """
+    if cc is None:
+        if im_ref is None or im is None:
+            raise ValueError("Provide either `cc` or both `im_ref` and `im`.")
+        F_ref = np.asarray(im_ref) if fft_input else np.fft.fft2(np.asarray(im_ref))
+        F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
+        cc = F_ref * np.conj(F_im)
+    else:
+        cc = np.asarray(cc)
+        F_im = None
+
+    cc_real = np.fft.ifft2(cc).real
+    M, N = cc_real.shape
+
+    if weight_real is not None:
+        w = np.asarray(weight_real)
+        if w.shape != cc_real.shape:
+            raise ValueError(f"weight_real.shape={w.shape} must match correlation shape {cc_real.shape}.")
+        cc_pick = cc_real * w
+    else:
+        cc_pick = cc_real
+
+    if max_shift is not None:
+        fr = np.fft.fftfreq(M) * M
+        fc = np.fft.fftfreq(N) * N
+        mask = fr[:, None] ** 2 + fc[None, :] ** 2 > float(max_shift) ** 2
+        cc_pick = cc_pick.copy()
+        cc_pick[mask] = -np.inf
+
+    flat_idx = int(np.argmax(cc_pick))
+    x0 = flat_idx // N
+    y0 = flat_idx % N
+
+    x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
+    y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
+    vx = cc_pick[x_inds, y0]
+    vy = cc_pick[x0, y_inds]
+
+    dx = _parabolic_peak(vx)
+    dy = _parabolic_peak(vy)
+
+    x0 = np.round((float(x0) + float(dx)) * 2.0) / 2.0
+    y0 = np.round((float(y0) + float(dy)) * 2.0) / 2.0
+    xy_shift = np.array([x0, y0], dtype=float)
+
+    if upsample_factor > 2:
+        xy_shift = _upsampled_correlation_numpy(cc, int(upsample_factor), xy_shift)
+
+    dr = ((xy_shift[0] + M / 2) % M) - M / 2
+    dc = ((xy_shift[1] + N / 2) % N) - N / 2
+    shift_rc = (float(dr), float(dc))
+
+    if not return_shifted_image:
+        return shift_rc
+
+    if im is None:
+        raise ValueError("return_shifted_image=True requires `im` (or its FFT via fft_input=True).")
+
+    if F_im is None:
+        F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
+
+    kr = np.fft.fftfreq(M)[:, None]
+    kc = np.fft.fftfreq(N)[None, :]
+    phase_ramp = np.exp(-2j * np.pi * (kr * shift_rc[0] + kc * shift_rc[1]))
+    F_im_shifted = F_im * phase_ramp
+
+    if fft_output:
+        return shift_rc, F_im_shifted
+    return shift_rc, np.fft.ifft2(F_im_shifted).real
 
 
 def bilinear_kde(
@@ -362,32 +451,6 @@ def bilinear_kde(
 ) -> NDArray | tuple[NDArray, NDArray]:
     """
     Compute a bilinear kernel density estimate (KDE) with smooth threshold masking.
-
-    Parameters
-    ----------
-    xa : NDArray
-        Vertical (row) coordinates of input points.
-    ya : NDArray
-        Horizontal (col) coordinates of input points.
-    values : NDArray
-        Weights for each (xa, ya) point.
-    output_shape : tuple of int
-        Output image shape (rows, cols).
-    kde_sigma : float
-        Standard deviation of Gaussian KDE smoothing.
-    pad_value : float, default = 1.0
-        Value to return when KDE support is too low.
-    threshold : float, default = 1e-3
-        Minimum counts_KDE value for trusting the output signal.
-    lowpass_filter : bool, optional
-        If True, apply sinc-based inverse filtering to deconvolve the kernel.
-    max_batch_size : int or None, optional
-        Max number of points to process in one batch.
-
-    Returns
-    -------
-    NDArray
-        The estimated KDE image with threshold-masked output.
     """
     rows, cols = output_shape
     xF = np.floor(xa.ravel()).astype(int)
@@ -417,14 +480,12 @@ def bilinear_kde(
                 inds_1D, weights=weights * w[start:end], minlength=rows * cols
             )
 
-    # Reshape to 2D and apply Gaussian KDE
     pix_count = pix_count.reshape(output_shape)
     pix_output = pix_output.reshape(output_shape)
 
     pix_count = gaussian_filter(pix_count, kde_sigma)
     pix_output = gaussian_filter(pix_output, kde_sigma)
 
-    # Final image
     weight = np.minimum(pix_count / threshold, 1.0)
     image = pad_value * (1.0 - weight) + weight * (pix_output / np.maximum(pix_count, 1e-8))
 
@@ -456,23 +517,7 @@ def bilinear_array_interpolation(
 ) -> NDArray:
     """
     Bilinear sampling of values from an array and pixel positions.
-
-    Parameters
-    ----------
-    image: np.ndarray
-        Image array to sample from
-    xa: np.ndarray
-        Vertical interpolation sampling positions of image array in pixels
-    ya: np.ndarray
-        Horizontal interpolation sampling positions of image array in pixels
-
-    Returns
-    -------
-    values: np.ndarray
-        Bilinear interpolation values of array at (xa,ya) positions
-
     """
-
     xF = np.floor(xa.ravel()).astype("int")
     yF = np.floor(ya.ravel()).astype("int")
     dx = xa.ravel() - xF
@@ -498,10 +543,7 @@ def bilinear_array_interpolation(
 
             values[start:end] += raveled_image[inds_1D] * weights
 
-    values = np.reshape(
-        values,
-        xa.shape,
-    )
+    values = np.reshape(values, xa.shape)
 
     return values
 
@@ -513,20 +555,7 @@ def fourier_cropping(
     """
     Crops a corner-centered FFT array to retain only the lowest frequencies,
     equivalent to a center crop on the fftshifted version.
-
-    Parameters:
-    -----------
-    corner_centered_array : ndarray
-        2D array (typically result of np.fft.fft2) with corner-centered DC
-    crop_shape : tuple of int
-        (height, width) of the desired cropped array (could be odd or even depending on arr.shape)
-
-    Returns:
-    --------
-    cropped : ndarray
-        Cropped array containing only the lowest frequencies, still corner-centered.
     """
-
     H, W = corner_centered_array.shape
     crop_h, crop_w = crop_shape
 
@@ -537,13 +566,9 @@ def fourier_cropping(
 
     result = np.zeros(crop_shape, dtype=corner_centered_array.dtype)
 
-    # Top-left
     result[:h1, :w1] = corner_centered_array[:h1, :w1]
-    # Top-right
     result[:h1, -w2:] = corner_centered_array[:h1, -w2:]
-    # Bottom-left
     result[-h2:, :w1] = corner_centered_array[-h2:, :w1]
-    # Bottom-right
     result[-h2:, -w2:] = corner_centered_array[-h2:, -w2:]
 
     return result
@@ -557,22 +582,6 @@ def compute_fsc_from_halfsets(
     """
     Compute radially averaged Fourier Shell Correlation (FSC)
     from two half-set reconstructions.
-
-    Parameters
-    ----------
-    halfset_recons : list[torch.Tensor]
-        Two statistically-independent reconstructions, using half the dataset.
-    sampling: tuple[float,float]
-        Reconstruction sampling in Angstroms.
-    epsilon: float, optional
-        Small number to avoid dividing by zero
-
-    Returns
-    -------
-    q_bins: NDarray
-        Spatial frequency bins
-    fsc : NDarray
-        Fourier shell correlation as function of spatial frequency
     """
     r1, r2 = halfset_recons
 
@@ -602,12 +611,10 @@ def compute_fsc_from_halfsets(
     w0 = 1.0 - d_ind
     w1 = d_ind
 
-    # Flatten arrays
     cross = cross.reshape(-1)
     p1 = p1.reshape(-1)
     p2 = p2.reshape(-1)
 
-    # Accumulate
     cross_b = torch.bincount(inds_f, weights=cross * w0, minlength=num_bins) + torch.bincount(
         inds_f + 1, weights=cross * w1, minlength=num_bins
     )
@@ -637,45 +644,14 @@ def compute_spectral_snr_from_halfsets(
 ):
     """
     Compute spectral SNR from two half-set reconstructions using symmetric/antisymmetric decomposition.
-
-    The method decomposes the Fourier transforms into:
-    - Symmetric: (F₁ + F₂)/2  → signal + correlated noise
-    - Antisymmetric: (F₁ - F₂)/2  → uncorrelated noise only
-
-    SSNR(q) = sqrt(signal_power / noise_power)
-
-    where:
-    - signal_power = (|symmetric|² - |antisymmetric|²)₊
-    - noise_power = |antisymmetric|²
-
-    Parameters
-    ----------
-    halfset_recons : list[torch.Tensor]
-        Two statistically-independent reconstructions, using half the dataset.
-    sampling: tuple[float,float]
-        Reconstruction sampling in Angstroms.
-    total_dose: float
-        Total _normalized_ electron dose, e.g. in DirectPtychography this is ~self.num_bf
-    epsilon: float, optional
-        Small number to avoid dividing by zero
-
-    Returns
-    -------
-    q_bins: NDarray
-        Spatial frequency bins
-    ssnr : NDarray
-        Radially averaged spectral SNR as function of spatial frequency
     """
-    # Compute Fourier transforms
     halfset_1, halfset_2 = halfset_recons
     F1 = torch.fft.fft2(halfset_1)
     F2 = torch.fft.fft2(halfset_2)
 
-    # Symmetric and antisymmetric decomposition
     symmetric = (F1 + F2) / 2
     antisymmetric = (F1 - F2) / 2
 
-    # Power spectra
     noise_power = antisymmetric.abs()
     total_power = symmetric.abs()
     signal_power = (total_power - noise_power).clamp_min(0)
@@ -699,11 +675,9 @@ def compute_spectral_snr_from_halfsets(
     w0 = 1.0 - d_ind
     w1 = d_ind
 
-    # Flatten arrays
     signal = signal_power.reshape(-1)
     noise = noise_power.reshape(-1)
 
-    # Accumulate
     signal_b = torch.bincount(inds_f, weights=signal * w0, minlength=num_bins) + torch.bincount(
         inds_f + 1, weights=signal * w1, minlength=num_bins
     )
@@ -726,20 +700,6 @@ def radially_average_fourier_array(
 ):
     """
     Radially average a corner-centered Fourier array.
-
-    Parameters
-    ----------
-    corner_centered_array : list[torch.Tensor]
-        Fourier array to average radially.
-    sampling: tuple[float,float]
-        Reconstruction sampling in Angstroms.
-
-    Returns
-    -------
-    q_bins: NDarray
-        Spatial frequency bins
-    array_1d : NDarray
-        Radially averaged Fourier array as function of spatial frequency
     """
     device = corner_centered_array.device
     nx, ny = corner_centered_array.shape
@@ -760,10 +720,8 @@ def radially_average_fourier_array(
     w0 = 1.0 - d_ind
     w1 = d_ind
 
-    # Flatten arrays
     array = corner_centered_array.reshape(-1)
 
-    # Accumulate
     array_b = torch.bincount(inds_f, weights=array * w0, minlength=num_bins) + torch.bincount(
         inds_f + 1, weights=array * w1, minlength=num_bins
     )
@@ -842,9 +800,7 @@ def _build_edges(phi, reliability, mask=None, wrap_around=True):
         inc = _find_wrap(phi_f[i1], phi_f[i2])
         rel = rel_f[i1] + rel_f[i2]
 
-        edges.append(  # ty:ignore[possibly-missing-attribute]
-            torch.stack([i1, i2, rel, inc], dim=1)
-        )
+        edges.append(torch.stack([i1, i2, rel, inc], dim=1))
 
     if wrap_around:
         add_edges(idx.flatten(), torch.roll(idx, -1, 1).flatten())
@@ -856,7 +812,6 @@ def _build_edges(phi, reliability, mask=None, wrap_around=True):
     edges = torch.cat(edges, dim=0)
     edges = edges[edges[:, 2].argsort()]
 
-    # return integer tensors only (CPU)
     return (
         edges[:, 0].long(),
         edges[:, 1].long(),
@@ -885,7 +840,6 @@ class UnionFindPhase:
         if rx == ry:
             return
 
-        # phase(y) + oy + inc = phase(x) + ox
         delta = ox - oy - inc_xy
 
         if self.rank[rx] < self.rank[ry]:
@@ -963,18 +917,6 @@ def _unwrap_phase_2d_torch_poisson(
 ):
     """
     Least-squares / Poisson phase unwrapping with optional mask.
-
-    Parameters
-    ----------
-    phi_wrapped : (H, W) tensor
-        Wrapped phase in (-pi, pi], any device
-    mask : (H, W) bool tensor, optional
-        True = valid pixel
-
-    Returns
-    -------
-    phi_unwrapped : (H, W) tensor
-        Unwrapped phase (same device as input)
     """
     device = phi_wrapped.device
     dtype = phi_wrapped.dtype
@@ -1014,10 +956,10 @@ def _unwrap_phase_2d_torch_poisson(
         denom = kx**2 + ky**2 + regularization_lambda
     else:
         denom = kx**2 + ky**2
-    denom[0, 0] = 1.0  # avoid divide by zero
+    denom[0, 0] = 1.0
 
     phi_hat = -div_hat / denom
-    phi_hat[0, 0] = 0.0  # fix piston
+    phi_hat[0, 0] = 0.0
 
     phi = torch.fft.ifftn(phi_hat).real
 
@@ -1049,7 +991,6 @@ def unwrap_phase_2d_torch(
         raise ValueError(
             f'`method` must be one of {{"reliability-sorting", "poisson"}}, got {method!r}'
         )
-
 
 
 def rotate_image(
