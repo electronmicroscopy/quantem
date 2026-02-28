@@ -6,8 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from quantem.core.fitting.base import RenderComponent, RenderContext
-from quantem.core.fitting.diffraction import OriginND
+from quantem.core.fitting.base import OriginND, RenderComponent, RenderContext
 
 
 def _parse_init(value: float | int | Sequence[float | int | None], *, name: str) -> float:
@@ -18,14 +17,6 @@ def _parse_init(value: float | int | Sequence[float | int | None], *, name: str)
             raise ValueError(f"{name} initial value cannot be None.")
         return float(value[0])
     return float(cast(float | int, value))
-
-
-def _softplus_pos(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return torch.nn.functional.softplus(x) + eps
-
-
-def _relu_pos(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return torch.nn.functional.relu(x) + eps
 
 
 class DCBackground(RenderComponent):
@@ -42,8 +33,7 @@ class DCBackground(RenderComponent):
         )
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
-        inten = _relu_pos(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype))
-        # inten = _softplus_pos(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype))
+        inten = torch.clamp(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype), min=0.0)
         return torch.ones(ctx.shape, device=ctx.device, dtype=ctx.dtype) * inten
 
 
@@ -79,9 +69,7 @@ class GaussianBackground(RenderComponent):
         cc = torch.arange(ctx.shape[1], device=ctx.device, dtype=ctx.dtype)[None, :]
         r0, c0 = self.origin.coords[0], self.origin.coords[1]
 
-        sigma = _relu_pos(self.sigma_raw.to(device=ctx.device, dtype=ctx.dtype), eps=1e-6)
-        # sigma = _softplus_pos(self.sigma_raw.to(device=ctx.device, dtype=ctx.dtype), eps=1e-6)
-        inten = _relu_pos(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype))
-        # inten = _softplus_pos(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype))
+        sigma = torch.clamp(self.sigma_raw.to(device=ctx.device, dtype=ctx.dtype), min=1e-6)
+        inten = torch.clamp(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype), min=0.0)
         r2 = (rr - r0) ** 2 + (cc - c0) ** 2
         return inten * torch.exp(-0.5 * r2 / (sigma * sigma))

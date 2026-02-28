@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from quantem.core.fitting.base import RenderComponent, RenderContext
+from quantem.core.fitting.base import OriginND, RenderComponent, RenderContext
 
 
 def _parse_init(value: float | int | Sequence[float | int | None], *, name: str) -> float:
@@ -17,14 +17,6 @@ def _parse_init(value: float | int | Sequence[float | int | None], *, name: str)
             raise ValueError(f"{name} initial value cannot be None.")
         return float(value[0])
     return float(cast(float | int, value))
-
-
-def _softplus_pos(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return torch.nn.functional.softplus(x) + eps
-
-
-def _relu_pos(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return torch.nn.functional.relu(x) + eps
 
 
 def _splat_patch(
@@ -63,17 +55,6 @@ def _splat_patch(
     put(r0i, c0i + 1, w01)
     put(r0i + 1, c0i, w10)
     put(r0i + 1, c0i + 1, w11)
-
-
-class OriginND(nn.Module):
-    def __init__(self, *, ndim: int, init: Sequence[float]):
-        super().__init__()
-        if int(ndim) <= 0:
-            raise ValueError("ndim must be >= 1.")
-        if len(init) != int(ndim):
-            raise ValueError("init length must match ndim.")
-        self.ndim = int(ndim)
-        self.coords = nn.Parameter(torch.as_tensor(init, dtype=torch.float32).reshape(self.ndim))
 
 
 class DiskTemplate(RenderComponent):
@@ -156,8 +137,7 @@ class DiskTemplate(RenderComponent):
 
     def patch_values(self) -> torch.Tensor:
         if self.refine_all_pixels:
-            return _relu_pos(self.template_raw).reshape(-1)
-            # return _softplus_pos(self.template_raw).reshape(-1)
+            return torch.clamp(self.template_raw, min=0.0).reshape(-1)
         return self.template_raw.reshape(-1)
 
     def patch_offsets(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -182,8 +162,7 @@ class DiskTemplate(RenderComponent):
         r0, c0 = self.origin.coords[0], self.origin.coords[1]
         if self.intensity_raw is None:
             raise RuntimeError("DiskTemplate intensity parameter is missing.")
-        scale = _relu_pos(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype))
-        # scale = _softplus_pos(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype))
+        scale = torch.clamp(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype), min=0.0)
         self.add_patch(out, r0=r0, c0=c0, scale=scale)
         return out
 
@@ -349,8 +328,7 @@ class SyntheticDiskLattice(RenderComponent):
             cc0 = centers_c[j]
 
             if self.per_disk_intensity:
-                inten = _relu_pos(self.i0_raw[j])
-                # inten = _softplus_pos(self.i0_raw[j])
+                inten = torch.clamp(self.i0_raw[j], min=0.0)
                 if active_order >= 1 and self.ir is not None and self.ic is not None:
                     inten = inten + self.ir[j] * dr + self.ic[j] * dc
                 if (
@@ -362,8 +340,7 @@ class SyntheticDiskLattice(RenderComponent):
                     inten = inten + self.irr[j] * dr2 + self.icc[j] * dc2 + self.irc[j] * drdc
                 inten = torch.clamp(inten, min=0.0)
             else:
-                inten = _relu_pos(self.i0_raw)
-                # inten = _softplus_pos(self.i0_raw)
+                inten = torch.clamp(self.i0_raw, min=0.0)
                 if active_order >= 1:
                     assert self.ir is not None and self.ic is not None
                     inten = inten + self.ir * rr0 + self.ic * cc0

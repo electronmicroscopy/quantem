@@ -11,10 +11,10 @@ from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset
 from quantem.core.fitting.base import (
     AdditiveRenderModel,
     FitBase,
+    OriginND,
     RenderComponent,
     RenderContext,
 )
-from quantem.core.fitting.diffraction import OriginND
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.core.visualization import show_2d
@@ -46,16 +46,10 @@ class ModelDiffraction(FitBase, AutoSerialize):
         self.preprocess_shifts: np.ndarray | None = None
         self.index_shape: tuple[int, ...] | None = None
 
-        self.ctx: RenderContext | None = None
-        self.model: AdditiveRenderModel | None = None
         self.target_mean: torch.Tensor | None = None
 
-        self.state_initialized: dict[str, torch.Tensor] | None = None
         self.state_mean_refined: dict[str, torch.Tensor] | None = None
-        self.state_current: dict[str, torch.Tensor] | None = None
         self.mean_refined: bool = False
-        self.mean_fit_history: list[float] = []
-        self.mean_fit_lrs: list[float] = []
 
     @classmethod
     def from_dataset(
@@ -67,54 +61,12 @@ class ModelDiffraction(FitBase, AutoSerialize):
             "from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance."
         )
 
-    def get_optimization_parameters(self) -> Any:
-        if self.model is None:
-            return []
-        return self.model.parameters()
-
-    def _forward_for_fit(self, *, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        return self.model(self.ctx)
-
-    def _fidelity_loss(
-        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
-    ) -> torch.Tensor:
+    def _data_loss(self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         if self.ctx is not None and self.ctx.mask is not None:
             diff = (pred - target) * self.ctx.mask
             denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
             return torch.sum(diff * diff) / denom
         return torch.mean((pred - target) ** 2)
-
-    def _soft_constraints(
-        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
-    ) -> dict[str, torch.Tensor]:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        constraint_weight = float(kwargs.get("constraint_weight", 1.0))
-        if constraint_weight == 0.0:
-            return {}
-        return {"constraint": constraint_weight * self.model.total_constraint_loss(self.ctx)}
-
-    def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return {k: v.detach().clone() for k, v in state.items()}
-
-    def _get_model_state_dict_copy(self) -> dict[str, torch.Tensor]:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        return self._clone_state_dict(self.model.state_dict())
-
-    def _load_model_state_dict_copy(self, state: dict[str, torch.Tensor]) -> None:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        self.model.load_state_dict(self._clone_state_dict(state), strict=True)
-
-    def _clear_histories(self) -> None:
-        for name in ("mean_fit_history", "mean_fit_lrs", "fit_history", "fit_lrs"):
-            if hasattr(self, name):
-                val = getattr(self, name)
-                if isinstance(val, list):
-                    val.clear()
 
     def _render_state_array(self, state: dict[str, torch.Tensor]) -> np.ndarray:
         if self.model is None or self.ctx is None:
@@ -157,18 +109,21 @@ class ModelDiffraction(FitBase, AutoSerialize):
                 raise RuntimeError(
                     "initialized state is unavailable. Call .define_model(...) first."
                 )
+            self._clear_fit_history_all()
         elif reset_to == "mean_refined":
             state = self.state_mean_refined
             if state is None:
                 raise RuntimeError(
                     "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
                 )
+            mean_hist = self.fit_history.get("mean")
+            self._clear_fit_history_all()
+            if mean_hist is not None:
+                self.fit_history["mean"] = mean_hist
         else:
             raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
 
         self._load_model_state_dict_copy(state)
-        self.state_current = self._get_model_state_dict_copy()
-        self._clear_histories()
         return self
 
     def preprocess(
@@ -285,10 +240,9 @@ class ModelDiffraction(FitBase, AutoSerialize):
 
         s0 = self._get_model_state_dict_copy()
         self.state_initialized = s0
-        self.state_current = self._clone_state_dict(s0)
         self.state_mean_refined = None
         self.mean_refined = False
-        self._clear_histories()
+        self._clear_fit_history_all()
         self.remove_optimizer()
         return self
 
@@ -314,20 +268,17 @@ class ModelDiffraction(FitBase, AutoSerialize):
         elif reset not in (False,):
             raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
 
-        fit_result = self.fit_render(
+        self.fit_render(
             target=self.target_mean,
             n_steps=int(n_steps),
+            constraint_weight=float(constraint_weight),
             optimizer_params=optimizer_params,
             scheduler_params=scheduler_params,
             progress=bool(progress),
             run_key="mean",
-            constraint_weight=float(constraint_weight),
         )
-        self.mean_fit_history.extend(fit_result.losses)
-        self.mean_fit_lrs.extend(fit_result.lrs)
 
         s_fit = self._get_model_state_dict_copy()
-        self.state_current = s_fit
         self.state_mean_refined = self._clone_state_dict(s_fit)
         self.mean_refined = True
         return self
@@ -342,7 +293,8 @@ class ModelDiffraction(FitBase, AutoSerialize):
         else:
             fig, ax = figax
 
-        losses = np.asarray(self.mean_fit_history, dtype=np.float64)
+        mean_hist = self.fit_history.get("mean")
+        losses = np.asarray([] if mean_hist is None else mean_hist.losses, dtype=np.float64)
         if losses.size == 0:
             ax.text(
                 0.5,
@@ -368,7 +320,7 @@ class ModelDiffraction(FitBase, AutoSerialize):
         ax.spines["left"].set_color("k")
         ax.set_xbound(-2, max(1, int(iters.max())) + 2)
 
-        lrs = np.asarray(self.mean_fit_lrs, dtype=np.float64)
+        lrs = np.asarray([] if mean_hist is None else mean_hist.lrs, dtype=np.float64)
         if plot_lrs and lrs.size > 0:
             if lrs.size == losses.size and not np.allclose(lrs, lrs[0]):
                 ax_lr = ax.twinx()
@@ -435,9 +387,10 @@ class ModelDiffraction(FitBase, AutoSerialize):
             vmax=vmax,
         )
 
-        if len(self.mean_fit_history) > 0:
+        mean_hist = self.fit_history.get("mean")
+        if mean_hist is not None and len(mean_hist.losses) > 0:
             fig.suptitle(
-                f"Final loss: {self.mean_fit_history[-1]:.3e} | Iters: {len(self.mean_fit_history)}",
+                f"Final loss: {mean_hist.losses[-1]:.3e} | Iters: {len(mean_hist.losses)}",
                 fontsize=13,
                 y=0.98,
             )
