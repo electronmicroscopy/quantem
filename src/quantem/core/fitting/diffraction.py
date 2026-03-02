@@ -71,7 +71,6 @@ class DiskTemplate(RenderComponent):
         name: str,
         array: np.ndarray,
         refine_all_pixels: bool = False,
-        place_at_origin: bool = False,
         normalize: str = "none",
         origin: OriginND | None = None,
         origin_key: str = "origin",
@@ -81,7 +80,6 @@ class DiskTemplate(RenderComponent):
         super().__init__()
         self.name = str(name)
         self.refine_all_pixels = bool(refine_all_pixels)
-        self.place_at_origin = bool(place_at_origin)
         self.origin = origin
         self.origin_key = str(origin_key)
 
@@ -102,13 +100,6 @@ class DiskTemplate(RenderComponent):
         template = torch.as_tensor(a, dtype=torch.float32)
         self.template_raw = nn.Parameter(template.clone(), requires_grad=self.refine_all_pixels)
 
-        if self.place_at_origin:
-            self.intensity_raw = nn.Parameter(
-                torch.as_tensor(_parse_init(intensity, name="intensity"), dtype=torch.float32)
-            )
-        else:
-            self.intensity_raw = None
-
         ht, wt = int(template.shape[0]), int(template.shape[1])
         rr, cc = np.mgrid[0:ht, 0:wt]
         rr = rr.astype(np.float32) - (ht - 1) * 0.5
@@ -127,7 +118,6 @@ class DiskTemplate(RenderComponent):
         name: str,
         array: np.ndarray,
         refine_all_pixels: bool = False,
-        place_at_origin: bool = False,
         normalize: str = "none",
         origin: OriginND | None = None,
         origin_key: str = "origin",
@@ -138,7 +128,6 @@ class DiskTemplate(RenderComponent):
             name=name,
             array=array,
             refine_all_pixels=refine_all_pixels,
-            place_at_origin=place_at_origin,
             normalize=normalize,
             origin=origin,
             origin_key=origin_key,
@@ -165,17 +154,10 @@ class DiskTemplate(RenderComponent):
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         out = torch.zeros(ctx.shape, device=ctx.device, dtype=ctx.dtype)
-        if not self.place_at_origin:
-            return out
         if self.origin is None:
-            raise RuntimeError(
-                "DiskTemplate with place_at_origin=True requires an OriginND instance."
-            )
+            raise RuntimeError("DiskTemplate.forward() requires an OriginND instance.")
         r0, c0 = self.origin.coords[0], self.origin.coords[1]
-        if self.intensity_raw is None:
-            raise RuntimeError("DiskTemplate intensity parameter is missing.")
-        scale = torch.clamp(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype), min=0.0)
-        self.add_patch(out, r0=r0, c0=c0, scale=scale)
+        self.add_patch(out, r0=r0, c0=c0, scale=torch.tensor(1.0))  # scale learned directly
         return out
 
     def _center_disk(self) -> None:
@@ -308,7 +290,7 @@ class SyntheticDiskLattice(RenderComponent):
         )
 
         if exclude_indices is None:
-            exclude = {(0, 0)} if bool(getattr(disk, "place_at_origin", False)) else set()
+            exclude = set()
         else:
             exclude = set(exclude_indices)
         uv: list[tuple[int, int]] = []

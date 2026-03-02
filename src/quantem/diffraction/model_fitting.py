@@ -15,6 +15,7 @@ from quantem.core.fitting.base import (
     RenderComponent,
     RenderContext,
 )
+from quantem.core.fitting.diffraction import DiskTemplate
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
@@ -77,60 +78,92 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         raise KeyError(f"Component not found: {target}")
 
     def get_component(self, name: str) -> RenderComponent:
+        """
+        Return a live model component by resolved name.
+
+        Parameters
+        ----------
+        name : str
+            Resolved component name.
+
+        Returns
+        -------
+        RenderComponent
+            The live component object.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        KeyError
+            If no component matches ``name``.
+        """
         return self._resolve_component_by_name(name)
 
-    def _render_disk_template_component(
-        self, component: RenderComponent, ctx: RenderContext
-    ) -> torch.Tensor:
-        from quantem.core.fitting.diffraction import DiskTemplate
+    def get_rendered_component(self, name: str) -> np.ndarray:
+        """
+        Render a component and return a NumPy array.
 
-        if not isinstance(component, DiskTemplate):
-            raise TypeError("Component is not a DiskTemplate.")
-        out = torch.zeros(ctx.shape, device=ctx.device, dtype=ctx.dtype)
-        r0 = torch.as_tensor((ctx.shape[0] - 1) * 0.5, device=ctx.device, dtype=ctx.dtype)
-        c0 = torch.as_tensor((ctx.shape[1] - 1) * 0.5, device=ctx.device, dtype=ctx.dtype)
-        scale = torch.as_tensor(1.0, device=ctx.device, dtype=ctx.dtype)
-        component.add_patch(out, r0=r0, c0=c0, scale=scale)
-        return out
+        Parameters
+        ----------
+        name : str
+            Resolved component name.
 
-    def get_rendered_component(
-        self, name: str, apply_hard_constraints: bool = False
-    ) -> np.ndarray:
+        Returns
+        -------
+        np.ndarray
+            Rendered component image.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined.
+        KeyError
+            If no component matches ``name``.
+        """
         if self.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
+        ctx = self.ctx
         component = self._resolve_component_by_name(name)
-        if apply_hard_constraints:
-            component.enforce_hard_constraints(self.ctx)
-        from quantem.core.fitting.diffraction import DiskTemplate
-
-        if isinstance(component, DiskTemplate):
-            rendered = self._render_disk_template_component(component, self.ctx)
-        else:
-            rendered = component(self.ctx)
+        rendered = component(ctx)
         return rendered.detach().cpu().numpy()
 
-    def get_rendered_disk_template(
-        self, apply_hard_constraints: bool = True, name: str | None = None
-    ) -> np.ndarray:
+    def get_rendered_disk_template(self, name: str | None = None) -> np.ndarray:
+        """
+        Return a DiskTemplate patch as a numpy array--not rendered onto the full frame.
+
+        Parameters
+        ----------
+        name : str | None, optional
+            DiskTemplate component name. If omitted, requires exactly one DiskTemplate.
+
+        Returns
+        -------
+        np.ndarray
+            Template-sized array from ``template_raw``.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined, no DiskTemplate exists, or multiple
+            DiskTemplates exist when ``name`` is omitted.
+        TypeError
+            If a named component exists but is not a DiskTemplate.
+        """
         if self.ctx is None or self.model is None:
             raise RuntimeError("Call .define_model(...) first.")
-        from quantem.core.fitting.diffraction import DiskTemplate
 
         if name is not None:
             component = self._resolve_component_by_name(name)
             if not isinstance(component, DiskTemplate):
                 raise TypeError(f"Component '{name}' is not a DiskTemplate.")
-            if apply_hard_constraints:
-                component.enforce_hard_constraints(self.ctx)
             return component.template_raw.detach().cpu().numpy()
         matches = [m for m in self.model.components if isinstance(m, DiskTemplate)]
         if len(matches) == 0:
             raise RuntimeError("No DiskTemplate components found.")
         if len(matches) > 1:
             raise RuntimeError("Multiple DiskTemplate components found; pass name explicitly.")
-        disk = matches[0]
-        if apply_hard_constraints:
-            disk.enforce_hard_constraints(self.ctx)
+        disk = cast(DiskTemplate, matches[0])
         return disk.template_raw.detach().cpu().numpy()
 
     def get_component_constraints(self, name: str) -> dict[str, dict[str, Any]]:
@@ -271,6 +304,43 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         constraint_params: dict[str, Any] | None = None,
         progress: bool = False,
     ) -> "ModelDiffraction":
+        """
+        Fit the mean diffraction pattern.
+
+        Parameters
+        ----------
+        n_steps : int, optional
+            Number of optimization steps.
+        reset : bool | Literal["initialized", "mean_refined"], optional
+            Reset behavior before fitting.
+        optimizer_params : dict | None, optional
+            Optimizer override for this fit call.
+        scheduler_params : dict | None, optional
+            Scheduler override for this fit call.
+        constraint_weight : float, optional
+            Global multiplier for soft-constraint loss.
+        constraint_params : dict[str, Any] | None, optional
+            Optional constraint updates applied once to components before fitting.
+            If ``None``, previously assigned constraints are reused.
+        progress : bool, optional
+            If ``True``, show progress bar.
+
+        Returns
+        -------
+        ModelDiffraction
+            Self, with updated fit state and history.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context/target are not defined.
+        ValueError
+            If ``reset`` has an unsupported value.
+
+        Notes
+        -----
+        Constraint assignments persist on components across fit calls.
+        """
         if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
         if reset is True:
