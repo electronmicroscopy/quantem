@@ -65,6 +65,81 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             "from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance."
         )
 
+    def _resolve_component_by_name(self, name: str) -> RenderComponent:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        target = str(name)
+        for idx, module in enumerate(self.model.components):
+            component = cast(RenderComponent, module)
+            resolved_name = self.model._component_constraint_name(component, idx)
+            if resolved_name == target:
+                return component
+        raise KeyError(f"Component not found: {target}")
+
+    def get_component(self, name: str) -> RenderComponent:
+        return self._resolve_component_by_name(name)
+
+    def _render_disk_template_component(
+        self, component: RenderComponent, ctx: RenderContext
+    ) -> torch.Tensor:
+        from quantem.core.fitting.diffraction import DiskTemplate
+
+        if not isinstance(component, DiskTemplate):
+            raise TypeError("Component is not a DiskTemplate.")
+        out = torch.zeros(ctx.shape, device=ctx.device, dtype=ctx.dtype)
+        r0 = torch.as_tensor((ctx.shape[0] - 1) * 0.5, device=ctx.device, dtype=ctx.dtype)
+        c0 = torch.as_tensor((ctx.shape[1] - 1) * 0.5, device=ctx.device, dtype=ctx.dtype)
+        scale = torch.as_tensor(1.0, device=ctx.device, dtype=ctx.dtype)
+        component.add_patch(out, r0=r0, c0=c0, scale=scale)
+        return out
+
+    def get_rendered_component(
+        self, name: str, apply_hard_constraints: bool = False
+    ) -> np.ndarray:
+        if self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        component = self._resolve_component_by_name(name)
+        if apply_hard_constraints:
+            component.enforce_hard_constraints(self.ctx)
+        from quantem.core.fitting.diffraction import DiskTemplate
+
+        if isinstance(component, DiskTemplate):
+            rendered = self._render_disk_template_component(component, self.ctx)
+        else:
+            rendered = component(self.ctx)
+        return rendered.detach().cpu().numpy()
+
+    def get_rendered_disk_template(
+        self, apply_hard_constraints: bool = True, name: str | None = None
+    ) -> np.ndarray:
+        if self.ctx is None or self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        from quantem.core.fitting.diffraction import DiskTemplate
+
+        if name is not None:
+            component = self._resolve_component_by_name(name)
+            if not isinstance(component, DiskTemplate):
+                raise TypeError(f"Component '{name}' is not a DiskTemplate.")
+            if apply_hard_constraints:
+                component.enforce_hard_constraints(self.ctx)
+            return component.template_raw.detach().cpu().numpy()
+        matches = [m for m in self.model.components if isinstance(m, DiskTemplate)]
+        if len(matches) == 0:
+            raise RuntimeError("No DiskTemplate components found.")
+        if len(matches) > 1:
+            raise RuntimeError("Multiple DiskTemplate components found; pass name explicitly.")
+        disk = matches[0]
+        if apply_hard_constraints:
+            disk.enforce_hard_constraints(self.ctx)
+        return disk.template_raw.detach().cpu().numpy()
+
+    def get_component_constraints(self, name: str) -> dict[str, dict[str, Any]]:
+        component = self._resolve_component_by_name(name)
+        return {
+            "hard": dict(component.hard_constraints),
+            "soft": dict(component.soft_constraints),
+        }
+
     def preprocess(
         self,
         *,
@@ -193,8 +268,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
+        constraint_params: dict[str, Any] | None = None,
         progress: bool = False,
-        **kwargs: Any,
     ) -> "ModelDiffraction":
         if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
@@ -211,6 +286,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             target=self.target_mean,
             n_steps=int(n_steps),
             constraint_weight=float(constraint_weight),
+            constraint_params=constraint_params,
             optimizer_params=optimizer_params,
             scheduler_params=scheduler_params,
             progress=bool(progress),
