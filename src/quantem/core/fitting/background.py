@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Sequence, cast
+from typing import Any, Sequence, cast
 
 import numpy as np
 import torch
@@ -25,12 +25,15 @@ class DCBackground(RenderComponent):
         *,
         intensity: float | int | Sequence[float | int | None] = 0.0,
         name: str = "dc_background",
+        constraint_params: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.name = str(name)
         self.intensity_raw = nn.Parameter(
             torch.tensor(_parse_init(intensity, name="intensity"), dtype=torch.float32)
         )
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         inten = torch.clamp(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype), min=0.0)
@@ -46,6 +49,7 @@ class GaussianBackground(RenderComponent):
         origin: OriginND | None = None,
         origin_key: str = "origin",
         name: str = "gaussian_background",
+        constraint_params: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.name = str(name)
@@ -57,6 +61,8 @@ class GaussianBackground(RenderComponent):
         self.intensity_raw = nn.Parameter(
             torch.tensor(_parse_init(intensity, name="intensity"), dtype=torch.float32)
         )
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
 
     def set_origin(self, origin: OriginND) -> None:
         self.origin = origin

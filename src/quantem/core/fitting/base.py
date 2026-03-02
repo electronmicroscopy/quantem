@@ -32,10 +32,91 @@ class OriginND(nn.Module):
 
 
 class RenderComponent(nn.Module):
+    DEFAULT_HARD_CONSTRAINTS: dict[str, Any] = {}
+    DEFAULT_SOFT_CONSTRAINTS: dict[str, Any] = {}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hard_constraints: dict[str, Any] = dict(self.DEFAULT_HARD_CONSTRAINTS)
+        self.soft_constraints: dict[str, Any] = dict(self.DEFAULT_SOFT_CONSTRAINTS)
+
+    def _set_constraints(
+        self,
+        current: dict[str, Any],
+        defaults: dict[str, Any],
+        constraints: dict[str, Any],
+        *,
+        strict: bool,
+    ) -> None:
+        if strict:
+            unknown = [k for k in constraints if k not in defaults]
+            if unknown:
+                keys = ", ".join(str(k) for k in unknown)
+                raise KeyError(f"Unknown constraint keys: {keys}")
+        current.update(constraints)
+
+    def set_hard_constraints(self, constraints: dict[str, Any], strict: bool = True) -> None:
+        self._set_constraints(
+            self.hard_constraints, self.DEFAULT_HARD_CONSTRAINTS, constraints, strict=strict
+        )
+
+    def set_soft_constraints(self, constraints: dict[str, Any], strict: bool = True) -> None:
+        self._set_constraints(
+            self.soft_constraints, self.DEFAULT_SOFT_CONSTRAINTS, constraints, strict=strict
+        )
+
+    def apply_constraint_params(self, params: dict[str, Any], strict: bool = True) -> None:
+        if not isinstance(params, dict):
+            raise TypeError("constraint params must be a dict.")
+        if "hard" in params or "soft" in params:
+            hard = params.get("hard")
+            soft = params.get("soft")
+            if hard is not None:
+                if not isinstance(hard, dict):
+                    raise TypeError("constraint params 'hard' value must be a dict.")
+                self.set_hard_constraints(hard, strict=strict)
+            if soft is not None:
+                if not isinstance(soft, dict):
+                    raise TypeError("constraint params 'soft' value must be a dict.")
+                self.set_soft_constraints(soft, strict=strict)
+            return
+
+        hard_updates: dict[str, Any] = {}
+        soft_updates: dict[str, Any] = {}
+        unknown: dict[str, Any] = {}
+        for k, v in params.items():
+            if k in self.DEFAULT_HARD_CONSTRAINTS:
+                hard_updates[k] = v
+            elif k in self.DEFAULT_SOFT_CONSTRAINTS:
+                soft_updates[k] = v
+            else:
+                unknown[k] = v
+
+        if unknown and strict:
+            keys = ", ".join(str(k) for k in unknown.keys())
+            raise KeyError(f"Unknown constraint keys for {self.__class__.__name__}: {keys}")
+        if unknown:
+            soft_updates.update(unknown)
+        if hard_updates:
+            self.set_hard_constraints(hard_updates, strict=strict)
+        if soft_updates:
+            self.set_soft_constraints(soft_updates, strict=strict)
+
+    def effective_soft_constraints(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        effective = dict(self.soft_constraints)
+        if isinstance(params, dict):
+            effective.update(params)
+        return effective
+
+    def enforce_hard_constraints(self, ctx: RenderContext) -> None:
+        return None
+
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         raise NotImplementedError
 
-    def constraint_loss(self, ctx: RenderContext) -> torch.Tensor:
+    def constraint_loss(
+        self, ctx: RenderContext, params: dict[str, Any] | None = None
+    ) -> torch.Tensor:
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
 
 
@@ -53,11 +134,65 @@ class AdditiveRenderModel(nn.Module):
             out = out + component(ctx)
         return out
 
-    def total_constraint_loss(self, ctx: RenderContext) -> torch.Tensor:
-        loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+    def _component_constraint_name(self, component: RenderComponent, idx: int) -> str:
+        name = getattr(component, "name", None)
+        if isinstance(name, str) and name:
+            return name
+        class_name = component.__class__.__name__
+        if class_name:
+            return class_name
+        return f"component_{idx}"
+
+    def apply_constraint_params(
+        self, constraint_params: dict[str, Any], strict: bool = True
+    ) -> None:
+        if not isinstance(constraint_params, dict):
+            raise TypeError("constraint_params must be a dict.")
+        source = constraint_params.get("components")
+        component_map = source if isinstance(source, dict) else constraint_params
+        for target, params in component_map.items():
+            if not isinstance(params, dict):
+                if strict:
+                    raise TypeError(f"Constraint params for '{target}' must be a dict.")
+                continue
+            target_str = str(target)
+            name_matches: list[RenderComponent] = []
+            class_matches: list[RenderComponent] = []
+            for idx, module in enumerate(self.components):
+                component = cast(RenderComponent, module)
+                if self._component_constraint_name(component, idx) == target_str:
+                    name_matches.append(component)
+                if component.__class__.__name__ == target_str:
+                    class_matches.append(component)
+            targets = name_matches if name_matches else class_matches
+            if not targets:
+                if strict:
+                    raise KeyError(f"No matching component for constraint target '{target_str}'.")
+                continue
+            for component in targets:
+                component.apply_constraint_params(params, strict=strict)
+
+    def apply_hard_constraints(self, ctx: RenderContext) -> None:
         for module in self.components:
             component = cast(RenderComponent, module)
-            loss = loss + component.constraint_loss(ctx)
+            component.enforce_hard_constraints(ctx)
+
+    def total_constraint_loss(
+        self, ctx: RenderContext, constraint_params: dict[str, Any] | None = None
+    ) -> torch.Tensor:
+        loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        per_component = None
+        if isinstance(constraint_params, dict):
+            comp_cfg = constraint_params.get("components")
+            if isinstance(comp_cfg, dict):
+                per_component = comp_cfg
+        for idx, module in enumerate(self.components):
+            component = cast(RenderComponent, module)
+            resolved_name = self._component_constraint_name(component, idx)
+            component_params = per_component.get(resolved_name) if per_component else None
+            if not isinstance(component_params, dict):
+                component_params = None
+            loss = loss + component.constraint_loss(ctx, params=component_params)
         return loss
 
 
@@ -128,12 +263,18 @@ class FitBase(OptimizerMixin):
         target: torch.Tensor,
         n_steps: int,
         constraint_weight: float = 1.0,
+        constraint_params: dict[str, Any] | None = None,
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         progress: bool = False,
         run_key: str = "default",
         **kwargs: Any,
     ) -> FitResult:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Model and context are not defined for fitting.")
+        if constraint_params is not None:
+            self.model.apply_constraint_params(constraint_params, strict=True)
+
         optimizer_rebuilt = False
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)
@@ -166,10 +307,13 @@ class FitBase(OptimizerMixin):
             self.zero_optimizer_grad()
             pred = self._forward_for_fit(target=target, **kwargs)
             data_loss = self._fidelity_loss(pred, target, **kwargs)
-            constraint_loss = self._constraint_loss(pred, target, **kwargs)
+            constraint_loss = self._constraint_loss(pred, target, constraint_params=None, **kwargs)
             total_loss = data_loss + constraint_weight * constraint_loss
             total_loss.backward()
             self.step_optimizer()
+            if self.model is None or self.ctx is None:
+                raise RuntimeError("Model and context are not defined for fitting.")
+            self.model.apply_hard_constraints(self.ctx)
             total_loss_value = float(total_loss.detach().cpu())
             self.step_scheduler(total_loss_value)
             losses.append(total_loss_value)
@@ -240,11 +384,16 @@ class FitBase(OptimizerMixin):
         return self.loss_fn(pred, target)
 
     def _constraint_loss(
-        self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        constraint_params: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         if self.model is None or self.ctx is None:
             raise RuntimeError("Model and context are not defined for fitting.")
-        return self.model.total_constraint_loss(self.ctx)
+        return self.model.total_constraint_loss(self.ctx, constraint_params=constraint_params)
 
 
 Component = RenderComponent

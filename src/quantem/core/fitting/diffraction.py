@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Iterable, Sequence, cast
+from typing import Any, Iterable, Sequence, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from quantem.core.fitting.base import OriginND, RenderComponent, RenderContext
@@ -58,6 +59,12 @@ def _splat_patch(
 
 
 class DiskTemplate(RenderComponent):
+    DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
+        "force_center": False,
+        "force_positive": True,
+    }
+    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {"tv_weight": 0.0}
+
     def __init__(
         self,
         *,
@@ -69,6 +76,7 @@ class DiskTemplate(RenderComponent):
         origin: OriginND | None = None,
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
+        constraint_params: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.name = str(name)
@@ -107,6 +115,10 @@ class DiskTemplate(RenderComponent):
         cc = cc.astype(np.float32) - (wt - 1) * 0.5
         self.register_buffer("dr", torch.as_tensor(rr.ravel(), dtype=torch.float32))
         self.register_buffer("dc", torch.as_tensor(cc.ravel(), dtype=torch.float32))
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
+        if bool(self.hard_constraints.get("force_positive", False)):
+            self._enforce_positivity()
 
     @classmethod
     def from_array(
@@ -120,6 +132,7 @@ class DiskTemplate(RenderComponent):
         origin: OriginND | None = None,
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
+        constraint_params: dict[str, Any] | None = None,
     ) -> "DiskTemplate":
         return cls(
             name=name,
@@ -130,14 +143,13 @@ class DiskTemplate(RenderComponent):
             origin=origin,
             origin_key=origin_key,
             intensity=intensity,
+            constraint_params=constraint_params,
         )
 
     def set_origin(self, origin: OriginND) -> None:
         self.origin = origin
 
     def patch_values(self) -> torch.Tensor:
-        if self.refine_all_pixels:
-            return torch.clamp(self.template_raw, min=0.0).reshape(-1)
         return self.template_raw.reshape(-1)
 
     def patch_offsets(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -165,6 +177,72 @@ class DiskTemplate(RenderComponent):
         scale = torch.clamp(self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype), min=0.0)
         self.add_patch(out, r0=r0, c0=c0, scale=scale)
         return out
+
+    def _center_disk(self) -> None:
+        with torch.no_grad():
+            template = self.template_raw
+            h, w = int(template.shape[0]), int(template.shape[1])
+            weights = torch.clamp(template, min=0.0)
+            mass = torch.sum(weights)
+            if float(mass.detach().cpu()) <= 1e-12:
+                return
+            rr = torch.arange(h, device=template.device, dtype=template.dtype)[:, None]
+            cc = torch.arange(w, device=template.device, dtype=template.dtype)[None, :]
+            com_r = torch.sum(weights * rr) / mass
+            com_c = torch.sum(weights * cc) / mass
+            target_r = torch.as_tensor((h - 1) * 0.5, device=template.device, dtype=template.dtype)
+            target_c = torch.as_tensor((w - 1) * 0.5, device=template.device, dtype=template.dtype)
+            shift_r = target_r - com_r
+            shift_c = target_c - com_c
+            denom_h = max(h - 1, 1)
+            denom_w = max(w - 1, 1)
+            ty = -2.0 * shift_r / float(denom_h)
+            tx = -2.0 * shift_c / float(denom_w)
+            theta = torch.as_tensor(
+                [[1.0, 0.0, tx], [0.0, 1.0, ty]],
+                device=template.device,
+                dtype=template.dtype,
+            )[None, ...]
+            src = template[None, None, :, :]
+            grid = F.affine_grid(theta, [1, 1, h, w], align_corners=True)
+            shifted = F.grid_sample(
+                src,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )[0, 0]
+            self.template_raw.copy_(shifted)
+
+    def _enforce_positivity(self) -> None:
+        with torch.no_grad():
+            self.template_raw.clamp_(min=0.0)
+
+    def enforce_hard_constraints(self, ctx: RenderContext) -> None:
+        if bool(self.hard_constraints.get("force_center", False)):
+            self._center_disk()
+        if bool(self.hard_constraints.get("force_positive", False)):
+            self._enforce_positivity()
+
+    def constraint_loss(
+        self, ctx: RenderContext, params: dict[str, object] | None = None
+    ) -> torch.Tensor:
+        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
+        tv_weight = float(cfg.get("tv_weight", 0.0))
+        if tv_weight <= 0.0:
+            return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        template = self.template_raw.to(device=ctx.device, dtype=ctx.dtype)
+        tv_r = (
+            torch.mean(torch.abs(template[1:, :] - template[:-1, :]))
+            if template.shape[0] > 1
+            else torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        )
+        tv_c = (
+            torch.mean(torch.abs(template[:, 1:] - template[:, :-1]))
+            if template.shape[1] > 1
+            else torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        )
+        return torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
 
 
 class SyntheticDiskLattice(RenderComponent):
@@ -194,6 +272,7 @@ class SyntheticDiskLattice(RenderComponent):
         boundary_px: float = 0.0,
         origin: OriginND | None = None,
         origin_key: str = "origin",
+        constraint_params: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.name = str(name)
@@ -282,6 +361,8 @@ class SyntheticDiskLattice(RenderComponent):
             self.irr = nn.Parameter(torch.tensor(irr_init, dtype=torch.float32))
             self.icc = nn.Parameter(torch.tensor(icc_init, dtype=torch.float32))
             self.irc = nn.Parameter(torch.tensor(irc_init, dtype=torch.float32))
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
 
     def set_origin(self, origin: OriginND) -> None:
         self.origin = origin
