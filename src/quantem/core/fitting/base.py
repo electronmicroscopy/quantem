@@ -177,22 +177,11 @@ class AdditiveRenderModel(nn.Module):
             component = cast(RenderComponent, module)
             component.enforce_hard_constraints(ctx)
 
-    def total_constraint_loss(
-        self, ctx: RenderContext, constraint_params: dict[str, Any] | None = None
-    ) -> torch.Tensor:
+    def total_constraint_loss(self, ctx: RenderContext) -> torch.Tensor:
         loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
-        per_component = None
-        if isinstance(constraint_params, dict):
-            comp_cfg = constraint_params.get("components")
-            if isinstance(comp_cfg, dict):
-                per_component = comp_cfg
-        for idx, module in enumerate(self.components):
+        for module in self.components:
             component = cast(RenderComponent, module)
-            resolved_name = self._component_constraint_name(component, idx)
-            component_params = per_component.get(resolved_name) if per_component else None
-            if not isinstance(component_params, dict):
-                component_params = None
-            loss = loss + component.constraint_loss(ctx, params=component_params)
+            loss = loss + component.constraint_loss(ctx)
         return loss
 
 
@@ -270,6 +259,45 @@ class FitBase(OptimizerMixin):
         run_key: str = "default",
         **kwargs: Any,
     ) -> FitResult:
+        """
+        Fit model parameters to a target render.
+
+        Parameters
+        ----------
+        target : torch.Tensor
+            Target tensor to fit.
+        n_steps : int
+            Number of optimization steps.
+        constraint_weight : float, optional
+            Multiplier applied to the summed soft-constraint loss.
+        constraint_params : dict[str, Any] | None, optional
+            Optional constraint updates applied once to matching components before
+            optimization starts. If ``None``, existing component constraints are reused.
+        optimizer_params : dict | None, optional
+            Optimizer configuration override for this call.
+        scheduler_params : dict | None, optional
+            Scheduler configuration override for this call.
+        progress : bool, optional
+            If ``True``, display a progress bar.
+        run_key : str, optional
+            History key used to store/append fit metrics.
+        **kwargs : Any
+            Forwarded to internal forward/loss hooks.
+
+        Returns
+        -------
+        FitResult
+            Fit history and final loss metadata for this run key.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are undefined.
+
+        Notes
+        -----
+        Hard constraints are applied after each optimizer step.
+        """
         if self.model is None or self.ctx is None:
             raise RuntimeError("Model and context are not defined for fitting.")
         if constraint_params is not None:
@@ -307,7 +335,7 @@ class FitBase(OptimizerMixin):
             self.zero_optimizer_grad()
             pred = self._forward_for_fit(target=target, **kwargs)
             data_loss = self._fidelity_loss(pred, target, **kwargs)
-            constraint_loss = self._constraint_loss(pred, target, constraint_params=None, **kwargs)
+            constraint_loss = self._constraint_loss(pred, target, **kwargs)
             total_loss = data_loss + constraint_weight * constraint_loss
             total_loss.backward()
             self.step_optimizer()
@@ -387,13 +415,11 @@ class FitBase(OptimizerMixin):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
-        *,
-        constraint_params: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         if self.model is None or self.ctx is None:
             raise RuntimeError("Model and context are not defined for fitting.")
-        return self.model.total_constraint_loss(self.ctx, constraint_params=constraint_params)
+        return self.model.total_constraint_loss(self.ctx)
 
 
 Component = RenderComponent
