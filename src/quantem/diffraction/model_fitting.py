@@ -1,117 +1,307 @@
 from __future__ import annotations
 
-"""High-level diffraction model fitting workflow utilities."""
-
-import warnings
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence, cast
 
 import numpy as np
 import torch
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
 
-from quantem.core.datastructures.dataset2d import Dataset2d
-from quantem.core.datastructures.dataset3d import Dataset3d
-from quantem.core.datastructures.dataset4d import Dataset4d
-from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
+from quantem.core.fitting.base import (
+    AdditiveRenderModel,
+    FitBase,
+    OriginND,
+    RenderComponent,
+    RenderContext,
+)
+from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.fitting.base import Model, ModelContext, Overlay, PreparedModel
-from quantem.core.fitting.diffraction import Origin2D
 from quantem.core.utils.imaging_utils import cross_correlation_shift
-from quantem.core.visualization import show_2d
+from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
 
 
-def _to_numpy(x: Any) -> np.ndarray:
-    """Convert arrays/tensors to NumPy arrays."""
-    if isinstance(x, np.ndarray):
-        return x
-    if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
+def _parse_init(value: float | int | Sequence[float | int | None], *, name: str) -> float:
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) == 0:
+            raise ValueError(f"{name} cannot be empty.")
+        if value[0] is None:
+            raise ValueError(f"{name} initial value cannot be None.")
+        return float(value[0])
+    return float(cast(float | int, value))
 
 
-class ModelDiffraction(AutoSerialize):
-    """
-    End-to-end helper for defining and fitting additive diffraction forward models.
-
-    This class wraps a diffraction dataset, builds an average reference image
-    (`image_ref`), compiles a composable component model, and provides optimization
-    routines for:
-    - fitting to the mean reference image,
-    - fitting selected individual diffraction patterns.
-
-    Features
-    --------
-    - Build a mean reference image with optional stack alignment.
-    - Define a composable model from origin/background/template/lattice components.
-    - Refine a mean model with Adam or L-BFGS.
-    - Fit all or selected patterns with optional progress bars.
-    - Plot reference/model comparisons and component overlays.
-
-    Typical workflow
-    ----------------
-    >>> md = ModelDiffraction.from_dataset(ds).preprocess().define_model(...)
-    >>> md.refine_mean_model(...)
-    >>> md.fit_all_patterns(...)
-    >>> md.plot_mean_model(...)
-    """
-
+class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
     _token = object()
+    DEFAULT_LR = 5e-2
+    DEFAULT_OPTIMIZER_TYPE = "adam"
 
     def __init__(self, dataset: Any, _token: object | None = None):
         if _token is not self._token:
             raise RuntimeError("Use ModelDiffraction.from_dataset() or .from_file().")
-        super().__init__()
+        AutoSerialize.__init__(self)
+        FitBase.__init__(self)
+
+        # Dataset/input references
         self.dataset = dataset
-        self.metadata: dict[str, Any] = {}
         self.image_ref: np.ndarray | None = None
         self.preprocess_shifts: np.ndarray | None = None
         self.index_shape: tuple[int, ...] | None = None
-        self.model: Model | None = None
-        self.prepared: PreparedModel | None = None
-        self.x_mean: torch.Tensor | None = None
-        self.x_defined: torch.Tensor | None = None
-        self.x_initial: torch.Tensor | None = None
+        self.target_mean: torch.Tensor | None = None
+
+        # Diffraction-specific state/checkpoints
+        self.state_mean_refined: dict[str, torch.Tensor] | None = None
         self.mean_refined: bool = False
-        self.x_patterns: torch.Tensor | None = None
-        self.pattern_fit_losses: np.ndarray | None = None
-        self.pattern_fit_linear_indices: np.ndarray | None = None
-        self.pattern_fit_indices: list[tuple[int, ...]] | None = None
 
-    @staticmethod
-    def _weak_softplus(x: torch.Tensor, *, scale: float) -> torch.Tensor:
-        s = torch.as_tensor(float(scale), device=x.device, dtype=x.dtype)
-        return torch.nn.functional.softplus(x / s) * s
+        # Misc metadata
+        self.metadata: dict[str, Any] = {}
 
     @classmethod
-    def _apply_intensity_transform(
-        cls, x: torch.Tensor, *, mode: str, weak_softplus_scale: float
-    ) -> torch.Tensor:
-        m = str(mode).lower()
-        if m == "none":
-            return x
-        if m == "weak_softplus":
-            return cls._weak_softplus(x, scale=weak_softplus_scale)
-        raise ValueError("intensity_transform must be one of: 'none', 'weak_softplus'.")
+    def from_dataset(
+        cls, dataset: Dataset2d | Dataset3d | Dataset4d | Dataset4dstem | Any
+    ) -> "ModelDiffraction":
+        if isinstance(dataset, (Dataset2d, Dataset3d, Dataset4d, Dataset4dstem)):
+            return cls(dataset=dataset, _token=cls._token)
+        raise TypeError(
+            "from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance."
+        )
 
-    @classmethod
-    def from_dataset(cls, dataset: Dataset2d | Dataset3d | Dataset4d | Dataset4dstem | Any) -> "ModelDiffraction":
+    @property
+    def components(self) -> torch.nn.ModuleList:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model.components
+
+    def get_component(self, name: str) -> RenderComponent:
         """
-        Construct a ModelDiffraction object from a QuantEM dataset container.
+        Return a live model component by resolved name.
 
         Parameters
         ----------
-        dataset
-            Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance.
+        name : str
+            Resolved component name.
 
         Returns
         -------
-        ModelDiffraction
-            New model-fitting helper bound to the provided dataset.
+        RenderComponent
+            The live component object.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        KeyError
+            If no component matches ``name``.
         """
-        if isinstance(dataset, (Dataset2d, Dataset3d, Dataset4d, Dataset4dstem)):
-            return cls(dataset=dataset, _token=cls._token)
-        raise TypeError("from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance.")
+        return self._resolve_component_by_name(name)
+
+    def get_rendered_component(self, name: str) -> np.ndarray:
+        """
+        Render a component and return a NumPy array.
+
+        Parameters
+        ----------
+        name : str
+            Resolved component name.
+
+        Returns
+        -------
+        np.ndarray
+            Rendered component image.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined.
+        KeyError
+            If no component matches ``name``.
+        """
+        if self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        ctx = self.ctx
+        component = self._resolve_component_by_name(name)
+        rendered = component(ctx)
+        return rendered.detach().cpu().numpy()
+
+    def get_rendered_disk_template(self, name: str | None = None) -> np.ndarray:
+        """
+        Return a DiskTemplate patch as a numpy array--not rendered onto the full frame.
+
+        Parameters
+        ----------
+        name : str | None, optional
+            DiskTemplate component name. If omitted, requires exactly one DiskTemplate.
+
+        Returns
+        -------
+        np.ndarray
+            Template-sized array from ``template_raw``.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined, no DiskTemplate exists, or multiple
+            DiskTemplates exist when ``name`` is omitted.
+        TypeError
+            If a named component exists but is not a DiskTemplate.
+        """
+        if self.ctx is None or self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+
+        if name is not None:
+            component = self._resolve_component_by_name(name)
+            if not isinstance(component, DiskTemplate):
+                raise TypeError(f"Component '{name}' is not a DiskTemplate.")
+            return component.template_raw.detach().cpu().numpy()
+        matches = [m for m in self.model.components if isinstance(m, DiskTemplate)]
+        if len(matches) == 0:
+            raise RuntimeError("No DiskTemplate components found.")
+        if len(matches) > 1:
+            raise RuntimeError("Multiple DiskTemplate components found; pass name explicitly.")
+        disk = cast(DiskTemplate, matches[0])
+        return disk.template_raw.detach().cpu().numpy()
+
+    def set_disk_template_trainable(
+        self, enabled: bool, name: str | None = None, rebuild_optimizer: bool = True
+    ) -> None:
+        """
+        Toggle DiskTemplate ``template_raw`` trainability.
+
+        Parameters
+        ----------
+        enabled : bool
+            If ``True``, enable optimization of ``template_raw``.
+        name : str | None, optional
+            DiskTemplate component name. If ``None``, applies to all DiskTemplate
+            components in the current model.
+        rebuild_optimizer : bool, optional
+            If ``True``, rebuild optimizer param groups after toggling.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        KeyError
+            If ``name`` does not match any component.
+        RuntimeError
+            If model is not defined or no DiskTemplate components are found.
+        TypeError
+            If ``name`` resolves to a non-DiskTemplate component.
+
+        Notes
+        -----
+        This toggles only ``template_raw.requires_grad``. Other DiskTemplate
+        parameters (for example ``intensity_raw``) are unchanged. When
+        ``rebuild_optimizer=True``, optimizer param groups are rebuilt to match
+        current ``requires_grad`` flags.
+        """
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+
+        if name is not None:
+            component = self._resolve_component_by_name(name)
+            if not isinstance(component, DiskTemplate):
+                raise TypeError(f"Component '{name}' is not a DiskTemplate.")
+            self.set_parameter_trainable(
+                name,
+                "template_raw",
+                enabled=enabled,
+                rebuild_optimizer=rebuild_optimizer,
+            )
+            return
+
+        disk_names = [
+            component_name
+            for component_name, component in self._iter_named_components()
+            if isinstance(component, DiskTemplate)
+        ]
+        if len(disk_names) == 0:
+            raise RuntimeError("No DiskTemplate components found.")
+
+        for disk_name in disk_names:
+            self.set_parameter_trainable(
+                disk_name,
+                "template_raw",
+                enabled=enabled,
+                rebuild_optimizer=False,
+            )
+        if rebuild_optimizer:
+            self._rebuild_optimizer_after_trainability_change()
+
+    def get_component_constraints(self, name: str) -> dict[str, dict[str, Any]]:
+        component = self._resolve_component_by_name(name)
+        return {
+            "hard": dict(component.hard_constraints),
+            "soft": dict(component.soft_constraints),
+        }
+
+    def get_overlay_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return origin and lattice disk-center coordinates for overlay plotting.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        origin_rc : np.ndarray
+            Origin coordinate array with shape ``(2,)`` as ``(row, col)``.
+        disk_centers_rc : np.ndarray
+            Disk-center array with shape ``(N, 2)`` as ``(row, col)``.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined.
+
+        Notes
+        -----
+        Coordinates are computed from current model parameters without mutating state.
+        Boundary filtering matches ``SyntheticDiskLattice.forward`` behavior.
+        """
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+
+        with torch.no_grad():
+            origin = cast(OriginND, self.model.origin)
+            origin_rc = origin.coords[:2].detach().cpu().numpy().astype(np.float32, copy=False)
+
+            centers: list[np.ndarray] = []
+            for module in self.model.components:
+                component = cast(RenderComponent, module)
+                if not isinstance(component, SyntheticDiskLattice):
+                    continue
+                if component.origin is None:
+                    continue
+                uv_indices = cast(torch.Tensor, component.uv_indices)
+                if torch.numel(uv_indices) == 0:
+                    continue
+
+                uv = torch.as_tensor(uv_indices, device=self.ctx.device)
+                u = uv[:, 0].to(dtype=self.ctx.dtype)
+                v = uv[:, 1].to(dtype=self.ctx.dtype)
+                r0, c0 = component.origin.coords[0], component.origin.coords[1]
+                centers_r = r0 + u * component.u_row + v * component.v_row
+                centers_c = c0 + u * component.u_col + v * component.v_col
+
+                b = torch.as_tensor(
+                    component.boundary_px, device=self.ctx.device, dtype=self.ctx.dtype
+                )
+                keep = (centers_r >= b) & (centers_r <= (self.ctx.shape[0] - 1) - b)
+                keep = keep & (centers_c >= b) & (centers_c <= (self.ctx.shape[1] - 1) - b)
+                if torch.any(keep):
+                    rc = torch.stack((centers_r[keep], centers_c[keep]), dim=1)
+                    centers.append(rc.detach().cpu().numpy().astype(np.float32, copy=False))
+
+            if centers:
+                disk_centers_rc = np.concatenate(centers, axis=0)
+            else:
+                disk_centers_rc = np.zeros((0, 2), dtype=np.float32)
+
+        return origin_rc, disk_centers_rc
 
     def preprocess(
         self,
@@ -122,73 +312,44 @@ class ModelDiffraction(AutoSerialize):
         max_shift: float | None = None,
         shift_order: int = 1,
     ) -> "ModelDiffraction":
-        """
-        Precompute the mean reference image used for model fitting.
-
-        Parameters
-        ----------
-        align
-            If True, align the flattened pattern stack before averaging.
-        edge_blend
-            Tukey edge taper width (pixels) used for robust FFT alignment.
-        upsample_factor
-            Sub-pixel alignment upsampling factor for cross-correlation shift.
-        max_shift
-            Optional maximum shift magnitude during alignment.
-        shift_order
-            Interpolation order used when applying shifts to patterns.
-
-        Returns
-        -------
-        ModelDiffraction
-            Returns self.
-
-        Notes
-        -----
-        - `dataset.array` is interpreted as `(..., H, W)`, where leading dimensions
-          are flattened into a pattern stack.
-        - The computed stack-average is stored in `self.image_ref`.
-        - If `align=False`, preprocessing is a direct mean over stack elements.
-        """
         arr = np.asarray(self.dataset.array)
         if arr.ndim < 2:
             raise ValueError("dataset.array must have at least 2 dimensions.")
-        H, W = arr.shape[-2], arr.shape[-1]
+        h, w = arr.shape[-2], arr.shape[-1]
         self.index_shape = tuple(arr.shape[:-2])
 
-        stack = arr.reshape((-1, H, W)).astype(np.float32, copy=False)
+        stack = arr.reshape((-1, h, w)).astype(np.float32, copy=False)
         n = stack.shape[0]
-
         if not align or n <= 1:
             self.image_ref = np.mean(stack, axis=0)
             self.preprocess_shifts = None
             return self
 
-        alpha_r = 0.0 if edge_blend <= 0 else min(1.0, 2.0 * float(edge_blend) / float(H))
-        alpha_c = 0.0 if edge_blend <= 0 else min(1.0, 2.0 * float(edge_blend) / float(W))
-        w = tukey(H, alpha=alpha_r)[:, None] * tukey(W, alpha=alpha_c)[None, :]
-        w = w.astype(np.float32, copy=False)
+        alpha_r = 0.0 if edge_blend <= 0 else min(1.0, 2.0 * float(edge_blend) / float(h))
+        alpha_c = 0.0 if edge_blend <= 0 else min(1.0, 2.0 * float(edge_blend) / float(w))
+        window = tukey(h, alpha=alpha_r)[:, None] * tukey(w, alpha=alpha_c)[None, :]
+        window = window.astype(np.float32, copy=False)
 
         shifts = np.zeros((n, 2), dtype=np.float32)
-        F_ref = np.fft.fft2(w * stack[0])
-
+        fft_ref = np.fft.fft2(window * stack[0])
         for i in range(1, n):
-            F_i = np.fft.fft2(w * stack[i])
-            drc, F_shift = cross_correlation_shift(
-                F_ref,
-                F_i,
+            fft_i = np.fft.fft2(window * stack[i])
+            drc, fft_shift = cross_correlation_shift(
+                fft_ref,
+                fft_i,
                 upsample_factor=int(upsample_factor),
                 max_shift=max_shift,
                 fft_input=True,
                 fft_output=True,
                 return_shifted_image=True,
             )
+            if not isinstance(drc, (list, tuple, np.ndarray)) or len(drc) < 2:
+                raise RuntimeError("cross_correlation_shift returned an invalid shift vector.")
             shifts[i, 0] = float(drc[0])
             shifts[i, 1] = float(drc[1])
-            F_ref = F_ref * (i / (i + 1)) + F_shift / (i + 1)
+            fft_ref = fft_ref * (i / (i + 1)) + fft_shift / (i + 1)
 
         shifts -= np.mean(shifts, axis=0, keepdims=True)
-
         aligned = np.empty_like(stack, dtype=np.float32)
         for i in range(n):
             aligned[i] = ndi_shift(
@@ -206,687 +367,168 @@ class ModelDiffraction(AutoSerialize):
     def define_model(
         self,
         *,
-        origin_row: float | tuple[float, float] | tuple[float, float, float | None],
-        origin_col: float | tuple[float, float] | tuple[float, float, float | None],
-        components: list[Any],
+        origin_row: float | Sequence[float],
+        origin_col: float | Sequence[float],
+        components: list[RenderComponent],
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         mask: np.ndarray | torch.Tensor | None = None,
         origin_key: str = "origin",
     ) -> "ModelDiffraction":
-        """
-        Define and compile a diffraction model against `image_ref`.
-
-        Parameters
-        ----------
-        origin_row, origin_col
-            Initial origin parameter specification. Supported forms are:
-            - scalar: fixed initial value with no explicit bounds
-            - `(value, deviation)`: symmetric bounds `(value - deviation, value + deviation)`
-            - `(value, lower_bound, upper_bound)`: explicit bounds
-        components
-            Sequence of model components (e.g. `DiskTemplate`, backgrounds, lattice).
-            Components are rendered additively in the provided order.
-        device
-            Torch device used for compiled parameters and rendering.
-        dtype
-            Torch dtype used for compiled parameters and rendering.
-        mask
-            Optional `(H, W)` mask for weighted loss during optimization.
-        origin_key
-            Name used to register/retrieve the origin component in context fields.
-
-        Returns
-        -------
-        ModelDiffraction
-            Returns self with compiled model state.
-
-        Notes
-        -----
-        - If `image_ref` is missing, `preprocess()` is run automatically.
-        - `Origin2D` is inserted automatically before user components.
-        - Component dependency ordering still matters for shared context fields:
-          for example, `DiskTemplate` should appear before `SyntheticDiskLattice`
-          when the lattice references that template.
-        - This method resets fit state (`x_defined`, `x_initial`, `x_mean`,
-          `x_patterns`, and pattern-fit metadata).
-        """
         if self.image_ref is None:
             self.preprocess()
-
         if self.image_ref is None:
             raise RuntimeError("image_ref not available.")
-        H, W = int(self.image_ref.shape[0]), int(self.image_ref.shape[1])
 
+        h, w = int(self.image_ref.shape[0]), int(self.image_ref.shape[1])
         dev = torch.device(device) if device is not None else torch.device("cpu")
         dt = dtype if dtype is not None else torch.float32
 
         mask_t = None
         if mask is not None:
-            if torch.is_tensor(mask):
-                mask_t = mask.to(device=dev, dtype=dt)
-            else:
-                m = np.asarray(mask)
-                if m.shape != (H, W):
-                    raise ValueError("mask must have shape (H, W).")
-                mask_t = torch.as_tensor(m.astype(np.float32, copy=False), device=dev, dtype=dt)
+            mask_t = (
+                mask.to(device=dev, dtype=dt)
+                if torch.is_tensor(mask)
+                else torch.as_tensor(mask, device=dev, dtype=dt)
+            )
+            if tuple(mask_t.shape) != (h, w):
+                raise ValueError("mask must have shape (H, W).")
 
-        ctx = ModelContext(H=H, W=W, device=dev, dtype=dt, mask=mask_t, fields={})
-        m = Model()
-        m.add([Origin2D(origin_key=str(origin_key), row=origin_row, col=origin_col)])
-        m.add(list(components))
+        origin = OriginND(
+            ndim=2,
+            init=[
+                _parse_init(origin_row, name="origin_row"),
+                _parse_init(origin_col, name="origin_col"),
+            ],
+        )
+        origin._quantem_origin_key = str(origin_key)  # type: ignore[attr-defined]
 
-        self.model = m
-        self.prepared = m.compile(ctx)
-        self.x_defined = self.prepared.x0.detach().clone()
-        self.x_initial = self.x_defined.detach().clone()
-        self.x_mean = self.x_initial.detach().clone()
+        for component in components:
+            if hasattr(component, "set_origin"):
+                component.set_origin(origin)  # type: ignore[misc]
+            elif hasattr(component, "origin") and getattr(component, "origin") is None:
+                component.origin = origin  # type: ignore[attr-defined]
+
+        self.model = AdditiveRenderModel(origin=origin, components=list(components)).to(
+            device=dev, dtype=dt
+        )
+        self.ctx = RenderContext(shape=(h, w), device=dev, dtype=dt, mask=mask_t, fields={})
+        self.target_mean = torch.as_tensor(self.image_ref, device=dev, dtype=dt)
+
+        s0 = self._get_model_state_dict_copy()
+        self.state_initialized = s0
+        self.state_mean_refined = None
         self.mean_refined = False
-        self.x_patterns = None
-        self.pattern_fit_losses = None
-        self.pattern_fit_linear_indices = None
-        self.pattern_fit_indices = None
+        self._clear_fit_history_all()
+        self.remove_optimizer()
         return self
 
-    def _fit_target_image(
+    def fit_mean_diffraction_pattern(
         self,
         *,
-        target: torch.Tensor,
-        x_start: torch.Tensor,
-        n_steps: int,
-        lr: float,
-        method: str,
-        power: float | None,
-        fit_disk_pixels: bool | None,
-        fit_only_disk_pixels: bool,
-        intensity_order: int | None,
-        enforce_disk_center_of_mass: bool,
-        normalize_disk_template_max: bool,
-        template_binary_weight: float,
-        template_binary_power: float,
-        intensity_transform: str,
-        weak_softplus_scale: float,
-        progress: bool = False,
-        progress_desc: str | None = None,
-    ) -> tuple[torch.Tensor, float]:
-        if self.prepared is None:
-            raise RuntimeError("Call .define_model(...) first.")
-
-        ctx = self.prepared.ctx
-        lb = self.prepared.lb
-        ub = self.prepared.ub
-
-        x = x_start.detach().clone().to(device=ctx.device, dtype=ctx.dtype)
-        x.requires_grad_(True)
-
-        if fit_disk_pixels is None:
-            fit_disk_pixels = any(p.tags.get("role") == "disk_pixel" for p in self.prepared.params)
-
-        freeze = torch.zeros_like(x, dtype=torch.bool)
-        disk_mask = torch.zeros_like(x, dtype=torch.bool)
-        for p in self.prepared.params:
-            if p.tags.get("role") == "disk_pixel":
-                disk_mask[p.index] = True
-            if intensity_order is not None and str(p.tags.get("role", "")).startswith("lat_int"):
-                p_ord = int(p.tags.get("intensity_order", 0))
-                if p_ord > int(intensity_order):
-                    freeze[p.index] = True
-
-        # Group disk pixel parameters by disk template for optional projection.
-        disk_param_groups: list[dict[str, Any]] = []
-        if (
-            enforce_disk_center_of_mass
-            or normalize_disk_template_max
-            or float(template_binary_weight) > 0.0
-        ):
-            disk_templates = self.prepared.ctx.fields.get("disk_templates", {})
-            grouped: dict[str, list[tuple[int, int]]] = {}
-            for p in self.prepared.params:
-                if p.tags.get("role") != "disk_pixel":
-                    continue
-                name = str(p.tags.get("disk"))
-                i_flat = int(p.tags.get("i"))
-                grouped.setdefault(name, []).append((i_flat, int(p.index)))
-            for name, pairs in grouped.items():
-                dmeta = disk_templates.get(name)
-                if dmeta is None:
-                    continue
-                order = sorted(pairs, key=lambda t: t[0])
-                p_idx = torch.as_tensor([t[1] for t in order], device=ctx.device, dtype=torch.long)
-                g: dict[str, Any] = {"param_idx": p_idx}
-                shape = dmeta.get("shape", None)
-                if shape is not None:
-                    g["shape"] = (int(shape[0]), int(shape[1]))
-                if enforce_disk_center_of_mass:
-                    flat_i = torch.as_tensor([t[0] for t in order], device=ctx.device, dtype=torch.long)
-                    g["dr"] = dmeta["dr"][flat_i]
-                    g["dc"] = dmeta["dc"][flat_i]
-                disk_param_groups.append(g)
-
-        if fit_only_disk_pixels:
-            if not fit_disk_pixels:
-                raise ValueError("fit_only_disk_pixels=True requires fit_disk_pixels=True.")
-            freeze[:] = True
-            freeze[disk_mask] = False
-        elif not fit_disk_pixels:
-            freeze[disk_mask] = True
-        x_frozen = x.detach().clone()
-
-        old_order_override = ctx.fields.get("lattice_intensity_order_override", None)
-        if intensity_order is not None:
-            ctx.fields["lattice_intensity_order_override"] = int(intensity_order)
-
-        target_t = target.to(device=ctx.device, dtype=ctx.dtype)
-        target_t = self._apply_intensity_transform(
-            target_t, mode=intensity_transform, weak_softplus_scale=weak_softplus_scale
-        )
-        if power is not None:
-            target_t = torch.clamp(target_t, min=0.0) ** float(power)
-
-        def clamp_inplace() -> None:
-            with torch.no_grad():
-                x.data = torch.max(torch.min(x.data, ub), lb)
-                if torch.any(freeze):
-                    x.data[freeze] = x_frozen[freeze]
-                if (
-                    enforce_disk_center_of_mass
-                    or normalize_disk_template_max
-                ) and disk_param_groups:
-                    eps = torch.as_tensor(1e-12, device=ctx.device, dtype=ctx.dtype)
-                    for g in disk_param_groups:
-                        p_idx = g["param_idx"]
-                        if torch.all(freeze[p_idx]):
-                            continue
-                        vals = torch.clamp(x.data[p_idx], min=0.0)
-                        if enforce_disk_center_of_mass:
-                            dr = g["dr"]
-                            dc = g["dc"]
-                            # Project template moments toward zero COM by iterative multiplicative reweighting.
-                            for _ in range(12):
-                                mass = torch.sum(vals)
-                                if mass <= eps:
-                                    break
-                                r_com = torch.sum(vals * dr) / mass
-                                c_com = torch.sum(vals * dc) / mass
-                                if torch.abs(r_com) <= 1e-5 and torch.abs(c_com) <= 1e-5:
-                                    break
-                                var_r = torch.sum(vals * dr * dr) / mass + eps
-                                var_c = torch.sum(vals * dc * dc) / mass + eps
-                                vals = vals * torch.exp(-(r_com / var_r) * dr - (c_com / var_c) * dc)
-                                vals = torch.clamp(vals, min=0.0)
-                        if normalize_disk_template_max:
-                            vmax = torch.max(vals)
-                            if vmax > eps:
-                                vals = vals / vmax
-                        x.data[p_idx] = vals
-
-        def loss_fn() -> torch.Tensor:
-            clamp_inplace()
-            pred = self.prepared.render(x)
-            pred = self._apply_intensity_transform(
-                pred, mode=intensity_transform, weak_softplus_scale=weak_softplus_scale
-            )
-            if power is not None:
-                pred = torch.clamp(pred, min=0.0) ** float(power)
-            if ctx.mask is not None:
-                m = ctx.mask
-                diff = (pred - target_t) * m
-                denom = torch.clamp(torch.sum(m), min=1.0)
-                loss = torch.sum(diff * diff) / denom
-            else:
-                diff = pred - target_t
-                loss = torch.mean(diff * diff)
-
-            if float(template_binary_weight) > 0.0 and disk_param_groups:
-                bp = torch.as_tensor(0.0, device=ctx.device, dtype=ctx.dtype)
-                n_bp = 0
-                eps = torch.as_tensor(1e-12, device=ctx.device, dtype=ctx.dtype)
-                pwr = float(template_binary_power)
-                for g in disk_param_groups:
-                    p_idx = g["param_idx"]
-                    vals = torch.clamp(x[p_idx], min=0.0)
-                    vmax = torch.max(vals)
-                    if vmax <= eps:
-                        continue
-                    vals_n = vals / (vmax + eps)
-                    core = vals_n * (1.0 - vals_n)
-                    if pwr != 1.0:
-                        core = torch.pow(core + eps, pwr)
-                    bp = bp + torch.mean(core)
-                    n_bp += 1
-                if n_bp > 0:
-                    loss = loss + float(template_binary_weight) * (bp / n_bp)
-
-            return loss
-
-        try:
-            if method == "adam":
-                opt = torch.optim.Adam([x], lr=lr)
-                step_iter: Any = range(int(n_steps))
-                if progress:
-                    try:
-                        from tqdm.auto import trange
-
-                        step_iter = trange(int(n_steps), desc=progress_desc or "Refining", leave=False)
-                    except Exception:
-                        warnings.warn("progress=True requested but tqdm is unavailable.", stacklevel=2)
-                for _ in step_iter:
-                    opt.zero_grad(set_to_none=True)
-                    loss = loss_fn()
-                    loss.backward()
-                    opt.step()
-                    clamp_inplace()
-            elif method == "lbfgs":
-                opt = torch.optim.LBFGS([x], lr=lr, max_iter=int(n_steps), line_search_fn="strong_wolfe")
-
-                def closure() -> torch.Tensor:
-                    opt.zero_grad(set_to_none=True)
-                    loss = loss_fn()
-                    loss.backward()
-                    return loss
-
-                opt.step(closure)
-                clamp_inplace()
-            else:
-                raise ValueError("method must be one of: 'lbfgs', 'adam'.")
-
-            with torch.no_grad():
-                final_loss = float(loss_fn().detach().cpu())
-            return x.detach().clone(), final_loss
-        finally:
-            if intensity_order is not None:
-                if old_order_override is None:
-                    ctx.fields.pop("lattice_intensity_order_override", None)
-                else:
-                    ctx.fields["lattice_intensity_order_override"] = old_order_override
-
-    def _resolve_pattern_indices(self, indices: Any, n: int, index_shape: tuple[int, ...]) -> np.ndarray:
-        if indices is None:
-            out = np.arange(n, dtype=np.int64)
-        elif isinstance(indices, (int, np.integer)):
-            out = np.asarray([int(indices)], dtype=np.int64)
-        elif isinstance(indices, slice):
-            out = np.arange(n, dtype=np.int64)[indices]
-        elif isinstance(indices, tuple) and all(isinstance(i, (int, np.integer)) for i in indices):
-            if len(index_shape) == 0:
-                if len(indices) != 0:
-                    raise ValueError("indices tuple must be empty for single-pattern datasets.")
-                out = np.asarray([0], dtype=np.int64)
-            else:
-                out = np.asarray([np.ravel_multi_index(tuple(int(i) for i in indices), index_shape)], dtype=np.int64)
-        elif isinstance(indices, tuple):
-            if len(index_shape) == 0:
-                raise ValueError("slice tuple indices are not valid for single-pattern datasets.")
-            grid = np.arange(n, dtype=np.int64).reshape(index_shape)
-            out = np.asarray(grid[indices], dtype=np.int64).ravel()
-        elif isinstance(indices, np.ndarray) and indices.dtype == np.bool_:
-            if indices.shape != index_shape:
-                raise ValueError(f"Boolean mask must have shape {index_shape}.")
-            out = np.flatnonzero(indices.ravel()).astype(np.int64, copy=False)
-        elif isinstance(indices, Sequence) and not isinstance(indices, (str, bytes)):
-            seq = list(indices)
-            if len(seq) == 0:
-                out = np.asarray([], dtype=np.int64)
-            elif isinstance(seq[0], (tuple, list, np.ndarray)):
-                if len(index_shape) == 0:
-                    raise ValueError("multi-index selection is not valid for single-pattern datasets.")
-                out = np.asarray(
-                    [np.ravel_multi_index(tuple(int(j) for j in i), index_shape) for i in seq],
-                    dtype=np.int64,
-                )
-            else:
-                out = np.asarray([int(i) for i in seq], dtype=np.int64)
-        else:
-            raise TypeError("Unsupported indices type for fit_all_patterns.")
-
-        if out.ndim != 1:
-            out = out.ravel()
-        if np.any(out < 0) or np.any(out >= n):
-            raise IndexError(f"indices must be in [0, {n - 1}].")
-        return out
-
-    def refine_mean_model(
-        self,
-        *,
-        n_steps: int = 50,
-        lr: float = 1e-3,
-        method: str = "adam",
-        power: float | None = 1.0,
-        fit_disk_pixels: bool | None = None,
-        fit_only_disk_pixels: bool = False,
-        intensity_order: int = 0,
-        enforce_disk_center_of_mass: bool = True,
-        normalize_disk_template_max: bool = False,
-        template_binary_weight: float = 0.0,
-        template_binary_power: float = 1.0,
-        warmup_disk_steps: int = 0,
-        overwrite_initial: bool = True,
-        intensity_transform: str = "none",
-        weak_softplus_scale: float = 1e-3,
-        progress: bool = False,
+        n_steps: int = 200,
+        reset: bool | Literal["initialized", "mean_refined"] = False,
+        optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        constraint_weight: float = 1.0,
+        constraint_params: dict[str, Any] | None = None,
+        progress: bool = True,
     ) -> "ModelDiffraction":
         """
-        Refine model parameters against the mean reference image.
+        Fit the mean diffraction pattern.
 
         Parameters
         ----------
-        n_steps
-            Number of optimization steps/iterations for the main phase.
-        lr
-            Optimizer learning rate.
-        method
-            Optimizer name: `"adam"` or `"lbfgs"`.
-        power
-            Optional power-law transform applied to both target and prediction
-            before computing MSE loss.
-        fit_disk_pixels
-            Controls whether `disk_pixel` parameters are trainable. If None,
-            inferred from model parameters.
-        fit_only_disk_pixels
-            If True, freeze all non-disk parameters.
-        warmup_disk_steps
-            Optional number of disk-only warmup steps run before the main phase.
-        overwrite_initial
-            If True, store refined parameters as new initial parameters for
-            subsequent per-pattern fitting.
-        intensity_transform
-            Optional intensity transform (`"none"` or `"weak_softplus"`) applied
-            before the power transform and loss evaluation.
-        weak_softplus_scale
-            Scale parameter used when `intensity_transform="weak_softplus"`.
-        progress
-            If True, show a tqdm progress bar (when tqdm is available).
+        n_steps : int, optional
+            Number of optimization steps.
+        reset : bool | Literal["initialized", "mean_refined"], optional
+            Reset behavior before fitting.
+        optimizer_params : dict | None, optional
+            Optimizer override for this fit call.
+        scheduler_params : dict | None, optional
+            Scheduler override for this fit call.
+        constraint_weight : float, optional
+            Global multiplier for soft-constraint loss.
+        constraint_params : dict[str, Any] | None, optional
+            Optional constraint updates applied once to components before fitting.
+            If ``None``, previously assigned constraints are reused.
+        progress : bool, optional
+            If ``True``, show progress bar.
 
         Returns
         -------
         ModelDiffraction
-            Returns self with updated `x_mean` (and optionally `x_initial`).
+            Self, with updated fit state and history.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context/target are not defined.
+        ValueError
+            If ``reset`` has an unsupported value.
+
+        Notes
+        -----
+        Constraint assignments persist on components across fit calls.
         """
-        method = str(method).lower()
-
-        if self.image_ref is None:
-            self.preprocess()
-        if self.image_ref is None or self.prepared is None or self.x_mean is None or self.x_initial is None:
+        if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
+        if reset is True:
+            self.reset("initialized")
+        elif isinstance(reset, str):
+            if reset not in ("initialized", "mean_refined"):
+                raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
+            self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset))
+        elif reset not in (False,):
+            raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
 
-        ctx = self.prepared.ctx
-        target = torch.as_tensor(self.image_ref, device=ctx.device, dtype=ctx.dtype)
-        x_start = self.x_initial if overwrite_initial else self.x_mean
-        if int(warmup_disk_steps) > 0:
-            x_start, _ = self._fit_target_image(
-                target=target,
-                x_start=x_start,
-                n_steps=int(warmup_disk_steps),
-                lr=float(lr),
-                method=method,
-                power=power,
-                fit_disk_pixels=True,
-                fit_only_disk_pixels=True,
-                intensity_order=int(intensity_order),
-                enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
-                normalize_disk_template_max=bool(normalize_disk_template_max),
-                template_binary_weight=float(template_binary_weight),
-                template_binary_power=float(template_binary_power),
-                intensity_transform=intensity_transform,
-                weak_softplus_scale=float(weak_softplus_scale),
-                progress=bool(progress),
-                progress_desc="Refine mean model (disk warmup)",
-            )
-        x_fit, _ = self._fit_target_image(
-            target=target,
-            x_start=x_start,
+        self.fit_render(
+            target=self.target_mean,
             n_steps=int(n_steps),
-            lr=float(lr),
-            method=method,
-            power=power,
-            fit_disk_pixels=fit_disk_pixels,
-            fit_only_disk_pixels=bool(fit_only_disk_pixels),
-            intensity_order=int(intensity_order),
-            enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
-            normalize_disk_template_max=bool(normalize_disk_template_max),
-            template_binary_weight=float(template_binary_weight),
-            template_binary_power=float(template_binary_power),
-            intensity_transform=intensity_transform,
-            weak_softplus_scale=float(weak_softplus_scale),
+            constraint_weight=float(constraint_weight),
+            constraint_params=constraint_params,
+            optimizer_params=optimizer_params,
+            scheduler_params=scheduler_params,
             progress=bool(progress),
-            progress_desc="Refine mean model",
+            run_key="mean",
         )
 
-        self.x_mean = x_fit
+        s_fit = self._get_model_state_dict_copy()
+        self.state_mean_refined = self._clone_state_dict(s_fit)
         self.mean_refined = True
-        if overwrite_initial:
-            self.x_initial = x_fit.detach().clone()
         return self
 
-    def fit_all_patterns(
+    def reset(
         self,
-        *,
-        indices: Any = None,
-        use_refined_init: bool = True,
-        strict_refined_init: bool = False,
-        n_steps: int = 50,
-        lr: float = 1e-3,
-        method: str = "adam",
-        power: float | None = 1.0,
-        fit_disk_pixels: bool | None = None,
-        fit_only_disk_pixels: bool = False,
-        intensity_order: int | None = None,
-        enforce_disk_center_of_mass: bool = True,
-        normalize_disk_template_max: bool = False,
-        template_binary_weight: float = 0.0,
-        template_binary_power: float = 1.0,
-        intensity_transform: str = "none",
-        weak_softplus_scale: float = 1e-3,
-        progress: bool = False,
+        reset_to: Literal["initialized", "mean_refined"] = "mean_refined",
     ) -> "ModelDiffraction":
-        """
-        Fit selected diffraction patterns using the compiled model.
-
-        Parameters
-        ----------
-        indices
-            Pattern selector. Supported forms include None (all patterns),
-            integer, slice, tuple indexing, list of linear indices, list of
-            multi-indices, or boolean mask shaped like scan dimensions.
-        use_refined_init
-            If True, initialize per-pattern fitting from `x_initial`.
-        strict_refined_init
-            If True, raise when refined init is requested before mean refinement.
-            If False, emit warning and fall back to defined initialization.
-        n_steps, lr, method, power, fit_disk_pixels, fit_only_disk_pixels
-            Optimization settings analogous to `refine_mean_model`.
-        intensity_transform, weak_softplus_scale
-            Prediction/target intensity transform options.
-        progress
-            If True, show a tqdm progress bar over selected patterns.
-
-        Returns
-        -------
-        ModelDiffraction
-            Returns self with:
-            - `x_patterns`: fitted parameter vectors `(n_selected, n_params)`
-            - `pattern_fit_losses`: per-pattern final losses
-            - index bookkeeping for selected patterns.
-        """
-        method = str(method).lower()
-
-        if self.prepared is None or self.x_defined is None or self.x_initial is None:
-            raise RuntimeError("Call .define_model(...) first.")
-
-        arr = np.asarray(self.dataset.array)
-        if arr.ndim < 2:
-            raise ValueError("dataset.array must have at least 2 dimensions.")
-        H, W = arr.shape[-2], arr.shape[-1]
-        index_shape = tuple(arr.shape[:-2])
-        stack = arr.reshape((-1, H, W)).astype(np.float32, copy=False)
-        n = int(stack.shape[0])
-
-        linear = self._resolve_pattern_indices(indices=indices, n=n, index_shape=index_shape)
-        if linear.size == 0:
-            raise ValueError("No patterns selected for fitting.")
-
-        if use_refined_init:
-            if not self.mean_refined:
-                msg = "fit_all_patterns(use_refined_init=True) was requested before refine_mean_model()."
-                if strict_refined_init:
-                    raise RuntimeError(msg)
-                warnings.warn(f"{msg} Falling back to defined initial parameters.", stacklevel=2)
-                x_seed = self.x_defined
-            else:
-                x_seed = self.x_initial
+        if reset_to == "initialized":
+            state = self.state_initialized
+            if state is None:
+                raise RuntimeError(
+                    "initialized state is unavailable. Call .define_model(...) first."
+                )
+            self._clear_fit_history_all()
+        elif reset_to == "mean_refined":
+            state = self.state_mean_refined
+            if state is None:
+                raise RuntimeError(
+                    "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
+                )
+            mean_hist = self.fit_history.get("mean")
+            self._clear_fit_history_all()
+            if mean_hist is not None:
+                self.fit_history["mean"] = mean_hist
         else:
-            x_seed = self.x_defined
+            raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
 
-        n_sel = int(linear.size)
-        x_fit_all = torch.empty(
-            (n_sel, self.x_defined.numel()),
-            device=self.prepared.ctx.device,
-            dtype=self.prepared.ctx.dtype,
-        )
-        losses = np.empty((n_sel,), dtype=np.float32)
-
-        pat_iter: Any = enumerate(linear)
-        if progress:
-            try:
-                from tqdm.auto import tqdm
-
-                pat_iter = enumerate(tqdm(linear, desc="Fit patterns", leave=False))
-            except Exception:
-                warnings.warn("progress=True requested but tqdm is unavailable.", stacklevel=2)
-
-        for j, i_lin in pat_iter:
-            target = torch.as_tensor(stack[int(i_lin)], device=self.prepared.ctx.device, dtype=self.prepared.ctx.dtype)
-            x_fit, loss = self._fit_target_image(
-                target=target,
-                x_start=x_seed,
-                n_steps=int(n_steps),
-                lr=float(lr),
-                method=method,
-                power=power,
-                fit_disk_pixels=fit_disk_pixels,
-                fit_only_disk_pixels=bool(fit_only_disk_pixels),
-                intensity_order=None if intensity_order is None else int(intensity_order),
-                enforce_disk_center_of_mass=bool(enforce_disk_center_of_mass),
-                normalize_disk_template_max=bool(normalize_disk_template_max),
-                template_binary_weight=float(template_binary_weight),
-                template_binary_power=float(template_binary_power),
-                intensity_transform=intensity_transform,
-                weak_softplus_scale=float(weak_softplus_scale),
-                progress=False,
-            )
-            x_fit_all[j] = x_fit
-            losses[j] = float(loss)
-
-        self.x_patterns = x_fit_all
-        self.pattern_fit_losses = losses
-        self.pattern_fit_linear_indices = linear
-        if len(index_shape) == 0:
-            self.pattern_fit_indices = [tuple() for _ in linear]
-        else:
-            self.pattern_fit_indices = [tuple(int(k) for k in np.unravel_index(int(i), index_shape)) for i in linear]
+        self._load_model_state_dict_copy(state)
         return self
 
-    def _apply_overlays(self, ax: Any, overlays: list[Overlay]) -> None:
-        for ov in overlays:
-            if ov.kind != "points_rc":
-                continue
-            d = dict(ov.data)
-            r = _to_numpy(d["r"]).ravel()
-            c = _to_numpy(d["c"]).ravel()
-            ax.scatter(
-                c,
-                r,
-                s=float(d.get("s", 60.0)),
-                marker=d.get("marker", "x"),
-                color=d.get("color", "orange"),
+    @property
+    def render_mean_refined(self) -> np.ndarray:
+        if self.state_mean_refined is None:
+            raise RuntimeError(
+                "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
             )
-
-    def plot_mean_model(
-        self,
-        *,
-        power: float = 0.25,
-        returnfig: bool = False,
-        show_overlays: bool = True,
-        axsize: tuple[int, int] = (6, 6),
-    ) -> tuple[Any, Any] | None:
-        """
-        Plot `image_ref` and the current mean-model prediction side-by-side.
-
-        Parameters
-        ----------
-        power
-            Display transform exponent applied to both reference and model images.
-        returnfig
-            If True, return `(fig, ax)` from `show_2d`.
-        show_overlays
-            If True, draw component overlays (e.g., origin and lattice markers).
-        axsize
-            Base axis size passed to the plotting helper.
-
-        Returns
-        -------
-        tuple[Any, Any] | None
-            `(fig, ax)` if `returnfig=True`, else None.
-        """
-        if self.image_ref is None:
-            self.preprocess()
-        if self.image_ref is None or self.prepared is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        if self.x_mean is None:
-            self.x_mean = self.prepared.x0.detach().clone()
-
-        ref = np.asarray(self.image_ref, dtype=np.float32)
-        mod = _to_numpy(self.prepared.render(self.x_mean)).astype(np.float32, copy=False)
-
-        refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
-        modp = mod if power == 1.0 else np.maximum(mod, 0.0) ** float(power)
-
-        vmin = float(min(refp.min(), modp.min()))
-        vmax = float(max(refp.max(), modp.max()))
-
-        fig, ax = show_2d(
-            [refp, modp],
-            title=["image_ref", "model"],
-            cmap="gray",
-            cbar=False,
-            returnfig=True,
-            axsize=axsize,
-            vmin=vmin,
-            vmax=vmax,
-        )
-
-        H, W = ref.shape[-2], ref.shape[-1]
-        pad = 0
-        boundaries = []
-        for c in getattr(self.prepared, "components", []):
-            b = getattr(c, "boundary_px", None)
-            if b is not None:
-                boundaries.append(float(b))
-        if boundaries:
-            min_b = float(np.min(boundaries))
-            if min_b < 0.0:
-                pad = int(np.ceil(-min_b))
-
-        axes: list[Any]
-        if isinstance(ax, np.ndarray):
-            axes = list(ax.ravel())
-        elif isinstance(ax, (list, tuple)):
-            axes = list(ax)
-        else:
-            axes = [ax]
-
-        for a in axes[:2]:
-            # Match imshow's pixel-edge convention so overlay markers land on pixel centers.
-            a.set_xlim(-0.5 - pad, (W - 0.5) + pad)
-            a.set_ylim((H - 0.5) + pad, -0.5 - pad)
-
-        if show_overlays:
-            ovs = self.prepared.overlays(self.x_mean)
-            if len(axes) >= 1:
-                self._apply_overlays(axes[0], ovs)
-            if len(axes) >= 2:
-                self._apply_overlays(axes[1], ovs)
-
-        if returnfig:
-            return fig, ax
-        return None
+        return self._render_state_array(self.state_mean_refined)

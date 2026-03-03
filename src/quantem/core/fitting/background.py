@@ -1,107 +1,112 @@
 from __future__ import annotations
 
-"""Background components for diffraction model fitting."""
-
-from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Sequence
 
 import torch
+from torch import nn
 
-from quantem.core.fitting.base import Component, ModelContext, Overlay, Parameter
-from quantem.core.fitting.diffraction import _origin_indices
+from quantem.core.fitting.base import OriginND, RenderComponent, RenderContext
 
 
-class DCBackground(Component):
-    """
-    Uniform additive background with nonnegative intensity.
-
-    Parameters
-    ----------
-    intensity
-        Constant background intensity parameter specification.
-    name
-        Component name.
-    """
-
+class DCBackground(RenderComponent):
     def __init__(
         self,
         *,
-        intensity: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
+        intensity: float | int | Sequence[float | int | None] = 0.0,
         name: str = "dc_background",
+        constraint_params: dict[str, Any] | None = None,
     ):
-        super().__init__(name=name)
-        self.p_intensity = Parameter(intensity, lower_bound=0.0, tags={"role": "dc_bg"})
+        """
+        Build a constant background component.
 
-    def parameters(self) -> list[Parameter]:
-        return [self.p_intensity]
+        Notes
+        -----
+        Validity is enforced via hard constraints/parameter bounds. Forward
+        intentionally avoids hard clamps for gradient flow.
+        """
+        super().__init__()
+        self.name = str(name)
+        intensity_init, intensity_lo, intensity_hi = self.parse_bounded_init(
+            intensity, name="intensity"
+        )
+        self.intensity_raw = nn.Parameter(torch.tensor(intensity_init, dtype=torch.float32))
+        bounded_lo = 0.0 if intensity_lo is None else max(float(intensity_lo), 0.0)
+        self.register_parameter_bounds("intensity_raw", bounded_lo, intensity_hi)
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
+        self._enforce_parameter_bounds()
 
-    def prepare(self, ctx: ModelContext) -> Any:
-        idx = self.p_intensity.index
+    def forward(self, ctx: RenderContext) -> torch.Tensor:
+        """
+        Render constant background from raw trainable intensity.
 
-        @dataclass
-        class Prepared:
-            def render(self, out: torch.Tensor, x: torch.Tensor, ctx: ModelContext) -> None:
-                out.add_(x[idx])
-
-            def overlays(self, x: torch.Tensor, ctx: ModelContext) -> Iterable[Overlay]:
-                return []
-
-        return Prepared()
+        Notes
+        -----
+        Validity is enforced via hard constraints/parameter bounds, not via
+        forward-time hard clamps.
+        """
+        inten = self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype)
+        return torch.ones(ctx.shape, device=ctx.device, dtype=ctx.dtype) * inten
 
 
-class GaussianBackground(Component):
-    """
-    Radial Gaussian background centered at a named model origin.
-
-    Parameters
-    ----------
-    sigma
-        Gaussian width parameter specification (constrained to `>= 1e-6`).
-    intensity
-        Nonnegative Gaussian amplitude parameter specification.
-    origin_key
-        Name of the origin to use from `ModelContext.fields["origins"]`.
-    name
-        Component name.
-    """
-
+class GaussianBackground(RenderComponent):  # TODO this should be N dimensional by default
     def __init__(
         self,
         *,
-        sigma: float | tuple[float, float] | tuple[float, float, float | None] = (40.0, 5.0, None),
-        intensity: float | tuple[float, float] | tuple[float, float, float | None] = 0.0,
+        sigma: float | int | Sequence[float | int | None] = (40.0, 5.0, None),
+        intensity: float | int | Sequence[float | int | None] = 0.0,
+        origin: OriginND | None = None,
         origin_key: str = "origin",
         name: str = "gaussian_background",
+        constraint_params: dict[str, Any] | None = None,
     ):
-        super().__init__(name=name)
+        """
+        Build a Gaussian background component centered at origin.
+
+        Notes
+        -----
+        ``sigma_raw`` and ``intensity_raw`` validity is enforced via hard
+        constraints/parameter bounds. Forward intentionally avoids hard clamps
+        for gradient flow.
+        """
+        super().__init__()
+        self.name = str(name)
+        self.origin = origin
         self.origin_key = str(origin_key)
-        self.p_sigma = Parameter(sigma, lower_bound=1e-6, upper_bound=None, tags={"role": "gauss_sigma"})
-        self.p_intensity = Parameter(intensity, lower_bound=0.0, tags={"role": "gauss_int"})
+        sigma_init, sigma_lo, sigma_hi = self.parse_bounded_init(sigma, name="sigma")
+        intensity_init, intensity_lo, intensity_hi = self.parse_bounded_init(
+            intensity, name="intensity"
+        )
+        self.sigma_raw = nn.Parameter(torch.tensor(sigma_init, dtype=torch.float32))
+        sigma_bounded_lo = 1e-6 if sigma_lo is None else max(float(sigma_lo), 1e-6)
+        self.register_parameter_bounds("sigma_raw", sigma_bounded_lo, sigma_hi)
+        self.intensity_raw = nn.Parameter(torch.tensor(intensity_init, dtype=torch.float32))
+        intensity_bounded_lo = 0.0 if intensity_lo is None else max(float(intensity_lo), 0.0)
+        self.register_parameter_bounds("intensity_raw", intensity_bounded_lo, intensity_hi)
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
+        self._enforce_parameter_bounds()
 
-    def parameters(self) -> list[Parameter]:
-        return [self.p_sigma, self.p_intensity]
+    def set_origin(self, origin: OriginND) -> None:
+        self.origin = origin
 
-    def prepare(self, ctx: ModelContext) -> Any:
-        i_sig = self.p_sigma.index
-        i_int = self.p_intensity.index
-        r_idx, c_idx = _origin_indices(ctx, self.origin_key)
+    def forward(self, ctx: RenderContext) -> torch.Tensor:
+        """
+        Render Gaussian background from raw trainable parameters.
 
-        rr = torch.arange(ctx.H, device=ctx.device, dtype=ctx.dtype)[:, None]
-        cc = torch.arange(ctx.W, device=ctx.device, dtype=ctx.dtype)[None, :]
+        Notes
+        -----
+        Validity is enforced via hard constraints/parameter bounds, not via
+        forward-time hard clamps.
+        """
+        if self.origin is None:
+            raise RuntimeError("GaussianBackground requires an OriginND instance.")
 
-        @dataclass
-        class Prepared:
-            def render(self, out: torch.Tensor, x: torch.Tensor, ctx: ModelContext) -> None:
-                sig = torch.clamp(x[i_sig], min=1e-6)
-                inten = x[i_int]
-                r0 = x[r_idx]
-                c0 = x[c_idx]
-                dr = rr - r0
-                dc = cc - c0
-                r2 = dr * dr + dc * dc
-                out.add_(inten * torch.exp(-0.5 * r2 / (sig * sig)))
+        rr = torch.arange(ctx.shape[0], device=ctx.device, dtype=ctx.dtype)[:, None]
+        cc = torch.arange(ctx.shape[1], device=ctx.device, dtype=ctx.dtype)[None, :]
+        r0, c0 = self.origin.coords[0], self.origin.coords[1]
 
-            def overlays(self, x: torch.Tensor, ctx: ModelContext) -> Iterable[Overlay]:
-                return []
-
-        return Prepared()
+        sigma = self.sigma_raw.to(device=ctx.device, dtype=ctx.dtype)
+        inten = self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype)
+        r2 = (rr - r0) ** 2 + (cc - c0) ** 2
+        return inten * torch.exp(-0.5 * r2 / (sigma * sigma))

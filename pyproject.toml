@@ -29,7 +29,7 @@ members = ["widget"]
 
 [project]
 name = "quantem"
-version = "0.1.7"
+version = "0.1.8"
 description = "quantitative electron microscopy analysis toolkit."
 keywords = ["EM","TEM","STEM","4DSTEM"]
 readme = "README.md"
@@ -53,6 +53,7 @@ dependencies = [
   "torchmetrics>=1.7.3",
   "optuna>=4.5.0",
   "hdf5plugin>=6.0.0",
+  "torchinfo>=1.8.0",
 ]
 
 [project.optional-dependencies]
@@ -72,6 +73,7 @@ only-include = [
 [dependency-groups]
 test = [
     "pytest>=8.3.5",
+    "pytest-cov>=7.0.0",
 ]
 dev = [
     { include-group = "test" },
