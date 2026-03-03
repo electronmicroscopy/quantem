@@ -78,17 +78,6 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             raise RuntimeError("Call .define_model(...) first.")
         return [cast(str, c.name) for c in self.components]
 
-    def _resolve_component_by_name(self, name: str) -> RenderComponent:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        target = str(name)
-        for idx, module in enumerate(self.model.components):
-            component = cast(RenderComponent, module)
-            resolved_name = self.model._component_constraint_name(component, idx)
-            if resolved_name == target:
-                return component
-        raise KeyError(f"Component not found: {target}")
-
     def get_component(self, name: str) -> RenderComponent:
         """
         Return a live model component by resolved name.
@@ -177,6 +166,75 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             raise RuntimeError("Multiple DiskTemplate components found; pass name explicitly.")
         disk = cast(DiskTemplate, matches[0])
         return disk.template_raw.detach().cpu().numpy()
+
+    def set_disk_template_trainable(
+        self, enabled: bool, name: str | None = None, rebuild_optimizer: bool = True
+    ) -> None:
+        """
+        Toggle DiskTemplate ``template_raw`` trainability.
+
+        Parameters
+        ----------
+        enabled : bool
+            If ``True``, enable optimization of ``template_raw``.
+        name : str | None, optional
+            DiskTemplate component name. If ``None``, applies to all DiskTemplate
+            components in the current model.
+        rebuild_optimizer : bool, optional
+            If ``True``, rebuild optimizer param groups after toggling.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        KeyError
+            If ``name`` does not match any component.
+        RuntimeError
+            If model is not defined or no DiskTemplate components are found.
+        TypeError
+            If ``name`` resolves to a non-DiskTemplate component.
+
+        Notes
+        -----
+        This toggles only ``template_raw.requires_grad``. Other DiskTemplate
+        parameters (for example ``intensity_raw``) are unchanged. When
+        ``rebuild_optimizer=True``, optimizer param groups are rebuilt to match
+        current ``requires_grad`` flags.
+        """
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+
+        if name is not None:
+            component = self._resolve_component_by_name(name)
+            if not isinstance(component, DiskTemplate):
+                raise TypeError(f"Component '{name}' is not a DiskTemplate.")
+            self.set_parameter_trainable(
+                name,
+                "template_raw",
+                enabled=enabled,
+                rebuild_optimizer=rebuild_optimizer,
+            )
+            return
+
+        disk_names: list[str] = []
+        for idx, module in enumerate(self.model.components):
+            component = cast(RenderComponent, module)
+            if isinstance(component, DiskTemplate):
+                disk_names.append(self.model._component_constraint_name(component, idx))
+        if len(disk_names) == 0:
+            raise RuntimeError("No DiskTemplate components found.")
+
+        for disk_name in disk_names:
+            self.set_parameter_trainable(
+                disk_name,
+                "template_raw",
+                enabled=enabled,
+                rebuild_optimizer=False,
+            )
+        if rebuild_optimizer:
+            self._rebuild_optimizer_after_trainability_change()
 
     def get_component_constraints(self, name: str) -> dict[str, dict[str, Any]]:
         component = self._resolve_component_by_name(name)
@@ -380,7 +438,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
-        progress: bool = False,
+        progress: bool = True,
     ) -> "ModelDiffraction":
         """
         Fit the mean diffraction pattern.
