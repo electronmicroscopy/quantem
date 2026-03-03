@@ -4,6 +4,7 @@ import numpy as np
 from matplotlib import gridspec
 from matplotlib import pyplot as plt
 
+from quantem.core import config
 from quantem.core.visualization import show_2d
 
 if TYPE_CHECKING:
@@ -46,12 +47,13 @@ class ModelDiffractionVisualizations:
         -------
         None
         """
+        colors = config.get("viz.colors.set")
         if overlay_origin and origin_rc.shape == (2,):
             kw_origin = {
                 "marker": "+",
-                "color": "red",
+                "color": colors[0],
                 "markersize": 10,
-                "markeredgewidth": 1.5,
+                "markeredgewidth": 3,
                 "linestyle": "None",
             }
             if origin_marker_kwargs is not None:
@@ -61,9 +63,9 @@ class ModelDiffractionVisualizations:
         if overlay_disks and disk_centers_rc.ndim == 2 and disk_centers_rc.shape[0] > 0:
             kw_disks = {
                 "marker": "x",
-                "color": "cyan",
+                "color": colors[1],
                 "markersize": 5,
-                "markeredgewidth": 1.0,
+                "markeredgewidth": 2.0,
                 "linestyle": "None",
             }
             if disk_marker_kwargs is not None:
@@ -74,6 +76,9 @@ class ModelDiffractionVisualizations:
         self, figax: tuple[Any, Any] | None = None, plot_lrs: bool = True
     ) -> tuple[Any, Any]:
         md = cast("ModelDiffraction", self)
+        colors = config.get("viz.colors.set")
+        loss_color = "k"
+        lr_color = colors[8]
 
         if figax is None:
             fig, ax = plt.subplots()
@@ -100,11 +105,11 @@ class ModelDiffractionVisualizations:
 
         iters = np.arange(losses.size)
         lines: list[Any] = []
-        lines.extend(ax.semilogy(iters, losses, c="k", lw=2, label="loss"))
+        lines.extend(ax.semilogy(iters, losses, c=loss_color, lw=2, label="loss"))
         ax.set_xlabel("Iterations")
-        ax.set_ylabel("Loss", color="k")
-        ax.tick_params(axis="y", which="both", colors="k")
-        ax.spines["left"].set_color("k")
+        ax.set_ylabel("Loss", color=loss_color)
+        ax.tick_params(axis="y", which="both", colors=loss_color)
+        ax.spines["left"].set_color(loss_color)
         ax.set_xbound(-2, max(1, int(iters.max())) + 2)
 
         lrs = np.asarray([] if mean_hist is None else mean_hist.lrs, dtype=np.float64)
@@ -116,13 +121,11 @@ class ModelDiffractionVisualizations:
                 ax.patch.set_visible(False)
                 ax_lr.spines["left"].set_visible(False)
                 lines.extend(
-                    ax_lr.semilogy(
-                        np.arange(lrs.size), lrs, c="tab:blue", lw=2, ls="--", label="LR"
-                    )
+                    ax_lr.semilogy(np.arange(lrs.size), lrs, c=lr_color, lw=2, ls="--", label="LR")
                 )
-                ax_lr.set_ylabel("LR", color="tab:blue")
-                ax_lr.tick_params(axis="y", which="both", colors="tab:blue")
-                ax_lr.spines["right"].set_color("tab:blue")
+                ax_lr.set_ylabel("LR", color=lr_color)
+                ax_lr.tick_params(axis="y", which="both", colors=lr_color)
+                ax_lr.spines["right"].set_color(lr_color)
             else:
                 ax.set_title(f"LR: {float(lrs[-1]):.2e}", fontsize=10)
 
@@ -211,7 +214,7 @@ class ModelDiffractionVisualizations:
             [refp, predp],
             figax=(fig, axs),
             title=["image_ref", "model"],
-            cmap="gray",
+            cmap=config.get("viz.cmap"),
             cbar=bool(cbar),
             returnfig=False,
             axsize=axsize,
@@ -314,7 +317,7 @@ class ModelDiffractionVisualizations:
         fig, ax = show_2d(
             [refp, predp],
             title=["image_ref", "model"],
-            cmap="gray",
+            cmap=config.get("viz.cmap"),
             cbar=False,
             returnfig=True,
             axsize=axsize,
@@ -402,7 +405,7 @@ class ModelDiffractionVisualizations:
         fig, ax = show_2d(
             summed_scaled,
             title=title,
-            cmap="gray",
+            cmap=config.get("viz.cmap"),
             cbar=bool(cbar),
             returnfig=True,
             axsize=axsize,
