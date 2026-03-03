@@ -356,12 +356,13 @@ class ModelDiffractionVisualizations:
         disk_marker_kwargs: dict[str, Any] | None = None,
     ) -> tuple[Any, Any] | None:
         """
-        Render and display one or more named components.
+        Render and display a summed component image.
 
         Parameters
         ----------
         components : str | list[str]
-            Component name or list of component names.
+            Component name or list of component names. Multiple names are
+            composited by summing component renders.
         power : float, optional
             Power-law display scaling.
         cbar : bool, optional
@@ -391,17 +392,16 @@ class ModelDiffractionVisualizations:
         if len(names) == 0:
             raise ValueError("components must contain at least one component name.")
 
-        rendered = [md.get_rendered_component(name) for name in names]
-        rendered_scaled = [
-            arr
-            if power == 1.0
-            else np.maximum(np.asarray(arr, dtype=np.float32), 0.0) ** float(power)
-            for arr in rendered
+        rendered = [
+            np.asarray(md.get_rendered_component(name), dtype=np.float32) for name in names
         ]
+        summed = np.sum(np.stack(rendered, axis=0), axis=0)
+        summed_scaled = summed if power == 1.0 else np.maximum(summed, 0.0) ** float(power)
+        title = names[0] if len(names) == 1 else " + ".join(names)
 
         fig, ax = show_2d(
-            rendered_scaled,
-            title=names,
+            summed_scaled,
+            title=title,
             cmap="gray",
             cbar=bool(cbar),
             returnfig=True,
@@ -410,17 +410,15 @@ class ModelDiffractionVisualizations:
 
         if overlay:
             origin_rc, disk_centers_rc = md.get_overlay_coordinates()
-            axs_arr = np.asarray(ax, dtype=object).reshape(-1)
-            for a in axs_arr:
-                self._plot_overlays(
-                    a,
-                    origin_rc,
-                    disk_centers_rc,
-                    overlay_origin=overlay_origin,
-                    overlay_disks=overlay_disks,
-                    origin_marker_kwargs=origin_marker_kwargs,
-                    disk_marker_kwargs=disk_marker_kwargs,
-                )
+            self._plot_overlays(
+                ax,
+                origin_rc,
+                disk_centers_rc,
+                overlay_origin=overlay_origin,
+                overlay_disks=overlay_disks,
+                origin_marker_kwargs=origin_marker_kwargs,
+                disk_marker_kwargs=disk_marker_kwargs,
+            )
 
         if returnfig:
             return fig, ax
