@@ -1,22 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Sequence, cast
+from typing import Any, Sequence
 
-import numpy as np
 import torch
 from torch import nn
 
 from quantem.core.fitting.base import OriginND, RenderComponent, RenderContext
-
-
-def _parse_init(value: float | int | Sequence[float | int | None], *, name: str) -> float:
-    if isinstance(value, (list, tuple, np.ndarray)):
-        if len(value) == 0:
-            raise ValueError(f"{name} cannot be empty.")
-        if value[0] is None:
-            raise ValueError(f"{name} initial value cannot be None.")
-        return float(value[0])
-    return float(cast(float | int, value))
 
 
 class DCBackground(RenderComponent):
@@ -29,9 +18,12 @@ class DCBackground(RenderComponent):
     ):
         super().__init__()
         self.name = str(name)
-        self.intensity_raw = nn.Parameter(
-            torch.tensor(_parse_init(intensity, name="intensity"), dtype=torch.float32)
+        intensity_init, intensity_lo, intensity_hi = self.parse_bounded_init(
+            intensity, name="intensity"
         )
+        self.intensity_raw = nn.Parameter(torch.tensor(intensity_init, dtype=torch.float32))
+        if intensity_lo is not None or intensity_hi is not None:
+            self.register_parameter_bounds("intensity_raw", intensity_lo, intensity_hi)
         if constraint_params is not None:
             self.apply_constraint_params(constraint_params, strict=True)
 
@@ -40,7 +32,7 @@ class DCBackground(RenderComponent):
         return torch.ones(ctx.shape, device=ctx.device, dtype=ctx.dtype) * inten
 
 
-class GaussianBackground(RenderComponent):
+class GaussianBackground(RenderComponent):  # TODO this should be N dimensional by default
     def __init__(
         self,
         *,
@@ -55,12 +47,16 @@ class GaussianBackground(RenderComponent):
         self.name = str(name)
         self.origin = origin
         self.origin_key = str(origin_key)
-        self.sigma_raw = nn.Parameter(
-            torch.tensor(_parse_init(sigma, name="sigma"), dtype=torch.float32)
+        sigma_init, sigma_lo, sigma_hi = self.parse_bounded_init(sigma, name="sigma")
+        intensity_init, intensity_lo, intensity_hi = self.parse_bounded_init(
+            intensity, name="intensity"
         )
-        self.intensity_raw = nn.Parameter(
-            torch.tensor(_parse_init(intensity, name="intensity"), dtype=torch.float32)
-        )
+        self.sigma_raw = nn.Parameter(torch.tensor(sigma_init, dtype=torch.float32))
+        if sigma_lo is not None or sigma_hi is not None:
+            self.register_parameter_bounds("sigma_raw", sigma_lo, sigma_hi)
+        self.intensity_raw = nn.Parameter(torch.tensor(intensity_init, dtype=torch.float32))
+        if intensity_lo is not None or intensity_hi is not None:
+            self.register_parameter_bounds("intensity_raw", intensity_lo, intensity_hi)
         if constraint_params is not None:
             self.apply_constraint_params(constraint_params, strict=True)
 

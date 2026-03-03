@@ -11,6 +11,65 @@ from tqdm.auto import tqdm
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 
 
+def parse_bounded_init(
+    value: float | int | Sequence[float | int | None], *, name: str
+) -> tuple[float, float | None, float | None]:
+    """
+    Parse a scalar or bounded initializer specification.
+
+    Parameters
+    ----------
+    value : float | int | Sequence[float | int | None]
+        Accepted forms:
+        - ``x`` -> init ``x`` with no bounds.
+        - ``(x0, delta)`` -> init ``x0`` with bounds ``[x0-|delta|, x0+|delta|]``.
+        - ``(x0, lo, hi)`` -> init ``x0`` with explicit bounds.
+    name : str
+        Parameter name used in error messages.
+
+    Returns
+    -------
+    tuple[float, float | None, float | None]
+        Parsed ``(init, lo, hi)``.
+
+    Raises
+    ------
+    ValueError
+        If the sequence form is invalid, contains required ``None`` entries,
+        has invalid ordering, or ``init`` lies outside explicit bounds.
+    """
+    if not isinstance(value, (list, tuple, np.ndarray)):
+        x = float(cast(float | int, value))
+        return x, None, None
+
+    seq = list(value)
+    if len(seq) == 0:
+        raise ValueError(f"{name} cannot be empty.")
+    if seq[0] is None:
+        raise ValueError(f"{name} initial value cannot be None.")
+    x0 = float(cast(float | int, seq[0]))
+
+    if len(seq) == 1:
+        return x0, None, None
+    if len(seq) == 2:
+        if seq[1] is None:
+            raise ValueError(f"{name} delta cannot be None.")
+        delta = abs(float(cast(float | int, seq[1])))
+        return x0, x0 - delta, x0 + delta
+    if len(seq) == 3:
+        if seq[1] is None or seq[2] is None:
+            raise ValueError(f"{name} bounds cannot contain None.")
+        lo = float(cast(float | int, seq[1]))
+        hi = float(cast(float | int, seq[2]))
+        if lo > hi:
+            raise ValueError(f"{name} has invalid bounds: lo ({lo}) > hi ({hi}).")
+        if x0 < lo or x0 > hi:
+            raise ValueError(f"{name} initial value {x0} is outside bounds [{lo}, {hi}].")
+        return x0, lo, hi
+
+    raise ValueError(f"{name} must be scalar, (x0, delta), or (x0, lo, hi).")
+
+
 @dataclass
 class RenderContext:
     shape: tuple[int, ...]
@@ -39,6 +98,98 @@ class RenderComponent(nn.Module):
         super().__init__()
         self.hard_constraints: dict[str, Any] = dict(self.DEFAULT_HARD_CONSTRAINTS)
         self.soft_constraints: dict[str, Any] = dict(self.DEFAULT_SOFT_CONSTRAINTS)
+        self.parameter_bounds: dict[str, tuple[float | None, float | None]] = {}
+
+    @staticmethod
+    def parse_bounded_init(
+        value: float | int | Sequence[float | int | None], *, name: str
+    ) -> tuple[float, float | None, float | None]:
+        """
+        Parse bounded initializer forms into ``(init, lo, hi)``.
+
+        Parameters
+        ----------
+        value : float | int | Sequence[float | int | None]
+            Scalar, ``(x0, delta)``, or ``(x0, lo, hi)``.
+        name : str
+            Parameter name used in error messages.
+
+        Returns
+        -------
+        tuple[float, float | None, float | None]
+            Parsed ``(init, lo, hi)``.
+        """
+        return parse_bounded_init(value, name=name)
+
+    def register_parameter_bounds(
+        self, parameter_name: str, lo: float | None, hi: float | None
+    ) -> None:
+        """
+        Register hard bounds for a trainable parameter.
+
+        Parameters
+        ----------
+        parameter_name : str
+            Name of an ``nn.Parameter`` attribute on this component.
+        lo : float | None
+            Lower bound, or ``None`` for unbounded lower side.
+        hi : float | None
+            Upper bound, or ``None`` for unbounded upper side.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If ``lo > hi``.
+        """
+        if lo is not None and hi is not None and float(lo) > float(hi):
+            raise ValueError(f"Invalid bounds for {parameter_name}: lo ({lo}) > hi ({hi}).")
+        self.parameter_bounds[str(parameter_name)] = (
+            None if lo is None else float(lo),
+            None if hi is None else float(hi),
+        )
+
+    def _enforce_parameter_bounds(self) -> None:
+        """
+        Clamp registered parameters in-place to configured bounds.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        AttributeError
+            If a registered parameter attribute is missing.
+        TypeError
+            If a registered attribute is not an ``nn.Parameter``.
+        """
+        if not self.parameter_bounds:
+            return
+        with torch.no_grad():
+            for param_name, (lo, hi) in self.parameter_bounds.items():
+                if not hasattr(self, param_name):
+                    raise AttributeError(
+                        f"Parameter '{param_name}' is not an attribute of {self.__class__.__name__}."
+                    )
+                param = getattr(self, param_name)
+                if not isinstance(param, nn.Parameter):
+                    raise TypeError(
+                        f"Attribute '{param_name}' on {self.__class__.__name__} is not an nn.Parameter."
+                    )
+                if lo is None and hi is None:
+                    continue
+                if lo is None:
+                    assert hi is not None
+                    param.clamp_(max=float(hi))
+                elif hi is None:
+                    assert lo is not None
+                    param.clamp_(min=float(lo))
+                else:
+                    param.clamp_(min=float(lo), max=float(hi))
 
     def _set_constraints(
         self,
@@ -109,7 +260,7 @@ class RenderComponent(nn.Module):
         return effective
 
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:
-        return None
+        self._enforce_parameter_bounds()
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         raise NotImplementedError
