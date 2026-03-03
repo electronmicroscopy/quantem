@@ -214,7 +214,7 @@ class FitBase(OptimizerMixin):
     def get_optimization_parameters(self) -> Any:
         if self.model is None:
             return []
-        return self.model.parameters()
+        return [p for p in self.model.parameters() if p.requires_grad]
 
     @property
     def state_current(self) -> dict[str, torch.Tensor] | None:
@@ -245,6 +245,164 @@ class FitBase(OptimizerMixin):
         self._load_model_state_dict_copy(self.state_initialized)
         self._clear_fit_history_all()
         return self
+
+    def set_component_trainable(
+        self, component_name: str, enabled: bool, rebuild_optimizer: bool = True
+    ) -> None:
+        """
+        Enable or disable optimization for all parameters in one component.
+
+        Parameters
+        ----------
+        component_name : str
+            Resolved component name.
+        enabled : bool
+            If ``True``, mark component parameters trainable.
+        rebuild_optimizer : bool, optional
+            If ``True``, rebuild optimizer param groups after toggling.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        KeyError
+            If ``component_name`` is unknown.
+
+        Notes
+        -----
+        When rebuilding, the optimizer is reconstructed from stored optimizer
+        parameters if available, otherwise inferred from the current optimizer
+        type and learning rate, else defaults. Scheduler state is cleared
+        predictably by setting scheduler type to ``"none"``.
+        """
+        component = self._resolve_component_by_name(component_name)
+        for _, param in component.named_parameters(recurse=True):
+            param.requires_grad_(bool(enabled))
+        if rebuild_optimizer:
+            self._rebuild_optimizer_after_trainability_change()
+
+    def set_parameter_trainable(
+        self,
+        component_name: str,
+        parameter_name: str,
+        enabled: bool,
+        rebuild_optimizer: bool = True,
+    ) -> None:
+        """
+        Enable or disable optimization for one component parameter.
+
+        Parameters
+        ----------
+        component_name : str
+            Resolved component name.
+        parameter_name : str
+            Parameter name from ``component.named_parameters()``.
+        enabled : bool
+            If ``True``, mark parameter trainable.
+        rebuild_optimizer : bool, optional
+            If ``True``, rebuild optimizer param groups after toggling.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        KeyError
+            If ``component_name`` or ``parameter_name`` is unknown.
+
+        Notes
+        -----
+        When rebuilding, scheduler state is cleared by setting scheduler type
+        to ``"none"``.
+        """
+        component = self._resolve_component_by_name(component_name)
+        params = dict(component.named_parameters(recurse=True))
+        if parameter_name not in params:
+            known = ", ".join(sorted(params.keys()))
+            raise KeyError(
+                f"Parameter '{parameter_name}' not found in component '{component_name}'. "
+                f"Known parameters: {known}"
+            )
+        params[parameter_name].requires_grad_(bool(enabled))
+        if rebuild_optimizer:
+            self._rebuild_optimizer_after_trainability_change()
+
+    def set_parameters_trainable(
+        self,
+        component_name: str,
+        parameter_names: list[str],
+        enabled: bool,
+        rebuild_optimizer: bool = True,
+    ) -> None:
+        """
+        Enable or disable optimization for multiple component parameters.
+
+        Parameters
+        ----------
+        component_name : str
+            Resolved component name.
+        parameter_names : list[str]
+            Parameter names from ``component.named_parameters()``.
+        enabled : bool
+            If ``True``, mark parameters trainable.
+        rebuild_optimizer : bool, optional
+            If ``True``, rebuild optimizer param groups after toggling.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        KeyError
+            If any parameter name is unknown.
+        """
+        component = self._resolve_component_by_name(component_name)
+        params = dict(component.named_parameters(recurse=True))
+        missing = [name for name in parameter_names if name not in params]
+        if missing:
+            known = ", ".join(sorted(params.keys()))
+            raise KeyError(
+                f"Unknown parameters for component '{component_name}': {', '.join(missing)}. "
+                f"Known parameters: {known}"
+            )
+        for name in parameter_names:
+            params[name].requires_grad_(bool(enabled))
+        if rebuild_optimizer:
+            self._rebuild_optimizer_after_trainability_change()
+
+    def get_component_trainable(self, component_name: str) -> dict[str, bool]:
+        """
+        Return trainability flags for one component's parameters.
+
+        Parameters
+        ----------
+        component_name : str
+            Resolved component name.
+
+        Returns
+        -------
+        dict[str, bool]
+            Mapping of parameter name to ``requires_grad``.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        KeyError
+            If ``component_name`` is unknown.
+        """
+        component = self._resolve_component_by_name(component_name)
+        return {name: bool(param.requires_grad) for name, param in component.named_parameters()}
 
     def fit_render(
         self,
@@ -364,6 +522,48 @@ class FitBase(OptimizerMixin):
             )
             self.fit_history[key] = result
         return result
+
+    def _resolve_component_by_name(self, component_name: str) -> RenderComponent:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        target = str(component_name)
+        for idx, module in enumerate(self.model.components):
+            component = cast(RenderComponent, module)
+            resolved_name = self.model._component_constraint_name(component, idx)
+            if resolved_name == target:
+                return component
+        raise KeyError(f"Component not found: {target}")
+
+    def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
+        if self.optimizer_params:
+            return dict(self.optimizer_params)
+        if self.optimizer is not None:
+            opt_type: str | type[torch.optim.Optimizer]
+            if isinstance(self.optimizer, torch.optim.AdamW):
+                opt_type = "adamw"
+            elif isinstance(self.optimizer, torch.optim.Adam):
+                opt_type = "adam"
+            elif isinstance(self.optimizer, torch.optim.SGD):
+                opt_type = "sgd"
+            else:
+                opt_type = type(self.optimizer)
+            lr = float(
+                self.optimizer.param_groups[0].get(
+                    "lr", getattr(self, "DEFAULT_LR", self.DEFAULT_LR)
+                )
+            )
+            return {"type": opt_type, "lr": lr}
+        return {
+            "type": getattr(self, "DEFAULT_OPTIMIZER_TYPE", self.DEFAULT_OPTIMIZER_TYPE),
+            "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
+        }
+
+    def _rebuild_optimizer_after_trainability_change(self) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        rebuild_params = self._infer_optimizer_rebuild_params()
+        self.set_optimizer(rebuild_params)
+        self.set_scheduler({"type": "none"})
 
     def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {k: v.detach().clone() for k, v in state.items()}
