@@ -77,11 +77,36 @@ class DiskTemplate(RenderComponent):
         intensity: float | Sequence[float] = 1.0,
         constraint_params: dict[str, Any] | None = None,
     ):
+        """
+        Build a disk template renderer centered at the shared origin.
+
+        Parameters
+        ----------
+        intensity : float | Sequence[float], optional
+            Trainable scalar amplitude applied to the rendered template.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If ``array`` is not 2D or if ``normalize`` is unsupported.
+
+        Notes
+        -----
+        ``template_raw`` controls template shape and ``intensity_raw`` controls
+        center-disk amplitude.
+        """
         super().__init__()
         self.name = str(name)
         self.refine_all_pixels = bool(refine_all_pixels)
         self.origin = origin
         self.origin_key = str(origin_key)
+        self.intensity_raw = nn.Parameter(
+            torch.tensor(_parse_init(intensity, name="intensity"), dtype=torch.float32)
+        )
 
         a = np.asarray(array, dtype=np.float32)
         if a.ndim != 2:
@@ -138,6 +163,11 @@ class DiskTemplate(RenderComponent):
     def set_origin(self, origin: OriginND) -> None:
         self.origin = origin
 
+    def set_intensity(self, value: float | int) -> None:
+        """Assign ``intensity_raw`` in-place."""
+        with torch.no_grad():
+            self.intensity_raw.copy_(torch.as_tensor(float(value), dtype=self.intensity_raw.dtype))
+
     def patch_values(self) -> torch.Tensor:
         return self.template_raw.reshape(-1)
 
@@ -153,11 +183,25 @@ class DiskTemplate(RenderComponent):
         _splat_patch(out, r0=r0, c0=c0, patch_vals=vals, dr=dr, dc=dc, scale=scale)
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
+        """
+        Render template at origin with scalar amplitude ``intensity_raw``.
+
+        Parameters
+        ----------
+        ctx : RenderContext
+            Rendering context.
+
+        Returns
+        -------
+        torch.Tensor
+            Rendered center disk image.
+        """
         out = torch.zeros(ctx.shape, device=ctx.device, dtype=ctx.dtype)
         if self.origin is None:
             raise RuntimeError("DiskTemplate.forward() requires an OriginND instance.")
         r0, c0 = self.origin.coords[0], self.origin.coords[1]
-        self.add_patch(out, r0=r0, c0=c0, scale=torch.tensor(1.0))  # scale learned directly
+        scale = self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype)
+        self.add_patch(out, r0=r0, c0=c0, scale=scale)
         return out
 
     def _center_disk(self) -> None:
@@ -199,6 +243,7 @@ class DiskTemplate(RenderComponent):
     def _enforce_positivity(self) -> None:
         with torch.no_grad():
             self.template_raw.clamp_(min=0.0)
+            self.intensity_raw.clamp_(min=0.0)
 
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:
         if bool(self.hard_constraints.get("force_center", False)):
@@ -228,6 +273,10 @@ class DiskTemplate(RenderComponent):
 
 
 class SyntheticDiskLattice(RenderComponent):
+    DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
+        "force_positive_intensity": True,
+    }
+
     def __init__(
         self,
         *,
@@ -256,6 +305,41 @@ class SyntheticDiskLattice(RenderComponent):
         origin_key: str = "origin",
         constraint_params: dict[str, Any] | None = None,
     ):
+        """
+        Build a synthetic disk lattice renderer.
+
+        Parameters
+        ----------
+        intensity_0 : float | Sequence[float], optional
+            Baseline intensity for included lattice disks.
+        center_intensity_0 : float | Sequence[float] | None, optional
+            Optional center-disk baseline used only when ``(0, 0)`` is included
+            in the lattice index set.
+        exclude_indices : Iterable[tuple[int, int]] | None, optional
+            Lattice indices excluded from rendering. By default, ``(0, 0)`` is
+            excluded. To include center explicitly, pass ``exclude_indices`` that
+            does not contain ``(0, 0)``.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If ``center_intensity_0`` is provided with center included while
+            ``per_disk_intensity=False``.
+
+        Notes
+        -----
+        Center-intensity routing is explicit:
+        - Center excluded (default): ``center_intensity_0`` maps to
+          ``disk.intensity_raw``.
+        - Center included with ``per_disk_intensity=True``:
+          ``center_intensity_0`` maps to lattice center ``i0_raw`` entry.
+          In this case ``disk.intensity_raw`` is set to ``0`` to avoid
+          duplicate center ownership when disk is rendered standalone.
+        """
         super().__init__()
         self.name = str(name)
         self.disk = disk
@@ -289,10 +373,13 @@ class SyntheticDiskLattice(RenderComponent):
             torch.tensor(_parse_init(v_col, name="v_col"), dtype=torch.float32)
         )
 
-        if exclude_indices is None:
-            exclude = set()
-        else:
-            exclude = set(exclude_indices)
+        exclude = {(0, 0)} if exclude_indices is None else set(exclude_indices)
+        center_included = (0, 0) not in exclude
+        if center_intensity_0 is not None and center_included and not self.per_disk_intensity:
+            raise ValueError(
+                "center_intensity_0 with center included requires per_disk_intensity=True, "
+                "or exclude (0,0) and use DiskTemplate intensity ownership."
+            )
         uv: list[tuple[int, int]] = []
         for u in range(-self.u_max, self.u_max + 1):
             for v in range(-self.v_max, self.v_max + 1):
@@ -310,6 +397,8 @@ class SyntheticDiskLattice(RenderComponent):
             if center_intensity_0 is None
             else _parse_init(center_intensity_0, name="center_intensity_0")
         )
+        if center_intensity_0 is not None and not center_included:
+            self.disk.set_intensity(float(i0_center))
         ir_init = _parse_init(intensity_row, name="intensity_row")
         ic_init = _parse_init(intensity_col, name="intensity_col")
         irr_init = _parse_init(intensity_row_row, name="intensity_row_row")
@@ -322,6 +411,8 @@ class SyntheticDiskLattice(RenderComponent):
                 center_mask = (uv_t[:, 0] == 0) & (uv_t[:, 1] == 0)
                 i0_values[center_mask] = float(i0_center)
             self.i0_raw = nn.Parameter(i0_values)
+            if center_intensity_0 is not None and center_included:
+                self.disk.set_intensity(0.0)
             if self.max_intensity_order >= 1:
                 self.ir = nn.Parameter(torch.full((n_uv,), float(ir_init), dtype=torch.float32))
                 self.ic = nn.Parameter(torch.full((n_uv,), float(ic_init), dtype=torch.float32))
@@ -345,9 +436,28 @@ class SyntheticDiskLattice(RenderComponent):
             self.irc = nn.Parameter(torch.tensor(irc_init, dtype=torch.float32))
         if constraint_params is not None:
             self.apply_constraint_params(constraint_params, strict=True)
+        if bool(self.hard_constraints.get("force_positive_intensity", False)):
+            self._enforce_positive_intensity_params()
 
     def set_origin(self, origin: OriginND) -> None:
         self.origin = origin
+
+    def _enforce_positive_intensity_params(self) -> None:
+        """
+        Project base intensity parameter(s) to nonnegative values.
+
+        Notes
+        -----
+        Positivity is enforced as a hard projection after optimizer steps.
+        The forward path intentionally avoids clamp-based dead gradients.
+        Only ``i0_raw`` is projected; slope terms remain unconstrained.
+        """
+        with torch.no_grad():
+            self.i0_raw.clamp_(min=0.0)
+
+    def enforce_hard_constraints(self, ctx: RenderContext) -> None:
+        if bool(self.hard_constraints.get("force_positive_intensity", False)):
+            self._enforce_positive_intensity_params()
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
@@ -391,7 +501,7 @@ class SyntheticDiskLattice(RenderComponent):
             cc0 = centers_c[j]
 
             if self.per_disk_intensity:
-                inten = torch.clamp(self.i0_raw[j], min=0.0)
+                inten = self.i0_raw[j]
                 if active_order >= 1 and self.ir is not None and self.ic is not None:
                     inten = inten + self.ir[j] * dr + self.ic[j] * dc
                 if (
@@ -401,9 +511,8 @@ class SyntheticDiskLattice(RenderComponent):
                     and self.irc is not None
                 ):
                     inten = inten + self.irr[j] * dr2 + self.icc[j] * dc2 + self.irc[j] * drdc
-                inten = torch.clamp(inten, min=0.0)
             else:
-                inten = torch.clamp(self.i0_raw, min=0.0)
+                inten = self.i0_raw
                 if active_order >= 1:
                     assert self.ir is not None and self.ic is not None
                     inten = inten + self.ir * rr0 + self.ic * cc0
@@ -412,7 +521,6 @@ class SyntheticDiskLattice(RenderComponent):
                     inten = (
                         inten + self.irr * rr0 * rr0 + self.icc * cc0 * cc0 + self.irc * rr0 * cc0
                     )
-                inten = torch.clamp(inten, min=0.0)
 
             self.disk.add_patch(out, r0=rr0, c0=cc0, scale=inten)
 
