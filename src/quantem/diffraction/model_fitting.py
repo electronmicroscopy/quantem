@@ -15,7 +15,7 @@ from quantem.core.fitting.base import (
     RenderComponent,
     RenderContext,
 )
-from quantem.core.fitting.diffraction import DiskTemplate
+from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
@@ -65,6 +65,18 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         raise TypeError(
             "from_dataset expects a Dataset2d, Dataset3d, Dataset4d, or Dataset4dstem instance."
         )
+
+    @property
+    def components(self) -> torch.nn.ModuleList:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model.components
+
+    @property
+    def component_names(self) -> list[str]:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return [cast(str, c.name) for c in self.components]
 
     def _resolve_component_by_name(self, name: str) -> RenderComponent:
         if self.model is None:
@@ -172,6 +184,72 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             "hard": dict(component.hard_constraints),
             "soft": dict(component.soft_constraints),
         }
+
+    def get_overlay_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return origin and lattice disk-center coordinates for overlay plotting.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        origin_rc : np.ndarray
+            Origin coordinate array with shape ``(2,)`` as ``(row, col)``.
+        disk_centers_rc : np.ndarray
+            Disk-center array with shape ``(N, 2)`` as ``(row, col)``.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined.
+
+        Notes
+        -----
+        Coordinates are computed from current model parameters without mutating state.
+        Boundary filtering matches ``SyntheticDiskLattice.forward`` behavior.
+        """
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+
+        with torch.no_grad():
+            origin = cast(OriginND, self.model.origin)
+            origin_rc = origin.coords[:2].detach().cpu().numpy().astype(np.float32, copy=False)
+
+            centers: list[np.ndarray] = []
+            for module in self.model.components:
+                component = cast(RenderComponent, module)
+                if not isinstance(component, SyntheticDiskLattice):
+                    continue
+                if component.origin is None:
+                    continue
+                uv_indices = cast(torch.Tensor, component.uv_indices)
+                if torch.numel(uv_indices) == 0:
+                    continue
+
+                uv = torch.as_tensor(uv_indices, device=self.ctx.device)
+                u = uv[:, 0].to(dtype=self.ctx.dtype)
+                v = uv[:, 1].to(dtype=self.ctx.dtype)
+                r0, c0 = component.origin.coords[0], component.origin.coords[1]
+                centers_r = r0 + u * component.u_row + v * component.v_row
+                centers_c = c0 + u * component.u_col + v * component.v_col
+
+                b = torch.as_tensor(
+                    component.boundary_px, device=self.ctx.device, dtype=self.ctx.dtype
+                )
+                keep = (centers_r >= b) & (centers_r <= (self.ctx.shape[0] - 1) - b)
+                keep = keep & (centers_c >= b) & (centers_c <= (self.ctx.shape[1] - 1) - b)
+                if torch.any(keep):
+                    rc = torch.stack((centers_r[keep], centers_c[keep]), dim=1)
+                    centers.append(rc.detach().cpu().numpy().astype(np.float32, copy=False))
+
+            if centers:
+                disk_centers_rc = np.concatenate(centers, axis=0)
+            else:
+                disk_centers_rc = np.zeros((0, 2), dtype=np.float32)
+
+        return origin_rc, disk_centers_rc
 
     def preprocess(
         self,
