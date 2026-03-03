@@ -72,15 +72,6 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             raise RuntimeError("Call .define_model(...) first.")
         return self.model.components
 
-    @property
-    def component_names(self) -> list[str]:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        return [
-            self.model._component_constraint_name(cast(RenderComponent, module), idx)
-            for idx, module in enumerate(self.model.components)
-        ]
-
     def get_component(self, name: str) -> RenderComponent:
         """
         Return a live model component by resolved name.
@@ -221,11 +212,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             )
             return
 
-        disk_names: list[str] = []
-        for idx, module in enumerate(self.model.components):
-            component = cast(RenderComponent, module)
-            if isinstance(component, DiskTemplate):
-                disk_names.append(self.model._component_constraint_name(component, idx))
+        disk_names = [
+            component_name
+            for component_name, component in self._iter_named_components()
+            if isinstance(component, DiskTemplate)
+        ]
         if len(disk_names) == 0:
             raise RuntimeError("No DiskTemplate components found.")
 

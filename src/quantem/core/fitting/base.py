@@ -674,16 +674,49 @@ class FitBase(OptimizerMixin):
             self.fit_history[key] = result
         return result
 
-    def _resolve_component_by_name(self, component_name: str) -> RenderComponent:
+    def _iter_named_components(self) -> list[tuple[str, RenderComponent]]:
+        """
+        Return canonical component names paired with components.
+
+        Returns
+        -------
+        list[tuple[str, RenderComponent]]
+            ``(name, component)`` entries using the model's canonical naming
+            rule. Names fall back to class-name/index behavior when ``.name`` is
+            missing.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        """
         if self.model is None:
             raise RuntimeError("Call .define_model(...) first.")
-        target = str(component_name)
+        entries: list[tuple[str, RenderComponent]] = []
         for idx, module in enumerate(self.model.components):
             component = cast(RenderComponent, module)
-            resolved_name = self.model._component_constraint_name(component, idx)
+            name = self.model._component_constraint_name(component, idx)
+            entries.append((name, component))
+        return entries
+
+    def get_component_names(self) -> list[str]:
+        """
+        Return canonical component names.
+
+        Returns
+        -------
+        list[str]
+            Canonical component names.
+        """
+        return [name for name, _ in self._iter_named_components()]
+
+    def _resolve_component_by_name(self, component_name: str) -> RenderComponent:
+        target = str(component_name)
+        for resolved_name, component in self._iter_named_components():
             if resolved_name == target:
                 return component
-        raise KeyError(f"Component not found: {target}")
+        known = ", ".join(self.get_component_names())
+        raise KeyError(f"Component not found: {target}. Known components: {known}")
 
     def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
         if self.optimizer_params:
