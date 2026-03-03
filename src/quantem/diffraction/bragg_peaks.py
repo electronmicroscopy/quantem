@@ -911,6 +911,7 @@ class BraggPeaksPolymer(AutoSerialize):
         width_factor=2.0,
         min_width=0.05,
         smoothing_sigma=2.0,
+        intensity_field='intensities',
     ):
         """
         Automatically detect the top N most prominent peaks and estimate their windows.
@@ -952,7 +953,7 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # Get radial intensity profile
         all_r = self.polar_peaks['r_invA'].flatten()
-        all_intensity = self.peak_intensities['intensities_sampled_from_dp'].flatten()
+        all_intensity = self.peak_intensities[intensity_field].flatten()
         
         if q_min is None:
             q_min = 0
@@ -1049,6 +1050,7 @@ class BraggPeaksPolymer(AutoSerialize):
         fill_color=None,
         plot=True,
         return_data=False,
+        intensity_field='intensities',
     ):
         """
         Create radial intensity line plot summarizing polar peaks.
@@ -1096,7 +1098,7 @@ class BraggPeaksPolymer(AutoSerialize):
             Integrated intensity per bin
         """
         all_r = self.polar_peaks['r_invA'].flatten()
-        all_intensity = self.peak_intensities['intensities_sampled_from_dp'].flatten()
+        all_intensity = self.peak_intensities[intensity_field].flatten()
         
         if q_min is None:
             q_min = 0
@@ -1384,7 +1386,8 @@ class BraggPeaksPolymer(AutoSerialize):
         progress_bar: bool = True,
         r_field: str = "r_invA",
         theta_field: str = "theta",
-        intensity_field: str = "intensities_sampled_from_dp",
+        intensity_field: str = "intensities",
+        # intensity_field: str = "intensities_sampled_from_dp",
     ):
         """
         Create a 3D or 4D orientation histogram from bragg peaks.
@@ -2061,7 +2064,7 @@ class BraggPeaksPolymer(AutoSerialize):
                                     peak_intensity_mode='size', peak_size_range=(30, 300),
                                     peak_cmap='hot', peak_vmin=None, peak_vmax=None,
                                     show_polar=True, vmax_polar=None, two_fold_symmetry=True,
-                                    map_cmap="viridis", dp_cmap="gray"):
+                                    map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',):
         """
         Interactive plot for browsing diffraction patterns with peak overlay.
         Central beam (closest to image center) plotted in blue.
@@ -2223,7 +2226,7 @@ class BraggPeaksPolymer(AutoSerialize):
             peaks_r_invA = self.polar_peaks['r_invA'][ry_data, rx_data]
             peaks_y = self.peak_coordinates_cartesian['y_pixels'][ry_data, rx_data]
             peaks_x = self.peak_coordinates_cartesian['x_pixels'][ry_data, rx_data]
-            peak_ints = self.peak_intensities['intensities_sampled_from_dp'][ry_data, rx_data]
+            peak_ints = self.peak_intensities[intensity_field][ry_data, rx_data]
             
             plot_peaks_on_ax(ax2, peaks_x, peaks_y, peaks_r_invA, peak_ints, ry_data, rx_data, is_polar=False)
             
@@ -2243,10 +2246,10 @@ class BraggPeaksPolymer(AutoSerialize):
                 
                 if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
                     polar_r = self.polar_peaks['r_invA'][ry_data, rx_data]
-                    polar_theta = self.polar_peaks['theta'][ry_data, rx_data]
+                    polar_theta = self.polar_peaks['theta'][ry_data, rx_data] # Need to add np.pi to polar_theta for it to map properly to polar transform right now. Will fix polar transform coordinate system in future.
                     if polar_r is not None and len(polar_r) > 0:
                         r_bins = polar_r / self.max_radius_invA * self.num_radial_bins
-                        theta_bins = polar_theta / ((2 - two_fold_symmetry) * np.pi) * self.num_annular_bins
+                        theta_bins = polar_theta / ((2 - two_fold_symmetry) * np.pi) * self.num_annular_bins  
                         plot_peaks_on_ax(ax3, r_bins, theta_bins, polar_r, peak_ints, ry_data, rx_data, is_polar=True)
             
             plt.tight_layout()
@@ -2267,7 +2270,7 @@ class BraggPeaksPolymer(AutoSerialize):
                          peak_intensity_mode='size', peak_size_range=(30, 300),
                          peak_cmap='hot', peak_vmin=None, peak_vmax=None,
                          show_polar=True, vmax_polar=None, two_fold_symmetry=True,
-                         map_cmap="viridis", dp_cmap="gray"):
+                         map_cmap="viridis", dp_cmap="gray", intensity_field='intensities'):
         """
         Save peak-annotated diffraction figures for a specific scan position.
         Central beam (closest to image center) plotted in blue.
@@ -2373,7 +2376,7 @@ class BraggPeaksPolymer(AutoSerialize):
         peaks_r_invA = self.polar_peaks['r_invA'][ry, rx]
         peaks_y = self.peak_coordinates_cartesian['y_pixels'][ry, rx]
         peaks_x = self.peak_coordinates_cartesian['x_pixels'][ry, rx]
-        peak_ints = self.peak_intensities['intensities_sampled_from_dp'][ry, rx]
+        peak_ints = self.peak_intensities[intensity_field][ry, rx]
         dp_data = get_normalized_dp(ry, rx)
         
         # Save intensity map
@@ -2667,6 +2670,7 @@ class BraggPeaksPolymer(AutoSerialize):
         figsize=(8, 6), 
         cmap='viridis',
         return_values=False,
+        intensity_field='intensities',
     ):
         """
         Plot 2D map showing the number of peaks found at each scan position.
@@ -2693,9 +2697,9 @@ class BraggPeaksPolymer(AutoSerialize):
         # Convert percentile to threshold if needed
         if intensity_percentile is not None:
             all_intensities = [
-                self.peak_intensities['intensities_sampled_from_dp'][i, j]
+                self.peak_intensities[intensity_field][i, j]
                 for i in range(Ry) for j in range(Rx)
-                if self.peak_intensities['intensities_sampled_from_dp'][i, j] is not None
+                if self.peak_intensities[intensity_field][i, j] is not None
             ]
             if all_intensities:
                 intensity_threshold = np.percentile(np.concatenate(all_intensities), intensity_percentile)
@@ -2711,7 +2715,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 if intensity_threshold is None:
                     count_map[i, j] = len(peaks)
                 else:
-                    intensities = self.peak_intensities['intensities_sampled_from_dp'][i, j]
+                    intensities = self.peak_intensities[intensity_field][i, j]
                     if intensities is not None:
                         count_map[i, j] = np.sum(intensities >= intensity_threshold)
         
