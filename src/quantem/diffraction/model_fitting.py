@@ -76,7 +76,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
     def component_names(self) -> list[str]:
         if self.model is None:
             raise RuntimeError("Call .define_model(...) first.")
-        return [cast(str, c.name) for c in self.components]
+        return [
+            self.model._component_constraint_name(cast(RenderComponent, module), idx)
+            for idx, module in enumerate(self.model.components)
+        ]
 
     def get_component(self, name: str) -> RenderComponent:
         """
