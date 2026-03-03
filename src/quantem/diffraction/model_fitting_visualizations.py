@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 from matplotlib import gridspec
@@ -11,6 +11,65 @@ if TYPE_CHECKING:
 
 
 class ModelDiffractionVisualizations:
+    def _plot_overlays(
+        self,
+        ax: Any,
+        origin_rc: np.ndarray,
+        disk_centers_rc: np.ndarray,
+        *,
+        overlay_origin: bool = True,
+        overlay_disks: bool = True,
+        origin_marker_kwargs: dict[str, Any] | None = None,
+        disk_marker_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Plot origin and disk-center overlays on an axis.
+
+        Parameters
+        ----------
+        ax : Any
+            Matplotlib axis receiving overlays.
+        origin_rc : np.ndarray
+            Origin coordinate as ``(row, col)``.
+        disk_centers_rc : np.ndarray
+            Disk centers as ``(N, 2)`` in ``(row, col)`` order.
+        overlay_origin : bool, optional
+            If ``True``, plot origin marker.
+        overlay_disks : bool, optional
+            If ``True``, plot disk-center markers.
+        origin_marker_kwargs : dict[str, Any] | None, optional
+            Matplotlib kwargs merged onto origin marker defaults.
+        disk_marker_kwargs : dict[str, Any] | None, optional
+            Matplotlib kwargs merged onto disk marker defaults.
+
+        Returns
+        -------
+        None
+        """
+        if overlay_origin and origin_rc.shape == (2,):
+            kw_origin = {
+                "marker": "+",
+                "color": "red",
+                "markersize": 10,
+                "markeredgewidth": 1.5,
+                "linestyle": "None",
+            }
+            if origin_marker_kwargs is not None:
+                kw_origin.update(origin_marker_kwargs)
+            ax.plot(float(origin_rc[1]), float(origin_rc[0]), **kw_origin)
+
+        if overlay_disks and disk_centers_rc.ndim == 2 and disk_centers_rc.shape[0] > 0:
+            kw_disks = {
+                "marker": "x",
+                "color": "cyan",
+                "markersize": 5,
+                "markeredgewidth": 1.0,
+                "linestyle": "None",
+            }
+            if disk_marker_kwargs is not None:
+                kw_disks.update(disk_marker_kwargs)
+            ax.plot(disk_centers_rc[:, 1], disk_centers_rc[:, 0], **kw_disks)
+
     def plot_losses(
         self, figax: tuple[Any, Any] | None = None, plot_lrs: bool = True
     ) -> tuple[Any, Any]:
@@ -82,7 +141,49 @@ class ModelDiffractionVisualizations:
         power: float = 0.25,
         cbar: bool = False,
         axsize: tuple[int, int] = (6, 6),
+        overlay: bool = True,
+        overlay_origin: bool = True,
+        overlay_disks: bool = True,
+        overlay_on: Literal["model", "both"] = "model",
+        origin_marker_kwargs: dict[str, Any] | None = None,
+        disk_marker_kwargs: dict[str, Any] | None = None,
     ) -> tuple[Any, Any]:
+        """
+        Visualize fit losses with reference/model image panels.
+
+        Parameters
+        ----------
+        power : float, optional
+            Power-law display scaling.
+        cbar : bool, optional
+            If ``True``, draw colorbars.
+        axsize : tuple[int, int], optional
+            Axis size passed through to ``show_2d``.
+        overlay : bool, optional
+            If ``True``, draw coordinate overlays.
+        overlay_origin : bool, optional
+            If ``True``, include origin marker in overlays.
+        overlay_disks : bool, optional
+            If ``True``, include disk-center markers in overlays.
+        overlay_on : {"model", "both"}, optional
+            Which image panel(s) receive overlays.
+        origin_marker_kwargs : dict[str, Any] | None, optional
+            Marker kwargs override for origin marker.
+        disk_marker_kwargs : dict[str, Any] | None, optional
+            Marker kwargs override for disk-center markers.
+
+        Returns
+        -------
+        tuple[Any, Any]
+            ``(fig, axs)`` for further editing.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined.
+        ValueError
+            If ``overlay_on`` is invalid.
+        """
         md = cast("ModelDiffraction", self)
 
         if md.image_ref is None:
@@ -118,6 +219,22 @@ class ModelDiffractionVisualizations:
             vmax=vmax,
         )
 
+        if overlay:
+            if overlay_on not in ("model", "both"):
+                raise ValueError("overlay_on must be 'model' or 'both'.")
+            origin_rc, disk_centers_rc = md.get_overlay_coordinates()
+            axes = [axs[1]] if overlay_on == "model" else [axs[0], axs[1]]
+            for ax in axes:
+                self._plot_overlays(
+                    ax,
+                    origin_rc,
+                    disk_centers_rc,
+                    overlay_origin=overlay_origin,
+                    overlay_disks=overlay_disks,
+                    origin_marker_kwargs=origin_marker_kwargs,
+                    disk_marker_kwargs=disk_marker_kwargs,
+                )
+
         mean_hist = md.fit_history.get("mean")
         if mean_hist is not None and len(mean_hist.losses) > 0:
             fig.suptitle(
@@ -134,8 +251,52 @@ class ModelDiffractionVisualizations:
         power: float = 0.25,
         returnfig: bool = False,
         axsize: tuple[int, int] = (6, 6),
+        overlay: bool = True,
+        overlay_origin: bool = True,
+        overlay_disks: bool = True,
+        overlay_on: Literal["model", "both"] = "model",
+        origin_marker_kwargs: dict[str, Any] | None = None,
+        disk_marker_kwargs: dict[str, Any] | None = None,
         **_: Any,
     ) -> tuple[Any, Any] | None:
+        """
+        Plot reference and model mean diffraction images.
+
+        Parameters
+        ----------
+        power : float, optional
+            Power-law display scaling.
+        returnfig : bool, optional
+            If ``True``, return ``(fig, ax)``.
+        axsize : tuple[int, int], optional
+            Axis size passed through to ``show_2d``.
+        overlay : bool, optional
+            If ``True``, draw coordinate overlays.
+        overlay_origin : bool, optional
+            If ``True``, include origin marker in overlays.
+        overlay_disks : bool, optional
+            If ``True``, include disk-center markers in overlays.
+        overlay_on : {"model", "both"}, optional
+            Which image panel(s) receive overlays.
+        origin_marker_kwargs : dict[str, Any] | None, optional
+            Marker kwargs override for origin marker.
+        disk_marker_kwargs : dict[str, Any] | None, optional
+            Marker kwargs override for disk-center markers.
+        **_ : Any
+            Ignored extra kwargs for backward compatibility.
+
+        Returns
+        -------
+        tuple[Any, Any] | None
+            Figure/axes tuple when ``returnfig=True``; otherwise ``None``.
+
+        Raises
+        ------
+        RuntimeError
+            If model/context are not defined.
+        ValueError
+            If ``overlay_on`` is invalid.
+        """
         md = cast("ModelDiffraction", self)
         if md.image_ref is None:
             md.preprocess()
@@ -160,6 +321,107 @@ class ModelDiffractionVisualizations:
             vmin=vmin,
             vmax=vmax,
         )
+        if overlay:
+            if overlay_on not in ("model", "both"):
+                raise ValueError("overlay_on must be 'model' or 'both'.")
+            origin_rc, disk_centers_rc = md.get_overlay_coordinates()
+            axs_arr = np.asarray(ax, dtype=object).reshape(-1)
+            axes = [axs_arr[1]] if overlay_on == "model" else [axs_arr[0], axs_arr[1]]
+            for a in axes:
+                self._plot_overlays(
+                    a,
+                    origin_rc,
+                    disk_centers_rc,
+                    overlay_origin=overlay_origin,
+                    overlay_disks=overlay_disks,
+                    origin_marker_kwargs=origin_marker_kwargs,
+                    disk_marker_kwargs=disk_marker_kwargs,
+                )
+        if returnfig:
+            return fig, ax
+        return None
+
+    def visualize_components(
+        self,
+        components: str | list[str],
+        *,
+        power: float = 0.25,
+        cbar: bool = False,
+        axsize: tuple[int, int] = (6, 6),
+        returnfig: bool = False,
+        overlay: bool = True,
+        overlay_origin: bool = True,
+        overlay_disks: bool = True,
+        origin_marker_kwargs: dict[str, Any] | None = None,
+        disk_marker_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[Any, Any] | None:
+        """
+        Render and display one or more named components.
+
+        Parameters
+        ----------
+        components : str | list[str]
+            Component name or list of component names.
+        power : float, optional
+            Power-law display scaling.
+        cbar : bool, optional
+            If ``True``, draw colorbars.
+        axsize : tuple[int, int], optional
+            Axis size passed through to ``show_2d``.
+        returnfig : bool, optional
+            If ``True``, return ``(fig, ax)``.
+        overlay : bool, optional
+            If ``True``, draw coordinate overlays on all component panels.
+        overlay_origin : bool, optional
+            If ``True``, include origin marker in overlays.
+        overlay_disks : bool, optional
+            If ``True``, include disk-center markers in overlays.
+        origin_marker_kwargs : dict[str, Any] | None, optional
+            Marker kwargs override for origin marker.
+        disk_marker_kwargs : dict[str, Any] | None, optional
+            Marker kwargs override for disk-center markers.
+
+        Returns
+        -------
+        tuple[Any, Any] | None
+            Figure/axes tuple when ``returnfig=True``; otherwise ``None``.
+        """
+        md = cast("ModelDiffraction", self)
+        names = [components] if isinstance(components, str) else list(components)
+        if len(names) == 0:
+            raise ValueError("components must contain at least one component name.")
+
+        rendered = [md.get_rendered_component(name) for name in names]
+        rendered_scaled = [
+            arr
+            if power == 1.0
+            else np.maximum(np.asarray(arr, dtype=np.float32), 0.0) ** float(power)
+            for arr in rendered
+        ]
+
+        fig, ax = show_2d(
+            rendered_scaled,
+            title=names,
+            cmap="gray",
+            cbar=bool(cbar),
+            returnfig=True,
+            axsize=axsize,
+        )
+
+        if overlay:
+            origin_rc, disk_centers_rc = md.get_overlay_coordinates()
+            axs_arr = np.asarray(ax, dtype=object).reshape(-1)
+            for a in axs_arr:
+                self._plot_overlays(
+                    a,
+                    origin_rc,
+                    disk_centers_rc,
+                    overlay_origin=overlay_origin,
+                    overlay_disks=overlay_disks,
+                    origin_marker_kwargs=origin_marker_kwargs,
+                    disk_marker_kwargs=disk_marker_kwargs,
+                )
+
         if returnfig:
             return fig, ax
         return None
