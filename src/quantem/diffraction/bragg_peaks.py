@@ -1717,7 +1717,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def plot_interactive_image_map(self, intensity_map=None, vmax_cartesian=None, vmin_cartesian=None, 
                                     map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
                                     norm_upper_quantile=None, norm_power=1.0,
-                                    show_polar=True, vmax_polar=None):
+                                    show_polar=True, vmax_polar=None, crosshair_color='r'):
         """
         Interactive plot for browsing diffraction patterns with optional intensity map.
         
@@ -1807,7 +1807,7 @@ class BraggPeaksPolymer(AutoSerialize):
         else:
             im_map = ax_map.imshow(intensity_map, cmap=map_cmap, 
                                   vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        line_marker, = ax_map.plot([], [], 'r+', markersize=15, markeredgewidth=2)
+        line_marker, = ax_map.plot([], [], color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
         ax_map.set_title(map_title)
         ax_map.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
         ax_map.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -1864,7 +1864,7 @@ class BraggPeaksPolymer(AutoSerialize):
                                 vmax_cartesian=None, vmin_cartesian=None,
                                 map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
                                 norm_upper_quantile=None, norm_power=1.0,
-                                show_polar=True, vmax_polar=None):
+                                show_polar=True, vmax_polar=None, crosshair_color='r'):
         """
         Save diffraction pattern figures for a specific scan position.
         
@@ -1971,7 +1971,7 @@ class BraggPeaksPolymer(AutoSerialize):
             else:
                 im = ax.imshow(intensity_map, cmap=map_cmap, 
                               vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-            ax.plot(marker_rx, marker_ry, 'r+', markersize=15, markeredgewidth=2)
+            ax.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
             ax.set_title(map_title)
             ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -2022,7 +2022,7 @@ class BraggPeaksPolymer(AutoSerialize):
             else:
                 im1 = ax1.imshow(intensity_map, cmap=map_cmap, 
                                 vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-            ax1.plot(marker_rx, marker_ry, 'r+', markersize=15, markeredgewidth=2)
+            ax1.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
             ax1.set_title(map_title)
             ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -2064,7 +2064,8 @@ class BraggPeaksPolymer(AutoSerialize):
                                     peak_intensity_mode='size', peak_size_range=(30, 300),
                                     peak_cmap='hot', peak_vmin=None, peak_vmax=None,
                                     show_polar=True, vmax_polar=None, two_fold_symmetry=True,
-                                    map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',):
+                                    map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',
+                                    crosshair_color='r'):
         """
         Interactive plot for browsing diffraction patterns with peak overlay.
         Central beam (closest to image center) plotted in blue.
@@ -2209,7 +2210,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 im1 = ax1.imshow(intensity_map, cmap=map_cmap)
             else:
                 im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-            ax1.plot(rx_slider, ry_slider, 'r+', markersize=15, markeredgewidth=2)
+            ax1.plot(rx_slider, ry_slider,  color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
             ax1.set_title(map_title)
             ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -2270,7 +2271,8 @@ class BraggPeaksPolymer(AutoSerialize):
                          peak_intensity_mode='size', peak_size_range=(30, 300),
                          peak_cmap='hot', peak_vmin=None, peak_vmax=None,
                          show_polar=True, vmax_polar=None, two_fold_symmetry=True,
-                         map_cmap="viridis", dp_cmap="gray", intensity_field='intensities'):
+                         map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',
+                         crosshair_color='r'):
         """
         Save peak-annotated diffraction figures for a specific scan position.
         Central beam (closest to image center) plotted in blue.
@@ -2385,7 +2387,7 @@ class BraggPeaksPolymer(AutoSerialize):
             im = ax.imshow(intensity_map, cmap=map_cmap)
         else:
             im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        ax.plot(rx * upsample_factor, ry * upsample_factor, 'r+', markersize=15, markeredgewidth=2)
+        ax.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
         ax.set_title(map_title)
         ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
         ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -2438,7 +2440,7 @@ class BraggPeaksPolymer(AutoSerialize):
             im1 = ax1.imshow(intensity_map, cmap=map_cmap)
         else:
             im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        ax1.plot(rx * upsample_factor, ry * upsample_factor, 'r+', markersize=15, markeredgewidth=2)
+        ax1.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
         ax1.set_title(map_title)
         ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
         ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
