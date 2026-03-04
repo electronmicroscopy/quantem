@@ -532,10 +532,10 @@ class BraggPeaksPolymer(AutoSerialize):
         np.save(filepath, self.image_centers)
 
     def load_image_centers(self, filepath):
-        iamge_centers = np.load(filepath, allow_pickle=True)
-        if isinstance(iamge_centers, np.ndarray) and iamge_centers.dtype == object and iamge_centers.size == 1:
-            iamge_centers = iamge_centers.item()
-        self.iamge_centers = iamge_centers
+        image_centers = np.load(filepath, allow_pickle=True)
+        if isinstance(image_centers, np.ndarray) and image_centers.dtype == object and image_centers.size == 1:
+            image_centers = image_centers.item()
+        self.image_centers = image_centers
     
     def process_polar(self, scan_mask: ArrayLike = None, two_fold_symmetry: bool = True):
         """ Find center of image through brightest peak, return polar transform of data and peaks"""
