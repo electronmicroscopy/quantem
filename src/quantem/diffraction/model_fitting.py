@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
+from tqdm import tqdm
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
 from quantem.core.fitting.base import (
@@ -52,6 +53,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         # Diffraction-specific state/checkpoints
         self.state_mean_refined: dict[str, torch.Tensor] | None = None
         self.mean_refined: bool = False
+
+        self.state_individual_refined: np.ndarray | None = None
+        self.individual_refined: bool = False
 
         # Misc metadata
         self.metadata: dict[str, Any] = {}
@@ -500,7 +504,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
     def reset(
         self,
-        reset_to: Literal["initialized", "mean_refined"] = "mean_refined",
+        reset_to: Literal["initialized", "mean_refined", "individual"] = "mean_refined",
+        reset_history: bool = True,
+        individual_row: int = 0,
+        individual_col: int = 0,
     ) -> "ModelDiffraction":
         if reset_to == "initialized":
             state = self.state_initialized
@@ -508,22 +515,144 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 raise RuntimeError(
                     "initialized state is unavailable. Call .define_model(...) first."
                 )
-            self._clear_fit_history_all()
+            if reset_history:
+                self._clear_fit_history_all()
         elif reset_to == "mean_refined":
             state = self.state_mean_refined
             if state is None:
                 raise RuntimeError(
                     "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
                 )
-            mean_hist = self.fit_history.get("mean")
-            self._clear_fit_history_all()
-            if mean_hist is not None:
-                self.fit_history["mean"] = mean_hist
+            if reset_history:
+                mean_hist = self.fit_history.get("mean")
+                self._clear_fit_history_all()
+                if mean_hist is not None:
+                    self.fit_history["mean"] = mean_hist
+        elif reset_to == "individual":
+            if self.state_individual_refined is None:
+                raise ValueError("individual states is unavalible. Run fit_individual_diffraction_pattern(....) first")
+            if (individual_row >= self.state_individual_refined.shape[0]) or (individual_col >= self.state_individual_refined.shape[1]):
+                raise ValueError("row and column values not in range")
+            state = self.state_individual_refined[individual_row, individual_col]
+            if reset_history:
+                self._clear_fit_history_all()
         else:
-            raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
+            raise ValueError("reset_to must be 'initialized' or 'mean_refined' or 'individual'.")
 
         self._load_model_state_dict_copy(state)
         return self
+    
+    def fit_individual_diffraction_pattern(
+        self,
+        *,
+        rows=None,
+        cols = None,
+        n_steps: int = 200,
+        reset: bool | Literal["initialized", "mean_refined"],
+        optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        constraint_weight: float = 1.0,
+        constraint_params: dict[str, Any] | None = None,
+        progress: bool = True,
+    ) -> "ModelDiffraction":
+
+        if self.model is None or self.ctx is None or self.target_mean is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        if reset not in ("initialized", "mean_refined"):
+            raise ValueError("reset must be initialized', or 'mean_refined'.")
+        self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset))
+        if not isinstance(self.dataset, Dataset4d):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem for fit_individual_diffraction_pattern")
+        
+        scan_r = self.dataset.shape[0]
+        scan_c = self.dataset.shape[1]
+
+        if rows is None and cols is None:
+            rows = range(self.dataset.shape[0])
+            cols = range(self.dataset.shape[1])
+        elif rows is not None and cols is None:
+            cols = range(self.dataset.shape[1])
+        elif rows is None and cols is not None:
+            rows = range(self.dataset.shape[0])
+        else:
+            rows = rows
+            cols = cols
+        
+        if isinstance(rows, int):
+            rows = [rows]
+        if isinstance(cols, int):
+            cols = [cols]
+
+        self.state_individual_refined = np.full(shape=(scan_r, scan_c), fill_value=None, dtype=object)
+        
+        if progress:
+            pbar = tqdm(total=len(rows) * len(cols), desc="Fit individual")
+
+        for r in rows:
+            for c in cols:
+                # print(self.dataset.array[r,c].shape)
+                self.fit_render(
+                    target=torch.as_tensor(self.dataset.array[r,c],device=self.ctx.device,dtype=self.ctx.dtype),
+                    n_steps=int(n_steps),
+                    constraint_weight=float(constraint_weight),
+                    constraint_params=constraint_params,
+                    optimizer_params=optimizer_params,
+                    scheduler_params=scheduler_params,
+                    progress=False,
+                    run_key=f"individual_{r}_{c}",
+                )
+
+                s_fit = self._get_model_state_dict_copy()
+                self.state_individual_refined[r,c] = self._clone_state_dict(s_fit)
+                self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset), reset_history=False)
+
+                if progress:
+                    pbar.update(1)
+        if progress:
+            pbar.close()
+        self.individual_refined=True
+        return self
+    
+    def get_individual_uv_vectors(self) ->tuple[np.ndarray, np.ndarray]:
+        scan_r = self.dataset.shape[0]
+        scan_c = self.dataset.shape[1]
+        # print(scan_r)
+        
+        u_array = np.empty(shape=(scan_r, scan_c, 2))
+        v_array = np.empty(shape=(scan_r, scan_c, 2))
+        if self.state_individual_refined is None:
+            raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
+        for r in range(scan_r):
+            for c in range(scan_c):
+                pos_state = self.state_individual_refined[r,c]
+                if pos_state is None:
+                    u_array[r,c,:] = None
+                    v_array[r,c,:] = None
+                for key in pos_state.keys():
+                    key_parts = key.split('.')
+                    if(key_parts[-1] == 'u_row'):
+                        u_array[r,c,0] = pos_state[key]
+                    if(key_parts[-1] == 'u_col'):
+                        u_array[r,c,1] = pos_state[key]
+                    if(key_parts[-1] == 'v_row'):
+                        v_array[r,c,0] = pos_state[key]
+                    if(key_parts[-1] == 'v_col'):
+                        v_array[r,c,1] = pos_state[key]
+
+        return u_array, v_array
+    
+    def render_indivdual_pattern(self, row, col):
+        if self.state_individual_refined is None:
+            raise RuntimeError(
+                "individual_refined_state is unavalible. Run fit_individual_diffraction_pattern(...) first."
+            )
+        if self.dataset.shape[0] <= row or self.dataset.shape[1] <= col:
+            raise ValueError("individual row or column outside bounds of dataset")
+        if self.state_individual_refined[row, col] is None:
+            raise RuntimeError(
+                "individual_refined_state is not avalible for given row and column. Run fit_individual_diffraction_pattern(...) for that row and column."
+            )
+        return self._render_state_array(self.state_individual_refined[row, col])
 
     @property
     def render_mean_refined(self) -> np.ndarray:

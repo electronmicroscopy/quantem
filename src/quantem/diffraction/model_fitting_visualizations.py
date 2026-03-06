@@ -73,7 +73,12 @@ class ModelDiffractionVisualizations:
             ax.plot(disk_centers_rc[:, 1], disk_centers_rc[:, 0], **kw_disks)
 
     def plot_losses(
-        self, figax: tuple[Any, Any] | None = None, plot_lrs: bool = True
+        self, 
+        figax: tuple[Any, Any] | None = None, 
+        plot_lrs: bool = True, 
+        plot_individual: bool = False,
+        individual_row: int = 0,
+        individual_col: int = 0,
     ) -> tuple[Any, Any]:
         md = cast("ModelDiffraction", self)
         colors = config.get("viz.colors.set")
@@ -84,9 +89,12 @@ class ModelDiffractionVisualizations:
             fig, ax = plt.subplots()
         else:
             fig, ax = figax
-
-        mean_hist = md.fit_history.get("mean")
-        losses = np.asarray([] if mean_hist is None else mean_hist.losses, dtype=np.float64)
+        if plot_individual:
+            mean_hist = md.fit_history.get(f"individual_{individual_row}_{individual_col}")
+            losses = np.asarray([] if mean_hist is None else mean_hist.losses, dtype=np.float64)
+        else:
+            mean_hist = md.fit_history.get("mean")
+            losses = np.asarray([] if mean_hist is None else mean_hist.losses, dtype=np.float64)
         if losses.size == 0:
             ax.text(
                 0.5,
@@ -141,6 +149,9 @@ class ModelDiffractionVisualizations:
     def visualize(
         self,
         *,
+        plot_individual: bool = False,
+        individual_row: int = 0,
+        individual_col: int = 0,
         power: float = 0.25,
         cbar: bool = False,
         axsize: tuple[int, int] = (6, 6),
@@ -193,14 +204,21 @@ class ModelDiffractionVisualizations:
             md.preprocess()
         if md.image_ref is None or md.model is None or md.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
+        if md.dataset.shape[0] <= individual_row or md.dataset.shape[1] <= individual_col:
+            raise ValueError("individual row or column outside bounds of dataset")
 
         fig = plt.figure(figsize=(12, 7))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax_top = fig.add_subplot(gs[0])
-        md.plot_losses(figax=(fig, ax_top), plot_lrs=True)
+        md.plot_losses(figax=(fig, ax_top), plot_lrs=True, plot_individual=plot_individual,individual_row=individual_row,individual_col=individual_col)
 
-        ref = np.asarray(md.image_ref, dtype=np.float32)
-        pred = md.render_current
+        if plot_individual:
+            ref = np.asarray(md.dataset.array[individual_row, individual_col], dtype=np.float32)
+            pred = md.render_indivdual_pattern(row=individual_row, col = individual_col)
+        else:
+            ref = np.asarray(md.image_ref, dtype=np.float32)
+            pred = md.render_current
+        
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
         vmin = float(min(refp.min(), predp.min()))
