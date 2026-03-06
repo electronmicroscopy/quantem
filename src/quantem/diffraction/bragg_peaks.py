@@ -1717,7 +1717,8 @@ class BraggPeaksPolymer(AutoSerialize):
     def plot_interactive_image_map(self, intensity_map=None, vmax_cartesian=None, vmin_cartesian=None, 
                                     map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
                                     norm_upper_quantile=None, norm_power=1.0,
-                                    show_polar=True, vmax_polar=None, crosshair_color='r'):
+                                    show_polar=True, vmax_polar=None, crosshair_color='r', figsize=None,
+                                    crosshair_width=2, crosshair_size=15,):
         """
         Interactive plot for browsing diffraction patterns with optional intensity map.
         
@@ -1796,9 +1797,13 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # ---- Create figure and axes once ----
         if show_polar:
-            fig, (ax_map, ax_diff, ax_polar) = plt.subplots(1, 3, figsize=(15, 4))
+            if figsize is None:
+                figsize=(15, 4)
+            fig, (ax_map, ax_diff, ax_polar) = plt.subplots(1, 3, figsize=figsize)
         else:
-            fig, (ax_map, ax_diff) = plt.subplots(1, 2, figsize=(12, 5))
+            if figsize is None:
+                figsize=(12, 5)
+            fig, (ax_map, ax_diff) = plt.subplots(1, 2, figsize=figsize)
             ax_polar = None
         
         # Initialize image objects
@@ -1807,7 +1812,7 @@ class BraggPeaksPolymer(AutoSerialize):
         else:
             im_map = ax_map.imshow(intensity_map, cmap=map_cmap, 
                                   vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        line_marker, = ax_map.plot([], [], color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
+        line_marker, = ax_map.plot([], [], color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
         ax_map.set_title(map_title)
         ax_map.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
         ax_map.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -1864,7 +1869,8 @@ class BraggPeaksPolymer(AutoSerialize):
                                 vmax_cartesian=None, vmin_cartesian=None,
                                 map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
                                 norm_upper_quantile=None, norm_power=1.0,
-                                show_polar=True, vmax_polar=None, crosshair_color='r'):
+                                show_polar=True, vmax_polar=None, crosshair_color='r', 
+                                 figsize_individual=None, figsize_combined=None, crosshair_width=2, crosshair_size=15):
         """
         Save diffraction pattern figures for a specific scan position.
         
@@ -1965,31 +1971,30 @@ class BraggPeaksPolymer(AutoSerialize):
         
         try:
             # Save intensity map
-            fig_map, ax = plt.subplots(figsize=(6, 6))
+            if figsize_individual is None:
+                figsize_individual = (6, 6)
+            fig_map, ax = plt.subplots(figsize=figsize_individual)
             if vmin_intensity_map is None:
                 im = ax.imshow(intensity_map, cmap=map_cmap)
             else:
                 im = ax.imshow(intensity_map, cmap=map_cmap, 
                               vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-            ax.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
+            ax.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
             ax.set_title(map_title)
             ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-            if not is_rgb_map:
-                plt.colorbar(im, ax=ax)
             filename = save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf'
             fig_map.savefig(filename)
             plt.close(fig_map)
             print(f'✓ Saved: {filename}')
             
             # Save diffraction pattern
-            fig_diff, ax = plt.subplots(figsize=(6, 6))
+            fig_diff, ax = plt.subplots(figsize=figsize_individual)
             dp_data = get_normalized_dp(ry, rx)
             im = ax.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
             ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
             ax.set_xticks([])
             ax.set_yticks([])
-            plt.colorbar(im, ax=ax)
             filename = save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf'
             fig_diff.savefig(filename)
             plt.close(fig_diff)
@@ -1997,13 +2002,12 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # Save polar transform
             if show_polar:
-                fig_polar, ax = plt.subplots(figsize=(6, 6))
+                fig_polar, ax = plt.subplots(figsize=figsize_individual)
                 im = ax.imshow(self.polar_data['intensity'][ry, rx].T, 
                               cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
                 ax.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
                 ax.set_xlabel('Radius (bins)')
                 ax.set_ylabel('Theta (bins)')
-                plt.colorbar(im, ax=ax)
                 filename = save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf'
                 fig_polar.savefig(filename)
                 plt.close(fig_polar)
@@ -2011,9 +2015,13 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # Save combined figure
             if show_polar:
-                fig_combined, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 4))
+                if figsize_combined is None:
+                    figsize_combined = (15, 4)
+                fig_combined, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=figsize_combined)
             else:
-                fig_combined, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                if figsize_combined is None:
+                    figszie_combined = (12, 5)
+                fig_combined, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize_combined)
                 ax3 = None
             
             # Plot intensity map
@@ -2022,19 +2030,16 @@ class BraggPeaksPolymer(AutoSerialize):
             else:
                 im1 = ax1.imshow(intensity_map, cmap=map_cmap, 
                                 vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-            ax1.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
+            ax1.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
             ax1.set_title(map_title)
             ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-            if not is_rgb_map:
-                plt.colorbar(im1, ax=ax1)
             
             # Plot diffraction pattern
             im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
             ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
             ax2.set_xticks([])
             ax2.set_yticks([])
-            plt.colorbar(im2, ax=ax2)
             
             # Plot polar transform
             if show_polar:
@@ -2043,7 +2048,6 @@ class BraggPeaksPolymer(AutoSerialize):
                 ax3.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
                 ax3.set_xlabel('Radius (bins)')
                 ax3.set_ylabel('Theta (bins)')
-                plt.colorbar(im3, ax=ax3)
             
             plt.tight_layout()
             filename = save_path / f'{prefix}_ry{ry}_rx{rx}_combined.pdf'
@@ -2056,7 +2060,7 @@ class BraggPeaksPolymer(AutoSerialize):
         except Exception as e:
             print(f"Error saving figures: {e}")
             
-    def plot_interactive_peak_map(self, radial_range=None, intensity_map_override=None,
+    def plot_interactive_peak_map(self, radial_range=None, intensity_map=None,
                                     vmax_cartesian=7, show_all_peaks=True,
                                     selected_peak_color='red', other_peak_color='gray',
                                     central_beam_color='red',
@@ -2065,12 +2069,17 @@ class BraggPeaksPolymer(AutoSerialize):
                                     peak_cmap='hot', peak_vmin=None, peak_vmax=None,
                                     show_polar=True, vmax_polar=None, two_fold_symmetry=True,
                                     map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',
-                                    crosshair_color='r'):
+                                    crosshair_color='r', figsize=None, crosshair_width=2, crosshair_size=15,
+                                    crosshair_width_peaks=2, crosshair_scaling_peaks=1, crosshair_scaling_central_beam=1):
         """
         Interactive plot for browsing diffraction patterns with peak overlay.
         Central beam (closest to image center) plotted in blue.
         """
-        
+        if figsize is None:
+            if show_polar:
+                figsize = (15, 4)
+            else:
+                figsize = (12, 5)
         Ry, Rx = self.peak_coordinates_cartesian.shape
         
         if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
@@ -2078,8 +2087,7 @@ class BraggPeaksPolymer(AutoSerialize):
             show_polar = False
         
         # Setup intensity map
-        if intensity_map_override is not None:
-            intensity_map = intensity_map_override
+        if intensity_map is not None:
             upsample_factor = intensity_map.shape[0] // Ry
             map_title = f'Custom Map ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else 'Custom Map'
         else:
@@ -2159,7 +2167,7 @@ class BraggPeaksPolymer(AutoSerialize):
             # Plot central beam if in range
             if central_idx is not None:
                 ax.scatter(peaks_x[central_idx], peaks_y[central_idx], 
-                          edgecolors='k', facecolors=central_beam_color, s=30, alpha=0.95, marker='o', linewidths=2, zorder=10)
+                          edgecolors='k', facecolors=central_beam_color, s=120*crosshair_scaling_central_beam, alpha=0.95, marker='o', linewidths=2, zorder=10)
                 non_central = np.ones(len(peaks_x), dtype=bool)
                 non_central[central_idx] = False
             else:
@@ -2185,8 +2193,8 @@ class BraggPeaksPolymer(AutoSerialize):
                 else:
                     colors, sizes = selected_peak_color, 100
                 
-                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes, 
-                          alpha=0.8, marker='x', linewidths=2, zorder=5)
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes*crosshair_scaling_peaks, 
+                          alpha=0.8, marker='x', linewidths=crosshair_width_peaks, zorder=5)
                 
                 if peak_intensity_mode in ['color', 'both']:
                     sm = plt.cm.ScalarMappable(cmap=peak_cmap, norm=plt.Normalize(vmin=int_min, vmax=int_max))
@@ -2194,14 +2202,13 @@ class BraggPeaksPolymer(AutoSerialize):
                     plt.colorbar(sm, ax=ax, pad=0.02, fraction=0.046).set_label('Peak Intensity', fontsize=8)
             else:
                 ax.scatter(peaks_x[non_central], peaks_y[non_central], c=selected_peak_color, 
-                          s=100, alpha=0.8, marker='x', linewidths=2, zorder=5)
+                          s=100, alpha=0.8, marker='x', linewidths=crosshair_width_peaks, zorder=5)
         
         # Interactive callback
         def show_pattern(ry_slider, rx_slider):
             ry_data = ry_slider // upsample_factor
             rx_data = rx_slider // upsample_factor
-            
-            fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=(15, 4) if show_polar else (12, 5))
+            fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=figsize)
             ax1, ax2 = axes[0], axes[1]
             ax3 = axes[2] if show_polar else None
             
@@ -2210,7 +2217,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 im1 = ax1.imshow(intensity_map, cmap=map_cmap)
             else:
                 im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-            ax1.plot(rx_slider, ry_slider,  color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
+            ax1.plot(rx_slider, ry_slider,  color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
             ax1.set_title(map_title)
             ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -2262,7 +2269,7 @@ class BraggPeaksPolymer(AutoSerialize):
         interactive_plot = interactive_output(show_pattern, {'ry_slider': ry_slider, 'rx_slider': rx_slider})
         display(VBox([HBox([ry_slider, rx_slider]), interactive_plot]))
         
-    def save_peak_figures(self, ry, rx, intensity_map_override=None,
+    def save_peak_figures(self, ry, rx, intensity_map=None,
                          map_title="", prefix='peaks', save_dir='.',
                          vmax_cartesian=7,
                          selected_peak_color='red',
@@ -2272,7 +2279,9 @@ class BraggPeaksPolymer(AutoSerialize):
                          peak_cmap='hot', peak_vmin=None, peak_vmax=None,
                          show_polar=True, vmax_polar=None, two_fold_symmetry=True,
                          map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',
-                         crosshair_color='r'):
+                         crosshair_color='r', figsize_individual=None, figsize_combined=None, 
+                         crosshair_width=2, crosshair_size=15, crosshair_width_peaks=2,
+                         crosshair_scaling_peaks=1, crosshair_scaling_central_beam=1):
         """
         Save peak-annotated diffraction figures for a specific scan position.
         Central beam (closest to image center) plotted in blue.
@@ -2288,8 +2297,7 @@ class BraggPeaksPolymer(AutoSerialize):
             show_polar = False
         
         # Setup intensity map
-        if intensity_map_override is not None:
-            intensity_map = intensity_map_override
+        if intensity_map is not None:
             upsample_factor = intensity_map.shape[0] // Ry
         else:
             intensity_map = np.array([[np.mean(self.dataset_cartesian[i, j].array) 
@@ -2333,7 +2341,7 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # Plot central beam
             ax.scatter(peaks_x[central_idx], peaks_y[central_idx], 
-                      edgecolors='k', facecolors=central_beam_color, s=30, alpha=0.95, marker='o', linewidths=2, zorder=10)
+                      edgecolors='k', facecolors=central_beam_color, s=120*crosshair_scaling_central_beam, alpha=0.95, marker='o', linewidths=crosshair_width_peaks, zorder=10)
             
             # Create non-central mask
             non_central = np.ones(len(peaks_x), dtype=bool)
@@ -2359,13 +2367,12 @@ class BraggPeaksPolymer(AutoSerialize):
                 else:
                     colors, sizes = selected_peak_color, 100
                 
-                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes, 
-                          alpha=0.8, marker='x', linewidths=2, zorder=5)
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes*crosshair_scaling_peaks, 
+                          alpha=0.8, marker='x', linewidths=crosshair_width_peaks, zorder=5)
                 
                 if peak_intensity_mode in ['color', 'both']:
                     sm = plt.cm.ScalarMappable(cmap=peak_cmap, norm=plt.Normalize(vmin=int_min, vmax=int_max))
                     sm.set_array([])
-                    plt.colorbar(sm, ax=ax, pad=0.02, fraction=0.046).set_label('Peak Intensity', fontsize=8)
             else:
                 ax.scatter(peaks_x[non_central], peaks_y[non_central], c=selected_peak_color, 
                           s=100, alpha=0.8, marker='x', linewidths=2, zorder=5)
@@ -2382,27 +2389,26 @@ class BraggPeaksPolymer(AutoSerialize):
         dp_data = get_normalized_dp(ry, rx)
         
         # Save intensity map
-        fig_map, ax = plt.subplots(figsize=(6, 6))
+        if figsize_individual is None:
+            figsize_individual = (6, 6)
+        fig_map, ax = plt.subplots(figsize=figsize_individual)
         if vmin_intensity_map is None:
             im = ax.imshow(intensity_map, cmap=map_cmap)
         else:
             im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        ax.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
+        ax.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
         ax.set_title(map_title)
         ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
         ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-        if not is_rgb_map:
-            plt.colorbar(im, ax=ax)
         fig_map.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf')
         plt.close(fig_map)
         print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_intensity_map.pdf')
         
         # Save diffraction pattern with peaks
-        fig_diff, ax = plt.subplots(figsize=(6, 6))
+        fig_diff, ax = plt.subplots(figsize=figsize_individual)
         im = ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian)
         ax.set_xticks([])
         ax.set_yticks([])
-        plt.colorbar(im, ax=ax)
         plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, is_polar=False)
         ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
         fig_diff.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf')
@@ -2411,12 +2417,11 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # Save polar transform with peaks
         if show_polar:
-            fig_polar, ax = plt.subplots(figsize=(6, 6))
+            fig_polar, ax = plt.subplots(figsize=figsize_individual)
             im = ax.imshow(self.polar_data['intensity'][ry, rx].T, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
             ax.set_title(f'Polar (Ry={ry}, Rx={rx})')
             ax.set_xlabel('Radius (bins)')
             ax.set_ylabel('Theta (bins)')
-            plt.colorbar(im, ax=ax)
             
             if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
                 polar_r = self.polar_peaks['r_invA'][ry, rx]
@@ -2431,7 +2436,12 @@ class BraggPeaksPolymer(AutoSerialize):
             print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_polar.pdf')
         
         # Save combined figure
-        fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=(15, 4) if show_polar else (12, 5))
+        if figsize_combined is None:
+            if show_polar:
+                figsize_combined = (15, 4)
+            else:
+                figsize_combined = (12, 5)
+        fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=figsize_combined)
         ax1, ax2 = axes[0], axes[1]
         ax3 = axes[2] if show_polar else None
         
@@ -2440,18 +2450,15 @@ class BraggPeaksPolymer(AutoSerialize):
             im1 = ax1.imshow(intensity_map, cmap=map_cmap)
         else:
             im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        ax1.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=15, markeredgewidth=2)
+        ax1.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
         ax1.set_title(map_title)
         ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
         ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-        if not is_rgb_map:
-            plt.colorbar(im1, ax=ax1)
         
         # Diffraction pattern
         im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian)
         ax2.set_xticks([])
         ax2.set_yticks([])
-        plt.colorbar(im2, ax=ax2)
         plot_peaks_on_ax(ax2, peaks_x, peaks_y, peaks_r_invA, peak_ints, is_polar=False)
         ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
         
@@ -2461,7 +2468,6 @@ class BraggPeaksPolymer(AutoSerialize):
             ax3.set_xlabel('Radius (bins)')
             ax3.set_ylabel('Theta (bins)')
             ax3.set_title(f'Polar (Ry={ry}, Rx={rx})')
-            plt.colorbar(im3, ax=ax3)
             
             if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
                 polar_r = self.polar_peaks['r_invA'][ry, rx]
@@ -2479,7 +2485,7 @@ class BraggPeaksPolymer(AutoSerialize):
         print(f'\nAll figures saved to: {save_path}')
     
     def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,
-                                         reference_image=None, overlay_alpha=0.3):
+                                         reference_image=None, overlay_alpha=0.3, crosshair_width=2, crosshair_size=15):
         """
         Interactive mask creation with sliders for circular region selection.
         
@@ -2611,7 +2617,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 im0 = axs[0].imshow(reference_image, cmap='gray')
                 circle = plt.Circle((y0, x0), r, color='red', fill=False, linewidth=2, linestyle='--')
                 axs[0].add_patch(circle)
-                axs[0].plot(y0, x0, 'r+', markersize=15, markeredgewidth=2)
+                axs[0].plot(y0, x0, 'r+', markersize=crosshair_size, markeredgewidth=crosshair_width)
                 axs[0].set_title('Reference Image')
                 axs[0].set_xlabel('Rx')
                 axs[0].set_ylabel('Ry')
