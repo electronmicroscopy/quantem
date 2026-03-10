@@ -487,6 +487,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
 
         self.fit_render(
+            # target=torch.tensor(self.dataset[30,30].array.astype("float32")),
             target=self.target_mean,
             n_steps=int(n_steps),
             constraint_weight=float(constraint_weight),
@@ -578,10 +579,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             rows = rows
             cols = cols
         
-        if isinstance(rows, int):
-            rows = [rows]
-        if isinstance(cols, int):
-            cols = [cols]
+        rows = np.asarray(rows)
+        cols = np.asarray(cols)
 
         self.state_individual_refined = np.full(shape=(scan_r, scan_c), fill_value=None, dtype=object)
         
@@ -591,6 +590,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         for r in rows:
             for c in cols:
                 # print(self.dataset.array[r,c].shape)
+                self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset), reset_history=False)
                 self.fit_render(
                     target=torch.as_tensor(self.dataset.array[r,c],device=self.ctx.device,dtype=self.ctx.dtype),
                     n_steps=int(n_steps),
@@ -604,12 +604,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
                 s_fit = self._get_model_state_dict_copy()
                 self.state_individual_refined[r,c] = self._clone_state_dict(s_fit)
-                self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset), reset_history=False)
-
+                # self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset), reset_history=False)
                 if progress:
                     pbar.update(1)
         if progress:
             pbar.close()
+
         self.individual_refined=True
         return self
     

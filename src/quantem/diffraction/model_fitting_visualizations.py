@@ -278,7 +278,7 @@ class ModelDiffractionVisualizations:
         overlay_on: Literal["model", "both"] = "model",
         origin_marker_kwargs: dict[str, Any] | None = None,
         disk_marker_kwargs: dict[str, Any] | None = None,
-        **_: Any,
+        **kwargs,
     ) -> tuple[Any, Any] | None:
         """
         Plot reference and model mean diffraction images.
@@ -325,22 +325,24 @@ class ModelDiffractionVisualizations:
             raise RuntimeError("Call .define_model(...) first.")
 
         ref = np.asarray(md.image_ref, dtype=np.float32)
-        pred = md.render_current
+        pred = md.render_mean_refined
 
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
         vmin = float(min(refp.min(), predp.min()))
         vmax = float(max(refp.max(), predp.max()))
 
+        t1 = kwargs.pop("title", "")
         fig, ax = show_2d(
             [refp, predp],
-            title=["image_ref", "model"],
+            title=[t1 + " image_ref", t1 + " model"],
             cmap=config.get("viz.cmap"),
-            cbar=False,
+            cbar=True,
             returnfig=True,
             axsize=axsize,
             vmin=vmin,
             vmax=vmax,
+            **kwargs, 
         )
         if overlay:
             if overlay_on not in ("model", "both"):

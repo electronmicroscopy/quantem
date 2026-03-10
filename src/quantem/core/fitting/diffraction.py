@@ -52,6 +52,7 @@ class DiskTemplate(RenderComponent):
     DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
         "force_center": False,
         "force_positive": True,
+        "force_norm": True, # force range [0,1]
     }
     DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {"tv_weight": 0.0}
 
@@ -238,12 +239,20 @@ class DiskTemplate(RenderComponent):
         with torch.no_grad():
             self.template_raw.clamp_(min=0.0)
             self.intensity_raw.clamp_(min=0.0)
+    
+    def _enforce_norm(self) -> None:
+        with torch.no_grad():
+            self.template_raw -= self.template_raw.min()
+            self.template_raw /= self.template_raw.max()
 
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:
         if bool(self.hard_constraints.get("force_center", False)):
             self._center_disk()
         if bool(self.hard_constraints.get("force_positive", False)):
             self._enforce_positivity()
+        if bool(self.hard_constraints.get("force_norm", False)): # could be put in positivity
+            self._enforce_norm()
+        
         super().enforce_hard_constraints(ctx)
 
     def constraint_loss(
@@ -291,7 +300,7 @@ class SyntheticDiskLattice(RenderComponent):
         intensity_row_col: float | Sequence[float] = 0.0,
         per_disk_intensity: bool = False,
         per_disk_slopes: bool = True,
-        max_intensity_order: int | None = None,
+        max_intensity_order: int | None = 0,
         default_pattern_intensity_order: int | None = None,
         center_intensity_0: float | Sequence[float] | None = None,
         exclude_indices: Iterable[tuple[int, int]] | None = None,
