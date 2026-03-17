@@ -120,6 +120,158 @@ def _normalize_coords_for_grid_sample(
     return torch.stack([x_norm, y_norm], dim=-1)
 
 
+def _polar_to_cartesian_offsets(
+    phi: torch.Tensor,
+    r: torch.Tensor,
+    ellipse_params: tuple[float, float, float] | None,
+    device: str = "cpu",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert polar (phi, r) grids to Cartesian (x, y) offsets from the origin,
+    optionally correcting for elliptical distortion."""
+    if ellipse_params is None:
+        x = r * torch.cos(phi)
+        y = r * torch.sin(phi)
+    else:
+        if len(ellipse_params) != 3:
+            raise ValueError("ellipse_params must be (a, b, theta_deg).")
+        a, b, theta_deg = ellipse_params
+        theta = torch.deg2rad(torch.tensor(theta_deg, dtype=torch.float32, device=device))
+        # Rotate into the ellipse frame, scale by a/b to undo the distortion,
+        # then rotate back so sampling follows the true circular rings
+        alpha = phi - theta
+        u = (a / b) * r * torch.cos(alpha)
+        v_prime = r * torch.sin(alpha)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        x = u * cos_t - v_prime * sin_t
+        y = u * sin_t + v_prime * cos_t
+    return x, y
+
+
+def _build_candidate_grids(
+    base_x_norm: torch.Tensor,
+    base_y_norm: torch.Tensor,
+    center_row: int,
+    center_col: int,
+    margin: int,
+    ny: int,
+    nx: int,
+    x_norm_scale: float,
+    y_norm_scale: float,
+    device: str = "cpu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a batch of normalized sampling grids for all candidate origins
+    within a search window around (center_row, center_col)."""
+    # Enumerate all pixel positions in the search window, clamped to image bounds
+    rows = torch.arange(
+        max(0, center_row - margin),
+        min(ny, center_row + margin + 1),
+        dtype=torch.long,
+        device=device,
+    )
+    cols = torch.arange(
+        max(0, center_col - margin),
+        min(nx, center_col + margin + 1),
+        dtype=torch.long,
+        device=device,
+    )
+    row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
+    row_flat, col_flat = row_grid.reshape(-1), col_grid.reshape(-1)
+    # Shift the pre-computed polar offsets to each candidate origin,
+    # converting to grid_sample's [-1, 1] normalized coordinates
+    grid_x = base_x_norm.unsqueeze(0) + (col_flat.float() * x_norm_scale - 1.0)[:, None, None]
+    grid_y = base_y_norm.unsqueeze(0) + (row_flat.float() * y_norm_scale - 1.0)[:, None, None]
+    grids = torch.stack([grid_x, grid_y], dim=-1)  # (N, n_phi, n_r, 2)
+    return row_flat, col_flat, grids
+
+
+def _angular_std_scores(
+    dp_batch: torch.Tensor,
+    grids: torch.Tensor,
+    min_r_idx: int,
+    max_r_idx: int,
+) -> torch.Tensor:
+    """Score candidate origins by angular std over a mid-radius band.
+    Lower scores indicate better centering."""
+    n = grids.shape[0]
+    # Sample the diffraction pattern at each candidate's polar grid positions
+    polars = F.grid_sample(
+        dp_batch.expand(n, -1, -1, -1),
+        grids,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    # A correctly centered pattern has uniform intensity along each ring,
+    # so the angular std is minimized at the true center
+    region = polars.squeeze(1)[:, :, min_r_idx:max_r_idx]
+    return region.std(dim=1).sum(dim=1)
+
+
+def _build_polar_sampling_offsets(
+    ellipse_params: tuple[float, float, float] | None,
+    num_annular_bins: int,
+    radial_min: float,
+    radial_max_eff: float,
+    radial_step: float,
+    two_fold_rotation_symmetry: bool,
+    device: str = "cpu",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build origin-independent Cartesian offsets for a polar sampling grid.
+    Returns (offset_x, offset_y, phi_bins, radial_bins) where offset_x and
+    offset_y have shape (n_phi, n_r) and represent pixel displacements from
+    an arbitrary origin."""
+    if radial_step <= 0:
+        raise ValueError(f"Got radial_step = {radial_step}. radial_step must be > 0.")
+    if num_annular_bins < 1:
+        raise ValueError("num_annular_bins must be >= 1.")
+
+    radial_bins = torch.arange(
+        radial_min, radial_max_eff, radial_step, dtype=torch.float32, device=device
+    )
+    if radial_bins.numel() == 0:
+        radial_bins = torch.tensor([radial_min], dtype=torch.float32, device=device)
+    phi_range = torch.pi if two_fold_rotation_symmetry else 2.0 * torch.pi
+    # Drop the last endpoint because 0 and 2pi (or pi) are the same angle
+    phi_bins = torch.linspace(
+        0.0, phi_range, num_annular_bins + 1, dtype=torch.float32, device=device
+    )[:-1]
+    phi_grid, r_grid = torch.meshgrid(phi_bins, radial_bins, indexing="ij")
+    # Compute offsets relative to origin (0,0) so they can be reused
+    # for any candidate origin by simple translation
+    offset_x, offset_y = _polar_to_cartesian_offsets(phi_grid, r_grid, ellipse_params, device)
+    return offset_x, offset_y, phi_bins, radial_bins
+
+
+def _compute_radial_max(
+    ny: int,
+    nx: int,
+    origin_row: float,
+    origin_col: float,
+    radial_max: float | None,
+    radial_min: float,
+    radial_step: float,
+) -> float:
+    """Compute the effective maximum radius, clamped to image bounds."""
+    # Use the shortest distance from the origin to any image edge so the
+    # polar grid never samples outside the image bounds
+    if radial_max is None:
+        radial_max_eff = float(
+            min(
+                origin_row,
+                (ny - 1) - origin_row,
+                origin_col,
+                (nx - 1) - origin_col,
+            )
+        )
+    else:
+        radial_max_eff = float(radial_max)
+    # Guarantee at least one radial bin
+    if radial_max_eff <= radial_min:
+        radial_max_eff = radial_min + radial_step
+    return radial_max_eff
+
+
 def _precompute_polar_coords(
     ny: int,
     nx: int,
@@ -133,61 +285,33 @@ def _precompute_polar_coords(
     two_fold_rotation_symmetry: bool,
     device: str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Build a normalized sampling grid for a single known origin."""
     origin_row = float(origin_row)
     origin_col = float(origin_col)
-    if radial_step <= 0:
-        raise ValueError(f"Got radial_step = {radial_step}. radial_step must be > 0.")
-    if num_annular_bins < 1:
-        raise ValueError("num_annular_bins must be >= 1.")
-    # Use the shortest distance from the origin to any image edge so the
-    # polar grid never samples outside the image bounds.
-    if radial_max is None:
-        r_row_pos = origin_row
-        r_row_neg = (ny - 1) - origin_row
-        r_col_pos = origin_col
-        r_col_neg = (nx - 1) - origin_col
-        radial_max_eff = float(min(r_row_pos, r_row_neg, r_col_pos, r_col_neg))
-    else:
-        radial_max_eff = float(radial_max)
-    # Guarantee at least one radial bin so downstream code never gets an empty array
-    if radial_max_eff <= radial_min:
-        radial_max_eff = radial_min + radial_step
-
-    #  create radial bins and phi bins, then create the grid of (phi, r) coordinates
-    radial_bins = torch.arange(
-        radial_min, radial_max_eff, radial_step, dtype=torch.float32, device=device
+    # Clamp radial range so the polar grid stays within image bounds
+    radial_max_eff = _compute_radial_max(
+        ny,
+        nx,
+        origin_row,
+        origin_col,
+        radial_max,
+        radial_min,
+        radial_step,
     )
-    if radial_bins.numel() == 0:
-        radial_bins = torch.tensor([radial_min], dtype=torch.float32, device=device)
-    phi_range = torch.pi if two_fold_rotation_symmetry else 2.0 * torch.pi
-    # Drop the last endpoint because 0 and 2pi (or pi) are the same angle
-    phi_bins = torch.linspace(
-        0.0, phi_range, num_annular_bins + 1, dtype=torch.float32, device=device
-    )[:-1]
-    phi_grid, r_grid = torch.meshgrid(phi_bins, radial_bins, indexing="ij")
-
-    # apply ellipse distortion correction if requested
-    # TODO: implement method to estimate ellipse_params from data
-    if ellipse_params is None:
-        x = r_grid * torch.cos(phi_grid)
-        y = r_grid * torch.sin(phi_grid)
-    else:
-        if len(ellipse_params) != 3:
-            raise ValueError("ellipse_params must be (a, b, theta_deg).")
-        a, b, theta_deg = ellipse_params
-        theta = torch.deg2rad(torch.tensor(theta_deg, dtype=torch.float32, device=device))
-        # Rotate into the ellipse frame, scale by a/b to undo the distortion,
-        # then rotate back so sampling follows the true circular rings
-        alpha = phi_grid - theta
-        u = (a / b) * r_grid * torch.cos(alpha)
-        v_prime = r_grid * torch.sin(alpha)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
-        x = u * cos_t - v_prime * sin_t
-        y = u * sin_t + v_prime * cos_t
-    coords_y = y + origin_row
-    coords_x = x + origin_col
-    # convert to normalized coordinates for grid_sample
+    # Get origin-independent polar offsets in pixel coordinates
+    offset_x, offset_y, phi_bins, radial_bins = _build_polar_sampling_offsets(
+        ellipse_params,
+        num_annular_bins,
+        radial_min,
+        radial_max_eff,
+        radial_step,
+        two_fold_rotation_symmetry,
+        device,
+    )
+    # Translate offsets to absolute pixel pos at this origin
+    coords_x = offset_x + origin_col
+    coords_y = offset_y + origin_row
+    # Convert to [-1, 1] normalized coordinates expected by grid_sample
     grid = _normalize_coords_for_grid_sample(coords_y, coords_x, ny, nx)
     grid = grid.unsqueeze(0)  # (1, n_phi, n_r, 2)
     return grid, phi_bins, radial_bins, radial_max_eff
@@ -205,16 +329,14 @@ def auto_origin_id(
     device: str = "cpu",
 ) -> NDArray:
     """
-    Automatic diffraction center finding by minimizing the standard deviation
-    along the annular direction in the polar transform.
+    Automatic diffraction center finding by minimizing angular intensity
+    variation in the polar transform. A correctly centered diffraction
+    pattern has uniform intensity along each ring, so the center that
+    minimizes the angular standard deviation is the true beam center.
 
-    For each scan position, this routine:
-    1) Computes a polar transform at an initial origin (image center, or
-       warm-started from the previous scan position).
-    2) Evaluates the sum of the standard deviation across angle (phi) over
-       a mid-radius band.
-    3) Performs a local search over neighboring pixel origins until the
-       objective no longer improves.
+    Uses a coarse-to-fine search on the mean diffraction pattern to find
+    a global center, then refines per scan position to account for beam
+    drift across the scan.
 
     Parameters
     ----------
@@ -223,7 +345,8 @@ def auto_origin_id(
     ellipse_params : tuple or None
         Ellipse parameters (a, b, theta_deg) for distortion correction.
     num_annular_bins : int
-        Number of angular bins for polar transform.
+        Number of angular bins for the final polar transform (not used
+        during center-finding, which uses 36 bins for speed).
     radial_min : float
         Minimum radius in pixels.
     radial_max : float or None
@@ -253,85 +376,135 @@ def auto_origin_id(
         )
 
     origin_array = np.zeros((scan_y, scan_x, 2), dtype=float)
-    max_steps = 1000
     total_positions = scan_y * scan_x
-    # start with center but subsequent positions warm-start from the previous result
-    estimated_origin_row = (ny - 1) / 2.0
-    estimated_origin_col = (nx - 1) / 2.0
-    pbar = tqdm(total=total_positions, desc="Origin of each scan position")
+
+    # first get COM of mean DP because it gives a robust rough center
+    array_4d = data.array if data.array.ndim == 4 else data.array[None, None, :, :]
+    mean_dp_np = array_4d.mean(axis=(0, 1)).astype(np.float32)
+    total_intensity = mean_dp_np.sum()
+    yy_grid, xx_grid = np.mgrid[0:ny, 0:nx]
+    com_row = int(round(float((yy_grid * mean_dp_np).sum() / total_intensity)))
+    com_col = int(round(float((xx_grid * mean_dp_np).sum() / total_intensity)))
+
+    # building a fixed polar grid that is safe for all candidates
+    # safe_rmax ensures no candidate's grid extends outside the image
+    global_margin = 20
+    safe_rmax = float(
+        min(
+            com_row - global_margin,
+            (ny - 1) - (com_row + global_margin),
+            com_col - global_margin,
+            (nx - 1) - (com_col + global_margin),
+        )
+    )
+    if radial_max is not None:
+        safe_rmax = min(safe_rmax, float(radial_max))
+    if safe_rmax <= radial_min:
+        safe_rmax = radial_min + radial_step
+    # use very coarse binning because asymmetry is still captured at
+    # low angular resolution and is significantly faster
+    search_n_phi = 36
+    offset_x, offset_y, _, radial_bins = _build_polar_sampling_offsets(
+        ellipse_params,
+        search_n_phi,
+        radial_min,
+        safe_rmax,
+        radial_step,
+        two_fold_rotation_symmetry,
+        device,
+    )
+    n_r = radial_bins.numel()
+    min_r_idx = int(np.floor(0.1 * n_r))
+    max_r_idx = int(np.ceil(0.9 * n_r))
+    # Normalize offsets to [-1, 1] because grid_sample expects normalized coordinates
+    x_norm_scale = 2.0 / (nx - 1)
+    y_norm_scale = 2.0 / (ny - 1)
+    base_x_norm = offset_x * x_norm_scale
+    base_y_norm = offset_y * y_norm_scale
+
+    # now find actual center
+    # Coarse search over ±global_margin around COM
+    coarse_step = 4
+    coarse_rows = torch.arange(
+        max(0, com_row - global_margin),
+        min(ny, com_row + global_margin + 1),
+        coarse_step,
+        dtype=torch.long,
+        device=device,
+    )
+    coarse_cols = torch.arange(
+        max(0, com_col - global_margin),
+        min(nx, com_col + global_margin + 1),
+        coarse_step,
+        dtype=torch.long,
+        device=device,
+    )
+    # Create all (row, col) candidate pairs and flatten for batched evaluation
+    coarse_row_grid, coarse_col_grid = torch.meshgrid(coarse_rows, coarse_cols, indexing="ij")
+    coarse_row_flat, coarse_col_flat = coarse_row_grid.reshape(-1), coarse_col_grid.reshape(-1)
+    # Shift polar offsets to each candidate origin in normalized coordinates
+    coarse_gx = (
+        base_x_norm.unsqueeze(0) + (coarse_col_flat.float() * x_norm_scale - 1.0)[:, None, None]
+    )
+    coarse_gy = (
+        base_y_norm.unsqueeze(0) + (coarse_row_flat.float() * y_norm_scale - 1.0)[:, None, None]
+    )
+    coarse_grids = torch.stack([coarse_gx, coarse_gy], dim=-1)
+    # Score all coarse candidates on the mean DP and pick the best one
+    mean_dp_batch = torch.from_numpy(mean_dp_np).to(device).unsqueeze(0).unsqueeze(0)
+    coarse_scores = _angular_std_scores(mean_dp_batch, coarse_grids, min_r_idx, max_r_idx)
+    best_coarse_idx = coarse_scores.argmin().item()
+    coarse_best_row = int(coarse_row_flat[best_coarse_idx].item())
+    coarse_best_col = int(coarse_col_flat[best_coarse_idx].item())
+
+    # Fine search (step=1) around coarse best for global center of mean DP
+    fine_margin = 6
+    fine_row_flat, fine_col_flat, fine_grids = _build_candidate_grids(
+        base_x_norm,
+        base_y_norm,
+        coarse_best_row,
+        coarse_best_col,
+        fine_margin,
+        ny,
+        nx,
+        x_norm_scale,
+        y_norm_scale,
+        device,
+    )
+    fine_scores = _angular_std_scores(mean_dp_batch, fine_grids, min_r_idx, max_r_idx)
+    best_fine_idx = fine_scores.argmin().item()
+    global_row = int(fine_row_flat[best_fine_idx].item())
+    global_col = int(fine_col_flat[best_fine_idx].item())
+    # Get center for each scan pos by fine search around global center
+    # Assuming that the center doesn't shift more than 10 pixels across the scan
+    local_margin = 10
+    local_rf, local_cf, local_grids = _build_candidate_grids(
+        base_x_norm,
+        base_y_norm,
+        global_row,
+        global_col,
+        local_margin,
+        ny,
+        nx,
+        x_norm_scale,
+        y_norm_scale,
+        device,
+    )
+    pbar = tqdm(total=total_positions, desc="Finding origin for each scan position")
     for y_pos in range(scan_y):
+        row_dps = torch.from_numpy(array_4d[y_pos].astype(np.float32)).to(
+            device
+        )  # (scan_x, ny, nx)
+
         for x_pos in range(scan_x):
-            test_origin = np.array([estimated_origin_row, estimated_origin_col], dtype=float)
-            # Cache avoids redundant polar transforms when neighbors are revisited across iterations
-            coords_cache: dict[tuple[int, int], float] = {}
-            polar = data.polar_transform(
-                origin_array=test_origin,
-                ellipse_params=ellipse_params,
-                num_annular_bins=num_annular_bins,
-                radial_min=radial_min,
-                radial_max=radial_max,
-                radial_step=radial_step,
-                two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                scan_pos=(y_pos, x_pos),
-                device=device,
-            )
-            # Exclude inner 10% (central beam) and outer 10% (edge artifacts)
-            # to focus on the diffraction ring region
-            min_r = int(np.floor(0.1 * polar.shape[1]))
-            max_r = int(np.ceil(0.9 * polar.shape[1]))
-            # A correctly centered pattern has uniform intensity along each ring,
-            # so minimizing angular std finds the true center
-            std_est_origin = polar[:, min_r:max_r].std(dim=0)
-            std_est_origin_sum = std_est_origin.sum()
-            origin_row = int(round(estimated_origin_row))
-            origin_col = int(round(estimated_origin_col))
-            coords_cache[(origin_row, origin_col)] = std_est_origin_sum
-
-            converged = False
-            best = std_est_origin_sum
-            steps = 0
-            while not converged and steps < max_steps:
-                steps += 1
-                moved = False
-                neighbors = [
-                    (origin_row + dr, origin_col + dc)
-                    for dr in (-1, 0, 1)
-                    for dc in (-1, 0, 1)
-                    if not (dr == 0 and dc == 0)
-                ]
-                neighbors = [(r, c) for (r, c) in neighbors if 0 <= r < ny and 0 <= c < nx]
-                for origin_r, origin_c in neighbors:
-                    if (origin_r, origin_c) not in coords_cache:
-                        test_origin = np.array([origin_r, origin_c], dtype=float)
-                        polar = data.polar_transform(
-                            origin_array=test_origin,
-                            ellipse_params=ellipse_params,
-                            num_annular_bins=num_annular_bins,
-                            radial_min=radial_min,
-                            radial_max=radial_max,
-                            radial_step=radial_step,
-                            two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                            scan_pos=(y_pos, x_pos),
-                            device=device,
-                        )
-                        std_test = polar[:, min_r:max_r].std(dim=0)
-                        coords_cache[(origin_r, origin_c)] = std_test.sum()
-                    if coords_cache[(origin_r, origin_c)] < best:
-                        origin_row = origin_r
-                        origin_col = origin_c
-                        best = coords_cache[(origin_r, origin_c)]
-                        moved = True
-                if not moved:
-                    converged = True
-
-            origin_array[y_pos, x_pos, 0] = origin_row
-            origin_array[y_pos, x_pos, 1] = origin_col
-            # start next scan position from this result
-            estimated_origin_row = float(origin_row)
-            estimated_origin_col = float(origin_col)
+            dp_batch = row_dps[x_pos].unsqueeze(0).unsqueeze(0)
+            scores = _angular_std_scores(dp_batch, local_grids, min_r_idx, max_r_idx)
+            best_idx = scores.argmin().item()
+            origin_array[y_pos, x_pos, 0] = local_rf[best_idx].item()
+            origin_array[y_pos, x_pos, 1] = local_cf[best_idx].item()
             pbar.update(1)
-    pbar.close()
 
+    pbar.close()
     return origin_array
 
 
@@ -429,8 +602,7 @@ def dataset4dstem_polar_transform(
     )
     n_phi = phi_bins.numel()
     n_r = radial_bins.numel()
-    result_dtype = np.result_type(self.array.dtype, np.float32)
-    out = np.empty((scan_y, scan_x, n_phi, n_r), dtype=result_dtype)
+    out = np.empty((scan_y, scan_x, n_phi, n_r), dtype=np.float32)
     for iy in range(scan_y):
         for ix in range(scan_x):
             dp = torch.from_numpy(self.array[iy, ix].astype(np.float32)).to(device)
