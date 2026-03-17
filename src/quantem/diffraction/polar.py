@@ -68,6 +68,7 @@ class PairDistributionFunction(AutoSerialize):
         self.Sk: torch.Tensor | None = None
         self.Fk: torch.Tensor | None = None
         self.bg: torch.Tensor | None = None
+        self.f: torch.Tensor | None = None
         self.Fk_mask: torch.Tensor | None = None
         self.Fk_damped: torch.Tensor | None = None
         self.reduced_pdf_damped: torch.Tensor | None = None
@@ -647,6 +648,8 @@ class PairDistributionFunction(AutoSerialize):
             # compute bg and the average scattering factor f(k)
             bg = self._scattering_model_torch(k2, c_scaled, i0_scaled, s0, i1_scaled, s1)
             f = bg - c_scaled
+        self.bg = bg
+        self.f = f
         return bg, f
 
     def calculate_Gr(
@@ -750,9 +753,11 @@ class PairDistributionFunction(AutoSerialize):
             Ik = self.Ik
         else:
             Ik = self.calculate_radial_mean(mask_realspace=mask_bool, returnval=True)
-        # background fitting on Ik is better with wider range of values so kmin_fit/kmax_fit
-        # can be different from kmin/kmax used for the final F(k) and G(r) calculation
-        bg, f = self.fit_bg(Ik, self.kmin_fit, self.kmax_fit)
+        # reuse existing background fit if already computed
+        if self.bg is not None and self.f is not None:
+            bg, f = self.bg, self.f
+        else:
+            bg, f = self.fit_bg(Ik, self.kmin_fit, self.kmax_fit)
         # prevent division by near-zero values which cause NaNs at high k
         f_safe = torch.clamp(f, min=1e-10 * f.max())
 
