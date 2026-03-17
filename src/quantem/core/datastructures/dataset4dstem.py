@@ -8,7 +8,12 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
-from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
+from quantem.core.datastructures.polar4dstem import (
+    auto_origin_id as _auto_origin_id,
+)
+from quantem.core.datastructures.polar4dstem import (
+    dataset4dstem_polar_transform as _dataset4dstem_polar_transform,
+)
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -78,7 +83,7 @@ class Dataset4dstem(Dataset4d):
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
-        mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
+        mdata_keys_4dstem = ["q_to_r_rotation_ccw_deg", "q_transpose", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
                 metadata[k] = None
@@ -800,4 +805,12 @@ class Dataset4dstem(Dataset4d):
                 self.array[:, :, x_min:x_max, y_min:y_max], axis=(2, 3)
             )
 
-    polar_transform = dataset4dstem_polar_transform
+    def auto_origin_id(self, **kwargs):
+        """Find diffraction centers by minimizing angular intensity variation.
+
+        Delegates to the module-level ``auto_origin_id`` function.
+        See its docstring for full parameter details.
+        """
+        return _auto_origin_id(self, **kwargs)
+
+    polar_transform = _dataset4dstem_polar_transform
