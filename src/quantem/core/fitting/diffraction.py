@@ -1,0 +1,581 @@
+from __future__ import annotations
+
+from typing import Any, Iterable, Sequence, cast
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from quantem.core.fitting.base import OriginND, RenderComponent, RenderContext
+
+
+def _splat_patch(
+    out: torch.Tensor,
+    *,
+    r0: torch.Tensor,
+    c0: torch.Tensor,
+    patch_vals: torch.Tensor,
+    dr: torch.Tensor,
+    dc: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    h, w = out.shape
+    r = r0 + dr
+    c = c0 + dc
+
+    r_base = torch.floor(r)
+    c_base = torch.floor(c)
+    fr = r - r_base
+    fc = c - c_base
+    r0i = r_base.to(torch.long)
+    c0i = c_base.to(torch.long)
+
+    w00 = (1.0 - fr) * (1.0 - fc)
+    w01 = (1.0 - fr) * fc
+    w10 = fr * (1.0 - fc)
+    w11 = fr * fc
+    v = patch_vals * scale
+
+    def put(rr: torch.Tensor, cc: torch.Tensor, ww: torch.Tensor) -> None:
+        keep = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+        if torch.any(keep):
+            out.index_put_((rr[keep], cc[keep]), v[keep] * ww[keep], accumulate=True)
+
+    put(r0i, c0i, w00)
+    put(r0i, c0i + 1, w01)
+    put(r0i + 1, c0i, w10)
+    put(r0i + 1, c0i + 1, w11)
+
+
+class DiskTemplate(RenderComponent):
+    DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
+        "force_center": False,
+        "force_positive": True,
+    }
+    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {"tv_weight": 0.0}
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        array: np.ndarray,
+        refine_all_pixels: bool = False,
+        normalize: str = "none",
+        origin: OriginND | None = None,
+        origin_key: str = "origin",
+        intensity: float | Sequence[float] = 1.0,
+        constraint_params: dict[str, Any] | None = None,
+    ):
+        """
+        Build a disk template renderer centered at the shared origin.
+
+        Parameters
+        ----------
+        intensity : float | Sequence[float], optional
+            Trainable scalar amplitude applied to the rendered template.
+            Accepts ``x``, ``(x0, delta)``, or ``(x0, lo, hi)``.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If ``array`` is not 2D or if ``normalize`` is unsupported.
+
+        Notes
+        -----
+        ``template_raw`` controls template shape and ``intensity_raw`` controls
+        center-disk amplitude.
+        """
+        super().__init__()
+        self.name = str(name)
+        self.refine_all_pixels = bool(refine_all_pixels)
+        self.origin = origin
+        self.origin_key = str(origin_key)
+        intensity_init, intensity_lo, intensity_hi = self.parse_bounded_init(
+            intensity, name="intensity"
+        )
+        self.intensity_raw = nn.Parameter(torch.tensor(intensity_init, dtype=torch.float32))
+        if intensity_lo is not None or intensity_hi is not None:
+            self.register_parameter_bounds("intensity_raw", intensity_lo, intensity_hi)
+
+        a = np.asarray(array, dtype=np.float32)
+        if a.ndim != 2:
+            raise ValueError("DiskTemplate.array must be 2D.")
+        if normalize == "max":
+            s = float(np.max(a))
+            if s > 0.0:
+                a = a / s
+        elif normalize == "mean":
+            s = float(np.mean(a))
+            if s != 0.0:
+                a = a / s
+        elif normalize != "none":
+            raise ValueError("normalize must be one of: 'none', 'max', 'mean'.")
+
+        template = torch.as_tensor(a, dtype=torch.float32)
+        self.template_raw = nn.Parameter(template.clone(), requires_grad=self.refine_all_pixels)
+
+        ht, wt = int(template.shape[0]), int(template.shape[1])
+        rr, cc = np.mgrid[0:ht, 0:wt]
+        rr = rr.astype(np.float32) - (ht - 1) * 0.5
+        cc = cc.astype(np.float32) - (wt - 1) * 0.5
+        self.register_buffer("dr", torch.as_tensor(rr.ravel(), dtype=torch.float32))
+        self.register_buffer("dc", torch.as_tensor(cc.ravel(), dtype=torch.float32))
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
+        if bool(self.hard_constraints.get("force_positive", False)):
+            self._enforce_positivity()
+
+    @classmethod
+    def from_array(
+        cls,
+        *,
+        name: str,
+        array: np.ndarray,
+        refine_all_pixels: bool = False,
+        normalize: str = "none",
+        origin: OriginND | None = None,
+        origin_key: str = "origin",
+        intensity: float | Sequence[float] = 1.0,
+        constraint_params: dict[str, Any] | None = None,
+    ) -> "DiskTemplate":
+        return cls(
+            name=name,
+            array=array,
+            refine_all_pixels=refine_all_pixels,
+            normalize=normalize,
+            origin=origin,
+            origin_key=origin_key,
+            intensity=intensity,
+            constraint_params=constraint_params,
+        )
+
+    def set_origin(self, origin: OriginND) -> None:
+        self.origin = origin
+
+    def set_intensity(self, value: float | int) -> None:
+        """Assign ``intensity_raw`` in-place."""
+        with torch.no_grad():
+            self.intensity_raw.copy_(torch.as_tensor(float(value), dtype=self.intensity_raw.dtype))
+
+    def patch_values(self) -> torch.Tensor:
+        return self.template_raw.reshape(-1)
+
+    def patch_offsets(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return cast(torch.Tensor, self.dr), cast(torch.Tensor, self.dc)
+
+    def add_patch(
+        self, out: torch.Tensor, *, r0: torch.Tensor, c0: torch.Tensor, scale: torch.Tensor
+    ) -> None:
+        vals = self.patch_values().to(device=out.device, dtype=out.dtype)
+        dr = cast(torch.Tensor, self.dr).to(device=out.device, dtype=out.dtype)
+        dc = cast(torch.Tensor, self.dc).to(device=out.device, dtype=out.dtype)
+        _splat_patch(out, r0=r0, c0=c0, patch_vals=vals, dr=dr, dc=dc, scale=scale)
+
+    def forward(self, ctx: RenderContext) -> torch.Tensor:
+        """
+        Render template at origin with scalar amplitude ``intensity_raw``.
+
+        Parameters
+        ----------
+        ctx : RenderContext
+            Rendering context.
+
+        Returns
+        -------
+        torch.Tensor
+            Rendered center disk image.
+        """
+        out = torch.zeros(ctx.shape, device=ctx.device, dtype=ctx.dtype)
+        if self.origin is None:
+            raise RuntimeError("DiskTemplate.forward() requires an OriginND instance.")
+        r0, c0 = self.origin.coords[0], self.origin.coords[1]
+        scale = self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype)
+        self.add_patch(out, r0=r0, c0=c0, scale=scale)
+        return out
+
+    def _center_disk(self) -> None:
+        with torch.no_grad():
+            template = self.template_raw
+            h, w = int(template.shape[0]), int(template.shape[1])
+            weights = torch.clamp(template, min=0.0)
+            mass = torch.sum(weights)
+            if float(mass.detach().cpu()) <= 1e-12:
+                return
+            rr = torch.arange(h, device=template.device, dtype=template.dtype)[:, None]
+            cc = torch.arange(w, device=template.device, dtype=template.dtype)[None, :]
+            com_r = torch.sum(weights * rr) / mass
+            com_c = torch.sum(weights * cc) / mass
+            target_r = torch.as_tensor((h - 1) * 0.5, device=template.device, dtype=template.dtype)
+            target_c = torch.as_tensor((w - 1) * 0.5, device=template.device, dtype=template.dtype)
+            shift_r = target_r - com_r
+            shift_c = target_c - com_c
+            denom_h = max(h - 1, 1)
+            denom_w = max(w - 1, 1)
+            ty = -2.0 * shift_r / float(denom_h)
+            tx = -2.0 * shift_c / float(denom_w)
+            theta = torch.as_tensor(
+                [[1.0, 0.0, tx], [0.0, 1.0, ty]],
+                device=template.device,
+                dtype=template.dtype,
+            )[None, ...]
+            src = template[None, None, :, :]
+            grid = F.affine_grid(theta, [1, 1, h, w], align_corners=True)
+            shifted = F.grid_sample(
+                src,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )[0, 0]
+            self.template_raw.copy_(shifted)
+
+    def _enforce_positivity(self) -> None:
+        with torch.no_grad():
+            self.template_raw.clamp_(min=0.0)
+            self.intensity_raw.clamp_(min=0.0)
+
+    def enforce_hard_constraints(self, ctx: RenderContext) -> None:
+        if bool(self.hard_constraints.get("force_center", False)):
+            self._center_disk()
+        if bool(self.hard_constraints.get("force_positive", False)):
+            self._enforce_positivity()
+        super().enforce_hard_constraints(ctx)
+
+    def constraint_loss(
+        self, ctx: RenderContext, params: dict[str, object] | None = None
+    ) -> torch.Tensor:
+        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
+        tv_weight = float(cfg.get("tv_weight", 0.0))
+        if tv_weight <= 0.0:
+            return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        template = self.template_raw.to(device=ctx.device, dtype=ctx.dtype)
+        tv_r = (
+            torch.mean(torch.abs(template[1:, :] - template[:-1, :]))
+            if template.shape[0] > 1
+            else torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        )
+        tv_c = (
+            torch.mean(torch.abs(template[:, 1:] - template[:, :-1]))
+            if template.shape[1] > 1
+            else torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        )
+        return torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
+
+
+class SyntheticDiskLattice(RenderComponent):
+    DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
+        "force_positive_intensity": True,
+    }
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        disk: DiskTemplate,
+        u_row: float | Sequence[float],
+        u_col: float | Sequence[float],
+        v_row: float | Sequence[float],
+        v_col: float | Sequence[float],
+        u_max: int = 0,
+        v_max: int = 0,
+        intensity_0: float | Sequence[float] = 0.0,
+        intensity_row: float | Sequence[float] = 0.0,
+        intensity_col: float | Sequence[float] = 0.0,
+        intensity_row_row: float | Sequence[float] = 0.0,
+        intensity_col_col: float | Sequence[float] = 0.0,
+        intensity_row_col: float | Sequence[float] = 0.0,
+        per_disk_intensity: bool = False,
+        per_disk_slopes: bool = True,
+        max_intensity_order: int | None = None,
+        default_pattern_intensity_order: int | None = None,
+        center_intensity_0: float | Sequence[float] | None = None,
+        exclude_indices: Iterable[tuple[int, int]] | None = None,
+        boundary_px: float = 0.0,
+        origin: OriginND | None = None,
+        origin_key: str = "origin",
+        constraint_params: dict[str, Any] | None = None,
+    ):
+        """
+        Build a synthetic disk lattice renderer.
+
+        Parameters
+        ----------
+        u_row, u_col, v_row, v_col : float | Sequence[float | int | None]
+            Lattice basis parameters. Accept ``x``, ``(x0, delta)``, or
+            ``(x0, lo, hi)``.
+        intensity_0 : float | Sequence[float], optional
+            Baseline intensity for included lattice disks. Accepts ``x``,
+            ``(x0, delta)``, or ``(x0, lo, hi)``.
+        intensity_row, intensity_col, intensity_row_row, intensity_col_col, intensity_row_col :
+            float | Sequence[float | int | None]
+            Intensity polynomial parameters. Accept ``x``, ``(x0, delta)``, or
+            ``(x0, lo, hi)``.
+        center_intensity_0 : float | Sequence[float] | None, optional
+            Optional center-disk baseline. Accepts ``x``, ``(x0, delta)``, or
+            ``(x0, lo, hi)`` and routes by center ownership rules.
+        exclude_indices : Iterable[tuple[int, int]] | None, optional
+            Lattice indices excluded from rendering. By default, ``(0, 0)`` is
+            excluded. To include center explicitly, pass ``exclude_indices`` that
+            does not contain ``(0, 0)``.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If ``center_intensity_0`` is provided with center included while
+            ``per_disk_intensity=False``.
+
+        Notes
+        -----
+        Center-intensity routing is explicit:
+        - Center excluded (default): ``center_intensity_0`` maps to
+          ``disk.intensity_raw``.
+        - Center included with ``per_disk_intensity=True``:
+          ``center_intensity_0`` maps to lattice center ``i0_raw`` entry.
+          In this case ``disk.intensity_raw`` is set to ``0`` to avoid
+          duplicate center ownership when disk is rendered standalone.
+        """
+        super().__init__()
+        self.name = str(name)
+        self.disk = disk
+        self.origin = origin
+        self.origin_key = str(origin_key)
+        self.per_disk_intensity = bool(per_disk_intensity)
+        self.u_max = int(u_max)
+        self.v_max = int(v_max)
+        self.boundary_px = float(boundary_px)
+
+        if max_intensity_order is None:
+            max_intensity_order = 1 if bool(per_disk_slopes) else 0
+        self.max_intensity_order = int(max_intensity_order)
+        if self.max_intensity_order < 0 or self.max_intensity_order > 2:
+            raise ValueError("max_intensity_order must be 0, 1, or 2.")
+
+        if default_pattern_intensity_order is None:
+            default_pattern_intensity_order = self.max_intensity_order
+        self.default_pattern_intensity_order = int(default_pattern_intensity_order)
+
+        u_row_init, u_row_lo, u_row_hi = self.parse_bounded_init(u_row, name="u_row")
+        u_col_init, u_col_lo, u_col_hi = self.parse_bounded_init(u_col, name="u_col")
+        v_row_init, v_row_lo, v_row_hi = self.parse_bounded_init(v_row, name="v_row")
+        v_col_init, v_col_lo, v_col_hi = self.parse_bounded_init(v_col, name="v_col")
+        self.u_row = nn.Parameter(torch.tensor(u_row_init, dtype=torch.float32))
+        if u_row_lo is not None or u_row_hi is not None:
+            self.register_parameter_bounds("u_row", u_row_lo, u_row_hi)
+        self.u_col = nn.Parameter(torch.tensor(u_col_init, dtype=torch.float32))
+        if u_col_lo is not None or u_col_hi is not None:
+            self.register_parameter_bounds("u_col", u_col_lo, u_col_hi)
+        self.v_row = nn.Parameter(torch.tensor(v_row_init, dtype=torch.float32))
+        if v_row_lo is not None or v_row_hi is not None:
+            self.register_parameter_bounds("v_row", v_row_lo, v_row_hi)
+        self.v_col = nn.Parameter(torch.tensor(v_col_init, dtype=torch.float32))
+        if v_col_lo is not None or v_col_hi is not None:
+            self.register_parameter_bounds("v_col", v_col_lo, v_col_hi)
+
+        exclude = {(0, 0)} if exclude_indices is None else set(exclude_indices)
+        center_included = (0, 0) not in exclude
+        if center_intensity_0 is not None and center_included and not self.per_disk_intensity:
+            raise ValueError(
+                "center_intensity_0 with center included requires per_disk_intensity=True, "
+                "or exclude (0,0) and use DiskTemplate intensity ownership."
+            )
+        uv: list[tuple[int, int]] = []
+        for u in range(-self.u_max, self.u_max + 1):
+            for v in range(-self.v_max, self.v_max + 1):
+                if (u, v) not in exclude:
+                    uv.append((u, v))
+        uv_t = (
+            torch.as_tensor(uv, dtype=torch.long) if uv else torch.zeros((0, 2), dtype=torch.long)
+        )
+        self.register_buffer("uv_indices", uv_t)
+
+        n_uv = int(uv_t.shape[0])
+        i0_init, i0_lo, i0_hi = self.parse_bounded_init(intensity_0, name="intensity_0")
+        if center_intensity_0 is None:
+            i0_center, i0_center_lo, i0_center_hi = i0_init, None, None
+        else:
+            i0_center, i0_center_lo, i0_center_hi = self.parse_bounded_init(
+                center_intensity_0, name="center_intensity_0"
+            )
+        if center_intensity_0 is not None and not center_included:
+            self.disk.set_intensity(float(i0_center))
+            if i0_center_lo is not None or i0_center_hi is not None:
+                self.disk.register_parameter_bounds("intensity_raw", i0_center_lo, i0_center_hi)
+        ir_init, ir_lo, ir_hi = self.parse_bounded_init(intensity_row, name="intensity_row")
+        ic_init, ic_lo, ic_hi = self.parse_bounded_init(intensity_col, name="intensity_col")
+        irr_init, irr_lo, irr_hi = self.parse_bounded_init(
+            intensity_row_row, name="intensity_row_row"
+        )
+        icc_init, icc_lo, icc_hi = self.parse_bounded_init(
+            intensity_col_col, name="intensity_col_col"
+        )
+        irc_init, irc_lo, irc_hi = self.parse_bounded_init(
+            intensity_row_col, name="intensity_row_col"
+        )
+        self._center_i0_bounds: tuple[float | None, float | None] | None = None
+        self._center_i0_index: int | None = None
+
+        if self.per_disk_intensity:
+            i0_values = torch.full((n_uv,), float(i0_init), dtype=torch.float32)
+            if n_uv > 0:
+                center_mask = (uv_t[:, 0] == 0) & (uv_t[:, 1] == 0)
+                i0_values[center_mask] = float(i0_center)
+                if center_intensity_0 is not None and bool(torch.any(center_mask)):
+                    self._center_i0_index = int(torch.nonzero(center_mask, as_tuple=False)[0, 0])
+                    self._center_i0_bounds = (i0_center_lo, i0_center_hi)
+            self.i0_raw = nn.Parameter(i0_values)
+            if i0_lo is not None or i0_hi is not None:
+                self.register_parameter_bounds("i0_raw", i0_lo, i0_hi)
+            if center_intensity_0 is not None and center_included:
+                self.disk.set_intensity(0.0)
+            if self.max_intensity_order >= 1:
+                self.ir = nn.Parameter(torch.full((n_uv,), float(ir_init), dtype=torch.float32))
+                self.ic = nn.Parameter(torch.full((n_uv,), float(ic_init), dtype=torch.float32))
+                if ir_lo is not None or ir_hi is not None:
+                    self.register_parameter_bounds("ir", ir_lo, ir_hi)
+                if ic_lo is not None or ic_hi is not None:
+                    self.register_parameter_bounds("ic", ic_lo, ic_hi)
+            else:
+                self.ir = None
+                self.ic = None
+            if self.max_intensity_order >= 2:
+                self.irr = nn.Parameter(torch.full((n_uv,), float(irr_init), dtype=torch.float32))
+                self.icc = nn.Parameter(torch.full((n_uv,), float(icc_init), dtype=torch.float32))
+                self.irc = nn.Parameter(torch.full((n_uv,), float(irc_init), dtype=torch.float32))
+                if irr_lo is not None or irr_hi is not None:
+                    self.register_parameter_bounds("irr", irr_lo, irr_hi)
+                if icc_lo is not None or icc_hi is not None:
+                    self.register_parameter_bounds("icc", icc_lo, icc_hi)
+                if irc_lo is not None or irc_hi is not None:
+                    self.register_parameter_bounds("irc", irc_lo, irc_hi)
+            else:
+                self.irr = None
+                self.icc = None
+                self.irc = None
+        else:
+            self.i0_raw = nn.Parameter(torch.tensor(i0_init, dtype=torch.float32))
+            if i0_lo is not None or i0_hi is not None:
+                self.register_parameter_bounds("i0_raw", i0_lo, i0_hi)
+            self.ir = nn.Parameter(torch.tensor(ir_init, dtype=torch.float32))
+            if ir_lo is not None or ir_hi is not None:
+                self.register_parameter_bounds("ir", ir_lo, ir_hi)
+            self.ic = nn.Parameter(torch.tensor(ic_init, dtype=torch.float32))
+            if ic_lo is not None or ic_hi is not None:
+                self.register_parameter_bounds("ic", ic_lo, ic_hi)
+            self.irr = nn.Parameter(torch.tensor(irr_init, dtype=torch.float32))
+            if irr_lo is not None or irr_hi is not None:
+                self.register_parameter_bounds("irr", irr_lo, irr_hi)
+            self.icc = nn.Parameter(torch.tensor(icc_init, dtype=torch.float32))
+            if icc_lo is not None or icc_hi is not None:
+                self.register_parameter_bounds("icc", icc_lo, icc_hi)
+            self.irc = nn.Parameter(torch.tensor(irc_init, dtype=torch.float32))
+            if irc_lo is not None or irc_hi is not None:
+                self.register_parameter_bounds("irc", irc_lo, irc_hi)
+        if constraint_params is not None:
+            self.apply_constraint_params(constraint_params, strict=True)
+        if bool(self.hard_constraints.get("force_positive_intensity", False)):
+            self._enforce_positive_intensity_params()
+
+    def set_origin(self, origin: OriginND) -> None:
+        self.origin = origin
+
+    def _enforce_positive_intensity_params(self) -> None:
+        """
+        Project base intensity parameter(s) to nonnegative values.
+
+        Notes
+        -----
+        Positivity is enforced as a hard projection after optimizer steps.
+        The forward path intentionally avoids clamp-based dead gradients.
+        Only ``i0_raw`` is projected; slope terms remain unconstrained.
+        """
+        with torch.no_grad():
+            self.i0_raw.clamp_(min=0.0)
+
+    def enforce_hard_constraints(self, ctx: RenderContext) -> None:
+        if bool(self.hard_constraints.get("force_positive_intensity", False)):
+            self._enforce_positive_intensity_params()
+        if self._center_i0_bounds is not None and self._center_i0_index is not None:
+            with torch.no_grad():
+                lo, hi = self._center_i0_bounds
+                idx = self._center_i0_index
+                if lo is not None:
+                    self.i0_raw[idx].clamp_(min=float(lo))
+                if hi is not None:
+                    self.i0_raw[idx].clamp_(max=float(hi))
+        super().enforce_hard_constraints(ctx)
+
+    def forward(self, ctx: RenderContext) -> torch.Tensor:
+        if self.origin is None:
+            raise RuntimeError("SyntheticDiskLattice requires an OriginND instance.")
+
+        out = torch.zeros(ctx.shape, device=ctx.device, dtype=ctx.dtype)
+        uv_indices = cast(torch.Tensor, self.uv_indices)
+        if torch.numel(uv_indices) == 0:
+            return out
+
+        uv = torch.as_tensor(uv_indices, device=ctx.device)
+        u = uv[:, 0].to(dtype=ctx.dtype)
+        v = uv[:, 1].to(dtype=ctx.dtype)
+        r0, c0 = self.origin.coords[0], self.origin.coords[1]
+        centers_r = r0 + u * self.u_row + v * self.v_row
+        centers_c = c0 + u * self.u_col + v * self.v_col
+
+        b = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
+        keep = (centers_r >= b) & (centers_r <= (ctx.shape[0] - 1) - b)
+        keep = keep & (centers_c >= b) & (centers_c <= (ctx.shape[1] - 1) - b)
+        keep_idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
+        if keep_idx.numel() == 0:
+            return out
+
+        active_order = int(
+            ctx.fields.get(
+                "lattice_intensity_order_override", self.default_pattern_intensity_order
+            )
+        )
+        active_order = max(0, min(active_order, self.max_intensity_order))
+
+        dr, dc = self.disk.patch_offsets()
+        dr = dr.to(device=ctx.device, dtype=ctx.dtype)
+        dc = dc.to(device=ctx.device, dtype=ctx.dtype)
+        dr2 = dr * dr
+        dc2 = dc * dc
+        drdc = dr * dc
+
+        for j in keep_idx:
+            rr0 = centers_r[j]
+            cc0 = centers_c[j]
+
+            if self.per_disk_intensity:
+                inten = self.i0_raw[j]
+                if active_order >= 1 and self.ir is not None and self.ic is not None:
+                    inten = inten + self.ir[j] * dr + self.ic[j] * dc
+                if (
+                    active_order >= 2
+                    and self.irr is not None
+                    and self.icc is not None
+                    and self.irc is not None
+                ):
+                    inten = inten + self.irr[j] * dr2 + self.icc[j] * dc2 + self.irc[j] * drdc
+            else:
+                inten = self.i0_raw
+                if active_order >= 1:
+                    assert self.ir is not None and self.ic is not None
+                    inten = inten + self.ir * rr0 + self.ic * cc0
+                if active_order >= 2:
+                    assert self.irr is not None and self.icc is not None and self.irc is not None
+                    inten = (
+                        inten + self.irr * rr0 * rr0 + self.icc * cc0 * cc0 + self.irc * rr0 * cc0
+                    )
+
+            self.disk.add_patch(out, r0=rr0, c0=cc0, scale=inten)
+
+        return out
