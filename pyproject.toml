@@ -54,6 +54,7 @@ dependencies = [
   "optuna>=4.5.0",
   "hdf5plugin>=6.0.0",
   "torchinfo>=1.8.0",
+  "ipywidgets>=8.1.8",
 ]
 
 [project.optional-dependencies]
