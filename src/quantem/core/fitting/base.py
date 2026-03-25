@@ -6,9 +6,14 @@ from typing import Any, Literal, Self, Sequence, cast
 import numpy as np
 import torch
 from torch import nn
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerMixin,
+    OptimizerParams,
+    OptimizerType,
+    SchedulerType,
+)
 
 
 def parse_bounded_init(
@@ -562,8 +567,8 @@ class FitBase(OptimizerMixin):
         n_steps: int,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
+        optimizer_params: OptimizerType | dict | None = None,
+        scheduler_params: SchedulerType | dict | None = None,
         progress: bool = False,
         run_key: str = "default",
         **kwargs: Any,
@@ -720,7 +725,12 @@ class FitBase(OptimizerMixin):
 
     def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
         if self.optimizer_params:
-            return dict(self.optimizer_params)
+            op = self.optimizer_params
+            if isinstance(op, OptimizerParams.NoneOptimizer):
+                return {"type": "none"}
+            out: dict[str, Any] = dict(op.params())
+            out["type"] = op._name
+            return out
         if self.optimizer is not None:
             opt_type: str | type[torch.optim.Optimizer]
             if isinstance(self.optimizer, torch.optim.AdamW):

@@ -17,6 +17,7 @@ from quantem.core.fitting.base import (
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
 
@@ -428,8 +429,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         *,
         n_steps: int = 200,
         reset: bool | Literal["initialized", "mean_refined"] = False,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
+        optimizer_params: OptimizerType | dict | None = None,
+        scheduler_params: SchedulerType | dict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         progress: bool = True,
