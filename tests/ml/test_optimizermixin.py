@@ -154,9 +154,9 @@ class TestSchedulerParseDictKeyHandling:
         result = SchedulerParams.parse_dict({"name": "plateau", "type": "linear"})
         assert isinstance(result, SchedulerParams.Plateau)
 
-    def test_neither_name_nor_type_raises(self):
-        with pytest.raises(ValueError, match="Must provide either"):
-            SchedulerParams.parse_dict({"patience": 20})
+    def test_neither_name_nor_type_defaults_to_none(self):
+        result = SchedulerParams.parse_dict({"patience": 20})
+        assert isinstance(result, SchedulerParams.NoneScheduler)
 
     def test_type_key_not_leaked_into_constructor(self):
         result = SchedulerParams.parse_dict({"type": "cyclic", "step_size_up": 50})
@@ -346,5 +346,5 @@ class TestSchedulerParseDict:
             SchedulerParams.parse_dict({"name": 3.14})
 
     def test_parse_default_name_is_none(self):
-        with pytest.raises(ValueError, match="Must provide either"):
-            SchedulerParams.parse_dict({})
+        result = SchedulerParams.parse_dict({})
+        assert isinstance(result, SchedulerParams.NoneScheduler)

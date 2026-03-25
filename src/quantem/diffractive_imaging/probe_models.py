@@ -14,7 +14,7 @@ from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
-from quantem.core.ml.loss_functions import get_loss_function
+from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
@@ -1391,7 +1391,7 @@ class ProbeDIP(ProbeConstraints):
         elif self.pretrain_target is None:
             self.pretrain_target = self._initial_probe.clone().detach()
 
-        loss_fn = get_loss_function(loss_fn, self.dtype)
+        loss_fn = get_loss_module(loss_fn, self.dtype)
         self._pretrain(
             num_iters=num_iters,
             loss_fn=loss_fn,

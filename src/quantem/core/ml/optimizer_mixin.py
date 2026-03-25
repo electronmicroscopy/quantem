@@ -1,3 +1,4 @@
+import textwrap
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generator, Iterator, Literal, Sequence
@@ -68,6 +69,16 @@ class OptimizerParams:
                 "weight_decay": self.weight_decay,
             }
 
+        def __str__(self) -> str:
+            return textwrap.dedent(f"""
+                OptimizerParams.Adam(
+                    lr = {self.lr},
+                    betas = {self.betas},
+                    eps = {self.eps},
+                    weight_decay = {self.weight_decay},
+                )
+            """).strip()
+
     @dataclass
     class AdamW:
         """
@@ -102,6 +113,16 @@ class OptimizerParams:
                 "eps": self.eps,
                 "weight_decay": self.weight_decay,
             }
+
+        def __str__(self) -> str:
+            return textwrap.dedent(f"""
+                OptimizerParams.AdamW(
+                    lr = {self.lr},
+                    betas = {self.betas},
+                    eps = {self.eps},
+                    weight_decay = {self.weight_decay},
+                )
+            """).strip()
 
     @dataclass
     class SGD:
@@ -138,6 +159,17 @@ class OptimizerParams:
                 "nesterov": self.nesterov,
             }
 
+        def __str__(self) -> str:
+            return textwrap.dedent(f"""
+                OptimizerParams.SGD(
+                    lr = {self.lr},
+                    momentum = {self.momentum},
+                    dampening = {self.dampening},
+                    weight_decay = {self.weight_decay},
+                    nesterov = {self.nesterov},
+                )
+            """).strip()
+
     @dataclass
     class NoneOptimizer:
         """
@@ -151,6 +183,11 @@ class OptimizerParams:
 
         def params(self) -> dict:
             return {}
+
+        def __str__(self) -> str:
+            return textwrap.dedent("""
+                OptimizerParams.NoneOptimizer()
+            """).strip()
 
     @classmethod
     def parse_dict(cls, d: dict):
@@ -236,7 +273,7 @@ class SchedulerParams:
         min_lr : float or None
             Absolute lower bound on the learning rate. Overrides ``min_lr_factor`` when set.
             Default: None.
-        factor : float
+        factor :     float
             Factor by which the LR is reduced: ``new_lr = lr * factor``. Default: 0.5.
         patience : int
             Number of epochs with no improvement before reducing LR. Default: 10.
@@ -454,7 +491,7 @@ class SchedulerParams:
         type_ = d.pop("type", None)
         name = name or type_
         if name is None:
-            raise ValueError("Must provide either 'name' or 'type' key")
+            name = "none"
         if isinstance(name, type):
             name = name.__name__.lower()
         elif isinstance(name, str):
