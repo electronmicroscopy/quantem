@@ -67,7 +67,8 @@ class DiskTemplate(RenderComponent):
         "soft_cutoff_target_ratio": 0.1,
         "hard_cutoff_threshold": 0.35,
         "shrinkage_amount": 0.25,
-        "circular_mask_radius_fraction": 1, 
+        "circular_mask_radius_fraction": 1,
+        "circular_mask_sharpness": 1.0,
     }
 
     def __init__(
@@ -290,8 +291,9 @@ class DiskTemplate(RenderComponent):
             rr, cc = torch.meshgrid(r, c, indexing='ij')
             circle_matrix = torch.sqrt(rr**2 + cc**2)
             
-            mask = circle_matrix <= radius
-            self.template_raw[~mask] = 0.0
+            # mask = circle_matrix <= radius
+            mask = torch.sigmoid(self.constraint_config["circular_mask_sharpness"]*(radius-circle_matrix))
+            self.template_raw *= mask
 
 
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:

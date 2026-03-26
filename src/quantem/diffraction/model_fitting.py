@@ -9,7 +9,7 @@ from scipy.signal.windows import tukey
 from tqdm import tqdm
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
-from quantem.core.fitting.basev2 import (
+from quantem.core.fitting.base import (
     AdditiveRenderModel,
     FitBase,
     OriginND,
@@ -673,18 +673,16 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         scan_c = self.dataset.shape[1]
 
         Uref = np.stack((u_ref, v_ref), axis=1).astype(float)
-        det = np.linalg.det(Uref)
-        if not np.isfinite(det) or abs(det) < 1e-12:
-            Uref_inv = np.linalg.pinv(Uref)
-        else:
-            Uref_inv = np.linalg.inv(Uref)
-
         strain_trans = np.zeros((scan_r, scan_c, 2, 2))
-
         for r in range(scan_r):
             for c in range(scan_c):
                 U = np.stack((u_fit[r, c, :], v_fit[r, c, :]), axis=1)
-                strain_trans[r, c, :, :] = U @ Uref_inv
+                det = np.linalg.det(U)
+                if not np.isfinite(det) or abs(det) < 1e-12:
+                    U_inv = np.linalg.pinv(U)
+                else:
+                    U_inv = np.linalg.inv(U)
+                strain_trans[r, c, :, :] = Uref @ U_inv
 
         self.strain_raw_err = Dataset2d.from_array(
             strain_trans[:, :, 0, 0] - 1,
@@ -716,7 +714,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         strain_range_percent=(-3.0, 3.0),
         rotation_range_degrees=(-2.0, 2.0),
         plot_rotation=True,
-        cmap_strain="RdBu_r",
+        cmap_strain="RdBu",
         cmap_rotation=None,
         layout="horizontal",
         figsize=(6, 6),
@@ -726,7 +724,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         if cmap_rotation is None:
             cmap_rotation = cmap_strain
 
-        angle = rotation_angle
+        angle = np.deg2rad(rotation_angle)
         c = np.cos(angle)
         s = np.sin(angle)
 
@@ -745,10 +743,6 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         strain_evv.array[...] = evv
         strain_euv.array[...] = euv
 
-        alpha = None
-        good = None
-        alpha_im = None
-
         if layout != "horizontal":
             raise ValueError("layout must be 'horizontal'")
 
@@ -765,38 +759,24 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         euv_pct = strain_euv.array * 100
         rot_deg = np.rad2deg(self.strain_rotation.array)
 
-        if good is not None and np.any(good):
-            euu_m = np.ma.array(euu_pct, mask=~good)
-            evv_m = np.ma.array(evv_pct, mask=~good)
-            euv_m = np.ma.array(euv_pct, mask=~good)
-            rot_m = np.ma.array(rot_deg, mask=~good)
-        else:
-            euu_m = euu_pct
-            evv_m = evv_pct
-            euv_m = euv_pct
-            rot_m = rot_deg
-
         title_fs = 16
         im0 = ax[0].imshow(
-            euu_m,
+            euu_pct,
             vmin=strain_range_percent[0],
             vmax=strain_range_percent[1],
             cmap=cm_strain,
-            alpha=alpha_im,
         )
         ax[1].imshow(
-            evv_m,
+            evv_pct,
             vmin=strain_range_percent[0],
             vmax=strain_range_percent[1],
             cmap=cm_strain,
-            alpha=alpha_im,
         )
         ax[2].imshow(
-            euv_m,
+            euv_pct,
             vmin=strain_range_percent[0],
             vmax=strain_range_percent[1],
             cmap=cm_strain,
-            alpha=alpha_im,
         )
 
         ax[0].set_title(r"$\epsilon_{uu}$", fontsize=title_fs)
@@ -805,11 +785,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         if plot_rotation:
             im3 = ax[3].imshow(
-                rot_m,
+                rot_deg,
                 vmin=rotation_range_degrees[0],
                 vmax=rotation_range_degrees[1],
                 cmap=cm_rot,
-                alpha=alpha_im,
             )
             ax[3].set_title("Rotation", fontsize=title_fs)
 

@@ -291,7 +291,7 @@ class RenderComponent(OptimizerMixin,nn.Module):
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
 
     def get_optimization_parameters(self) -> Any: # make copy in synthetic disklattice which only refs lattice not disk lattice params, reoeat for origin byt in dusk teplate
-        return [p for p in self.parameters() if p.requires_grad]
+        return [p for p in self.parameters(recurse=False) if p.requires_grad]
     
     def initialize_optimizer(self, 
         optimizer_params: dict[str, Any] | None = None,
@@ -1002,6 +1002,12 @@ class FitBase(OptimizerMixin):
     
     def get_component_by_name(self, component_name: str) -> RenderComponent:
         return self._resolve_component_by_name(component_name)
+    
+    def _rebuild_optimizer_after_trainability_change(self) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        self.model.rebuild_independant_optimizers()
+        
 
 Component = RenderComponent
 ModelContext = RenderContext
