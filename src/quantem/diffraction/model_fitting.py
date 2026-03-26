@@ -9,7 +9,7 @@ from scipy.signal.windows import tukey
 from tqdm import tqdm
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
-from quantem.core.fitting.base import (
+from quantem.core.fitting.basev2 import (
     AdditiveRenderModel,
     FitBase,
     OriginND,
@@ -579,13 +579,20 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             rows = rows
             cols = cols
         
-        rows = np.asarray(rows)
-        cols = np.asarray(cols)
+        if isinstance(rows, int):
+            rows = np.array([rows]).astype(int)
+        else:        
+            rows = np.asarray(rows).astype(int)
+        
+        if isinstance(cols, int):
+            cols = np.array([cols]).astype(int)
+        else:        
+            cols = np.asarray(cols).astype(int)
 
         self.state_individual_refined = np.full(shape=(scan_r, scan_c), fill_value=None, dtype=object)
         
         if progress:
-            pbar = tqdm(total=len(rows) * len(cols), desc="Fit individual")
+            pbar = tqdm(total=rows.shape[0] * cols.shape[0], desc="Fit individual")
 
         for r in rows:
             for c in cols:
@@ -613,33 +620,33 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self.individual_refined=True
         return self
     
-    def get_individual_uv_vectors(self) ->tuple[np.ndarray, np.ndarray]:
+    def get_individual_uv_vectors(self) -> "ModelDiffraction":
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
         # print(scan_r)
         
-        u_array = np.empty(shape=(scan_r, scan_c, 2))
-        v_array = np.empty(shape=(scan_r, scan_c, 2))
+        self.u_array = np.empty(shape=(scan_r, scan_c, 2))
+        self.v_array = np.empty(shape=(scan_r, scan_c, 2))
         if self.state_individual_refined is None:
             raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
         for r in range(scan_r):
             for c in range(scan_c):
                 pos_state = self.state_individual_refined[r,c]
                 if pos_state is None:
-                    u_array[r,c,:] = None
-                    v_array[r,c,:] = None
+                    self.u_array[r,c,:] = None
+                    self.v_array[r,c,:] = None
                 for key in pos_state.keys():
                     key_parts = key.split('.')
                     if(key_parts[-1] == 'u_row'):
-                        u_array[r,c,0] = pos_state[key]
+                        self.u_array[r,c,0] = pos_state[key]
                     if(key_parts[-1] == 'u_col'):
-                        u_array[r,c,1] = pos_state[key]
+                        self.u_array[r,c,1] = pos_state[key]
                     if(key_parts[-1] == 'v_row'):
-                        v_array[r,c,0] = pos_state[key]
+                        self.v_array[r,c,0] = pos_state[key]
                     if(key_parts[-1] == 'v_col'):
-                        v_array[r,c,1] = pos_state[key]
+                        self.v_array[r,c,1] = pos_state[key]
 
-        return u_array, v_array
+        return self
     
     def render_indivdual_pattern(self, row, col):
         if self.state_individual_refined is None:
@@ -648,11 +655,200 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             )
         if self.dataset.shape[0] <= row or self.dataset.shape[1] <= col:
             raise ValueError("individual row or column outside bounds of dataset")
+        if row < 0 or col < 0:
+            raise ValueError("individual row or column outside bounds of dataset")
         if self.state_individual_refined[row, col] is None:
             raise RuntimeError(
                 "individual_refined_state is not avalible for given row and column. Run fit_individual_diffraction_pattern(...) for that row and column."
             )
         return self._render_state_array(self.state_individual_refined[row, col])
+
+    def fit_strain(self) -> "ModelDiffraction":
+        u_fit = self.u_array
+        v_fit = self.v_array
+        u_ref = np.median(u_fit.reshape(-1, 2), axis=0)
+        v_ref = np.median(v_fit.reshape(-1, 2), axis=0)
+
+        scan_r = self.dataset.shape[0]
+        scan_c = self.dataset.shape[1]
+
+        Uref = np.stack((u_ref, v_ref), axis=1).astype(float)
+        det = np.linalg.det(Uref)
+        if not np.isfinite(det) or abs(det) < 1e-12:
+            Uref_inv = np.linalg.pinv(Uref)
+        else:
+            Uref_inv = np.linalg.inv(Uref)
+
+        strain_trans = np.zeros((scan_r, scan_c, 2, 2))
+
+        for r in range(scan_r):
+            for c in range(scan_c):
+                U = np.stack((u_fit[r, c, :], v_fit[r, c, :]), axis=1)
+                strain_trans[r, c, :, :] = U @ Uref_inv
+
+        self.strain_raw_err = Dataset2d.from_array(
+            strain_trans[:, :, 0, 0] - 1,
+            name="strain err",
+            signal_units="fractional",
+        )
+        self.strain_raw_ecc = Dataset2d.from_array(
+            strain_trans[:, :, 1, 1] - 1,
+            name="strain ecc",
+            signal_units="fractional",
+        )
+        self.strain_raw_erc = Dataset2d.from_array(
+            strain_trans[:, :, 1, 0] * 0.5 + strain_trans[:, :, 0, 1] * 0.5,
+            name="strain erc",
+            signal_units="fractional",
+        )
+        self.strain_rotation = Dataset2d.from_array(
+            strain_trans[:, :, 1, 0] * -0.5 + strain_trans[:, :, 0, 1] * 0.5,
+            name="strain rotation",
+            signal_units="fractional",
+        )
+
+        return self
+
+
+    def plot_strain(
+        self,
+        rotation_angle=20,
+        strain_range_percent=(-3.0, 3.0),
+        rotation_range_degrees=(-2.0, 2.0),
+        plot_rotation=True,
+        cmap_strain="RdBu_r",
+        cmap_rotation=None,
+        layout="horizontal",
+        figsize=(6, 6),
+    ):
+        import matplotlib.pyplot as plt
+
+        if cmap_rotation is None:
+            cmap_rotation = cmap_strain
+
+        angle = rotation_angle
+        c = np.cos(angle)
+        s = np.sin(angle)
+
+        err = self.strain_raw_err.array
+        ecc = self.strain_raw_ecc.array
+        erc = self.strain_raw_erc.array
+
+        euu = err * (c * c) + 2.0 * erc * (c * s) + ecc * (s * s)
+        evv = err * (s * s) - 2.0 * erc * (c * s) + ecc * (c * c)
+        euv = (ecc - err) * (c * s) + erc * (c * c - s * s)
+
+        strain_euu = self.strain_raw_err.copy()
+        strain_evv = self.strain_raw_ecc.copy()
+        strain_euv = self.strain_raw_erc.copy()
+        strain_euu.array[...] = euu
+        strain_evv.array[...] = evv
+        strain_euv.array[...] = euv
+
+        alpha = None
+        good = None
+        alpha_im = None
+
+        if layout != "horizontal":
+            raise ValueError("layout must be 'horizontal'")
+
+        ncols = 4 if plot_rotation else 3
+        fig, ax = plt.subplots(1, ncols, figsize=figsize)
+
+        cm_strain = plt.get_cmap(cmap_strain).copy()
+        cm_strain.set_bad(color="black")
+        cm_rot = plt.get_cmap(cmap_rotation).copy()
+        cm_rot.set_bad(color="black")
+
+        euu_pct = strain_euu.array * 100
+        evv_pct = strain_evv.array * 100
+        euv_pct = strain_euv.array * 100
+        rot_deg = np.rad2deg(self.strain_rotation.array)
+
+        if good is not None and np.any(good):
+            euu_m = np.ma.array(euu_pct, mask=~good)
+            evv_m = np.ma.array(evv_pct, mask=~good)
+            euv_m = np.ma.array(euv_pct, mask=~good)
+            rot_m = np.ma.array(rot_deg, mask=~good)
+        else:
+            euu_m = euu_pct
+            evv_m = evv_pct
+            euv_m = euv_pct
+            rot_m = rot_deg
+
+        title_fs = 16
+        im0 = ax[0].imshow(
+            euu_m,
+            vmin=strain_range_percent[0],
+            vmax=strain_range_percent[1],
+            cmap=cm_strain,
+            alpha=alpha_im,
+        )
+        ax[1].imshow(
+            evv_m,
+            vmin=strain_range_percent[0],
+            vmax=strain_range_percent[1],
+            cmap=cm_strain,
+            alpha=alpha_im,
+        )
+        ax[2].imshow(
+            euv_m,
+            vmin=strain_range_percent[0],
+            vmax=strain_range_percent[1],
+            cmap=cm_strain,
+            alpha=alpha_im,
+        )
+
+        ax[0].set_title(r"$\epsilon_{uu}$", fontsize=title_fs)
+        ax[1].set_title(r"$\epsilon_{vv}$", fontsize=title_fs)
+        ax[2].set_title(r"$\epsilon_{uv}$", fontsize=title_fs)
+
+        if plot_rotation:
+            im3 = ax[3].imshow(
+                rot_m,
+                vmin=rotation_range_degrees[0],
+                vmax=rotation_range_degrees[1],
+                cmap=cm_rot,
+                alpha=alpha_im,
+            )
+            ax[3].set_title("Rotation", fontsize=title_fs)
+
+        for a in ax:
+            a.set_xticks([])
+            a.set_yticks([])
+            a.set_facecolor("black")
+
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.16, wspace=0.03)
+
+        b0 = ax[0].get_position()
+        b2 = ax[2].get_position()
+        left = b0.x0
+        right = b2.x1
+        width = right - left
+
+        b3 = ax[3].get_position() if plot_rotation else None
+
+        cb_height = 0.04
+        cb_pad = 0.03
+        y = b0.y0 - cb_pad - cb_height
+
+        cax1 = fig.add_axes([left, y, width, cb_height])
+        cbar1 = fig.colorbar(im0, cax=cax1, orientation="horizontal")
+        cbar1.set_label("Strain (%)", fontsize=title_fs)
+        cbar1.ax.tick_params(labelsize=12)
+
+        if plot_rotation:
+            left_r = b3.x0
+            width_r = b3.x1 - b3.x0
+            cax2 = fig.add_axes([left_r, y, width_r, cb_height])
+            cbar2 = fig.colorbar(im3, cax=cax2, orientation="horizontal")
+            cbar2.set_label("Rotation (deg)", fontsize=title_fs)
+            cbar2.ax.tick_params(labelsize=12)
+
+        for a in ax:
+            a.set_aspect("equal")
+
+        return fig, ax
 
     @property
     def render_mean_refined(self) -> np.ndarray:

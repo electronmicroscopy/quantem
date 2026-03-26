@@ -149,9 +149,9 @@ class ModelDiffractionVisualizations:
     def visualize(
         self,
         *,
-        plot_individual: bool = False,
-        individual_row: int = 0,
-        individual_col: int = 0,
+        individual_loss: bool = False,
+        pattern_row: int = 0,
+        pattern_col: int = 0,
         power: float = 0.25,
         cbar: bool = False,
         axsize: tuple[int, int] = (6, 6),
@@ -204,17 +204,17 @@ class ModelDiffractionVisualizations:
             md.preprocess()
         if md.image_ref is None or md.model is None or md.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
-        if md.dataset.shape[0] <= individual_row or md.dataset.shape[1] <= individual_col:
+        if md.dataset.shape[0] <= pattern_row or md.dataset.shape[1] <= pattern_col:
             raise ValueError("individual row or column outside bounds of dataset")
 
         fig = plt.figure(figsize=(12, 7))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax_top = fig.add_subplot(gs[0])
-        md.plot_losses(figax=(fig, ax_top), plot_lrs=True, plot_individual=plot_individual,individual_row=individual_row,individual_col=individual_col)
+        md.plot_losses(figax=(fig, ax_top), plot_lrs=True, plot_individual=individual_loss,individual_row=pattern_row,individual_col=pattern_col)
 
-        if plot_individual:
-            ref = np.asarray(md.dataset.array[individual_row, individual_col], dtype=np.float32)
-            pred = md.render_indivdual_pattern(row=individual_row, col = individual_col)
+        if individual_loss:
+            pred = md.render_indivdual_pattern(row=pattern_row, col=pattern_col)
+            ref = np.asarray(md.dataset.array[pattern_row, pattern_col], dtype=np.float32)
         else:
             ref = np.asarray(md.image_ref, dtype=np.float32)
             pred = md.render_current
@@ -257,6 +257,8 @@ class ModelDiffractionVisualizations:
                 )
 
         mean_hist = md.fit_history.get("mean")
+        if individual_loss:
+            mean_hist = md.fit_history.get(f"individual_{pattern_row}_{pattern_row}")
         if mean_hist is not None and len(mean_hist.losses) > 0:
             fig.suptitle(
                 f"Final loss: {mean_hist.losses[-1]:.3e} | Iters: {len(mean_hist.losses)}",
@@ -266,9 +268,13 @@ class ModelDiffractionVisualizations:
         plt.show()
         return fig, axs
 
-    def plot_mean_model(
+    def plot_model(
         self,
         *,
+        plot_mean_model: bool = False,
+        plot_individual_model: bool = False,
+        pattern_row: int = 0,
+        pattern_col: int= 0,
         power: float = 0.25,
         returnfig: bool = False,
         axsize: tuple[int, int] = (6, 6),
@@ -281,7 +287,7 @@ class ModelDiffractionVisualizations:
         **kwargs,
     ) -> tuple[Any, Any] | None:
         """
-        Plot reference and model mean diffraction images.
+        Plot reference and indiviual diffraction images.
 
         Parameters
         ----------
@@ -323,9 +329,17 @@ class ModelDiffractionVisualizations:
             md.preprocess()
         if md.image_ref is None or md.model is None or md.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
-
-        ref = np.asarray(md.image_ref, dtype=np.float32)
-        pred = md.render_mean_refined
+        if plot_mean_model and plot_individual_model:
+            raise RuntimeError("can only plot mean or plot individual, not both")
+        if plot_individual_model:
+            pred = md.render_indivdual_pattern(pattern_row, pattern_col)
+            ref = np.asarray(md.dataset.array[pattern_row, pattern_col], dtype=np.float32)
+        elif plot_mean_model:
+            ref = np.asarray(md.image_ref, dtype=np.float32)
+            pred = md.render_mean_refined
+        else:
+            ref = np.asarray(md.image_ref, dtype=np.float32)
+            pred = md.render_current
 
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)

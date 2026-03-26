@@ -53,8 +53,22 @@ class DiskTemplate(RenderComponent):
         "force_center": False,
         "force_positive": True,
         "force_norm": True, # force range [0,1]
+        "force_shrinkage": False,
+        "force_cutoff": False,
+        "force_circular_mask": True,
     }
-    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {"tv_weight": 0.0}
+    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {
+        "tv_weight": 0.0,
+        "cutoff_weight": 0.0,
+        "circular_weight": 0.0,
+    }
+    DEFAULT_CONSTRAINT_CONFIG: dict[str, float] = {
+        "soft_cutoff_threshold": 0.0,
+        "soft_cutoff_target_ratio": 0.1,
+        "hard_cutoff_threshold": 0.35,
+        "shrinkage_amount": 0.25,
+        "circular_mask_radius_fraction": 1, 
+    }
 
     def __init__(
         self,
@@ -67,6 +81,7 @@ class DiskTemplate(RenderComponent):
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config: dict[str, Any] | None = None,
     ):
         """
         Build a disk template renderer centered at the shared origin.
@@ -126,10 +141,17 @@ class DiskTemplate(RenderComponent):
         cc = cc.astype(np.float32) - (wt - 1) * 0.5
         self.register_buffer("dr", torch.as_tensor(rr.ravel(), dtype=torch.float32))
         self.register_buffer("dc", torch.as_tensor(cc.ravel(), dtype=torch.float32))
+
+        self.constraint_config = self.DEFAULT_CONSTRAINT_CONFIG.copy()
+        if constraint_config is not None:
+            self.constraint_config.update(constraint_config)
+        
         if constraint_params is not None:
             self.apply_constraint_params(constraint_params, strict=True)
         if bool(self.hard_constraints.get("force_positive", False)):
             self._enforce_positivity()
+        if bool(self.hard_constraints.get("force_shrinkage", False)) and bool(self.hard_constraints.get("force_positive", True)):
+            raise RuntimeWarning("Setting shrinkage true and positivity false might cause negative values in disk template")
 
     @classmethod
     def from_array(
@@ -143,6 +165,8 @@ class DiskTemplate(RenderComponent):
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config: dict[str, Any] | None = None,
+
     ) -> "DiskTemplate":
         return cls(
             name=name,
@@ -153,6 +177,8 @@ class DiskTemplate(RenderComponent):
             origin_key=origin_key,
             intensity=intensity,
             constraint_params=constraint_params,
+            constraint_config=constraint_config,
+
         )
 
     def set_origin(self, origin: OriginND) -> None:
@@ -240,14 +266,43 @@ class DiskTemplate(RenderComponent):
             self.template_raw.clamp_(min=0.0)
             self.intensity_raw.clamp_(min=0.0)
     
-    def _enforce_norm(self) -> None:
+    def _enforce_norm(self) -> None: # pick value and cut off 5 percent of mean, or every iteration shrinkage, every iteration just subtract a valye of 0.01
         with torch.no_grad():
             self.template_raw -= self.template_raw.min()
             self.template_raw /= self.template_raw.max()
+    
+    def _enforce_shrinkage(self) -> None:
+        with torch.no_grad():
+            self.template_raw -= self.constraint_config["shrinkage_amount"]
+    
+    def _enforce_cutoff(self) -> None:
+        with torch.no_grad():
+            mean_val = torch.max(self.template_raw) * self.constraint_config["hard_cutoff_threshold"]
+            self.template_raw[self.template_raw <= mean_val] = 0
+    
+    def _enforce_circular_mask(self) -> None:
+        with torch.no_grad():
+            h, w = self.template_raw.shape
+            radius = (min(h, w) / 2.0) * self.constraint_config["circular_mask_radius_fraction"]
+            
+            r = torch.arange(-h/2, h/2, device=self.template_raw.device, dtype=self.template_raw.dtype)
+            c = torch.arange(-w/2, w/2, device=self.template_raw.device, dtype=self.template_raw.dtype)
+            rr, cc = torch.meshgrid(r, c, indexing='ij')
+            circle_matrix = torch.sqrt(rr**2 + cc**2)
+            
+            mask = circle_matrix <= radius
+            self.template_raw[~mask] = 0.0
+
 
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:
         if bool(self.hard_constraints.get("force_center", False)):
             self._center_disk()
+        if bool(self.hard_constraints.get("force_cutoff", False)):
+            self._enforce_cutoff()
+        if bool(self.hard_constraints.get("force_circular_mask", False)):
+            self._enforce_circular_mask()
+        if bool(self.hard_constraints.get("force_shrinkage", False)):
+            self._enforce_shrinkage()
         if bool(self.hard_constraints.get("force_positive", False)):
             self._enforce_positivity()
         if bool(self.hard_constraints.get("force_norm", False)): # could be put in positivity
@@ -260,8 +315,17 @@ class DiskTemplate(RenderComponent):
     ) -> torch.Tensor:
         cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
         tv_weight = float(cfg.get("tv_weight", 0.0))
+        cutoff_weight = float(cfg.get("cutoff_weight", 0.0))
+        circular_weight = float(cfg.get("circular_weight", 0.0))
+        
         if tv_weight <= 0.0:
-            return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+            tv_weight = 0.0
+        if cutoff_weight <= 0.0:
+            cutoff_weight = 0.0
+        if circular_weight <= 0.0:
+            circular_weight = 0.0
+
+        # tv loss calculation
         template = self.template_raw.to(device=ctx.device, dtype=ctx.dtype)
         tv_r = (
             torch.mean(torch.abs(template[1:, :] - template[:-1, :]))
@@ -273,7 +337,33 @@ class DiskTemplate(RenderComponent):
             if template.shape[1] > 1
             else torch.zeros((), device=ctx.device, dtype=ctx.dtype)
         )
-        return torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
+        tv_loss = torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
+
+        # Cutoff loss calculation
+        num_px = torch.prod(torch.tensor(template.shape))
+        px_under_threshold = torch.sum(template <= torch.mean(template)*self.constraint_config["soft_cutoff_threshold"])/num_px
+        cutoff_loss = torch.as_tensor(cutoff_weight, device=ctx.device, dtype=ctx.dtype) * torch.maximum(
+            px_under_threshold-self.constraint_config["soft_cutoff_target_ratio"], torch.as_tensor(0.0, device=ctx.device, dtype=ctx.dtype))
+        
+        # circular loss calculation
+        h, w = template.shape
+        radius = (min(h, w) / 2.0) * self.constraint_config["circular_mask_radius_fraction"]
+
+        r = torch.arange(h, device=ctx.device, dtype=ctx.dtype) - h / 2.0
+        c = torch.arange(w, device=ctx.device, dtype=ctx.dtype) - w / 2.0
+        rr, cc = torch.meshgrid(r, c, indexing='ij')
+        
+        circle_mask = torch.sqrt(rr**2 + cc**2)
+
+        dist_from_radius = torch.abs(circle_mask - radius)
+        dist_from_radius = torch.relu(dist_from_radius)
+        circular_err = torch.mean(dist_from_radius * template)
+        
+        circular_loss = torch.as_tensor(circular_weight, device=ctx.device, dtype=ctx.dtype) * circular_err
+
+        return cutoff_loss + tv_loss + circular_loss
+
+        
 
 
 class SyntheticDiskLattice(RenderComponent):
