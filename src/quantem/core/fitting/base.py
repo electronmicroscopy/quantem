@@ -90,15 +90,35 @@ class OriginND(nn.Module):
         self.coords = nn.Parameter(torch.as_tensor(init, dtype=torch.float32).reshape(self.ndim))
 
 
-class RenderComponent(nn.Module):
+class RenderComponent(OptimizerMixin,nn.Module):
     DEFAULT_HARD_CONSTRAINTS: dict[str, Any] = {}
     DEFAULT_SOFT_CONSTRAINTS: dict[str, Any] = {}
 
+    DEFAULT_OPTIMIZER: str = "adam"
+    DEFAULT_LR: float = 1e-2
+    DEFAULT_SCHEDULER_TYPE: str = "none"
+
     def __init__(self) -> None:
-        super().__init__()
+        nn.Module.__init__(self)
+        
+        self._optimizer = None
+        self._scheduler = None
+        self._optimizer_params = {}
+        self._scheduler_params = {}
         self.hard_constraints: dict[str, Any] = dict(self.DEFAULT_HARD_CONSTRAINTS)
         self.soft_constraints: dict[str, Any] = dict(self.DEFAULT_SOFT_CONSTRAINTS)
         self.parameter_bounds: dict[str, tuple[float | None, float | None]] = {}
+
+        optimizer_params = {
+                "type": self.DEFAULT_OPTIMIZER,
+                "lr": self.DEFAULT_LR
+            }
+        self.optimizer_params = optimizer_params
+
+        scheduler_params = {
+                "type": self.DEFAULT_SCHEDULER_TYPE
+            }
+        self.scheduler_params = scheduler_params
 
     @staticmethod
     def parse_bounded_init(
@@ -270,8 +290,82 @@ class RenderComponent(nn.Module):
     ) -> torch.Tensor:
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
 
+    def get_optimization_parameters(self) -> Any: # make copy in synthetic disklattice which only refs lattice not disk lattice params, reoeat for origin byt in dusk teplate
+        return [p for p in self.parameters() if p.requires_grad]
+    
+    def initialize_optimizer(self, 
+        optimizer_params: dict[str, Any] | None = None,
+        scheduler_params: dict[str, Any] | None = None,
+        num_iter: int | None = None,
+        ) -> None:
+        trainable_params = list(self.get_optimization_parameters())
+        if not trainable_params:
+            self._optimizer = None
+            self._scheduler = None
+            return
+        if optimizer_params is not None:
+            self.optimizer_params = optimizer_params
+        else:
+            self.optimizer_params = {
+                "type": self.DEFAULT_OPTIMIZER,
+                "lr": self.DEFAULT_LR
+            }
+        self.set_optimizer(self.optimizer_params)
 
-class AdditiveRenderModel(nn.Module):
+        if scheduler_params is not None:
+            self.scheduler_params = scheduler_params
+        else:
+            self.scheduler_params = {
+                "type": self.DEFAULT_SCHEDULER_TYPE
+            }
+        self.set_scheduler(self.scheduler_params, num_iter = num_iter)
+        return
+    
+    
+    def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
+        if self.optimizer_params:
+            return dict(self.optimizer_params)
+        if self.optimizer is not None:
+            opt_type: str | type[torch.optim.Optimizer]
+            if isinstance(self.optimizer, torch.optim.AdamW):
+                opt_type = "adamw"
+            elif isinstance(self.optimizer, torch.optim.Adam):
+                opt_type = "adam"
+            elif isinstance(self.optimizer, torch.optim.SGD):
+                opt_type = "sgd"
+            else:
+                opt_type = type(self.optimizer)
+            lr = float(
+                self.optimizer.param_groups[0].get(
+                    "lr", getattr(self, "DEFAULT_LR", self.DEFAULT_LR)
+                )
+            )
+            return {"type": opt_type, "lr": lr}
+        return {
+            "type": getattr(self, "DEFAULT_OPTIMIZER_TYPE", self.DEFAULT_OPTIMIZER),
+            "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
+        }
+    
+    def _infer_scheduler_rebuild_params(self) -> dict[str, Any]:
+        if self.scheduler_params:
+            return dict(self.scheduler_params)
+        return {
+            "type": self.DEFAULT_SCHEDULER_TYPE,
+        }
+    
+    def _rebuild_optimizer_after_trainability_change(self) -> None:
+        trainable_params = list(self.get_optimization_parameters())
+        if not trainable_params:
+            self._optimizer = None
+            self._scheduler = None
+            return
+        rebuild_params = self._infer_optimizer_rebuild_params()
+        rebuild_params_scheduler = self._infer_scheduler_rebuild_params()
+        self.set_optimizer(rebuild_params)
+        self.set_scheduler(rebuild_params_scheduler)
+
+
+class AdditiveRenderModel(nn.Module): # step all otpimzers
     def __init__(self, *, origin: nn.Module, components: list[RenderComponent]):
         super().__init__()
         self.origin = origin
@@ -335,71 +429,125 @@ class AdditiveRenderModel(nn.Module):
             loss = loss + component.constraint_loss(ctx)
         return loss
 
+    def initilize_independant_optimizers(self, 
+        individual_optimizers: dict[str, dict[str, Any]] | None = None,
+        individual_schedulers: dict[str, dict[str, Any]] | None = None,
+        num_iter: int | None = None,
+        ) -> None:
+        for idx, module in enumerate(self.components):
+            component = cast(RenderComponent, module)
+            component_name = self._component_constraint_name(component, idx)
 
-@dataclass
-class FitResult:
-    losses: list[float]
-    lrs: list[float]
-    final_loss: float
-    num_steps: int
-    metrics: dict[str, list[float]] = field(default_factory=dict)
+            component_optimizer_params = None
+            component_scheduler_params = None
+            if individual_optimizers is not None:
+                if component_name in individual_optimizers:
+                    component_optimizer_params = individual_optimizers[component_name]
+                elif component.__class__.__name__ in individual_optimizers :
+                    component_optimizer_params = individual_optimizers[component.__class__.__name__]
 
+            if individual_schedulers is not None:
+                if component_name in individual_schedulers:
+                    component_scheduler_params = individual_schedulers[component_name]
+                elif component.__class__.__name__ in individual_schedulers:
+                    component_scheduler_params = individual_schedulers[component.__class__.__name__]
+            
+            component.initialize_optimizer(component_optimizer_params, component_scheduler_params, num_iter=num_iter)
+    
+    def set_independant_optimizer_params(self, 
+        individual_optimizer_params: dict[str, dict[str, Any]],
+        individual_scheduler_params: dict[str, dict[str, Any]] | None = None,
+        num_iter: int | None = None,
+        ) -> None:
+        for component_name, param in individual_optimizer_params.items():
+            scheduler_params = None
+            if individual_scheduler_params is not None and component_name in individual_scheduler_params:
+                scheduler_params = individual_scheduler_params[component_name]
+        
+            component = self._resolve_component_by_name(str(component_name))
+            component.initialize_optimizer(param,scheduler_params,num_iter)
+    
+    def rebuild_independant_optimizers(self) -> None:
+        for module in self.components:
+            component = cast(RenderComponent, module)
+            component.initialize_optimizer()
 
-class FitBase(OptimizerMixin):
-    DEFAULT_LR = 1e-2
-    DEFAULT_OPTIMIZER_TYPE = "adam"
+    def step_optimizers(self) -> None:
+        for module in self.components:
+            component = cast(RenderComponent, module)
+            component.step_optimizer()
+    
+    def step_schedulers(self, loss: float | None = None) -> None:
+        for module in self.components:
+            component = cast(RenderComponent, module)
+            if hasattr(component, 'step_scheduler'):
+                try:
+                    component.step_scheduler(loss)
+                except (AttributeError, TypeError):
+                    pass
+    
+    def zero_grad_optimizers(self) -> None:
+        for module in self.components:
+            component = cast(RenderComponent, module)
+            component.zero_optimizer_grad()
+    
+    def _iter_named_components(self) -> list[tuple[str, RenderComponent]]:
+        """
+        Return canonical component names paired with components.
 
-    def __init__(self):
-        super().__init__()
-        # Core wiring
-        self.loss_fn = torch.nn.L1Loss(reduction="mean")
-        # self.loss_fn = torch.nn.MSELoss(reduction="mean")
-        self.model: AdditiveRenderModel | None = None
-        self.ctx: RenderContext | None = None
+        Returns
+        -------
+        list[tuple[str, RenderComponent]]
+            ``(name, component)`` entries using the model's canonical naming
+            rule. Names fall back to class-name/index behavior when ``.name`` is
+            missing.
 
-        # State/checkpoints
-        self.state_initialized: dict[str, torch.Tensor] | None = None
+        Raises
+        ------
+        RuntimeError
+            If the model is not defined.
+        """
+        entries: list[tuple[str, RenderComponent]] = []
+        for idx, module in enumerate(self.components):
+            component = cast(RenderComponent, module)
+            name = self._component_constraint_name(component, idx)
+            entries.append((name, component))
+        return entries
+    
+    def _resolve_component_by_name(self, component_name: str) -> RenderComponent:
+        target = str(component_name)
+        for resolved_name, component in self._iter_named_components():
+            if resolved_name == target:
+                return component
+        
+        for resolved_name, component in self._iter_named_components():
+            if component.__class__.__name__ == target:
+                return component
+        
+        known = ", ".join(self.get_component_names())
+        raise KeyError(f"Component not found: {target}. Known components: {known}")
+    
+    def get_component_names(self) -> list[str]:
+        """
+        Return canonical component names.
 
-        # Histories/results
-        self.fit_history: dict[str, FitResult] = {}
-
-    def get_optimization_parameters(self) -> Any:
-        if self.model is None:
-            return []
-        return [p for p in self.model.parameters() if p.requires_grad]
-
-    @property
-    def state_current(self) -> dict[str, torch.Tensor] | None:
-        if self.model is None:
-            return None
-        return self._get_model_state_dict_copy()
-
-    @property
-    def render_initialized(self) -> np.ndarray:
-        if self.state_initialized is None:
-            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
-        return self._render_state_array(self.state_initialized)
-
-    @property
-    def render_current(self) -> np.ndarray:
-        if self.model is None or self.ctx is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        return self.model(self.ctx).detach().cpu().numpy()
-
-    def reset(
-        self,
-        reset_to: Literal["initialized"] = "initialized",
-    ) -> Self:
-        if reset_to != "initialized":
-            raise ValueError("FitBase.reset only supports reset_to='initialized'.")
-        if self.state_initialized is None:
-            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
-        self._load_model_state_dict_copy(self.state_initialized)
-        self._clear_fit_history_all()
-        return self
+        Returns
+        -------
+        list[str]
+            Canonical component names.
+        """
+        return [name for name, _ in self._iter_named_components()]
+    
+    def get_component_by_name(self, component_name: str) -> RenderComponent:
+        return self._resolve_component_by_name(component_name) 
+    
 
     def set_component_trainable(
-        self, component_name: str, enabled: bool, rebuild_optimizer: bool = True
+        self, 
+        component_name: str, 
+        enabled: bool, 
+        rebuild_optimizer: bool = True,  
+        num_iter: int | None = None,
     ) -> None:
         """
         Enable or disable optimization for all parameters in one component.
@@ -435,7 +583,7 @@ class FitBase(OptimizerMixin):
         for _, param in component.named_parameters(recurse=True):
             param.requires_grad_(bool(enabled))
         if rebuild_optimizer:
-            self._rebuild_optimizer_after_trainability_change()
+            component._rebuild_optimizer_after_trainability_change()
 
     def set_parameter_trainable(
         self,
@@ -443,6 +591,7 @@ class FitBase(OptimizerMixin):
         parameter_name: str,
         enabled: bool,
         rebuild_optimizer: bool = True,
+        num_iter: int | None = None,
     ) -> None:
         """
         Enable or disable optimization for one component parameter.
@@ -484,7 +633,7 @@ class FitBase(OptimizerMixin):
             )
         params[parameter_name].requires_grad_(bool(enabled))
         if rebuild_optimizer:
-            self._rebuild_optimizer_after_trainability_change()
+            component._rebuild_optimizer_after_trainability_change()
 
     def set_parameters_trainable(
         self,
@@ -492,6 +641,7 @@ class FitBase(OptimizerMixin):
         parameter_names: list[str],
         enabled: bool,
         rebuild_optimizer: bool = True,
+        num_iter: int | None = None,
     ) -> None:
         """
         Enable or disable optimization for multiple component parameters.
@@ -530,7 +680,7 @@ class FitBase(OptimizerMixin):
         for name in parameter_names:
             params[name].requires_grad_(bool(enabled))
         if rebuild_optimizer:
-            self._rebuild_optimizer_after_trainability_change()
+            component._rebuild_optimizer_after_trainability_change()
 
     def get_component_trainable(self, component_name: str) -> dict[str, bool]:
         """
@@ -556,6 +706,77 @@ class FitBase(OptimizerMixin):
         component = self._resolve_component_by_name(component_name)
         return {name: bool(param.requires_grad) for name, param in component.named_parameters()}
 
+           
+
+    
+    
+
+
+
+@dataclass
+class FitResult:
+    losses: list[float]
+    lrs: list[float]
+    final_loss: float
+    num_steps: int
+    metrics: dict[str, list[float]] = field(default_factory=dict)
+
+
+class FitBase(OptimizerMixin):
+
+    def __init__(self):
+        super().__init__()
+        # Core wiring
+        self.loss_fn = torch.nn.L1Loss(reduction="mean")
+        # self.loss_fn = torch.nn.MSELoss(reduction="mean")
+        self.model: AdditiveRenderModel | None = None
+        self.ctx: RenderContext | None = None
+
+        # State/checkpoints
+        self.state_initialized: dict[str, torch.Tensor] | None = None
+
+        # Histories/results
+        self.fit_history: dict[str, FitResult] = {}
+
+        # self.multi_optimizers: dict[str, torch.optim.Optimizer] | None = None
+        # self.use_mutiple_optimizers: bool = False
+
+    def get_optimization_parameters(self) -> Any:
+        if self.model is None:
+            return []
+        
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    @property
+    def state_current(self) -> dict[str, torch.Tensor] | None:
+        if self.model is None:
+            return None
+        return self._get_model_state_dict_copy()
+
+    @property
+    def render_initialized(self) -> np.ndarray:
+        if self.state_initialized is None:
+            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
+        return self._render_state_array(self.state_initialized)
+
+    @property
+    def render_current(self) -> np.ndarray:
+        if self.model is None or self.ctx is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model(self.ctx).detach().cpu().numpy()
+
+    def reset(
+        self,
+        reset_to: Literal["initialized"] = "initialized",
+    ) -> Self:
+        if reset_to != "initialized":
+            raise ValueError("FitBase.reset only supports reset_to='initialized'.")
+        if self.state_initialized is None:
+            raise RuntimeError("initialized state is unavailable. Call .define_model(...) first.")
+        self._load_model_state_dict_copy(self.state_initialized)
+        self._clear_fit_history_all()
+        return self
+
     def fit_render(
         self,
         *,
@@ -563,8 +784,8 @@ class FitBase(OptimizerMixin):
         n_steps: int,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
+        optimizer_params: dict[str, dict[str, Any]] | None = None,
+        scheduler_params: dict[str, dict[str, Any]] | None = None,
         progress: bool = False,
         run_key: str = "default",
         **kwargs: Any,
@@ -613,49 +834,41 @@ class FitBase(OptimizerMixin):
         if constraint_params is not None:
             self.model.apply_constraint_params(constraint_params, strict=True)
 
-        optimizer_rebuilt = False
-        if optimizer_params is not None:
-            self.set_optimizer(optimizer_params)
-            optimizer_rebuilt = True
-        elif self.optimizer is None:
-            if self.optimizer_params:
-                self.set_optimizer(self.optimizer_params)
-            else:
-                self.set_optimizer(
-                    {
-                        "type": getattr(self, "DEFAULT_OPTIMIZER_TYPE", "adamw"),
-                        "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
-                    }
-                )
-            optimizer_rebuilt = True
-
         n_steps = int(n_steps)
-        if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_iter=n_steps)
-        elif self.scheduler is None and self.scheduler_params:
-            self.set_scheduler(self.scheduler_params, num_iter=n_steps)
-        elif optimizer_rebuilt and self.scheduler is not None and self.optimizer is not None:
-            self.scheduler.optimizer = self.optimizer
+        self.model.initilize_independant_optimizers(
+            optimizer_params,
+            scheduler_params,
+            num_iter=n_steps
+        )
 
         pbar = tqdm(range(n_steps), desc="Fit render", disable=not progress)
 
         losses: list[float] = []
         lrs: list[float] = []
         for _ in pbar:
-            self.zero_optimizer_grad()
+            self.model.zero_grad_optimizers()
             pred = self._forward_for_fit(target=target, **kwargs)
             data_loss = self._fidelity_loss(pred, target, **kwargs)
             constraint_loss = self._constraint_loss(pred, target, **kwargs)
             total_loss = data_loss + constraint_weight * constraint_loss
             total_loss.backward()
-            self.step_optimizer()
+            self.model.step_optimizers()
             if self.model is None or self.ctx is None:
                 raise RuntimeError("Model and context are not defined for fitting.")
             self.model.apply_hard_constraints(self.ctx)
             total_loss_value = float(total_loss.detach().cpu())
-            self.step_scheduler(total_loss_value)
+            self.model.step_schedulers(total_loss_value)
             losses.append(total_loss_value)
-            lrs.append(float(self.get_current_lr()))
+
+            first_lr = 0.0
+            if len(self.model.components) > 0:
+                first_comp = cast(RenderComponent, self.model.components[0])
+                if hasattr(first_comp, 'get_current_lr'):
+                    try:
+                        first_lr = float(first_comp.get_current_lr())
+                    except (AttributeError, TypeError):
+                        first_lr = 0.0
+            lrs.append(first_lr)
 
         key = str(run_key)
         if key in self.fit_history:
@@ -675,80 +888,6 @@ class FitBase(OptimizerMixin):
             self.fit_history[key] = result
         return result
 
-    def _iter_named_components(self) -> list[tuple[str, RenderComponent]]:
-        """
-        Return canonical component names paired with components.
-
-        Returns
-        -------
-        list[tuple[str, RenderComponent]]
-            ``(name, component)`` entries using the model's canonical naming
-            rule. Names fall back to class-name/index behavior when ``.name`` is
-            missing.
-
-        Raises
-        ------
-        RuntimeError
-            If the model is not defined.
-        """
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        entries: list[tuple[str, RenderComponent]] = []
-        for idx, module in enumerate(self.model.components):
-            component = cast(RenderComponent, module)
-            name = self.model._component_constraint_name(component, idx)
-            entries.append((name, component))
-        return entries
-
-    def get_component_names(self) -> list[str]:
-        """
-        Return canonical component names.
-
-        Returns
-        -------
-        list[str]
-            Canonical component names.
-        """
-        return [name for name, _ in self._iter_named_components()]
-
-    def _resolve_component_by_name(self, component_name: str) -> RenderComponent:
-        target = str(component_name)
-        for resolved_name, component in self._iter_named_components():
-            if resolved_name == target:
-                return component
-        known = ", ".join(self.get_component_names())
-        raise KeyError(f"Component not found: {target}. Known components: {known}")
-
-    def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
-        if self.optimizer_params:
-            return dict(self.optimizer_params)
-        if self.optimizer is not None:
-            opt_type: str | type[torch.optim.Optimizer]
-            if isinstance(self.optimizer, torch.optim.AdamW):
-                opt_type = "adamw"
-            elif isinstance(self.optimizer, torch.optim.Adam):
-                opt_type = "adam"
-            elif isinstance(self.optimizer, torch.optim.SGD):
-                opt_type = "sgd"
-            else:
-                opt_type = type(self.optimizer)
-            lr = float(
-                self.optimizer.param_groups[0].get(
-                    "lr", getattr(self, "DEFAULT_LR", self.DEFAULT_LR)
-                )
-            )
-            return {"type": opt_type, "lr": lr}
-        return {
-            "type": getattr(self, "DEFAULT_OPTIMIZER_TYPE", self.DEFAULT_OPTIMIZER_TYPE),
-            "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
-        }
-
-    def _rebuild_optimizer_after_trainability_change(self) -> None:
-        if self.model is None:
-            raise RuntimeError("Call .define_model(...) first.")
-        rebuild_params = self._infer_optimizer_rebuild_params()
-        self.set_optimizer(rebuild_params)
-        self.set_scheduler({"type": "none"})
 
     def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {k: v.detach().clone() for k, v in state.items()}
@@ -806,6 +945,63 @@ class FitBase(OptimizerMixin):
             raise RuntimeError("Model and context are not defined for fitting.")
         return self.model.total_constraint_loss(self.ctx)
 
+    def set_component_trainable(
+        self, 
+        component_name: str, 
+        enabled: bool, 
+        rebuild_optimizer: bool = True,
+        num_iter: int | None = None
+    ) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        self.model.set_component_trainable(component_name, enabled, rebuild_optimizer, num_iter)
+
+    def set_parameter_trainable(
+        self,
+        component_name: str,
+        parameter_name: str,
+        enabled: bool,
+        rebuild_optimizer: bool = True,
+        num_iter: int | None = None
+    ) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        self.model.set_parameter_trainable(component_name, parameter_name, enabled, rebuild_optimizer, num_iter)
+
+    def set_parameters_trainable(
+        self,
+        component_name: str,
+        parameter_names: list[str],
+        enabled: bool,
+        rebuild_optimizer: bool = True,
+        num_iter: int | None = None
+    ) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        self.model.set_parameters_trainable(component_name, parameter_names, enabled, rebuild_optimizer, num_iter)
+
+    def get_component_trainable(self, component_name: str) -> dict[str, bool]:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model.get_component_trainable(component_name)
+
+    def get_component_names(self) -> list[str]:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model.get_component_names()
+
+    def _iter_named_components(self) -> list[tuple[str, RenderComponent]]:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model._iter_named_components()
+    
+    def _resolve_component_by_name(self, component_name: str) -> RenderComponent:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return self.model._resolve_component_by_name(component_name)
+    
+    def get_component_by_name(self, component_name: str) -> RenderComponent:
+        return self._resolve_component_by_name(component_name)
 
 Component = RenderComponent
 ModelContext = RenderContext
