@@ -67,8 +67,9 @@ class DiskTemplate(RenderComponent):
         "soft_cutoff_target_ratio": 0.1,
         "hard_cutoff_threshold": 0.35,
         "shrinkage_amount": 0.25,
-        "circular_mask_radius_fraction": 1,
-        "circular_mask_sharpness": 1.0,
+        "circular_mask_radius_fraction": 0.95,
+        "circular_mask_sharpness": 0,
+        "soft_circular_mask": False,
     }
 
     def __init__(
@@ -291,8 +292,10 @@ class DiskTemplate(RenderComponent):
             rr, cc = torch.meshgrid(r, c, indexing='ij')
             circle_matrix = torch.sqrt(rr**2 + cc**2)
             
-            # mask = circle_matrix <= radius
-            mask = torch.sigmoid(self.constraint_config["circular_mask_sharpness"]*(radius-circle_matrix))
+            if self.constraint_config["soft_circular_mask"]:
+                mask = torch.sigmoid(self.constraint_config["circular_mask_sharpness"]*(radius-circle_matrix))
+            else:
+                mask = circle_matrix <= radius
             self.template_raw *= mask
 
 
@@ -364,6 +367,13 @@ class DiskTemplate(RenderComponent):
         circular_loss = torch.as_tensor(circular_weight, device=ctx.device, dtype=ctx.dtype) * circular_err
 
         return cutoff_loss + tv_loss + circular_loss
+    
+    def get_optimization_parameters(self) -> Any: 
+        params = []
+        for name, param in self.named_parameters(recurse=True):
+            if not name.startswith('origin.') and param.requires_grad:
+                params.append(param)
+        return params
 
         
 
@@ -680,3 +690,10 @@ class SyntheticDiskLattice(RenderComponent):
             self.disk.add_patch(out, r0=rr0, c0=cc0, scale=inten)
 
         return out
+    
+    def get_optimization_parameters(self) -> Any: 
+        params = []
+        for name, param in self.named_parameters(recurse=True):
+            if not name.startswith('disk.') and param.requires_grad:
+                params.append(param)
+        return params

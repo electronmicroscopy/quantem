@@ -436,6 +436,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config_params: dict[str, Any] | None = None,
         progress: bool = True,
     ) -> "ModelDiffraction":
         """
@@ -492,6 +493,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             n_steps=int(n_steps),
             constraint_weight=float(constraint_weight),
             constraint_params=constraint_params,
+            constraint_config_params=constraint_config_params,
             optimizer_params=optimizer_params,
             scheduler_params=scheduler_params,
             progress=bool(progress),
@@ -714,8 +716,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         strain_range_percent=(-3.0, 3.0),
         rotation_range_degrees=(-2.0, 2.0),
         plot_rotation=True,
-        cmap_strain="RdBu",
-        cmap_rotation=None,
+        cmap_strain="RdBu_r",
+        cmap_rotation="PiYG",
         layout="horizontal",
         figsize=(6, 6),
     ):

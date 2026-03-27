@@ -93,6 +93,7 @@ class OriginND(nn.Module):
 class RenderComponent(OptimizerMixin,nn.Module):
     DEFAULT_HARD_CONSTRAINTS: dict[str, Any] = {}
     DEFAULT_SOFT_CONSTRAINTS: dict[str, Any] = {}
+    DEFAULT_CONSTRAINT_CONFIG: dict[str, Any] = {}
 
     DEFAULT_OPTIMIZER: str = "adam"
     DEFAULT_LR: float = 1e-2
@@ -107,6 +108,7 @@ class RenderComponent(OptimizerMixin,nn.Module):
         self._scheduler_params = {}
         self.hard_constraints: dict[str, Any] = dict(self.DEFAULT_HARD_CONSTRAINTS)
         self.soft_constraints: dict[str, Any] = dict(self.DEFAULT_SOFT_CONSTRAINTS)
+        self.constraint_config: dict[str, Any] = dict(self.DEFAULT_CONSTRAINT_CONFIG)
         self.parameter_bounds: dict[str, tuple[float | None, float | None]] = {}
 
         optimizer_params = {
@@ -290,8 +292,8 @@ class RenderComponent(OptimizerMixin,nn.Module):
     ) -> torch.Tensor:
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
 
-    def get_optimization_parameters(self) -> Any: # make copy in synthetic disklattice which only refs lattice not disk lattice params, reoeat for origin byt in dusk teplate
-        return [p for p in self.parameters(recurse=False) if p.requires_grad]
+    def get_optimization_parameters(self) -> Any: 
+        return [p for p in self.parameters() if p.requires_grad]
     
     def initialize_optimizer(self, 
         optimizer_params: dict[str, Any] | None = None,
@@ -363,6 +365,28 @@ class RenderComponent(OptimizerMixin,nn.Module):
         rebuild_params_scheduler = self._infer_scheduler_rebuild_params()
         self.set_optimizer(rebuild_params)
         self.set_scheduler(rebuild_params_scheduler)
+    
+    def initialize_constraint_config(self, config: dict[str, Any], strict: bool = True) -> None:
+        if not hasattr(self, 'constraint_config'):
+            if strict:
+                raise AttributeError(
+                    f"{self.__class__.__name__} does not have constraint_config attribute"
+                )
+            return
+        if not isinstance(config, dict):
+            raise TypeError("constraint config must be a dict.")
+        
+        unknown: dict[str, Any] = {}
+        for k, v in config.items():
+            if k in self.DEFAULT_CONSTRAINT_CONFIG:
+                self.constraint_config[k] = v
+            else:
+                unknown[k] = v
+
+        if unknown and strict:
+            keys = ", ".join(str(k) for k in unknown.keys())
+            raise KeyError(f"Unknown constraint keys for {self.__class__.__name__}: {keys}")
+        return
 
 
 class AdditiveRenderModel(nn.Module): # step all otpimzers
@@ -705,6 +729,13 @@ class AdditiveRenderModel(nn.Module): # step all otpimzers
         """
         component = self._resolve_component_by_name(component_name)
         return {name: bool(param.requires_grad) for name, param in component.named_parameters()}
+    
+    def apply_constraint_configs(
+        self, constraint_configs: dict[str, Any], strict: bool = True
+    ) -> None:
+        for component_name, param in constraint_configs.items():
+            component = self._resolve_component_by_name(str(component_name))
+            component.initialize_constraint_config(param, strict=strict)
 
            
 
@@ -784,6 +815,7 @@ class FitBase(OptimizerMixin):
         n_steps: int,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config_params: dict[str, Any] | None = None,
         optimizer_params: dict[str, dict[str, Any]] | None = None,
         scheduler_params: dict[str, dict[str, Any]] | None = None,
         progress: bool = False,
@@ -833,6 +865,8 @@ class FitBase(OptimizerMixin):
             raise RuntimeError("Model and context are not defined for fitting.")
         if constraint_params is not None:
             self.model.apply_constraint_params(constraint_params, strict=True)
+        if constraint_config_params is not None:
+            self.model.apply_constraint_configs(constraint_config_params, strict=True)
 
         n_steps = int(n_steps)
         self.model.initilize_independant_optimizers(
@@ -1007,6 +1041,13 @@ class FitBase(OptimizerMixin):
         if self.model is None:
             raise RuntimeError("Call .define_model(...) first.")
         self.model.rebuild_independant_optimizers()
+
+    def apply_constraint_config_params(
+        self, constraint_configs: dict[str, Any], strict: bool = True
+    ) -> None:
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        self.model.apply_constraint_configs(constraint_configs, strict=strict)
         
 
 Component = RenderComponent
