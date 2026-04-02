@@ -1350,6 +1350,7 @@ class MAPEDTorch(AutoSerialize):
         Dataset4dstem
             Merged dataset.
         """
+
         if not hasattr(self, "real_space_shifts"):
             raise RuntimeError("Run real_space_align() first so self.real_space_shifts exists.")
         if not hasattr(self, "diffraction_shifts"):
@@ -1393,6 +1394,7 @@ class MAPEDTorch(AutoSerialize):
         if method not in {"bilinear", "fourier"}:
             raise ValueError("shift_method must be 'bilinear' or 'fourier'.")
 
+        # set up real space edge blending weights
         if real_space_edge_blend and float(real_space_edge_blend) > 0:
             alpha_r = min(1.0, 2.0 * float(real_space_edge_blend) / float(Rs))
             alpha_c = min(1.0, 2.0 * float(real_space_edge_blend) / float(Cs))
@@ -1403,6 +1405,7 @@ class MAPEDTorch(AutoSerialize):
         else:
             w_rs = torch.ones((Rs, Cs), dtype=torch.float32, device=self.device)
 
+        # set up diffraction space edge blending weights
         if diffraction_edge_blend and float(diffraction_edge_blend) > 0:
             alpha_dr = min(1.0, 2.0 * float(diffraction_edge_blend) / float(H))
             alpha_dc = min(1.0, 2.0 * float(diffraction_edge_blend) / float(W))
@@ -1413,8 +1416,7 @@ class MAPEDTorch(AutoSerialize):
         else:
             w_dp = torch.ones((H, W), dtype=torch.float32, device=self.device)
 
-        dp_means = [torch.mean(a, axis=(0, 1)) for a in arrays]
-        v = torch.stack(dp_means, axis=0).reshape(-1)
+        v = torch.stack(self.dp_mean, axis=0).reshape(-1)
 
         if isinstance(diffraction_pad_val, str):
             s = diffraction_pad_val.strip().lower()
@@ -1462,14 +1464,16 @@ class MAPEDTorch(AutoSerialize):
         coverage = torch.clip(torch.sum(wdp_shifted, dim=0), 0.0, 1.0)
         edge_w_dp = 1.0 - coverage
 
-        # Determine batch size based on available memory
+        # Determine batch size (somewhat arbitrary)
         if batch_size is None:
-            batch_size = max(1, min(32, Rout // 2))  # Adaptive batch size (1-32 rows)
+            batch_size = max(1, min(32, Rout // 2))
 
         c_out = torch.arange(Cout, dtype=torch.float32, device=self.device)
-        c_base = c_out - real_space_padding  # (Cout,)
+        c_base = c_out - real_space_padding
 
         merged = torch.zeros((Rout, Cout, Hp, Wp), dtype=torch.float64, device=self.device)
+
+        # start batching
 
         for batch_start in tqdm(
             range(0, Rout, batch_size),
@@ -1538,19 +1542,15 @@ class MAPEDTorch(AutoSerialize):
                         align_corners=True,
                     )
 
-                    # Reshape to (Cout, H, W) and (Cout,)
-                    dp_b = (
-                        dp_sample.squeeze(0).squeeze(-1).view(H, W, Cout).permute(2, 0, 1)
-                    )  # (Cout, H, W)
-                    wi_b = wi_sample.squeeze(0).squeeze(-1).squeeze(0)  # (Cout,)
+                    dp_b = dp_sample.squeeze(0).squeeze(-1).view(H, W, Cout).permute(2, 0, 1)
+                    wi_b = wi_sample.squeeze(0).squeeze(-1).squeeze(0)
 
                     dp_interp_list.append(dp_b)
                     wi_list.append(wi_b)
 
-                dp_interp = torch.stack(dp_interp_list)  # (batch_size, Cout, H, W)
-                wi = torch.stack(wi_list)  # (batch_size, Cout)
+                dp_interp = torch.stack(dp_interp_list)
+                wi = torch.stack(wi_list)
 
-                # Pad to diffraction canvas: (batch_size, Cout, Hp, Wp)
                 dp_padded = torch.zeros(
                     (batch_end - batch_start, Cout, Hp, Wp),
                     dtype=torch.float32,
@@ -1560,14 +1560,11 @@ class MAPEDTorch(AutoSerialize):
                     dp_interp * w_dp.unsqueeze(0).unsqueeze(0)
                 ).float()
 
-                # apply to DPs
                 if method == "fourier":
                     ramp = ramps[i]
-                    fft_result = torch.fft.fft2(dp_padded)  # (batch_size, Cout, Hp, Wp)
-                    ramp_exp = ramp.unsqueeze(0).unsqueeze(0)  # (1, 1, Hp, Wp)
-                    dp_shifted = torch.fft.ifft2(
-                        fft_result * ramp_exp
-                    ).real  # (batch_size, Cout, Hp, Wp)
+                    fft_result = torch.fft.fft2(dp_padded)
+                    ramp_exp = ramp.unsqueeze(0).unsqueeze(0)
+                    dp_shifted = torch.fft.ifft2(fft_result * ramp_exp).real
                 else:
                     dp_shifted = torch.zeros_like(dp_padded)
                     for batch_idx in range(batch_end - batch_start):
@@ -1578,8 +1575,8 @@ class MAPEDTorch(AutoSerialize):
                                 mode="bilinear",
                             ).squeeze(0)
 
-                wi_exp = wi.unsqueeze(-1).unsqueeze(-1)  # (batch_size, Cout, 1, 1)
-                wdp_i = wdp_shifted[i].unsqueeze(0).unsqueeze(0)  # (1, 1, Hp, Wp)
+                wi_exp = wi.unsqueeze(-1).unsqueeze(-1)
+                wdp_i = wdp_shifted[i].unsqueeze(0).unsqueeze(0)
 
                 num_batch += wi_exp * dp_shifted
                 den_batch += wi_exp * wdp_i
@@ -1607,6 +1604,7 @@ class MAPEDTorch(AutoSerialize):
         self.im_bf_merged = torch.mean(merged, dim=(2, 3))
         self.dp_mean_merged = torch.mean(merged, dim=(0, 1))
 
+        # dtype scaling and clipping
         try:
             info = torch.iinfo(dtype_out)
             is_int_dtype = True
@@ -1626,7 +1624,6 @@ class MAPEDTorch(AutoSerialize):
                 else:
                     merged_scaled = merged_f * (dmax / peak)
 
-                # unsigned in PyTorch is typically uint8
                 lo, hi = (0.0, dmax) if dtype_out == torch.uint8 else (dmin, dmax)
                 merged_out = torch.rint(torch.clamp(merged_scaled, lo, hi)).to(dtype=dtype_out)
             else:
