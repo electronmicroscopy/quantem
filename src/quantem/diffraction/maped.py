@@ -1197,7 +1197,7 @@ class MAPEDTorch(AutoSerialize):
         if hanning_filter:
             w_h = (
                 torch.hann_window(H, dtype=torch.float32, device=self.device)[:, None]
-                * torch.hanning(W, dtype=torch.float32, device=self.device)[None, :]
+                * torch.hann_window(W, dtype=torch.float32, device=self.device)[None, :]
             )
         w_h_pad = torch.zeros((Hp, Wp), dtype=torch.float32, device=self.device)
         w_h_pad[r0 : r0 + H, c0 : c0 + W] = w_h
