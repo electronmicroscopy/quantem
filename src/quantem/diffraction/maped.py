@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import warnings
 from typing import Any, Sequence
 
@@ -1900,7 +1899,7 @@ def shift_images_torch(
     # padding (compute from max shift if not provided)
     max_shift = float(torch.max(torch.abs(shifts_rc)).item()) if shifts_rc.numel() else 0.0
     if padding is None:
-        padding = int(math.ceil(max_shift + float(edge_blend))) + 2
+        padding = int(np.ceil(max_shift + float(edge_blend))) + 2
     padding = int(padding)
 
     alpha_r = min(1.0, 2.0 * float(edge_blend) / float(H)) if edge_blend > 0 else 0.0
