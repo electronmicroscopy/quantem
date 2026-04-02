@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Any, Sequence
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, shift as ndi_shift
+import torch
+import torch.nn.functional as F
+import torchvision
+from scipy.ndimage import gaussian_filter
+from scipy.ndimage import shift as ndi_shift
 from scipy.signal import convolve2d
 from scipy.signal.windows import tukey
 from tqdm import tqdm
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.utils.imaging_utils import weighted_cross_correlation_shift
+from quantem.core.utils.imaging_utils import (
+    cross_correlation_shift_torch,
+    weighted_cross_correlation_shift,
+)
 from quantem.core.visualization import show_2d
 
 
@@ -55,10 +63,14 @@ class MAPED(AutoSerialize):
         ds_list: list[Dataset4dstem] = []
         for d in datasets:
             if not isinstance(d, Dataset4dstem):
-                raise TypeError("MAPED.from_datasets expects a sequence of Dataset4dstem instances.")
+                raise TypeError(
+                    "MAPED.from_datasets expects a sequence of Dataset4dstem instances."
+                )
             ds_list.append(d)
         if not ds_list:
-            raise ValueError("MAPED.from_datasets expects a non-empty sequence of Dataset4dstem instances.")
+            raise ValueError(
+                "MAPED.from_datasets expects a non-empty sequence of Dataset4dstem instances."
+            )
         return cls(datasets=ds_list, _token=cls._token)
 
     def preprocess(
@@ -87,7 +99,9 @@ class MAPED(AutoSerialize):
         else:
             self.scales = np.asarray(list(scale), dtype=float)
             if self.scales.shape != (n,):
-                raise ValueError("scale must be a scalar or a sequence with the same length as datasets.")
+                raise ValueError(
+                    "scale must be a scalar or a sequence with the same length as datasets."
+                )
         if np.any(self.scales == 0):
             raise ValueError("scale entries must be nonzero.")
 
@@ -119,7 +133,9 @@ class MAPED(AutoSerialize):
 
         if plot_summary:
             tiles = [[(self.im_bf[i] / self.scales[i]), self.dp_mean[i]] for i in range(n)]
-            titles = [[f"{i} - Mean Bright Field", f"{i} - Mean Diffraction Pattern"] for i in range(n)]
+            titles = [
+                [f"{i} - Mean Bright Field", f"{i} - Mean Diffraction Pattern"] for i in range(n)
+            ]
             show_2d(tiles, title=titles, **plot_kwargs)
 
         return self
@@ -172,7 +188,9 @@ class MAPED(AutoSerialize):
             for i in range(n):
                 dp = np.asarray(self.dp_mean[i])
                 if sigma is not None and float(sigma) > 0:
-                    dp_use = gaussian_filter(dp.astype(float, copy=False), float(sigma), mode="nearest")
+                    dp_use = gaussian_filter(
+                        dp.astype(float, copy=False), float(sigma), mode="nearest"
+                    )
                 else:
                     dp_use = dp
                 r, c = np.unravel_index(int(np.argmax(dp_use)), dp_use.shape)
@@ -184,7 +202,9 @@ class MAPED(AutoSerialize):
             else:
                 origins_list = list(origins)
                 if len(origins_list) != n:
-                    raise ValueError("origins must be a single (row,col) tuple or a list of length n.")
+                    raise ValueError(
+                        "origins must be a single (row,col) tuple or a list of length n."
+                    )
                 origins_arr = np.asarray(origins_list, dtype=int)
                 if origins_arr.shape != (n, 2):
                     raise ValueError("origins must have shape (n, 2) after conversion.")
@@ -240,13 +260,16 @@ class MAPED(AutoSerialize):
         if not hasattr(self, "dp_mean"):
             raise RuntimeError("Run preprocess() first so self.dp_mean exists.")
         if not hasattr(self, "diffraction_origins"):
-            raise RuntimeError("Run diffraction_origin() first so self.diffraction_origins exists.")
+            raise RuntimeError(
+                "Run diffraction_origin() first so self.diffraction_origins exists."
+            )
 
         H, W = np.asarray(self.dp_mean[0]).shape
 
-        w = tukey(H, alpha=2.0 * float(edge_blend) / float(H))[:, None] * tukey(
-            W, alpha=2.0 * float(edge_blend) / float(W)
-        )[None, :]
+        w = (
+            tukey(H, alpha=2.0 * float(edge_blend) / float(H))[:, None]
+            * tukey(W, alpha=2.0 * float(edge_blend) / float(W))[None, :]
+        )
 
         r = np.fft.fftfreq(H, 1.0 / float(H))[:, None]
         c = np.fft.fftfreq(W, 1.0 / float(W))[None, :]
@@ -296,8 +319,7 @@ class MAPED(AutoSerialize):
 
         return self
 
-
-    def real_space_align(
+    def real_space_align(  # torch.grid_sample
         self,
         num_images=None,
         num_iter: int = 3,
@@ -592,7 +614,9 @@ class MAPED(AutoSerialize):
             elif s == "median":
                 pad_val_dp = float(np.median(v))
             else:
-                raise ValueError("diffraction_pad_val must be a float or one of {'min','max','mean','median'}.")
+                raise ValueError(
+                    "diffraction_pad_val must be a float or one of {'min','max','mean','median'}."
+                )
         else:
             pad_val_dp = float(diffraction_pad_val)
 
@@ -761,6 +785,877 @@ class MAPED(AutoSerialize):
         return dataset_merged
 
 
+class MAPEDTorch(AutoSerialize):
+    """
+    Merge-Averaged Precession Electron Diffraction (MAPED) helper coded in PyTorch.
+
+    This class manages a set of 4D-STEM datasets and provides utilities to:
+    - compute mean BF and mean DP summaries,
+    - choose/find diffraction origins,
+    - align diffraction space and real space,
+    - merge datasets into a single composite Dataset4dstem.
+    """
+
+    _token = object()
+
+    def __init__(
+        self,
+        datasets: list[torch.Tensor],
+        device: str | Any,
+        dtype: str | Any,
+        _token: object | None = None,
+    ):
+        if _token is not self._token:
+            raise RuntimeError("Use MAPED.from_datasets() to instantiate this class.")
+        super().__init__()
+        self.datasets = datasets
+        self.metadata: dict[str, Any] = {}
+        self.device = device
+        self.dtype = dtype
+
+    @classmethod
+    def from_datasets(cls, datasets: Sequence[torch.Tensor]) -> MAPED:
+        """
+        Construct a MAPED instance from a non-empty sequence of Dataset4dstem.
+
+        Parameters
+        ----------
+        datasets
+            Sequence of Dataset4dstem instances.
+
+        Returns
+        -------
+        MAPED
+            New MAPED instance.
+        """
+        if not isinstance(datasets, Sequence) or isinstance(datasets, (str, bytes)):
+            raise TypeError("MAPED.from_datasets expects a sequence of Torch tensor instances.")
+        ds_list: list[torch.Tensor] = []
+        for d in datasets:
+            if not isinstance(d, torch.Tensor):
+                raise TypeError(
+                    "MAPED.from_datasets expects a sequence of Torch tensor instances."
+                )
+            ds_list.append(d)
+
+        dtypes = np.array([dataset.dtype for dataset in datasets])
+        devices = np.array([dataset.device for dataset in datasets])
+
+        # check that all datasets have the same dtype and device
+        if not np.all(dtypes == dtypes[0]):
+            raise TypeError("All datasets need to have the same type")
+        if not np.all(devices == devices[0]):
+            raise TypeError("All datasets need to have the same device")
+
+        if not ds_list:
+            raise ValueError(
+                "MAPED.from_datasets expects a non-empty sequence of Torch tensor instances."
+            )
+        return cls(datasets=ds_list, _token=cls._token, device=devices[0], dtype=dtypes[0])
+
+    def preprocess(
+        self,
+        plot_summary: bool = True,
+        scale: float | Sequence[float] | None = None,
+        **plot_kwargs: Any,
+    ) -> MAPED:
+        """
+        Compute dataset summary images.
+
+        Stores
+        ------
+        self.scales : torch.tensor
+            Per-dataset scaling factors (n,).
+        self.dp_mean : list[torch.tensor]
+            Mean diffraction patterns (H, W), one per dataset.
+        self.im_bf : list[torch.tensor]
+            Mean bright-field images (R, C), one per dataset.
+        """
+        n = len(self.datasets)
+
+        if scale is None:
+            self.scales = torch.ones(n, dtype=self.dtype, device=self.device)
+        elif isinstance(scale, (int, float, np.floating)):
+            self.scales = torch.full(n, float(scale), dtype=float)
+        else:
+            self.scales = torch.tensor(scale, dtype=self.dtype, device=self.device)
+            if self.scales.dim != (n,):
+                raise ValueError(
+                    "scale must be a scalar or a sequence with the same length as datasets."
+                )
+        if torch.any(self.scales == 0):
+            raise ValueError("scale entries must be nonzero.")
+
+        self.dp_mean: list[torch.Tensor] = []
+        self.im_bf: list[torch.Tensor] = []
+
+        for d in self.datasets:
+            dp_arr = torch.mean(d, dim=(0, 1))
+
+            im_bf_arr = torch.mean(d, dim=(2, 3))
+
+            self.dp_mean.append(dp_arr)
+            self.im_bf.append(im_bf_arr)
+
+        if plot_summary:
+            tiles = [[(self.im_bf[i] / self.scales[i]), self.dp_mean[i]] for i in range(n)]
+            titles = [
+                [f"{i} - Mean Bright Field", f"{i} - Mean Diffraction Pattern"] for i in range(n)
+            ]
+            show_2d(tiles, title=titles, **plot_kwargs)
+
+        return self
+
+    def diffraction_origin(
+        self,
+        origins=None,
+        sigma=None,
+        plot_origins: bool = True,
+        plot_indices=None,
+        **plot_kwargs: Any,
+    ) -> MAPED:
+        """
+        Choose or automatically find the origin in diffraction space.
+
+        Parameters
+        ----------
+        origins
+            Optional manual origins. Can be:
+            - a single (row, col) tuple, applied to all datasets
+            - a list of (row, col) tuples of length n (one per dataset)
+        sigma
+            Optional low-pass smoothing sigma (pixels) applied to each mean DP prior to peak finding.
+        plot_origins
+            If True, plot mean diffraction patterns with overlaid origin markers.
+        plot_indices
+            Optional indices to plot. If None, plots all datasets.
+        **plot_kwargs
+            Passed to show_2d.
+
+        Stores
+        ------
+        self.diffraction_origins : np.ndarray
+            Array of shape (n, 2) with integer (row, col) origins.
+        """
+        n = len(self.datasets)
+        if not hasattr(self, "dp_mean"):
+            raise RuntimeError("Run preprocess() first so self.dp_mean exists.")
+
+        if plot_indices is None:
+            plot_indices_list = list(range(n))
+        else:
+            plot_indices_list = list(plot_indices)
+            for i in plot_indices_list:
+                if i < 0 or i >= n:
+                    raise IndexError("plot_indices contains an out-of-range index.")
+
+        if sigma is not None and float(sigma) > 0:
+            gaussian_filter_torch = torchvision.transforms.GaussianBlur(
+                kernel_size=[2 * int(2 * float(sigma)) + 1, 2 * int(2 * float(sigma)) + 1],
+                sigma=[sigma, sigma],
+            )
+
+            dp_means_use = gaussian_filter_torch(torch.stack(self.dp_mean))
+        else:
+            dp_means_use = torch.stack(self.dp_mean)
+
+        if origins is None:
+            origins_arr = torch.zeros((n, 2), dtype=torch.int)
+            for i in range(n):
+                dp_use = dp_means_use[i]
+
+                r, c = torch.unravel_index(torch.argmax(dp_use), dp_use.shape)
+                origins_arr[i, 0] = int(r)
+                origins_arr[i, 1] = int(c)
+        else:
+            if isinstance(origins, tuple) and len(origins) == 2:
+                origins_arr = torch.tile(
+                    torch.tensor(origins, dtype=torch.int, device=self.device)[None, :], (n, 1)
+                )
+            else:
+                origins_list = list(origins)
+                if len(origins_list) != n:
+                    raise ValueError(
+                        "origins must be a single (row,col) tuple or a list of length n."
+                    )
+                origins_arr = torch.tensor(origins_list, dtype=torch.int, device=self.device)
+                if origins_arr.shape != (n, 2):
+                    raise ValueError("origins must have shape (n, 2) after conversion.")
+
+        self.diffraction_origins = origins_arr
+
+        if plot_origins:
+            arrays = [np.asarray(self.dp_mean[i].cpu()) for i in plot_indices_list]
+            titles = [f"{i} - Mean Diffraction Pattern" for i in plot_indices_list]
+            fig, ax = show_2d(arrays, title=titles, returnfig=True, **plot_kwargs)
+            axs = np.ravel(np.asarray(ax, dtype=object))
+            for j, i in enumerate(plot_indices_list):
+                r, c = self.diffraction_origins[i].cpu().numpy()
+                axs[j].plot([c], [r], marker="+", color="red", markersize=16, markeredgewidth=2)
+
+        return self
+
+    def diffraction_align(
+        self,
+        edge_blend: float = 16.0,
+        padding=None,
+        pad_val: str | float = "min",
+        upsample_factor: int = 100,
+        weight_scale: float = 1 / 8,
+        plot_aligned: bool = True,
+        **plot_kwargs: Any,
+    ) -> MAPED:
+        """
+        Align mean diffraction patterns using weighted cross-correlation in Fourier space.
+
+        Parameters
+        ----------
+        edge_blend
+            Tukey window edge taper (pixels).
+        padding
+            Passed to shift_images for plotting.
+        pad_val
+            Passed to shift_images for plotting.
+        upsample_factor
+            Subpixel upsampling factor for correlation peak estimation.
+        weight_scale
+            Radial weight falloff scale (fraction of mean DP size).
+        plot_aligned
+            If True, plot aligned mean diffraction patterns.
+        **plot_kwargs
+            Passed to show_2d when plotting.
+
+        Stores
+        ------
+        self.diffraction_shifts : np.ndarray
+            Array of shape (n, 2) with (row, col) shifts to align diffraction patterns.
+        """
+        if not hasattr(self, "dp_mean"):
+            raise RuntimeError("Run preprocess() first so self.dp_mean exists.")
+        if not hasattr(self, "diffraction_origins"):
+            raise RuntimeError(
+                "Run diffraction_origin() first so self.diffraction_origins exists."
+            )
+
+        H, W = self.dp_mean[0].shape
+
+        w = (
+            tukey_torch(
+                H,
+                alpha=2.0 * float(edge_blend) / float(H),
+                device=self.device,
+                dtype=torch.float32,
+            )[:, None]
+            * tukey_torch(
+                W,
+                alpha=2.0 * float(edge_blend) / float(W),
+                device=self.device,
+                dtype=torch.float32,
+            )[None, :]
+        )
+
+        r = torch.fft.fftfreq(H, 1.0 / float(H))[:, None]
+        c = torch.fft.fftfreq(W, 1.0 / float(W))[None, :]
+
+        n = len(self.dp_mean)
+        self.diffraction_shifts = torch.zeros((n, 2), device=self.device, dtype=torch.float32)
+
+        G_ref = torch.fft.fft2(w * self.dp_mean[0])
+        xy0 = self.diffraction_origins[0]
+
+        for ind in range(1, n):
+            G = torch.fft.fft2(w * self.dp_mean[ind])
+            xy = self.diffraction_origins[ind]
+
+            dr2 = (r - xy0[0] + xy[0]) ** 2 + (c - xy0[1] + xy[1]) ** 2
+            im_weight = torch.clip(
+                1.0
+                - torch.sqrt(dr2)
+                / float(torch.mean(torch.tensor([H, W], device=self.device, dtype=torch.float32)))
+                / float(weight_scale),
+                0.0,
+                1.0,
+            )
+            im_weight = torch.sin(im_weight * torch.pi / 2.0) ** 2
+            shift_rc = cross_correlation_shift_torch(  # not torchified yet
+                im_ref=G_ref,
+                im=G,
+                # weight_real=im_weight * 0.0 + 1.0,
+                upsample_factor=int(upsample_factor),
+                fft_input=True,
+            )
+            kr = torch.fft.fftfreq(H, device=self.device)[:, None]
+            kc = torch.fft.fftfreq(W, device=self.device)[None, :]
+
+            phase_ramp = torch.exp(-2j * torch.pi * (kr * shift_rc[0] + kc * shift_rc[1]))
+
+            G_shift = G * phase_ramp
+            self.diffraction_shifts[ind, :] = torch.tensor(
+                shift_rc, device=self.device, dtype=torch.float32
+            )
+
+            G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
+
+        self.diffraction_shifts -= torch.mean(self.diffraction_shifts, axis=0)[None, :]
+        if plot_aligned:
+            im_aligned = shift_images_torch(
+                images=torch.stack(self.dp_mean),
+                shifts_rc=self.diffraction_shifts,
+                edge_blend=float(edge_blend),
+                padding=padding,
+                pad_val=pad_val,
+            )
+            show_2d(im_aligned.unbind(0), **plot_kwargs)
+
+        return self
+
+    def real_space_align(
+        self,
+        num_images=None,
+        num_iter: int = 3,
+        edge_blend: float = 1.0,
+        padding=None,
+        pad_val: str | float = "median",
+        upsample_factor: int = 100,
+        max_shift=None,
+        shift_method: str = "bilinear",
+        edge_filter: bool = True,
+        edge_sigma: float = 2.0,
+        hanning_filter: bool = False,
+        plot_aligned: bool = True,
+        **plot_kwargs: Any,
+    ) -> MAPED:
+        """
+        Align real-space mean BF images using iterative average-reference correlation.
+
+        Parameters
+        ----------
+        num_images
+            If provided, align only the first num_images images.
+        num_iter
+            Number of refinement iterations.
+        edge_blend
+            Used to set default correlation padding when max_shift is None.
+        padding
+            Passed to shift_images for plotting.
+        pad_val
+            Passed to shift_images for plotting.
+        upsample_factor
+            Subpixel upsampling factor for correlation peak estimation.
+        max_shift
+            Optional maximum shift constraint passed to weighted_cross_correlation_shift.
+        shift_method
+            Passed to shift_images for plotting ('bilinear' or 'fourier').
+        edge_filter
+            If True, correlate on gradient magnitude instead of raw intensity.
+        edge_sigma
+            Gaussian sigma applied to gradients when edge_filter is True.
+        hanning_filter
+            If True, apply a Hanning window prior to FFT.
+        plot_aligned
+            If True, plot aligned mean BF images.
+        **plot_kwargs
+            Passed to show_2d when plotting.
+
+        Stores
+        ------
+        self.real_space_shifts : np.ndarray
+            Array of shape (n_total, 2) with (row, col) shifts for aligned datasets.
+        """
+        if not hasattr(self, "im_bf"):
+            raise RuntimeError("Run preprocess() first so self.im_bf exists.")
+        if len(self.im_bf) == 0:
+            raise RuntimeError("No images found in self.im_bf.")
+
+        H, W = self.im_bf[0].shape
+        for im in self.im_bf:
+            if im.shape != (H, W):
+                raise ValueError("all self.im_bf images must have the same shape")
+
+        n_total = len(self.im_bf)
+        if num_images is None:
+            n = n_total
+        else:
+            n = int(num_images)
+            if n <= 0:
+                raise ValueError("num_images must be positive")
+            n = min(n, n_total)
+
+        if int(num_iter) < 1:
+            raise ValueError("num_iter must be >= 1")
+
+        if max_shift is not None:
+            pad_cc = int(np.ceil(float(max_shift))) + 4
+        else:
+            pad_cc = int(np.ceil(float(edge_blend))) + 4
+
+        Hp = H + 2 * pad_cc
+        Wp = W + 2 * pad_cc
+        r0 = pad_cc
+        c0 = pad_cc
+
+        w_h = torch.ones((H, W), dtype=torch.float32, device=self.device)
+        if hanning_filter:
+            w_h = (
+                torch.hann_window(H, dtype=torch.float32, device=self.device)[:, None]
+                * torch.hanning(W, dtype=torch.float32, device=self.device)[None, :]
+            )
+        w_h_pad = torch.zeros((Hp, Wp), dtype=torch.float32, device=self.device)
+        w_h_pad[r0 : r0 + H, c0 : c0 + W] = w_h
+        w_h_sum = torch.sum(w_h_pad)
+        if w_h_sum <= 0:
+            raise RuntimeError("hanning window sum is zero")
+
+        if edge_filter:
+            wx = torch.tensor(
+                [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            wx = None
+
+        base_pad = torch.zeros((n, Hp, Wp), dtype=torch.float32, device=self.device)
+        for i in range(n):
+            im0 = self.im_bf[i]
+
+            if edge_filter:
+                pad_symmetric = wx.shape[-1] // 2
+                im0_pad = F.pad(
+                    im0.unsqueeze(0).unsqueeze(0),
+                    pad=(pad_symmetric, pad_symmetric, pad_symmetric, pad_symmetric),
+                    mode="reflect",
+                )
+
+                gx = F.conv2d(im0_pad, wx.unsqueeze(0).unsqueeze(0))[0, 0]
+                gy = F.conv2d(im0_pad, wx.T.unsqueeze(0).unsqueeze(0))[0, 0]
+
+                gaussian_filt = torchvision.transforms.GaussianBlur(
+                    kernel_size=[
+                        2 * int(2 * float(edge_sigma)) + 1,
+                        2 * int(2 * float(edge_sigma)) + 1,
+                    ],
+                    sigma=[edge_sigma, edge_sigma],
+                )
+                gx = gaussian_filt(gx.unsqueeze(0))
+                gy = gaussian_filt(gy.unsqueeze(0))
+                im_use = torch.sqrt(gx * gx + gy * gy)
+            else:
+                im_use = im0
+
+            base_pad[i, r0 : r0 + H, c0 : c0 + W] = im_use
+
+        shifts = torch.zeros((n, 2), dtype=torch.float32, device=self.device)
+
+        for _ in range(int(num_iter)):
+            G_list = torch.empty((n, Hp, Wp), dtype=torch.complex128)
+
+            # shift images to current guess
+            ims_a = shift_images_torch(base_pad, shifts)
+            ims_mean = torch.sum(ims_a * w_h_pad, dim=(1, 2)) / w_h_sum
+
+            ims_win = (ims_a - ims_mean[:, None, None]) * w_h_pad[None]
+            G_list = torch.fft.fft2(ims_win)
+
+            G_ref = torch.mean(G_list, axis=0)
+
+            # perform cross correlation again
+            for i in range(1, n):
+                drc = cross_correlation_shift_torch(
+                    im_ref=G_ref,
+                    im=G_list[i],
+                    # weight_real=None,
+                    upsample_factor=int(upsample_factor),
+                    # max_shift=max_shift,
+                    fft_input=True,
+                    # fft_output=False,
+                    # return_shifted_image=False,
+                )
+
+                shifts[i, 0] += float(drc[0])
+                shifts[i, 1] += float(drc[1])
+
+            shifts -= shifts[0][None, :].clone()
+
+        shifts -= torch.mean(shifts, dim=0)[None, :]
+
+        self.real_space_shifts = torch.zeros((n_total, 2), dtype=torch.float32, device=self.device)
+        self.real_space_shifts[:n, :] = shifts
+
+        if plot_aligned:
+            im_aligned = shift_images_torch(
+                images=torch.stack(self.im_bf[:n]),
+                shifts_rc=self.real_space_shifts[:n, :],
+                edge_blend=float(edge_blend),
+                padding=padding,
+                pad_val=pad_val,
+                mode=shift_method,
+                blend=False,
+            )
+            show_2d(im_aligned.sum(0), **plot_kwargs)
+
+        return self
+
+    def merge_datasets(
+        self,
+        real_space_padding=0,
+        real_space_edge_blend=1.0,
+        diffraction_padding=0,
+        diffraction_edge_blend=0.0,
+        diffraction_pad_val="min",
+        shift_method: str = "bilinear",
+        dtype=None,
+        scale_output: bool = False,
+        plot_result: bool = True,
+        batch_size: int = None,
+        **plot_kwargs: Any,
+    ) -> Dataset4dstem:
+        """
+        Merge aligned datasets into a single Dataset4dstem.
+
+        Requires
+        --------
+        self.real_space_shifts
+            From real_space_align().
+        self.diffraction_shifts
+            From diffraction_align().
+
+        Parameters
+        ----------
+        real_space_padding
+            Output scan padding in pixels (adds border to scan grid).
+        real_space_edge_blend
+            Tukey taper width for scan-space interpolation weights.
+        diffraction_padding
+            Output diffraction padding in pixels (adds border around DPs).
+        diffraction_edge_blend
+            Tukey taper width for diffraction-space weights.
+        diffraction_pad_val
+            Pad value for diffraction padding ('min','max','mean','median' or float).
+        shift_method
+            Diffraction shift method: 'bilinear' or 'fourier'.
+        dtype
+            Output dtype. If None, uses parent dtype.
+        scale_output
+            If True and dtype is integer, scale to full dynamic range using global max.
+        plot_result
+            If True, plot merged BF and merged mean DP.
+        batch_size
+            Number of rows to process per batch. If None, uses adaptive sizing (1-32 rows).
+        **plot_kwargs
+            Passed to show_2d.
+
+        Returns
+        -------
+        Dataset4dstem
+            Merged dataset.
+        """
+        if not hasattr(self, "real_space_shifts"):
+            raise RuntimeError("Run real_space_align() first so self.real_space_shifts exists.")
+        if not hasattr(self, "diffraction_shifts"):
+            raise RuntimeError("Run diffraction_align() first so self.diffraction_shifts exists.")
+
+        arrays = self.datasets
+        n = len(arrays)
+        if n == 0:
+            raise RuntimeError("No datasets found in self.datasets.")
+
+        Rs, Cs, H, W = arrays[0].shape
+        for a in arrays:
+            if a.shape != (Rs, Cs, H, W):
+                raise ValueError("All dataset arrays must have the same shape (Rs, Cs, H, W).")
+
+        rs_shifts = self.real_space_shifts
+        dp_shifts = self.diffraction_shifts
+        if rs_shifts.shape != (n, 2):
+            raise ValueError("self.real_space_shifts must have shape (n, 2).")
+        if dp_shifts.shape != (n, 2):
+            raise ValueError("self.diffraction_shifts must have shape (n, 2).")
+
+        if dtype is None:
+            dtype_out = arrays[0].dtype
+            warnings.warn(f"dtype=None; using parent dtype {dtype_out}.", RuntimeWarning)
+        else:
+            dtype_out = torch.dtype(dtype)
+
+        real_space_padding = int(real_space_padding)
+        diffraction_padding = int(diffraction_padding)
+
+        Rout = Rs + 2 * real_space_padding
+        Cout = Cs + 2 * real_space_padding
+
+        Hp = H + 2 * diffraction_padding
+        Wp = W + 2 * diffraction_padding
+        rp0 = diffraction_padding
+        cp0 = diffraction_padding
+
+        method = str(shift_method).strip().lower()
+        if method not in {"bilinear", "fourier"}:
+            raise ValueError("shift_method must be 'bilinear' or 'fourier'.")
+
+        if real_space_edge_blend and float(real_space_edge_blend) > 0:
+            alpha_r = min(1.0, 2.0 * float(real_space_edge_blend) / float(Rs))
+            alpha_c = min(1.0, 2.0 * float(real_space_edge_blend) / float(Cs))
+            w_rs = (
+                tukey_torch(Rs, alpha=alpha_r, device=self.device, dtype=torch.float32)[:, None]
+                * tukey_torch(Cs, alpha=alpha_c, device=self.device, dtype=torch.float32)[None, :]
+            )
+        else:
+            w_rs = torch.ones((Rs, Cs), dtype=torch.float32, device=self.device)
+
+        if diffraction_edge_blend and float(diffraction_edge_blend) > 0:
+            alpha_dr = min(1.0, 2.0 * float(diffraction_edge_blend) / float(H))
+            alpha_dc = min(1.0, 2.0 * float(diffraction_edge_blend) / float(W))
+            w_dp = (
+                tukey_torch(H, alpha=alpha_dr, device=self.device, dtype=torch.float32)[:, None]
+                * tukey_torch(W, alpha=alpha_dc, device=self.device, dtype=torch.float32)[None, :]
+            )
+        else:
+            w_dp = torch.ones((H, W), dtype=torch.float32, device=self.device)
+
+        dp_means = [torch.mean(a, axis=(0, 1)) for a in arrays]
+        v = torch.stack(dp_means, axis=0).reshape(-1)
+
+        if isinstance(diffraction_pad_val, str):
+            s = diffraction_pad_val.strip().lower()
+            if s == "min":
+                pad_val_dp = float(torch.min(v))
+            elif s == "max":
+                pad_val_dp = float(torch.max(v))
+            elif s == "mean":
+                pad_val_dp = float(torch.mean(v))
+            elif s == "median":
+                pad_val_dp = float(torch.median(v))
+            else:
+                raise ValueError(
+                    "diffraction_pad_val must be a float or one of {'min','max','mean','median'}."
+                )
+        else:
+            pad_val_dp = float(diffraction_pad_val)
+
+        wdp_pad = torch.zeros((Hp, Wp), dtype=torch.float32, device=self.device)
+        wdp_pad[rp0 : rp0 + H, cp0 : cp0 + W] = w_dp
+
+        wdp_shifted = torch.zeros((n, Hp, Wp), dtype=torch.float32, device=self.device)
+        if method == "fourier":
+            kr = torch.fft.fftfreq(Hp, device=self.device)[:, None]
+            kc = torch.fft.fftfreq(Wp, device=self.device)[None, :]
+            Fw = torch.fft.fft2(wdp_pad)
+            ramps: list[torch.Tensor] = []
+            for i in range(n):
+                dr, dc = dp_shifts[i, 0], dp_shifts[i, 1]
+
+                ramp = torch.exp(-2j * torch.pi * (kr * dr + kc * dc))
+                ramps.append(ramp)
+                w_i = torch.fft.ifft2(Fw * ramp).real
+                wdp_shifted[i] = torch.clip(w_i, 0.0, 1.0)
+        else:
+            for i in range(n):
+                w_i = shift_images_torch(
+                    wdp_pad,
+                    shifts_rc=dp_shifts[i, :],
+                    mode="bilinear",
+                )
+                wdp_shifted[i] = w_i
+            wdp_shifted = torch.clip(w_i, 0.0, 1.0)
+
+        coverage = torch.clip(torch.sum(wdp_shifted, dim=0), 0.0, 1.0)
+        edge_w_dp = 1.0 - coverage
+
+        # Determine batch size based on available memory
+        if batch_size is None:
+            batch_size = max(1, min(32, Rout // 2))  # Adaptive batch size (1-32 rows)
+
+        c_out = torch.arange(Cout, dtype=torch.float32, device=self.device)
+        c_base = c_out - real_space_padding  # (Cout,)
+
+        merged = torch.zeros((Rout, Cout, Hp, Wp), dtype=torch.float64, device=self.device)
+
+        for batch_start in tqdm(
+            range(0, Rout, batch_size),
+            desc="Merging (batches)",
+            total=(Rout + batch_size - 1) // batch_size,
+        ):
+            batch_end = min(batch_start + batch_size, Rout)
+            batch_rows = torch.arange(
+                batch_start, batch_end, dtype=torch.float32, device=self.device
+            )
+
+            num_batch = torch.zeros(
+                (batch_end - batch_start, Cout, Hp, Wp), dtype=torch.float32, device=self.device
+            )
+            den_batch = torch.zeros(
+                (batch_end - batch_start, Cout, Hp, Wp), dtype=torch.float32, device=self.device
+            )
+
+            r_base_batch = batch_rows.unsqueeze(1) - real_space_padding  # (batch_size, 1)
+            c_base_batch = c_base.unsqueeze(0)  # (1, Cout)
+
+            for i in range(n):
+                a = arrays[i]
+                if isinstance(a, torch.Tensor):
+                    a = a.float()
+                else:
+                    a = torch.tensor(a, dtype=torch.float32, device=self.device)
+
+                r_in = r_base_batch.expand(-1, Cout) - rs_shifts[i, 0]  # (batch_size, Cout)
+                c_in = (
+                    c_base_batch.expand(batch_end - batch_start, -1) - rs_shifts[i, 1]
+                )  # (batch_size, Cout)
+
+                c_norm = 2.0 * c_in / (Cs - 1) - 1.0  # (batch_size, Cout)
+                r_norm = 2.0 * r_in / (Rs - 1) - 1.0  # (batch_size, Cout)
+
+                a_reshaped = (
+                    a.view(Rs, Cs, H * W).permute(2, 0, 1).unsqueeze(0)
+                )  # (1, H*W, Rs, Cs)
+
+                # Reshape w_rs from (Rs, Cs) to (1, 1, Rs, Cs)
+                w_rs_reshaped = w_rs.unsqueeze(0).unsqueeze(0)  # (1, 1, Rs, Cs)
+
+                dp_interp_list = []
+                wi_list = []
+
+                # Loop through batches, vectorize columns per batch
+                for b in range(batch_end - batch_start):
+                    grid_batch = torch.stack(
+                        [c_norm[b : b + 1, :], r_norm[b : b + 1, :]], dim=-1
+                    ).unsqueeze(2)  # (1, Cout, 1, 2)
+
+                    dp_sample = torch.nn.functional.grid_sample(
+                        a_reshaped,
+                        grid_batch,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=True,
+                    )
+
+                    wi_sample = torch.nn.functional.grid_sample(
+                        w_rs_reshaped,
+                        grid_batch,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=True,
+                    )
+
+                    # Reshape to (Cout, H, W) and (Cout,)
+                    dp_b = (
+                        dp_sample.squeeze(0).squeeze(-1).view(H, W, Cout).permute(2, 0, 1)
+                    )  # (Cout, H, W)
+                    wi_b = wi_sample.squeeze(0).squeeze(-1).squeeze(0)  # (Cout,)
+
+                    dp_interp_list.append(dp_b)
+                    wi_list.append(wi_b)
+
+                dp_interp = torch.stack(dp_interp_list)  # (batch_size, Cout, H, W)
+                wi = torch.stack(wi_list)  # (batch_size, Cout)
+
+                # Pad to diffraction canvas: (batch_size, Cout, Hp, Wp)
+                dp_padded = torch.zeros(
+                    (batch_end - batch_start, Cout, Hp, Wp),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                dp_padded[:, :, rp0 : rp0 + H, cp0 : cp0 + W] = (
+                    dp_interp * w_dp.unsqueeze(0).unsqueeze(0)
+                ).float()
+
+                # apply to DPs
+                if method == "fourier":
+                    ramp = ramps[i]
+                    fft_result = torch.fft.fft2(dp_padded)  # (batch_size, Cout, Hp, Wp)
+                    ramp_exp = ramp.unsqueeze(0).unsqueeze(0)  # (1, 1, Hp, Wp)
+                    dp_shifted = torch.fft.ifft2(
+                        fft_result * ramp_exp
+                    ).real  # (batch_size, Cout, Hp, Wp)
+                else:
+                    dp_shifted = torch.zeros_like(dp_padded)
+                    for batch_idx in range(batch_end - batch_start):
+                        for co in range(Cout):
+                            dp_shifted[batch_idx, co] = shift_images_torch(
+                                dp_padded[batch_idx, co].unsqueeze(0),
+                                shifts_rc=dp_shifts[i, :].unsqueeze(0),
+                                mode="bilinear",
+                            ).squeeze(0)
+
+                wi_exp = wi.unsqueeze(-1).unsqueeze(-1)  # (batch_size, Cout, 1, 1)
+                wdp_i = wdp_shifted[i].unsqueeze(0).unsqueeze(0)  # (1, 1, Hp, Wp)
+
+                num_batch += wi_exp * dp_shifted
+                den_batch += wi_exp * wdp_i
+
+                # clear memory
+                del a, a_reshaped, w_rs_reshaped, dp_padded, dp_shifted
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            # Final division for this batch
+            num_final = num_batch + edge_w_dp.unsqueeze(0).unsqueeze(0) * pad_val_dp
+            den_final = den_batch + edge_w_dp.unsqueeze(0).unsqueeze(0)
+
+            merged[batch_start:batch_end] = torch.where(
+                den_final != 0.0,
+                (num_final / den_final).to(torch.float64),
+                torch.zeros_like(num_final).to(torch.float64),
+            )
+
+            del num_batch, den_batch, num_final, den_final  # clear memory
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        self.im_bf_merged = torch.mean(merged, dim=(2, 3))
+        self.dp_mean_merged = torch.mean(merged, dim=(0, 1))
+
+        self.im_bf_merged = torch.mean(merged, dim=(2, 3))
+        self.dp_mean_merged = torch.mean(merged, dim=(0, 1))
+
+        try:
+            info = torch.iinfo(dtype_out)
+            is_int_dtype = True
+        except TypeError:
+            is_int_dtype = False
+
+        if is_int_dtype:
+            dmin = float(info.min)
+            dmax = float(info.max)
+
+            merged_f = merged
+
+            if scale_output:
+                peak = torch.max(merged_f).item()
+                if peak <= 0.0:
+                    merged_scaled = merged_f
+                else:
+                    merged_scaled = merged_f * (dmax / peak)
+
+                # unsigned in PyTorch is typically uint8
+                lo, hi = (0.0, dmax) if dtype_out == torch.uint8 else (dmin, dmax)
+                merged_out = torch.rint(torch.clamp(merged_scaled, lo, hi)).to(dtype=dtype_out)
+            else:
+                below = torch.min(merged_f).item()
+                above = torch.max(merged_f).item()
+                if below < dmin or above > dmax:
+                    warnings.warn(
+                        f"Output overflow for dtype {dtype_out}: data range [{below}, {above}] exceeds "
+                        f"[{dmin}, {dmax}]. Values will be clipped.",
+                        RuntimeWarning,
+                    )
+                merged_out = torch.rint(torch.clamp(merged_f, dmin, dmax)).to(dtype=dtype_out)
+        else:
+            merged_out = merged.to(dtype=dtype_out)
+
+        dataset_merged = Dataset4dstem.from_array(array=merged_out.cpu().numpy())
+        dataset_merged.im_bf_merged = self.im_bf_merged
+        dataset_merged.dp_mean_merged = self.dp_mean_merged
+
+        if plot_result:
+            show_2d(
+                [[self.im_bf_merged, self.dp_mean_merged]],
+                title=[["Merged Bright Field", "Merged Mean Diffraction Pattern"]],
+                **plot_kwargs,
+            )
+
+        return dataset_merged
+
+
 def shift_images(
     images,
     shifts_rc,
@@ -888,5 +1783,180 @@ def shift_images(
     out = np.empty_like(num)
     np.divide(num, den, out=out, where=den != 0.0)
     out[den == 0.0] = 0.0
+
+    return out
+
+
+def tukey_torch(N, alpha=0.5, device=None, dtype=torch.float32):
+    """
+    Creates a 1D Tukey window of length N and shape parameter alpha.
+
+    Parameters
+    ----------
+    N
+        int, Length of the window.
+    alpha
+        float, Shape parameter for the Tukey window.
+    device
+        torch.device, Device on which to create the window.
+    dtype
+        torch.dtype, Data type of the window.
+
+    Returns
+    -------
+    torch.Tensor
+        1D Tukey window of length N.
+    """
+    n = torch.arange(N, device=device, dtype=dtype)
+    w = torch.ones(N, device=device, dtype=dtype)
+
+    if alpha <= 0:
+        return w
+    if alpha >= 1:
+        return torch.hann_window(N, device=device, dtype=dtype)
+
+    edge = alpha * (N - 1) / 2
+
+    left = n < edge
+    right = n >= (N - 1 - edge)
+
+    w[left] = 0.5 * (1 + torch.cos(torch.pi * (2 * n[left] / (alpha * (N - 1)) - 1)))
+
+    w[right] = 0.5 * (1 + torch.cos(torch.pi * (2 * n[right] / (alpha * (N - 1)) - 2 / alpha + 1)))
+
+    return w
+
+
+def shift_images_torch(
+    images,
+    shifts_rc,
+    mode="bilinear",
+    blend: bool = False,
+    edge_blend: float = 8.0,
+    padding=None,
+    pad_val: str | float = 0.0,
+):
+    """
+    Shift (and optionally blend) a stack of 2D images by per-image (dr, dc) pixel shifts using grid_sample.
+
+    Parameters
+    ----------
+    images : torch.Tensor, shape (n, H, W) or (H, W)
+        Stack of images (or a single image).
+    shifts_rc : torch.Tensor, shape (n, 2) or (2,)
+        Per-image shifts as (row_shift, col_shift) in pixels.
+    mode : 'bilinear' or 'nearest'
+    blend : bool, whether to blend the shifted images using a Tukey window
+    edge_blend : float, Tukey edge width in pixels used when blending
+    padding : int or None, canvas padding. If None, computed from max shift + edge_blend
+    pad_val : float or one of 'min','max','mean','median', fill value outside support
+
+    Returns
+    -------
+    torch.Tensor — shifted (and blended) images; if input was a single image, returns (Hp, Wp),
+    otherwise returns (n, Hp, Wp) for blended result or (n, H, W) for non-blended.
+    """
+    single = images.dim() == 2
+    if single:
+        images = images.unsqueeze(0)
+        shifts_rc = shifts_rc.unsqueeze(0)
+
+    n, H, W = images.shape
+
+    shifts_rc = shifts_rc.to(dtype=torch.float32, device=images.device)
+
+    if not blend:
+        # simple shift per-image without padding/blending — keep original behavior
+        imgs = images.unsqueeze(1)
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=images.device),
+            torch.linspace(-1, 1, W, device=images.device),
+            indexing="ij",
+        )
+        base_grid = torch.stack([grid_x, grid_y], dim=-1)  # (H, W, 2)
+        grid = base_grid.unsqueeze(0).expand(n, -1, -1, -1).clone()  # (n, H, W, 2)
+        grid[..., 0] -= 2.0 * shifts_rc[:, 1].view(n, 1, 1) / W  # col shift → x
+        grid[..., 1] -= 2.0 * shifts_rc[:, 0].view(n, 1, 1) / H  # row shift → y
+
+        shifted = F.grid_sample(imgs, grid, mode=mode, padding_mode="zeros", align_corners=True)
+        result = shifted[:, 0]  # (n, H, W)
+        return result[0] if single else result
+
+    # --- blending path ---
+    # determine pad_val numeric
+    if isinstance(pad_val, str):
+        s = pad_val.strip().lower()
+        v = images.reshape(-1)
+        if s == "min":
+            pad_val_f = float(torch.min(v).item())
+        elif s == "max":
+            pad_val_f = float(torch.max(v).item())
+        elif s == "mean":
+            pad_val_f = float(torch.mean(v).item())
+        elif s == "median":
+            pad_val_f = float(torch.median(v).item())
+        else:
+            raise ValueError("pad_val must be a float or one of {'min','max','mean','median'}")
+    else:
+        pad_val_f = float(pad_val)
+
+    # padding (compute from max shift if not provided)
+    max_shift = float(torch.max(torch.abs(shifts_rc)).item()) if shifts_rc.numel() else 0.0
+    if padding is None:
+        padding = int(math.ceil(max_shift + float(edge_blend))) + 2
+    padding = int(padding)
+
+    alpha_r = min(1.0, 2.0 * float(edge_blend) / float(H)) if edge_blend > 0 else 0.0
+    alpha_c = min(1.0, 2.0 * float(edge_blend) / float(W)) if edge_blend > 0 else 0.0
+
+    w = (
+        tukey_torch(H, alpha=alpha_r, device=images.device, dtype=torch.float32)[:, None]
+        * tukey_torch(W, alpha=alpha_c, device=images.device, dtype=torch.float32)[None, :]
+    )
+
+    Hp = H + 2 * padding
+    Wp = W + 2 * padding
+    r0 = padding
+    c0 = padding
+
+    # build padded stacks
+    stack = torch.zeros((n, Hp, Wp), dtype=torch.float32, device=images.device)
+    stack_w = torch.zeros_like(stack)
+    for ind in range(n):
+        stack[ind, r0 : r0 + H, c0 : c0 + W] = images[ind].to(dtype=torch.float32) * w
+        stack_w[ind, r0 : r0 + H, c0 : c0 + W] = w
+
+    # shift both stack and stack_w using grid_sample on (n,1,Hp,Wp)
+    imgs = stack.unsqueeze(1)
+    imgs_w = stack_w.unsqueeze(1)
+
+    # Build base normalized grid for Hp, Wp
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, Hp, device=images.device),
+        torch.linspace(-1, 1, Wp, device=images.device),
+        indexing="ij",
+    )
+    base_grid = torch.stack([grid_x, grid_y], dim=-1)  # (Hp, Wp, 2)
+    grid = base_grid.unsqueeze(0).expand(n, -1, -1, -1).clone()  # (n, Hp, Wp, 2)
+    grid[..., 0] -= 2.0 * shifts_rc[:, 1].view(n, 1, 1) / Wp  # col shift → x
+    grid[..., 1] -= 2.0 * shifts_rc[:, 0].view(n, 1, 1) / Hp  # row shift → y
+
+    shifted = F.grid_sample(imgs, grid, mode=mode, padding_mode="zeros", align_corners=True)
+    shifted_w = F.grid_sample(imgs_w, grid, mode=mode, padding_mode="zeros", align_corners=True)
+
+    shifted = shifted[:, 0]
+    shifted_w = shifted_w[:, 0]
+
+    shifted_w = torch.clamp(shifted_w, 0.0, 1.0)
+
+    edge_w = torch.clamp(1.0 - torch.sum(shifted_w, dim=0), 0.0, 1.0)
+
+    num = torch.sum(shifted, dim=0) + edge_w * pad_val_f
+    den = torch.sum(shifted_w, dim=0) + edge_w
+
+    out = torch.empty_like(num)
+    mask = den != 0.0
+    out[mask] = num[mask] / den[mask]
+    out[~mask] = 0.0
 
     return out
