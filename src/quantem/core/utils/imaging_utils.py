@@ -6,8 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from quantem.core.utils.utils import generate_batches
 
@@ -60,7 +59,9 @@ def _upsampled_correlation_numpy(
     globalShift = math.floor(math.ceil(upsampleFactor * 1.5) / 2.0)
     upsampleCenter = float(globalShift) - (float(upsampleFactor) * xyShift)
 
-    im_up = dft_upsample(np.conj(imageCorr), upsampleFactor, (float(upsampleCenter[0]), float(upsampleCenter[1])))
+    im_up = dft_upsample(
+        np.conj(imageCorr), upsampleFactor, (float(upsampleCenter[0]), float(upsampleCenter[1]))
+    )
     imageCorrUpsample = np.conj(im_up)
 
     flat_idx = int(np.argmax(imageCorrUpsample.real))
@@ -176,14 +177,18 @@ def cross_correlation_shift(
 
 
 def cross_correlation_shift_torch(
-    im_ref: torch.Tensor, im: torch.Tensor, upsample_factor: int = 2
+    im_ref: torch.Tensor, im: torch.Tensor, upsample_factor: int = 2, fft_input: bool = False
 ) -> torch.Tensor:
     """
     Align two real images using Fourier cross-correlation and DFT upsampling.
     Returns dx, dy in pixel units (signed shifts).
     """
-    G1 = torch.fft.fft2(im_ref)
-    G2 = torch.fft.fft2(im)
+    if fft_input:
+        G1 = im_ref
+        G2 = im
+    else:
+        G1 = torch.fft.fft2(im_ref)
+        G2 = torch.fft.fft2(im)
 
     xy_shift = align_images_fourier_torch(G1, G2, upsample_factor)
 
@@ -271,12 +276,8 @@ def upsampled_correlation_torch(
         patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
         if patch.shape == (3, 3):
             icc = patch
-            dx = (icc[2, 1] - icc[0, 1]) / (
-                4.0 * icc[1, 1] - 2.0 * icc[2, 1] - 2.0 * icc[0, 1]
-            )
-            dy = (icc[1, 2] - icc[1, 0]) / (
-                4.0 * icc[1, 1] - 2.0 * icc[1, 2] - 2.0 * icc[1, 0]
-            )
+            dx = (icc[2, 1] - icc[0, 1]) / (4.0 * icc[1, 1] - 2.0 * icc[2, 1] - 2.0 * icc[0, 1])
+            dy = (icc[1, 2] - icc[1, 0]) / (4.0 * icc[1, 1] - 2.0 * icc[1, 2] - 2.0 * icc[1, 0])
             dx = dx.item()
             dy = dy.item()
         else:
@@ -383,7 +384,9 @@ def weighted_cross_correlation_shift(
     if weight_real is not None:
         w = np.asarray(weight_real)
         if w.shape != cc_real.shape:
-            raise ValueError(f"weight_real.shape={w.shape} must match correlation shape {cc_real.shape}.")
+            raise ValueError(
+                f"weight_real.shape={w.shape} must match correlation shape {cc_real.shape}."
+            )
         cc_pick = cc_real * w
     else:
         cc_pick = cc_real
@@ -422,7 +425,9 @@ def weighted_cross_correlation_shift(
         return shift_rc
 
     if im is None:
-        raise ValueError("return_shifted_image=True requires `im` (or its FFT via fft_input=True).")
+        raise ValueError(
+            "return_shifted_image=True requires `im` (or its FFT via fft_input=True)."
+        )
 
     if F_im is None:
         F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
