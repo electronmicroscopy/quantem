@@ -1,5 +1,5 @@
-import os
 import numbers
+import os
 from pathlib import Path
 from typing import Any, Literal, Optional, Self, Union, overload
 
@@ -52,7 +52,9 @@ class Dataset(AutoSerialize):
         super().__init__()
         arr = ensure_valid_array(array)
         if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         self._array = arr
         self.name = name
         self.origin = origin
@@ -97,7 +99,9 @@ class Dataset(AutoSerialize):
         """
         validated_array = ensure_valid_array(array)
         if not isinstance(validated_array, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         _ndim = validated_array.ndim
 
         # Set defaults if None
@@ -126,7 +130,9 @@ class Dataset(AutoSerialize):
     def array(self, value: NDArray) -> None:
         arr = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
         if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         self._array = arr
         # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
 
@@ -350,8 +356,9 @@ class Dataset(AutoSerialize):
     @overload
     def pad(
         self,
-        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None,
-        output_shape: tuple[int, ...] | None,
+        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None = None,
+        output_shape: tuple[int, ...] | None = None,
+        *,
         modify_in_place: Literal[True],
         **kwargs: Any,
     ) -> None: ...
@@ -363,7 +370,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: Literal[False] = False,
         **kwargs: Any,
-    ) -> "Dataset": ...
+    ) -> Self: ...
 
     def pad(
         self,
@@ -371,7 +378,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
         **kwargs: Any,
-    ) -> "Dataset | None":
+    ) -> Self | None:
         """
         Pads Dataset data array using numpy.pad.
         Metadata (origin, sampling) is not modified.
@@ -426,7 +433,8 @@ class Dataset(AutoSerialize):
     def crop(
         self,
         crop_widths: tuple[tuple[int, int], ...],
-        axes: tuple | None,
+        axes: tuple | None = None,
+        *,
         modify_in_place: Literal[True],
     ) -> None: ...
 
@@ -444,27 +452,56 @@ class Dataset(AutoSerialize):
         axes: tuple | None = None,
         modify_in_place: bool = False,
     ) -> Self | None:
-        """
-        Crops Dataset
+        """Select a sub-region of the dataset along specified axes
+
+        Each ``crop_widths`` entry is a ``(start, stop)`` pair defining
+        which elements to keep. A ``stop`` of ``0`` keeps everything from
+        ``start`` to the end.
 
         Parameters
         ----------
-        crop_widths:tuple
-            Min and max for cropping each axis specified as a tuple
-        axes:
-            Axes over which to crop. If None specified, all are cropped.
-        modify_in_place: bool
-            If True, modifies dataset
+        crop_widths : tuple[tuple[int, int], ...]
+            ``(start, stop)`` indices for each axis specified in ``axes``.
+        axes : tuple | None
+            Axes to crop. If None, all axes are cropped.
+        modify_in_place : bool
+            If True, modifies this dataset in-place and frees the original
+            array. If False, returns a new dataset.
 
         Returns
+        -------
+        Dataset | None
+            Cropped dataset if ``modify_in_place`` is False, otherwise None.
+
+        Examples
         --------
-        Dataset (cropped) only if modify_in_place is False
+        Crop real-space to a 128x128 region:
+
+        >>> dset_cropped = dset.crop(
+        ...     crop_widths=((64, 192), (64, 192)),
+        ...     axes=(0, 1),
+        ... )
+
+        Crop k-space to keep the first 180 pixels:
+
+        >>> dset_preview = dset.crop(
+        ...     crop_widths=((0, 180), (0, 180)),
+        ...     axes=(2, 3),
+        ... )
+
+        Crop k-space in-place to free memory:
+
+        >>> dset.crop(
+        ...     crop_widths=((4, 92), (4, 92)),
+        ...     axes=(2, 3),
+        ...     modify_in_place=True,
+        ... )
         """
         if axes is None:
             if len(crop_widths) != self.ndim:
                 raise ValueError("crop_widths must match number of dimensions when axes is None.")
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
             crop_widths = (crop_widths[0],)  # Take first crop_width for single axis
         else:
@@ -496,7 +533,8 @@ class Dataset(AutoSerialize):
     def bin(
         self,
         bin_factors,
-        axes,
+        axes=None,
+        *,
         modify_in_place: Literal[True],
         reducer: str = "sum",
     ) -> None: ...
@@ -517,20 +555,31 @@ class Dataset(AutoSerialize):
         modify_in_place: bool = False,
         reducer: str = "sum",
     ) -> Self | None:
-        """
-        Bin the Dataset by integer factors along selected axes using block reduction.
+        """Reduce the dataset resolution by grouping pixels into blocks
+
+        Useful for reducing diffraction pattern size to speed up
+        reconstruction or lower memory usage. Sampling metadata is
+        updated automatically.
 
         Parameters
         ----------
         bin_factors : int | tuple[int, ...]
-            Bin factors per specified axis (positive integers).
+            A single integer bins all axes by the same factor. A tuple
+            specifies a different factor per axis, e.g. ``(1, 1, 2, 2)``
+            to bin only the last two axes by 2x.
         axes : int | tuple[int, ...] | None
             Axes to bin. If None, all axes are binned.
         modify_in_place : bool
-            If True, modifies this dataset; otherwise returns a new Dataset.
-        reducer : {"sum","mean"}
-            Reduction applied within each block. "sum" (default) preserves counts;
-            "mean" averages over each block (block volume = product of factors).
+            If True, modifies this dataset in-place. If False, returns
+            a new dataset.
+        reducer : {"sum", "mean"}
+            Reduction applied within each block. "sum" (default) preserves
+            counts; "mean" averages over each block.
+
+        Returns
+        -------
+        Dataset | None
+            Binned dataset if ``modify_in_place`` is False, otherwise None.
 
         Notes
         -----
@@ -538,6 +587,19 @@ class Dataset(AutoSerialize):
         - Sampling is multiplied by the factor on each binned axis.
         - Origin is shifted to the center of the first block:
             origin_new = origin_old + 0.5 * (factor - 1) * sampling_old
+
+        Examples
+        --------
+        Bin diffraction space by 2x to reduce memory:
+
+        >>> dset.bin(
+        ...     bin_factors=(1, 1, 2, 2),
+        ...     modify_in_place=True,
+        ... )
+
+        Bin all axes by 2x and return a new dataset:
+
+        >>> dset_binned = dset.bin(bin_factors=2)
         """
         reducer_norm = str(reducer).lower()
         if reducer_norm not in ("sum", "mean"):
@@ -545,7 +607,7 @@ class Dataset(AutoSerialize):
 
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(ax) for ax in axes)
@@ -660,7 +722,7 @@ class Dataset(AutoSerialize):
         """
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(a0) for a0 in axes)
@@ -670,14 +732,17 @@ class Dataset(AutoSerialize):
 
         # Resolve out_shape & factors
         if factors is not None:
-            if np.isscalar(factors):
+            if isinstance(factors, int | float):
                 factors = (float(factors),) * len(axes)
             else:
                 factors = tuple(float(f) for f in factors)
                 if len(factors) != len(axes):
                     raise ValueError("factors length must match number of axes.")
-            out_shape = tuple(max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors))
+            out_shape = tuple(
+                max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors)
+            )
         else:
+            assert out_shape is not None  # Guaranteed by check above
             if len(out_shape) != len(axes):
                 raise ValueError("out_shape length must match number of axes.")
             out_shape = tuple(int(nl) for nl in out_shape)
@@ -806,7 +871,9 @@ class Dataset(AutoSerialize):
         kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
 
         # Slice/reduce metadata accordingly
-        new_origin = np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        new_origin = (
+            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        )
         new_sampling = (
             np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
         )

@@ -454,12 +454,15 @@ def show_2d(
     norm : NormalizationConfig or dict or str, optional
         Configuration for normalizing the data before visualization. This can be a string,
         dictionary, or a NormalizationConfig object. Strings for preset normalization types
-        include: "linear_auto" (quantile), "linear_minmax", "linear_centered", "log_auto",
-        "log_minmax", "power_squared", "power_sqrt", "asinh_centered"
+        include: ``"linear_auto"`` (quantile), ``"log_auto"``, ``"power_sqrt"``.
+        Dict form example: ``{"power": 0.5}``.
     scalebar : ScalebarConfig or dict or bool, optional
         Configuration for adding a scale bar to the plot.
+        Dict form example: ``{"sampling": 0.5, "units": "Å"}`` or
+        ``{"sampling": 0.02, "units": "1/Å"}``.
     cmap : str or Colormap, default="gray"
         Colormap to use for real data or amplitude of complex data.
+        Common choices: ``"gray"``, ``"viridis"``, ``"turbo"``, ``"inferno"``, ``"magma"``.
     cbar : bool, default=False
         Whether to add a colorbar to the plot.
     title : str, optional
@@ -507,6 +510,38 @@ def show_2d(
     ValueError
         If combine_images is True but arrays contains multiple rows, or if
         figax is provided but the axes shape doesn't match the grid shape.
+
+    Examples
+    --------
+    Display a single image:
+
+    >>> import numpy as np
+    >>> from quantem.core.visualization import show_2d
+    >>> image = np.random.rand(256, 256)
+    >>> fig, ax = show_2d(image, axsize=(3, 3))
+
+    Display a 2-row grid with titles and a scale bar:
+
+    >>> image_rows = [[np.random.rand(128, 128) for _ in range(3)] for _ in range(2)]
+    >>> label_rows = [["BF", "ADF", "ABF"], ["HAADF", "DPC", "SSB"]]
+    >>> fig, axs = show_2d(
+    ...     image_rows,
+    ...     title=label_rows,
+    ...     cmap="gray",
+    ...     scalebar={"sampling": 0.5, "units": "Å"},
+    ... )
+
+    Display diffraction patterns with log normalization, colorbar, and scale bar:
+
+    >>> dps = [np.random.rand(256, 256) ** 3 for _ in range(3)]
+    >>> fig, axs = show_2d(
+    ...     dps,
+    ...     title=["Zone axis", "Off-axis", "CBED"],
+    ...     norm="log_auto",
+    ...     cbar=True,
+    ...     cmap="turbo",
+    ...     scalebar={"sampling": 0.02, "units": "1/Å"},
+    ... )
     """
     arrays = to_cpu(arrays)
     grid = _normalize_show_input_to_grid(arrays)

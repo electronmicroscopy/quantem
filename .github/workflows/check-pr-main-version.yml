@@ -17,16 +17,24 @@ jobs:
 
     steps:
       - name: Checkout PR branch (head)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
+
+      - name: Ensure uv.lock is up to date
+        run: |
+          if ! uv lock --check; then
+            echo "❌ uv.lock is out of date."
+            echo "Please update uv.lock before versioning can proceed."
+            exit 1
+          fi
 
       - name: Install the project
-        run: uv sync --all-extras --dev --no-editable
+        run: uv sync --locked --group test
 
       - name: Get PR branch version
         id: pr_version
@@ -76,17 +84,13 @@ jobs:
               echo "New version is greater — creating release branch"
               git checkout -b release/$PR_VERSION
               git push origin release/$PR_VERSION
-
-              echo "Tagging release v$PR_VERSION"
-              git tag -a v$PR_VERSION -m "Release v$PR_VERSION"
-              git push origin v$PR_VERSION
             fi
 
           elif [[ "$RESULT" -eq 0 ]]; then
             echo "Version matches — bumping version and creating new release branch"
 
             uv version --bump patch
-            uv sync
+            uv sync --locked --group test
             NEXT_VERSION=$(uv version --short)
 
             if [[ "$NEXT_VERSION" == "$PR_VERSION" ]]; then
@@ -99,10 +103,6 @@ jobs:
 
             git checkout -b release/$NEXT_VERSION
             git push origin release/$NEXT_VERSION
-
-            echo "Tagging release v$NEXT_VERSION"
-            git tag -a v$NEXT_VERSION -m "Release v$NEXT_VERSION"
-            git push origin v$NEXT_VERSION
 
             PR_BODY=$(printf "This PR was automatically created because the submitted version \`%s\` matched the current release on \`main\`.\n\nIt bumps the patch version to \`%s\` and starts a new release process." "$PR_VERSION" "$NEXT_VERSION")
             gh pr create \

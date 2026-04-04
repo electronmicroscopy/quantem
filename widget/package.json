@@ -1,0 +1,18 @@
+{
+  "name": "quantem-widget-frontend",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "@anywidget/react": "^0.1.0"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0",
+    "@anywidget/vite": "^0.2.0",
+    "@vitejs/plugin-react": "^4.3.0"
+  }
+}

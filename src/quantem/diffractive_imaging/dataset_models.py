@@ -87,7 +87,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
         self.register_buffer("_targets", torch.zeros(self.num_gpts, *self.roi_shape))
         self.register_buffer(
-            "_patch_indices", torch.zeros(self.num_gpts, *self.roi_shape, dtype=torch.int64)
+            "_patch_indices", torch.zeros(self.num_gpts, *self.roi_shape, dtype=torch.int32)
         )
         self.register_buffer("_last_patch_positions_px", torch.zeros(self.num_gpts, 2))
         self.register_buffer("_detector_mask", torch.ones(*self.roi_shape))
@@ -254,9 +254,9 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
     @dset.setter
     def dset(self, new_dset: Dataset3d):
-        # if not isinstance(new_dset, Dataset3d): # TODO put back
-        #     raise TypeError(f"dset should be a Dataset3d, got {type(new_dset)}")
-        self._dset = new_dset.copy()
+        if not isinstance(new_dset, Dataset3d):
+            raise TypeError(f"dset should be a Dataset3d, got {type(new_dset)}")
+        self._dset = new_dset
 
     @property
     def centered_amplitudes(self) -> torch.Tensor:
@@ -1406,6 +1406,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
         amplitudes = np.zeros(diff_intensities.shape, dtype=dtype)
         centered_intensities = np.zeros(diff_intensities.shape, dtype=dtype)
         intensities = np.zeros(diff_intensities.shape, dtype=dtype)
+        ## there is some additional memory overhead in this loop due to numpy array assignment
+        ## but I don't think it's easy to avoid -- ARCM 251212
         for Rr, Rc in tqdmnd(
             range(diff_intensities.shape[0]),
             range(diff_intensities.shape[1]),

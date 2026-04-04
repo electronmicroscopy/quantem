@@ -503,6 +503,14 @@ def bilinear_histogram_2d(
     x0, y0 = origin
     x1, y1 = x0 + Nx * dx, y0 + Ny * dy
 
+    x = _as_histogram_vector(x, "x")
+    y = _as_histogram_vector(y, "y")
+    weight = _as_histogram_vector(weight, "weight")
+    if not (x.shape == y.shape == weight.shape):
+        raise ValueError(
+            f"x, y, and weight must have matching shapes after coercion, got {x.shape}, {y.shape}, {weight.shape}"
+        )
+
     # Convert shape tuple to list for binned_statistic_2d
     bins: Sequence[int] = [Nx, Ny]
     hist, _, _, _ = binned_statistic_2d(
@@ -515,6 +523,15 @@ def bilinear_histogram_2d(
     )
 
     return hist  # shape = (Nx, Ny), i.e., array[x, y]
+
+
+def _as_histogram_vector(value: NDArray, name: str) -> NDArray:
+    array = np.asarray(value)
+    if array.ndim == 1:
+        return array
+    if array.ndim == 2 and 1 in array.shape:
+        return array.reshape(-1)
+    raise ValueError(f"{name} must be 1D or shape (N, 1)/(1, N), got {array.shape}")
 
 
 def axes_with_inset(

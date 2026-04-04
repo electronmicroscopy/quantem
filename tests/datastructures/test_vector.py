@@ -1,433 +1,436 @@
+import zipfile
+
 import numpy as np
 import pytest
 
 from quantem.core.datastructures.vector import Vector
+from quantem.core.io.serialize import load
+
+
+def make_line_vector() -> Vector:
+    v = Vector.from_shape(
+        shape=(4,),
+        fields=["intensity", "kx", "ky"],
+        units=["a.u.", "px", "px"],
+        name="line",
+    )
+    v[0] = np.array([[1.0, 10.0, 100.0], [2.0, 20.0, 200.0]])
+    v[1] = np.array([[3.0, 30.0, 300.0]])
+    v[2] = np.array([[4.0, 40.0, 400.0], [5.0, 50.0, 500.0]])
+    v[3] = np.array([[6.0, 60.0, 600.0]])
+    return v
+
+
+def make_grid_vector() -> Vector:
+    v = Vector.from_shape(shape=(3, 2), fields=["intensity", "kx", "ky"])
+    for i in range(3):
+        for j in range(2):
+            base = float(i * 10 + j)
+            v[i, j] = np.array([[base, base + 100.0, base + 200.0]])
+    return v
 
 
 class TestVector:
-    """Test suite for the Vector class."""
-
-    def test_initialization(self):
-        """Test Vector initialization with different parameters."""
-        # Test with fields
-        v1 = Vector.from_shape(shape=(2, 3), fields=["field0", "field1", "field2"])
+    def test_initialization_and_len(self):
+        v1 = Vector.from_shape(shape=(2, 3), fields=["a", "b", "c"])
         assert v1.shape == (2, 3)
+        assert len(v1) == 2
+        assert v1.num_cells == 6
         assert v1.num_fields == 3
-        assert v1.fields == ["field0", "field1", "field2"]
+        assert v1.dtype == np.dtype(float)
+        assert v1.fields == ["a", "b", "c"]
         assert v1.units == ["none", "none", "none"]
         assert v1.name == "2d ragged array"
-        assert hasattr(v1, "metadata")
+        assert v1[0, 0].array.shape == (0, 3)
+        np.testing.assert_array_equal(v1[0, 0].flatten(), v1[0, 0].array)
 
-        # Test with num_fields
-        v2 = Vector.from_shape(shape=(2, 3), num_fields=3)
-        assert v2.shape == (2, 3)
-        assert v2.num_fields == 3
-        assert v2.fields == ["field_0", "field_1", "field_2"]
-        assert v2.units == ["none", "none", "none"]
-        assert hasattr(v2, "metadata")
+        v2 = Vector.from_shape(shape=(2, 3), num_fields=2)
+        assert v2.fields == ["field_0", "field_1"]
 
-        # Test with custom name and units
-        v3 = Vector.from_shape(
-            shape=(2, 3),
-            fields=["field0", "field1", "field2"],
-            name="my_vector",
-            units=["unit0", "unit1", "unit2"],
-        )
-        assert v3.name == "my_vector"
-        assert v3.units == ["unit0", "unit1", "unit2"]
-        assert hasattr(v3, "metadata")
+        with pytest.raises(TypeError):
+            len(v1[0, 0])
 
-        # Test error cases
         with pytest.raises(ValueError, match="Must specify either 'fields' or 'num_fields'."):
             Vector.from_shape(shape=(2, 3))
 
         with pytest.raises(ValueError, match="does not match length of fields"):
-            Vector.from_shape(shape=(2, 3), num_fields=3, fields=["field0", "field1"])
+            Vector.from_shape(shape=(2, 3), num_fields=2, fields=["a", "b", "c"])
 
         with pytest.raises(ValueError, match="Duplicate field names"):
-            Vector.from_shape(shape=(2, 3), fields=["field0", "field0", "field2"])
+            Vector.from_shape(shape=(2, 3), fields=["a", "a"])
 
-    def test_data_access(self):
-        """Test data access and assignment."""
-        v = Vector.from_shape(shape=(2, 3), fields=["field0", "field1", "field2"])
-
-        # Set data at specific indices
-        data1 = np.array([[1.0, 2.0, 3.0]])
-        v[0, 0] = data1
-        np.testing.assert_array_equal(v.get_data(0, 0), data1)  # type: ignore
-
-        # Test get_data method
-        assert np.array_equal(v.get_data(0, 0), data1)
-
-        # Test set_data method
-        data2 = np.array([[4.0, 5.0, 6.0]])
-        v.set_data(data2, 0, 1)
-        assert np.array_equal(v.get_data(0, 1), data2)
-
-        # Test error cases
-        with pytest.raises(IndexError):
-            v[2, 0] = data1  # Out of bounds
-
-        with pytest.raises(ValueError):
-            v[0, 0] = np.array([[1.0, 2.0]])  # Wrong number of fields
-
-        with pytest.raises(ValueError):
-            v.set_data(np.array([[1.0, 2.0]]), 0, 0)  # Wrong number of fields
-
-    def test_field_operations(self):
-        """Test field-level operations."""
-        v = Vector.from_shape(shape=(2, 3), fields=["field0", "field1", "field2"])
-
-        # Set initial data
-        v[0, 0] = np.array([[1.0, 2.0, 3.0]])
-        v[0, 1] = np.array([[4.0, 5.0, 6.0]])
-        v[0, 2] = np.array([[7.0, 8.0, 9.0]])
-
-        # Test field access
-        field_view = v["field0"]
-        assert (
-            hasattr(field_view, "vector")
-            and hasattr(field_view, "field_name")
-            and hasattr(field_view, "field_index")
+        assert str(v1) == (
+            "quantem.Vector, shape=(2, 3), name=2d ragged array\n"
+            "  fields = ['a', 'b', 'c']\n"
+            "  units: ['none', 'none', 'none']"
         )
 
-        # Test field operations
-        v["field0"] += 10  # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 0)[:, 0], np.array([11.0]))  # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 1)[:, 0], np.array([14.0]))  # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 2)[:, 0], np.array([17.0]))  # type: ignore
+    def test_indexing_and_array_contract(self):
+        v = make_grid_vector()
 
-        # Test applying a function to a field
-        v["field1"] *= 2  # Using multiplication instead of lambda # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 0)[:, 1], np.array([4.0]))  # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 1)[:, 1], np.array([10.0]))  # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 2)[:, 1], np.array([16.0]))  # type: ignore
+        assert isinstance(v[:2, 1], Vector)
+        assert v[:2, 1].shape == (2,)
+        assert v[1].shape == (2,)
+        assert v[1, 1].shape == ()
+        np.testing.assert_array_equal(v[-1, -1].array, np.array([[21.0, 121.0, 221.0]]))
 
-        # Test field flattening
-        flat = v["field2"].flatten()
-        np.testing.assert_array_equal(flat, np.array([3.0, 6.0, 9.0]))  # type: ignore
+        with pytest.raises(ValueError):
+            _ = v[:, 1].array
 
-        # Test setting flattened data
-        v["field2"].set_flattened(np.array([18.0, 18.0, 18.0]))
+        result = v[[-1, 0], 1]
+        assert result.shape == (2,)
+        assert result.num_cells == 2
+        np.testing.assert_array_equal(result[0].array, np.array([[21.0, 121.0, 221.0]]))
+        np.testing.assert_array_equal(result[1].array, np.array([[1.0, 101.0, 201.0]]))
 
-        # Test error cases
+    def test_select_fields_and_chaining_equivalence(self):
+        v = make_line_vector()
+
+        selected = v.select_fields("kx")
+        assert selected.fields == ["kx"]
+        assert selected.units == ["px"]
+        assert selected.shape == v.shape
+
+        np.testing.assert_array_equal(
+            v.select_fields("kx")[2].array,
+            v[2].select_fields("kx").array,
+        )
+
         with pytest.raises(KeyError):
-            v["nonexistent_field"]
-
-        with pytest.raises(ValueError):
-            v["field0"].set_flattened(np.array([1.0, 2.0]))  # Wrong length
-
-    def test_slicing(self):
-        """Test slicing operations."""
-        v = Vector.from_shape(shape=(4, 3), fields=["field0", "field1", "field2"])
-
-        # Set data
-        for i in range(4):
-            for j in range(3):
-                v[i, j] = np.array(
-                    [[float(i * 3 + j), float(i * 3 + j + 1), float(i * 3 + j + 2)]]
-                )
-
-        # Test slicing
-        sliced = v[1:3, 1]
-        assert isinstance(sliced, Vector)
-        assert sliced.shape == (2, 1)
-
-        # Compare arrays directly
-        expected1 = np.array([[4.0, 5.0, 6.0]])
-        expected2 = np.array([[7.0, 8.0, 9.0]])
-        np.testing.assert_array_equal(sliced.get_data(0, 0), expected1)  # type: ignore
-        np.testing.assert_array_equal(sliced.get_data(1, 0), expected2)  # type: ignore
-
-        # Test field access on sliced vector
-        field_sliced = sliced["field1"]
-        np.testing.assert_array_equal(field_sliced.flatten(), np.array([5.0, 8.0]))  # type: ignore
-
-        # Test copying slices of vectors
-        v[2:4, 1] = v[1:3, 1]
-
-        # Test copying slices of vectors with fancy indexing
-        v[[0, 1], 1] = v[[2, 3], 0]
-
-    def test_field_management(self):
-        """Test adding and removing fields."""
-        v = Vector.from_shape(shape=(2, 3), fields=["field0", "field1", "field2"])
-
-        # Set initial data
-        v[0, 0] = np.array([[1.0, 2.0, 3.0]])
-
-        # Test adding fields
-        v.add_fields(["field3", "field4"])
-        assert v.num_fields == 5
-        assert v.fields == ["field0", "field1", "field2", "field3", "field4"]
-        assert v.units == ["none", "none", "none", "none", "none"]
-
-        # Check that new fields are initialized to zeros
-        np.testing.assert_array_equal(v.get_data(0, 0)[:, 3:5], np.array([[0.0, 0.0]]))  # type: ignore
-
-        # Test removing fields
-        v.remove_fields(["field1", "field3"])
-        assert v.num_fields == 3
-        assert v.fields == ["field0", "field2", "field4"]
-        assert v.units == ["none", "none", "none"]
-
-        # Check that data is preserved for remaining fields
-        np.testing.assert_array_equal(v.get_data(0, 0)[:, 0], np.array([1.0]))  # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 0)[:, 1], np.array([3.0]))  # type: ignore
-        np.testing.assert_array_equal(v.get_data(0, 0)[:, 2], np.array([0.0]))  # type: ignore
-
-        # Test error cases
-        with pytest.raises(ValueError):
-            v.add_fields(["field0"])  # Duplicate field
-
-        v.remove_fields(["nonexistent_field"])  # Should just print a warning
-
-    def test_copy(self):
-        """Test deep copying."""
-        v = Vector.from_shape(shape=(2, 3), fields=["field0", "field1", "field2"])
-        v[0, 0] = np.array([[1.0, 2.0, 3.0]])
-
-        # Create a copy
-        v_copy = v.copy()
-
-        # Check that it's a deep copy
-        assert v_copy is not v
-        assert v_copy.shape == v.shape
-        assert v_copy.fields == v.fields
-        assert v_copy.units == v.units
-        np.testing.assert_array_equal(v_copy.get_data(0, 0), v.get_data(0, 0))  # type: ignore
-
-        # Modify the copy and check that the original is unchanged
-        v_copy[0, 0] = np.array([[4.0, 5.0, 6.0]])
-        np.testing.assert_array_equal(v.get_data(0, 0), np.array([[1.0, 2.0, 3.0]]))  # type: ignore
-
-    def test_flatten(self):
-        """Test flattening the entire vector."""
-        v = Vector.from_shape(shape=(2, 3), fields=["field0", "field1", "field2"])
-
-        # Set data
-        v[0, 0] = np.array([[1.0, 2.0, 3.0]])
-        v[0, 1] = np.array([[4.0, 5.0, 6.0]])
-        v[0, 2] = np.array([[7.0, 8.0, 9.0]])
-        v[1, 0] = np.array([[10.0, 11.0, 12.0]])
-        v[1, 1] = np.array([[13.0, 14.0, 15.0]])
-        v[1, 2] = np.array([[16.0, 17.0, 18.0]])
-
-        # Flatten the vector
-        flattened = v.flatten()
-
-        # Check the flattened array
-        expected = np.array(
-            [
-                [1.0, 2.0, 3.0],
-                [4.0, 5.0, 6.0],
-                [7.0, 8.0, 9.0],
-                [10.0, 11.0, 12.0],
-                [13.0, 14.0, 15.0],
-                [16.0, 17.0, 18.0],
-            ]
-        )
-        np.testing.assert_array_equal(flattened, expected)  # type: ignore
-
-    def test_from_data(self):
-        """Test creating a Vector from ragged lists or numpy arrays."""
-        # Create test data
-        data = [
-            np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-            np.array([[7.0, 8.0, 9.0]]),
-            np.array([[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [16.0, 17.0, 18.0]]),
-        ]
-
-        # Test with explicit fields
-        v1 = Vector.from_data(
-            data=data,
-            fields=["field0", "field1", "field2"],
-            name="test_vector",
-            units=["unit0", "unit1", "unit2"],
-        )
-
-        # Check properties
-        assert v1.shape == (3,)
-        assert v1.num_fields == 3
-        assert v1.fields == ["field0", "field1", "field2"]
-        assert v1.units == ["unit0", "unit1", "unit2"]
-        assert v1.name == "test_vector"
-
-        # Check data
-        np.testing.assert_array_equal(v1.get_data(0), data[0])  # type: ignore
-        np.testing.assert_array_equal(v1.get_data(1), data[1])  # type: ignore
-        np.testing.assert_array_equal(v1.get_data(2), data[2])  # type: ignore
-
-        # Test with inferred fields
-        v2 = Vector.from_data(data=data, num_fields=3)
-
-        # Check properties
-        assert v2.shape == (3,)
-        assert v2.num_fields == 3
-        assert v2.fields == ["field_0", "field_1", "field_2"]
-        assert v2.units == ["none", "none", "none"]
-
-        # Check data
-        np.testing.assert_array_equal(v2.get_data(0), data[0])  # type: ignore
-        np.testing.assert_array_equal(v2.get_data(1), data[1])  # type: ignore
-        np.testing.assert_array_equal(v2.get_data(2), data[2])  # type: ignore
-
-        # Test error cases
-        with pytest.raises(TypeError, match="Data must be a list"):
-            Vector.from_data(data=np.array([1, 2, 3]))  # type: ignore
-
-        with pytest.raises(ValueError, match="does not match length of fields"):
-            Vector.from_data(
-                data=data,
-                fields=["field0", "field1"],  # Wrong number of fields
-            )
-
-        with pytest.raises(ValueError, match="Duplicate field names"):
-            Vector.from_data(
-                data=data,
-                fields=["field0", "field0", "field2"],  # Duplicate field names
-            )
-
-    def test_fancy_indexing(self):
-        """Test fancy indexing with __getitem__ and __setitem__."""
-        v = Vector.from_shape(shape=(3, 2), fields=["field0", "field1", "field2"])
-
-        # Set initial data
-        v[0, 0] = np.array([[1.0, 2.0, 3.0]])
-        v[0, 1] = np.array([[4.0, 5.0, 6.0]])
-        v[1, 0] = np.array([[7.0, 8.0, 9.0]])
-        v[1, 1] = np.array([[10.0, 11.0, 12.0]])
-        v[2, 0] = np.array([[13.0, 14.0, 15.0]])
-        v[2, 1] = np.array([[16.0, 17.0, 18.0]])
-
-        # Test list indexing with __getitem__
-        result = v[[0, 1], 0]
-        assert isinstance(result, Vector)
-        assert result.shape == (2, 1)
-        np.testing.assert_array_equal(result.get_data(0, 0), np.array([[1.0, 2.0, 3.0]]))
-        np.testing.assert_array_equal(result.get_data(1, 0), np.array([[7.0, 8.0, 9.0]]))
-
-        # Test numpy array indexing with __getitem__
-        result = v[np.array([1, 2]), 1]  # type: ignore
-        assert isinstance(result, Vector)
-        assert result.shape == (2, 1)
-        np.testing.assert_array_equal(result.get_data(0, 0), np.array([[10.0, 11.0, 12.0]]))
-        np.testing.assert_array_equal(result.get_data(1, 0), np.array([[16.0, 17.0, 18.0]]))
-
-        # Test fancy indexing with __setitem__
-        new_data = [np.array([[20.0, 21.0, 22.0]]), np.array([[23.0, 24.0, 25.0]])]
-        v[[0, 2], 1] = new_data
-        np.testing.assert_array_equal(v.get_data(0, 1), new_data[0])
-        np.testing.assert_array_equal(v.get_data(2, 1), new_data[1])
-
-        # Test numpy array fancy indexing with __setitem__
-        new_data = [np.array([[26.0, 27.0, 28.0]]), np.array([[29.0, 30.0, 31.0]])]
-        v[np.array([1, 2]), 0] = new_data  # type: ignore
-        np.testing.assert_array_equal(v.get_data(1, 0), new_data[0])
-        np.testing.assert_array_equal(v.get_data(2, 0), new_data[1])
-
-        # Test error cases
-        with pytest.raises(IndexError):
-            v[[3, 4], 0]  # Index out of bounds
-
-        with pytest.raises(IndexError):
-            v[[0, 1], 2]  # Index out of bounds
-
-        with pytest.raises(ValueError):
-            v[[0, 1], 0] = [np.array([[1.0]])]  # Wrong number of arrays
-
-        with pytest.raises(ValueError):
-            v[[0, 1], 0] = [
-                np.array([[1.0]]),
-                np.array([[2.0]]),
-            ]  # Wrong number of fields
-
-    def test_get_data_methods(self):
-        """Test get_data method with various indexing scenarios."""
-        v = Vector.from_shape(shape=(3, 2), fields=["field0", "field1", "field2"])
-
-        # Set some test data
-        v[0, 0] = np.array([[1.0, 2.0, 3.0]])
-        v[0, 1] = np.array([[4.0, 5.0, 6.0]])
-        v[1, 0] = np.array([[7.0, 8.0, 9.0]])
-        v[1, 1] = np.array([[10.0, 11.0, 12.0]])
-        v[2, 0] = np.array([[13.0, 14.0, 15.0]])
-        v[2, 1] = np.array([[16.0, 17.0, 18.0]])
-
-        # Test single integer indexing
-        result = v.get_data(0, 0)
-        np.testing.assert_array_equal(result, np.array([[1.0, 2.0, 3.0]]))
-
-        # Test list indexing
-        result = v.get_data([0, 1], 0)
-        np.testing.assert_array_equal(result[0], np.array([[1.0, 2.0, 3.0]]))
-        np.testing.assert_array_equal(result[1], np.array([[7.0, 8.0, 9.0]]))
-
-        # Test numpy array indexing
-        result = v.get_data(np.array([1, 2]), 1)
-        np.testing.assert_array_equal(result[0], np.array([[10.0, 11.0, 12.0]]))
-        np.testing.assert_array_equal(result[1], np.array([[16.0, 17.0, 18.0]]))
-
-        # Test slice indexing
-        result = v.get_data(slice(1, 3), 0)
-        np.testing.assert_array_equal(result[0], np.array([[7.0, 8.0, 9.0]]))
-        np.testing.assert_array_equal(result[1], np.array([[13.0, 14.0, 15.0]]))
-
-        # Test error cases
-        with pytest.raises(ValueError, match="Expected 2 indices"):
-            v.get_data(0)  # Too few indices
-
-        with pytest.raises(ValueError, match="Expected 2 indices"):
-            v.get_data(0, 0, 0)  # Too many indices
-
-        with pytest.raises(IndexError):
-            v.get_data(3, 0)  # Index out of bounds
-
-        with pytest.raises(IndexError):
-            v.get_data([3, 4], 0)  # List index out of bounds
-
-    def test_set_data_methods(self):
-        """Test set_data method with various indexing scenarios."""
-        v = Vector.from_shape(shape=(3, 2), fields=["field0", "field1", "field2"])
-
-        # Test single integer indexing
-        data1 = np.array([[1.0, 2.0, 3.0]])
-        v.set_data(data1, 0, 0)
-        np.testing.assert_array_equal(v.get_data(0, 0), data1)
-
-        # Test list indexing
-        data2 = [np.array([[4.0, 5.0, 6.0]]), np.array([[7.0, 8.0, 9.0]])]
-        v.set_data(data2, [0, 1], 1)
-        np.testing.assert_array_equal(v.get_data(0, 1), data2[0])
-        np.testing.assert_array_equal(v.get_data(1, 1), data2[1])
-
-        # Test numpy array indexing
-        data3 = [np.array([[10.0, 11.0, 12.0]]), np.array([[13.0, 14.0, 15.0]])]
-        v.set_data(data3, np.array([1, 2]), 0)
-        np.testing.assert_array_equal(v.get_data(1, 0), data3[0])
-        np.testing.assert_array_equal(v.get_data(2, 0), data3[1])
-
-        # Test slice indexing
-        data4 = [np.array([[16.0, 17.0, 18.0]]), np.array([[19.0, 20.0, 21.0]])]
-        v.set_data(data4, slice(1, 3), 1)
-        np.testing.assert_array_equal(v.get_data(1, 1), data4[0])
-        np.testing.assert_array_equal(v.get_data(2, 1), data4[1])
-
-        # Test error cases
-        with pytest.raises(ValueError, match="Expected 2 indices"):
-            v.set_data(data1, 0)  # Too few indices
-
-        with pytest.raises(ValueError, match="Expected 2 indices"):
-            v.set_data(data1, 0, 0, 0)  # Too many indices
-
-        with pytest.raises(IndexError):
-            v.set_data(data1, 3, 0)  # Index out of bounds
-
-        with pytest.raises(IndexError):
-            v.set_data([data1, data1], [3, 4], 0)  # List index out of bounds
+            v.select_fields("missing")
 
         with pytest.raises(TypeError):
-            v.set_data([1, 2, 3], 0, 0)  # Invalid data type # type: ignore
+            _ = v["kx"]
 
-        with pytest.raises(ValueError):
-            v.set_data(np.array([[1.0]]), 0, 0)  # Wrong number of fields
+        with pytest.raises(TypeError):
+            _ = v[1, "kx"]
+
+        multi = v.select_fields("intensity", "kx")
+        assert multi.fields == ["intensity", "kx"]
+        assert multi.dtype == np.dtype(float)
+        assert multi.total_rows == 6
+        assert multi.row_counts() == [2, 1, 2, 1]
+
+    def test_array_mutation_writes_through_for_single_field(self):
+        v = make_line_vector()
+        cell = v.select_fields("kx")[1].array
+        cell[0, 0] = 99.0
+        assert v[1].array[0, 1] == 99.0
+
+    def test_set_flattened_updates_rowwise(self):
+        v = make_line_vector()
+        kx = v.select_fields("kx")
+
+        flat_kx = kx.flatten()
+        mask = flat_kx >= 30.0
+        flat_kx[mask[:, 0], 0] = -1.0
+        kx.set_flattened(flat_kx)
+
+        np.testing.assert_array_equal(
+            kx.flatten(),
+            np.array([[10.0], [20.0], [-1.0], [-1.0], [-1.0], [-1.0]]),
+        )
+
+    def test_field_arithmetic_with_scalar_and_ndarray(self):
+        v = make_line_vector()
+
+        kx = v.select_fields("kx")
+        kx += 10
+        np.testing.assert_array_equal(
+            v.select_fields("kx").flatten(),
+            np.array([[20.0], [30.0], [40.0], [50.0], [60.0], [70.0]]),
+        )
+
+        v.select_fields("kx")[...] += np.arange(6)
+        np.testing.assert_array_equal(
+            v.select_fields("kx").flatten(),
+            np.array([[20.0], [31.0], [42.0], [53.0], [64.0], [75.0]]),
+        )
+
+        summed = v.select_fields("intensity") + v.select_fields("ky")
+        np.testing.assert_array_equal(
+            summed.flatten(),
+            np.array([[101.0], [202.0], [303.0], [404.0], [505.0], [606.0]]),
+        )
+
+    def test_power_operations(self):
+        v = make_line_vector()
+
+        squared = v.select_fields("intensity") ** 2
+        np.testing.assert_array_equal(
+            squared.flatten(),
+            np.array([[1.0], [4.0], [9.0], [16.0], [25.0], [36.0]]),
+        )
+
+        intensity = v.select_fields("intensity")
+        intensity **= 2
+        np.testing.assert_array_equal(
+            intensity.flatten(),
+            np.array([[1.0], [4.0], [9.0], [16.0], [25.0], [36.0]]),
+        )
+
+        reverse = 2 ** v.select_fields("intensity")
+        np.testing.assert_array_equal(
+            reverse.flatten(),
+            np.array([[2.0], [16.0], [512.0], [65536.0], [33554432.0], [68719476736.0]]),
+        )
+
+    def test_unary_mod_and_floor_division_operations(self):
+        v = make_line_vector()
+
+        negative = -v.select_fields("intensity")
+        np.testing.assert_array_equal(
+            negative.flatten(),
+            np.array([[-1.0], [-2.0], [-3.0], [-4.0], [-5.0], [-6.0]]),
+        )
+
+        absolute = abs(negative)
+        np.testing.assert_array_equal(
+            absolute.flatten(),
+            np.array([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]),
+        )
+
+        floored = v.select_fields("ky") // 150
+        np.testing.assert_array_equal(
+            floored.flatten(),
+            np.array([[0.0], [1.0], [2.0], [2.0], [3.0], [4.0]]),
+        )
+
+        modded = v.select_fields("ky") % 150
+        np.testing.assert_array_equal(
+            modded.flatten(),
+            np.array([[100.0], [50.0], [0.0], [100.0], [50.0], [0.0]]),
+        )
+
+        ky = v.select_fields("ky")
+        ky //= 150
+        np.testing.assert_array_equal(
+            ky.flatten(),
+            np.array([[0.0], [1.0], [2.0], [2.0], [3.0], [4.0]]),
+        )
+
+        intensity = v.select_fields("intensity")
+        intensity %= 2
+        np.testing.assert_array_equal(
+            intensity.flatten(),
+            np.array([[1.0], [0.0], [1.0], [0.0], [1.0], [0.0]]),
+        )
+
+    def test_numpy_ufunc_support(self):
+        v = make_line_vector()
+
+        sine = np.sin(v.select_fields("kx"))
+        np.testing.assert_allclose(
+            sine.flatten(),
+            np.sin(v.select_fields("kx").flatten()),
+        )
+
+        maximum = np.maximum(v.select_fields("intensity"), 3.0)  # type: ignore[arg-type]
+        np.testing.assert_array_equal(
+            maximum.flatten(),
+            np.array([[3.0], [3.0], [3.0], [4.0], [5.0], [6.0]]),
+        )
+
+        frac, whole = np.modf(v.select_fields("intensity") / 2.0)
+        np.testing.assert_allclose(
+            frac.flatten(),
+            np.array([[0.5], [0.0], [0.5], [0.0], [0.5], [0.0]]),
+        )
+        np.testing.assert_allclose(
+            whole.flatten(),
+            np.array([[0.0], [1.0], [1.0], [2.0], [2.0], [3.0]]),
+        )
+
+    def test_field_assignment_from_vector_expression(self):
+        v = make_line_vector()
+        scale = 2.5
+
+        v[:2].select_fields("intensity")[...] = v[2:4].select_fields("intensity") * scale
+        np.testing.assert_array_equal(
+            v[:2].select_fields("intensity").flatten(),
+            np.array([[10.0], [12.5], [15.0]]),
+        )
+
+    def test_field_assignment_requires_matching_per_cell_row_counts(self):
+        v = make_line_vector()
+        with pytest.raises(ValueError, match="Per-cell row counts must match"):
+            v[:2].select_fields("intensity")[...] = v[1:3].select_fields("intensity")
+
+    def test_full_cell_assignment_allows_row_count_changes(self):
+        v = make_line_vector()
+
+        v[1] = v[0]
+        assert v[1].array.shape == (2, 3)
+        np.testing.assert_array_equal(v[1].array, v[0].array)
+
+        v[0:2] = v[1:3]
+        assert v[0].array.shape == (2, 3)
+        assert v[1].array.shape == (2, 3)
+
+        broadcast_cell = np.array([[9.0, 8.0, 7.0]])
+        v[[0, 3]] = broadcast_cell
+        np.testing.assert_array_equal(v[0].array, broadcast_cell)
+        np.testing.assert_array_equal(v[3].array, broadcast_cell)
+
+    def test_append_rows_and_compact(self):
+        v = make_line_vector()
+
+        v.append_rows(1, np.array([[7.0, 70.0, 700.0]]))
+        np.testing.assert_array_equal(
+            v[1].array,
+            np.array([[3.0, 30.0, 300.0], [7.0, 70.0, 700.0]]),
+        )
+
+        v[1] = np.array([[8.0, 80.0, 800.0]])
+        assert v._state["data"].shape[0] > v.total_rows
+
+        v.compact()
+        assert v._state["data"].shape[0] == v.total_rows
+
+        with pytest.raises(ValueError, match="exactly one cell"):
+            v.append_rows(slice(None), np.array([[1.0, 2.0, 3.0]]))
+
+    def test_boolean_indexing_is_axis_wise(self):
+        v = make_grid_vector()
+
+        rows = np.array([True, False, True])
+        cols = np.array([False, True])
+        selected = v[rows, cols]
+
+        assert selected.shape == (2, 1)
+        np.testing.assert_array_equal(selected[0, 0].array, np.array([[1.0, 101.0, 201.0]]))
+        np.testing.assert_array_equal(selected[1, 0].array, np.array([[21.0, 121.0, 221.0]]))
+
+        with pytest.raises(IndexError):
+            _ = v[np.array([[True, False], [False, True]])]
+
+    def test_empty_selection_is_valid_and_no_op_for_scalar_math(self):
+        v = make_grid_vector()
+        before = v.copy().flatten()
+
+        empty = v[[], :]
+        assert empty.shape == (0, 2)
+        assert empty.flatten().shape == (0, 3)
+
+        empty.select_fields("kx")[...] += 1
+        np.testing.assert_array_equal(v.flatten(), before)
+
+    def test_add_fields_defaults_expression_and_multiple_values(self):
+        v = make_line_vector()
+
+        v.add_fields(("h", "k"))
+        assert v.fields == ["intensity", "kx", "ky", "h", "k"]
+        assert np.isnan(v[0].array[:, 3:5]).all()
+
+        v.add_fields("field_out", v.select_fields("kx") + v.select_fields("ky"))
+        np.testing.assert_array_equal(
+            v.select_fields("field_out").flatten(),
+            np.array([[110.0], [220.0], [330.0], [440.0], [550.0], [660.0]]),
+        )
+
+        v2 = make_line_vector()
+        v2.add_fields(("h", "k"), (1.0, np.array([5.0, 6.0, 7.0, 8.0, 9.0, 10.0])))
+        np.testing.assert_array_equal(v2.select_fields("h").flatten(), np.ones((6, 1)))
+        np.testing.assert_array_equal(
+            v2.select_fields("k").flatten(),
+            np.array([[5.0], [6.0], [7.0], [8.0], [9.0], [10.0]]),
+        )
+
+        with pytest.raises(ValueError, match="all fields are selected"):
+            v2.select_fields("kx").add_fields("bad")
+
+    def test_rename_fields(self):
+        v = make_line_vector()
+        kx_data = v.select_fields("kx").flatten().copy()
+
+        v.rename_fields({"kx": "qx", "ky": "qy"})
+        assert v.fields == ["intensity", "qx", "qy"]
+        np.testing.assert_array_equal(v.select_fields("qx").flatten(), kx_data)
+
+        # Renaming through a field-selected view updates that view's selected names
+        view = v.select_fields("qx")
+        assert view.fields == ["qx"]
+        view.rename_fields({"qx": "px"})
+        assert view.fields == ["px"]
+        assert v.fields == ["intensity", "px", "qy"]
+
+        with pytest.raises(KeyError, match="Unknown field"):
+            v.rename_fields({"nonexistent": "x"})
+
+        with pytest.raises(ValueError, match="already exist"):
+            v.rename_fields({"px": "intensity"})
+
+    def test_remove_fields_preserves_remaining_data(self):
+        v = make_line_vector()
+        v.add_fields("extra", 1.0)
+        v.remove_fields(("kx", "extra"))
+
+        assert v.fields == ["intensity", "ky"]
+        np.testing.assert_array_equal(
+            v[0].array,
+            np.array([[1.0, 100.0], [2.0, 200.0]]),
+        )
+
+    def test_copy_is_deep(self):
+        v = make_line_vector()
+        v_copy = v.select_fields(["intensity", "kx"]).copy()
+
+        v_copy[0].array[0, 0] = -1.0
+        assert v[0].array[0, 0] == 1.0
+        assert v_copy.fields == ["intensity", "kx"]
+        assert v_copy.shape == (4,)
+
+    def test_from_data_supports_nested_fixed_grid(self):
+        data = [
+            [np.array([[1.0, 2.0]]), np.array([[3.0, 4.0], [5.0, 6.0]])],
+            [np.array([[7.0, 8.0]]), np.array([[9.0, 10.0]])],
+        ]
+        v = Vector.from_data(data=data, fields=["a", "b"], units=["u1", "u2"], name="nested")
+
+        assert v.shape == (2, 2)
+        assert v.fields == ["a", "b"]
+        assert v.units == ["u1", "u2"]
+        assert v.name == "nested"
+        np.testing.assert_array_equal(v[0, 1].array, np.array([[3.0, 4.0], [5.0, 6.0]]))
+
+        tuple_cells = [
+            ([1.0, 2.0], [3.0, 4.0]),
+            ([5.0, 6.0], [7.0, 8.0], [9.0, 10.0]),
+        ]
+        tuple_vector = Vector.from_data(data=tuple_cells, fields=["a", "b"])
+        assert tuple_vector.shape == (2,)
+        np.testing.assert_array_equal(tuple_vector[0].array, np.array([[1.0, 2.0], [3.0, 4.0]]))
+        np.testing.assert_array_equal(
+            tuple_vector[1].array,
+            np.array([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]),
+        )
+
+        tuple_data = (np.array([[1.0, 2.0]]), np.array([[3.0, 4.0]]))
+        tuple_outer = Vector.from_data(data=tuple_data, fields=["a", "b"])
+        assert tuple_outer.shape == (2,)
+
+        with pytest.raises(TypeError, match="Data must be a list or tuple"):
+            Vector.from_data(data=np.array([1, 2, 3]))  # type: ignore[arg-type]
+
+        with pytest.raises(ValueError, match="same number of fields"):
+            Vector.from_data(data=[np.array([[1.0, 2.0]]), np.array([[1.0, 2.0, 3.0]])])
+
+    def test_save_and_load_round_trip(self, tmp_path):
+        v = make_grid_vector()
+        v.add_fields("extra", v.select_fields("intensity") + 1.0)
+
+        path = tmp_path / "vector_test.zip"
+        v.save(path, mode="o", compression_level=4)
+
+        with zipfile.ZipFile(path) as zf:
+            names = [info.filename for info in zf.infolist()]
+        assert len(names) < 30
+        assert "_state/data/zarr.json" in names
+        assert all(not name.startswith("_selection_coords/") for name in names)
+
+        loaded = load(path)
+        assert isinstance(loaded, Vector)
+        assert loaded.shape == v.shape
+        assert loaded.fields == v.fields
+        assert loaded.units == v.units
+        np.testing.assert_array_equal(loaded[2, 1].array, v[2, 1].array)

@@ -297,3 +297,11 @@ class TestBilinearHistogram2D:
         hist = bilinear_histogram_2d(shape, x, y, weight, statistic="mean")
         assert hist.shape == shape
         assert np.all(~np.isnan(hist[hist > 0]))  # Only check non-zero values for NaN
+
+    def test_bilinear_histogram_2d_accepts_column_vectors(self):
+        shape = (8, 8)
+        x = np.array([[1.0], [2.0], [3.0]])
+        y = np.array([[1.5], [2.5], [3.5]])
+        weight = np.array([[2.0], [3.0], [4.0]])
+        hist = bilinear_histogram_2d(shape, x, y, weight)
+        assert hist.shape == shape

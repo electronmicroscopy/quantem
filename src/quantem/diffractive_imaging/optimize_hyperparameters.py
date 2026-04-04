@@ -168,9 +168,9 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
 def _extract_default_loss(recon_obj, class_type):
     """Extract loss from reconstruction object."""
     if class_type == "ptycholite":
-        losses = getattr(recon_obj, "_losses", None) or getattr(recon_obj, "_epoch_losses", None)
+        losses = getattr(recon_obj, "_losses", None) or getattr(recon_obj, "_iter_losses", None)
     else:
-        losses = getattr(recon_obj, "_epoch_losses", None)
+        losses = getattr(recon_obj, "_iter_losses", None)
 
     if not losses:
         msg = f"No losses available on {class_type} object. Provide a loss_getter."
