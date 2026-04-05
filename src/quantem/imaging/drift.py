@@ -28,6 +28,7 @@ from quantem.core.utils.imaging_utils import (
 from quantem.imaging.drift_utils import (
     bilinear_kde_batch_torch,
     cross_corr_batch_torch,
+    transform_coordinates_torch,
 )
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
@@ -294,16 +295,24 @@ class DriftCorrection(AutoSerialize):
                 )
             )
 
-        # Generate initial resampled images
+        # Generate initial resampled images on GPU
         self.images_warped = Dataset3d.from_shape(self.shape)
         self.weights_warped = Dataset3d.from_shape(self.shape)
+        device = self.device
+        dtype = self.dtype
+        canvas_shape = (self.shape[1], self.shape[2])
         for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                ind
-            ].warp_image(
-                self.images[ind].array,
-                self.knots[ind],
-            )
+            knots_t = torch.tensor(self.knots[ind], dtype=dtype, device=device)
+            scan_fast_t = torch.tensor(self.scan_fast[ind], dtype=dtype, device=device)
+            row_t, col_t = transform_coordinates_torch(
+                knots_t, scan_fast_t, self.images[ind].shape)
+            image_t = torch.tensor(
+                self.images[ind].array, dtype=dtype, device=device)
+            warped, weights = bilinear_kde_batch_torch(
+                row_t[None], col_t[None], image_t, canvas_shape,
+                self.kde_sigma, self.pad_value[ind])
+            self.images_warped.array[ind] = warped[0].cpu().numpy()
+            self.weights_warped.array[ind] = weights[0].cpu().numpy()
 
         # Error tracking
         self.calculate_error(0)
@@ -491,10 +500,8 @@ class DriftCorrection(AutoSerialize):
             self.knots[a0][1] += drift_rc[ind, 1] * u[:, None]
 
         # Regenerate images + translation alignment on GPU
-        self._warp_and_translate_torch(max_image_shift)
-
-        # Error tracking
-        self.calculate_error(1)
+        warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor)
+        self.calculate_error(1, _warped_t=warped_t)
 
         # BSBL: two-pass coarse-to-fine — divide step size by (num_tests - 1)
         # so the refined grid fills the gap between adjacent coarse candidates,
@@ -508,10 +515,8 @@ class DriftCorrection(AutoSerialize):
                 self.knots[a0][1] += drift_rc[ind, 1] * u[:, None]
 
         # Regenerate images + translation alignment on GPU
-        self._warp_and_translate_torch(max_image_shift)
-
-        # Error tracking
-        self.calculate_error(1)
+        warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor)
+        self.calculate_error(1, _warped_t=warped_t)
 
         # Plots
         kwargs.pop("title", None)
@@ -559,12 +564,13 @@ class DriftCorrection(AutoSerialize):
         # candidates by cross-correlating this pair, other images unused
         base_data = []
         for img_idx in range(min(2, self.shape[0])):
-            interp = self.interpolator[img_idx]
             image_t = torch.tensor(
                 self.images[img_idx].array, dtype=dtype, device=device)
-            row_base_np, col_base_np = interp.transform_coordinates(self.knots[img_idx])
-            row_base = torch.tensor(row_base_np, dtype=dtype, device=device)
-            col_base = torch.tensor(col_base_np, dtype=dtype, device=device)
+            knots_t = torch.tensor(self.knots[img_idx], dtype=dtype, device=device)
+            scan_fast_t = torch.tensor(
+                self.scan_fast[img_idx], dtype=dtype, device=device)
+            row_base, col_base = transform_coordinates_torch(
+                knots_t, scan_fast_t, self.images[img_idx].shape)
             num_rows = self.knots[img_idx].shape[1]
             u = (torch.arange(num_rows, dtype=dtype, device=device)
                  - (num_rows - 1) / 2)
@@ -621,142 +627,142 @@ class DriftCorrection(AutoSerialize):
                 warped_stack[0], warped_stack[1],
                 upsample_factor, max_image_shift,
                 max_shift_mask=shift_mask)
-            all_costs.append(cost.cpu())
-            # BSBL: free warped images and cost before next chunk
+            all_costs.append(cost)
+            # BSBL: free warped images before next chunk
             # to keep peak VRAM at ~1 chunk's worth of data
-            del warped_stack, cost
+            del warped_stack
 
         all_costs = torch.cat(all_costs)
         return torch.argmin(all_costs).item()
 
-    def _warp_and_translate_torch(self, max_image_shift):
+    def _warp_and_translate_torch(self, max_image_shift, upsample_factor=8):
         """Regenerate warped images and solve translation on GPU.
 
         Replaces the NumPy warp_image + align_translation combo with torch
-        equivalents for use inside align_affine.
+        equivalents for use inside align_affine. Returns the GPU tensor
+        so callers can pass it to calculate_error without a round-trip.
         """
-        # BSBL: lazy import — only this private method needs dft_upsample_torch;
-        # the module-level imports cover bilinear_kde and cross_corr batched versions
         from quantem.imaging.drift_utils import dft_upsample_torch
 
         device = self.device
         dtype = self.dtype
-
+        num_images = self.shape[0]
         canvas_shape = (self.shape[1], self.shape[2])
 
-        # Warp all images using torch bilinear_kde
-        for img_idx in range(self.shape[0]):
-            row_coords, col_coords = self.interpolator[img_idx].transform_coordinates(self.knots[img_idx])
-            image_t = torch.tensor(
-                self.images[img_idx].array, dtype=dtype, device=device)
-            row_t = torch.tensor(row_coords, dtype=dtype, device=device)[None]
-            col_t = torch.tensor(col_coords, dtype=dtype, device=device)[None]
-            warped, weights = bilinear_kde_batch_torch(
-                row_t, col_t, image_t, canvas_shape,
-                self.kde_sigma, self.pad_value[img_idx])
-            self.images_warped.array[img_idx] = warped[0].cpu().numpy()
-            self.weights_warped.array[img_idx] = weights[0].cpu().numpy()
+        def _warp_all_to_gpu():
+            """Warp all images onto GPU tensors, no CPU copy."""
+            warped_t = torch.zeros(num_images, *canvas_shape, dtype=dtype, device=device)
+            weights_t = torch.zeros_like(warped_t)
+            for img_idx in range(num_images):
+                knots_t = torch.tensor(
+                    self.knots[img_idx], dtype=dtype, device=device)
+                scan_fast_t = torch.tensor(
+                    self.scan_fast[img_idx], dtype=dtype, device=device)
+                row_t, col_t = transform_coordinates_torch(
+                    knots_t, scan_fast_t, self.images[img_idx].shape)
+                image_t = torch.tensor(
+                    self.images[img_idx].array, dtype=dtype, device=device)
+                w, wt = bilinear_kde_batch_torch(
+                    row_t[None], col_t[None], image_t, canvas_shape,
+                    self.kde_sigma, self.pad_value[img_idx])
+                warped_t[img_idx] = w[0]
+                weights_t[img_idx] = wt[0]
+            return warped_t, weights_t
 
-        # Translation alignment on GPU — pairwise cross-correlation
-        # with running Fourier-domain average (matches NumPy align_translation)
-        upsample_factor = 8
-        num_images = self.shape[0]
-        warped_t = torch.tensor(
-            self.images_warped.array, dtype=dtype, device=device)
+        # First warp pass — for translation cross-correlation
+        warped_t, weights_t = _warp_all_to_gpu()
 
-        shifts_rc = np.zeros((num_images, 2))
+        # Translation alignment — fully on GPU, no .item() calls.
+        # Pairwise cross-correlation with running Fourier-domain average.
+        num_rows, num_cols = canvas_shape
+        shifts_t = torch.zeros(num_images, 2, dtype=dtype, device=device)
         F_ref = fft2(warped_t[0])
+
+        # Precompute max_shift mask and frequency grids once
+        shift_mask = None
+        if max_image_shift is not None:
+            fr = fftfreq(num_rows, 1.0 / num_rows, device=device, dtype=dtype)
+            fc = fftfreq(num_cols, 1.0 / num_cols, device=device, dtype=dtype)
+            shift_mask = fr[:, None] ** 2 + fc[None, :] ** 2 >= max_image_shift ** 2
+        kr = fftfreq(num_rows, device=device, dtype=dtype)[:, None]
+        kc = fftfreq(num_cols, device=device, dtype=dtype)[None, :]
+
         for img_idx in range(1, num_images):
             F_im = fft2(warped_t[img_idx])
             cc = F_ref * F_im.conj()
             cc_real = ifft2(cc).real
-            num_rows, num_cols = cc_real.shape
 
-            # max_shift mask
-            if max_image_shift is not None:
-                freq_row = fftfreq(
-                    num_rows, 1.0 / num_rows, device=device, dtype=dtype)
-                freq_col = fftfreq(
-                    num_cols, 1.0 / num_cols, device=device, dtype=dtype)
-                dist_sq = freq_row[:, None] ** 2 + freq_col[None, :] ** 2
-                cc_real[dist_sq >= max_image_shift ** 2] = 0.0
+            if shift_mask is not None:
+                cc_real[shift_mask] = 0.0
 
-            # Coarse peak
-            peak_idx = cc_real.reshape(-1).argmax()
-            r0 = (peak_idx // num_cols).item()
-            c0 = (peak_idx % num_cols).item()
+            # Coarse peak — stay on GPU tensors
+            peak_flat = cc_real.reshape(-1).argmax()
+            r0 = peak_flat // num_cols
+            c0 = peak_flat % num_cols
 
-            # Parabolic refinement
-            vr = cc_real[[(r0 - 1) % num_rows, r0, (r0 + 1) % num_rows], c0]
-            vc = cc_real[r0, [(c0 - 1) % num_cols, c0, (c0 + 1) % num_cols]]
-            dr_denom = (4 * vr[1] - 2 * vr[2] - 2 * vr[0]).item()
-            dc_denom = (4 * vc[1] - 2 * vc[2] - 2 * vc[0]).item()
-            dr = (vr[2] - vr[0]).item() / dr_denom if dr_denom != 0 else 0.0
-            dc = (vc[2] - vc[0]).item() / dc_denom if dc_denom != 0 else 0.0
-            r0_para = (r0 + dr) % num_rows
-            c0_para = (c0 + dc) % num_cols
+            # Parabolic refinement — all tensor ops, no .item()
+            vr = cc_real[torch.stack([(r0 - 1) % num_rows, r0, (r0 + 1) % num_rows]), c0]
+            vc = cc_real[r0, torch.stack([(c0 - 1) % num_cols, c0, (c0 + 1) % num_cols])]
+            dr_denom = 4 * vr[1] - 2 * vr[2] - 2 * vr[0]
+            dc_denom = 4 * vc[1] - 2 * vc[2] - 2 * vc[0]
+            dr = torch.where(dr_denom != 0, (vr[2] - vr[0]) / dr_denom, torch.zeros(1, device=device, dtype=dtype))
+            dc = torch.where(dc_denom != 0, (vc[2] - vc[0]) / dc_denom, torch.zeros(1, device=device, dtype=dtype))
+            r0_para = (r0.to(dtype) + dr) % num_rows
+            c0_para = (c0.to(dtype) + dc) % num_cols
 
-            # DFT upsample for sub-pixel accuracy
-            local = dft_upsample_torch(cc, upsample_factor, (r0_para, c0_para))
-            pk = local.reshape(-1).argmax()
-            lr = (pk // local.shape[1]).item()
-            lc = (pk % local.shape[1]).item()
+            # DFT upsample — needs scalar shift, single .item() pair
+            # This is unavoidable: dft_upsample_torch builds kernels from the shift value
+            r0_val = r0_para.item()
+            c0_val = c0_para.item()
+            local = dft_upsample_torch(cc, upsample_factor, (r0_val, c0_val))
 
-            d_row_fine, d_col_fine = 0.0, 0.0
-            if 1 <= lr < local.shape[0] - 1 and 1 <= lc < local.shape[1] - 1:
-                patch = local[lr - 1 : lr + 2, lc - 1 : lc + 2]
-                if patch.shape == (3, 3):
-                    dr2 = (4 * patch[1, 1] - 2 * patch[2, 1] - 2 * patch[0, 1]).item()
-                    dc2 = (4 * patch[1, 1] - 2 * patch[1, 2] - 2 * patch[1, 0]).item()
-                    if dr2 != 0:
-                        d_row_fine = (patch[2, 1] - patch[0, 1]).item() / dr2
-                    if dc2 != 0:
-                        d_col_fine = (patch[1, 2] - patch[1, 0]).item() / dc2
+            # Upsampled peak — back on GPU
+            pk_flat = local.reshape(-1).argmax()
+            lr = pk_flat // local.shape[1]
+            lc = pk_flat % local.shape[1]
+            patch_size = local.shape[0]
 
-            shifts = (
-                np.array([r0_para, c0_para])
-                + (np.array([lr, lc]) - upsample_factor) / upsample_factor
-                + np.array([d_row_fine, d_col_fine]) / upsample_factor
-            )
-            shifts = (
-                (shifts + 0.5 * np.array([num_rows, num_cols]))
-                % np.array([num_rows, num_cols])
-                - 0.5 * np.array([num_rows, num_cols])
-            )
-            shifts_rc[img_idx] = shifts
+            # Parabolic on upsampled patch — clamp to avoid OOB
+            can_refine = (lr >= 1) & (lr < patch_size - 1) & (lc >= 1) & (lc < patch_size - 1)
+            lr_safe = lr.clamp(1, patch_size - 2)
+            lc_safe = lc.clamp(1, patch_size - 2)
 
-            # Fourier shift and running average (matches NumPy align_translation)
-            kr = fftfreq(num_rows, device=device, dtype=dtype)[:, None]
-            kc = fftfreq(num_cols, device=device, dtype=dtype)[None, :]
-            phase = torch.exp(-2j * torch.pi * (kr * shifts[0] + kc * shifts[1]))
-            # BSBL: incremental mean: new_avg = old_avg * n/(n+1) + new_val/(n+1)
-            # Avoids accumulating a growing sum (numerical stability for large stacks)
+            vr_up = local[torch.stack([lr_safe - 1, lr_safe, lr_safe + 1]), lc_safe]
+            vc_up = local[lr_safe, torch.stack([lc_safe - 1, lc_safe, lc_safe + 1])]
+            dr2 = 4 * vr_up[1] - 2 * vr_up[2] - 2 * vr_up[0]
+            dc2 = 4 * vc_up[1] - 2 * vc_up[2] - 2 * vc_up[0]
+            d_row_fine = torch.where(can_refine & (dr2 != 0), (vr_up[2] - vr_up[0]) / dr2, torch.zeros(1, device=device, dtype=dtype))
+            d_col_fine = torch.where(can_refine & (dc2 != 0), (vc_up[2] - vc_up[0]) / dc2, torch.zeros(1, device=device, dtype=dtype))
+
+            # Convert upsampled-patch coords to image-pixel shifts
+            shift_r = r0_para + (lr.to(dtype) - upsample_factor) / upsample_factor + d_row_fine / upsample_factor
+            shift_c = c0_para + (lc.to(dtype) - upsample_factor) / upsample_factor + d_col_fine / upsample_factor
+            shift_r = ((shift_r + num_rows / 2) % num_rows) - num_rows / 2
+            shift_c = ((shift_c + num_cols / 2) % num_cols) - num_cols / 2
+            shifts_t[img_idx, 0] = shift_r
+            shifts_t[img_idx, 1] = shift_c
+
+            # Fourier shift and running average
+            phase = torch.exp(-2j * torch.pi * (kr * shift_r + kc * shift_c))
             F_shifted = F_im * phase
             F_ref = F_ref * img_idx / (img_idx + 1) + F_shifted / (img_idx + 1)
 
-        # Zero-mean normalization so net translation across all images is zero
-        shifts_rc -= np.mean(shifts_rc, axis=0)
+        # Zero-mean normalization — single CPU sync at the end
+        shifts_t -= shifts_t.mean(dim=0)
+        shifts_np = shifts_t.cpu().numpy()
 
-        # Apply shifts to knots
         for img_idx in range(num_images):
-            self.knots[img_idx][0] += shifts_rc[img_idx, 0]
-            self.knots[img_idx][1] += shifts_rc[img_idx, 1]
+            self.knots[img_idx][0] += shifts_np[img_idx, 0]
+            self.knots[img_idx][1] += shifts_np[img_idx, 1]
 
-        # BSBL: two warp passes are needed because translation shifts are applied
-        # to knots (not pixels). The first pass (above) warps with pre-translation
-        # knots for cross-correlation; after shifts are folded into knots, this
-        # second pass regenerates the final aligned images with corrected knots.
-        for img_idx in range(self.shape[0]):
-            row_coords, col_coords = self.interpolator[img_idx].transform_coordinates(self.knots[img_idx])
-            image_t = torch.tensor(
-                self.images[img_idx].array, dtype=dtype, device=device)
-            row_t = torch.tensor(row_coords, dtype=dtype, device=device)[None]
-            col_t = torch.tensor(col_coords, dtype=dtype, device=device)[None]
-            warped, weights = bilinear_kde_batch_torch(
-                row_t, col_t, image_t, canvas_shape,
-                self.kde_sigma, self.pad_value[img_idx])
-            self.images_warped.array[img_idx] = warped[0].cpu().numpy()
-            self.weights_warped.array[img_idx] = weights[0].cpu().numpy()
+        # Second warp pass with corrected knots
+        warped_t, weights_t = _warp_all_to_gpu()
+
+        # Single CPU sync at the end (for plots, serialization, downstream methods)
+        self.images_warped.array[:] = warped_t.cpu().numpy()
+        self.weights_warped.array[:] = weights_t.cpu().numpy()
+
+        return warped_t
 
     # non-rigid alignment
     def align_nonrigid(
@@ -1173,10 +1179,19 @@ class DriftCorrection(AutoSerialize):
     def calculate_error(
         self,
         mode,
+        _warped_t=None,
     ):
-        # Estimate current error
-        images_mean = np.mean(self.images_warped.array, axis=0)
-        sig_diff = np.mean(np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2))
+        # Estimate current error — use GPU tensor if provided, else NumPy
+        if _warped_t is not None:
+            images_mean = _warped_t.mean(dim=0)
+            sig_diff = torch.mean(
+                torch.abs(_warped_t - images_mean[None]), dim=(1, 2)
+            ).cpu().numpy()
+        else:
+            images_mean = np.mean(self.images_warped.array, axis=0)
+            sig_diff = np.mean(
+                np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2)
+            )
 
         # Error vector
         error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
