@@ -3,6 +3,7 @@ from collections.abc import Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.fft import fft2, fftfreq, ifft2
 import warnings
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
@@ -10,7 +11,7 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.optimize import minimize
 from tqdm import tqdm
 
-from quantem.core.config import get_device
+from quantem.core.config import validate_device
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
@@ -23,6 +24,10 @@ from quantem.core.utils.imaging_utils import (
     bilinear_kde,
     cross_correlation_shift,
     fourier_cropping,
+)
+from quantem.imaging.drift_utils import (
+    bilinear_kde_batch_torch,
+    cross_corr_batch_torch,
 )
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
@@ -114,6 +119,13 @@ class DriftCorrection(AutoSerialize):
         self._images = images
         self.scan_direction_degrees = scan_direction_degrees
 
+        # BSBL: detect best available device once at construction —
+        # all GPU methods (align_affine, align_nonrigid) use self._device.
+        # float32 for portability (works on CUDA/MPS/CPU) and halves VRAM.
+        device, _ = validate_device(None)
+        self._device = device
+        self._dtype = torch.float32
+
     @classmethod
     def from_file(
         cls,
@@ -142,6 +154,20 @@ class DriftCorrection(AutoSerialize):
         )
 
     # --- Properties ---
+
+    @property
+    def device(self) -> str:
+        # BSBL: lazy init for backward compat — deserialization bypasses __init__
+        if not hasattr(self, "_device"):
+            self._device, _ = validate_device(None)
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        if not hasattr(self, "_dtype"):
+            self._dtype = torch.float32
+        return self._dtype
+
     @property
     def images(self) -> list[Dataset2d]:
         return self._images
@@ -381,8 +407,53 @@ class DriftCorrection(AutoSerialize):
         show_knots: bool = True,
         **kwargs,
     ):
-        """
-        Estimate affine drift from the first 2 images.
+        """Correct affine drift between scan pairs using a GPU grid search.
+
+        Builds a grid of candidate linear-drift vectors, warps both images
+        for each candidate, and picks the one with the lowest cross-correlation
+        cost. An optional refinement pass subdivides the winning cell for
+        sub-step accuracy. Translation alignment is applied afterwards.
+
+        Parameters
+        ----------
+        step : float
+            Spacing between adjacent candidate drift vectors in pixels
+            per scan line. Smaller values give finer angular resolution
+            but increase the number of candidates quadratically.
+        num_tests : int
+            Number of candidates along each axis of the search grid.
+            Must be odd so the grid is centered on zero drift.
+            Total candidates ≈ ``π/4 * num_tests²`` (circular mask).
+        refine : bool
+            If True, run a second pass with step size reduced by
+            ``1 / (num_tests - 1)``, centered on the coarse winner.
+        upsample_factor : int
+            Sub-pixel precision factor for DFT cross-correlation.
+            Higher values give finer shift estimates but cost more.
+            8 gives 1/8-pixel precision.
+        max_image_shift : float or None
+            Maximum allowed translational shift in pixels. Cross-correlation
+            peaks beyond this radius are masked to reject spurious matches.
+            Set to None to allow any shift.
+        show_merged : bool
+            Display the merged (averaged) image after alignment.
+        show_images : bool
+            Display each individual warped image after alignment.
+        show_knots : bool
+            Overlay knot positions on the displayed images.
+        **kwargs
+            Additional keyword arguments passed to the plotting functions.
+
+        Returns
+        -------
+        DriftCorrection
+            Self, for method chaining.
+
+        Examples
+        --------
+        >>> drift = DriftCorrection.from_data(
+        ...     images=[im0, im1], scan_direction_degrees=[0, 90])
+        >>> drift.preprocess().align_affine(step=0.02, num_tests=11)
         """
 
         if not hasattr(self, "knots"):
@@ -390,146 +461,54 @@ class DriftCorrection(AutoSerialize):
             self.preprocess()
 
         if num_tests % 2 == 0:
-            raise ValueError("num_tests should be odd.")
+            raise ValueError(
+                f"You passed num_tests={num_tests}, but num_tests must be odd "
+                f"so the grid search is centered on zero drift. "
+                f"Try num_tests={num_tests + 1}."
+            )
 
         # Potential drift vectors
         vec = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
-        xx, yy = np.meshgrid(vec, vec, indexing="ij")
-        keep = xx**2 + yy**2 <= (num_tests / 2) ** 2
-        dxy = (
+        row_grid, col_grid = np.meshgrid(vec, vec, indexing="ij")
+        # BSBL: circular mask eliminates corner candidates that are farther
+        # from zero drift than any axis-aligned candidate — reduces search
+        # space by ~21% without missing useful directions
+        keep = row_grid**2 + col_grid**2 <= (num_tests / 2) ** 2
+        drift_rc = (
             np.vstack(
                 (
-                    xx[keep],
-                    yy[keep],
+                    row_grid[keep],
+                    col_grid[keep],
                 )
             ).T
             * step
         )
 
-        # Measure cost function for linear drift vectors
-        cost = np.zeros(dxy.shape[0])
-        for a0 in tqdm(range(dxy.shape[0]), desc="Solving affine drift"):
-            # updated knots
-            knot_0 = self.knots[0].copy()
-            u = np.arange(knot_0.shape[1]) - (knot_0.shape[1] - 1) / 2
-            knot_0[0] += dxy[a0, 0] * u[:, None]
-            knot_0[1] += dxy[a0, 1] * u[:, None]
-
-            knot_1 = self.knots[1].copy()
-            u = np.arange(knot_1.shape[1]) - (knot_1.shape[1] - 1) / 2
-            knot_1[0] += dxy[a0, 0] * u[:, None]
-            knot_1[1] += dxy[a0, 1] * u[:, None]
-
-            im0, w0 = self.interpolator[0].warp_image(
-                self.images[0].array,
-                knot_0,
-            )
-            im1, w1 = self.interpolator[1].warp_image(
-                self.images[1].array,
-                knot_1,
-            )
-            # Cross correlation alignment
-            shifts, image_shift = cross_correlation_shift(
-                im0,
-                im1,
-                upsample_factor=upsample_factor,
-                fft_input=False,
-                fft_output=False,
-                return_shifted_image=True,
-                max_shift=max_image_shift,
-            )
-            cost[a0] = np.mean(np.abs(im0 - image_shift))
-
-        # update all knots
-        ind = np.argmin(cost)
+        ind = self._affine_grid_search_batch(drift_rc, upsample_factor, max_image_shift)
         for a0 in range(self.shape[0]):
             u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
-            self.knots[a0][0] += dxy[ind, 0] * u[:, None]
-            self.knots[a0][1] += dxy[ind, 1] * u[:, None]
+            self.knots[a0][0] += drift_rc[ind, 0] * u[:, None]
+            self.knots[a0][1] += drift_rc[ind, 1] * u[:, None]
 
-        # Regenerate images
-        for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                ind
-            ].warp_image(
-                self.images[ind].array,
-                self.knots[ind],
-            )
-
-        # Translation alignment
-        self.align_translation(
-            max_image_shift=max_image_shift,
-            show_images=False,
-            show_merged=False,
-            show_knots=False,
-        )
+        # Regenerate images + translation alignment on GPU
+        self._warp_and_translate_torch(max_image_shift)
 
         # Error tracking
         self.calculate_error(1)
 
-        # Affine drift refinement
+        # BSBL: two-pass coarse-to-fine — divide step size by (num_tests - 1)
+        # so the refined grid fills the gap between adjacent coarse candidates,
+        # giving (num_tests-1)x finer angular resolution
         if refine:
-            # Potential drift vectors
-            dxy /= num_tests - 1
-
-            # Measure cost function
-            cost = np.zeros(dxy.shape[0])
-            for a0 in tqdm(range(dxy.shape[0]), desc="Refining affine drift"):
-                # updated knots
-
-                knot_0 = self.knots[0].copy()
-                u = np.arange(knot_0.shape[1]) - (knot_0.shape[1] - 1) / 2
-                knot_0[0] += dxy[a0, 0] * u[:, None]
-                knot_0[1] += dxy[a0, 1] * u[:, None]
-
-                knot_1 = self.knots[1].copy()
-                u = np.arange(knot_1.shape[1]) - (knot_1.shape[1] - 1) / 2
-                knot_1[0] += dxy[a0, 0] * u[:, None]
-                knot_1[1] += dxy[a0, 1] * u[:, None]
-
-                im0, w0 = self.interpolator[0].warp_image(
-                    self.images[0].array,
-                    knot_0,
-                )
-                im1, w1 = self.interpolator[1].warp_image(
-                    self.images[1].array,
-                    knot_1,
-                )
-                # Cross correlation alignment
-                shifts, image_shift = cross_correlation_shift(
-                    im0,
-                    im1,
-                    upsample_factor=upsample_factor,
-                    fft_input=False,
-                    fft_output=False,
-                    return_shifted_image=True,
-                    max_shift=max_image_shift,
-                )
-                cost[a0] = np.mean(np.abs(im0 - image_shift))
-
-            # update all knots
-            ind = np.argmin(cost)
+            drift_rc /= num_tests - 1
+            ind = self._affine_grid_search_batch(drift_rc, upsample_factor, max_image_shift)
             for a0 in range(self.shape[0]):
                 u = np.arange(self.knots[a0].shape[1]) - (self.knots[a0].shape[1] - 1) / 2
-                self.knots[a0][0] += dxy[ind, 0] * u[:, None]
-                self.knots[a0][1] += dxy[ind, 1] * u[:, None]
+                self.knots[a0][0] += drift_rc[ind, 0] * u[:, None]
+                self.knots[a0][1] += drift_rc[ind, 1] * u[:, None]
 
-        # Regenerate images
-        for ind in range(self.shape[0]):
-            self.images_warped.array[ind], self.weights_warped.array[ind] = self.interpolator[
-                ind
-            ].warp_image(
-                self.images[ind].array,
-                self.knots[ind],
-            )
-
-        # Translation alignment
-        self.align_translation(
-            max_image_shift=max_image_shift,
-            show_images=False,
-            show_merged=False,
-            show_knots=False,
-        )
+        # Regenerate images + translation alignment on GPU
+        self._warp_and_translate_torch(max_image_shift)
 
         # Error tracking
         self.calculate_error(1)
@@ -550,6 +529,234 @@ class DriftCorrection(AutoSerialize):
             )
 
         return self
+
+    def _affine_grid_search_batch(self, drift_rc, upsample_factor, max_image_shift):
+        """Evaluate all candidate drift vectors in parallel on GPU.
+
+        Parameters
+        ----------
+        drift_rc : ndarray, shape (N, 2)
+            Candidate drift vectors to test, columns are (row, col).
+        upsample_factor : int
+            Subpixel cross-correlation upsampling factor.
+        max_image_shift : float or None
+            Maximum allowed shift for cross-correlation peak search.
+
+        Returns
+        -------
+        int
+            Index of the best candidate in drift_rc.
+        """
+        device = self.device
+        dtype = self.dtype
+        N = drift_rc.shape[0]
+        drift_rc_t = torch.tensor(drift_rc, dtype=dtype, device=device)
+        canvas_shape = (self.shape[1], self.shape[2])
+
+        # Precompute base coordinates and image tensors on GPU once,
+        # since they are shared across all candidate chunks
+        # BSBL: only precompute images 0 and 1 — the grid search scores
+        # candidates by cross-correlating this pair, other images unused
+        base_data = []
+        for img_idx in range(min(2, self.shape[0])):
+            interp = self.interpolator[img_idx]
+            image_t = torch.tensor(
+                self.images[img_idx].array, dtype=dtype, device=device)
+            row_base_np, col_base_np = interp.transform_coordinates(self.knots[img_idx])
+            row_base = torch.tensor(row_base_np, dtype=dtype, device=device)
+            col_base = torch.tensor(col_base_np, dtype=dtype, device=device)
+            num_rows = self.knots[img_idx].shape[1]
+            u = (torch.arange(num_rows, dtype=dtype, device=device)
+                 - (num_rows - 1) / 2)
+            base_data.append((image_t, row_base, col_base, u))
+
+        # Precompute max_shift boolean mask once to avoid recomputation
+        # inside cross_corr_batch_torch for every chunk
+        shift_mask = None
+        if max_image_shift is not None:
+            canvas_rows, canvas_cols = canvas_shape
+            freq_row = fftfreq(
+                canvas_rows, 1.0 / canvas_rows, device=device, dtype=dtype)
+            freq_col = fftfreq(
+                canvas_cols, 1.0 / canvas_cols, device=device, dtype=dtype)
+            shift_mask = freq_row[:, None] ** 2 + freq_col[None, :] ** 2 >= max_image_shift ** 2
+
+        # Process candidates in chunks to avoid OOM — each candidate
+        # requires a full warped image pair on GPU
+        bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+        canvas_pixels = canvas_shape[0] * canvas_shape[1]
+        bytes_per_candidate = 6 * bytes_per_element * canvas_pixels
+        if "cuda" in device:
+            free_mem = torch.cuda.mem_get_info(device)[0]
+            max_by_mem = max(1, int(0.7 * free_mem / bytes_per_candidate))
+        else:
+            # BSBL: on CPU/MPS we can't cheaply query free RAM without
+            # adding a dependency — default to 8 candidates per chunk,
+            # conservative enough for most host memory configs
+            max_by_mem = 8
+        # BSBL: cap at 48 — empirically tuned for 96GB VRAM on RTX PRO 6000.
+        # Beyond 48, batched matmul in dft_upsample_batch_torch sees diminishing
+        # GPU occupancy returns while VRAM pressure grows linearly.
+        chunk_size = max(1, min(N, max_by_mem, 48))
+        all_costs = []
+        for chunk_start in range(0, N, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, N)
+            drift_chunk = drift_rc_t[chunk_start:chunk_end]
+
+            warped_stack = []
+            for img_idx in range(min(2, self.shape[0])):
+                image_t, row_base, col_base, u = base_data[img_idx]
+                row_all = row_base[None] + drift_chunk[:, 0, None, None] * u[None, :, None]
+                col_all = col_base[None] + drift_chunk[:, 1, None, None] * u[None, :, None]
+                warped, _ = bilinear_kde_batch_torch(
+                    row_all, col_all, image_t,
+                    canvas_shape, self.kde_sigma,
+                    self.pad_value[img_idx])
+                warped_stack.append(warped)
+                # BSBL: free coordinate tensors immediately — each is
+                # (chunk, H, W) and keeping them alive causes OOM
+                del row_all, col_all
+
+            cost = cross_corr_batch_torch(
+                warped_stack[0], warped_stack[1],
+                upsample_factor, max_image_shift,
+                max_shift_mask=shift_mask)
+            all_costs.append(cost.cpu())
+            # BSBL: free warped images and cost before next chunk
+            # to keep peak VRAM at ~1 chunk's worth of data
+            del warped_stack, cost
+
+        all_costs = torch.cat(all_costs)
+        return torch.argmin(all_costs).item()
+
+    def _warp_and_translate_torch(self, max_image_shift):
+        """Regenerate warped images and solve translation on GPU.
+
+        Replaces the NumPy warp_image + align_translation combo with torch
+        equivalents for use inside align_affine.
+        """
+        # BSBL: lazy import — only this private method needs dft_upsample_torch;
+        # the module-level imports cover bilinear_kde and cross_corr batched versions
+        from quantem.imaging.drift_utils import dft_upsample_torch
+
+        device = self.device
+        dtype = self.dtype
+
+        canvas_shape = (self.shape[1], self.shape[2])
+
+        # Warp all images using torch bilinear_kde
+        for img_idx in range(self.shape[0]):
+            row_coords, col_coords = self.interpolator[img_idx].transform_coordinates(self.knots[img_idx])
+            image_t = torch.tensor(
+                self.images[img_idx].array, dtype=dtype, device=device)
+            row_t = torch.tensor(row_coords, dtype=dtype, device=device)[None]
+            col_t = torch.tensor(col_coords, dtype=dtype, device=device)[None]
+            warped, weights = bilinear_kde_batch_torch(
+                row_t, col_t, image_t, canvas_shape,
+                self.kde_sigma, self.pad_value[img_idx])
+            self.images_warped.array[img_idx] = warped[0].cpu().numpy()
+            self.weights_warped.array[img_idx] = weights[0].cpu().numpy()
+
+        # Translation alignment on GPU — pairwise cross-correlation
+        # with running Fourier-domain average (matches NumPy align_translation)
+        upsample_factor = 8
+        num_images = self.shape[0]
+        warped_t = torch.tensor(
+            self.images_warped.array, dtype=dtype, device=device)
+
+        shifts_rc = np.zeros((num_images, 2))
+        F_ref = fft2(warped_t[0])
+        for img_idx in range(1, num_images):
+            F_im = fft2(warped_t[img_idx])
+            cc = F_ref * F_im.conj()
+            cc_real = ifft2(cc).real
+            num_rows, num_cols = cc_real.shape
+
+            # max_shift mask
+            if max_image_shift is not None:
+                freq_row = fftfreq(
+                    num_rows, 1.0 / num_rows, device=device, dtype=dtype)
+                freq_col = fftfreq(
+                    num_cols, 1.0 / num_cols, device=device, dtype=dtype)
+                dist_sq = freq_row[:, None] ** 2 + freq_col[None, :] ** 2
+                cc_real[dist_sq >= max_image_shift ** 2] = 0.0
+
+            # Coarse peak
+            peak_idx = cc_real.reshape(-1).argmax()
+            r0 = (peak_idx // num_cols).item()
+            c0 = (peak_idx % num_cols).item()
+
+            # Parabolic refinement
+            vr = cc_real[[(r0 - 1) % num_rows, r0, (r0 + 1) % num_rows], c0]
+            vc = cc_real[r0, [(c0 - 1) % num_cols, c0, (c0 + 1) % num_cols]]
+            dr_denom = (4 * vr[1] - 2 * vr[2] - 2 * vr[0]).item()
+            dc_denom = (4 * vc[1] - 2 * vc[2] - 2 * vc[0]).item()
+            dr = (vr[2] - vr[0]).item() / dr_denom if dr_denom != 0 else 0.0
+            dc = (vc[2] - vc[0]).item() / dc_denom if dc_denom != 0 else 0.0
+            r0_para = (r0 + dr) % num_rows
+            c0_para = (c0 + dc) % num_cols
+
+            # DFT upsample for sub-pixel accuracy
+            local = dft_upsample_torch(cc, upsample_factor, (r0_para, c0_para))
+            pk = local.reshape(-1).argmax()
+            lr = (pk // local.shape[1]).item()
+            lc = (pk % local.shape[1]).item()
+
+            d_row_fine, d_col_fine = 0.0, 0.0
+            if 1 <= lr < local.shape[0] - 1 and 1 <= lc < local.shape[1] - 1:
+                patch = local[lr - 1 : lr + 2, lc - 1 : lc + 2]
+                if patch.shape == (3, 3):
+                    dr2 = (4 * patch[1, 1] - 2 * patch[2, 1] - 2 * patch[0, 1]).item()
+                    dc2 = (4 * patch[1, 1] - 2 * patch[1, 2] - 2 * patch[1, 0]).item()
+                    if dr2 != 0:
+                        d_row_fine = (patch[2, 1] - patch[0, 1]).item() / dr2
+                    if dc2 != 0:
+                        d_col_fine = (patch[1, 2] - patch[1, 0]).item() / dc2
+
+            shifts = (
+                np.array([r0_para, c0_para])
+                + (np.array([lr, lc]) - upsample_factor) / upsample_factor
+                + np.array([d_row_fine, d_col_fine]) / upsample_factor
+            )
+            shifts = (
+                (shifts + 0.5 * np.array([num_rows, num_cols]))
+                % np.array([num_rows, num_cols])
+                - 0.5 * np.array([num_rows, num_cols])
+            )
+            shifts_rc[img_idx] = shifts
+
+            # Fourier shift and running average (matches NumPy align_translation)
+            kr = fftfreq(num_rows, device=device, dtype=dtype)[:, None]
+            kc = fftfreq(num_cols, device=device, dtype=dtype)[None, :]
+            phase = torch.exp(-2j * torch.pi * (kr * shifts[0] + kc * shifts[1]))
+            # BSBL: incremental mean: new_avg = old_avg * n/(n+1) + new_val/(n+1)
+            # Avoids accumulating a growing sum (numerical stability for large stacks)
+            F_shifted = F_im * phase
+            F_ref = F_ref * img_idx / (img_idx + 1) + F_shifted / (img_idx + 1)
+
+        # Zero-mean normalization so net translation across all images is zero
+        shifts_rc -= np.mean(shifts_rc, axis=0)
+
+        # Apply shifts to knots
+        for img_idx in range(num_images):
+            self.knots[img_idx][0] += shifts_rc[img_idx, 0]
+            self.knots[img_idx][1] += shifts_rc[img_idx, 1]
+
+        # BSBL: two warp passes are needed because translation shifts are applied
+        # to knots (not pixels). The first pass (above) warps with pre-translation
+        # knots for cross-correlation; after shifts are folded into knots, this
+        # second pass regenerates the final aligned images with corrected knots.
+        for img_idx in range(self.shape[0]):
+            row_coords, col_coords = self.interpolator[img_idx].transform_coordinates(self.knots[img_idx])
+            image_t = torch.tensor(
+                self.images[img_idx].array, dtype=dtype, device=device)
+            row_t = torch.tensor(row_coords, dtype=dtype, device=device)[None]
+            col_t = torch.tensor(col_coords, dtype=dtype, device=device)[None]
+            warped, weights = bilinear_kde_batch_torch(
+                row_t, col_t, image_t, canvas_shape,
+                self.kde_sigma, self.pad_value[img_idx])
+            self.images_warped.array[img_idx] = warped[0].cpu().numpy()
+            self.weights_warped.array[img_idx] = weights[0].cpu().numpy()
 
     # non-rigid alignment
     def align_nonrigid(
@@ -704,15 +911,15 @@ class DriftCorrection(AutoSerialize):
             raise NotImplementedError(
                 f"PyTorch backend only supports single knot (got {knots_init.shape[2]}). "
                 "Use backend='scipy' for multiple knots.")
-        device = get_device()
-        H, W = self.images[idx].array.shape
+        device = self.device
+        num_rows, num_cols = self.images[idx].array.shape
         # Convert to tensors
         ref_image = torch.tensor(image_ref, dtype=torch.float32, device=device)
         target_image = torch.tensor(self.images[idx].array, dtype=torch.float32, device=device)
         row_position = torch.tensor(self.interpolator[idx].u, dtype=torch.float32, device=device)
         scan_fast = self.interpolator[idx].scan_fast
-        scale_x = scan_fast[0] * (H - 1)
-        scale_y = scan_fast[1] * (W - 1)
+        scale_row = scan_fast[0] * (num_rows - 1)
+        scale_col = scan_fast[1] * (num_cols - 1)
         # Initialize knots as trainable tensor: shape (2, num_rows)
         knots = torch.tensor(knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True)
         optimizer = torch.optim.Adam([knots], lr=lr)
@@ -720,19 +927,18 @@ class DriftCorrection(AutoSerialize):
         for _ in range(adam_steps):
             optimizer.zero_grad()
             # Transform: single knot = shift along scan direction
-            xa = knots[0, :, None] + row_position[None, :] * scale_x
-            ya = knots[1, :, None] + row_position[None, :] * scale_y
+            row_coords = knots[0, :, None] + row_position[None, :] * scale_row
+            col_coords = knots[1, :, None] + row_position[None, :] * scale_col
             # Bilinear interpolation (boundary clamp critical for lower RMSE than scipy's L-BFGS)
-            xa_c = xa.clamp(0, H - 1.001)
-            ya_c = ya.clamp(0, W - 1.001)
-            # Guarantee xf+1 ≤ H-1 
-            xf = xa_c.floor().long().clamp(0, H - 2)
-            yf = ya_c.floor().long().clamp(0, W - 2)
-            dx, dy = xa_c - xf.float(), ya_c - yf.float()
-            warped = (ref_image[xf, yf] * (1 - dx) * (1 - dy)
-                      + ref_image[xf + 1, yf] * dx * (1 - dy)
-                      + ref_image[xf, yf + 1] * (1 - dx) * dy
-                      + ref_image[xf + 1, yf + 1] * dx * dy)
+            row_c = row_coords.clamp(0, num_rows - 1.001)
+            col_c = col_coords.clamp(0, num_cols - 1.001)
+            row_f = row_c.floor().long().clamp(0, num_rows - 2)
+            col_f = col_c.floor().long().clamp(0, num_cols - 2)
+            d_row, d_col = row_c - row_f.float(), col_c - col_f.float()
+            warped = (ref_image[row_f, col_f] * (1 - d_row) * (1 - d_col)
+                      + ref_image[row_f + 1, col_f] * d_row * (1 - d_col)
+                      + ref_image[row_f, col_f + 1] * (1 - d_row) * d_col
+                      + ref_image[row_f + 1, col_f + 1] * d_row * d_col)
             loss = ((warped - target_image) ** 2).mean()
             loss.backward()
             optimizer.step()
@@ -778,7 +984,6 @@ class DriftCorrection(AutoSerialize):
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
         return knots_updated
-
     def generate_corrected_image(
         self,
         upsample_factor: int = 2,
