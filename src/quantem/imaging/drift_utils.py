@@ -6,7 +6,6 @@ Float64 is supported when the caller passes float64 tensors.
 
 import math
 
-import numpy as np
 import torch
 from torch.fft import fft2, fftfreq, ifft2, ifftshift
 
@@ -100,6 +99,29 @@ def symmetric_pad(
     return images
 
 
+# Cache for Gaussian kernels — avoids rebuilding on every call.
+# Keyed by (sigma, dtype, device) → (k_col, k_row, radius).
+_gaussian_kernel_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, int]] = {}
+
+
+def _get_gaussian_kernels(
+    sigma: float, dtype: torch.dtype, device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Return cached (k_col, k_row, radius) for separable Gaussian conv2d."""
+    key = (sigma, dtype, device)
+    if key not in _gaussian_kernel_cache:
+        radius = int(4 * sigma + 0.5)
+        t = torch.arange(-radius, radius + 1, dtype=dtype, device=device)
+        kernel_1d = torch.exp(-0.5 * (t / sigma) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        _gaussian_kernel_cache[key] = (
+            kernel_1d[None, None, None, :],  # (1, 1, 1, K) for col pass
+            kernel_1d[None, None, :, None],  # (1, 1, K, 1) for row pass
+            radius,
+        )
+    return _gaussian_kernel_cache[key]
+
+
 def gaussian_smooth_batch(
     images: torch.Tensor,
     sigma: float,
@@ -129,22 +151,16 @@ def gaussian_smooth_batch(
     >>> out.shape
     torch.Size([2, 32, 32])
     """
-    # BSBL: +0.5 rounds to nearest int, matching scipy's truncate=4.0 kernel size
-    radius = int(4 * sigma + 0.5)
-    t = torch.arange(-radius, radius + 1, dtype=images.dtype, device=images.device)
-    kernel_1d = torch.exp(-0.5 * (t / sigma) ** 2)
-    kernel_1d = kernel_1d / kernel_1d.sum()
+    k_col, k_row, radius = _get_gaussian_kernels(sigma, images.dtype, images.device)
 
     images = images[:, None]  # (N, 1, H, W)
 
     # Horizontal pass
     images = symmetric_pad(images, 0, radius)
-    k_col = kernel_1d[None, None, None, :]
     images = torch.nn.functional.conv2d(images, k_col)
 
     # Vertical pass
     images = symmetric_pad(images, radius, 0)
-    k_row = kernel_1d[None, None, :, None]
     images = torch.nn.functional.conv2d(images, k_row)
 
     return images[:, 0]
@@ -153,7 +169,7 @@ def gaussian_smooth_batch(
 def dft_upsample_torch(
     cross_corr_fft: torch.Tensor,
     upsample_factor: int,
-    shift: tuple[float, float],
+    shift: tuple[float | torch.Tensor, float | torch.Tensor],
 ) -> torch.Tensor:
     """Upsampled DFT around a correlation peak for sub-pixel shift estimation.
 
@@ -193,7 +209,7 @@ def dft_upsample_torch(
     real_dtype = torch.float32 if cross_corr_fft.dtype == torch.complex64 else torch.float64
     # BSBL: 1.5x radius ensures the upsampled patch extends far enough to
     # capture the true peak even after parabolic refinement shifts it off-center
-    du = int(np.ceil(1.5 * upsample_factor))
+    du = math.ceil(1.5 * upsample_factor)
 
     row_coords = torch.arange(-du, du + 1, dtype=real_dtype, device=cross_corr_fft.device)
     col_coords = torch.arange(-du, du + 1, dtype=real_dtype, device=cross_corr_fft.device)
@@ -278,7 +294,7 @@ def dft_upsample_batch_torch(
     """
     num_candidates, num_rows, num_cols = cross_corr_fft.shape
     real_dtype = torch.float32 if cross_corr_fft.dtype == torch.complex64 else torch.float64
-    du = int(np.ceil(1.5 * upsample_factor))
+    du = math.ceil(1.5 * upsample_factor)
     patch_coords = torch.arange(-du, du + 1, dtype=real_dtype, device=cross_corr_fft.device)
 
     # Base frequency axes (shared across candidates)
@@ -438,6 +454,7 @@ def cross_corr_batch_torch(
     upsample_factor: int,
     max_shift: float | None,
     max_shift_mask: torch.Tensor | None = None,
+    freq_grids: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Score candidate drift vectors by cross-correlation alignment cost.
 
@@ -465,6 +482,11 @@ def cross_corr_batch_torch(
         Precomputed boolean mask, shape ``(num_rows, num_cols)``.
         True where pixels should be zeroed. If provided, skips
         recomputation from ``max_shift``.
+    freq_grids : tuple[torch.Tensor, torch.Tensor] or None, optional
+        Precomputed ``(freq_row, freq_col)`` from ``torch.fft.fftfreq``,
+        shapes ``(num_rows, 1)`` and ``(1, num_cols)``. Pass these when
+        calling in a loop to avoid recomputing the same grids each time.
+        If None, computed internally. Default is None.
 
     Returns
     -------
@@ -617,12 +639,15 @@ def cross_corr_batch_torch(
         shifts[:, 1] = ((refined_col + num_cols / 2) % num_cols) - num_cols / 2
 
     # Apply sub-pixel shift in Fourier domain (exact, no interpolation artifacts)
-    freq_row = fftfreq(
-        num_rows, device=images_ref.device, dtype=dtype
-    )[:, None]
-    freq_col = fftfreq(
-        num_cols, device=images_ref.device, dtype=dtype
-    )[None, :]
+    if freq_grids is not None:
+        freq_row, freq_col = freq_grids
+    else:
+        freq_row = fftfreq(
+            num_rows, device=images_ref.device, dtype=dtype
+        )[:, None]
+        freq_col = fftfreq(
+            num_cols, device=images_ref.device, dtype=dtype
+        )[None, :]
     phase = -2j * torch.pi * (
         freq_row[None] * shifts[:, 0, None, None]
         + freq_col[None] * shifts[:, 1, None, None]
