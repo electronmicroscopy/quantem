@@ -1,9 +1,7 @@
-"""Parity tests: torch drift_utils functions vs numpy/scipy equivalents.
+"""Parity tests for drift_utils.py torch functions.
 
-Every torch function in drift_utils.py must produce identical output to
-its numpy/scipy counterpart at float32 precision. These tests ensure that
-the GPU-accelerated path doesn't silently diverge from the reference
-implementation during refactoring.
+Tests the core building blocks against numpy/scipy equivalents.
+The full pipeline is covered by frozen baselines in test_drift.py.
 """
 
 import numpy as np
@@ -13,16 +11,68 @@ from scipy.ndimage import gaussian_filter
 
 from quantem.core.utils.imaging_utils import bilinear_kde
 from quantem.imaging.drift_utils import (
+    _parabolic_peak_2d,
     _parabolic_sub_pixel,
     _symmetric_pad,
     bilinear_kde_batch,
+    cross_corr_batch,
     gaussian_smooth_batch,
 )
 
 
 # ---------------------------------------------------------------------------
-# High-level: the core warping operation that drives the grid search
+# High-level: cross-correlation and warping
 # ---------------------------------------------------------------------------
+
+
+def test_cross_corr_zero_cost_for_identical():
+    """Identical images must produce near-zero MAE after alignment.
+
+    This validates the full sub-pixel pipeline: FFT cross-correlation →
+    parabolic peak → DFT upsample → Fourier shift. If any step has a
+    bias (like the 0.5 px center-index bug), identical images will show
+    a nonzero cost from the spurious shift.
+    """
+    rng = np.random.default_rng(42)
+    image = rng.random((64, 64)).astype(np.float32)
+    reference = torch.tensor(image)[None]
+    cost = cross_corr_batch(reference, reference.clone(), upsample_factor=8)
+    assert cost.item() < 1e-6
+
+
+@pytest.mark.parametrize("shift_row,shift_col", [(0, 0), (3, -5), (7, 2), (2.3, -1.7)])
+def test_parabolic_peak_2d_known_shift(shift_row, shift_col):
+    """Parabolic peak refinement must recover known shifts from Fourier-shifted images.
+
+    At zero shift, this catches the negative-float-rounding bug where
+    (-4.5e-8) % N = N instead of 0. At nonzero shifts, it verifies
+    the periodic wrapping, stencil extraction, and sub-pixel precision.
+    """
+    rng = np.random.default_rng(42)
+    num_pixels = 64
+    image = rng.random((num_pixels, num_pixels)).astype(np.float64)
+    # Fourier shift creates a perfect sub-pixel-accurate shifted image
+    k_row = np.fft.fftfreq(num_pixels)[:, None]
+    k_col = np.fft.fftfreq(num_pixels)[None, :]
+    shifted = np.real(np.fft.ifft2(
+        np.fft.fft2(image) * np.exp(-2j * np.pi * (k_row * shift_row + k_col * shift_col))
+    ))
+    reference = torch.tensor(image, dtype=torch.float32)[None]
+    moving = torch.tensor(shifted, dtype=torch.float32)[None]
+    cross_corr = torch.fft.ifft2(torch.fft.fft2(reference) * torch.fft.fft2(moving).conj()).real
+    peak_flat = cross_corr.flatten(1).argmax(dim=1)
+    peak_row = peak_flat // num_pixels
+    peak_col = peak_flat % num_pixels
+    batch_idx = torch.arange(1)
+    refined_row, refined_col = _parabolic_peak_2d(
+        cross_corr, peak_row, peak_col, num_pixels, num_pixels, batch_idx)
+    # Cross-correlation finds the negative shift, wrapped to [0, N)
+    expected_row = (-shift_row) % num_pixels
+    expected_col = (-shift_col) % num_pixels
+    # Parabolic gives ~0.1 px precision on sub-pixel shifts, exact on integer
+    tolerance = 0.15
+    assert abs(refined_row.item() - expected_row) < tolerance, f"Row: expected {expected_row}, got {refined_row.item()}"
+    assert abs(refined_col.item() - expected_col) < tolerance, f"Col: expected {expected_col}, got {refined_col.item()}"
 
 
 @pytest.mark.parametrize("scale", [1, 2])
@@ -41,25 +91,26 @@ def test_bilinear_kde_matches_numpy(scale):
     num_cols_out = 40 * scale
     kde_sigma = 0.5
     pad_value = 100.0
-    values = rng.random((num_rows_in, num_cols_in)).astype(np.float32)
-    # Coordinates with small offset — mimics a slight drift
-    row_coords = (np.arange(num_rows_in)[:, None] + 4.0 * scale
+    source_image = rng.random((num_rows_in, num_cols_in)).astype(np.float32)
+    # Fractional offsets (not integer) to exercise the bilinear weight split —
+    # 4.3 means each pixel lands 0.3 of the way between grid points
+    row_coords = (np.arange(num_rows_in)[:, None] + 4.3 * scale
                   + np.zeros((1, num_cols_in))).astype(np.float32)
     col_coords = (np.zeros((num_rows_in, 1))
-                  + np.arange(num_cols_in)[None, :] + 4.0 * scale).astype(np.float32)
+                  + np.arange(num_cols_in)[None, :] + 4.7 * scale).astype(np.float32)
     expected = bilinear_kde(
-        row_coords, col_coords, values,
+        row_coords, col_coords, source_image,
         (num_rows_out, num_cols_out), kde_sigma, pad_value,
     )
     result, _ = bilinear_kde_batch(
         torch.tensor(row_coords)[None],
         torch.tensor(col_coords)[None],
-        torch.tensor(values),
+        torch.tensor(source_image),
         (num_rows_out, num_cols_out),
         kde_sigma, pad_value,
     )
     np.testing.assert_allclose(
-        result[0].numpy(), expected.astype(np.float32), atol=1e-4,
+        result[0].numpy(), expected.astype(np.float32), atol=1e-5,
         err_msg=f"Warped image mismatch at scale={scale}",
     )
 
@@ -78,9 +129,9 @@ def test_gaussian_smooth_matches_scipy(sigma):
     (wide, 9-pixel kernel) to cover both regimes.
     """
     rng = np.random.default_rng(42)
-    arr = rng.random((64, 64)).astype(np.float32)
-    expected = gaussian_filter(arr, sigma).astype(np.float32)
-    result = gaussian_smooth_batch(torch.tensor(arr)[None], sigma)[0].numpy()
+    image = rng.random((64, 64)).astype(np.float32)
+    expected = gaussian_filter(image, sigma).astype(np.float32)
+    result = gaussian_smooth_batch(torch.tensor(image)[None], sigma)[0].numpy()
     np.testing.assert_allclose(result, expected, atol=1e-5)
 
 
@@ -93,10 +144,10 @@ def test_symmetric_pad_matches_numpy():
     baselines in test_drift.py break.
     """
     rng = np.random.default_rng(42)
-    arr = rng.random((8, 10)).astype(np.float32)
+    image = rng.random((8, 10)).astype(np.float32)
     pad_rows, pad_cols = 3, 4
-    expected = np.pad(arr, ((pad_rows, pad_rows), (pad_cols, pad_cols)), mode="symmetric")
-    result = _symmetric_pad(torch.tensor(arr)[None, None], pad_rows, pad_cols)[0, 0].numpy()
+    expected = np.pad(image, ((pad_rows, pad_rows), (pad_cols, pad_cols)), mode="symmetric")
+    result = _symmetric_pad(torch.tensor(image)[None, None], pad_rows, pad_cols)[0, 0].numpy()
     np.testing.assert_allclose(result, expected, atol=1e-6)
 
 

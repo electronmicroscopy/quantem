@@ -192,3 +192,4 @@ ipynb-playground/
 node_modules/
 widget/src/quantem/widget/static/
 .vscode/
+FUTURE.md

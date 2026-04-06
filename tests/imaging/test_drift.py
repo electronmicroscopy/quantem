@@ -135,9 +135,9 @@ def test_full_pipeline_deterministic():
 # Baseline values from float32 torch path, captured once and frozen.
 # (scale, error, knots0_sum, knots1_sum)
 AFFINE_BASELINES = [
-    (1, 0.09371880441904068, 12091.138622065724, 28612.861377934278),
-    (2, 0.1400984227657318, 48473.840748950926, 114854.15925104907),
-    (4, 0.163963183760643, 194424.12894570845, 459911.8710542915),
+    (1, 0.09237676858901978, 12157.7373046875, 28546.2626953125),
+    (2, 0.13844291865825653, 49830.908203125, 113497.091796875),
+    (4, 0.163960263133049, 194685.2421875, 459650.7578125),
 ]
 
 
@@ -153,8 +153,8 @@ def test_align_affine_deterministic(scale, expected_error, expected_k0, expected
         show_merged=False, show_images=False,
     )
     np.testing.assert_almost_equal(
-        drift.error_track[-1, 1], expected_error, decimal=4)
+        drift.error_track[-1, 1], expected_error, decimal=8)
     np.testing.assert_almost_equal(
-        drift.knots[0].sum(), expected_k0, decimal=2)
+        drift.knots[0].sum(), expected_k0, decimal=6)
     np.testing.assert_almost_equal(
-        drift.knots[1].sum(), expected_k1, decimal=2)
+        drift.knots[1].sum(), expected_k1, decimal=6)

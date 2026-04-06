@@ -528,6 +528,7 @@ class DriftCorrection(AutoSerialize):
 
         return self
 
+    @torch.inference_mode()
     def _affine_grid_search_batch(self, drift_vectors, upsample_factor, max_image_shift, chunk_size=None):
         """Evaluate all candidate drift vectors in parallel.
 
@@ -611,6 +612,7 @@ class DriftCorrection(AutoSerialize):
         all_costs = torch.cat(all_costs)
         return torch.argmin(all_costs).item(), all_costs
 
+    @torch.inference_mode()
     def _warp_and_translate_torch(
         self,
         max_image_shift: float | None,
