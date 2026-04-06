@@ -558,6 +558,46 @@ def _parabolic_sub_pixel(val_m1, val_0, val_p1, mask=None):
     return torch.where(valid, (val_p1 - val_m1) / denom, torch.zeros_like(denom))
 
 
+def _symmetric_pad_1d(signal: torch.Tensor, pad: int) -> torch.Tensor:
+    """Symmetric 1D padding matching scipy's reflect mode.
+
+    Same edge-repeat semantics as ``_symmetric_pad`` but for 1D signals.
+    Used by ``gaussian_smooth_1d`` for regularization of knot vectors.
+    """
+    left = signal[:, :, :pad].flip(-1)
+    right = signal[:, :, -pad:].flip(-1)
+    return torch.cat([left, signal, right], dim=-1)
+
+
+def gaussian_smooth_1d(
+    signal: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """1D Gaussian smoothing matching ``scipy.ndimage.gaussian_filter``.
+
+    Smooths each row of the input independently using a separable 1D kernel.
+    Used for regularizing knot displacement vectors in the nonrigid loop,
+    where the signal is 1D (one value per scan line).
+
+    Parameters
+    ----------
+    signal : torch.Tensor
+        Input tensor of shape ``(N, L)`` — N channels, L samples.
+    sigma : float
+        Standard deviation of the Gaussian kernel in pixels.
+
+    Returns
+    -------
+    torch.Tensor
+        Smoothed tensor of shape ``(N, L)``.
+    """
+    kernel, radius = _gaussian_kernel_1d(sigma, signal.dtype, signal.device)
+    # conv1d expects (batch, channels, length); kernel is (out_ch, in_ch, length)
+    x = signal[:, None]  # (N, 1, L)
+    x = _symmetric_pad_1d(x, radius)
+    return torch.nn.functional.conv1d(x, kernel[None, None, :])[:, 0]
+
+
 def _symmetric_pad(
     field_stack: torch.Tensor,
     pad_rows: int,

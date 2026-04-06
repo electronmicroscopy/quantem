@@ -160,11 +160,12 @@ def test_align_affine_deterministic(scale, expected_error, expected_k0, expected
         drift.knots[1].sum(), expected_k1, decimal=6)
 
 
-# Nonrigid baselines: pytorch backend, num_iterations=2, captured before GPU warp changes.
-# GPU warp + translate + grid_sample optimization
+# Nonrigid baselines: pure-torch pytorch backend, zero numpy crossings.
+# Translation shifts applied in float32 (not float64 via numpy round-trip).
+# Regularization: centered Vandermonde lstsq + gaussian_smooth_1d.
 NONRIGID_BASELINES = [
-    (1, 0.05627446621656418, 12023.860489196775, 28671.66400039673),
-    (2, 0.12942714989185333, 49767.53432312011, 113542.33698913576),
+    (1, 0.05627746880054474, 12023.784965515137, 28671.75657939911),
+    (2, 0.12947562336921692, 49858.001026153564, 113453.12250328064),
 ]
 
 

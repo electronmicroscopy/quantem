@@ -16,6 +16,7 @@ from quantem.imaging.drift_utils import (
     _symmetric_pad,
     bilinear_kde_batch,
     cross_corr_batch,
+    gaussian_smooth_1d,
     gaussian_smooth_batch,
 )
 
@@ -132,6 +133,22 @@ def test_gaussian_smooth_matches_scipy(sigma):
     image = rng.random((64, 64)).astype(np.float32)
     expected = gaussian_filter(image, sigma).astype(np.float32)
     result = gaussian_smooth_batch(torch.tensor(image)[None], sigma)[0].numpy()
+    np.testing.assert_allclose(result, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize("sigma", [0.5, 2.0, 16.0])
+def test_gaussian_smooth_1d_matches_scipy(sigma):
+    """Torch 1D Gaussian must match scipy.ndimage.gaussian_filter on 1D signal.
+
+    Used in nonrigid regularization to smooth knot residuals. sigma=16 is
+    the default regularization_sigma_px — tests the exact kernel size used
+    in production. If this diverges, the polynomial-detrend + smooth
+    regularization produces different knot positions.
+    """
+    rng = np.random.default_rng(42)
+    signal = rng.random(128).astype(np.float32)
+    expected = gaussian_filter(signal, sigma).astype(np.float32)
+    result = gaussian_smooth_1d(torch.tensor(signal)[None], sigma)[0].numpy()
     np.testing.assert_allclose(result, expected, atol=1e-5)
 
 

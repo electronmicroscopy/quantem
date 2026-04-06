@@ -29,6 +29,7 @@ from quantem.core.utils.imaging_utils import (
 from quantem.imaging.drift_utils import (
     bilinear_kde_batch,
     cross_corr_batch,
+    gaussian_smooth_1d,
     transform_coordinates,
     translate_align,
 )
@@ -617,12 +618,14 @@ class DriftCorrection(AutoSerialize):
         self,
         max_image_shift: float | None,
         upsample_factor: int = 8,
+        knots_t: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Regenerate warped images and solve translation on GPU.
 
-        Replaces the NumPy warp_image + align_translation combo with torch
-        equivalents for use inside align_affine. Returns the GPU tensor
-        so callers can pass it to calculate_error without a round-trip.
+        Three phases: warp → solve translation → re-warp. When ``knots_t``
+        is provided, reads/writes torch tensors directly (zero numpy
+        crossings). Without it, falls back to ``self.knots`` (numpy) for
+        compatibility with ``align_affine``.
 
         Parameters
         ----------
@@ -630,6 +633,9 @@ class DriftCorrection(AutoSerialize):
             Maximum allowed translational shift in pixels.
         upsample_factor : int
             Sub-pixel precision for cross-correlation (1/N pixel).
+        knots_t : list of torch.Tensor or None
+            If provided, list of ``(2, num_rows)`` torch tensors on GPU.
+            Translation shifts are applied in-place. Skips numpy sync.
 
         Returns
         -------
@@ -644,9 +650,13 @@ class DriftCorrection(AutoSerialize):
         def _warp_all(warped_t, weights_t):
             """Warp all images onto the canvas using current knots."""
             for img_idx in range(num_images):
-                knots_t = torch.tensor(self.knots[img_idx], dtype=dtype, device=device)
+                if knots_t is not None:
+                    # Torch path: add trailing dim for transform_coordinates (2, N) → (2, N, 1)
+                    k = knots_t[img_idx].detach()[:, :, None]
+                else:
+                    k = torch.tensor(self.knots[img_idx], dtype=dtype, device=device)
                 row_t, col_t = transform_coordinates(
-                    knots_t, self.scan_fast_t[img_idx], self.images[img_idx].shape)
+                    k, self.scan_fast_t[img_idx], self.images[img_idx].shape)
                 warped, weights = bilinear_kde_batch(
                     row_t[None], col_t[None], self.images_t[img_idx], canvas_shape,
                     self.kde_sigma, self.pad_value[img_idx])
@@ -658,14 +668,21 @@ class DriftCorrection(AutoSerialize):
         weights_t = torch.zeros_like(warped_t)
         _warp_all(warped_t, weights_t)
         # Phase 2: solve translation shifts and apply to knots
-        shifts_np = translate_align(warped_t, upsample_factor, max_image_shift).cpu().numpy()
-        for img_idx in range(num_images):
-            self.knots[img_idx][0] += shifts_np[img_idx, 0]
-            self.knots[img_idx][1] += shifts_np[img_idx, 1]
+        shifts_t = translate_align(warped_t, upsample_factor, max_image_shift)
+        if knots_t is not None:
+            for img_idx in range(num_images):
+                knots_t[img_idx].data[0] += shifts_t[img_idx, 0]
+                knots_t[img_idx].data[1] += shifts_t[img_idx, 1]
+        else:
+            shifts_np = shifts_t.cpu().numpy()
+            for img_idx in range(num_images):
+                self.knots[img_idx][0] += shifts_np[img_idx, 0]
+                self.knots[img_idx][1] += shifts_np[img_idx, 1]
         # Phase 3: re-warp with corrected knots and sync to CPU
         _warp_all(warped_t, weights_t)
-        self.images_warped.array[:] = warped_t.cpu().numpy()
-        self.weights_warped.array[:] = weights_t.cpu().numpy()
+        if knots_t is None:
+            self.images_warped.array[:] = warped_t.cpu().numpy()
+            self.weights_warped.array[:] = weights_t.cpu().numpy()
         return warped_t
 
     # non-rigid alignment
@@ -746,49 +763,101 @@ class DriftCorrection(AutoSerialize):
                 "No knots found. Call .preprocess() before running alignment."
             )
         # Main optimization loop
-        for _ in tqdm(range(num_iterations), desc=f"Solving nonrigid drift ({backend})"):
-            for ind in range(self.shape[0]):
-                image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
-                knots_init = self.knots[ind]
-                # Optimize knots
-                if backend == "pytorch":
-                    knots_updated = self._optimize_knots_pytorch(
-                        ind, image_ref, knots_init, adam_steps=adam_steps, lr=lr)
-                else:
+        if backend == "pytorch":
+            device = self._device
+            dtype = self._dtype
+            num_images = self.shape[0]
+            canvas_shape = (self.shape[1], self.shape[2])
+            # Setup once: knots, targets, optimizers on GPU
+            knots_t = [
+                torch.tensor(self.knots[i][:, :, 0], dtype=dtype, device=device, requires_grad=True)
+                for i in range(num_images)
+            ]
+            # Precompute per-image scan geometry (constant across iterations)
+            row_positions_t = [
+                torch.tensor(self.interpolator[i].u, dtype=dtype, device=device)
+                for i in range(num_images)
+            ]
+            scale_rows = [self.interpolator[i].scan_fast[0] * (self.images[i].shape[0] - 1) for i in range(num_images)]
+            scale_cols = [self.interpolator[i].scan_fast[1] * (self.images[i].shape[1] - 1) for i in range(num_images)]
+            optimizers = [torch.optim.Adam([k], lr=lr) for k in knots_t]
+            # Precompute Vandermonde matrix for polynomial detrending (constant across iterations)
+            if regularization_sigma_px is not None and regularization_sigma_px > 0:
+                num_rows_knot = knots_t[0].shape[1]
+                x_knot = torch.arange(num_rows_knot, dtype=dtype, device=device)
+                x_norm = (x_knot - x_knot.mean()) / x_knot.std()
+                vander = torch.stack([x_norm ** p for p in range(regularization_poly_order + 1)], dim=1)
+            warped_t = self._warp_and_translate_torch(
+                max_image_shift, upsample_factor=8, knots_t=knots_t)
+            for _ in tqdm(range(num_iterations), desc="Solving nonrigid drift (pytorch)"):
+                warped_sum = warped_t.sum(0)
+                for ind in range(num_images):
+                    ref_image_t = ((warped_sum - warped_t[ind]) / (num_images - 1))[None, None]
+                    knots_prev = knots_t[ind].detach().clone()
+                    optimizers[ind].state.clear()
+                    self._optimize_knots_pytorch(
+                        ref_image_t, self.images_t[ind], knots_t[ind],
+                        row_positions_t[ind], scale_rows[ind], scale_cols[ind],
+                        canvas_shape[0], canvas_shape[1],
+                        optimizers[ind], adam_steps)
+                    with torch.no_grad():
+                        if regularization_max_image_shift_px is not None:
+                            shift = knots_t[ind] - knots_prev
+                            dist = torch.norm(shift, dim=0, keepdim=True)
+                            scale_factor = torch.clamp(regularization_max_image_shift_px / dist.clamp(min=1e-8), max=1.0)
+                            knots_t[ind].data.copy_(knots_prev + shift * scale_factor)
+                        if regularization_sigma_px is not None and regularization_sigma_px > 0:
+                            for axis in range(2):
+                                y = knots_t[ind][axis]
+                                coefs, _, _, _ = torch.linalg.lstsq(vander, y)
+                                trend = vander @ coefs
+                                residual = y - trend
+                                smoothed = gaussian_smooth_1d(residual[None], regularization_sigma_px)[0]
+                                knots_t[ind].data[axis] = smoothed + trend
+                        if regularization_update_step_size is not None:
+                            knots_t[ind].data.copy_(
+                                knots_prev + (knots_t[ind] - knots_prev) * regularization_update_step_size)
+                warped_t = self._warp_and_translate_torch(
+                    max_image_shift, upsample_factor=8, knots_t=knots_t)
+                self.calculate_error(2, _warped_t=warped_t)
+            # Sync torch knots back to numpy once, then final warp to populate images_warped
+            for ind in range(num_images):
+                self.knots[ind][:, :, 0] = knots_t[ind].detach().cpu().numpy()
+            self._warp_and_translate_torch(max_image_shift, upsample_factor=8)
+        else:
+            for _ in tqdm(range(num_iterations), desc="Solving nonrigid drift (scipy)"):
+                for ind in range(self.shape[0]):
+                    image_ref = np.delete(self.images_warped.array, ind, axis=0).mean(axis=0)
                     knots_updated = self._optimize_knots_scipy(
-                        ind, image_ref, knots_init,
+                        ind, image_ref, self.knots[ind],
                         max_optimize_iterations=max_optimize_iterations,
                         solve_individual_rows=solve_individual_rows)
-                # Max shift regularization
-                if regularization_max_image_shift_px is not None:
-                    knots_shift = knots_updated - self.knots[ind]
-                    knots_dist = np.sqrt(np.sum(knots_shift**2, axis=0))
-                    sub = knots_dist > regularization_max_image_shift_px
-                    knots_updated[0][sub] = (self.knots[ind][0][sub]
-                        + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub])
-                    knots_updated[1][sub] = (self.knots[ind][1][sub]
-                        + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub])
-                # Smoothness regularization
-                if regularization_sigma_px is not None and regularization_sigma_px > 0:
-                    knots_smoothed = knots_updated.copy()
-                    for dim in range(knots_updated.shape[0]):
-                        x = np.arange(knots_updated.shape[1])
-                        for knot_ind in range(knots_updated.shape[2]):
-                            y = knots_updated[dim, :, knot_ind]
-                            coefs = np.polyfit(x, y, deg=regularization_poly_order)
-                            trend = np.polyval(coefs, x)
-                            residual = y - trend
-                            residual_smooth = gaussian_filter(residual, sigma=regularization_sigma_px)
-                            knots_smoothed[dim, :, knot_ind] = residual_smooth + trend
-                    knots_updated = knots_smoothed
-                # Step size
-                if regularization_update_step_size is not None:
-                    knots_updated = (self.knots[ind]
-                        + (knots_updated - self.knots[ind]) * regularization_update_step_size)
-                self.knots[ind] = knots_updated
-            # GPU warp + translation alignment + error tracking
-            warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor=8)
-            self.calculate_error(2, _warped_t=warped_t)
+                    if regularization_max_image_shift_px is not None:
+                        knots_shift = knots_updated - self.knots[ind]
+                        knots_dist = np.sqrt(np.sum(knots_shift**2, axis=0))
+                        sub = knots_dist > regularization_max_image_shift_px
+                        knots_updated[0][sub] = (self.knots[ind][0][sub]
+                            + knots_shift[0][sub] * regularization_max_image_shift_px / knots_dist[sub])
+                        knots_updated[1][sub] = (self.knots[ind][1][sub]
+                            + knots_shift[1][sub] * regularization_max_image_shift_px / knots_dist[sub])
+                    if regularization_sigma_px is not None and regularization_sigma_px > 0:
+                        knots_smoothed = knots_updated.copy()
+                        for dim in range(2):
+                            x = np.arange(knots_updated.shape[1])
+                            for knot_ind in range(knots_updated.shape[2]):
+                                y = knots_updated[dim, :, knot_ind]
+                                coefs = np.polyfit(x, y, deg=regularization_poly_order)
+                                trend = np.polyval(coefs, x)
+                                residual = y - trend
+                                residual_smooth = gaussian_filter(residual, sigma=regularization_sigma_px)
+                                knots_smoothed[dim, :, knot_ind] = residual_smooth + trend
+                        knots_updated = knots_smoothed
+                    if regularization_update_step_size is not None:
+                        knots_updated = (self.knots[ind]
+                            + (knots_updated - self.knots[ind]) * regularization_update_step_size)
+                    self.knots[ind] = knots_updated
+                warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor=8)
+                self.calculate_error(2, _warped_t=warped_t)
 
         if show_merged:
             self.plot_merged_images(
@@ -807,47 +876,29 @@ class DriftCorrection(AutoSerialize):
         return self
 
     def _optimize_knots_pytorch(
-        self, idx: int, image_ref: np.ndarray, knots_init: np.ndarray,
-        adam_steps: int = 5, lr: float = 0.02,
-    ) -> np.ndarray:
-        """Optimize knot positions for one image using Adam gradient descent.
+        self, ref_image_t, target_image_t, knots_t,
+        row_position_t, scale_row, scale_col,
+        num_rows_canvas, num_cols_canvas,
+        optimizer, adam_steps,
+    ):
+        """Run Adam steps on knots to minimize MSE against reference.
 
-        Minimizes MSE between the bilinearly interpolated reference image
-        and the target image, with knots as trainable parameters. All rows
-        are optimized simultaneously (batched). Without this, nonrigid
-        correction would fall back to scipy L-BFGS which optimizes one
-        row at a time.
+        All inputs and outputs are torch tensors on GPU — no numpy
+        crossings. The optimizer is created once and reused across
+        outer iterations to avoid construction overhead.
         """
-        # TODO: support multiple knots (requires differentiable spline interpolation)
-        if knots_init.shape[2] != 1:
-            raise NotImplementedError(
-                f"PyTorch backend only supports single knot (got {knots_init.shape[2]}). "
-                "Use backend='scipy' for multiple knots.")
-        device = self._device
-        num_rows_source, num_cols_source = self.images[idx].array.shape
-        num_rows_canvas, num_cols_canvas = image_ref.shape
-        ref_image = torch.tensor(image_ref, dtype=torch.float32, device=device)[None, None]
-        target_image = torch.tensor(self.images[idx].array, dtype=torch.float32, device=device)
-        row_position = torch.tensor(self.interpolator[idx].u, dtype=torch.float32, device=device)
-        scan_fast = self.interpolator[idx].scan_fast
-        scale_row = scan_fast[0] * (num_rows_source - 1)
-        scale_col = scan_fast[1] * (num_cols_source - 1)
-        knots = torch.tensor(knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True)
-        optimizer = torch.optim.Adam([knots], lr=lr)
         for _ in range(adam_steps):
             optimizer.zero_grad()
-            row_coords = knots[0, :, None] + row_position[None, :] * scale_row
-            col_coords = knots[1, :, None] + row_position[None, :] * scale_col
-            # grid_sample expects coordinates in [-1, 1] with (x=col, y=row)
+            row_coords = knots_t[0, :, None] + row_position_t[None, :] * scale_row
+            col_coords = knots_t[1, :, None] + row_position_t[None, :] * scale_col
             grid_col = 2.0 * col_coords / (num_cols_canvas - 1) - 1.0
             grid_row = 2.0 * row_coords / (num_rows_canvas - 1) - 1.0
             grid = torch.stack([grid_col, grid_row], dim=-1)[None]
             warped = torch.nn.functional.grid_sample(
-                ref_image, grid, mode='bilinear', align_corners=True, padding_mode='border')[0, 0]
-            loss = ((warped - target_image) ** 2).mean()
+                ref_image_t, grid, mode='bilinear', align_corners=True, padding_mode='border')[0, 0]
+            loss = ((warped - target_image_t) ** 2).mean()
             loss.backward()
             optimizer.step()
-        return knots.detach().cpu().numpy()[:, :, None]
 
     def _optimize_knots_scipy(
         self, idx: int, image_ref: np.ndarray, knots_init: np.ndarray,
