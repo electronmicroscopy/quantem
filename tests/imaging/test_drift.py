@@ -158,3 +158,40 @@ def test_align_affine_deterministic(scale, expected_error, expected_k0, expected
         drift.knots[0].sum(), expected_k0, decimal=6)
     np.testing.assert_almost_equal(
         drift.knots[1].sum(), expected_k1, decimal=6)
+
+
+# Nonrigid baselines: pytorch backend, num_iterations=2, captured before GPU warp changes.
+# GPU warp + translate + grid_sample optimization
+NONRIGID_BASELINES = [
+    (1, 0.05627446621656418, 12023.860489196775, 28671.66400039673),
+    (2, 0.12942714989185333, 49767.53432312011, 113542.33698913576),
+]
+
+
+@pytest.mark.parametrize("scale,expected_error,expected_k0,expected_k1", NONRIGID_BASELINES)
+def test_align_nonrigid_deterministic(scale, expected_error, expected_k0, expected_k1):
+    """Nonrigid on synthetic data must match frozen baseline.
+
+    Runs preprocess → affine → nonrigid (2 iterations for speed).
+    If the GPU warp or translation path changes numerical output,
+    these baselines catch it immediately.
+    """
+    im0, im1, _ = generate_standardized_synthetic_data(scale=scale, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(
+        step=0.02, num_tests=5, refine=True,
+        show_merged=False, show_images=False,
+    )
+    drift.align_nonrigid(
+        backend="pytorch", num_iterations=2,
+        regularization_sigma_px=16.0,
+        show_merged=False, show_images=False,
+    )
+    np.testing.assert_almost_equal(
+        drift.error_track[-1, 1], expected_error, decimal=8)
+    np.testing.assert_almost_equal(
+        drift.knots[0].sum(), expected_k0, decimal=6)
+    np.testing.assert_almost_equal(
+        drift.knots[1].sum(), expected_k1, decimal=6)

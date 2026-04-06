@@ -786,15 +786,9 @@ class DriftCorrection(AutoSerialize):
                     knots_updated = (self.knots[ind]
                         + (knots_updated - self.knots[ind]) * regularization_update_step_size)
                 self.knots[ind] = knots_updated
-            # Update warped images
-            for ind in range(self.shape[0]):
-                self.images_warped.array[ind], self.weights_warped.array[ind] = (
-                    self.interpolator[ind].warp_image(self.images[ind].array, self.knots[ind]))
-            # Translation alignment
-            self.align_translation(
-                min_image_shift=min_image_shift, max_image_shift=max_image_shift,
-                show_images=False, show_merged=False, show_knots=False)
-            self.calculate_error(2)
+            # GPU warp + translation alignment + error tracking
+            warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor=8)
+            self.calculate_error(2, _warped_t=warped_t)
 
         if show_merged:
             self.plot_merged_images(
@@ -830,34 +824,26 @@ class DriftCorrection(AutoSerialize):
                 f"PyTorch backend only supports single knot (got {knots_init.shape[2]}). "
                 "Use backend='scipy' for multiple knots.")
         device = self._device
-        num_rows, num_cols = self.images[idx].array.shape
-        # Convert to tensors
-        ref_image = torch.tensor(image_ref, dtype=torch.float32, device=device)
+        num_rows_source, num_cols_source = self.images[idx].array.shape
+        num_rows_canvas, num_cols_canvas = image_ref.shape
+        ref_image = torch.tensor(image_ref, dtype=torch.float32, device=device)[None, None]
         target_image = torch.tensor(self.images[idx].array, dtype=torch.float32, device=device)
         row_position = torch.tensor(self.interpolator[idx].u, dtype=torch.float32, device=device)
         scan_fast = self.interpolator[idx].scan_fast
-        scale_row = scan_fast[0] * (num_rows - 1)
-        scale_col = scan_fast[1] * (num_cols - 1)
-        # Initialize knots as trainable tensor: shape (2, num_rows)
+        scale_row = scan_fast[0] * (num_rows_source - 1)
+        scale_col = scan_fast[1] * (num_cols_source - 1)
         knots = torch.tensor(knots_init[:, :, 0], dtype=torch.float32, device=device, requires_grad=True)
         optimizer = torch.optim.Adam([knots], lr=lr)
-        # Adam optimization (batched over all rows)
         for _ in range(adam_steps):
             optimizer.zero_grad()
-            # Transform: single knot = shift along scan direction
             row_coords = knots[0, :, None] + row_position[None, :] * scale_row
             col_coords = knots[1, :, None] + row_position[None, :] * scale_col
-            # Bilinear interpolation — clamp to valid range for differentiable sampling
-            row_clamped = row_coords.clamp(0, num_rows - 1.001)
-            col_clamped = col_coords.clamp(0, num_cols - 1.001)
-            row_floor = row_clamped.floor().long().clamp(0, num_rows - 2)
-            col_floor = col_clamped.floor().long().clamp(0, num_cols - 2)
-            frac_row = row_clamped - row_floor.float()
-            frac_col = col_clamped - col_floor.float()
-            warped = (ref_image[row_floor, col_floor] * (1 - frac_row) * (1 - frac_col)
-                      + ref_image[row_floor + 1, col_floor] * frac_row * (1 - frac_col)
-                      + ref_image[row_floor, col_floor + 1] * (1 - frac_row) * frac_col
-                      + ref_image[row_floor + 1, col_floor + 1] * frac_row * frac_col)
+            # grid_sample expects coordinates in [-1, 1] with (x=col, y=row)
+            grid_col = 2.0 * col_coords / (num_cols_canvas - 1) - 1.0
+            grid_row = 2.0 * row_coords / (num_rows_canvas - 1) - 1.0
+            grid = torch.stack([grid_col, grid_row], dim=-1)[None]
+            warped = torch.nn.functional.grid_sample(
+                ref_image, grid, mode='bilinear', align_corners=True, padding_mode='border')[0, 0]
             loss = ((warped - target_image) ** 2).mean()
             loss.backward()
             optimizer.step()
