@@ -994,6 +994,30 @@ class MAPEDTorch(AutoSerialize):
 
         return self
 
+    def dscan_align(
+        self,
+        iterations,
+        upsample_factor: int = 100,
+        plot_aligned: bool = True,
+        edge_blend: float = 2.0,
+        fit_shifts=True,
+        mode="linear",
+    ):
+        for i, dataset in enumerate(self.datasets):
+            _, aligned_dataset, _ = dscan_correct(
+                dataset,
+                iterations,
+                upsample_factor=upsample_factor,
+                plot_aligned=plot_aligned,
+                edge_blend=edge_blend,
+                device=self.device,
+                fit_shifts=fit_shifts,
+                mode=mode,
+            )
+            self.datasets[i] = aligned_dataset
+
+        return self
+
     def diffraction_align(
         self,
         edge_blend: float = 16.0,
@@ -1062,6 +1086,9 @@ class MAPEDTorch(AutoSerialize):
         G_ref = torch.fft.fft2(w * self.dp_mean[0])
         xy0 = self.diffraction_origins[0]
 
+        kr = torch.fft.fftfreq(H, device=self.device)[:, None]
+        kc = torch.fft.fftfreq(W, device=self.device)[None, :]
+
         for ind in range(1, n):
             G = torch.fft.fft2(w * self.dp_mean[ind])
             xy = self.diffraction_origins[ind]
@@ -1083,8 +1110,6 @@ class MAPEDTorch(AutoSerialize):
                 upsample_factor=int(upsample_factor),
                 fft_input=True,
             )
-            kr = torch.fft.fftfreq(H, device=self.device)[:, None]
-            kc = torch.fft.fftfreq(W, device=self.device)[None, :]
 
             phase_ramp = torch.exp(-2j * torch.pi * (kr * shift_rc[0] + kc * shift_rc[1]))
 
@@ -1956,3 +1981,173 @@ def shift_images_torch(
     out[~mask] = 0.0
 
     return out
+
+
+def fit_surface_lstsq(img, mode="linear"):
+    """
+    Fits an image with a linear or quadratic function
+
+    Parameters
+    ----------
+    img : torch.Tensor
+        Image to fit, of shape (H, W)
+    mode : str
+        Fitting mode, either "linear" or "quadratic"
+
+    Returns
+    ------
+    fitted : torch.Tensor
+        Array of shape (H, W) of the fit function over the image
+    coeffs : torch.Tensor
+        fitting coefficients
+    """
+    H, W = img.shape
+    x_1d = torch.arange(img.shape[1], device=img.device, dtype=torch.float32)
+    y_1d = torch.arange(img.shape[0], device=img.device, dtype=torch.float32)
+
+    xx, yy = torch.meshgrid(x_1d, y_1d)
+
+    x = xx.flatten()
+    y = yy.flatten()
+    z = img.flatten()
+
+    if mode == "linear":
+        A = torch.stack([x, y, torch.ones_like(x)], dim=1)
+    elif mode == "quadratic":
+        A = torch.stack([x**2, y**2, x * y, x, y, torch.ones_like(x)], dim=1)
+
+    coeffs, _, _, _ = torch.linalg.lstsq(A, z.unsqueeze(1))
+
+    fitted = (A @ coeffs).reshape(H, W)
+    return fitted, coeffs
+
+
+def dscan_correct(
+    dataset,
+    iterations,
+    upsample_factor: int = 100,
+    plot_aligned: bool = True,
+    edge_blend: float = 2.0,
+    device="cpu",
+    fit_shifts=True,
+    mode="linear",
+):
+    """
+    Align diffraction patterns using cross-correlation.
+
+    Parameters
+    ----------
+    dataset : torch.Tensor
+        Input 4D dataset
+    iterations : int
+        Number of refinement iterations
+    upsample_factor : int
+        Upsampling factor for sub-pixel accuracy
+    plot_aligned : bool
+        Whether to plot results after each iteration
+    edge_blend : float
+        Edge blending parameter for Tukey window
+    device : torch.device
+        Device to use
+    fit_shifts : bool
+        Whether to fit shifts to a smooth surface
+    mode : str
+        "linear" or "quadratic" for surface fitting
+    """
+    H_rs, W_rs, H_dp, W_dp = dataset.shape
+
+    w = (
+        tukey_torch(
+            H_dp,
+            alpha=2.0 * float(edge_blend) / float(H_dp),
+            device=device,
+            dtype=torch.float32,
+        )[:, None]
+        * tukey_torch(
+            W_dp,
+            alpha=2.0 * float(edge_blend) / float(W_dp),
+            device=device,
+            dtype=torch.float32,
+        )[None, :]
+    )
+
+    diffraction_shifts = torch.zeros((H_rs, W_rs, 2), device=device, dtype=torch.float32)
+    shifted_dps = dataset.clone()
+
+    kr = torch.fft.fftfreq(H_dp, device=device)[:, None]
+    kc = torch.fft.fftfreq(W_dp, device=device)[None, :]
+
+    for iteration in range(iterations):
+        G_ref = torch.fft.fft2(shifted_dps.mean(dim=(0, 1)) * w)
+
+        for h_rs in tqdm(range(H_rs), desc=f"Iteration {iteration + 1}/{iterations}"):
+            for w_rs in range(W_rs):
+                ind = w_rs + h_rs * H_rs
+                dp = shifted_dps[h_rs, w_rs]  # <-- Read from current shifted_dps, not original
+                G = torch.fft.fft2(w * dp)
+                shift = cross_correlation_shift_torch(
+                    G_ref, G, upsample_factor=upsample_factor, fft_input=True
+                )
+                diffraction_shifts[h_rs, w_rs] = shift
+
+                phase_ramp = torch.exp(-1j * torch.pi * (kr * shift[0] + kc * shift[1]))
+                G_shift = G * phase_ramp
+
+                shifted_dps[h_rs, w_rs, :, :] = torch.fft.ifft2(G_shift).real
+                G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
+
+        G_ref_final = G_ref.clone()
+
+        if fit_shifts:
+            diffraction_shifts_1, _ = fit_surface_lstsq(diffraction_shifts[:, :, 0], mode=mode)
+            diffraction_shifts_2, _ = fit_surface_lstsq(diffraction_shifts[:, :, 1], mode=mode)
+            diffraction_shifts_old = diffraction_shifts.clone()
+            diffraction_shifts = torch.stack((diffraction_shifts_1, diffraction_shifts_2), dim=2)
+
+            # Recompute fitted shifts
+            for h_rs in tqdm(range(H_rs), desc="Applying fitted shifts"):
+                for w_rs in range(W_rs):
+                    dp = shifted_dps[h_rs, w_rs]  # <-- Also read from shifted_dps here
+                    G = torch.fft.fft2(w * dp)
+                    shift = diffraction_shifts[h_rs, w_rs]
+
+                    phase_ramp = torch.exp(-1j * torch.pi * (kr * shift[0] + kc * shift[1]))
+                    G_shift = G * phase_ramp
+
+                    shifted_dps[h_rs, w_rs, :, :] = torch.fft.ifft2(G_shift).real
+
+        if plot_aligned:
+            if fit_shifts:
+                show_2d(
+                    [
+                        [
+                            diffraction_shifts_old[:, :, 0],
+                            diffraction_shifts[:, :, 0],
+                            diffraction_shifts[:, :, 0] - diffraction_shifts_old[:, :, 0],
+                        ],
+                        [
+                            diffraction_shifts_old[:, :, 1],
+                            diffraction_shifts[:, :, 1],
+                            diffraction_shifts[:, :, 1] - diffraction_shifts_old[:, :, 1],
+                        ],
+                    ],
+                    title=[
+                        ["Shifts x", "Fit x", "Residual x"],
+                        ["Shifts y", "Fit y", "Residual y"],
+                    ],
+                    cmap="RdBu_r",
+                    vmax=3,
+                    vmin=-3,
+                )
+
+            dp_mean_before = dataset.mean(dim=(0, 1))
+            dp_mean = shifted_dps.mean(dim=(0, 1))
+            dp_max = torch.max(
+                torch.max(shifted_dps, dim=0, keepdim=False).values, dim=0, keepdim=False
+            ).values
+            show_2d(
+                [dp_mean_before, dp_mean, dp_max],
+                vmax=0.75,
+            )
+
+    return diffraction_shifts, shifted_dps, G_ref_final
