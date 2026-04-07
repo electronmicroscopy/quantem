@@ -12,73 +12,77 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection
 
 
-def generate_standardized_synthetic_data(scale=1, seed=42):
-    """Generate standardized synthetic drift data with linear drift and jitter."""
-    np.random.seed(seed)
+def make_synthetic_drift_data(scale=1, seed=42):
+    """Generate a chevron base image plus two scan-distorted views.
 
+    Image 0 scans along columns; image 1 scans along rows. Both apply the
+    same linear row/col drift plus per-scanline jitter so the nonrigid
+    solver has a non-trivial knot field to recover.
+    """
+    np.random.seed(seed)
     shape = (200 * scale, 200 * scale)
-    xa, ya = np.meshgrid(
+    row_grid, col_grid = np.meshgrid(
         np.arange(-shape[0] / 2, shape[0] / 2),
         np.arange(-shape[0] / 2, shape[0] / 2),
         indexing="ij",
     )
-    im = (np.mod(np.abs(xa) + np.abs(ya), 16 * scale) < 8 * scale).astype("float")
-    im[np.logical_and(xa > 0, ya > 0)] += 0.5
-    im[np.maximum(np.abs(xa), np.abs(ya)) < 20 * scale] = 2
-    im = gaussian_filter(im, sigma=0.667 * scale)
+    base_image = (np.mod(np.abs(row_grid) + np.abs(col_grid), 16 * scale) < 8 * scale).astype("float")
+    base_image[np.logical_and(row_grid > 0, col_grid > 0)] += 0.5
+    base_image[np.maximum(np.abs(row_grid), np.abs(col_grid)) < 20 * scale] = 2
+    base_image = gaussian_filter(base_image, sigma=0.667 * scale)
 
     scan_size = 128 * scale
-    u = np.arange(scan_size)
-    x_drift = u * 0.001 * scale
-    y_drift = u * 0.1 * scale
+    scan_positions = np.arange(scan_size)
+    row_drift = scan_positions * 0.001 * scale
+    col_drift = scan_positions * 0.1 * scale
     jitter_mag = 0.5 * scale
     jitter0 = np.random.randn(2, scan_size) * jitter_mag
     jitter1 = np.random.randn(2, scan_size) * jitter_mag
 
     im0 = np.zeros((scan_size, scan_size))
-    for a0 in range(scan_size):
-        x0 = 40 * scale + a0 + x_drift[a0] + jitter0[0, a0]
-        y0 = 30 * scale + 0 + y_drift[a0] + jitter0[1, a0]
-        x = x0 + u * 0
-        y = y0 + u * 1
-        x = np.clip(x, 0, shape[0] - 2)
-        y = np.clip(y, 0, shape[1] - 2)
-        xf = np.floor(x).astype("int")
-        yf = np.floor(y).astype("int")
-        dx = x - xf
-        dy = y - yf
-        im0[a0, :] = (
-            im[xf, yf] * (1 - dx) * (1 - dy)
-            + im[xf + 1, yf] * (dx) * (1 - dy)
-            + im[xf, yf + 1] * (1 - dx) * (dy)
-            + im[xf + 1, yf + 1] * (dx) * (dy)
+    for row_idx in range(scan_size):
+        start_row = 40 * scale + row_idx + row_drift[row_idx] + jitter0[0, row_idx]
+        start_col = 30 * scale + 0 + col_drift[row_idx] + jitter0[1, row_idx]
+        row_coords = start_row + scan_positions * 0
+        col_coords = start_col + scan_positions * 1
+        row_coords = np.clip(row_coords, 0, shape[0] - 2)
+        col_coords = np.clip(col_coords, 0, shape[1] - 2)
+        row_floor = np.floor(row_coords).astype("int")
+        col_floor = np.floor(col_coords).astype("int")
+        row_frac = row_coords - row_floor
+        col_frac = col_coords - col_floor
+        im0[row_idx, :] = (
+            base_image[row_floor, col_floor] * (1 - row_frac) * (1 - col_frac)
+            + base_image[row_floor + 1, col_floor] * row_frac * (1 - col_frac)
+            + base_image[row_floor, col_floor + 1] * (1 - row_frac) * col_frac
+            + base_image[row_floor + 1, col_floor + 1] * row_frac * col_frac
         )
 
     im1 = np.zeros((scan_size, scan_size))
-    for a0 in range(scan_size):
-        x0 = 170 * scale + 0 + x_drift[a0] + jitter1[0, a0]
-        y0 = 30 * scale + a0 + y_drift[a0] + jitter1[1, a0]
-        x = x0 - u * 1
-        y = y0 + u * 0
-        x = np.clip(x, 0, shape[0] - 2)
-        y = np.clip(y, 0, shape[1] - 2)
-        xf = np.floor(x).astype("int")
-        yf = np.floor(y).astype("int")
-        dx = x - xf
-        dy = y - yf
-        im1[a0, :] = (
-            im[xf, yf] * (1 - dx) * (1 - dy)
-            + im[xf + 1, yf] * (dx) * (1 - dy)
-            + im[xf, yf + 1] * (1 - dx) * (dy)
-            + im[xf + 1, yf + 1] * (dx) * (dy)
+    for row_idx in range(scan_size):
+        start_row = 170 * scale + 0 + row_drift[row_idx] + jitter1[0, row_idx]
+        start_col = 30 * scale + row_idx + col_drift[row_idx] + jitter1[1, row_idx]
+        row_coords = start_row - scan_positions * 1
+        col_coords = start_col + scan_positions * 0
+        row_coords = np.clip(row_coords, 0, shape[0] - 2)
+        col_coords = np.clip(col_coords, 0, shape[1] - 2)
+        row_floor = np.floor(row_coords).astype("int")
+        col_floor = np.floor(col_coords).astype("int")
+        row_frac = row_coords - row_floor
+        col_frac = col_coords - col_floor
+        im1[row_idx, :] = (
+            base_image[row_floor, col_floor] * (1 - row_frac) * (1 - col_frac)
+            + base_image[row_floor + 1, col_floor] * row_frac * (1 - col_frac)
+            + base_image[row_floor, col_floor + 1] * (1 - row_frac) * col_frac
+            + base_image[row_floor + 1, col_floor + 1] * row_frac * col_frac
         )
 
-    return im0, im1, im
+    return im0, im1, base_image
 
 
 def test_full_pipeline_deterministic():
     """Full pipeline produces correct, deterministic, low-error results."""
-    im0, im1, _ = generate_standardized_synthetic_data(scale=1, seed=42)
+    im0, im1, _ = make_synthetic_drift_data(scale=1, seed=42)
 
     drift = DriftCorrection.from_data(
         images=[im0, im1],
@@ -105,7 +109,7 @@ def test_full_pipeline_deterministic():
     assert drift.error_track[-1, 1] < 0.1
 
     # Determinism: second run with same seed must match exactly
-    im0_2, im1_2, _ = generate_standardized_synthetic_data(scale=1, seed=42)
+    im0_2, im1_2, _ = make_synthetic_drift_data(scale=1, seed=42)
     drift2 = DriftCorrection.from_data(
         images=[im0_2, im1_2],
         scan_direction_degrees=[0.0, 90.0],
@@ -142,9 +146,9 @@ AFFINE_BASELINES = [
 
 
 @pytest.mark.parametrize("scale,expected_error,expected_k0,expected_k1", AFFINE_BASELINES)
-def test_align_affine_deterministic(scale, expected_error, expected_k0, expected_k1):
+def test_align_affine_matches_frozen_baseline(scale, expected_error, expected_k0, expected_k1):
     """Affine on synthetic data must match frozen float32 baseline."""
-    im0, im1, _ = generate_standardized_synthetic_data(scale=scale, seed=42)
+    im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
         images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
@@ -160,24 +164,22 @@ def test_align_affine_deterministic(scale, expected_error, expected_k0, expected
         drift.knots[1].sum(), expected_k1, decimal=6)
 
 
-# Nonrigid baselines: pure-torch pytorch backend, zero numpy crossings.
-# Translation shifts applied in float32 (not float64 via numpy round-trip).
-# Regularization: centered Vandermonde lstsq + gaussian_smooth_1d.
-NONRIGID_BASELINES = [
-    (1, 0.05627746880054474, 12023.784965515137, 28671.75657939911),
-    (2, 0.12947562336921692, 49858.001026153564, 113453.12250328064),
+# Frozen baselines for the pytorch backend with optimizer_name="adam".
+NONRIGID_ADAM_BASELINES = [
+    (1, 0.0562780499458313, 12023.870644569397, 28671.6764421463),
+    (2, 0.12947668135166168, 49829.36344528198, 113481.72154045105),
 ]
 
 
-@pytest.mark.parametrize("scale,expected_error,expected_k0,expected_k1", NONRIGID_BASELINES)
-def test_align_nonrigid_deterministic(scale, expected_error, expected_k0, expected_k1):
+@pytest.mark.parametrize("scale,expected_error,expected_k0,expected_k1", NONRIGID_ADAM_BASELINES)
+def test_align_nonrigid_adam_matches_frozen_baseline(scale, expected_error, expected_k0, expected_k1):
     """Nonrigid on synthetic data must match frozen baseline.
 
     Runs preprocess → affine → nonrigid (2 iterations for speed).
     If the GPU warp or translation path changes numerical output,
     these baselines catch it immediately.
     """
-    im0, im1, _ = generate_standardized_synthetic_data(scale=scale, seed=42)
+    im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
     drift = DriftCorrection.from_data(
         images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
     ).preprocess(show_merged=False, show_images=False)
@@ -186,7 +188,50 @@ def test_align_nonrigid_deterministic(scale, expected_error, expected_k0, expect
         show_merged=False, show_images=False,
     )
     drift.align_nonrigid(
-        backend="pytorch", num_iterations=2,
+        backend="pytorch", num_iterations=2, adam_steps=50,
+        regularization_sigma_px=16.0,
+        # Pin lr to the value the baselines were captured at - the public
+        # default is now auto-derived from max_image_shift, but the frozen
+        # baselines must stay numerically stable across that change.
+        lr=0.02,
+        show_merged=False, show_images=False,
+    )
+    np.testing.assert_almost_equal(
+        drift.error_track[-1, 1], expected_error, decimal=8)
+    np.testing.assert_almost_equal(
+        drift.knots[0].sum(), expected_k0, decimal=6)
+    np.testing.assert_almost_equal(
+        drift.knots[1].sum(), expected_k1, decimal=6)
+
+
+# Frozen baselines for the pytorch backend with optimizer_name="lbfgs".
+# Shares _compiled_loss_fn with the Adam path, so this catches regressions
+# in either the optimizer dispatch or the shared loss.
+NONRIGID_LBFGS_BASELINES = [
+    (1, 0.07269975543022156, 12152.98459815979, 28536.15177345276),
+    (2, 0.11153321713209152, 50293.12340545654, 113601.38675689697),
+]
+
+
+@pytest.mark.parametrize("scale,expected_error,expected_k0,expected_k1", NONRIGID_LBFGS_BASELINES)
+def test_align_nonrigid_lbfgs_matches_frozen_baseline(scale, expected_error, expected_k0, expected_k1):
+    """Nonrigid LBFGS path on synthetic data must match frozen baseline.
+
+    The LBFGS optimizer uses a closure-based forward+backward instead of
+    Adam's compiled inner loop. This test ensures both paths stay
+    numerically deterministic and that LBFGS doesn't silently regress.
+    """
+    im0, im1, _ = make_synthetic_drift_data(scale=scale, seed=42)
+    drift = DriftCorrection.from_data(
+        images=[im0, im1], scan_direction_degrees=[0.0, 90.0],
+    ).preprocess(show_merged=False, show_images=False)
+    drift.align_affine(
+        step=0.02, num_tests=5, refine=True,
+        show_merged=False, show_images=False,
+    )
+    drift.align_nonrigid(
+        backend="pytorch", optimizer_name="lbfgs",
+        num_iterations=2, lbfgs_max_iter=20,
         regularization_sigma_px=16.0,
         show_merged=False, show_images=False,
     )
