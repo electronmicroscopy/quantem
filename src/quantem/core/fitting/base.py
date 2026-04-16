@@ -792,7 +792,7 @@ class FitBase(OptimizerMixin):
         # Core wiring
         # self.loss_fn = torch.nn.L1Loss(reduction="mean")
         self.loss_fn = torch.nn.MSELoss(reduction="mean")
-        self.loss_fn = BCEMSELoss()
+        # self.loss_fn = BCEMSELoss()
         self.model: AdditiveRenderModel | None = None
         self.ctx: RenderContext | None = None
 
