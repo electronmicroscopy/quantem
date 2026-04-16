@@ -665,11 +665,31 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             )
         return self._render_state_array(self.state_individual_refined[row, col])
 
-    def fit_strain(self) -> "ModelDiffraction":
+    def fit_strain(self,
+    mask_reference=None,
+    ) -> "ModelDiffraction":
         u_fit = self.u_array
         v_fit = self.v_array
-        u_ref = np.median(u_fit.reshape(-1, 2), axis=0)
-        v_ref = np.median(v_fit.reshape(-1, 2), axis=0)
+
+        if mask_reference is None:
+            u_ref = np.median(u_fit.reshape(-1, 2), axis=0)
+            v_ref = np.median(v_fit.reshape(-1, 2), axis=0)
+        else:
+            m = np.asarray(mask_reference, dtype=bool)
+            u_ref = np.array(
+                (
+                    np.median(u_fit[m, 0]),
+                    np.median(u_fit[m, 1]),
+                ),
+                dtype=float,
+            )
+            v_ref = np.array(
+                (
+                    np.median(v_fit[m, 0]),
+                    np.median(v_fit[m, 1]),
+                ),
+                dtype=float,
+            )
 
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]

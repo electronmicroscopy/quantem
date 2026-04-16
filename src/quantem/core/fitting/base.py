@@ -758,8 +758,8 @@ class FitBase(OptimizerMixin):
     def __init__(self):
         super().__init__()
         # Core wiring
-        self.loss_fn = torch.nn.L1Loss(reduction="mean")
-        # self.loss_fn = torch.nn.MSELoss(reduction="mean")
+        # self.loss_fn = torch.nn.L1Loss(reduction="mean")
+        self.loss_fn = torch.nn.MSELoss(reduction="mean")
         self.model: AdditiveRenderModel | None = None
         self.ctx: RenderContext | None = None
 
