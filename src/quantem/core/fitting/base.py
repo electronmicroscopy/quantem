@@ -752,6 +752,38 @@ class FitResult:
     num_steps: int
     metrics: dict[str, list[float]] = field(default_factory=dict)
 
+class BCEMSELoss(nn.Module):
+
+    def __init__(
+        self,
+        gamma: float = 1,  
+        percentile: float = 0.95,
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.percentile = percentile
+    
+    def forward(self, pred, target):
+        mse_loss = torch.mean((pred - target) ** 2)
+        
+        threshold_pred = torch.quantile(pred, self.percentile)
+        threshold_target = torch.quantile(target, self.percentile)
+        
+        # Create binary masks
+        target_binary = (target > threshold_target).float()
+        pred_binary = (pred > threshold_pred).float()
+        
+        epsilon = 1e-7
+        pred_binary_clamped = torch.clamp(pred_binary, epsilon, 1.0 - epsilon)
+        bce_loss = -torch.mean(
+            target_binary * torch.log(pred_binary_clamped) + 
+            (1 - target_binary) * torch.log(1 - pred_binary_clamped)
+        )
+        
+        # Combined loss
+        total_loss = mse_loss + self.gamma ** bce_loss
+        
+        return total_loss
 
 class FitBase(OptimizerMixin):
 
@@ -760,6 +792,7 @@ class FitBase(OptimizerMixin):
         # Core wiring
         # self.loss_fn = torch.nn.L1Loss(reduction="mean")
         self.loss_fn = torch.nn.MSELoss(reduction="mean")
+        self.loss_fn = BCEMSELoss()
         self.model: AdditiveRenderModel | None = None
         self.ctx: RenderContext | None = None
 
