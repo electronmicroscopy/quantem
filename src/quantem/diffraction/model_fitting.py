@@ -315,10 +315,37 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         upsample_factor: int = 32,
         max_shift: float | None = None,
         shift_order: int = 1,
+        gamma: float = 0.5,
+        mode: str = "linear",
     ) -> "ModelDiffraction":
         arr = np.asarray(self.dataset.array)
         if arr.ndim < 2:
             raise ValueError("dataset.array must have at least 2 dimensions.")
+        mode_in = mode.strip().lower()
+        if mode_in in {"linear", "patterson", "paterson", "acf", "autocorrelation"}:
+            mode_norm = "linear"
+        elif mode_in in {"log", "cepstrum", "cepstral"}:
+            mode_norm = "log"
+        elif mode_in in {"gamma", "power", "sqrt"}:
+            mode_norm = "gamma"
+        else:
+            raise ValueError(
+                "mode must be 'linear', 'log', or 'gamma' (aliases: 'patterson'->'linear', 'cepstrum'/'cepstral'->'log')."
+            )
+
+        self.metadata["mode"] = mode_norm
+        if mode_norm == "gamma":
+            self.metadata["gamma"] = gamma
+        
+        if mode_norm == "linear":
+            arr = arr
+        elif mode_norm == "log":
+            arr = np.log1p(arr)
+        elif mode_norm == "gamma":
+            arr = np.power(np.clip(arr, 0.0, None), self.metadata["gamma"])
+        else:
+            raise RuntimeError("Unreachable: normalized mode mapping failed.")
+
         h, w = arr.shape[-2], arr.shape[-1]
         self.index_shape = tuple(arr.shape[:-2])
 
@@ -665,8 +692,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             )
         return self._render_state_array(self.state_individual_refined[row, col])
 
-    def fit_strain(self,
-    mask_reference=None,
+    def fit_strain(
+        self, 
+        mask_reference=None,
     ) -> "ModelDiffraction":
         u_fit = self.u_array
         v_fit = self.v_array
