@@ -152,7 +152,7 @@ class ModelDiffractionVisualizations:
         individual_loss: bool = False,
         pattern_row: int = 0,
         pattern_col: int = 0,
-        power: float = 0.25,
+        power: float = 1,
         cbar: bool = False,
         axsize: tuple[int, int] = (6, 6),
         overlay: bool = True,

@@ -345,7 +345,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             arr = np.power(np.clip(arr, 0.0, None), self.metadata["gamma"])
         else:
             raise RuntimeError("Unreachable: normalized mode mapping failed.")
-
+        self.dataset.array = np.asarray(arr)
         h, w = arr.shape[-2], arr.shape[-1]
         self.index_shape = tuple(arr.shape[:-2])
 
