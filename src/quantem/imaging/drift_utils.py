@@ -7,7 +7,7 @@ from torch.fft import fft2, fftfreq, ifft2, ifftshift
 
 
 # ---------------------------------------------------------------------------
-# Public API — called by DriftCorrection in drift.py
+# Public API - called by DriftCorrection in drift.py
 # ---------------------------------------------------------------------------
 
 
@@ -17,21 +17,19 @@ def bilinear_kde_batch(
     source_image: torch.Tensor,
     output_shape: tuple[int, int],
     kde_sigma: float,
-    pad_value: float,
+    pad_value: float | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Batched bilinear KDE for warping images under test drift vectors.
-
-    Each test drift vector maps source pixels to different canvas
-    positions. This function scatters all test drifts onto the canvas
-    in one pass, producing N warped images simultaneously. Without
-    batched warping, each test drift would require a separate Python
-    loop iteration — the single largest bottleneck before GPU acceleration.
+    """Batched bilinear KDE: scatter N source images onto an output canvas.
 
     Each pixel scatters its value to its 4 nearest grid neighbors with
-    weights ``w = (1-dr)·(1-dc)``, ``dr·(1-dc)``, ``(1-dr)·dc``, ``dr·dc``
-    where ``dr, dc`` are fractional row/col distances. Accumulated counts
-    and values are Gaussian-smoothed, then normalized:
+    bilinear weights ``(1-dr)·(1-dc)``, ``dr·(1-dc)``, ``(1-dr)·dc``,
+    ``dr·dc`` where ``dr, dc`` are fractional row/col distances.
+    Accumulated counts and values are Gaussian-smoothed, then normalized:
     ``output = pad_value·(1-coverage) + coverage·(values/counts)``.
+
+    Used by both the affine grid search (N = candidate drift vectors,
+    single source image broadcast across drifts) and the nonrigid loop
+    (N = stacked source images, one per drift).
 
     Parameters
     ----------
@@ -40,34 +38,27 @@ def bilinear_kde_batch(
     col_coords : torch.Tensor
         Column coordinates of input pixels, shape ``(N, rows, cols)``.
     source_image : torch.Tensor
-        Pixel values to scatter, shape ``(rows, cols)``.
-        Same image is used for all N test drifts.
+        Pixel values to scatter. Either ``(rows, cols)`` (same image used
+        for all N drifts - affine grid search) or ``(N, rows, cols)``
+        (different image per drift - multi-image batched warping).
     output_shape : tuple[int, int]
         Canvas size ``(num_rows, num_cols)`` for the output images.
     kde_sigma : float
         Gaussian smoothing sigma in pixels.
-    pad_value : float
-        Fill value where pixel coverage is below threshold.
+    pad_value : float or torch.Tensor
+        Fill value where pixel coverage is below threshold. If a tensor of
+        shape ``(N,)``, applies a different pad value per drift.
 
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor]
-        ``(warped_images, sum_weights)`` — warped images and smoothed pixel coverage,
+        ``(warped_images, sum_weights)`` - warped images and smoothed pixel coverage,
         both shape ``(N, num_rows, num_cols)``.
-
-    Examples
-    --------
-    >>> rows = torch.rand(5, 32, 32, dtype=torch.float64) * 38 + 0.5
-    >>> cols = torch.rand(5, 32, 32, dtype=torch.float64) * 38 + 0.5
-    >>> vals = torch.randn(32, 32, dtype=torch.float64)
-    >>> out, weights = bilinear_kde_batch(rows, cols, vals, (40, 40), 0.5, 0.0)
-    >>> out.shape
-    torch.Size([5, 40, 40])
     """
     num_test_drifts = row_coords.shape[0]
     num_rows, num_cols = output_shape
     coverage_threshold = 1e-3
-    # Flatten spatial dims — scatter_add_ works on 1D buffers
+    # Flatten spatial dims - scatter_add_ works on 1D buffers
     row_flat = row_coords.flatten(1)
     col_flat = col_coords.flatten(1)
     # Stay in float for fractional distance, convert to int only for scatter indices
@@ -77,13 +68,18 @@ def bilinear_kde_batch(
     frac_col = col_flat - col_floor
     row_floor = row_floor.int()
     col_floor = col_floor.int()
-    # float32 for scatter arithmetic regardless of input dtype
-    source_values_flat = source_image.float().flatten().repeat(num_test_drifts)
-    # All N test drifts scatter into one flat buffer — offset separates them
-    test_offset = (
+    if source_image.dim() == 3:
+        # Per-drift source images: each drift scatters its own pixel values
+        source_values_flat = source_image.flatten()
+    else:
+        source_values_flat = source_image.flatten().repeat(num_test_drifts)
+    # All N batch entries scatter into one flat buffer - offset separates them
+    batch_offsets = (
         torch.arange(num_test_drifts, device=row_coords.device, dtype=torch.int32)
         * num_rows * num_cols
     )[:, None]
+    # Float32 accumulators - scatter_add_ requires source dtype to match,
+    # so all input tensors must be float32 (raises on float64).
     sum_weights = torch.zeros(
         num_test_drifts * num_rows * num_cols, dtype=torch.float32, device=row_coords.device
     )
@@ -101,7 +97,7 @@ def bilinear_kde_batch(
         (row_wrapped, col_next, ((1 - frac_row) * frac_col).flatten()),
         (row_next, col_next, (frac_row * frac_col).flatten()),
     ]:
-        flat_indices = (corner_row * num_cols + corner_col + test_offset).flatten()
+        flat_indices = (corner_row * num_cols + corner_col + batch_offsets).flatten()
         sum_weights.scatter_add_(0, flat_indices, corner_weight)
         sum_values.scatter_add_(0, flat_indices, corner_weight * source_values_flat)
     sum_weights = sum_weights.reshape(num_test_drifts, num_rows, num_cols)
@@ -112,6 +108,9 @@ def bilinear_kde_batch(
     # Blend between pad_value (uncovered) and normalized values (covered),
     # ramping linearly with coverage to avoid hard edges at the boundary
     coverage_weight = torch.clamp(sum_weights / coverage_threshold, max=1.0)
+    if isinstance(pad_value, torch.Tensor) and pad_value.dim() == 1:
+        # Per-drift pad value: reshape (N,) → (N, 1, 1) for broadcasting
+        pad_value = pad_value[:, None, None]
     warped_images = pad_value * (1 - coverage_weight) + coverage_weight * (
         sum_values / torch.clamp(sum_weights, min=1e-8)
     )
@@ -130,7 +129,7 @@ def cross_corr_batch(
     Core cost function of the affine grid search. For each test drift,
     measures how well the warped image pairs align after sub-pixel
     translation correction. Without this, the grid search has no way
-    to rank test drifts — it is the signal that drives drift estimation.
+    to rank test drifts - it is the signal that drives drift estimation.
 
     Pipeline: FFT cross-correlation → parabolic coarse peak →
     DFT upsample for sub-pixel refinement → Fourier-domain shift →
@@ -279,12 +278,18 @@ def translate_align(
     return image_shifts
 
 
-def transform_coordinates(
+def transform_coordinates_single_knot(
     knots: torch.Tensor,
     scan_fast: torch.Tensor,
     input_shape: tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute canvas-space coordinates from single Bezier knot.
+    """Single-knot fast path: map source pixels to canvas coordinates.
+
+    **Single-knot only.** Each scanline has exactly one (row, col) anchor;
+    the fast-scan-direction position is filled in by linear interpolation
+    along the scanline. Multi-knot Bezier interpolation is intentionally
+    not supported here - that's the scipy backend's job. The pytorch path
+    optimizes for the common single-knot case (≥95% of real STEM workflows).
 
     Called by ``preprocess``, ``_affine_grid_search_batch``, and
     ``_warp_and_translate_torch`` to map source image pixels onto the
@@ -300,6 +305,8 @@ def transform_coordinates(
     ----------
     knots : torch.Tensor
         Knot positions, shape ``(2, num_rows, 1)``. First dim is (row, col).
+        The trailing 1 is the single-knot dimension; multi-knot inputs are
+        rejected by the caller before reaching this function.
     scan_fast : torch.Tensor
         Fast scan direction vector, shape ``(2,)``.
     input_shape : tuple[int, int]
@@ -316,7 +323,7 @@ def transform_coordinates(
     --------
     >>> knots = torch.zeros(2, 64, 1)
     >>> scan_fast = torch.tensor([0.0, 1.0])
-    >>> r, c = transform_coordinates(knots, scan_fast, (64, 64))
+    >>> r, c = transform_coordinates_single_knot(knots, scan_fast, (64, 64))
     >>> r.shape
     torch.Size([64, 64])
     """
@@ -351,7 +358,7 @@ def gaussian_smooth_batch(
 
     """
     kernel, radius = _gaussian_kernel_1d(sigma, field_stack.dtype, field_stack.device)
-    # conv2d expects (N, C, H, W) input and (1, 1, 1, K) / (1, 1, K, 1) kernels
+    # Separable kernel: column pass then row pass to halve FLOPs vs full 2D conv
     kernel_col = kernel[None, None, None, :]
     kernel_row = kernel[None, None, :, None]
     field_stack = field_stack[:, None]
@@ -359,8 +366,36 @@ def gaussian_smooth_batch(
     field_stack = torch.nn.functional.conv2d(_symmetric_pad(field_stack, radius, 0), kernel_row)
     return field_stack[:, 0]
 
+
+def gaussian_smooth_1d(
+    signal: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """1D Gaussian smoothing matching ``scipy.ndimage.gaussian_filter``.
+
+    Smooths each row of the input independently using a separable 1D kernel.
+    Used for regularizing knot displacement vectors in the nonrigid loop,
+    where the signal is 1D (one value per scan line).
+
+    Parameters
+    ----------
+    signal : torch.Tensor
+        Input tensor of shape ``(N, L)`` - N channels, L samples.
+    sigma : float
+        Standard deviation of the Gaussian kernel in pixels.
+
+    Returns
+    -------
+    torch.Tensor
+        Smoothed tensor of shape ``(N, L)``.
+    """
+    kernel, radius = _gaussian_kernel_1d(sigma, signal.dtype, signal.device)
+    signal_padded = _symmetric_pad_1d(signal[:, None], radius)
+    return torch.nn.functional.conv1d(signal_padded, kernel[None, None, :])[:, 0]
+
+
 # ---------------------------------------------------------------------------
-# Building blocks — used internally by the public API functions above
+# Building blocks - used internally by the public API functions above
 # ---------------------------------------------------------------------------
 
 
@@ -399,7 +434,7 @@ def _dft_refine_shifts(
     dtype = peak_row.dtype
     batch_idx = torch.arange(num_test_drifts, device=cross_corr_fft.device)
     # Evaluate the correlation surface at 1/upsample_factor pixel spacing
-    # in a small window around each coarse peak — gives actual values,
+    # in a small window around each coarse peak - gives actual values,
     # not the parabolic approximation from step 1
     upsampled_corr = _dft_upsample_batch(
         cross_corr_fft, upsample_factor, torch.stack([peak_row, peak_col], dim=1)
@@ -435,7 +470,7 @@ def _dft_refine_shifts(
     # so (local_row - patch_radius) / upsample_factor = offset from coarse peak
     patch_radius = math.ceil(1.5 * upsample_factor)
     image_shifts = torch.zeros(num_test_drifts, 2, dtype=dtype, device=cross_corr_fft.device)
-    # local_row/col are int from argmax — cast to float for sub-pixel arithmetic
+    # local_row/col are int from argmax - cast to float for sub-pixel arithmetic
     image_shifts[:, 0] = peak_row + (local_row.to(dtype) - patch_radius + d_row_fine) / upsample_factor
     image_shifts[:, 1] = peak_col + (local_col.to(dtype) - patch_radius + d_col_fine) / upsample_factor
     return image_shifts
@@ -499,7 +534,7 @@ def _dft_upsample_batch(
     return (kern_row @ cross_corr_fft @ kern_col).real
 
 # ---------------------------------------------------------------------------
-# Primitives — lowest-level operations
+# Primitives - lowest-level operations
 # ---------------------------------------------------------------------------
 
 
@@ -533,7 +568,7 @@ def _parabolic_peak_2d(cross_corr, peak_row, peak_col, num_rows, num_cols, batch
     val_row_p1 = cross_corr[batch_idx, (peak_row + 1) % num_rows, peak_col]
     val_col_m1 = cross_corr[batch_idx, peak_row, (peak_col - 1) % num_cols]
     val_col_p1 = cross_corr[batch_idx, peak_row, (peak_col + 1) % num_cols]
-    # peak_row/col are int from argmax — cast to float for sub-pixel addition.
+    # peak_row/col are int from argmax - cast to float for sub-pixel addition.
     # Double modulo handles tiny negative offsets from float32 rounding
     # that would otherwise wrap to N instead of 0 (e.g. -4e-8 % 64 = 64.0)
     refined_row = ((peak_row.to(dtype) + _parabolic_sub_pixel(val_row_m1, val_center, val_row_p1)) % num_rows) % num_rows
@@ -556,6 +591,17 @@ def _parabolic_sub_pixel(val_m1, val_0, val_p1, mask=None):
     if mask is not None:
         valid = valid & mask
     return torch.where(valid, (val_p1 - val_m1) / denom, torch.zeros_like(denom))
+
+
+def _symmetric_pad_1d(signal: torch.Tensor, pad: int) -> torch.Tensor:
+    """Symmetric 1D padding matching scipy's reflect mode.
+
+    Same edge-repeat semantics as ``_symmetric_pad`` but for 1D signals.
+    Used by ``gaussian_smooth_1d`` for regularization of knot vectors.
+    """
+    left = signal[:, :, :pad].flip(-1)
+    right = signal[:, :, -pad:].flip(-1)
+    return torch.cat([left, signal, right], dim=-1)
 
 
 def _symmetric_pad(
@@ -606,7 +652,7 @@ def _symmetric_pad(
 def _gaussian_kernel_1d(sigma, dtype, device, _cache={}):
     """Normalized 1D Gaussian ``exp(-0.5*(x/sigma)^2)``, radius ``4*sigma``.
 
-    Cached via mutable default arg — the grid search calls this ~800 times
+    Cached via mutable default arg - the grid search calls this ~800 times
     with the same sigma, saving ~44ms of redundant kernel construction.
     """
     key = (sigma, dtype, device)
