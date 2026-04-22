@@ -1166,6 +1166,162 @@ class DriftCorrection(AutoSerialize):
             result = minimize(cost_function, x0, method="L-BFGS-B", options=options)
             knots_updated = result.x.reshape(shape_knots)
         return knots_updated
+
+    @torch.inference_mode()
+    def generate_corrected(
+        self,
+        upsample_factor: int = 2,
+        output_original_shape: bool = True,
+        strip_padding: bool = False,
+        mask_output: bool = True,
+        mask_edge_blend: float = 8.0,
+        fourier_filter: bool = True,
+        filter_midpoint: float = 0.5,
+        kde_sigma: float | None = 0.5,
+        weight_thresh: float = 0.1,
+        show_merged: bool = True,
+        **kwargs,
+    ):
+        """Generate the final drift-corrected image on GPU using torch.
+
+        Parameters
+        ----------
+        upsample_factor : int, default 2
+            Factor to upsample the output image for enhanced interpolation accuracy.
+        output_original_shape : bool, default True
+            If True, crop the output image back to the original input dimensions.
+        strip_padding : bool, default False
+            If True (and output_original_shape is True), also strip the scan padding
+            to return only the original scan-area pixels.
+        mask_output : bool, default True
+            If True, mask the output using the probe position weights.
+        mask_edge_blend : float, default 8.0
+            Pixels over which the mask edge is blended.
+        fourier_filter : bool, default True
+            Whether to apply Fourier-based directional filtering to merge corrected images.
+        filter_midpoint : float, default 0.5
+            Midpoint for the sigmoid-based Fourier weighting filter.
+        kde_sigma : float or None, default 0.5
+            Standard deviation for kernel density estimation. Uses object's kde_sigma if None.
+        weight_thresh : float, default 0.1
+            Threshold for masking outputs.
+        show_merged : bool, default True
+            Whether to display the final corrected image.
+        **kwargs
+            Additional keyword arguments passed to the plotting function.
+
+        Returns
+        -------
+        image_corr : Dataset2d
+            The final drift-corrected output image.
+        """
+        if not hasattr(self, "knots"):
+            raise RuntimeError(
+                "No knots found. Call .preprocess() before generating the corrected image."
+            )
+
+        device = self._device
+        dtype = self._dtype
+        up_h = round(self.shape[1] * upsample_factor)
+        up_w = round(self.shape[2] * upsample_factor)
+        canvas_shape = (up_h, up_w)
+
+        if kde_sigma is None:
+            kde_sigma = self.kde_sigma
+
+        stack_corr = torch.zeros(self.shape[0], up_h, up_w, dtype=dtype, device=device)
+        weight_corr = torch.zeros_like(stack_corr)
+        for img_idx in range(self.shape[0]):
+            knots_t = torch.as_tensor(self.knots[img_idx], dtype=dtype, device=device)
+            row_t, col_t = transform_coordinates_single_knot(
+                knots_t,
+                self.scan_fast_t[img_idx],
+                self.images[img_idx].shape,
+            )
+            warped, weights = bilinear_kde_batch(
+                row_t[None] * upsample_factor,
+                col_t[None] * upsample_factor,
+                self.images_t[img_idx],
+                canvas_shape,
+                kde_sigma * upsample_factor,
+                self.pad_value[img_idx],
+            )
+            stack_corr[img_idx] = warped[0]
+            weight_corr[img_idx] = weights[0]
+
+        if fourier_filter:
+            freq_row = torch.fft.fftfreq(up_h, dtype=dtype, device=device)[:, None]
+            freq_col = torch.fft.fftfreq(up_w, dtype=dtype, device=device)[None, :]
+            freq_angle = torch.atan2(freq_col, freq_row)
+            stack_fft = torch.fft.fft2(stack_corr)
+            weights = torch.zeros_like(stack_corr)
+            for img_idx in range(self.shape[0]):
+                weights[img_idx] = torch.abs(
+                    torch.remainder(
+                        (freq_angle - self.scan_direction[img_idx]) / np.pi + 0.5,
+                        1.0,
+                    ) - 0.5
+                ) / 0.5
+                weights[img_idx, 0, 0] = 1.0
+                weights[img_idx] = _bounded_sine_sigmoid_torch(
+                    weights[img_idx],
+                    midpoint=filter_midpoint,
+                )
+                stack_fft[img_idx] *= weights[img_idx]
+            weights_sum = weights.sum(0)
+            fft_sum = stack_fft.sum(0)
+            image_corr_fft = torch.where(
+                weights_sum > 0.0,
+                fft_sum / weights_sum.clamp(min=1e-8),
+                torch.zeros_like(fft_sum),
+            )
+        else:
+            image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
+
+        if mask_output:
+            weight_np = weight_corr.cpu().numpy()
+            mask_edge = np.prod(weight_np >= (weight_thresh / upsample_factor**2), axis=0)
+            mask_edge[:, 0] = False
+            mask_edge[:, -1] = False
+            mask_edge[0, :] = False
+            mask_edge[-1, :] = False
+            mask_inner = distance_transform_edt(mask_edge) <= mask_edge_blend
+            mask_np = (
+                np.cos(
+                    (np.pi / 2)
+                    * np.clip(distance_transform_edt(mask_inner) / mask_edge_blend, 0.0, 1.0)
+                )
+                ** 2
+            )
+            mask_t = torch.as_tensor(mask_np, dtype=dtype, device=device)
+            pad_value_mean = float(np.mean(self.pad_value))
+            image_corr_fft = torch.fft.fft2(
+                torch.fft.ifft2(image_corr_fft).real * mask_t + pad_value_mean * (1 - mask_t)
+            )
+
+        if output_original_shape:
+            image_corr_fft = _fourier_crop_torch(image_corr_fft, self.shape[-2:]) / upsample_factor**2
+
+        corr_np = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
+        if strip_padding and output_original_shape:
+            scan_h, scan_w = self.images[0].shape[:2]
+            canvas_h, canvas_w = corr_np.shape[:2]
+            pad_h = (canvas_h - scan_h) // 2
+            pad_w = (canvas_w - scan_w) // 2
+            corr_np = corr_np[pad_h:pad_h + scan_h, pad_w:pad_w + scan_w]
+
+        image_corr = Dataset2d.from_array(
+            corr_np,
+            name="drift corrected image",
+            origin=self.images[0].origin,
+            sampling=self.images[0].sampling,
+            units=self.images[0].units,
+        )
+        if show_merged:
+            show_2d(image_corr.array, **kwargs)
+            plt.show()
+        return image_corr
+
     def generate_corrected_image(
         self,
         upsample_factor: int = 2,
@@ -1645,3 +1801,32 @@ def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
     y[in_band] = np.sin(t * np.pi / 2) ** 2
     y[x > right] = 1.0
     return y
+
+
+def _bounded_sine_sigmoid_torch(
+    x: torch.Tensor,
+    midpoint: float = 0.5,
+    width: float = 1.0,
+) -> torch.Tensor:
+    width = min(width, 2 * midpoint, 2 * (1 - midpoint))
+    left = midpoint - width / 2
+    right = midpoint + width / 2
+    t = ((x - left) / width).clamp(0.0, 1.0)
+    return torch.where(x > right, torch.ones_like(x), torch.sin(t * (np.pi / 2)) ** 2)
+
+
+def _fourier_crop_torch(
+    fft_array: torch.Tensor,
+    crop_shape: tuple[int, int],
+) -> torch.Tensor:
+    crop_h, crop_w = crop_shape
+    h1 = crop_h // 2
+    h2 = crop_h - h1
+    w1 = crop_w // 2
+    w2 = crop_w - w1
+    result = torch.zeros(crop_shape, dtype=fft_array.dtype, device=fft_array.device)
+    result[:h1, :w1] = fft_array[:h1, :w1]
+    result[:h1, -w2:] = fft_array[:h1, -w2:]
+    result[-h2:, :w1] = fft_array[-h2:, :w1]
+    result[-h2:, -w2:] = fft_array[-h2:, -w2:]
+    return result

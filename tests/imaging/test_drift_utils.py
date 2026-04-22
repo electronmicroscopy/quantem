@@ -9,7 +9,9 @@ import pytest
 import torch
 from scipy.ndimage import gaussian_filter
 
-from quantem.core.utils.imaging_utils import bilinear_kde
+from quantem.core.utils.imaging_utils import bilinear_kde, fourier_cropping
+from quantem.imaging.drift import _bounded_sine_sigmoid_torch, _fourier_crop_torch
+from quantem.imaging.drift import bounded_sine_sigmoid
 from quantem.imaging.drift_utils import (
     _parabolic_peak_2d,
     _parabolic_sub_pixel,
@@ -186,3 +188,48 @@ def test_parabolic_sub_pixel_exact():
         val_p1 = torch.tensor([-(1 - offset) ** 2])
         result = _parabolic_sub_pixel(val_m1, val_0, val_p1)
         assert abs(result.item() - offset) < 1e-6, f"Failed for offset={offset}"
+
+
+# ---------------------------------------------------------------------------
+# generate_corrected helpers: torch parity against numpy originals
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("midpoint,width", [(0.5, 1.0), (0.3, 0.4), (0.7, 0.5)])
+def test_bounded_sine_sigmoid_torch_matches_numpy(midpoint, width):
+    """Torch sigmoid helper must match the numpy original point-for-point.
+
+    bounded_sine_sigmoid is the Fourier low-pass weight ramp used in
+    generate_corrected(). A mismatch would apply different weighting
+    to the merged output than the numpy path.
+    """
+    rng = np.random.default_rng(0)
+    x = rng.random(256).astype(np.float32)
+    expected = bounded_sine_sigmoid(x, midpoint=midpoint, width=width).astype(np.float32)
+    result = _bounded_sine_sigmoid_torch(
+        torch.tensor(x), midpoint=midpoint, width=width
+    ).numpy()
+    np.testing.assert_allclose(result, expected, atol=1e-6,
+        err_msg=f"Sigmoid mismatch at midpoint={midpoint}, width={width}")
+
+
+@pytest.mark.parametrize("input_shape,crop_shape", [
+    ((64, 64), (32, 32)),
+    ((48, 80), (24, 40)),
+    ((33, 33), (17, 17)),
+])
+def test_fourier_crop_torch_matches_numpy(input_shape, crop_shape):
+    """Torch Fourier crop must match fourier_cropping from imaging_utils.
+
+    This is applied to the upsampled FFT before the final IFFT in
+    generate_corrected(). A mismatch shifts power into wrong frequencies
+    and corrupts the corrected image.
+    """
+    rng = np.random.default_rng(1)
+    arr = (rng.random(input_shape) + 1j * rng.random(input_shape)).astype(np.complex64)
+    expected = fourier_cropping(arr, crop_shape)
+    result = _fourier_crop_torch(
+        torch.tensor(arr), crop_shape
+    ).numpy()
+    np.testing.assert_allclose(result, expected, atol=1e-6,
+        err_msg=f"Fourier crop mismatch: {input_shape} → {crop_shape}")
