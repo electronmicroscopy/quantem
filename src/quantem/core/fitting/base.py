@@ -785,14 +785,36 @@ class BCEMSELoss(nn.Module):
         
         return total_loss
 
+class SqrtMSELoss(nn.Module):
+    def __init__(
+        self,
+        gamma: float = 0.25,  
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.mse_fn = torch.nn.MSELoss(reduction="mean")
+    
+    def forward(self, pred, target):
+        return self.mse_fn(pred ** self.gamma, target ** self.gamma)
+
+class LogMSELoss(nn.Module):
+    def __init__(
+        self,  
+    ):
+        super().__init__()
+        self.mse_fn = torch.nn.MSELoss(reduction="mean")
+    
+    def forward(self, pred, target):
+        return self.mse_fn(torch.log(1+pred), torch.log(1+target))
+
 class FitBase(OptimizerMixin):
 
     def __init__(self):
         super().__init__()
         # Core wiring
         # self.loss_fn = torch.nn.L1Loss(reduction="mean")
-        self.loss_fn = torch.nn.MSELoss(reduction="mean")
-        # self.loss_fn = BCEMSELoss()
+        # self.loss_fn = torch.nn.MSELoss(reduction="mean")
+        self.loss_fn = SqrtMSELoss()
         self.model: AdditiveRenderModel | None = None
         self.ctx: RenderContext | None = None
 
@@ -828,6 +850,21 @@ class FitBase(OptimizerMixin):
         if self.model is None or self.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
         return self.model(self.ctx).detach().cpu().numpy()
+    
+    def set_loss(self, loss_fn: str = "sqrtmse", gamma: float = 0.25):
+        mode_in = loss_fn.strip().lower()
+        if mode_in in {"mse"}:
+            self.loss_fn = torch.nn.MSELoss(reduction="mean")
+        elif mode_in in {"sqrtmse"}:
+            self.loss_fn = SqrtMSELoss(gamma = gamma)
+        elif mode_in in {"logmse"}:
+            self.loss_fn = LogMSELoss()
+        elif mode_in in {"l1"}:
+            self.loss_fn = torch.nn.L1Loss(reduction="mean")
+        else:
+            raise ValueError(
+                "loss function must be mse, sqrtmse, logmse or l1"
+            )
 
     def reset(
         self,
