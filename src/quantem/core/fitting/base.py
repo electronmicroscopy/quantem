@@ -795,7 +795,15 @@ class SqrtMSELoss(nn.Module):
         self.mse_fn = torch.nn.MSELoss(reduction="mean")
     
     def forward(self, pred, target):
-        return self.mse_fn(pred ** self.gamma, target ** self.gamma)
+        eps = 1
+        pred_modified = (pred-torch.min(pred)+eps)**self.gamma
+        # pred_modified = pred_modified / torch.linalg.norm(pred_modified)
+
+        target_modified = (target-torch.min(target)+eps)**self.gamma
+        # target_modified = target_modified / torch.linalg.norm(target_modified)
+
+        loss = self.mse_fn(pred_modified, target_modified)
+        return loss
 
 class LogMSELoss(nn.Module):
     def __init__(
