@@ -69,12 +69,102 @@ def differentiable_rotx_vectorized(mags, theta, mode="bilinear"):
     return rotated_mags.permute(1, 2, 3, 0)
 
 
-def tv_loss_1d(x: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+def differentiable_shift_2d(image, shift_x, shift_y, sampling_rate):
     """
-    1D Total Variation Loss.
+    Shifts a 2D image using grid_sample in a differentiable manner.
 
-    Encourages piecewise smoothness by penalizing differences between
-    adjacent elements.
+    Args:
+        image: Tensor of shape [H, W]
+        shift_x: Scalar tensor (dx) for shift in x-direction (in physical units)
+        shift_y: Scalar tensor (dy) for shift in y-direction (in physical units)
+        sampling_rate: Scalar value (physical units per pixel) to correctly normalize shifts
+
+    Returns:
+        Shifted image of shape [H, W]
+    """
+    H, W = image.shape
+
+    # Convert physical shift to pixel shift
+    shift_x_pixel = shift_x
+    shift_y_pixel = shift_y
+
+    # Normalize shift for grid_sample (assuming align_corners=True)
+    normalized_shift_x = shift_x_pixel * 2 / (W - 1)
+    normalized_shift_y = shift_y_pixel * 2 / (H - 1)
+
+    # Create normalized grid
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=image.device),
+        torch.linspace(-1, 1, W, device=image.device),
+        indexing="ij",
+    )
+
+    grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)  # [1, H, W, 2]
+
+    # Apply shift (ensure it's differentiable)
+    grid[:, :, :, 0] -= normalized_shift_x
+    grid[:, :, :, 1] -= normalized_shift_y
+
+    # Add batch and channel dimensions
+    image = image.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+
+    # Sample using grid_sample (fully differentiable)
+    shifted_image = F.grid_sample(
+        image, grid, mode="bicubic", padding_mode="zeros", align_corners=True
+    )
+
+    return shifted_image.squeeze(0).squeeze(0)  # Back to [H, W]
+
+
+# --- TV loss ---
+
+
+def get_TV_loss(tensor, factor=1e-3):
+    tv_d = torch.pow(tensor[:, :, 1:, :, :] - tensor[:, :, :-1, :, :], 2).sum()
+    tv_h = torch.pow(tensor[:, :, :, 1:, :] - tensor[:, :, :, :-1, :], 2).sum()
+    tv_w = torch.pow(tensor[:, :, :, :, 1:] - tensor[:, :, :, :, :-1], 2).sum()
+    tv_loss = tv_d + tv_h + tv_w
+
+    return tv_loss * factor / (torch.prod(torch.tensor(tensor.shape)))
+
+
+# --- Gaussian filters ---
+
+
+def gaussian_kernel_1d(sigma: float, num_sigmas: float = 3.0) -> torch.Tensor:
+    radius = np.ceil(num_sigmas * sigma)
+    support = torch.arange(-radius, radius + 1, dtype=torch.float)
+    kernel = torch.distributions.Normal(loc=0, scale=sigma).log_prob(support).exp_()
+    # Ensure kernel weights sum to 1, so that image brightness is not altered
+    return kernel.mul_(1 / kernel.sum())
+
+
+def gaussian_filter_2d(
+    img: torch.Tensor, sigma: float, kernel_1d: torch.Tensor
+) -> torch.Tensor:  # Add kernel_1d as an argument
+    # kernel_1d = gaussian_kernel_1d(sigma)  # Create 1D Gaussian kernel - Moved outside function
+    padding = len(kernel_1d) // 2  # Ensure that image size does not change
+    img = img.unsqueeze(0).unsqueeze_(0)  # Make copy, make 4D for ``conv2d()``
+    # Convolve along columns and rows
+    img = torch.nn.functional.conv2d(img, weight=kernel_1d.view(1, 1, -1, 1), padding=(padding, 0))
+    img = torch.nn.functional.conv2d(img, weight=kernel_1d.view(1, 1, 1, -1), padding=(0, padding))
+    return img.squeeze_(0).squeeze_(0)  # Make 2D again
+
+
+def gaussian_filter_1d(
+    arr: torch.Tensor, kernel_1d: torch.Tensor
+) -> torch.Tensor:  # Replicate-padded torch alternative to ``scipy.ndimage.gaussian_filter1d``
+    padding = len(kernel_1d) // 2  # Ensure that signal size does not change
+    arr = arr.unsqueeze(0).unsqueeze_(0)  # Make copy, make 3D for ``conv1d()``
+    # Replicate edge values so the output has no zero-padded ringing at boundaries
+    arr = torch.nn.functional.pad(arr, (padding, padding), mode="replicate")
+    arr = torch.nn.functional.conv1d(arr, weight=kernel_1d.view(1, 1, -1))
+    return arr.squeeze_(0).squeeze_(0)  # Make 1D again
+
+
+def gaussian_filter_2d_stack(stack: torch.Tensor, kernel_1d: torch.Tensor) -> torch.Tensor:
+    """
+    Apply 2D Gaussian blur to each slice stack[:, i, :] in a vectorized way.
 
     Args:
         x:         Input tensor of shape (N, C, L) or (N, L) or (L,)

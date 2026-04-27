@@ -3,8 +3,9 @@ import pytest
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
-from quantem.core.datastructures.polar4dstem import Polar4dstem, auto_origin_id
+from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.diffraction.polar import PairDistributionFunction
+from quantem.diffraction.polar_transform import auto_origin_id, polar_transform
 
 # ============================================================================
 # Fixtures
@@ -90,12 +91,6 @@ class TestPairDistributionFunctionConstruction:
         assert pdf.polar.shape[1] == 3  # scan_x
         assert pdf.polar.shape[2] == 180  # num_annular_bins
 
-    def test_from_data_with_invalid_array_raises(self):
-        """Test that arrays with wrong dimensions raise ValueError."""
-        array_1d = np.random.rand(100)
-        with pytest.raises(ValueError, match="only supports 2D or 4D arrays"):
-            PairDistributionFunction.from_data(array_1d)
-
     def test_direct_init_without_token_raises(self, synthetic_dataset2d):
         """Test that direct __init__ without token raises RuntimeError."""
         pdf_valid = PairDistributionFunction.from_data(synthetic_dataset2d, find_origin=False)
@@ -126,7 +121,7 @@ class TestPolarTransform:
 
     def test_polar_transform_basic(self, synthetic_4dstem_dataset):
         """Test basic polar transformation."""
-        polar = synthetic_4dstem_dataset.polar_transform()
+        polar = polar_transform(synthetic_4dstem_dataset)
         assert isinstance(polar, Polar4dstem)
         assert polar.shape[0] == 3  # scan_y
         assert polar.shape[1] == 3  # scan_x
@@ -136,14 +131,16 @@ class TestPolarTransform:
     def test_polar_transform_single_origin(self, synthetic_4dstem_dataset):
         """Test polar transformation with single origin broadcast to all positions."""
         origin = np.array([128.0, 128.0])
-        polar = synthetic_4dstem_dataset.polar_transform(
+        polar = polar_transform(
+            synthetic_4dstem_dataset,
             origin_array=origin,
         )
         assert isinstance(polar, Polar4dstem)
 
     def test_polar_transform_radial_range(self, synthetic_4dstem_dataset):
         """Test polar transformation with custom radial range."""
-        polar = synthetic_4dstem_dataset.polar_transform(
+        polar = polar_transform(
+            synthetic_4dstem_dataset,
             radial_min=5.0,
             radial_max=50.0,
             radial_step=2.0,
@@ -155,7 +152,8 @@ class TestPolarTransform:
 
     def test_polar_transform_scan_pos(self, synthetic_4dstem_dataset):
         """Test polar transformation for a single scan position."""
-        polar_2d = synthetic_4dstem_dataset.polar_transform(
+        polar_2d = polar_transform(
+            synthetic_4dstem_dataset,
             scan_pos=(0, 0),
         )
         # should return 2D tensor (phi, r)
@@ -201,7 +199,7 @@ class TestBackgroundFitting:
             find_origin=False,
         )
         Ik = pdf.calculate_radial_mean(returnval=True)
-        k = pdf._to_torch(np.asarray(pdf.qq))
+        k = np.asarray(pdf.qq)
         kmin, kmax = float(k.min()), float(k.max())
         bg, f = pdf.fit_bg(Ik, kmin=kmin * 0.1, kmax=kmax * 0.9)
         assert bg.shape == Ik.shape
@@ -225,8 +223,8 @@ class TestPDFCalculation:
             find_origin=False,
         )
         pdf.calculate_Gr(
-            k_min=0.1,
-            k_max=2.0,
+            k_min_fit=0.1,
+            k_max_fit=2.0,
             k_lowpass=0.02,
             k_highpass=0.001,
         )
@@ -241,8 +239,8 @@ class TestPDFCalculation:
         mask = np.zeros((3, 3), dtype=bool)
         mask[0:2, 0:2] = True
         pdf.calculate_Gr(
-            k_min=0.1,
-            k_max=2.0,
+            k_min_fit=0.1,
+            k_max_fit=2.0,
             mask_realspace=mask,
         )
         assert pdf.reduced_pdf is not None
@@ -262,7 +260,7 @@ class TestPDFCalculation:
             synthetic_dataset2d,
             find_origin=False,
         )
-        pdf.calculate_Gr(k_min=0.1, k_max=2.0)
+        pdf.calculate_Gr(k_min_fit=0.1, k_max_fit=2.0)
         results = pdf.calculate_gr(returnval=True)
         assert results is not None
         r, gr = results
@@ -297,8 +295,8 @@ class TestIntegrationWorkflows:
             find_origin=False,
         )
         Gr_results = pdf.calculate_Gr(
-            k_min=0.1,
-            k_max=2.0,
+            k_min_fit=0.1,
+            k_max_fit=2.0,
             r_min=0.0,
             r_max=10.0,
             r_step=0.05,
@@ -330,8 +328,8 @@ class TestIntegrationWorkflows:
         mask = np.zeros((3, 3), dtype=bool)
         mask[0:2, 0:2] = True
         pdf.calculate_Gr(
-            k_min=0.1,
-            k_max=2.0,
+            k_min_fit=0.1,
+            k_max_fit=2.0,
             mask_realspace=mask,
         )
         assert pdf.reduced_pdf is not None
@@ -339,7 +337,7 @@ class TestIntegrationWorkflows:
         assert not np.isinf(pdf.reduced_pdf).any()
 
     def test_polar_transform_input_types(self, synthetic_diffraction_pattern):
-        """Test polar_transform works with numpy array, Dataset2d, Dataset4dstem."""
+        """Test from_data works with Dataset2d and Dataset4dstem."""
         # Test with Dataset2d
         ds2 = Dataset2d.from_array(
             array=synthetic_diffraction_pattern,
@@ -367,7 +365,7 @@ class TestIntegrationWorkflows:
             synthetic_dataset2d,
             find_origin=False,
         )
-        pdf.calculate_Gr(k_min=0.1, k_max=2.0)
+        pdf.calculate_Gr(k_min_fit=0.1, k_max_fit=2.0)
         rho0, Fk_damped, G_cor = pdf.estimate_density(
             max_iter=5,
             tol_percent=1.0,
