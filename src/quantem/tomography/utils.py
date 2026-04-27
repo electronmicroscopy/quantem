@@ -157,6 +157,17 @@ def gaussian_filter_2d(
     return img.squeeze_(0).squeeze_(0)  # Make 2D again
 
 
+def gaussian_filter_1d(
+    arr: torch.Tensor, kernel_1d: torch.Tensor
+) -> torch.Tensor:  # Replicate-padded torch alternative to ``scipy.ndimage.gaussian_filter1d``
+    padding = len(kernel_1d) // 2  # Ensure that signal size does not change
+    arr = arr.unsqueeze(0).unsqueeze_(0)  # Make copy, make 3D for ``conv1d()``
+    # Replicate edge values so the output has no zero-padded ringing at boundaries
+    arr = torch.nn.functional.pad(arr, (padding, padding), mode="replicate")
+    arr = torch.nn.functional.conv1d(arr, weight=kernel_1d.view(1, 1, -1))
+    return arr.squeeze_(0).squeeze_(0)  # Make 1D again
+
+
 def gaussian_filter_2d_stack(stack: torch.Tensor, kernel_1d: torch.Tensor) -> torch.Tensor:
     """
     Apply 2D Gaussian blur to each slice stack[:, i, :] in a vectorized way.
