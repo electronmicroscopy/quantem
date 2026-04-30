@@ -402,7 +402,7 @@ class SyntheticDiskLattice(RenderComponent):
         intensity_row_col: float | Sequence[float] = 0.0,
         per_disk_intensity: bool = False,
         per_disk_slopes: bool = True,
-        max_intensity_order: int | None = 0,
+        max_intensity_order: int | None = None,
         default_pattern_intensity_order: int | None = None,
         center_intensity_0: float | Sequence[float] | None = None,
         exclude_indices: Iterable[tuple[int, int]] | None = None,
