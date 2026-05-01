@@ -81,14 +81,26 @@ class MAPED(AutoSerialize):
         """
         Compute dataset summary images.
 
-        Stores
-        ------
-        self.scales : np.ndarray
+        Parameters
+        ----------
+        plot_summary : bool, optional
+            If True, display summary plots (default True).
+        scale : float or sequence of float or None, optional
+            Per-dataset scaling factor(s) (default None).
+
+        Attributes
+        ----------
+        scales : np.ndarray
             Per-dataset scaling factors (n,).
-        self.dp_mean : list[np.ndarray]
+        dp_mean : list[np.ndarray]
             Mean diffraction patterns (H, W), one per dataset.
-        self.im_bf : list[np.ndarray]
+        im_bf : list[np.ndarray]
             Mean bright-field images (R, C), one per dataset.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         n = len(self.datasets)
         if scale is None:
@@ -152,23 +164,28 @@ class MAPED(AutoSerialize):
 
         Parameters
         ----------
-        origins
+        origins : tuple or sequence, optional
             Optional manual origins. Can be:
             - a single (row, col) tuple, applied to all datasets
             - a list of (row, col) tuples of length n (one per dataset)
-        sigma
+        sigma : float, optional
             Optional low-pass smoothing sigma (pixels) applied to each mean DP prior to peak finding.
-        plot_origins
+        plot_origins : bool, optional
             If True, plot mean diffraction patterns with overlaid origin markers.
-        plot_indices
+        plot_indices : sequence of int, optional
             Optional indices to plot. If None, plots all datasets.
         **plot_kwargs
             Passed to show_2d.
 
-        Stores
-        ------
-        self.diffraction_origins : np.ndarray
+        Attributes
+        ----------
+        diffraction_origins : np.ndarray
             Array of shape (n, 2) with integer (row, col) origins.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         n = len(self.datasets)
         if not hasattr(self, "dp_mean"):
@@ -236,25 +253,30 @@ class MAPED(AutoSerialize):
 
         Parameters
         ----------
-        edge_blend
+        edge_blend : float
             Tukey window edge taper (pixels).
-        padding
+        padding : int or None
             Passed to shift_images for plotting.
-        pad_val
+        pad_val : str or float
             Passed to shift_images for plotting.
-        upsample_factor
+        upsample_factor : int
             Subpixel upsampling factor for correlation peak estimation.
-        weight_scale
+        weight_scale : float
             Radial weight falloff scale (fraction of mean DP size).
-        plot_aligned
+        plot_aligned : bool
             If True, plot aligned mean diffraction patterns.
         **plot_kwargs
             Passed to show_2d when plotting.
 
-        Stores
-        ------
-        self.diffraction_shifts : np.ndarray
+        Attributes
+        ----------
+        diffraction_shifts : np.ndarray
             Array of shape (n, 2) with (row, col) shifts to align diffraction patterns.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         if not hasattr(self, "dp_mean"):
             raise RuntimeError("Run preprocess() first so self.dp_mean exists.")
@@ -339,37 +361,42 @@ class MAPED(AutoSerialize):
 
         Parameters
         ----------
-        num_images
+        num_images : int, optional
             If provided, align only the first num_images images.
-        num_iter
+        num_iter : int
             Number of refinement iterations.
-        edge_blend
+        edge_blend : float
             Used to set default correlation padding when max_shift is None.
-        padding
+        padding : int or None
             Passed to shift_images for plotting.
-        pad_val
+        pad_val : str or float
             Passed to shift_images for plotting.
-        upsample_factor
+        upsample_factor : int
             Subpixel upsampling factor for correlation peak estimation.
-        max_shift
+        max_shift : float, optional
             Optional maximum shift constraint passed to weighted_cross_correlation_shift.
-        shift_method
+        shift_method : str
             Passed to shift_images for plotting ('bilinear' or 'fourier').
-        edge_filter
+        edge_filter : bool
             If True, correlate on gradient magnitude instead of raw intensity.
-        edge_sigma
+        edge_sigma : float
             Gaussian sigma applied to gradients when edge_filter is True.
-        hanning_filter
+        hanning_filter : bool
             If True, apply a Hanning window prior to FFT.
-        plot_aligned
+        plot_aligned : bool
             If True, plot aligned mean BF images.
         **plot_kwargs
             Passed to show_2d when plotting.
 
-        Stores
-        ------
-        self.real_space_shifts : np.ndarray
+        Attributes
+        ----------
+        real_space_shifts : np.ndarray
             Array of shape (n_total, 2) with (row, col) shifts for aligned datasets.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         if not hasattr(self, "im_bf"):
             raise RuntimeError("Run preprocess() first so self.im_bf exists.")
@@ -505,12 +532,14 @@ class MAPED(AutoSerialize):
         """
         Merge aligned datasets into a single Dataset4dstem.
 
-        Requires
-        --------
+        Notes
+        -----
+        Requires the following attributes to be present on ``self``:
+
         self.real_space_shifts
-            From real_space_align().
+            From ``real_space_align()``.
         self.diffraction_shifts
-            From diffraction_align().
+            From ``diffraction_align()``.
 
         Parameters
         ----------
@@ -861,14 +890,26 @@ class MAPEDTorch(AutoSerialize):
         """
         Compute dataset summary images.
 
-        Stores
-        ------
-        self.scales : torch.tensor
+        Parameters
+        ----------
+        plot_summary : bool, optional
+            If True, display summary plots (default True).
+        scale : float or sequence of float or None, optional
+            Per-dataset scaling factor(s) (default None).
+
+        Attributes
+        ----------
+        scales : torch.tensor
             Per-dataset scaling factors (n,).
-        self.dp_mean : list[torch.tensor]
+        dp_mean : list[torch.tensor]
             Mean diffraction patterns (H, W), one per dataset.
-        self.im_bf : list[torch.tensor]
+        im_bf : list[torch.tensor]
             Mean bright-field images (R, C), one per dataset.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         n = len(self.datasets)
 
@@ -890,7 +931,6 @@ class MAPEDTorch(AutoSerialize):
 
         for d in self.datasets:
             dp_arr = torch.mean(d, dim=(0, 1))
-
             im_bf_arr = torch.mean(d, dim=(2, 3))
 
             self.dp_mean.append(dp_arr)
@@ -907,10 +947,10 @@ class MAPEDTorch(AutoSerialize):
 
     def diffraction_origin(
         self,
-        origins=None,
-        sigma=None,
+        origins: tuple | list | None = None,
+        sigma: float | None = None,
         plot_origins: bool = True,
-        plot_indices=None,
+        plot_indices: list | None = None,
         **plot_kwargs: Any,
     ) -> MAPED:
         """
@@ -918,23 +958,28 @@ class MAPEDTorch(AutoSerialize):
 
         Parameters
         ----------
-        origins
+        origins : tuple or list, optional
             Optional manual origins. Can be:
             - a single (row, col) tuple, applied to all datasets
             - a list of (row, col) tuples of length n (one per dataset)
-        sigma
+        sigma : float, optional
             Optional low-pass smoothing sigma (pixels) applied to each mean DP prior to peak finding.
-        plot_origins
+        plot_origins : bool, optional
             If True, plot mean diffraction patterns with overlaid origin markers.
-        plot_indices
+        plot_indices : list, optional
             Optional indices to plot. If None, plots all datasets.
         **plot_kwargs
             Passed to show_2d.
 
-        Stores
-        ------
-        self.diffraction_origins : np.ndarray
+        Attributes
+        ----------
+        diffraction_origins : np.ndarray
             Array of shape (n, 2) with integer (row, col) origins.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         n = len(self.datasets)
         if not hasattr(self, "dp_mean"):
@@ -996,12 +1041,12 @@ class MAPEDTorch(AutoSerialize):
 
     def dscan_align(
         self,
-        iterations,
+        iterations: int,
         upsample_factor: int = 100,
         plot_aligned: bool = True,
         edge_blend: float = 2.0,
-        fit_shifts=True,
-        mode="linear",
+        fit_shifts: bool = True,
+        mode: str = "linear",
     ):
         for i, dataset in enumerate(self.datasets):
             _, aligned_dataset, _ = dscan_correct(
@@ -1033,25 +1078,30 @@ class MAPEDTorch(AutoSerialize):
 
         Parameters
         ----------
-        edge_blend
+        edge_blend : float
             Tukey window edge taper (pixels).
-        padding
+        padding : int or tuple, optional
             Passed to shift_images for plotting.
-        pad_val
+        pad_val : str or float
             Passed to shift_images for plotting.
-        upsample_factor
+        upsample_factor : int
             Subpixel upsampling factor for correlation peak estimation.
-        weight_scale
+        weight_scale : float
             Radial weight falloff scale (fraction of mean DP size).
-        plot_aligned
+        plot_aligned : bool
             If True, plot aligned mean diffraction patterns.
         **plot_kwargs
             Passed to show_2d when plotting.
 
-        Stores
-        ------
-        self.diffraction_shifts : np.ndarray
+        Attributes
+        ----------
+        diffraction_shifts : np.ndarray
             Array of shape (n, 2) with (row, col) shifts to align diffraction patterns.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         if not hasattr(self, "dp_mean"):
             raise RuntimeError("Run preprocess() first so self.dp_mean exists.")
@@ -1154,37 +1204,42 @@ class MAPEDTorch(AutoSerialize):
 
         Parameters
         ----------
-        num_images
+        num_images : int, optional
             If provided, align only the first num_images images.
-        num_iter
+        num_iter : int
             Number of refinement iterations.
-        edge_blend
+        edge_blend : float
             Used to set default correlation padding when max_shift is None.
-        padding
+        padding : int or tuple, optional
             Passed to shift_images for plotting.
-        pad_val
+        pad_val : float
             Passed to shift_images for plotting.
-        upsample_factor
+        upsample_factor  : int
             Subpixel upsampling factor for correlation peak estimation.
-        max_shift
+        max_shift : float
             Optional maximum shift constraint passed to weighted_cross_correlation_shift.
-        shift_method
+        shift_method : 'bilinear' or 'fourier'
             Passed to shift_images for plotting ('bilinear' or 'fourier').
-        edge_filter
+        edge_filter : bool
             If True, correlate on gradient magnitude instead of raw intensity.
-        edge_sigma
+        edge_sigma : float
             Gaussian sigma applied to gradients when edge_filter is True.
-        hanning_filter
+        hanning_filter : bool
             If True, apply a Hanning window prior to FFT.
-        plot_aligned
+        plot_aligned : bool
             If True, plot aligned mean BF images.
         **plot_kwargs
             Passed to show_2d when plotting.
 
-        Stores
-        ------
-        self.real_space_shifts : np.ndarray
+        Attributes
+        ----------
+        real_space_shifts : np.ndarray
             Array of shape (n_total, 2) with (row, col) shifts for aligned datasets.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
         """
         if not hasattr(self, "im_bf"):
             raise RuntimeError("Run preprocess() first so self.im_bf exists.")
@@ -1322,11 +1377,11 @@ class MAPEDTorch(AutoSerialize):
 
     def merge_datasets(
         self,
-        real_space_padding=0,
-        real_space_edge_blend=1.0,
-        diffraction_padding=0,
-        diffraction_edge_blend=0.0,
-        diffraction_pad_val="min",
+        real_space_padding: int = 0,
+        real_space_edge_blend: float = 1.0,
+        diffraction_padding: int = 0,
+        diffraction_edge_blend: float = 0.0,
+        diffraction_pad_val: str | float = "min",
         shift_method: str = "bilinear",
         dtype=None,
         scale_output: bool = False,
@@ -1337,34 +1392,36 @@ class MAPEDTorch(AutoSerialize):
         """
         Merge aligned datasets into a single Dataset4dstem.
 
-        Requires
-        --------
+        Notes
+        -----
+        Requires the following attributes to be present on ``self``:
+
         self.real_space_shifts
-            From real_space_align().
+            From ``real_space_align()``.
         self.diffraction_shifts
-            From diffraction_align().
+            From ``diffraction_align()``.
 
         Parameters
         ----------
-        real_space_padding
+        real_space_padding : int
             Output scan padding in pixels (adds border to scan grid).
-        real_space_edge_blend
+        real_space_edge_blend : float
             Tukey taper width for scan-space interpolation weights.
-        diffraction_padding
+        diffraction_padding : int
             Output diffraction padding in pixels (adds border around DPs).
-        diffraction_edge_blend
+        diffraction_edge_blend : float
             Tukey taper width for diffraction-space weights.
-        diffraction_pad_val
+        diffraction_pad_val : str | float
             Pad value for diffraction padding ('min','max','mean','median' or float).
-        shift_method
+        shift_method : str
             Diffraction shift method: 'bilinear' or 'fourier'.
-        dtype
+        dtype : str or torch.dtype, optional
             Output dtype. If None, uses parent dtype.
-        scale_output
+        scale_output : bool
             If True and dtype is integer, scale to full dynamic range using global max.
-        plot_result
+        plot_result : bool
             If True, plot merged BF and merged mean DP.
-        batch_size
+        batch_size : int, optional
             Number of rows to process per batch. If None, uses adaptive sizing (1-32 rows).
         **plot_kwargs
             Passed to show_2d.
@@ -1678,10 +1735,10 @@ class MAPEDTorch(AutoSerialize):
 
 
 def shift_images(
-    images,
-    shifts_rc,
+    images: list[np.ndarray],
+    shifts_rc: np.ndarray,
     edge_blend: float = 8.0,
-    padding=None,
+    padding: int | None = None,
     pad_val: str | float = 0.0,
     shift_method: str = "bilinear",
 ):
@@ -1690,17 +1747,17 @@ def shift_images(
 
     Parameters
     ----------
-    images
+    images : list of np.ndarray
         Sequence of (H, W) arrays.
-    shifts_rc
+    shifts_rc : np.ndarray
         Array-like of shape (n, 2) with (row, col) shifts for each image.
-    edge_blend
+    edge_blend : float, optional
         Tukey taper width in pixels for image blending.
-    padding
+    padding : int
         Output padding. If None, set from max shift and edge_blend.
-    pad_val
+    pad_val : str | float optional
         Fill value outside support ('min','max','mean','median' or float).
-    shift_method
+    shift_method : str
         'bilinear' or 'fourier'.
 
     Returns
@@ -1814,18 +1871,18 @@ def tukey_torch(N, alpha=0.5, device=None, dtype=torch.float32):
 
     Parameters
     ----------
-    N
-        int, Length of the window.
-    alpha
-        float, Shape parameter for the Tukey window.
-    device
-        torch.device, Device on which to create the window.
-    dtype
+    N : int
+        Length of the window.
+    alpha : float
+        Shape parameter for the Tukey window.
+    device : torch.device | str
+        Device on which to create the window.
+    dtype : torch.dtype
         torch.dtype, Data type of the window.
 
     Returns
     -------
-    torch.Tensor
+    window : torch.Tensor
         1D Tukey window of length N.
     """
     n = torch.arange(N, device=device, dtype=dtype)
@@ -1874,8 +1931,10 @@ def shift_images_torch(
 
     Returns
     -------
-    torch.Tensor — shifted (and blended) images; if input was a single image, returns (Hp, Wp),
-    otherwise returns (n, Hp, Wp) for blended result or (n, H, W) for non-blended.
+    torch.Tensor
+        Shifted (and blended) images. If the input was a single image, returns an array
+        of shape (Hp, Wp). Otherwise returns (n, Hp, Wp) for blended result or (n, H, W)
+        for the non-blended case.
     """
     single = images.dim() == 2
     if single:
@@ -2053,6 +2112,15 @@ def dscan_correct(
         Whether to fit shifts to a smooth surface
     mode : str
         "linear" or "quadratic" for surface fitting
+
+    Returns
+    -------
+    tuple
+        A tuple ``(diffraction_shifts, shifted_dps, G_ref_final)`` where
+        ``diffraction_shifts`` is a ``torch.Tensor`` of shape (H_rs, W_rs, 2) with
+        per-scan-position shifts, ``shifted_dps`` is the aligned dataset (same shape
+        as ``dataset``), and ``G_ref_final`` is the final complex Fourier-domain
+        reference (torch.Tensor).
     """
     H_rs, W_rs, H_dp, W_dp = dataset.shape
 
