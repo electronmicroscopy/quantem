@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import NoneType
 from typing import Any, Literal, Self, Sequence, cast
 
 import numpy as np
@@ -954,10 +955,11 @@ class FitBase(OptimizerMixin):
         )
 
         pbar = tqdm(range(n_steps), desc="Fit render", disable=not progress)
+        loss_vals = torch.empty(n_steps, device=self.ctx.device)
 
         losses: list[float] = []
         lrs: list[float] = []
-        for _ in pbar:
+        for step in pbar:
             self.model.zero_grad_optimizers()
             pred = self._forward_for_fit(target=target, **kwargs)
             data_loss = self._fidelity_loss(pred, target, **kwargs)
@@ -968,9 +970,10 @@ class FitBase(OptimizerMixin):
             if self.model is None or self.ctx is None:
                 raise RuntimeError("Model and context are not defined for fitting.")
             self.model.apply_hard_constraints(self.ctx)
-            total_loss_value = float(total_loss.detach().cpu())
+            total_loss_value = (total_loss.detach())
             self.model.step_schedulers(total_loss_value)
-            losses.append(total_loss_value)
+            # losses.append(total_loss_value)
+            loss_vals[step] = total_loss_value
 
             first_lr = 0.0
             if len(self.model.components) > 0:
@@ -981,6 +984,7 @@ class FitBase(OptimizerMixin):
                     except (AttributeError, TypeError):
                         first_lr = 0.0
             lrs.append(first_lr)
+        losses = loss_vals.cpu().tolist()
 
         key = str(run_key)
         if key in self.fit_history:
