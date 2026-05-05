@@ -101,7 +101,7 @@ class Dataset4dstem(Dataset4d):
         ----------
         file_path : str | PathLike
             Path to the data file
-        file_type : str
+        file_type : str | None
             The type of file reader needed. See rosettasciio for supported formats
             https://hyperspy.org/rosettasciio/supported_formats/index.html
 

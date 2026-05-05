@@ -1,3 +1,4 @@
+
 import warnings
 from typing import Any, Literal
 
@@ -829,50 +830,94 @@ class PtychographyVisualizations(PtychographyBase):
             **kwargs,
         )
 
-    def show_scan_positions(self, plot_radii: bool = True):
-        """
-        Show the scan positions and the probe radius.
+    def show_scan_positions(
+        self,
+        plot_radii: bool = True,
+        num_probes: int | None = None,
+        axsize: tuple[int, int] = (10, 10),
+        edgecolors: str = "red",
+        linewidths: float = 0.5,
+        **kwargs,
+    ):
+        r"""Show scan positions, probe radii, and overlap metadata
+
+        Visualize probe coverage to verify sufficient overlap for
+        ptychographic reconstruction. The probe radius is estimated as
+        :math:`r = 0.61 \lambda / \alpha + |\Delta f| \cdot \alpha`
+        where :math:`\lambda` is the electron wavelength, :math:`\alpha` is
+        the convergence semi-angle, and :math:`\Delta f` is the defocus.
+        Overlap is :math:`(d - s)/d = 1 - s/d` where :math:`d = 2r` is
+        the probe diameter and :math:`s` is the scan step size.
+
         Parameters
         ----------
-        plot_radii: bool, optional
-            Whether to plot the probe radius, by default True
+        plot_radii : bool, optional
+            Whether to plot the probe radius. Default is True
+        num_probes : int | None, optional
+            Number of probe positions to display. Default is 3 rows
+            of scan positions
+        axsize : tuple[int, int], optional
+            Size of the figure axes. Default is (10, 10)
+        edgecolors : str, optional
+            Edge color for the probe circles. Default is "red"
+        linewidths : float, optional
+            Line width of the probe circles. Default is 0.5
+        **kwargs
+            Additional keyword arguments passed to ``matplotlib.axes.Axes.scatter``
 
-        Returns
-        -------
-        None
+        Examples
+        --------
+        >>> ptycho.show_scan_positions()
+        Scan grid: 192 x 192 positions
+        FOV: 133.46 x 133.46 Å
+        Probe diameter (rough estimate): 3.46 Å
+        Step size: 0.70 Å
+        Probe overlap (rough estimate): 79.8%
+
+        >>> ptycho.show_scan_positions(num_probes=10, edgecolors="b", linewidths=0.5)
         """
         # for each scan position, sum the intensity of self.probe at that position
         scan_positions = self.dset.scan_positions_px.cpu().detach().numpy()
-
         probe_params = self.probe_model.probe_params
         probe_radius_px = None
-
         conv_angle = probe_params.get("semiangle_cutoff")
         defocus = probe_params.get("defocus", 0)
         energy = probe_params.get("energy")
+        scan_gpts = self.dset.gpts
+        scan_sampling = self.dset.scan_sampling
+        fov = scan_sampling * (np.array(scan_gpts) - 1)
+        print(f"Scan grid: {scan_gpts[0]} x {scan_gpts[1]} positions")
+        print(f"Object FOV: {fov[0]:.2f} x {fov[1]:.2f} Å")
 
         if conv_angle is not None and energy is not None:
             from quantem.core.utils.utils import electron_wavelength_angstrom
-
             wavelength = electron_wavelength_angstrom(energy)
             conv_angle_rad = conv_angle * 1e-3
-
             # For defocused probe: radius ≈ |defocus| * convergence_angle + diffraction_limit
-            diffraction_limit_angstrom = 0.61 * wavelength / conv_angle_rad
-            defocus_blur_angstrom = abs(defocus) * conv_angle_rad
-            probe_radius_angstrom = diffraction_limit_angstrom + defocus_blur_angstrom
-            probe_radius_px = probe_radius_angstrom / self.sampling[0]
+            diffraction_limit_A = 0.61 * wavelength / conv_angle_rad
+            defocus_blur_A = abs(defocus) * conv_angle_rad
+            probe_radius_A = diffraction_limit_A + defocus_blur_A
+            probe_radius_px = probe_radius_A / self.sampling[0]
+            probe_diameter_A = 2 * probe_radius_A
+            probe_step_size_A = scan_sampling[0]
+            overlap = max(0.0, 1 - probe_step_size_A / probe_diameter_A)
+            print(f"Probe diameter (rough estimate): {probe_diameter_A:.2f} Å")
+            print(f"Step size: {probe_step_size_A:.2f} Å")
+            print(f"Probe overlap (rough estimate): {overlap * 100:.1f}%")
 
-        _fig, ax = show_2d(self._get_probe_overlap(), title="probe overlap")
+        _fig, ax = show_2d(self._get_probe_overlap(), title="probe overlap", axsize=axsize)
         if probe_radius_px is not None and plot_radii:
             # plot a circle with the probe radius for each probe position
+            if num_probes is None:
+                num_probes = 3 * scan_gpts[1]  # 3 rows worth
             ax.scatter(
-                scan_positions[:, 1],
-                scan_positions[:, 0],
+                scan_positions[:num_probes, 1],
+                scan_positions[:num_probes, 0],
                 s=probe_radius_px**2,
-                edgecolors="red",
-                c="none",
-                linestyle="--",
+                facecolors="none",
+                edgecolors=edgecolors,
+                linewidths=linewidths,
+                **kwargs,
             )
         plt.show()
 

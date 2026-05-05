@@ -52,6 +52,7 @@ class DiskTemplate(RenderComponent):
     DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
         "force_center": False,
         "force_positive": True,
+<<<<<<< HEAD
         "force_norm": True, # force range [0,1]
         "force_shrinkage": False,
         "force_cutoff": False,
@@ -71,6 +72,10 @@ class DiskTemplate(RenderComponent):
         "circular_mask_sharpness": 0,
         "soft_circular_mask": False,
     }
+=======
+    }
+    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {"tv_weight": 0.0}
+>>>>>>> upstream/fitting_models_clean
 
     def __init__(
         self,
@@ -83,7 +88,10 @@ class DiskTemplate(RenderComponent):
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
         constraint_params: dict[str, Any] | None = None,
+<<<<<<< HEAD
         constraint_config: dict[str, Any] | None = None,
+=======
+>>>>>>> upstream/fitting_models_clean
     ):
         """
         Build a disk template renderer centered at the shared origin.
@@ -143,17 +151,23 @@ class DiskTemplate(RenderComponent):
         cc = cc.astype(np.float32) - (wt - 1) * 0.5
         self.register_buffer("dr", torch.as_tensor(rr.ravel(), dtype=torch.float32))
         self.register_buffer("dc", torch.as_tensor(cc.ravel(), dtype=torch.float32))
+<<<<<<< HEAD
 
         self.constraint_config = self.DEFAULT_CONSTRAINT_CONFIG.copy()
         if constraint_config is not None:
             self.constraint_config.update(constraint_config)
         
+=======
+>>>>>>> upstream/fitting_models_clean
         if constraint_params is not None:
             self.apply_constraint_params(constraint_params, strict=True)
         if bool(self.hard_constraints.get("force_positive", False)):
             self._enforce_positivity()
+<<<<<<< HEAD
         if bool(self.hard_constraints.get("force_shrinkage", False)) and bool(self.hard_constraints.get("force_positive", True)):
             raise RuntimeWarning("Setting shrinkage true and positivity false might cause negative values in disk template")
+=======
+>>>>>>> upstream/fitting_models_clean
 
     @classmethod
     def from_array(
@@ -167,8 +181,11 @@ class DiskTemplate(RenderComponent):
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
         constraint_params: dict[str, Any] | None = None,
+<<<<<<< HEAD
         constraint_config: dict[str, Any] | None = None,
 
+=======
+>>>>>>> upstream/fitting_models_clean
     ) -> "DiskTemplate":
         return cls(
             name=name,
@@ -179,8 +196,11 @@ class DiskTemplate(RenderComponent):
             origin_key=origin_key,
             intensity=intensity,
             constraint_params=constraint_params,
+<<<<<<< HEAD
             constraint_config=constraint_config,
 
+=======
+>>>>>>> upstream/fitting_models_clean
         )
 
     def set_origin(self, origin: OriginND) -> None:
@@ -267,6 +287,7 @@ class DiskTemplate(RenderComponent):
         with torch.no_grad():
             self.template_raw.clamp_(min=0.0)
             self.intensity_raw.clamp_(min=0.0)
+<<<<<<< HEAD
     
     def _enforce_norm(self) -> None: # pick value and cut off 5 percent of mean, or every iteration shrinkage, every iteration just subtract a valye of 0.01
         with torch.no_grad():
@@ -298,10 +319,13 @@ class DiskTemplate(RenderComponent):
                 mask = circle_matrix <= radius
             self.template_raw *= mask
 
+=======
+>>>>>>> upstream/fitting_models_clean
 
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:
         if bool(self.hard_constraints.get("force_center", False)):
             self._center_disk()
+<<<<<<< HEAD
         if bool(self.hard_constraints.get("force_cutoff", False)):
             self._enforce_cutoff()
         if bool(self.hard_constraints.get("force_circular_mask", False)):
@@ -313,6 +337,10 @@ class DiskTemplate(RenderComponent):
         if bool(self.hard_constraints.get("force_norm", False)): # could be put in positivity
             self._enforce_norm()
         
+=======
+        if bool(self.hard_constraints.get("force_positive", False)):
+            self._enforce_positivity()
+>>>>>>> upstream/fitting_models_clean
         super().enforce_hard_constraints(ctx)
 
     def constraint_loss(
@@ -320,6 +348,7 @@ class DiskTemplate(RenderComponent):
     ) -> torch.Tensor:
         cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
         tv_weight = float(cfg.get("tv_weight", 0.0))
+<<<<<<< HEAD
         cutoff_weight = float(cfg.get("cutoff_weight", 0.0))
         circular_weight = float(cfg.get("circular_weight", 0.0))
         
@@ -331,6 +360,10 @@ class DiskTemplate(RenderComponent):
             circular_weight = 0.0
 
         # tv loss calculation
+=======
+        if tv_weight <= 0.0:
+            return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+>>>>>>> upstream/fitting_models_clean
         template = self.template_raw.to(device=ctx.device, dtype=ctx.dtype)
         tv_r = (
             torch.mean(torch.abs(template[1:, :] - template[:-1, :]))
@@ -342,6 +375,7 @@ class DiskTemplate(RenderComponent):
             if template.shape[1] > 1
             else torch.zeros((), device=ctx.device, dtype=ctx.dtype)
         )
+<<<<<<< HEAD
         tv_loss = torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
 
         # Cutoff loss calculation
@@ -376,6 +410,9 @@ class DiskTemplate(RenderComponent):
         return params
 
         
+=======
+        return torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
+>>>>>>> upstream/fitting_models_clean
 
 
 class SyntheticDiskLattice(RenderComponent):
@@ -624,6 +661,7 @@ class SyntheticDiskLattice(RenderComponent):
                     self.i0_raw[idx].clamp_(max=float(hi))
         super().enforce_hard_constraints(ctx)
 
+<<<<<<< HEAD
     # def forward(self, ctx: RenderContext) -> torch.Tensor:
     #     if self.origin is None:
     #         raise RuntimeError("SyntheticDiskLattice requires an OriginND instance.")
@@ -691,6 +729,8 @@ class SyntheticDiskLattice(RenderComponent):
 
     #     return out
 
+=======
+>>>>>>> upstream/fitting_models_clean
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
             raise RuntimeError("SyntheticDiskLattice requires an OriginND instance.")
@@ -710,6 +750,7 @@ class SyntheticDiskLattice(RenderComponent):
         b = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
         keep = (centers_r >= b) & (centers_r <= (ctx.shape[0] - 1) - b)
         keep = keep & (centers_c >= b) & (centers_c <= (ctx.shape[1] - 1) - b)
+<<<<<<< HEAD
         if not torch.any(keep):
             return out
         
@@ -717,6 +758,11 @@ class SyntheticDiskLattice(RenderComponent):
         centers_c = centers_c[keep]
         keep_idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
         num_disks = centers_r.shape[0]
+=======
+        keep_idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
+        if keep_idx.numel() == 0:
+            return out
+>>>>>>> upstream/fitting_models_clean
 
         active_order = int(
             ctx.fields.get(
@@ -725,6 +771,7 @@ class SyntheticDiskLattice(RenderComponent):
         )
         active_order = max(0, min(active_order, self.max_intensity_order))
 
+<<<<<<< HEAD
         dr = cast(torch.Tensor, self.disk.dr).to(device=ctx.device, dtype=ctx.dtype)
         dc = cast(torch.Tensor, self.disk.dc).to(device=ctx.device, dtype=ctx.dtype)
         patch_vals = self.disk.patch_values().to(device=ctx.device, dtype=ctx.dtype)
@@ -775,3 +822,41 @@ class SyntheticDiskLattice(RenderComponent):
             if not name.startswith('disk.') and param.requires_grad:
                 params.append(param)
         return params
+=======
+        dr, dc = self.disk.patch_offsets()
+        dr = dr.to(device=ctx.device, dtype=ctx.dtype)
+        dc = dc.to(device=ctx.device, dtype=ctx.dtype)
+        dr2 = dr * dr
+        dc2 = dc * dc
+        drdc = dr * dc
+
+        for j in keep_idx:
+            rr0 = centers_r[j]
+            cc0 = centers_c[j]
+
+            if self.per_disk_intensity:
+                inten = self.i0_raw[j]
+                if active_order >= 1 and self.ir is not None and self.ic is not None:
+                    inten = inten + self.ir[j] * dr + self.ic[j] * dc
+                if (
+                    active_order >= 2
+                    and self.irr is not None
+                    and self.icc is not None
+                    and self.irc is not None
+                ):
+                    inten = inten + self.irr[j] * dr2 + self.icc[j] * dc2 + self.irc[j] * drdc
+            else:
+                inten = self.i0_raw
+                if active_order >= 1:
+                    assert self.ir is not None and self.ic is not None
+                    inten = inten + self.ir * rr0 + self.ic * cc0
+                if active_order >= 2:
+                    assert self.irr is not None and self.icc is not None and self.irc is not None
+                    inten = (
+                        inten + self.irr * rr0 * rr0 + self.icc * cc0 * cc0 + self.irc * rr0 * cc0
+                    )
+
+            self.disk.add_patch(out, r0=rr0, c0=cc0, scale=inten)
+
+        return out
+>>>>>>> upstream/fitting_models_clean

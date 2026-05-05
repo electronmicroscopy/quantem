@@ -1,6 +1,7 @@
 import importlib
 from os import PathLike
 from pathlib import Path
+from typing import Any
 
 import h5py
 import numpy as np
@@ -33,6 +34,7 @@ def read_4dstem(
     dataset_index : int, optional
         Index of the dataset to load if file contains multiple datasets.
         If None, automatically selects the first 4D dataset found.
+<<<<<<< HEAD
         If no 4D dataset is found but a 3D stack exists, a 3D dataset can be
         interpreted as 4D if `scan_length` is provided.
     scan_length : int, optional
@@ -52,6 +54,23 @@ def read_4dstem(
 
     **kwargs : dict
         Additional keyword arguments to pass to the Dataset4dstem constructor.
+=======
+    **kwargs: dict
+        Additional keyword arguments to pass to the file reader.
+
+    Other Parameters
+    ----------------
+    name : str | None, optional
+        A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
+    origin : NDArray | tuple | list | float | int | None, optional
+        The origin coordinates for each dimension. If None, defaults to zeros
+    sampling : NDArray | tuple | list | float | int | None, optional
+        The sampling rate/spacing for each dimension. If None, defaults to ones
+    units : list[str] | tuple | list | None, optional
+        Units for each dimension. If None, defaults to ["pixels"] * 4
+    signal_units : str, optional
+        Units for the array values, by default "arb. units"
+>>>>>>> upstream/fitting_models_clean
 
     Returns
     -------
@@ -148,8 +167,13 @@ def read_4dstem(
     if file_type is None:
         file_type = Path(file_path).suffix.lower().lstrip(".")
 
+    sampling_override = kwargs.pop("sampling", None)
+    origin_override = kwargs.pop("origin", None)
+    units_override = kwargs.pop("units", None)
+    name_override = kwargs.pop("name", None)
+
     file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
-    data_list = file_reader(file_path)
+    data_list = file_reader(file_path, **kwargs)
 
     if not data_list:
         raise ValueError(f"No datasets returned by rsciio.{file_type} for '{file_path}'")
@@ -247,17 +271,20 @@ def read_4dstem(
 
     imported_axes = imported_data["axes"]
 
-    sampling = kwargs.pop(
-        "sampling",
-        [ax["scale"] for ax in imported_axes],
+    sampling = (
+        sampling_override
+        if sampling_override is not None
+        else [ax.get("scale", 1) for ax in imported_axes]
     )
-    origin = kwargs.pop(
-        "origin",
-        [ax["offset"] for ax in imported_axes],
+    origin = (
+        origin_override
+        if origin_override is not None
+        else [ax.get("offset", 0) for ax in imported_axes]
     )
-    units = kwargs.pop(
-        "units",
-        ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes],
+    units = (
+        units_override
+        if units_override is not None
+        else ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes]
     )
 
     dataset = Dataset4dstem.from_array(
@@ -265,7 +292,7 @@ def read_4dstem(
         sampling=sampling,
         origin=origin,
         units=units,
-        **kwargs,
+        name=name_override,
     )
 
     return dataset
@@ -293,7 +320,7 @@ def read_2d(
     if file_type is None:
         file_type = Path(file_path).suffix.lower().lstrip(".")
 
-    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
+    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
     imported_data = file_reader(file_path)[0]
 
     dataset = Dataset2d.from_array(
@@ -338,9 +365,9 @@ def read_emdfile_to_4dstem(
         data_keys = ["datacube_root", "datacube", "data"] if data_keys is None else data_keys
         print("keys: ", data_keys)
         try:
-            data = file
+            data: Any = file
             for key in data_keys:
-                data = data[key]  # type: ignore
+                data = data[key]
         except KeyError:
             raise KeyError(f"Could not find key {data_keys} in {file_path}")
 
@@ -353,13 +380,13 @@ def read_emdfile_to_4dstem(
         try:
             calibration = file
             for key in calibration_keys:
-                calibration = calibration[key]  # type: ignore
+                calibration = calibration[key]
         except KeyError:
             raise KeyError(f"Could not find calibration key {calibration_keys} in {file_path}")
-        r_pixel_size = calibration["R_pixel_size"][()]  # type: ignore
-        q_pixel_size = calibration["Q_pixel_size"][()]  # type: ignore
-        r_pixel_units = calibration["R_pixel_units"][()]  # type: ignore
-        q_pixel_units = calibration["Q_pixel_units"][()]  # type: ignore
+        r_pixel_size = calibration["R_pixel_size"][()]
+        q_pixel_size = calibration["Q_pixel_size"][()]
+        r_pixel_units = calibration["R_pixel_units"][()]
+        q_pixel_units = calibration["Q_pixel_units"][()]
 
         dataset = Dataset4dstem.from_array(
             array=data,
@@ -369,3 +396,113 @@ def read_emdfile_to_4dstem(
     dataset.file_path = file_path
 
     return dataset
+
+
+def read_abtem(url: str | PathLike):
+    """
+    Read canonical abTEM Zarr file(s) into quantem Dataset(s).
+
+    Returns
+    -------
+    Dataset or list[Dataset]
+    """
+
+    def _open_zarr(url):
+        import zarr
+
+        if url.endswith(".zip"):
+            store = zarr.storage.ZipStore(url, mode="r")  # type: ignore
+            return zarr.open(store=store, mode="r")
+        return zarr.open(url, mode="r")
+
+    def _validate_canonical_format(root):
+        if "metadata0" in root.attrs:
+            return
+
+        if "kwargs0" in root.attrs:
+            raise ValueError(
+                "Legacy abTEM Zarr format detected.\n\n"
+                "quantem supports only canonical abTEM Zarr format.\n"
+                "Re-save using abtem>=1.1.0:\n\n"
+                "    measurement = abtem.from_zarr(<legacy_path>)\n"
+                "    measurement.to_zarr(<new_path>)"
+            )
+
+        raise ValueError("Unrecognized Zarr format.")
+
+    def _iter_metadata_indices(root):
+        i = 0
+        while f"metadata{i}" in root.attrs:
+            yield i
+            i += 1
+
+    def _decode_types(obj) -> Any:
+        if isinstance(obj, dict):
+            if obj.get("_type") == "tuple":
+                return tuple(_decode_types(v) for v in obj["_value"])
+            return {k: _decode_types(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_decode_types(v) for v in obj]
+        return obj
+
+    def _normalize_unit(unit):
+        if unit is None:
+            return "pixels"
+
+        unit = unit.strip()
+
+        UNIT_MAP = {
+            "Å": "A",
+            "Ångström": "A",
+            "Angstrom": "A",
+            "1/Å": "A^-1",
+            "Å^-1": "A^-1",
+            "1/A": "A^-1",
+        }
+
+        return UNIT_MAP.get(unit, unit)
+
+    def _convert_axes(axes_dict):
+        sampling = []
+        origin = []
+        units = []
+
+        for key in sorted(axes_dict, key=lambda x: int(x.split("_")[1])):
+            axis = axes_dict[key]
+
+            sampling.append(axis.get("sampling", 1.0))
+            units.append(_normalize_unit(axis.get("units", None)))
+            origin.append(0.0)  # deliberate design choice
+
+        return tuple(origin), tuple(sampling), tuple(units)
+
+    def _read_single_dataset(root, index):
+        metadata = _decode_types(root.attrs[f"metadata{index}"]).copy()
+
+        axes_dict = metadata.pop("axes")
+        dataset_type = metadata.pop("type")
+        metadata.pop("data_origin", None)
+
+        origin, sampling, units = _convert_axes(axes_dict)
+
+        array = root[f"array{index}"]
+        signal_units = metadata.get("units", "arb. units")
+
+        dataset = Dataset.from_array(
+            array=array,
+            name=dataset_type,
+            origin=origin,
+            sampling=sampling,
+            units=units,
+            signal_units=signal_units,
+        )
+
+        dataset._metadata = metadata
+        return dataset
+
+    root = _open_zarr(url)
+    _validate_canonical_format(root)
+
+    datasets = [_read_single_dataset(root, i) for i in _iter_metadata_indices(root)]
+
+    return datasets[0] if len(datasets) == 1 else datasets
