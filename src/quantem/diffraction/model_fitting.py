@@ -6,10 +6,7 @@ import numpy as np
 import torch
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
-<<<<<<< HEAD
 from tqdm import tqdm
-=======
->>>>>>> upstream/fitting_models_clean
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
 from quantem.core.fitting.base import (
@@ -21,10 +18,7 @@ from quantem.core.fitting.base import (
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
-<<<<<<< HEAD
-=======
 from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
->>>>>>> upstream/fitting_models_clean
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
 
@@ -61,12 +55,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self.state_mean_refined: dict[str, torch.Tensor] | None = None
         self.mean_refined: bool = False
 
-<<<<<<< HEAD
         self.state_individual_refined: np.ndarray | None = None
         self.individual_refined: bool = False
 
-=======
->>>>>>> upstream/fitting_models_clean
         # Misc metadata
         self.metadata: dict[str, Any] = {}
 
@@ -325,16 +316,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         upsample_factor: int = 32,
         max_shift: float | None = None,
         shift_order: int = 1,
-<<<<<<< HEAD
         gamma: float = 0.5,
         mode: str = "linear",
-=======
->>>>>>> upstream/fitting_models_clean
     ) -> "ModelDiffraction":
         arr = np.asarray(self.dataset.array)
         if arr.ndim < 2:
             raise ValueError("dataset.array must have at least 2 dimensions.")
-<<<<<<< HEAD
         mode_in = mode.strip().lower()
         if mode_in in {"linear", "patterson", "paterson", "acf", "autocorrelation"}:
             mode_norm = "linear"
@@ -360,8 +347,6 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         else:
             raise RuntimeError("Unreachable: normalized mode mapping failed.")
         self.dataset.array = np.asarray(arr)
-=======
->>>>>>> upstream/fitting_models_clean
         h, w = arr.shape[-2], arr.shape[-1]
         self.index_shape = tuple(arr.shape[:-2])
 
@@ -475,18 +460,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         *,
         n_steps: int = 200,
         reset: bool | Literal["initialized", "mean_refined"] = False,
-<<<<<<< HEAD
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         constraint_config_params: dict[str, Any] | None = None,
-=======
-        optimizer_params: OptimizerType | dict | None = None,
-        scheduler_params: SchedulerType | dict | None = None,
-        constraint_weight: float = 1.0,
-        constraint_params: dict[str, Any] | None = None,
->>>>>>> upstream/fitting_models_clean
         progress: bool = True,
     ) -> "ModelDiffraction":
         """
@@ -538,18 +516,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             raise ValueError("reset must be False, True, 'initialized', or 'mean_refined'.")
 
         self.fit_render(
-<<<<<<< HEAD
             # target=torch.tensor(self.dataset[30,30].array.astype("float32")),
-=======
->>>>>>> upstream/fitting_models_clean
             target=self.target_mean,
             n_steps=int(n_steps),
             constraint_weight=float(constraint_weight),
             constraint_params=constraint_params,
-<<<<<<< HEAD
             constraint_config_params=constraint_config_params,
-=======
->>>>>>> upstream/fitting_models_clean
             optimizer_params=optimizer_params,
             scheduler_params=scheduler_params,
             progress=bool(progress),
@@ -563,14 +535,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
     def reset(
         self,
-<<<<<<< HEAD
         reset_to: Literal["initialized", "mean_refined", "individual"] = "mean_refined",
         reset_history: bool = True,
         individual_row: int = 0,
         individual_col: int = 0,
-=======
-        reset_to: Literal["initialized", "mean_refined"] = "mean_refined",
->>>>>>> upstream/fitting_models_clean
     ) -> "ModelDiffraction":
         if reset_to == "initialized":
             state = self.state_initialized
@@ -578,19 +546,14 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 raise RuntimeError(
                     "initialized state is unavailable. Call .define_model(...) first."
                 )
-<<<<<<< HEAD
             if reset_history:
                 self._clear_fit_history_all()
-=======
-            self._clear_fit_history_all()
->>>>>>> upstream/fitting_models_clean
         elif reset_to == "mean_refined":
             state = self.state_mean_refined
             if state is None:
                 raise RuntimeError(
                     "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
                 )
-<<<<<<< HEAD
             if reset_history:
                 mean_hist = self.fit_history.get("mean")
                 self._clear_fit_history_all()
@@ -916,17 +879,6 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             a.set_aspect("equal")
 
         return fig, ax
-=======
-            mean_hist = self.fit_history.get("mean")
-            self._clear_fit_history_all()
-            if mean_hist is not None:
-                self.fit_history["mean"] = mean_hist
-        else:
-            raise ValueError("reset_to must be 'initialized' or 'mean_refined'.")
-
-        self._load_model_state_dict_copy(state)
-        return self
->>>>>>> upstream/fitting_models_clean
 
     @property
     def render_mean_refined(self) -> np.ndarray:
