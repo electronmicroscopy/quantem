@@ -39,7 +39,7 @@ class Dataset4d(Dataset):
         name : str
             A descriptive name for the dataset
         origin : NDArray | tuple | list | float | int
-            The origin coordinates for each dimension
+            The origin coordinates for each dimension in calibrated units
         sampling : NDArray | tuple | list | float | int
             The sampling rate/spacing for each dimension
         units : list[str] | tuple | list

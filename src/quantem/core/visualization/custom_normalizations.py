@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 from matplotlib import colors
@@ -461,8 +462,8 @@ class CustomNormalization(colors.Normalize):
 
     def __init__(
         self,
-        interval_type: str = "quantile",
-        stretch_type: str = "linear",
+        interval_type: Literal["quantile", "manual", "centered"] = "quantile",
+        stretch_type: Literal["linear", "power", "logarithmic", "asinh"] = "linear",
         *,
         data: NDArray | None = None,
         lower_quantile: float = 0.02,
@@ -599,8 +600,8 @@ class NormalizationConfig:
         Linear range for "asinh" stretch type.
     """
 
-    interval_type: str = "quantile"
-    stretch_type: str = "linear"
+    interval_type: Literal["quantile", "manual", "centered"] = "quantile"
+    stretch_type: Literal["linear", "power", "logarithmic", "asinh"] = "linear"
     lower_quantile: float = 0.02
     upper_quantile: float = 0.98
     vmin: float | None = None
@@ -673,5 +674,7 @@ def _resolve_normalization(norm, **kwargs) -> NormalizationConfig:
         return NORMALIZATION_PRESETS[norm]()
     elif isinstance(norm, NormalizationConfig):
         return norm
+    elif hasattr(norm, "to_config"):
+        return norm.to_config()
     else:
-        raise TypeError("norm must be None, dict, str, or NormalizationConfig")
+        raise TypeError("norm must be None, dict, str, NormalizationConfig, or ShowParams.Norm")
