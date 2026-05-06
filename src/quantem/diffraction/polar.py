@@ -23,27 +23,40 @@ from quantem.tomography.utils import gaussian_filter_1d, gaussian_kernel_1d
 
 
 class PairDistributionFunction(AutoSerialize):
-    """
-    Pair distribution function (PDF) utilities for diffraction / 4D-STEM data.
+    """Compute the pair distribution function from 4D-STEM diffuse scattering
 
-    This class wraps a 4D-STEM (or 2D diffraction) dataset and stores a
-    polar-transformed representation as a Polar4dstem instance in `self.polar`.
-    The PDF pipeline provides methods to compute:
+    The pair distribution function g(r) gives the probability of finding
+    pairs of atoms at separation r, and is the standard tool for
+    characterizing local atomic structure in amorphous materials where
+    Bragg diffraction is unavailable. This class implements the standard
+    extraction pipeline from a 4D-STEM scan (or a single averaged
+    diffraction pattern):
 
-    - azimuthal integration to obtain I(k)
-    - background fitting using a parametric model in k^2 / k^4
-    - formation of F(k) and a windowed sine transform to obtain G(r)
-    - optional density estimation and origin correction (Yoshimoto & Omote-style iteration)
-    - basic plotting helpers for I(k), background, F(k), G(r), and g(r)
+    - polar transform of the diffraction patterns
+    - azimuthal averaging to obtain I(k)
+    - parametric background fit B(k) (Gaussian model in k² and k⁴)
+    - reduced structure factor F(k) = 2π · k · [S(k) − 1]
+    - windowed sine transform of F(k) to recover the reduced PDF G(r)
+    - optional density estimation and Yoshimoto–Omote oscillation damping
+    - normalization to g(r) = 1 + G(r) / (4π · r · ρ₀)
+
+    Diffraction data is held in two complementary forms. ``Dataset4dstem``
+    holds the input scan with each DP in Cartesian coordinates, indexed as
+    ``(scan_row, scan_col, n_row, n_col)``. ``Polar4dstem`` holds the
+    result of rebinning each DP to polar coordinates ``(phi, r_pix)``.
+    The polar transform is expensive and irreversible, so its result is
+    cached as a first-class dataset on ``self.polar`` rather than
+    recomputed on demand. ``from_data`` runs the polar transform (and
+    optional origin finding) once.
 
     Attributes
     ----------
     polar : Polar4dstem
         Polar-transformed diffraction data wrapped by this instance.
-    input_data : Dataset4dstem, Polar4dstem, or None
-        Dataset that was polar-transformed to produce ``self.polar``,
-        preserved for reference. A ``Dataset2d`` input to ``from_data`` is
-        wrapped as a 1x1 ``Dataset4dstem`` before being stored here.
+    input_data : Dataset4dstem or None
+        Original input dataset that was polar-transformed to produce
+        ``self.polar``. A ``Dataset2d`` input to ``from_data`` is wrapped
+        as a 1×1 ``Dataset4dstem`` before being stored here.
     device : str
         Torch device used for computation.
     Ik : torch.Tensor or None
@@ -78,6 +91,26 @@ class PairDistributionFunction(AutoSerialize):
         G(r) = (2/π) ∫ F(k) · sin(2π · k · r) dk.
     pdf : NDArray or None
         Pair distribution function g(r) = 1 + G(r) / (4π · r · ρ₀).
+
+    Examples
+    --------
+    Construct from a 4D-STEM scan and run the standard pipeline:
+
+    >>> import quantem as em
+    >>> ds = em.core.io.read_4dstem("scan.h5", file_type="arina")
+    >>> rdf = em.diffraction.PairDistributionFunction.from_data(ds)
+    >>> rdf.calculate_Gr(k_min_fit=0.05, k_max_fit=2.0, r_max=10.0)
+    >>> rdf.calculate_gr(set_pdf_positive=True)
+
+    Inspect intermediate results:
+
+    >>> rdf.plot_pdf_results(["background_fits", "reduced_sf", "reduced_pdf", "pdf"])
+
+    Restrict the radial average to a real-space region of interest:
+
+    >>> mask = np.zeros(ds.array.shape[:2], dtype=bool)
+    >>> mask[300:, 300:] = True
+    >>> rdf.calculate_Gr(k_min_fit=0.05, k_max_fit=2.0, mask_realspace=mask)
     """
 
     _token = object()
@@ -85,7 +118,7 @@ class PairDistributionFunction(AutoSerialize):
     def __init__(
         self,
         polar: Polar4dstem,
-        input_data: Dataset4dstem | Polar4dstem | None = None,
+        input_data: Dataset4dstem | None = None,
         device: str = "cpu",
         _token: object | None = None,
     ):
@@ -119,7 +152,7 @@ class PairDistributionFunction(AutoSerialize):
     @classmethod
     def from_data(
         cls,
-        data: Dataset2d | Dataset4dstem | Polar4dstem,
+        data: Dataset2d | Dataset4dstem,
         *,
         find_origin: bool = True,
         origin_row: float | None = None,
@@ -136,14 +169,12 @@ class PairDistributionFunction(AutoSerialize):
 
         Parameters
         ----------
-        data : Dataset4dstem, Dataset2d, or Polar4dstem
+        data : Dataset4dstem or Dataset2d
             - ``Dataset4dstem``: triggers origin finding (optional) and polar
               transform.
             - ``Dataset2d``: single averaged diffraction pattern (e.g. SAED
               or a pre-averaged 4DSTEM result); wrapped as a 1x1 scan
               internally.
-            - ``Polar4dstem``: already polar-transformed; used directly, no
-              origin finding or polar transform performed.
         find_origin : bool
             If True, run ``auto_origin_id`` to find the origin at each scan
             position. If False, use ``origin_row`` / ``origin_col`` (or the
@@ -170,11 +201,6 @@ class PairDistributionFunction(AutoSerialize):
         -------
         PairDistributionFunction
         """
-        # Polar input: use directly
-        if isinstance(data, Polar4dstem):
-            polar = data
-            return cls(polar=polar, input_data=data, device=device, _token=cls._token)
-
         # Dataset2d input: wrap as a trivial 4D-STEM (1x1 scan) and fall through
         if isinstance(data, Dataset2d):
             arr2d = data.array
@@ -238,8 +264,8 @@ class PairDistributionFunction(AutoSerialize):
 
         raise TypeError(
             f"Got {type(data).__name__}. PairDistributionFunction.from_data "
-            "accepts Polar4dstem, Dataset4dstem, or Dataset2d. Wrap numpy "
-            "arrays with Dataset4dstem.from_array or Dataset2d.from_array first."
+            "accepts Dataset4dstem or Dataset2d. Wrap numpy arrays with "
+            "Dataset4dstem.from_array or Dataset2d.from_array first."
         )
 
     # ------------------------------------------------------------------
@@ -364,7 +390,13 @@ class PairDistributionFunction(AutoSerialize):
         """
         Fit a smooth background B(k) to a radial intensity curve I(k) using
         PyTorch LBFGS optimizer, with weighting that downweights the low-k
-        region and emphasizes higher k.
+        region and emphasizes higher k. LBFGS was chosen empirically through
+        trial and error to see which optimizer matched scipy.curve_fit() best
+        on test data.
+
+        B(k) is later subtracted from I(k) to isolate the diffuse signal, and
+        f(k) is used as the denominator in the structure factor
+        S(k) = 1 + [I(k) − B(k)] / f(k).
 
         The fitted function uses the following form (adopted from py4dstem):
             B(k) = c
@@ -387,7 +419,7 @@ class PairDistributionFunction(AutoSerialize):
             Fitted background curve B(k), shape (Nk,).
         f : torch.Tensor
             Background minus the constant offset, f(k) = B(k) - c, or functionally
-            similar to <f>^2(k)
+            similar to <f>^2(k). Used later to compute the reduced structure factor F(k).
         """
         k = torch.from_numpy(np.asarray(self.qq).astype(np.float32)).to(device=self.device)
         if kmin is None:
