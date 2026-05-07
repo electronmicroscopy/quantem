@@ -243,11 +243,14 @@ class TestDatasetMethods:
         cropped_dataset = sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)))
         # Check shape
         assert cropped_dataset.shape == (8, 8)  # Original (10, 10) - 1 from each side
+        assert np.array_equal(cropped_dataset.origin, np.array([1, 1]))
         # Check that the original dataset is unchanged
         assert sample_dataset_2d.shape == (10, 10)
+        assert np.array_equal(sample_dataset_2d.origin, np.array([0, 0]))
         # Test modify_in_place
         sample_dataset_2d.crop(crop_widths=((1, 9), (1, 9)), modify_in_place=True)
         assert sample_dataset_2d.shape == (8, 8)
+        assert np.array_equal(sample_dataset_2d.origin, np.array([1, 1]))
 
     def test_crop_4dstem_kspace(self):
         """Test cropping k-space axes of a 4D-STEM dataset."""
@@ -258,15 +261,64 @@ class TestDatasetMethods:
 
     def test_crop_4dstem_realspace_in_place(self):
         """Test in-place real-space crop of a 4D-STEM dataset."""
-        dset = Dataset.from_array(np.random.rand(16, 16, 32, 32))
+        dset = Dataset.from_array(
+            np.random.rand(16, 16, 32, 32),
+            origin=(10, 20, 30, 40),
+            sampling=(0.5, 0.25, 2, 3),
+        )
         dset.crop(crop_widths=((4, 12), (4, 12)), axes=(0, 1), modify_in_place=True)
         assert dset.shape == (8, 8, 32, 32)
+        assert np.array_equal(dset.origin, np.array([12, 21, 30, 40]))
 
     def test_crop_4dstem_stop_zero(self):
         """Test that stop=0 keeps all remaining elements."""
         dset = Dataset.from_array(np.random.rand(8, 8, 96, 96))
         cropped = dset.crop(crop_widths=((10, 0), (10, 0)), axes=(2, 3))
         assert cropped.shape == (8, 8, 86, 86)
+
+    def test_crop_single_axis_updates_origin_in_place(self):
+        """Test in-place single-axis crop updates origin."""
+        dset = Dataset.from_array(
+            np.random.rand(2048, 64),
+            origin=(5, 7),
+            sampling=(0.5, 2),
+        )
+        dset.crop(crop_widths=((80, 2000),), axes=0, modify_in_place=True)
+        assert dset.shape == (1920, 64)
+        assert np.array_equal(dset.origin, np.array([45, 7]))
+
+    def test_getitem_slice_updates_origin_like_crop(self):
+        """Test slicing keeps origin aligned with crop semantics."""
+        dset = Dataset.from_array(
+            np.random.rand(16, 8),
+            origin=(10, 20),
+            sampling=(0.5, 2.0),
+            units=["nm", "nm"],
+        )
+
+        sliced = dset[4:12]
+        cropped = dset.crop(crop_widths=((4, 12),), axes=0)
+
+        assert sliced.shape == (8, 8)
+        assert np.array_equal(sliced.origin, np.array([12, 20]))
+        assert np.array_equal(sliced.origin, cropped.origin)
+        assert np.array_equal(sliced.sampling, cropped.sampling)
+
+    def test_getitem_slice_reduced_rank_updates_origin_and_sampling(self):
+        """Test slicing before integer indexing updates remaining metadata."""
+        dset = Dataset.from_array(
+            np.random.rand(10, 6, 4),
+            origin=(1.5, 10, -2),
+            sampling=(0.25, 2.0, 5.0),
+            units=["nm", "nm", "1/nm"],
+        )
+
+        sliced = dset[2:8:2, 3]
+
+        assert sliced.shape == (3, 4)
+        assert np.allclose(sliced.origin, np.array([2.0, -2.0]))
+        assert np.allclose(sliced.sampling, np.array([0.5, 5.0]))
+        assert sliced.units == ["nm", "1/nm"]
 
     def test_bin(self, sample_dataset_2d):
         """Test bin method."""

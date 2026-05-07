@@ -63,7 +63,7 @@ def read_4dstem(
     name : str | None, optional
         A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
     origin : NDArray | tuple | list | float | int | None, optional
-        The origin coordinates for each dimension. If None, defaults to zeros
+        The origin coordinates for each dimension in calibrated units. If None, defaults to zeros
     sampling : NDArray | tuple | list | float | int | None, optional
         The sampling rate/spacing for each dimension. If None, defaults to ones
     units : list[str] | tuple | list | None, optional

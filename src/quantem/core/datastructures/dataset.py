@@ -23,7 +23,7 @@ class Dataset(AutoSerialize):
     Attributes (Properties):
         array (NDArray): The underlying n-dimensional NumPy array data.
         name (str): A descriptive name for the dataset.
-        origin (NDArray): The origin coordinates for each dimension (1D array).
+        origin (NDArray): The origin coordinates for each dimension (1D array) in calibrated units.
         sampling (NDArray): The sampling rate/spacing for each dimension (1D array).
         units (list[str]): Units for each dimension.
         signal_units (str): Units for the array values.
@@ -84,7 +84,7 @@ class Dataset(AutoSerialize):
         name: str | None
             The name of the Dataset.
         origin: NDArray | tuple | list | float | int | None
-            The origin of the Dataset.
+            The origin of the Dataset in calibrated units.
         sampling: NDArray | tuple | list | float | int | None
             The sampling of the Dataset.
         units: list[str] | tuple | list | None
@@ -545,22 +545,28 @@ class Dataset(AutoSerialize):
             raise ValueError("Length of crop_widths must match length of axes.")
 
         full_slices = []
+        new_origin = self.origin.astype(float).copy()
         crop_dict = dict(zip(axes, crop_widths))
-        for axis, _ in enumerate(self.shape):
+        for axis, axis_size in enumerate(self.shape):
             if axis in crop_dict:
                 before, after = crop_dict[axis]
                 start = before
                 stop = after if after != 0 else None
-                full_slices.append(slice(start, stop))
+                axis_slice = slice(start, stop)
+                normalized_start, _, _ = axis_slice.indices(axis_size)
+                full_slices.append(axis_slice)
+                new_origin[axis] = new_origin[axis] + normalized_start * self.sampling[axis]
             else:
                 full_slices.append(slice(None))
 
         if modify_in_place is False:
             dataset = self.copy()
             dataset.array = dataset.array[tuple(full_slices)]
+            dataset.origin = new_origin
             return dataset
 
         self.array = self.array[tuple(full_slices)]
+        self.origin = new_origin
         return None
 
     @overload
@@ -903,22 +909,25 @@ class Dataset(AutoSerialize):
 
         # Compute which dimensions are kept
         kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
+        kept_axis_to_index = {axis: j for j, axis in enumerate(kept_axes)}
 
         # Slice/reduce metadata accordingly
-        new_origin = (
-            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
-        )
+        origin_array = np.asarray(self.origin, dtype=float)
+        sampling_array = np.asarray(self.sampling, dtype=float)
+        new_origin = origin_array[kept_axes].copy() if np.ndim(self.origin) > 0 else self.origin
         new_sampling = (
-            np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
+            sampling_array[kept_axes].copy() if np.ndim(self.sampling) > 0 else self.sampling
         )
         new_units = [self.units[i] for i in kept_axes] if len(self.units) > 0 else self.units
 
-        # Adjust sampling for slice steps (e.g. [::2] doubles spacing)
+        # Adjust origin/sampling for sliced axes.
         for i, idx in enumerate(index):
-            if isinstance(idx, slice) and idx.step not in (None, 1):
-                if i in kept_axes:
-                    j = kept_axes.index(i)
-                    new_sampling[j] *= idx.step
+            if isinstance(idx, slice) and i in kept_axis_to_index:
+                j = kept_axis_to_index[i]
+                normalized_start, _, normalized_step = idx.indices(self.shape[i])
+                new_origin[j] = new_origin[j] + normalized_start * sampling_array[i]
+                if normalized_step != 1:
+                    new_sampling[j] *= normalized_step
 
         out_ndim = array_view.ndim
 
