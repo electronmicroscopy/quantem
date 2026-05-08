@@ -611,6 +611,7 @@ class DiffractionTomography(AutoSerialize):
         for ind, r in enumerate(r_all):
             # trilinear interpolation of structure factor slice from 6D volume
             SF = np.zeros(Psi0.shape, dtype=self.array.dtype)
+            weight_sum = 0.0
             for (ix, iy, iz), weight in self._trilinear_real_weights(r):
                 if np.isclose(weight, 0.0):
                     continue
@@ -620,14 +621,19 @@ class DiffractionTomography(AutoSerialize):
                     and 0 <= iz < self.real_shape[2]
                 ):
                     continue
+                weight_sum += weight
                 SF += weight * self._sample_complex_volume_trilinear(
                     self.array[ix, iy, iz],
                     k_slice_coords,
                     mode="wrap",
                 )
+            if weight_sum > 0.0:
+                SF /= weight_sum
 
             # transmit
-            Psi = np.fft.fft2(np.fft.ifft2(Psi) * np.fft.ifft2(SF))
+            # Use the forward-normalized inverse transform so the transmission
+            # function is not suppressed by a 1/(Nx*Ny) factor at every slice.
+            Psi = np.fft.fft2(np.fft.ifft2(Psi) * np.fft.ifft2(SF, norm="forward"))
 
             # propagate
             if ind < len(r_all) - 1:
