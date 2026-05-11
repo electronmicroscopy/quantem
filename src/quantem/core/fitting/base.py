@@ -330,9 +330,9 @@ class RenderComponent(OptimizerMixin,nn.Module):
         return
     
     
-    def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
+    def _infer_optimizer_rebuild_params(self) -> Any:
         if self.optimizer_params:
-            return dict(self.optimizer_params)
+            return self.optimizer_params
         if self.optimizer is not None:
             opt_type: str | type[torch.optim.Optimizer]
             if isinstance(self.optimizer, torch.optim.AdamW):
@@ -354,9 +354,9 @@ class RenderComponent(OptimizerMixin,nn.Module):
             "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
         }
     
-    def _infer_scheduler_rebuild_params(self) -> dict[str, Any]:
+    def _infer_scheduler_rebuild_params(self) -> Any:
         if self.scheduler_params:
-            return dict(self.scheduler_params)
+            return self.scheduler_params
         return {
             "type": self.DEFAULT_SCHEDULER_TYPE,
         }
@@ -367,10 +367,10 @@ class RenderComponent(OptimizerMixin,nn.Module):
             self._optimizer = None
             self._scheduler = None
             return
-        rebuild_params = self._infer_optimizer_rebuild_params()
-        rebuild_params_scheduler = self._infer_scheduler_rebuild_params()
-        self.set_optimizer(rebuild_params)
-        self.set_scheduler(rebuild_params_scheduler)
+        # rebuild_params = self._infer_optimizer_rebuild_params()
+        # rebuild_params_scheduler = self._infer_scheduler_rebuild_params()
+        self.set_optimizer(self.optimizer_params)
+        self.set_scheduler(self.scheduler_params)
     
     def initialize_constraint_config(self, config: dict[str, Any], strict: bool = True) -> None:
         if not hasattr(self, 'constraint_config'):
