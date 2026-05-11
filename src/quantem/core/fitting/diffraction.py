@@ -429,8 +429,67 @@ class DiskTemplate(RenderComponent):
         circular_loss = torch.as_tensor(circular_weight, device=ctx.device, dtype=ctx.dtype) * circular_err
 
         return cutoff_loss + tv_loss + circular_loss
-    
-    def get_optimization_parameters(self) -> Any: 
+
+    def constraint_loss_batched(
+        self,
+        ctx: RenderContext,
+        *,
+        template_raw_b: torch.Tensor,
+        params: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        """
+        Per-sample analogue of ``constraint_loss`` for stacked templates.
+
+        Parameters
+        ----------
+        template_raw_b : torch.Tensor
+            Stacked templates with shape ``(B, H_t, W_t)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-sample soft-constraint losses with shape ``(B,)``. Identical
+            semantics to ``constraint_loss`` on each slice, but reductions are
+            taken over ``dim=(1, 2)`` only.
+        """
+        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
+        tv_weight = max(float(cfg.get("tv_weight", 0.0)), 0.0)
+        cutoff_weight = max(float(cfg.get("cutoff_weight", 0.0)), 0.0)
+        circular_weight = max(float(cfg.get("circular_weight", 0.0)), 0.0)
+
+        template = template_raw_b.to(device=ctx.device, dtype=ctx.dtype)
+        B, h, w = template.shape
+
+        if h > 1:
+            tv_r = torch.mean(torch.abs(template[:, 1:, :] - template[:, :-1, :]), dim=(1, 2))
+        else:
+            tv_r = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+        if w > 1:
+            tv_c = torch.mean(torch.abs(template[:, :, 1:] - template[:, :, :-1]), dim=(1, 2))
+        else:
+            tv_c = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+        tv_loss = tv_weight * (tv_r + tv_c)
+
+        # Per-sample cutoff (note: hard `<=` is non-differentiable; matches serial).
+        per_sample_mean = template.mean(dim=(1, 2), keepdim=True)
+        thresh = per_sample_mean * float(self.constraint_config["soft_cutoff_threshold"])
+        frac_under = (template <= thresh).to(dtype=ctx.dtype).mean(dim=(1, 2))
+        target_ratio = float(self.constraint_config["soft_cutoff_target_ratio"])
+        cutoff_loss = cutoff_weight * torch.relu(frac_under - target_ratio)
+
+        # Per-sample circular: mask depends only on (H, W), so build once.
+        radius = (min(h, w) / 2.0) * float(self.constraint_config["circular_mask_radius_fraction"])
+        r = torch.arange(h, device=ctx.device, dtype=ctx.dtype) - h / 2.0
+        c = torch.arange(w, device=ctx.device, dtype=ctx.dtype) - w / 2.0
+        rr, cc = torch.meshgrid(r, c, indexing="ij")
+        circle_mask = torch.sqrt(rr * rr + cc * cc)
+        dist_from_radius = torch.relu(torch.abs(circle_mask - radius))  # (H, W)
+        circular_err = (dist_from_radius.unsqueeze(0) * template).mean(dim=(1, 2))
+        circular_loss = circular_weight * circular_err
+
+        return tv_loss + cutoff_loss + circular_loss
+
+    def get_optimization_parameters(self) -> Any:
         params = []
         for name, param in self.named_parameters(recurse=True):
             if not name.startswith('origin.') and param.requires_grad:

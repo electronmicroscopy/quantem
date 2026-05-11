@@ -586,8 +586,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config_params: dict[str, Any] | None = None,
         progress: bool = True,
         batch_size: int | None = None,
+        frozen_components: list[str] | str | None = None,
+        sample_trainability: dict[str, Any] | None = None,
         **_compat_kwargs: Any,
     ) -> "ModelDiffraction":
         if batch_size is not None:
@@ -598,7 +601,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 n_steps=int(n_steps),
                 reset=cast(Literal["initialized", "mean_refined"], reset),
                 optimizer_params=optimizer_params,
+                scheduler_params=scheduler_params,
+                constraint_weight=float(constraint_weight),
                 constraint_params=constraint_params,
+                constraint_config_params=constraint_config_params,
+                frozen_components=frozen_components,
+                sample_trainability=sample_trainability,
                 progress=progress,
             )
 
@@ -674,7 +682,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         n_steps: int = 200,
         reset: Literal["initialized", "mean_refined"] = "mean_refined",
         optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config_params: dict[str, Any] | None = None,
+        frozen_components: list[str] | str | None = None,
+        sample_trainability: dict[str, Any] | None = None,
         progress: bool = True,
     ) -> "ModelDiffraction":
         """
@@ -683,8 +696,33 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         See ``fit_individual_diffraction_pattern`` for argument semantics. The
         batched version runs ``batch_size`` patterns in parallel per optimizer
         step, with per-sample stacked parameters and per-sample Adam moments.
-        Soft constraint losses are not yet supported; only hard constraints
-        and parameter bounds are enforced between steps.
+
+        Soft constraint losses are added per-sample via
+        ``model.total_constraint_loss``-style accumulation (currently only
+        ``DiskTemplate`` contributes). Hard constraints and parameter bounds
+        are still enforced between steps.
+
+        Parameters
+        ----------
+        scheduler_params : dict | None, optional
+            Either a single spec dict (``{"type": "cosine", "t_max": N}``)
+            applied to every parameter group, or a dict keyed by component
+            name/class. Supported types: ``none``, ``cosine`` (a.k.a.
+            ``cosine_annealing``), ``linear``, ``exponential``. ``plateau``
+            and ``cyclic`` fall back to constant LR with a warning.
+        constraint_weight : float
+            Global multiplier on the per-sample soft-constraint loss.
+        constraint_config_params : dict | None
+            Applied to the model once before the fit (``apply_constraint_configs``).
+        frozen_components : list[str] | str | None
+            Component name(s) whose parameters are frozen across all samples.
+            Resolved via ``AdditiveRenderModel._component_constraint_name``;
+            both instance names (``"disk0"``) and class names (``"DiskTemplate"``)
+            work.
+        sample_trainability : dict[str, ArrayLike] | None
+            Per-canonical-key (e.g. ``"disk.template_raw"``) boolean array of
+            length ``len(positions)``; ``False`` entries freeze that parameter
+            for the matching scan position.
         """
         if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
@@ -707,6 +745,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         if constraint_params is not None:
             self.model.apply_constraint_params(constraint_params, strict=True)
+        if constraint_config_params is not None:
+            self.model.apply_constraint_configs(constraint_config_params, strict=True)
 
         scan_r = int(self.dataset.shape[0])
         scan_c = int(self.dataset.shape[1])
@@ -721,6 +761,32 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         ctx = self.ctx
         components_list = list(self.model.components)
         plan = _BatchedPlan.from_model(self.model, components_list, optimizer_params or {})
+        plan.set_scheduler_params(scheduler_params)
+
+        # Build per-position trainability arrays (default True everywhere).
+        n_positions = len(positions)
+        is_trainable_pos: dict[str, np.ndarray] = {
+            key: np.ones(n_positions, dtype=bool) for key in plan.lrs
+        }
+        frozen_keys = plan.resolve_component_keys(frozen_components)
+        for key in frozen_keys:
+            is_trainable_pos[key][:] = False
+        # Keys that are frozen for ALL samples skip hard constraints too.
+        hard_skip_keys: set[str] = set(frozen_keys)
+        if sample_trainability is not None:
+            for key, arr in sample_trainability.items():
+                if key not in is_trainable_pos:
+                    raise KeyError(
+                        f"sample_trainability key '{key}' is not a known stacked-param. "
+                        f"Known: {sorted(is_trainable_pos)}"
+                    )
+                mask = np.asarray(arr, dtype=bool).reshape(-1)
+                if mask.shape != (n_positions,):
+                    raise ValueError(
+                        f"sample_trainability['{key}'] has shape {mask.shape}, "
+                        f"expected ({n_positions},)."
+                    )
+                is_trainable_pos[key] = mask
 
         loss_fn = self.loss_fn
 
@@ -749,6 +815,23 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 for name, p in stacked.items()
             }
 
+            # Per-chunk trainability slice as (B,) bool tensors on device.
+            chunk_slice = slice(start, start + B)
+            chunk_trainable: dict[str, torch.Tensor] = {}
+            mixed_trainable_keys: list[str] = []
+            init_snapshots: dict[str, torch.Tensor] = {}
+            for key in stacked:
+                if key in is_trainable_pos:
+                    mask_np = is_trainable_pos[key][chunk_slice]
+                    mask = torch.as_tensor(mask_np, device=ctx.device, dtype=torch.bool)
+                    chunk_trainable[key] = mask
+                    # A "mixed" key has some frozen samples and some trainable.
+                    # We snapshot the init value so frozen samples can be
+                    # restored after hard constraints / Adam.
+                    if not bool(mask.all()) and not bool((~mask).all()):
+                        mixed_trainable_keys.append(key)
+                        init_snapshots[key] = stacked[key].detach().clone()
+
             for step in range(int(n_steps)):
                 pred = plan.batched_forward(ctx, stacked)
                 # Per-sample fidelity loss summed → scalar with per-sample grads
@@ -768,14 +851,45 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                     per_sample_loss = ((torch.log1p(pred) - torch.log1p(targets)) ** 2).mean(dim=(1, 2))
                 else:
                     per_sample_loss = (diff2 * diff2).mean(dim=(1, 2))
+
+                # Add per-sample soft constraint loss.
+                if float(constraint_weight) != 0.0:
+                    constraint_per_sample = plan.batched_constraint_loss(ctx, stacked)
+                    per_sample_loss = per_sample_loss + float(constraint_weight) * constraint_per_sample
+
                 total_loss = per_sample_loss.sum()
 
-                grads = torch.autograd.grad(total_loss, list(stacked.values()))
+                grads_list = list(torch.autograd.grad(total_loss, list(stacked.values())))
+
+                # Apply trainability masks: zero out per-sample gradient entries
+                # for frozen samples/params before the Adam step.
+                for i, (name, g) in enumerate(zip(stacked.keys(), grads_list)):
+                    if g is None:
+                        continue
+                    mask_b = chunk_trainable.get(name)
+                    if mask_b is None:
+                        continue
+                    if bool(mask_b.all()):
+                        continue
+                    # Broadcast (B,) over remaining dims.
+                    view_shape = (g.shape[0],) + (1,) * (g.ndim - 1)
+                    grads_list[i] = g * mask_b.view(view_shape).to(dtype=g.dtype)
+
                 t = step + 1
-                _adam_step_inplace(stacked, grads, adam_state, plan.lrs, t)
+                current_lrs = plan.lr_at_step(t, int(n_steps))
+                _adam_step_inplace(stacked, tuple(grads_list), adam_state, current_lrs, t)
 
                 with torch.no_grad():
-                    plan.apply_hard_constraints(stacked)
+                    plan.apply_hard_constraints(stacked, skip_keys=hard_skip_keys)
+                    # For mixed-trainability keys, restore frozen-sample values
+                    # from the init snapshot so they stay at their starting state.
+                    for key in mixed_trainable_keys:
+                        mask = chunk_trainable[key]
+                        view_shape = (mask.shape[0],) + (1,) * (stacked[key].ndim - 1)
+                        keep = mask.view(view_shape)
+                        stacked[key].data.copy_(
+                            torch.where(keep, stacked[key].data, init_snapshots[key])
+                        )
 
                 pbar.update(B)
 
@@ -1074,6 +1188,11 @@ class _BatchedPlan:
         self.gaussbg_idx: int | None = None
         self.lat_idx: int | None = None
         self.lrs: dict[str, float] = {}
+        # Per-param normalized scheduler spec; keys match self.lrs.
+        # Each value: {"type": "none|cosine|linear|exponential", ...numerics}.
+        self.scheduler_specs: dict[str, dict[str, Any]] = {}
+        # Mapping from canonical component name -> stacked-param keys.
+        self.component_keys: dict[str, list[str]] = {}
 
     @classmethod
     def from_model(
@@ -1108,23 +1227,170 @@ class _BatchedPlan:
         if self.disk is not None and self.disk_idx is not None:
             self.lrs["disk.template_raw"] = _lr_for_component(self.disk, self.disk_idx, optimizer_params, model)
             self.lrs["disk.intensity_raw"] = self.lrs["disk.template_raw"]
+            name = model._component_constraint_name(self.disk, self.disk_idx)
+            self.component_keys[name] = ["disk.template_raw", "disk.intensity_raw"]
+            self.component_keys[self.disk.__class__.__name__] = list(self.component_keys[name])
         if self.dcbg is not None and self.dcbg_idx is not None:
             self.lrs["dcbg.intensity_raw"] = _lr_for_component(self.dcbg, self.dcbg_idx, optimizer_params, model)
+            name = model._component_constraint_name(self.dcbg, self.dcbg_idx)
+            self.component_keys[name] = ["dcbg.intensity_raw"]
+            self.component_keys[self.dcbg.__class__.__name__] = list(self.component_keys[name])
         if self.gaussbg is not None and self.gaussbg_idx is not None:
             lr = _lr_for_component(self.gaussbg, self.gaussbg_idx, optimizer_params, model)
             self.lrs["gaussbg.sigma_raw"] = lr
             self.lrs["gaussbg.intensity_raw"] = lr
+            name = model._component_constraint_name(self.gaussbg, self.gaussbg_idx)
+            self.component_keys[name] = ["gaussbg.sigma_raw", "gaussbg.intensity_raw"]
+            self.component_keys[self.gaussbg.__class__.__name__] = list(self.component_keys[name])
         if self.lat is not None and self.lat_idx is not None:
             lr = _lr_for_component(self.lat, self.lat_idx, optimizer_params, model)
+            lat_keys = []
             for k in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
                 self.lrs[f"lat.{k}"] = lr
+                lat_keys.append(f"lat.{k}")
             # Origin uses the lattice's LR (lattice is the most common owner of origin).
             self.lrs["origin.coords"] = lr
+            name = model._component_constraint_name(self.lat, self.lat_idx)
+            self.component_keys[name] = lat_keys
+            self.component_keys[self.lat.__class__.__name__] = list(lat_keys)
         elif self.gaussbg is not None and self.gaussbg_idx is not None:
             self.lrs["origin.coords"] = self.lrs["gaussbg.intensity_raw"]
         else:
             self.lrs["origin.coords"] = 1e-2
+
+        # Default schedulers: constant LR for every key.
+        self.scheduler_specs = {k: {"type": "none"} for k in self.lrs}
         return self
+
+    def set_scheduler_params(self, scheduler_params: Any) -> None:
+        """
+        Configure per-key scheduler specs.
+
+        Accepts either a single spec dict (applied to all params) or a dict
+        keyed by component name / class name (matching ``optimizer_params``).
+        Unknown scheduler types fall back to constant LR.
+        """
+        if scheduler_params is None:
+            return
+        if not isinstance(scheduler_params, dict):
+            return
+
+        def _normalize(spec: dict[str, Any]) -> dict[str, Any]:
+            out = dict(spec)
+            t = str(out.pop("type", out.pop("name", "none"))).lower()
+            # Aliases.
+            if t in ("cosine", "cosineannealing"):
+                t = "cosine_annealing"
+            if t == "cosine_annealing":
+                # Normalize T_max alias and cast numeric strings.
+                if "t_max" in out:
+                    out["T_max"] = out.pop("t_max")
+                if "T_max" in out and out["T_max"] is not None:
+                    out["T_max"] = int(float(out["T_max"]))
+                if "eta_min" in out:
+                    out["eta_min"] = float(out["eta_min"])
+            elif t == "exponential":
+                if "gamma" in out:
+                    out["gamma"] = float(out["gamma"])
+            elif t == "linear":
+                for k in ("start_factor", "end_factor", "total_iters"):
+                    if k in out and out[k] is not None:
+                        out[k] = float(out[k]) if k != "total_iters" else int(float(out[k]))
+            out["type"] = t
+            return out
+
+        # Single-spec form: {"type": ..., ...}.
+        if "type" in scheduler_params or "name" in scheduler_params:
+            spec = _normalize(cast(dict[str, Any], scheduler_params))
+            for k in self.scheduler_specs:
+                self.scheduler_specs[k] = dict(spec)
+            return
+
+        # Per-component form: {component_name_or_class: spec_dict}.
+        for comp_name, spec in scheduler_params.items():
+            if not isinstance(spec, dict):
+                continue
+            norm = _normalize(spec)
+            param_keys = self.component_keys.get(str(comp_name), [])
+            for k in param_keys:
+                if k in self.scheduler_specs:
+                    self.scheduler_specs[k] = dict(norm)
+
+    def lr_at_step(self, step: int, n_steps: int) -> dict[str, float]:
+        """
+        Evaluate the analytic LR schedule for each stacked-param key at
+        ``step`` (1-indexed, matches the bias correction).
+        """
+        out: dict[str, float] = {}
+        for key, base_lr in self.lrs.items():
+            spec = self.scheduler_specs.get(key, {"type": "none"})
+            t = str(spec.get("type", "none")).lower()
+            if t == "cosine_annealing":
+                T_max = int(spec.get("T_max") or n_steps)
+                if T_max < 1:
+                    T_max = 1
+                eta_min = float(spec.get("eta_min", 1e-7))
+                # PyTorch CosineAnnealingLR formula at step s (0-indexed):
+                # lr(s) = eta_min + 0.5*(base - eta_min)*(1 + cos(pi*s/T_max))
+                s = max(step - 1, 0)
+                import math
+                lr = eta_min + 0.5 * (base_lr - eta_min) * (1.0 + math.cos(math.pi * s / T_max))
+                out[key] = float(lr)
+            elif t == "exponential":
+                gamma = float(spec.get("gamma", 1.0))
+                out[key] = float(base_lr * (gamma ** max(step - 1, 0)))
+            elif t == "linear":
+                start = float(spec.get("start_factor", 1.0 / 3.0))
+                end = float(spec.get("end_factor", 1.0))
+                total = int(spec.get("total_iters", n_steps) or n_steps)
+                if total < 1:
+                    total = 1
+                s = min(max(step - 1, 0), total)
+                factor = start + (end - start) * (s / total)
+                out[key] = float(base_lr * factor)
+            else:
+                # none / plateau / cyclic / unknown -> constant LR.
+                out[key] = float(base_lr)
+        return out
+
+    def batched_constraint_loss(
+        self,
+        ctx: RenderContext,
+        stacked: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Per-sample soft-constraint loss summed across components.
+
+        Returns a tensor of shape ``(B,)``. Only ``DiskTemplate`` contributes
+        today; other components inherit the zero-returning base
+        ``constraint_loss``.
+        """
+        B = stacked["origin.coords"].shape[0]
+        out = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+        if self.disk is not None:
+            template_b = stacked.get("disk.template_raw")
+            if template_b is not None:
+                out = out + self.disk.constraint_loss_batched(ctx, template_raw_b=template_b)
+        return out
+
+    def resolve_component_keys(self, components: Any) -> list[str]:
+        """Resolve a name/list of component names to the stacked-param keys they own."""
+        if components is None:
+            return []
+        if isinstance(components, str):
+            components = [components]
+        keys: list[str] = []
+        for name in components:
+            ks = self.component_keys.get(str(name))
+            if ks is None:
+                raise KeyError(
+                    f"Unknown component name '{name}' for batched fit. "
+                    f"Known: {sorted(self.component_keys)}"
+                )
+            for k in ks:
+                if k not in keys:
+                    keys.append(k)
+        return keys
 
     def build_stacked_params(self, B: int) -> dict[str, torch.Tensor]:
         out: dict[str, torch.Tensor] = {}
@@ -1200,32 +1466,44 @@ class _BatchedPlan:
             )
         return pred
 
-    def apply_hard_constraints(self, stacked: dict[str, torch.Tensor]) -> None:
-        """Apply batched analogues of each component's hard constraints to stacked params (in-place)."""
+    def apply_hard_constraints(
+        self,
+        stacked: dict[str, torch.Tensor],
+        skip_keys: set[str] | None = None,
+    ) -> None:
+        """Apply batched analogues of each component's hard constraints to stacked params (in-place).
+
+        ``skip_keys`` is a set of stacked-param keys that should not be mutated
+        by any hard-constraint op (used for fully-frozen components).
+        """
+        skip_keys = skip_keys or set()
         # Parameter bounds (always elementwise; safe on any shape).
         if self.disk is not None:
             for pname, (lo, hi) in self.disk.parameter_bounds.items():
                 key = f"disk.{pname}"
-                if key in stacked:
+                if key in stacked and key not in skip_keys:
                     self._clamp_bounds_inplace(stacked[key], lo, hi)
         if self.dcbg is not None:
             for pname, (lo, hi) in self.dcbg.parameter_bounds.items():
                 key = f"dcbg.{pname}"
-                if key in stacked:
+                if key in stacked and key not in skip_keys:
                     self._clamp_bounds_inplace(stacked[key], lo, hi)
         if self.gaussbg is not None:
             for pname, (lo, hi) in self.gaussbg.parameter_bounds.items():
                 key = f"gaussbg.{pname}"
-                if key in stacked:
+                if key in stacked and key not in skip_keys:
                     self._clamp_bounds_inplace(stacked[key], lo, hi)
         if self.lat is not None:
             for pname, (lo, hi) in self.lat.parameter_bounds.items():
                 key = f"lat.{pname}"
-                if key in stacked:
+                if key in stacked and key not in skip_keys:
                     self._clamp_bounds_inplace(stacked[key], lo, hi)
 
+        disk_template_frozen = "disk.template_raw" in skip_keys
+        disk_intensity_frozen = "disk.intensity_raw" in skip_keys
+
         # DiskTemplate composite hard constraints.
-        if self.disk is not None:
+        if self.disk is not None and not disk_template_frozen:
             template = stacked.get("disk.template_raw")
             intensity = stacked.get("disk.intensity_raw")
             cfg = self.disk.constraint_config
@@ -1240,13 +1518,16 @@ class _BatchedPlan:
                     template.sub_(float(cfg.get("shrinkage_amount", 0.25)))
                 if bool(self.disk.hard_constraints.get("force_positive", False)):
                     template.clamp_(min=0.0)
-                    intensity.clamp_(min=0.0)
+                    if not disk_intensity_frozen:
+                        intensity.clamp_(min=0.0)
                 if bool(self.disk.hard_constraints.get("force_norm", False)):
                     self._batched_enforce_norm(template)
 
         # SyntheticDiskLattice.force_positive_intensity.
-        if self.lat is not None and bool(
-            self.lat.hard_constraints.get("force_positive_intensity", False)
+        if (
+            self.lat is not None
+            and "lat.i0_raw" not in skip_keys
+            and bool(self.lat.hard_constraints.get("force_positive_intensity", False))
         ):
             i0 = stacked.get("lat.i0_raw")
             if i0 is not None:
