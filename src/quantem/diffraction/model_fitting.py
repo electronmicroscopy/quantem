@@ -4,6 +4,7 @@ from typing import Any, Literal, Sequence, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
 from tqdm import tqdm
@@ -16,6 +17,7 @@ from quantem.core.fitting.base import (
     RenderComponent,
     RenderContext,
 )
+from quantem.core.fitting.background import DCBackground, GaussianBackground
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
@@ -584,8 +586,29 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config_params: dict[str, Any] | None = None,
         progress: bool = True,
+        batch_size: int | None = None,
+        frozen_components: list[str] | str | None = None,
+        sample_trainability: dict[str, Any] | None = None,
+        **_compat_kwargs: Any,
     ) -> "ModelDiffraction":
+        if batch_size is not None:
+            return self.fit_individual_diffraction_pattern_batched(
+                rows=rows,
+                cols=cols,
+                batch_size=int(batch_size),
+                n_steps=int(n_steps),
+                reset=cast(Literal["initialized", "mean_refined"], reset),
+                optimizer_params=optimizer_params,
+                scheduler_params=scheduler_params,
+                constraint_weight=float(constraint_weight),
+                constraint_params=constraint_params,
+                constraint_config_params=constraint_config_params,
+                frozen_components=frozen_components,
+                sample_trainability=sample_trainability,
+                progress=progress,
+            )
 
         if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
@@ -649,7 +672,236 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         self.individual_refined=True
         return self
-    
+
+    def fit_individual_diffraction_pattern_batched(
+        self,
+        *,
+        rows: Any = None,
+        cols: Any = None,
+        batch_size: int = 16,
+        n_steps: int = 200,
+        reset: Literal["initialized", "mean_refined"] = "mean_refined",
+        optimizer_params: dict | None = None,
+        scheduler_params: dict | None = None,
+        constraint_weight: float = 1.0,
+        constraint_params: dict[str, Any] | None = None,
+        constraint_config_params: dict[str, Any] | None = None,
+        frozen_components: list[str] | str | None = None,
+        sample_trainability: dict[str, Any] | None = None,
+        progress: bool = True,
+    ) -> "ModelDiffraction":
+        """
+        Per-pattern fit, vectorized across a batch dimension on a single GPU.
+
+        See ``fit_individual_diffraction_pattern`` for argument semantics. The
+        batched version runs ``batch_size`` patterns in parallel per optimizer
+        step, with per-sample stacked parameters and per-sample Adam moments.
+
+        Soft constraint losses are added per-sample via
+        ``model.total_constraint_loss``-style accumulation (currently only
+        ``DiskTemplate`` contributes). Hard constraints and parameter bounds
+        are still enforced between steps.
+
+        Parameters
+        ----------
+        scheduler_params : dict | None, optional
+            Either a single spec dict (``{"type": "cosine", "t_max": N}``)
+            applied to every parameter group, or a dict keyed by component
+            name/class. Supported types: ``none``, ``cosine`` (a.k.a.
+            ``cosine_annealing``), ``linear``, ``exponential``. ``plateau``
+            and ``cyclic`` fall back to constant LR with a warning.
+        constraint_weight : float
+            Global multiplier on the per-sample soft-constraint loss.
+        constraint_config_params : dict | None
+            Applied to the model once before the fit (``apply_constraint_configs``).
+        frozen_components : list[str] | str | None
+            Component name(s) whose parameters are frozen across all samples.
+            Resolved via ``AdditiveRenderModel._component_constraint_name``;
+            both instance names (``"disk0"``) and class names (``"DiskTemplate"``)
+            work.
+        sample_trainability : dict[str, ArrayLike] | None
+            Per-canonical-key (e.g. ``"disk.template_raw"``) boolean array of
+            length ``len(positions)``; ``False`` entries freeze that parameter
+            for the matching scan position.
+        """
+        if self.model is None or self.ctx is None or self.target_mean is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        if not isinstance(self.dataset, Dataset4d):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        if reset not in ("initialized", "mean_refined"):
+            raise ValueError("reset must be 'initialized' or 'mean_refined'.")
+
+        # Choose initialization state and load into the live model so we can
+        # read current parameter values + constraint settings off the modules.
+        if reset == "mean_refined":
+            if self.state_mean_refined is None:
+                raise RuntimeError("mean_refined state is unavailable. Run fit_mean_diffraction_pattern first.")
+            init_state = self._clone_state_dict(self.state_mean_refined)
+        else:
+            if self.state_initialized is None:
+                raise RuntimeError("initialized state is unavailable. Call define_model first.")
+            init_state = self._clone_state_dict(self.state_initialized)
+        self._load_model_state_dict_copy(init_state)
+
+        if constraint_params is not None:
+            self.model.apply_constraint_params(constraint_params, strict=True)
+        if constraint_config_params is not None:
+            self.model.apply_constraint_configs(constraint_config_params, strict=True)
+
+        scan_r = int(self.dataset.shape[0])
+        scan_c = int(self.dataset.shape[1])
+        rows_arr, cols_arr = _resolve_rows_cols_for_batched(rows, cols, scan_r, scan_c)
+        positions: list[tuple[int, int]] = [(int(r), int(c)) for r in rows_arr for c in cols_arr]
+        if len(positions) == 0:
+            return self
+
+        if self.state_individual_refined is None or self.state_individual_refined.shape != (scan_r, scan_c):
+            self.state_individual_refined = np.full(shape=(scan_r, scan_c), fill_value=None, dtype=object)
+
+        ctx = self.ctx
+        components_list = list(self.model.components)
+        plan = _BatchedPlan.from_model(self.model, components_list, optimizer_params or {})
+        plan.set_scheduler_params(scheduler_params)
+
+        # Build per-position trainability arrays (default True everywhere).
+        n_positions = len(positions)
+        is_trainable_pos: dict[str, np.ndarray] = {
+            key: np.ones(n_positions, dtype=bool) for key in plan.lrs
+        }
+        frozen_keys = plan.resolve_component_keys(frozen_components)
+        for key in frozen_keys:
+            is_trainable_pos[key][:] = False
+        # Keys that are frozen for ALL samples skip hard constraints too.
+        hard_skip_keys: set[str] = set(frozen_keys)
+        if sample_trainability is not None:
+            for key, arr in sample_trainability.items():
+                if key not in is_trainable_pos:
+                    raise KeyError(
+                        f"sample_trainability key '{key}' is not a known stacked-param. "
+                        f"Known: {sorted(is_trainable_pos)}"
+                    )
+                mask = np.asarray(arr, dtype=bool).reshape(-1)
+                if mask.shape != (n_positions,):
+                    raise ValueError(
+                        f"sample_trainability['{key}'] has shape {mask.shape}, "
+                        f"expected ({n_positions},)."
+                    )
+                is_trainable_pos[key] = mask
+
+        loss_fn = self.loss_fn
+
+        total_steps = len(positions) * n_steps
+        pbar = tqdm(total=total_steps, desc="Fit individual (batched)", disable=not progress)
+
+        for start in range(0, len(positions), int(batch_size)):
+            chunk = positions[start:start + int(batch_size)]
+            B = len(chunk)
+
+            targets = torch.stack(
+                [
+                    torch.as_tensor(self.dataset.array[r, c], device=ctx.device, dtype=ctx.dtype)
+                    for (r, c) in chunk
+                ],
+                dim=0,
+            )
+
+            stacked = plan.build_stacked_params(B)
+
+            adam_state: dict[str, dict[str, torch.Tensor]] = {
+                name: {
+                    "m": torch.zeros_like(p.detach()),
+                    "v": torch.zeros_like(p.detach()),
+                }
+                for name, p in stacked.items()
+            }
+
+            # Per-chunk trainability slice as (B,) bool tensors on device.
+            chunk_slice = slice(start, start + B)
+            chunk_trainable: dict[str, torch.Tensor] = {}
+            mixed_trainable_keys: list[str] = []
+            init_snapshots: dict[str, torch.Tensor] = {}
+            for key in stacked:
+                if key in is_trainable_pos:
+                    mask_np = is_trainable_pos[key][chunk_slice]
+                    mask = torch.as_tensor(mask_np, device=ctx.device, dtype=torch.bool)
+                    chunk_trainable[key] = mask
+                    # A "mixed" key has some frozen samples and some trainable.
+                    # We snapshot the init value so frozen samples can be
+                    # restored after hard constraints / Adam.
+                    if not bool(mask.all()) and not bool((~mask).all()):
+                        mixed_trainable_keys.append(key)
+                        init_snapshots[key] = stacked[key].detach().clone()
+
+            for step in range(int(n_steps)):
+                pred = plan.batched_forward(ctx, stacked)
+                # Per-sample fidelity loss summed → scalar with per-sample grads
+                diff2 = (pred.float() - targets.float())
+                # Match SqrtMSELoss behavior approximately when loss_fn is SqrtMSELoss:
+                # gamma-power transform of (x - min(x) + 1), per-sample independently.
+                from quantem.core.fitting.base import SqrtMSELoss, LogMSELoss
+                if isinstance(loss_fn, SqrtMSELoss):
+                    gamma = float(loss_fn.gamma)
+                    eps = 1.0
+                    pred_min = pred.amin(dim=(1, 2), keepdim=True)
+                    tgt_min = targets.amin(dim=(1, 2), keepdim=True)
+                    pred_mod = (pred - pred_min + eps) ** gamma
+                    tgt_mod = (targets - tgt_min + eps) ** gamma
+                    per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
+                elif isinstance(loss_fn, LogMSELoss):
+                    per_sample_loss = ((torch.log1p(pred) - torch.log1p(targets)) ** 2).mean(dim=(1, 2))
+                else:
+                    per_sample_loss = (diff2 * diff2).mean(dim=(1, 2))
+
+                # Add per-sample soft constraint loss.
+                if float(constraint_weight) != 0.0:
+                    constraint_per_sample = plan.batched_constraint_loss(ctx, stacked)
+                    per_sample_loss = per_sample_loss + float(constraint_weight) * constraint_per_sample
+
+                total_loss = per_sample_loss.sum()
+
+                grads_list = list(torch.autograd.grad(total_loss, list(stacked.values())))
+
+                # Apply trainability masks: zero out per-sample gradient entries
+                # for frozen samples/params before the Adam step.
+                for i, (name, g) in enumerate(zip(stacked.keys(), grads_list)):
+                    if g is None:
+                        continue
+                    mask_b = chunk_trainable.get(name)
+                    if mask_b is None:
+                        continue
+                    if bool(mask_b.all()):
+                        continue
+                    # Broadcast (B,) over remaining dims.
+                    view_shape = (g.shape[0],) + (1,) * (g.ndim - 1)
+                    grads_list[i] = g * mask_b.view(view_shape).to(dtype=g.dtype)
+
+                t = step + 1
+                current_lrs = plan.lr_at_step(t, int(n_steps))
+                _adam_step_inplace(stacked, tuple(grads_list), adam_state, current_lrs, t)
+
+                with torch.no_grad():
+                    plan.apply_hard_constraints(stacked, skip_keys=hard_skip_keys)
+                    # For mixed-trainability keys, restore frozen-sample values
+                    # from the init snapshot so they stay at their starting state.
+                    for key in mixed_trainable_keys:
+                        mask = chunk_trainable[key]
+                        view_shape = (mask.shape[0],) + (1,) * (stacked[key].ndim - 1)
+                        keep = mask.view(view_shape)
+                        stacked[key].data.copy_(
+                            torch.where(keep, stacked[key].data, init_snapshots[key])
+                        )
+
+                pbar.update(B)
+
+            # Unstack each sample back into a state_dict and store
+            for b, (r, c) in enumerate(chunk):
+                sample_state = plan.build_sample_state_dict(init_state, stacked, b)
+                self.state_individual_refined[r, c] = sample_state
+
+        pbar.close()
+        self.individual_refined = True
+        return self
+
     def get_individual_uv_vectors(self) -> "ModelDiffraction":
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
@@ -887,3 +1139,546 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
             )
         return self._render_state_array(self.state_mean_refined)
+
+
+def _resolve_rows_cols_for_batched(
+    rows: Any, cols: Any, scan_r: int, scan_c: int
+) -> tuple[np.ndarray, np.ndarray]:
+    if rows is None:
+        rows = range(scan_r)
+    if cols is None:
+        cols = range(scan_c)
+    if isinstance(rows, int):
+        rows_arr = np.array([rows], dtype=int)
+    else:
+        rows_arr = np.asarray(list(rows), dtype=int)
+    if isinstance(cols, int):
+        cols_arr = np.array([cols], dtype=int)
+    else:
+        cols_arr = np.asarray(list(cols), dtype=int)
+    return rows_arr, cols_arr
+
+
+def _lr_for_component(
+    component: RenderComponent,
+    component_idx: int,
+    optimizer_params: dict[str, Any],
+    model: AdditiveRenderModel,
+) -> float:
+    name = model._component_constraint_name(component, component_idx)
+    if name in optimizer_params:
+        return float(optimizer_params[name].get("lr", component.DEFAULT_LR))
+    class_name = component.__class__.__name__
+    if class_name in optimizer_params:
+        return float(optimizer_params[class_name].get("lr", component.DEFAULT_LR))
+    return float(component.DEFAULT_LR)
+
+
+class _BatchedPlan:
+    """Resolved layout for the batched per-pattern fit: component refs, lrs, and helpers."""
+
+    def __init__(self) -> None:
+        self.origin: OriginND | None = None
+        self.disk: DiskTemplate | None = None
+        self.dcbg: DCBackground | None = None
+        self.gaussbg: GaussianBackground | None = None
+        self.lat: SyntheticDiskLattice | None = None
+        self.disk_idx: int | None = None
+        self.dcbg_idx: int | None = None
+        self.gaussbg_idx: int | None = None
+        self.lat_idx: int | None = None
+        self.lrs: dict[str, float] = {}
+        # Per-param normalized scheduler spec; keys match self.lrs.
+        # Each value: {"type": "none|cosine|linear|exponential", ...numerics}.
+        self.scheduler_specs: dict[str, dict[str, Any]] = {}
+        # Mapping from canonical component name -> stacked-param keys.
+        self.component_keys: dict[str, list[str]] = {}
+
+    @classmethod
+    def from_model(
+        cls,
+        model: AdditiveRenderModel,
+        components_list: list[Any],
+        optimizer_params: dict[str, Any],
+    ) -> "_BatchedPlan":
+        self = cls()
+        self.origin = cast(OriginND, model.origin)
+
+        for idx, comp in enumerate(components_list):
+            if isinstance(comp, DiskTemplate) and self.disk is None:
+                self.disk = comp
+                self.disk_idx = idx
+            elif isinstance(comp, DCBackground) and self.dcbg is None:
+                self.dcbg = comp
+                self.dcbg_idx = idx
+            elif isinstance(comp, GaussianBackground) and self.gaussbg is None:
+                self.gaussbg = comp
+                self.gaussbg_idx = idx
+            elif isinstance(comp, SyntheticDiskLattice) and self.lat is None:
+                self.lat = comp
+                self.lat_idx = idx
+            else:
+                raise TypeError(
+                    f"Batched fit does not yet support component type {type(comp).__name__} "
+                    f"at index {idx} (or duplicate of an already-handled type)."
+                )
+
+        # Per-component LRs (with fallback to the component's DEFAULT_LR).
+        if self.disk is not None and self.disk_idx is not None:
+            self.lrs["disk.template_raw"] = _lr_for_component(self.disk, self.disk_idx, optimizer_params, model)
+            self.lrs["disk.intensity_raw"] = self.lrs["disk.template_raw"]
+            name = model._component_constraint_name(self.disk, self.disk_idx)
+            self.component_keys[name] = ["disk.template_raw", "disk.intensity_raw"]
+            self.component_keys[self.disk.__class__.__name__] = list(self.component_keys[name])
+        if self.dcbg is not None and self.dcbg_idx is not None:
+            self.lrs["dcbg.intensity_raw"] = _lr_for_component(self.dcbg, self.dcbg_idx, optimizer_params, model)
+            name = model._component_constraint_name(self.dcbg, self.dcbg_idx)
+            self.component_keys[name] = ["dcbg.intensity_raw"]
+            self.component_keys[self.dcbg.__class__.__name__] = list(self.component_keys[name])
+        if self.gaussbg is not None and self.gaussbg_idx is not None:
+            lr = _lr_for_component(self.gaussbg, self.gaussbg_idx, optimizer_params, model)
+            self.lrs["gaussbg.sigma_raw"] = lr
+            self.lrs["gaussbg.intensity_raw"] = lr
+            name = model._component_constraint_name(self.gaussbg, self.gaussbg_idx)
+            self.component_keys[name] = ["gaussbg.sigma_raw", "gaussbg.intensity_raw"]
+            self.component_keys[self.gaussbg.__class__.__name__] = list(self.component_keys[name])
+        if self.lat is not None and self.lat_idx is not None:
+            lr = _lr_for_component(self.lat, self.lat_idx, optimizer_params, model)
+            lat_keys = []
+            for k in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
+                self.lrs[f"lat.{k}"] = lr
+                lat_keys.append(f"lat.{k}")
+            # Origin uses the lattice's LR (lattice is the most common owner of origin).
+            self.lrs["origin.coords"] = lr
+            name = model._component_constraint_name(self.lat, self.lat_idx)
+            self.component_keys[name] = lat_keys
+            self.component_keys[self.lat.__class__.__name__] = list(lat_keys)
+        elif self.gaussbg is not None and self.gaussbg_idx is not None:
+            self.lrs["origin.coords"] = self.lrs["gaussbg.intensity_raw"]
+        else:
+            self.lrs["origin.coords"] = 1e-2
+
+        # Default schedulers: constant LR for every key.
+        self.scheduler_specs = {k: {"type": "none"} for k in self.lrs}
+        return self
+
+    def set_scheduler_params(self, scheduler_params: Any) -> None:
+        """
+        Configure per-key scheduler specs.
+
+        Accepts either a single spec dict (applied to all params) or a dict
+        keyed by component name / class name (matching ``optimizer_params``).
+        Unknown scheduler types fall back to constant LR.
+        """
+        if scheduler_params is None:
+            return
+        if not isinstance(scheduler_params, dict):
+            return
+
+        def _normalize(spec: dict[str, Any]) -> dict[str, Any]:
+            out = dict(spec)
+            t = str(out.pop("type", out.pop("name", "none"))).lower()
+            # Aliases.
+            if t in ("cosine", "cosineannealing"):
+                t = "cosine_annealing"
+            if t == "cosine_annealing":
+                # Normalize T_max alias and cast numeric strings.
+                if "t_max" in out:
+                    out["T_max"] = out.pop("t_max")
+                if "T_max" in out and out["T_max"] is not None:
+                    out["T_max"] = int(float(out["T_max"]))
+                if "eta_min" in out:
+                    out["eta_min"] = float(out["eta_min"])
+            elif t == "exponential":
+                if "gamma" in out:
+                    out["gamma"] = float(out["gamma"])
+            elif t == "linear":
+                for k in ("start_factor", "end_factor", "total_iters"):
+                    if k in out and out[k] is not None:
+                        out[k] = float(out[k]) if k != "total_iters" else int(float(out[k]))
+            out["type"] = t
+            return out
+
+        # Single-spec form: {"type": ..., ...}.
+        if "type" in scheduler_params or "name" in scheduler_params:
+            spec = _normalize(cast(dict[str, Any], scheduler_params))
+            for k in self.scheduler_specs:
+                self.scheduler_specs[k] = dict(spec)
+            return
+
+        # Per-component form: {component_name_or_class: spec_dict}.
+        for comp_name, spec in scheduler_params.items():
+            if not isinstance(spec, dict):
+                continue
+            norm = _normalize(spec)
+            param_keys = self.component_keys.get(str(comp_name), [])
+            for k in param_keys:
+                if k in self.scheduler_specs:
+                    self.scheduler_specs[k] = dict(norm)
+
+    def lr_at_step(self, step: int, n_steps: int) -> dict[str, float]:
+        """
+        Evaluate the analytic LR schedule for each stacked-param key at
+        ``step`` (1-indexed, matches the bias correction).
+        """
+        out: dict[str, float] = {}
+        for key, base_lr in self.lrs.items():
+            spec = self.scheduler_specs.get(key, {"type": "none"})
+            t = str(spec.get("type", "none")).lower()
+            if t == "cosine_annealing":
+                T_max = int(spec.get("T_max") or n_steps)
+                if T_max < 1:
+                    T_max = 1
+                eta_min = float(spec.get("eta_min", 1e-7))
+                # PyTorch CosineAnnealingLR formula at step s (0-indexed):
+                # lr(s) = eta_min + 0.5*(base - eta_min)*(1 + cos(pi*s/T_max))
+                s = max(step - 1, 0)
+                import math
+                lr = eta_min + 0.5 * (base_lr - eta_min) * (1.0 + math.cos(math.pi * s / T_max))
+                out[key] = float(lr)
+            elif t == "exponential":
+                gamma = float(spec.get("gamma", 1.0))
+                out[key] = float(base_lr * (gamma ** max(step - 1, 0)))
+            elif t == "linear":
+                start = float(spec.get("start_factor", 1.0 / 3.0))
+                end = float(spec.get("end_factor", 1.0))
+                total = int(spec.get("total_iters", n_steps) or n_steps)
+                if total < 1:
+                    total = 1
+                s = min(max(step - 1, 0), total)
+                factor = start + (end - start) * (s / total)
+                out[key] = float(base_lr * factor)
+            else:
+                # none / plateau / cyclic / unknown -> constant LR.
+                out[key] = float(base_lr)
+        return out
+
+    def batched_constraint_loss(
+        self,
+        ctx: RenderContext,
+        stacked: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Per-sample soft-constraint loss summed across components.
+
+        Returns a tensor of shape ``(B,)``. Only ``DiskTemplate`` contributes
+        today; other components inherit the zero-returning base
+        ``constraint_loss``.
+        """
+        B = stacked["origin.coords"].shape[0]
+        out = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+        if self.disk is not None:
+            template_b = stacked.get("disk.template_raw")
+            if template_b is not None:
+                out = out + self.disk.constraint_loss_batched(ctx, template_raw_b=template_b)
+        return out
+
+    def resolve_component_keys(self, components: Any) -> list[str]:
+        """Resolve a name/list of component names to the stacked-param keys they own."""
+        if components is None:
+            return []
+        if isinstance(components, str):
+            components = [components]
+        keys: list[str] = []
+        for name in components:
+            ks = self.component_keys.get(str(name))
+            if ks is None:
+                raise KeyError(
+                    f"Unknown component name '{name}' for batched fit. "
+                    f"Known: {sorted(self.component_keys)}"
+                )
+            for k in ks:
+                if k not in keys:
+                    keys.append(k)
+        return keys
+
+    def build_stacked_params(self, B: int) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        assert self.origin is not None
+        out["origin.coords"] = self._stack(self.origin.coords, B)
+
+        if self.disk is not None:
+            out["disk.template_raw"] = self._stack(self.disk.template_raw, B)
+            out["disk.intensity_raw"] = self._stack(self.disk.intensity_raw, B)
+        if self.dcbg is not None:
+            out["dcbg.intensity_raw"] = self._stack(self.dcbg.intensity_raw, B)
+        if self.gaussbg is not None:
+            out["gaussbg.sigma_raw"] = self._stack(self.gaussbg.sigma_raw, B)
+            out["gaussbg.intensity_raw"] = self._stack(self.gaussbg.intensity_raw, B)
+        if self.lat is not None:
+            for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw"):
+                t = getattr(self.lat, attr)
+                if t is not None:
+                    out[f"lat.{attr}"] = self._stack(t, B)
+            for attr in ("ir", "ic", "irr", "icc", "irc"):
+                t = getattr(self.lat, attr, None)
+                if t is not None:
+                    out[f"lat.{attr}"] = self._stack(t, B)
+        return out
+
+    @staticmethod
+    def _stack(p: torch.Tensor, B: int) -> torch.Tensor:
+        x = p.detach().clone().unsqueeze(0).expand(B, *p.shape).contiguous()
+        x.requires_grad_(True)
+        return x
+
+    def batched_forward(
+        self, ctx: RenderContext, stacked: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        B = stacked["origin.coords"].shape[0]
+        origin_b = stacked["origin.coords"]
+
+        pred = torch.zeros(B, ctx.shape[0], ctx.shape[1], device=ctx.device, dtype=ctx.dtype)
+
+        if self.disk is not None:
+            pred = pred + self.disk.forward_batched(
+                ctx,
+                template_raw_b=stacked["disk.template_raw"],
+                intensity_raw_b=stacked["disk.intensity_raw"],
+                origin_coords_b=origin_b,
+            )
+        if self.dcbg is not None:
+            pred = pred + self.dcbg.forward_batched(
+                ctx, intensity_raw_b=stacked["dcbg.intensity_raw"]
+            )
+        if self.gaussbg is not None:
+            pred = pred + self.gaussbg.forward_batched(
+                ctx,
+                sigma_raw_b=stacked["gaussbg.sigma_raw"],
+                intensity_raw_b=stacked["gaussbg.intensity_raw"],
+                origin_coords_b=origin_b,
+            )
+        if self.lat is not None:
+            pred = pred + self.lat.forward_batched(
+                ctx,
+                u_row_b=stacked["lat.u_row"],
+                u_col_b=stacked["lat.u_col"],
+                v_row_b=stacked["lat.v_row"],
+                v_col_b=stacked["lat.v_col"],
+                i0_raw_b=stacked["lat.i0_raw"],
+                ir_b=stacked.get("lat.ir"),
+                ic_b=stacked.get("lat.ic"),
+                irr_b=stacked.get("lat.irr"),
+                icc_b=stacked.get("lat.icc"),
+                irc_b=stacked.get("lat.irc"),
+                template_raw_b=stacked["disk.template_raw"],
+                origin_coords_b=origin_b,
+            )
+        return pred
+
+    def apply_hard_constraints(
+        self,
+        stacked: dict[str, torch.Tensor],
+        skip_keys: set[str] | None = None,
+    ) -> None:
+        """Apply batched analogues of each component's hard constraints to stacked params (in-place).
+
+        ``skip_keys`` is a set of stacked-param keys that should not be mutated
+        by any hard-constraint op (used for fully-frozen components).
+        """
+        skip_keys = skip_keys or set()
+        # Parameter bounds (always elementwise; safe on any shape).
+        if self.disk is not None:
+            for pname, (lo, hi) in self.disk.parameter_bounds.items():
+                key = f"disk.{pname}"
+                if key in stacked and key not in skip_keys:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+        if self.dcbg is not None:
+            for pname, (lo, hi) in self.dcbg.parameter_bounds.items():
+                key = f"dcbg.{pname}"
+                if key in stacked and key not in skip_keys:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+        if self.gaussbg is not None:
+            for pname, (lo, hi) in self.gaussbg.parameter_bounds.items():
+                key = f"gaussbg.{pname}"
+                if key in stacked and key not in skip_keys:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+        if self.lat is not None:
+            for pname, (lo, hi) in self.lat.parameter_bounds.items():
+                key = f"lat.{pname}"
+                if key in stacked and key not in skip_keys:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+
+        disk_template_frozen = "disk.template_raw" in skip_keys
+        disk_intensity_frozen = "disk.intensity_raw" in skip_keys
+
+        # DiskTemplate composite hard constraints.
+        if self.disk is not None and not disk_template_frozen:
+            template = stacked.get("disk.template_raw")
+            intensity = stacked.get("disk.intensity_raw")
+            cfg = self.disk.constraint_config
+            if template is not None and intensity is not None:
+                if bool(self.disk.hard_constraints.get("force_center", False)):
+                    self._batched_center_disk(template)
+                if bool(self.disk.hard_constraints.get("force_cutoff", False)):
+                    self._batched_enforce_cutoff(template, cfg)
+                if bool(self.disk.hard_constraints.get("force_circular_mask", False)):
+                    self._batched_enforce_circular_mask(template, cfg)
+                if bool(self.disk.hard_constraints.get("force_shrinkage", False)):
+                    template.sub_(float(cfg.get("shrinkage_amount", 0.25)))
+                if bool(self.disk.hard_constraints.get("force_positive", False)):
+                    template.clamp_(min=0.0)
+                    if not disk_intensity_frozen:
+                        intensity.clamp_(min=0.0)
+                if bool(self.disk.hard_constraints.get("force_norm", False)):
+                    self._batched_enforce_norm(template)
+
+        # SyntheticDiskLattice.force_positive_intensity.
+        if (
+            self.lat is not None
+            and "lat.i0_raw" not in skip_keys
+            and bool(self.lat.hard_constraints.get("force_positive_intensity", False))
+        ):
+            i0 = stacked.get("lat.i0_raw")
+            if i0 is not None:
+                i0.clamp_(min=0.0)
+
+    @staticmethod
+    def _clamp_bounds_inplace(t: torch.Tensor, lo: float | None, hi: float | None) -> None:
+        if lo is None and hi is None:
+            return
+        if lo is None:
+            t.clamp_(max=float(hi))  # type: ignore[arg-type]
+        elif hi is None:
+            t.clamp_(min=float(lo))
+        else:
+            t.clamp_(min=float(lo), max=float(hi))
+
+    @staticmethod
+    def _batched_center_disk(template_b: torch.Tensor) -> None:
+        # template_b: (B, H_t, W_t)
+        B, h, w = template_b.shape
+        weights = template_b.clamp(min=0.0)
+        mass = weights.sum(dim=(1, 2))
+        if not torch.any(mass > 1e-12):
+            return
+        rr = torch.arange(h, device=template_b.device, dtype=template_b.dtype).view(1, h, 1)
+        cc = torch.arange(w, device=template_b.device, dtype=template_b.dtype).view(1, 1, w)
+        safe_mass = mass.clamp(min=1e-12)
+        com_r = (weights * rr).sum(dim=(1, 2)) / safe_mass
+        com_c = (weights * cc).sum(dim=(1, 2)) / safe_mass
+        target_r = (h - 1) * 0.5
+        target_c = (w - 1) * 0.5
+        shift_r = target_r - com_r  # (B,)
+        shift_c = target_c - com_c
+        denom_h = max(h - 1, 1)
+        denom_w = max(w - 1, 1)
+        ty = -2.0 * shift_r / float(denom_h)
+        tx = -2.0 * shift_c / float(denom_w)
+        zeros = torch.zeros_like(tx)
+        ones = torch.ones_like(tx)
+        theta = torch.stack(
+            [
+                torch.stack([ones, zeros, tx], dim=1),
+                torch.stack([zeros, ones, ty], dim=1),
+            ],
+            dim=1,
+        )  # (B, 2, 3)
+        src = template_b.unsqueeze(1)  # (B, 1, H, W)
+        grid = F.affine_grid(theta, [B, 1, h, w], align_corners=True)
+        shifted = F.grid_sample(src, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[:, 0]
+        # Only shift samples with nonzero mass; others left as-is.
+        do_shift = (mass > 1e-12).view(B, 1, 1)
+        template_b.copy_(torch.where(do_shift, shifted, template_b))
+
+    @staticmethod
+    def _batched_enforce_norm(template_b: torch.Tensor) -> None:
+        mins = template_b.amin(dim=(1, 2), keepdim=True)
+        template_b.sub_(mins)
+        maxs = template_b.amax(dim=(1, 2), keepdim=True).clamp(min=1e-12)
+        template_b.div_(maxs)
+
+    @staticmethod
+    def _batched_enforce_cutoff(template_b: torch.Tensor, cfg: dict[str, Any]) -> None:
+        thresh_ratio = float(cfg.get("hard_cutoff_threshold", 0.35))
+        maxs = template_b.amax(dim=(1, 2), keepdim=True)
+        thresh = maxs * thresh_ratio
+        mask = template_b <= thresh
+        template_b.masked_fill_(mask, 0.0)
+
+    @staticmethod
+    def _batched_enforce_circular_mask(template_b: torch.Tensor, cfg: dict[str, Any]) -> None:
+        B, h, w = template_b.shape
+        radius = (min(h, w) / 2.0) * float(cfg.get("circular_mask_radius_fraction", 0.95))
+        r = torch.arange(-h / 2, h / 2, device=template_b.device, dtype=template_b.dtype)
+        c = torch.arange(-w / 2, w / 2, device=template_b.device, dtype=template_b.dtype)
+        rr, cc = torch.meshgrid(r, c, indexing="ij")
+        circle = torch.sqrt(rr * rr + cc * cc)
+        if bool(cfg.get("soft_circular_mask", False)):
+            sharpness = float(cfg.get("circular_mask_sharpness", 0))
+            mask2d = torch.sigmoid(sharpness * (radius - circle))
+        else:
+            mask2d = (circle <= radius).to(dtype=template_b.dtype)
+        template_b.mul_(mask2d.view(1, h, w))
+
+    def build_sample_state_dict(
+        self,
+        init_state: dict[str, torch.Tensor],
+        stacked: dict[str, torch.Tensor],
+        b: int,
+    ) -> dict[str, torch.Tensor]:
+        out = {k: v.detach().clone() for k, v in init_state.items()}
+
+        # Origin: top-level key plus any 'components.X.origin.coords' or
+        # 'components.X.disk.origin.coords' that PyTorch state_dict registers.
+        origin_val = stacked["origin.coords"][b].detach().clone()
+        for key in list(out.keys()):
+            if key == "origin.coords" or key.endswith(".origin.coords"):
+                out[key] = origin_val.clone()
+
+        # DiskTemplate (shared with lat.disk).
+        if self.disk is not None and self.disk_idx is not None:
+            t_val = stacked["disk.template_raw"][b].detach().clone()
+            i_val = stacked["disk.intensity_raw"][b].detach().clone()
+            for key in list(out.keys()):
+                if key.endswith(".template_raw"):
+                    out[key] = t_val.clone()
+            for key in (
+                f"components.{self.disk_idx}.intensity_raw",
+                f"components.{self.lat_idx}.disk.intensity_raw" if self.lat_idx is not None else None,
+            ):
+                if key is not None and key in out:
+                    out[key] = i_val.clone()
+
+        # DCBackground.
+        if self.dcbg is not None and self.dcbg_idx is not None:
+            out[f"components.{self.dcbg_idx}.intensity_raw"] = stacked["dcbg.intensity_raw"][b].detach().clone()
+
+        # GaussianBackground.
+        if self.gaussbg is not None and self.gaussbg_idx is not None:
+            out[f"components.{self.gaussbg_idx}.sigma_raw"] = stacked["gaussbg.sigma_raw"][b].detach().clone()
+            out[f"components.{self.gaussbg_idx}.intensity_raw"] = stacked["gaussbg.intensity_raw"][b].detach().clone()
+
+        # SyntheticDiskLattice scalar + tensor params.
+        if self.lat is not None and self.lat_idx is not None:
+            for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
+                key = f"components.{self.lat_idx}.{attr}"
+                stacked_key = f"lat.{attr}"
+                if key in out and stacked_key in stacked:
+                    out[key] = stacked[stacked_key][b].detach().clone()
+        return out
+
+
+def _adam_step_inplace(
+    stacked: dict[str, torch.Tensor],
+    grads: tuple[torch.Tensor, ...],
+    adam_state: dict[str, dict[str, torch.Tensor]],
+    lrs: dict[str, float],
+    t: int,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+) -> None:
+    bias1 = 1.0 - beta1 ** t
+    bias2 = 1.0 - beta2 ** t
+    with torch.no_grad():
+        for (name, p), g in zip(stacked.items(), grads):
+            if g is None:
+                continue
+            st = adam_state[name]
+            st["m"].mul_(beta1).add_(g, alpha=1.0 - beta1)
+            st["v"].mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+            m_hat = st["m"] / bias1
+            v_hat = st["v"] / bias2
+            lr = float(lrs.get(name, 1e-2))
+            p.data.addcdiv_(m_hat, v_hat.sqrt().add_(eps), value=-lr)

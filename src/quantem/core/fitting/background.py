@@ -48,6 +48,17 @@ class DCBackground(RenderComponent):
         inten = self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype)
         return torch.ones(ctx.shape, device=ctx.device, dtype=ctx.dtype) * inten
 
+    def forward_batched(
+        self,
+        ctx: RenderContext,
+        *,
+        intensity_raw_b: torch.Tensor,
+    ) -> torch.Tensor:
+        B = intensity_raw_b.shape[0]
+        return intensity_raw_b.view(B, 1, 1).expand(B, ctx.shape[0], ctx.shape[1]).to(
+            device=ctx.device, dtype=ctx.dtype
+        )
+
 
 class GaussianBackground(RenderComponent):  # TODO this should be N dimensional by default
     def __init__(
@@ -108,5 +119,23 @@ class GaussianBackground(RenderComponent):  # TODO this should be N dimensional 
 
         sigma = self.sigma_raw.to(device=ctx.device, dtype=ctx.dtype)
         inten = self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype)
+        r2 = (rr - r0) ** 2 + (cc - c0) ** 2
+        return inten * torch.exp(-0.5 * r2 / (sigma * sigma))
+
+    def forward_batched(
+        self,
+        ctx: RenderContext,
+        *,
+        sigma_raw_b: torch.Tensor,
+        intensity_raw_b: torch.Tensor,
+        origin_coords_b: torch.Tensor,
+    ) -> torch.Tensor:
+        B = sigma_raw_b.shape[0]
+        rr = torch.arange(ctx.shape[0], device=ctx.device, dtype=ctx.dtype).view(1, ctx.shape[0], 1)
+        cc = torch.arange(ctx.shape[1], device=ctx.device, dtype=ctx.dtype).view(1, 1, ctx.shape[1])
+        r0 = origin_coords_b[:, 0].view(B, 1, 1)
+        c0 = origin_coords_b[:, 1].view(B, 1, 1)
+        sigma = sigma_raw_b.view(B, 1, 1)
+        inten = intensity_raw_b.view(B, 1, 1)
         r2 = (rr - r0) ** 2 + (cc - c0) ** 2
         return inten * torch.exp(-0.5 * r2 / (sigma * sigma))
