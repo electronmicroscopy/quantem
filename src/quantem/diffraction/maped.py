@@ -1369,9 +1369,9 @@ class MAPEDTorch(AutoSerialize):
                 padding=padding,
                 pad_val=pad_val,
                 mode=shift_method,
-                blend=False,
+                blend=True,
             )
-            show_2d(im_aligned.sum(0), **plot_kwargs)
+            show_2d(im_aligned, **plot_kwargs)
 
         return self
 
@@ -2005,7 +2005,6 @@ def shift_images_torch(
     for ind in range(n):
         stack[ind, r0 : r0 + H, c0 : c0 + W] = images[ind].to(dtype=torch.float32) * w
         stack_w[ind, r0 : r0 + H, c0 : c0 + W] = w
-
     # shift both stack and stack_w using grid_sample on (n,1,Hp,Wp)
     imgs = stack.unsqueeze(1)
     imgs_w = stack_w.unsqueeze(1)
@@ -2088,6 +2087,7 @@ def dscan_correct(
     plot_aligned: bool = True,
     edge_blend: float = 2.0,
     device="cpu",
+    method="cross_correlation",
     fit_shifts=True,
     mode="linear",
 ):
@@ -2147,22 +2147,25 @@ def dscan_correct(
 
     for iteration in range(iterations):
         G_ref = torch.fft.fft2(shifted_dps.mean(dim=(0, 1)) * w)
+        if method == "cross_correlation":
+            for h_rs in tqdm(range(H_rs), desc=f"Iteration {iteration + 1}/{iterations}"):
+                for w_rs in range(W_rs):
+                    ind = w_rs + h_rs * H_rs
+                    dp = shifted_dps[h_rs, w_rs]  # <-- Read from current shifted_dps, not original
+                    G = torch.fft.fft2(w * dp)
+                    shift = cross_correlation_shift_torch(
+                        G_ref, G, upsample_factor=upsample_factor, fft_input=True
+                    )
+                    diffraction_shifts[h_rs, w_rs] = shift
 
-        for h_rs in tqdm(range(H_rs), desc=f"Iteration {iteration + 1}/{iterations}"):
-            for w_rs in range(W_rs):
-                ind = w_rs + h_rs * H_rs
-                dp = shifted_dps[h_rs, w_rs]  # <-- Read from current shifted_dps, not original
-                G = torch.fft.fft2(w * dp)
-                shift = cross_correlation_shift_torch(
-                    G_ref, G, upsample_factor=upsample_factor, fft_input=True
-                )
-                diffraction_shifts[h_rs, w_rs] = shift
+                    phase_ramp = torch.exp(-1j * torch.pi * (kr * shift[0] + kc * shift[1]))
+                    G_shift = G * phase_ramp
 
-                phase_ramp = torch.exp(-1j * torch.pi * (kr * shift[0] + kc * shift[1]))
-                G_shift = G * phase_ramp
+                    shifted_dps[h_rs, w_rs, :, :] = torch.fft.ifft2(G_shift).real
+                    G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
 
-                shifted_dps[h_rs, w_rs, :, :] = torch.fft.ifft2(G_shift).real
-                G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
+        if method == "autocorrelation":
+            pass
 
         G_ref_final = G_ref.clone()
 
