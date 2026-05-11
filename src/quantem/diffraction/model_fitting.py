@@ -4,6 +4,7 @@ from typing import Any, Literal, Sequence, cast
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal.windows import tukey
 from tqdm import tqdm
@@ -16,6 +17,7 @@ from quantem.core.fitting.base import (
     RenderComponent,
     RenderContext,
 )
+from quantem.core.fitting.background import DCBackground, GaussianBackground
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
@@ -585,7 +587,20 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         progress: bool = True,
+        batch_size: int | None = None,
+        **_compat_kwargs: Any,
     ) -> "ModelDiffraction":
+        if batch_size is not None:
+            return self.fit_individual_diffraction_pattern_batched(
+                rows=rows,
+                cols=cols,
+                batch_size=int(batch_size),
+                n_steps=int(n_steps),
+                reset=cast(Literal["initialized", "mean_refined"], reset),
+                optimizer_params=optimizer_params,
+                constraint_params=constraint_params,
+                progress=progress,
+            )
 
         if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
@@ -649,7 +664,130 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         self.individual_refined=True
         return self
-    
+
+    def fit_individual_diffraction_pattern_batched(
+        self,
+        *,
+        rows: Any = None,
+        cols: Any = None,
+        batch_size: int = 16,
+        n_steps: int = 200,
+        reset: Literal["initialized", "mean_refined"] = "mean_refined",
+        optimizer_params: dict | None = None,
+        constraint_params: dict[str, Any] | None = None,
+        progress: bool = True,
+    ) -> "ModelDiffraction":
+        """
+        Per-pattern fit, vectorized across a batch dimension on a single GPU.
+
+        See ``fit_individual_diffraction_pattern`` for argument semantics. The
+        batched version runs ``batch_size`` patterns in parallel per optimizer
+        step, with per-sample stacked parameters and per-sample Adam moments.
+        Soft constraint losses are not yet supported; only hard constraints
+        and parameter bounds are enforced between steps.
+        """
+        if self.model is None or self.ctx is None or self.target_mean is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        if not isinstance(self.dataset, Dataset4d):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        if reset not in ("initialized", "mean_refined"):
+            raise ValueError("reset must be 'initialized' or 'mean_refined'.")
+
+        # Choose initialization state and load into the live model so we can
+        # read current parameter values + constraint settings off the modules.
+        if reset == "mean_refined":
+            if self.state_mean_refined is None:
+                raise RuntimeError("mean_refined state is unavailable. Run fit_mean_diffraction_pattern first.")
+            init_state = self._clone_state_dict(self.state_mean_refined)
+        else:
+            if self.state_initialized is None:
+                raise RuntimeError("initialized state is unavailable. Call define_model first.")
+            init_state = self._clone_state_dict(self.state_initialized)
+        self._load_model_state_dict_copy(init_state)
+
+        if constraint_params is not None:
+            self.model.apply_constraint_params(constraint_params, strict=True)
+
+        scan_r = int(self.dataset.shape[0])
+        scan_c = int(self.dataset.shape[1])
+        rows_arr, cols_arr = _resolve_rows_cols_for_batched(rows, cols, scan_r, scan_c)
+        positions: list[tuple[int, int]] = [(int(r), int(c)) for r in rows_arr for c in cols_arr]
+        if len(positions) == 0:
+            return self
+
+        if self.state_individual_refined is None or self.state_individual_refined.shape != (scan_r, scan_c):
+            self.state_individual_refined = np.full(shape=(scan_r, scan_c), fill_value=None, dtype=object)
+
+        ctx = self.ctx
+        components_list = list(self.model.components)
+        plan = _BatchedPlan.from_model(self.model, components_list, optimizer_params or {})
+
+        loss_fn = self.loss_fn
+
+        total_steps = len(positions) * n_steps
+        pbar = tqdm(total=total_steps, desc="Fit individual (batched)", disable=not progress)
+
+        for start in range(0, len(positions), int(batch_size)):
+            chunk = positions[start:start + int(batch_size)]
+            B = len(chunk)
+
+            targets = torch.stack(
+                [
+                    torch.as_tensor(self.dataset.array[r, c], device=ctx.device, dtype=ctx.dtype)
+                    for (r, c) in chunk
+                ],
+                dim=0,
+            )
+
+            stacked = plan.build_stacked_params(B)
+
+            adam_state: dict[str, dict[str, torch.Tensor]] = {
+                name: {
+                    "m": torch.zeros_like(p.detach()),
+                    "v": torch.zeros_like(p.detach()),
+                }
+                for name, p in stacked.items()
+            }
+
+            for step in range(int(n_steps)):
+                pred = plan.batched_forward(ctx, stacked)
+                # Per-sample fidelity loss summed → scalar with per-sample grads
+                diff2 = (pred.float() - targets.float())
+                # Match SqrtMSELoss behavior approximately when loss_fn is SqrtMSELoss:
+                # gamma-power transform of (x - min(x) + 1), per-sample independently.
+                from quantem.core.fitting.base import SqrtMSELoss, LogMSELoss
+                if isinstance(loss_fn, SqrtMSELoss):
+                    gamma = float(loss_fn.gamma)
+                    eps = 1.0
+                    pred_min = pred.amin(dim=(1, 2), keepdim=True)
+                    tgt_min = targets.amin(dim=(1, 2), keepdim=True)
+                    pred_mod = (pred - pred_min + eps) ** gamma
+                    tgt_mod = (targets - tgt_min + eps) ** gamma
+                    per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
+                elif isinstance(loss_fn, LogMSELoss):
+                    per_sample_loss = ((torch.log1p(pred) - torch.log1p(targets)) ** 2).mean(dim=(1, 2))
+                else:
+                    per_sample_loss = (diff2 * diff2).mean(dim=(1, 2))
+                total_loss = per_sample_loss.sum()
+
+                grads = torch.autograd.grad(total_loss, list(stacked.values()))
+                t = step + 1
+                _adam_step_inplace(stacked, grads, adam_state, plan.lrs, t)
+
+                with torch.no_grad():
+                    plan.apply_hard_constraints(stacked)
+
+                pbar.update(B)
+
+            # Unstack each sample back into a state_dict and store
+            for b, (r, c) in enumerate(chunk):
+                sample_state = plan.build_sample_state_dict(init_state, stacked, b)
+                self.state_individual_refined[r, c] = sample_state
+
+        pbar.close()
+        self.individual_refined = True
+        return self
+
     def get_individual_uv_vectors(self) -> "ModelDiffraction":
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
@@ -887,3 +1025,379 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 "mean_refined state is unavailable. Run .fit_mean_diffraction_pattern(...) first."
             )
         return self._render_state_array(self.state_mean_refined)
+
+
+def _resolve_rows_cols_for_batched(
+    rows: Any, cols: Any, scan_r: int, scan_c: int
+) -> tuple[np.ndarray, np.ndarray]:
+    if rows is None:
+        rows = range(scan_r)
+    if cols is None:
+        cols = range(scan_c)
+    if isinstance(rows, int):
+        rows_arr = np.array([rows], dtype=int)
+    else:
+        rows_arr = np.asarray(list(rows), dtype=int)
+    if isinstance(cols, int):
+        cols_arr = np.array([cols], dtype=int)
+    else:
+        cols_arr = np.asarray(list(cols), dtype=int)
+    return rows_arr, cols_arr
+
+
+def _lr_for_component(
+    component: RenderComponent,
+    component_idx: int,
+    optimizer_params: dict[str, Any],
+    model: AdditiveRenderModel,
+) -> float:
+    name = model._component_constraint_name(component, component_idx)
+    if name in optimizer_params:
+        return float(optimizer_params[name].get("lr", component.DEFAULT_LR))
+    class_name = component.__class__.__name__
+    if class_name in optimizer_params:
+        return float(optimizer_params[class_name].get("lr", component.DEFAULT_LR))
+    return float(component.DEFAULT_LR)
+
+
+class _BatchedPlan:
+    """Resolved layout for the batched per-pattern fit: component refs, lrs, and helpers."""
+
+    def __init__(self) -> None:
+        self.origin: OriginND | None = None
+        self.disk: DiskTemplate | None = None
+        self.dcbg: DCBackground | None = None
+        self.gaussbg: GaussianBackground | None = None
+        self.lat: SyntheticDiskLattice | None = None
+        self.disk_idx: int | None = None
+        self.dcbg_idx: int | None = None
+        self.gaussbg_idx: int | None = None
+        self.lat_idx: int | None = None
+        self.lrs: dict[str, float] = {}
+
+    @classmethod
+    def from_model(
+        cls,
+        model: AdditiveRenderModel,
+        components_list: list[Any],
+        optimizer_params: dict[str, Any],
+    ) -> "_BatchedPlan":
+        self = cls()
+        self.origin = cast(OriginND, model.origin)
+
+        for idx, comp in enumerate(components_list):
+            if isinstance(comp, DiskTemplate) and self.disk is None:
+                self.disk = comp
+                self.disk_idx = idx
+            elif isinstance(comp, DCBackground) and self.dcbg is None:
+                self.dcbg = comp
+                self.dcbg_idx = idx
+            elif isinstance(comp, GaussianBackground) and self.gaussbg is None:
+                self.gaussbg = comp
+                self.gaussbg_idx = idx
+            elif isinstance(comp, SyntheticDiskLattice) and self.lat is None:
+                self.lat = comp
+                self.lat_idx = idx
+            else:
+                raise TypeError(
+                    f"Batched fit does not yet support component type {type(comp).__name__} "
+                    f"at index {idx} (or duplicate of an already-handled type)."
+                )
+
+        # Per-component LRs (with fallback to the component's DEFAULT_LR).
+        if self.disk is not None and self.disk_idx is not None:
+            self.lrs["disk.template_raw"] = _lr_for_component(self.disk, self.disk_idx, optimizer_params, model)
+            self.lrs["disk.intensity_raw"] = self.lrs["disk.template_raw"]
+        if self.dcbg is not None and self.dcbg_idx is not None:
+            self.lrs["dcbg.intensity_raw"] = _lr_for_component(self.dcbg, self.dcbg_idx, optimizer_params, model)
+        if self.gaussbg is not None and self.gaussbg_idx is not None:
+            lr = _lr_for_component(self.gaussbg, self.gaussbg_idx, optimizer_params, model)
+            self.lrs["gaussbg.sigma_raw"] = lr
+            self.lrs["gaussbg.intensity_raw"] = lr
+        if self.lat is not None and self.lat_idx is not None:
+            lr = _lr_for_component(self.lat, self.lat_idx, optimizer_params, model)
+            for k in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
+                self.lrs[f"lat.{k}"] = lr
+            # Origin uses the lattice's LR (lattice is the most common owner of origin).
+            self.lrs["origin.coords"] = lr
+        elif self.gaussbg is not None and self.gaussbg_idx is not None:
+            self.lrs["origin.coords"] = self.lrs["gaussbg.intensity_raw"]
+        else:
+            self.lrs["origin.coords"] = 1e-2
+        return self
+
+    def build_stacked_params(self, B: int) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        assert self.origin is not None
+        out["origin.coords"] = self._stack(self.origin.coords, B)
+
+        if self.disk is not None:
+            out["disk.template_raw"] = self._stack(self.disk.template_raw, B)
+            out["disk.intensity_raw"] = self._stack(self.disk.intensity_raw, B)
+        if self.dcbg is not None:
+            out["dcbg.intensity_raw"] = self._stack(self.dcbg.intensity_raw, B)
+        if self.gaussbg is not None:
+            out["gaussbg.sigma_raw"] = self._stack(self.gaussbg.sigma_raw, B)
+            out["gaussbg.intensity_raw"] = self._stack(self.gaussbg.intensity_raw, B)
+        if self.lat is not None:
+            for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw"):
+                t = getattr(self.lat, attr)
+                if t is not None:
+                    out[f"lat.{attr}"] = self._stack(t, B)
+            for attr in ("ir", "ic", "irr", "icc", "irc"):
+                t = getattr(self.lat, attr, None)
+                if t is not None:
+                    out[f"lat.{attr}"] = self._stack(t, B)
+        return out
+
+    @staticmethod
+    def _stack(p: torch.Tensor, B: int) -> torch.Tensor:
+        x = p.detach().clone().unsqueeze(0).expand(B, *p.shape).contiguous()
+        x.requires_grad_(True)
+        return x
+
+    def batched_forward(
+        self, ctx: RenderContext, stacked: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        B = stacked["origin.coords"].shape[0]
+        origin_b = stacked["origin.coords"]
+
+        pred = torch.zeros(B, ctx.shape[0], ctx.shape[1], device=ctx.device, dtype=ctx.dtype)
+
+        if self.disk is not None:
+            pred = pred + self.disk.forward_batched(
+                ctx,
+                template_raw_b=stacked["disk.template_raw"],
+                intensity_raw_b=stacked["disk.intensity_raw"],
+                origin_coords_b=origin_b,
+            )
+        if self.dcbg is not None:
+            pred = pred + self.dcbg.forward_batched(
+                ctx, intensity_raw_b=stacked["dcbg.intensity_raw"]
+            )
+        if self.gaussbg is not None:
+            pred = pred + self.gaussbg.forward_batched(
+                ctx,
+                sigma_raw_b=stacked["gaussbg.sigma_raw"],
+                intensity_raw_b=stacked["gaussbg.intensity_raw"],
+                origin_coords_b=origin_b,
+            )
+        if self.lat is not None:
+            pred = pred + self.lat.forward_batched(
+                ctx,
+                u_row_b=stacked["lat.u_row"],
+                u_col_b=stacked["lat.u_col"],
+                v_row_b=stacked["lat.v_row"],
+                v_col_b=stacked["lat.v_col"],
+                i0_raw_b=stacked["lat.i0_raw"],
+                ir_b=stacked.get("lat.ir"),
+                ic_b=stacked.get("lat.ic"),
+                irr_b=stacked.get("lat.irr"),
+                icc_b=stacked.get("lat.icc"),
+                irc_b=stacked.get("lat.irc"),
+                template_raw_b=stacked["disk.template_raw"],
+                origin_coords_b=origin_b,
+            )
+        return pred
+
+    def apply_hard_constraints(self, stacked: dict[str, torch.Tensor]) -> None:
+        """Apply batched analogues of each component's hard constraints to stacked params (in-place)."""
+        # Parameter bounds (always elementwise; safe on any shape).
+        if self.disk is not None:
+            for pname, (lo, hi) in self.disk.parameter_bounds.items():
+                key = f"disk.{pname}"
+                if key in stacked:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+        if self.dcbg is not None:
+            for pname, (lo, hi) in self.dcbg.parameter_bounds.items():
+                key = f"dcbg.{pname}"
+                if key in stacked:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+        if self.gaussbg is not None:
+            for pname, (lo, hi) in self.gaussbg.parameter_bounds.items():
+                key = f"gaussbg.{pname}"
+                if key in stacked:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+        if self.lat is not None:
+            for pname, (lo, hi) in self.lat.parameter_bounds.items():
+                key = f"lat.{pname}"
+                if key in stacked:
+                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+
+        # DiskTemplate composite hard constraints.
+        if self.disk is not None:
+            template = stacked.get("disk.template_raw")
+            intensity = stacked.get("disk.intensity_raw")
+            cfg = self.disk.constraint_config
+            if template is not None and intensity is not None:
+                if bool(self.disk.hard_constraints.get("force_center", False)):
+                    self._batched_center_disk(template)
+                if bool(self.disk.hard_constraints.get("force_cutoff", False)):
+                    self._batched_enforce_cutoff(template, cfg)
+                if bool(self.disk.hard_constraints.get("force_circular_mask", False)):
+                    self._batched_enforce_circular_mask(template, cfg)
+                if bool(self.disk.hard_constraints.get("force_shrinkage", False)):
+                    template.sub_(float(cfg.get("shrinkage_amount", 0.25)))
+                if bool(self.disk.hard_constraints.get("force_positive", False)):
+                    template.clamp_(min=0.0)
+                    intensity.clamp_(min=0.0)
+                if bool(self.disk.hard_constraints.get("force_norm", False)):
+                    self._batched_enforce_norm(template)
+
+        # SyntheticDiskLattice.force_positive_intensity.
+        if self.lat is not None and bool(
+            self.lat.hard_constraints.get("force_positive_intensity", False)
+        ):
+            i0 = stacked.get("lat.i0_raw")
+            if i0 is not None:
+                i0.clamp_(min=0.0)
+
+    @staticmethod
+    def _clamp_bounds_inplace(t: torch.Tensor, lo: float | None, hi: float | None) -> None:
+        if lo is None and hi is None:
+            return
+        if lo is None:
+            t.clamp_(max=float(hi))  # type: ignore[arg-type]
+        elif hi is None:
+            t.clamp_(min=float(lo))
+        else:
+            t.clamp_(min=float(lo), max=float(hi))
+
+    @staticmethod
+    def _batched_center_disk(template_b: torch.Tensor) -> None:
+        # template_b: (B, H_t, W_t)
+        B, h, w = template_b.shape
+        weights = template_b.clamp(min=0.0)
+        mass = weights.sum(dim=(1, 2))
+        if not torch.any(mass > 1e-12):
+            return
+        rr = torch.arange(h, device=template_b.device, dtype=template_b.dtype).view(1, h, 1)
+        cc = torch.arange(w, device=template_b.device, dtype=template_b.dtype).view(1, 1, w)
+        safe_mass = mass.clamp(min=1e-12)
+        com_r = (weights * rr).sum(dim=(1, 2)) / safe_mass
+        com_c = (weights * cc).sum(dim=(1, 2)) / safe_mass
+        target_r = (h - 1) * 0.5
+        target_c = (w - 1) * 0.5
+        shift_r = target_r - com_r  # (B,)
+        shift_c = target_c - com_c
+        denom_h = max(h - 1, 1)
+        denom_w = max(w - 1, 1)
+        ty = -2.0 * shift_r / float(denom_h)
+        tx = -2.0 * shift_c / float(denom_w)
+        zeros = torch.zeros_like(tx)
+        ones = torch.ones_like(tx)
+        theta = torch.stack(
+            [
+                torch.stack([ones, zeros, tx], dim=1),
+                torch.stack([zeros, ones, ty], dim=1),
+            ],
+            dim=1,
+        )  # (B, 2, 3)
+        src = template_b.unsqueeze(1)  # (B, 1, H, W)
+        grid = F.affine_grid(theta, [B, 1, h, w], align_corners=True)
+        shifted = F.grid_sample(src, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[:, 0]
+        # Only shift samples with nonzero mass; others left as-is.
+        do_shift = (mass > 1e-12).view(B, 1, 1)
+        template_b.copy_(torch.where(do_shift, shifted, template_b))
+
+    @staticmethod
+    def _batched_enforce_norm(template_b: torch.Tensor) -> None:
+        mins = template_b.amin(dim=(1, 2), keepdim=True)
+        template_b.sub_(mins)
+        maxs = template_b.amax(dim=(1, 2), keepdim=True).clamp(min=1e-12)
+        template_b.div_(maxs)
+
+    @staticmethod
+    def _batched_enforce_cutoff(template_b: torch.Tensor, cfg: dict[str, Any]) -> None:
+        thresh_ratio = float(cfg.get("hard_cutoff_threshold", 0.35))
+        maxs = template_b.amax(dim=(1, 2), keepdim=True)
+        thresh = maxs * thresh_ratio
+        mask = template_b <= thresh
+        template_b.masked_fill_(mask, 0.0)
+
+    @staticmethod
+    def _batched_enforce_circular_mask(template_b: torch.Tensor, cfg: dict[str, Any]) -> None:
+        B, h, w = template_b.shape
+        radius = (min(h, w) / 2.0) * float(cfg.get("circular_mask_radius_fraction", 0.95))
+        r = torch.arange(-h / 2, h / 2, device=template_b.device, dtype=template_b.dtype)
+        c = torch.arange(-w / 2, w / 2, device=template_b.device, dtype=template_b.dtype)
+        rr, cc = torch.meshgrid(r, c, indexing="ij")
+        circle = torch.sqrt(rr * rr + cc * cc)
+        if bool(cfg.get("soft_circular_mask", False)):
+            sharpness = float(cfg.get("circular_mask_sharpness", 0))
+            mask2d = torch.sigmoid(sharpness * (radius - circle))
+        else:
+            mask2d = (circle <= radius).to(dtype=template_b.dtype)
+        template_b.mul_(mask2d.view(1, h, w))
+
+    def build_sample_state_dict(
+        self,
+        init_state: dict[str, torch.Tensor],
+        stacked: dict[str, torch.Tensor],
+        b: int,
+    ) -> dict[str, torch.Tensor]:
+        out = {k: v.detach().clone() for k, v in init_state.items()}
+
+        # Origin: top-level key plus any 'components.X.origin.coords' or
+        # 'components.X.disk.origin.coords' that PyTorch state_dict registers.
+        origin_val = stacked["origin.coords"][b].detach().clone()
+        for key in list(out.keys()):
+            if key == "origin.coords" or key.endswith(".origin.coords"):
+                out[key] = origin_val.clone()
+
+        # DiskTemplate (shared with lat.disk).
+        if self.disk is not None and self.disk_idx is not None:
+            t_val = stacked["disk.template_raw"][b].detach().clone()
+            i_val = stacked["disk.intensity_raw"][b].detach().clone()
+            for key in list(out.keys()):
+                if key.endswith(".template_raw"):
+                    out[key] = t_val.clone()
+            for key in (
+                f"components.{self.disk_idx}.intensity_raw",
+                f"components.{self.lat_idx}.disk.intensity_raw" if self.lat_idx is not None else None,
+            ):
+                if key is not None and key in out:
+                    out[key] = i_val.clone()
+
+        # DCBackground.
+        if self.dcbg is not None and self.dcbg_idx is not None:
+            out[f"components.{self.dcbg_idx}.intensity_raw"] = stacked["dcbg.intensity_raw"][b].detach().clone()
+
+        # GaussianBackground.
+        if self.gaussbg is not None and self.gaussbg_idx is not None:
+            out[f"components.{self.gaussbg_idx}.sigma_raw"] = stacked["gaussbg.sigma_raw"][b].detach().clone()
+            out[f"components.{self.gaussbg_idx}.intensity_raw"] = stacked["gaussbg.intensity_raw"][b].detach().clone()
+
+        # SyntheticDiskLattice scalar + tensor params.
+        if self.lat is not None and self.lat_idx is not None:
+            for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
+                key = f"components.{self.lat_idx}.{attr}"
+                stacked_key = f"lat.{attr}"
+                if key in out and stacked_key in stacked:
+                    out[key] = stacked[stacked_key][b].detach().clone()
+        return out
+
+
+def _adam_step_inplace(
+    stacked: dict[str, torch.Tensor],
+    grads: tuple[torch.Tensor, ...],
+    adam_state: dict[str, dict[str, torch.Tensor]],
+    lrs: dict[str, float],
+    t: int,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+) -> None:
+    bias1 = 1.0 - beta1 ** t
+    bias2 = 1.0 - beta2 ** t
+    with torch.no_grad():
+        for (name, p), g in zip(stacked.items(), grads):
+            if g is None:
+                continue
+            st = adam_state[name]
+            st["m"].mul_(beta1).add_(g, alpha=1.0 - beta1)
+            st["v"].mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+            m_hat = st["m"] / bias1
+            v_hat = st["v"] / bias2
+            lr = float(lrs.get(name, 1e-2))
+            p.data.addcdiv_(m_hat, v_hat.sqrt().add_(eps), value=-lr)
