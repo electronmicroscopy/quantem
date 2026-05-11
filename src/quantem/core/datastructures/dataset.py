@@ -23,7 +23,7 @@ class Dataset(AutoSerialize):
     Attributes (Properties):
         array (NDArray): The underlying n-dimensional NumPy array data.
         name (str): A descriptive name for the dataset.
-        origin (NDArray): The origin coordinates for each dimension (1D array).
+        origin (NDArray): The origin coordinates for each dimension (1D array) in calibrated units.
         sampling (NDArray): The sampling rate/spacing for each dimension (1D array).
         units (list[str]): Units for each dimension.
         signal_units (str): Units for the array values.
@@ -84,7 +84,7 @@ class Dataset(AutoSerialize):
         name: str | None
             The name of the Dataset.
         origin: NDArray | tuple | list | float | int | None
-            The origin of the Dataset.
+            The origin of the Dataset in calibrated units.
         sampling: NDArray | tuple | list | float | int | None
             The sampling of the Dataset.
         units: list[str] | tuple | list | None
@@ -486,21 +486,50 @@ class Dataset(AutoSerialize):
         axes: tuple | None = None,
         modify_in_place: bool = False,
     ) -> Self | None:
-        """
-        Crops Dataset
+        """Select a sub-region of the dataset along specified axes
+
+        Each ``crop_widths`` entry is a ``(start, stop)`` pair defining
+        which elements to keep. A ``stop`` of ``0`` keeps everything from
+        ``start`` to the end.
 
         Parameters
         ----------
-        crop_widths:tuple
-            Min and max for cropping each axis specified as a tuple
-        axes:
-            Axes over which to crop. If None specified, all are cropped.
-        modify_in_place: bool
-            If True, modifies dataset
+        crop_widths : tuple[tuple[int, int], ...]
+            ``(start, stop)`` indices for each axis specified in ``axes``.
+        axes : tuple | None
+            Axes to crop. If None, all axes are cropped.
+        modify_in_place : bool
+            If True, modifies this dataset in-place and frees the original
+            array. If False, returns a new dataset.
 
         Returns
+        -------
+        Dataset | None
+            Cropped dataset if ``modify_in_place`` is False, otherwise None.
+
+        Examples
         --------
-        Dataset (cropped) only if modify_in_place is False
+        Crop real-space to a 128x128 region:
+
+        >>> dset_cropped = dset.crop(
+        ...     crop_widths=((64, 192), (64, 192)),
+        ...     axes=(0, 1),
+        ... )
+
+        Crop k-space to keep the first 180 pixels:
+
+        >>> dset_preview = dset.crop(
+        ...     crop_widths=((0, 180), (0, 180)),
+        ...     axes=(2, 3),
+        ... )
+
+        Crop k-space in-place to free memory:
+
+        >>> dset.crop(
+        ...     crop_widths=((4, 92), (4, 92)),
+        ...     axes=(2, 3),
+        ...     modify_in_place=True,
+        ... )
         """
         if axes is None:
             if len(crop_widths) != self.ndim:
@@ -516,22 +545,28 @@ class Dataset(AutoSerialize):
             raise ValueError("Length of crop_widths must match length of axes.")
 
         full_slices = []
+        new_origin = self.origin.astype(float).copy()
         crop_dict = dict(zip(axes, crop_widths))
-        for axis, _ in enumerate(self.shape):
+        for axis, axis_size in enumerate(self.shape):
             if axis in crop_dict:
                 before, after = crop_dict[axis]
                 start = before
                 stop = after if after != 0 else None
-                full_slices.append(slice(start, stop))
+                axis_slice = slice(start, stop)
+                normalized_start, _, _ = axis_slice.indices(axis_size)
+                full_slices.append(axis_slice)
+                new_origin[axis] = new_origin[axis] + normalized_start * self.sampling[axis]
             else:
                 full_slices.append(slice(None))
 
         if modify_in_place is False:
             dataset = self.copy()
             dataset.array = dataset.array[tuple(full_slices)]
+            dataset.origin = new_origin
             return dataset
 
         self.array = self.array[tuple(full_slices)]
+        self.origin = new_origin
         return None
 
     @overload
@@ -560,20 +595,31 @@ class Dataset(AutoSerialize):
         modify_in_place: bool = False,
         reducer: str = "sum",
     ) -> Self | None:
-        """
-        Bin the Dataset by integer factors along selected axes using block reduction.
+        """Reduce the dataset resolution by grouping pixels into blocks
+
+        Useful for reducing diffraction pattern size to speed up
+        reconstruction or lower memory usage. Sampling metadata is
+        updated automatically.
 
         Parameters
         ----------
         bin_factors : int | tuple[int, ...]
-            Bin factors per specified axis (positive integers).
+            A single integer bins all axes by the same factor. A tuple
+            specifies a different factor per axis, e.g. ``(1, 1, 2, 2)``
+            to bin only the last two axes by 2x.
         axes : int | tuple[int, ...] | None
             Axes to bin. If None, all axes are binned.
         modify_in_place : bool
-            If True, modifies this dataset; otherwise returns a new Dataset.
-        reducer : {"sum","mean"}
-            Reduction applied within each block. "sum" (default) preserves counts;
-            "mean" averages over each block (block volume = product of factors).
+            If True, modifies this dataset in-place. If False, returns
+            a new dataset.
+        reducer : {"sum", "mean"}
+            Reduction applied within each block. "sum" (default) preserves
+            counts; "mean" averages over each block.
+
+        Returns
+        -------
+        Dataset | None
+            Binned dataset if ``modify_in_place`` is False, otherwise None.
 
         Notes
         -----
@@ -581,6 +627,19 @@ class Dataset(AutoSerialize):
         - Sampling is multiplied by the factor on each binned axis.
         - Origin is shifted to the center of the first block:
             origin_new = origin_old + 0.5 * (factor - 1) * sampling_old
+
+        Examples
+        --------
+        Bin diffraction space by 2x to reduce memory:
+
+        >>> dset.bin(
+        ...     bin_factors=(1, 1, 2, 2),
+        ...     modify_in_place=True,
+        ... )
+
+        Bin all axes by 2x and return a new dataset:
+
+        >>> dset_binned = dset.bin(bin_factors=2)
         """
         reducer_norm = str(reducer).lower()
         if reducer_norm not in ("sum", "mean"):
@@ -850,22 +909,25 @@ class Dataset(AutoSerialize):
 
         # Compute which dimensions are kept
         kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
+        kept_axis_to_index = {axis: j for j, axis in enumerate(kept_axes)}
 
         # Slice/reduce metadata accordingly
-        new_origin = (
-            np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
-        )
+        origin_array = np.asarray(self.origin, dtype=float)
+        sampling_array = np.asarray(self.sampling, dtype=float)
+        new_origin = origin_array[kept_axes].copy() if np.ndim(self.origin) > 0 else self.origin
         new_sampling = (
-            np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
+            sampling_array[kept_axes].copy() if np.ndim(self.sampling) > 0 else self.sampling
         )
         new_units = [self.units[i] for i in kept_axes] if len(self.units) > 0 else self.units
 
-        # Adjust sampling for slice steps (e.g. [::2] doubles spacing)
+        # Adjust origin/sampling for sliced axes.
         for i, idx in enumerate(index):
-            if isinstance(idx, slice) and idx.step not in (None, 1):
-                if i in kept_axes:
-                    j = kept_axes.index(i)
-                    new_sampling[j] *= idx.step
+            if isinstance(idx, slice) and i in kept_axis_to_index:
+                j = kept_axis_to_index[i]
+                normalized_start, _, normalized_step = idx.indices(self.shape[i])
+                new_origin[j] = new_origin[j] + normalized_start * sampling_array[i]
+                if normalized_step != 1:
+                    new_sampling[j] *= normalized_step
 
         out_ndim = array_view.ndim
 
