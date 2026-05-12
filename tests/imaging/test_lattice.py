@@ -151,6 +151,232 @@ class TestDefineLatticeVectors:
             lattice.define_lattice_vectors(origin=[50, 50], u=[5, 0], v=[10, 0])
 
 
+class TestLatticeAtoms:
+    """Test add_atoms method."""
+
+    @pytest.fixture
+    def simple_lattice(self):
+        """Create a fitted lattice with atoms without defined lattice vectors."""
+        # Create synthetic image
+        H, W = 100, 100
+        image = np.random.randn(H, W) * 0.1
+
+        # Add some peaks with random shifts
+        peaks = [
+            (25, 25),
+            (25, 50),
+            (25, 75),
+            (50, 25),
+            (50, 50),
+            (50, 75),
+            (75, 25),
+            (75, 50),
+            (75, 75),
+        ]
+        for y, x in peaks:
+            # Add random shift up to 3 pixels in each direction
+            y_shift = np.random.randint(-3, 4)
+            x_shift = np.random.randint(-3, 4)
+            y_shifted = y + y_shift
+            x_shifted = x + x_shift
+
+            yy, xx = np.ogrid[-10:11, -10:11]
+            peak = np.exp(-(xx**2 + yy**2) / 20.0)
+            y_start, y_end = max(0, y_shifted - 10), min(H, y_shifted + 11)
+            x_start, x_end = max(0, x_shifted - 10), min(W, x_shifted + 11)
+            peak_h, peak_w = y_end - y_start, x_end - x_start
+            image[y_start:y_end, x_start:x_end] += peak[:peak_h, :peak_w]
+
+        lattice = Lattice.from_data(image)
+
+        return lattice
+
+    @pytest.fixture
+    def fitted_lattice(self):
+        """Create a fitted lattice with atoms."""
+        # Create synthetic image
+        H, W = 100, 100
+        image = np.random.randn(H, W) * 0.1
+
+        # Add some peaks with random shifts
+        peaks = [
+            (25, 25),
+            (25, 50),
+            (25, 75),
+            (50, 25),
+            (50, 50),
+            (50, 75),
+            (75, 25),
+            (75, 50),
+            (75, 75),
+        ]
+        for y, x in peaks:
+            # Add random shift up to 2 pixels in each direction
+            y_shift = np.random.randint(-2, 3)
+            x_shift = np.random.randint(-2, 3)
+            y_shifted = y + y_shift
+            x_shifted = x + x_shift
+
+            yy, xx = np.ogrid[-10:11, -10:11]
+            peak = np.exp(-(xx**2 + yy**2) / 20.0)
+            y_start, y_end = max(0, y_shifted - 10), min(H, y_shifted + 11)
+            x_start, x_end = max(0, x_shifted - 10), min(W, x_shifted + 11)
+            peak_h, peak_w = y_end - y_start, x_end - x_start
+            image[y_start:y_end, x_start:x_end] += peak[:peak_h, :peak_w]
+
+        lattice = Lattice.from_data(image)
+
+        # Define lattice vectors before adding atoms
+        lattice.define_lattice_vectors(
+            origin=[23.0, 24.0],
+            u=[27.0, 0.0],
+            v=[0.0, 25.0],
+        )
+
+        return lattice
+
+    def test_add_atoms_basic(self, fitted_lattice: Lattice):
+        """Test basic add_atoms."""
+        positions_frac = np.array([[0.0, 0.0]])
+
+        result = fitted_lattice.add_atoms(positions_frac)
+
+        assert result is fitted_lattice
+        # Check that atoms were added
+        assert hasattr(fitted_lattice, "_atoms") or hasattr(fitted_lattice, "atoms")
+
+    def test_add_atoms_plotting(self, fitted_lattice: Lattice):
+        """Test add_atoms sets defualt_plot to atoms."""
+        positions_frac = np.array([[0.0, 0.0]])
+
+        fitted_lattice.add_atoms(positions_frac)
+
+        assert fitted_lattice.default_plot == "atoms"
+
+    def test_add_atoms_with_all_parameters(self, simple_lattice: Lattice):
+        """Test add_atoms with all optional parameters."""
+        fitted_lattice = simple_lattice.define_lattice_vectors(
+            origin=[25.0, 25.0], u=[50.0, 0.0], v=[0.0, 50.0]
+        )
+        positions_frac = np.array([[0.0, 0.0], [0.5, 0.0], [0.0, 0.5], [0.5, 0.5]])
+        numbers = np.array([0, 1, 1, 2])
+        mask = np.ones(fitted_lattice.image.shape, dtype=bool)
+        mask[:30, :30] = False
+
+        result = fitted_lattice.add_atoms(
+            positions_frac,
+            numbers=numbers,
+            intensity_min=0.1,
+            intensity_radius=5,
+            edge_min_dist_px=5,
+            mask=mask,
+            contrast_min=0.2,
+            annulus_radii=(3, 6),
+        )
+
+        assert result is simple_lattice
+
+    def test_add_atoms_empty_positions(self, fitted_lattice: Lattice):
+        """Test add_atoms with empty positions array."""
+        positions_frac = np.array([]).reshape(0, 2)
+
+        result = fitted_lattice.add_atoms(positions_frac)
+
+        assert result is fitted_lattice
+
+    def test_add_atoms_without_fitting_raises_error(self):
+        """Test that add_atoms raises error if lattice not fitted."""
+        image = np.random.randn(100, 100)
+        lattice = Lattice.from_data(image)
+
+        positions_frac = np.array([[0.0, 0.0]])
+
+        with pytest.raises(ValueError, match="Lattice vectors have not been fitted"):
+            lattice.add_atoms(positions_frac)
+
+    def test_refine_atoms_chaining_and_plotting(self, fitted_lattice: Lattice):
+        """Test refine_atoms can be called by chaining functions and default_plot is set to atoms."""
+        positions_frac = np.array([[0.0, 0.0]])
+
+        result = fitted_lattice.add_atoms(positions_frac).refine_atoms()
+
+        assert result is fitted_lattice
+        # Check that atoms were added
+        assert hasattr(fitted_lattice, "_atoms") or hasattr(fitted_lattice, "atoms")
+
+        assert fitted_lattice.default_plot == "atoms"
+
+    def test_refine_atoms_without_add_atoms_raises_error(self, fitted_lattice: Lattice):
+        """Test that refine_atoms raises error if add_atoms hasn't been called."""
+        with pytest.raises(ValueError, match=r"No atoms to refine\. Call add_atoms\(\) first\."):
+            fitted_lattice.refine_atoms()
+
+    def test_refine_atoms_internal_call(self, fitted_lattice: Lattice):
+        """Test refine_atoms = True parameter in add_atoms"""
+        positions_frac = np.array([[0.0, 0.0]])
+
+        result = fitted_lattice.add_atoms(positions_frac, refine_atoms=True)
+
+        assert result is fitted_lattice
+        # Check that atoms were added
+        assert hasattr(fitted_lattice, "_atoms") or hasattr(fitted_lattice, "atoms")
+        assert fitted_lattice.default_plot == "atoms"
+
+    def test_refine_atoms_with_all_parameters(self, simple_lattice: Lattice):
+        """Test refine_atoms with all optional parameters."""
+        fitted_lattice = simple_lattice.define_lattice_vectors(
+            origin=[25.0, 25.0], u=[50.0, 0.0], v=[0.0, 50.0]
+        )
+        positions_frac = np.array([[0.0, 0.0], [0.5, 0.0], [0.0, 0.5], [0.5, 0.5]])
+        numbers = np.array([0, 1, 1, 2])
+        mask = np.ones(fitted_lattice.image.shape, dtype=bool)
+        mask[:30, :30] = False
+
+        result = fitted_lattice.add_atoms(
+            positions_frac,
+            numbers=numbers,
+            intensity_min=0.1,
+            intensity_radius=5,
+            edge_min_dist_px=5,
+            mask=mask,
+            contrast_min=0.2,
+            annulus_radii=(3, 6),
+        ).refine_atoms(
+            fit_radius=15.0,
+            max_nfev=250,
+            max_move_px=5.0,
+        )
+
+        assert result is simple_lattice
+
+    def test_refine_atoms_internal_call_with_all_parameters(self, simple_lattice: Lattice):
+        """Test refine_atoms with all optional parameters."""
+        fitted_lattice = simple_lattice.define_lattice_vectors(
+            origin=[25.0, 25.0], u=[50.0, 0.0], v=[0.0, 50.0]
+        )
+        positions_frac = np.array([[0.0, 0.0], [0.5, 0.0], [0.0, 0.5], [0.5, 0.5]])
+        numbers = np.array([0, 1, 1, 2])
+        mask = np.ones(fitted_lattice.image.shape, dtype=bool)
+        mask[:30, :30] = False
+
+        result = fitted_lattice.add_atoms(
+            positions_frac,
+            numbers=numbers,
+            intensity_min=0.1,
+            intensity_radius=5,
+            edge_min_dist_px=5,
+            mask=mask,
+            contrast_min=0.2,
+            annulus_radii=(3, 6),
+            refine_atoms=True,
+            fit_radius=15.0,
+            max_nfev=250,
+            max_move_px=5.0,
+        )
+
+        assert result is simple_lattice
+
+
 class TestLatticeSerialize:
     """Test Lattice Autoserialize implementation."""
 
