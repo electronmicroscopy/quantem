@@ -13,9 +13,9 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.filter import gaussian_filter_1d, gaussian_kernel_1d
 from quantem.core.utils.utils import to_numpy
 from quantem.diffraction.polar_transform import auto_origin_id, polar_transform
-from quantem.tomography.utils import gaussian_filter_1d, gaussian_kernel_1d
 
 # TODO: subpixel origin finding (auto_origin_id currently uses integer pixel search)
 # TODO: elliptical distortion correction in origin finding
