@@ -320,6 +320,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         shift_order: int = 1,
         gamma: float = 0.5,
         mode: str = "linear",
+        rows=None,
+        cols = None,
     ) -> "ModelDiffraction":
         arr = np.asarray(self.dataset.array)
         if arr.ndim < 2:
@@ -349,6 +351,30 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         else:
             raise RuntimeError("Unreachable: normalized mode mapping failed.")
         self.dataset.array = np.asarray(arr)
+
+        if rows is None and cols is None:
+            rows = range(self.dataset.shape[0])
+            cols = range(self.dataset.shape[1])
+        elif rows is not None and cols is None:
+            cols = range(self.dataset.shape[1])
+        elif rows is None and cols is not None:
+            rows = range(self.dataset.shape[0])
+        else:
+            rows = rows
+            cols = cols
+        
+        if isinstance(rows, int):
+            rows = np.array([rows]).astype(int)
+        else:        
+            rows = np.asarray(rows).astype(int)
+        
+        if isinstance(cols, int):
+            cols = np.array([cols]).astype(int)
+        else:        
+            cols = np.asarray(cols).astype(int)
+        
+        arr = arr[rows, cols]
+
         h, w = arr.shape[-2], arr.shape[-1]
         self.index_shape = tuple(arr.shape[:-2])
 
