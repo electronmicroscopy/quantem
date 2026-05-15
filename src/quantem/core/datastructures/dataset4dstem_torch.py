@@ -5,24 +5,15 @@ import torch
 
 
 class Dataset4dstemTorch:
-    """Minimal torch-backed 4D-STEM container.
+    """Torch-backed 4D-STEM container. GPU counterpart to ``Dataset4dstem``.
 
-    Holds a 4D ``torch.Tensor`` (any device) plus standard metadata fields
-    (``array``, ``name``, ``origin``, ``sampling``, ``units``,
-    ``signal_units``).
-
-    ``Dataset4dstem`` wraps a numpy array and lives in CPU RAM. Use it
-    when the raw data starts on the host (file readers that return numpy,
-    CPU-only analysis).
-
-    Use ``Dataset4dstemTorch`` instead when the raw data already lives on
-    the GPU - any CUDA pipeline producing torch / cupy arrays, live
-    streaming detector frames, GPU file readers. Wrapping the existing
-    GPU array is effectively free and the data stays in VRAM end-to-end.
-    Going through the CPU class instead forces a copy from GPU to CPU on
-    wrap and another copy from CPU back to GPU when the consumer
-    re-uploads, which is expensive on multi-GB datasets and doubles peak
-    memory.
+    Same metadata surface (``array``, ``name``, ``origin``, ``sampling``,
+    ``units``, ``signal_units``) but ``array`` is a 4D ``torch.Tensor``
+    on any device. Use when the raw data already lives on the GPU (CUDA
+    pipelines, live detector frames, GPU file readers) so it stays in
+    VRAM end-to-end. Wrapping with ``Dataset4dstem`` instead requires a
+    device-to-host transfer on wrap and a host-to-device transfer on
+    consume, doubling peak memory.
     """
 
     _token = object()
