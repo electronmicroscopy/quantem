@@ -1,4 +1,4 @@
-from typing import Any, Self
+from typing import Self
 
 import numpy as np
 import torch
@@ -80,7 +80,7 @@ class Dataset4dstemTorch:
     @classmethod
     def from_array(
         cls,
-        array: Any,
+        array: object,
         name: str | None = None,
         origin: tuple[float, ...] | list[float] | None = None,
         sampling: tuple[float, ...] | list[float] | None = None,
@@ -94,9 +94,10 @@ class Dataset4dstemTorch:
 
         Parameters
         ----------
-        array : Any
+        array : object
             A 4D ``torch.Tensor`` or any object exposing the dlpack
-            protocol (e.g. ``cupy.ndarray``).
+            protocol (e.g. ``cupy.ndarray``, ``jax.Array``). Non-tensor
+            inputs wrap zero-copy via ``torch.from_dlpack``.
         name : str | None, optional
             A descriptive name for the dataset. If None, defaults to
             "4D-STEM dataset (torch)".
