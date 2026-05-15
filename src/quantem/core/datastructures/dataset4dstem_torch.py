@@ -2,9 +2,9 @@ from typing import Self
 
 import numpy as np
 import torch
+from quantem.core.io.serialize import AutoSerialize
 
-
-class Dataset4dstemTorch:
+class Dataset4dstemTorch(AutoSerialize):
     """A torch-backed 4D-STEM dataset class. GPU counterpart to ``Dataset4dstem``.
 
     Same metadata surface as ``Dataset4dstem`` (``array``, ``name``,
