@@ -32,6 +32,7 @@ class Dataset4dstemTorch:
         sampling: tuple[float, ...] | list[float] | None = None,
         units: list[str] | tuple[str, ...] | None = None,
         signal_units: str = "arb. units",
+        metadata: dict | None = None,
         _token: object | None = None,
     ):
         """Initialize a torch-backed 4D-STEM dataset.
@@ -51,6 +52,10 @@ class Dataset4dstemTorch:
             Units for each dimension. If None, defaults to ["pixels"] * 4.
         signal_units : str, optional
             Units for the array values, by default "arb. units".
+        metadata : dict | None, optional
+            Mirror of ``Dataset4dstem.metadata``. Auto-populates
+            ``r_to_q_rotation_cw_deg`` and ``ellipticity`` keys with
+            ``None`` so consumers expecting them do not need a guard.
         _token : object | None, optional
             Token to prevent direct instantiation, by default None.
         """
@@ -76,6 +81,9 @@ class Dataset4dstemTorch:
         self.sampling = np.asarray(sampling if sampling is not None else (1, 1, 1, 1), dtype=float)
         self.units = list(units) if units is not None else ["pixels"] * 4
         self.signal_units = signal_units
+        self.metadata = dict(metadata) if metadata is not None else {}
+        for k in ("r_to_q_rotation_cw_deg", "ellipticity"):
+            self.metadata.setdefault(k, None)
 
     @classmethod
     def from_array(
@@ -86,8 +94,9 @@ class Dataset4dstemTorch:
         sampling: tuple[float, ...] | list[float] | None = None,
         units: list[str] | tuple[str, ...] | None = None,
         signal_units: str = "arb. units",
+        metadata: dict | None = None,
     ) -> Self:
-        """Create a new Dataset4dstemTorch from a torch tensor or dlpack-compatible array.
+        """Create a Dataset4dstemTorch from a torch tensor or dlpack-compatible array.
 
         torch tensors pass through. Cupy / jax / other GPU arrays exposing
         the dlpack protocol wrap zero-copy via ``torch.from_dlpack``.
@@ -96,8 +105,7 @@ class Dataset4dstemTorch:
         ----------
         array : object
             A 4D ``torch.Tensor`` or any object exposing the dlpack
-            protocol (e.g. ``cupy.ndarray``, ``jax.Array``). Non-tensor
-            inputs wrap zero-copy via ``torch.from_dlpack``.
+            protocol (e.g. ``cupy.ndarray``, ``jax.Array``).
         name : str | None, optional
             A descriptive name for the dataset. If None, defaults to
             "4D-STEM dataset (torch)".
@@ -110,6 +118,10 @@ class Dataset4dstemTorch:
             Units for each dimension. If None, defaults to ["pixels"] * 4.
         signal_units : str, optional
             Units for the array values, by default "arb. units".
+        metadata : dict | None, optional
+            Per-dataset metadata mirroring ``Dataset4dstem.metadata``.
+            Auto-populates ``r_to_q_rotation_cw_deg`` and ``ellipticity``
+            keys with ``None``.
 
         Returns
         -------
@@ -135,5 +147,6 @@ class Dataset4dstemTorch:
             sampling=sampling,
             units=units,
             signal_units=signal_units,
+            metadata=metadata,
             _token=cls._token,
         )

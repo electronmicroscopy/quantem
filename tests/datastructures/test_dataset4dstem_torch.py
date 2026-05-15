@@ -32,3 +32,15 @@ class TestDataset4dstemTorch:
     def test_direct_init_blocked(self, sample_4d_tensor):
         with pytest.raises(RuntimeError, match="from_array"):
             Dataset4dstemTorch(sample_4d_tensor)
+
+    def test_metadata_defaults_and_override(self, sample_4d_tensor):
+        ds = Dataset4dstemTorch.from_array(sample_4d_tensor)
+        assert ds.metadata == {"r_to_q_rotation_cw_deg": None, "ellipticity": None}
+
+        ds = Dataset4dstemTorch.from_array(
+            sample_4d_tensor,
+            metadata={"r_to_q_rotation_cw_deg": 12.5, "voltage_kV": 200},
+        )
+        assert ds.metadata["r_to_q_rotation_cw_deg"] == 12.5
+        assert ds.metadata["voltage_kV"] == 200
+        assert ds.metadata["ellipticity"] is None  # auto-populated
