@@ -11,11 +11,21 @@ class Dataset4dstemTorch:
     (``array``, ``name``, ``origin``, ``sampling``, ``units``,
     ``signal_units``).
 
-    Goal: keep 4D-STEM data on the GPU end-to-end and skip VRAM <-> RAM
-    round-trips. Each hop is expensive on multi-GB datasets and doubles
-    peak memory. Wrapping a cupy or torch GPU array here is effectively
-    free and holds the original VRAM allocation.
+    ``Dataset4dstem`` wraps a numpy array and lives in CPU RAM. Use it
+    when the raw data starts on the host (file readers that return numpy,
+    CPU-only analysis).
+
+    Use ``Dataset4dstemTorch`` instead when the raw data already lives on
+    the GPU - any CUDA pipeline producing torch / cupy arrays, live
+    streaming detector frames, GPU file readers. Wrapping the existing
+    GPU array is effectively free and the data stays in VRAM end-to-end.
+    Going through the CPU class instead forces a copy from GPU to CPU on
+    wrap and another copy from CPU back to GPU when the consumer
+    re-uploads, which is expensive on multi-GB datasets and doubles peak
+    memory.
     """
+
+    _token = object()
 
     def __init__(
         self,
@@ -25,7 +35,10 @@ class Dataset4dstemTorch:
         sampling: tuple[float, ...] | list[float] | None = None,
         units: list[str] | tuple[str, ...] | None = None,
         signal_units: str = "arb. units",
+        _token: object | None = None,
     ):
+        if _token is not self._token:
+            raise RuntimeError("Use Dataset4dstemTorch.from_array() to instantiate this class.")
         if not (isinstance(array, torch.Tensor) and array.ndim == 4):
             raise TypeError("Dataset4dstemTorch requires a 4D torch tensor")
         self.array = array
@@ -59,4 +72,5 @@ class Dataset4dstemTorch:
             sampling=sampling,
             units=units,
             signal_units=signal_units,
+            _token=cls._token,
         )
