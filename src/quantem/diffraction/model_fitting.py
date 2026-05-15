@@ -324,6 +324,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         cols = None,
     ) -> "ModelDiffraction":
         arr = np.asarray(self.dataset.array)
+        self.mask = np.ones(arr.shape[:2])
+
         if arr.ndim < 2:
             raise ValueError("dataset.array must have at least 2 dimensions.")
         mode_in = mode.strip().lower()
@@ -373,7 +375,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         else:        
             cols = np.asarray(cols).astype(int)
         
-        arr = arr[rows, cols]
+        arr = arr[np.ix_(rows, cols)]
 
         h, w = arr.shape[-2], arr.shape[-1]
         self.index_shape = tuple(arr.shape[:-2])
@@ -1035,6 +1037,54 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         )
 
         return self
+    
+    def create_mask(
+        self,
+        min_threshold: float = 0.4,
+        max_threshold: float = 0.6,
+        smooth: bool = True,
+        
+    ):
+        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        scan_r = self.dataset.shape[0]
+        scan_c = self.dataset.shape[1]
+        self.mask = np.zeros(self.dataset.shape[:2])
+        
+        self.i0_sum_array = np.empty(shape=(scan_r, scan_c))
+        
+        if self.state_individual_refined is None:
+            raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
+        
+        for r in range(scan_r):
+            for c in range(scan_c):
+                pos_state = self.state_individual_refined[r, c]
+                if pos_state is None:
+                    self.i0_sum_array[r, c] = 0.0
+                    continue
+
+                i0_raw = None
+                uv_indices = None
+                for key in pos_state.keys():
+                    if key.endswith('i0_raw'):
+                        i0_raw = pos_state[key].cpu().numpy()
+                    if key.endswith('uv_indices'):
+                        uv_indices = pos_state[key].cpu().numpy()
+                
+                if i0_raw is None or uv_indices is None:
+                    self.i0_sum_array[r, c] = 0.0
+                    continue
+                
+                is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
+                self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
+        max_intensity = np.max(self.i0_sum_array)
+        if max_intensity == 0:
+            return np.zeros_like(self.i0_sum_array)
+        self.mask = self.i0_sum_array / max_intensity
+        self.mask = np.clip((self.mask - min_threshold) / (max_threshold - min_threshold), 0, 1)
+        if smooth:
+            self.mask = np.sin(np.pi / 2 * self.mask) ** 2
+        return self        
 
 
     def plot_strain(
@@ -1088,24 +1138,21 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         euv_pct = strain_euv.array * 100
         rot_deg = np.rad2deg(self.strain_rotation.array)
 
+        from matplotlib.colors import Normalize
+        norm_strain = Normalize(vmin=strain_range_percent[0], vmax=strain_range_percent[1])
+        euu_rgb = cm_strain(norm_strain(euu_pct))[:, :, :3]
+        evv_rgb = cm_strain(norm_strain(evv_pct))[:, :, :3]
+        euv_rgb = cm_strain(norm_strain(euv_pct))[:, :, :3]
+
         title_fs = 16
         im0 = ax[0].imshow(
-            euu_pct,
-            vmin=strain_range_percent[0],
-            vmax=strain_range_percent[1],
-            cmap=cm_strain,
+            euu_rgb * self.mask[:, :, np.newaxis],
         )
         ax[1].imshow(
-            evv_pct,
-            vmin=strain_range_percent[0],
-            vmax=strain_range_percent[1],
-            cmap=cm_strain,
+            evv_rgb * self.mask[:, :, np.newaxis],
         )
         ax[2].imshow(
-            euv_pct,
-            vmin=strain_range_percent[0],
-            vmax=strain_range_percent[1],
-            cmap=cm_strain,
+            euv_rgb * self.mask[:, :, np.newaxis],
         )
 
         ax[0].set_title(r"$\epsilon_{uu}$", fontsize=title_fs)
@@ -1113,11 +1160,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         ax[2].set_title(r"$\epsilon_{uv}$", fontsize=title_fs)
 
         if plot_rotation:
+            norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
+            rot_rgb = cm_rot(norm_rot(rot_deg))[:, :, :3]
             im3 = ax[3].imshow(
-                rot_deg,
-                vmin=rotation_range_degrees[0],
-                vmax=rotation_range_degrees[1],
-                cmap=cm_rot,
+                rot_rgb * self.mask[:, :, np.newaxis],
             )
             ax[3].set_title("Rotation", fontsize=title_fs)
 
@@ -1139,9 +1185,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         cb_height = 0.04
         cb_pad = 0.03
         y = b0.y0 - cb_pad - cb_height
-
+        from matplotlib.cm import ScalarMappable
         cax1 = fig.add_axes([left, y, width, cb_height])
-        cbar1 = fig.colorbar(im0, cax=cax1, orientation="horizontal")
+        sm_strain = ScalarMappable(norm=norm_strain, cmap=cm_strain)
+        cbar1 = fig.colorbar(sm_strain, cax=cax1, orientation="horizontal")
         cbar1.set_label("Strain (%)", fontsize=title_fs)
         cbar1.ax.tick_params(labelsize=12)
 
@@ -1149,7 +1196,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             left_r = b3.x0
             width_r = b3.x1 - b3.x0
             cax2 = fig.add_axes([left_r, y, width_r, cb_height])
-            cbar2 = fig.colorbar(im3, cax=cax2, orientation="horizontal")
+            sm_rot = ScalarMappable(norm=norm_rot, cmap=cm_rot)
+            cbar2 = fig.colorbar(sm_rot, cax=cax2, orientation="horizontal")
             cbar2.set_label("Rotation (deg)", fontsize=title_fs)
             cbar2.ax.tick_params(labelsize=12)
 
