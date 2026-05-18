@@ -7,8 +7,6 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
-from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
-
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -61,7 +59,7 @@ class Dataset4dstem(Dataset4d):
         name : str
             A descriptive name for the dataset
         origin : NDArray | tuple | list | float | int
-            The origin coordinates for each dimension
+            The origin coordinates for each dimension in calibrated units
         sampling : NDArray | tuple | list | float | int
             The sampling rate/spacing for each dimension
         units : list[str] | tuple | list
@@ -74,7 +72,7 @@ class Dataset4dstem(Dataset4d):
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
-        mdata_keys_4dstem = ["q_to_r_rotation_ccw_deg", 'q_transpose', "ellipticity"]
+        mdata_keys_4dstem = ["q_to_r_rotation_ccw_deg", "q_transpose", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
                 metadata[k] = None
@@ -135,7 +133,7 @@ class Dataset4dstem(Dataset4d):
         name : str | None, optional
             A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
         origin : NDArray | tuple | list | float | int | None, optional
-            The origin coordinates for each dimension. If None, defaults to zeros
+            The origin coordinates for each dimension in calibrated units. If None, defaults to zeros
         sampling : NDArray | tuple | list | float | int | None, optional
             The sampling rate/spacing for each dimension. If None, defaults to ones
         units : list[str] | tuple | list | None, optional
@@ -753,6 +751,3 @@ class Dataset4dstem(Dataset4d):
             self.array[:, :, index_x, index_y] = np.median(
                 self.array[:, :, x_min:x_max, y_min:y_max], axis=(2, 3)
             )
-
-
-    polar_transform = dataset4dstem_polar_transform

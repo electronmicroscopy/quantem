@@ -13,8 +13,8 @@ from tqdm.auto import tqdm
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
-from quantem.core.ml.loss_functions import get_loss_function
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerType, SchedulerType
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.validators import (
     validate_arr_gt,
@@ -1050,8 +1050,8 @@ class ObjectDIP(ObjectConstraints):
         pretrain_target: torch.Tensor | None = None,
         reset: bool = False,
         num_iters: int = 100,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
+        optimizer_params: dict | OptimizerType | None = None,
+        scheduler_params: dict | SchedulerType | None = None,
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,
@@ -1085,7 +1085,7 @@ class ObjectDIP(ObjectConstraints):
                 "No pretrain target set. Provide pretrain_target or set it beforehand."
             )
 
-        loss_fn = get_loss_function(loss_fn, self.dtype)
+        loss_fn = get_loss_module(loss_fn, self.dtype)
         self._pretrain(
             num_iters=num_iters,
             loss_fn=loss_fn,

@@ -754,7 +754,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         name : str | None, optional
             A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
         origin : np.ndarray | tuple | list | float | int | None, optional
-            The origin coordinates for each dimension. If None, defaults to zeros
+            The origin coordinates for each dimension in calibrated units. If None, defaults to zeros
         sampling : np.ndarray | tuple | list | float | int | None, optional
             The sampling rate/spacing for each dimension. If None, defaults to ones
         units : list[str] | tuple | list | None, optional
@@ -981,7 +981,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
                     self.num_gpts,
                     *padded_diffraction_intensities_shape,
                 ),
-                in_place=True,
+                modify_in_place=True,
             )
             self.intensities_4d = self.dset.array.reshape(
                 (*self.gpts, *padded_diffraction_intensities_shape)

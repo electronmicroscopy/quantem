@@ -9,37 +9,25 @@ import torch.nn.functional as F
 
 
 def radon_torch(images, theta=None, device=None):
-    """
-    Batched Radon transform implemented in PyTorch.
-    images: torch.Tensor of shape [B, H, W]
-    Returns: torch.Tensor of shape [B, N_angles, N_pixels]
-    """
     if images.ndim == 2:
-        images = images.unsqueeze(0)  # [1, H, W]
+        images = images.unsqueeze(0)
     B, H, W = images.shape
+    device = device or images.device
+    theta = theta if theta is not None else torch.arange(180, device=device)
+    A = len(theta)
 
-    if device is None:
-        device = images.device
-
-    if theta is None:
-        theta = torch.arange(180, device=device)
-
-    N_angles = len(theta)
     shape_min = min(H, W)
     radius = shape_min // 2
-    center = torch.tensor([H // 2, W // 2], device=device)
+    center_h, center_w = H // 2, W // 2
 
     Y, X = torch.meshgrid(
         torch.arange(H, device=device),
         torch.arange(W, device=device),
         indexing="ij",
     )
-    dist2 = (X - center[1]) ** 2 + (Y - center[0]) ** 2
-    mask = dist2 <= radius**2
-    images = images.clone()
-    images *= mask  # broadcasting over batch
+    mask = (X - center_w) ** 2 + (Y - center_h) ** 2 <= radius**2
+    images = images.clone() * mask
 
-    # Crop to square
     excess = torch.tensor([H, W], device=device) - shape_min
     slices = tuple(
         slice(int((e.item() + 1) // 2), int((e.item() + 1) // 2 + shape_min))
@@ -51,112 +39,104 @@ def radon_torch(images, theta=None, device=None):
     N = images.shape[-1]
     center = N // 2
 
-    radon_images = torch.zeros((B, N_angles, N), dtype=images.dtype, device=device)
+    # Build all rotation matrices at once: [A, 2, 2]
+    angles_rad = torch.deg2rad(theta.float())
+    cos_a = torch.cos(angles_rad)
+    sin_a = torch.sin(angles_rad)
+    rot = torch.stack(
+        [
+            torch.stack([cos_a, -sin_a], dim=1),
+            torch.stack([-sin_a, -cos_a], dim=1),
+        ],
+        dim=1,
+    )  # [A, 2, 2]
 
+    # Pixel coords: [N*N, 2]
     grid_y, grid_x = torch.meshgrid(
         torch.arange(N, dtype=torch.float32, device=device),
         torch.arange(N, dtype=torch.float32, device=device),
         indexing="ij",
     )
-    coords = torch.stack((grid_x - center, grid_y - center), dim=-1)  # (N, N, 2)
-    coords = coords.view(1, N, N, 2).expand(B, -1, -1, -1)  # [B, N, N, 2]
+    coords = torch.stack((grid_x - center, grid_y - center), dim=-1).view(-1, 2)  # [N*N, 2]
 
-    for i, angle in enumerate(theta):
-        angle_rad = torch.deg2rad(angle)
-        rot = torch.tensor(
-            [
-                [torch.cos(angle_rad), -torch.sin(angle_rad)],
-                [-torch.sin(angle_rad), -torch.cos(angle_rad)],
-            ],
-            device=device,
-            dtype=torch.float32,
-        )
+    # Rotate all angles at once: [A, N*N, 2]
+    coords_rot = (coords @ rot.transpose(1, 2)) + center  # [A, N*N, 2]
 
-        rot = rot.unsqueeze(0).expand(B, -1, -1)  # [B, 2, 2]
-        coords_rot = torch.matmul(coords.view(B, -1, 2), rot.transpose(1, 2)).view(B, N, N, 2)
-        coords_rot += center
+    # Normalize to [-1, 1] for grid_sample
+    grid = (2 * coords_rot / (N - 1) - 1).view(A, N, N, 2)  # [A, N, N, 2]
 
-        # Normalize to [-1, 1]
-        grid = 2 * coords_rot / (N - 1) - 1  # [B, N, N, 2]
+    # Expand images: [B, 1, N, N] -> sample with [B*A, 1, N, N] style
+    # Tile images over angles, tile grid over batch
+    images_exp = images.unsqueeze(1).expand(-1, A, -1, -1).reshape(B * A, 1, N, N)
+    grid_exp = grid.unsqueeze(0).expand(B, -1, -1, -1, -1).reshape(B * A, N, N, 2)
 
-        # grid = grid.unsqueeze(1)  # [B, 1, N, N, 2]
-        imgs = images.unsqueeze(1)  # [B, 1, N, N]
+    sampled = F.grid_sample(
+        images_exp, grid_exp, mode="bilinear", padding_mode="zeros", align_corners=True
+    )
+    # sampled: [B*A, 1, N, N] -> sum over rows -> [B, A, N]
+    radon_images = sampled.squeeze(1).sum(dim=1).view(B, A, N)
 
-        sampled = F.grid_sample(
-            imgs, grid, mode="bilinear", padding_mode="zeros", align_corners=True
-        )
-        projection = sampled.squeeze(1).sum(dim=1)  # [B, N]
-        radon_images[:, i, :] = projection
-
-    return radon_images.squeeze(0) if radon_images.shape[0] == 1 else radon_images
+    return radon_images.squeeze(0) if B == 1 else radon_images
 
 
 def iradon_torch(
     sinograms,
     theta=None,
     output_size=None,
-    filter_name="ramp",
+    filter_name: str | None = "ramp",
     circle=True,
     device=None,
 ):
-    """
-    Batched inverse Radon transform (filtered backprojection).
-    sinograms: [B, N_angles, N_pixels] or [N_angles, N_pixels] (automatically batched)
-    Returns: [B, output_size, output_size] or [output_size, output_size]
-    """
     if sinograms.ndim == 2:
-        sinograms = sinograms.unsqueeze(0)  # [1, A, P]
+        sinograms = sinograms.unsqueeze(0)
     B, A, N = sinograms.shape
-
-    device = sinograms.device if device is None else device
+    device = device or sinograms.device
     theta = theta if theta is not None else torch.linspace(0, 180, steps=A, device=device)
 
-    if theta.shape[0] != A:
-        raise ValueError("theta does not match number of projections")
-
     if output_size is None:
-        output_size = N if circle else int(torch.floor(torch.sqrt(torch.tensor(N**2 / 2.0))))
+        output_size = N if circle else int((N**2 / 2) ** 0.5)
 
-    # Padding for FFT
-    padded_size = max(
-        64, int(2 ** torch.ceil(torch.log2(torch.tensor(2 * N, dtype=torch.float32))))
-    )
+    # Filter
+    padded_size = max(64, int(2 ** torch.ceil(torch.log2(torch.tensor(2.0 * N)))))
     pad_y = padded_size - N
-    sinograms_padded = F.pad(sinograms, (0, pad_y))  # [B, A, padded]
+    sinograms_padded = F.pad(sinograms, (0, pad_y))
+    f_filter = get_fourier_filter_torch(padded_size, filter_name, device=device)
+    filtered = torch.real(
+        torch.fft.ifft(torch.fft.fft(sinograms_padded, dim=2) * f_filter, dim=2)
+    )[:, :, :N]  # [B, A, N]
 
-    f_filter = get_fourier_filter_torch(padded_size, filter_name, device=device)  # [1, padded]
-    spectrum = torch.fft.fft(sinograms_padded, dim=2)
-    filtered = torch.real(torch.fft.ifft(spectrum * f_filter, dim=2))[:, :, :N]
-
-    # Backprojection
-    recon = torch.zeros((B, output_size, output_size), device=device)
     radius = output_size // 2
-
     y, x = torch.meshgrid(
         torch.arange(output_size, device=device) - radius,
         torch.arange(output_size, device=device) - radius,
         indexing="ij",
     )
-    x = x.flatten()
-    y = y.flatten()
+    x = x.float().flatten()  # [H*W]
+    y = y.float().flatten()
 
-    for i, angle in enumerate(torch.deg2rad(theta)):
-        t = (x * torch.cos(angle) - y * torch.sin(angle)).reshape(1, output_size, output_size)
-        t_idx = t + (N // 2)
+    # Compute t for all angles at once: [A, H*W]
+    angles_rad = torch.deg2rad(theta.float())
+    t = x.unsqueeze(0) * torch.cos(angles_rad).unsqueeze(1) - y.unsqueeze(0) * torch.sin(
+        angles_rad
+    ).unsqueeze(1)  # [A, H*W]
+    t_idx = t + (N // 2)  # [A, H*W]
 
-        t0 = torch.floor(t_idx).long().clamp(0, N - 2)  # [1, H, W]
-        t1 = t0 + 1
-        w = t_idx - t0.float()
+    t0 = t_idx.long().clamp(0, N - 2)  # [A, H*W]
+    t1 = t0 + 1
+    w = t_idx - t0.float()  # [A, H*W]
 
-        t0 = t0.expand(B, -1, -1)  # [B, H, W]
-        t1 = t1.expand(B, -1, -1)
+    # Gather from filtered: [B, A, N] -> gather at [A, H*W] indices
+    # Expand: [B, A, H*W]
+    # HW = output_size * output_size
+    t0_exp = t0.unsqueeze(0).expand(B, -1, -1)  # [B, A, H*W]
+    t1_exp = t1.unsqueeze(0).expand(B, -1, -1)
+    w_exp = w.unsqueeze(0).expand(B, -1, -1)
 
-        filtered_i = filtered[:, i, :]  # [B, N]
-        val0 = torch.gather(filtered_i, 1, t0.view(B, -1)).view(B, output_size, output_size)
-        val1 = torch.gather(filtered_i, 1, t1.view(B, -1)).view(B, output_size, output_size)
+    val0 = torch.gather(filtered, 2, t0_exp)  # [B, A, H*W]
+    val1 = torch.gather(filtered, 2, t1_exp)
+    proj = ((1 - w_exp) * val0 + w_exp * val1).sum(dim=1)  # [B, H*W]
 
-        proj = (1 - w) * val0 + w * val1
-        recon += proj
+    recon = proj.view(B, output_size, output_size)
 
     if circle:
         mask = (
@@ -166,10 +146,12 @@ def iradon_torch(
         recon[:, mask] = 0.0
 
     recon *= torch.pi / (2 * A)
-    return recon.squeeze(0) if recon.shape[0] == 1 else recon
+    return recon.squeeze(0) if B == 1 else recon
 
 
-def get_fourier_filter_torch(size, filter_name="ramp", device=None, dtype=torch.float32):
+def get_fourier_filter_torch(
+    size, filter_name: str | None = "ramp", device=None, dtype=torch.float32
+):
     """
     Construct the Fourier filter in PyTorch.
     """

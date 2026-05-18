@@ -23,6 +23,7 @@ class Siren(nn.Module):
         hsiren: bool = False,
         dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
+        winner_initialization: bool | int = False,
     ) -> None:
         """Initialize Siren.
 
@@ -59,7 +60,7 @@ class Siren(nn.Module):
         self.alpha = alpha
         self.hsiren = hsiren
         self.dtype = dtype
-
+        self.winner_initialization = winner_initialization
         self.final_activation = final_activation
 
         self._build()
@@ -109,6 +110,21 @@ class Siren(nn.Module):
         net_list.append(self._final_activation)
         self.net = nn.Sequential(*net_list)
 
+        if self.winner_initialization:
+            if type(self.winner_initialization) is int:
+                rng = torch.Generator()
+                rng.manual_seed(self.winner_initialization)
+            else:
+                rng = torch.Generator()
+                rng.manual_seed(42)
+            with torch.no_grad():
+                self.net[0].linear.weight += (  # type: ignore[reportAttributeAccessIssue]
+                    torch.randn_like(self.net[0].linear.weight) * 5 / self.first_omega_0  # type:ignore
+                )
+                self.net[1].linear.weight += (  # type: ignore[reportAttributeAccessIssue]
+                    torch.randn_like(self.net[1].linear.weight) * 0.1 / self.hidden_omega_0  # type:ignore
+                )
+
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
         output = self.net(coords)
         return output
@@ -118,7 +134,10 @@ class Siren(nn.Module):
         self._build()
 
     def make_equispaced_grid(
-        self, bounds: tuple[tuple[float, float], ...], sampling: tuple[float, ...]
+        self,
+        bounds: tuple[tuple[float, float], ...],
+        sampling: tuple[float, ...] | None = None,
+        num_points: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         """Create an equispaced coordinate grid for the implicit neural representation.
 
@@ -130,7 +149,10 @@ class Siren(nn.Module):
         sampling : tuple of float
             Sampling interval for each dimension (spacing_0, spacing_1, ...).
             Length must match in_features.
-
+        num_points : tuple of int, optional
+            Number of points to sample in each dimension. If None, the number of points
+            is calculated from the sampling interval. If both sampling and num_points are provided,
+            num_points takes precedence.
         Returns
         -------
         torch.Tensor
@@ -145,7 +167,7 @@ class Siren(nn.Module):
         Examples
         --------
         For a model with in_features=2:
-        >>> bounds = ((0, 1), (0, 1))
+        >>> bounds = ((-1, 1), (-1, 1))
         >>> sampling = (0.1, 0.1)
         >>> coords = siren.make_equispaced_grid(bounds, sampling)
         """
@@ -153,15 +175,28 @@ class Siren(nn.Module):
             raise ValueError(
                 f"Bounds length ({len(bounds)}) must match in_features ({self.in_features})"
             )
-        if len(sampling) != self.in_features:
-            raise ValueError(
-                f"Sampling length ({len(sampling)}) must match in_features ({self.in_features})"
+        if sampling is not None and num_points is not None:
+            raise ValueError("Only one of sampling or num_points can be provided")
+        if sampling is not None:
+            if len(sampling) != self.in_features:
+                raise ValueError(
+                    f"Sampling length ({len(sampling)}) must match in_features ({self.in_features})"
+                )
+            num_points = tuple(
+                int((bound_max - bound_min) / sample) + 1
+                for (bound_min, bound_max), sample in zip(bounds, sampling)
             )
-
+        elif num_points is not None:
+            if len(num_points) != self.in_features:
+                raise ValueError(
+                    f"Num points length ({len(num_points)}) must match in_features ({self.in_features})"
+                )
+        else:
+            raise ValueError("Either sampling or num_points must be provided")
         grids = []
-        for (bound_min, bound_max), sample in zip(bounds, sampling):
-            num_points = int((bound_max - bound_min) / sample) + 1
-            grids.append(torch.linspace(bound_min, bound_max, num_points))
+        for i, (bound_min, bound_max) in enumerate(bounds):
+            n = num_points[i]
+            grids.append(torch.linspace(bound_min, bound_max, n))
 
         coords = torch.meshgrid(*grids, indexing="ij")
         coords = torch.stack(coords, dim=-1).to(self.dtype)
@@ -182,6 +217,7 @@ class HSiren(Siren):
         alpha: float = 1.0,
         dtype: torch.dtype = torch.float32,
         final_activation: str | Callable = "identity",
+        winner_initialization: bool | int = False,
     ) -> None:
         """Initialize HSiren.
 
@@ -217,4 +253,5 @@ class HSiren(Siren):
             hsiren=True,
             dtype=dtype,
             final_activation=final_activation,
+            winner_initialization=winner_initialization,
         )

@@ -465,6 +465,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 "No snapshots available. Use store_snapshots=True during reconstruction."
             )
         iteration = int(iteration)
+        if iteration < 0:
+            iteration = self.num_iters + iteration
         if closest:
             closest_snapshot = min(self.snapshots, key=lambda s: abs(s["iteration"] - iteration))
             snp = closest_snapshot

@@ -1,6 +1,13 @@
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from quantem.core import config
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerParams,
+    OptimizerType,
+    SchedulerParams,
+    SchedulerType,
+)
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 
 if TYPE_CHECKING:
@@ -16,12 +23,10 @@ class PtychographyOpt(PtychographyBase):
     """
 
     OPTIMIZABLE_VALS = ["object", "probe", "dataset"]
-    DEFAULT_OPTIMIZER_TYPE = "adam"
+    DEFAULT_OPTIMIZER_TYPE: OptimizerType = OptimizerParams.Adam()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # self._optimizer_params = {}
-        # self._scheduler_params = {}
 
     def _get_default_lr(self, key: str) -> float:
         """Get default learning rate for a given optimization key."""
@@ -37,7 +42,7 @@ class PtychographyOpt(PtychographyBase):
     # region --- explicit properties and setters ---
 
     @property
-    def optimizer_params(self) -> dict[str, dict]:
+    def optimizer_params(self) -> dict[str, OptimizerType]:
         return {
             key: params
             for key, params in [
@@ -45,45 +50,40 @@ class PtychographyOpt(PtychographyBase):
                 ("probe", self.probe_model.optimizer_params),
                 ("dataset", self.dset.optimizer_params),
             ]
-            if params
+            if not isinstance(params, OptimizerParams.NoneOptimizer)
         }
 
     @optimizer_params.setter
     def optimizer_params(self, d: dict) -> None:
         """
-        Takes a dictionary:
-        {
-            "object": {
-                "type": "adam",
-                "lr": 0.001,
-                },
-            "probe": {
-                "type": "adam",
-                "lr": 0.001,
-                },
-            "dataset": {
-                "type": "adam",
-                "lr": 0.001,
-                },
-            ...
-        }
+        Takes a dictionary mapping optimizable keys to either an ``OptimizerType``
+        dataclass or a plain dict (with optional ``"name"``/``"type"`` and ``"lr"``
+        keys).  Missing ``"name"`` / ``"lr"`` are filled from ``DEFAULT_OPTIMIZER_TYPE``
+        and ``_get_default_lr`` respectively.
+
+        Examples
+        --------
+        >>> ptycho.optimizer_params = {"object": OptimizerParams.Adam(lr=5e-3)}
+        >>> ptycho.optimizer_params = {"object": {"name": "adam", "lr": 5e-3}}
+        >>> ptycho.optimizer_params = ["object", "probe"]  # use all defaults
         """
         if isinstance(d, (tuple, list)):
             d = {k: {} for k in d}
 
-        ## previously removed unspecified optimizers, but I think its better to keep them
-        ## and only remove if type is none
-        # for key in self.OPTIMIZABLE_VALS:
-        #     # if not specified, remove the scheduler for that model
-        #     if key not in d:
-        #         d[key] = {"type": "none"}
-
         for k, v in d.items():
-            if "type" not in v.keys():
-                v["type"] = self.DEFAULT_OPTIMIZER_TYPE
-            if "lr" not in v.keys():
-                v["lr"] = self._get_default_lr(k)
-            # self._optimizer_params[k] = v
+            if isinstance(v, OptimizerType):
+                pass  # already a dataclass, pass through
+            elif isinstance(v, dict):
+                if not v:
+                    v = replace(self.DEFAULT_OPTIMIZER_TYPE, lr=self._get_default_lr(k))
+                else:
+                    if "name" not in v and "type" not in v:
+                        v["name"] = self.DEFAULT_OPTIMIZER_TYPE._name
+                    if "lr" not in v:
+                        v["lr"] = self._get_default_lr(k)
+            else:
+                raise TypeError(f"Expected OptimizerType or dict for key '{k}', got {type(v)}")
+
             if k == "object":
                 self.obj_model.optimizer_params = v
             elif k == "probe":
@@ -131,7 +131,7 @@ class PtychographyOpt(PtychographyBase):
             self.dset.remove_optimizer()
 
     @property
-    def scheduler_params(self) -> dict[str, dict]:
+    def scheduler_params(self) -> dict[str, SchedulerType]:
         """Returns the parameters used to set the schedulers."""
         return {
             "object": self.obj_model.scheduler_params,
@@ -142,22 +142,18 @@ class PtychographyOpt(PtychographyBase):
     @scheduler_params.setter
     def scheduler_params(self, d: dict) -> None:
         """
-        Takes a dictionary:
-        {
-            "object": {
-                "type": "cyclic",
-                "base_lr": 0.001,
-                },
-            "probe": {
-                ...
-                },
-            ...
-        }
+        Takes a dictionary mapping optimizable keys to either a ``SchedulerType``
+        dataclass or a plain dict.  Keys not present in ``d`` are set to
+        ``SchedulerParams.NoneScheduler()`` (disables scheduling for that model).
+
+        Examples
+        --------
+        >>> ptycho.scheduler_params = {"object": SchedulerParams.Plateau(factor=0.5)}
+        >>> ptycho.scheduler_params = {"object": {"name": "plateau", "factor": 0.5}}
         """
         for key in self.OPTIMIZABLE_VALS:
-            # if not specified, remove the scheduler for that model
             if key not in d:
-                d[key] = {}
+                d[key] = SchedulerParams.NoneScheduler()
         for k, v in d.items():
             if k == "object":
                 self.obj_model.scheduler_params = v
@@ -182,11 +178,7 @@ class PtychographyOpt(PtychographyBase):
             schedulers["dataset"] = self.dset.scheduler
         return schedulers
 
-    def set_schedulers(
-        self,
-        params: dict[str, dict],
-        num_iter: int | None = None,
-    ):
+    def set_schedulers(self, params: dict[str, SchedulerType], num_iter: int | None = None):
         """Set schedulers for each model."""
         for key, scheduler_params in params.items():
             if key not in self.OPTIMIZABLE_VALS:
