@@ -63,6 +63,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         # Misc metadata
         self.metadata: dict[str, Any] = {}
 
+        self.u_ref: np.ndarray | None = None
+        self.v_ref: np.ndarray | None = None
+
     @classmethod
     def from_dataset(
         cls, dataset: Dataset2d | Dataset3d | Dataset4d | Dataset4dstem | Any
@@ -999,6 +1002,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 ),
                 dtype=float,
             )
+        self.u_ref = u_ref
+        self.v_ref = v_ref
 
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
@@ -1084,7 +1089,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self.mask = np.clip((self.mask - min_threshold) / (max_threshold - min_threshold), 0, 1)
         if smooth:
             self.mask = np.sin(np.pi / 2 * self.mask) ** 2
-        return self        
+        return self
 
 
     def plot_strain(
@@ -1155,9 +1160,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             euv_rgb * self.mask[:, :, np.newaxis],
         )
 
-        ax[0].set_title(r"$\epsilon_{uu}$", fontsize=title_fs)
-        ax[1].set_title(r"$\epsilon_{vv}$", fontsize=title_fs)
-        ax[2].set_title(r"$\epsilon_{uv}$", fontsize=title_fs)
+        ax[0].set_title(r"$\epsilon_{uu}$ $\updownarrow$", fontsize=title_fs)
+        ax[1].set_title(r"$\epsilon_{vv}$ $\leftrightarrow$", fontsize=title_fs)
+        ax[2].set_title(r"$\epsilon_{uv}$ $\nearrow$", fontsize=title_fs)
 
         if plot_rotation:
             norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
@@ -1165,14 +1170,17 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             im3 = ax[3].imshow(
                 rot_rgb * self.mask[:, :, np.newaxis],
             )
-            ax[3].set_title("Rotation", fontsize=title_fs)
+            ax[3].set_title(r"Rotation $\circlearrowleft$", fontsize=title_fs)
 
         for a in ax:
             a.set_xticks([])
             a.set_yticks([])
             a.set_facecolor("black")
 
-        fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.16, wspace=0.03)
+        fig.subplots_adjust(left=0.04, right=0.98, top=0.90, bottom=0.16, wspace=0.05)
+        if plot_rotation:
+            pos3 = ax[3].get_position()
+            ax[3].set_position([pos3.x0 + 0.03, pos3.y0, pos3.width, pos3.height])
 
         b0 = ax[0].get_position()
         b2 = ax[2].get_position()
@@ -1182,8 +1190,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         b3 = ax[3].get_position() if plot_rotation else None
 
-        cb_height = 0.04
-        cb_pad = 0.03
+        cb_height = 0.02
+        cb_pad = 0.02
         y = b0.y0 - cb_pad - cb_height
         from matplotlib.cm import ScalarMappable
         cax1 = fig.add_axes([left, y, width, cb_height])
@@ -1200,7 +1208,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             cbar2 = fig.colorbar(sm_rot, cax=cax2, orientation="horizontal")
             cbar2.set_label("Rotation (deg)", fontsize=title_fs)
             cbar2.ax.tick_params(labelsize=12)
-
+                
         for a in ax:
             a.set_aspect("equal")
 
