@@ -16,13 +16,7 @@ def read_4dstem(
     file_path: str | PathLike,
     file_type: str | None = None,
     dataset_index: int | None = None,
-<<<<<<< HEAD
-    scan_length: int | None = None,
-    scan_axis: int = 0,
-    transpose_scan_axes: bool = False,
-=======
     hot_pixel_filter: bool = False,
->>>>>>> dev
     **kwargs,
 ) -> Dataset4dstem:
     """
