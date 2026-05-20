@@ -10,6 +10,7 @@ from scipy.signal.windows import tukey
 from tqdm import tqdm
 
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset4dstem
+from quantem.core.fitting.background import DCBackground, GaussianBackground
 from quantem.core.fitting.base import (
     AdditiveRenderModel,
     FitBase,
@@ -17,11 +18,11 @@ from quantem.core.fitting.base import (
     RenderComponent,
     RenderContext,
 )
-from quantem.core.fitting.background import DCBackground, GaussianBackground
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
 from quantem.core.utils.imaging_utils import cross_correlation_shift
+from quantem.core.visualization.visualization_utils import ScalebarConfig, add_scalebar_to_ax
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
 
 
@@ -1045,13 +1046,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
     
     def create_mask(
         self,
+        use_radial_method: bool = False,
         min_threshold: float = 0.4,
         max_threshold: float = 0.6,
+        exclusion_radius_fraction: float = 0.1,
         smooth: bool = True,
-        
     ):
-        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
-            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
         self.mask = np.zeros(self.dataset.shape[:2])
@@ -1060,28 +1060,41 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         
         if self.state_individual_refined is None:
             raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
-        
-        for r in range(scan_r):
-            for c in range(scan_c):
-                pos_state = self.state_individual_refined[r, c]
-                if pos_state is None:
-                    self.i0_sum_array[r, c] = 0.0
-                    continue
+        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
+                raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
 
-                i0_raw = None
-                uv_indices = None
-                for key in pos_state.keys():
-                    if key.endswith('i0_raw'):
-                        i0_raw = pos_state[key].cpu().numpy()
-                    if key.endswith('uv_indices'):
-                        uv_indices = pos_state[key].cpu().numpy()
-                
-                if i0_raw is None or uv_indices is None:
-                    self.i0_sum_array[r, c] = 0.0
-                    continue
-                
-                is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
-                self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
+        if use_radial_method:
+            center_y, center_x = np.array(self.dataset.shape[:-2]) / 2
+            y, x = np.ogrid[:self.dataset.shape[-2], :self.dataset.shape[-1]]
+            radius_map = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
+            for r in range(scan_r):
+                for c in range(scan_c):
+                    dp = self.dataset.array[r, c]             
+                    outside_mask = radius_map > exclusion_radius
+                    self.i0_sum_array[r, c] = np.sum(dp[outside_mask])
+        else:
+            for r in range(scan_r):
+                for c in range(scan_c):
+                    pos_state = self.state_individual_refined[r, c]
+                    if pos_state is None:
+                        self.i0_sum_array[r, c] = 0.0
+                        continue
+
+                    i0_raw = None
+                    uv_indices = None
+                    for key in pos_state.keys():
+                        if key.endswith('i0_raw'):
+                            i0_raw = pos_state[key].cpu().numpy()
+                        if key.endswith('uv_indices'):
+                            uv_indices = pos_state[key].cpu().numpy()
+                    
+                    if i0_raw is None or uv_indices is None:
+                        self.i0_sum_array[r, c] = 0.0
+                        continue
+                    
+                    is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
+                    self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
         max_intensity = np.max(self.i0_sum_array)
         if max_intensity == 0:
             return np.zeros_like(self.i0_sum_array)
@@ -1098,10 +1111,13 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         strain_range_percent=(-3.0, 3.0),
         rotation_range_degrees=(-2.0, 2.0),
         plot_rotation=True,
+        plot_gvecs=True,
+        plot_scalebar=True,
         cmap_strain="RdBu_r",
         cmap_rotation="PiYG",
         layout="horizontal",
         figsize=(6, 6),
+        **scalebar_kwargs,
     ):
         import matplotlib.pyplot as plt
 
@@ -1150,44 +1166,76 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         euv_rgb = cm_strain(norm_strain(euv_pct))[:, :, :3]
 
         title_fs = 16
-        im0 = ax[0].imshow(
-            euu_rgb * self.mask[:, :, np.newaxis],
-        )
-        ax[1].imshow(
-            evv_rgb * self.mask[:, :, np.newaxis],
-        )
-        ax[2].imshow(
-            euv_rgb * self.mask[:, :, np.newaxis],
-        )
+        ax[0].imshow(euu_rgb * self.mask[:, :, np.newaxis],)
+        ax[1].imshow(evv_rgb * self.mask[:, :, np.newaxis],)
+        ax[2].imshow(euv_rgb * self.mask[:, :, np.newaxis],)
 
         ax[0].set_title(r"$\epsilon_{uu}$ $\updownarrow$", fontsize=title_fs)
         ax[1].set_title(r"$\epsilon_{vv}$ $\leftrightarrow$", fontsize=title_fs)
-        ax[2].set_title(r"$\epsilon_{uv}$ $\nearrow$", fontsize=title_fs)
+        ax[2].set_title(r"$\epsilon_{uv}$ $\nearrow\!\swarrow$", fontsize=title_fs)
 
         if plot_rotation:
             norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
             rot_rgb = cm_rot(norm_rot(rot_deg))[:, :, :3]
-            im3 = ax[3].imshow(
-                rot_rgb * self.mask[:, :, np.newaxis],
-            )
+            ax[3].imshow(rot_rgb * self.mask[:, :, np.newaxis],)
             ax[3].set_title(r"Rotation $\circlearrowleft$", fontsize=title_fs)
 
         for a in ax:
             a.set_xticks([])
             a.set_yticks([])
             a.set_facecolor("black")
+            a.set_aspect("equal")
+
+        if plot_scalebar and isinstance(self.dataset, Dataset4dstem):
+            default_sampling = 1.0
+            default_units = 'pixels'
+            
+            if hasattr(self.dataset, 'units'):
+                if isinstance(self.dataset.units, (tuple, list)):
+                    default_units = str(self.dataset.units[0])
+                else:
+                    default_units = str(self.dataset.units)
+            if hasattr(self.dataset, 'sampling'):
+                if isinstance(self.dataset.sampling, (tuple, list, np.ndarray)):
+                    default_sampling = float(self.dataset.sampling[0])
+                else:
+                    default_sampling = float(self.dataset.sampling)
+            scalebar_defaults = {
+                'sampling': default_sampling,
+                'units': default_units,
+                'length': None,
+                'width_px': 1,
+                'pad_px': 0.5,
+                'color': 'black',
+                'loc': 'lower left',
+                'fontsize': 12,
+                'bold': True,
+            }
+            scalebar_defaults.update(scalebar_kwargs)
+            scalebar_config = ScalebarConfig(**scalebar_defaults)
+            add_scalebar_to_ax(
+                ax[0],
+                array_size=int(self.dataset.shape[0]),
+                sampling=scalebar_config.sampling,
+                length_units=scalebar_config.length,
+                units=scalebar_config.units,
+                width_px=scalebar_config.width_px,
+                pad_px=scalebar_config.pad_px,
+                color=scalebar_config.color,
+                loc=scalebar_config.loc,
+                fontsize=scalebar_config.fontsize,
+                bold=scalebar_config.bold,
+            )
 
         fig.subplots_adjust(left=0.04, right=0.98, top=0.90, bottom=0.16, wspace=0.05)
         if plot_rotation:
             pos3 = ax[3].get_position()
             ax[3].set_position([pos3.x0 + 0.03, pos3.y0, pos3.width, pos3.height])
-
         b0 = ax[0].get_position()
         b2 = ax[2].get_position()
         left = b0.x0
         right = b2.x1
         width = right - left
-
         b3 = ax[3].get_position() if plot_rotation else None
 
         cb_height = 0.02
@@ -1208,9 +1256,49 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             cbar2 = fig.colorbar(sm_rot, cax=cax2, orientation="horizontal")
             cbar2.set_label("Rotation (deg)", fontsize=title_fs)
             cbar2.ax.tick_params(labelsize=12)
-                
-        for a in ax:
-            a.set_aspect("equal")
+        
+        if plot_gvecs:
+            from matplotlib.patches import FancyArrowPatch
+            if not hasattr(self, 'u_ref') or not hasattr(self, 'v_ref'):
+                print("Warning: u_ref and v_ref not found. Call fit_strain() first.")
+                return fig, ax
+            
+            last_pos = b3 if plot_rotation else b2
+            
+            ref_width = last_pos.width * 0.8
+            ref_left = last_pos.x1 - 0.035
+            
+            ref_ax = fig.add_axes([ref_left, last_pos.y0, ref_width, last_pos.height])
+            ref_ax.set_xlim(-1.5, 1.5)
+            ref_ax.set_ylim(-1.5, 1.5)
+            ref_ax.set_aspect('equal')
+            ref_ax.axis('off')
+            u_norm = self.u_ref / np.linalg.norm(self.u_ref)
+            v_norm = self.v_ref / np.linalg.norm(self.v_ref)
+            
+            u_row, u_col = u_norm
+            v_row, v_col = v_norm
+            arrow_props_ref = dict(arrowstyle='->', lw=3, mutation_scale=25)
+            
+            u_arrow = FancyArrowPatch(
+                (0, 0), (u_col, -u_row),
+                color='darkred', **arrow_props_ref
+            )
+            ref_ax.add_patch(u_arrow)
+            
+            v_arrow = FancyArrowPatch(
+                (0, 0), (v_col, -v_row),
+                color='darkblue', **arrow_props_ref
+            )
+            ref_ax.add_patch(v_arrow)
+            ref_ax.text(u_col * 1.3, -u_row * 1.3, r'$\mathbf{u}_{ref}$',
+                    fontsize=14, fontweight='bold', color='darkred',
+                    ha='center', va='center')
+            
+            ref_ax.text(v_col * 1.3, -v_row * 1.3, r'$\mathbf{v}_{ref}$',
+                    fontsize=14, fontweight='bold', color='darkblue',
+                    ha='center', va='center')
+        
 
         return fig, ax
 
