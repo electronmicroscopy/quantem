@@ -585,8 +585,8 @@ class DiffractionTomography(AutoSerialize):
         
     ):
         # projection vectors
-        u_proj = torch.tensor(u_proj,dtype=torch.float32)
-        v_proj = torch.tensor(v_proj,dtype=torch.float32)
+        u_proj = torch.asarray(u_proj,dtype=torch.float32)
+        v_proj = torch.asarray(v_proj,dtype=torch.float32)
         u_proj /= torch.linalg.norm(u_proj)
         v_proj /= torch.linalg.norm(v_proj)
         w_proj = torch.cross(u_proj,v_proj)
@@ -599,7 +599,7 @@ class DiffractionTomography(AutoSerialize):
         if not hasattr(self, "prop_distance"):
             self.make_prop()
 
-        position = torch.tensor(position, dtype=float).squeeze()
+        position = torch.asarray(position, dtype=float).squeeze()
         if position.shape != (3,):
             raise ValueError(
                 f"position must have shape (3,), got {position.shape}"
