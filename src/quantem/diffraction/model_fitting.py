@@ -1117,7 +1117,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         cmap_rotation="PiYG",
         layout="horizontal",
         figsize=(6, 6),
-        **scalebar_kwargs,
+        **kwargs,
     ):
         import matplotlib.pyplot as plt
 
@@ -1189,6 +1189,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         if plot_scalebar and isinstance(self.dataset, Dataset4dstem):
             default_sampling = 1.0
             default_units = 'pixels'
+            scalebar_kwargs = {}
+            for key, value in kwargs.items():
+                if key.startswith('scalebar_'):
+                    scalebar_key = key[len('scalebar_'):]
+                    scalebar_kwargs[scalebar_key] = value
             
             if hasattr(self.dataset, 'units'):
                 if isinstance(self.dataset.units, (tuple, list)):
