@@ -381,7 +381,7 @@ class DiffractionTomography(AutoSerialize):
 
         # Output
         dataset = Dataset6d.from_array(
-            array=np.array(tensor),
+            array=torch.asarray(tensor),
             name=name if name is not None else "Diffraction tomography dataset",
             origin=origin,
             sampling=sampling,
