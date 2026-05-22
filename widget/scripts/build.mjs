@@ -9,6 +9,7 @@ const watch = process.argv.includes("--watch");
 const widgets = [
   { name: "show2d" },
   { name: "show3d" },
+  { name: "show3dslices" },
   { name: "show4dstem" },
 ];
 

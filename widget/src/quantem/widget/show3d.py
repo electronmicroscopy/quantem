@@ -117,7 +117,7 @@ class Show3D(anywidget.AnyWidget):
         Canvas rendering size in CSS pixels (the on-screen width of the main
         viewport).  ``0`` uses the frontend default (500 px).  Pass e.g.
         ``size=800`` to enlarge for a presentation, or ``size=300`` to compress
-        alongside a control panel.  This controls **display only** — the
+        alongside a control panel.  This controls **display only** - the
         underlying stack resolution is never resampled; scrubbing and zoom
         still see every pixel of the full-resolution frame.
     max_cols : int, default 4
@@ -128,7 +128,7 @@ class Show3D(anywidget.AnyWidget):
         row are not rendered (transparent, non-interactive).
     panel_gap : int, default 10
         Gap in CSS pixels between adjacent panels.  ``0`` = flush (panels share
-        an edge — useful for tiled montages), ``20`` = roomy (clear separation
+        an edge - useful for tiled montages), ``20`` = roomy (clear separation
         for slides).  Single-panel widgets ignore this.
     panel_title_font_size : int, default 11
         Font size in CSS pixels for the per-panel title drawn at the top of
@@ -190,11 +190,11 @@ class Show3D(anywidget.AnyWidget):
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
     # Monotonic counter incremented each time frame_bytes is written. Defensive
     # against the case where traitlets.Bytes identity-compares to suppress the
-    # trait change event when JS sees the same DataView wrapper — JS subscribes
+    # trait change event when JS sees the same DataView wrapper - JS subscribes
     # to this counter as a guaranteed-changing dep so render effects always
     # re-fire on slice scrubs / playback ticks.
     frame_seq = traitlets.Int(0).tag(sync=True)
-    _display_bin_factor = traitlets.Int(1).tag(sync=True)
+    _display_bin_factor = traitlets.Int(1)  # Python-only: JS doesn't read
     # Flipped True by JS after the first colormap pass has painted to canvas.
     # Drives the truthful timing print (end-to-end, not __init__-only).
     _js_rendered = traitlets.Bool(False).tag(sync=True)
@@ -206,14 +206,14 @@ class Show3D(anywidget.AnyWidget):
     # Multi-Panel (side-by-side stacks, independent zoom by default with optional link)
     n_panels = traitlets.Int(1).tag(sync=True)
     panel_titles = traitlets.List(traitlets.Unicode()).tag(sync=True)
-    panel_width_px = traitlets.Int(0).tag(sync=True)  # pixel width of ONE panel inside frame_bytes (0 for single-panel)
+    panel_width_px = traitlets.Int(0)  # Python-only: JS infers panel width from frame width / n_panels
     # Real frame count per panel for stack comparison: stacks of different
     # lengths get auto-padded to the longest; this trait lets JS mark
     # "end-of-stack" frames (frame idx >= real[panel]). Empty = all real.
     panel_real_frames = traitlets.List(traitlets.Int()).tag(sync=True)
     # Single Link toggle controls both zoom AND pan (independent axes proved confusing).
-    link_zoom = traitlets.Bool(True).tag(sync=True)
-    link_pan = traitlets.Bool(True).tag(sync=True)
+    link_zoom = traitlets.Bool(True)  # Python-only: JS uses link_panels for linked zoom+pan
+    link_pan = traitlets.Bool(True)   # Python-only: JS uses link_panels for linked zoom+pan
     link_panels = traitlets.Bool(True).tag(sync=True)
     link_contrast = traitlets.Bool(True).tag(sync=True)  # share vmin/vmax across panels
     # 0 = single row (no wrap). N > 0 = wrap into rows of at most N panels.
@@ -252,10 +252,12 @@ class Show3D(anywidget.AnyWidget):
     stats_max = traitlets.Float(0.0).tag(sync=True)
     stats_std = traitlets.Float(0.0).tag(sync=True)
     # Per-panel stats (length = n_panels). Empty for single-panel.
-    stats_mean_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
-    stats_min_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
-    stats_max_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
-    stats_std_per_panel = traitlets.List(traitlets.Float()).tag(sync=True)
+    # Per-panel stats: JS computes its own locally (`localPanelStats`), so these
+    # are Python-only readouts. Don't sync - saves shipping 4 List[Float] per scrub.
+    stats_mean_per_panel = traitlets.List(traitlets.Float())
+    stats_min_per_panel = traitlets.List(traitlets.Float())
+    stats_max_per_panel = traitlets.List(traitlets.Float())
+    stats_std_per_panel = traitlets.List(traitlets.Float())
 
     # =========================================================================
     # Display Options
@@ -286,7 +288,7 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     timestamps = traitlets.List(traitlets.Float()).tag(sync=True)
     timestamp_unit = traitlets.Unicode("s").tag(sync=True)
-    current_timestamp = traitlets.Float(0.0).tag(sync=True)
+    current_timestamp = traitlets.Float(0.0)  # Python-only: JS reads timestamps[slice_idx] directly
 
     # =========================================================================
     # ROI Selection
@@ -311,8 +313,8 @@ class Show3D(anywidget.AnyWidget):
     # =========================================================================
     show_fft = traitlets.Bool(False).tag(sync=True)
     fft_window = traitlets.Bool(True).tag(sync=True)
-    show_playback = traitlets.Bool(False).tag(sync=True)
-    widget_version = traitlets.Unicode("unknown").tag(sync=True)
+    show_playback = traitlets.Bool(False)         # Python-only: not consumed in JS
+    widget_version = traitlets.Unicode("unknown")  # Python-only: telemetry readout
     # =========================================================================
     # Line Profile
     # =========================================================================
@@ -605,8 +607,8 @@ class Show3D(anywidget.AnyWidget):
             kwargs["show_resize_handles"] = bool(show_resize_handles)
         if show_zoom_indicator is not None:
             kwargs["show_zoom_indicator"] = bool(show_zoom_indicator)
-        import time as _time
-        _t0 = _time.perf_counter()
+        import time
+        _t0 = time.perf_counter()
         # Reject unknown kwargs so typos raise instead of being silently ignored.
         _reject_unknown_kwargs(type(self), kwargs)
         super().__init__(**kwargs)
@@ -639,7 +641,7 @@ class Show3D(anywidget.AnyWidget):
                    show_stats, show_controls, size,
                    diff_mode, buffer_size, dim_label, use_torch, device, display_bin,
                    state, _t0):
-        import time as _time
+        import time
         self.widget_version = resolve_widget_version()
 
         # Optional torch acceleration. Do not move NumPy/Dataset input to GPU
@@ -762,13 +764,13 @@ class Show3D(anywidget.AnyWidget):
                         f"Panel {i}: complex data not accepted. Convert first: "
                         "np.abs(arr) for magnitude or np.angle(arr) for phase."
                     )
-                # Image (H,W) must match across panels — viewer cannot composite
+                # Image (H,W) must match across panels - viewer cannot composite
                 # different image sizes into one canvas.
                 if arr.shape[1:] != panels[0].shape[1:]:
                     raise ValueError(
                         f"Panel {i} image shape {arr.shape[1:]} must match panel 0 image shape {panels[0].shape[1:]}."
                     )
-                # Slice counts can differ — caller compares trials with different
+                # Slice counts can differ - caller compares trials with different
                 # iteration counts. We auto-pad shorter stacks below.
                 panels.append(_as_valid_panel(arr, f"Panel {i}"))
             self.n_panels = len(panels)
@@ -778,7 +780,7 @@ class Show3D(anywidget.AnyWidget):
                 self.panel_titles = [f"Panel {i+1}" for i in range(len(panels))]
             # Auto-pad short stacks to longest, auto-fill panel_real_frames so
             # JS marks end-of-stack frames. Pad by repeating each panel's last
-            # frame — visually obvious vs zeros and keeps colormap range stable.
+            # frame - visually obvious vs zeros and keeps colormap range stable.
             real_n = [p.shape[0] for p in panels]
             max_n = max(real_n)
             if any(n != max_n for n in real_n):
@@ -794,7 +796,7 @@ class Show3D(anywidget.AnyWidget):
                 if not self.panel_real_frames:
                     self.panel_real_frames = real_n
             # NEVER BIN (CLAUDE.md rule). Operator wants full source resolution
-            # on every multi-panel surface — pixel-exact for microscopy.
+            # on every multi-panel surface - pixel-exact for microscopy.
             # Memory: bumped JS-side buffer cap (see _buffer_size logic) so
             # 10 panels × 1366² × 4B fits.
             panel_bin = 1
@@ -822,7 +824,7 @@ class Show3D(anywidget.AnyWidget):
             if panel_titles is not None:
                 self.panel_titles = list(panel_titles)
 
-        # Reject complex input — silently dropping the imaginary part on
+        # Reject complex input - silently dropping the imaginary part on
         # ptychography probes was a real data-loss footgun. User should
         # pass np.abs(probe) for magnitude or np.angle(probe) for phase.
         if np.iscomplexobj(data):
@@ -976,14 +978,14 @@ class Show3D(anywidget.AnyWidget):
         # TRUE end-to-end time after JS signals first paint.  The Python-only
         # __init__ number is misleading for widget UX.
         self._init_t0 = _t0
-        self._init_py_elapsed_ms = (_time.perf_counter() - _t0) * 1000
+        self._init_py_elapsed_ms = (time.perf_counter() - _t0) * 1000
         self.observe(self._on_first_render, names=["_js_rendered"])
 
     def _on_first_render(self, change):
-        import time as _time
+        import time
         if not change.get("new"):
             return
-        total_ms = (_time.perf_counter() - self._init_t0) * 1000
+        total_ms = (time.perf_counter() - self._init_t0) * 1000
         py_ms = self._init_py_elapsed_ms
         shape = f"{self.n_slices}×{self.height}×{self.width}"
         mem = self._data.nbytes
@@ -992,15 +994,15 @@ class Show3D(anywidget.AnyWidget):
         self.render_python_build_ms = int(py_ms)
         self.render_wire_js_ms = int(total_ms - py_ms)
         print(
-            f"Show3D: {shape} {mem_str} — "
+            f"Show3D: {shape} {mem_str} - "
             f"rendered in {total_ms:.0f} ms (Python build {py_ms:.0f} ms, "
             f"wire+JS {total_ms - py_ms:.0f} ms)",
             flush=True,
         )
         try:
             self.unobserve(self._on_first_render, names=["_js_rendered"])
-        except Exception:
-            pass
+        except (ValueError, KeyError):
+            pass  # observer already removed
 
     def set_image(self, data, labels=None):
         """Replace the stack data. Preserves all display settings."""
@@ -1023,8 +1025,9 @@ class Show3D(anywidget.AnyWidget):
         # Cancel any pending ROI plot timer so it doesn't fire mid-swap with
         # stale _display_data dims (race observed by audit).
         if getattr(self, "_roi_plot_timer", None) is not None:
-            try: self._roi_plot_timer.cancel()
-            except Exception: pass
+            # threading.Timer.cancel() is documented not to raise; guard kept
+            # for defensive paranoia only.
+            self._roi_plot_timer.cancel()
             self._roi_plot_timer = None
         self.playing = False
         self._display_torch = None
@@ -1178,7 +1181,7 @@ class Show3D(anywidget.AnyWidget):
         save_state_file(path, "Show3D", self.state_dict())
 
     def load_state_dict(self, state):
-        import warnings as _w
+        import warnings
         state = dict(state)
         allowed = {
             "title", "cmap", "log_scale", "auto_contrast",
@@ -1263,7 +1266,7 @@ class Show3D(anywidget.AnyWidget):
         self._vmin = self.vmin if self.vmin is not None else self.data_min
         self._vmax = self.vmax if self.vmax is not None else self.data_max
         if unknown:
-            _w.warn(
+            warnings.warn(
                 f"load_state_dict ignored unknown keys: {unknown}. "
                 "These may be from a newer widget version or a different widget type.",
                 stacklevel=2,
@@ -1287,9 +1290,9 @@ class Show3D(anywidget.AnyWidget):
         gc.collect()
         # Flush cupy pool: _data may have been a torch view into cupy memory.
         if "cupy" in sys.modules:
-            import cupy as _cp
-            _cp.get_default_memory_pool().free_all_blocks()
-            _cp.fft.config.get_plan_cache().clear()
+            import cupy
+            cupy.get_default_memory_pool().free_all_blocks()
+            cupy.fft.config.get_plan_cache().clear()
         if device == "mps":
             torch.mps.empty_cache()
         elif device.startswith("cuda"):
@@ -1558,7 +1561,7 @@ class Show3D(anywidget.AnyWidget):
         if self.playing:
             self._send_buffer(self.slice_idx)
         else:
-            # Playback stopped — refresh stats for the current frame
+            # Playback stopped - refresh stats for the current frame
             self._update_all()
 
     def _on_prefetch(self, change=None):
@@ -1599,7 +1602,7 @@ class Show3D(anywidget.AnyWidget):
         if mask.sum() == 0:
             self.roi_plot_data = b""
             return
-        # Use _display_data (binned) — 4-16× less data than _data, same ROI result.
+        # Use _display_data (binned) - 4-16× less data than _data, same ROI result.
         # Cache torch view of _display_data on the instance so every drag doesn't
         # reallocate VRAM (was leaking ~4 GB/drag on large stacks).
         # Apply diff_mode so plot matches what the stats panel shows.
@@ -1875,7 +1878,7 @@ class Show3D(anywidget.AnyWidget):
         self._gif_export_requested = False
         try:
             self._generate_gif()
-        except Exception as e:
+        except (RuntimeError, OSError, ValueError, MemoryError, ImportError) as e:
             # On error: clear _gif_data + bump frame_seq so JS observer fires
             # and resets exporting=False. Without this the UI shows "..." forever.
             import warnings
@@ -1892,7 +1895,7 @@ class Show3D(anywidget.AnyWidget):
         if self.auto_contrast:
             flat = frames.reshape(-1).float()
             # torch.quantile fails with "input tensor is too large" above 2^24 ≈ 16.7M
-            # elements (e.g. 16 × 1370² = 30M). Subsample for percentile estimation —
+            # elements (e.g. 16 × 1370² = 30M). Subsample for percentile estimation -
             # 1M samples is more than enough for the 2/98 percentile to within ~0.01%.
             if flat.numel() > 16_000_000:
                 stride = flat.numel() // 1_000_000
@@ -1989,7 +1992,7 @@ class Show3D(anywidget.AnyWidget):
         self._zip_export_requested = False
         try:
             self._generate_zip()
-        except Exception as e:
+        except (RuntimeError, OSError, ValueError, MemoryError, ImportError) as e:
             import warnings
             warnings.warn(f"ZIP export failed: {type(e).__name__}: {e}")
             self._zip_data = b""

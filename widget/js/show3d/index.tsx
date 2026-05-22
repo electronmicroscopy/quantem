@@ -644,7 +644,7 @@ function computeROIPixelStats(
       }
     }
   } else {
-    // square or rectangle — all pixels in bounding box
+    // square or rectangle - all pixels in bounding box
     for (let dy = 0; dy < cropH; dy++) {
       for (let dx = 0; dx < cropW; dx++) {
         const v = data[(y0 + dy) * imgW + (x0 + dx)];
@@ -880,7 +880,7 @@ function Show3D() {
   const [showRoiResizeHint, setShowRoiResizeHint] = React.useState(true);
   const pendingRoiAddRef = React.useRef<{ row: number; col: number } | null>(null);
 
-  // Preview panel state (JS-only, shows ROI crop at full resolution — auto-shows when ROI selected)
+  // Preview panel state (JS-only, shows ROI crop at full resolution - auto-shows when ROI selected)
   const [previewZoom, setPreviewZoom] = React.useState({ zoom: 1, panX: 0, panY: 0 });
   const previewCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const previewOverlayRef = React.useRef<HTMLCanvasElement>(null);
@@ -1013,12 +1013,12 @@ function Show3D() {
     const parsed = extractFloat32(bufferBytes);
     if (!parsed) return;
     if (!bufferRef.current || bufferCountRef.current === 0) {
-      // No active buffer — use as current (initial load)
+      // No active buffer - use as current (initial load)
       bufferRef.current = parsed;
       bufferStartRef.current = bufferStart;
       bufferCountRef.current = bufferCount;
     } else {
-      // Active buffer exists — store as next (prefetch)
+      // Active buffer exists - store as next (prefetch)
       nextBufferRef.current = parsed;
       nextBufferStartRef.current = bufferStart;
       nextBufferCountRef.current = bufferCount;
@@ -1224,10 +1224,10 @@ function Show3D() {
     profileActive, profilePoints, profileWidth,
     traitVmin, traitVmax, smooth, imageRotation]);
 
-  // Playback logic — rAF-driven, zero React re-renders in hot path
+  // Playback logic - rAF-driven, zero React re-renders in hot path
   React.useEffect(() => {
     if (!playing) {
-      // Playback stopped — sync final position to Python
+      // Playback stopped - sync final position to Python
       if (playbackIdxRef.current !== sliceIdx && bufferRef.current) {
         setSliceIdx(playbackIdxRef.current);
       }
@@ -1260,7 +1260,7 @@ function Show3D() {
       const c = playRef.current;
       const intervalMs = 1000 / c.fps;
 
-      // First tick — just record time
+      // First tick - just record time
       if (lastFrameTime === 0) {
         lastFrameTime = now;
         lastUIUpdate = now;
@@ -1318,7 +1318,7 @@ function Show3D() {
       const frameSize = c.width * c.height;
       let frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, next, frameSize);
       if (!frame && nextBufferRef.current) {
-        // Current buffer doesn't have this frame — swap to next buffer
+        // Current buffer doesn't have this frame - swap to next buffer
         bufferRef.current = nextBufferRef.current;
         bufferStartRef.current = nextBufferStartRef.current;
         bufferCountRef.current = nextBufferCountRef.current;
@@ -1327,7 +1327,7 @@ function Show3D() {
         frame = getFrameFromBuffer(bufferRef.current, bufferStartRef.current, bufferCountRef.current, c.nSlices, next, frameSize);
       }
       if (!frame) {
-        // Buffer not ready yet — keep requesting frames
+        // Buffer not ready yet - keep requesting frames
         animId = requestAnimationFrame(tick);
         return;
       }
@@ -1335,7 +1335,7 @@ function Show3D() {
       playbackIdxRef.current = next;
       rawFrameDataRef.current = frame;
 
-      // Render frame — fused single-pass when possible
+      // Render frame - fused single-pass when possible
       const lut = COLORMAPS[c.cmap] || COLORMAPS.inferno;
       if (mainOffscreenRef.current && mainImgDataRef.current) {
         let vmin: number, vmax: number;
@@ -1350,7 +1350,7 @@ function Show3D() {
             renderToOffscreenReuse(frame, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
           }
         } else {
-          // Global range + slider — fused single-pass render (fastest path)
+          // Global range + slider - fused single-pass render (fastest path)
           ({ vmin, vmax } = resolveDisplayRange(
             c.dataMin,
             c.dataMax,
@@ -1391,7 +1391,7 @@ function Show3D() {
         }
       }
 
-      // Throttled UI updates — 10 FPS for slider/stats/profile (avoids costly MUI re-renders)
+      // Throttled UI updates - 10 FPS for slider/stats/profile (avoids costly MUI re-renders)
       if (now - lastUIUpdate > 100) {
         lastUIUpdate = now;
         setDisplaySliceIdx(next);
@@ -1411,7 +1411,7 @@ function Show3D() {
         }
       }
 
-      // Prefetch at 25% buffer consumed — only if no next buffer is already queued.
+      // Prefetch at 25% buffer consumed - only if no next buffer is already queued.
       // Respect loop range so we don't fetch frames outside [loop_start, loop_end].
       if (!prefetchPendingRef.current && !nextBufferRef.current && bufferCountRef.current > 0) {
         let idxInBuffer = next - bufferStartRef.current;
@@ -1553,7 +1553,7 @@ function Show3D() {
 
     const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
 
-    // GPU colormap path (single frame) — zero-copy via OffscreenCanvas→ImageBitmap
+    // GPU colormap path (single frame) - zero-copy via OffscreenCanvas→ImageBitmap
     const engine = gpuCmapRef.current;
     if (engine && gpuCmapReadyRef.current) {
       engine.uploadLUT(cmap, lut);
@@ -1627,7 +1627,7 @@ function Show3D() {
       renderToOffscreenReuse(processed, lut, vmin, vmax, mainOffscreenRef.current, mainImgDataRef.current);
     }
 
-    // Draw to main canvas (CPU path only — GPU path draws in its own rAF above)
+    // Draw to main canvas (CPU path only - GPU path draws in its own rAF above)
     if (!engine || !gpuCmapReadyRef.current) {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -1641,7 +1641,7 @@ function Show3D() {
   const drawMain = React.useCallback((ctx: CanvasRenderingContext2D, offscreen: HTMLCanvasElement | OffscreenCanvas) => {
     ctx.imageSmoothingEnabled = smooth;
     // Clear entire canvas. Slot-level bg fill happens inside the per-panel
-    // loop so empty grid cells (partial last row) stay transparent — the
+    // loop so empty grid cells (partial last row) stay transparent - the
     // page bg shows through instead of a dead white block.
     ctx.clearRect(0, 0, canvasW, canvasH);
     const n = Math.max(1, nPanels || 1);
@@ -1658,7 +1658,7 @@ function Show3D() {
       const row = Math.floor(i / cols);
       const slotX = col * (outPanelW + gap);
       const slotY = row * (outPanelH + gap);
-      // Per-slot bg fill — only real panels get the theme bg; empty grid
+      // Per-slot bg fill - only real panels get the theme bg; empty grid
       // cells in a partial last row stay transparent.
       ctx.fillStyle = themeColors.bg;
       ctx.fillRect(slotX, slotY, outPanelW, outPanelH);
@@ -1683,7 +1683,7 @@ function Show3D() {
       if (pastEnd) ctx.filter = "blur(4px)";
       ctx.drawImage(offscreen as CanvasImageSource, i * srcPanelW, 0, srcPanelW, srcH, 0, 0, w, h);
       ctx.restore();
-      // Per-panel title — drawn on canvas at top-center of each panel slot.
+      // Per-panel title - drawn on canvas at top-center of each panel slot.
       // Lives on the canvas (not below it) so it follows grid layout when
       // panels wrap into multiple rows. Clipped to slot so long titles
       // don't bleed into the next column.
@@ -1708,7 +1708,7 @@ function Show3D() {
         ctx.fillText(label, lx, ly);
         ctx.restore();
       }
-      // No end badge — blur alone signals past-real-frame.
+      // No end badge - blur alone signals past-real-frame.
     }
   }, [smooth, canvasW, canvasH, nPanels, maxCols, imageRotation, panelStates, linkedState, linkZoom, linkPan, themeColors.bg, panelRealFrames, panelTitles, panelGapTrait, panelTitleFontSize, sliceIdx, displaySliceIdx, playing, nSlices]);
 
@@ -1718,7 +1718,7 @@ function Show3D() {
     if (ctx) drawMain(ctx, mainOffscreenRef.current);
   }, [drawMain]);
 
-  // Render overlay (ROI only) — HiDPI aware
+  // Render overlay (ROI only) - HiDPI aware
   React.useEffect(() => {
     if (!overlayRef.current) return;
     const ctx = overlayRef.current.getContext("2d");
@@ -1728,7 +1728,7 @@ function Show3D() {
     // Match the main image's rotation so ROIs / profile sit on the right pixels.
     // Image draw applies `translate(panX,panY) → scale(zoom) → rotate(around cx)`,
     // so the rotation pivot in screen pixels is (canvasW/2+panX, canvasH/2+panY).
-    // Overlay must use the SAME screen-space pivot — earlier bug used (canvasW/2,
+    // Overlay must use the SAME screen-space pivot - earlier bug used (canvasW/2,
     // canvasH/2) without pan offset, drifting ROIs when user panned + rotated.
     if (imageRotation % 4 !== 0) {
       const cx = canvasW / 2 + panX;
@@ -2151,7 +2151,7 @@ function Show3D() {
     profileLayoutRef.current = { padLeft, plotW, padTop, plotH, gMin, gMax, totalDist, xUnit };
   }, [profileData, profilePoints, pixelSize, canvasW, themeInfo.theme, themeColors.accent, profileHeight]);
 
-  // Profile hover handler — draws crosshair + value readout
+  // Profile hover handler - draws crosshair + value readout
   const handleProfileMouseMove = React.useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = profileCanvasRef.current;
     const base = profileBaseImageRef.current;
@@ -2316,7 +2316,7 @@ function Show3D() {
       const lut = COLORMAPS[cmap] || COLORMAPS.inferno;
       // Colorbar must match what's painted on the image, not the raw data range.
       // When autoContrast is on, the image uses percentileClip(low, high) of the
-      // current frame — show that range. Otherwise use slider range over data.
+      // current frame - show that range. Otherwise use slider range over data.
       let vmin: number, vmax: number;
       if (traitVmin != null || traitVmax != null) {
         ({ vmin, vmax } = resolveDisplayRange(
@@ -2342,7 +2342,7 @@ function Show3D() {
     }
   }, [pixelSize, pixelUnit, scaleBarVisible, width, canvasW, canvasH, displayScale, zoom, nPanels, maxCols, panelStates, linkedState, linkZoom, panelGapTrait, showZoomIndicator, showColorbar, hideDisplay, cmap, imageDataRange, imageVminPct, imageVmaxPct, logScale, autoContrast, imageHistogramData, percentileLow, percentileHigh, dataMin, dataMax, traitVmin, traitVmax]);
 
-  // Compute FFT magnitude (expensive, async — only re-run on data/GPU changes)
+  // Compute FFT magnitude (expensive, async - only re-run on data/GPU changes)
   // Supports ROI-scoped FFT: when ROI is active with a selected ROI, compute
   // FFT of the cropped region instead of the full frame.
   const fftMagRef = React.useRef<Float32Array | null>(null);
@@ -2488,7 +2488,7 @@ function Show3D() {
     }
   }, [effectiveShowFft, fftMagVersion, fftLogScale, fftAuto, fftVminPct, fftVmaxPct, fftColormap, width, height, canvasW, canvasH, fftCropDims]);
 
-  // Redraw cached FFT with zoom/pan (cheap — no recomputation)
+  // Redraw cached FFT with zoom/pan (cheap - no recomputation)
   React.useEffect(() => {
     if (!effectiveShowFft || !fftCanvasRef.current || !fftOffscreenRef.current) return;
     const canvas = fftCanvasRef.current;
@@ -2539,7 +2539,7 @@ function Show3D() {
       ctx.restore();
     }
 
-    // D-spacing crosshair marker — use crop dims for coordinate mapping
+    // D-spacing crosshair marker - use crop dims for coordinate mapping
     if (fftClickInfo) {
       ctx.save();
       ctx.scale(DPR, DPR);
@@ -2573,8 +2573,8 @@ function Show3D() {
   }, [effectiveShowFft, fftZoom, fftPanX, fftPanY, canvasW, canvasH, pixelSize, width, height, fftDataRange, fftVminPct, fftVmaxPct, fftColormap, fftLogScale, fftShowColorbar, fftClickInfo, fftCropDims]);
 
   // -------------------------------------------------------------------------
-  // Preview panel — cache colormapped offscreen (only recomputes when ROI
-  // geometry, data, or display settings change — NOT on zoom/pan)
+  // Preview panel - cache colormapped offscreen (only recomputes when ROI
+  // geometry, data, or display settings change - NOT on zoom/pan)
   // -------------------------------------------------------------------------
   React.useEffect(() => {
     if (!previewVisible || !rawFrameDataRef.current) {
@@ -2629,7 +2629,7 @@ function Show3D() {
   }, [previewVisible, selectedRoiKey, cmap, logScale, autoContrast, imageVminPct, imageVmaxPct, imageDataRange, dataMin, dataMax, traitVmin, traitVmax, percentileLow, percentileHigh, width, height, frameBytes, displaySliceIdx]);
 
   // -------------------------------------------------------------------------
-  // Preview panel — compute aspect-ratio-aware canvas dimensions
+  // Preview panel - compute aspect-ratio-aware canvas dimensions
   // -------------------------------------------------------------------------
   const previewCanvasDims = React.useMemo(() => {
     if (!previewCropDims) return { w: canvasW, h: canvasH };
@@ -2643,7 +2643,7 @@ function Show3D() {
   }, [previewCropDims, canvasW, canvasH]);
 
   // -------------------------------------------------------------------------
-  // Preview panel — draw cached offscreen with zoom/pan (fast, no recompute)
+  // Preview panel - draw cached offscreen with zoom/pan (fast, no recompute)
   // -------------------------------------------------------------------------
   React.useEffect(() => {
     const canvas = previewCanvasRef.current;
@@ -2677,7 +2677,7 @@ function Show3D() {
     }
   }, [previewVisible, previewVersion, previewZoom, previewCanvasDims, previewCropDims]);
 
-  // Preview overlay — scale bar + zoom indicator
+  // Preview overlay - scale bar + zoom indicator
   React.useEffect(() => {
     const overlay = previewOverlayRef.current;
     if (!overlay || !previewVisible) return;
@@ -3173,7 +3173,7 @@ function Show3D() {
   };
 
   const handleCanvasMouseMove = (e: React.MouseEvent) => {
-    // Fast path: during pan drag, skip all cursor/hover/lens work — just update pan
+    // Fast path: during pan drag, skip all cursor/hover/lens work - just update pan
     if (isDraggingPan && panStart && !lockView) {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -3423,7 +3423,7 @@ function Show3D() {
     setCursorInfo(null);
     // Lens persists at last position when cursor exits main canvas. Wiping on every
     // leave kills the inset whenever the user touches a slider, FFT panel, or any
-    // sibling control — surprising "lens vanished" footgun. User explicitly turns
+    // sibling control - surprising "lens vanished" footgun. User explicitly turns
     // lens off via the Lens switch.
     pendingRoiAddRef.current = null;
     setIsDraggingROI(false);
@@ -3784,7 +3784,7 @@ function Show3D() {
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Auto: Percentile-based contrast (clips outliers). FFT Auto masks DC + clips to 99.9th.</Typography>
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>ROI: Click empty image to add at cursor, click ROI to select, drag to move, hover edge to resize. Del removes selected; Ctrl/⌘+D duplicates.</Typography>
               <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Loop: Loop playback. Drag end markers on slider for loop range.</Typography>
-              <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Bounce: Ping-pong playback — alternates forward and reverse.</Typography>
+              <Typography sx={{ fontSize: 11, lineHeight: 1.4 }}>Bounce: Ping-pong playback - alternates forward and reverse.</Typography>
               <Typography sx={{ fontSize: 11, fontWeight: "bold", mt: 0.5 }}>Keyboard</Typography>
               <KeyboardShortcuts items={[["Space", "Play / Pause"], ["← / →", `Prev / Next ${dimLabel.toLowerCase()}`], ["Home / End", `First / Last ${dimLabel.toLowerCase()}`], ["R", "Reset zoom"], ["C", "Copy cursor coords"], ["Del", "Delete selected ROI"], ["Ctrl/⌘+D", "Duplicate selected ROI"], ["Esc", "Release keyboard focus"], ["Scroll", "Zoom"], ["Dbl-click", "Reset view"]]} />
             </Box>} theme={themeInfo.theme} />
@@ -3968,7 +3968,7 @@ function Show3D() {
               });
             })()}
           </Box>
-          {/* Panel titles render ON canvas inside drawMain — follows grid layout. */}
+          {/* Panel titles render ON canvas inside drawMain - follows grid layout. */}
           {/* Statistics bar - right below the image. Multi-panel = one row per panel. */}
           {showStats && !hideStats && (
             (localPanelStats && (nPanels || 1) > 1) ? (
@@ -4020,7 +4020,7 @@ function Show3D() {
               />
             </Box>
           )}
-          {/* Image Controls — Display / Histogram / Playback in one row, each
+          {/* Image Controls - Display / Histogram / Playback in one row, each
               spanning two control-row heights so the three blocks line up. */}
           {showControls && (!hideDisplay || !hideHistogram || !hidePlayback) && (
             <Box sx={{ mt: `${SPACING.SM}px`, display: "flex", gap: `${SPACING.SM}px`, alignItems: "stretch", width: canvasW, boxSizing: "border-box", flexWrap: "wrap" }}>
@@ -4261,12 +4261,12 @@ function Show3D() {
           )}
         </Box>
 
-        {/* Preview Panel — ROI crop at full resolution with aspect ratio */}
+        {/* Preview Panel - ROI crop at full resolution with aspect ratio */}
         {previewVisible && (
           <Box sx={{ width: canvasW }}>
-            {/* Spacer — matches main panel title row height for canvas alignment */}
+            {/* Spacer - matches main panel title row height for canvas alignment */}
             <Box sx={{ mb: `${SPACING.XS}px`, height: 16 }} />
-            {/* Header row — matches main panel controls row height */}
+            {/* Header row - matches main panel controls row height */}
             <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
               <Typography sx={{ ...typography.label, color: themeColors.accentGreen }}>
                 Preview{previewCropDims ? ` (${previewCropDims.w}\u00d7${previewCropDims.h})` : ""}
@@ -4291,7 +4291,7 @@ function Show3D() {
                 <Box onMouseDown={handleMainResizeStart} sx={{ position: "absolute", bottom: 0, right: 0, width: 28, height: 28, cursor: lockView ? "default" : "nwse-resize", opacity: lockView ? 0.4 : 0.95, pointerEvents: lockView ? "none" : "auto", background: `linear-gradient(135deg, transparent 50%, ${themeColors.border} 50%)`, "&:hover": { opacity: lockView ? 0.4 : 1 } }} />
               )}
             </Box>
-            {/* All-ROI Stats — one row per ROI, same style as main stats bar */}
+            {/* All-ROI Stats - one row per ROI, same style as main stats bar */}
             {!hideStats && showStats && allRoiStats.length > 0 && (
               <Box sx={{ mt: `${SPACING.XS}px`, display: "flex", flexDirection: "column", gap: 0.5, width: previewCanvasDims.w }}>
                 {allRoiStats.map((stats, i) => {
@@ -4316,9 +4316,9 @@ function Show3D() {
         {/* FFT Panel - same size as main image, canvas-aligned with spacer */}
         {effectiveShowFft && (
           <Box sx={{ width: canvasW }}>
-            {/* Spacer — matches main panel title row height for canvas alignment */}
+            {/* Spacer - matches main panel title row height for canvas alignment */}
             <Box sx={{ mb: `${SPACING.XS}px`, height: 16 }} />
-            {/* Controls row — matches main panel controls row height */}
+            {/* Controls row - matches main panel controls row height */}
             <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: `${SPACING.XS}px`, height: 28 }}>
               {roiFftActive && fftCropDims ? (
                 <Typography sx={{ ...typography.label, color: themeColors.accentGreen }}>
