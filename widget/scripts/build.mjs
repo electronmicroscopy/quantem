@@ -8,6 +8,7 @@ import { rmSync, copyFileSync, mkdirSync, existsSync } from "fs";
 const watch = process.argv.includes("--watch");
 const widgets = [
   { name: "show2d" },
+  { name: "show3d" },
   { name: "show4dstem" },
 ];
 
@@ -40,6 +41,14 @@ for (const w of widgets) {
     const start = Date.now();
     await build(opts);
     console.log(`built ${w.name}.js (${Date.now() - start}ms)`);
+  }
+  // Copy CSS sibling if present (anywidget _css trait reads from static/).
+  for (const cssName of [`${w.name}.css`, "styles.css"]) {
+    const cssSrc = `js/${w.name}/${cssName}`;
+    if (existsSync(cssSrc)) {
+      copyFileSync(cssSrc, `src/quantem/widget/static/${w.name}.css`);
+      break;
+    }
   }
 }
 

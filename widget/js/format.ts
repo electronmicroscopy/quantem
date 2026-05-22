@@ -12,6 +12,12 @@ export function extractBytes(dataView: DataView | ArrayBuffer | Uint8Array): Uin
 export function extractFloat32(dataView: DataView | ArrayBuffer | Uint8Array): Float32Array | null {
   const bytes = extractBytes(dataView);
   if (bytes.length === 0) return null;
+  if (bytes.byteLength % 4 !== 0) return null;
+  if (bytes.byteOffset % 4 !== 0) {
+    const aligned = new Uint8Array(bytes.byteLength);
+    aligned.set(bytes);
+    return new Float32Array(aligned.buffer);
+  }
   return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
 }
 

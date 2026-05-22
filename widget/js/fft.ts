@@ -446,7 +446,8 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
   if (gpuDevice) return gpuDevice;
   if (!navigator.gpu) return null;
   try {
-    const adapter = await navigator.gpu.requestAdapter();
+    // Prefer discrete GPU on hybrid systems (NVIDIA Optimus / AMD hybrid).
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) return null;
     try {
       // @ts-ignore - requestAdapterInfo is not yet in all type definitions
@@ -455,7 +456,9 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
         gpuInfo = info.description || `${info.vendor} ${info.architecture || ""} ${info.device || ""}`.trim() || "Generic WebGPU Adapter";
       }
     } catch (_e) { /* adapter info not available */ }
-    gpuDevice = await adapter.requestDevice();
+    gpuDevice = await adapter.requestDevice({ requiredFeatures: [] });
+    // Re-acquire if GPU process crashes (Linux NVIDIA hiccups, Electron tab suspend).
+    gpuDevice.lost.then(() => { gpuDevice = null; gpuFFT = null; });
     return gpuDevice;
   } catch { return null; }
 }

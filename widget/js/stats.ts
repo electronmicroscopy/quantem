@@ -12,19 +12,22 @@ export function findDataRange(data: Float32Array): { min: number; max: number } 
   return { min, max };
 }
 
-/** Apply log1p scale: result[i] = log(1 + max(0, data[i])). Returns a new array. */
+/** Signed log1p. For non-negative inputs identical to log1p(x); for negatives
+ *  returns -log1p(|x|) so diff_mode frames don't collapse to zero. */
 export function applyLogScale(data: Float32Array): Float32Array {
   const result = new Float32Array(data.length);
   for (let i = 0; i < data.length; i++) {
-    result[i] = Math.log1p(Math.max(0, data[i]));
+    const v = data[i];
+    result[i] = v >= 0 ? Math.log1p(v) : -Math.log1p(-v);
   }
   return result;
 }
 
-/** Apply log1p scale into a pre-allocated buffer. Avoids per-frame allocation. */
+/** Apply signed log1p scale into a pre-allocated buffer. Avoids per-frame allocation. */
 export function applyLogScaleInPlace(data: Float32Array, out: Float32Array): Float32Array {
   for (let i = 0; i < data.length; i++) {
-    out[i] = Math.log1p(Math.max(0, data[i]));
+    const v = data[i];
+    out[i] = v >= 0 ? Math.log1p(v) : -Math.log1p(-v);
   }
   return out;
 }
@@ -100,20 +103,38 @@ export function sliderRange(
   };
 }
 
-/** Compute normalized histogram bins from Float32Array. Returns array of 0-1 values. */
-export function computeHistogramFromBytes(data: Float32Array | null, numBins = 256): number[] {
+/** Compute normalized histogram bins from Float32Array.
+ *  fixedMin/fixedMax pin bin edges to a global range (so scrubbing through
+ *  a stack doesn't rescale per-frame). Defaults to per-array min/max. */
+export function computeHistogramFromBytes(
+  data: Float32Array | null,
+  numBins = 256,
+  fixedMin?: number,
+  fixedMax?: number,
+): number[] {
   if (!data || data.length === 0) return new Array(numBins).fill(0);
   const bins = new Array(numBins).fill(0);
-  let min = Infinity, max = -Infinity;
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i];
-    if (isFinite(v)) { if (v < min) min = v; if (v > max) max = v; }
+  let min: number, max: number;
+  if (fixedMin !== undefined && fixedMax !== undefined && isFinite(fixedMin) && isFinite(fixedMax) && fixedMin < fixedMax) {
+    min = fixedMin;
+    max = fixedMax;
+  } else {
+    min = Infinity; max = -Infinity;
+    for (let i = 0; i < data.length; i++) {
+      const v = data[i];
+      if (isFinite(v)) { if (v < min) min = v; if (v > max) max = v; }
+    }
+    if (!isFinite(min) || !isFinite(max) || min === max) return bins;
   }
-  if (!isFinite(min) || !isFinite(max) || min === max) return bins;
   const range = max - min;
   for (let i = 0; i < data.length; i++) {
     const v = data[i];
-    if (isFinite(v)) bins[Math.min(numBins - 1, Math.floor(((v - min) / range) * numBins))]++;
+    if (isFinite(v)) {
+      // Clamp into last bin so max-value pixels aren't silently dropped.
+      let idx = Math.floor(((v - min) / range) * numBins);
+      if (idx === numBins) idx = numBins - 1;
+      if (idx >= 0 && idx < numBins) bins[idx]++;
+    }
   }
   const maxCount = Math.max(...bins);
   if (maxCount > 0) for (let i = 0; i < numBins; i++) bins[i] /= maxCount;

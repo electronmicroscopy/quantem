@@ -3,13 +3,19 @@ import numpy as np
 
 
 def to_numpy(data, dtype: np.dtype | None = None) -> np.ndarray:
-    """Convert NumPy / PyTorch / Dataset to NumPy."""
+    """Convert NumPy / PyTorch / Dataset to NumPy.
+
+    Upcasts torch dtypes numpy can't represent (bfloat16, float8) to float32 first
+    so the user sees their data instead of "Got unsupported ScalarType BFloat16".
+    """
     try:
         import torch
         is_tensor = isinstance(data, torch.Tensor)
     except ImportError:
         is_tensor = False
     if is_tensor:
+        if data.dtype in (torch.bfloat16,) or str(data.dtype).startswith("torch.float8"):
+            data = data.to(torch.float32)
         result = data.detach().cpu().numpy()
     elif isinstance(data, np.ndarray):
         result = data

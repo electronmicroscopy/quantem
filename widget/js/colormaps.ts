@@ -39,6 +39,37 @@ const COLORMAP_POINTS: Record<string, number[][]> = {
     [253, 219, 199], [247, 247, 247], [209, 229, 240], [146, 197, 222],
     [67, 147, 195], [33, 102, 172], [5, 48, 97],
   ],
+  // cividis: perceptually uniform, colorblind-safe.
+  cividis: [
+    [0, 32, 76], [0, 42, 102], [13, 64, 117], [42, 80, 125],
+    [70, 97, 125], [99, 113, 124], [127, 130, 121], [156, 148, 117],
+    [187, 167, 105], [221, 188, 80], [253, 215, 21],
+  ],
+  // seismic: divergent blue-white-red, saturated.
+  seismic: [
+    [0, 0, 76], [0, 0, 153], [0, 0, 255], [124, 124, 255],
+    [255, 255, 255], [255, 124, 124], [255, 0, 0], [153, 0, 0], [76, 0, 0],
+  ],
+  // RdBu_r: reverse of RdBu (blue → red, blue at low values).
+  RdBu_r: [
+    [5, 48, 97], [33, 102, 172], [67, 147, 195], [146, 197, 222],
+    [209, 229, 240], [247, 247, 247], [253, 219, 199], [244, 165, 130],
+    [214, 96, 77], [178, 24, 43], [103, 0, 31],
+  ],
+  // twilight: cyclic, dark-light-dark.
+  twilight: [
+    [225, 216, 226], [184, 192, 224], [136, 158, 213], [101, 124, 197],
+    [80, 92, 174], [69, 64, 135], [57, 36, 87], [40, 17, 47],
+    [57, 36, 87], [69, 64, 135], [80, 92, 174], [101, 124, 197],
+    [136, 158, 213], [184, 192, 224], [225, 216, 226],
+  ],
+  // twilight_shifted: same as twilight but phase-shifted to start mid-cycle.
+  twilight_shifted: [
+    [40, 17, 47], [57, 36, 87], [69, 64, 135], [80, 92, 174],
+    [101, 124, 197], [136, 158, 213], [184, 192, 224], [225, 216, 226],
+    [184, 192, 224], [136, 158, 213], [101, 124, 197], [80, 92, 174],
+    [69, 64, 135], [57, 36, 87], [40, 17, 47],
+  ],
 };
 
 export const COLORMAP_NAMES = Object.keys(COLORMAP_POINTS);
@@ -194,6 +225,15 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 }
 `;
 
+// Tiny per-pass GPU buffers (e.g. 32B region uniforms) that must live until
+// the GPU has consumed them. We push them here when recorded into an encoder
+// and destroy them once the caller has submitted the work.
+const paramsBufQueue: GPUBuffer[] = [];
+function flushParamsBufQueue(): void {
+  for (const b of paramsBufQueue) b.destroy();
+  paramsBufQueue.length = 0;
+}
+
 /**
  * GPU-accelerated colormap engine. Holds persistent data buffers on GPU;
  * histogram slider changes only update a small uniform — no data re-upload.
@@ -205,6 +245,10 @@ type GPUSlot = {
   paramsBuffer: GPUBuffer;
   histBinsBuffer: GPUBuffer;
   histReadBuffer: GPUBuffer;
+  // Lazily allocated per-slot 16-byte buffer holding { vmin, vmax, _p0, _p1 }.
+  // Populated by computeRange* on GPU and consumed directly by the range-aware
+  // colormap shader (no CPU readback between passes).
+  rangeBuffer: GPUBuffer | null;
   count: number;
   width: number;
   height: number;
@@ -260,6 +304,7 @@ export class GPUColormapEngine {
       this.slots[idx].paramsBuffer.destroy();
       this.slots[idx].histBinsBuffer.destroy();
       this.slots[idx].histReadBuffer.destroy();
+      this.slots[idx].rangeBuffer?.destroy();
     }
     // Validate dimensions — if width*height doesn't match data length, derive from sqrt
     // (catches stale closure values like width=1 from mount effects)
@@ -282,9 +327,12 @@ export class GPUColormapEngine {
       size: rgbaSize,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
-    // Persistent params buffer — reused (just writeBuffer on each call)
+    // Persistent params buffer — reused (just writeBuffer on each call).
+    // Size 32 covers both the 24-byte colormap/histogram structs and the
+    // 32-byte range-aware colormap struct (extra trailing bytes are unused
+    // by the smaller shaders).
     const paramsBuffer = this.device.createBuffer({
-      size: 24,
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     // Persistent histogram buffers (256 bins × 4 bytes = 1KB each)
@@ -296,7 +344,7 @@ export class GPUColormapEngine {
       size: 256 * 4,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
-    this.slots[idx] = { dataBuffer, rgbaBuffer, readBuffer, paramsBuffer, histBinsBuffer, histReadBuffer, count: data.length, width: w, height: h };
+    this.slots[idx] = { dataBuffer, rgbaBuffer, readBuffer, paramsBuffer, histBinsBuffer, histReadBuffer, rangeBuffer: null, count: data.length, width: w, height: h };
   }
 
   // Params buffer: 24 bytes = { width: u32, height: u32, vmin: f32, vmax: f32, log_scale: u32, _pad: u32 }
@@ -499,6 +547,7 @@ export class GPUColormapEngine {
     const encoder = this.device.createCommandEncoder();
     const params = new ArrayBuffer(24);
     let rendered = 0;
+    const tempBuffers: GPUBuffer[] = [];
 
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
@@ -556,13 +605,13 @@ export class GPUColormapEngine {
       renderPass.end();
       rendered++;
 
-      // Note: blitParamsBuffer is a temporary — ideally per-slot persistent
-      // For now, acceptable overhead (8 bytes per image)
+      // The 8-byte uniform is finished referencing once the encoder is closed;
+      // we destroy after submit to avoid a per-frame leak (was previously accumulating).
+      tempBuffers.push(blitParamsBuffer);
     }
 
     this.device.queue.submit([encoder.finish()]);
-    if (rendered > 0) {
-    }
+    for (const b of tempBuffers) b.destroy();
     return rendered;
   }
 
@@ -585,6 +634,7 @@ export class GPUColormapEngine {
     const encoder = this.device.createCommandEncoder();
     const params = new ArrayBuffer(24);
     const canvases: OffscreenCanvas[] = [];
+    const tempBuffers: GPUBuffer[] = [];
 
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
@@ -620,6 +670,7 @@ export class GPUColormapEngine {
         size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
       this.device.queue.writeBuffer(blitParamsBuffer, 0, new Uint32Array([slot.width, slot.height]));
+      tempBuffers.push(blitParamsBuffer);
 
       const blitGroup = this.device.createBindGroup({
         layout: this.blitPipeline!.getBindGroupLayout(0),
@@ -646,6 +697,7 @@ export class GPUColormapEngine {
     }
 
     this.device.queue.submit([encoder.finish()]);
+    for (const b of tempBuffers) b.destroy();
 
     // transferToImageBitmap after GPU finishes (synchronous, no mapAsync)
     const bitmaps: ImageBitmap[] = [];
@@ -687,12 +739,15 @@ export class GPUColormapEngine {
         slot.paramsBuffer.destroy();
         slot.histBinsBuffer.destroy();
         slot.histReadBuffer.destroy();
+        slot.rangeBuffer?.destroy();
       }
     }
     this.slots = [];
     this.lutBuffer?.destroy();
     this.lutBuffer = null;
     this.currentLutName = "";
+    for (const v of this.panelRgbaBuffers.values()) { v.rgba.destroy(); v.range.destroy(); }
+    this.panelRgbaBuffers.clear();
   }
 
   /** Number of uploaded image slots. */
@@ -808,6 +863,477 @@ fn reduce(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_i
     return results;
   }
 
+  // ── GPU region min/max → range-aware colormap (no CPU readback) ──
+  //
+  // Used by Show3D per-panel contrast: each panel is a sub-region of one full
+  // frame buffer. We avoid the JS slab-extract + findDataRange loop entirely
+  // by reducing on GPU and feeding the result straight into the colormap pass
+  // via a small storage buffer (no mapAsync between the two passes).
+
+  private rangeRegionPipeline: GPUComputePipeline | null = null;
+  private colormapRangePipeline: GPUComputePipeline | null = null;
+  // Per-panel scratch state for `renderPerPanelGpu` when N panels share ONE
+  // GPU slot (full frame). Each entry holds the panel-sized rgba output
+  // buffer and the 16-byte range buffer. Keyed by panel index.
+  private panelRgbaBuffers: Map<number, { rgba: GPUBuffer; range: GPUBuffer; size: number }> = new Map();
+
+  private ensurePanelScratch(panel: number, panelPixels: number): { rgba: GPUBuffer; range: GPUBuffer } {
+    const want = panelPixels * 4;
+    const existing = this.panelRgbaBuffers.get(panel);
+    if (existing && existing.size === want) return existing;
+    if (existing) { existing.rgba.destroy(); existing.range.destroy(); }
+    const rgba = this.device.createBuffer({
+      size: want,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const range = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    const entry = { rgba, range, size: want };
+    this.panelRgbaBuffers.set(panel, entry);
+    return entry;
+  }
+
+  private ensureRangeRegionPipeline(): void {
+    if (this.rangeRegionPipeline) return;
+    // Single-workgroup grid-stride reduction over a rectangular region of a
+    // larger frame buffer. region = (x_offset, y_offset, width, height).
+    // fullWidth is the stride of the underlying data buffer.
+    const code = /* wgsl */ `
+struct RangeOut { vmin: f32, vmax: f32, _p0: f32, _p1: f32 };
+struct RegionParams { region: vec4u, fullWidth: u32, _pad0: u32, _pad1: u32, _pad2: u32 };
+
+@group(0) @binding(0) var<storage, read> data: array<f32>;
+@group(0) @binding(1) var<uniform> params: RegionParams;
+@group(0) @binding(2) var<storage, read_write> out: RangeOut;
+
+var<workgroup> sMin: array<f32, 256>;
+var<workgroup> sMax: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn reduce(@builtin(local_invocation_index) lid: u32) {
+  var lmin = 3.4028235e+38;
+  var lmax = -3.4028235e+38;
+  let rw = params.region.z;
+  let rh = params.region.w;
+  let n = rw * rh;
+  var i = lid;
+  loop {
+    if (i >= n) { break; }
+    let r = i / rw;
+    let c = i - r * rw;
+    let v = data[(params.region.y + r) * params.fullWidth + params.region.x + c];
+    if (v < lmin) { lmin = v; }
+    if (v > lmax) { lmax = v; }
+    i = i + 256u;
+  }
+  sMin[lid] = lmin;
+  sMax[lid] = lmax;
+  workgroupBarrier();
+  var s = 128u;
+  loop {
+    if (s == 0u) { break; }
+    if (lid < s) {
+      sMin[lid] = min(sMin[lid], sMin[lid + s]);
+      sMax[lid] = max(sMax[lid], sMax[lid + s]);
+    }
+    workgroupBarrier();
+    s = s >> 1u;
+  }
+  if (lid == 0u) {
+    out.vmin = sMin[0];
+    out.vmax = sMax[0];
+    out._p0 = 0.0;
+    out._p1 = 0.0;
+  }
+}
+`;
+    const module = this.device.createShaderModule({ code });
+    this.rangeRegionPipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "reduce" },
+    });
+  }
+
+  private ensureColormapRangePipeline(): void {
+    if (this.colormapRangePipeline) return;
+    // Same as COLORMAP_SHADER but reads vmin/vmax from a storage buffer
+    // (filled by computeRangeRegion) and applies the user slider percentages
+    // on GPU so we never round-trip back through JS for those scalars.
+    // Also accepts a region (offset + size into the full data buffer) and a
+    // stride so the colormap output is the panel sub-image, sourced from
+    // the full frame in-place — no slab extraction in JS.
+    const code = /* wgsl */ `
+struct Params {
+  width: u32,        // output (panel) width
+  height: u32,       // output (panel) height
+  vmin_pct: f32,
+  vmax_pct: f32,
+  log_scale: u32,
+  src_x: u32,        // region offset x in source data
+  src_y: u32,        // region offset y in source data
+  src_stride: u32,   // row stride of source data
+};
+struct RangeOut { vmin: f32, vmax: f32, _p0: f32, _p1: f32 };
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> data: array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgba: array<u32>;
+@group(0) @binding(4) var<storage, read> range_in: RangeOut;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= params.width || gid.y >= params.height) { return; }
+  let out_idx = gid.y * params.width + gid.x;
+  let src_idx = (params.src_y + gid.y) * params.src_stride + (params.src_x + gid.x);
+  var val = data[src_idx];
+  if (params.log_scale == 1u) {
+    val = log(1.0 + max(val, 0.0));
+  }
+  let span = range_in.vmax - range_in.vmin;
+  let vmin = range_in.vmin + span * (params.vmin_pct / 100.0);
+  let vmax = range_in.vmin + span * (params.vmax_pct / 100.0);
+  let range = max(vmax - vmin, 1e-30);
+  let clipped = clamp(val, vmin, vmax);
+  let t = (clipped - vmin) / range;
+  let lutIdx = min(u32(t * 255.0), 255u);
+  let rgb = lut[lutIdx];
+  rgba[out_idx] = rgb | 0xFF000000u;
+}
+`;
+    const module = this.device.createShaderModule({ code });
+    this.colormapRangePipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "main" },
+    });
+  }
+
+  private ensureSlotRangeBuffer(slot: GPUSlot): GPUBuffer {
+    if (!slot.rangeBuffer) {
+      slot.rangeBuffer = this.device.createBuffer({
+        // 4 floats: vmin, vmax, _p0, _p1
+        size: 16,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+    }
+    return slot.rangeBuffer;
+  }
+
+  /**
+   * Reduce a rectangular region of slot `idx`'s data buffer to (vmin, vmax)
+   * on GPU and stash the result in `slot.rangeBuffer`. Caller chains a
+   * `renderSlotsWithGpuRange` pass that reads it directly — no CPU sync.
+   *
+   * `region` is { x, y, width, height } in pixels into the slot's full frame
+   * (which has stride `slot.width`). Omit `region` to scan the whole slot.
+   *
+   * Records into the supplied encoder so callers can fuse multiple panels
+   * into a single submit.
+   */
+  recordComputeRangeRegion(
+    encoder: GPUCommandEncoder,
+    idx: number,
+    region?: { x: number; y: number; width: number; height: number },
+  ): boolean {
+    this.ensureRangeRegionPipeline();
+    const slot = this.slots[idx];
+    if (!slot || !this.rangeRegionPipeline) return false;
+    const r = region ?? { x: 0, y: 0, width: slot.width, height: slot.height };
+    const rangeBuf = this.ensureSlotRangeBuffer(slot);
+
+    // Region params: 32 bytes = vec4u + 4xu32 (we only use first u32 of the tail)
+    const paramsBuf = this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(
+      paramsBuf, 0,
+      new Uint32Array([r.x, r.y, r.width, r.height, slot.width, 0, 0, 0]),
+    );
+
+    const bg = this.device.createBindGroup({
+      layout: this.rangeRegionPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: slot.dataBuffer } },
+        { binding: 1, resource: { buffer: paramsBuf } },
+        { binding: 2, resource: { buffer: rangeBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.rangeRegionPipeline);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+    // paramsBuf can be destroyed once the encoder is submitted; defer to caller.
+    // Stash on the slot's rangeBuffer-adjacent state via the returned descriptor.
+    // Simpler: rely on JS GC for the small (32B) buffer. Mark it for destroy.
+    paramsBufQueue.push(paramsBuf);
+    return true;
+  }
+
+  /**
+   * Convenience wrapper: standalone submit of a single region reduction.
+   * For batched per-panel work prefer `recordComputeRangeRegion` + your own
+   * encoder so all panels share one submit.
+   */
+  computeRangeRegion(
+    idx: number,
+    region?: { x: number; y: number; width: number; height: number },
+  ): void {
+    const encoder = this.device.createCommandEncoder();
+    if (!this.recordComputeRangeRegion(encoder, idx, region)) return;
+    this.device.queue.submit([encoder.finish()]);
+    flushParamsBufQueue();
+  }
+
+  /**
+   * Range-aware colormap → ImageBitmap, reading vmin/vmax from each slot's
+   * `rangeBuffer` (populated by `recordComputeRangeRegion`). Slider scaling
+   * is applied on GPU.
+   *
+   * `vminPct`/`vmaxPct` parallel `indices`; pass `[0,100]` for raw range.
+   *
+   * Returns one ImageBitmap per index (null entries for missing slots).
+   */
+  renderSlotsWithGpuRange(
+    indices: number[],
+    vminPct: number[],
+    vmaxPct: number[],
+    logScale: boolean = false,
+  ): ImageBitmap[] | null {
+    this.ensureColormapRangePipeline();
+    if (!this.colormapRangePipeline || !this.lutBuffer || indices.length === 0) return null;
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureBlitPipeline(fmt);
+    if (!this.blitPipeline) return null;
+
+    const encoder = this.device.createCommandEncoder();
+    const params = new ArrayBuffer(32);
+    const canvases: (OffscreenCanvas | null)[] = [];
+    const tempBuffers: GPUBuffer[] = [];
+
+    for (let k = 0; k < indices.length; k++) {
+      const i = indices[k];
+      const slot = this.slots[i];
+      if (!slot || !slot.rangeBuffer) { canvases.push(null); continue; }
+      const lowPct = vminPct[k] ?? 0;
+      const highPct = vmaxPct[k] ?? 100;
+
+      // Whole-slot colormap: region = full slot, stride = width
+      const pu = new Uint32Array(params);
+      const pf = new Float32Array(params);
+      pu[0] = slot.width; pu[1] = slot.height;
+      pf[2] = lowPct; pf[3] = highPct;
+      pu[4] = logScale ? 1 : 0;
+      pu[5] = 0; pu[6] = 0; pu[7] = slot.width;
+      this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
+
+      const computeGroup = this.device.createBindGroup({
+        layout: this.colormapRangePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: slot.paramsBuffer } },
+          { binding: 1, resource: { buffer: slot.dataBuffer } },
+          { binding: 2, resource: { buffer: this.lutBuffer } },
+          { binding: 3, resource: { buffer: slot.rgbaBuffer } },
+          { binding: 4, resource: { buffer: slot.rangeBuffer } },
+        ],
+      });
+      const computePass = encoder.beginComputePass();
+      computePass.setPipeline(this.colormapRangePipeline);
+      computePass.setBindGroup(0, computeGroup);
+      computePass.dispatchWorkgroups(Math.ceil(slot.width / 16), Math.ceil(slot.height / 16));
+      computePass.end();
+
+      const oc = new OffscreenCanvas(slot.width, slot.height);
+      const ctx = oc.getContext("webgpu") as GPUCanvasContext;
+      ctx.configure({ device: this.device, format: fmt, alphaMode: "opaque" });
+
+      const blitParamsBuffer = this.device.createBuffer({
+        size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(blitParamsBuffer, 0, new Uint32Array([slot.width, slot.height]));
+      tempBuffers.push(blitParamsBuffer);
+
+      const blitGroup = this.device.createBindGroup({
+        layout: this.blitPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: blitParamsBuffer } },
+          { binding: 1, resource: { buffer: slot.rgbaBuffer } },
+        ],
+      });
+
+      const texture = ctx.getCurrentTexture();
+      const renderPass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: texture.createView(),
+          loadOp: "clear" as GPULoadOp,
+          storeOp: "store" as GPUStoreOp,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      renderPass.setPipeline(this.blitPipeline);
+      renderPass.setBindGroup(0, blitGroup);
+      renderPass.draw(3);
+      renderPass.end();
+      canvases.push(oc);
+    }
+
+    this.device.queue.submit([encoder.finish()]);
+    for (const b of tempBuffers) b.destroy();
+    flushParamsBufQueue();
+
+    const bitmaps: ImageBitmap[] = [];
+    for (const oc of canvases) {
+      if (oc) bitmaps.push(oc.transferToImageBitmap());
+      else bitmaps.push(null as never);
+    }
+    return bitmaps;
+  }
+
+  /**
+   * Fused per-panel pipeline for Show3D: ONE GPU slot holds the full frame;
+   * each panel reads a sub-region. In ONE submit, for each panel:
+   *   1. Region-reduce slot.dataBuffer over the panel region → vmin/vmax
+   *      into a per-panel 16-byte range buffer
+   *   2. Colormap (reading range buffer + slider pcts on GPU) → per-panel
+   *      rgba buffer (sized to the panel sub-image)
+   *   3. Blit per-panel rgba → OffscreenCanvas texture
+   * Then synchronously transferToImageBitmap per panel. Zero CPU round-trips
+   * for vmin/vmax — replaces the JS slab-extract + findDataRange loop.
+   *
+   * `slotIdx` is the GPU slot holding the full frame.
+   * `regions[k]` is the sub-rect of panel k inside the full frame.
+   * `vminPct/vmaxPct[k]` are the user contrast slider percentages [0,100].
+   */
+  renderPerPanelGpu(
+    slotIdx: number,
+    regions: { x: number; y: number; width: number; height: number }[],
+    vminPct: number[],
+    vmaxPct: number[],
+    logScale: boolean = false,
+  ): ImageBitmap[] | null {
+    this.ensureRangeRegionPipeline();
+    this.ensureColormapRangePipeline();
+    if (!this.rangeRegionPipeline || !this.colormapRangePipeline || !this.lutBuffer) return null;
+    const slot = this.slots[slotIdx];
+    if (!slot || regions.length === 0) return null;
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureBlitPipeline(fmt);
+    if (!this.blitPipeline) return null;
+
+    const encoder = this.device.createCommandEncoder();
+    const cmParams = new ArrayBuffer(32);
+    const canvases: (OffscreenCanvas | null)[] = [];
+    const tempBuffers: GPUBuffer[] = [];
+
+    for (let k = 0; k < regions.length; k++) {
+      const r = regions[k];
+      if (!r) { canvases.push(null); continue; }
+      const scratch = this.ensurePanelScratch(k, r.width * r.height);
+
+      // --- 1. Region reduce → scratch.range ---
+      const rgParams = this.device.createBuffer({
+        size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(
+        rgParams, 0,
+        new Uint32Array([r.x, r.y, r.width, r.height, slot.width, 0, 0, 0]),
+      );
+      tempBuffers.push(rgParams);
+      const rgGroup = this.device.createBindGroup({
+        layout: this.rangeRegionPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: slot.dataBuffer } },
+          { binding: 1, resource: { buffer: rgParams } },
+          { binding: 2, resource: { buffer: scratch.range } },
+        ],
+      });
+      const rgPass = encoder.beginComputePass();
+      rgPass.setPipeline(this.rangeRegionPipeline);
+      rgPass.setBindGroup(0, rgGroup);
+      rgPass.dispatchWorkgroups(1);
+      rgPass.end();
+
+      // --- 2. Colormap reading scratch.range + slider pcts ---
+      // Output is the panel sub-image (size r.width × r.height) sourced from
+      // slot.dataBuffer at offset (r.x, r.y) with stride slot.width.
+      const lowPct = vminPct[k] ?? 0;
+      const highPct = vmaxPct[k] ?? 100;
+      const pu = new Uint32Array(cmParams);
+      const pf = new Float32Array(cmParams);
+      pu[0] = r.width; pu[1] = r.height;
+      pf[2] = lowPct; pf[3] = highPct;
+      pu[4] = logScale ? 1 : 0;
+      pu[5] = r.x; pu[6] = r.y; pu[7] = slot.width;
+      const cmParamsBuf = this.device.createBuffer({
+        size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(cmParamsBuf, 0, cmParams);
+      tempBuffers.push(cmParamsBuf);
+
+      const cmGroup = this.device.createBindGroup({
+        layout: this.colormapRangePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: cmParamsBuf } },
+          { binding: 1, resource: { buffer: slot.dataBuffer } },
+          { binding: 2, resource: { buffer: this.lutBuffer } },
+          { binding: 3, resource: { buffer: scratch.rgba } },
+          { binding: 4, resource: { buffer: scratch.range } },
+        ],
+      });
+      const cmPass = encoder.beginComputePass();
+      cmPass.setPipeline(this.colormapRangePipeline);
+      cmPass.setBindGroup(0, cmGroup);
+      cmPass.dispatchWorkgroups(Math.ceil(r.width / 16), Math.ceil(r.height / 16));
+      cmPass.end();
+
+      // --- 3. Blit scratch.rgba → OffscreenCanvas texture ---
+      const oc = new OffscreenCanvas(r.width, r.height);
+      const ctx = oc.getContext("webgpu") as GPUCanvasContext;
+      ctx.configure({ device: this.device, format: fmt, alphaMode: "opaque" });
+
+      const blitParamsBuffer = this.device.createBuffer({
+        size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(blitParamsBuffer, 0, new Uint32Array([r.width, r.height]));
+      tempBuffers.push(blitParamsBuffer);
+
+      const blitGroup = this.device.createBindGroup({
+        layout: this.blitPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: blitParamsBuffer } },
+          { binding: 1, resource: { buffer: scratch.rgba } },
+        ],
+      });
+      const texture = ctx.getCurrentTexture();
+      const renderPass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: texture.createView(),
+          loadOp: "clear" as GPULoadOp,
+          storeOp: "store" as GPUStoreOp,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      renderPass.setPipeline(this.blitPipeline);
+      renderPass.setBindGroup(0, blitGroup);
+      renderPass.draw(3);
+      renderPass.end();
+      canvases.push(oc);
+    }
+
+    this.device.queue.submit([encoder.finish()]);
+    for (const b of tempBuffers) b.destroy();
+
+    const bitmaps: ImageBitmap[] = [];
+    for (const oc of canvases) {
+      if (oc) bitmaps.push(oc.transferToImageBitmap());
+      else bitmaps.push(null as never);
+    }
+    return bitmaps;
+  }
+
   // ── GPU histogram ──
 
   private histPipeline: GPUComputePipeline | null = null;
@@ -854,47 +1380,6 @@ fn clear_bins(@builtin(global_invocation_id) gid: vec3u) {
       layout: "auto",
       compute: { module, entryPoint: "clear_bins" },
     });
-  }
-
-  /**
-   * Compute a 256-bin histogram for slot `idx` on GPU.
-   * Returns normalized bins (0–1) matching `computeHistogramFromBytes`.
-   */
-  async computeHistogram(idx: number, _logScale: boolean = false): Promise<number[]> {
-    this.ensureHistPipeline();
-    const slot = this.slots[idx];
-    if (!slot || !this.histPipeline || !this.histClearPipeline) return new Array(256).fill(0);
-
-    // Find data range (we need min/max for binning)
-    // For GPU efficiency, do a quick CPU scan — findDataRange is fast (<5ms for 16M)
-    // A full GPU min/max reduction would add complexity for minimal gain here.
-    // Note: when logScale is true, we need the log-transformed range.
-
-    const binsBuffer = this.device.createBuffer({
-      size: 256 * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-    const readBuffer = this.device.createBuffer({
-      size: 256 * 4,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-    const paramsBuf = this.device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    // We need min/max from the (possibly log-transformed) data for proper binning.
-    // Pass raw min/max = 0; the shader will use the actual data range.
-    // Actually, we need to know the range to bin correctly. Read it back from
-    // the data we already uploaded. For now, accept min/max as parameters.
-    // The caller (Show2D data effect) already computes findDataRange.
-    // So let's accept dmin/dmax as params.
-
-    // This method needs dmin/dmax — return a version that takes them:
-    binsBuffer.destroy();
-    readBuffer.destroy();
-    paramsBuf.destroy();
-    return new Array(256).fill(0);
   }
 
   /**
