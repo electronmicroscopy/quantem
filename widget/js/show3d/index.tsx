@@ -719,15 +719,8 @@ function Show3D() {
   const [nPanels] = useModelState<number>("n_panels");
   const [panelTitles] = useModelState<string[]>("panel_titles");
   const [panelRealFrames] = useModelState<number[]>("panel_real_frames");
-  const [hideable] = useModelState<boolean>("hideable");
-  const [hiddenIndices, setHiddenIndices] = useModelState<number[]>("hidden_indices");
+  const [hiddenIndices] = useModelState<number[]>("hidden_indices");
   const hiddenSet = React.useMemo(() => new Set(hiddenIndices || []), [hiddenIndices]);
-  const toggleHidden = (i: number) => {
-    const cur = new Set(hiddenIndices || []);
-    if (cur.has(i)) cur.delete(i);
-    else if (cur.size < (nSlices - 1)) cur.add(i);  // keep ≥1 visible
-    setHiddenIndices(Array.from(cur).sort((a, b) => a - b));
-  };
   const nextVisible = (from: number, dir: 1 | -1, allowWrap = true): number => {
     if (!hiddenSet.size) return from + dir;
     let n = from + dir;
@@ -745,8 +738,6 @@ function Show3D() {
     return from;
   };
   const visibleCount = nSlices - hiddenSet.size;
-  // Labels dropdown anchor
-  const [labelsAnchor, setLabelsAnchor] = React.useState<HTMLElement | null>(null);
   // If the user hides the currently-displayed slice, snap to next visible.
   React.useEffect(() => {
     if (!hiddenSet.has(sliceIdx)) return;
@@ -773,7 +764,7 @@ function Show3D() {
   const [loop, setLoop] = useModelState<boolean>("loop");
   const [loopStart, setLoopStart] = useModelState<number>("loop_start");
   const [loopEnd, setLoopEnd] = useModelState<number>("loop_end");
-  const [bookmarkedFrames, setBookmarkedFrames] = useModelState<number[]>("bookmarked_frames");
+  const [bookmarkedFrames] = useModelState<number[]>("bookmarked_frames");
   const [playbackPath] = useModelState<number[]>("playback_path");
 
   // Boomerang direction ref (avoids stale closure in setInterval)
@@ -806,14 +797,10 @@ function Show3D() {
   // Customization
   const [canvasSizeTrait] = useModelState<number>("size");
 
-  // Timestamps
-  const [timestamps] = useModelState<number[]>("timestamps");
-  const [timestampUnit] = useModelState<string>("timestamp_unit");
   // ROI
   const [roiActive, setRoiActive] = useModelState<boolean>("roi_active");
   const [roiList, setRoiList] = useModelState<ROIItem[]>("roi_list");
   const [roiSelectedIdx, setRoiSelectedIdx] = useModelState<number>("roi_selected_idx");
-  const [_roiStats] = useModelState<Record<string, number>>("roi_stats");
   const [roiPlotData] = useModelState<DataView>("roi_plot_data");
   const [newRoiShape, setNewRoiShape] = React.useState<"circle" | "square" | "rectangle" | "annular">("square");
 

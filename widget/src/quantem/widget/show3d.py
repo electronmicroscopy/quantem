@@ -1469,23 +1469,6 @@ class Show3D(anywidget.AnyWidget):
             self.stats_min = float(display_frame.min())
             self.stats_max = float(display_frame.max())
             self.stats_std = float(display_frame.std())
-            # Per-panel stats so multi-panel widgets show each panel's range
-            # separately rather than a misleading global aggregate.
-            if self.n_panels > 1 and self._panel_width > 0:
-                pw = self._panel_width
-                means, mins, maxs, stds = [], [], [], []
-                for i in range(self.n_panels):
-                    sl = display_frame[:, i * pw:(i + 1) * pw]
-                    means.append(float(sl.mean()))
-                    mins.append(float(sl.min()))
-                    maxs.append(float(sl.max()))
-                    stds.append(float(sl.std()))
-                self.stats_mean_per_panel = means
-                self.stats_min_per_panel = mins
-                self.stats_max_per_panel = maxs
-                self.stats_std_per_panel = stds
-            if self.timestamps and self.slice_idx < len(self.timestamps):
-                self.current_timestamp = self.timestamps[self.slice_idx]
             if self.roi_active:
                 self._update_roi_stats(display_frame)
             else:
