@@ -40,18 +40,18 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.transform: Dataset2d | None = None
         self.transform_rotated: Dataset2d | None = None
 
-        self.u: NDArray | None = None
-        self.v: NDArray | None = None
         self.mean_img_peaks: NDArray | None = None
         self.mean_img_weights: NDArray | None = None
 
-        self.u_fit: Dataset3d | None = None
-        self.v_fit: Dataset3d | None = None
-        self.u_peak_fit: Dataset3d | None = None
-        self.v_peak_fit: Dataset3d | None = None
-
         self.mask_diffraction = np.ones(self.dataset.array.shape[2:])
         self.mask_diffraction_inv = np.zeros(self.dataset.array.shape[2:])
+
+        self.u_ref: np.ndarray | None = None
+        self.v_ref: np.ndarray | None = None
+        self.u_array: np.ndarray | None = None
+        self.v_array: np.ndarray | None = None
+
+        self.real_space = True
 
     @classmethod
     def from_dataset(cls, dataset: Dataset4dstem, *, name: str | None = None) -> "StrainMapAutocorrelation":
@@ -478,16 +478,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             signal_units="mixed",
         )
 
-        self.u_fit = Dataset3d.from_shape(
-            (scan_r, scan_c, 2),
-            name="u_fit",
-            signal_units="pixels",
-        )
-        self.v_fit = Dataset3d.from_shape(
-            (scan_r, scan_c, 2),
-            name="v_fit",
-            signal_units="pixels",
-        )
+        self.u_array = np.zeros((scan_r, scan_c, 2))
+        self.v_array = np.zeros((scan_r, scan_c, 2))
 
         mode = self.metadata.get("mode", "linear").lower()
         if mode == "gamma":
@@ -505,9 +497,6 @@ class StrainMapAutocorrelation(AutoSerialize):
         u0 = np.asarray(self.u, dtype=float).reshape(2)
         v0 = np.asarray(self.v, dtype=float).reshape(2)
 
-        dp_shape = self.dataset.array.shape[2:]
-        r_center = dp_shape[0] // 2
-        c_center = dp_shape[1] // 2
 
         for r, c in it:
             dp = self.dataset.array[r, c] * self.mask_diffraction + self.mask_diffraction_inv
@@ -538,10 +527,10 @@ class StrainMapAutocorrelation(AutoSerialize):
             self.u_peak_fit.array[r, c, :] = u_fit_abs
             self.v_peak_fit.array[r, c, :] = v_fit_abs
 
-            self.u_fit.array[r, c, 0] = u_fit_abs[0]
-            self.u_fit.array[r, c, 1] = u_fit_abs[1]
-            self.v_fit.array[r, c, 0] = v_fit_abs[0]
-            self.v_fit.array[r, c, 1] = v_fit_abs[1]
+            self.u_array[r, c, 0] = u_fit_abs[0]
+            self.u_array[r, c, 1] = u_fit_abs[1]
+            self.v_array[r, c, 0] = v_fit_abs[0]
+            self.v_array[r, c, 1] = v_fit_abs[1]
 
         self.metadata["fit_refine_gaussian"] = refine_gaussian
         self.metadata["fit_refine_dft"] = refine_dft
@@ -561,15 +550,15 @@ class StrainMapAutocorrelation(AutoSerialize):
         figsize: tuple[float, float] | None = None,
         **imshow_kwargs: Any,
     ):
-        if self.u_fit is None or self.v_fit is None:
-            raise ValueError("Run fit_lattice_vectors() first to compute u_fit and v_fit.")
+        if self.u_array is None or self.v_array is None:
+            raise ValueError("Run fit_lattice_vectors() first to compute u_array and v_array.")
         if self.u is None or self.v is None:
             raise ValueError("Run choose_lattice_vector() first to set self.u and self.v.")
 
-        im0 = self.u_fit.array[:, :, 0]
-        im1 = self.u_fit.array[:, :, 1]
-        im2 = self.v_fit.array[:, :, 0]
-        im3 = self.v_fit.array[:, :, 1]
+        im0 = self.u_array[:, :, 0]
+        im1 = self.u_array[:, :, 1]
+        im2 = self.v_array[:, :, 0]
+        im3 = self.v_array[:, :, 1]
 
         du0 = im0 - self.u[0]
         du1 = im1 - self.u[1]
@@ -639,267 +628,6 @@ class StrainMapAutocorrelation(AutoSerialize):
         for a in ax:
             a.set_xticks([])
             a.set_yticks([])
-
-        return fig, ax
-
-    def fit_strain(
-        self,
-        mask_reference=None,
-        plot_strain=True,
-    ):
-        if self.u_fit is None or self.v_fit is None:
-            raise ValueError("Run fit_lattice_vectors() first to compute u_fit and v_fit.")
-
-        u_fit = self.u_fit.array
-        v_fit = self.v_fit.array
-        scan_r, scan_c = u_fit.shape[0], u_fit.shape[1]
-
-        if mask_reference is None:
-            self.u_ref = np.median(u_fit.reshape(-1, 2), axis=0)
-            self.v_ref = np.median(v_fit.reshape(-1, 2), axis=0)
-        else:
-            m = np.asarray(mask_reference, dtype=bool)
-            self.u_ref = np.array(
-                (
-                    np.median(u_fit[m, 0]),
-                    np.median(u_fit[m, 1]),
-                ),
-                dtype=float,
-            )
-            self.v_ref = np.array(
-                (
-                    np.median(v_fit[m, 0]),
-                    np.median(v_fit[m, 1]),
-                ),
-                dtype=float,
-            )
-
-        Uref = np.stack((self.u_ref, self.v_ref), axis=1).astype(float)
-        det = np.linalg.det(Uref)
-        if not np.isfinite(det) or abs(det) < 1e-12:
-            Uref_inv = np.linalg.pinv(Uref)
-        else:
-            Uref_inv = np.linalg.inv(Uref)
-
-        self.strain_trans = Dataset4d.from_shape(
-            (scan_r, scan_c, 2, 2),
-            name="transformation matrix",
-            signal_units="fractional",
-        )
-
-        for r in range(scan_r):
-            for c in range(scan_c):
-                U = np.stack((u_fit[r, c, :], v_fit[r, c, :]), axis=1)
-                self.strain_trans.array[r, c, :, :] = U @ Uref_inv
-
-        self.strain_raw_err = Dataset2d.from_array(
-            self.strain_trans.array[:, :, 0, 0] - 1,
-            name="strain err",
-            signal_units="fractional",
-        )
-        self.strain_raw_ecc = Dataset2d.from_array(
-            self.strain_trans.array[:, :, 1, 1] - 1,
-            name="strain ecc",
-            signal_units="fractional",
-        )
-        self.strain_raw_erc = Dataset2d.from_array(
-            self.strain_trans.array[:, :, 1, 0] * 0.5 + self.strain_trans.array[:, :, 0, 1] * 0.5,
-            name="strain erc",
-            signal_units="fractional",
-        )
-        self.strain_rotation = Dataset2d.from_array(
-            self.strain_trans.array[:, :, 1, 0] * -0.5 + self.strain_trans.array[:, :, 0, 1] * 0.5,
-            name="strain rotation",
-            signal_units="fractional",
-        )
-
-        return self
-
-
-    def plot_strain(
-        self,
-        ref_u_v=(1.0, 0.0),
-        rotation_angle=None,
-        strain_range_percent=(-3.0, 3.0),
-        rotation_range_degrees=(-2.0, 2.0),
-        plot_rotation=True,
-        plot_scalebar=True,
-        plot_gvecs=False,
-        cmap_strain="RdBu_r",
-        cmap_rotation=None,
-        layout="horizontal",
-        figsize=(6, 6),
-        max_shift: tuple[float, float] | None = None,
-        amp_range: tuple[float, float] | None = None,
-        **kwargs,
-    ):
-        import matplotlib.pyplot as plt
-
-        if cmap_rotation is None:
-            cmap_rotation = cmap_strain
-
-        if rotation_angle is None:
-            ref_vec = self.u_ref * ref_u_v[0] + self.v_ref * ref_u_v[1]
-            ref_angle = np.arctan2(ref_vec[1], ref_vec[0])
-        else:
-            ref_angle = np.deg2rad(rotation_angle)
-
-        angle = ref_angle + np.deg2rad(self.metadata["q_to_r_rotation_ccw_deg"])
-        c = np.cos(angle)
-        s = np.sin(angle)
-
-        err = self.strain_raw_err.array
-        ecc = self.strain_raw_ecc.array
-        erc = self.strain_raw_erc.array
-
-        euu = err * (c * c) + 2.0 * erc * (c * s) + ecc * (s * s)
-        evv = err * (s * s) - 2.0 * erc * (c * s) + ecc * (c * c)
-        euv = (ecc - err) * (c * s) + erc * (c * c - s * s)
-
-        self.strain_euu = self.strain_raw_err.copy()
-        self.strain_evv = self.strain_raw_ecc.copy()
-        self.strain_euv = self.strain_raw_erc.copy()
-        self.strain_euu.array[...] = euu
-        self.strain_evv.array[...] = evv
-        self.strain_euv.array[...] = euv
-
-        alpha = None
-        if max_shift is not None:
-            if self.u_fit is None or self.v_fit is None or self.u is None or self.v is None:
-                raise ValueError("max_shift masking requires u_fit, v_fit, u, v to be available.")
-
-            ur = self.u_fit.array[:, :, 0]
-            uc = self.u_fit.array[:, :, 1]
-            vr = self.v_fit.array[:, :, 0]
-            vc = self.v_fit.array[:, :, 1]
-
-            du0 = ur - self.u[0]
-            du1 = uc - self.u[1]
-            dv0 = vr - self.v[0]
-            dv1 = vc - self.v[1]
-
-            su = du0 * du0 + du1 * du1
-            sv = dv0 * dv0 + dv1 * dv1
-            sdist2 = 0.5 * (su + sv)
-
-            smin, smax = max_shift
-            mask = np.clip((sdist2 - smin) / (smax - smin), 0.0, 1.0)
-            alpha = 1.0 - mask
-
-        if amp_range is not None:
-            if self.u_peak_fit is None or self.v_peak_fit is None:
-                raise ValueError("amp_range masking requires u_peak_fit and v_peak_fit to be available.")
-            a = 0.5 * (self.u_peak_fit.array[:, :, 2] + self.v_peak_fit.array[:, :, 2])
-            amin, amax = amp_range
-            a_mask = np.clip((a - amin) / (amax - amin), 0.0, 1.0)
-            alpha = a_mask if alpha is None else alpha * a_mask
-
-        if alpha is not None:
-            alpha = np.asarray(alpha, dtype=float)
-            good = alpha > 0
-            alpha_im = np.where(good, alpha, 1.0)
-        else:
-            good = None
-            alpha_im = None
-
-        if layout != "horizontal":
-            raise ValueError("layout must be 'horizontal'")
-
-        ncols = 4 if plot_rotation else 3
-        fig, ax = plt.subplots(1, ncols, figsize=figsize)
-
-        cm_strain = plt.get_cmap(cmap_strain).copy()
-        cm_strain.set_bad(color="black")
-        cm_rot = plt.get_cmap(cmap_rotation).copy()
-        cm_rot.set_bad(color="black")
-
-        euu_pct = self.strain_euu.array * 100
-        evv_pct = self.strain_evv.array * 100
-        euv_pct = self.strain_euv.array * 100
-        rot_deg = np.rad2deg(self.strain_rotation.array)
-
-        if good is not None and np.any(good):
-            euu_m = np.ma.array(euu_pct, mask=~good)
-            evv_m = np.ma.array(evv_pct, mask=~good)
-            euv_m = np.ma.array(euv_pct, mask=~good)
-            rot_m = np.ma.array(rot_deg, mask=~good)
-        else:
-            euu_m = euu_pct
-            evv_m = evv_pct
-            euv_m = euv_pct
-            rot_m = rot_deg
-
-        title_fs = 16
-        im0 = ax[0].imshow(
-            euu_m,
-            vmin=strain_range_percent[0],
-            vmax=strain_range_percent[1],
-            cmap=cm_strain,
-            alpha=alpha_im,
-        )
-        ax[1].imshow(
-            evv_m,
-            vmin=strain_range_percent[0],
-            vmax=strain_range_percent[1],
-            cmap=cm_strain,
-            alpha=alpha_im,
-        )
-        ax[2].imshow(
-            euv_m,
-            vmin=strain_range_percent[0],
-            vmax=strain_range_percent[1],
-            cmap=cm_strain,
-            alpha=alpha_im,
-        )
-
-        ax[0].set_title(r"$\epsilon_{uu}$", fontsize=title_fs)
-        ax[1].set_title(r"$\epsilon_{vv}$", fontsize=title_fs)
-        ax[2].set_title(r"$\epsilon_{uv}$", fontsize=title_fs)
-
-        if plot_rotation:
-            im3 = ax[3].imshow(
-                rot_m,
-                vmin=rotation_range_degrees[0],
-                vmax=rotation_range_degrees[1],
-                cmap=cm_rot,
-                alpha=alpha_im,
-            )
-            ax[3].set_title("Rotation", fontsize=title_fs)
-
-        for a in ax:
-            a.set_xticks([])
-            a.set_yticks([])
-            a.set_facecolor("black")
-
-        fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.16, wspace=0.03)
-
-        b0 = ax[0].get_position()
-        b2 = ax[2].get_position()
-        left = b0.x0
-        right = b2.x1
-        width = right - left
-
-        b3 = ax[3].get_position() if plot_rotation else None
-
-        cb_height = 0.04
-        cb_pad = 0.03
-        y = b0.y0 - cb_pad - cb_height
-
-        cax1 = fig.add_axes([left, y, width, cb_height])
-        cbar1 = fig.colorbar(im0, cax=cax1, orientation="horizontal")
-        cbar1.set_label("Strain (%)", fontsize=title_fs)
-        cbar1.ax.tick_params(labelsize=12)
-
-        if plot_rotation:
-            left_r = b3.x0
-            width_r = b3.x1 - b3.x0
-            cax2 = fig.add_axes([left_r, y, width_r, cb_height])
-            cbar2 = fig.colorbar(im3, cax=cax2, orientation="horizontal")
-            cbar2.set_label("Rotation (deg)", fontsize=title_fs)
-            cbar2.ax.tick_params(labelsize=12)
-
-        for a in ax:
-            a.set_aspect("equal")
 
         return fig, ax
 
