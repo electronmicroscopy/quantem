@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Any, Sequence
 
@@ -15,10 +16,7 @@ from tqdm import tqdm
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.utils.imaging_utils import (
-    cross_correlation_shift_torch,
-    weighted_cross_correlation_shift,
-)
+from quantem.core.utils.imaging_utils import weighted_cross_correlation_shift
 from quantem.core.visualization import show_2d
 
 
@@ -1043,15 +1041,17 @@ class MAPEDTorch(AutoSerialize):
         self,
         iterations: int,
         upsample_factor: int = 100,
+        method: str = "autocorrelation",
         plot_aligned: bool = True,
         edge_blend: float = 2.0,
         fit_shifts: bool = True,
         mode: str = "linear",
     ):
         for i, dataset in enumerate(self.datasets):
-            _, aligned_dataset, _ = dscan_correct(
+            _, aligned_dataset = dscan_correct(
                 dataset,
                 iterations,
+                method=method,
                 upsample_factor=upsample_factor,
                 plot_aligned=plot_aligned,
                 edge_blend=edge_blend,
@@ -2039,6 +2039,250 @@ def shift_images_torch(
     return out
 
 
+def cross_correlation_shift_torch(
+    im_ref: torch.Tensor,
+    im: torch.Tensor,
+    upsample_factor: int = 2,
+    fft_input: bool = False,
+) -> torch.Tensor:
+    """
+    Align two real images using Fourier cross-correlation and DFT upsampling.
+
+    Supports a single image pair with shape (H, W) or a batch of image pairs with
+    shape (N, H, W). When batched, returns a tensor of shape (N, 2).
+    """
+    if im_ref.shape != im.shape:
+        raise ValueError("im_ref and im must have the same shape")
+
+    if im_ref.ndim == 2:
+        if fft_input:
+            G1 = im_ref
+            G2 = im
+        else:
+            G1 = torch.fft.fft2(im_ref)
+            G2 = torch.fft.fft2(im)
+
+        xy_shift = align_images_fourier_torch(G1, G2, upsample_factor)
+        M, N = im_ref.shape
+        dx = ((xy_shift[0] + M / 2) % M) - M / 2
+        dy = ((xy_shift[1] + N / 2) % N) - N / 2
+        return torch.tensor([dx, dy], device=G1.device)
+
+    if im_ref.ndim == 3:
+        if fft_input:
+            G1 = im_ref
+            G2 = im
+        else:
+            G1 = torch.fft.fft2(im_ref, dim=(-2, -1))
+            G2 = torch.fft.fft2(im, dim=(-2, -1))
+
+        xy_shift = align_images_fourier_torch_batched(G1, G2, upsample_factor)
+        M, N = im_ref.shape[-2:]
+        dx = ((xy_shift[..., 0] + M / 2) % M) - M / 2
+        dy = ((xy_shift[..., 1] + N / 2) % N) - N / 2
+        return torch.stack([dx, dy], dim=-1)
+
+    raise ValueError("im_ref and im must be 2D or 3D tensors")
+
+
+def align_images_fourier_torch(
+    G1: torch.Tensor,
+    G2: torch.Tensor,
+    upsample_factor: int,
+) -> torch.Tensor:
+    """
+    Alignment using DFT upsampling of cross correlation.
+    G1, G2: torch tensors representing FTs of images (complex)
+    Returns: xy_shift (tensor length 2)
+    """
+    device = G1.device
+    cc = G1 * G2.conj()
+    cc_real = torch.fft.ifft2(cc).real
+
+    flat_idx = torch.argmax(cc_real)
+    x0 = (flat_idx // cc_real.shape[1]).to(torch.long).item()
+    y0 = (flat_idx % cc_real.shape[1]).to(torch.long).item()
+
+    M, N = cc_real.shape
+    x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
+    y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
+
+    vx = cc_real[x_inds, y0]
+    vy = cc_real[x0, y_inds]
+
+    denom_x = 4.0 * vx[1] - 2.0 * vx[2] - 2.0 * vx[0]
+    denom_y = 4.0 * vy[1] - 2.0 * vy[2] - 2.0 * vy[0]
+    dx = (vx[2] - vx[0]) / denom_x if denom_x != 0 else torch.tensor(0.0, device=device)
+    dy = (vy[2] - vy[0]) / denom_y if denom_y != 0 else torch.tensor(0.0, device=device)
+
+    x0 = torch.round((x0 + dx) * 2.0) / 2.0
+    y0 = torch.round((y0 + dy) * 2.0) / 2.0
+
+    xy_shift = torch.tensor([x0, y0], device=device)
+
+    if upsample_factor > 2:
+        xy_shift = upsampled_correlation_torch(cc, upsample_factor, xy_shift)
+
+    return xy_shift
+
+
+def align_images_fourier_torch_batched(
+    G1: torch.Tensor,
+    G2: torch.Tensor,
+    upsample_factor: int,
+) -> torch.Tensor:
+    """
+    Batched version of align_images_fourier_torch.
+
+    G1 and G2 must have shape (N, H, W), where N is the batch size.
+    Returns a tensor of shape (N, 2) with unwrapped peak locations.
+    """
+    if G1.shape != G2.shape:
+        raise ValueError("G1 and G2 must have the same shape")
+    if G1.ndim != 3:
+        raise ValueError("G1 and G2 must have shape (N, H, W)")
+
+    device = G1.device
+    cc = G1 * G2.conj()
+    cc_real = torch.fft.ifft2(cc, dim=(-2, -1)).real
+
+    batch, M, N = cc_real.shape
+    flat_idx = torch.argmax(cc_real.reshape(batch, -1), dim=1)
+    x0 = flat_idx // N
+    y0 = flat_idx % N
+
+    offsets = torch.tensor([-1, 0, 1], device=device, dtype=torch.long)
+    x_inds = (x0[:, None] + offsets[None, :]) % M
+    y_inds = (y0[:, None] + offsets[None, :]) % N
+
+    batch_inds = torch.arange(batch, device=device)[:, None]
+    vx = cc_real[batch_inds, x_inds, y0[:, None].expand(-1, 3)]
+    vy = cc_real[batch_inds, x0[:, None].expand(-1, 3), y_inds]
+
+    denom_x = 4.0 * vx[:, 1] - 2.0 * vx[:, 2] - 2.0 * vx[:, 0]
+    denom_y = 4.0 * vy[:, 1] - 2.0 * vy[:, 2] - 2.0 * vy[:, 0]
+    dx = torch.where(denom_x != 0, (vx[:, 2] - vx[:, 0]) / denom_x, torch.zeros_like(denom_x))
+    dy = torch.where(denom_y != 0, (vy[:, 2] - vy[:, 0]) / denom_y, torch.zeros_like(denom_y))
+
+    x0 = torch.round((x0.to(cc_real.dtype) + dx) * 2.0) / 2.0
+    y0 = torch.round((y0.to(cc_real.dtype) + dy) * 2.0) / 2.0
+    xy_shift = torch.stack([x0, y0], dim=-1)
+
+    if upsample_factor > 2:
+        xy_shift = upsampled_correlation_torch(cc, upsample_factor, xy_shift)
+
+    return xy_shift
+
+
+def upsampled_correlation_torch(
+    imageCorr: torch.Tensor,
+    upsampleFactor: int,
+    xyShift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Refine the correlation peak of imageCorr around xyShift by DFT upsampling.
+
+    Supports a single correlation image or a batch of them.
+    """
+    assert upsampleFactor > 2
+
+    squeeze_output = imageCorr.ndim == 2
+    if squeeze_output:
+        imageCorr = imageCorr.unsqueeze(0)
+    if xyShift.ndim == 1:
+        xyShift = xyShift.unsqueeze(0)
+
+    if imageCorr.ndim != 3 or xyShift.ndim != 2:
+        raise ValueError("imageCorr must have shape (H, W) or (N, H, W), and xyShift must match")
+    if imageCorr.shape[0] != xyShift.shape[0]:
+        raise ValueError("imageCorr and xyShift batch dimensions must match")
+
+    xyShift = torch.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
+    globalShift = float(math.floor(math.ceil(upsampleFactor * 1.5) / 2.0))
+    upsampleCenter = globalShift - (upsampleFactor * xyShift)
+
+    conj_input = imageCorr.conj()
+    im_up = dftUpsample_torch(conj_input, upsampleFactor, upsampleCenter)
+    imageCorrUpsample = im_up.conj()
+
+    batch, _, out_w = imageCorrUpsample.real.shape
+    flat_idx = torch.argmax(imageCorrUpsample.real.reshape(batch, -1), dim=1)
+    r = flat_idx // out_w
+    c = flat_idx % out_w
+
+    padded = F.pad(imageCorrUpsample.real, (1, 1, 1, 1), mode="circular")
+    batch_inds = torch.arange(batch, device=imageCorr.device)
+
+    center = padded[batch_inds, r + 1, c + 1]
+    top = padded[batch_inds, r, c + 1]
+    bottom = padded[batch_inds, r + 2, c + 1]
+    left = padded[batch_inds, r + 1, c]
+    right = padded[batch_inds, r + 1, c + 2]
+
+    denom_x = 4.0 * center - 2.0 * bottom - 2.0 * top
+    denom_y = 4.0 * center - 2.0 * right - 2.0 * left
+    dx = torch.where(denom_x != 0, (bottom - top) / denom_x, torch.zeros_like(denom_x))
+    dy = torch.where(denom_y != 0, (right - left) / denom_y, torch.zeros_like(denom_y))
+
+    xySubShift = torch.stack([r, c], dim=-1).to(dtype=xyShift.dtype) - globalShift
+    xyShift = xyShift + (xySubShift + torch.stack([dx, dy], dim=-1)) / float(upsampleFactor)
+
+    return xyShift[0] if squeeze_output else xyShift
+
+
+def dftUpsample_torch(
+    imageCorr: torch.Tensor,
+    upsampleFactor: int,
+    xyShift: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Matrix-multiply DFT upsampling for a single correlation image or a batch.
+    """
+    squeeze_output = imageCorr.ndim == 2
+    if squeeze_output:
+        imageCorr = imageCorr.unsqueeze(0)
+    if xyShift.ndim == 1:
+        xyShift = xyShift.unsqueeze(0)
+
+    if imageCorr.ndim != 3 or xyShift.ndim != 2:
+        raise ValueError("imageCorr must have shape (M, N) or (B, M, N), and xyShift must match")
+    if imageCorr.shape[0] != xyShift.shape[0]:
+        raise ValueError("imageCorr and xyShift batch dimensions must match")
+
+    device = imageCorr.device
+    _, M, N = imageCorr.shape
+    pixelRadius = 1.5
+    numRow = int(math.ceil(pixelRadius * upsampleFactor))
+    numCol = numRow
+
+    col_freq = torch.fft.ifftshift(torch.arange(N, device=device)) - math.floor(N / 2)
+    row_freq = torch.fft.ifftshift(torch.arange(M, device=device)) - math.floor(M / 2)
+
+    col_coords = (
+        torch.arange(numCol, device=device, dtype=torch.get_default_dtype())[None, :]
+        - (xyShift[:, 1:2])
+    )
+    row_coords = (
+        torch.arange(numRow, device=device, dtype=torch.get_default_dtype())[None, :]
+        - (xyShift[:, 0:1])
+    )
+
+    factor_col = -2j * math.pi / (N * float(upsampleFactor))
+    colKern = torch.exp(factor_col * (col_freq[None, :, None] * col_coords[:, None, :])).to(
+        imageCorr.dtype
+    )
+
+    factor_row = -2j * math.pi / (M * float(upsampleFactor))
+    rowKern = torch.exp(factor_row * (row_coords[:, :, None] * row_freq[None, None, :])).to(
+        imageCorr.dtype
+    )
+
+    imageUpsample = torch.matmul(torch.matmul(rowKern, imageCorr), colKern)
+
+    result = imageUpsample.real
+    return result[0] if squeeze_output else result
+
+
 def fit_surface_lstsq(img, mode="linear"):
     """
     Fits an image with a linear or quadratic function
@@ -2085,12 +2329,12 @@ def dscan_correct(
     plot_aligned: bool = True,
     edge_blend: float = 2.0,
     device="cpu",
-    method="cross_correlation",
+    method="autocorrelation",
     fit_shifts=True,
     mode="linear",
 ):
     """
-    Align diffraction patterns using cross-correlation.
+    Align diffraction patterns using autocorrelation.
 
     Parameters
     ----------
@@ -2163,22 +2407,23 @@ def dscan_correct(
                     shifted_dps[h_rs, w_rs, :, :] = torch.fft.ifft2(G_shift).real
                     G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
 
-    if method == "autocorrelation":
-        for h_rs in tqdm(range(H_rs), desc=f"Iteration {iteration + 1}/{iterations}"):
-            for w_rs in range(W_rs):
-                dp = shifted_dps[h_rs, w_rs]
-                G = torch.fft.fft2(w * dp)
+        if method == "autocorrelation":
+            # Vectorize over the scan grid by flattening (H_rs, W_rs) into a batch dimension.
+            dp_batch = (w * shifted_dps).reshape(H_rs * W_rs, H_dp, W_dp)
+            G = torch.fft.fft2(dp_batch, dim=(-2, -1))
+            G_flipped = torch.conj(G)
 
-                G_flipped = torch.conj(G)
-
-                shift = cross_correlation_shift_torch(
-                    G, G_flipped, upsample_factor=upsample_factor, fft_input=True
+            shifts = (
+                -cross_correlation_shift_torch(
+                    G,
+                    G_flipped,
+                    upsample_factor=upsample_factor,
+                    fft_input=True,
                 )
-                shift = shift / 2.0  # peak is at 2x the true offset
+                / 2.0
+            )
 
-                diffraction_shifts[h_rs, w_rs] = shift
-
-            G_ref_final = G_ref.clone()
+            diffraction_shifts[:, :, :] = shifts.reshape(H_rs, W_rs, 2)
 
         if fit_shifts:
             diffraction_shifts_1, _ = fit_surface_lstsq(diffraction_shifts[:, :, 0], mode=mode)
@@ -2186,17 +2431,23 @@ def dscan_correct(
             diffraction_shifts_old = diffraction_shifts.clone()
             diffraction_shifts = torch.stack((diffraction_shifts_1, diffraction_shifts_2), dim=2)
 
-            # Recompute fitted shifts
-            for h_rs in tqdm(range(H_rs), desc="Applying fitted shifts"):
-                for w_rs in range(W_rs):
-                    dp = shifted_dps[h_rs, w_rs]  # <-- Also read from shifted_dps here
-                    G = torch.fft.fft2(w * dp)
-                    shift = diffraction_shifts[h_rs, w_rs]
+            # Recompute fitted shifts in one batched pass over all scan positions.
+            dp_batch = (w * shifted_dps).reshape(H_rs * W_rs, H_dp, W_dp)
+            G_batch = torch.fft.fft2(dp_batch, dim=(-2, -1))
 
-                    phase_ramp = torch.exp(-1j * torch.pi * (kr * shift[0] + kc * shift[1]))
-                    G_shift = G * phase_ramp
-
-                    shifted_dps[h_rs, w_rs, :, :] = torch.fft.ifft2(G_shift).real
+            shifts_batch = diffraction_shifts.reshape(H_rs * W_rs, 2)
+            phase_ramp = torch.exp(
+                -1j
+                * torch.pi
+                * (
+                    kr.unsqueeze(0) * shifts_batch[:, 0][:, None, None]
+                    + kc.unsqueeze(0) * shifts_batch[:, 1][:, None, None]
+                )
+            )
+            G_shift = G_batch * phase_ramp
+            shifted_dps[:, :, :, :] = torch.fft.ifft2(G_shift, dim=(-2, -1)).real.reshape(
+                H_rs, W_rs, H_dp, W_dp
+            )
 
         if plot_aligned:
             if fit_shifts:
@@ -2218,8 +2469,8 @@ def dscan_correct(
                         ["Shifts y", "Fit y", "Residual y"],
                     ],
                     cmap="RdBu_r",
-                    vmax=3,
-                    vmin=-3,
+                    # vmax=3,
+                    # vmin=-3,
                 )
 
             dp_mean_before = dataset.mean(dim=(0, 1))
@@ -2232,4 +2483,4 @@ def dscan_correct(
                 vmax=0.75,
             )
 
-    return diffraction_shifts, shifted_dps, G_ref_final
+    return diffraction_shifts, shifted_dps
