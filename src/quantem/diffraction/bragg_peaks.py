@@ -26,7 +26,6 @@ from scipy.signal import find_peaks, peak_widths
 import ipywidgets as widgets
 from ipywidgets import interact, IntSlider, Button, Text, HBox, VBox, Output, interactive_output
 from IPython.display import clear_output
-import matplotlib.cm as cm
 from pathlib import Path
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from matplotlib.patches import Rectangle
@@ -420,6 +419,7 @@ class BraggPeaksPolymer(AutoSerialize):
                     # ----------------------------------------
                     # 2c. Resize chunk
                     # ----------------------------------------
+                    # self.model.to(device)
                     chunk_resized = self.resize_images(
                         chunk_array, 
                         device=device, 
@@ -2221,16 +2221,16 @@ class BraggPeaksPolymer(AutoSerialize):
                 else:
                     colors, sizes = selected_peak_color, 100
                 
-                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes*crosshair_scaling_peaks, 
-                          alpha=0.8, marker='x', linewidths=crosshair_width_peaks, zorder=5)
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], edgecolors=colors, s=sizes*crosshair_scaling_peaks, 
+                          alpha=0.8, marker='o', facecolors='none', linewidths=crosshair_width_peaks, zorder=5)
                 
                 if peak_intensity_mode in ['color', 'both']:
                     sm = plt.cm.ScalarMappable(cmap=peak_cmap, norm=plt.Normalize(vmin=int_min, vmax=int_max))
                     sm.set_array([])
                     plt.colorbar(sm, ax=ax, pad=0.02, fraction=0.046).set_label('Peak Intensity', fontsize=8)
             else:
-                ax.scatter(peaks_x[non_central], peaks_y[non_central], c=selected_peak_color, 
-                          s=100, alpha=0.8, marker='x', linewidths=crosshair_width_peaks, zorder=5)
+                ax.scatter(peaks_x[non_central], peaks_y[non_central], edgecolors=selected_peak_color, 
+                          s=100, alpha=0.8, marker='o', facecolors='none', linewidths=crosshair_width_peaks, zorder=5)
         
         # Interactive callback
         def show_pattern(ry_slider, rx_slider):
@@ -2388,7 +2388,8 @@ class BraggPeaksPolymer(AutoSerialize):
                          crosshair_color='r', figsize_individual=None, figsize_combined=None, 
                          crosshair_width=2, crosshair_size=15, crosshair_width_peaks=2,
                          crosshair_scaling_peaks=1, crosshair_scaling_central_beam=1, peak_marker="o",
-                         peak_marker_facecolors='none', peak_marker_size=None, gaussian_filter_sigma=None):
+                         peak_marker_facecolors='none', peak_marker_size=None, gaussian_filter_sigma=None,
+                         zoom=1, peak_alpha=1.0):
         """
         Save peak-annotated diffraction figures for a specific scan position.
         Central beam (closest to image center) plotted in blue.
@@ -2433,22 +2434,13 @@ class BraggPeaksPolymer(AutoSerialize):
             return dp_data
         
         # Peak plotting function
-        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, is_polar=False):
+        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, central_idx):
             if peaks_r_invA is None or len(peaks_r_invA) == 0:
                 return
             
-            # Find central beam index
-            if is_polar:
-                central_idx = np.argmin(peaks_r_invA)
-            else:
-                center_y = self.image_centers[0, ry, rx]
-                center_x = self.image_centers[1, ry, rx]
-                distances = np.sqrt((peaks_x - center_x)**2 + (peaks_y - center_y)**2)
-                central_idx = np.argmin(distances)
-            
             # Plot central beam
             ax.scatter(peaks_x[central_idx], peaks_y[central_idx], 
-                      edgecolors='k', facecolors=central_beam_color, s=120*crosshair_scaling_central_beam, alpha=0.95, marker='o', linewidths=crosshair_width_peaks, zorder=10)
+                      edgecolors='k', facecolors=central_beam_color, s=120*crosshair_scaling_central_beam, alpha=peak_alpha, marker='o', linewidths=crosshair_width_peaks, zorder=10)
             
             # Create non-central mask
             non_central = np.ones(len(peaks_x), dtype=bool)
@@ -2479,10 +2471,10 @@ class BraggPeaksPolymer(AutoSerialize):
                 
                 if peak_marker_facecolors == 'none':
                     ax.scatter(peaks_x[non_central], peaks_y[non_central], s=sizes*crosshair_scaling_peaks,     
-                              alpha=0.8, marker=peak_marker, facecolors=peak_marker_facecolors, edgecolors=colors, linewidths=crosshair_width_peaks, zorder=5)
+                              alpha=peak_alpha, marker=peak_marker, facecolors=peak_marker_facecolors, edgecolors=colors, linewidths=crosshair_width_peaks, zorder=5)
                 else:
                     ax.scatter(peaks_x[non_central], peaks_y[non_central], c=colors, s=sizes*crosshair_scaling_peaks, 
-                              alpha=0.8, marker=peak_marker, facecolors=peak_marker_facecolors, linewidths=crosshair_width_peaks, zorder=5)
+                              alpha=peak_alpha, marker=peak_marker, facecolors=peak_marker_facecolors, linewidths=crosshair_width_peaks, zorder=5)
                 
                 if peak_intensity_mode in ['color', 'both']:
                     sm = plt.cm.ScalarMappable(cmap=peak_cmap, norm=plt.Normalize(vmin=int_min, vmax=int_max))
@@ -2490,11 +2482,11 @@ class BraggPeaksPolymer(AutoSerialize):
             else:
                 if peak_marker_facecolors == 'none':
                     ax.scatter(peaks_x[non_central], peaks_y[non_central], 
-                              s=100, alpha=0.8, marker=peak_marker, facecolors=peak_marker_facecolors, edgecolors=selected_peak_color,
+                              s=100, alpha=peak_alpha, marker=peak_marker, facecolors=peak_marker_facecolors, edgecolors=selected_peak_color,
                               linewidths=2, zorder=5)
                 else:
                     ax.scatter(peaks_x[non_central], peaks_y[non_central], c=selected_peak_color, 
-                              s=100, alpha=0.8, marker=peak_marker, facecolors=peak_marker_facecolors, linewidths=2, zorder=5)
+                              s=100, alpha=peak_alpha, marker=peak_marker, facecolors=peak_marker_facecolors, linewidths=2, zorder=5)
         
         # Create save directory
         save_path = Path(save_dir)
@@ -2510,6 +2502,33 @@ class BraggPeaksPolymer(AutoSerialize):
         if gaussian_filter_sigma is not None:
             dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
             polar_im_data = gaussian_filter(polar_im_data, gaussian_filter_sigma)
+        
+        # Apply zoom if requested
+        if zoom != 1 and peaks_y is not None:
+            dp_data, ranges = _apply_zoom_crop(dp_data, zoom)
+            top, bot, left, right = ranges
+            
+            # Filter peaks to zoomed region
+            peaks_y_mask = (top <= peaks_y) & (peaks_y <= bot)
+            peaks_x_mask = (left <= peaks_x) & (peaks_x <= right)
+            mask = peaks_y_mask & peaks_x_mask
+            peaks_y = peaks_y[mask] - top
+            peaks_x = peaks_x[mask] - left
+            peaks_r_invA = peaks_r_invA[mask]
+            peak_ints = peak_ints[mask]
+        
+        # Find central beam index
+        if len(peaks_r_invA) > 0:
+            central_idx = np.argmin(peaks_r_invA)
+        elif peaks_y is not None:
+            if zoom != 1:
+                center_y = self.image_centers[0, ry, rx] - top
+                center_x = self.image_centers[1, ry, rx] - left
+            else:
+                center_y = self.image_centers[0, ry, rx]
+                center_x = self.image_centers[1, ry, rx]
+            distances = np.sqrt((peaks_x - center_x)**2 + (peaks_y - center_y)**2)
+            central_idx = np.argmin(distances)
             
         # Save intensity map
         if figsize_individual is None:
@@ -2519,7 +2538,44 @@ class BraggPeaksPolymer(AutoSerialize):
             im = ax.imshow(intensity_map, cmap=map_cmap)
         else:
             im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        ax.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
+        
+        ry_slider = ry * upsample_factor
+        rx_slider = rx * upsample_factor
+        
+        ax.scatter(rx_slider, ry_slider, facecolor='none', edgecolor=crosshair_color, marker='o', s=crosshair_size, linewidth=crosshair_width)
+        
+        # Add inset
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+        axins = inset_axes(ax, width="30%", height="30%", loc='upper right', borderpad=1.5)
+        
+        margin = 4
+        ry_min = max(0, ry_slider - margin)
+        ry_max = min(intensity_map.shape[0], ry_slider + margin + 1)
+        rx_min = max(0, rx_slider - margin)
+        rx_max = min(intensity_map.shape[1], rx_slider + margin + 1)
+        
+        zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
+        
+        if vmin_intensity_map is None:
+            axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min], interpolation='nearest')
+        else:
+            axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min],
+                         vmin=vmin_intensity_map, vmax=vmax_intensity_map, interpolation='nearest')
+        
+        pixel_border = Rectangle((rx_slider, ry_slider), 1, 1, linewidth=2, edgecolor=crosshair_color, 
+                                 facecolor='none', zorder=10)
+        axins.add_patch(pixel_border)
+        
+        axins.set_xlim(rx_min, rx_max)
+        axins.set_ylim(ry_max, ry_min)
+        axins.set_xticks([])
+        axins.set_yticks([])
+        axins.set_title('9×9 zoom', fontsize=8, pad=2)
+        
+        rect = Rectangle((rx_min, ry_min), rx_max-rx_min, ry_max-ry_min,
+                         linewidth=1.5, edgecolor=crosshair_color, facecolor='none', linestyle='--', alpha=0.7)
+        ax.add_patch(rect)
+        
         ax.set_title(map_title)
         ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
         ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -2532,7 +2588,8 @@ class BraggPeaksPolymer(AutoSerialize):
         im = ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
         ax.set_xticks([])
         ax.set_yticks([])
-        plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, is_polar=False)
+        if peaks_x is not None:
+            plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx)
         ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
         fig_diff.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
         plt.close(fig_diff)
@@ -2542,7 +2599,6 @@ class BraggPeaksPolymer(AutoSerialize):
         if show_polar:
             fig_polar, ax = plt.subplots(figsize=figsize_individual)
             im = ax.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
-            # ax.set_aspect('equal', adjustable='box')
             ax.set_title(f'Polar (Ry={ry}, Rx={rx})')
             ax.set_xlabel('Radius (bins)')
             ax.set_ylabel('Theta (bins)')
@@ -2553,61 +2609,11 @@ class BraggPeaksPolymer(AutoSerialize):
                 if polar_r is not None and len(polar_r) > 0:
                     r_bins = polar_r / self.max_radius_invA * self.num_radial_bins
                     theta_bins = polar_theta / ((2 - two_fold_symmetry) * np.pi) * self.num_annular_bins
-                    plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, peak_ints, is_polar=True)
-            
-            fig_polar.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
-            plt.close(fig_polar)
-            print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_polar.pdf')
-        
-        # Save combined figure
-        if figsize_combined is None:
-            if show_polar:
-                figsize_combined = (15, 4)
-            else:
-                figsize_combined = (12, 5)
-        fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=figsize_combined)
-        ax1, ax2 = axes[0], axes[1]
-        ax3 = axes[2] if show_polar else None
-        
-        # Intensity map
-        if vmin_intensity_map is None:
-            im1 = ax1.imshow(intensity_map, cmap=map_cmap)
-        else:
-            im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        ax1.plot(rx * upsample_factor, ry * upsample_factor, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
-        ax1.set_title(map_title)
-        ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
-        ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-        
-        # Diffraction pattern
-        im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
-        ax2.set_xticks([])
-        ax2.set_yticks([])
-        plot_peaks_on_ax(ax2, peaks_x, peaks_y, peaks_r_invA, peak_ints, is_polar=False)
-        ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
-        
-        # Polar transform
-        if show_polar:
-            im3 = ax3.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
-            # ax3.set_aspect('equal', adjustable='box')
-            ax3.set_xlabel('Radius (bins)')
-            ax3.set_ylabel('Theta (bins)')
-            ax3.set_title(f'Polar (Ry={ry}, Rx={rx})')
-            
-            if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
-                polar_r = self.polar_peaks['r_invA'][ry, rx]
-                polar_theta = self.polar_peaks['theta'][ry, rx]
-                if polar_r is not None and len(polar_r) > 0:
-                    r_bins = polar_r / self.max_radius_invA * self.num_radial_bins
-                    theta_bins = polar_theta / ((2 - two_fold_symmetry) * np.pi) * self.num_annular_bins
-                    plot_peaks_on_ax(ax3, r_bins, theta_bins, polar_r, peak_ints, is_polar=True)
-        
-        plt.tight_layout()
-        fig.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_combined.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
-        plt.close(fig)
-        print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_combined.pdf')
-        
-        print(f'\nAll figures saved to: {save_path}')
+                    
+                    # Find central beam for polar
+                    polar_central_idx = np.argmin(polar_r)
+                    if peaks_r_invA is not None:
+                        plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, peak_ints, polar_central_idx)
     
     def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,
                                          reference_image=None, overlay_alpha=0.3, crosshair_width=2, crosshair_size=15):

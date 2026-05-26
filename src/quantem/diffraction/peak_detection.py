@@ -203,8 +203,8 @@ def pair_peaks_polar(peaks_experimental, peaks_reference, radius_max, angle_max=
     unmatched_ref = list(range(len(peaks_reference)))
     
     # Find the central beams (smallest radius in both experimental and reference peaks)
-    central_beam_exp_index = np.argmin(peaks_experimental[:, 0])
-    central_beam_ref_index = np.argmin(peaks_reference[:, 0])
+    central_beam_exp_index = np.argmin(peaks_experimental[:, 0]) if len(peaks_experimental) > 0 else None
+    central_beam_ref_index = np.argmin(peaks_reference[:, 0]) if len(peaks_reference) > 0 else None
     
     central_beam_info_exp = {
         'exp_index': central_beam_exp_index,

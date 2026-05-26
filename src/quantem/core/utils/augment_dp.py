@@ -710,10 +710,6 @@ class DPAugmentor(RNGMixin):
             warnings.warn(f"Expected shape (C,H,W), got {label.shape}. Returning unchanged.", stacklevel=2)
             return label
         
-        if len(self.background_label_application) == 0:
-            warnings.warn("background_label_application is empty. Returning unchanged.", stacklevel=2)
-            return label
-        
         # Process each channel
         result_channels = []
         for c in range(label.shape[0]):
