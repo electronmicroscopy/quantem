@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,7 +11,6 @@ from matplotlib.patches import FancyArrowPatch
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
-from quantem.core.io.serialize import AutoSerialize
 from quantem.core.visualization.visualization_utils import ScalebarConfig, add_scalebar_to_ax
 
 if TYPE_CHECKING:
@@ -20,7 +19,7 @@ if TYPE_CHECKING:
 
 StrainParent = TypeVar('StrainParent', bound='StrainFittingMixin')
 
-class StrainFittingMixin(AutoSerialize):
+class StrainFittingMixin:
     mask: np.ndarray | None = None
     i0_sum_array: np.ndarray
     strain_raw_err: Dataset2d
@@ -30,6 +29,7 @@ class StrainFittingMixin(AutoSerialize):
 
     def fit_strain(
         self, 
+        plot_strain = False,
     ) -> "StrainFittingMixin":
         parent = cast('ModelDiffraction | StrainMapAutocorrelation', self)
         
@@ -103,7 +103,8 @@ class StrainFittingMixin(AutoSerialize):
             name="strain rotation",
             signal_units="fractional",
         )
-
+        if plot_strain:
+            self.plot_strain()
         return self
     
     def create_mask(
@@ -113,7 +114,6 @@ class StrainFittingMixin(AutoSerialize):
         max_threshold: float = 0.6,
         exclusion_radius_fraction: float = 0.1,
         smooth: bool = True,
-        peak_intensity_array: np.ndarray | None = None 
     ):
         parent = cast('ModelDiffraction | StrainMapAutocorrelation', self)
         
@@ -193,7 +193,7 @@ class StrainFittingMixin(AutoSerialize):
         cmap_strain="RdBu_r",
         cmap_rotation="PiYG",
         layout="horizontal",
-        figsize=(6, 6),
+        figsize=None,
         **kwargs,
     ):
         parent = cast('ModelDiffraction | StrainMapAutocorrelation', self)
@@ -211,6 +211,9 @@ class StrainFittingMixin(AutoSerialize):
 
         if cmap_rotation is None:
             cmap_rotation = cmap_strain
+
+        if layout not in ["horizontal", "vertical"]:
+            raise ValueError("layout must be 'horizontal' or 'vertical'")
 
         angle = np.deg2rad(rotation_angle)
         c = np.cos(angle)
@@ -231,11 +234,16 @@ class StrainFittingMixin(AutoSerialize):
         strain_evv.array[...] = evv
         strain_euv.array[...] = euv
 
-        if layout != "horizontal":
-            raise ValueError("layout must be 'horizontal'")
-
         ncols = 4 if plot_rotation else 3
-        fig, ax = plt.subplots(1, ncols, figsize=figsize)
+        is_horizontal = layout == "horizontal"
+        
+        if figsize is None:
+            figsize = (6, 6) if is_horizontal else (6, 8)
+        
+        if is_horizontal:
+            fig, ax = plt.subplots(1, ncols, figsize=figsize)
+        else:
+            fig, ax = plt.subplots(ncols, 1, figsize=figsize)
 
         cm_strain = plt.get_cmap(cmap_strain).copy()
         cm_strain.set_bad(color="black")
@@ -247,7 +255,6 @@ class StrainFittingMixin(AutoSerialize):
         euv_pct = strain_euv.array * 100
         rot_deg = np.rad2deg(self.strain_rotation.array)
 
-        from matplotlib.colors import Normalize
         norm_strain = Normalize(vmin=strain_range_percent[0], vmax=strain_range_percent[1])
         euu_rgb = cm_strain(norm_strain(euu_pct))[:, :, :3]
         evv_rgb = cm_strain(norm_strain(evv_pct))[:, :, :3]
@@ -260,7 +267,7 @@ class StrainFittingMixin(AutoSerialize):
 
         ax[0].set_title(r"$\epsilon_{uu}$ $\updownarrow$", fontsize=title_fs)
         ax[1].set_title(r"$\epsilon_{vv}$ $\leftrightarrow$", fontsize=title_fs)
-        ax[2].set_title(r"$\epsilon_{uv}$ $\nearrow\!\swarrow$", fontsize=title_fs)
+        ax[2].set_title(r"$\epsilon_{uv}$ $\nearrow\!\!\!\!\swarrow$", fontsize=title_fs)
 
         if plot_rotation:
             norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
@@ -320,38 +327,61 @@ class StrainFittingMixin(AutoSerialize):
                 bold=scalebar_config.bold,
             )
 
-        fig.subplots_adjust(left=0.04, right=0.98, top=0.90, bottom=0.16, wspace=0.05)
-        if plot_rotation:
-            pos3 = ax[3].get_position()
-            ax[3].set_position([pos3.x0 + 0.03, pos3.y0, pos3.width, pos3.height])
-        b0 = ax[0].get_position()
-        b2 = ax[2].get_position()
-        left = b0.x0
-        right = b2.x1
-        width = right - left
-        b3 = ax[3].get_position() if plot_rotation else None
+        if is_horizontal:
+            fig.subplots_adjust(left=0.04, right=0.98, top=0.90, bottom=0.16, wspace=0.05)
+            if plot_rotation:
+                pos3 = ax[3].get_position()
+                ax[3].set_position([pos3.x0 + 0.03, pos3.y0, pos3.width, pos3.height])
+            
+            cb_orientation = "horizontal"
+            cb_size = 0.02
+            cb_pad = 0.02
+            
+            b0 = ax[0].get_position()
+            b2 = ax[2].get_position()
+            strain_cb_pos = [b0.x0, b0.y0 - cb_pad - cb_size, b2.x1 - b0.x0, cb_size]
+            
+            if plot_rotation:
+                b3 = ax[3].get_position()
+                rot_cb_pos = [b3.x0, b0.y0 - cb_pad - cb_size, b3.x1 - b3.x0, cb_size]
+                last_pos = b3
+            else:
+                rot_cb_pos = None
+                last_pos = b2
+                
+        else:
+            fig.subplots_adjust(left=0.04, right=0.80, top=0.98, bottom=0.04, hspace=0.15)
+            
+            cb_orientation = "vertical"
+            cb_size = 0.02
+            cb_pad = 0.02
+            
+            b0 = ax[0].get_position()
+            b2 = ax[2].get_position()
+            strain_cb_pos = [b0.x1 + cb_pad, b2.y0, cb_size, b0.y1 - b2.y0]
+            
+            if plot_rotation:
+                b3 = ax[3].get_position()
+                rot_cb_pos = [b0.x1 + cb_pad, b3.y0, cb_size, b3.y1 - b3.y0]
+                last_pos = b3
+            else:
+                rot_cb_pos = None
+                last_pos = b2
 
-        cb_height = 0.02
-        cb_pad = 0.02
-        y = b0.y0 - cb_pad - cb_height
-        from matplotlib.cm import ScalarMappable
-        cax1 = fig.add_axes([left, y, width, cb_height])
+        cax1 = fig.add_axes(strain_cb_pos)
         sm_strain = ScalarMappable(norm=norm_strain, cmap=cm_strain)
-        cbar1 = fig.colorbar(sm_strain, cax=cax1, orientation="horizontal")
+        cbar1 = fig.colorbar(sm_strain, cax=cax1, orientation=cb_orientation)
         cbar1.set_label("Strain (%)", fontsize=title_fs)
         cbar1.ax.tick_params(labelsize=12)
 
-        if plot_rotation:
-            left_r = b3.x0
-            width_r = b3.x1 - b3.x0
-            cax2 = fig.add_axes([left_r, y, width_r, cb_height])
+        if plot_rotation and rot_cb_pos is not None:
+            cax2 = fig.add_axes(rot_cb_pos)
             sm_rot = ScalarMappable(norm=norm_rot, cmap=cm_rot)
-            cbar2 = fig.colorbar(sm_rot, cax=cax2, orientation="horizontal")
+            cbar2 = fig.colorbar(sm_rot, cax=cax2, orientation=cb_orientation)
             cbar2.set_label("Rotation (deg)", fontsize=title_fs)
             cbar2.ax.tick_params(labelsize=12)
         
         if plot_gvecs:
-            from matplotlib.patches import FancyArrowPatch
             if not hasattr(parent, 'u_ref') or not hasattr(parent, 'v_ref'):
                 print("Warning: u_ref and v_ref not found. Call fit_strain() first.")
                 return fig, ax
@@ -359,12 +389,15 @@ class StrainFittingMixin(AutoSerialize):
                 print("Warning: u_ref and v_ref not found. Call fit_strain() first.")
                 return fig, ax
             
-            last_pos = b3 if plot_rotation else b2
+            if is_horizontal:
+                ref_width = last_pos.width * 0.8
+                ref_left = last_pos.x1 - 0.035
+                ref_ax = fig.add_axes([ref_left, last_pos.y0, ref_width, last_pos.height])
+            else: 
+                ref_height = last_pos.height * 0.8
+                ref_bottom = last_pos.y0 + 0.02
+                ref_ax = fig.add_axes([last_pos.x0, ref_bottom, last_pos.width, ref_height])
             
-            ref_width = last_pos.width * 0.8
-            ref_left = last_pos.x1 - 0.035
-            
-            ref_ax = fig.add_axes([ref_left, last_pos.y0, ref_width, last_pos.height])
             ref_ax.set_xlim(-1.5, 1.5)
             ref_ax.set_ylim(-1.5, 1.5)
             ref_ax.set_aspect('equal')

@@ -17,9 +17,10 @@ from quantem.core.utils.imaging_utils import dft_upsample, rotate_image
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import ScalebarConfig, show_2d
+from quantem.diffraction.strain_fitting_mixin import StrainFittingMixin
 
 
-class StrainMapAutocorrelation(AutoSerialize):
+class StrainMapAutocorrelation(AutoSerialize, StrainFittingMixin):
     _token = object()
 
     def __init__(
@@ -306,6 +307,8 @@ class StrainMapAutocorrelation(AutoSerialize):
     ):
         if self.transform is None or self.transform_rotated is None:
             raise ValueError("Run preprocess() first to compute transform images.")
+        if self.u_peak_fit is None or self.v_peak_fit is None:
+            raise ValueError("Run fit_lattice_vectors() first.")
 
         sampling = np.mean(self.metadata["sampling_real"])
         units = self.metadata.get("real_units", r"$\mathrm{\AA}$")
@@ -361,8 +364,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         _overlay_lattice_vectors(
             ax=ax,
             shape=self.transform.shape,
-            u_rc= self.u_fit.array[row, col, :],
-            v_rc=self.v_fit.array[row, col, :],
+            u_rc= self.u_peak_fit.array[row, col, :2],
+            v_rc=self.v_peak_fit.array[row, col, :2],
             rot_ccw_deg=rot_ccw,
             q_transpose=q_transpose,
             peaks_plot=self.mean_img_peaks,

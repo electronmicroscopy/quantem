@@ -22,8 +22,8 @@ from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
 from quantem.core.utils.imaging_utils import cross_correlation_shift
-from quantem.core.visualization.visualization_utils import ScalebarConfig, add_scalebar_to_ax
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
+from quantem.diffraction.strain_fitting_mixin import StrainFittingMixin
 
 
 def _parse_init(value: float | int | Sequence[float | int | None], *, name: str) -> float:
@@ -36,7 +36,7 @@ def _parse_init(value: float | int | Sequence[float | int | None], *, name: str)
     return float(cast(float | int, value))
 
 
-class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
+class ModelDiffraction(ModelDiffractionVisualizations, StrainFittingMixin, FitBase, AutoSerialize):
     _token = object()
     DEFAULT_LR = 5e-2
     DEFAULT_OPTIMIZER_TYPE = "adam"
