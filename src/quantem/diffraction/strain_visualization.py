@@ -55,7 +55,7 @@ class StrainFitting(AutoSerialize):
         self.ds_units = 'pixels' if ds_units is None else ds_units
 
         self.mask = np.ones(ds_shape[:2]) if mask is None else mask
-        self.mask = (self.mask - np.min(self.mask))/np.linalg.norm(self.mask)   
+        self.mask = (self.mask - np.min(self.mask))/np.max(self.mask) 
 
         self.u_ref = u_ref if u_ref is not None else None
         self.v_ref = v_ref if v_ref is not None else None

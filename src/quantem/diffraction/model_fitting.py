@@ -940,12 +940,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
     def get_individual_uv_vectors(self) -> "ModelDiffraction":
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
-        # print(scan_r)
         
         self.u_array = np.empty(shape=(scan_r, scan_c, 2))
         self.v_array = np.empty(shape=(scan_r, scan_c, 2))
         if self.state_individual_refined is None:
-            raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
+            raise RuntimeError("Call .fit_individual_diffraction_pattern(...) on all patterns first.")
         for r in range(scan_r):
             for c in range(scan_c):
                 pos_state = self.state_individual_refined[r,c]
@@ -1047,7 +1046,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         v_ref: np.ndarray | None = None,
     )->StrainFitting:
         if self.u_array is None or self.v_array is None:
-            raise RuntimeWarning("Need to run fit_lattice_vectors before initilizing strain class")
+            self.get_individual_uv_vectors()
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
         
@@ -1064,29 +1063,17 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             else:
                 default_sampling = float(self.dataset.sampling)
         
-        if self.mask is not None:
-            return StrainFitting(
-                u_array = self.u_array,
-                v_array = self.v_array,
-                ds_shape = self.dataset.shape,
-                real_space = self.real_space,
-                u_ref = u_ref,
-                v_ref = v_ref,
-                mask = self.mask,
-                ds_sampling=default_sampling,
-                ds_units = default_units,
-            )
-        else:
-            return StrainFitting(
-                u_array = self.u_array,
-                v_array = self.v_array,
-                ds_shape = self.dataset.shape,
-                real_space = self.real_space,
-                u_ref = u_ref,
-                v_ref = v_ref,
-                ds_sampling=default_sampling,
-                ds_units = default_units,
-            )
+        return StrainFitting(
+            u_array = self.u_array,
+            v_array = self.v_array,
+            ds_shape = self.dataset.shape,
+            real_space = self.real_space,
+            u_ref = u_ref,
+            v_ref = v_ref,
+            mask = self.mask,
+            ds_sampling=default_sampling,
+            ds_units = default_units,
+        )
 
     @property
     def render_mean_refined(self) -> np.ndarray:
