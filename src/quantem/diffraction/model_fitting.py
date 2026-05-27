@@ -20,10 +20,9 @@ from quantem.core.fitting.base import (
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.ml.optimizer_mixin import OptimizerType, SchedulerType
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
-from quantem.diffraction.strain_fitting_mixin import StrainFittingMixin
+from quantem.diffraction.strain_visualization import StrainFitting
 
 
 def _parse_init(value: float | int | Sequence[float | int | None], *, name: str) -> float:
@@ -36,7 +35,7 @@ def _parse_init(value: float | int | Sequence[float | int | None], *, name: str)
     return float(cast(float | int, value))
 
 
-class ModelDiffraction(ModelDiffractionVisualizations, StrainFittingMixin, FitBase, AutoSerialize):
+class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
     _token = object()
     DEFAULT_LR = 5e-2
     DEFAULT_OPTIMIZER_TYPE = "adam"
@@ -982,65 +981,112 @@ class ModelDiffraction(ModelDiffractionVisualizations, StrainFittingMixin, FitBa
         return self._render_state_array(self.state_individual_refined[row, col])
 
     
-    # def create_mask(
-    #     self,
-    #     use_radial_method: bool = False,
-    #     min_threshold: float = 0.4,
-    #     max_threshold: float = 0.6,
-    #     exclusion_radius_fraction: float = 0.1,
-    #     smooth: bool = True,
-    # ):
-    #     scan_r = self.dataset.shape[0]
-    #     scan_c = self.dataset.shape[1]
-    #     self.mask = np.zeros(self.dataset.shape[:2])
+    def create_mask(
+        self,
+        use_radial_method: bool = False,
+        min_threshold: float = 0.4,
+        max_threshold: float = 0.6,
+        exclusion_radius_fraction: float = 0.1,
+        smooth: bool = True,
+    ):
+        scan_r = self.dataset.shape[0]
+        scan_c = self.dataset.shape[1]
+        self.mask = np.zeros(self.dataset.shape[:2])
         
-    #     self.i0_sum_array = np.empty(shape=(scan_r, scan_c))
+        self.i0_sum_array = np.empty(shape=(scan_r, scan_c))
         
-    #     if self.state_individual_refined is None:
-    #         raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
-    #     if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
-    #             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        if self.state_individual_refined is None:
+            raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
+        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
+                raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
 
-    #     if use_radial_method:
-    #         center_y, center_x = np.array(self.dataset.shape[:-2]) / 2
-    #         y, x = np.ogrid[:self.dataset.shape[-2], :self.dataset.shape[-1]]
-    #         radius_map = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    #         exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
-    #         for r in range(scan_r):
-    #             for c in range(scan_c):
-    #                 dp = self.dataset.array[r, c]             
-    #                 outside_mask = radius_map > exclusion_radius
-    #                 self.i0_sum_array[r, c] = np.sum(dp[outside_mask])
-    #     else:
-    #         for r in range(scan_r):
-    #             for c in range(scan_c):
-    #                 pos_state = self.state_individual_refined[r, c]
-    #                 if pos_state is None:
-    #                     self.i0_sum_array[r, c] = 0.0
-    #                     continue
+        if use_radial_method:
+            center_y, center_x = np.array(self.dataset.shape[:-2]) / 2
+            y, x = np.ogrid[:self.dataset.shape[-2], :self.dataset.shape[-1]]
+            radius_map = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
+            for r in range(scan_r):
+                for c in range(scan_c):
+                    dp = self.dataset.array[r, c]             
+                    outside_mask = radius_map > exclusion_radius
+                    self.i0_sum_array[r, c] = np.sum(dp[outside_mask])
+        else:
+            for r in range(scan_r):
+                for c in range(scan_c):
+                    pos_state = self.state_individual_refined[r, c]
+                    if pos_state is None:
+                        self.i0_sum_array[r, c] = 0.0
+                        continue
 
-    #                 i0_raw = None
-    #                 uv_indices = None
-    #                 for key in pos_state.keys():
-    #                     if key.endswith('i0_raw'):
-    #                         i0_raw = pos_state[key].cpu().numpy()
-    #                     if key.endswith('uv_indices'):
-    #                         uv_indices = pos_state[key].cpu().numpy()
+                    i0_raw = None
+                    uv_indices = None
+                    for key in pos_state.keys():
+                        if key.endswith('i0_raw'):
+                            i0_raw = pos_state[key].cpu().numpy()
+                        if key.endswith('uv_indices'):
+                            uv_indices = pos_state[key].cpu().numpy()
                     
-    #                 if i0_raw is None or uv_indices is None:
-    #                     self.i0_sum_array[r, c] = 0.0
-    #                     continue
+                    if i0_raw is None or uv_indices is None:
+                        self.i0_sum_array[r, c] = 0.0
+                        continue
                     
-    #                 is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
-    #                 self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
-    #     max_intensity = np.max(self.i0_sum_array)
-    #     if max_intensity == 0:
-    #         return np.zeros_like(self.i0_sum_array)
-    #     self.mask = self.i0_sum_array / max_intensity
-    #     self.mask = np.clip((self.mask - min_threshold) / (max_threshold - min_threshold), 0, 1)
-    #     if smooth:
-    #         self.mask = np.sin(np.pi / 2 * self.mask) ** 2
-    #     return self
+                    is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
+                    self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
+        max_intensity = np.max(self.i0_sum_array)
+        if max_intensity == 0:
+            return np.zeros_like(self.i0_sum_array)
+        self.mask = self.i0_sum_array / max_intensity
+        self.mask = np.clip((self.mask - min_threshold) / (max_threshold - min_threshold), 0, 1)
+        if smooth:
+            self.mask = np.sin(np.pi / 2 * self.mask) ** 2
+        return self
+
+    def initilize_strain_class(
+        self,
+        u_ref: np.ndarray | None = None,
+        v_ref: np.ndarray | None = None,
+    )->StrainFitting:
+        if self.u_array is None or self.v_array is None:
+            raise RuntimeWarning("Need to run fit_lattice_vectors before initilizing strain class")
+        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        
+        default_units = None
+        default_sampling = None
+        if hasattr(self.dataset, 'units'):
+            if isinstance(self.dataset.units, (tuple, list)):
+                default_units = str(self.dataset.units[0])
+            else:
+                default_units = str(self.dataset.units)
+        if hasattr(self.dataset, 'sampling'):
+            if isinstance(self.dataset.sampling, (tuple, list, np.ndarray)):
+                default_sampling = float(self.dataset.sampling[0])
+            else:
+                default_sampling = float(self.dataset.sampling)
+        
+        if self.mask is not None:
+            return StrainFitting(
+                u_array = self.u_array,
+                v_array = self.v_array,
+                ds_shape = self.dataset.shape,
+                real_space = self.real_space,
+                u_ref = u_ref,
+                v_ref = v_ref,
+                mask = self.mask,
+                ds_sampling=default_sampling,
+                ds_units = default_units,
+            )
+        else:
+            return StrainFitting(
+                u_array = self.u_array,
+                v_array = self.v_array,
+                ds_shape = self.dataset.shape,
+                real_space = self.real_space,
+                u_ref = u_ref,
+                v_ref = v_ref,
+                ds_sampling=default_sampling,
+                ds_units = default_units,
+            )
 
     @property
     def render_mean_refined(self) -> np.ndarray:

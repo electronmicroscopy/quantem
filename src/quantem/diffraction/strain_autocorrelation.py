@@ -17,10 +17,10 @@ from quantem.core.utils.imaging_utils import dft_upsample, rotate_image
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import ScalebarConfig, show_2d
-from quantem.diffraction.strain_fitting_mixin import StrainFittingMixin
+from quantem.diffraction.strain_visualization import StrainFitting
 
 
-class StrainMapAutocorrelation(AutoSerialize, StrainFittingMixin):
+class StrainMapAutocorrelation(AutoSerialize):
     _token = object()
 
     def __init__(
@@ -51,6 +51,7 @@ class StrainMapAutocorrelation(AutoSerialize, StrainFittingMixin):
         self.v_ref: np.ndarray | None = None
         self.u_array: np.ndarray | None = None
         self.v_array: np.ndarray | None = None
+        self.mask: np.ndarray | None = None
 
         self.real_space = True
 
@@ -543,6 +544,97 @@ class StrainMapAutocorrelation(AutoSerialize, StrainFittingMixin):
         self.metadata["fit_gaussian_maxfev"] = gaussian_maxfev
 
         return self
+
+    def create_mask(
+        self,
+        use_radial_method: bool = False,
+        min_threshold: float = 0.4,
+        max_threshold: float = 0.6,
+        exclusion_radius_fraction: float = 0.1,
+        smooth: bool = True,
+    ):        
+        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        
+        scan_r = self.dataset.shape[0]
+        scan_c = self.dataset.shape[1]
+        self.mask = np.ones(self.dataset.shape[:2])
+        
+        i0_sum_array = np.empty(shape=(scan_r, scan_c))
+
+        if use_radial_method:
+            center_y, center_x = np.array(self.dataset.shape[:-2]) / 2
+            y, x = np.ogrid[:self.dataset.shape[-2], :self.dataset.shape[-1]]
+            radius_map = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
+            for r in range(scan_r):
+                for c in range(scan_c):
+                    dp = self.dataset.array[r, c]             
+                    outside_mask = radius_map > exclusion_radius
+                    i0_sum_array[r, c] = np.sum(dp[outside_mask])
+        else:
+            if self.u_peak_fit is None or self.v_peak_fit is None:
+                raise RuntimeError("For intensity-based masking, run fit_lattice_vectors() first.")
+            u_amplitudes = self.u_peak_fit.array[:, :, 2]
+            v_amplitudes = self.v_peak_fit.array[:, :, 2]
+            i0_sum_array = (u_amplitudes + v_amplitudes) / 2.0
+        
+        max_intensity = np.max(i0_sum_array)
+        if max_intensity == 0:
+            return np.ones_like(i0_sum_array)
+        self.mask = i0_sum_array / max_intensity
+        self.mask = np.clip((self.mask - min_threshold) / (max_threshold - min_threshold), 0, 1)
+        if smooth:
+            self.mask = np.sin(np.pi / 2 * self.mask) ** 2
+        return self
+
+
+    def initilize_strain_class(
+        self,
+        u_ref: np.ndarray | None = None,
+        v_ref: np.ndarray | None = None,
+    )->StrainFitting:
+        if self.u_array is None or self.v_array is None:
+            raise RuntimeWarning("Need to run fit_lattice_vectors before initilizing strain class")
+        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        
+        default_units = None
+        default_sampling = None
+        if hasattr(self.dataset, 'units'):
+            if isinstance(self.dataset.units, (tuple, list)):
+                default_units = str(self.dataset.units[0])
+            else:
+                default_units = str(self.dataset.units)
+        if hasattr(self.dataset, 'sampling'):
+            if isinstance(self.dataset.sampling, (tuple, list, np.ndarray)):
+                default_sampling = float(self.dataset.sampling[0])
+            else:
+                default_sampling = float(self.dataset.sampling)
+        
+        if self.mask is not None:
+            return StrainFitting(
+                u_array = self.u_array,
+                v_array = self.v_array,
+                ds_shape = self.dataset.shape,
+                real_space = self.real_space,
+                u_ref = u_ref,
+                v_ref = v_ref,
+                mask = self.mask,
+                ds_sampling=default_sampling,
+                ds_units = default_units,
+            )
+        else:
+            return StrainFitting(
+                u_array = self.u_array,
+                v_array = self.v_array,
+                ds_shape = self.dataset.shape,
+                real_space = self.real_space,
+                u_ref = u_ref,
+                v_ref = v_ref,
+                ds_sampling=default_sampling,
+                ds_units = default_units,
+            )
 
     def plot_lattice_vectors(
         self,
