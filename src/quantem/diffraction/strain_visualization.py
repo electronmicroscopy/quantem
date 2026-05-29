@@ -203,7 +203,7 @@ class StrainFitting(AutoSerialize):
         is_horizontal = layout == "horizontal"
         
         if figsize is None:
-            figsize = (6, 6) if is_horizontal else (6, 8)
+            figsize = (6, 6) if is_horizontal else (6, 6)
         
         if is_horizontal:
             fig, ax = plt.subplots(1, ncols, figsize=figsize)
