@@ -213,7 +213,7 @@ class ModelDiffractionVisualizations:
         md.plot_losses(figax=(fig, ax_top), plot_lrs=True, plot_individual=individual_loss,individual_row=pattern_row,individual_col=pattern_col)
 
         if individual_loss:
-            pred = md.render_indivdual_pattern(row=pattern_row, col=pattern_col)
+            pred = md.render_individual_pattern(row=pattern_row, col=pattern_col)
             ref = np.asarray(md.dataset.array[pattern_row, pattern_col], dtype=np.float32)
         else:
             ref = np.asarray(md.image_ref, dtype=np.float32)
@@ -332,7 +332,7 @@ class ModelDiffractionVisualizations:
         if plot_mean_model and plot_individual_model:
             raise RuntimeError("can only plot mean or plot individual, not both")
         if plot_individual_model:
-            pred = md.render_indivdual_pattern(pattern_row, pattern_col)
+            pred = md.render_individual_pattern(pattern_row, pattern_col)
             ref = np.asarray(md.dataset.array[pattern_row, pattern_col], dtype=np.float32)
         elif plot_mean_model:
             ref = np.asarray(md.image_ref, dtype=np.float32)

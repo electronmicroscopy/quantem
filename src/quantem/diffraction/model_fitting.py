@@ -964,7 +964,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         return self
     
-    def render_indivdual_pattern(self, row, col):
+    def render_individual_pattern(self, row, col):
         if self.state_individual_refined is None:
             raise RuntimeError(
                 "individual_refined_state is unavalible. Run fit_individual_diffraction_pattern(...) first."
@@ -1040,7 +1040,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             self.mask = np.sin(np.pi / 2 * self.mask) ** 2
         return self
 
-    def initilize_strain_class(
+    def initialize_strain_class(
         self,
         u_ref: np.ndarray | None = None,
         v_ref: np.ndarray | None = None,
