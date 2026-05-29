@@ -55,9 +55,6 @@ class DPAugmentor(RNGMixin):
         log_file: os.PathLike | None = None,
         rng: np.random.Generator | int | None = None,
         device: str = "cpu",
-        add_aperture: bool = False,
-        radius_factor: list[float] | float = [0.8, 1],
-        aperture_shift: list[float] | float = [0, 10],
     ):
         """
         Initialize diffraction pattern augmentor with configurable transformations.
@@ -132,16 +129,6 @@ class DPAugmentor(RNGMixin):
         device : str, default="cpu"
             Device for computations ("cpu", "cuda", "cuda:0", etc.).
 
-        add_aperture : bool, default=False
-            Enable circular aperture mask to simulate objective aperture effects.
-        radius_factor : list[float] | float, default=[0.8, 1]
-            Range for aperture radius as fraction of maximum image radius (distance from
-            center to corner). Values < 1 create vignetted diffraction patterns. The mask
-            is centered at (height//2, width//2) + aperture_shift.
-        aperture_shift : list[float] | float, default=[0, 10]
-            Range for random shift of aperture center in pixels (applied with random sign
-            to both x and y). Simulates misalignment of the objective aperture.
-        
         Notes
         -----
         - Augmentations are applied in order: flipshift → elastic → background →
@@ -167,7 +154,6 @@ class DPAugmentor(RNGMixin):
         self.add_scale = add_scale
         self.add_blur = add_blur
         self.add_flipshift = add_flipshift
-        self.add_aperture = add_aperture
 
         self._bkg_weight_range = self._check_input(bkg_weight) if add_bkg else [0, 0]
         self._bkg_q_range = self._check_input(bkg_q) if add_bkg else [0, 0]
@@ -187,8 +173,6 @@ class DPAugmentor(RNGMixin):
         self.free_rotation = free_rotation
         self._rotation_range = self._check_input(rotation_range) if add_flipshift else [0, 0]
 
-        self._radius_range = self._check_input(radius_factor) if add_aperture else [0, 0]
-        self._aptshift_range = self._check_input(aperture_shift) if add_aperture else [0, 0]
 
         # Generate parameters from set parameters
         self.generate_params()
@@ -226,8 +210,6 @@ class DPAugmentor(RNGMixin):
         self.blur_sigma = self._uniform_or_zero(self._blur_range, self.add_blur)
         self.xshift = self._uniform_with_sign(self._xshift_range, self.add_shift)
         self.yshift = self._uniform_with_sign(self._yshift_range, self.add_shift)
-        self.xshiftapt = self._uniform_with_sign(self._aptshift_range, self.add_aperture)
-        self.yshiftapt = self._uniform_with_sign(self._aptshift_range, self.add_aperture)
         self._generate_ellipticity_params()
         self._generate_flipshift_params()
 
@@ -235,11 +217,6 @@ class DPAugmentor(RNGMixin):
             self.scale_factor = self.rng.uniform(self._scale_range[0], self._scale_range[1])
         else:
             self.scale_factor = 0
-
-        if self.add_aperture:
-            self.radius_factor = self.rng.uniform(self._radius_range[0], self._radius_range[1])
-        else:
-            self.radius_factor = 0
 
     def _uniform_or_zero(self, range_vals: list, enabled: bool) -> float:
         return self.rng.uniform(range_vals[0], range_vals[1]) if enabled else 0
@@ -447,8 +424,6 @@ class DPAugmentor(RNGMixin):
                     if len(transformed_label.shape) == 3:
                         transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
         
-        if self.add_aperture: # currently input can only be Tensor
-            result = self._apply_aperture(result)
         if self.add_shot:
             result = self._apply_shot(result)
         if self.add_gaussian_noise:
@@ -549,23 +524,6 @@ class DPAugmentor(RNGMixin):
             image = (image - offset) / (image - offset).sum()
             return self.rng.poisson(image * self.e_dose) + offset
 
-    def _apply_aperture(self, inputs: "torch.Tensor") -> "torch.Tensor":
-        height, width = inputs.shape
-        device = inputs.device
-        y, x = torch.meshgrid(
-            torch.arange(height, dtype=torch.float32, device=device),
-            torch.arange(width, dtype=torch.float32, device=device),
-            indexing="ij",
-        )
-        y_center, x_center = height // 2, width // 2
-        y = y.clone() - y_center + self.yshiftapt
-        x = x.clone() - x_center + self.xshiftapt
-        r = torch.sqrt(x**2+y**2)
-
-        aperture_mask = (r <= self.radius_factor*np.sqrt(y_center**2+x_center**2)).float()
-        output = inputs * aperture_mask
-        return output
-
     def _apply_elastic(self, inputs: ArrayLike) -> ArrayLike:
         """Apply elastic transformations (scaling, translation)"""
         if self.use_torch:
@@ -632,8 +590,8 @@ class DPAugmentor(RNGMixin):
         qx = af.view(af.sort(af.fftfreq(height, 0.1, like=inputs), axis=0), (-1, 1))
         qy = af.view(af.sort(af.fftfreq(width, 0.1, like=inputs), axis=0), (1, -1))
 
-        qxc = self.yshift / (height*0.1)
-        qyc = self.xshift / (width*0.1)
+        qxc = self.yshift / (height*0.1) if self.add_shift else 0
+        qyc = self.xshift / (width*0.1) if self.add_shift else 0
         
         CBEDbg = 1.0 / ((qx+qxc)**2 + (qy+qyc)**2 + self.bkg_q**2)  # Plasmon form factor: 1/(q² + q₀²)
         CBEDbg = CBEDbg.squeeze() / af.sum(CBEDbg.squeeze())
@@ -650,10 +608,6 @@ class DPAugmentor(RNGMixin):
         """Apply background to specified channels of multichannel label"""
         if len(label.shape) != 3:
             warnings.warn(f"Expected shape (C,H,W), got {label.shape}. Returning unchanged.", stacklevel=2)
-            return label
-        
-        if len(self.background_label_application) == 0:
-            warnings.warn("background_label_application is empty. Returning unchanged.", stacklevel=2)
             return label
         
         # Process each channel
