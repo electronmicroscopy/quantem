@@ -806,7 +806,6 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         frozen_keys = plan.resolve_component_keys(frozen_components)
         for key in frozen_keys:
             is_trainable_pos[key][:] = False
-        # Keys that are frozen for ALL samples skip hard constraints too.
         hard_skip_keys: set[str] = set(frozen_keys)
         if sample_trainability is not None:
             for key, arr in sample_trainability.items():
@@ -1183,7 +1182,6 @@ class _BatchedPlan:
         self.scheduler_specs: dict[str, dict[str, Any]] = {}
         self.component_keys: dict[str, list[str]] = {}
         
-        # NEW: Track which params are trainable
         self._trainable_flags: dict[str, bool] = {}
 
     @classmethod
@@ -1515,7 +1513,6 @@ class _BatchedPlan:
                 if bool(self.disk.hard_constraints.get("force_norm", False)):
                     self._batched_enforce_norm(template)
 
-        # SyntheticDiskLattice.force_positive_intensity
         if (
             self.lat is not None
             and "lat.i0_raw" not in skip_keys
