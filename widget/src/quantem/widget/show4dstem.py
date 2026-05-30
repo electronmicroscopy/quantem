@@ -333,15 +333,18 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         _io_labels = None
 
-        # Auto-extract sampling + units from Dataset4dstem if available.
-        if hasattr(data, "sampling") and hasattr(data, "array"):
-            if not title and hasattr(data, "name") and data.name:
+        # Extract underlying array / tensor + auto-calibrate from Dataset input
+        # (duck-typed via the dual-slot private attributes _tensor / _array).
+        tensor = getattr(data, "_tensor", None)
+        array = getattr(data, "_array", None)
+        if tensor is not None or array is not None:
+            if not title and getattr(data, "name", ""):
                 title = str(data.name)
             if sampling is None:
                 sampling = tuple(float(s) for s in data.sampling)
-            if units is None and hasattr(data, "units"):
+            if units is None:
                 units = list(data.units)
-            data = data.array
+            data = tensor if tensor is not None else array
 
         # Resolve sampling + units (4 axes for 4D-STEM):
         # [scan_row, scan_col, k_row, k_col]. Scalar/None broadcast to (1, 1, 1, 1).
