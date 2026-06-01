@@ -166,35 +166,53 @@ def plot_strain_panels(
             bold=scalebar_config.bold,
         )
 
+    cb_size = 0.02
+    cb_pad = 0.02
+
+    def _finalize_layout():
+        # set_aspect("equal") only resizes/recenters each panel at draw time, so
+        # get_position() before a draw returns stale boxes -- placing the colorbars
+        # and g-vector compass off those boxes then spills them off the figure.
+        # Settle the layout cheaply first so every box read below is the real one.
+        try:
+            fig.draw_without_rendering()
+        except AttributeError:  # matplotlib < 3.5
+            fig.canvas.draw()
+
     if is_horizontal:
-        fig.subplots_adjust(left=0.04, right=0.98, top=0.90, bottom=0.16, wspace=0.05)
+        # Reserve a bottom band wide enough for the colorbar + its tick labels and
+        # title (fontsize 16) and a right band for the rotation-panel gap; widen the
+        # right band when the g-vector compass is drawn in it. These keep the figure
+        # usable when saved "as is" (no bbox_inches='tight').
+        right = 0.78 if plot_gvecs else 0.93
+        fig.subplots_adjust(left=0.04, right=right, top=0.88, bottom=0.24, wspace=0.05)
         if plot_rotation:
+            # nudge the rotation panel right for a visual gap from the strain panels;
+            # 0.03 stays inside the reserved right band so nothing is clipped.
             pos3 = ax[3].get_position()
             ax[3].set_position([pos3.x0 + 0.03, pos3.y0, pos3.width, pos3.height])
+        _finalize_layout()
 
         cb_orientation = "horizontal"
-        cb_size = 0.02
-        cb_pad = 0.02
-
         b0 = ax[0].get_position()
         b2 = ax[2].get_position()
-        strain_cb_pos = [b0.x0, b0.y0 - cb_pad - cb_size, b2.x1 - b0.x0, cb_size]
+        cb_y = b2.y0 - cb_pad - cb_size
+        strain_cb_pos = [b0.x0, cb_y, b2.x1 - b0.x0, cb_size]
 
         if plot_rotation:
             b3 = ax[3].get_position()
-            rot_cb_pos = [b3.x0, b0.y0 - cb_pad - cb_size, b3.x1 - b3.x0, cb_size]
+            rot_cb_pos = [b3.x0, cb_y, b3.x1 - b3.x0, cb_size]
             last_pos = b3
         else:
             rot_cb_pos = None
             last_pos = b2
 
     else:
-        fig.subplots_adjust(left=0.04, right=0.80, top=0.98, bottom=0.04, hspace=0.15)
+        # Top band for the panel titles, right band for the vertical colorbars + labels.
+        fig.subplots_adjust(left=0.04, right=0.80, top=0.92, bottom=0.06, hspace=0.15)
+        _finalize_layout()
 
         cb_orientation = "vertical"
-        cb_size = 0.02
-        cb_pad = 0.02
-
         b0 = ax[0].get_position()
         b2 = ax[2].get_position()
         strain_cb_pos = [b0.x1 + cb_pad, b2.y0, cb_size, b0.y1 - b2.y0]
@@ -229,16 +247,16 @@ def plot_strain_panels(
             print("Warning: u_ref and v_ref not found. Call fit_strain() first.")
             return fig, ax
 
+        # The compass goes in the reserved margin beside the last panel; clamp its
+        # right edge to 0.99 so it never spills off the figure when saved "as is".
         if is_horizontal:
-            ref_width = last_pos.width * 0.8
-            ref_left = last_pos.x1 - 0.035
+            ref_left = last_pos.x1 + 0.005
+            ref_width = min(last_pos.width, 0.99 - ref_left)
             ref_ax = fig.add_axes([ref_left, last_pos.y0, ref_width, last_pos.height])
         else:
-            ref_height = last_pos.height * 0.5
-            ref_bottom = last_pos.y0 - ref_height - 0.05
-            ref_width = last_pos.width * 0.8
-            ref_left = last_pos.x0 + (last_pos.width - ref_width) / 2
-            ref_ax = fig.add_axes([ref_left, ref_bottom, ref_width, ref_height])
+            ref_left = min(last_pos.x1 + 0.18, 0.74)
+            ref_width = min(last_pos.width, 0.99 - ref_left)
+            ref_ax = fig.add_axes([ref_left, last_pos.y0, ref_width, last_pos.height])
 
         ref_ax.set_xlim(-1.5, 1.5)
         ref_ax.set_ylim(-1.5, 1.5)

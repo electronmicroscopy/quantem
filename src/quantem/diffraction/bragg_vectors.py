@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal, Sequence, Union
 
 import numpy as np
 import torch
@@ -86,7 +87,7 @@ class BraggVectors(AutoSerialize):
     ):
         if _token is not self._token:
             raise RuntimeError("Use BraggVectors.from_dataset() to instantiate this class.")
-        super().__init__()
+        super(BraggVectors, self).__init__()
         self.dataset = dataset
         self.device = device
 
@@ -140,6 +141,68 @@ class BraggVectors(AutoSerialize):
         if name is not None:
             dataset.name = name
         return cls(dataset=dataset, device=device, _token=cls._token)
+
+    def save(
+        self,
+        path: str | Path,
+        mode: Literal["w", "o"] = "w",
+        store: Literal["auto", "zip", "dir"] = "auto",
+        skip: Union[str, type, Sequence[Union[str, type]]] = (),
+        compression_level: int | None = 4,
+        *,
+        include_dataset: bool = False,
+    ) -> None:
+        """Save the workflow to disk, excluding the raw 4D-STEM dataset by default.
+
+        Overrides :meth:`~quantem.core.io.serialize.AutoSerialize.save` to drop
+        :attr:`dataset` — the raw 4D-STEM cube, which dominates the file size — from
+        serialization by default. The detected :attr:`peaks`, lattice fit
+        (:attr:`u_array`/:attr:`v_array`), Bragg vector map and all diagnostics are
+        kept, so the file holds the *results* of the workflow (orders of magnitude
+        smaller than the data) rather than the data itself.
+
+        ``"dataset"`` is recorded in the file's skip metadata, so a reloaded workflow
+        simply has no ``dataset`` attribute. Re-attach one (``bv.dataset = ds``) before
+        calling methods that read the raw cube — :meth:`detect_disks`,
+        :meth:`correlation_map`, :meth:`make_template_from_data`,
+        :meth:`calculate_strain_map`, etc. Pass ``include_dataset=True`` to keep the
+        dataset in the file instead.
+
+        Parameters
+        ----------
+        path : str or Path
+            Target file path. Use a ``.zip`` extension for zip format, otherwise a
+            directory is written.
+        mode : {'w', 'o'}, default='w'
+            ``'w'`` writes only if the path does not exist; ``'o'`` overwrites.
+        store : {'auto', 'zip', 'dir'}, default='auto'
+            Storage format; ``'auto'`` infers from the file extension.
+        skip : str, type, or sequence of (str or type), default=()
+            Additional attribute names/types to skip during serialization, merged with
+            the default ``dataset`` exclusion.
+        compression_level : int or None, default=4
+            Zstandard/Blosc compression level (0–9); ``0`` disables compression.
+        include_dataset : bool, default=False
+            If ``True``, keep the raw 4D-STEM :attr:`dataset` in the file (large). The
+            default ``False`` excludes it.
+        """
+        if isinstance(skip, (str, type)):
+            skip = [skip]
+        else:
+            skip = list(skip)
+        if not include_dataset and "dataset" not in skip:
+            skip.append("dataset")
+        # Explicit (two-arg) super() rather than the bare super(): the zero-arg form
+        # needs a compiler-created __class__ closure cell that is absent when this
+        # method's source is re-exec'd from a string (Jupyter autoreload), which
+        # raises "super(): __class__ cell not found". The explicit form is immune.
+        super(BraggVectors, self).save(
+            path,
+            mode=mode,
+            store=store,
+            skip=skip,
+            compression_level=compression_level,
+        )
 
     # ---- main methods ----
 

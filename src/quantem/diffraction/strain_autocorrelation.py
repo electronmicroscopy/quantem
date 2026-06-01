@@ -21,7 +21,57 @@ from quantem.diffraction.strain import StrainMap
 
 
 class StrainMapAutocorrelation(AutoSerialize):
+    """Cepstral / autocorrelation lattice fitting and strain mapping for 4D-STEM.
+
+    An alternative to correlation-based :class:`~quantem.diffraction.bragg_vectors.BraggVectors`
+    that needs no disk template: every diffraction pattern is transformed into the
+    autocorrelation (real-space) domain, where the crystal periodicity shows up as a
+    lattice of sharp peaks, and those peaks are fit per scan position to recover the
+    local lattice vectors. Because the transform lives in real space, the peaks track
+    real-space lattice spacings (they *expand* under tension, opposite to Bragg disks),
+    so ``real_space=True`` -- :func:`~quantem.diffraction.strain._strain_tensor` then
+    reduces both this and the reciprocal-space Bragg path to the same deformation
+    gradient, and the two strain maps can be compared directly.
+
+    Workflow (each step writes state consumed by the next):
+
+    1. :meth:`diffraction_mask` -- build a soft mask over the detector that suppresses
+       the bright central beam / vacuum so the transform is dominated by the lattice.
+    2. :meth:`preprocess` -- transform every pattern and average the magnitudes into a
+       mean transform image. Three ``mode`` choices set the intensity scaling applied
+       before the FFT: ``"linear"`` (Patterson / autocorrelation), ``"log"``
+       (cepstrum), or ``"gamma"`` (power law). The detector->scan rotation
+       (``q_to_r_rotation_ccw_deg`` + ``q_transpose``) is read from the parent dataset
+       metadata, the single source of truth shared with the DPC/CoM and Bragg
+       workflows.
+    3. :meth:`choose_lattice_vector` -- refine a hand-picked initial ``(u, v)`` basis
+       against the mean transform, optionally auto-detecting and re-fitting all peaks.
+    4. :meth:`fit_lattice_vectors` -- the heavy step: transform and fit the lattice
+       vectors at every scan position into ``u_array``/``v_array`` of shape
+       ``(scan_row, scan_col, 2)``.
+    5. :meth:`create_mask` -- compute the per-position weight :attr:`mask_weight`
+       (lattice signal strength) used to weight the reference lattice.
+    6. :meth:`calculate_strain_map` -- hand the lattice vectors (and
+       :attr:`mask_weight`) to a :class:`~quantem.diffraction.strain.StrainMap`.
+
+    Use :meth:`from_dataset` or :meth:`from_array` to construct an instance.
+
+    Parameters
+    ----------
+    dataset : Dataset4dstem
+        The 4D-STEM dataset to analyze.
+    input_data : Any, optional
+        The original object passed to the constructor (a dataset or array), retained
+        for provenance.
+    """
+
     _token = object()
+
+    # Cepstral / Patterson lattice vectors are measured in the autocorrelation
+    # (real-space) domain -- the peaks track real-space lattice spacings and expand
+    # under tension -- so real_space=True. _strain_tensor reduces both this and the
+    # reciprocal-space Bragg path to F.T, so the two strain maps agree.
+    real_space: bool = True
 
     def __init__(
         self,
@@ -29,11 +79,30 @@ class StrainMapAutocorrelation(AutoSerialize):
         input_data: Any | None = None,
         _token: object | None = None,
     ):
+        """Private constructor; use :meth:`from_dataset` or :meth:`from_array`.
+
+        Direct instantiation is blocked by the ``_token`` guard. The factory
+        classmethods are the supported entry points and document their arguments.
+
+        Parameters
+        ----------
+        dataset : Dataset4dstem
+            The 4D-STEM dataset to analyze.
+        input_data : Any, optional
+            The original object passed to a factory (kept for provenance).
+        _token : object, optional
+            Internal sentinel; must match the class token or a ``RuntimeError`` is
+            raised.
+        """
         if _token is not self._token:
             raise RuntimeError(
                 "Use StrainMapAutocorrelation.from_dataset() or StrainMapAutocorrelation.from_array() to instantiate this class."
             )
-        super().__init__()
+        # Explicit (two-arg) super() rather than the bare super(): the zero-arg form
+        # needs a compiler-created __class__ closure cell that is absent when this
+        # method's source is re-exec'd from a string (Jupyter autoreload), which would
+        # raise "super(): __class__ cell not found".
+        super(StrainMapAutocorrelation, self).__init__()
         self.dataset = dataset
         self.input_data = input_data
         self.strain = None
@@ -47,16 +116,34 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.mask_diffraction = np.ones(self.dataset.array.shape[2:])
         self.mask_diffraction_inv = np.zeros(self.dataset.array.shape[2:])
 
+        # initial basis from choose_lattice_vector(); per-position fits from
+        # fit_lattice_vectors(); per-position weight from create_mask().
+        self.u: np.ndarray | None = None
+        self.v: np.ndarray | None = None
+        self.u_peak_fit: Dataset3d | None = None
+        self.v_peak_fit: Dataset3d | None = None
         self.u_ref: np.ndarray | None = None
         self.v_ref: np.ndarray | None = None
         self.u_array: np.ndarray | None = None
         self.v_array: np.ndarray | None = None
-        self.mask: np.ndarray | None = None
-
-        self.real_space = True
+        self.mask_weight: np.ndarray | None = None
 
     @classmethod
     def from_dataset(cls, dataset: Dataset4dstem, *, name: str | None = None) -> "StrainMapAutocorrelation":
+        """Create a cepstral strain workflow bound to a 4D-STEM dataset.
+
+        Parameters
+        ----------
+        dataset : Dataset4dstem
+            The 4D-STEM dataset to analyze.
+        name : str, optional
+            If given, sets ``dataset.name``.
+
+        Returns
+        -------
+        StrainMapAutocorrelation
+            A new workflow instance bound to ``dataset``.
+        """
         if not isinstance(dataset, Dataset4dstem):
             raise TypeError("StrainMapAutocorrelation.from_dataset expects a Dataset4dstem instance.")
         if name is not None:
@@ -65,6 +152,20 @@ class StrainMapAutocorrelation(AutoSerialize):
 
     @classmethod
     def from_array(cls, array: NDArray, *, name: str = "strain_map_autocorrelation") -> "StrainMapAutocorrelation":
+        """Create a cepstral strain workflow from a raw 4D array.
+
+        Parameters
+        ----------
+        array : np.ndarray
+            4D-STEM data with shape ``(scan_row, scan_col, dp_row, dp_col)``.
+        name : str, default="strain_map_autocorrelation"
+            Name for the wrapped :class:`Dataset4dstem`.
+
+        Returns
+        -------
+        StrainMapAutocorrelation
+            A new workflow instance wrapping the data in a :class:`Dataset4dstem`.
+        """
         arr = ensure_valid_array(array)
         if arr.ndim != 4:
             raise ValueError(
@@ -80,6 +181,37 @@ class StrainMapAutocorrelation(AutoSerialize):
         plot_mask=True,
         figsize=(8, 4),
     ):
+        """Build a soft detector mask suppressing the central beam and vacuum.
+
+        Pixels of the mean diffraction pattern below ``threshold`` (plus the detector
+        border) are treated as "outside" the useful signal. The kept region is feathered
+        with a raised-cosine taper of width ``edge_blend`` (via a Euclidean distance
+        transform) into :attr:`mask_diffraction` (multiplicative, in ``[0, 1]``), and a
+        complementary fill :attr:`mask_diffraction_inv` replaces the masked region with a
+        flat edge intensity. Both are applied to every pattern in :meth:`preprocess` and
+        :meth:`fit_lattice_vectors` so the transform is dominated by the crystalline
+        signal rather than the bright unscattered beam.
+
+        Parameters
+        ----------
+        threshold : float, optional
+            Mean-intensity level below which detector pixels are masked out. Required;
+            choose it from the mean diffraction pattern (e.g. just above the vacuum
+            level).
+        edge_blend : float, default=64.0
+            Feather width in pixels of the raised-cosine taper between kept and masked
+            regions; larger values give a softer transition.
+        plot_mask : bool, default=True
+            If ``True``, show the raw mean pattern beside the masked/filled pattern (log
+            scaled) so the mask can be checked.
+        figsize : tuple of float, default=(8, 4)
+            Figure size in inches for the diagnostic plot.
+
+        Returns
+        -------
+        StrainMapAutocorrelation
+            ``self``, with :attr:`mask_diffraction` and :attr:`mask_diffraction_inv` set.
+        """
         dp_mean = np.mean(self.dataset.array, axis=(0, 1))
         mask_init = dp_mean < threshold
         mask_init[:, 0] = True
@@ -125,6 +257,54 @@ class StrainMapAutocorrelation(AutoSerialize):
         gamma: float = 0.5,
         **plot_kwargs: Any,
     ) -> "StrainMapAutocorrelation":
+        """Transform every pattern into the autocorrelation domain and average it.
+
+        For each diffraction pattern the masked/filled pattern (from
+        :meth:`diffraction_mask`) is intensity-scaled per ``mode``, Fourier transformed,
+        and its magnitude accumulated; the mean over all scan positions is stored
+        (fft-shifted, origin centered) as :attr:`transform`. A display copy rotated by
+        the detector->scan rotation is stored as :attr:`transform_rotated`. The crystal
+        periodicity appears as a lattice of peaks about the center, which later steps fit.
+
+        The detector->scan rotation (``q_to_r_rotation_ccw_deg``) and transpose
+        (``q_transpose``) default to the parent dataset metadata -- the same source used
+        by the DPC/CoM and :class:`BraggVectors` workflows -- so the strain frame is
+        consistent across methods; pass them explicitly to override.
+
+        Parameters
+        ----------
+        mode : {"linear", "log", "gamma"}, default="linear"
+            Intensity scaling applied before the FFT. ``"linear"`` is the Patterson /
+            autocorrelation (aliases ``"patterson"``, ``"acf"``, ``"autocorrelation"``);
+            ``"log"`` is the cepstrum, ``log1p(I)`` (aliases ``"cepstrum"``,
+            ``"cepstral"``); ``"gamma"`` raises intensity to the power ``gamma``
+            (aliases ``"power"``, ``"sqrt"``).
+        q_to_r_rotation_ccw_deg : float, optional
+            Counter-clockwise detector->scan rotation in degrees for the rotated display
+            transform. Defaults to ``dataset.metadata["q_to_r_rotation_ccw_deg"]`` if
+            present, else ``0`` (with a warning).
+        q_transpose : bool, optional
+            Whether to transpose the detector axes before rotating the display transform.
+            Defaults to ``dataset.metadata["q_transpose"]`` if present, else ``False``.
+        skip : int, optional
+            If given, subsample the scan by this stride (``array[::skip, ::skip]``) when
+            building the mean transform -- a fast preview over fewer patterns.
+        plot_transform : bool, default=True
+            If ``True``, show the original and rotated mean transforms via
+            :meth:`plot_transform`.
+        cropping_factor : float, default=0.25
+            Fraction of the transform width/height shown when ``plot_transform`` is
+            ``True`` (the lattice peaks sit near the center).
+        gamma : float, default=0.5
+            Exponent for ``mode="gamma"`` (ignored otherwise).
+        **plot_kwargs
+            Forwarded to :meth:`plot_transform`.
+
+        Returns
+        -------
+        StrainMapAutocorrelation
+            ``self``, with :attr:`transform` and :attr:`transform_rotated` set.
+        """
         mode_in = mode.strip().lower()
         if mode_in in {"linear", "patterson", "paterson", "acf", "autocorrelation"}:
             mode_norm = "linear"
@@ -202,7 +382,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             q_to_r_rotation_ccw_deg = 0.0 if q_to_r_rotation_ccw_deg is None else q_to_r_rotation_ccw_deg
             q_transpose = False if q_transpose is None else q_transpose
             warnings.warn(
-                "StrainMapPatterson.preprocess: setting q_to_r_rotation_ccw_deg=0.0 and q_transpose=False.",
+                "StrainMapAutocorrelation.preprocess: setting q_to_r_rotation_ccw_deg=0.0 and q_transpose=False.",
                 UserWarning,
             )
 
@@ -259,6 +439,29 @@ class StrainMapAutocorrelation(AutoSerialize):
         scalebar_fraction: float = 0.25,
         **plot_kwargs: Any,
     ):
+        """Show the original and rotated mean transform images side by side.
+
+        The color range is set from the brightest lattice peak (the global max of the
+        radially weighted transform) so the central DC peak does not wash out the panel,
+        and both panels are cropped to the central ``cropping_factor`` window where the
+        lattice peaks lie. A scale bar is drawn in real-space units.
+
+        Parameters
+        ----------
+        cropping_factor : float, default=0.25
+            Fraction of the full transform width/height shown about the center.
+        scalebar_fraction : float, default=0.25
+            Target scale-bar length as a fraction of the cropped view width (snapped to
+            a "nice" round value).
+        **plot_kwargs
+            Forwarded to :func:`~quantem.core.visualization.show_2d` (overriding the
+            defaults computed here).
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)`` from :func:`~quantem.core.visualization.show_2d`.
+        """
         if self.transform is None or self.transform_rotated is None:
             raise ValueError("Run preprocess() first to compute transform images.")
 
@@ -306,6 +509,31 @@ class StrainMapAutocorrelation(AutoSerialize):
         scalebar_fraction: float = 0.25,
         **plot_kwargs: Any,
     ):
+        """Show the transform of a single scan position with its fitted lattice vectors.
+
+        Recomputes the transform for the pattern at ``(row, col)`` using the current
+        ``mode``, and overlays the per-position fitted ``u``/``v`` vectors (from
+        :meth:`fit_lattice_vectors`) plus any detected peaks. Useful for inspecting the
+        fit quality at a specific position.
+
+        Parameters
+        ----------
+        row : int, default=0
+            Scan row index of the pattern to transform.
+        col : int, default=0
+            Scan column index of the pattern to transform.
+        cropping_factor : float, default=0.25
+            Fraction of the full transform width/height shown about the center.
+        scalebar_fraction : float, default=0.25
+            Target scale-bar length as a fraction of the cropped view width.
+        **plot_kwargs
+            Forwarded to :func:`~quantem.core.visualization.show_2d`.
+
+        Returns
+        -------
+        None
+            Draws the figure; nothing is returned.
+        """
         if self.transform is None or self.transform_rotated is None:
             raise ValueError("Run preprocess() first to compute transform images.")
         if self.u_peak_fit is None or self.v_peak_fit is None:
@@ -393,6 +621,57 @@ class StrainMapAutocorrelation(AutoSerialize):
         cropping_factor: float = 0.25,
         **plot_kwargs: Any,
     ) -> "StrainMapAutocorrelation":
+        """Refine a hand-picked initial lattice basis against the mean transform.
+
+        Takes an approximate basis ``(u, v)`` -- read off the transform plot by eye --
+        and refines each vector to the nearest transform peak, storing the result in
+        :attr:`u` and :attr:`v`. These seed the per-position fit in
+        :meth:`fit_lattice_vectors`. Vectors are ``(row, col)`` offsets from the
+        transform center, in transform pixels.
+
+        Parameters
+        ----------
+        u : tuple of float or np.ndarray
+            Initial first lattice vector ``(d_row, d_col)`` relative to the center.
+        v : tuple of float or np.ndarray
+            Initial second lattice vector ``(d_row, d_col)`` relative to the center.
+        define_in_rotated : bool, default=False
+            If ``True``, ``u``/``v`` are given in the rotated (display) frame and are
+            converted back to the raw detector frame before fitting.
+        refine_gaussian : bool, default=True
+            If ``True``, refine each peak by a 2D isotropic Gaussian fit; otherwise use
+            the parabolic sub-pixel estimate only.
+        refine_dft : bool, default=False
+            If ``True``, additionally refine by DFT upsampling (uses ``upsample``).
+        refine_all_peaks : bool, default=False
+            If ``True``, auto-detect all peaks above ``threshold_percentile`` and fit
+            the basis to the full set by weighted least squares (storing the detected
+            peaks/weights for reuse), rather than refining only ``u`` and ``v``.
+        refine_radius_px : float, default=2.0
+            Half-width in pixels of the window used for sub-pixel/Gaussian refinement.
+        upsample : int, default=16
+            DFT upsampling factor used when ``refine_dft=True``.
+        gaussian_maxfev : int, default=100
+            Maximum function evaluations for the Gaussian fit.
+        threshold_percentile : float, default=0.9975
+            Intensity percentile (0--1) above which local maxima are kept as peaks when
+            ``refine_all_peaks=True``.
+        min_peak_spacing : float, default=0
+            Minimum spacing in pixels between accepted peaks when
+            ``refine_all_peaks=True`` (0 disables the spacing filter).
+        plot : bool, default=True
+            If ``True``, show the transform with the refined ``u``/``v`` overlaid.
+        cropping_factor : float, default=0.25
+            Fraction of the transform shown about the center when ``plot=True``.
+        **plot_kwargs
+            Forwarded to :meth:`plot_transform`.
+
+        Returns
+        -------
+        StrainMapAutocorrelation
+            ``self``, with :attr:`u` and :attr:`v` set (and the detected peaks/weights
+            when ``refine_all_peaks=True``).
+        """
         if self.transform is None or self.transform_rotated is None:
             raise ValueError("Run preprocess() first to compute transform images.")
 
@@ -462,6 +741,42 @@ class StrainMapAutocorrelation(AutoSerialize):
         gaussian_maxfev: int = 100,
         progressbar: bool = True,
     ) -> "StrainMapAutocorrelation":
+        """Fit the lattice vectors at every scan position (the heavy step).
+
+        For each scan position the masked/filled pattern is transformed (same ``mode``
+        as :meth:`preprocess`) and the lattice basis is refined from the
+        :meth:`choose_lattice_vector` seed ``(self.u, self.v)``. The fitted vectors are
+        written to :attr:`u_array`/:attr:`v_array` (shape ``(scan_row, scan_col, 2)``,
+        row/col components) for :meth:`calculate_strain_map`; the full fit records
+        (position, amplitude, width, background) are kept in :attr:`u_peak_fit`/
+        :attr:`v_peak_fit` (shape ``(scan_row, scan_col, 5)``).
+
+        Parameters
+        ----------
+        refine_gaussian : bool, default=True
+            If ``True``, refine each peak with a 2D isotropic Gaussian fit; otherwise
+            use the parabolic sub-pixel estimate only.
+        refine_dft : bool, default=False
+            If ``True``, additionally refine by DFT upsampling (uses ``upsample``).
+        refine_all_peaks : bool, default=False
+            If ``True``, fit the basis to all peaks detected in
+            :meth:`choose_lattice_vector` (which must have been called with
+            ``refine_all_peaks=True``) rather than just ``u`` and ``v``.
+        refine_radius_px : float, default=2.0
+            Half-width in pixels of the window used for sub-pixel/Gaussian refinement.
+        upsample : int, default=16
+            DFT upsampling factor used when ``refine_dft=True``.
+        gaussian_maxfev : int, default=100
+            Maximum function evaluations for each Gaussian fit.
+        progressbar : bool, default=True
+            If ``True``, show a tqdm progress bar over the scan positions.
+
+        Returns
+        -------
+        StrainMapAutocorrelation
+            ``self``, with :attr:`u_array`, :attr:`v_array`, :attr:`u_peak_fit`, and
+            :attr:`v_peak_fit` set.
+        """
         if self.u is None or self.v is None:
             raise ValueError("Run choose_lattice_vector() first to set initial lattice vectors (self.u, self.v).")
         if refine_all_peaks:
@@ -552,25 +867,62 @@ class StrainMapAutocorrelation(AutoSerialize):
         max_threshold: float = 0.6,
         exclusion_radius_fraction: float = 0.1,
         smooth: bool = True,
-    ):        
+    ):
+        """Compute the per-position weight :attr:`mask_weight` from lattice signal.
+
+        Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring how much
+        crystalline signal each position carries, the analogue of
+        :attr:`BraggVectors.mask_weight`. It is the default reference weighting handed to
+        :meth:`calculate_strain_map`, so strong, well-fit positions dominate the
+        reference lattice and weak/vacuum positions are down-weighted. Two estimators are
+        available, both rescaled by the ``(min_threshold, max_threshold)`` window (values
+        below ``min`` -> 0, above ``max`` -> 1) and optionally smoothed.
+
+        Parameters
+        ----------
+        use_radial_method : bool, default=False
+            If ``True``, weight by the total diffracted intensity *outside* a central
+            disk (radius ``exclusion_radius_fraction`` of the detector width), excluding
+            the bright unscattered beam. If ``False`` (default), weight by the mean
+            fitted peak amplitude from :meth:`fit_lattice_vectors` (requires it to have
+            been run).
+        min_threshold : float, default=0.4
+            Lower edge of the rescaling window (as a fraction of the max signal); weights
+            at or below this map to 0.
+        max_threshold : float, default=0.6
+            Upper edge of the rescaling window; weights at or above this map to 1.
+        exclusion_radius_fraction : float, default=0.1
+            Central-disk radius (fraction of detector width) excluded by the radial
+            method.
+        smooth : bool, default=True
+            If ``True``, apply a ``sin^2`` easing to the rescaled weight for a smoother
+            ramp.
+
+        Returns
+        -------
+        StrainMapAutocorrelation
+            ``self``, with :attr:`mask_weight` set.
+        """
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
-        
+
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
-        self.mask = np.ones(self.dataset.shape[:2])
-        
+        self.mask_weight = np.ones(self.dataset.shape[:2])
+
         i0_sum_array = np.empty(shape=(scan_r, scan_c))
 
         if use_radial_method:
-            center_y, center_x = np.array(self.dataset.shape[:-2]) / 2
+            # center / radius are in DETECTOR coordinates (the last two axes)
+            center_y = self.dataset.shape[-2] / 2.0
+            center_x = self.dataset.shape[-1] / 2.0
             y, x = np.ogrid[:self.dataset.shape[-2], :self.dataset.shape[-1]]
             radius_map = np.sqrt((x - center_x)**2 + (y - center_y)**2)
             exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
+            outside_mask = radius_map > exclusion_radius
             for r in range(scan_r):
                 for c in range(scan_c):
-                    dp = self.dataset.array[r, c]             
-                    outside_mask = radius_map > exclusion_radius
+                    dp = self.dataset.array[r, c]
                     i0_sum_array[r, c] = np.sum(dp[outside_mask])
         else:
             if self.u_peak_fit is None or self.v_peak_fit is None:
@@ -578,50 +930,75 @@ class StrainMapAutocorrelation(AutoSerialize):
             u_amplitudes = self.u_peak_fit.array[:, :, 2]
             v_amplitudes = self.v_peak_fit.array[:, :, 2]
             i0_sum_array = (u_amplitudes + v_amplitudes) / 2.0
-        
+
         max_intensity = np.max(i0_sum_array)
         if max_intensity == 0:
-            return np.ones_like(i0_sum_array)
-        self.mask = i0_sum_array / max_intensity
-        self.mask = np.clip((self.mask - min_threshold) / (max_threshold - min_threshold), 0, 1)
+            self.mask_weight = np.ones_like(i0_sum_array)
+            return self
+        self.mask_weight = i0_sum_array / max_intensity
+        self.mask_weight = np.clip(
+            (self.mask_weight - min_threshold) / (max_threshold - min_threshold), 0, 1
+        )
         if smooth:
-            self.mask = np.sin(np.pi / 2 * self.mask) ** 2
+            self.mask_weight = np.sin(np.pi / 2 * self.mask_weight) ** 2
         return self
 
 
-    def initialize_strain_class(
+    def calculate_strain_map(
         self,
         u_ref: np.ndarray | None = None,
         v_ref: np.ndarray | None = None,
-    )->StrainMap:
+        mask: np.ndarray | None = None,
+    ) -> StrainMap:
+        """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
+
+        Mirrors :meth:`BraggVectors.calculate_strain_map` so the downstream strain cells
+        (``plot_strain``, ``update_reference``, ``estimate_strain_precision``) are
+        identical for the correlation and cepstral workflows. Because the cepstral
+        vectors are real-space, ``real_space=True`` is passed and
+        :func:`~quantem.diffraction.strain._strain_tensor` yields strain matching the
+        correlation result on the same data.
+
+        Parameters
+        ----------
+        u_ref : np.ndarray, optional
+            ``(2,)`` reference for the first lattice vector. Defaults to the median over
+            the scan inside :class:`StrainMap`.
+        v_ref : np.ndarray, optional
+            ``(2,)`` reference for the second lattice vector. Defaults to the median over
+            the scan inside :class:`StrainMap`.
+        mask : np.ndarray, optional
+            ``(scan_row, scan_col)`` per-position weighting used when computing the
+            reference lattice. Defaults to :attr:`mask_weight` from :meth:`create_mask`
+            (the lattice signal strength), so strong, well-fit positions dominate the
+            reference.
+
+        Returns
+        -------
+        StrainMap
+            A strain map initialized from the fitted lattice vectors.
+        """
         if self.u_array is None or self.v_array is None:
-            raise RuntimeWarning("Need to run fit_lattice_vectors before initializing strain class")
+            raise ValueError("Run fit_lattice_vectors() before calculate_strain_map().")
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
 
-        default_units = None
-        default_sampling = None
-        if hasattr(self.dataset, 'units'):
-            if isinstance(self.dataset.units, (tuple, list)):
-                default_units = str(self.dataset.units[0])
-            else:
-                default_units = str(self.dataset.units)
-        if hasattr(self.dataset, 'sampling'):
-            if isinstance(self.dataset.sampling, (tuple, list, np.ndarray)):
-                default_sampling = float(self.dataset.sampling[0])
-            else:
-                default_sampling = float(self.dataset.sampling)
+        if mask is None:
+            mask = self.mask_weight
+
+        ds_sampling = float(self.dataset.sampling[0])
+        ds_units = str(self.dataset.units[0])
 
         return StrainMap(
-            u_array = self.u_array,
-            v_array = self.v_array,
-            ds_shape = self.dataset.shape,
-            real_space = self.real_space,
-            u_ref = u_ref,
-            v_ref = v_ref,
-            mask = self.mask,
-            ds_sampling=default_sampling,
-            ds_units = default_units,
+            u_array=self.u_array,
+            v_array=self.v_array,
+            ds_shape=tuple(self.dataset.shape),
+            real_space=self.real_space,
+            u_ref=u_ref,
+            v_ref=v_ref,
+            mask=mask,
+            ds_sampling=ds_sampling,
+            ds_units=ds_units,
         )
 
     def plot_lattice_vectors(
@@ -633,6 +1010,37 @@ class StrainMapAutocorrelation(AutoSerialize):
         figsize: tuple[float, float] | None = None,
         **imshow_kwargs: Any,
     ):
+        """Plot the four per-position lattice-vector component maps.
+
+        Shows ``u_row``, ``u_col``, ``v_row``, ``v_col`` from :attr:`u_array`/
+        :attr:`v_array` as four panels (optionally with the mean subtracted), on a
+        shared symmetric color range. Positions whose vectors deviate from the
+        :meth:`choose_lattice_vector` seed by more than ``max_shift`` are masked out, so
+        bad fits do not blow up the color scale. A quick diagnostic of fit smoothness
+        before computing strain.
+
+        Parameters
+        ----------
+        subtract_mean : bool, default=True
+            If ``True``, subtract the (in-range) mean of each component so deviations
+            from the average lattice are shown.
+        max_shift : float, default=1.0
+            Maximum allowed deviation (pixels) of a vector from the seed before its
+            position is masked out of the plot and the color-range statistics.
+        cmap : str, default="PiYG_r"
+            Diverging colormap; masked positions are drawn black.
+        axsize : tuple of float, optional
+            Per-panel size in inches; defaults to ``(4, 4)`` when ``figsize`` is unset.
+        figsize : tuple of float, optional
+            Overall figure size in inches; defaults to ``(4 * axsize[0], axsize[1])``.
+        **imshow_kwargs
+            Forwarded to :meth:`matplotlib.axes.Axes.imshow`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)`` with the four-panel figure.
+        """
         if self.u_array is None or self.v_array is None:
             raise ValueError("Run fit_lattice_vectors() first to compute u_array and v_array.")
         if self.u is None or self.v is None:
@@ -716,6 +1124,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
 
 def _nice_length_units(target: float) -> float:
+    """Round ``target`` to the nearest "nice" scale-bar length (1/2/5 x 10^n)."""
     if not np.isfinite(target) or target <= 0:
         return 0.0
     exp = np.floor(np.log10(target))
@@ -732,6 +1141,10 @@ def _nice_length_units(target: float) -> float:
 
 
 def _apply_center_crop_limits(ax: Any, shape: tuple[int, int], cropping_factor: float) -> None:
+    """Zoom ``ax`` to the central ``cropping_factor`` fraction of a ``shape`` image.
+
+    Preserves the existing y-axis direction (inverted for image coordinates).
+    """
     if cropping_factor >= 1.0:
         return
     if not (0.0 < cropping_factor <= 1.0):
@@ -753,6 +1166,7 @@ def _apply_center_crop_limits(ax: Any, shape: tuple[int, int], cropping_factor: 
 
 
 def _flatten_axes(ax: Any) -> list[Any]:
+    """Flatten a matplotlib axes container (array/list/tuple) to a flat list of axes."""
     if isinstance(ax, np.ndarray):
         return list(ax.ravel())
     if isinstance(ax, (list, tuple)):
@@ -764,6 +1178,11 @@ def _flatten_axes(ax: Any) -> list[Any]:
 
 
 def _raw_vec_to_display(vec_rc: NDArray, *, rotation_ccw_deg: float, transpose: bool) -> NDArray:
+    """Map a raw-detector ``(row, col)`` vector into the rotated display frame.
+
+    Applies the optional axis transpose, then a counter-clockwise rotation of
+    ``rotation_ccw_deg``. Inverse of :func:`_display_vec_to_raw`.
+    """
     v = np.asarray(vec_rc, dtype=float).reshape(2)
     dr, dc = v[0], v[1]
 
@@ -780,6 +1199,10 @@ def _raw_vec_to_display(vec_rc: NDArray, *, rotation_ccw_deg: float, transpose: 
 
 
 def _display_vec_to_raw(vec_rc: NDArray, *, rotation_ccw_deg: float, transpose: bool) -> NDArray:
+    """Map a rotated-display ``(row, col)`` vector back to the raw detector frame.
+
+    Inverse of :func:`_raw_vec_to_display`: undo the rotation, then the transpose.
+    """
     v = np.asarray(vec_rc, dtype=float).reshape(2)
     dr, dc = v[0], v[1]
 
@@ -797,6 +1220,7 @@ def _display_vec_to_raw(vec_rc: NDArray, *, rotation_ccw_deg: float, transpose: 
 
 
 def _plot_lattice_vectors(ax: Any, center_rc: tuple[float, float], u_rc: NDArray, v_rc: NDArray) -> None:
+    """Draw the ``u`` (red) and ``v`` (cyan) lattice vectors from ``center_rc`` on ``ax``."""
     r0, c0 = center_rc
 
     def _draw(vec: NDArray, label: str, color: tuple[float, float, float]) -> None:
@@ -809,6 +1233,7 @@ def _plot_lattice_vectors(ax: Any, center_rc: tuple[float, float], u_rc: NDArray
     _draw(np.asarray(v_rc, dtype=float).reshape(2), "v", (0.0, 0.7, 1.0))
 
 def _plot_peaks(ax: Any, center_rc: tuple[float, float], peaks_plot: NDArray) -> None:
+    """Mark each detected peak (green dot), offset from ``center_rc``, on ``ax``."""
     r0, c0 = center_rc
 
     def _draw(vec: NDArray, color: tuple[float, float, float]) -> None:
@@ -828,6 +1253,11 @@ def _overlay_lattice_vectors(
     q_transpose: bool,
     peaks_plot: NDArray | None = None,
 ) -> None:
+    """Overlay lattice vectors on the original (and, if present, rotated) transform axes.
+
+    Draws ``u``/``v`` (and any ``peaks_plot``) on the first axis in raw coordinates, and
+    on the second axis (if any) in the rotated display frame.
+    """
     axs = _flatten_axes(ax)
     if not axs:
         return
@@ -846,6 +1276,11 @@ def _overlay_lattice_vectors(
 
 
 def _parabolic_vertex_delta(v_m1: float, v_0: float, v_p1: float) -> float:
+    """Sub-pixel vertex offset (in ``[-1, 1]``) of a parabola through three samples.
+
+    Given values at offsets ``-1, 0, +1``, returns the offset of the parabola's extremum
+    from the center sample; ``0`` for a degenerate (flat/non-finite) fit.
+    """
     denom = v_m1 - 2.0 * v_0 + v_p1
     if denom == 0 or not np.isfinite(denom):
         return 0.0
@@ -862,6 +1297,11 @@ def _refine_peak_subpixel(
     c_guess: float,
     radius_px: float = 2.0,
 ) -> tuple[float, float]:
+    """Refine a peak near ``(r_guess, c_guess)`` to sub-pixel ``(row, col)``.
+
+    Finds the brightest pixel in a ``radius_px`` window, then applies independent
+    parabolic vertex offsets along each axis.
+    """
     im = np.asarray(im, dtype=float)
     H, W = im.shape
 
@@ -904,6 +1344,31 @@ def _refine_peak_subpixel_dft(
     c0: float,
     upsample: int,
 ) -> tuple[float, float]:
+    """Refine a peak location to subpixel precision via local DFT upsampling.
+
+    Uses a matrix-multiply DFT (the Guizar-Sicairos upsampled cross-correlation
+    trick) to evaluate the image's Fourier interpolant on a fine grid in a small
+    neighborhood around the initial estimate, then locates the maximum of that
+    upsampled patch with a 3-point parabolic vertex refinement. This avoids
+    interpolating the whole image and is accurate to roughly ``1 / upsample`` of a
+    pixel.
+
+    Parameters
+    ----------
+    im : NDArray
+        2D real image (a transform panel) whose peak is being refined.
+    r0, c0 : float
+        Initial peak estimate in pixel coordinates (row, column). If ``r0`` or
+        ``c0`` is a torch tensor it is converted to a Python float.
+    upsample : int
+        DFT upsampling factor. Values ``<= 1`` skip refinement and return the
+        input estimate unchanged; larger values give finer subpixel resolution.
+
+    Returns
+    -------
+    tuple[float, float]
+        The refined ``(row, column)`` peak location in pixel coordinates.
+    """
     if upsample <= 1:
         return r0, c0
 
@@ -955,6 +1420,62 @@ def _refine_lattice_vectors(
     threshold_percentile: float = 0.9975,
     min_peak_spacing: float = 0,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray]:
+    """Refine the two lattice vectors of a transform panel to subpixel precision.
+
+    Starting from integer-pixel guesses for the ``u`` and ``v`` lattice vectors
+    (expressed as row/column offsets from the panel center), this locates the
+    corresponding autocorrelation/cepstral peaks and refines them with up to
+    three successively finer stages: a 3-point parabolic vertex estimate, an
+    isotropic 2D Gaussian least-squares fit, and DFT upsampling. When
+    ``refine_all_peaks`` is set, all bright peaks are detected and the lattice
+    basis is recovered by an intensity-weighted least-squares fit to the full
+    peak lattice instead of refining only the two seed vectors.
+
+    Parameters
+    ----------
+    im : NDArray
+        2D real transform panel (Patterson/cepstral image) to fit.
+    u_rc, v_rc : NDArray
+        Length-2 initial lattice vectors as ``(row, column)`` offsets relative to
+        the panel center.
+    radius_px : float, optional
+        Half-width (in pixels) of the fitting window used for the Gaussian fit.
+        Default 2.0.
+    refine_gaussian : bool, optional
+        If True (default), refine each peak with an isotropic 2D Gaussian fit.
+    refine_dft : bool, optional
+        If True, follow the Gaussian fit with DFT-upsampled refinement
+        (requires ``upsample > 1``). Default False.
+    refine_all_peaks : bool, optional
+        If True, detect every bright peak and solve a weighted least-squares fit
+        for the lattice basis rather than refining only ``u_rc`` and ``v_rc``.
+        Default False.
+    peaks : NDArray or None, optional
+        Precomputed peak positions (row/col offsets from center) to use when
+        ``refine_all_peaks`` is set; if None they are detected automatically.
+    weights : NDArray or None, optional
+        Precomputed peak weights paired with ``peaks``; if None they are derived
+        from peak amplitudes.
+    upsample : int, optional
+        DFT upsampling factor for ``refine_dft``. Default 16.
+    maxfev : int, optional
+        Maximum function evaluations for the Gaussian ``curve_fit``. Default 100.
+    threshold_percentile : float, optional
+        Fractional intensity percentile (0-1) used as the peak-detection
+        threshold when auto-detecting peaks. Default 0.9975.
+    min_peak_spacing : float, optional
+        Minimum allowed spacing (in pixels) between detected peaks; ``0`` (default)
+        disables the spacing filter.
+
+    Returns
+    -------
+    tuple[NDArray, NDArray, NDArray, NDArray]
+        ``(u_result, v_result, pts, weights)``. ``u_result`` and ``v_result`` are
+        length-5 arrays ``(row_offset, col_offset, amplitude, sigma, background)``
+        giving the refined lattice vectors relative to the panel center. ``pts``
+        and ``weights`` are the detected peak positions and their normalized
+        weights when ``refine_all_peaks`` is True, otherwise both are ``None``.
+    """
     from scipy.optimize import curve_fit
 
     im = np.asarray(im, dtype=float)

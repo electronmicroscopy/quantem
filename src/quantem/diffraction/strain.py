@@ -21,8 +21,10 @@ class StrainMap(AutoSerialize):
     is the median of the fitted ``g_u``/``g_v`` over a mask/ROI; the strain tensor
     is recomputed by :meth:`update_reference`.
 
-    For nanobeam 4D-STEM the lattice vectors are measured in reciprocal space, so
-    the shear/rotation signs are flipped relative to real space (``real_space=False``).
+    Two measurement modalities are supported and give identical strain for the same
+    deformation, so correlation and cepstral maps can be compared directly:
+    reciprocal-space Bragg vectors (``real_space=False``, nanobeam correlation) and
+    real-space cepstral/autocorrelation vectors (``real_space=True``).
 
     Parameters
     ----------
@@ -33,8 +35,9 @@ class StrainMap(AutoSerialize):
     ds_shape : tuple of int
         Shape of the parent scan grid, used to size the strain maps.
     real_space : bool
-        ``True`` for real-space lattice vectors; ``False`` for reciprocal-space
-        (nanobeam) data, which flips the shear/rotation signs.
+        ``False`` for reciprocal-space (Bragg/correlation) lattice vectors; ``True``
+        for real-space (cepstral autocorrelation / DPC) vectors. Both modalities are
+        arranged to yield matching strain (see :func:`_strain_tensor`).
     u_ref : np.ndarray, optional
         Fixed reference for ``u``; if omitted the median over the mask/ROI is used.
         A value supplied here persists across re-fits.
@@ -705,8 +708,21 @@ def _strain_tensor(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Per-position strain tensor from lattice vectors relative to a reference.
 
-    For reciprocal-space (nanobeam) data the shear and rotation are sign-flipped via
-    ``const = -1``.
+    Two measurement modalities are supported and are arranged to give *identical*
+    strain for the same physical deformation, so correlation (Bragg) and cepstral
+    (autocorrelation) maps can be compared directly:
+
+    * ``real_space=False`` -- reciprocal-space lattice vectors (nanobeam Bragg
+      disks), which contract under tension. The per-position transform is
+      ``strain_trans = U_ref @ inv(U)``.
+    * ``real_space=True`` -- real-space lattice vectors (cepstral / Patterson
+      autocorrelation peaks, or DPC), which expand under tension. The transform is
+      ``strain_trans = (U @ inv(U_ref)).T``.
+
+    Both expressions evaluate to ``F.T`` (the transpose of the real-space deformation
+    gradient), so the normal strains, shear, and rotation come out the same
+    regardless of modality, and the reciprocal-space sign convention (``const = -1``,
+    which sets the shear/rotation handedness) is shared.
 
     Parameters
     ----------
@@ -719,8 +735,9 @@ def _strain_tensor(
     v_ref : np.ndarray
         Reference second lattice vector (length 2).
     real_space : bool
-        ``True`` for real-space data; ``False`` (nanobeam, reciprocal space) flips
-        the shear and rotation signs.
+        ``False`` for reciprocal-space (Bragg/correlation) vectors; ``True`` for
+        real-space (cepstral autocorrelation / DPC) vectors. Selects the per-position
+        transform above; both yield matching strain.
 
     Returns
     -------
@@ -730,6 +747,13 @@ def _strain_tensor(
     scan_r, scan_c = u_array.shape[0], u_array.shape[1]
     Uref = np.stack((u_ref, v_ref), axis=1).astype(float)
     strain_trans = np.zeros((scan_r, scan_c, 2, 2))
+
+    # For real-space vectors the reference is inverted once (it is shared by every
+    # position); a non-finite or singular reference leaves the whole map undefined.
+    Uref_inv = None
+    if real_space and np.all(np.isfinite(Uref)) and abs(np.linalg.det(Uref)) >= 1e-12:
+        Uref_inv = np.linalg.inv(Uref)
+
     for r in range(scan_r):
         for c in range(scan_c):
             U = np.stack((u_array[r, c, :], v_array[r, c, :]), axis=1)
@@ -740,9 +764,19 @@ def _strain_tensor(
             if not np.all(np.isfinite(U)) or abs(np.linalg.det(U)) < 1e-12:
                 strain_trans[r, c, :, :] = np.nan
                 continue
-            strain_trans[r, c, :, :] = Uref @ np.linalg.inv(U)
+            if real_space:
+                # real-space vectors expand under tension: (U @ U_ref^-1).T == F.T
+                if Uref_inv is None:
+                    strain_trans[r, c, :, :] = np.nan
+                else:
+                    strain_trans[r, c, :, :] = (U @ Uref_inv).T
+            else:
+                # reciprocal-space vectors contract under tension: U_ref @ U^-1 == F.T
+                strain_trans[r, c, :, :] = Uref @ np.linalg.inv(U)
 
-    const = 1 if real_space else -1
+    # const = -1 is the reciprocal-space (nanobeam) shear/rotation convention. Both
+    # modalities reduce strain_trans to F.T above, so the convention is shared.
+    const = -1
     e_rr = strain_trans[:, :, 0, 0] - 1
     e_cc = strain_trans[:, :, 1, 1] - 1
     e_rc = strain_trans[:, :, 1, 0] * 0.5 * const + strain_trans[:, :, 0, 1] * 0.5 * const
