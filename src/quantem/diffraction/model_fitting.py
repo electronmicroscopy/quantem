@@ -986,61 +986,104 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
     def create_mask(
         self,
         use_radial_method: bool = False,
-        min_threshold: float = 0.4,
-        max_threshold: float = 0.6,
         exclusion_radius_fraction: float = 0.1,
-        smooth: bool = True,
+        plot: bool = True,
+        figsize: tuple[float, float] = (5, 4),
     ):
+        """Compute the per-position weight :attr:`mask` from the fitted lattice signal.
+
+        Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring how much
+        crystalline signal each position carries -- the model-fitting analogue of
+        :attr:`BraggVectors.mask_weight` and the cepstral ``mask_weight``. It is handed to
+        :meth:`initialize_strain_class`, so strong, well-fit positions dominate the
+        reference lattice and weak/vacuum positions are down-weighted.
+
+        The raw signal (summed intensity of the non-central fitted disks, or the
+        diffracted intensity outside a central disk for the radial method) is normalized
+        to ``[0, 1]`` with **no** contrast windowing or smoothing: this is the honest
+        per-position order parameter. Set the display contrast later, in one place, via
+        the ``mask_range`` argument of :meth:`StrainMap.plot_strain`,
+        :meth:`StrainMap.update_reference`, and :meth:`StrainMap.estimate_strain_precision`
+        (e.g. ``mask_range=(0.37, 0.5)``) -- weights at/below ``low`` render black, at/above
+        ``high`` render full color. The weight-map plot here shows where the bulk sits so
+        an appropriate ``mask_range`` can be chosen.
+
+        Parameters
+        ----------
+        use_radial_method : bool, default=False
+            If ``True``, weight by the total diffracted intensity *outside* a central
+            disk (radius ``exclusion_radius_fraction`` of the detector width). If
+            ``False`` (default, recommended), weight by the summed intensity of the
+            fitted non-central lattice disks -- requires
+            :meth:`fit_individual_diffraction_pattern` to have been run.
+        exclusion_radius_fraction : float, default=0.1
+            Central-disk radius (fraction of detector width) excluded by the radial
+            method.
+        plot : bool, default=True
+            If ``True``, show the resulting per-position weight map (so a separate
+            ``plt.imshow(mask)`` cell is unnecessary).
+        figsize : tuple of float, default=(5, 4)
+            Figure size in inches for the weight-map plot.
+
+        Returns
+        -------
+        ModelDiffraction
+            ``self``, with :attr:`mask` set.
+        """
+        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
+            raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
-        self.mask = np.zeros(self.dataset.shape[:2])
-        
-        self.i0_sum_array = np.empty(shape=(scan_r, scan_c))
-        
-        if self.state_individual_refined is None:
-            raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
-        if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
-                raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
+        self.i0_sum_array = np.zeros(shape=(scan_r, scan_c))
 
         if use_radial_method:
             center_y, center_x = np.array(self.dataset.shape[:-2]) / 2
-            y, x = np.ogrid[:self.dataset.shape[-2], :self.dataset.shape[-1]]
-            radius_map = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            y, x = np.ogrid[: self.dataset.shape[-2], : self.dataset.shape[-1]]
+            radius_map = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
             exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
+            outside_mask = radius_map > exclusion_radius
             for r in range(scan_r):
                 for c in range(scan_c):
-                    dp = self.dataset.array[r, c]             
-                    outside_mask = radius_map > exclusion_radius
-                    self.i0_sum_array[r, c] = np.sum(dp[outside_mask])
+                    self.i0_sum_array[r, c] = np.sum(self.dataset.array[r, c][outside_mask])
         else:
+            if self.state_individual_refined is None:
+                raise RuntimeError("Call .fit_individual_diffraction_pattern(...) first.")
             for r in range(scan_r):
                 for c in range(scan_c):
                     pos_state = self.state_individual_refined[r, c]
                     if pos_state is None:
-                        self.i0_sum_array[r, c] = 0.0
                         continue
-
                     i0_raw = None
                     uv_indices = None
                     for key in pos_state.keys():
-                        if key.endswith('i0_raw'):
+                        if key.endswith("i0_raw"):
                             i0_raw = pos_state[key].cpu().numpy()
-                        if key.endswith('uv_indices'):
+                        if key.endswith("uv_indices"):
                             uv_indices = pos_state[key].cpu().numpy()
-                    
                     if i0_raw is None or uv_indices is None:
-                        self.i0_sum_array[r, c] = 0.0
                         continue
-                    
                     is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
                     self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
+
+        # honest [0, 1] normalization, no contrast windowing (set mask_range at display)
         max_intensity = np.max(self.i0_sum_array)
-        if max_intensity == 0:
-            return np.zeros_like(self.i0_sum_array)
-        self.mask = self.i0_sum_array / max_intensity
-        self.mask = np.clip((self.mask - min_threshold) / (max_threshold - min_threshold), 0, 1)
-        if smooth:
-            self.mask = np.sin(np.pi / 2 * self.mask) ** 2
+        if max_intensity > 0:
+            self.mask = self.i0_sum_array / max_intensity
+        else:
+            self.mask = np.zeros_like(self.i0_sum_array)
+
+        if plot:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(1, 1, figsize=figsize)
+            handle = ax.imshow(self.mask, cmap="gray", vmin=0.0, vmax=1.0)
+            ax.set_title("Per-position lattice weight (mask)")
+            ax.set_xlabel("scan column")
+            ax.set_ylabel("scan row")
+            fig.colorbar(handle, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+
         return self
 
     def initialize_strain_class(

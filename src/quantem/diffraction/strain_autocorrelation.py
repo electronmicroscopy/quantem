@@ -941,7 +941,13 @@ class StrainMapAutocorrelation(AutoSerialize):
         batch-refined across the stack and the basis is recovered per position by the
         same intensity-weighted least-squares fit as the per-position all-peaks branch --
         so that path is batched too rather than looping ``scipy.optimize.curve_fit`` over
-        ``n_positions x n_peaks``.
+        ``n_positions x n_peaks``. In both cases the amplitude/width/background stored in
+        :attr:`u_peak_fit`/:attr:`v_peak_fit` (columns 2-4, the source of the mask weight)
+        come from the single-peak refinement at ``u0``/``v0`` -- the background-subtracted
+        Gaussian height, the crystalline order parameter. The all-peaks least squares
+        only improves the u/v *positions* (columns 0-1); the raw cepstral value at those
+        positions rides the central-autocorrelation pedestal and would invert the mask
+        (bright in vacuum), so it is deliberately not used.
         """
         scan_r, scan_c, H, W = self.dataset.array.shape
         n_pos = scan_r * scan_c
@@ -1015,7 +1021,18 @@ class StrainMapAutocorrelation(AutoSerialize):
                         refine_gaussian=refine_gaussian,
                     ).cpu().numpy()
                     pts_all[:, j, :] = rj[:, :2]
-                ims_np = ims.cpu().numpy()
+                # Amplitude/width/background for the mask weight come from the SAME
+                # single-peak refinement at the u/v seeds as the single-peak branch
+                # below -- i.e. the background-subtracted Gaussian height, the true
+                # crystalline order parameter. (The all-peaks lstsq only improves the
+                # u/v *positions*; the raw cepstral value at those positions rides the
+                # central-autocorrelation pedestal and would invert the mask in vacuum.)
+                u_fit = _refine_peaks_batched(
+                    ims, u0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
+                ).cpu().numpy()
+                v_fit = _refine_peaks_batched(
+                    ims, v0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
+                ).cpu().numpy()
                 for k, (r, c) in enumerate(idxs):
                     pts = pts_all[k]  # (n_pk, 2) row/col offsets from center
                     ab = np.round(np.linalg.lstsq(A_seed, pts.T, rcond=None)[0]).T
@@ -1023,10 +1040,12 @@ class StrainMapAutocorrelation(AutoSerialize):
                     M[:, :2] = ab  # integer (h, k) indices + constant (center) column
                     uvc = np.linalg.lstsq(M * sqrt_w, pts * sqrt_w, rcond=None)[0]  # (3, 2)
                     u_ref, v_ref = uvc[0], uvc[1]
-                    amp_u = _parabolic_peak_rc_amp(ims_np[k], rcent + u_ref[0], ccent + u_ref[1])[2]
-                    amp_v = _parabolic_peak_rc_amp(ims_np[k], rcent + v_ref[0], ccent + v_ref[1])[2]
-                    self.u_peak_fit.array[r, c, :] = (u_ref[0], u_ref[1], amp_u, 0.0, 0.0)
-                    self.v_peak_fit.array[r, c, :] = (v_ref[0], v_ref[1], amp_v, 0.0, 0.0)
+                    self.u_peak_fit.array[r, c, :] = (
+                        u_ref[0], u_ref[1], u_fit[k, 2], u_fit[k, 3], u_fit[k, 4]
+                    )
+                    self.v_peak_fit.array[r, c, :] = (
+                        v_ref[0], v_ref[1], v_fit[k, 2], v_fit[k, 3], v_fit[k, 4]
+                    )
                     self.u_array[r, c, 0] = u_ref[0]
                     self.u_array[r, c, 1] = u_ref[1]
                     self.v_array[r, c, 0] = v_ref[0]
@@ -1742,6 +1761,11 @@ def _refine_lattice_vectors(
         giving the refined lattice vectors relative to the panel center. ``pts``
         and ``weights`` are the detected peak positions and their normalized
         weights when ``refine_all_peaks`` is True, otherwise both are ``None``.
+        When ``refine_all_peaks`` is True the position comes from the
+        intensity-weighted all-peaks least squares, but the amplitude/sigma/background
+        come from the single-peak refinement at the u/v seed -- the
+        background-subtracted Gaussian height (the mask order parameter), not the raw
+        cepstral value, which rides the central pedestal and inverts the mask in vacuum.
     """
     from scipy.optimize import curve_fit
 
@@ -1914,10 +1938,15 @@ def _refine_lattice_vectors(
         uvr0 = np.linalg.lstsq(A_weighted, pts_weighted, rcond=None)[0]
         u_refined = uvr0[0,:]
         v_refined = uvr0[1,:]
-        _, _, amp_par_u = _parabolic_peak_rc_amp(im, r_center + u_refined[0], c_center + u_refined[1])
-        _, _, amp_par_v = _parabolic_peak_rc_amp(im, r_center + v_refined[0], c_center + v_refined[1])
+        # Position from the weighted all-peaks lstsq; amplitude/width/background from
+        # the SAME single-peak refinement at the u/v seeds as the single-peak return
+        # below -- the background-subtracted Gaussian height (the crystalline order
+        # parameter), not the raw cepstral value, which rides the central pedestal and
+        # would invert the mask in vacuum.
+        u_amp_fit = _refine_one(u_rc)
+        v_amp_fit = _refine_one(v_rc)
 
-        return np.array((u_refined[0], u_refined[1], amp_par_u, 0, 0), dtype=float), np.array((v_refined[0], v_refined[1], amp_par_v, 0, 0), dtype=float), pts, weights
+        return np.array((u_refined[0], u_refined[1], u_amp_fit[2], u_amp_fit[3], u_amp_fit[4]), dtype=float), np.array((v_refined[0], v_refined[1], v_amp_fit[2], v_amp_fit[3], v_amp_fit[4]), dtype=float), pts, weights
 
     return _refine_one(u_rc), _refine_one(v_rc), None, None
 
