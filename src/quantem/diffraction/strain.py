@@ -92,8 +92,21 @@ class StrainMap(AutoSerialize):
         self.ds_sampling = 1.0 if ds_sampling is None else ds_sampling
         self.ds_units = "pixels" if ds_units is None else ds_units
 
-        self.mask = np.ones(ds_shape[:2]) if mask is None else mask
-        self.mask = (self.mask - np.min(self.mask)) / np.max(self.mask)
+        # Per-position weighting / ROI in [0, 1]. The mask producers
+        # (BraggVectors.fit_lattice, StrainMapAutocorrelation.create_mask) already emit a
+        # [0, 1] weight, so a well-formed mask is taken as-is: re-normalizing it here
+        # would collide with that scaling -- a near-constant mask (e.g. the radial
+        # cepstral weight) would be squashed to ~0 and blank the strain display. Only a
+        # mask that falls outside [0, 1] (e.g. a raw-intensity ROI) is rescaled, and a
+        # constant / empty / all-NaN mask falls back to uniform full weight.
+        m = np.ones(ds_shape[:2], dtype=float) if mask is None else np.asarray(mask, dtype=float)
+        m_lo = np.nanmin(m)
+        m_hi = np.nanmax(m)
+        if not (np.isfinite(m_lo) and np.isfinite(m_hi)) or m_hi <= m_lo:
+            m = np.ones_like(m)
+        elif m_lo < 0.0 or m_hi > 1.0:
+            m = (m - m_lo) / (m_hi - m_lo)
+        self.mask = m
 
         # user-supplied reference vectors persist across re-fits (None = use median)
         self._u_ref_fixed = None if u_ref is None else np.asarray(u_ref, dtype=float)
@@ -434,13 +447,17 @@ class StrainMap(AutoSerialize):
         component : {"combined","e_uu","e_vv","e_uv","rotation"}, default="combined"
             Which error distribution to histogram.
         bins : int, default=50
-            Number of histogram bins (or a sequence of bin edges).
+            Number of histogram bins, or a sequence of explicit bin edges. With a
+            bin *count* and no ``bounds``, the range defaults to ``[0, weighted 99th
+            percentile]`` of the trusted deviations -- robust to the heavy outlier
+            tail, which otherwise sets the range to its max and crushes the bulk into
+            the first bin. Passing explicit edges (or ``bounds``) overrides this.
         bounds : tuple of float, optional
             ``(low, high)`` histogram range in display units (percent for strain,
-            degrees for rotation). Fix it to compare datasets on the same axis. Values
-            outside the range are left out of the bars (no overflow spike); the median
-            is computed from all trusted positions regardless, and
-            ``out_of_range_fraction`` records how much was off-range.
+            degrees for rotation). Fix it to compare datasets on the same axis, or to
+            see the full tail. Values outside the range are left out of the bars (no
+            overflow spike); the median is computed from all trusted positions
+            regardless, and ``out_of_range_fraction`` records how much was off-range.
         plot : bool, default=True
             If ``True``, draw the weighted precision histogram.
         returnfig : bool, default=False
@@ -531,6 +548,17 @@ class StrainMap(AutoSerialize):
         use = np.isfinite(e) & valid  # trusted positions only, consistent with median
         e_f = e[use]
         w_f = scaled[use]
+        # Default histogram range: a robust weighted upper percentile, NOT the raw
+        # max. A handful of bad-fit positions can reach tens of percent; used as the
+        # range they crush the entire bulk into the first bin and leave the rest of
+        # the axis empty (a spurious "spike at 0" plus a far outlier spike). Capping
+        # at the weighted 99th percentile keeps the common error values readable; the
+        # few positions past it spill into out_of_range_fraction (reported, not
+        # drawn). An explicit `bounds`, or passing bin EDGES as `bins`, overrides it.
+        if bounds is None and np.ndim(bins) == 0 and e_f.size and float(w_f.sum()) > 0:
+            hi_default = _weighted_quantile(e_f, w_f, 0.99)
+            if np.isfinite(hi_default) and hi_default > 0:
+                bounds = (0.0, hi_default)
         edges = np.histogram_bin_edges(e_f, bins=bins, range=bounds)
         lo, hi = float(edges[0]), float(edges[-1])
         wtot = float(w_f.sum())
@@ -662,7 +690,18 @@ def _reference_lattice(
     mask: np.ndarray | None = None,
     strain_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Median reference lattice vectors over an ROI / mask, else the global median.
+    """Weighted-median reference lattice vectors, else the global median.
+
+    The reference is the per-component **weighted median** of the lattice vectors.
+    Weights come from ``strain_mask`` if given, else the continuous ``mask``
+    (the ``[0, 1]`` per-position weight from :meth:`create_mask` / ``fit_lattice``):
+    strong, well-indexed positions dominate the reference and weak / vacuum / bad-fit
+    positions are down-weighted. A boolean ROI (weights in ``{0, 1}``) reduces to the
+    plain median over the selected positions, so an explicit ``strain_mask`` behaves
+    as before. The weighted median (not ``mask == 1``) is used because a continuous
+    weight rarely hits *exactly* 1 -- the old exact-equality test collapsed a min-max
+    normalized mask to its single global-max position and made the reference one
+    arbitrary pixel.
 
     Parameters
     ----------
@@ -671,10 +710,10 @@ def _reference_lattice(
     v_array : np.ndarray
         Per-position second lattice vector, shape ``(scan_row, scan_col, 2)``.
     mask : np.ndarray, optional
-        ``(scan_row, scan_col)`` ROI; positions equal to 1 are included. Used when
-        ``strain_mask`` is not given.
+        ``(scan_row, scan_col)`` per-position weight in ``[0, 1]``. Used as the median
+        weights when ``strain_mask`` is not given.
     strain_mask : np.ndarray, optional
-        ``(scan_row, scan_col)`` ROI taking precedence over ``mask``.
+        ``(scan_row, scan_col)`` ROI / weight taking precedence over ``mask``.
 
     Returns
     -------
@@ -682,20 +721,29 @@ def _reference_lattice(
         ``(u_ref, v_ref)``, each a length-2 reference vector.
     """
     if strain_mask is not None:
-        m = np.asarray(strain_mask == 1, dtype=bool)
+        w = np.asarray(strain_mask, dtype=float).reshape(-1)
     elif mask is not None:
-        m = np.asarray(mask == 1, dtype=bool)
+        w = np.asarray(mask, dtype=float).reshape(-1)
     else:
-        m = None
+        w = None
 
-    # nan-median: positions fit_lattice could not fit are NaN and must be ignored,
-    # otherwise the reference (and hence the whole strain map) collapses to NaN.
-    if m is None or not m.any():
-        u_ref = np.nanmedian(u_array.reshape(-1, 2), axis=0)
-        v_ref = np.nanmedian(v_array.reshape(-1, 2), axis=0)
-    else:
-        u_ref = np.array((np.nanmedian(u_array[m, 0]), np.nanmedian(u_array[m, 1])), dtype=float)
-        v_ref = np.array((np.nanmedian(v_array[m, 0]), np.nanmedian(v_array[m, 1])), dtype=float)
+    u_flat = u_array.reshape(-1, 2)
+    v_flat = v_array.reshape(-1, 2)
+
+    def _wmed(vals: np.ndarray) -> float:
+        # weighted median over finite, positively-weighted positions; positions
+        # fit_lattice could not fit are NaN and must be dropped, else the reference
+        # (and the whole strain map) collapses to NaN. Falls back to the unweighted
+        # nan-median when no weight is given or none survives.
+        finite = np.isfinite(vals)
+        ww = np.ones_like(vals) if w is None else w
+        use = finite & (ww > 0)
+        if not use.any():
+            return float(np.nanmedian(vals)) if finite.any() else float("nan")
+        return _weighted_quantile(vals[use], ww[use], 0.5)
+
+    u_ref = np.array((_wmed(u_flat[:, 0]), _wmed(u_flat[:, 1])), dtype=float)
+    v_ref = np.array((_wmed(v_flat[:, 0]), _wmed(v_flat[:, 1])), dtype=float)
     return u_ref, v_ref
 
 

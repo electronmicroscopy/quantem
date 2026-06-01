@@ -26,10 +26,13 @@ def plot_template(
     position : tuple of int
         ``(row, col)`` scan position the correlation map was computed at.
     crop : tuple of float, optional
-        ``(center_row, center_col, half_width)`` zoom window (in pixels) applied to
-        all three panels. The view spans ``half_width`` either side of the center,
-        clamped to each image's bounds, so an over-large ``half_width`` just shows
-        the full image. ``None`` (default) shows the full panels.
+        ``(center_row, center_col, half_width)`` zoom window (in pixels). The mean
+        diffraction and correlation panels are centered on ``(center_row,
+        center_col)`` -- the central-beam position -- while the template panel is
+        centered on its own array center (it is displayed fftshifted to there). The
+        view spans ``half_width`` either side of the center, clamped to each image's
+        bounds, so an over-large ``half_width`` just shows the full image. ``None``
+        (default) shows the full panels.
     figsize : tuple of float, default=(13, 4)
         Figure size in inches.
 
@@ -50,10 +53,15 @@ def plot_template(
         a.set_yticks([])
     if crop is not None:
         cr, cc, hw = float(crop[0]), float(crop[1]), float(crop[2])
-        for a, img in zip(ax, (dp_mean, template, corr_map)):
+        th, tw = template.shape[:2]
+        # The mean-diffraction beam and the correlation peak sit at the beam center
+        # (cr, cc); the displayed template is fftshifted to its own array center, so
+        # zoom that panel about its center instead.
+        panel_centers = ((cr, cc), (th / 2.0, tw / 2.0), (cr, cc))
+        for a, img, (ecr, ecc) in zip(ax, (dp_mean, template, corr_map), panel_centers):
             h, w = img.shape[:2]
-            a.set_xlim(max(cc - hw, -0.5), min(cc + hw, w - 0.5))
-            a.set_ylim(min(cr + hw, h - 0.5), max(cr - hw, -0.5))
+            a.set_xlim(max(ecc - hw, -0.5), min(ecc + hw, w - 0.5))
+            a.set_ylim(min(ecr + hw, h - 0.5), max(ecr - hw, -0.5))
     fig.tight_layout()
     return fig, ax
 

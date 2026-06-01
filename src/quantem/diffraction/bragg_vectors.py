@@ -959,13 +959,14 @@ class BraggVectors(AutoSerialize):
         position : tuple of int, default=(0, 0)
             ``(row, col)`` scan position whose correlation map is shown.
         crop_factor : float, optional
-            If given, zoom all three panels to a square window of half-width
-            ``crop_factor * radius`` about the pattern center, where ``radius`` is
-            the central-beam radius (the synthetic template radius if known, else
-            estimated from the mean diffraction pattern). For example,
-            ``crop_factor=2.0`` shows two beam radii either side of the center. The
-            window is clamped to the detector, so a large factor shows the full
-            image. ``None`` (default) shows the full panels.
+            If given, zoom to a square window of half-width ``crop_factor * radius``
+            about the central-beam center, where ``radius`` is the central-beam
+            radius (the synthetic template radius if known, else estimated from the
+            mean diffraction pattern). The mean-diffraction and correlation panels are
+            centered on the beam; the template panel on its own (fftshifted) center.
+            For example, ``crop_factor=2.0`` shows two beam radii either side of the
+            center. The window is clamped to the detector, so a large factor shows the
+            full image. ``None`` (default) shows the full panels.
         returnfig : bool, default=False
             If ``True``, return the ``(fig, ax)`` for further customization.
         **kwargs
@@ -984,11 +985,15 @@ class BraggVectors(AutoSerialize):
 
         crop = None
         if crop_factor is not None:
-            H, W = int(self.dataset.shape[-2]), int(self.dataset.shape[-1])
+            # Center the mean-diffraction and correlation panels on the actual
+            # central-beam position rather than the geometric center (H//2, W//2):
+            # the unscattered beam -- and the correlation peak that matches it -- are
+            # generally offset by a few pixels from the detector center.
+            center, radius_est = estimate_central_beam(dp_mean)
             radius = self.metadata.get("template", {}).get("radius")
             if radius is None:
-                _, radius = estimate_central_beam(dp_mean)
-            crop = (H // 2, W // 2, float(crop_factor) * float(radius))
+                radius = radius_est
+            crop = (float(center[0]), float(center[1]), float(crop_factor) * float(radius))
 
         fig, ax = plot_template(
             dp_mean,

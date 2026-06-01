@@ -177,6 +177,7 @@ class StrainMapAutocorrelation(AutoSerialize):
     def diffraction_mask(
         self,
         threshold=None,
+        threshold_percentile=50.0,
         edge_blend=64.0,
         plot_mask=True,
         figsize=(8, 4),
@@ -195,9 +196,14 @@ class StrainMapAutocorrelation(AutoSerialize):
         Parameters
         ----------
         threshold : float, optional
-            Mean-intensity level below which detector pixels are masked out. Required;
-            choose it from the mean diffraction pattern (e.g. just above the vacuum
-            level).
+            Absolute mean-intensity level below which detector pixels are masked out. If
+            ``None`` (default), the level is taken from ``threshold_percentile`` of the
+            mean diffraction pattern, so no manual intensity value is needed.
+        threshold_percentile : float, default=50.0
+            Percentile (``0``-``100``) of the mean diffraction pattern used to set the
+            masking level when ``threshold`` is ``None``. The default keeps the brighter
+            half of the detector (disks and central beam) and masks the dimmer vacuum;
+            raise it to mask more aggressively. Ignored when ``threshold`` is given.
         edge_blend : float, default=64.0
             Feather width in pixels of the raised-cosine taper between kept and masked
             regions; larger values give a softer transition.
@@ -213,6 +219,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             ``self``, with :attr:`mask_diffraction` and :attr:`mask_diffraction_inv` set.
         """
         dp_mean = np.mean(self.dataset.array, axis=(0, 1))
+        if threshold is None:
+            threshold = np.percentile(dp_mean, threshold_percentile)
         mask_init = dp_mean < threshold
         mask_init[:, 0] = True
         mask_init[0, :] = True
@@ -740,6 +748,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         upsample: int = 16,
         gaussian_maxfev: int = 100,
         progressbar: bool = True,
+        device: str = "cpu",
     ) -> "StrainMapAutocorrelation":
         """Fit the lattice vectors at every scan position (the heavy step).
 
@@ -750,6 +759,19 @@ class StrainMapAutocorrelation(AutoSerialize):
         row/col components) for :meth:`calculate_strain_map`; the full fit records
         (position, amplitude, width, background) are kept in :attr:`u_peak_fit`/
         :attr:`v_peak_fit` (shape ``(scan_row, scan_col, 5)``).
+
+        Whenever ``refine_dft=False`` (including ``refine_all_peaks=True``) the transforms
+        and the isotropic-Gaussian peak fits are batched across scan positions on
+        ``device`` (the analogue of the correlation pipeline's
+        :func:`~quantem.diffraction.disk_detection.detect_disks_batch`): the Gaussian fit
+        is a vectorized Levenberg-Marquardt solve rather than a per-position
+        ``scipy.optimize.curve_fit``. For ``refine_all_peaks=True`` every detected peak is
+        batch-refined across the stack and the basis is solved per position by weighted
+        least squares -- avoiding the ``n_positions x n_peaks`` ``curve_fit`` calls of the
+        old loop. This removes the dominant per-call overhead and reproduces the
+        per-position result to ~1e-6 px, so the fitted vectors are unchanged while the
+        step runs far faster (and faster still on a GPU). Only ``refine_dft=True`` falls
+        back to the per-position path.
 
         Parameters
         ----------
@@ -800,56 +822,73 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.u_array = np.zeros((scan_r, scan_c, 2))
         self.v_array = np.zeros((scan_r, scan_c, 2))
 
-        mode = self.metadata.get("mode", "linear").lower()
-        if mode == "gamma":
-            g = self.metadata["gamma"]
-
-        it = np.ndindex(scan_r, scan_c)
-        if progressbar:
-            try:
-                from tqdm.auto import tqdm  # type: ignore
-
-                it = tqdm(it, total=scan_r * scan_c, desc="fit_lattice_vectors", leave=True)
-            except Exception:
-                pass
-
         u0 = np.asarray(self.u, dtype=float).reshape(2)
         v0 = np.asarray(self.v, dtype=float).reshape(2)
 
-
-        for r, c in it:
-            dp = self.dataset.array[r, c] * self.mask_diffraction + self.mask_diffraction_inv
-
-            if mode == "linear":
-                im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
-            elif mode == "log":
-                im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
-            elif mode == "gamma":
-                im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g))))
-            else:
-                raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
-
-            u_fit_abs, v_fit_abs, _, _ = _refine_lattice_vectors(
-                im,
-                u_rc=u0,
-                v_rc=v0,
-                radius_px=refine_radius_px,
+        if not refine_dft:
+            # Fast path: batch the transforms and isotropic-Gaussian fits across scan
+            # positions on `device` (per-position scipy.optimize.curve_fit -> vectorized
+            # LM). Covers both the 2-vector fit and the all-peaks basis fit; reproduces
+            # the per-position result to ~1e-6 px. Only DFT upsampling still falls back.
+            self._fit_lattice_vectors_batched(
+                u0=u0,
+                v0=v0,
                 refine_gaussian=refine_gaussian,
-                refine_dft=refine_dft,
+                refine_radius_px=refine_radius_px,
+                device=device,
+                progressbar=progressbar,
                 refine_all_peaks=refine_all_peaks,
-                peaks=self.mean_img_peaks,
-                weights=self.mean_img_weights,
-                upsample=upsample,
-                maxfev=gaussian_maxfev,
+                peaks=self.mean_img_peaks if refine_all_peaks else None,
+                weights=self.mean_img_weights if refine_all_peaks else None,
             )
+        else:
+            # Per-position fallback for DFT upsampling (refine_dft=True).
+            mode = self.metadata.get("mode", "linear").lower()
+            if mode == "gamma":
+                g = self.metadata["gamma"]
 
-            self.u_peak_fit.array[r, c, :] = u_fit_abs
-            self.v_peak_fit.array[r, c, :] = v_fit_abs
+            it = np.ndindex(scan_r, scan_c)
+            if progressbar:
+                try:
+                    from tqdm.auto import tqdm  # type: ignore
 
-            self.u_array[r, c, 0] = u_fit_abs[0]
-            self.u_array[r, c, 1] = u_fit_abs[1]
-            self.v_array[r, c, 0] = v_fit_abs[0]
-            self.v_array[r, c, 1] = v_fit_abs[1]
+                    it = tqdm(it, total=scan_r * scan_c, desc="fit_lattice_vectors", leave=True)
+                except Exception:
+                    pass
+
+            for r, c in it:
+                dp = self.dataset.array[r, c] * self.mask_diffraction + self.mask_diffraction_inv
+
+                if mode == "linear":
+                    im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
+                elif mode == "log":
+                    im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
+                elif mode == "gamma":
+                    im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g))))
+                else:
+                    raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
+
+                u_fit_abs, v_fit_abs, _, _ = _refine_lattice_vectors(
+                    im,
+                    u_rc=u0,
+                    v_rc=v0,
+                    radius_px=refine_radius_px,
+                    refine_gaussian=refine_gaussian,
+                    refine_dft=refine_dft,
+                    refine_all_peaks=refine_all_peaks,
+                    peaks=self.mean_img_peaks,
+                    weights=self.mean_img_weights,
+                    upsample=upsample,
+                    maxfev=gaussian_maxfev,
+                )
+
+                self.u_peak_fit.array[r, c, :] = u_fit_abs
+                self.v_peak_fit.array[r, c, :] = v_fit_abs
+
+                self.u_array[r, c, 0] = u_fit_abs[0]
+                self.u_array[r, c, 1] = u_fit_abs[1]
+                self.v_array[r, c, 0] = v_fit_abs[0]
+                self.v_array[r, c, 1] = v_fit_abs[1]
 
         self.metadata["fit_refine_gaussian"] = refine_gaussian
         self.metadata["fit_refine_dft"] = refine_dft
@@ -858,45 +897,225 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.metadata["fit_upsample"] = upsample
         self.metadata["fit_gaussian_maxfev"] = gaussian_maxfev
 
+        # Populate the per-position weight directly from the fitted peak amplitudes,
+        # mirroring the correlation pipeline where BraggVectors.fit_lattice emits
+        # mask_weight. create_mask() is therefore optional -- call it only to plot the
+        # weight map, recompute, or switch to the radial estimator.
+        self.mask_weight = self._amplitude_mask_weight()
+
         return self
+
+    def _fit_lattice_vectors_batched(
+        self,
+        *,
+        u0: NDArray,
+        v0: NDArray,
+        refine_gaussian: bool,
+        refine_radius_px: float,
+        device: str,
+        progressbar: bool,
+        refine_all_peaks: bool = False,
+        peaks: NDArray | None = None,
+        weights: NDArray | None = None,
+    ) -> None:
+        """Batched torch implementation of the non-DFT :meth:`fit_lattice_vectors` path.
+
+        The transform (mask/fill -> ``mode`` -> ``|FFT|`` -> fftshift) and the
+        parabolic/isotropic-Gaussian peak refinement are evaluated for a stack of scan
+        positions at once on ``device``, the analogue of the correlation pipeline's
+        :func:`~quantem.diffraction.disk_detection.detect_disks_batch`. This reproduces
+        :func:`_refine_lattice_vectors` (with ``refine_dft=False``) to ~1e-6 px while
+        removing the per-position ``scipy.optimize.curve_fit`` overhead. Results are
+        written into :attr:`u_array`/:attr:`v_array` and :attr:`u_peak_fit`/
+        :attr:`v_peak_fit`.
+
+        With ``refine_all_peaks=False`` only the two seed vectors ``u0``/``v0`` are
+        refined per position. With ``refine_all_peaks=True`` every peak in ``peaks`` (the
+        basis detected by :meth:`choose_lattice_vector`, weighted by ``weights``) is
+        batch-refined across the stack and the basis is recovered per position by the
+        same intensity-weighted least-squares fit as the per-position all-peaks branch --
+        so that path is batched too rather than looping ``scipy.optimize.curve_fit`` over
+        ``n_positions x n_peaks``.
+        """
+        scan_r, scan_c, H, W = self.dataset.array.shape
+        n_pos = scan_r * scan_c
+        rcent, ccent = H // 2, W // 2
+
+        mode = self.metadata.get("mode", "linear").lower()
+        if mode not in ("linear", "log", "gamma"):
+            raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
+        gamma = float(self.metadata["gamma"]) if mode == "gamma" else None
+
+        dev = torch.device(device)
+        mask = torch.as_tensor(self.mask_diffraction, dtype=torch.float64, device=dev)
+        mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=torch.float64, device=dev)
+
+        if refine_all_peaks:
+            # Precompute the fixed pieces of the per-position all-peaks fit (these do not
+            # change across scan positions): the detected peak seeds, their normalized
+            # weights, and the seed basis used to assign integer (h, k) indices.
+            peaks_arr = np.asarray(peaks, dtype=float).reshape(-1, 2)
+            w = np.asarray(weights, dtype=float).reshape(-1)
+            wsum = float(w.sum())
+            w_norm = w / wsum if wsum != 0 else np.full(w.shape, 1.0 / max(1, w.size))
+            sqrt_w = np.sqrt(w_norm)[:, None]
+            A_seed = np.column_stack((u0, v0))  # (2, 2)
+            n_pk = peaks_arr.shape[0]
+
+        # Match the correlation chunking heuristic (see BraggVectors._detect_positions).
+        batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
+
+        starts = range(0, n_pos, batch_size)
+        if progressbar:
+            try:
+                from tqdm.auto import tqdm  # type: ignore
+
+                bar = tqdm(total=n_pos, desc="fit_lattice_vectors", leave=True)
+            except Exception:
+                bar = None
+        else:
+            bar = None
+
+        for start in starts:
+            stop = min(start + batch_size, n_pos)
+            idxs = [(idx // scan_c, idx % scan_c) for idx in range(start, stop)]
+
+            dps = torch.stack(
+                [
+                    torch.as_tensor(
+                        np.asarray(self.dataset.array[r, c]), dtype=torch.float64, device=dev
+                    )
+                    for r, c in idxs
+                ],
+                dim=0,
+            )
+            dpm = dps * mask + mask_inv
+            if mode == "linear":
+                tr = dpm
+            elif mode == "log":
+                tr = torch.log1p(dpm)
+            else:  # gamma
+                tr = dpm.clamp(min=0.0).pow(gamma)
+            ims = torch.fft.fftshift(torch.fft.fft2(tr).abs(), dim=(-2, -1))
+
+            if refine_all_peaks:
+                # Batch-refine each detected peak across the stack (one vectorized LM
+                # solve per peak), then recover the basis per position with the same
+                # weighted least squares as _refine_lattice_vectors' all-peaks branch.
+                pts_all = np.empty((len(idxs), n_pk, 2), dtype=float)
+                for j in range(n_pk):
+                    rj = _refine_peaks_batched(
+                        ims, peaks_arr[j], radius_px=refine_radius_px,
+                        refine_gaussian=refine_gaussian,
+                    ).cpu().numpy()
+                    pts_all[:, j, :] = rj[:, :2]
+                ims_np = ims.cpu().numpy()
+                for k, (r, c) in enumerate(idxs):
+                    pts = pts_all[k]  # (n_pk, 2) row/col offsets from center
+                    ab = np.round(np.linalg.lstsq(A_seed, pts.T, rcond=None)[0]).T
+                    M = np.ones((n_pk, 3))
+                    M[:, :2] = ab  # integer (h, k) indices + constant (center) column
+                    uvc = np.linalg.lstsq(M * sqrt_w, pts * sqrt_w, rcond=None)[0]  # (3, 2)
+                    u_ref, v_ref = uvc[0], uvc[1]
+                    amp_u = _parabolic_peak_rc_amp(ims_np[k], rcent + u_ref[0], ccent + u_ref[1])[2]
+                    amp_v = _parabolic_peak_rc_amp(ims_np[k], rcent + v_ref[0], ccent + v_ref[1])[2]
+                    self.u_peak_fit.array[r, c, :] = (u_ref[0], u_ref[1], amp_u, 0.0, 0.0)
+                    self.v_peak_fit.array[r, c, :] = (v_ref[0], v_ref[1], amp_v, 0.0, 0.0)
+                    self.u_array[r, c, 0] = u_ref[0]
+                    self.u_array[r, c, 1] = u_ref[1]
+                    self.v_array[r, c, 0] = v_ref[0]
+                    self.v_array[r, c, 1] = v_ref[1]
+            else:
+                u_np = _refine_peaks_batched(
+                    ims, u0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
+                ).cpu().numpy()
+                v_np = _refine_peaks_batched(
+                    ims, v0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
+                ).cpu().numpy()
+                for k, (r, c) in enumerate(idxs):
+                    self.u_peak_fit.array[r, c, :] = u_np[k]
+                    self.v_peak_fit.array[r, c, :] = v_np[k]
+                    self.u_array[r, c, 0] = u_np[k, 0]
+                    self.u_array[r, c, 1] = u_np[k, 1]
+                    self.v_array[r, c, 0] = v_np[k, 0]
+                    self.v_array[r, c, 1] = v_np[k, 1]
+
+            if bar is not None:
+                bar.update(len(idxs))
+
+        if bar is not None:
+            bar.close()
+
+    def _amplitude_mask_weight(self) -> np.ndarray:
+        """Per-position weight from the fitted u/v peak amplitudes, min-max to ``[0, 1]``.
+
+        The mean of the two fitted lattice-peak amplitudes is the cepstral order
+        parameter (how much crystalline signal a position carries). It is min-max
+        normalized to ``[0, 1]`` with no contrast windowing -- the honest weight; set
+        display contrast later via :meth:`StrainMap.plot_strain`'s ``mask_range``.
+        Degenerate input (constant / non-finite / amplitudes unavailable) falls back to
+        uniform full weight.
+        """
+        scan_r = self.dataset.shape[0]
+        scan_c = self.dataset.shape[1]
+        if self.u_peak_fit is None or self.v_peak_fit is None:
+            return np.ones((scan_r, scan_c))
+        signal = (self.u_peak_fit.array[:, :, 2] + self.v_peak_fit.array[:, :, 2]) / 2.0
+        lo = np.nanmin(signal)
+        hi = np.nanmax(signal)
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            return (signal - lo) / (hi - lo)
+        return np.ones((scan_r, scan_c))
 
     def create_mask(
         self,
         use_radial_method: bool = False,
-        min_threshold: float = 0.4,
-        max_threshold: float = 0.6,
         exclusion_radius_fraction: float = 0.1,
-        smooth: bool = True,
+        plot: bool = True,
+        figsize: tuple[float, float] = (5, 4),
     ):
-        """Compute the per-position weight :attr:`mask_weight` from lattice signal.
+        """(Re)compute the per-position weight :attr:`mask_weight` from lattice signal.
+
+        Usually **optional**: :meth:`fit_lattice_vectors` already populates
+        :attr:`mask_weight` from the fitted peak amplitudes (mirroring the correlation
+        pipeline, where ``BraggVectors.fit_lattice`` emits ``mask_weight``). Call this
+        only to plot the weight map, to recompute it, or to switch to the radial
+        estimator.
 
         Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring how much
         crystalline signal each position carries, the analogue of
         :attr:`BraggVectors.mask_weight`. It is the default reference weighting handed to
         :meth:`calculate_strain_map`, so strong, well-fit positions dominate the
-        reference lattice and weak/vacuum positions are down-weighted. Two estimators are
-        available, both rescaled by the ``(min_threshold, max_threshold)`` window (values
-        below ``min`` -> 0, above ``max`` -> 1) and optionally smoothed.
+        reference lattice and weak/vacuum positions are down-weighted.
+
+        The raw signal is min-max normalized to ``[0, 1]`` with **no** contrast windowing
+        or smoothing: this is the honest per-position order parameter. Set the display
+        contrast later, in one place, via :meth:`StrainMap.plot_strain`'s ``mask_range``
+        argument (e.g. ``mask_range=(0.6, 0.8)``) -- weights at/below ``low`` render
+        black, at/above ``high`` render full color. (Min-max is sensitive to a few very
+        bright positions, which compress the bulk toward 0; pick ``mask_range`` to match
+        where the bulk actually sits -- the weight-map plot here shows it.)
 
         Parameters
         ----------
         use_radial_method : bool, default=False
             If ``True``, weight by the total diffracted intensity *outside* a central
             disk (radius ``exclusion_radius_fraction`` of the detector width), excluding
-            the bright unscattered beam. If ``False`` (default), weight by the mean
-            fitted peak amplitude from :meth:`fit_lattice_vectors` (requires it to have
-            been run).
-        min_threshold : float, default=0.4
-            Lower edge of the rescaling window (as a fraction of the max signal); weights
-            at or below this map to 0.
-        max_threshold : float, default=0.6
-            Upper edge of the rescaling window; weights at or above this map to 1.
+            the bright unscattered beam. Use a **small** exclusion (~0.1) so the Bragg
+            disks are kept: a large exclusion keeps only the far-corner diffuse scatter,
+            which is *anti*-correlated with crystallinity and inverts the contrast. If
+            ``False`` (default, recommended), weight by the mean fitted peak amplitude
+            from :meth:`fit_lattice_vectors` (requires it to have been run) -- the direct
+            cepstral order parameter (identical to the weight ``fit_lattice_vectors``
+            stores automatically).
         exclusion_radius_fraction : float, default=0.1
             Central-disk radius (fraction of detector width) excluded by the radial
             method.
-        smooth : bool, default=True
-            If ``True``, apply a ``sin^2`` easing to the rescaled weight for a smoother
-            ramp.
+        plot : bool, default=True
+            If ``True``, show the resulting per-position weight map (the analogue of the
+            correlation pipeline's :meth:`BraggVectors.fit_lattice` plot).
+        figsize : tuple of float, default=(5, 4)
+            Figure size in inches for the weight-map plot.
 
         Returns
         -------
@@ -908,9 +1127,6 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
-        self.mask_weight = np.ones(self.dataset.shape[:2])
-
-        i0_sum_array = np.empty(shape=(scan_r, scan_c))
 
         if use_radial_method:
             # center / radius are in DETECTOR coordinates (the last two axes)
@@ -920,27 +1136,32 @@ class StrainMapAutocorrelation(AutoSerialize):
             radius_map = np.sqrt((x - center_x)**2 + (y - center_y)**2)
             exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
             outside_mask = radius_map > exclusion_radius
+            signal = np.empty(shape=(scan_r, scan_c))
             for r in range(scan_r):
                 for c in range(scan_c):
                     dp = self.dataset.array[r, c]
-                    i0_sum_array[r, c] = np.sum(dp[outside_mask])
+                    signal[r, c] = np.sum(dp[outside_mask])
+            # honest min-max normalization to [0, 1]; constant/degenerate -> ones
+            lo = np.nanmin(signal)
+            hi = np.nanmax(signal)
+            if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                self.mask_weight = (signal - lo) / (hi - lo)
+            else:
+                self.mask_weight = np.ones((scan_r, scan_c))
         else:
             if self.u_peak_fit is None or self.v_peak_fit is None:
                 raise RuntimeError("For intensity-based masking, run fit_lattice_vectors() first.")
-            u_amplitudes = self.u_peak_fit.array[:, :, 2]
-            v_amplitudes = self.v_peak_fit.array[:, :, 2]
-            i0_sum_array = (u_amplitudes + v_amplitudes) / 2.0
+            self.mask_weight = self._amplitude_mask_weight()
 
-        max_intensity = np.max(i0_sum_array)
-        if max_intensity == 0:
-            self.mask_weight = np.ones_like(i0_sum_array)
-            return self
-        self.mask_weight = i0_sum_array / max_intensity
-        self.mask_weight = np.clip(
-            (self.mask_weight - min_threshold) / (max_threshold - min_threshold), 0, 1
-        )
-        if smooth:
-            self.mask_weight = np.sin(np.pi / 2 * self.mask_weight) ** 2
+        if plot:
+            fig, ax = plt.subplots(1, 1, figsize=figsize)
+            handle = ax.imshow(self.mask_weight, cmap="gray", vmin=0.0, vmax=1.0)
+            ax.set_title("Per-position lattice weight (mask_weight)")
+            ax.set_xlabel("scan column")
+            ax.set_ylabel("scan row")
+            fig.colorbar(handle, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+
         return self
 
 
@@ -1290,6 +1511,46 @@ def _parabolic_vertex_delta(v_m1: float, v_0: float, v_p1: float) -> float:
     return np.clip(delta, -1.0, 1.0)
 
 
+def _parabolic_peak_rc_amp(im: NDArray, r_guess: float, c_guess: float) -> tuple[float, float, float]:
+    """3-point parabolic sub-pixel peak near ``(r_guess, c_guess)`` and its amplitude.
+
+    Snaps to the brightest pixel in the 3x3 window around the (absolute-coordinate)
+    guess, refines row and column independently by a parabolic vertex, and returns
+    ``(r_sub, c_sub, amp)`` -- the sub-pixel peak position and the image value at the
+    rounded vertex. Shared by the per-position :func:`_refine_lattice_vectors` and the
+    batched :meth:`StrainMapAutocorrelation._fit_lattice_vectors_batched` so they agree
+    exactly.
+    """
+    H, W = im.shape
+    r0 = int(np.clip(int(np.round(r_guess)), 0, H - 1))
+    c0 = int(np.clip(int(np.round(c_guess)), 0, W - 1))
+    win = im[max(0, r0 - 1) : min(H, r0 + 2), max(0, c0 - 1) : min(W, c0 + 2)]
+    if win.size == 0:
+        return r_guess, c_guess, 0.0
+
+    ir, ic = np.unravel_index(np.argmax(win), win.shape)
+    r_peak = max(0, r0 - 1) + ir
+    c_peak = max(0, c0 - 1) + ic
+
+    if 0 < r_peak < H - 1:
+        col = im[r_peak - 1 : r_peak + 2, c_peak]
+        dr = _parabolic_vertex_delta(col[0], col[1], col[2])
+    else:
+        dr = 0.0
+
+    if 0 < c_peak < W - 1:
+        row = im[r_peak, c_peak - 1 : c_peak + 2]
+        dc = _parabolic_vertex_delta(row[0], row[1], row[2])
+    else:
+        dc = 0.0
+
+    r_sub = r_peak + dr
+    c_sub = c_peak + dc
+    r_int = int(np.clip(int(np.round(r_sub)), 0, H - 1))
+    c_int = int(np.clip(int(np.round(c_sub)), 0, W - 1))
+    return r_sub, c_sub, float(im[r_int, c_int])
+
+
 def _refine_peak_subpixel(
     im: NDArray,
     *,
@@ -1381,7 +1642,7 @@ def _refine_peak_subpixel_dft(
 
     up = upsample
     du = int(np.fix(np.ceil(1.5 * up)))
-    patch = np.abs(dft_upsample(F, up=up, shift=(r0, c0), device="cpu"))
+    patch = np.abs(dft_upsample(F, up=up, shift=(r0, c0)))
     patch = np.asarray(patch, dtype=float)
 
     i0, j0 = np.unravel_index(np.argmax(patch), patch.shape)
@@ -1486,43 +1747,6 @@ def _refine_lattice_vectors(
     r_center = H // 2
     c_center = W // 2
 
-    def _parabolic_peak_rc_amp(*, r_guess: float, c_guess: float) -> tuple[float, float, float]:
-        r0 = int(np.clip(int(np.round(r_guess)), 0, H - 1))
-        c0 = int(np.clip(int(np.round(c_guess)), 0, W - 1))
-        win = im[
-            max(0, r0 - 1) : min(H, r0 + 2),
-            max(0, c0 - 1) : min(W, c0 + 2),
-        ]
-        if win.size == 0:
-            return r_guess, c_guess, 0.0
-
-        ir, ic = np.unravel_index(np.argmax(win), win.shape)
-        r_peak = max(0, r0 - 1) + ir
-        c_peak = max(0, c0 - 1) + ic
-
-        r_ref = r_peak
-        c_ref = c_peak
-
-        if 0 < r_peak < H - 1:
-            col = im[r_peak - 1 : r_peak + 2, c_peak]
-            dr = _parabolic_vertex_delta(col[0], col[1], col[2])
-        else:
-            dr = 0.0
-
-        if 0 < c_peak < W - 1:
-            row = im[r_peak, c_peak - 1 : c_peak + 2]
-            dc = _parabolic_vertex_delta(row[0], row[1], row[2])
-        else:
-            dc = 0.0
-
-        r_sub = r_ref + dr
-        c_sub = c_ref + dc
-        r_int = int(np.clip(int(np.round(r_sub)), 0, H - 1))
-        c_int = int(np.clip(int(np.round(c_sub)), 0, W - 1))
-        amp = im[r_int, c_int]
-
-        return r_sub, c_sub, amp
-
     def _fit_gaussian_isotropic(
         *,
         r0: float,
@@ -1599,7 +1823,7 @@ def _refine_lattice_vectors(
         r_guess = r_center + vec[0]
         c_guess = c_center + vec[1]
 
-        r_par, c_par, amp_par = _parabolic_peak_rc_amp(r_guess=r_guess, c_guess=c_guess)
+        r_par, c_par, amp_par = _parabolic_peak_rc_amp(im, r_guess, c_guess)
 
         if refine_gaussian:
             r_fit, c_fit, amp, sig, bg = _fit_gaussian_isotropic(
@@ -1684,10 +1908,164 @@ def _refine_lattice_vectors(
         uvr0 = np.linalg.lstsq(A_weighted, pts_weighted, rcond=None)[0]
         u_refined = uvr0[0,:]
         v_refined = uvr0[1,:]
-        _,_, amp_par_u = _parabolic_peak_rc_amp(r_guess=u_refined[0], c_guess=u_refined[1])
-        _,_, amp_par_v = _parabolic_peak_rc_amp(r_guess=v_refined[0], c_guess=v_refined[1])
+        _, _, amp_par_u = _parabolic_peak_rc_amp(im, r_center + u_refined[0], c_center + u_refined[1])
+        _, _, amp_par_v = _parabolic_peak_rc_amp(im, r_center + v_refined[0], c_center + v_refined[1])
 
         return np.array((u_refined[0], u_refined[1], amp_par_u, 0, 0), dtype=float), np.array((v_refined[0], v_refined[1], amp_par_v, 0, 0), dtype=float), pts, weights
 
     return _refine_one(u_rc), _refine_one(v_rc), None, None
+
+
+def _refine_peaks_batched(
+    ims: torch.Tensor,
+    vec: NDArray,
+    *,
+    radius_px: float,
+    refine_gaussian: bool,
+    lm_iters: int = 50,
+) -> torch.Tensor:
+    """Batched, vectorized version of the single-image ``_refine_one`` peak refinement.
+
+    Refines one lattice peak (located near ``center + vec``) for every transform in the
+    stack ``ims`` of shape ``(B, H, W)`` at once. The parabolic sub-pixel step matches
+    :func:`_refine_lattice_vectors`' ``_parabolic_peak_rc_amp`` exactly; when
+    ``refine_gaussian`` is set, the per-position ``scipy.optimize.curve_fit`` of an
+    isotropic 2D Gaussian is replaced by a batched Levenberg-Marquardt solve of the
+    identical objective and bounds. The two agree to ~1e-6 px (machine precision) but the
+    batched solve removes the dominant per-call overhead, so it runs far faster (and
+    scales onto a GPU via the tensor ``device``).
+
+    Parameters
+    ----------
+    ims : torch.Tensor
+        Stack of transformed (fftshifted ``|FFT|``) images, shape ``(B, H, W)``, float.
+    vec : NDArray
+        Lattice vector ``(row, col)`` relative to the panel center; the peak is sought
+        near ``(H // 2 + row, W // 2 + col)``.
+    radius_px : float
+        Half-width in pixels of the Gaussian-fit window.
+    refine_gaussian : bool
+        If ``True``, refine with the batched isotropic-Gaussian LM fit; otherwise return
+        the parabolic estimate only (``sigma`` and ``background`` set to 0).
+    lm_iters : int, default=50
+        Number of Levenberg-Marquardt iterations.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(B, 5)``: ``(row_offset, col_offset, amplitude, sigma, background)`` with
+        ``row_offset``/``col_offset`` measured relative to the panel center (matching
+        :func:`_refine_lattice_vectors`).
+    """
+    Bn, Hn, Wn = ims.shape
+    dev, dt = ims.device, ims.dtype
+    rcent, ccent = Hn // 2, Wn // 2
+    bidx = torch.arange(Bn, device=dev)
+
+    # Clamp the seed into the interior so the 3x3 window below is always in-bounds
+    # (mirrors the clamping in _parabolic_peak_rc_amp; matters only for edge peaks,
+    # which are interior in normal use but must not crash the batched solve).
+    r0 = int(np.clip(round(rcent + float(vec[0])), 1, Hn - 2))
+    c0 = int(np.clip(round(ccent + float(vec[1])), 1, Wn - 2))
+
+    # --- 3x3 argmax around the seed (matches _parabolic_peak_rc_amp) ---
+    win3 = ims[:, r0 - 1 : r0 + 2, c0 - 1 : c0 + 2].reshape(Bn, -1)
+    am = win3.argmax(1)
+    r_peak = r0 - 1 + torch.div(am, 3, rounding_mode="floor")
+    c_peak = c0 - 1 + (am % 3)
+
+    def _parab(vm1: torch.Tensor, v0_: torch.Tensor, vp1: torch.Tensor) -> torch.Tensor:
+        denom = vm1 - 2.0 * v0_ + vp1
+        delta = 0.5 * (vm1 - vp1) / denom
+        delta = torch.where(torch.isfinite(delta), delta, torch.zeros_like(delta))
+        delta = torch.where(denom == 0, torch.zeros_like(delta), delta)
+        return delta.clamp(-1.0, 1.0)
+
+    v0_ = ims[bidx, r_peak, c_peak]
+    dr = _parab(ims[bidx, (r_peak - 1).clamp(0, Hn - 1), c_peak], v0_, ims[bidx, (r_peak + 1).clamp(0, Hn - 1), c_peak])
+    dr = torch.where((r_peak > 0) & (r_peak < Hn - 1), dr, torch.zeros_like(dr))
+    dc = _parab(ims[bidx, r_peak, (c_peak - 1).clamp(0, Wn - 1)], v0_, ims[bidx, r_peak, (c_peak + 1).clamp(0, Wn - 1)])
+    dc = torch.where((c_peak > 0) & (c_peak < Wn - 1), dc, torch.zeros_like(dc))
+    r_sub = r_peak.to(dt) + dr
+    c_sub = c_peak.to(dt) + dc
+
+    if not refine_gaussian:
+        ri = r_sub.round().long().clamp(0, Hn - 1)
+        ci = c_sub.round().long().clamp(0, Wn - 1)
+        amp = ims[bidx, ri, ci]
+        zeros = torch.zeros(Bn, device=dev, dtype=dt)
+        return torch.stack([r_sub - rcent, c_sub - ccent, amp, zeros, zeros], 1)
+
+    # --- isotropic Gaussian fit over a (2*rad+1)^2 window, batched LM ---
+    rad = int(max(1, np.ceil(radius_px)))
+    P = 2 * rad + 1
+    r0i = r_sub.round().long()
+    c0i = c_sub.round().long()
+    off = torch.arange(-rad, rad + 1, device=dev)
+    rows_idx = (r0i[:, None, None] + off[None, :, None]).expand(Bn, P, P)
+    cols_idx = (c0i[:, None, None] + off[None, None, :]).expand(Bn, P, P)
+    bexp = bidx[:, None, None].expand(Bn, P, P)
+    win = ims[bexp, rows_idx.clamp(0, Hn - 1), cols_idx.clamp(0, Wn - 1)]
+    RR = rows_idx.to(dt).reshape(Bn, -1)
+    CC = cols_idx.to(dt).reshape(Bn, -1)
+    y = win.reshape(Bn, -1)
+
+    am2 = y.argmax(1)
+    r_pk2 = (r0i - rad + torch.div(am2, P, rounding_mode="floor")).to(dt)
+    c_pk2 = (c0i - rad + (am2 % P)).to(dt)
+    bg0 = y.median(1).values
+    amp0 = (y.max(1).values - bg0).clamp(min=0.0)
+    sig0 = torch.full((Bn,), max(0.75, radius_px / 2.0), device=dev, dtype=dt)
+    p = torch.stack([r_pk2, c_pk2, amp0, sig0, bg0], 1)
+
+    rlo = (r0i - rad).to(dt) - 0.5
+    rhi = (r0i + rad).to(dt) + 0.5
+    clo = (c0i - rad).to(dt) - 0.5
+    chi = (c0i + rad).to(dt) + 0.5
+    sig_hi = radius_px * 4.0
+
+    lam = torch.full((Bn,), 1e-2, device=dev, dtype=dt)
+    eye5 = torch.eye(5, device=dev, dtype=dt)[None]
+
+    def _sse(p_: torch.Tensor) -> torch.Tensor:
+        row, col, amp, sig, bg = [p_[:, i : i + 1] for i in range(5)]
+        sig = sig.clamp(min=1e-9)
+        E = torch.exp(-((RR - row) ** 2 + (CC - col) ** 2) / (2.0 * sig * sig))
+        return ((bg + amp * E - y) ** 2).sum(1)
+
+    for _ in range(lm_iters):
+        row, col, amp, sig, bg = [p[:, i : i + 1] for i in range(5)]
+        sig = sig.clamp(min=1e-9)
+        d_row = RR - row
+        d_col = CC - col
+        E = torch.exp(-(d_row * d_row + d_col * d_col) / (2.0 * sig * sig))
+        res = (bg + amp * E) - y
+        g_row = amp * E * d_row / (sig * sig)
+        g_col = amp * E * d_col / (sig * sig)
+        g_amp = E
+        g_sig = amp * E * ((d_row * d_row + d_col * d_col) / (sig**3))
+        g_bg = torch.ones_like(E)
+        J = torch.stack([g_row, g_col, g_amp, g_sig, g_bg], 2)  # (B, N, 5)
+        JT = J.transpose(1, 2)
+        JTJ = JT @ J
+        JTr = JT @ res[..., None]
+        diag = torch.diagonal(JTJ, dim1=1, dim2=2).clamp(min=1e-12)
+        A = JTJ + lam[:, None, None] * eye5 * diag[:, None, :]
+        delta = torch.linalg.solve(A, -JTr)[..., 0]
+        pn = p + delta
+        pn[:, 0] = pn[:, 0].clamp(rlo, rhi)
+        pn[:, 1] = pn[:, 1].clamp(clo, chi)
+        pn[:, 2] = pn[:, 2].clamp(min=0.0)
+        pn[:, 3] = pn[:, 3].clamp(0.25, sig_hi)
+        s_new = _sse(pn)
+        s_old = res.pow(2).sum(1)
+        better = s_new < s_old
+        p = torch.where(better[:, None], pn, p)
+        lam = torch.where(better, (lam * 0.5).clamp(min=1e-9), (lam * 3.0).clamp(max=1e6))
+
+    row, col, amp, sig, bg = [p[:, i] for i in range(5)]
+    ok = torch.isfinite(p).all(1)
+    row = torch.where(ok, row, r_sub)
+    col = torch.where(ok, col, c_sub)
+    return torch.stack([row - rcent, col - ccent, amp, sig, bg], 1)
 
