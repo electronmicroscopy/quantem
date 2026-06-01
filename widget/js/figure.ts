@@ -16,10 +16,31 @@ export function roundToNiceValue(value: number): number {
   return 10 * magnitude;
 }
 
-/** Format scale bar label. Unit string is displayed verbatim - no conversion. */
+/**
+ * Normalize a unit string to its scientific symbol for DISPLAY only. Users pass
+ * units like "micron"/"um" on a Dataset; we keep the trait verbatim but render
+ * the conventional glyph (µm, Å) so labels read like a journal figure. Unknown
+ * strings pass through unchanged. Case-insensitive on the spelled-out forms.
+ */
+export function unitSymbol(unit: string): string {
+  const u = (unit || "").trim();
+  const lc = u.toLowerCase();
+  if (lc === "micron" || lc === "microns" || lc === "um" || u === "μm" || u === "µm") return "µm";
+  if (lc === "angstrom" || lc === "angstroms" || lc === "ang" || u === "Å" || lc === "a") return "Å";
+  if (lc === "nanometer" || lc === "nanometers" || lc === "nm") return "nm";
+  if (lc === "picometer" || lc === "picometers" || lc === "pm") return "pm";
+  if (lc === "millimeter" || lc === "millimeters" || lc === "mm") return "mm";
+  if (lc === "picosecond" || lc === "picoseconds" || lc === "ps") return "ps";
+  if (lc === "femtosecond" || lc === "femtoseconds" || lc === "fs") return "fs";
+  if (lc === "nanosecond" || lc === "nanoseconds" || lc === "ns") return "ns";
+  return u;
+}
+
+/** Format scale bar label. Unit rendered as its scientific symbol via unitSymbol. */
 export function formatScaleLabel(value: number, unit: string): string {
   const nice = roundToNiceValue(value);
-  return nice >= 1 ? `${Math.round(nice)} ${unit}` : `${nice.toFixed(2)} ${unit}`;
+  const sym = unitSymbol(unit);
+  return nice >= 1 ? `${Math.round(nice)} ${sym}` : `${nice.toFixed(2)} ${sym}`;
 }
 
 const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";

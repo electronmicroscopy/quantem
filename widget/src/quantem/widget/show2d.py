@@ -208,6 +208,16 @@ class Show2D(anywidget.AnyWidget):
     # Used by the Python-side truthful timing print (end-to-end wall clock, not just __init__).
     _js_rendered = traitlets.Bool(False).tag(sync=True)
     frame_bytes = traitlets.Bytes(b"").tag(sync=True)
+    # Offline mode: stack quantized to uint8 against global (min, max). 4x
+    # smaller than float32 — drops standalone HTML from ~200 MB to ~110 MB.
+    # JS dequantizes on read. Eye can't tell uint8 from float32 after colormap
+    # reduces to 256 levels anyway.
+    offline = traitlets.Bool(False).tag(sync=True)
+    # True only on a clone written by export_html: forces the standalone HTML to
+    # render on a light/white background regardless of the viewer's OS theme.
+    _export_light = traitlets.Bool(False).tag(sync=True)
+    _offline_min = traitlets.Float(0.0).tag(sync=True)
+    _offline_max = traitlets.Float(1.0).tag(sync=True)
     labels = traitlets.List(traitlets.Unicode()).tag(sync=True)
     title = traitlets.Unicode("").tag(sync=True)
     cmap = traitlets.Unicode("inferno").tag(sync=True)
@@ -294,6 +304,7 @@ class Show2D(anywidget.AnyWidget):
         verbose: bool = True,
         log_scale: bool = False,
         auto_contrast: bool = False,
+        offline: bool = False,
         vmin: float | list | None = None,
         vmax: float | list | None = None,
         ncols: int = 3,
@@ -328,7 +339,7 @@ class Show2D(anywidget.AnyWidget):
                 sampling=sampling, units=units, scale_bar_visible=scale_bar_visible,
                 show_fft=show_fft, fft_window=fft_window,
                 show_controls=show_controls, show_stats=show_stats,
-                log_scale=log_scale, auto_contrast=auto_contrast,
+                log_scale=log_scale, auto_contrast=auto_contrast, offline=offline,
                 vmin=vmin, vmax=vmax,
                 ncols=ncols, size=size, smooth=smooth, zoom=zoom,
                 zoom_row=zoom_row, zoom_col=zoom_col,
@@ -338,7 +349,7 @@ class Show2D(anywidget.AnyWidget):
 
     def _init_sync(self, *, data, labels, title, cmap, sampling, units,
                    scale_bar_visible, show_fft, fft_window,
-                   show_controls, show_stats, log_scale, auto_contrast,
+                   show_controls, show_stats, log_scale, auto_contrast, offline,
                    vmin, vmax,
                    ncols, size, smooth, zoom, zoom_row, zoom_col,
                    link_zoom, link_pan, link_contrast, diff_mode, view_box,
@@ -462,6 +473,7 @@ class Show2D(anywidget.AnyWidget):
         self.show_stats = show_stats
         self.log_scale = log_scale
         self.auto_contrast = auto_contrast
+        self.offline = offline
         # Accept scalar OR list for vmin/vmax. List → per-image (vmins/vmaxs).
         if isinstance(vmin, (list, tuple)) or isinstance(vmax, (list, tuple)):
             n = self.n_images
@@ -900,7 +912,24 @@ class Show2D(anywidget.AnyWidget):
     def _update_all_frames(self):
         """Send display data to JS (possibly binned for large galleries)."""
         data = self._display_data if self._display_data is not None else self._data
-        self.frame_bytes = data.tobytes()
+        if self.offline:
+            # Quantize to uint8 against global (min, max). Drops standalone-HTML
+            # bytes by 4x. Display-only mode — colormap reduces to 256 levels
+            # anyway, eye can't tell the difference.
+            arr = np.ascontiguousarray(data, dtype=np.float32)
+            finite = arr[np.isfinite(arr)]
+            if finite.size == 0:
+                lo, hi = 0.0, 1.0
+            else:
+                lo = float(finite.min())
+                hi = float(finite.max())
+            rng = hi - lo if hi > lo else 1.0
+            quantized = np.clip((arr - lo) * (255.0 / rng), 0, 255).astype(np.uint8)
+            self._offline_min = lo
+            self._offline_max = hi
+            self.frame_bytes = quantized.tobytes()
+        else:
+            self.frame_bytes = data.tobytes()
 
     def _apply_rotations(self):
         """Re-rotate each displayed image from its original by ``image_rotations[i] * 90°``.

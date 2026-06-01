@@ -19,7 +19,7 @@ export interface VolumeRenderParams {
   nz: number;
   opacity: number;       // global opacity multiplier 0..1
   brightness: number;    // brightness adjustment 0.1..3
-  showSlicePlanes: boolean;  // toggle slice plane indicators
+  slicePlaneMask: number; // bit0=XY, bit1=XZ, bit2=YZ slice plane indicators
   slicePlaneOpacity: number; // slice plane alpha 0..1 (default 0.35)
   vmin: number;  // 0..1 normalized (maps to texture's [0,1] range)
   vmax: number;  // 0..1 normalized
@@ -182,7 +182,7 @@ struct Uniforms {
   opacity: f32,
   brightness: f32,
   numSteps: u32,
-  showSlicePlanes: u32,
+  slicePlaneMask: u32,
   vmin: f32,
   vmax: f32,
   slicePlaneOpacity: f32,
@@ -285,13 +285,20 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let tStart = max(tNear, 0.0);
   let stepSize = (tFar - tStart) / f32(u.numSteps);
 
-  // Compute slice plane intersections (only if enabled)
+  // Compute slice plane intersections (bit0=XY, bit1=XZ, bit2=YZ)
+  let showXY = (u.slicePlaneMask & 1u) != 0u;
+  let showXZ = (u.slicePlaneMask & 2u) != 0u;
+  let showYZ = (u.slicePlaneMask & 4u) != 0u;
   var tSliceXY: f32 = -1.0;
   var tSliceXZ: f32 = -1.0;
   var tSliceYZ: f32 = -1.0;
-  if (u.showSlicePlanes != 0u) {
+  if (showXY) {
     tSliceXY = intersectSlicePlane(rayOrigin, rayDir, 2, u.sliceZ, bmin, bmax);
+  }
+  if (showXZ) {
     tSliceXZ = intersectSlicePlane(rayOrigin, rayDir, 1, u.sliceY, bmin, bmax);
+  }
+  if (showYZ) {
     tSliceYZ = intersectSlicePlane(rayOrigin, rayDir, 0, u.sliceX, bmin, bmax);
   }
 
@@ -307,7 +314,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     // Composite slice planes at their depth (before volume at this step)
     // XY plane (blue)
-    if (tSliceXY > 0.0 && abs(t - tSliceXY) < stepSize * 0.6) {
+    if (showXY && tSliceXY > 0.0 && abs(t - tSliceXY) < stepSize * 0.6) {
       let slicePos = rayOrigin + tSliceXY * rayDir;
       let sliceTex = worldToTex(slicePos, bmin, bmax);
       var sliceValXY = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
@@ -319,7 +326,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
       tSliceXY = -1.0;
     }
     // XZ plane (green)
-    if (tSliceXZ > 0.0 && abs(t - tSliceXZ) < stepSize * 0.6) {
+    if (showXZ && tSliceXZ > 0.0 && abs(t - tSliceXZ) < stepSize * 0.6) {
       let slicePos = rayOrigin + tSliceXZ * rayDir;
       let sliceTex = worldToTex(slicePos, bmin, bmax);
       var sliceValXZ = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
@@ -331,7 +338,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
       tSliceXZ = -1.0;
     }
     // YZ plane (red)
-    if (tSliceYZ > 0.0 && abs(t - tSliceYZ) < stepSize * 0.6) {
+    if (showYZ && tSliceYZ > 0.0 && abs(t - tSliceYZ) < stepSize * 0.6) {
       let slicePos = rayOrigin + tSliceYZ * rayDir;
       let sliceTex = worldToTex(slicePos, bmin, bmax);
       var sliceValYZ = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
@@ -384,7 +391,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 // 124     opacity            f32                 4
 // 128     brightness         f32                 4
 // 132     numSteps           u32                 4
-// 136     showSlicePlanes    u32                 4
+// 136     slicePlaneMask     u32                 4
 // 140     vmin               f32                 4
 // 144     vmax               f32                 4
 // 148     slicePlaneOpacity  f32                 4
@@ -698,8 +705,8 @@ export class VolumeRenderer {
     f32[32] = params.brightness;
     // numSteps at offset 132/4=33
     u32[33] = numSteps;
-    // showSlicePlanes at offset 136/4=34
-    u32[34] = params.showSlicePlanes ? 1 : 0;
+    // slicePlaneMask at offset 136/4=34
+    u32[34] = params.slicePlaneMask & 7;
     // vmin at offset 140/4=35
     f32[35] = params.vmin;
     // vmax at offset 144/4=36

@@ -968,7 +968,7 @@ function Show4DSTEM() {
   const [virtualImageBytes] = useModelState<DataView>("virtual_image_bytes");
 
   // ROI state
-  const [roiRadius, setRoiRadius] = useModelState<number>("roi_radius");
+  const [roiRadiusModel, setRoiRadius] = useModelState<number>("roi_radius");
   const [roiRadiusInner, setRoiRadiusInner] = useModelState<number>("roi_radius_inner");
   const [roiMode, setRoiMode] = useModelState<string>("roi_mode");
   const [roiWidth, setRoiWidth] = useModelState<number>("roi_width");
@@ -1039,6 +1039,44 @@ function Show4DSTEM() {
       roiCenterRafRef.current = requestAnimationFrame(flushRoiCenter);
     }
   }, [flushRoiCenter]);
+  // rAF coalescing for ROI RADIUS drag — same reason as center: a no-bin BF/DF
+  // recompute is ~100ms in Python, and a resize-drag fires 60+ mousemoves/sec.
+  // Without coalescing every move becomes a queued comm message + recompute, so
+  // the image lags ~1s behind the cursor. Collapse to <=1 radius per frame.
+  // Local radius drives the ring/handle render INSTANTLY during a resize drag, so
+  // the ring tracks the cursor with no snap-back, while the model trait (which
+  // triggers the ~100ms Python recompute) is sent at most once per recompute.
+  const [localRoiRadius, setLocalRoiRadius] = React.useState<number | null>(null);
+  // Effective radius used by ALL render/hit-test code below: the live local value
+  // while dragging, else the model value. Keeps the ring glued to the cursor.
+  const roiRadius = localRoiRadius != null ? localRoiRadius : roiRadiusModel;
+  const roiRadiusPendingRef = React.useRef<number | null>(null);
+  const roiRadiusInflightRef = React.useRef<boolean>(false);
+  const sendRoiRadius = React.useCallback((radius: number) => {
+    // Skip if a recompute is already in flight — keep only the LATEST radius as
+    // pending; it gets sent when the in-flight one lands (effect below). This
+    // drops intermediate radii so the queue never builds, and because the ring
+    // is rendered from localRoiRadius it never snaps back to a stale value.
+    if (roiRadiusInflightRef.current) {
+      roiRadiusPendingRef.current = radius;
+      return;
+    }
+    roiRadiusInflightRef.current = true;
+    roiRadiusPendingRef.current = null;
+    model.set("roi_radius", radius);
+    model.save_changes();
+  }, [model]);
+  React.useEffect(() => {
+    // recompute landed: release the guard, send the latest pending radius if any
+    roiRadiusInflightRef.current = false;
+    if (roiRadiusPendingRef.current !== null) {
+      const r = roiRadiusPendingRef.current;
+      roiRadiusPendingRef.current = null;
+      roiRadiusInflightRef.current = true;
+      model.set("roi_radius", r);
+      model.save_changes();
+    }
+  }, [virtualImageBytes, model]);
   const [isDraggingVI, setIsDraggingVI] = React.useState(false);
   const [isDraggingFFT, setIsDraggingFFT] = React.useState(false);
   const [fftDragStart, setFftDragStart] = React.useState<{ x: number, y: number, panX: number, panY: number } | null>(null);
@@ -1617,6 +1655,17 @@ function Show4DSTEM() {
       }
     } else if (viAutoContrast) {
       ({ vmin, vmax } = percentileClip(scaled, 1, 99));
+      // Reflect the auto-chosen clip on the histogram slider so the user sees
+      // where Auto landed (and can grab it from there). Map the absolute
+      // vmin/vmax back to slider percent; guard against a redundant write that
+      // would loop this effect.
+      const span = dataMax - dataMin;
+      if (span > 0) {
+        const lo = Math.max(0, Math.min(100, ((vmin - dataMin) / span) * 100));
+        const hi = Math.max(0, Math.min(100, ((vmax - dataMin) / span) * 100));
+        if (Math.abs(lo - viVminPct) > 0.5) setViVminPct(lo);
+        if (Math.abs(hi - viVmaxPct) > 0.5) setViVmaxPct(hi);
+      }
     } else {
       ({ vmin, vmax } = sliderRange(dataMin, dataMax, viVminPct, viVmaxPct));
     }
@@ -2798,7 +2847,9 @@ function Show4DSTEM() {
         const newRadius = roiMode === "square" ? Math.max(dx, dy) : Math.sqrt(dx ** 2 + dy ** 2);
         // For annular mode, outer radius must be greater than inner radius
         const minRadius = roiMode === "annular" ? (roiRadiusInner || 0) + 1 : 1;
-        setRoiRadius(Math.max(minRadius, Math.round(newRadius)));
+        const rad = Math.max(minRadius, Math.round(newRadius));
+        setLocalRoiRadius(rad);   // ring follows the cursor instantly
+        sendRoiRadius(rad);       // coalesced Python recompute (latest-only)
       }
       return;
     }
@@ -2827,7 +2878,9 @@ function Show4DSTEM() {
       dpClickStartRef.current = null;
       setIsDraggingDP(false);
       setIsDraggingResize(false);
+      setLocalRoiRadius(null);  // revert ring to committed model radius on release
       setIsDraggingResizeInner(false);
+      setLocalRoiRadius(null);
       setHoveredDpProfileEndpoint(null);
       setIsHoveringDpProfileLine(false);
       return;
@@ -2861,6 +2914,7 @@ function Show4DSTEM() {
     }
     dpClickStartRef.current = null;
     setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+    setLocalRoiRadius(null);
     setDraggingDpProfileEndpoint(null);
     setIsDraggingDpProfileLine(false);
     setHoveredDpProfileEndpoint(null);
@@ -2870,6 +2924,7 @@ function Show4DSTEM() {
   const handleDpMouseLeave = () => {
     dpClickStartRef.current = null;
     setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
+    setLocalRoiRadius(null);
     setDraggingDpProfileEndpoint(null);
     setIsDraggingDpProfileLine(false);
     setHoveredDpProfileEndpoint(null);
@@ -3898,7 +3953,7 @@ function Show4DSTEM() {
               </Box>
               {/* Right: Histogram spanning both rows */}
               <Box sx={{ display: "flex", flexDirection: "column", alignItems: "flex-end", justifyContent: "center" }}>
-                <Histogram data={viHistogramData} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} dataMin={viDataMin} dataMax={viDataMax} />
+                <Histogram data={viHistogramData} vminPct={viVminPct} vmaxPct={viVmaxPct} onRangeChange={(min, max) => { if (viAutoContrast) setViAutoContrast(false); setViVminPct(min); setViVmaxPct(max); }} width={110} height={58} theme={themeInfo.theme} dataMin={viDataMin} dataMax={viDataMax} />
               </Box>
             </Box>
           )}

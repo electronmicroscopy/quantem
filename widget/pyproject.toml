@@ -9,6 +9,7 @@ description = "Interactive custom Python widgets for electron microscopy"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
+    "quantem>=0.1.8",
     "anywidget>=0.9.0",
     "numpy>=2.0.0",
     "traitlets>=5.0.0",

@@ -19,13 +19,15 @@ def to_numpy(data, dtype: np.dtype | None = None) -> np.ndarray:
         result = data.detach().cpu().numpy()
     elif isinstance(data, np.ndarray):
         result = data
+    elif hasattr(data, "get") and type(data).__module__.split(".", 1)[0] == "cupy":
+        result = data.get()
     else:
         # Last-resort fallback covers Dataset.__array__, dlpack-compatible objects, etc.
         try:
             result = np.asarray(data)
         except Exception as e:
             raise TypeError(
-                f"to_numpy expected a NumPy array or PyTorch tensor, got {type(data).__name__}."
+                f"to_numpy expected a NumPy, PyTorch, or CuPy array, got {type(data).__name__}."
             ) from e
     if dtype is not None:
         result = np.asarray(result, dtype=dtype)
