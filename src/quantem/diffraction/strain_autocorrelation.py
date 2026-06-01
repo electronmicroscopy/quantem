@@ -768,10 +768,13 @@ class StrainMapAutocorrelation(AutoSerialize):
         ``scipy.optimize.curve_fit``. For ``refine_all_peaks=True`` every detected peak is
         batch-refined across the stack and the basis is solved per position by weighted
         least squares -- avoiding the ``n_positions x n_peaks`` ``curve_fit`` calls of the
-        old loop. This removes the dominant per-call overhead and reproduces the
-        per-position result to ~1e-6 px, so the fitted vectors are unchanged while the
-        step runs far faster (and faster still on a GPU). Only ``refine_dft=True`` falls
-        back to the per-position path.
+        old loop. This removes the dominant per-call overhead and runs far faster (and
+        faster still on a GPU). The batched Levenberg-Marquardt fit reproduces the
+        per-position ``scipy.optimize.curve_fit`` to ~1e-6 px on clean, well-isolated
+        peaks; on noisy, non-Gaussian cepstral peaks the bounded-trf and LM optima can
+        land a few hundredths of a pixel apart (amplitude-preserving and well below
+        strain-relevant precision). Only ``refine_dft=True`` falls back to the
+        per-position path.
 
         Parameters
         ----------
@@ -828,8 +831,9 @@ class StrainMapAutocorrelation(AutoSerialize):
         if not refine_dft:
             # Fast path: batch the transforms and isotropic-Gaussian fits across scan
             # positions on `device` (per-position scipy.optimize.curve_fit -> vectorized
-            # LM). Covers both the 2-vector fit and the all-peaks basis fit; reproduces
-            # the per-position result to ~1e-6 px. Only DFT upsampling still falls back.
+            # LM). Covers both the 2-vector fit and the all-peaks basis fit; matches the
+            # per-position result to ~1e-6 px on clean peaks (a few 0.01 px on noisy,
+            # non-Gaussian peaks -- optimizer variance). Only DFT upsampling still falls back.
             self._fit_lattice_vectors_batched(
                 u0=u0,
                 v0=v0,
@@ -924,8 +928,10 @@ class StrainMapAutocorrelation(AutoSerialize):
         parabolic/isotropic-Gaussian peak refinement are evaluated for a stack of scan
         positions at once on ``device``, the analogue of the correlation pipeline's
         :func:`~quantem.diffraction.disk_detection.detect_disks_batch`. This reproduces
-        :func:`_refine_lattice_vectors` (with ``refine_dft=False``) to ~1e-6 px while
-        removing the per-position ``scipy.optimize.curve_fit`` overhead. Results are
+        :func:`_refine_lattice_vectors` (with ``refine_dft=False``) -- to ~1e-6 px on
+        clean peaks, within a few 0.01 px on noisy non-Gaussian peaks (bounded-trf vs LM
+        optimizer variance) -- while removing the per-position
+        ``scipy.optimize.curve_fit`` overhead. Results are
         written into :attr:`u_array`/:attr:`v_array` and :attr:`u_peak_fit`/
         :attr:`v_peak_fit`.
 
@@ -1931,9 +1937,12 @@ def _refine_peaks_batched(
     :func:`_refine_lattice_vectors`' ``_parabolic_peak_rc_amp`` exactly; when
     ``refine_gaussian`` is set, the per-position ``scipy.optimize.curve_fit`` of an
     isotropic 2D Gaussian is replaced by a batched Levenberg-Marquardt solve of the
-    identical objective and bounds. The two agree to ~1e-6 px (machine precision) but the
-    batched solve removes the dominant per-call overhead, so it runs far faster (and
-    scales onto a GPU via the tensor ``device``).
+    identical objective and bounds. On clean, well-isolated peaks the two agree to
+    ~1e-6 px; on noisy, non-Gaussian peaks (e.g. a sinc-like cepstral peak on the sloped
+    tail of a bright neighbor) the bounded-trf and LM optima can differ by a few 0.01 px
+    -- amplitude-preserving and well below strain-relevant precision. The batched solve
+    removes the dominant per-call overhead, so it runs far faster (and scales onto a GPU
+    via the tensor ``device``).
 
     Parameters
     ----------
