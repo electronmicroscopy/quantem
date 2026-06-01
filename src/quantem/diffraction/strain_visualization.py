@@ -284,10 +284,10 @@ def plot_strain_precision_histogram(
 ):
     """Weighted histogram of the local-deviation strain precision.
 
-    ``edges``/``counts`` describe the (mask-weighted, normalized) distribution of
-    the chosen ``component`` deviation in display units (``unit``). ``precision``
-    carries the mask-weighted RMS precision of every component for the annotation
-    box; the RMS of the plotted component is marked with a dashed line.
+    ``edges``/``counts`` describe the (mask-weighted, normalized) distribution of the
+    chosen ``component`` deviation in display units (``unit``). ``precision`` is the
+    weighted-median local deviation per component (used for the annotation box); the
+    plotted component's median is marked with a solid line.
     """
     fig, ax = plt.subplots(figsize=figsize)
     edges = np.asarray(edges, dtype=float)
@@ -298,25 +298,35 @@ def plot_strain_precision_histogram(
     ax.bar(centers, counts, width=widths, align="center",
            color="#4C72B0", edgecolor="white", linewidth=0.3)
 
-    rms_value = precision[component]
-    if np.isfinite(rms_value):
-        ax.axvline(rms_value, color="crimson", ls="--", lw=2,
-                   label=f"RMS = {rms_value:.3g} {unit}")
-        ax.legend(loc="upper left", fontsize=9)
+    median_value = precision[component]
+    if np.isfinite(median_value):
+        ax.axvline(median_value, color="crimson", ls="-", lw=2)
+        # label the line inline -- a legend box here would sit on top of the info box.
+        # Put the text on whichever side of the line keeps it clear of the right box.
+        span = float(edges[-1] - edges[0])
+        on_right = span > 0 and (median_value - edges[0]) / span > 0.5
+        ax.annotate(
+            f"median = {median_value:.3g} {unit}",
+            xy=(median_value, 0.96), xycoords=("data", "axes fraction"),
+            xytext=(-6 if on_right else 6, 0), textcoords="offset points",
+            ha="right" if on_right else "left", va="top",
+            color="crimson", fontsize=9,
+        )
 
     label = "combined" if component == "combined" else component
-    ax.set_xlabel(f"{label} precision ({unit})", fontsize=12)
+    ax.set_xlabel(f"{label} deviation ({unit})", fontsize=12)
     ax.set_ylabel("weighted fraction", fontsize=12)
-    ax.set_title("Strain precision  (RMS of local median deviation)", fontsize=13)
+    ax.set_title("Strain precision  (median local deviation)", fontsize=13)
     ax.tick_params(labelsize=10)
 
     annotation = "\n".join(
         [
-            rf"$\epsilon_{{uu}}$: {precision['e_uu']:.3g} %",
-            rf"$\epsilon_{{vv}}$: {precision['e_vv']:.3g} %",
-            rf"$\epsilon_{{uv}}$: {precision['e_uv']:.3g} %",
-            f"rotation: {precision['rotation']:.3g} °",
-            f"combined: {precision['combined']:.3g} %",
+            r"median:",
+            rf"  $\epsilon_{{uu}}$: {precision['e_uu']:.3g} %",
+            rf"  $\epsilon_{{vv}}$: {precision['e_vv']:.3g} %",
+            rf"  $\epsilon_{{uv}}$: {precision['e_uv']:.3g} %",
+            rf"  rotation: {precision['rotation']:.3g} °",
+            rf"  combined: {precision['combined']:.3g} %",
         ]
     )
     ax.text(0.97, 0.97, annotation, transform=ax.transAxes, ha="right", va="top",

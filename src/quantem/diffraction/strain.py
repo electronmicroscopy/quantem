@@ -392,17 +392,22 @@ class StrainMap(AutoSerialize):
         single strain precision can be quoted and compared between datasets. Rotation
         precision is reported separately, not folded into ``combined``.
 
-        Each component's precision is summarized as the mask-weighted **RMS** of its
-        per-position deviations — a sigma-like scatter — and a weighted histogram of
-        those deviations is shown. RMS combining is self-consistent under the
-        Frobenius sum: ``rms(combined) == sqrt(rms_uu**2 + rms_vv**2 + 2*rms_uv**2)``.
+        Each component's precision is summarized by the mask-weighted **median** of its
+        per-position deviations — the center of the histogram bulk. The median is used
+        (not the mean or RMS) because a handful of bad-fit pixels form a heavy tail that
+        would drag a second moment far to the right of where the distribution actually
+        sits, leaving the reported number disconnected from the histogram; the median
+        ignores that tail. A weighted histogram of the chosen component is shown, marked
+        with its median.
 
         Parameters
         ----------
         mask_range : tuple of float, default=(0.0, 1.0)
             ``(low, high)`` window remapping :attr:`mask` to ``[0, 1]`` (same
-            convention as :meth:`plot_strain`); the remapped mask both selects
-            neighbors (``> mask_threshold``) and weights the histogram and mean.
+            convention as :meth:`plot_strain`); the remapped mask both selects which
+            positions are trusted (``> mask_threshold`` -- used as neighbors *and* as
+            the set the precision is computed over) and weights the histogram and the
+            median.
         rotation_angle : float, default=0.0
             Frame rotation (degrees) applied before measuring per-component precision,
             matching :meth:`plot_strain`. ``0`` reports the raw row/col frame
@@ -415,8 +420,11 @@ class StrainMap(AutoSerialize):
             *curved* strain and biasing the masked edges. ``5`` roughly halves the
             noise-floor over-estimate of ``3`` (~9% -> ~4%) while staying local.
         mask_threshold : float, default=0.5
-            A neighbor contributes to the local median only if its scaled mask
-            exceeds this value.
+            A position is trusted only if its scaled mask exceeds this value. Trusted
+            positions are the ones used as local-median neighbors *and* the ones whose
+            deviations enter the reported median and histogram; sub-threshold positions
+            are excluded from both (not merely down-weighted), so a poorly-indexed
+            pixel cannot leak its scatter into the precision.
         min_neighbors : int, default=3
             Minimum number of valid neighbors required; positions with fewer get no
             precision estimate (``nan``, dropped from the statistics).
@@ -426,10 +434,10 @@ class StrainMap(AutoSerialize):
             Number of histogram bins (or a sequence of bin edges).
         bounds : tuple of float, optional
             ``(low, high)`` histogram range in display units (percent for strain,
-            degrees for rotation). Fix it to compare datasets on the same axis. Mass
-            outside the range (or outside an explicit ``bins`` edge array) is piled
-            into the edge bins as overflow rather than dropped, so the histogram
-            always integrates to the same weight as the reported RMS.
+            degrees for rotation). Fix it to compare datasets on the same axis. Values
+            outside the range are left out of the bars (no overflow spike); the median
+            is computed from all trusted positions regardless, and
+            ``out_of_range_fraction`` records how much was off-range.
         plot : bool, default=True
             If ``True``, draw the weighted precision histogram.
         returnfig : bool, default=False
@@ -438,12 +446,13 @@ class StrainMap(AutoSerialize):
         Returns
         -------
         dict or tuple
-            A results dict with the mask-weighted ``rms`` precision per component and
-            the ``combined`` value (strain in percent, rotation in degrees), the
-            normalized ``counts`` and ``edges`` of the histogrammed ``component`` (and
-            ``counts_raw``, the weighted bin sums), ``out_of_range_fraction`` (weighted
-            mass piled into the edge bins as overflow), and the chosen settings; or
-            ``(fig, ax)`` when ``returnfig=True``.
+            A results dict with the ``precision`` (mask-weighted median local
+            deviation) per component and ``combined`` (strain in percent, rotation in
+            degrees), the normalized ``counts`` and ``edges`` of the histogrammed
+            ``component`` (and ``counts_raw``, the weighted bin sums),
+            ``out_of_range_fraction`` (weighted mass outside the histogram range,
+            excluded from the bars), and the chosen settings; or ``(fig, ax)`` when
+            ``returnfig=True``.
         """
         if window < 3 or window % 2 == 0:
             raise ValueError("window must be an odd integer >= 3.")
@@ -494,43 +503,43 @@ class StrainMap(AutoSerialize):
             "combined": 100.0,
         }
 
-        def _weighted_rms(err_native: np.ndarray, factor: float) -> float:
+        # Precision = the weighted MEDIAN of each per-position deviation distribution,
+        # in display units. Restricted to trusted positions (valid == scaled >
+        # mask_threshold, the SAME set used to pick neighbors) and mask-weighted within
+        # it -- otherwise sub-threshold junk pixels, already excluded as neighbors,
+        # would leak in. The median sits at the center of the histogram bulk and is
+        # immune to the heavy outlier tail that a mean / RMS would chase out to the
+        # right (a few bad-fit pixels dominate a second moment but not the median).
+        def _weighted_median(err_native: np.ndarray, factor: float) -> float:
             e = err_native * factor
-            finite = np.isfinite(e)
-            w = scaled[finite]
-            wsum = float(w.sum())
-            return float(np.sqrt(np.sum(e[finite] ** 2 * w) / wsum)) if wsum > 0 else float("nan")
+            use = np.isfinite(e) & valid
+            return _weighted_quantile(e[use], scaled[use], 0.5)
 
-        # mask-weighted RMS deviation (a sigma-like scatter). Under the Frobenius
-        # sum this is self-consistent: rms(combined) == sqrt(rms_uu**2 + rms_vv**2
-        # + 2*rms_uv**2), so the combined number agrees with the per-component ones.
-        rms = {name: _weighted_rms(dev[name], scale[name]) for name in scale}
+        precision = {name: _weighted_median(dev[name], scale[name]) for name in scale}
 
-        # weighted histogram of the chosen component, in display units. The headline
-        # RMS above is computed over *all* finite positions, so the histogram must be
-        # too: with an explicit bin-edge array (e.g. bins=np.arange(0, 1, 0.02))
-        # np.histogram ignores `range` and silently DROPS everything outside the
-        # edges, then renormalizing makes the plot look far tighter than the reported
-        # RMS. Instead pile any out-of-range mass into the edge bins (overflow) so the
-        # histogram integrates to the same weight the RMS sees, and report the
-        # fraction that landed there.
+        # weighted histogram of the chosen component, over the same trusted positions
+        # as the median above. This is purely a picture of the common error values, so
+        # anything beyond the bin range is left OUT of the bars -- no overflow spike at
+        # the edge to crush the bulk. Nothing is lost: the median is computed from all
+        # trusted positions regardless. Bars are normalized by the total trusted
+        # weight, so each bar is the true fraction of all trusted positions and the
+        # off-range mass simply isn't drawn (the bars sum to 1 - out_of_range_fraction).
         e = dev[component] * scale[component]
-        finite = np.isfinite(e)
-        e_f = e[finite]
-        w_f = scaled[finite]
+        use = np.isfinite(e) & valid  # trusted positions only, consistent with median
+        e_f = e[use]
+        w_f = scaled[use]
         edges = np.histogram_bin_edges(e_f, bins=bins, range=bounds)
         lo, hi = float(edges[0]), float(edges[-1])
         wtot = float(w_f.sum())
         frac_below = float(w_f[e_f < lo].sum()) / wtot if wtot > 0 else 0.0
         frac_above = float(w_f[e_f > hi].sum()) / wtot if wtot > 0 else 0.0
         out_of_range_fraction = frac_below + frac_above
-        counts_raw, edges = np.histogram(np.clip(e_f, lo, hi), bins=edges, weights=w_f)
-        total = float(counts_raw.sum())
-        counts = counts_raw / total if total > 0 else counts_raw
+        counts_raw, edges = np.histogram(e_f, bins=edges, weights=w_f)
+        counts = counts_raw / wtot if wtot > 0 else counts_raw
 
         unit = "°" if component == "rotation" else "%"
         result = {
-            "rms": rms,
+            "precision": precision,
             "component": component,
             "unit": unit,
             "counts": counts,
@@ -544,37 +553,49 @@ class StrainMap(AutoSerialize):
             "rotation_angle": float(rotation_angle),
         }
 
-        print("Strain precision  (RMS of local median deviation, weighted by scaled mask)")
+        print("Strain precision  (median local deviation, mask-weighted)")
         print(
             f"  reference={n_neighbors} neighbors (disk, window={window})  "
             f"mask>{mask_threshold:g}  min_neighbors={min_neighbors}  "
             f"rotation_angle={rotation_angle:g} deg"
         )
         for name in ("e_uu", "e_vv", "e_uv"):
-            print(f"    {name:<9}: {rms[name]:7.4f} %")
-        print(f"    {'rotation':<9}: {rms['rotation']:7.4f} deg")
+            print(f"    {name:<9}: {precision[name]:7.4f} %")
+        print(f"    {'rotation':<9}: {precision['rotation']:7.4f} deg")
         print(
-            f"    {'combined':<9}: {rms['combined']:7.4f} %   "
+            f"    {'combined':<9}: {precision['combined']:7.4f} %   "
             "(strain-only Frobenius norm; rotation excluded)"
         )
-        if out_of_range_fraction > 0:
-            print(
-                f"  note: {100 * out_of_range_fraction:.1f}% of weighted mass fell "
-                f"outside the histogram range [{lo:g}, {hi:g}] {unit} and was piled "
-                "into the edge bins (overflow); widen `bins`/`bounds` to resolve the "
-                "tail. The RMS above includes it."
-            )
 
         if not (plot or returnfig):
             return result
 
-        fig, ax = plot_strain_precision_histogram(edges, counts, rms, component, unit)
+        fig, ax = plot_strain_precision_histogram(edges, counts, precision, component, unit)
         if returnfig:
             return fig, ax
         return result
 
 
 # ---- module-level fitting functions ----
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    """Weighted ``q``-quantile of ``values`` (``q`` in ``[0, 1]``); ``nan`` if no weight.
+
+    Uses cumulative-weight interpolation with weights centered on each sorted sample,
+    so with uniform weights it tracks ``np.quantile``'s linear interpolation and is
+    robust to a heavy upper tail (the median ignores how far the outliers reach).
+    """
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    total = float(weights.sum())
+    if values.size == 0 or total <= 0:
+        return float("nan")
+    order = np.argsort(values)
+    v = values[order]
+    w = weights[order]
+    cw = np.cumsum(w) - 0.5 * w
+    return float(np.interp(q * total, cw, v))
 
 
 def _local_masked_median(
