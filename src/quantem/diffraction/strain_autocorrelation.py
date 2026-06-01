@@ -17,7 +17,7 @@ from quantem.core.utils.imaging_utils import dft_upsample, rotate_image
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import ScalebarConfig, show_2d
-from quantem.diffraction.strain_visualization import StrainFitting
+from quantem.diffraction.strain import StrainMap
 
 
 class StrainMapAutocorrelation(AutoSerialize):
@@ -589,16 +589,16 @@ class StrainMapAutocorrelation(AutoSerialize):
         return self
 
 
-    def initilize_strain_class(
+    def initialize_strain_class(
         self,
         u_ref: np.ndarray | None = None,
         v_ref: np.ndarray | None = None,
-    )->StrainFitting:
+    )->StrainMap:
         if self.u_array is None or self.v_array is None:
-            raise RuntimeWarning("Need to run fit_lattice_vectors before initilizing strain class")
+            raise RuntimeWarning("Need to run fit_lattice_vectors before initializing strain class")
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
-        
+
         default_units = None
         default_sampling = None
         if hasattr(self.dataset, 'units'):
@@ -611,30 +611,18 @@ class StrainMapAutocorrelation(AutoSerialize):
                 default_sampling = float(self.dataset.sampling[0])
             else:
                 default_sampling = float(self.dataset.sampling)
-        
-        if self.mask is not None:
-            return StrainFitting(
-                u_array = self.u_array,
-                v_array = self.v_array,
-                ds_shape = self.dataset.shape,
-                real_space = self.real_space,
-                u_ref = u_ref,
-                v_ref = v_ref,
-                mask = self.mask,
-                ds_sampling=default_sampling,
-                ds_units = default_units,
-            )
-        else:
-            return StrainFitting(
-                u_array = self.u_array,
-                v_array = self.v_array,
-                ds_shape = self.dataset.shape,
-                real_space = self.real_space,
-                u_ref = u_ref,
-                v_ref = v_ref,
-                ds_sampling=default_sampling,
-                ds_units = default_units,
-            )
+
+        return StrainMap(
+            u_array = self.u_array,
+            v_array = self.v_array,
+            ds_shape = self.dataset.shape,
+            real_space = self.real_space,
+            u_ref = u_ref,
+            v_ref = v_ref,
+            mask = self.mask,
+            ds_sampling=default_sampling,
+            ds_units = default_units,
+        )
 
     def plot_lattice_vectors(
         self,

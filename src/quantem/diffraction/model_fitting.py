@@ -22,7 +22,7 @@ from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
-from quantem.diffraction.strain_visualization import StrainFitting
+from quantem.diffraction.strain import StrainMap
 
 
 def _parse_init(value: float | int | Sequence[float | int | None], *, name: str) -> float:
@@ -1047,7 +1047,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self,
         u_ref: np.ndarray | None = None,
         v_ref: np.ndarray | None = None,
-    )->StrainFitting:
+    )->StrainMap:
         if self.u_array is None or self.v_array is None:
             self.get_individual_uv_vectors()
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
@@ -1066,7 +1066,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             else:
                 default_sampling = float(self.dataset.sampling)
         
-        return StrainFitting(
+        return StrainMap(
             u_array = self.u_array,
             v_array = self.v_array,
             ds_shape = self.dataset.shape,
