@@ -195,6 +195,374 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
+const SCALED_COLORMAP_SHADER = /* wgsl */ `
+struct Params {
+  src_width: u32,
+  src_height: u32,
+  out_width: u32,
+  out_height: u32,
+  vmin: f32,
+  vmax: f32,
+  log_scale: u32,
+  _pad: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> data: array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgba: array<u32>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= params.out_width || gid.y >= params.out_height) { return; }
+  let src_x = min(u32((f32(gid.x) + 0.5) * f32(params.src_width) / f32(params.out_width)), params.src_width - 1u);
+  let src_y = min(u32((f32(gid.y) + 0.5) * f32(params.src_height) / f32(params.out_height)), params.src_height - 1u);
+  let src_idx = src_y * params.src_width + src_x;
+  let out_idx = gid.y * params.out_width + gid.x;
+  var val = data[src_idx];
+  if (params.log_scale == 1u) {
+    val = log(1.0 + max(val, 0.0));
+  }
+  let range = max(params.vmax - params.vmin, 1e-30);
+  let clipped = clamp(val, params.vmin, params.vmax);
+  let t = (clipped - params.vmin) / range;
+  let lutIdx = min(u32(t * 255.0), 255u);
+  let rgb = lut[lutIdx];
+  rgba[out_idx] = rgb | 0xFF000000u;
+}
+`;
+
+const SHARED_GRID_COLORMAP_SHADER = /* wgsl */ `
+struct Params {
+  src_width: u32,
+  src_height: u32,
+  src_panel_width: u32,
+  out_width: u32,
+  out_height: u32,
+  panel_count: u32,
+  cols: u32,
+  rows: u32,
+  log_scale: u32,
+  bg_rgb: u32,
+  shared_source: u32,
+  _pad0: u32,
+  vmin: f32,
+  vmax: f32,
+  gap: f32,
+  _pad1: f32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> data: array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgba: array<u32>;
+
+fn pack_rgb(rgb: u32) -> u32 {
+  return rgb | 0xFF000000u;
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= params.out_width || gid.y >= params.out_height) { return; }
+  let out_idx = gid.y * params.out_width + gid.x;
+  let bg = pack_rgb(params.bg_rgb);
+  if (params.cols == 0u || params.rows == 0u || params.panel_count == 0u || params.src_width == 0u || params.src_height == 0u) {
+    rgba[out_idx] = bg;
+    return;
+  }
+
+  let src_panel_w = max(1u, min(params.src_panel_width, params.src_width));
+  let gap = params.gap;
+  let panel_w = (f32(params.out_width) - gap * f32(params.cols - 1u)) / f32(params.cols);
+  let panel_h = (f32(params.out_height) - gap * f32(params.rows - 1u)) / f32(params.rows);
+  let stride_x = panel_w + gap;
+  let stride_y = panel_h + gap;
+  let px = f32(gid.x) + 0.5;
+  let py = f32(gid.y) + 0.5;
+  let col = u32(floor(px / stride_x));
+  let row = u32(floor(py / stride_y));
+  if (col >= params.cols || row >= params.rows) {
+    rgba[out_idx] = bg;
+    return;
+  }
+
+  let local_x = px - f32(col) * stride_x;
+  let local_y = py - f32(row) * stride_y;
+  let panel_idx = row * params.cols + col;
+  if (panel_idx >= params.panel_count || local_x < 0.0 || local_y < 0.0 || local_x >= panel_w || local_y >= panel_h) {
+    rgba[out_idx] = bg;
+    return;
+  }
+
+  let src_panel_idx = select(panel_idx, 0u, params.shared_source == 1u);
+  let src_local_x = min(u32(local_x * f32(src_panel_w) / panel_w), src_panel_w - 1u);
+  let src_x = min(src_panel_idx * src_panel_w + src_local_x, params.src_width - 1u);
+  let src_y = min(u32(local_y * f32(params.src_height) / panel_h), params.src_height - 1u);
+  let src_idx = src_y * params.src_width + src_x;
+  var val = data[src_idx];
+  if (params.log_scale == 1u) {
+    val = log(1.0 + max(val, 0.0));
+  }
+  let range = max(params.vmax - params.vmin, 1e-30);
+  let clipped = clamp(val, params.vmin, params.vmax);
+  let t = (clipped - params.vmin) / range;
+  let lutIdx = min(u32(t * 255.0), 255u);
+  let rgb = lut[lutIdx];
+  rgba[out_idx] = rgb | 0xFF000000u;
+}
+`;
+
+const DIRECT_GRID_COLORMAP_SHADER = /* wgsl */ `
+struct Params {
+  src_width: u32,
+  src_height: u32,
+  src_panel_width: u32,
+  out_width: u32,
+  out_height: u32,
+  panel_count: u32,
+  cols: u32,
+  rows: u32,
+  log_scale: u32,
+  bg_rgb: u32,
+  shared_source: u32,
+  _pad0: u32,
+  vmin: f32,
+  vmax: f32,
+  gap: f32,
+  _pad1: f32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> data: array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
+  var out: VSOut;
+  let x = f32(i32(vi & 1u)) * 4.0 - 1.0;
+  let y = f32(i32(vi >> 1u)) * 4.0 - 1.0;
+  out.pos = vec4f(x, y, 0.0, 1.0);
+  out.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+  return out;
+}
+
+fn unpack_rgb(rgb: u32) -> vec4f {
+  let r = f32(rgb & 0xFFu) / 255.0;
+  let g = f32((rgb >> 8u) & 0xFFu) / 255.0;
+  let b = f32((rgb >> 16u) & 0xFFu) / 255.0;
+  return vec4f(r, g, b, 1.0);
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  if (params.cols == 0u || params.rows == 0u || params.panel_count == 0u || params.src_width == 0u || params.src_height == 0u) {
+    return unpack_rgb(params.bg_rgb);
+  }
+
+  let out_x = min(u32(in.uv.x * f32(params.out_width)), params.out_width - 1u);
+  let out_y = min(u32(in.uv.y * f32(params.out_height)), params.out_height - 1u);
+  let src_panel_w = max(1u, min(params.src_panel_width, params.src_width));
+  let gap = params.gap;
+  let panel_w = (f32(params.out_width) - gap * f32(params.cols - 1u)) / f32(params.cols);
+  let panel_h = (f32(params.out_height) - gap * f32(params.rows - 1u)) / f32(params.rows);
+  let stride_x = panel_w + gap;
+  let stride_y = panel_h + gap;
+  let px = f32(out_x) + 0.5;
+  let py = f32(out_y) + 0.5;
+  let col = u32(floor(px / stride_x));
+  let row = u32(floor(py / stride_y));
+  if (col >= params.cols || row >= params.rows) {
+    return unpack_rgb(params.bg_rgb);
+  }
+
+  let local_x = px - f32(col) * stride_x;
+  let local_y = py - f32(row) * stride_y;
+  let panel_idx = row * params.cols + col;
+  if (panel_idx >= params.panel_count || local_x < 0.0 || local_y < 0.0 || local_x >= panel_w || local_y >= panel_h) {
+    return unpack_rgb(params.bg_rgb);
+  }
+
+  let src_panel_idx = select(panel_idx, 0u, params.shared_source == 1u);
+  let src_local_x = min(u32(local_x * f32(src_panel_w) / panel_w), src_panel_w - 1u);
+  let src_x = min(src_panel_idx * src_panel_w + src_local_x, params.src_width - 1u);
+  let src_y = min(u32(local_y * f32(params.src_height) / panel_h), params.src_height - 1u);
+  let src_idx = src_y * params.src_width + src_x;
+  var val = data[src_idx];
+  if (params.log_scale == 1u) {
+    val = log(1.0 + max(val, 0.0));
+  }
+  let range = max(params.vmax - params.vmin, 1e-30);
+  let clipped = clamp(val, params.vmin, params.vmax);
+  let t = (clipped - params.vmin) / range;
+  let lut_idx = min(u32(t * 255.0), 255u);
+  return unpack_rgb(lut[lut_idx]);
+}
+`;
+
+const DIRECT_GRID_RANGES_COLORMAP_SHADER = /* wgsl */ `
+struct Params {
+  src_width: u32,
+  src_height: u32,
+  src_panel_width: u32,
+  out_width: u32,
+  out_height: u32,
+  panel_count: u32,
+  cols: u32,
+  rows: u32,
+  _unused_log_scale: u32,
+  bg_rgb: u32,
+  shared_source: u32,
+  _pad0: u32,
+  _unused_vmin: f32,
+  _unused_vmax: f32,
+  gap: f32,
+  _pad1: f32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> data: array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+@group(0) @binding(3) var<storage, read> panel_ranges: array<vec4f>;
+
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
+  var out: VSOut;
+  let x = f32(i32(vi & 1u)) * 4.0 - 1.0;
+  let y = f32(i32(vi >> 1u)) * 4.0 - 1.0;
+  out.pos = vec4f(x, y, 0.0, 1.0);
+  out.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+  return out;
+}
+
+fn unpack_rgb(rgb: u32) -> vec4f {
+  let r = f32(rgb & 0xFFu) / 255.0;
+  let g = f32((rgb >> 8u) & 0xFFu) / 255.0;
+  let b = f32((rgb >> 16u) & 0xFFu) / 255.0;
+  return vec4f(r, g, b, 1.0);
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  if (params.cols == 0u || params.rows == 0u || params.panel_count == 0u || params.src_width == 0u || params.src_height == 0u) {
+    return unpack_rgb(params.bg_rgb);
+  }
+
+  let out_x = min(u32(in.uv.x * f32(params.out_width)), params.out_width - 1u);
+  let out_y = min(u32(in.uv.y * f32(params.out_height)), params.out_height - 1u);
+  let src_panel_w = max(1u, min(params.src_panel_width, params.src_width));
+  let gap = params.gap;
+  let panel_w = (f32(params.out_width) - gap * f32(params.cols - 1u)) / f32(params.cols);
+  let panel_h = (f32(params.out_height) - gap * f32(params.rows - 1u)) / f32(params.rows);
+  let stride_x = panel_w + gap;
+  let stride_y = panel_h + gap;
+  let px = f32(out_x) + 0.5;
+  let py = f32(out_y) + 0.5;
+  let col = u32(floor(px / stride_x));
+  let row = u32(floor(py / stride_y));
+  if (col >= params.cols || row >= params.rows) {
+    return unpack_rgb(params.bg_rgb);
+  }
+
+  let local_x = px - f32(col) * stride_x;
+  let local_y = py - f32(row) * stride_y;
+  let panel_idx = row * params.cols + col;
+  if (panel_idx >= params.panel_count || local_x < 0.0 || local_y < 0.0 || local_x >= panel_w || local_y >= panel_h) {
+    return unpack_rgb(params.bg_rgb);
+  }
+
+  let src_panel_idx = select(panel_idx, 0u, params.shared_source == 1u);
+  let src_local_x = min(u32(local_x * f32(src_panel_w) / panel_w), src_panel_w - 1u);
+  let src_x = min(src_panel_idx * src_panel_w + src_local_x, params.src_width - 1u);
+  let src_y = min(u32(local_y * f32(params.src_height) / panel_h), params.src_height - 1u);
+  let src_idx = src_y * params.src_width + src_x;
+  let panel_range = panel_ranges[panel_idx];
+  var val = data[src_idx];
+  if (panel_range.z > 0.5) {
+    val = log(1.0 + max(val, 0.0));
+  }
+  let vmin = panel_range.x;
+  let vmax = panel_range.y;
+  let range = max(vmax - vmin, 1e-30);
+  let clipped = clamp(val, vmin, vmax);
+  let t = (clipped - vmin) / range;
+  let lut_idx = min(u32(t * 255.0), 255u);
+  return unpack_rgb(lut[lut_idx]);
+}
+`;
+
+const DIRECT_SLOT_COLORMAP_SHADER = /* wgsl */ `
+struct Params {
+  src_width: u32,
+  src_height: u32,
+  src_x0: u32,
+  src_region_width: u32,
+  out_height: u32,
+  out_width: u32,
+  _unused_cols: u32,
+  _unused_rows: u32,
+  log_scale: u32,
+  bg_rgb: u32,
+  zoom: f32,
+  _pad0: u32,
+  vmin: f32,
+  vmax: f32,
+  pan_x: f32,
+  pan_y: f32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> data: array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+
+struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
+  var out: VSOut;
+  let x = f32(i32(vi & 1u)) * 4.0 - 1.0;
+  let y = f32(i32(vi >> 1u)) * 4.0 - 1.0;
+  out.pos = vec4f(x, y, 0.0, 1.0);
+  out.uv = vec2f((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+  return out;
+}
+
+fn unpack_rgb(rgb: u32) -> vec4f {
+  let r = f32(rgb & 0xFFu) / 255.0;
+  let g = f32((rgb >> 8u) & 0xFFu) / 255.0;
+  let b = f32((rgb >> 16u) & 0xFFu) / 255.0;
+  return vec4f(r, g, b, 1.0);
+}
+
+@fragment fn fs(in: VSOut) -> @location(0) vec4f {
+  if (params.src_width == 0u || params.src_height == 0u) {
+    return vec4f(0.0, 0.0, 0.0, 1.0);
+  }
+  let region_w = max(1u, min(params.src_region_width, params.src_width));
+  let region_x0 = min(params.src_x0, params.src_width - 1u);
+  let out_w = f32(max(1u, params.out_width));
+  let out_h = f32(max(1u, params.out_height));
+  let local_x = in.uv.x * out_w;
+  let local_y = in.uv.y * out_h;
+  let image_x = (local_x - params.pan_x) / max(params.zoom, 1e-6);
+  let image_y = (local_y - params.pan_y) / max(params.zoom, 1e-6);
+  if (image_x < 0.0 || image_y < 0.0 || image_x >= out_w || image_y >= out_h) {
+    return unpack_rgb(params.bg_rgb);
+  }
+  let src_local_x = min(u32(image_x * f32(region_w) / out_w), region_w - 1u);
+  let src_x = min(region_x0 + src_local_x, params.src_width - 1u);
+  let src_y = min(u32(image_y * f32(params.src_height) / out_h), params.src_height - 1u);
+  let src_idx = src_y * params.src_width + src_x;
+  var val = data[src_idx];
+  if (params.log_scale == 1u) {
+    val = log(1.0 + max(val, 0.0));
+  }
+  let range = max(params.vmax - params.vmin, 1e-30);
+  let clipped = clamp(val, params.vmin, params.vmax);
+  let t = (clipped - params.vmin) / range;
+  let lut_idx = min(u32(t * 255.0), 255u);
+  return unpack_rgb(lut[lut_idx]);
+}
+`;
+
 // Fullscreen-quad blit shader: reads RGBA u32 buffer, renders to canvas texture
 const BLIT_SHADER = /* wgsl */ `
 struct BlitParams { width: u32, height: u32 };
@@ -214,8 +582,8 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 }
 
 @fragment fn fs(in: VSOut) -> @location(0) vec4f {
-  let px = u32(in.uv.x * f32(params.width));
-  let py = u32(in.uv.y * f32(params.height));
+  let px = min(u32(in.uv.x * f32(params.width)), params.width - 1u);
+  let py = min(u32(in.uv.y * f32(params.height)), params.height - 1u);
   let idx = py * params.width + px;
   let packed = rgba[idx];
   let r = f32(packed & 0xFFu) / 255.0;
@@ -224,6 +592,196 @@ struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
   return vec4f(r, g, b, 1.0);
 }
 `;
+
+// Volume-resident orthogonal slice + colormap in ONE compute pass. The whole 3D
+// volume lives in a GPU storage buffer (uploaded once); per scrub only a tiny
+// uniform (axis + slice index + vmin/vmax) changes, so there is NO per-frame CPU
+// slice extraction and NO per-frame volume re-upload. axis: 0=XY(z fixed),
+// 1=XZ(y fixed), 2=YZ(x fixed). Order matches the CPU path: log THEN flip.
+const VOLUME_SLICE_SHADER = /* wgsl */ `
+struct VParams {
+  nx: u32, ny: u32, nz: u32, axis: u32,
+  index: u32, outW: u32, outH: u32, logScale: u32,
+  flip: u32, viewMode: u32, canvasW: u32, canvasH: u32,
+  vmin: f32, vmax: f32, zoom: f32, panX: f32,
+  panY: f32, _p0: f32, _p1: f32, _p2: f32,
+};
+@group(0) @binding(0) var<uniform> p: VParams;
+@group(0) @binding(1) var<storage, read> vol: array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgba: array<u32>;
+
+fn sampleSlice(p_axis: u32, p_index: u32, nx: u32, ny: u32, sliceX: u32, sliceY: u32) -> f32 {
+  var sx: u32; var sy: u32; var sz: u32;
+  if (p_axis == 0u) { sx = sliceX; sy = sliceY; sz = p_index; }          // XY
+  else if (p_axis == 1u) { sx = sliceX; sy = p_index; sz = sliceY; }     // XZ
+  else { sx = p_index; sy = sliceX; sz = sliceY; }                       // YZ
+  return vol[sz * ny * nx + sy * nx + sx];
+}
+
+fn signedLog1p(v: f32) -> f32 {
+  if (v >= 0.0) { return log(1.0 + v); }
+  return -log(1.0 - v);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= p.outW || gid.y >= p.outH) { return; }
+  // Full slice dims for this axis (source resolution).
+  var fullW: u32; var fullH: u32;
+  if (p.axis == 0u) { fullW = p.nx; fullH = p.ny; }        // XY
+  else if (p.axis == 1u) { fullW = p.nx; fullH = p.nz; }   // XZ
+  else { fullW = p.ny; fullH = p.nz; }                     // YZ
+  var x0: u32; var y0: u32; var x1: u32; var y1: u32;
+  if (p.viewMode == 0u) {
+    // AREA AVERAGE downsample: this output pixel covers the source block
+    // [x0,x1) x [y0,y1). Average every covered source value, so no source pixels
+    // are silently skipped when a 4k slice is displayed in a smaller panel. When
+    // outW==fullW the block is 1x1 = exact native pixel.
+    x0 = (gid.x * fullW) / p.outW;
+    y0 = (gid.y * fullH) / p.outH;
+    x1 = max(x0 + 1u, ((gid.x + 1u) * fullW) / p.outW);
+    y1 = max(y0 + 1u, ((gid.y + 1u) * fullH) / p.outH);
+  } else {
+    let cw = max(f32(p.canvasW), 1.0);
+    let ch = max(f32(p.canvasH), 1.0);
+    let z = max(p.zoom, 1e-6);
+    let cx = cw * 0.5;
+    let cy = ch * 0.5;
+    let sx0 = (((f32(gid.x) - cx - p.panX) / z) + cx) * f32(fullW) / cw;
+    let sy0 = (((f32(gid.y) - cy - p.panY) / z) + cy) * f32(fullH) / ch;
+    let sx1 = (((f32(gid.x + 1u) - cx - p.panX) / z) + cx) * f32(fullW) / cw;
+    let sy1 = (((f32(gid.y + 1u) - cy - p.panY) / z) + cy) * f32(fullH) / ch;
+    let loX = min(sx0, sx1);
+    let hiX = max(sx0, sx1);
+    let loY = min(sy0, sy1);
+    let hiY = max(sy0, sy1);
+    if (hiX <= 0.0 || hiY <= 0.0 || loX >= f32(fullW) || loY >= f32(fullH)) {
+      rgba[gid.y * p.outW + gid.x] = 0xFF000000u;
+      return;
+    }
+    x0 = u32(clamp(floor(loX), 0.0, f32(fullW - 1u)));
+    y0 = u32(clamp(floor(loY), 0.0, f32(fullH - 1u)));
+    x1 = max(x0 + 1u, u32(clamp(ceil(hiX), 1.0, f32(fullW))));
+    y1 = max(y0 + 1u, u32(clamp(ceil(hiY), 1.0, f32(fullH))));
+  }
+  var sum = 0.0; var cnt = 0.0;
+  var yy = y0;
+  loop {
+    if (yy >= y1) { break; }
+    var xx = x0;
+    loop {
+      if (xx >= x1) { break; }
+      sum = sum + sampleSlice(p.axis, p.index, p.nx, p.ny, min(xx, fullW - 1u), min(yy, fullH - 1u));
+      cnt = cnt + 1.0;
+      xx = xx + 1u;
+    }
+    yy = yy + 1u;
+  }
+  var val = sum / max(cnt, 1.0);
+  if (p.logScale == 1u) { val = signedLog1p(val); }
+  if (p.flip == 1u) { val = -val; }
+  let range = max(p.vmax - p.vmin, 1e-30);
+  let t = clamp((val - p.vmin) / range, 0.0, 1.0);
+  let li = min(u32(t * 255.0), 255u);
+  rgba[gid.y * p.outW + gid.x] = lut[li] | 0xFF000000u;
+}
+`;
+
+const VOLUME_TEXTURE_SLICE_SHADER = /* wgsl */ `
+struct VParams {
+  nx: u32, ny: u32, nz: u32, axis: u32,
+  index: u32, outW: u32, outH: u32, logScale: u32,
+  flip: u32, viewMode: u32, canvasW: u32, canvasH: u32,
+  vmin: f32, vmax: f32, zoom: f32, panX: f32,
+  panY: f32, _p0: f32, _p1: f32, _p2: f32,
+};
+@group(0) @binding(0) var<uniform> p: VParams;
+@group(0) @binding(1) var volTex: texture_2d_array<f32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rgba: array<u32>;
+
+fn sampleSlice(p_axis: u32, p_index: u32, sliceX: u32, sliceY: u32) -> f32 {
+  var sx: u32; var sy: u32; var sz: u32;
+  if (p_axis == 0u) { sx = sliceX; sy = sliceY; sz = p_index; }
+  else if (p_axis == 1u) { sx = sliceX; sy = p_index; sz = sliceY; }
+  else { sx = p_index; sy = sliceX; sz = sliceY; }
+  return textureLoad(volTex, vec2<i32>(i32(sx), i32(sy)), i32(sz), 0).r;
+}
+
+fn signedLog1p(v: f32) -> f32 {
+  if (v >= 0.0) { return log(1.0 + v); }
+  return -log(1.0 - v);
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= p.outW || gid.y >= p.outH) { return; }
+  var fullW: u32; var fullH: u32;
+  if (p.axis == 0u) { fullW = p.nx; fullH = p.ny; }
+  else if (p.axis == 1u) { fullW = p.nx; fullH = p.nz; }
+  else { fullW = p.ny; fullH = p.nz; }
+  var x0: u32; var y0: u32; var x1: u32; var y1: u32;
+  if (p.viewMode == 0u) {
+    x0 = (gid.x * fullW) / p.outW;
+    y0 = (gid.y * fullH) / p.outH;
+    x1 = max(x0 + 1u, ((gid.x + 1u) * fullW) / p.outW);
+    y1 = max(y0 + 1u, ((gid.y + 1u) * fullH) / p.outH);
+  } else {
+    let cw = max(f32(p.canvasW), 1.0);
+    let ch = max(f32(p.canvasH), 1.0);
+    let z = max(p.zoom, 1e-6);
+    let cx = cw * 0.5;
+    let cy = ch * 0.5;
+    let sx0 = (((f32(gid.x) - cx - p.panX) / z) + cx) * f32(fullW) / cw;
+    let sy0 = (((f32(gid.y) - cy - p.panY) / z) + cy) * f32(fullH) / ch;
+    let sx1 = (((f32(gid.x + 1u) - cx - p.panX) / z) + cx) * f32(fullW) / cw;
+    let sy1 = (((f32(gid.y + 1u) - cy - p.panY) / z) + cy) * f32(fullH) / ch;
+    let loX = min(sx0, sx1);
+    let hiX = max(sx0, sx1);
+    let loY = min(sy0, sy1);
+    let hiY = max(sy0, sy1);
+    if (hiX <= 0.0 || hiY <= 0.0 || loX >= f32(fullW) || loY >= f32(fullH)) {
+      rgba[gid.y * p.outW + gid.x] = 0xFF000000u;
+      return;
+    }
+    x0 = u32(clamp(floor(loX), 0.0, f32(fullW - 1u)));
+    y0 = u32(clamp(floor(loY), 0.0, f32(fullH - 1u)));
+    x1 = max(x0 + 1u, u32(clamp(ceil(hiX), 1.0, f32(fullW))));
+    y1 = max(y0 + 1u, u32(clamp(ceil(hiY), 1.0, f32(fullH))));
+  }
+  var sum = 0.0; var cnt = 0.0;
+  var yy = y0;
+  loop {
+    if (yy >= y1) { break; }
+    var xx = x0;
+    loop {
+      if (xx >= x1) { break; }
+      sum = sum + sampleSlice(p.axis, p.index, min(xx, fullW - 1u), min(yy, fullH - 1u));
+      cnt = cnt + 1.0;
+      xx = xx + 1u;
+    }
+    yy = yy + 1u;
+  }
+  var val = sum / max(cnt, 1.0);
+  if (p.logScale == 1u) { val = signedLog1p(val); }
+  if (p.flip == 1u) { val = -val; }
+  let range = max(p.vmax - p.vmin, 1e-30);
+  let t = clamp((val - p.vmin) / range, 0.0, 1.0);
+  let li = min(u32(t * 255.0), 255u);
+  rgba[gid.y * p.outW + gid.x] = lut[li] | 0xFF000000u;
+}
+`;
+
+const VOLUME_PARAMS_BYTES = 96;
+
+interface VolumeSliceView {
+  zoom: number;
+  panX: number;
+  panY: number;
+  canvasW: number;
+  canvasH: number;
+}
 
 // Tiny per-pass GPU buffers (e.g. 32B region uniforms) that must live until
 // the GPU has consumed them. We push them here when recorded into an encoder
@@ -243,27 +801,87 @@ type GPUSlot = {
   rgbaBuffer: GPUBuffer;
   readBuffer: GPUBuffer;
   paramsBuffer: GPUBuffer;
+  blitParamsBuffer: GPUBuffer;
   histBinsBuffer: GPUBuffer;
   histReadBuffer: GPUBuffer;
   // Lazily allocated per-slot 16-byte buffer holding { vmin, vmax, _p0, _p1 }.
   // Populated by computeRange* on GPU and consumed directly by the range-aware
   // colormap shader (no CPU readback between passes).
   rangeBuffer: GPUBuffer | null;
+  directGridBindGroup: GPUBindGroup | null;
+  directSlotBindGroup: GPUBindGroup | null;
+  directRegionParamsBuffers: (GPUBuffer | null)[];
+  directRegionBindGroups: (GPUBindGroup | null)[];
+  sharedGridBindGroup: GPUBindGroup | null;
+  sharedGridBlitBindGroup: GPUBindGroup | null;
   count: number;
+  rgbaCapacity: number;
   width: number;
   height: number;
+  directOnly: boolean;
 };
 
 export class GPUColormapEngine {
   private device: GPUDevice;
   private pipeline: GPUComputePipeline | null = null;
+  private scaledPipeline: GPUComputePipeline | null = null;
+  private sharedGridPipeline: GPUComputePipeline | null = null;
+  private directGridPipeline: GPURenderPipeline | null = null;
+  private directGridRangesPipeline: GPURenderPipeline | null = null;
+  private directSlotPipeline: GPURenderPipeline | null = null;
   private blitPipeline: GPURenderPipeline | null = null;
   // Per-image GPU state: persistent buffers (data, rgba, read, params, histogram)
   private slots: GPUSlot[] = [];
   private lutBuffer: GPUBuffer | null = null;
   private currentLutName: string = "";
+  private directGridParams = new ArrayBuffer(64);
+  private directGridParamsU32 = new Uint32Array(this.directGridParams);
+  private directGridParamsF32 = new Float32Array(this.directGridParams);
+  private directGridRangesBuffer: GPUBuffer | null = null;
+  private directGridRangesCapacity = 0;
+  // Volume-resident slice pipeline (Show3DSlices): volume uploaded once, slice +
+  // colormap done on GPU per scrub - no per-frame CPU extract / re-upload.
+  private volumePipeline: GPUComputePipeline | null = null;
+  private volumeTexturePipeline: GPUComputePipeline | null = null;
+  private volumeBuffer: GPUBuffer | null = null;
+  private volumeTexture: GPUTexture | null = null;
+  private volTextureView: GPUTextureView | null = null;
+  private volUseTexture = false;
+  private volTextureWidth = 0;
+  private volNx = 0;
+  private volNy = 0;
+  private volNz = 0;
+  private volCount = 0;
+  private volParamsBuffer: GPUBuffer | null = null;
+  private volRgbaBuffer: GPUBuffer | null = null;
+  private volRgbaCapacity = 0;
+  private volParams = new ArrayBuffer(VOLUME_PARAMS_BYTES);
+  private volParamsU32 = new Uint32Array(this.volParams);
+  private volParamsF32 = new Float32Array(this.volParams);
+  private volBlitCanvas: OffscreenCanvas | null = null;
+  private volBlitContext: GPUCanvasContext | null = null;
+  private volBlitFormat: GPUTextureFormat | null = null;
+  private volBlitWidth = 0;
+  private volBlitHeight = 0;
+  private volBlitParamsBuffer: GPUBuffer | null = null;
+  private volBlitParams = new Uint32Array(2);
+  private volBlitBindGroup: GPUBindGroup | null = null;
+  private volComputeBindGroup: GPUBindGroup | null = null;
+  private volTextureBindGroup: GPUBindGroup | null = null;
 
   constructor(device: GPUDevice) { this.device = device; }
+
+  private destroySlot(slot: GPUSlot): void {
+    slot.dataBuffer.destroy();
+    slot.rgbaBuffer.destroy();
+    slot.readBuffer.destroy();
+    slot.paramsBuffer.destroy();
+    slot.blitParamsBuffer.destroy();
+    slot.histBinsBuffer.destroy();
+    slot.histReadBuffer.destroy();
+    slot.rangeBuffer?.destroy();
+    for (const buf of slot.directRegionParamsBuffers) buf?.destroy();
+  }
 
   private ensurePipeline(): void {
     if (this.pipeline) return;
@@ -274,11 +892,85 @@ export class GPUColormapEngine {
     });
   }
 
+  private ensureScaledPipeline(): void {
+    if (this.scaledPipeline) return;
+    const module = this.device.createShaderModule({ code: SCALED_COLORMAP_SHADER });
+    this.scaledPipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "main" },
+    });
+  }
+
+  private ensureSharedGridPipeline(): void {
+    if (this.sharedGridPipeline) return;
+    const module = this.device.createShaderModule({ code: SHARED_GRID_COLORMAP_SHADER });
+    this.sharedGridPipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "main" },
+    });
+  }
+
+  private ensureDirectGridPipeline(format: GPUTextureFormat): void {
+    if (this.directGridPipeline) return;
+    const module = this.device.createShaderModule({ code: DIRECT_GRID_COLORMAP_SHADER });
+    this.directGridPipeline = this.device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        targets: [{ format }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+  }
+
+  private ensureDirectGridRangesPipeline(format: GPUTextureFormat): void {
+    if (this.directGridRangesPipeline) return;
+    const module = this.device.createShaderModule({ code: DIRECT_GRID_RANGES_COLORMAP_SHADER });
+    this.directGridRangesPipeline = this.device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        targets: [{ format }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+  }
+
+  private ensureDirectSlotPipeline(format: GPUTextureFormat): void {
+    if (this.directSlotPipeline) return;
+    const module = this.device.createShaderModule({ code: DIRECT_SLOT_COLORMAP_SHADER });
+    this.directSlotPipeline = this.device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        targets: [{ format }],
+      },
+      primitive: { topology: "triangle-list" },
+    });
+  }
+
   /** Upload LUT to GPU (only when colormap name changes). */
   uploadLUT(lutName: string, lut: Uint8Array): void {
     if (this.currentLutName === lutName && this.lutBuffer) return;
     this.ensurePipeline();
-    if (this.lutBuffer) this.lutBuffer.destroy();
+    if (this.lutBuffer) {
+      this.lutBuffer.destroy();
+      this.volComputeBindGroup = null;
+      this.volTextureBindGroup = null;
+      for (const slot of this.slots) {
+        if (!slot) continue;
+        slot.directGridBindGroup = null;
+        slot.directSlotBindGroup = null;
+        slot.directRegionBindGroups = slot.directRegionBindGroups.map(() => null);
+        slot.sharedGridBindGroup = null;
+      }
+    }
     // Pack RGB triplets into u32 for GPU (R in low bits)
     const packed = new Uint32Array(256);
     for (let i = 0; i < 256; i++) {
@@ -294,25 +986,25 @@ export class GPUColormapEngine {
 
 
   /** Upload float32 image data for slot `idx`. Only call when data changes. */
-  uploadData(idx: number, data: Float32Array, width?: number, height?: number): void {
+  uploadData(idx: number, data: Float32Array, width?: number, height?: number, rgbaCapacityHint?: number, directOnly: boolean = false): void {
     this.ensurePipeline();
     while (this.slots.length <= idx) this.slots.push(null as never);
-    if (this.slots[idx]) {
-      this.slots[idx].dataBuffer.destroy();
-      this.slots[idx].rgbaBuffer.destroy();
-      this.slots[idx].readBuffer.destroy();
-      this.slots[idx].paramsBuffer.destroy();
-      this.slots[idx].histBinsBuffer.destroy();
-      this.slots[idx].histReadBuffer.destroy();
-      this.slots[idx].rangeBuffer?.destroy();
-    }
     // Validate dimensions — if width*height doesn't match data length, derive from sqrt
     // (catches stale closure values like width=1 from mount effects)
     const validDims = width && height && width > 1 && height > 1 && width * height === data.length;
     const w = validDims ? width : Math.round(Math.sqrt(data.length));
     const h = validDims ? height : Math.round(data.length / w);
     const byteSize = data.byteLength;
-    const rgbaSize = data.length * 4;
+    const rgbaCapacity = directOnly ? 1 : Math.max(1, Math.round(rgbaCapacityHint ?? data.length));
+    const rgbaSize = rgbaCapacity * 4;
+    const existing = this.slots[idx];
+    if (existing && existing.directOnly === directOnly && existing.count === data.length && existing.width === w && existing.height === h && existing.rgbaCapacity >= rgbaCapacity) {
+      this.device.queue.writeBuffer(existing.dataBuffer, 0, data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
+      return;
+    }
+    if (existing) {
+      this.destroySlot(existing);
+    }
     const dataBuffer = this.device.createBuffer({
       size: byteSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -328,11 +1020,14 @@ export class GPUColormapEngine {
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     // Persistent params buffer — reused (just writeBuffer on each call).
-    // Size 32 covers both the 24-byte colormap/histogram structs and the
-    // 32-byte range-aware colormap struct (extra trailing bytes are unused
-    // by the smaller shaders).
+    // Size 64 covers the 24-byte colormap/histogram structs, 32-byte scaled
+    // colormap structs, and 64-byte direct grid colormap struct.
     const paramsBuffer = this.device.createBuffer({
-      size: 32,
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const blitParamsBuffer = this.device.createBuffer({
+      size: 8,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     // Persistent histogram buffers (256 bins × 4 bytes = 1KB each)
@@ -344,7 +1039,27 @@ export class GPUColormapEngine {
       size: 256 * 4,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
-    this.slots[idx] = { dataBuffer, rgbaBuffer, readBuffer, paramsBuffer, histBinsBuffer, histReadBuffer, rangeBuffer: null, count: data.length, width: w, height: h };
+    this.slots[idx] = {
+      dataBuffer,
+      rgbaBuffer,
+      readBuffer,
+      paramsBuffer,
+      blitParamsBuffer,
+      histBinsBuffer,
+      histReadBuffer,
+      rangeBuffer: null,
+      directGridBindGroup: null,
+      directSlotBindGroup: null,
+      directRegionParamsBuffers: [],
+      directRegionBindGroups: [],
+      sharedGridBindGroup: null,
+      sharedGridBlitBindGroup: null,
+      count: data.length,
+      rgbaCapacity,
+      width: w,
+      height: h,
+      directOnly,
+    };
   }
 
   // Params buffer: 24 bytes = { width: u32, height: u32, vmin: f32, vmax: f32, log_scale: u32, _pad: u32 }
@@ -378,7 +1093,7 @@ export class GPUColormapEngine {
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
       const slot = this.slots[i];
-      if (!slot) continue;
+      if (!slot || slot.directOnly || slot.rgbaCapacity < slot.count) continue;
       const range = ranges[k] || { vmin: 0, vmax: 1 };
 
       // Reuse persistent paramsBuffer — just write new values
@@ -470,7 +1185,7 @@ export class GPUColormapEngine {
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
       const slot = this.slots[i];
-      if (!slot || !offscreens[k] || !imgDatas[k]) continue;
+      if (!slot || slot.directOnly || slot.rgbaCapacity < slot.count || !offscreens[k] || !imgDatas[k]) continue;
       const range = ranges[k] || { vmin: 0, vmax: 1 };
 
       this._writeParams(params, slot.width, slot.height, range.vmin, range.vmax, logScale);
@@ -553,7 +1268,7 @@ export class GPUColormapEngine {
       const i = indices[k];
       const slot = this.slots[i];
       const ctx = contexts[k];
-      if (!slot || !ctx) continue;
+      if (!slot || slot.directOnly || slot.rgbaCapacity < slot.count || !ctx) continue;
       const range = ranges[k] || { vmin: 0, vmax: 1 };
 
       // 1. Compute colormap (same as renderSlots)
@@ -639,7 +1354,7 @@ export class GPUColormapEngine {
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
       const slot = this.slots[i];
-      if (!slot) { canvases.push(null as never); continue; }
+      if (!slot || slot.directOnly || slot.rgbaCapacity < slot.count) { canvases.push(null as never); continue; }
       const range = ranges[k] || { vmin: 0, vmax: 1 };
 
       // Compute colormap
@@ -708,12 +1423,874 @@ export class GPUColormapEngine {
     return bitmaps;
   }
 
+  private ensureVolumePipeline(): void {
+    if (this.volumePipeline) return;
+    const module = this.device.createShaderModule({ code: VOLUME_SLICE_SHADER });
+    this.volumePipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "main" },
+    });
+    if (!this.volParamsBuffer) {
+      this.volParamsBuffer = this.device.createBuffer({
+        size: VOLUME_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+  }
+
+  private ensureVolumeTexturePipeline(): void {
+    if (this.volumeTexturePipeline) return;
+    const module = this.device.createShaderModule({ code: VOLUME_TEXTURE_SLICE_SHADER });
+    this.volumeTexturePipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: { module, entryPoint: "main" },
+    });
+    if (!this.volParamsBuffer) {
+      this.volParamsBuffer = this.device.createBuffer({
+        size: VOLUME_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+  }
+
+  /**
+   * Upload a 3D volume (nz, ny, nx) row-major float32 into GPU memory once.
+   * 4k and row-padded large stacks use a 2D texture array to avoid
+   * storage-buffer binding limits. The texture path keeps original float32
+   * values; unaligned rows are padded only in the upload stride and never
+   * sampled. Other shapes use the storage-buffer path.
+   */
+  uploadVolume(vol: Float32Array, nx: number, ny: number, nz: number): boolean {
+    const rowBytes = nx * 4;
+    const paddedRowBytes = Math.ceil(rowBytes / 256) * 256;
+    const textureWidth = paddedRowBytes / 4;
+    const canTexture = textureWidth <= this.device.limits.maxTextureDimension2D &&
+      ny <= this.device.limits.maxTextureDimension2D &&
+      nz <= this.device.limits.maxTextureArrayLayers;
+    if (canTexture) {
+      try {
+        this.ensureVolumeTexturePipeline();
+        const needsTexture = !this.volumeTexture || this.volCount !== vol.length ||
+          this.volNx !== nx || this.volNy !== ny || this.volNz !== nz ||
+          this.volTextureWidth !== textureWidth;
+        if (needsTexture) {
+          this.volumeTexture?.destroy();
+          this.volumeTexture = this.device.createTexture({
+            size: { width: textureWidth, height: ny, depthOrArrayLayers: nz },
+            format: "r32float",
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+          });
+          this.volTextureView = this.volumeTexture.createView({ dimension: "2d-array" });
+          this.volTextureBindGroup = null;
+          this.volCount = vol.length;
+        }
+        const texture = this.volumeTexture;
+        if (!texture) return false;
+        if (paddedRowBytes === rowBytes) {
+          this.device.queue.writeTexture(
+            { texture },
+            vol.buffer as ArrayBuffer,
+            { offset: vol.byteOffset, bytesPerRow: rowBytes, rowsPerImage: ny },
+            { width: nx, height: ny, depthOrArrayLayers: nz },
+          );
+        } else {
+          const layer = new Float32Array(textureWidth * ny);
+          const sliceStride = nx * ny;
+          for (let z = 0; z < nz; z++) {
+            const srcZ = z * sliceStride;
+            for (let y = 0; y < ny; y++) {
+              const src = srcZ + y * nx;
+              layer.set(vol.subarray(src, src + nx), y * textureWidth);
+            }
+            this.device.queue.writeTexture(
+              { texture, origin: { x: 0, y: 0, z } },
+              layer.buffer,
+              { bytesPerRow: paddedRowBytes, rowsPerImage: ny },
+              { width: nx, height: ny, depthOrArrayLayers: 1 },
+            );
+          }
+        }
+        this.volUseTexture = true;
+        this.volumeBuffer?.destroy();
+        this.volumeBuffer = null;
+        this.volComputeBindGroup = null;
+        this.volTextureWidth = textureWidth;
+        this.volNx = nx; this.volNy = ny; this.volNz = nz;
+        return true;
+      } catch {
+        this.volumeTexture?.destroy();
+        this.volumeTexture = null;
+        this.volTextureView = null;
+        this.volTextureBindGroup = null;
+        this.volUseTexture = false;
+        this.volTextureWidth = 0;
+      }
+    }
+    this.ensureVolumePipeline();
+    this.volumeTexture?.destroy();
+    this.volumeTexture = null;
+    this.volTextureView = null;
+    this.volTextureBindGroup = null;
+    this.volTextureWidth = 0;
+    const maxBind = this.device.limits.maxStorageBufferBindingSize;
+    if (vol.byteLength > maxBind) return false;
+    if (!this.volumeBuffer || this.volCount !== vol.length) {
+      this.volumeBuffer?.destroy();
+      this.volumeBuffer = this.device.createBuffer({
+        size: vol.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      this.volCount = vol.length;
+      this.volComputeBindGroup = null;
+    }
+    this.device.queue.writeBuffer(this.volumeBuffer, 0, vol.buffer as ArrayBuffer, vol.byteOffset, vol.byteLength);
+    this.volUseTexture = false;
+    this.volNx = nx; this.volNy = ny; this.volNz = nz;
+    return true;
+  }
+
+  /**
+   * Slice the resident volume along `axis` (0=XY, 1=XZ, 2=YZ) at `index`,
+   * colormap with the current LUT + vmin/vmax (logScale/flip applied in-shader to
+   * match the CPU path), and blit to an ImageBitmap. Returns null if the volume
+   * isn't uploaded or the LUT/pipeline isn't ready (caller falls back to CPU).
+   */
+  renderVolumeSliceToImageBitmap(
+    axis: number, index: number,
+    range: { vmin: number; vmax: number },
+    logScale: boolean, flip: boolean,
+    maxOut?: number,
+    view?: VolumeSliceView,
+  ): ImageBitmap | null {
+    const texturePipeline = this.volUseTexture ? this.volumeTexturePipeline : null;
+    const textureView = this.volUseTexture ? this.volTextureView : null;
+    const useTexture = texturePipeline != null && textureView != null;
+    const bufferPipeline = this.volumePipeline;
+    const useBuffer = !useTexture && this.volumeBuffer != null && bufferPipeline != null;
+    if ((!useTexture && !useBuffer) || !this.lutBuffer || !this.volParamsBuffer) return null;
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureBlitPipeline(fmt);
+    if (!this.blitPipeline) return null;
+    const nx = this.volNx, ny = this.volNy, nz = this.volNz;
+    const fullW = axis === 0 ? nx : axis === 1 ? nx : ny;
+    const fullH = axis === 0 ? ny : nz;
+    // If maxOut is supplied, cap the output raster while still sampling from
+    // the full-resolution source. Callers that need native-pixel zoom leave it
+    // undefined, so outW/outH stay at the full slice dimensions.
+    const cap = maxOut && maxOut > 0 ? maxOut : Math.max(fullW, fullH);
+    const scale = Math.min(1, cap / Math.max(fullW, fullH));
+    const outW = view ? Math.max(1, Math.round(view.canvasW)) : Math.max(1, Math.round(fullW * scale));
+    const outH = view ? Math.max(1, Math.round(view.canvasH)) : Math.max(1, Math.round(fullH * scale));
+    const idx = Math.max(0, Math.min((axis === 2 ? nx : axis === 1 ? ny : nz) - 1, Math.round(index)));
+    const rgbaCount = outW * outH;
+    if (!this.volRgbaBuffer || this.volRgbaCapacity < rgbaCount) {
+      this.volRgbaBuffer?.destroy();
+      this.volRgbaBuffer = this.device.createBuffer({
+        size: rgbaCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      this.volRgbaCapacity = rgbaCount;
+      this.volBlitBindGroup = null;
+      this.volComputeBindGroup = null;
+      this.volTextureBindGroup = null;
+    }
+    const paramsBuffer = this.volParamsBuffer;
+    const lutBuffer = this.lutBuffer;
+    const rgbaBuffer = this.volRgbaBuffer;
+    if (!paramsBuffer || !lutBuffer || !rgbaBuffer) return null;
+    // VParams: u32 control block + float contrast / viewport block.
+    const vp = this.volParams;
+    const u = this.volParamsU32; const f = this.volParamsF32;
+    u[0] = nx; u[1] = ny; u[2] = nz; u[3] = axis;
+    u[4] = idx; u[5] = outW; u[6] = outH; u[7] = logScale ? 1 : 0;
+    u[8] = flip ? 1 : 0;
+    u[9] = view ? 1 : 0;
+    u[10] = view ? Math.max(1, Math.round(view.canvasW)) : outW;
+    u[11] = view ? Math.max(1, Math.round(view.canvasH)) : outH;
+    f[12] = range.vmin; f[13] = range.vmax;
+    f[14] = view ? Math.max(1e-6, view.zoom) : 1;
+    f[15] = view ? view.panX : 0;
+    f[16] = view ? view.panY : 0;
+    this.device.queue.writeBuffer(paramsBuffer, 0, vp);
+    const encoder = this.device.createCommandEncoder();
+    if (useTexture) {
+      if (!this.volTextureBindGroup) {
+        this.volTextureBindGroup = this.device.createBindGroup({
+          layout: texturePipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } },
+            { binding: 1, resource: textureView },
+            { binding: 2, resource: { buffer: lutBuffer } },
+            { binding: 3, resource: { buffer: rgbaBuffer } },
+          ],
+        });
+      }
+    } else if (!this.volComputeBindGroup && bufferPipeline && this.volumeBuffer) {
+      this.volComputeBindGroup = this.device.createBindGroup({
+        layout: bufferPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: paramsBuffer } },
+          { binding: 1, resource: { buffer: this.volumeBuffer } },
+          { binding: 2, resource: { buffer: lutBuffer } },
+          { binding: 3, resource: { buffer: rgbaBuffer } },
+        ],
+      });
+    }
+    const cpass = encoder.beginComputePass();
+    if (useTexture) {
+      cpass.setPipeline(texturePipeline);
+      cpass.setBindGroup(0, this.volTextureBindGroup!);
+    } else {
+      if (!bufferPipeline || !this.volComputeBindGroup) { cpass.end(); return null; }
+      cpass.setPipeline(bufferPipeline);
+      cpass.setBindGroup(0, this.volComputeBindGroup);
+    }
+    cpass.dispatchWorkgroups(Math.ceil(outW / 16), Math.ceil(outH / 16));
+    cpass.end();
+    const sizeChanged = !this.volBlitCanvas || this.volBlitWidth !== outW || this.volBlitHeight !== outH;
+    const formatChanged = this.volBlitFormat !== fmt;
+    if (sizeChanged || formatChanged || !this.volBlitContext) {
+      this.volBlitCanvas = new OffscreenCanvas(outW, outH);
+      this.volBlitContext = this.volBlitCanvas.getContext("webgpu") as GPUCanvasContext | null;
+      if (!this.volBlitContext) return null;
+      this.volBlitContext.configure({ device: this.device, format: fmt, alphaMode: "opaque" });
+      this.volBlitWidth = outW;
+      this.volBlitHeight = outH;
+      this.volBlitFormat = fmt;
+    }
+    if (!this.volBlitParamsBuffer) {
+      this.volBlitParamsBuffer = this.device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
+    this.volBlitParams[0] = outW;
+    this.volBlitParams[1] = outH;
+    this.device.queue.writeBuffer(this.volBlitParamsBuffer, 0, this.volBlitParams);
+    if (!this.volBlitBindGroup) {
+      this.volBlitBindGroup = this.device.createBindGroup({
+        layout: this.blitPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.volBlitParamsBuffer } },
+          { binding: 1, resource: { buffer: rgbaBuffer } },
+        ],
+      });
+    }
+    const blitContext = this.volBlitContext;
+    const blitCanvas = this.volBlitCanvas;
+    if (!blitContext || !blitCanvas) return null;
+    const rpass = encoder.beginRenderPass({
+      colorAttachments: [{ view: blitContext.getCurrentTexture().createView(), loadOp: "clear" as GPULoadOp, storeOp: "store" as GPUStoreOp, clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+    });
+    rpass.setPipeline(this.blitPipeline);
+    rpass.setBindGroup(0, this.volBlitBindGroup);
+    rpass.draw(3);
+    rpass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return blitCanvas.transferToImageBitmap();
+  }
+
+  /**
+   * GPU colormap one slot, then blit the full-resolution RGBA buffer into a
+   * smaller OffscreenCanvas. The fragment shader samples the source buffer by
+   * UV, so values stay full-precision through the colormap step while playback
+   * avoids creating a 4096x4096 ImageBitmap when the visible canvas is smaller.
+   */
+  renderSlotScaledToImageBitmap(
+    idx: number,
+    range: { vmin: number; vmax: number },
+    logScale: boolean,
+    outW: number,
+    outH: number,
+  ): ImageBitmap | null {
+    if (!this.pipeline || !this.lutBuffer) return null;
+    const slot = this.slots[idx];
+    if (!slot || slot.directOnly) return null;
+    const w = Math.max(1, Math.round(outW));
+    const h = Math.max(1, Math.round(outH));
+    if (w * h > slot.rgbaCapacity) {
+      if (slot.rgbaCapacity < slot.count) return null;
+      const bitmaps = this.renderSlotsToImageBitmap([idx], [range], logScale);
+      return bitmaps?.[0] ?? null;
+    }
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureScaledPipeline();
+    this.ensureBlitPipeline(fmt);
+    if (!this.scaledPipeline || !this.blitPipeline) return null;
+
+    const encoder = this.device.createCommandEncoder();
+    const params = new ArrayBuffer(32);
+
+    const pu = new Uint32Array(params);
+    const pf = new Float32Array(params);
+    pu[0] = slot.width;
+    pu[1] = slot.height;
+    pu[2] = w;
+    pu[3] = h;
+    pf[4] = range.vmin;
+    pf[5] = range.vmax;
+    pu[6] = logScale ? 1 : 0;
+    pu[7] = 0;
+    this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
+
+    const computeGroup = this.device.createBindGroup({
+      layout: this.scaledPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: slot.paramsBuffer } },
+        { binding: 1, resource: { buffer: slot.dataBuffer } },
+        { binding: 2, resource: { buffer: this.lutBuffer } },
+        { binding: 3, resource: { buffer: slot.rgbaBuffer } },
+      ],
+    });
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(this.scaledPipeline);
+    computePass.setBindGroup(0, computeGroup);
+    computePass.dispatchWorkgroups(Math.ceil(w / 16), Math.ceil(h / 16));
+    computePass.end();
+
+    const oc = new OffscreenCanvas(w, h);
+    const ctx = oc.getContext("webgpu") as GPUCanvasContext | null;
+    if (!ctx) return null;
+    ctx.configure({ device: this.device, format: fmt, alphaMode: "opaque" });
+
+    const blitParamsBuffer = this.device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(blitParamsBuffer, 0, new Uint32Array([w, h]));
+
+    const blitGroup = this.device.createBindGroup({
+      layout: this.blitPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: blitParamsBuffer } },
+        { binding: 1, resource: { buffer: slot.rgbaBuffer } },
+      ],
+    });
+
+    const texture = ctx.getCurrentTexture();
+    const renderPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: "clear" as GPULoadOp,
+        storeOp: "store" as GPUStoreOp,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    renderPass.setPipeline(this.blitPipeline);
+    renderPass.setBindGroup(0, blitGroup);
+    renderPass.draw(3);
+    renderPass.end();
+
+    this.device.queue.submit([encoder.finish()]);
+    blitParamsBuffer.destroy();
+    return oc.transferToImageBitmap();
+  }
+
+  renderSharedGridToCanvas(
+    idx: number,
+    range: { vmin: number; vmax: number },
+    logScale: boolean,
+    ctx: GPUCanvasContext,
+  opts: {
+      width: number;
+      height: number;
+      panelCount: number;
+      cols: number;
+      rows: number;
+      gap: number;
+      bgRgb: number;
+      sourcePanelWidth?: number;
+      sharedSource?: boolean;
+    },
+  ): boolean {
+    if (!this.lutBuffer) return false;
+    const slot = this.slots[idx];
+    if (!slot || slot.directOnly) return false;
+    const outW = Math.max(1, Math.round(opts.width));
+    const outH = Math.max(1, Math.round(opts.height));
+    if (outW * outH > slot.rgbaCapacity) return false;
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureSharedGridPipeline();
+    this.ensureBlitPipeline(fmt);
+    if (!this.sharedGridPipeline || !this.blitPipeline) return false;
+
+    const encoder = this.device.createCommandEncoder();
+    const params = this.directGridParams;
+    const pu = this.directGridParamsU32;
+    const pf = this.directGridParamsF32;
+    pu[0] = slot.width;
+    pu[1] = slot.height;
+    pu[2] = Math.max(1, Math.min(slot.width, Math.round(opts.sourcePanelWidth ?? slot.width)));
+    pu[3] = outW;
+    pu[4] = outH;
+    pu[5] = Math.max(1, Math.round(opts.panelCount));
+    pu[6] = Math.max(1, Math.round(opts.cols));
+    pu[7] = Math.max(1, Math.round(opts.rows));
+    pu[8] = logScale ? 1 : 0;
+    pu[9] = opts.bgRgb & 0xFFFFFF;
+    pu[10] = opts.sharedSource ? 1 : 0;
+    pu[11] = 0;
+    pf[12] = range.vmin;
+    pf[13] = range.vmax;
+    pf[14] = Math.max(0, opts.gap);
+    pf[15] = 0;
+    this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
+
+    let computeGroup = slot.sharedGridBindGroup;
+    if (!computeGroup) {
+      computeGroup = this.device.createBindGroup({
+        layout: this.sharedGridPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: slot.paramsBuffer } },
+          { binding: 1, resource: { buffer: slot.dataBuffer } },
+          { binding: 2, resource: { buffer: this.lutBuffer } },
+          { binding: 3, resource: { buffer: slot.rgbaBuffer } },
+        ],
+      });
+      slot.sharedGridBindGroup = computeGroup;
+    }
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(this.sharedGridPipeline);
+    computePass.setBindGroup(0, computeGroup);
+    computePass.dispatchWorkgroups(Math.ceil(outW / 16), Math.ceil(outH / 16));
+    computePass.end();
+
+    this.device.queue.writeBuffer(slot.blitParamsBuffer, 0, new Uint32Array([outW, outH]));
+
+    let blitGroup = slot.sharedGridBlitBindGroup;
+    if (!blitGroup) {
+      blitGroup = this.device.createBindGroup({
+        layout: this.blitPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: slot.blitParamsBuffer } },
+          { binding: 1, resource: { buffer: slot.rgbaBuffer } },
+        ],
+      });
+      slot.sharedGridBlitBindGroup = blitGroup;
+    }
+
+    const texture = ctx.getCurrentTexture();
+    const renderPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: "clear" as GPULoadOp,
+        storeOp: "store" as GPUStoreOp,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    renderPass.setPipeline(this.blitPipeline);
+    renderPass.setBindGroup(0, blitGroup);
+    renderPass.draw(3);
+    renderPass.end();
+
+    this.device.queue.submit([encoder.finish()]);
+    return true;
+  }
+
+  renderSharedGridDirectToCanvas(
+    idx: number,
+    range: { vmin: number; vmax: number },
+    logScale: boolean,
+    ctx: GPUCanvasContext,
+    opts: {
+      width: number;
+      height: number;
+      panelCount: number;
+      cols: number;
+      rows: number;
+      gap: number;
+      bgRgb: number;
+      sourcePanelWidth?: number;
+      sharedSource?: boolean;
+    },
+  ): boolean {
+    if (!this.lutBuffer) return false;
+    const slot = this.slots[idx];
+    if (!slot) return false;
+    const outW = Math.max(1, Math.round(opts.width));
+    const outH = Math.max(1, Math.round(opts.height));
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureDirectGridPipeline(fmt);
+    const pipeline = this.directGridPipeline;
+    if (!pipeline) return false;
+
+    const params = new ArrayBuffer(64);
+    const pu = new Uint32Array(params);
+    const pf = new Float32Array(params);
+    pu[0] = slot.width;
+    pu[1] = slot.height;
+    pu[2] = Math.max(1, Math.min(slot.width, Math.round(opts.sourcePanelWidth ?? slot.width)));
+    pu[3] = outW;
+    pu[4] = outH;
+    pu[5] = Math.max(1, Math.round(opts.panelCount));
+    pu[6] = Math.max(1, Math.round(opts.cols));
+    pu[7] = Math.max(1, Math.round(opts.rows));
+    pu[8] = logScale ? 1 : 0;
+    pu[9] = opts.bgRgb & 0xFFFFFF;
+    pu[10] = opts.sharedSource ? 1 : 0;
+    pu[11] = 0;
+    pf[12] = range.vmin;
+    pf[13] = range.vmax;
+    pf[14] = Math.max(0, opts.gap);
+    pf[15] = 0;
+    this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
+
+    let bindGroup = slot.directGridBindGroup;
+    if (!bindGroup) {
+      bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: slot.paramsBuffer } },
+          { binding: 1, resource: { buffer: slot.dataBuffer } },
+          { binding: 2, resource: { buffer: this.lutBuffer } },
+        ],
+      });
+      slot.directGridBindGroup = bindGroup;
+    }
+
+    const texture = ctx.getCurrentTexture();
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: "clear" as GPULoadOp,
+        storeOp: "store" as GPUStoreOp,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return true;
+  }
+
+  renderPanelSlotsDirectToCanvas(
+    indices: number[],
+    range: { vmin: number; vmax: number } | { vmin: number; vmax: number }[],
+    logScale: boolean | boolean[],
+    ctx: GPUCanvasContext,
+    opts: {
+      width: number;
+      height: number;
+      panelCount: number;
+      cols: number;
+      rows: number;
+      gap: number;
+      bgRgb: number;
+      transforms?: { zoom: number; panX: number; panY: number }[];
+    },
+  ): boolean {
+    if (!this.lutBuffer || indices.length === 0) return false;
+    const outW = Math.max(1, Math.round(opts.width));
+    const outH = Math.max(1, Math.round(opts.height));
+    const n = Math.max(1, Math.min(indices.length, Math.round(opts.panelCount)));
+    const cols = Math.max(1, Math.round(opts.cols));
+    const rows = Math.max(1, Math.round(opts.rows));
+    const gap = Math.max(0, opts.gap);
+    const panelW = (outW - gap * (cols - 1)) / cols;
+    const panelH = (outH - gap * (rows - 1)) / rows;
+    if (panelW <= 0 || panelH <= 0) return false;
+
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureDirectSlotPipeline(fmt);
+    const pipeline = this.directSlotPipeline;
+    if (!pipeline) return false;
+
+    const params = this.directGridParams;
+    const pu = this.directGridParamsU32;
+    const pf = this.directGridParamsF32;
+    for (let panel = 0; panel < n; panel++) {
+      const slot = this.slots[indices[panel]];
+      if (!slot) return false;
+      const panelRange = Array.isArray(range) ? (range[panel] ?? range[0]) : range;
+      const panelLogScale = Array.isArray(logScale) ? !!logScale[panel] : logScale;
+      pu[0] = slot.width;
+      pu[1] = slot.height;
+      pu[2] = 0;
+      pu[3] = slot.width;
+      pu[4] = Math.max(1, Math.round(panelH));
+      pu[5] = Math.max(1, Math.round(panelW));
+      pu[6] = 1;
+      pu[7] = 1;
+      pu[8] = panelLogScale ? 1 : 0;
+      pu[9] = opts.bgRgb & 0xFFFFFF;
+      const transform = opts.transforms?.[panel];
+      pf[10] = Math.max(1e-6, transform?.zoom ?? 1);
+      pu[11] = 0;
+      pf[12] = panelRange.vmin;
+      pf[13] = panelRange.vmax;
+      pf[14] = transform?.panX ?? 0;
+      pf[15] = transform?.panY ?? 0;
+      this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
+      if (!slot.directSlotBindGroup) {
+        slot.directSlotBindGroup = this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: slot.paramsBuffer } },
+            { binding: 1, resource: { buffer: slot.dataBuffer } },
+            { binding: 2, resource: { buffer: this.lutBuffer } },
+          ],
+        });
+      }
+    }
+
+    const texture = ctx.getCurrentTexture();
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: "clear" as GPULoadOp,
+        storeOp: "store" as GPUStoreOp,
+        clearValue: {
+          r: ((opts.bgRgb & 0xFF) / 255),
+          g: (((opts.bgRgb >> 8) & 0xFF) / 255),
+          b: (((opts.bgRgb >> 16) & 0xFF) / 255),
+          a: 1,
+        },
+      }],
+    });
+    pass.setPipeline(pipeline);
+    for (let panel = 0; panel < n; panel++) {
+      const slot = this.slots[indices[panel]];
+      if (!slot?.directSlotBindGroup) continue;
+      const col = panel % cols;
+      const row = Math.floor(panel / cols);
+      const x = col * (panelW + gap);
+      const y = row * (panelH + gap);
+      const sx = Math.max(0, Math.floor(x));
+      const sy = Math.max(0, Math.floor(y));
+      const sw = Math.max(1, Math.ceil(panelW));
+      const sh = Math.max(1, Math.ceil(panelH));
+      pass.setViewport(x, y, panelW, panelH, 0, 1);
+      pass.setScissorRect(sx, sy, Math.min(sw, outW - sx), Math.min(sh, outH - sy));
+      pass.setBindGroup(0, slot.directSlotBindGroup);
+      pass.draw(3);
+    }
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return true;
+  }
+
+  renderCombinedGridRangesDirectToCanvas(
+    slotIdx: number,
+    ranges: { vmin: number; vmax: number }[],
+    logScale: boolean | boolean[],
+    ctx: GPUCanvasContext,
+    opts: {
+      width: number;
+      height: number;
+      panelCount: number;
+      cols: number;
+      rows: number;
+      gap: number;
+      bgRgb: number;
+      sourcePanelWidth: number;
+      sharedSource?: boolean;
+    },
+  ): boolean {
+    if (!this.lutBuffer) return false;
+    const slot = this.slots[slotIdx];
+    if (!slot || ranges.length === 0) return false;
+    const outW = Math.max(1, Math.round(opts.width));
+    const outH = Math.max(1, Math.round(opts.height));
+    const n = Math.max(1, Math.round(opts.panelCount));
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureDirectGridRangesPipeline(fmt);
+    const pipeline = this.directGridRangesPipeline;
+    if (!pipeline) return false;
+
+    const neededRangeBytes = Math.max(1, n) * 16;
+    if (!this.directGridRangesBuffer || this.directGridRangesCapacity < neededRangeBytes) {
+      this.directGridRangesBuffer?.destroy();
+      this.directGridRangesBuffer = this.device.createBuffer({
+        size: neededRangeBytes,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      this.directGridRangesCapacity = neededRangeBytes;
+    }
+    const packedRanges = new Float32Array(n * 4);
+    for (let panel = 0; panel < n; panel++) {
+      const panelRange = ranges[panel] ?? ranges[0];
+      packedRanges[panel * 4] = panelRange.vmin;
+      packedRanges[panel * 4 + 1] = panelRange.vmax;
+      packedRanges[panel * 4 + 2] = Array.isArray(logScale) ? (logScale[panel] ? 1 : 0) : (logScale ? 1 : 0);
+      packedRanges[panel * 4 + 3] = 0;
+    }
+    this.device.queue.writeBuffer(this.directGridRangesBuffer, 0, packedRanges);
+
+    const params = this.directGridParams;
+    const pu = this.directGridParamsU32;
+    const pf = this.directGridParamsF32;
+    pu[0] = slot.width;
+    pu[1] = slot.height;
+    pu[2] = Math.max(1, Math.min(slot.width, Math.round(opts.sourcePanelWidth)));
+    pu[3] = outW;
+    pu[4] = outH;
+    pu[5] = n;
+    pu[6] = Math.max(1, Math.round(opts.cols));
+    pu[7] = Math.max(1, Math.round(opts.rows));
+    pu[8] = 0;
+    pu[9] = opts.bgRgb & 0xFFFFFF;
+    pu[10] = opts.sharedSource ? 1 : 0;
+    pu[11] = 0;
+    pf[12] = 0;
+    pf[13] = 1;
+    pf[14] = Math.max(0, opts.gap);
+    pf[15] = 0;
+    this.device.queue.writeBuffer(slot.paramsBuffer, 0, params);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: slot.paramsBuffer } },
+        { binding: 1, resource: { buffer: slot.dataBuffer } },
+        { binding: 2, resource: { buffer: this.lutBuffer } },
+        { binding: 3, resource: { buffer: this.directGridRangesBuffer } },
+      ],
+    });
+
+    const texture = ctx.getCurrentTexture();
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: "clear" as GPULoadOp,
+        storeOp: "store" as GPUStoreOp,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(3);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return true;
+  }
+
+  renderCombinedPanelRegionsDirectToCanvas(
+    slotIdx: number,
+    range: { vmin: number; vmax: number } | { vmin: number; vmax: number }[],
+    logScale: boolean | boolean[],
+    ctx: GPUCanvasContext,
+    opts: {
+      width: number;
+      height: number;
+      panelCount: number;
+      cols: number;
+      rows: number;
+      gap: number;
+      bgRgb: number;
+      sourcePanelWidth: number;
+    },
+  ): boolean {
+    if (!this.lutBuffer) return false;
+    const slot = this.slots[slotIdx];
+    if (!slot) return false;
+    const outW = Math.max(1, Math.round(opts.width));
+    const outH = Math.max(1, Math.round(opts.height));
+    const n = Math.max(1, Math.round(opts.panelCount));
+    const cols = Math.max(1, Math.round(opts.cols));
+    const rows = Math.max(1, Math.round(opts.rows));
+    const gap = Math.max(0, opts.gap);
+    const panelW = (outW - gap * (cols - 1)) / cols;
+    const panelH = (outH - gap * (rows - 1)) / rows;
+    if (panelW <= 0 || panelH <= 0) return false;
+
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureDirectSlotPipeline(fmt);
+    const pipeline = this.directSlotPipeline;
+    if (!pipeline) return false;
+
+    const params = this.directGridParams;
+    const pu = this.directGridParamsU32;
+    const pf = this.directGridParamsF32;
+    const sourcePanelW = Math.max(1, Math.min(slot.width, Math.round(opts.sourcePanelWidth)));
+    while (slot.directRegionParamsBuffers.length < n) {
+      slot.directRegionParamsBuffers.push(null);
+      slot.directRegionBindGroups.push(null);
+    }
+    for (let panel = 0; panel < n; panel++) {
+      let paramsBuffer = slot.directRegionParamsBuffers[panel];
+      if (!paramsBuffer) {
+        paramsBuffer = this.device.createBuffer({
+          size: 64,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        slot.directRegionParamsBuffers[panel] = paramsBuffer;
+      }
+      const panelRange = Array.isArray(range) ? (range[panel] ?? range[0]) : range;
+      const panelLogScale = Array.isArray(logScale) ? !!logScale[panel] : logScale;
+      const srcX0 = Math.min(panel * sourcePanelW, Math.max(0, slot.width - 1));
+      pu[0] = slot.width;
+      pu[1] = slot.height;
+      pu[2] = srcX0;
+      pu[3] = Math.max(1, Math.min(sourcePanelW, slot.width - srcX0));
+      pu[4] = Math.max(1, Math.round(panelH));
+      pu[5] = 1;
+      pu[6] = 1;
+      pu[7] = 1;
+      pu[8] = panelLogScale ? 1 : 0;
+      pu[9] = opts.bgRgb & 0xFFFFFF;
+      pu[10] = 1;
+      pu[11] = 0;
+      pf[12] = panelRange.vmin;
+      pf[13] = panelRange.vmax;
+      pf[14] = 0;
+      pf[15] = 0;
+      this.device.queue.writeBuffer(paramsBuffer, 0, params);
+      if (!slot.directRegionBindGroups[panel]) {
+        slot.directRegionBindGroups[panel] = this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } },
+            { binding: 1, resource: { buffer: slot.dataBuffer } },
+            { binding: 2, resource: { buffer: this.lutBuffer } },
+          ],
+        });
+      }
+    }
+
+    const texture = ctx.getCurrentTexture();
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: "clear" as GPULoadOp,
+        storeOp: "store" as GPUStoreOp,
+        clearValue: {
+          r: ((opts.bgRgb & 0xFF) / 255),
+          g: (((opts.bgRgb >> 8) & 0xFF) / 255),
+          b: (((opts.bgRgb >> 16) & 0xFF) / 255),
+          a: 1,
+        },
+      }],
+    });
+    pass.setPipeline(pipeline);
+    for (let panel = 0; panel < n; panel++) {
+      const bindGroup = slot.directRegionBindGroups[panel];
+      if (!bindGroup) continue;
+      const col = panel % cols;
+      const row = Math.floor(panel / cols);
+      const x = col * (panelW + gap);
+      const y = row * (panelH + gap);
+      const sx = Math.max(0, Math.floor(x));
+      const sy = Math.max(0, Math.floor(y));
+      const sw = Math.max(1, Math.min(Math.ceil(panelW), outW - sx));
+      const sh = Math.max(1, Math.min(Math.ceil(panelH), outH - sy));
+      pass.setViewport(x, y, panelW, panelH, 0, 1);
+      pass.setScissorRect(sx, sy, sw, sh);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(3);
+    }
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    return true;
+  }
+
   /**
    * Configure a canvas for WebGPU zero-copy rendering.
    * Returns the GPUCanvasContext, or null if WebGPU canvas is not supported.
    */
   configureCanvas(canvas: HTMLCanvasElement, width: number, height: number): GPUCanvasContext | null {
     try {
+      canvas.width = width;
+      canvas.height = height;
       const ctx = canvas.getContext("webgpu") as GPUCanvasContext | null;
       if (!ctx) return null;
       ctx.configure({
@@ -721,8 +2298,6 @@ export class GPUColormapEngine {
         format: navigator.gpu.getPreferredCanvasFormat(),
         alphaMode: "opaque",
       });
-      canvas.width = width;
-      canvas.height = height;
       return ctx;
     } catch {
       return null;
@@ -732,26 +2307,35 @@ export class GPUColormapEngine {
   /** Release all GPU resources. */
   destroy(): void {
     for (const slot of this.slots) {
-      if (slot) {
-        slot.dataBuffer.destroy();
-        slot.rgbaBuffer.destroy();
-        slot.readBuffer.destroy();
-        slot.paramsBuffer.destroy();
-        slot.histBinsBuffer.destroy();
-        slot.histReadBuffer.destroy();
-        slot.rangeBuffer?.destroy();
-      }
+      if (slot) this.destroySlot(slot);
     }
     this.slots = [];
     this.lutBuffer?.destroy();
     this.lutBuffer = null;
+    this.directGridRangesBuffer?.destroy();
+    this.directGridRangesBuffer = null;
+    this.directGridRangesCapacity = 0;
     this.currentLutName = "";
     for (const v of this.panelRgbaBuffers.values()) { v.rgba.destroy(); v.range.destroy(); }
     this.panelRgbaBuffers.clear();
+    this.volumeBuffer?.destroy(); this.volumeBuffer = null;
+    this.volumeTexture?.destroy(); this.volumeTexture = null; this.volTextureView = null;
+    this.volParamsBuffer?.destroy(); this.volParamsBuffer = null;
+    this.volRgbaBuffer?.destroy(); this.volRgbaBuffer = null;
+    this.volBlitParamsBuffer?.destroy(); this.volBlitParamsBuffer = null;
+    this.volBlitCanvas = null; this.volBlitContext = null; this.volBlitFormat = null;
+    this.volBlitBindGroup = null; this.volComputeBindGroup = null; this.volTextureBindGroup = null; this.volBlitWidth = 0; this.volBlitHeight = 0;
+    this.volUseTexture = false;
+    this.volCount = 0; this.volRgbaCapacity = 0; this.volTextureWidth = 0;
   }
 
   /** Number of uploaded image slots. */
   get slotCount(): number { return this.slots.filter(s => s).length; }
+
+  /** Resolve once all GPU work submitted so far has completed. */
+  async waitForSubmittedWork(): Promise<void> {
+    await this.device.queue.onSubmittedWorkDone();
+  }
 
   // ── GPU min/max reduction ──
 
@@ -1117,7 +2701,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     for (let k = 0; k < indices.length; k++) {
       const i = indices[k];
       const slot = this.slots[i];
-      if (!slot || !slot.rangeBuffer) { canvases.push(null); continue; }
+      if (!slot || slot.directOnly || slot.rgbaCapacity < slot.count || !slot.rangeBuffer) { canvases.push(null); continue; }
       const lowPct = vminPct[k] ?? 0;
       const highPct = vmaxPct[k] ?? 100;
 
@@ -1189,6 +2773,108 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       if (oc) bitmaps.push(oc.transferToImageBitmap());
       else bitmaps.push(null as never);
     }
+    return bitmaps;
+  }
+
+  /**
+   * Render panel sub-regions with explicit per-panel ranges. Used when
+   * Show3D contrast is unlinked and each histogram owns its own clip state.
+   */
+  renderPerPanelGpuExplicit(
+    slotIdx: number,
+    regions: { x: number; y: number; width: number; height: number }[],
+    ranges: { vmin: number; vmax: number }[],
+    logScale: boolean | boolean[] = false,
+  ): ImageBitmap[] | null {
+    this.ensureColormapRangePipeline();
+    if (!this.colormapRangePipeline || !this.lutBuffer) return null;
+    const slot = this.slots[slotIdx];
+    if (!slot || regions.length === 0) return null;
+    const fmt = navigator.gpu.getPreferredCanvasFormat();
+    this.ensureBlitPipeline(fmt);
+    if (!this.blitPipeline) return null;
+
+    const encoder = this.device.createCommandEncoder();
+    const cmParams = new ArrayBuffer(32);
+    const canvases: (OffscreenCanvas | null)[] = [];
+    const tempBuffers: GPUBuffer[] = [];
+
+    for (let k = 0; k < regions.length; k++) {
+      const r = regions[k];
+      const panelRange = ranges[k] ?? ranges[0];
+      if (!r || !panelRange) { canvases.push(null); continue; }
+      const scratch = this.ensurePanelScratch(k, r.width * r.height);
+      this.device.queue.writeBuffer(
+        scratch.range,
+        0,
+        new Float32Array([panelRange.vmin, panelRange.vmax, 0, 0]),
+      );
+
+      const pu = new Uint32Array(cmParams);
+      const pf = new Float32Array(cmParams);
+      pu[0] = r.width; pu[1] = r.height;
+      pf[2] = 0; pf[3] = 100;
+      pu[4] = Array.isArray(logScale) ? (logScale[k] ? 1 : 0) : (logScale ? 1 : 0);
+      pu[5] = r.x; pu[6] = r.y; pu[7] = slot.width;
+      const cmParamsBuf = this.device.createBuffer({
+        size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(cmParamsBuf, 0, cmParams);
+      tempBuffers.push(cmParamsBuf);
+
+      const cmGroup = this.device.createBindGroup({
+        layout: this.colormapRangePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: cmParamsBuf } },
+          { binding: 1, resource: { buffer: slot.dataBuffer } },
+          { binding: 2, resource: { buffer: this.lutBuffer } },
+          { binding: 3, resource: { buffer: scratch.rgba } },
+          { binding: 4, resource: { buffer: scratch.range } },
+        ],
+      });
+      const cmPass = encoder.beginComputePass();
+      cmPass.setPipeline(this.colormapRangePipeline);
+      cmPass.setBindGroup(0, cmGroup);
+      cmPass.dispatchWorkgroups(Math.ceil(r.width / 16), Math.ceil(r.height / 16));
+      cmPass.end();
+
+      const oc = new OffscreenCanvas(r.width, r.height);
+      const ctx = oc.getContext("webgpu") as GPUCanvasContext;
+      ctx.configure({ device: this.device, format: fmt, alphaMode: "opaque" });
+      const blitParamsBuffer = this.device.createBuffer({
+        size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(blitParamsBuffer, 0, new Uint32Array([r.width, r.height]));
+      tempBuffers.push(blitParamsBuffer);
+
+      const blitGroup = this.device.createBindGroup({
+        layout: this.blitPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: blitParamsBuffer } },
+          { binding: 1, resource: { buffer: scratch.rgba } },
+        ],
+      });
+      const texture = ctx.getCurrentTexture();
+      const renderPass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: texture.createView(),
+          loadOp: "clear" as GPULoadOp,
+          storeOp: "store" as GPUStoreOp,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      renderPass.setPipeline(this.blitPipeline);
+      renderPass.setBindGroup(0, blitGroup);
+      renderPass.draw(3);
+      renderPass.end();
+      canvases.push(oc);
+    }
+
+    this.device.queue.submit([encoder.finish()]);
+    for (const b of tempBuffers) b.destroy();
+
+    const bitmaps: ImageBitmap[] = [];
+    for (const oc of canvases) bitmaps.push(oc ? oc.transferToImageBitmap() : null as never);
     return bitmaps;
   }
 
@@ -1418,8 +3104,6 @@ fn clear_bins(@builtin(global_invocation_id) gid: vec3u) {
       const clearGroup = this.device.createBindGroup({
         layout: this.histClearPipeline!.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: { buffer: slot.paramsBuffer } },
-          { binding: 1, resource: { buffer: slot.dataBuffer } },
           { binding: 2, resource: { buffer: slot.histBinsBuffer } },
         ],
       });
@@ -1504,8 +3188,6 @@ fn clear_bins(@builtin(global_invocation_id) gid: vec3u) {
     const clearGroup = this.device.createBindGroup({
       layout: this.histClearPipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: paramsBuf } },
-        { binding: 1, resource: { buffer: slot.dataBuffer } },
         { binding: 2, resource: { buffer: binsBuffer } },
       ],
     });
@@ -1553,21 +3235,25 @@ fn clear_bins(@builtin(global_invocation_id) gid: vec3u) {
   }
 }
 
+/** Create a GPU colormap engine. Returns null if WebGPU unavailable. */
+export async function createGPUColormapEngine(): Promise<GPUColormapEngine | null> {
+  try {
+    const { getGPUDevice } = await import("./fft");
+    const device = await getGPUDevice();
+    if (!device) return null;
+    return new GPUColormapEngine(device);
+  } catch {
+    return null;
+  }
+}
+
 let gpuColormapEngine: GPUColormapEngine | null = null;
 
 /** Get or create the singleton GPU colormap engine. Returns null if WebGPU unavailable. */
 export async function getGPUColormapEngine(): Promise<GPUColormapEngine | null> {
   if (gpuColormapEngine) return gpuColormapEngine;
-  // Reuse the GPU device from fft
-  try {
-    const { getGPUDevice } = await import("./fft");
-    const device = await getGPUDevice();
-    if (!device) return null;
-    gpuColormapEngine = new GPUColormapEngine(device);
-    return gpuColormapEngine;
-  } catch {
-    return null;
-  }
+  gpuColormapEngine = await createGPUColormapEngine();
+  return gpuColormapEngine;
 }
 
 /** Query the GPU's max buffer size in bytes. Returns 0 if WebGPU unavailable. */

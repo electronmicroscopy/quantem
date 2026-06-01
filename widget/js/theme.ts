@@ -125,15 +125,15 @@ export function detectTheme(): ThemeInfo {
 // ============================================================================
 // React hook
 // ============================================================================
-export function useTheme(): { themeInfo: ThemeInfo; colors: ThemeColors } {
-  const [themeInfo, setThemeInfo] = useState<ThemeInfo>(() => detectTheme());
+export function useTheme(forceLight = false): { themeInfo: ThemeInfo; colors: ThemeColors } {
+  const [detected, setDetected] = useState<ThemeInfo>(() => detectTheme());
 
   useEffect(() => {
     const mediaQuery = window.matchMedia?.('(prefers-color-scheme: dark)');
-    const handleChange = () => setThemeInfo(detectTheme());
+    const handleChange = () => setDetected(detectTheme());
     mediaQuery?.addEventListener?.('change', handleChange);
 
-    const observer = new MutationObserver(() => setThemeInfo(detectTheme()));
+    const observer = new MutationObserver(() => setDetected(detectTheme()));
     observer.observe(document.body, { attributes: true, attributeFilter: ['data-jp-theme-light', 'class'] });
 
     return () => {
@@ -142,6 +142,10 @@ export function useTheme(): { themeInfo: ThemeInfo; colors: ThemeColors } {
     };
   }, []);
 
+  // Offline HTML exports always render on a light (white) background: the report
+  // is a static, theme-less artifact and a forced dark page leaks the kernel's
+  // dark Jupyter theme into a shared file the colleague opens in any browser.
+  const themeInfo: ThemeInfo = forceLight ? { ...detected, theme: "light" } : detected;
   // Memoize by theme string so `colors` is referentially stable across renders —
   // effects/components that depend on `colors` only re-run when the theme flips.
   const colors = useMemo(() => getThemeColors(themeInfo.theme), [themeInfo.theme]);

@@ -206,3 +206,5 @@ widget/scripts/
 widget/tests/integration/
 widget/tests/snapshots/
 
+
+widget/PERFORMANCE.md

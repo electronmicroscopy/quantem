@@ -58,19 +58,33 @@ export function percentileClip(
     bins[Math.floor((data[i] - min) * scale)]++;
   }
 
-  // Walk cumulative histogram to find percentile values
-  const lowCount = Math.floor(len * (pLow / 100));
-  const highCount = Math.ceil(len * (pHigh / 100));
+  // Walk cumulative histogram to find percentile values. Linear-interpolate
+  // between bin edges where the target count is crossed so the result is
+  // continuous in the data, not snapped to 1024 discrete bin midpoints.
+  const lowCount = len * (pLow / 100);
+  const highCount = len * (pHigh / 100);
   let cumSum = 0;
   let vmin = min, vmax = max;
+  let prevSum = 0;
   for (let i = 0; i < NUM_BINS; i++) {
+    prevSum = cumSum;
     cumSum += bins[i];
-    if (cumSum >= lowCount) { vmin = min + (i / (NUM_BINS - 1)) * range; break; }
+    if (cumSum >= lowCount) {
+      const frac = (lowCount - prevSum) / Math.max(1, cumSum - prevSum);
+      vmin = min + ((i + frac) / NUM_BINS) * range;
+      break;
+    }
   }
   cumSum = 0;
+  prevSum = 0;
   for (let i = 0; i < NUM_BINS; i++) {
+    prevSum = cumSum;
     cumSum += bins[i];
-    if (cumSum >= highCount) { vmax = min + (i / (NUM_BINS - 1)) * range; break; }
+    if (cumSum >= highCount) {
+      const frac = (highCount - prevSum) / Math.max(1, cumSum - prevSum);
+      vmax = min + ((i + frac) / NUM_BINS) * range;
+      break;
+    }
   }
   return { vmin, vmax, min, max };
 }

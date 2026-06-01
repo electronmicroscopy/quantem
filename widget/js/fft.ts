@@ -456,7 +456,27 @@ export async function getGPUDevice(): Promise<GPUDevice | null> {
         gpuInfo = info.description || `${info.vendor} ${info.architecture || ""} ${info.device || ""}`.trim() || "Generic WebGPU Adapter";
       }
     } catch (_e) { /* adapter info not available */ }
-    gpuDevice = await adapter.requestDevice({ requiredFeatures: [] });
+    const requiredLimits: Record<string, number> = {};
+    const maxBufferSize = adapter.limits.maxBufferSize || 0;
+    const maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize || 0;
+    if (maxBufferSize > 0) {
+      requiredLimits.maxBufferSize = maxBufferSize;
+    }
+    if (maxStorageBufferBindingSize > 0) {
+      requiredLimits.maxStorageBufferBindingSize = maxStorageBufferBindingSize;
+    }
+    // Raise the texture-dimension cap to the adapter's max. The DEVICE default is
+    // 8192 even when the adapter supports more (16384 on Apple/Metal), and that
+    // default applies to OffscreenCanvas swapchain textures. A multi-panel stack
+    // wider than 8192 (e.g. 9 panels x 1024 = 9216) then fails swapchain-texture
+    // creation, which silently invalidates the whole command submit -> black
+    // canvas + unwritten rgba buffer. Requesting the adapter max keeps the GPU
+    // colormap path valid for wide concatenated panels. (D6/D7, verified phil.)
+    const maxTextureDimension2D = adapter.limits.maxTextureDimension2D || 0;
+    if (maxTextureDimension2D > 0) {
+      requiredLimits.maxTextureDimension2D = maxTextureDimension2D;
+    }
+    gpuDevice = await adapter.requestDevice({ requiredFeatures: [], requiredLimits });
     // Re-acquire if GPU process crashes (Linux NVIDIA hiccups, Electron tab suspend).
     gpuDevice.lost.then(() => { gpuDevice = null; gpuFFT = null; });
     return gpuDevice;

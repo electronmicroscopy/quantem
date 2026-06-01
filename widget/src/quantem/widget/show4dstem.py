@@ -333,15 +333,18 @@ class Show4DSTEM(anywidget.AnyWidget):
 
         _io_labels = None
 
-        # Auto-extract sampling + units from Dataset4dstem if available.
-        if hasattr(data, "sampling") and hasattr(data, "array"):
-            if not title and hasattr(data, "name") and data.name:
+        # Extract underlying array / tensor + auto-calibrate from Dataset input
+        # (duck-typed via the dual-slot private attributes _tensor / _array).
+        tensor = getattr(data, "_tensor", None)
+        array = getattr(data, "_array", None)
+        if tensor is not None or array is not None:
+            if not title and getattr(data, "name", ""):
                 title = str(data.name)
             if sampling is None:
                 sampling = tuple(float(s) for s in data.sampling)
-            if units is None and hasattr(data, "units"):
+            if units is None:
                 units = list(data.units)
-            data = data.array
+            data = tensor if tensor is not None else array
 
         # Resolve sampling + units (4 axes for 4D-STEM):
         # [scan_row, scan_col, k_row, k_col]. Scalar/None broadcast to (1, 1, 1, 1).
@@ -378,7 +381,11 @@ class Show4DSTEM(anywidget.AnyWidget):
         self._suppress_roi_recompute = False
         # Torch tensor input keeps its device (lets user pin a specific GPU via
         # `data.cuda(1)`). NumPy / Dataset input gets default-validated device.
-        if isinstance(data, torch.Tensor):
+        if isinstance(data, torch.Tensor) or getattr(data, "_is_gpu_frames", False):
+            # `_is_gpu_frames` lets a duck-typed GPU array (e.g. a chunk-backed
+            # no-bin stack that can't be one tensor) take the GPU path without a
+            # numpy round-trip. It must expose .shape/.dtype/.ndim/.device and
+            # single-frame integer indexing.
             self._device = data.device
             self._data_pre = data
             data_np = None
@@ -1162,16 +1169,22 @@ class Show4DSTEM(anywidget.AnyWidget):
         >>> widget.auto_detect_center()  # Auto-detect and apply
         """
         # Sum diffraction patterns over scan positions to find BF disk centroid.
-        # Single chunked torch float path: works identically on CUDA / MPS / CPU.
-        # Each chunk casts uint16 → float32 transiently (~600 MB max), accumulates.
+        # Chunked torch INTEGER path: works identically on CUDA / MPS / CPU.
+        # int64 accumulator, no float32 cast of the stack — keeps the data in its
+        # native dtype (a float32 cast doubles memory and is lossy above 2^24),
+        # is bit-exact, and avoids the MPS "tensor dims larger than INT_MAX"
+        # error a single full-stack reduce hits once positions*det > 2^31 (a bin2
+        # 512x512x96x96 stack = 2.42e9 elements). The chunk cap keeps each op's
+        # element count well under 2^31; the (det, det) accumulator is tiny.
         data_flat = self._data.reshape(-1, *self._det_shape)
         n_pos = data_flat.shape[0]
-        mean_dp = torch.zeros(self._det_shape, dtype=torch.float32, device=self._device)
-        # Float32 cast transient = positions × det_h × det_w × 4 bytes; cap at budget.
-        pos_per_chunk = max(1, _CHUNK_BYTE_BUDGET // max(1, self._det_shape[0] * self._det_shape[1] * 4))
+        mean_dp = torch.zeros(self._det_shape, dtype=torch.int64, device=self._device)
+        pos_per_chunk = max(1, (1 << 30) // max(1, self._det_shape[0] * self._det_shape[1]))
         for i in range(0, n_pos, pos_per_chunk):
-            mean_dp += data_flat[i:i + pos_per_chunk].sum(dim=0, dtype=torch.float32)
+            mean_dp += data_flat[i:i + pos_per_chunk].sum(dim=0, dtype=torch.int64)
 
+        # float only on the tiny (det, det) summed image, never on the full stack
+        mean_dp = mean_dp.float()
         threshold = mean_dp.mean() + mean_dp.std()
         mask = mean_dp > threshold
 
