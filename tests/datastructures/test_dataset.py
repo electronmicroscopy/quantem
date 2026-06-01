@@ -434,3 +434,21 @@ class TestFourierResample:
         # Neither specified
         with pytest.raises(ValueError):
             sample_dataset_2d.fourier_resample()
+
+
+class TestDatasetTorch:
+    """Tests for torch-backed Dataset (from_tensor path)."""
+
+    def test_numpy_copy_is_readonly(self):
+        """``.numpy()`` on a tensor-backed dataset returns a read-only CPU copy
+        so writes raise instead of silently updating only the detached copy.
+        """
+        import torch
+        from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+        ds = Dataset4dstem.from_tensor(torch.zeros(2, 2, 2, 2))
+        arr = ds.numpy()
+        assert arr.flags.writeable is False
+        with pytest.raises(ValueError, match="read-only"):
+            arr[0, 0, 0, 0] = 99.0
+
+
