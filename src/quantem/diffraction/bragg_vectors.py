@@ -659,7 +659,7 @@ class BraggVectors(AutoSerialize):
         brightest is kept. The result is a compact reference lattice stored on
         :attr:`reference_ab` / :attr:`reference_qpos` / :attr:`reference_intensity`
         which :meth:`fit_lattice` matches against at every scan position. This step
-        is deliberately quick and lightweight.
+        is quick and lightweight.
 
         With ``plot=True`` (default) the reference lattice is drawn over the Bragg
         vector map, each site ringed and labelled with its ``(a, b)`` index. The ring

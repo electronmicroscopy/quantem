@@ -992,21 +992,21 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
     ):
         """Compute the per-position weight :attr:`mask` from the fitted lattice signal.
 
-        Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring how much
-        crystalline signal each position carries -- the model-fitting analogue of
-        :attr:`BraggVectors.mask_weight` and the cepstral ``mask_weight``. It is handed to
-        :meth:`initialize_strain_class`, so strong, well-fit positions dominate the
+        Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring the lattice
+        signal at each position -- the model-fitting analogue of
+        :attr:`BraggVectors.mask_weight` and the cepstral ``mask_weight``. It is passed to
+        :meth:`calculate_strain_map`, where higher-weight positions contribute more to the
         reference lattice and weak/vacuum positions are down-weighted.
 
         The raw signal (summed intensity of the non-central fitted disks, or the
-        diffracted intensity outside a central disk for the radial method) is normalized
-        to ``[0, 1]`` with **no** contrast windowing or smoothing: this is the honest
-        per-position order parameter. Set the display contrast later, in one place, via
-        the ``mask_range`` argument of :meth:`StrainMap.plot_strain`,
-        :meth:`StrainMap.update_reference`, and :meth:`StrainMap.estimate_strain_precision`
-        (e.g. ``mask_range=(0.37, 0.5)``) -- weights at/below ``low`` render black, at/above
-        ``high`` render full color. The weight-map plot here shows where the bulk sits so
-        an appropriate ``mask_range`` can be chosen.
+        diffracted intensity outside a central disk for the radial method) is min-max
+        normalized to ``[0, 1]``; no contrast windowing or smoothing is applied. Display
+        contrast is applied via the ``mask_range`` argument of
+        :meth:`StrainMap.plot_strain`, :meth:`StrainMap.update_reference`, and
+        :meth:`StrainMap.estimate_strain_precision` (e.g. ``mask_range=(0.37, 0.5)``):
+        weights at/below ``low`` render black, at/above ``high`` render full color. The
+        weight-map plot shows the distribution so an appropriate ``mask_range`` can be
+        chosen.
 
         Parameters
         ----------
@@ -1066,12 +1066,17 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                     is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
                     self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
 
-        # honest [0, 1] normalization, no contrast windowing (set mask_range at display)
-        max_intensity = np.max(self.i0_sum_array)
-        if max_intensity > 0:
-            self.mask = self.i0_sum_array / max_intensity
+        # Min-max normalization to [0, 1], no contrast windowing (set mask_range at
+        # display). Subtracting the floor -- rather than only dividing by the max -- keeps
+        # the weight from saturating near 1.0 when every position carries a baseline
+        # lattice intensity, and matches the cepstral _amplitude_mask_weight. Degenerate
+        # (constant / non-finite) input falls back to uniform full weight.
+        lo = np.nanmin(self.i0_sum_array)
+        hi = np.nanmax(self.i0_sum_array)
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            self.mask = (self.i0_sum_array - lo) / (hi - lo)
         else:
-            self.mask = np.zeros_like(self.i0_sum_array)
+            self.mask = np.ones_like(self.i0_sum_array)
 
         if plot:
             import matplotlib.pyplot as plt
@@ -1086,16 +1091,46 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         return self
 
-    def initialize_strain_class(
+    def calculate_strain_map(
         self,
         u_ref: np.ndarray | None = None,
         v_ref: np.ndarray | None = None,
-    )->StrainMap:
+        mask: np.ndarray | None = None,
+    ) -> StrainMap:
+        """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
+
+        Mirrors :meth:`BraggVectors.calculate_strain_map` and
+        :meth:`StrainMapAutocorrelation.calculate_strain_map` so the downstream strain
+        cells (``plot_strain``, ``update_reference``, ``estimate_strain_precision``) are
+        identical across the correlation, cepstral, and model-fitting workflows.
+
+        Parameters
+        ----------
+        u_ref : np.ndarray, optional
+            ``(2,)`` reference for the first lattice vector. Defaults to the median over
+            the scan inside :class:`StrainMap`.
+        v_ref : np.ndarray, optional
+            ``(2,)`` reference for the second lattice vector. Defaults to the median over
+            the scan inside :class:`StrainMap`.
+        mask : np.ndarray, optional
+            ``(scan_row, scan_col)`` per-position weighting used when computing the
+            reference lattice. Defaults to :attr:`mask` from :meth:`create_mask` (the
+            lattice signal strength), so strong, well-fit positions dominate the
+            reference.
+
+        Returns
+        -------
+        StrainMap
+            A strain map initialized from the fitted lattice vectors.
+        """
         if self.u_array is None or self.v_array is None:
             self.get_individual_uv_vectors()
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
-        
+
+        if mask is None:
+            mask = self.mask
+
         default_units = None
         default_sampling = None
         if hasattr(self.dataset, 'units'):
@@ -1108,7 +1143,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 default_sampling = float(self.dataset.sampling[0])
             else:
                 default_sampling = float(self.dataset.sampling)
-        
+
         return StrainMap(
             u_array = self.u_array,
             v_array = self.v_array,
@@ -1116,7 +1151,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             real_space = self.real_space,
             u_ref = u_ref,
             v_ref = v_ref,
-            mask = self.mask,
+            mask = mask,
             ds_sampling=default_sampling,
             ds_units = default_units,
         )

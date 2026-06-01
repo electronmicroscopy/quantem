@@ -944,10 +944,10 @@ class StrainMapAutocorrelation(AutoSerialize):
         ``n_positions x n_peaks``. In both cases the amplitude/width/background stored in
         :attr:`u_peak_fit`/:attr:`v_peak_fit` (columns 2-4, the source of the mask weight)
         come from the single-peak refinement at ``u0``/``v0`` -- the background-subtracted
-        Gaussian height, the crystalline order parameter. The all-peaks least squares
-        only improves the u/v *positions* (columns 0-1); the raw cepstral value at those
-        positions rides the central-autocorrelation pedestal and would invert the mask
-        (bright in vacuum), so it is deliberately not used.
+        Gaussian height. The all-peaks least squares only improves the u/v *positions*
+        (columns 0-1); the raw cepstral value at those positions rides the
+        central-autocorrelation pedestal and would invert the mask (bright in vacuum), so
+        it is not used for the weight.
         """
         scan_r, scan_c, H, W = self.dataset.array.shape
         n_pos = scan_r * scan_c
@@ -1023,10 +1023,10 @@ class StrainMapAutocorrelation(AutoSerialize):
                     pts_all[:, j, :] = rj[:, :2]
                 # Amplitude/width/background for the mask weight come from the SAME
                 # single-peak refinement at the u/v seeds as the single-peak branch
-                # below -- i.e. the background-subtracted Gaussian height, the true
-                # crystalline order parameter. (The all-peaks lstsq only improves the
-                # u/v *positions*; the raw cepstral value at those positions rides the
-                # central-autocorrelation pedestal and would invert the mask in vacuum.)
+                # below -- i.e. the background-subtracted Gaussian height. (The all-peaks
+                # lstsq only improves the u/v *positions*; the raw cepstral value at those
+                # positions rides the central-autocorrelation pedestal and would invert
+                # the mask in vacuum.)
                 u_fit = _refine_peaks_batched(
                     ims, u0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
                 ).cpu().numpy()
@@ -1074,12 +1074,11 @@ class StrainMapAutocorrelation(AutoSerialize):
     def _amplitude_mask_weight(self) -> np.ndarray:
         """Per-position weight from the fitted u/v peak amplitudes, min-max to ``[0, 1]``.
 
-        The mean of the two fitted lattice-peak amplitudes is the cepstral order
-        parameter (how much crystalline signal a position carries). It is min-max
-        normalized to ``[0, 1]`` with no contrast windowing -- the honest weight; set
-        display contrast later via :meth:`StrainMap.plot_strain`'s ``mask_range``.
-        Degenerate input (constant / non-finite / amplitudes unavailable) falls back to
-        uniform full weight.
+        The mean of the two fitted lattice-peak amplitudes measures the lattice signal at
+        each position. It is min-max normalized to ``[0, 1]`` with no contrast windowing;
+        display contrast is applied later via :meth:`StrainMap.plot_strain`'s
+        ``mask_range``. Degenerate input (constant / non-finite / amplitudes unavailable)
+        falls back to uniform full weight.
         """
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
@@ -1107,19 +1106,19 @@ class StrainMapAutocorrelation(AutoSerialize):
         only to plot the weight map, to recompute it, or to switch to the radial
         estimator.
 
-        Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring how much
-        crystalline signal each position carries, the analogue of
-        :attr:`BraggVectors.mask_weight`. It is the default reference weighting handed to
-        :meth:`calculate_strain_map`, so strong, well-fit positions dominate the
-        reference lattice and weak/vacuum positions are down-weighted.
+        Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring the lattice
+        signal at each position, the analogue of :attr:`BraggVectors.mask_weight`. It is
+        the default reference weighting handed to :meth:`calculate_strain_map`, so strong,
+        well-fit positions dominate the reference lattice and weak/vacuum positions are
+        down-weighted.
 
         The raw signal is min-max normalized to ``[0, 1]`` with **no** contrast windowing
-        or smoothing: this is the honest per-position order parameter. Set the display
-        contrast later, in one place, via :meth:`StrainMap.plot_strain`'s ``mask_range``
-        argument (e.g. ``mask_range=(0.6, 0.8)``) -- weights at/below ``low`` render
-        black, at/above ``high`` render full color. (Min-max is sensitive to a few very
-        bright positions, which compress the bulk toward 0; pick ``mask_range`` to match
-        where the bulk actually sits -- the weight-map plot here shows it.)
+        or smoothing. Display contrast is applied via :meth:`StrainMap.plot_strain`'s
+        ``mask_range`` argument (e.g. ``mask_range=(0.6, 0.8)``) -- weights at/below
+        ``low`` render black, at/above ``high`` render full color. (Min-max is sensitive
+        to a few very bright positions, which compress the bulk toward 0; pick
+        ``mask_range`` to match where the bulk actually sits -- the weight-map plot here
+        shows it.)
 
         Parameters
         ----------
@@ -1130,9 +1129,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             disks are kept: a large exclusion keeps only the far-corner diffuse scatter,
             which is *anti*-correlated with crystallinity and inverts the contrast. If
             ``False`` (default, recommended), weight by the mean fitted peak amplitude
-            from :meth:`fit_lattice_vectors` (requires it to have been run) -- the direct
-            cepstral order parameter (identical to the weight ``fit_lattice_vectors``
-            stores automatically).
+            from :meth:`fit_lattice_vectors` (requires it to have been run), identical to
+            the weight ``fit_lattice_vectors`` stores automatically.
         exclusion_radius_fraction : float, default=0.1
             Central-disk radius (fraction of detector width) excluded by the radial
             method.
@@ -1166,7 +1164,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 for c in range(scan_c):
                     dp = self.dataset.array[r, c]
                     signal[r, c] = np.sum(dp[outside_mask])
-            # honest min-max normalization to [0, 1]; constant/degenerate -> ones
+            # min-max normalization to [0, 1]; constant/degenerate -> ones
             lo = np.nanmin(signal)
             hi = np.nanmax(signal)
             if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
@@ -1764,8 +1762,8 @@ def _refine_lattice_vectors(
         When ``refine_all_peaks`` is True the position comes from the
         intensity-weighted all-peaks least squares, but the amplitude/sigma/background
         come from the single-peak refinement at the u/v seed -- the
-        background-subtracted Gaussian height (the mask order parameter), not the raw
-        cepstral value, which rides the central pedestal and inverts the mask in vacuum.
+        background-subtracted Gaussian height, not the raw cepstral value, which rides
+        the central pedestal and inverts the mask in vacuum.
     """
     from scipy.optimize import curve_fit
 
