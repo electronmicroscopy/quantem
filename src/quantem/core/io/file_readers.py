@@ -6,10 +6,10 @@ from typing import Any
 import h5py
 import numpy as np
 
-from quantem.core.datastructures import Dataset as Dataset
-from quantem.core.datastructures import Dataset2d as Dataset2d
-from quantem.core.datastructures import Dataset3d as Dataset3d
-from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
+from quantem.core.datastructures.dataset import Dataset as Dataset
+from quantem.core.datastructures.dataset2d import Dataset2d as Dataset2d
+from quantem.core.datastructures.dataset3d import Dataset3d as Dataset3d
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem as Dataset4dstem
 
 
 def read_4dstem(
@@ -83,8 +83,7 @@ def read_4dstem(
         data = imported_data["data"]
         if data.ndim != 3:
             raise ValueError(
-                f"Expected 3D data to reshape, got ndim={data.ndim} "
-                f"with shape {data.shape}"
+                f"Expected 3D data to reshape, got ndim={data.ndim} with shape {data.shape}"
             )
 
         if scan_axis_local not in (0, 1):
@@ -116,8 +115,7 @@ def read_4dstem(
         old_axes = imported_data.get("axes", None)
         if old_axes is None or len(old_axes) != 3:
             raise ValueError(
-                "Expected 3 axes for 3D data when reshaping to 4D; "
-                f"got axes={old_axes}"
+                f"Expected 3 axes for 3D data when reshaping to 4D; got axes={old_axes}"
             )
 
         ax_scan_y = {
