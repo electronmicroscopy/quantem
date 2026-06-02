@@ -232,11 +232,13 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     # --- Optimization Parameters ---
 
-    def get_optimization_parameters(self) -> list[nn.Parameter]:
+    def get_optimization_parameters(self) -> dict[str, list[torch.Tensor]]:
+        """Single param group keyed by DEFAULT_OPTIMIZER_KEY.
+
+        Hyperparameters are baked by ``set_optimizer``, not here — return only the tensors,
+        matching the ``dict[str, list[tensor]]`` contract the object models use.
         """
-        Get the parameters that should be optimized for this model.
-        """
-        return list(self.parameters())
+        return {self.DEFAULT_OPTIMIZER_KEY: list(self.parameters())}
 
     # --- Forward pass ---
     @abstractmethod
@@ -484,8 +486,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
         elif self.learn_tilt_axis:
             return torch.zeros_like(shifts), z1, z3
-        elif self.learn_shift and self.learn_tilt_axis:
-            return shifts, z1, z3
         else:
             return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
 
@@ -642,6 +642,32 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 
         self.device = device
         self.reconnect_optimizer_to_parameters()
+
+    # --- Save learned parameters ---
+
+    def save_parameters(self, path: str):
+        """
+        Saves the learned parameters to a file.
+        """
+        torch.save(
+            {
+                "z1": self._z1_params.detach().cpu(),
+                "z3": self._z3_params.detach().cpu(),
+                "shifts": self._shifts_params.detach().cpu(),
+            },
+            path,
+        )
+
+    def load_parameters(self, path: str):
+        """
+        Loads the learned parameters from a file.
+        """
+        data = torch.load(path)
+        self._z1_params = nn.Parameter(data["z1"]).to(self.device)
+        self._z3_params = nn.Parameter(data["z3"]).to(self.device)
+        self._shifts_params = nn.Parameter(data["shifts"]).to(self.device)
+        if self.optimizer is not None:
+            self.reconnect_optimizer_to_parameters()
 
 
 class TomographyINRPretrainDataset(Dataset):

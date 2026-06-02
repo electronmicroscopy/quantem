@@ -168,7 +168,6 @@ def fourier_binning(img, crop_size):
     center = np.array(img.shape) // 2
 
     fft_img = np.fft.fftshift(np.fft.fft2(img))
-
     cropped_fft = fft_img[
         center[0] - crop_size[0] // 2 : center[0] + crop_size[0] // 2,
         center[1] - crop_size[1] // 2 : center[1] + crop_size[1] // 2,
