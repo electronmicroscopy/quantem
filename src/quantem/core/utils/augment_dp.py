@@ -29,29 +29,30 @@ class DPAugmentor(RNGMixin):
     def __init__(
         self,
         add_bkg: bool = False,
-        bkg_weight: list[float] | float = [0.001, 0.05],
-        bkg_q: list[float] | float = [0.01, 0.1],
+        bkg_weight: list[float] | float | list[dict] = [0.001, 0.05],
+        bkg_q: list[float] | float | list[dict] = [0.01, 0.1],
         apply_background_to_label: list[bool] | None = None,
         add_shot: bool = False,
-        e_dose: list[float] | float = [1e4, 1e7],
+        e_dose: list[float] | float | list[dict] = [1e4, 1e7],
         add_shift: bool = False,
-        xshift: list[float] | float = [0, 10],
-        yshift: list[float] | float = [0, 10],
+        xshift: list[float] | float | list[dict] = [0, 10],
+        yshift: list[float] | float | list[dict] = [0, 10],
         add_ellipticity: bool = False,
-        ellipticity_scale: list[float] | float = [0, 0.15],
+        ellipticity_scale: list[float] | float | list[dict] = [0, 0.15],
         add_ellipticity_to_label: bool = True,
         add_salt_and_pepper: bool = False,
-        salt_and_pepper: list[float] | float = [0, 5e-4],
+        salt_and_pepper: list[float] | float | list[dict] = [0, 5e-4],
         add_gaussian_noise: bool = False,
-        gaussian_noise_mu: float = 0.0,
-        gaussian_noise_std: float = 1e-5,
+        gaussian_noise_profiles: list[dict] | None = None,
+        gaussian_noise_mu: list[float] | float | list[dict] = 0.0,
+        gaussian_noise_std: list[float] | float | list[dict] = 1e-5,
         add_scale: bool = False,
-        scale_factor: list[float] | float = [0.9, 1.1],
+        scale_factor: list[float] | float | list[dict] = [0.9, 1.1],
         add_blur: bool = False,
-        blur_sigma: list[float] | float = [0.0, 1.5],
+        blur_sigma: list[float] | float | list[dict] = [0.0, 1.5],
         add_flipshift: bool = False,
         free_rotation: bool = False,
-        rotation_range: list[float] | float = [-180, 180],
+        rotation_range: list[float] | float | list[dict] = [-180, 180],
         log_file: os.PathLike | None = None,
         rng: np.random.Generator | int | None = None,
         device: str = "cpu",
@@ -136,6 +137,11 @@ class DPAugmentor(RNGMixin):
         - For labels, only geometric transforms (flipshift, elastic) are applied
         - Ellipticity creates anisotropic scaling via exx, eyy, exy parameters
         - All ranges can be single values, val, or [min, max] for uniform sampling
+        - Scalar/range parameters also accept weighted mixtures:
+            [{"weight": w, "value": val_or_range}, ...]
+        - Gaussian noise can be coupled using gaussian_noise_profiles:
+            [{"weight": w, "mu": val_or_range, "std": val_or_range}, ...]
+          If gaussian_noise_profiles is provided, it overrides gaussian_noise_mu/std.
         """
         super().__init__(rng=rng)
         self._setup_device(device)
@@ -149,30 +155,26 @@ class DPAugmentor(RNGMixin):
         self.add_ellipticity_to_label = add_ellipticity_to_label or []
         self.add_salt_and_pepper = add_salt_and_pepper
         self.add_gaussian_noise = add_gaussian_noise
-        self.gaussian_noise_mu = gaussian_noise_mu
-        self.gaussian_noise_std = gaussian_noise_std
+        self._gaussian_noise_mu_spec = gaussian_noise_mu
+        self._gaussian_noise_std_spec = gaussian_noise_std
+        self._gaussian_noise_profiles = gaussian_noise_profiles
         self.add_scale = add_scale
         self.add_blur = add_blur
         self.add_flipshift = add_flipshift
 
-        self._bkg_weight_range = self._check_input(bkg_weight) if add_bkg else [0, 0]
-        self._bkg_q_range = self._check_input(bkg_q) if add_bkg else [0, 0]
+        self._bkg_weight_spec = bkg_weight
+        self._bkg_q_spec = bkg_q
         self.apply_background_to_label = apply_background_to_label
-        self._e_dose_range = self._check_input(e_dose) if add_shot else [np.inf, np.inf]
-        self._xshift_range = self._check_input(xshift) if add_shift else [0, 0]
-        self._yshift_range = self._check_input(yshift) if add_shift else [0, 0]
-        self._ellipticity_scale_range = (
-            self._check_input(ellipticity_scale) if add_ellipticity else [0, 0]
-        )
-        self._salt_and_pepper_range = (
-            self._check_input(salt_and_pepper) if add_salt_and_pepper else [0, 0]
-        )
-        self._scale_range = self._check_input(scale_factor) if add_scale else [0, 0]
-        self._blur_range = self._check_input(blur_sigma) if add_blur else [0, 0]
+        self._e_dose_spec = e_dose
+        self._xshift_spec = xshift
+        self._yshift_spec = yshift
+        self._ellipticity_scale_spec = ellipticity_scale
+        self._salt_and_pepper_spec = salt_and_pepper
+        self._scale_spec = scale_factor
+        self._blur_spec = blur_sigma
 
         self.free_rotation = free_rotation
-        self._rotation_range = self._check_input(rotation_range) if add_flipshift else [0, 0]
-
+        self._rotation_range_spec = rotation_range
 
         # Generate parameters from set parameters
         self.generate_params()
@@ -200,23 +202,71 @@ class DPAugmentor(RNGMixin):
                     "rotation_angle,blur_sigma,salt_and_pepper,rng_seed\n"
                 )
 
+    def _is_weighted_spec(self, inp) -> bool:
+        return isinstance(inp, list) and len(inp) > 0 and isinstance(inp[0], dict)
+
+    def _sample_from_spec(self, spec, *, context: str) -> float:
+        if self._is_weighted_spec(spec):
+            weights = np.array([float(d.get("weight", 1.0)) for d in spec], dtype=np.float64)
+            if np.any(weights < 0) or not np.isfinite(weights).all():
+                raise ValueError(f"{context}: weights must be finite and nonnegative. Got: {weights}")
+            s = float(weights.sum())
+            if s <= 0:
+                raise ValueError(f"{context}: weights must sum to > 0. Got sum={s}")
+            probs = weights / s
+            idx = int(self.rng.choice(len(spec), p=probs))
+            chosen = spec[idx]
+            if "value" not in chosen:
+                raise ValueError(f"{context}: weighted entry missing 'value': {chosen}")
+            return float(self.rng.uniform(*self._check_input(chosen["value"])))
+        return float(self.rng.uniform(*self._check_input(spec)))
+
+    def _choose_weighted_profile(self, profiles: list[dict], *, context: str) -> dict:
+        if len(profiles) == 0:
+            raise ValueError(f"{context}: gaussian_noise_profiles is empty")
+        weights = np.array([float(p.get("weight", 1.0)) for p in profiles], dtype=np.float64)
+        if np.any(weights < 0) or not np.isfinite(weights).all():
+            raise ValueError(f"{context}: weights must be finite and nonnegative. Got: {weights}")
+        s = float(weights.sum())
+        if s <= 0:
+            raise ValueError(f"{context}: weights must sum to > 0. Got sum={s}")
+        probs = weights / s
+        idx = int(self.rng.choice(len(profiles), p=probs))
+        prof = profiles[idx]
+        if "mu" not in prof or "std" not in prof:
+            raise ValueError(f"{context}: each profile must include 'mu' and 'std'. Got: {prof}")
+        return prof
+
     def generate_params(self) -> None:
-        self.bkg_weight = self._uniform_or_zero(self._bkg_weight_range, self.add_bkg)
-        self.bkg_q = self._uniform_or_zero(self._bkg_q_range, self.add_bkg)
-        self.e_dose = self._uniform_or_default(self._e_dose_range, self.add_shot, np.inf)
-        self.salt_and_pepper = self._uniform_or_zero(
-            self._salt_and_pepper_range, self.add_salt_and_pepper
-        )
-        self.blur_sigma = self._uniform_or_zero(self._blur_range, self.add_blur)
-        self.xshift = self._uniform_with_sign(self._xshift_range, self.add_shift)
-        self.yshift = self._uniform_with_sign(self._yshift_range, self.add_shift)
+        if self.add_bkg:
+            self.bkg_weight = self._sample_from_spec(self._bkg_weight_spec, context="bkg_weight")
+            self.bkg_q = self._sample_from_spec(self._bkg_q_spec, context="bkg_q")
+        else:
+            self.bkg_weight = 0
+            self.bkg_q = 0
+
+        self.e_dose = self._sample_from_spec(self._e_dose_spec, context="e_dose") if self.add_shot else np.inf
+        self.salt_and_pepper = self._sample_from_spec(self._salt_and_pepper_spec, context="salt_and_pepper") if self.add_salt_and_pepper else 0
+        self.blur_sigma = self._sample_from_spec(self._blur_spec, context="blur_sigma") if self.add_blur else 0
+        self.xshift = self._sample_from_spec(self._xshift_spec, context="xshift") * self.rng.choice([1, -1]) if self.add_shift else 0
+        self.yshift = self._sample_from_spec(self._yshift_spec, context="yshift") * self.rng.choice([1, -1]) if self.add_shift else 0
+
         self._generate_ellipticity_params()
         self._generate_flipshift_params()
 
-        if self.add_scale:
-            self.scale_factor = self.rng.uniform(self._scale_range[0], self._scale_range[1])
+        self.scale_factor = self._sample_from_spec(self._scale_spec, context="scale_factor") if self.add_scale else 0
+
+        if self.add_gaussian_noise:
+            if self._gaussian_noise_profiles is not None:
+                prof = self._choose_weighted_profile(self._gaussian_noise_profiles, context="gaussian_noise_profiles")
+                self.gaussian_noise_mu = float(self.rng.uniform(*self._check_input(prof["mu"])))
+                self.gaussian_noise_std = float(self.rng.uniform(*self._check_input(prof["std"])))
+            else:
+                self.gaussian_noise_mu = self._sample_from_spec(self._gaussian_noise_mu_spec, context="gaussian_noise_mu")
+                self.gaussian_noise_std = self._sample_from_spec(self._gaussian_noise_std_spec, context="gaussian_noise_std")
         else:
-            self.scale_factor = 0
+            self.gaussian_noise_mu = 0.0
+            self.gaussian_noise_std = 0.0
 
     def _uniform_or_zero(self, range_vals: list, enabled: bool) -> float:
         return self.rng.uniform(range_vals[0], range_vals[1]) if enabled else 0
@@ -231,9 +281,7 @@ class DPAugmentor(RNGMixin):
 
     def _generate_ellipticity_params(self) -> None:
         if self.add_ellipticity:
-            self.ellipticity_scale = self.rng.uniform(
-                self._ellipticity_scale_range[0], self._ellipticity_scale_range[1]
-            )
+            self.ellipticity_scale = self._sample_from_spec(self._ellipticity_scale_spec, context="ellipticity_scale")
             exx = self.rng.normal(loc=1, scale=self.ellipticity_scale)
             eyy = self.rng.normal(loc=1, scale=self.ellipticity_scale)
             mval = (exx + eyy) / 2  # Normalize to preserve area
@@ -253,9 +301,7 @@ class DPAugmentor(RNGMixin):
 
             # Always apply rotation when flipshift is enabled
             if self.free_rotation:
-                self.rotation_angle = self.rng.uniform(
-                    self._rotation_range[0], self._rotation_range[1]
-                )
+                self.rotation_angle = self._sample_from_spec(self._rotation_range_spec, context="rotation_range")
             else:
                 self.rotation_angle = self.rng.choice([0, 90, 180, 270])
         else:
@@ -700,7 +746,7 @@ class DPAugmentor(RNGMixin):
             return image
         else:
             image = np.array(inputs).copy()
-            noise = np.clip(np.random.normal(loc=mean, scale=std, size=inputs.shape), a_min=0, a_max=None)
+            noise = np.clip(self.rng.normal(loc=mean, scale=std, size=inputs.shape), a_min=0, a_max=None)
             image += noise
             return image
 
