@@ -193,3 +193,82 @@ class TestObjectTensorDecomp:
         obj = ObjectTensorDecomp.from_model(self._model(), shape=(16, 16, 16), device=torch_device)
         with pytest.raises(NotImplementedError):
             obj.pretrain()
+
+
+@requires_torch
+class TestObjectINRBehaviour:
+    def _obj(self, device, n=16):
+        from quantem.core.ml.inr import HSiren
+
+        model = HSiren(in_features=3, out_features=1, hidden_layers=1, hidden_features=8)
+        return ObjectINR.from_model(model, shape=(n, n, n), device=device)
+
+    def test_forward_masks_out_of_range(self, torch_device):
+        obj = self._obj(torch_device)
+        coords = torch.tensor([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], device=torch_device)
+        out = obj.forward(coords)
+        assert out.shape[0] == 2
+        assert float(out[1].detach()) == 0.0  # x=5 is outside [-1, 1] -> masked to zero
+
+    def test_apply_hard_constraints_positivity(self, torch_device):
+        obj = self._obj(torch_device)
+        obj.constraints.positivity = True
+        pred = torch.tensor([-1.0, 0.5, 2.0], device=torch_device)
+        assert torch.all(obj.apply_hard_constraints(pred) >= 0.0)
+
+    def test_get_tv_loss_scalar(self, torch_device):
+        obj = self._obj(torch_device)
+        obj.constraints.tv_vol = 1.0
+        coords = torch.rand(64, 3, device=torch_device) * 2 - 1
+        ctx = ReconstructionContext(coords=coords, pred=torch.rand(64, device=torch_device))
+        loss = obj.get_tv_loss(ctx)
+        assert loss.ndim == 0
+        assert torch.isfinite(loss)
+
+
+@requires_torch
+class TestObjectTensorDecompTV:
+    def _obj(self, device, n=16):
+        from quantem.core.ml.models.kplanes import KPlanesTILTED
+
+        model = KPlanesTILTED(
+            M_features=2, resolution=(n, n, n), multiscale_res_multipliers=[1], T=2
+        )
+        return ObjectTensorDecomp.from_model(model, shape=(n, n, n), device=device)
+
+    def test_apply_hard_constraints_positivity(self, torch_device):
+        obj = self._obj(torch_device)
+        obj.constraints.positivity = True
+        pred = torch.tensor([-2.0, 0.0, 3.0], device=torch_device)
+        assert torch.all(obj.apply_hard_constraints(pred) >= 0.0)
+
+    def test_plane_tv_loss_nonneg_scalar(self, torch_device):
+        obj = self._obj(torch_device)
+        obj.constraints.tv_plane = 0.1
+        loss = obj._get_plane_tv_loss()
+        assert loss.ndim == 0
+        assert float(loss.detach()) >= 0.0
+
+    def test_volume_tv_loss_scalar(self, torch_device):
+        obj = self._obj(torch_device)
+        obj.constraints.tv_vol = 0.1
+        coords = torch.rand(64, 3, device=torch_device) * 2 - 1
+        loss = obj.get_volume_tv_loss(coords)
+        assert loss.ndim == 0
+        assert torch.isfinite(loss)
+
+    def test_normalize_optimizer_params_rejects_non_dict(self, torch_device):
+        from quantem.core.ml.optimizer_mixin import OptimizerParams
+
+        obj = self._obj(torch_device)
+        with pytest.raises(TypeError):
+            obj._normalize_optimizer_params([OptimizerParams.Adam()])
+
+    def test_normalize_optimizer_params_rejects_wrong_keys(self, torch_device):
+        from quantem.core.ml.optimizer_mixin import OptimizerParams
+
+        obj = self._obj(torch_device)
+        with pytest.raises(ValueError):
+            obj._normalize_optimizer_params(
+                {"grids": OptimizerParams.Adam(), "wrong": OptimizerParams.Adam()}
+            )

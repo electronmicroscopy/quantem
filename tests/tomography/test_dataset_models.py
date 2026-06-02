@@ -133,3 +133,62 @@ class TestTomographyINRPretrainDataset:
         item = ds[0]
         assert set(item.keys()) == {"coords", "target"}
         assert item["coords"].shape == (3,)
+
+
+@requires_torch
+class TestINRRayMath:
+    """The static ray helpers are pure tensor math (CPU), exercised here without a recon."""
+
+    def test_create_batch_rays_shape_and_endpoints(self):
+        N, S = 8, 5
+        rays = TomographyINRDataset.create_batch_rays(
+            torch.tensor([0, N - 1]), torch.tensor([0, N - 1]), N=N, num_samples_per_ray=S
+        )
+        assert rays.shape == (2, S, 3)
+        # pixel 0 maps to -1, pixel N-1 maps to +1 on both x (j) and y (i).
+        assert torch.allclose(rays[0, :, 0], torch.full((S,), -1.0))
+        assert torch.allclose(rays[1, :, 0], torch.full((S,), 1.0))
+        # z spans the full -1..1 sampling range.
+        assert torch.isclose(rays[0, 0, 2], torch.tensor(-1.0))
+        assert torch.isclose(rays[0, -1, 2], torch.tensor(1.0))
+
+    def test_transform_batch_rays_identity_at_zero_pose(self):
+        rays = torch.rand(4, 6, 3)
+        zero = torch.zeros(4)
+        out = TomographyINRDataset.transform_batch_rays(
+            rays, z1=zero, x=zero, z3=zero, shifts=torch.zeros(4, 2), N=8, sampling_rate=1.0
+        )
+        # No rotation and no shift -> rays pass through unchanged.
+        assert torch.allclose(out, rays, atol=1e-5)
+
+    def test_integrate_rays_sums_with_step_size(self):
+        B, S = 3, 5
+        out = TomographyINRDataset.integrate_rays(
+            torch.ones(B, S), num_samples_per_ray=S, target_values_len=B
+        )
+        step = 2.0 / (S - 1)
+        assert out.shape == (B,)
+        assert torch.allclose(out, torch.full((B,), S * step))
+
+    def test_getitem_index_mapping(self):
+        # n=4 -> H*W=16 per projection. idx=21 -> projection 1, remaining 5 -> i=1, j=1.
+        stack = _stack(nang=3, n=4)
+        d = TomographyINRDataset.from_data(stack, np.linspace(-60, 60, 3, dtype="f4"))
+        item = d[21]
+        assert int(item["projection_idx"]) == 1
+        assert int(item["pixel_i"]) == 1
+        assert int(item["pixel_j"]) == 1
+        assert torch.isclose(item["target_value"], d.tilt_stack[1, 1, 1])
+
+    def test_save_load_parameters_roundtrip(self, tmp_path):
+        angles = np.linspace(-60, 60, 5, dtype="f4")
+        d = TomographyINRDataset.from_data(_stack(), angles)
+        d.to("cpu")
+        d.z1_params.data.fill_(0.37)
+        path = str(tmp_path / "params.pt")
+        d.save_parameters(path)
+
+        d2 = TomographyINRDataset.from_data(_stack(), angles)
+        d2.to("cpu")
+        d2.load_parameters(path)
+        assert torch.allclose(d2.z1_params.detach(), d.z1_params.detach())

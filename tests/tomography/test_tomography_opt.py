@@ -162,6 +162,28 @@ class TestOptimizerParams:
 
 
 @requires_torch
+class TestOptHelpers:
+    def test_get_default_lr_object_and_pose(self, torch_device):
+        tomo = _inr_tomography(torch_device)
+        assert isinstance(tomo._get_default_lr("object"), float)
+        assert isinstance(tomo._get_default_lr("pose"), float)
+
+    def test_get_default_lr_unknown_raises(self, torch_device):
+        tomo = _inr_tomography(torch_device)
+        with pytest.raises(ValueError):
+            tomo._get_default_lr("banana")
+
+    def test_remove_optimizer_unknown_raises(self, torch_device):
+        tomo = _inr_tomography(torch_device)
+        with pytest.raises(ValueError):
+            tomo.remove_optimizer("banana")
+
+    def test_current_lrs_zero_without_optimizers(self, torch_device):
+        tomo = _inr_tomography(torch_device)
+        assert tomo.get_current_lrs() == {"object": 0.0, "pose": 0.0}
+
+
+@requires_torch
 class TestSchedulerParams:
     def test_scheduler_setter_getter(self, torch_device):
         tomo = _inr_tomography(torch_device)
