@@ -1060,3 +1060,108 @@ def rotate_image(
     for i in range(n):
         out_flat[i] = map_coordinates(im_flat[i], coords, order=order, mode=mode, cval=cval)
     return out_flat.reshape(*prefix, H, W)
+
+
+def radially_project_fourier_tensor(
+    corner_centered_array: torch.Tensor,
+    sampling: Tuple[float, float],
+    q_bins: torch.Tensor | None = None,
+):
+    """
+    Radially project a corner-centered Fourier array onto radial bins.
+
+    Supports:
+    - single array: (kx, ky)
+    - batched arrays: (n, kx, ky)
+    - implicit bins (from grid) or explicit external bins
+
+    Parameters
+    ----------
+    corner_centered_array : torch.Tensor
+        Shape (kx, ky) or (n, kx, ky)
+    sampling : (float, float)
+        Real-space sampling (sx, sy)
+    q_bins : torch.Tensor, optional
+        1D tensor of radial bin centers
+
+    Returns
+    -------
+    q_bins_out : torch.Tensor
+        Radial bin centers
+    array_1d : torch.Tensor
+        Shape (n, nq) or (nq,)
+    """
+
+    if corner_centered_array.is_complex():
+        q, real_part = radially_project_fourier_tensor(
+            corner_centered_array.real, sampling, q_bins
+        )
+        return q, real_part
+
+    device = corner_centered_array.device
+    sx, sy = sampling
+
+    if corner_centered_array.ndim == 2:
+        array = corner_centered_array[None, ...]
+        squeeze_output = True
+    elif corner_centered_array.ndim == 3:
+        array = corner_centered_array
+        squeeze_output = False
+    else:
+        raise ValueError("Input must be 2D or 3D tensor")
+
+    n_batch, nkx, nky = array.shape
+
+    kx = torch.fft.fftfreq(nkx, d=sx, device=device)
+    ky = torch.fft.fftfreq(nky, d=sy, device=device)
+    k = torch.sqrt(kx[:, None] ** 2 + ky[None, :] ** 2).reshape(-1)
+
+    k_max = min(0.5 / sx, 0.5 / sy)
+
+    if q_bins is None:
+        dk = kx[1] - kx[0]
+        num_bins = int(torch.floor(k_max / dk).item()) + 1
+        dq = dk
+        q_bins_out = torch.arange(num_bins, device=device, dtype=k.dtype) * dk
+    else:
+        q_bins = q_bins.to(device)
+        dq = q_bins[1] - q_bins[0]
+        q_bins_out = q_bins[q_bins <= k_max]
+        num_bins = q_bins_out.numel()
+
+    num_bins_internal = num_bins + 2
+
+    inds = k / dq
+    inds_f = torch.floor(inds).long()
+    inds_f = torch.clamp(inds_f, 0, num_bins_internal - 2)
+
+    d_ind = inds - inds_f
+    w0 = 1.0 - d_ind
+    w1 = d_ind
+
+    array_f = array.reshape(n_batch, -1)
+
+    out = []
+    for b in range(n_batch):
+        a = array_f[b]
+
+        num = torch.bincount(inds_f, weights=a * w0, minlength=num_bins_internal) + torch.bincount(
+            inds_f + 1, weights=a * w1, minlength=num_bins_internal
+        )
+
+        den = (
+            torch.bincount(inds_f, weights=w0, minlength=num_bins_internal)
+            + torch.bincount(inds_f + 1, weights=w1, minlength=num_bins_internal)
+        ).clamp_min(1)
+
+        out.append(num / den)
+
+    array_1d = torch.stack(out, dim=0)
+
+    array_1d = array_1d[..., :num_bins]
+    q_bins_out = q_bins_out[:num_bins]
+
+    if squeeze_output:
+        array_1d = array_1d[0]
+
+    return q_bins_out, array_1d

@@ -68,7 +68,9 @@ class Dataset(AutoSerialize):
             self._tensor = None
         else:
             if not isinstance(tensor, torch.Tensor):
-                raise TypeError(f"Dataset.tensor must be torch.Tensor, got {type(tensor).__name__}.")
+                raise TypeError(
+                    f"Dataset.tensor must be torch.Tensor, got {type(tensor).__name__}."
+                )
             self._array = None
             self._tensor = tensor
         self.name = name
@@ -192,6 +194,11 @@ class Dataset(AutoSerialize):
         self._sampling = validate_ndinfo(value, self.ndim, "sampling")
 
     @property
+    def origin_units(self) -> NDArray:
+        # Origin expressed in physical units: origin * sampling
+        return np.asarray(self.origin) * np.asarray(self.sampling)
+
+    @property
     def units(self) -> list[str]:
         return self._units
 
@@ -266,11 +273,10 @@ class Dataset(AutoSerialize):
         all resolve to the same canonical device.
         """
         from quantem.core import config
+
         tensor = getattr(self, "_tensor", None)
         if tensor is None:
-            raise AttributeError(
-                f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'."
-            )
+            raise AttributeError(f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'.")
         dev, _ = config.validate_device(device)
         self._tensor = tensor.to(dev)
         return self
@@ -367,6 +373,35 @@ class Dataset(AutoSerialize):
                         except (AttributeError, TypeError):
                             # Skip attributes that can't be copied
                             pass
+
+    def coords(self, axis: int) -> Any:
+        """
+        Coordinate array for a given axis in pixel units.
+
+        coords(d) = arange(shape[d]) - origin[d]
+        """
+        axis = int(axis)
+        if axis < 0 or axis >= self.ndim:
+            raise ValueError(f"axis {axis} out of bounds for ndim={self.ndim}")
+
+        xp = self._xp
+        n = int(self.shape[axis])
+        origin_d = float(np.asarray(self.origin)[axis])
+
+        return xp.arange(n, dtype=float) - origin_d
+
+    def coords_units(self, axis: int) -> Any:
+        """
+        Coordinate array for a given axis in physical units.
+
+        coords_units(d) = (arange(shape[d]) - origin[d]) * sampling[d]
+        """
+        axis = int(axis)
+        if axis < 0 or axis >= self.ndim:
+            raise ValueError(f"axis {axis} out of bounds for ndim={self.ndim}")
+
+        sampling_d = float(np.asarray(self.sampling)[axis])
+        return self.coords(axis) * sampling_d
 
     def mean(self, axes: int | tuple[int, ...] | None = None) -> Any:
         """
