@@ -14,7 +14,6 @@ from scipy.signal import convolve2d
 from scipy.signal.windows import tukey
 from tqdm import tqdm
 
-from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.imaging_utils import weighted_cross_correlation_shift
@@ -828,8 +827,8 @@ class MAPEDTorch(AutoSerialize):
     def __init__(
         self,
         datasets: list[torch.Tensor],
+        device: str | Any,
         dtype: str | Any,
-        device: str | int | None = None,
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -839,19 +838,6 @@ class MAPEDTorch(AutoSerialize):
         self.metadata: dict[str, Any] = {}
         self.device = device
         self.dtype = dtype
-
-    @property
-    def device(self) -> str:
-        if hasattr(self, "_device"):
-            return self._device
-        return config.get_device()
-
-    @device.setter
-    def device(self, device: str | int | None) -> None:
-        if device is not None:
-            dev, _id = config.validate_device(device)
-            self._device = dev
-        # if None, leave unset so the property falls back to config.get_device()
 
     @classmethod
     def from_datasets(cls, datasets: Sequence[torch.Tensor]) -> MAPED:
@@ -878,13 +864,13 @@ class MAPEDTorch(AutoSerialize):
                 )
             ds_list.append(d)
 
-        dtypes = [dataset.dtype for dataset in datasets]
-        devices = [str(dataset.device) for dataset in datasets]
+        dtypes = np.array([dataset.dtype for dataset in datasets])
+        devices = np.array([dataset.device for dataset in datasets])
 
         # check that all datasets have the same dtype and device
-        if len(set(str(d) for d in dtypes)) > 1:
+        if not np.all(dtypes == dtypes[0]):
             raise TypeError("All datasets need to have the same type")
-        if len(set(devices)) > 1:
+        if not np.all(devices == devices[0]):
             raise TypeError("All datasets need to have the same device")
 
         if not ds_list:
@@ -1056,11 +1042,10 @@ class MAPEDTorch(AutoSerialize):
         iterations: int,
         upsample_factor: int = 100,
         method: str = "autocorrelation",
-        plot: bool = True,
+        plot_aligned: bool = True,
         edge_blend: float = 2.0,
         fit_shifts: bool = True,
         mode: str = "linear",
-        batch_size: int | None = None,
     ):
         for i, dataset in enumerate(self.datasets):
             _, aligned_dataset = dscan_correct(
@@ -1068,12 +1053,11 @@ class MAPEDTorch(AutoSerialize):
                 iterations,
                 method=method,
                 upsample_factor=upsample_factor,
-                plot=plot,
+                plot_aligned=plot_aligned,
                 edge_blend=edge_blend,
                 device=self.device,
                 fit_shifts=fit_shifts,
                 mode=mode,
-                batch_size=batch_size,
             )
             self.datasets[i] = aligned_dataset
 
@@ -1310,7 +1294,7 @@ class MAPEDTorch(AutoSerialize):
 
         base_pad = torch.zeros((n, Hp, Wp), dtype=torch.float32, device=self.device)
         for i in range(n):
-            im0 = self.im_bf[i].float()
+            im0 = self.im_bf[i]
 
             if edge_filter:
                 pad_symmetric = wx.shape[-1] // 2
@@ -1961,7 +1945,7 @@ def shift_images_torch(
 
     if not blend:
         # simple shift per-image without padding/blending — keep original behavior
-        imgs = images.float().unsqueeze(1)
+        imgs = images.unsqueeze(1)
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(-1, 1, H, device=images.device),
             torch.linspace(-1, 1, W, device=images.device),
@@ -2342,13 +2326,12 @@ def dscan_correct(
     dataset,
     iterations,
     upsample_factor: int = 100,
-    plot: bool = True,
+    plot_aligned: bool = True,
     edge_blend: float = 2.0,
     device="cpu",
     method="autocorrelation",
     fit_shifts=True,
     mode="linear",
-    batch_size: int | None = None,
 ):
     """
     Align diffraction patterns using autocorrelation.
@@ -2361,7 +2344,7 @@ def dscan_correct(
         Number of refinement iterations
     upsample_factor : int
         Upsampling factor for sub-pixel accuracy
-    plot : bool
+    plot_aligned : bool
         Whether to plot results after each iteration
     edge_blend : float
         Edge blending parameter for Tukey window
@@ -2382,9 +2365,6 @@ def dscan_correct(
         reference (torch.Tensor).
     """
     H_rs, W_rs, H_dp, W_dp = dataset.shape
-    n_pos = H_rs * W_rs
-    if batch_size is None:
-        batch_size = max(1, min(n_pos, 256))
 
     w = (
         tukey_torch(
@@ -2428,88 +2408,22 @@ def dscan_correct(
                     G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
 
         if method == "autocorrelation":
-            shifts_flat = torch.zeros((n_pos, 2), device=device, dtype=torch.float32)
-            shifted_dps_flat = shifted_dps.reshape(n_pos, H_dp, W_dp)
+            # Vectorize over the scan grid by flattening (H_rs, W_rs) into a batch dimension.
+            dp_batch = (w * shifted_dps).reshape(H_rs * W_rs, H_dp, W_dp)
+            G = torch.fft.fft2(dp_batch, dim=(-2, -1))
+            G_flipped = torch.conj(G)
 
-            for batch_start in tqdm(
-                range(0, n_pos, batch_size),
-                desc=f"Iteration {iteration + 1}/{iterations} (autocorrelation)",
-            ):
-                batch_end = min(batch_start + batch_size, n_pos)
-                dp_b = w * shifted_dps_flat[batch_start:batch_end]
-                G_b = torch.fft.fft2(dp_b, dim=(-2, -1))
-                G_flipped = torch.conj(G_b)
-                shifts_flat[batch_start:batch_end] = (
-                    -cross_correlation_shift_torch(
-                        G_b,
-                        G_flipped,
-                        upsample_factor=upsample_factor,
-                        fft_input=True,
-                    )
-                    / 2.0
+            shifts = (
+                -cross_correlation_shift_torch(
+                    G,
+                    G_flipped,
+                    upsample_factor=upsample_factor,
+                    fft_input=True,
                 )
-                del dp_b, G_b, G_flipped
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                / 2.0
+            )
 
-            diffraction_shifts[:, :, :] = shifts_flat.reshape(H_rs, W_rs, 2)
-
-        if method == "direct_fitting":
-            centers = torch.zeros((n_pos, 2), device=device, dtype=torch.float32)
-            shifted_dps_flat = shifted_dps.reshape(n_pos, H_dp, W_dp)
-
-            for batch_start in tqdm(
-                range(0, n_pos, batch_size),
-                desc=f"Iteration {iteration + 1}/{iterations} (direct fitting)",
-            ):
-                batch_end = min(batch_start + batch_size, n_pos)
-                dp_b = shifted_dps_flat[batch_start:batch_end].float()
-                B = dp_b.shape[0]
-                batch_idx = torch.arange(B, device=device)
-
-                # argmax: integer center estimate
-                flat_idx = torch.argmax(dp_b.reshape(B, -1), dim=1)
-                row_peak = flat_idx // W_dp
-                col_peak = flat_idx % W_dp
-
-                # log-parabolic sub-pixel refinement — row direction
-                row_safe = row_peak.clamp(1, H_dp - 2)
-                vr_m = dp_b[batch_idx, row_safe - 1, col_peak].clamp(min=1e-6).log()
-                vr_0 = dp_b[batch_idx, row_safe, col_peak].clamp(min=1e-6).log()
-                vr_p = dp_b[batch_idx, row_safe + 1, col_peak].clamp(min=1e-6).log()
-                denom_r = vr_m + vr_p - 2.0 * vr_0
-                dr = torch.where(
-                    (denom_r < -1e-6) & (row_peak > 0) & (row_peak < H_dp - 1),
-                    ((vr_m - vr_p) / (2.0 * denom_r)).clamp(-1.0, 1.0),
-                    torch.zeros(B, device=device),
-                )
-
-                # log-parabolic sub-pixel refinement — col direction
-                col_safe = col_peak.clamp(1, W_dp - 2)
-                vc_m = dp_b[batch_idx, row_peak, col_safe - 1].clamp(min=1e-6).log()
-                vc_0 = dp_b[batch_idx, row_peak, col_safe].clamp(min=1e-6).log()
-                vc_p = dp_b[batch_idx, row_peak, col_safe + 1].clamp(min=1e-6).log()
-                denom_c = vc_m + vc_p - 2.0 * vc_0
-                dc = torch.where(
-                    (denom_c < -1e-6) & (col_peak > 0) & (col_peak < W_dp - 1),
-                    ((vc_m - vc_p) / (2.0 * denom_c)).clamp(-1.0, 1.0),
-                    torch.zeros(B, device=device),
-                )
-
-                centers[batch_start:batch_end, 0] = row_peak.float() + dr
-                centers[batch_start:batch_end, 1] = col_peak.float() + dc
-
-                del dp_b, flat_idx, row_peak, col_peak, batch_idx
-                del vr_m, vr_0, vr_p, vc_m, vc_0, vc_p, dr, dc
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-            # fit a plane to centers across the real-space scan grid
-            centers_2d = centers.reshape(H_rs, W_rs, 2)
-            centers_fit_r, _ = fit_surface_lstsq(centers_2d[:, :, 0], mode="linear")
-            centers_fit_c, _ = fit_surface_lstsq(centers_2d[:, :, 1], mode="linear")
-
-            # shifts = mean_center - fitted_center: moves each DP toward the global mean
-            diffraction_shifts[:, :, 0] = H_dp / 2 - centers_fit_r
-            diffraction_shifts[:, :, 1] = W_dp / 2 - centers_fit_c
+            diffraction_shifts[:, :, :] = shifts.reshape(H_rs, W_rs, 2)
 
         if fit_shifts:
             diffraction_shifts_1, _ = fit_surface_lstsq(diffraction_shifts[:, :, 0], mode=mode)
@@ -2517,29 +2431,25 @@ def dscan_correct(
             diffraction_shifts_old = diffraction_shifts.clone()
             diffraction_shifts = torch.stack((diffraction_shifts_1, diffraction_shifts_2), dim=2)
 
-            # Apply fitted shifts in batches over all scan positions.
-            shifted_dps_flat = shifted_dps.reshape(n_pos, H_dp, W_dp)
-            shifts_flat = diffraction_shifts.reshape(n_pos, 2)
+            # Recompute fitted shifts in one batched pass over all scan positions.
+            dp_batch = (w * shifted_dps).reshape(H_rs * W_rs, H_dp, W_dp)
+            G_batch = torch.fft.fft2(dp_batch, dim=(-2, -1))
 
-            for batch_start in range(0, n_pos, batch_size):
-                batch_end = min(batch_start + batch_size, n_pos)
-                G_b = torch.fft.fft2(w * shifted_dps_flat[batch_start:batch_end], dim=(-2, -1))
-                s_b = shifts_flat[batch_start:batch_end]
-                phase_ramp = torch.exp(
-                    -1j
-                    * torch.pi
-                    * (
-                        kr.unsqueeze(0) * s_b[:, 0][:, None, None]
-                        + kc.unsqueeze(0) * s_b[:, 1][:, None, None]
-                    )
+            shifts_batch = diffraction_shifts.reshape(H_rs * W_rs, 2)
+            phase_ramp = torch.exp(
+                -1j
+                * torch.pi
+                * (
+                    kr.unsqueeze(0) * shifts_batch[:, 0][:, None, None]
+                    + kc.unsqueeze(0) * shifts_batch[:, 1][:, None, None]
                 )
-                shifted_dps_flat[batch_start:batch_end] = torch.fft.ifft2(
-                    G_b * phase_ramp, dim=(-2, -1)
-                ).real
-                del G_b, s_b, phase_ramp
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            )
+            G_shift = G_batch * phase_ramp
+            shifted_dps[:, :, :, :] = torch.fft.ifft2(G_shift, dim=(-2, -1)).real.reshape(
+                H_rs, W_rs, H_dp, W_dp
+            )
 
-        if plot:
+        if plot_aligned:
             if fit_shifts:
                 show_2d(
                     [

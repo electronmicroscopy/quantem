@@ -5,10 +5,10 @@ from typing import Any
 
 import h5py
 
-from quantem.core.datastructures.dataset import Dataset as Dataset
-from quantem.core.datastructures.dataset2d import Dataset2d as Dataset2d
-from quantem.core.datastructures.dataset3d import Dataset3d as Dataset3d
-from quantem.core.datastructures.dataset4dstem import Dataset4dstem as Dataset4dstem
+from quantem.core.datastructures import Dataset as Dataset
+from quantem.core.datastructures import Dataset2d as Dataset2d
+from quantem.core.datastructures import Dataset3d as Dataset3d
+from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
 
 
 def read_4dstem(
@@ -37,92 +37,6 @@ def read_4dstem(
     --------
     Dataset4dstem
     """
-
-    def _reshape_3d_to_4d(
-        imported_data: dict,
-        *,
-        dataset_index_local: int | None,
-        scan_length_local: int,
-        scan_axis_local: int,
-        transpose_scan_axes_local: bool,
-    ) -> dict:
-        data = imported_data["data"]
-        if data.ndim != 3:
-            raise ValueError(
-                f"Expected 3D data to reshape, got ndim={data.ndim} with shape {data.shape}"
-            )
-
-        if scan_axis_local not in (0, 1):
-            raise ValueError(f"scan_axis must be 0 or 1, got {scan_axis_local}")
-
-        # Move scan axis to front so it becomes the frame axis
-        if scan_axis_local != 0:
-            data = np.moveaxis(data, scan_axis_local, 0)
-
-        n_frames, ny, nx = data.shape
-
-        if scan_length_local <= 0:
-            raise ValueError(f"scan_length must be positive, got {scan_length_local}")
-        if n_frames % scan_length_local != 0:
-            raise ValueError(
-                f"scan_length={scan_length_local} is not compatible with n_frames={n_frames}; "
-                f"n_frames % scan_length = {n_frames % scan_length_local}"
-            )
-
-        scan_y = n_frames // scan_length_local
-        scan_x = scan_length_local
-
-        data_4d = data.reshape(scan_y, scan_x, ny, nx)
-
-        if transpose_scan_axes_local:
-            data_4d = np.transpose(data_4d, (1, 0, 2, 3))
-            scan_y, scan_x = scan_x, scan_y
-
-        old_axes = imported_data.get("axes", None)
-        if old_axes is None or len(old_axes) != 3:
-            raise ValueError(
-                f"Expected 3 axes for 3D data when reshaping to 4D; got axes={old_axes}"
-            )
-
-        ax_scan_y = {
-            "scale": 1.0,
-            "offset": 0.0,
-            "units": "pixels",
-            "name": "scan_y",
-        }
-        ax_scan_x = {
-            "scale": 1.0,
-            "offset": 0.0,
-            "units": "pixels",
-            "name": "scan_x",
-        }
-
-        ax_qy = dict(old_axes[1])
-        ax_qx = dict(old_axes[2])
-
-        imported_data_4d = imported_data.copy()
-        imported_data_4d["data"] = data_4d
-        imported_data_4d["axes"] = [ax_scan_y, ax_scan_x, ax_qy, ax_qx]
-
-        original_shape = imported_data["data"].shape
-        new_shape = data_4d.shape
-        if dataset_index_local is not None:
-            print(
-                f"Using 3D dataset {dataset_index_local} with shape {original_shape} "
-                f"interpreted as 4D with shape={new_shape} "
-                f"(scan_axis={scan_axis_local}, scan_length={scan_length_local}, "
-                f"transpose_scan_axes={transpose_scan_axes_local})."
-            )
-        else:
-            print(
-                f"Using 3D dataset with shape {original_shape} "
-                f"interpreted as 4D with shape={new_shape} "
-                f"(scan_axis={scan_axis_local}, scan_length={scan_length_local}, "
-                f"transpose_scan_axes={transpose_scan_axes_local})."
-            )
-
-        return imported_data_4d
-
     if file_type is None:
         file_type = Path(file_path).suffix.lower().lstrip(".")
 
