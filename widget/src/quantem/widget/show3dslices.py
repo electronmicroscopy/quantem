@@ -1,11 +1,11 @@
 """
-Show3DSlices: ptycho-oriented orthogonal slice viewer.
+Show3DSlices: ptycho-oriented oblique slice viewer.
 
-Displays orthogonal top/row/column slices with interactive sliders plus a
-contextual 3D orientation view. All slicing happens in JavaScript for instant
-response. This widget is intentionally focused on single-object iterative
-ptychography volumes; comparison and tomography-specific workflows belong in
-Show3DVolume.
+Displays a top slice plus one arbitrary-angle vertical plane with interactive
+sliders and a contextual 3D orientation view. All slicing happens in
+JavaScript for instant response. This widget is intentionally focused on
+single-object iterative ptychography volumes; comparison and tomography-specific
+workflows belong in Show3DVolume.
 """
 import gc
 import io
@@ -62,21 +62,22 @@ _MAX_PLAYBACK_FPS = 30.0
 
 class Show3DSlices(anywidget.AnyWidget):
     """
-    Three-panel orthogonal slice viewer for a single 3D volume.
+    Linked top-slice and oblique vertical slice viewer for a single 3D volume.
 
-    Renders XY / XZ / YZ slice planes of a ``(nz, ny, nx)`` volume in three
-    linked canvases with synchronized crosshair, per-plane contrast, optional
-    FFT, and per-axis playback. Designed for multislice ptychography
-    reconstructions and other small-to-medium 3D volumes where the operator
-    wants to scrub through depth (axis 0) while seeing the orthogonal context.
+    Renders an XY slice plus one arbitrary-angle vertical plane through a
+    ``(nz, ny, nx)`` volume in linked canvases with synchronized context,
+    optional FFT, and playback over depth or plane position. Designed for
+    multislice ptychography reconstructions and other small-to-medium 3D
+    volumes where the operator wants to scrub through depth while marching an
+    angled plane through lateral regions.
     The raw volume is sent once over the Jupyter Comm channel and re-sliced
     in JS for each scrubber update.
 
     Features
     --------
-    - Three linked XY / XZ / YZ slice canvases with crosshair guides
-    - Per-axis playback (Z, Y, X, or cycle all) with loop / reverse / boomerang
-    - Independent scrub of each plane via ``slice_z``, ``slice_y``, ``slice_x``
+    - Linked XY plus arbitrary-angle vertical slice canvases
+    - Playback over Z slice, oblique plane position, or both
+    - Adjustable oblique endpoints, angle, and perpendicular position bounds
     - Log scale, percentile auto-contrast, manual ``vmin`` / ``vmax``
     - Per-plane statistics (opt-in via ``show_stats``)
     - Anisotropic scale bars via ``pixel_size_axes`` (e.g. nz << nxy multislice)
@@ -161,7 +162,7 @@ class Show3DSlices(anywidget.AnyWidget):
         the config; otherwise defaults to 0.
     show_stats : bool, default False
         Compute per-slice statistics traits on each slice change (`widget.stats_mean`,
-        `stats_min`, `stats_max`, `stats_std`, each a list of 3 floats: XY/XZ/YZ).
+        `stats_min`, `stats_max`, `stats_std`, each a legacy list of 3 floats).
         Python-side only; the JS widget does not render a stats bar. Set False to
         skip 12 reductions per slice scrub on multi-MB volumes when you don't
         need the values.
@@ -186,7 +187,8 @@ class Show3DSlices(anywidget.AnyWidget):
     fps : float, default 30.0
         Playback speed when scrubbing one axis, capped at 30.
     play_axis : int, default 0
-        Which axis to animate (0=Z, 1=Y, 2=X, 3=cycle all).
+        Which control to animate (0=slice/Z, 1=oblique plane position,
+        3=both). Legacy saved states with 2 are mapped to 1.
     dim_labels : list of str, optional
         Labels for data axes 0, 1, 2 in that order. Default ["slice", "row", "col"]
         matches the project-wide detector-plane convention (axis 0 = multislice
@@ -235,6 +237,8 @@ class Show3DSlices(anywidget.AnyWidget):
     slice_x = traitlets.CInt(0).tag(sync=True)
     slice_y = traitlets.CInt(0).tag(sync=True)
     slice_z = traitlets.CInt(0).tag(sync=True)
+    oblique_angle = traitlets.Float(0.0).tag(sync=True)
+    oblique_profile_line = traitlets.List(traitlets.Dict(), default_value=[]).tag(sync=True)
     # Raw volume data (sent once)
     volume_bytes = traitlets.Bytes(b"").tag(sync=True)
     # Offline HTML report mode: volume_bytes is uint8-quantized against this
@@ -260,7 +264,7 @@ class Show3DSlices(anywidget.AnyWidget):
     auto_contrast = traitlets.Bool(True).tag(sync=True)
     vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
     vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
-    # Scale bar. `pixel_size` is a scalar (lateral sampling, used by XY/XZ/YZ width-axis
+    # Scale bar. `pixel_size` is a scalar (lateral sampling, used by XY/oblique width-axis
     # scale bars). `pixel_size_axes` is the full per-axis triple [z, y, x] in the same
     # units - populated from tuple/list input; defaults to [pixel_size]*3 for scalar input.
     # Both sync to JS; JS uses pixel_size_axes when present for depth-axis scale bars
@@ -269,9 +273,9 @@ class Show3DSlices(anywidget.AnyWidget):
     pixel_size_axes = traitlets.List(traitlets.Float(), default_value=[0.0, 0.0, 0.0]).tag(sync=True)
     scale_bar_visible = traitlets.Bool(True).tag(sync=True)
     # Depth-axis display stretch for non-cubic volumes (CSS-only, zero memory).
-    # Scales XZ/YZ panel display height. Useful when nz << nxy (e.g. multislice
-    # ptycho with nz=14, nxy=730 → set z_stretch high to make depth panels readable).
-    z_stretch = traitlets.Float(1.0).tag(sync=True)
+    # Scales the oblique panel display height. Useful when nz << nxy (e.g. multislice
+    # ptycho with nz=14, nxy=730 -> set z_stretch high to make depth panels readable).
+    z_stretch = traitlets.Float(30.0).tag(sync=True)
     # UI
     show_controls = traitlets.Bool(True).tag(sync=True)
     show_stats = traitlets.Bool(False)  # Python-only: gates _compute_stats reductions, no JS bar
@@ -290,13 +294,13 @@ class Show3DSlices(anywidget.AnyWidget):
     show_slice_planes = traitlets.Bool(True).tag(sync=True)
     plane_visibility = traitlets.List(
         traitlets.Bool(),
-        default_value=[True, True, True],
+        default_value=[True, True],
     ).tag(sync=True)
     volume_opacity = traitlets.Float(0.5).tag(sync=True)
     slice_plane_opacity = traitlets.Float(0.35).tag(sync=True)
     # Axis labels (dim 0, 1, 2). Use detector-plane convention: axis 0 = slice
-    # (multislice depth), axis 1 = row, axis 2 = col. Panel headers display as
-    # "<dl[1]><dl[2]> (<dl[0]>=...)" so default reads as e.g. "row col (slice=7)".
+    # (multislice depth), axis 1 = row, axis 2 = col. The public plane UI is
+    # now Top + Side; these labels remain for data coordinates and exports.
     dim_labels = traitlets.List(traitlets.Unicode(), default_value=["slice", "row", "col"]).tag(sync=True)
     # Stats (3 values: xy, xz, yz)
     # stats_*: programmatic Python access only (no JS consumer). Don't sync.
@@ -310,7 +314,7 @@ class Show3DSlices(anywidget.AnyWidget):
     boomerang = traitlets.Bool(True).tag(sync=True)
     fps = traitlets.Float(30.0).tag(sync=True)
     loop = traitlets.Bool(True).tag(sync=True)
-    play_axis = traitlets.Int(0).tag(sync=True)  # 0=Z, 1=Y, 2=X, 3=All
+    play_axis = traitlets.Int(0).tag(sync=True)  # 0=slice, 1=oblique plane, 3=All
     # Validators (consistent with Show3D)
 
     @traitlets.validate("cmap")
@@ -341,6 +345,33 @@ class Show3DSlices(anywidget.AnyWidget):
             raise traitlets.TraitError(f"{proposal['trait'].name} must be finite, got {val}")
         return max(0.0, min(val, 100.0))
 
+    @traitlets.validate("oblique_angle")
+    def _validate_oblique_angle(self, proposal: dict) -> float:
+        """Normalize the arbitrary vertical plane angle to [0, 180)."""
+        val = float(proposal["value"])
+        if not math.isfinite(val):
+            raise traitlets.TraitError(f"oblique_angle must be finite, got {val}")
+        return val % 180.0
+
+    @traitlets.validate("oblique_profile_line")
+    def _validate_oblique_profile_line(self, proposal: dict) -> list[dict[str, float]]:
+        """Accept [] or two Show3D-style endpoint dicts with row/col keys."""
+        val = list(proposal["value"])
+        if len(val) == 0:
+            return []
+        if len(val) != 2:
+            raise traitlets.TraitError(
+                f"oblique_profile_line must be [] or two endpoints, got {len(val)}"
+            )
+        out: list[dict[str, float]] = []
+        for point in val:
+            row = float(point["row"])
+            col = float(point["col"])
+            if not math.isfinite(row) or not math.isfinite(col):
+                raise traitlets.TraitError("oblique_profile_line endpoints must be finite")
+            out.append({"row": row, "col": col})
+        return out
+
     @traitlets.validate("volume_opacity", "slice_plane_opacity")
     def _validate_opacity(self, proposal: dict) -> float:
         """Clamp volume display opacity sliders to [0, 1]."""
@@ -351,13 +382,13 @@ class Show3DSlices(anywidget.AnyWidget):
 
     @traitlets.validate("plane_visibility")
     def _validate_plane_visibility(self, proposal: dict) -> list[bool]:
-        """Require exactly three flags in [XY, XZ, YZ] order."""
+        """Accept new [XY, oblique] flags plus legacy [XY, XZ, YZ] state."""
         val = [bool(v) for v in proposal["value"]]
-        if len(val) != 3:
+        if len(val) not in (2, 3):
             raise traitlets.TraitError(
-                f"plane_visibility must have length 3 [XY, XZ, YZ], got {len(val)}"
+                f"plane_visibility must have length 2 [XY, oblique], got {len(val)}"
             )
-        return val
+        return val[:2]
 
     @traitlets.validate("fps")
     def _validate_fps(self, proposal: dict) -> float:
@@ -396,19 +427,26 @@ class Show3DSlices(anywidget.AnyWidget):
 
     @traitlets.validate("play_axis")
     def _validate_play_axis(self, proposal: dict) -> int:
-        """Restrict play axis to 0/1/2 (Z/Y/X) or 3 (all)."""
+        """Restrict playback to slice, oblique plane, or both.
+
+        Legacy Show3DSlices states used 1=Y and 2=X. Both now map to the
+        single arbitrary-angle plane so old notebooks do not resurrect row/col
+        playback labels.
+        """
         val = int(proposal["value"])
-        if val not in (0, 1, 2, 3):
-            raise traitlets.TraitError(f"play_axis must be 0/1/2/3, got {val}")
-        return val
+        if val == 0 or val == 3:
+            return val
+        if val in (1, 2):
+            return 1
+        raise traitlets.TraitError(f"play_axis must be 0/1/3, got {val}")
 
     @traitlets.validate("z_stretch")
     def _validate_z_stretch(self, proposal: dict) -> float:
-        """Clamp z stretch to [1, 30] so the 3D view stays usable."""
+        """Clamp z stretch to [1, 50] so the 3D view stays usable."""
         val = float(proposal["value"])
         if math.isnan(val) or math.isinf(val):
             raise traitlets.TraitError(f"z_stretch must be finite, got {val}")
-        return max(1.0, min(val, 30.0))
+        return max(1.0, min(val, 50.0))
 
     @traitlets.validate("dim_labels")
     def _validate_dim_labels(self, proposal: dict) -> list[str]:
@@ -681,13 +719,8 @@ class Show3DSlices(anywidget.AnyWidget):
         self.pixel_size = ps_scalar
         self.pixel_size_axes = ps_axes
         self.scale_bar_visible = scale_bar_visible
-        # Default z_stretch = 15 for thin-Z multislice ptycho (nz~14, nxy~700+).
-        # Renders depth panels at a readable height without hiding lateral detail.
-        # User can override via constructor or runtime trait. For near-cubic data
-        # (nxy/nz <= 4) keep 1.0 so XZ/YZ panels stay square.
-        thin_z_ratio = min(self.nx, self.ny) / max(self.nz, 1)
         if z_stretch is None:
-            z_stretch = 15.0 if thin_z_ratio > 4 else 1.0
+            z_stretch = 30.0
         self.z_stretch = float(z_stretch)
         self.show_controls = show_controls
         self.show_stats = show_stats
@@ -779,9 +812,9 @@ class Show3DSlices(anywidget.AnyWidget):
         if visible:
             if any(bool(v) for v in self.plane_visibility):
                 return
-            next_visibility = [True, True, True]
+            next_visibility = [True, True]
         else:
-            next_visibility = [False, False, False]
+            next_visibility = [False, False]
         if list(self.plane_visibility) == next_visibility:
             return
         self._syncing_plane_visibility = True
@@ -861,6 +894,8 @@ class Show3DSlices(anywidget.AnyWidget):
             "slice_x": self.slice_x,
             "slice_y": self.slice_y,
             "slice_z": self.slice_z,
+            "oblique_angle": self.oblique_angle,
+            "oblique_profile_line": list(self.oblique_profile_line),
             "fps": self.fps,
             "loop": self.loop,
             "reverse": self.reverse,
@@ -1012,7 +1047,7 @@ class Show3DSlices(anywidget.AnyWidget):
         if "plane_visibility" in state:
             state["show_slice_planes"] = any(bool(v) for v in state["plane_visibility"])
         elif "show_slice_planes" in state:
-            state["plane_visibility"] = [bool(state["show_slice_planes"])] * 3
+            state["plane_visibility"] = [bool(state["show_slice_planes"])] * 2
         state.pop("viewer_kind", None)
         vmin_marker = object()
         vmax_marker = object()
@@ -1128,8 +1163,8 @@ class Show3DSlices(anywidget.AnyWidget):
         """Start slice playback along the current ``play_axis``.
 
         Sets the ``playing`` trait to ``True``. The JS animation loop scrubs
-        the axis selected by ``play_axis`` (``0=Z``, ``1=Y``, ``2=X``,
-        ``3=cycle all``) at ``fps`` frames per second.
+        the control selected by ``play_axis`` (``0=slice/Z``, ``1=oblique
+        plane position``, ``3=both``) at ``fps`` frames per second.
 
         Returns
         -------
@@ -1201,13 +1236,13 @@ class Show3DSlices(anywidget.AnyWidget):
     ) -> pathlib.Path:
         """Save a single 2D slice of the volume as PNG, PDF, or TIFF.
 
-        Extracts the requested orthogonal slice, colorizes it with the current
+        Extracts the requested axis-aligned slice, colorizes it with the current
         ``cmap`` and contrast (``vmin`` / ``vmax`` or 2-98 percentile
         auto-contrast), and writes it to ``path``. ``log_scale`` and ``flip``
         are honored so the saved file matches what the browser shows for that
         plane.
 
-        Plane / index mapping:
+        Plane / index mapping for this legacy export helper:
 
         - ``"xy"``: slice along Z, ``slice_idx`` indexes into ``nz``; defaults
           to current ``slice_z``.
@@ -1221,7 +1256,10 @@ class Show3DSlices(anywidget.AnyWidget):
         path : str or pathlib.Path
             Output file path. Parent directories are created if needed.
         plane : str | None, optional
-            One of ``"xy"``, ``"xz"``, ``"yz"``. Defaults to ``"xy"``.
+            One of ``"xy"``, ``"xz"``, ``"yz"``. Defaults to ``"xy"``. The
+            interactive browser UI now exposes Top plus an arbitrary Side
+            plane; this helper keeps the older axis-aligned export names for
+            backwards compatibility.
         slice_idx : int | None, optional
             Slice index along the chosen axis. Defaults to the current
             position for that plane.
@@ -1358,7 +1396,7 @@ class Show3DSlices(anywidget.AnyWidget):
     # =========================================================================
 
     def _compute_stats(self) -> None:
-        """Compute statistics for the 3 current slices.
+        """Compute legacy statistics for the 3 axis-aligned slice indices.
 
         Skipped when show_stats is False to avoid 12 reductions
         per slice movement on multi-MB volumes (JS does not render a stats bar; this

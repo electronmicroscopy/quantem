@@ -969,7 +969,7 @@ function Show4DSTEM() {
 
   // ROI state
   const [roiRadiusModel, setRoiRadius] = useModelState<number>("roi_radius");
-  const [roiRadiusInner, setRoiRadiusInner] = useModelState<number>("roi_radius_inner");
+  const [roiRadiusInnerModel, setRoiRadiusInner] = useModelState<number>("roi_radius_inner");
   const [roiMode, setRoiMode] = useModelState<string>("roi_mode");
   const [roiWidth, setRoiWidth] = useModelState<number>("roi_width");
   const [roiHeight, setRoiHeight] = useModelState<number>("roi_height");
@@ -1051,32 +1051,55 @@ function Show4DSTEM() {
   // while dragging, else the model value. Keeps the ring glued to the cursor.
   const roiRadius = localRoiRadius != null ? localRoiRadius : roiRadiusModel;
   const roiRadiusPendingRef = React.useRef<number | null>(null);
-  const roiRadiusInflightRef = React.useRef<boolean>(false);
-  const sendRoiRadius = React.useCallback((radius: number) => {
-    // Skip if a recompute is already in flight — keep only the LATEST radius as
-    // pending; it gets sent when the in-flight one lands (effect below). This
-    // drops intermediate radii so the queue never builds, and because the ring
-    // is rendered from localRoiRadius it never snaps back to a stale value.
-    if (roiRadiusInflightRef.current) {
-      roiRadiusPendingRef.current = radius;
-      return;
-    }
-    roiRadiusInflightRef.current = true;
-    roiRadiusPendingRef.current = null;
-    model.set("roi_radius", radius);
-    model.save_changes();
-  }, [model]);
-  React.useEffect(() => {
-    // recompute landed: release the guard, send the latest pending radius if any
-    roiRadiusInflightRef.current = false;
+  const roiRadiusRafRef = React.useRef<number | null>(null);
+  const flushRoiRadius = React.useCallback(() => {
     if (roiRadiusPendingRef.current !== null) {
       const r = roiRadiusPendingRef.current;
       roiRadiusPendingRef.current = null;
-      roiRadiusInflightRef.current = true;
       model.set("roi_radius", r);
       model.save_changes();
     }
-  }, [virtualImageBytes, model]);
+    roiRadiusRafRef.current = null;
+  }, [model]);
+  const sendRoiRadius = React.useCallback((radius: number) => {
+    roiRadiusPendingRef.current = radius;
+    if (roiRadiusRafRef.current === null) {
+      roiRadiusRafRef.current = requestAnimationFrame(flushRoiRadius);
+    }
+  }, [flushRoiRadius]);
+  React.useEffect(() => {
+    if (localRoiRadius != null && Math.abs(localRoiRadius - roiRadiusModel) < 0.5) {
+      setLocalRoiRadius(null);
+    }
+  }, [localRoiRadius, roiRadiusModel]);
+  const [localRoiRadiusInner, setLocalRoiRadiusInner] = React.useState<number | null>(null);
+  const roiRadiusInner = localRoiRadiusInner != null ? localRoiRadiusInner : roiRadiusInnerModel;
+  const roiRadiusInnerPendingRef = React.useRef<number | null>(null);
+  const roiRadiusInnerRafRef = React.useRef<number | null>(null);
+  const flushRoiRadiusInner = React.useCallback(() => {
+    if (roiRadiusInnerPendingRef.current !== null) {
+      const r = roiRadiusInnerPendingRef.current;
+      roiRadiusInnerPendingRef.current = null;
+      model.set("roi_radius_inner", r);
+      model.save_changes();
+    }
+    roiRadiusInnerRafRef.current = null;
+  }, [model]);
+  const sendRoiRadiusInner = React.useCallback((radius: number) => {
+    roiRadiusInnerPendingRef.current = radius;
+    if (roiRadiusInnerRafRef.current === null) {
+      roiRadiusInnerRafRef.current = requestAnimationFrame(flushRoiRadiusInner);
+    }
+  }, [flushRoiRadiusInner]);
+  React.useEffect(() => {
+    if (localRoiRadiusInner != null && Math.abs(localRoiRadiusInner - roiRadiusInnerModel) < 0.5) {
+      setLocalRoiRadiusInner(null);
+    }
+  }, [localRoiRadiusInner, roiRadiusInnerModel]);
+  React.useEffect(() => () => {
+    if (roiRadiusRafRef.current !== null) cancelAnimationFrame(roiRadiusRafRef.current);
+    if (roiRadiusInnerRafRef.current !== null) cancelAnimationFrame(roiRadiusInnerRafRef.current);
+  }, []);
   const [isDraggingVI, setIsDraggingVI] = React.useState(false);
   const [isDraggingFFT, setIsDraggingFFT] = React.useState(false);
   const [fftDragStart, setFftDragStart] = React.useState<{ x: number, y: number, panX: number, panY: number } | null>(null);
@@ -2674,8 +2697,11 @@ function Show4DSTEM() {
     return false;
   };
 
-  // Mouse handlers
-  const handleDpMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  // Pointer handlers
+  const handleDpMouseDown = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
+    if ("pointerId" in e) {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    }
     dpClickStartRef.current = { x: e.clientX, y: e.clientY };
     const canvas = dpOverlayRef.current;
     if (!canvas) return;
@@ -2743,7 +2769,7 @@ function Show4DSTEM() {
     model.save_changes();
   };
 
-  const handleDpMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleDpMouseMove = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = dpOverlayRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -2825,7 +2851,9 @@ function Show4DSTEM() {
       const dy = Math.abs(imgY - roiCenterRow);
       const newRadius = Math.sqrt(dx ** 2 + dy ** 2);
       // Inner radius must be less than outer radius
-      setRoiRadiusInner(Math.max(1, Math.min(roiRadius - 1, Math.round(newRadius))));
+      const rad = Math.max(1, Math.min(roiRadius - 1, Math.round(newRadius)));
+      setLocalRoiRadiusInner(rad);
+      sendRoiRadiusInner(rad);
       return;
     }
 
@@ -2870,7 +2898,10 @@ function Show4DSTEM() {
     queueRoiCenter(newRow, newCol);
   };
 
-  const handleDpMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleDpMouseUp = (e: React.MouseEvent<HTMLCanvasElement> | React.PointerEvent<HTMLCanvasElement>) => {
+    if ("pointerId" in e) {
+      try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    }
     if (draggingDpProfileEndpoint !== null || isDraggingDpProfileLine) {
       setDraggingDpProfileEndpoint(null);
       setIsDraggingDpProfileLine(false);
@@ -2878,9 +2909,7 @@ function Show4DSTEM() {
       dpClickStartRef.current = null;
       setIsDraggingDP(false);
       setIsDraggingResize(false);
-      setLocalRoiRadius(null);  // revert ring to committed model radius on release
       setIsDraggingResizeInner(false);
-      setLocalRoiRadius(null);
       setHoveredDpProfileEndpoint(null);
       setIsHoveringDpProfileLine(false);
       return;
@@ -2914,7 +2943,6 @@ function Show4DSTEM() {
     }
     dpClickStartRef.current = null;
     setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
-    setLocalRoiRadius(null);
     setDraggingDpProfileEndpoint(null);
     setIsDraggingDpProfileLine(false);
     setHoveredDpProfileEndpoint(null);
@@ -2922,9 +2950,12 @@ function Show4DSTEM() {
     dpProfileDragStartRef.current = null;
   };
   const handleDpMouseLeave = () => {
+    if (isDraggingDP || isDraggingResize || isDraggingResizeInner || draggingDpProfileEndpoint !== null || isDraggingDpProfileLine) {
+      setCursorInfo(prev => prev?.panel === "DP" ? null : prev);
+      return;
+    }
     dpClickStartRef.current = null;
     setIsDraggingDP(false); setIsDraggingResize(false); setIsDraggingResizeInner(false);
-    setLocalRoiRadius(null);
     setDraggingDpProfileEndpoint(null);
     setIsDraggingDpProfileLine(false);
     setHoveredDpProfileEndpoint(null);
@@ -3657,8 +3688,9 @@ function Show4DSTEM() {
             <canvas ref={dpCanvasRef} width={detCols} height={detRows} style={{ position: "absolute", width: "100%", height: "100%", imageRendering: "pixelated" }} />
             <canvas
               ref={dpOverlayRef} width={detCols} height={detRows}
-              onMouseDown={handleDpMouseDown} onMouseMove={handleDpMouseMove}
-              onMouseUp={handleDpMouseUp} onMouseLeave={handleDpMouseLeave}
+              onPointerDown={handleDpMouseDown} onPointerMove={handleDpMouseMove}
+              onPointerUp={handleDpMouseUp} onPointerCancel={handleDpMouseUp}
+              onMouseLeave={handleDpMouseLeave}
               onWheel={createZoomHandler(setDpZoom, setDpPanX, setDpPanY, dpZoom, dpPanX, dpPanY, dpOverlayRef)}
               onDoubleClick={handleDpDoubleClick}
               style={{

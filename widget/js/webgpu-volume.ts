@@ -19,8 +19,13 @@ export interface VolumeRenderParams {
   nz: number;
   opacity: number;       // global opacity multiplier 0..1
   brightness: number;    // brightness adjustment 0.1..3
-  slicePlaneMask: number; // bit0=XY, bit1=XZ, bit2=YZ slice plane indicators
+  slicePlaneMask: number; // bit0=XY, bit1=oblique vertical slice plane indicators
   slicePlaneOpacity: number; // slice plane alpha 0..1 (default 0.35)
+  obliqueAngleDeg?: number; // angle about Z in XY texture space
+  obliqueStartX?: number; // oblique segment start, in pixel coordinates
+  obliqueStartY?: number;
+  obliqueEndX?: number;   // oblique segment end, in pixel coordinates
+  obliqueEndY?: number;
   vmin: number;  // 0..1 normalized (maps to texture's [0,1] range)
   vmax: number;  // 0..1 normalized
 }
@@ -186,8 +191,12 @@ struct Uniforms {
   vmin: f32,
   vmax: f32,
   slicePlaneOpacity: f32,
-  _pad4: f32,
-  _pad5: f32,
+  obliqueStartX: f32,
+  obliqueStartY: f32,
+  obliqueEndX: f32,
+  obliqueEndY: f32,
+  obliqueDirX: f32,
+  obliqueDirY: f32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -254,6 +263,31 @@ fn intersectSlicePlane(origin: vec3<f32>, dir: vec3<f32>, axis: i32, pos: f32,
   return t;
 }
 
+fn intersectObliquePlane(origin: vec3<f32>, dir: vec3<f32>,
+                         bmin: vec3<f32>, bmax: vec3<f32>) -> f32 {
+  let texOrigin = worldToTex(origin, bmin, bmax);
+  let texDir = dir / (bmax - bmin);
+  let start = vec2<f32>(u.obliqueStartX, u.obliqueStartY);
+  let end = vec2<f32>(u.obliqueEndX, u.obliqueEndY);
+  let segmentLength = distance(start, end);
+  if (segmentLength < 1e-6) { return -1.0; }
+  let lineDir = vec2<f32>(u.obliqueDirX, u.obliqueDirY);
+  let center = (start + end) * 0.5;
+  let normal = vec2<f32>(-u.obliqueDirY, u.obliqueDirX);
+  let denom = dot(normal, texDir.xy);
+  if (abs(denom) < 1e-8) { return -1.0; }
+  let t = dot(normal, center - texOrigin.xy) / denom;
+  if (t < 0.0) { return -1.0; }
+  let p = origin + t * dir;
+  if (p.x < bmin.x || p.x > bmax.x) { return -1.0; }
+  if (p.y < bmin.y || p.y > bmax.y) { return -1.0; }
+  if (p.z < bmin.z || p.z > bmax.z) { return -1.0; }
+  let texP = worldToTex(p, bmin, bmax).xy;
+  let along = dot(texP - start, lineDir);
+  if (along < 0.0 || along > segmentLength) { return -1.0; }
+  return t;
+}
+
 fn applyWindow(value: f32) -> f32 {
   let denom = max(u.vmax - u.vmin, 1e-6);
   return clamp((value - u.vmin) / denom, 0.0, 1.0);
@@ -285,21 +319,16 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let tStart = max(tNear, 0.0);
   let stepSize = (tFar - tStart) / f32(u.numSteps);
 
-  // Compute slice plane intersections (bit0=XY, bit1=XZ, bit2=YZ)
+  // Compute slice plane intersections (bit0=XY, bit1=oblique vertical)
   let showXY = (u.slicePlaneMask & 1u) != 0u;
-  let showXZ = (u.slicePlaneMask & 2u) != 0u;
-  let showYZ = (u.slicePlaneMask & 4u) != 0u;
+  let showOblique = (u.slicePlaneMask & 2u) != 0u;
   var tSliceXY: f32 = -1.0;
-  var tSliceXZ: f32 = -1.0;
-  var tSliceYZ: f32 = -1.0;
+  var tSliceOblique: f32 = -1.0;
   if (showXY) {
     tSliceXY = intersectSlicePlane(rayOrigin, rayDir, 2, u.sliceZ, bmin, bmax);
   }
-  if (showXZ) {
-    tSliceXZ = intersectSlicePlane(rayOrigin, rayDir, 1, u.sliceY, bmin, bmax);
-  }
-  if (showYZ) {
-    tSliceYZ = intersectSlicePlane(rayOrigin, rayDir, 0, u.sliceX, bmin, bmax);
+  if (showOblique) {
+    tSliceOblique = intersectObliquePlane(rayOrigin, rayDir, bmin, bmax);
   }
 
   // Front-to-back compositing
@@ -325,29 +354,17 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
       accum = vec4<f32>(accum.rgb + sliceCol * sliceAlpha, accum.a + sliceAlpha);
       tSliceXY = -1.0;
     }
-    // XZ plane (green)
-    if (showXZ && tSliceXZ > 0.0 && abs(t - tSliceXZ) < stepSize * 0.6) {
-      let slicePos = rayOrigin + tSliceXZ * rayDir;
+    // Oblique vertical plane (green)
+    if (showOblique && tSliceOblique > 0.0 && abs(t - tSliceOblique) < stepSize * 0.6) {
+      let slicePos = rayOrigin + tSliceOblique * rayDir;
       let sliceTex = worldToTex(slicePos, bmin, bmax);
-      var sliceValXZ = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
-      sliceValXZ = applyWindow(sliceValXZ);
-      var sliceCol = textureSampleLevel(colormap, colormapSampler, vec2<f32>(clamp(sliceValXZ * u.brightness, 0.0, 1.0), 0.5), 0.0).rgb;
+      var sliceValOblique = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
+      sliceValOblique = applyWindow(sliceValOblique);
+      var sliceCol = textureSampleLevel(colormap, colormapSampler, vec2<f32>(clamp(sliceValOblique * u.brightness, 0.0, 1.0), 0.5), 0.0).rgb;
       sliceCol = mix(sliceCol, vec3<f32>(0.3, 1.0, 0.4), 0.25);
       let sliceAlpha = u.slicePlaneOpacity * (1.0 - accum.a);
       accum = vec4<f32>(accum.rgb + sliceCol * sliceAlpha, accum.a + sliceAlpha);
-      tSliceXZ = -1.0;
-    }
-    // YZ plane (red)
-    if (showYZ && tSliceYZ > 0.0 && abs(t - tSliceYZ) < stepSize * 0.6) {
-      let slicePos = rayOrigin + tSliceYZ * rayDir;
-      let sliceTex = worldToTex(slicePos, bmin, bmax);
-      var sliceValYZ = textureSampleLevel(volume, volumeSampler, sliceTex, 0.0).r;
-      sliceValYZ = applyWindow(sliceValYZ);
-      var sliceCol = textureSampleLevel(colormap, colormapSampler, vec2<f32>(clamp(sliceValYZ * u.brightness, 0.0, 1.0), 0.5), 0.0).rgb;
-      sliceCol = mix(sliceCol, vec3<f32>(1.0, 0.3, 0.3), 0.25);
-      let sliceAlpha = u.slicePlaneOpacity * (1.0 - accum.a);
-      accum = vec4<f32>(accum.rgb + sliceCol * sliceAlpha, accum.a + sliceAlpha);
-      tSliceYZ = -1.0;
+      tSliceOblique = -1.0;
     }
 
     // Sample volume — remap from [vmin, vmax] to [0, 1]
@@ -395,10 +412,15 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 // 140     vmin               f32                 4
 // 144     vmax               f32                 4
 // 148     slicePlaneOpacity  f32                 4
-// 152-159 padding            2×f32               8
-// total: 160 bytes (must be multiple of 16)
+// 152     obliqueStartX      f32                 4
+// 156     obliqueStartY      f32                 4
+// 160     obliqueEndX        f32                 4
+// 164     obliqueEndY        f32                 4
+// 168     obliqueDirX        f32                 4
+// 172     obliqueDirY        f32                 4
+// total: 176 bytes (must be multiple of 16)
 
-const UNIFORM_BUFFER_SIZE = 160;
+const UNIFORM_BUFFER_SIZE = 176;
 
 // ============================================================================
 // VolumeRenderer class
@@ -713,6 +735,44 @@ export class VolumeRenderer {
     f32[36] = params.vmax;
     // slicePlaneOpacity at offset 148/4=37
     f32[37] = params.slicePlaneOpacity ?? 0.35;
+    const theta = ((params.obliqueAngleDeg ?? 0) * Math.PI) / 180;
+    let dirX = Math.cos(theta);
+    let dirY = Math.sin(theta);
+    let startX: number;
+    let startY: number;
+    let endX: number;
+    let endY: number;
+    if (
+      params.obliqueStartX !== undefined && params.obliqueStartY !== undefined &&
+      params.obliqueEndX !== undefined && params.obliqueEndY !== undefined &&
+      params.nx > 0 && params.ny > 0
+    ) {
+      startX = (params.obliqueStartX + 0.5) / params.nx;
+      startY = (params.obliqueStartY + 0.5) / params.ny;
+      endX = (params.obliqueEndX + 0.5) / params.nx;
+      endY = (params.obliqueEndY + 0.5) / params.ny;
+      const dx = endX - startX;
+      const dy = endY - startY;
+      const len = Math.hypot(dx, dy);
+      if (len > 1e-8) {
+        dirX = dx / len;
+        dirY = dy / len;
+      }
+    } else {
+      const centerX = params.nx > 0 ? (params.sliceX + 0.5) / params.nx : 0.5;
+      const centerY = params.ny > 0 ? (params.sliceY + 0.5) / params.ny : 0.5;
+      startX = centerX - dirX * 2;
+      startY = centerY - dirY * 2;
+      endX = centerX + dirX * 2;
+      endY = centerY + dirY * 2;
+    }
+    // Oblique segment and direction at offsets 152/4=38 through 172/4=43
+    f32[38] = startX;
+    f32[39] = startY;
+    f32[40] = endX;
+    f32[41] = endY;
+    f32[42] = dirX;
+    f32[43] = dirY;
 
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uniformData);
 
