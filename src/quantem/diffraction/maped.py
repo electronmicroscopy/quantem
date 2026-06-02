@@ -1734,7 +1734,7 @@ class MAPEDTorch(AutoSerialize):
         else:
             merged_out = merged.to(dtype=dtype_out)
 
-        dataset_merged = Dataset4dstem.from_array(array=merged_out.cpu().numpy())
+        dataset_merged = Dataset4dstem.from_tensor(tensor=merged_out)
         dataset_merged.im_bf_merged = self.im_bf_merged
         dataset_merged.dp_mean_merged = self.dp_mean_merged
 
