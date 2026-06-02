@@ -489,12 +489,14 @@ class DiskTemplate(RenderComponent):
 
         return tv_loss + cutoff_loss + circular_loss
 
-    def get_optimization_parameters(self) -> Any:
+    def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
         params = []
         for name, param in self.named_parameters(recurse=True):
             if not name.startswith('origin.') and param.requires_grad:
                 params.append(param)
-        return params
+        if not params:
+            return {}
+        return {'default': params}
 
         
 
@@ -916,9 +918,11 @@ class SyntheticDiskLattice(RenderComponent):
             device=ctx.device, dtype=ctx.dtype,
         )
 
-    def get_optimization_parameters(self) -> Any:
+    def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
         params = []
         for name, param in self.named_parameters(recurse=True):
             if not name.startswith('disk.') and param.requires_grad:
                 params.append(param)
-        return params
+        if not params:
+            return {}
+        return {'default': params}

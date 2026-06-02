@@ -295,15 +295,18 @@ class RenderComponent(OptimizerMixin,nn.Module):
     ) -> torch.Tensor:
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
 
-    def get_optimization_parameters(self) -> Any: 
-        return [p for p in self.parameters() if p.requires_grad]
+    def get_optimization_parameters(self) -> dict[str, list]:
+        params = [p for p in self.parameters() if p.requires_grad]
+        if not params:
+            return {}
+        return {'default': params}
     
     def initialize_optimizer(self, 
         optimizer_params: dict[str, Any] | None = None,
         scheduler_params: dict[str, Any] | None = None,
         num_iter: int | None = None,
         ) -> None:
-        trainable_params = list(self.get_optimization_parameters())
+        trainable_params = (self.get_optimization_parameters())
         if not trainable_params:
             self._optimizer = None
             self._scheduler = None
@@ -359,7 +362,7 @@ class RenderComponent(OptimizerMixin,nn.Module):
         }
     
     def _rebuild_optimizer_after_trainability_change(self) -> None:
-        trainable_params = list(self.get_optimization_parameters())
+        trainable_params = (self.get_optimization_parameters())
         if not trainable_params:
             self._optimizer = None
             self._scheduler = None
