@@ -1,4 +1,3 @@
-
 import warnings
 from typing import Any, Literal
 
@@ -171,19 +170,26 @@ class PtychographyVisualizations(PtychographyBase):
                 obj_show = obj_pad
             else:  # complex or pure phase just show the phase
                 obj_show = np.angle(obj_pad)
-            show_2d(
+            fig, ax = show_2d(
                 [
                     obj_show,
                     np.abs(obj_fft),
                 ],
                 title=[t + "Object", t + "Fourier Transform"],
                 scalebar=[obj_scalebar, fft_scalebar],
+                return_fig=True,
                 **kwargs,
             )
+            ax[1].set_aspect(obj_np.shape[-1] / obj_np.shape[-2])
         else:
-            show_2d(
-                np.abs(obj_fft), scalebar=fft_scalebar, title=t + "Fourier Transform", **kwargs
+            fig, ax = show_2d(
+                np.abs(obj_fft),
+                scalebar=fft_scalebar,
+                title=t + "Fourier Transform",
+                return_fig=True,
+                **kwargs,
             )
+            ax.set_aspect(obj_np.shape[-1] / obj_np.shape[-2])
         if return_fft:
             return obj_fft
         else:
@@ -891,6 +897,7 @@ class PtychographyVisualizations(PtychographyBase):
 
         if conv_angle is not None and energy is not None:
             from quantem.core.utils.utils import electron_wavelength_angstrom
+
             wavelength = electron_wavelength_angstrom(energy)
             conv_angle_rad = conv_angle * 1e-3
             # For defocused probe: radius ≈ |defocus| * convergence_angle + diffraction_limit

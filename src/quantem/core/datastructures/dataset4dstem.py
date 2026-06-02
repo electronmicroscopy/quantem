@@ -3,6 +3,7 @@ from typing import Any, Self
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib.patches import Circle, Wedge
 from numpy.typing import NDArray
 
@@ -42,11 +43,12 @@ class Dataset4dstem(Dataset4d):
 
     def __init__(
         self,
-        array: NDArray | Any,
-        name: str,
-        origin: NDArray | tuple | list | float | int,
-        sampling: NDArray | tuple | list | float | int,
-        units: list[str] | tuple | list,
+        array: NDArray | None = None,
+        tensor: torch.Tensor | None = None,
+        name: str = "",
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
         metadata: dict = {},
         _token: object | None = None,
@@ -57,10 +59,13 @@ class Dataset4dstem(Dataset4d):
         ----------
         array : NDArray | Any
             The underlying 4D array data
+        tensor : torch.Tensor | None, optional
+            Alternative to ``array``: the underlying 4D torch tensor (any device).
+            Provide exactly one of ``array`` or ``tensor``.
         name : str
             A descriptive name for the dataset
         origin : NDArray | tuple | list | float | int
-            The origin coordinates for each dimension
+            The origin coordinates for each dimension in calibrated units
         sampling : NDArray | tuple | list | float | int
             The sampling rate/spacing for each dimension
         units : list[str] | tuple | list
@@ -80,6 +85,7 @@ class Dataset4dstem(Dataset4d):
 
         super().__init__(
             array=array,
+            tensor=tensor,
             name=name,
             origin=origin,
             sampling=sampling,
@@ -134,7 +140,7 @@ class Dataset4dstem(Dataset4d):
         name : str | None, optional
             A descriptive name for the dataset. If None, defaults to "4D-STEM dataset"
         origin : NDArray | tuple | list | float | int | None, optional
-            The origin coordinates for each dimension. If None, defaults to zeros
+            The origin coordinates for each dimension in calibrated units. If None, defaults to zeros
         sampling : NDArray | tuple | list | float | int | None, optional
             The sampling rate/spacing for each dimension. If None, defaults to ones
         units : list[str] | tuple | list | None, optional
@@ -155,6 +161,47 @@ class Dataset4dstem(Dataset4d):
             sampling=sampling if sampling is not None else np.ones(4),
             units=units if units is not None else ["pixels"] * 4,
             signal_units=signal_units,
+            _token=cls._token,
+        )
+
+    @classmethod
+    def from_tensor(
+        cls,
+        tensor: torch.Tensor,
+        name: str | None = None,
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
+        signal_units: str = "arb. units",
+        metadata: dict | None = None,
+    ) -> Self:
+        """Create a Dataset4dstem from a torch tensor (any device).
+
+        Use this when raw data is GPU-resident (CUDA pipelines, live detector
+        frames, GPU file readers) to skip the VRAM<->RAM round-trip.
+
+        For cupy / jax arrays, wrap with ``torch.from_dlpack(arr)`` first.
+        """
+        # TODO: factor type + ndim checks into `ensure_valid_tensor(value, ndim=4)`
+        # in validators.py, matching `ensure_valid_array` pattern. Cuts bloat.
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"from_tensor requires torch.Tensor, got {type(tensor).__name__}. "
+                f"For cupy / jax, wrap with `torch.from_dlpack(arr)` first."
+            )
+        if tensor.ndim != 4:
+            raise ValueError(
+                f"Dataset4dstem.from_tensor requires a 4D tensor "
+                f"(scan_row, scan_col, dp_row, dp_col), got shape {tuple(tensor.shape)}."
+            )
+        return cls(
+            tensor=tensor,
+            name=name if name is not None else "4D-STEM dataset (torch)",
+            origin=origin if origin is not None else np.zeros(4),
+            sampling=sampling if sampling is not None else np.ones(4),
+            units=units if units is not None else ["pixels"] * 4,
+            signal_units=signal_units,
+            metadata=metadata if metadata is not None else {},
             _token=cls._token,
         )
 

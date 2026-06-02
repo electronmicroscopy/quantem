@@ -167,6 +167,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# BasedPyRight Config
+pyrightconfig.json
+
 # Ruff stuff:
 .ruff_cache/
 
@@ -185,9 +188,24 @@ ipynb-playground/
 *.h5
 *.npy
 
-# cursor
+# cursor/CLI
 .cursor
+.claude
+CLAUDE.md
+AGENTS.md
+AGENT.md
 
 # widget (JS build artifacts)
 node_modules/
 widget/src/quantem/widget/static/
+
+# widget — local-only (per-developer notebooks, docs scratch, build/test scripts).
+# Track only src/, js/, tests/test_*.py for now.
+widget/.gitignore
+widget/docs/
+widget/notebooks/
+widget/scripts/
+!widget/scripts/build.mjs
+widget/tests/integration/
+widget/tests/snapshots/
+
