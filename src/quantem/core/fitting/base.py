@@ -11,9 +11,6 @@ from tqdm import tqdm
 
 from quantem.core.ml.optimizer_mixin import (
     OptimizerMixin,
-    OptimizerParams,
-    OptimizerType,
-    SchedulerType,
 )
 
 
