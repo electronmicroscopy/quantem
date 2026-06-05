@@ -73,7 +73,12 @@ class ModelDiffractionVisualizations:
             ax.plot(disk_centers_rc[:, 1], disk_centers_rc[:, 0], **kw_disks)
 
     def plot_losses(
-        self, figax: tuple[Any, Any] | None = None, plot_lrs: bool = True
+        self, 
+        figax: tuple[Any, Any] | None = None, 
+        plot_lrs: bool = True, 
+        plot_individual: bool = False,
+        individual_row: int = 0,
+        individual_col: int = 0,
     ) -> tuple[Any, Any]:
         md = cast("ModelDiffraction", self)
         colors = config.get("viz.colors.set")
@@ -84,9 +89,12 @@ class ModelDiffractionVisualizations:
             fig, ax = plt.subplots()
         else:
             fig, ax = figax
-
-        mean_hist = md.fit_history.get("mean")
-        losses = np.asarray([] if mean_hist is None else mean_hist.losses, dtype=np.float64)
+        if plot_individual:
+            mean_hist = md.fit_history.get(f"individual_{individual_row}_{individual_col}")
+            losses = np.asarray([] if mean_hist is None else mean_hist.losses, dtype=np.float64)
+        else:
+            mean_hist = md.fit_history.get("mean")
+            losses = np.asarray([] if mean_hist is None else mean_hist.losses, dtype=np.float64)
         if losses.size == 0:
             ax.text(
                 0.5,
@@ -141,7 +149,10 @@ class ModelDiffractionVisualizations:
     def visualize(
         self,
         *,
-        power: float = 0.25,
+        individual_loss: bool = False,
+        pattern_row: int = 0,
+        pattern_col: int = 0,
+        power: float = 1,
         cbar: bool = False,
         axsize: tuple[int, int] = (6, 6),
         overlay: bool = True,
@@ -193,14 +204,21 @@ class ModelDiffractionVisualizations:
             md.preprocess()
         if md.image_ref is None or md.model is None or md.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
+        if md.dataset.shape[0] <= pattern_row or md.dataset.shape[1] <= pattern_col:
+            raise ValueError("individual row or column outside bounds of dataset")
 
         fig = plt.figure(figsize=(12, 7))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax_top = fig.add_subplot(gs[0])
-        md.plot_losses(figax=(fig, ax_top), plot_lrs=True)
+        md.plot_losses(figax=(fig, ax_top), plot_lrs=True, plot_individual=individual_loss,individual_row=pattern_row,individual_col=pattern_col)
 
-        ref = np.asarray(md.image_ref, dtype=np.float32)
-        pred = md.render_current
+        if individual_loss:
+            pred = md.render_individual_pattern(row=pattern_row, col=pattern_col)
+            ref = np.asarray(md.dataset.array[pattern_row, pattern_col], dtype=np.float32)
+        else:
+            ref = np.asarray(md.image_ref, dtype=np.float32)
+            pred = md.render_current
+        
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
         vmin = float(min(refp.min(), predp.min()))
@@ -239,6 +257,8 @@ class ModelDiffractionVisualizations:
                 )
 
         mean_hist = md.fit_history.get("mean")
+        if individual_loss:
+            mean_hist = md.fit_history.get(f"individual_{pattern_row}_{pattern_row}")
         if mean_hist is not None and len(mean_hist.losses) > 0:
             fig.suptitle(
                 f"Final loss: {mean_hist.losses[-1]:.3e} | Iters: {len(mean_hist.losses)}",
@@ -248,9 +268,13 @@ class ModelDiffractionVisualizations:
         plt.show()
         return fig, axs
 
-    def plot_mean_model(
+    def plot_model(
         self,
         *,
+        plot_mean_model: bool = False,
+        plot_individual_model: bool = False,
+        pattern_row: int = 0,
+        pattern_col: int= 0,
         power: float = 0.25,
         returnfig: bool = False,
         axsize: tuple[int, int] = (6, 6),
@@ -260,10 +284,10 @@ class ModelDiffractionVisualizations:
         overlay_on: Literal["model", "both"] = "model",
         origin_marker_kwargs: dict[str, Any] | None = None,
         disk_marker_kwargs: dict[str, Any] | None = None,
-        **_: Any,
+        **kwargs,
     ) -> tuple[Any, Any] | None:
         """
-        Plot reference and model mean diffraction images.
+        Plot reference and indiviual diffraction images.
 
         Parameters
         ----------
@@ -305,24 +329,34 @@ class ModelDiffractionVisualizations:
             md.preprocess()
         if md.image_ref is None or md.model is None or md.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
-
-        ref = np.asarray(md.image_ref, dtype=np.float32)
-        pred = md.render_current
+        if plot_mean_model and plot_individual_model:
+            raise RuntimeError("can only plot mean or plot individual, not both")
+        if plot_individual_model:
+            pred = md.render_individual_pattern(pattern_row, pattern_col)
+            ref = np.asarray(md.dataset.array[pattern_row, pattern_col], dtype=np.float32)
+        elif plot_mean_model:
+            ref = np.asarray(md.image_ref, dtype=np.float32)
+            pred = md.render_mean_refined
+        else:
+            ref = np.asarray(md.image_ref, dtype=np.float32)
+            pred = md.render_current
 
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
         vmin = float(min(refp.min(), predp.min()))
         vmax = float(max(refp.max(), predp.max()))
 
+        t1 = kwargs.pop("title", "")
         fig, ax = show_2d(
             [refp, predp],
-            title=["image_ref", "model"],
+            title=[t1 + " image_ref", t1 + " model"],
             cmap=config.get("viz.cmap"),
-            cbar=False,
+            cbar=True,
             returnfig=True,
             axsize=axsize,
             vmin=vmin,
             vmax=vmax,
+            **kwargs, 
         )
         if overlay:
             if overlay_on not in ("model", "both"):
