@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
 import scipy.ndimage as ndi
@@ -29,35 +29,35 @@ class DPAugmentor(RNGMixin):
     def __init__(
         self,
         add_bkg: bool = False,
-        bkg_weight: list[float] | float = [0.001, 0.05],
-        bkg_q: list[float] | float = [0.01, 0.1],
+        bkg_weight: list[float] | float | list[dict] = [0.001, 0.05],
+        bkg_q: list[float] | float | list[dict] = [0.01, 0.1],
         apply_background_to_label: list[bool] | None = None,
         add_shot: bool = False,
-        e_dose: list[float] | float = [1e4, 1e7],
+        e_dose: list[float] | float | list[dict] = [1e4, 1e7],
         add_shift: bool = False,
-        xshift: list[float] | float = [0, 10],
-        yshift: list[float] | float = [0, 10],
+        xshift: list[float] | float | list[dict] = [0, 10],
+        yshift: list[float] | float | list[dict] = [0, 10],
         add_ellipticity: bool = False,
-        ellipticity_scale: list[float] | float = [0, 0.15],
+        ellipticity_scale: list[float] | float | list[dict] = [0, 0.15],
         add_ellipticity_to_label: bool = True,
         add_salt_and_pepper: bool = False,
-        salt_and_pepper: list[float] | float = [0, 5e-4],
+        salt_and_pepper: list[float] | float | list[dict] = [0, 5e-4],
         add_gaussian_noise: bool = False,
-        gaussian_noise_mu: float = 0.0,
-        gaussian_noise_std: float = 1e-5,
+        gaussian_noise_mu: list[float] | float | list[dict] = 0.0,
+        gaussian_noise_std: list[float] | float | list[dict] = 1e-5,
         add_scale: bool = False,
-        scale_factor: list[float] | float = [0.9, 1.1],
+        scale_factor: list[float] | float | list[dict] = [0.9, 1.1],
         add_blur: bool = False,
-        blur_sigma: list[float] | float = [0.0, 1.5],
+        blur_sigma: list[float] | float | list[dict] = [0.0, 1.5],
         add_flipshift: bool = False,
         free_rotation: bool = False,
-        rotation_range: list[float] | float = [-180, 180],
+        rotation_range: list[float] | float | list[dict] = [-180, 180],
         log_file: os.PathLike | None = None,
         rng: np.random.Generator | int | None = None,
         device: str = "cpu",
         add_aperture: bool = False,
-        radius_factor: list[float] | float = [0.8, 1],
-        aperture_shift: list[float] | float = [0, 10],
+        radius_factor: list[float] | float | list[dict] = [0.8, 1],
+        aperture_shift: list[float] | float | list[dict] = [0, 10],
     ):
         """
         Initialize diffraction pattern augmentor with configurable transformations.
@@ -66,28 +66,28 @@ class DPAugmentor(RNGMixin):
         ----------
         add_bkg : bool, default=False
             Enable inelastic plasmon background addition via convolution with probe.
-        bkg_weight : list[float] | float, default=[0.001, 0.05]
+        bkg_weight : list[float] | float | list[dict], default=[0.001, 0.05]
             Range for background weight (fraction of total intensity).
-        bkg_q : list[float] | float, default=[0.01, 0.1]
+        bkg_q : list[float] | float | list[dict], default=[0.01, 0.1]
             Range for plasmon scattering parameter q₀ in 1/(q² + q₀²) form factor.
         apply_background_to_label: list[bool] | None, default=None
             Flag for whether background should be applied to labels, and which ones based on 1/0 list.
             List of 1/0 for if background should be applied to label. None if no application.
         add_shot : bool, default=False
             Enable Poisson shot noise based on electron dose.
-        e_dose : list[float] | float, default=[1e4, 1e7]
+        e_dose : list[float] | float | list[dict], default=[1e4, 1e7]
             Range for electron dose (electrons per image) for shot noise.
 
         add_shift : bool, default=False
             Enable random translation of the diffraction pattern.
-        xshift : list[float] | float, default=[0, 10]
+        xshift : list[float] | float | list[dict], default=[0, 10]
             Range for horizontal shift in pixels (applied with random sign).
-        yshift : list[float] | float, default=[0, 10]
+        yshift : list[float] | float | list[dict], default=[0, 10]
             Range for vertical shift in pixels (applied with random sign).
 
         add_ellipticity : bool, default=False
             Enable elliptical distortion of the diffraction pattern.
-        ellipticity_scale : list[float] | float, default=[0, 0.15]
+        ellipticity_scale : list[float] | float | list[dict], default=[0, 0.15]
             Range for ellipticity strength parameter (std dev of Gaussian distortion).
         add_ellipticity_to_label : bool, default=True
             Whether to apply ellipticity transforms to labels. If False, labels get
@@ -95,26 +95,26 @@ class DPAugmentor(RNGMixin):
 
         add_salt_and_pepper : bool, default=False
             Enable salt and pepper (impulse) noise.
-        salt_and_pepper : list[float] | float, default=[0, 5e-4]
+        salt_and_pepper : list[float] | float | list[dict], default=[0, 5e-4]
             Range for fraction of pixels affected by salt and pepper noise.
 
         add_gaussian_noise : bool, default=False
             Enable gaussian noise.
-        gaussian_noise_mu : float, default=0.0
+        gaussian_noise_mu : list[float] | float | list[dict], default=0.0
             Mean for gaussian noise distribution. Should be 0 for scientifically accurate representation.
             Scaled by electron dose. So value of 0.1 represents mean = 10% of electron dose.
-        gaussian_noise_std : float, defualt=1e-5
+        gaussian_noise_std : list[float] | float | list[dict], defualt=1e-5
             Standard deviation for gaussian noise distribution.
             Scaled by electron dose. So value of 0.1 represents std. dev. = 10% of electron dose.
 
         add_scale : bool, default=False
             Enable uniform scaling of the diffraction pattern.
-        scale_factor : list[float] | float, default=[0.9, 1.1]
+        scale_factor : list[float] | float | list[dict], default=[0.9, 1.1]
             Range for scaling factor. Use [1.0, max_val] for magnification only.
 
         add_blur : bool, default=False
             Enable Gaussian blur.
-        blur_sigma : list[float] | float, default=[0.0, 1.5]
+        blur_sigma : list[float] | float | list[dict], default=[0.0, 1.5]
             Range for Gaussian blur standard deviation in pixels.
 
         add_flipshift : bool, default=False
@@ -122,7 +122,7 @@ class DPAugmentor(RNGMixin):
         free_rotation : bool, default=False
             If True, use continuous rotation within rotation_range.
             If False, use only 90-degree rotations (0°, 90°, 180°, 270°).
-        rotation_range : list[float] | float, default=[-180, 180]
+        rotation_range : list[float] | float | list[dict], default=[-180, 180]
             Range for rotation angles in degrees (only used if free_rotation=True).
 
         log_file : os.PathLike | None, default=None
@@ -134,11 +134,11 @@ class DPAugmentor(RNGMixin):
 
         add_aperture : bool, default=False
             Enable circular aperture mask to simulate objective aperture effects.
-        radius_factor : list[float] | float, default=[0.8, 1]
+        radius_factor : list[float] | float | list[dict], default=[0.8, 1]
             Range for aperture radius as fraction of maximum image radius (distance from
             center to corner). Values < 1 create vignetted diffraction patterns. The mask
             is centered at (height//2, width//2) + aperture_shift.
-        aperture_shift : list[float] | float, default=[0, 10]
+        aperture_shift : list[float] | float | list[dict], default=[0, 10]
             Range for random shift of aperture center in pixels (applied with random sign
             to both x and y). Simulates misalignment of the objective aperture.
         
@@ -149,6 +149,14 @@ class DPAugmentor(RNGMixin):
         - For labels, only geometric transforms (flipshift, elastic) are applied
         - Ellipticity creates anisotropic scaling via exx, eyy, exy parameters
         - All ranges can be single values, val, or [min, max] for uniform sampling
+        - Additionally, any numeric parameter can be given as a weighted mixture of
+          ranges/scalars, so different ranges can be sampled with different
+          probabilities:
+              [{"weight": w0, "value": [min0, max0]},
+               {"weight": w1, "value": scalar1}, ...]
+          For each augmentation a mixture component is chosen proportional to its
+          weight (weights need only be nonnegative with a positive sum), then a
+          value is drawn uniformly from that component's range.
         """
         super().__init__(rng=rng)
         self._setup_device(device)
@@ -212,32 +220,32 @@ class DPAugmentor(RNGMixin):
     def set_params(
         self,
         add_bkg: bool = False,
-        bkg_weight: list[float] | float = [0.01, 0.1],
-        bkg_q: list[float] | float = [0.01, 0.1],
+        bkg_weight: list[float] | float | list[dict] = [0.01, 0.1],
+        bkg_q: list[float] | float | list[dict] = [0.01, 0.1],
         apply_background_to_label: list[bool] | None = None,
         add_shot: bool = False,
-        e_dose: list[float] | float = [1e5, 1e10],
+        e_dose: list[float] | float | list[dict] = [1e5, 1e10],
         add_shift: bool = False,
-        xshift: list[float] | float = [0, 10],
-        yshift: list[float] | float = [0, 10],
+        xshift: list[float] | float | list[dict] = [0, 10],
+        yshift: list[float] | float | list[dict] = [0, 10],
         add_ellipticity: bool = False,
-        ellipticity_scale: list[float] | float = [0, 0.15],
+        ellipticity_scale: list[float] | float | list[dict] = [0, 0.15],
         add_ellipticity_to_label: bool = True,
         add_salt_and_pepper: bool = False,
-        salt_and_pepper: list[float] | float = [0, 1e-3],
+        salt_and_pepper: list[float] | float | list[dict] = [0, 1e-3],
         add_gaussian_noise: bool = False,
-        gaussian_noise_mu: list[float] | float = 0.0,
-        gaussian_noise_std: list[float] | float = 1e-5,
+        gaussian_noise_mu: list[float] | float | list[dict] = 0.0,
+        gaussian_noise_std: list[float] | float | list[dict] = 1e-5,
         add_scale: bool = False,
-        scale_factor: list[float] | float = [0.9, 1.1],
+        scale_factor: list[float] | float | list[dict] = [0.9, 1.1],
         add_blur: bool = False,
-        blur_sigma: list[float] | float = [0.0, 1.5],
+        blur_sigma: list[float] | float | list[dict] = [0.0, 1.5],
         add_flipshift: bool = False,
         free_rotation: bool = False,
-        rotation_range: list[float] | float = [-180, 180],
+        rotation_range: list[float] | float | list[dict] = [-180, 180],
         add_aperture: bool = False,
-        radius_factor: list[float] | float = [0.8, 1],
-        aperture_shift: list[float] | float = [0, 10],
+        radius_factor: list[float] | float | list[dict] = [0.8, 1],
+        aperture_shift: list[float] | float | list[dict] = [0, 10],
     ) -> None:
         self.add_bkg = add_bkg
         self.add_shot = add_shot
@@ -265,6 +273,8 @@ class DPAugmentor(RNGMixin):
         self._salt_and_pepper_range = (
             self._check_input(salt_and_pepper) if add_salt_and_pepper else [0, 0]
         )
+        self._gaussian_noise_mu_range = self._check_input(gaussian_noise_mu) if add_gaussian_noise else [0, 0]
+        self._gaussian_noise_std_range = self._check_input(gaussian_noise_std) if add_gaussian_noise else [0, 0]
         self._scale_range = self._check_input(scale_factor) if add_scale else [0, 0]
         self._blur_range = self._check_input(blur_sigma) if add_blur else [0, 0]
 
@@ -281,6 +291,7 @@ class DPAugmentor(RNGMixin):
         self.salt_and_pepper = self._uniform_or_zero(
             self._salt_and_pepper_range, self.add_salt_and_pepper
         )
+        
         self.blur_sigma = self._uniform_or_zero(self._blur_range, self.add_blur)
         self.xshift = self._uniform_with_sign(self._xshift_range, self.add_shift)
         self.yshift = self._uniform_with_sign(self._yshift_range, self.add_shift)
@@ -289,32 +300,37 @@ class DPAugmentor(RNGMixin):
         self._generate_ellipticity_params()
         self._generate_flipshift_params()
 
+        if self.add_gaussian_noise:
+            self.gaussian_noise_mu = self._sample(self._gaussian_noise_mu_range)
+            self.gaussian_noise_std = self._sample(self._gaussian_noise_std_range)
+        else:
+            self.gaussian_noise_mu = 0.0
+            self.gaussian_noise_std = 0.0
+
         if self.add_scale:
-            self.scale_factor = self.rng.uniform(self._scale_range[0], self._scale_range[1])
+            self.scale_factor = self._sample(self._scale_range)
         else:
             self.scale_factor = 0
 
         if self.add_aperture:
-            self.radius_factor = self.rng.uniform(self._radius_range[0], self._radius_range[1])
+            self.radius_factor = self._sample(self._radius_range)
         else:
             self.radius_factor = 0
 
     def _uniform_or_zero(self, range_vals: list, enabled: bool) -> float:
-        return self.rng.uniform(range_vals[0], range_vals[1]) if enabled else 0
+        return self._sample(range_vals) if enabled else 0
 
     def _uniform_or_default(self, range_vals: list, enabled: bool, default) -> float:
-        return self.rng.uniform(range_vals[0], range_vals[1]) if enabled else default
+        return self._sample(range_vals) if enabled else default
 
     def _uniform_with_sign(self, range_vals: list, enabled: bool) -> float:
         if not enabled:
             return 0
-        return self.rng.uniform(range_vals[0], range_vals[1]) * self.rng.choice([1, -1])
+        return self._sample(range_vals) * self.rng.choice([1, -1])
 
     def _generate_ellipticity_params(self) -> None:
         if self.add_ellipticity:
-            self.ellipticity_scale = self.rng.uniform(
-                self._ellipticity_scale_range[0], self._ellipticity_scale_range[1]
-            )
+            self.ellipticity_scale = self._sample(self._ellipticity_scale_range)
             exx = self.rng.normal(loc=1, scale=self.ellipticity_scale)
             eyy = self.rng.normal(loc=1, scale=self.ellipticity_scale)
             mval = (exx + eyy) / 2  # Normalize to preserve area
@@ -334,9 +350,7 @@ class DPAugmentor(RNGMixin):
 
             # Always apply rotation when flipshift is enabled
             if self.free_rotation:
-                self.rotation_angle = self.rng.uniform(
-                    self._rotation_range[0], self._rotation_range[1]
-                )
+                self.rotation_angle = self._sample(self._rotation_range)
             else:
                 self.rotation_angle = self.rng.choice([0, 90, 180, 270])
         else:
@@ -800,7 +814,7 @@ class DPAugmentor(RNGMixin):
             return image
         else:
             image = np.array(inputs).copy()
-            noise = np.clip(np.random.normal(loc=mean, scale=std, size=inputs.shape), a_min=0, a_max=None)
+            noise = np.clip(self.rng.normal(loc=mean, scale=std, size=inputs.shape), a_min=0, a_max=None)
             image += noise
             return image
 
@@ -820,11 +834,74 @@ class DPAugmentor(RNGMixin):
         return config.get("has_cupy") and hasattr(arr, "__module__") and "cupy" in arr.__module__
 
     @staticmethod
-    def _check_input(inp: list[float] | float) -> list[float]:
-        if isinstance(inp, list):
+    def _is_weighted_spec(inp: Any) -> bool:
+        """A weighted mixture spec is a non-empty list whose entries are dicts."""
+        return isinstance(inp, list) and len(inp) > 0 and isinstance(inp[0], dict)
+
+    @staticmethod
+    def _check_range(inp: list[float] | float) -> tuple[float, float]:
+        """Validate a scalar or [min, max] and return it as a (lo, hi) pair."""
+        if isinstance(inp, (list, tuple)):
             assert len(inp) == 2 and inp[0] <= inp[1], f"Bad value range: {inp}"
-            return inp
-        return [inp, inp]
+            return float(inp[0]), float(inp[1])
+        return float(inp), float(inp)
+
+    @staticmethod
+    def _check_input(inp: list[float] | float | list[dict]) -> list[tuple[float, float, float]]:
+        """
+        Normalize a parameter spec into a canonical list of (weight, lo, hi) components.
+
+        Accepts (all backward compatible):
+          - scalar x          -> [(1.0, x, x)]
+          - range [lo, hi]    -> [(1.0, lo, hi)]
+          - weighted mixture  -> [(w0, lo0, hi0), (w1, lo1, hi1), ...]
+                given as [{"weight": w, "value": x_or_[lo, hi]}, ...]
+
+        Mixture weights need only be nonnegative with a positive sum; they are
+        sampled proportionally in _sample(). Validation happens here so malformed
+        configs raise at construction time rather than mid-augmentation.
+        """
+        if DPAugmentor._is_weighted_spec(inp):
+            components: list[tuple[float, float, float]] = []
+            weights: list[float] = []
+            for i, entry in enumerate(inp):
+                if not isinstance(entry, dict):
+                    raise ValueError(f"Weighted spec entries must all be dicts; got {type(entry)} at index {i}")
+                if "value" not in entry:
+                    raise ValueError(f"Weighted spec entry missing 'value' at index {i}: {entry}")
+                weight = float(entry.get("weight", 1.0))
+                lo, hi = DPAugmentor._check_range(entry["value"])
+                weights.append(weight)
+                components.append((weight, lo, hi))
+
+            w_arr = np.asarray(weights, dtype=np.float64)
+            if not np.all(np.isfinite(w_arr)):
+                raise ValueError(f"Weighted spec weights must be finite; got {weights}")
+            if np.any(w_arr < 0):
+                raise ValueError(f"Weighted spec weights must be nonnegative; got {weights}")
+            if float(w_arr.sum()) <= 0:
+                raise ValueError(f"Weighted spec weights must sum to > 0; got {weights}")
+            return components
+
+        lo, hi = DPAugmentor._check_range(inp)
+        return [(1.0, lo, hi)]
+
+    def _sample(self, spec: list[tuple[float, float, float]]) -> float:
+        """
+        Draw a scalar from a canonical spec produced by _check_input().
+
+        Picks a mixture component proportional to its weight, then draws uniformly
+        from that component's [lo, hi] range.
+        """
+        if len(spec) == 1:
+            _, lo, hi = spec[0]
+            return float(self.rng.uniform(lo, hi))
+
+        weights = np.asarray([component[0] for component in spec], dtype=np.float64)
+        probs = weights / weights.sum()
+        idx = int(self.rng.choice(len(spec), p=probs))
+        _, lo, hi = spec[idx]
+        return float(self.rng.uniform(lo, hi))
 
     def _as_array(self, ar) -> ArrayLike:
         if self.use_torch:
@@ -929,3 +1006,4 @@ class DPAugmentor(RNGMixin):
             return result
         else:
             return self._apply_elastic(inputs)
+   
