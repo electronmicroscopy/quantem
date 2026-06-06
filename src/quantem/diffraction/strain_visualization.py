@@ -167,7 +167,7 @@ def plot_strain_panels(
         )
 
     cb_size = 0.02
-    cb_pad = 0.02
+    cb_pad = 0.03
 
     def _finalize_layout():
         # set_aspect("equal") only resizes/recenters each panel at draw time, so
