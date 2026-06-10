@@ -211,3 +211,12 @@ class TestINRRayMath:
         d2.to("cpu")
         d2.load_parameters(path)
         assert torch.allclose(d2.z1_params.detach(), d.z1_params.detach())
+
+
+def test_learnable_tilts_is_read_only():
+    """Regression: the old setter wrote a private attribute the getter never read,
+    so assignment appeared to succeed while silently doing nothing."""
+    d = TomographyPixDataset.from_data(_stack(), np.linspace(-60, 60, 5).astype(np.float32))
+    with pytest.raises(AttributeError):
+        d.learnable_tilts = 3
+    assert d.learnable_tilts == 4
