@@ -179,8 +179,9 @@ pyrightconfig.json
 # DS
 .DS_Store
 
-# jupyter notebooks
+# jupyter notebooks (curated docs notebooks are exempt)
 *.ipynb
+!docs/notebooks/*.ipynb
 ipynb-playground/
 
 # zip files
