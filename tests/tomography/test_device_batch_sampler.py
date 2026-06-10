@@ -101,4 +101,42 @@ def test_reconstruct_uses_sampler_single_process():
     )
     assert isinstance(tomo.dataloader, DeviceBatchSampler)
     assert isinstance(tomo.val_dataloader, DeviceBatchSampler)
-    assert tomo.sampler is None
+    # the loop drives epoch reshuffling through set_epoch on self.sampler
+    assert tomo.sampler is tomo.dataloader
+
+
+def _flat(batch, s1, s2):
+    return batch["projection_idx"] * (s1 * s2) + batch["pixel_i"] * s1 + batch["pixel_j"]
+
+
+def test_ddp_shards_are_disjoint_and_equal():
+    dset = _dset()
+    s1, s2 = dset.tilt_stack.shape[1], dset.tilt_stack.shape[2]
+    world = 4
+    shards = []
+    for rank in range(world):
+        sampler = DeviceBatchSampler(dset, 32, "cpu", rank=rank, world_size=world)
+        sampler.set_epoch(3)
+        flats = torch.cat([_flat(b, s1, s2) for b in sampler])
+        shards.append(flats)
+        assert len(sampler) == (len(dset) // world) // 32  # equal on every rank
+    allv = torch.cat(shards)
+    assert allv.unique().numel() == allv.numel()  # no pixel on two ranks
+
+
+def test_ddp_epoch_permutation_shared_and_reproducible():
+    dset = _dset()
+    s1, s2 = dset.tilt_stack.shape[1], dset.tilt_stack.shape[2]
+
+    def epoch_flats(rank, epoch):
+        sampler = DeviceBatchSampler(dset, 32, "cpu", rank=rank, world_size=2)
+        sampler.set_epoch(epoch)
+        return torch.cat([_flat(b, s1, s2) for b in sampler])
+
+    # same (rank, epoch) on a fresh instance -> identical batches
+    torch.testing.assert_close(epoch_flats(0, 7), epoch_flats(0, 7), rtol=0, atol=0)
+    # different epoch -> different order
+    assert not torch.equal(epoch_flats(0, 7), epoch_flats(0, 8))
+    # ranks of the same epoch are disjoint
+    both = torch.cat([epoch_flats(0, 7), epoch_flats(1, 7)])
+    assert both.unique().numel() == both.numel()

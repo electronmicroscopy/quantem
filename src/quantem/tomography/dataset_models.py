@@ -443,17 +443,25 @@ class TomographyPixDataset(TomographyDatasetConstraints):
 class DeviceBatchSampler:
     """Epoch iterator that builds INR training batches directly on a device.
 
-    Replaces the per-pixel DataLoader path for single-process runs: the tilt
-    stack and angles are made resident on ``device`` once, so producing a
-    batch is index arithmetic plus two tensor lookups instead of
-    ``batch_size`` Python ``__getitem__`` calls, a collate, and a
-    host-to-device copy per step. On a GPU this removes the CPU dataloader
-    bottleneck entirely.
+    Replaces the per-pixel DataLoader path: the tilt stack and angles are
+    made resident on ``device`` once, so producing a batch is index
+    arithmetic plus two tensor lookups instead of ``batch_size`` Python
+    ``__getitem__`` calls, a collate, and a host-to-device copy per step.
+    On a GPU this removes the CPU dataloader bottleneck entirely.
 
     Yields the same batch dicts as ``TomographyINRDataset.__getitem__``
     under a DataLoader collate (``projection_idx``, ``pixel_i``,
     ``pixel_j``, ``phi``, ``target_value``), with the train loader's
     ``drop_last=True`` semantics.
+
+    Distributed runs: pass ``rank``/``world_size`` and every rank derives
+    the *same* epoch permutation from ``seed + epoch`` (CPU generator, so
+    it is identical across ranks and reproducible), then takes an
+    equal-size contiguous shard — equal so per-rank batch counts match and
+    DDP gradient sync cannot hang on a ragged tail. The training loop's
+    ``sampler.set_epoch(epoch)`` drives reshuffling, exactly like
+    ``DistributedSampler``; without ``set_epoch`` the epoch advances
+    automatically on each ``__iter__``.
     """
 
     def __init__(
@@ -463,10 +471,17 @@ class DeviceBatchSampler:
         device: torch.device | str,
         indices: torch.Tensor | None = None,
         shuffle: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
     ):
         self.batch_size = batch_size
         self.device = torch.device(device)
         self.shuffle = shuffle
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self._epoch = 0
         self._stack = dset.tilt_stack.to(self.device)
         self._angles = dset.tilt_angles.to(self.device)
         # __getitem__ decodes flat indices with shape[1] for both rows and
@@ -476,14 +491,29 @@ class DeviceBatchSampler:
         if indices is None:
             indices = torch.arange(len(dset), dtype=torch.int64)
         self._indices = indices.to(self.device)
+        self._per_rank = len(self._indices) // world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used to seed this epoch's shared permutation."""
+        self._epoch = epoch
 
     def __len__(self) -> int:
-        return len(self._indices) // self.batch_size  # drop_last=True
+        return self._per_rank // self.batch_size  # drop_last=True
 
-    def __iter__(self):
+    def _epoch_shard(self) -> torch.Tensor:
         idx = self._indices
         if self.shuffle:
-            idx = idx[torch.randperm(len(idx), device=self.device)]
+            g = torch.Generator()
+            g.manual_seed(self.seed + self._epoch)
+            perm = torch.randperm(len(idx), generator=g).to(self.device)
+            idx = idx[perm]
+            self._epoch += 1  # auto-advance; set_epoch overrides per epoch
+        if self.world_size > 1:
+            idx = idx[self.rank * self._per_rank : (self.rank + 1) * self._per_rank]
+        return idx
+
+    def __iter__(self):
+        idx = self._epoch_shard()
         per_proj = self._s1 * self._s2
         for k in range(len(self)):
             sel = idx[k * self.batch_size : (k + 1) * self.batch_size]

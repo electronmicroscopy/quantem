@@ -414,30 +414,41 @@ class Tomography(TomographyOpt, TomographyBase):
     def _setup_recon_dataloaders(self, batch_size: int, num_workers: int, val_fraction: float):
         """Build the train/val batch iterators.
 
-        Single-process runs use ``DeviceBatchSampler`` — batches are built
-        with tensor ops on the compute device from a device-resident tilt
-        stack, removing the per-pixel ``__getitem__`` / collate / H2D-copy
+        INR datasets use ``DeviceBatchSampler`` — batches are built with
+        tensor ops on the compute device from a device-resident tilt stack,
+        removing the per-pixel ``__getitem__`` / collate / H2D-copy
         dataloader bottleneck (``num_workers`` is ignored on this path).
-        Multi-process (DDP) runs keep the DataLoader + DistributedSampler
-        path.
+        Distributed runs shard the same seeded epoch permutation across
+        ranks (DistributedSampler semantics; the loop's ``set_epoch`` drives
+        reshuffling). Non-INR datasets keep the DataLoader path.
         """
-        if self.world_size == 1 and isinstance(self.dset, TomographyINRDataset):
+        if isinstance(self.dset, TomographyINRDataset):
             n = len(self.dset)
             n_val = int(n * val_fraction)
-            perm = torch.randperm(n)
+            # Fixed-seed split: identical across DDP ranks (no train/val
+            # leakage between ranks) and stable across save/reload, so a
+            # resumed run keeps validating on the same held-out pixels.
+            split_gen = torch.Generator()
+            split_gen.manual_seed(0)
+            perm = torch.randperm(n, generator=split_gen)
+            ddp = dict(rank=self.global_rank, world_size=self.world_size)
             self.dataloader = DeviceBatchSampler(
-                self.dset, batch_size, self.device, indices=perm[n_val:]
+                self.dset, batch_size, self.device, indices=perm[n_val:], **ddp
             )
             # The val sampler keeps its own device-resident copy of the tilt
             # stack; acceptable, since val_fraction > 0 is the rare case.
-            self.val_dataloader = (
+            val = (
                 DeviceBatchSampler(
-                    self.dset, batch_size, self.device, indices=perm[:n_val], shuffle=False
+                    self.dset, batch_size, self.device, indices=perm[:n_val], shuffle=False, **ddp
                 )
                 if n_val > 0
                 else None
             )
-            self.sampler = None
+            # A per-rank val shard smaller than one batch would divide by
+            # zero in the val-loss average.
+            self.val_dataloader = val if val is not None and len(val) > 0 else None
+            # The training loop calls set_epoch on self.sampler.
+            self.sampler = self.dataloader
             self.val_sampler = None
             return
 
