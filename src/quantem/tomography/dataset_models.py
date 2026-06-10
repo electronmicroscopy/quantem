@@ -440,6 +440,66 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         self.device = device
 
 
+class DeviceBatchSampler:
+    """Epoch iterator that builds INR training batches directly on a device.
+
+    Replaces the per-pixel DataLoader path for single-process runs: the tilt
+    stack and angles are made resident on ``device`` once, so producing a
+    batch is index arithmetic plus two tensor lookups instead of
+    ``batch_size`` Python ``__getitem__`` calls, a collate, and a
+    host-to-device copy per step. On a GPU this removes the CPU dataloader
+    bottleneck entirely.
+
+    Yields the same batch dicts as ``TomographyINRDataset.__getitem__``
+    under a DataLoader collate (``projection_idx``, ``pixel_i``,
+    ``pixel_j``, ``phi``, ``target_value``), with the train loader's
+    ``drop_last=True`` semantics.
+    """
+
+    def __init__(
+        self,
+        dset: "TomographyINRDataset",
+        batch_size: int,
+        device: torch.device | str,
+        indices: torch.Tensor | None = None,
+        shuffle: bool = True,
+    ):
+        self.batch_size = batch_size
+        self.device = torch.device(device)
+        self.shuffle = shuffle
+        self._stack = dset.tilt_stack.to(self.device)
+        self._angles = dset.tilt_angles.to(self.device)
+        # __getitem__ decodes flat indices with shape[1] for both rows and
+        # columns; replicate it exactly.
+        self._s1 = dset.tilt_stack.shape[1]
+        self._s2 = dset.tilt_stack.shape[2]
+        if indices is None:
+            indices = torch.arange(len(dset), dtype=torch.int64)
+        self._indices = indices.to(self.device)
+
+    def __len__(self) -> int:
+        return len(self._indices) // self.batch_size  # drop_last=True
+
+    def __iter__(self):
+        idx = self._indices
+        if self.shuffle:
+            idx = idx[torch.randperm(len(idx), device=self.device)]
+        per_proj = self._s1 * self._s2
+        for k in range(len(self)):
+            sel = idx[k * self.batch_size : (k + 1) * self.batch_size]
+            proj = sel // per_proj
+            rem = sel - proj * per_proj
+            pixel_i = rem // self._s1
+            pixel_j = rem - pixel_i * self._s1
+            yield {
+                "projection_idx": proj,
+                "pixel_i": pixel_i,
+                "pixel_j": pixel_j,
+                "phi": self._angles[proj],
+                "target_value": self._stack[proj, pixel_i, pixel_j],
+            }
+
+
 class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
     """
     Dataset class for INR-based tomography.

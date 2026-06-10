@@ -17,6 +17,7 @@ from quantem.tomography.dataset_models import (
     DatasetConstraintParams,
     DatasetConstraintsType,
     DatasetModelType,
+    DeviceBatchSampler,
     TomographyINRDataset,
     TomographyPixDataset,
 )
@@ -145,14 +146,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.scheduler_params = scheduler_params
                     self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
-            self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
-                self.setup_dataloader(
-                    self.dset,
-                    batch_size,
-                    num_workers=num_workers,
-                    val_fraction=val_fraction,
-                )
-            )
+            self._setup_recon_dataloaders(batch_size, num_workers, val_fraction)
 
         # Type check for INR-based reconstruction
         if not isinstance(self.dset, TomographyINRDataset):
@@ -285,10 +279,14 @@ class Tomography(TomographyOpt, TomographyBase):
                     val_loss = torch.tensor(0.0, device=self.device)
 
                     for batch in self.val_dataloader:
+                        # Match the training pass (enabled=False): bf16 autocast
+                        # breaks the so3 pose solve (lu_factor has no BFloat16
+                        # kernel) and would make the val loss inconsistent with
+                        # the fp32 training loss it is compared to.
                         with torch.autocast(
                             device_type=self.device.type,
                             dtype=torch.bfloat16,
-                            enabled=True,
+                            enabled=False,
                         ):
                             all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
@@ -411,6 +409,38 @@ class Tomography(TomographyOpt, TomographyBase):
         """
         Rebuilds the dataloader due to persistent workers error when reloading the object.
         """
+        self._setup_recon_dataloaders(batch_size, num_workers, val_fraction)
+
+    def _setup_recon_dataloaders(self, batch_size: int, num_workers: int, val_fraction: float):
+        """Build the train/val batch iterators.
+
+        Single-process runs use ``DeviceBatchSampler`` — batches are built
+        with tensor ops on the compute device from a device-resident tilt
+        stack, removing the per-pixel ``__getitem__`` / collate / H2D-copy
+        dataloader bottleneck (``num_workers`` is ignored on this path).
+        Multi-process (DDP) runs keep the DataLoader + DistributedSampler
+        path.
+        """
+        if self.world_size == 1 and isinstance(self.dset, TomographyINRDataset):
+            n = len(self.dset)
+            n_val = int(n * val_fraction)
+            perm = torch.randperm(n)
+            self.dataloader = DeviceBatchSampler(
+                self.dset, batch_size, self.device, indices=perm[n_val:]
+            )
+            # The val sampler keeps its own device-resident copy of the tilt
+            # stack; acceptable, since val_fraction > 0 is the rare case.
+            self.val_dataloader = (
+                DeviceBatchSampler(
+                    self.dset, batch_size, self.device, indices=perm[:n_val], shuffle=False
+                )
+                if n_val > 0
+                else None
+            )
+            self.sampler = None
+            self.val_sampler = None
+            return
+
         self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
             self.setup_dataloader(
                 self.dset,
