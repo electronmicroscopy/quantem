@@ -309,15 +309,9 @@ class Tomography(TomographyOpt, TomographyBase):
 
                     avg_val_loss = val_loss.item() / len(self.val_dataloader)
 
-            metrics = torch.tensor(
-                [total_loss, consistency_loss, epoch_soft_constraint_loss], device=self.device
-            )
-
-            if self.world_size > 1:
-                dist.all_reduce(metrics, dist.ReduceOp.AVG)
-
-            total_loss, consistency_loss, epoch_soft_constraint_loss = metrics.tolist()
-
+            # The three losses were already rank-averaged (and batch-normalized) right
+            # after the batch loop; re-reducing identical values here was a redundant
+            # all_reduce plus an extra host sync per epoch.
             pbar.set_description(
                 f"Reconstruction | Loss: {total_loss:.5e}, Consistency Loss: {consistency_loss:.5e}, Soft Constraint Loss: {epoch_soft_constraint_loss:.5e}"
             )
