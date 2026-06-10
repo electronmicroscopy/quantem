@@ -421,12 +421,10 @@ class ObjectPixelated(ObjectConstraints):
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
         assert ctx.obj is not None, "ObjectPixelated requires ctx.obj to be set"
-        soft_loss = torch.tensor(
-            0.0, device=ctx.obj.device, dtype=ctx.obj.dtype, requires_grad=True
-        )
+        soft_loss = torch.tensor(0.0, device=ctx.obj.device, dtype=ctx.obj.dtype)
         if self.constraints.tv_vol > 0:
             tv_loss = self.get_tv_loss(ctx)
-            soft_loss += tv_loss
+            soft_loss = soft_loss + tv_loss
         return soft_loss
 
     # --- Forward method ---
