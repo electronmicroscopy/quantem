@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from quantem.core import config
+
 from .model_base import PPLR, TensorDecompositionModel
 from .so3params import SO3ParamQuat, SO3ParamR9SVD
 
@@ -169,6 +171,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
     """
     K-Planes model adapted from Fridovich-Keil et al., https://arxiv.org/abs/2301.10241
     """
+
     def __init__(
         self,
         # Grid parameters
@@ -312,9 +315,29 @@ def interpolate_ms_features_tilted(
     """
     Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
     Returns features of shape (B, C * T * num_scales).
+
+    When the optional ``quantem-cuda`` package is installed, the tensors live
+    on a CUDA device, and the ``use_cuda_kernels`` config option is true
+    (default), each scale dispatches to the fused CUDA kernel (rotate +
+    grid_sample + Hadamard product in one launch, analytic backward) —
+    identical semantics to the torch path below.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
+
+    if (
+        pts.is_cuda
+        and pts.dtype == torch.float32
+        and rotation_matrices.dtype == torch.float32
+        and all(g.dtype == torch.float32 for g in ms_grids)
+        and config.get("has_quantem_cuda")
+        and config.get("use_cuda_kernels", default=True)
+    ):
+        from quantem.cuda import kplanes_tilted_fuse
+
+        return torch.cat(
+            [kplanes_tilted_fuse(pts, rotation_matrices, g) for g in ms_grids], dim=-1
+        )
 
     # (T, B, 3)  — rotate all points by all rotations at once
     rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
