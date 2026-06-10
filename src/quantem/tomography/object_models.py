@@ -540,7 +540,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         self,
         ctx: ReconstructionContext,
     ) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=ctx.coords.device)
+        device = ctx.coords.device if ctx.coords is not None else self._device
+        soft_loss = torch.tensor(0.0, device=device)
         if self.constraints.tv_vol > 0:
             assert ctx.coords is not None, (
                 "coords must be provided for INR object model to compute the TV loss"
@@ -660,7 +661,12 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
         valid_mask = (
-            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
+            (coords[:, 0] >= -1)
+            & (coords[:, 0] <= 1)
+            & (coords[:, 1] >= -1)
+            & (coords[:, 1] <= 1)
+            & (coords[:, 2] >= -1)
+            & (coords[:, 2] <= 1)
         ).float()
 
         if all_densities.dim() > 1:
