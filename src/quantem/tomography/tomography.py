@@ -17,6 +17,7 @@ from quantem.tomography.dataset_models import (
     DatasetConstraintParams,
     DatasetConstraintsType,
     DatasetModelType,
+    DeviceBatchSampler,
     TomographyINRDataset,
     TomographyPixDataset,
 )
@@ -145,14 +146,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.scheduler_params = scheduler_params
                     self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
-            self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
-                self.setup_dataloader(
-                    self.dset,
-                    batch_size,
-                    num_workers=num_workers,
-                    val_fraction=val_fraction,
-                )
-            )
+            self._setup_recon_dataloaders(batch_size, num_workers, val_fraction)
 
         # Type check for INR-based reconstruction
         if not isinstance(self.dset, TomographyINRDataset):
@@ -285,10 +279,14 @@ class Tomography(TomographyOpt, TomographyBase):
                     val_loss = torch.tensor(0.0, device=self.device)
 
                     for batch in self.val_dataloader:
+                        # Match the training pass (enabled=False): bf16 autocast
+                        # breaks the so3 pose solve (lu_factor has no BFloat16
+                        # kernel) and would make the val loss inconsistent with
+                        # the fp32 training loss it is compared to.
                         with torch.autocast(
                             device_type=self.device.type,
                             dtype=torch.bfloat16,
-                            enabled=True,
+                            enabled=False,
                         ):
                             all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
@@ -411,6 +409,49 @@ class Tomography(TomographyOpt, TomographyBase):
         """
         Rebuilds the dataloader due to persistent workers error when reloading the object.
         """
+        self._setup_recon_dataloaders(batch_size, num_workers, val_fraction)
+
+    def _setup_recon_dataloaders(self, batch_size: int, num_workers: int, val_fraction: float):
+        """Build the train/val batch iterators.
+
+        INR datasets use ``DeviceBatchSampler`` — batches are built with
+        tensor ops on the compute device from a device-resident tilt stack,
+        removing the per-pixel ``__getitem__`` / collate / H2D-copy
+        dataloader bottleneck (``num_workers`` is ignored on this path).
+        Distributed runs shard the same seeded epoch permutation across
+        ranks (DistributedSampler semantics; the loop's ``set_epoch`` drives
+        reshuffling). Non-INR datasets keep the DataLoader path.
+        """
+        if isinstance(self.dset, TomographyINRDataset):
+            n = len(self.dset)
+            n_val = int(n * val_fraction)
+            # Fixed-seed split: identical across DDP ranks (no train/val
+            # leakage between ranks) and stable across save/reload, so a
+            # resumed run keeps validating on the same held-out pixels.
+            split_gen = torch.Generator()
+            split_gen.manual_seed(0)
+            perm = torch.randperm(n, generator=split_gen)
+            ddp = dict(rank=self.global_rank, world_size=self.world_size)
+            self.dataloader = DeviceBatchSampler(
+                self.dset, batch_size, self.device, indices=perm[n_val:], **ddp
+            )
+            # The val sampler keeps its own device-resident copy of the tilt
+            # stack; acceptable, since val_fraction > 0 is the rare case.
+            val = (
+                DeviceBatchSampler(
+                    self.dset, batch_size, self.device, indices=perm[:n_val], shuffle=False, **ddp
+                )
+                if n_val > 0
+                else None
+            )
+            # A per-rank val shard smaller than one batch would divide by
+            # zero in the val-loss average.
+            self.val_dataloader = val if val is not None and len(val) > 0 else None
+            # The training loop calls set_epoch on self.sampler.
+            self.sampler = self.dataloader
+            self.val_sampler = None
+            return
+
         self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
             self.setup_dataloader(
                 self.dset,
