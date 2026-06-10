@@ -180,6 +180,25 @@ class TestINRRayMath:
         assert int(item["pixel_j"]) == 1
         assert torch.isclose(item["target_value"], d.tilt_stack[1, 1, 1])
 
+    def test_len_and_getitem_non_square(self):
+        # Regression: pixel_i/pixel_j must decompose by the width (shape[2]) and __len__
+        # by H*W, not max(shape)^2 -- both were wrong for rectangular tilt images.
+        rng = np.random.default_rng(0)
+        stack = rng.random((3, 4, 6)).astype(np.float32)  # nang=3, H=4, W=6
+        d = TomographyINRDataset.from_data(stack, np.linspace(-60, 60, 3, dtype="f4"))
+        assert len(d) == 3 * 4 * 6
+        # idx = proj*(H*W) + i*W + j = 1*24 + 2*6 + 3 = 39
+        item = d[39]
+        assert int(item["projection_idx"]) == 1
+        assert int(item["pixel_i"]) == 2
+        assert int(item["pixel_j"]) == 3
+        assert torch.isclose(item["target_value"], d.tilt_stack[1, 2, 3])
+        # every index in range maps to a valid pixel
+        last = d[len(d) - 1]
+        assert int(last["projection_idx"]) == 2
+        assert int(last["pixel_i"]) == 3
+        assert int(last["pixel_j"]) == 5
+
     def test_save_load_parameters_roundtrip(self, tmp_path):
         angles = np.linspace(-60, 60, 5, dtype="f4")
         d = TomographyINRDataset.from_data(_stack(), angles)

@@ -148,6 +148,17 @@ class TestObjectPixelatedConstraints:
         obj.constraints.tv_vol = 0.0
         assert float(obj.apply_soft_constraints(ctx).detach()) == 0.0
 
+    def test_soft_constraint_with_tv_on_backprops(self):
+        # Regression: soft_loss was a leaf tensor with requires_grad=True, so the
+        # in-place `+= tv_loss` raised RuntimeError whenever tv_vol > 0.
+        ctx = ReconstructionContext(obj=torch.rand(8, 8, 8).requires_grad_(True))
+        obj = ObjectPixelated.from_uniform(shape=(8, 8, 8), device="cpu")
+        obj.constraints.tv_vol = 1.0
+        loss = obj.apply_soft_constraints(ctx)
+        assert torch.isfinite(loss) and loss > 0.0
+        loss.backward()
+        assert ctx.obj.grad is not None
+
 
 class TestFactoryGuard:
     def test_objectbase_requires_token(self):
@@ -205,10 +216,25 @@ class TestObjectINRBehaviour:
 
     def test_forward_masks_out_of_range(self, torch_device):
         obj = self._obj(torch_device)
-        coords = torch.tensor([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], device=torch_device)
+        # Regression: the mask used to check x and y only, so tilted rays leaving the
+        # volume along z still contributed (extrapolated) density to the integral.
+        coords = torch.tensor(
+            [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 5.0]],
+            device=torch_device,
+        )
         out = obj.forward(coords)
-        assert out.shape[0] == 2
-        assert float(out[1].detach()) == 0.0  # x=5 is outside [-1, 1] -> masked to zero
+        assert out.shape[0] == 4
+        for i in (1, 2, 3):  # each axis outside [-1, 1] -> masked to zero
+            assert float(out[i].detach()) == 0.0
+
+    def test_soft_constraints_without_coords(self, torch_device):
+        # Regression: soft_loss was created on ctx.coords.device before the None
+        # check, raising AttributeError when no constraints are active.
+        obj = self._obj(torch_device)
+        obj.constraints.tv_vol = 0.0
+        obj.constraints.sparsity = 0.0
+        loss = obj.apply_soft_constraints(ReconstructionContext())
+        assert float(loss.detach()) == 0.0
 
     def test_apply_hard_constraints_positivity(self, torch_device):
         obj = self._obj(torch_device)
