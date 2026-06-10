@@ -550,37 +550,37 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
         shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
 
-        rays_x = rays[:, :, 0] - shift_x_norm
-        rays_y = rays[:, :, 1] - shift_y_norm
-        rays_z = rays[:, :, 2]
+        shifted = torch.stack(
+            [rays[:, :, 0] - shift_x_norm, rays[:, :, 1] - shift_y_norm, rays[:, :, 2]],
+            dim=2,
+        )
 
-        theta = torch.deg2rad(-z3).view(-1, 1)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
+        # Compose the three Euler rotations Rz(-z1) @ Rx(x) @ Rz(-z3) into a single
+        # (B, 3, 3) matrix and apply it with one batched matmul, instead of nine
+        # elementwise passes over the full (B, S) ray tensors.
+        a = torch.deg2rad(-z3).view(-1)
+        b = torch.deg2rad(x).view(-1)
+        g = torch.deg2rad(-z1).view(-1)
+        zero = torch.zeros_like(a)
+        one = torch.ones_like(a)
 
-        rays_x_rot1 = cos_t * rays_x - sin_t * rays_y
-        rays_y_rot1 = sin_t * rays_x + cos_t * rays_y
-        rays_z_rot1 = rays_z
+        cos_a, sin_a = torch.cos(a), torch.sin(a)
+        cos_b, sin_b = torch.cos(b), torch.sin(b)
+        cos_g, sin_g = torch.cos(g), torch.sin(g)
 
-        theta = torch.deg2rad(x).view(-1, 1)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
+        rot_a = torch.stack(
+            [cos_a, -sin_a, zero, sin_a, cos_a, zero, zero, zero, one], dim=-1
+        ).view(-1, 3, 3)
+        rot_b = torch.stack(
+            [one, zero, zero, zero, cos_b, -sin_b, zero, sin_b, cos_b], dim=-1
+        ).view(-1, 3, 3)
+        rot_g = torch.stack(
+            [cos_g, -sin_g, zero, sin_g, cos_g, zero, zero, zero, one], dim=-1
+        ).view(-1, 3, 3)
 
-        rays_x_rot2 = rays_x_rot1
-        rays_y_rot2 = cos_t * rays_y_rot1 - sin_t * rays_z_rot1
-        rays_z_rot2 = sin_t * rays_y_rot1 + cos_t * rays_z_rot1
+        rot = rot_g @ rot_b @ rot_a  # (B, 3, 3)
 
-        theta = torch.deg2rad(-z1).view(-1, 1)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
-
-        rays_x_final = cos_t * rays_x_rot2 - sin_t * rays_y_rot2
-        rays_y_final = sin_t * rays_x_rot2 + cos_t * rays_y_rot2
-        rays_z_final = rays_z_rot2
-
-        transformed_rays = torch.stack([rays_x_final, rays_y_final, rays_z_final], dim=2)
-
-        return transformed_rays
+        return shifted @ rot.transpose(1, 2)
 
     @staticmethod
     @torch.compile(mode="reduce-overhead")
@@ -614,10 +614,13 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         pixel_i = remaining // self.tilt_stack.shape[2]
         pixel_j = remaining % self.tilt_stack.shape[2]
 
+        # Plain ints for the index fields: default_collate builds one int64 tensor per
+        # batch either way, but wrapping each index in torch.tensor() here allocates
+        # three scalar tensors per item on the dataloader hot path.
         return {
-            "projection_idx": torch.tensor(projection_idx),
-            "pixel_i": torch.tensor(pixel_i),
-            "pixel_j": torch.tensor(pixel_j),
+            "projection_idx": projection_idx,
+            "pixel_i": pixel_i,
+            "pixel_j": pixel_j,
             "phi": self.tilt_angles[projection_idx],  # tensor
             "target_value": self.tilt_stack[projection_idx, pixel_i, pixel_j],  # tensor
         }
