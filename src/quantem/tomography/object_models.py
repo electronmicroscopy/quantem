@@ -421,12 +421,10 @@ class ObjectPixelated(ObjectConstraints):
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
         assert ctx.obj is not None, "ObjectPixelated requires ctx.obj to be set"
-        soft_loss = torch.tensor(
-            0.0, device=ctx.obj.device, dtype=ctx.obj.dtype, requires_grad=True
-        )
+        soft_loss = torch.tensor(0.0, device=ctx.obj.device, dtype=ctx.obj.dtype)
         if self.constraints.tv_vol > 0:
             tv_loss = self.get_tv_loss(ctx)
-            soft_loss += tv_loss
+            soft_loss = soft_loss + tv_loss
         return soft_loss
 
     # --- Forward method ---
@@ -542,7 +540,8 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         self,
         ctx: ReconstructionContext,
     ) -> torch.Tensor:
-        soft_loss = torch.tensor(0.0, device=ctx.coords.device)
+        device = ctx.coords.device if ctx.coords is not None else self._device
+        soft_loss = torch.tensor(0.0, device=device)
         if self.constraints.tv_vol > 0:
             assert ctx.coords is not None, (
                 "coords must be provided for INR object model to compute the TV loss"
@@ -662,7 +661,12 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         if all_densities.dim() > 1:
             all_densities = all_densities.squeeze(-1)
         valid_mask = (
-            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
+            (coords[:, 0] >= -1)
+            & (coords[:, 0] <= 1)
+            & (coords[:, 1] >= -1)
+            & (coords[:, 1] <= 1)
+            & (coords[:, 2] >= -1)
+            & (coords[:, 2] <= 1)
         ).float()
 
         if all_densities.dim() > 1:
@@ -985,25 +989,25 @@ class ObjectTensorDecomp(ObjectINR):
         model = _unwrap(self.model)
         h = 2.0 / min(model.resolution)
 
-        pred = model(tv_coords)
-        if isinstance(pred, tuple):
-            pred = pred[0]
-        if pred.dim() == 1:
-            pred = pred.unsqueeze(-1)  # (N, 1)
+        # Evaluate the base points and the three axis-shifted copies in a single
+        # batched forward (4N points) instead of 4 sequential model calls.
+        offsets = h * torch.eye(3, device=tv_coords.device, dtype=tv_coords.dtype)  # (3, 3)
+        all_coords = torch.cat(
+            [tv_coords, (tv_coords.unsqueeze(0) + offsets.unsqueeze(1)).reshape(-1, 3)]
+        )  # (4N, 3)
 
-        grads = []
-        for axis in range(3):
-            offset = torch.zeros(3, device=tv_coords.device)
-            offset[axis] = h
-            shifted_pred = self.model(tv_coords + offset)
-            if isinstance(shifted_pred, tuple):
-                shifted_pred = shifted_pred[0]
-            if shifted_pred.dim() == 1:
-                shifted_pred = shifted_pred.unsqueeze(-1)
-            grads.append((shifted_pred - pred) / h)  # (N, 1)
+        all_pred = model(all_coords)
+        if isinstance(all_pred, tuple):
+            all_pred = all_pred[0]
+        if all_pred.dim() == 1:
+            all_pred = all_pred.unsqueeze(-1)  # (4N, 1)
 
-        grad_stack = torch.stack(grads, dim=-1)  # (N, C, 3)
-        grad_norm = torch.norm(grad_stack, dim=-1)  # (N, C)
+        n = tv_coords.shape[0]
+        pred = all_pred[:n]  # (N, C)
+        shifted_pred = all_pred[n:].view(3, n, -1)  # (3, N, C)
+
+        grad_stack = (shifted_pred - pred.unsqueeze(0)) / h  # (3, N, C)
+        grad_norm = torch.norm(grad_stack, dim=0)  # (N, C)
 
         return self.constraints.tv_vol * grad_norm.mean()
 

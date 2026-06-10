@@ -111,18 +111,20 @@ class Siren(nn.Module):
         self.net = nn.Sequential(*net_list)
 
         if self.winner_initialization:
-            if type(self.winner_initialization) is int:
-                rng = torch.Generator()
-                rng.manual_seed(self.winner_initialization)
-            else:
-                rng = torch.Generator()
-                rng.manual_seed(42)
+            seed = self.winner_initialization if type(self.winner_initialization) is int else 42
+            rng = torch.Generator()
+            rng.manual_seed(seed)
+            # torch.randn_like ignores generators, so the noise must come from
+            # torch.randn with the seeded generator -- otherwise the "winner" seed
+            # silently has no effect and the perturbation is not reproducible.
             with torch.no_grad():
-                self.net[0].linear.weight += (  # type: ignore[reportAttributeAccessIssue]
-                    torch.randn_like(self.net[0].linear.weight) * 5 / self.first_omega_0  # type:ignore
-                )
-                self.net[1].linear.weight += (  # type: ignore[reportAttributeAccessIssue]
-                    torch.randn_like(self.net[1].linear.weight) * 0.1 / self.hidden_omega_0  # type:ignore
+                w0 = self.net[0].linear.weight  # type: ignore[reportAttributeAccessIssue]
+                w0 += torch.randn(w0.shape, generator=rng, dtype=w0.dtype) * 5 / self.first_omega_0
+                w1 = self.net[1].linear.weight  # type: ignore[reportAttributeAccessIssue]
+                w1 += (
+                    torch.randn(w1.shape, generator=rng, dtype=w1.dtype)
+                    * 0.1
+                    / self.hidden_omega_0
                 )
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:

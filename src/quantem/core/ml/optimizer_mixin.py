@@ -294,14 +294,15 @@ class SchedulerParams:
         _name: str = "plateau"
 
         def params(self, base_LR: float, num_iter: int | None = None) -> dict:
-            if self.min_lr is None:
-                self.min_lr = self.min_lr_factor * base_LR
+            # Derived values stay local: params() must not mutate the dataclass, or a
+            # shared instance bakes in the first optimizer's base LR for every later one.
+            min_lr = self.min_lr if self.min_lr is not None else self.min_lr_factor * base_LR
             return {
                 "mode": self.mode,
                 "factor": self.factor,
                 "patience": self.patience,
                 "threshold": self.threshold,
-                "min_lr": self.min_lr,
+                "min_lr": min_lr,
                 "cooldown": self.cooldown,
             }
 
@@ -332,13 +333,12 @@ class SchedulerParams:
             if effective_num_iter is None:
                 raise ValueError("num_iter must be set if num_iter is not provided")
 
-            self.num_iter = effective_num_iter
-
+            gamma = self.gamma
             if self.factor is not None:
-                self.gamma = self.factor ** (1.0 / effective_num_iter)
+                gamma = self.factor ** (1.0 / effective_num_iter)
 
             return {
-                "gamma": self.gamma,
+                "gamma": gamma,
             }
 
     @dataclass
@@ -385,13 +385,11 @@ class SchedulerParams:
         _name: str = "cyclic"
 
         def params(self, base_LR: float, num_iter: int | None = None) -> dict:
-            if self.base_lr is None:
-                self.base_lr = self.base_lr_factor * base_LR
-            if self.max_lr is None:
-                self.max_lr = self.max_lr_factor * base_LR
+            base_lr = self.base_lr if self.base_lr is not None else self.base_lr_factor * base_LR
+            max_lr = self.max_lr if self.max_lr is not None else self.max_lr_factor * base_LR
             return {
-                "base_lr": self.base_lr,
-                "max_lr": self.max_lr,
+                "base_lr": base_lr,
+                "max_lr": max_lr,
                 "step_size_up": self.step_size_up,
                 "step_size_down": self.step_size_down,
                 "mode": self.mode,
@@ -426,12 +424,11 @@ class SchedulerParams:
                 raise ValueError(
                     "total_iters must be set if num_iter is not provided"
                 )  # Should never be reached
-            if self.total_iters is None:
-                self.total_iters = num_iter
+            total_iters = self.total_iters if self.total_iters is not None else num_iter
             return {
                 "start_factor": self.start_factor,
                 "end_factor": self.end_factor,
-                "total_iters": self.total_iters,
+                "total_iters": total_iters,
             }
 
     @dataclass
@@ -459,10 +456,9 @@ class SchedulerParams:
                 raise ValueError(
                     "T_max must be set if num_iter is not provided"
                 )  # Should never be reached
-            if self.T_max is None:
-                self.T_max = num_iter
+            T_max = self.T_max if self.T_max is not None else num_iter
             return {
-                "T_max": self.T_max,
+                "T_max": T_max,
                 "eta_min": self.eta_min,
             }
 
@@ -572,7 +568,9 @@ class OptimizerMixin:
         if isinstance(params, OptimizerParamsType):
             return {self.DEFAULT_OPTIMIZER_KEY: params}
         if not isinstance(params, dict):
-            raise TypeError(f"optimizer_params must be OptimizerParamsType or dict, got {type(params)}")
+            raise TypeError(
+                f"optimizer_params must be OptimizerParamsType or dict, got {type(params)}"
+            )
         # Single optimizer as dict shorthand, e.g. {"name": "adam", "lr": 1e-3}
         if self._is_single_optimizer_dict(params):
             return {self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.parse_dict(d=params)}
@@ -597,7 +595,9 @@ class OptimizerMixin:
         if isinstance(params, dict):
             params = SchedulerParams.parse_dict(d=params)
         if not isinstance(params, SchedulerParamsType):
-            raise TypeError(f"scheduler parameters must be a SchedulerParamsType, got {type(params)}")
+            raise TypeError(
+                f"scheduler parameters must be a SchedulerParamsType, got {type(params)}"
+            )
         self._scheduler_params = params
 
     @abstractmethod
@@ -688,7 +688,9 @@ class OptimizerMixin:
                 raise NotImplementedError(f"Unknown optimizer type: {opt_params}")
 
     def set_scheduler(
-        self, scheduler_params: SchedulerParamsType | dict | None = None, num_iter: int | None = None
+        self,
+        scheduler_params: SchedulerParamsType | dict | None = None,
+        num_iter: int | None = None,
     ) -> None:
         """Set the scheduler for this model."""
         if scheduler_params is not None:

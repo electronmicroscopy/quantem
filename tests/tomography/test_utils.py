@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from quantem.tomography.utils import (
+    differentiable_rotx_vectorized,
     differentiable_rotz_vectorized,
     rot_ZXZ,
     tv_loss_1d,
@@ -76,3 +77,37 @@ class TestRotations:
         out.sum().backward()
         assert vol.grad is not None
         assert torch.isfinite(vol.grad).all()
+
+
+class TestRotZXZGradients:
+    def test_grad_flows_with_mixed_float_and_tensor_angles(self):
+        """Regression: a non-tensor angle made rot_ZXZ re-wrap every angle with
+        torch.tensor(), detaching gradients through tensor angles."""
+        vol = _block_volume()
+        x = torch.tensor(20.0, requires_grad=True)
+        out = rot_ZXZ(vol, 0.0, x, 0.0, device="cpu")
+        out.sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad)
+    @pytest.mark.parametrize(
+        "rot_fn", [differentiable_rotz_vectorized, differentiable_rotx_vectorized]
+    )
+    def test_multi_angle_matches_per_angle_calls(self, rot_fn):
+        # Regression: the per-slice vmap version raised for more than one angle
+        # (affine_grid requires the matrix batch to match the slice batch of 1).
+        vol = _block_volume()
+        angles = torch.tensor([10.0, -25.0, 60.0])
+        multi = rot_fn(vol, angles)
+        per_angle = torch.cat([rot_fn(vol, a) for a in angles])
+        assert multi.shape == (3, *vol.shape[1:])
+        assert torch.allclose(multi, per_angle, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        "rot_fn", [differentiable_rotz_vectorized, differentiable_rotx_vectorized]
+    )
+    def test_per_volume_angles(self, rot_fn):
+        vols = torch.cat([_block_volume(), _block_volume().flip(-1), _block_volume().flip(-2)])
+        angles = torch.tensor([10.0, -25.0, 60.0])
+        batched = rot_fn(vols, angles)
+        per_volume = torch.cat([rot_fn(vols[i : i + 1], angles[i]) for i in range(3)])
+        assert torch.allclose(batched, per_volume, atol=1e-6)

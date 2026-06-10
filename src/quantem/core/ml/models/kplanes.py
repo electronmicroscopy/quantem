@@ -330,14 +330,18 @@ def interpolate_ms_features_tilted(
     rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
 
     # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
-    # index_select is faster and cleaner than advanced indexing with python lists.
-    # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2)
-    idx = torch.tensor([[0, 1], [2, 0], [1, 2]], device=pts.device)  # (3, 2)
-    # rotated: (T, B, 3) -> gather along last dim with idx (3, 2)
-    # Result: (T, 3, B, 2)
-    coords = (
-        rotated.unsqueeze(1).expand(T, 3, B, 3).gather(-1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2))
-    )
+    # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2). Stacking views avoids the
+    # per-call index-tensor allocation (a host-to-device copy) and the
+    # (T, 3, B, 3) expand+gather this used to do.
+    x, y, z = rotated.unbind(-1)  # each (T, B)
+    coords = torch.stack(
+        (
+            torch.stack((x, y), dim=-1),
+            torch.stack((z, x), dim=-1),
+            torch.stack((y, z), dim=-1),
+        ),
+        dim=1,
+    )  # (T, 3, B, 2)
 
     # Flatten (T, 3) -> 3*T so it matches grid's first dim, and add the H_out=1 axis
     coord_tensor = coords.reshape(3 * T, B, 1, 2)  # (3T, B, 1, 2)
