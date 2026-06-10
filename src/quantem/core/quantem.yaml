@@ -14,6 +14,10 @@ dtype_complex: complex64
 # global verbosity, not currently used
 
 verbose: 1
+
+# Dispatch to the fused quantem-cuda kernels when installed (pip install quantem[cuda])
+# and the tensors are on a CUDA device. Set false to force the pure-torch paths.
+use_cuda_kernels: true
 cupy:
   # The size of the fft cache in MB used by cupy
   # https://docs.cupy.dev/en/stable/user_guide/fft.html#fft-plan-cache

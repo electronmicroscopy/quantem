@@ -18,6 +18,7 @@ from quantem.core.ml.optimizer_mixin import OptimizerMixin
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 from quantem.tomography.tomography_context import ReconstructionContext
+from quantem.tomography.utils import tv_loss_vol_sq
 
 
 class ObjConstraintParams:
@@ -439,11 +440,9 @@ class ObjectPixelated(ObjectConstraints):
         # TV over the three trailing spatial dims, leaving any leading channel/batch axes
         # intact. Works for a 3-D volume, obj_view's [1, D, H, W], and a multimodal
         # [C, D, H, W] (channels = elemental compositions), matching the INR / tensor-decomp
-        # convention where the object carries a leading channel dimension.
-        tv_d = torch.pow(ctx.obj[..., 1:, :, :] - ctx.obj[..., :-1, :, :], 2).sum()
-        tv_h = torch.pow(ctx.obj[..., :, 1:, :] - ctx.obj[..., :, :-1, :], 2).sum()
-        tv_w = torch.pow(ctx.obj[..., :, :, 1:] - ctx.obj[..., :, :, :-1], 2).sum()
-        tv_loss = tv_d + tv_h + tv_w
+        # convention where the object carries a leading channel dimension. tv_loss_vol_sq
+        # dispatches to the fused quantem-cuda kernel when available.
+        tv_loss = tv_loss_vol_sq(ctx.obj)
 
         return tv_loss * self.constraints.tv_vol / ctx.obj.numel()
 
