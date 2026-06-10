@@ -356,9 +356,7 @@ from quantem.core import config  # noqa: E402
 from quantem.core.ml.optimizer_mixin import OptimizerMixin  # noqa: E402
 
 torch = pytest.importorskip("torch") if config.get("has_torch") else None
-requires_torch = pytest.mark.skipif(
-    not config.get("has_torch"), reason="requires torch"
-)
+requires_torch = pytest.mark.skipif(not config.get("has_torch"), reason="requires torch")
 
 
 def _param(value=1.0):
@@ -413,7 +411,10 @@ class TestSetOptimizer:
     def test_multi_group_pplr_applies_per_group_lr(self):
         model = _FakeModel({"descan": [_param()], "scan_positions": [_param(2.0)]})
         model.set_optimizer(
-            {"descan": OptimizerParams.SGD(lr=1e-2), "scan_positions": OptimizerParams.SGD(lr=1e-3)}
+            {
+                "descan": OptimizerParams.SGD(lr=1e-2),
+                "scan_positions": OptimizerParams.SGD(lr=1e-3),
+            }
         )
         groups = model.optimizer.param_groups
         assert len(groups) == 2
@@ -445,9 +446,56 @@ class TestSetOptimizer:
     def test_set_scheduler_base_lr_uses_max_group_lr(self):
         model = _FakeModel({"descan": [_param()], "scan_positions": [_param(2.0)]})
         model.set_optimizer(
-            {"descan": OptimizerParams.SGD(lr=1e-2), "scan_positions": OptimizerParams.SGD(lr=1e-3)}
+            {
+                "descan": OptimizerParams.SGD(lr=1e-2),
+                "scan_positions": OptimizerParams.SGD(lr=1e-3),
+            }
         )
         model.set_scheduler(SchedulerParams.Plateau(), num_iter=10)
         assert model.scheduler is not None
         # Plateau min_lr defaults to base_LR / 20, with base_LR = max group lr (1e-2)
         assert model.scheduler.min_lrs[0] == pytest.approx(1e-2 / 20)
+
+
+class TestSchedulerParamsArePure:
+    """Regression: params() mutated the dataclass, so a shared instance baked in the
+    first call's derived values (min_lr, gamma, bounds, horizons) for every later
+    optimizer or reconstruct() call."""
+
+    def test_plateau_min_lr_follows_base_lr(self):
+        p = SchedulerParams.Plateau()
+        assert p.params(base_LR=1.0)["min_lr"] == pytest.approx(1 / 20)
+        assert p.params(base_LR=10.0)["min_lr"] == pytest.approx(10 / 20)
+        assert p.min_lr is None  # instance untouched
+
+    def test_exponential_gamma_follows_num_iter(self):
+        p = SchedulerParams.Exponential(factor=0.5)
+        g10 = p.params(base_LR=1.0, num_iter=10)["gamma"]
+        g100 = p.params(base_LR=1.0, num_iter=100)["gamma"]
+        assert g10 == pytest.approx(0.5 ** (1 / 10))
+        assert g100 == pytest.approx(0.5 ** (1 / 100))
+        assert p.num_iter is None and p.gamma == 0.9
+
+    def test_cyclic_bounds_follow_base_lr(self):
+        p = SchedulerParams.Cyclic()
+        first = p.params(base_LR=1.0)
+        second = p.params(base_LR=2.0)
+        assert second["base_lr"] == pytest.approx(2 * first["base_lr"])
+        assert second["max_lr"] == pytest.approx(2 * first["max_lr"])
+        assert p.base_lr is None and p.max_lr is None
+
+    def test_linear_and_cosine_follow_num_iter(self):
+        lin = SchedulerParams.Linear()
+        assert lin.params(base_LR=1.0, num_iter=5)["total_iters"] == 5
+        assert lin.params(base_LR=1.0, num_iter=50)["total_iters"] == 50
+        assert lin.total_iters is None
+        cos = SchedulerParams.CosineAnnealing()
+        assert cos.params(base_LR=1.0, num_iter=5)["T_max"] == 5
+        assert cos.params(base_LR=1.0, num_iter=50)["T_max"] == 50
+        assert cos.T_max is None
+
+    def test_explicit_values_still_win(self):
+        p = SchedulerParams.Plateau(min_lr=1e-6)
+        assert p.params(base_LR=1.0)["min_lr"] == 1e-6
+        e = SchedulerParams.Exponential(gamma=0.8)
+        assert e.params(base_LR=1.0, num_iter=10)["gamma"] == 0.8

@@ -78,6 +78,17 @@ class TestRotations:
         assert vol.grad is not None
         assert torch.isfinite(vol.grad).all()
 
+
+class TestRotZXZGradients:
+    def test_grad_flows_with_mixed_float_and_tensor_angles(self):
+        """Regression: a non-tensor angle made rot_ZXZ re-wrap every angle with
+        torch.tensor(), detaching gradients through tensor angles."""
+        vol = _block_volume()
+        x = torch.tensor(20.0, requires_grad=True)
+        out = rot_ZXZ(vol, 0.0, x, 0.0, device="cpu")
+        out.sum().backward()
+        assert x.grad is not None
+        assert torch.isfinite(x.grad)
     @pytest.mark.parametrize(
         "rot_fn", [differentiable_rotz_vectorized, differentiable_rotx_vectorized]
     )
