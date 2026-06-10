@@ -572,6 +572,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
 
         return pred
 
+    def sample_tv_tap_coords(self, coords: torch.Tensor) -> Optional[torch.Tensor]:
+        """Hook for the training loop: returns None (INR TV uses autograd, no tap merging)."""
+        return None
+
     # --- Define get_tv_loss ---
 
     def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
@@ -672,6 +676,35 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         all_densities = self.apply_hard_constraints(all_densities)
 
         return all_densities
+
+    def forward_with_tv_taps(
+        self, coords: torch.Tensor, tap_coords: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Single model call covering the main batch and the volume-TV tap points.
+
+        The out-of-bounds mask and hard constraints apply to the main chunk
+        only; tap densities are returned raw (border-clamped), matching the
+        fallback path in ``get_volume_tv_loss``.
+        """
+        merged = self.model(torch.cat([coords, tap_coords], dim=0))
+        if isinstance(merged, tuple):
+            merged = merged[0]
+        main, taps = merged[: coords.shape[0]], merged[coords.shape[0] :]
+
+        if main.dim() > 1:
+            main = main.squeeze(-1)
+        valid_mask = (
+            (coords[:, 0] >= -1) & (coords[:, 0] <= 1) & (coords[:, 1] >= -1) & (coords[:, 1] <= 1)
+        ).float()
+        if main.dim() > 1:
+            valid_mask = valid_mask.unsqueeze(-1)
+        main = main * valid_mask
+        main = self.apply_hard_constraints(main)
+
+        if taps.dim() == 1:
+            taps = taps.unsqueeze(-1)
+        return main, taps
 
     # Pretrain Loop
 
@@ -910,6 +943,30 @@ class ObjectTensorDecomp(ObjectINR):
         obj_model.to(device)
         return obj_model
 
+    def sample_tv_tap_coords(self, coords: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        Sample the finite-difference tap coordinates for the volume TV loss.
+
+        Returns a (4*n, 3) tensor [base; base+h*ex; base+h*ey; base+h*ez] for n
+        sampled base points, or None when tv_vol == 0.  The training loop
+        concatenates this to all_coords so the TV taps are evaluated in the
+        same model call as the main forward pass.
+        """
+        if self.constraints.tv_vol == 0:
+            return None
+        model = _unwrap(self.model)
+        h = 2.0 / min(model.resolution)
+        num_tv_samples = min(10_000, coords.shape[0])
+        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+        tv_coords = coords[tv_indices]  # (n, 3)
+        ex = torch.zeros(3, device=tv_coords.device)
+        ex[0] = h
+        ey = torch.zeros(3, device=tv_coords.device)
+        ey[1] = h
+        ez = torch.zeros(3, device=tv_coords.device)
+        ez[2] = h
+        return torch.cat([tv_coords, tv_coords + ex, tv_coords + ey, tv_coords + ez], dim=0)
+
     # --- Constraints ---
 
     def apply_soft_constraints(self, ctx: ReconstructionContext) -> torch.Tensor:
@@ -945,7 +1002,9 @@ class ObjectTensorDecomp(ObjectINR):
         if self.constraints.tv_plane > 0:
             tv_loss += self._get_plane_tv_loss()
         if self.constraints.tv_vol > 0:
-            tv_loss += self.get_volume_tv_loss(ctx.coords)
+            tv_loss += self.get_volume_tv_loss(
+                ctx.coords, precomputed_tap_densities=ctx.tv_tap_densities
+            )
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
@@ -973,36 +1032,45 @@ class ObjectTensorDecomp(ObjectINR):
 
         return self.constraints.tv_plane * torch.stack(per_level).sum()
 
-    def get_volume_tv_loss(self, coords: torch.Tensor) -> torch.Tensor:
+    def get_volume_tv_loss(
+        self,
+        coords: torch.Tensor,
+        precomputed_tap_densities: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Isotropic volume TV via finite differences. Same form as the autograd
         version (L1 of gradient L2-norm) but avoids double-backward, so it
         works for KPlanesTILTED, CPTilted, and anything else.
 
-        The four finite-difference taps (base, +x, +y, +z) are evaluated in a
-        single batched 4N-point model call rather than four separate calls —
-        identical math, one kernel-launch sequence and one autograd subgraph.
+        When *precomputed_tap_densities* is provided (a (4N, C) tensor from the
+        merged single-pass forward in the training loop), the model call is
+        skipped entirely and the supplied values are used directly.  When absent
+        the existing batched 4N-point fallback path runs unchanged.
         """
-        num_tv_samples = min(10_000, coords.shape[0])
-        tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
-        tv_coords = coords[tv_indices]  # (N, 3)
-
         model = _unwrap(self.model)
         h = 2.0 / min(model.resolution)
 
-        ex = torch.zeros(3, device=tv_coords.device)
-        ex[0] = h
-        ey = torch.zeros(3, device=tv_coords.device)
-        ey[1] = h
-        ez = torch.zeros(3, device=tv_coords.device)
-        ez[2] = h
+        if precomputed_tap_densities is not None:
+            batched_pred = precomputed_tap_densities
+        else:
+            num_tv_samples = min(10_000, coords.shape[0])
+            tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
+            tv_coords = coords[tv_indices]  # (N, 3)
 
-        batched = torch.cat(
-            [tv_coords, tv_coords + ex, tv_coords + ey, tv_coords + ez], dim=0
-        )  # (4N, 3)
-        batched_pred = model(batched)
-        if isinstance(batched_pred, tuple):
-            batched_pred = batched_pred[0]
+            ex = torch.zeros(3, device=tv_coords.device)
+            ex[0] = h
+            ey = torch.zeros(3, device=tv_coords.device)
+            ey[1] = h
+            ez = torch.zeros(3, device=tv_coords.device)
+            ez[2] = h
+
+            batched = torch.cat(
+                [tv_coords, tv_coords + ex, tv_coords + ey, tv_coords + ez], dim=0
+            )  # (4N, 3)
+            batched_pred = model(batched)
+            if isinstance(batched_pred, tuple):
+                batched_pred = batched_pred[0]
+
         if batched_pred.dim() == 1:
             batched_pred = batched_pred.unsqueeze(-1)  # (4N, C)
 
