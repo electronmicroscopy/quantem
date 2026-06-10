@@ -97,7 +97,7 @@ def tv_loss_vol_sq(obj: torch.Tensor) -> torch.Tensor:
         and config.get("has_quantem_cuda")
         and config.get("use_cuda_kernels", default=True)
     ):
-        from quantem.cuda import tv_loss_sq_3d
+        from quantem.cuda.core import tv_loss_sq_3d
 
         return tv_loss_sq_3d(obj)
 

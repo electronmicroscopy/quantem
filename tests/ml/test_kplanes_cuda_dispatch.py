@@ -60,16 +60,16 @@ def test_gpu_grads_match_cpu_reference():
 @requires_gpu
 @requires_quantem_cuda
 def test_dispatches_to_kernel_per_scale(monkeypatch):
-    import quantem.cuda
+    import quantem.cuda.core.ml
 
     calls = []
-    real = quantem.cuda.kplanes_tilted_fuse
+    real = quantem.cuda.core.ml.kplanes_tilted_fuse
 
     def spy(pts, rotations, plane):
         calls.append(plane.shape)
         return real(pts, rotations, plane)
 
-    monkeypatch.setattr(quantem.cuda, "kplanes_tilted_fuse", spy)
+    monkeypatch.setattr(quantem.cuda.core.ml, "kplanes_tilted_fuse", spy)
     pts, rot, grids = _inputs("cuda")
     interpolate_ms_features_tilted(pts, grids, rot)
     assert len(calls) == len(grids)
@@ -78,12 +78,12 @@ def test_dispatches_to_kernel_per_scale(monkeypatch):
 @requires_gpu
 @requires_quantem_cuda
 def test_kill_switch_forces_torch_path(monkeypatch):
-    import quantem.cuda
+    import quantem.cuda.core.ml
 
     def boom(pts, rotations, plane):
         raise AssertionError("kernel should not be called with use_cuda_kernels=False")
 
-    monkeypatch.setattr(quantem.cuda, "kplanes_tilted_fuse", boom)
+    monkeypatch.setattr(quantem.cuda.core.ml, "kplanes_tilted_fuse", boom)
     pts, rot, grids = _inputs("cuda")
     pts_c, rot_c, grids_c = _inputs("cpu")
     expected = interpolate_ms_features_tilted(pts_c, grids_c, rot_c)

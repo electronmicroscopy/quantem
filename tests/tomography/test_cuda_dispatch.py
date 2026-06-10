@@ -59,16 +59,16 @@ def test_gpu_grad_matches_cpu_reference():
 @requires_gpu
 @requires_quantem_cuda
 def test_dispatches_to_kernel(monkeypatch):
-    import quantem.cuda
+    import quantem.cuda.core
 
     calls = []
-    real = quantem.cuda.tv_loss_sq_3d
+    real = quantem.cuda.core.tv_loss_sq_3d
 
     def spy(volume):
         calls.append(volume.shape)
         return real(volume)
 
-    monkeypatch.setattr(quantem.cuda, "tv_loss_sq_3d", spy)
+    monkeypatch.setattr(quantem.cuda.core, "tv_loss_sq_3d", spy)
     tv_loss_vol_sq(torch.rand(4, 4, 4, device="cuda"))
     assert len(calls) == 1
 
@@ -76,12 +76,12 @@ def test_dispatches_to_kernel(monkeypatch):
 @requires_gpu
 @requires_quantem_cuda
 def test_kill_switch_forces_torch_path(monkeypatch):
-    import quantem.cuda
+    import quantem.cuda.core
 
     def boom(volume):
         raise AssertionError("kernel should not be called with use_cuda_kernels=False")
 
-    monkeypatch.setattr(quantem.cuda, "tv_loss_sq_3d", boom)
+    monkeypatch.setattr(quantem.cuda.core, "tv_loss_sq_3d", boom)
     obj = torch.rand(4, 4, 4, device="cuda")
     # config.set lacks __exit__, so restore explicitly rather than via `with`.
     config.set({"use_cuda_kernels": False})

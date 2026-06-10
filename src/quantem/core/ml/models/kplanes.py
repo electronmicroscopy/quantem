@@ -333,7 +333,7 @@ def interpolate_ms_features_tilted(
         and config.get("has_quantem_cuda")
         and config.get("use_cuda_kernels", default=True)
     ):
-        from quantem.cuda import kplanes_tilted_fuse
+        from quantem.cuda.core.ml import kplanes_tilted_fuse
 
         return torch.cat(
             [kplanes_tilted_fuse(pts, rotation_matrices, g) for g in ms_grids], dim=-1
