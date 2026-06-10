@@ -14,7 +14,11 @@ from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.filter import gaussian_filter_1d, gaussian_kernel_1d
 from quantem.core.utils.utils import to_numpy
-from quantem.diffraction.polar_transform import auto_origin_id, polar_transform
+from quantem.diffraction.polar_transform import (
+    find_origin_angular_descent,
+    find_origin_angular_grid,
+    polar_transform,
+)
 
 # TODO: elliptical distortion correction in origin finding
 # TODO: beamstop mask support (mask diffraction-space pixels before azimuthal averaging)
@@ -153,6 +157,7 @@ class PairDistributionFunction(AutoSerialize):
         data: Dataset2d | Dataset4dstem,
         *,
         find_origin: bool = True,
+        origin_method: str = "grid",
         origin_row: float | None = None,
         origin_col: float | None = None,
         origin_array: NDArray | None = None,
@@ -175,16 +180,21 @@ class PairDistributionFunction(AutoSerialize):
               or a pre-averaged 4DSTEM result); wrapped as a 1x1 scan
               internally.
         find_origin : bool
-            If True, run ``auto_origin_id`` to find the origin at each scan
-            position. If False, use ``origin_row`` / ``origin_col`` (or the
-            image center if those are None).
+            If True, find the diffraction origin at each scan position (method chosen
+            by ``origin_method``). If False, use ``origin_row`` / ``origin_col`` (or
+            the image center if those are None).
+        origin_method : {"grid", "descent"}
+            Origin finder used when ``find_origin=True``. ``"grid"`` (default) is the
+            global angular-variance search (:func:`find_origin_angular_grid`);
+            ``"descent"`` is the COM-anchored local descent
+            (:func:`find_origin_angular_descent`), better on small detectors.
         origin_row, origin_col : float or None
             Fixed diffraction-space origin in pixels, used only when
             ``find_origin=False`` and ``origin_array`` is None. Defaults to
             the center of the diffraction pattern.
         origin_array : ndarray or None
             Pre-computed per-DP origins of shape ``(scan_row, scan_col, 2)``.
-            When provided, ``auto_origin_id`` is skipped and these origins
+            When provided, ``find_origin_angular_grid`` is skipped and these origins
             are used directly. Takes precedence over ``find_origin`` and
             ``origin_row``/``origin_col``.
         ellipse_params : tuple of (float, float, float) or None
@@ -246,16 +256,30 @@ class PairDistributionFunction(AutoSerialize):
                         f"({scan_row}, {scan_col}, 2)."
                     )
             elif find_origin:
-                origin_array = auto_origin_id(
-                    data,
-                    ellipse_params=ellipse_params,
-                    num_annular_bins=num_annular_bins,
-                    radial_min=radial_min,
-                    radial_max=radial_max,
-                    radial_step=radial_step,
-                    two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                    device=device,
-                )
+                if origin_method == "descent":
+                    origin_array = find_origin_angular_descent(
+                        data,
+                        ellipse_params=ellipse_params,
+                        radial_min=radial_min,
+                        radial_max=radial_max,
+                        radial_step=radial_step,
+                        device=device,
+                    )
+                elif origin_method == "grid":
+                    origin_array = find_origin_angular_grid(
+                        data,
+                        ellipse_params=ellipse_params,
+                        num_annular_bins=num_annular_bins,
+                        radial_min=radial_min,
+                        radial_max=radial_max,
+                        radial_step=radial_step,
+                        two_fold_rotation_symmetry=two_fold_rotation_symmetry,
+                        device=device,
+                    )
+                else:
+                    raise ValueError(
+                        f"origin_method must be 'grid' or 'descent', got {origin_method!r}."
+                    )
             else:
                 if origin_row is None:
                     origin_row = (n_row - 1) / 2.0

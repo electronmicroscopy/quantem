@@ -15,7 +15,7 @@ from quantem.core.utils.utils import to_numpy
 # but is noted where the call occures
 
 
-def auto_origin_id(
+def find_origin_angular_grid(
     data: Dataset4dstem,
     *,
     ellipse_params: tuple[float, float, float] | None = None,
@@ -81,7 +81,7 @@ def auto_origin_id(
     else:
         raise ValueError(
             f" Got array with shape {data.shape}."
-            "To use auto_origin_id, pass a 2D or 4DSTEM dataset."
+            "To use find_origin_angular_grid, pass a 2D or 4DSTEM dataset."
         )
 
     # Move the full dataset to the chosen device once
@@ -105,7 +105,9 @@ def auto_origin_id(
     # in-image. Single pos candidates further from COM might be out of bounds
     # and are masked with [safe_low, safe_high_*] if so
     # (zero-padded samples would otherwise produce a falsely low score)
-    global_margin = 40
+    # global_margin is the half-width of the candidate-center search around the COM.
+    com_edge_budget = min(com_row, com_col, (n_row - 1) - com_row, (n_col - 1) - com_col)
+    global_margin = int(min(40, max(2, com_edge_budget // 2)))
     safe_radial_max = float(
         min(
             com_row - global_margin,
@@ -317,7 +319,7 @@ def auto_origin_id(
     pbar.close()
     if n_not_converged:
         warnings.warn(
-            f"auto_origin_id: {n_not_converged} of {n_pos} scan positions did not "
+            f"find_origin_angular_grid: {n_not_converged} of {n_pos} scan positions did not "
             "converge to a sub-pixel origin (descan may exceed local_margin). The integer-pixel origin was "
             "used at those positions.",
             stacklevel=2,
@@ -728,3 +730,218 @@ def _quadratic_subpixel_offset(patch: torch.Tensor) -> torch.Tensor:
     drow = torch.where(valid, (f * c - 2.0 * e * b) / det_safe, torch.zeros_like(det))
     dcol = torch.where(valid, (f * b - 2.0 * d * c) / det_safe, torch.zeros_like(det))
     return torch.stack([drow.clamp(-1.0, 1.0), dcol.clamp(-1.0, 1.0)], dim=1)
+
+
+
+def find_origin_angular_descent(
+    data: Dataset4dstem,
+    *,
+    ellipse_params: tuple[float, float, float] | None = None,
+    radial_min: float = 0.0,
+    radial_max: float | None = None,
+    n_phi: int = 120,
+    radial_step: float = 1.0,
+    kpow: float = 0.0,
+    device: str = "cpu",
+) -> NDArray:
+    """Margin-free diffraction-center finding by COM-anchored local descent.
+
+    Anchors every pattern at the intensity centroid and walks downhill, then 
+    fits a 2D quadratic for the sub-pixel center. Robust on small detectors.
+
+    Parameters
+    ----------
+    data : Dataset4dstem
+        A 4D-STEM dataset (or a 2D dataset, treated as a 1x1 scan).
+    ellipse_params : tuple or None
+        ``(a, b, theta_deg)`` to sample along elliptical rings. Origin finding stays
+        accurate without it (the center is located by the pattern's inversion
+        symmetry, independent of ring shape); supplying it deepens the score minimum
+        and is a mild refinement on strongly elliptical data. ``None`` = circular.
+    radial_min, radial_max : float
+        Inner / outer radius (px) of the scoring annulus. Set ``radial_min`` above
+        the central beam (or any saturated core). ``radial_max=None`` defaults to
+        ``min(n_row, n_col) // 2 - 2``.
+    n_phi : int
+        Number of angular samples per ring.
+    radial_step : float
+        Radial sampling step (px).
+    kpow : float
+        Up-weight each ring's contribution by ``k**kpow`` (k == radius). ``0`` is the
+        plain ratio-of-sums objective; ``1``/``2`` emphasize high-k.
+    device : str
+        Torch device.
+
+    Returns
+    -------
+    origin_array : np.ndarray
+        Shape ``(scan_row, scan_col, 2)`` of ``(row, col)`` origins in pixels.
+
+    See Also
+    --------
+    find_origin_angular_grid : global angular-variance grid search; more robust to a
+        poor initial guess.
+    """
+    if data.ndim == 2:
+        scan_row, scan_col, n_row, n_col = 1, 1, *data.shape
+    elif data.ndim == 4:
+        scan_row, scan_col, n_row, n_col = data.shape
+    else:
+        raise ValueError(
+            f"Got array with shape {data.shape}. "
+            "To use find_origin_angular_descent, pass a 2D or 4D-STEM dataset."
+        )
+    if radial_max is None:
+        radial_max = float(min(n_row, n_col) // 2 - 2)
+    n_radial = max(4, int(round((radial_max - radial_min) / radial_step)) + 1)
+    data_tensor = (
+        torch.from_numpy(np.ascontiguousarray(data.array))
+        if data.array is not None
+        else data.tensor
+    )
+    array_tensor = data_tensor.to(device=device, dtype=torch.float32)
+    if array_tensor.ndim == 2:
+        array_tensor = array_tensor[None, None]
+    patterns = array_tensor.reshape(-1, n_row, n_col)
+    n_patterns = patterns.shape[0]
+    offset_row, offset_col, ring_weights = _local_sampling(
+        radial_min, radial_max, n_phi, n_radial, kpow, ellipse_params, device
+    )
+    # Global anchor: descend on the high-SNR mean DP (a batch of one), seeded at its COM.
+    mean_pattern = array_tensor.mean(dim=(0, 1))
+    global_origin = _descend_batched(
+        mean_pattern[None], torch.round(_com_anchor(mean_pattern))[None],
+        offset_row, offset_col, ring_weights, n_phi, n_radial, device,
+    )[0]
+    # Per-position: start every DP at the integer global anchor and descend (tracks descan).
+    start_centers = torch.round(global_origin)[None].expand(n_patterns, 2).clone()
+    origins = _descend_batched(
+        patterns, start_centers, offset_row, offset_col, ring_weights, n_phi, n_radial, device,
+    )
+    return origins.reshape(scan_row, scan_col, 2).cpu().numpy()
+
+
+# --- helpers for find_origin_angular_descent -------------------------------------
+# The 8 neighbor directions (axial + diagonal) for the pattern search.
+_NEIGHBOR_STEPS_8 = [[1.0, 0], [-1, 0], [0, 1.0], [0, -1], [1, 1.0], [1, -1], [-1, 1], [-1, -1]]
+# The 9 offsets of a 3x3 patch, row-major: index k = i*3 + j -> (row i-1, col j-1);
+# the patch center is k = 4.
+_PATCH_OFFSETS_3X3 = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0], [1, 1]]
+
+
+def _com_anchor(pattern: torch.Tensor) -> torch.Tensor:
+    """Rough center guess from the intensity-weighted centroid of the DP."""
+    n_row, n_col = pattern.shape
+    clipped = pattern.clamp(min=0)
+    total = clipped.sum() + 1e-9
+    rows = torch.arange(n_row, device=pattern.device, dtype=torch.float32)
+    cols = torch.arange(n_col, device=pattern.device, dtype=torch.float32)
+    center_row = (rows[:, None] * clipped).sum() / total
+    center_col = (cols[None, :] * clipped).sum() / total
+    return torch.tensor([center_row.item(), center_col.item()], device=pattern.device)
+
+
+def _local_sampling(radial_min, radial_max, n_phi, n_radial, kpow, ellipse_params, device):
+    """Polar-sampling template (row/col offset per (phi, radius)) + per-ring k-weights.
+
+    With ``ellipse_params=(a, b, theta_deg)`` the template follows the elliptical rings. ``None`` samples on
+    circles. Uses the same ``_polar_to_cartesian_offsets`` transform as the grid finder."""
+    phi = torch.linspace(0, 2 * np.pi, n_phi + 1, device=device)[:-1]
+    radii = torch.linspace(radial_min, radial_max, n_radial, device=device)
+    phi_grid, radius_grid = torch.meshgrid(phi, radii, indexing="ij")   # (n_phi, n_radial)
+    offset_row, offset_col = _polar_to_cartesian_offsets(
+        phi_grid, radius_grid, ellipse_params, device
+    )
+    ring_weights = radii**kpow                                          # (n_radial,)
+    return offset_row, offset_col, ring_weights
+
+
+def _local_polar_score(polar_values, valid_mask, n_phi, ring_weights, min_valid_frac):
+    """Angular-uniformity score from sampled polar values."""
+    n_valid = valid_mask.sum(dim=-2).clamp(min=1)              # (..., n_radial)
+    ring_mean = (polar_values * valid_mask).sum(dim=-2) / n_valid
+    ring_var = (((polar_values - ring_mean.unsqueeze(-2)) ** 2) * valid_mask).sum(dim=-2) / n_valid
+    ring_std = ring_var.sqrt()
+    ring_usable = valid_mask.sum(dim=-2) >= (min_valid_frac * n_phi)
+    weights = ring_weights * ring_usable
+    score = (weights * ring_std).sum(dim=-1) / ((weights * ring_mean.abs()).sum(dim=-1) + 1e-6)
+    return score, ring_usable
+
+
+def _local_score_pairs(patterns, pattern_index, centers, offset_row, offset_col,
+                       ring_weights, n_phi, device, min_valid_frac=0.5, chunk=4096):
+    """Score K (pattern, center) pairs: patterns[pattern_index[k]] scored at centers[k].
+
+    patterns:(M,H,W), pattern_index:(K,), centers:(K,2) -> (K,) angular-uniformity scores."""
+    _, n_row, n_col = patterns.shape
+    ones_image = torch.ones(1, 1, n_row, n_col, device=device)
+    scores = torch.empty(centers.shape[0], device=device)
+    for start in range(0, centers.shape[0], chunk):
+        index = pattern_index[start:start + chunk]
+        n_chunk = index.shape[0]
+        center_row = centers[start:start + chunk, 0][:, None, None]
+        center_col = centers[start:start + chunk, 1][:, None, None]
+        sample_grid = torch.stack(
+            [2.0 * (center_col + offset_col[None]) / (n_col - 1) - 1.0,
+             2.0 * (center_row + offset_row[None]) / (n_row - 1) - 1.0], dim=-1
+        )
+        polar_values = F.grid_sample(
+            patterns[index][:, None], sample_grid, mode="bilinear",
+            padding_mode="zeros", align_corners=True
+        )[:, 0]
+        valid_mask = F.grid_sample(
+            ones_image.expand(n_chunk, 1, n_row, n_col), sample_grid, mode="bilinear",
+            padding_mode="zeros", align_corners=True
+        )[:, 0] > 0.999
+        scores[start:start + n_chunk], _ = _local_polar_score(
+            polar_values, valid_mask, n_phi, ring_weights, min_valid_frac
+        )
+    return scores
+
+
+def _descend_batched(patterns, anchors, offset_row, offset_col, ring_weights, n_phi,
+                     n_radial, device, schedule=(4.0, 2.0, 1.0), sweeps=2):
+    """Batched coarse descent (shared step schedule, to 1 px) + quadratic sub-pixel.
+
+    Walks each pattern downhill on the angular-uniformity score from its integer
+    ``anchors`` center (Hooke-Jeeves 8-neighbor search, step halving over ``schedule``),
+    then fits a 2D quadratic to the local 3x3 for the sub-pixel vertex. Used for both
+    the global mean-DP anchor (a batch of one) and the per-position pass.
+
+    patterns : (M, H, W);  anchors : (M, 2) integer-valued start centers.
+    Returns (M, 2) sub-pixel (row, col) origins.
+    """
+    n_patterns = patterns.shape[0]
+    pattern_ids = torch.arange(n_patterns, device=device)
+    neighbor_steps = torch.tensor(_NEIGHBOR_STEPS_8, device=device)
+    patch_offsets = torch.tensor(_PATCH_OFFSETS_3X3, dtype=torch.float32, device=device)
+    pattern_ids_per_neighbor = pattern_ids.repeat_interleave(8)
+    pattern_ids_per_patch = pattern_ids.repeat_interleave(9)
+    center = anchors.clone()
+
+    def score_at(pattern_index, centers):
+        return _local_score_pairs(patterns, pattern_index, centers, offset_row, offset_col,
+                                  ring_weights, n_phi, device)
+
+    best_score = score_at(pattern_ids, center)
+    # Coarse descent: at each step size, move to the best-improving 8-neighbor; when no
+    # neighbor improves, halve the step. Brackets the minimum to ~1 px.
+    for step in schedule:
+        for _ in range(sweeps):
+            neighbors = (center[:, None, :] + step * neighbor_steps[None]).reshape(n_patterns * 8, 2)
+            neighbor_scores = score_at(pattern_ids_per_neighbor, neighbors).reshape(n_patterns, 8)
+            best_neighbor = neighbor_scores.argmin(dim=1)
+            best_neighbor_score = neighbor_scores.gather(1, best_neighbor[:, None]).squeeze(1)
+            improved = best_neighbor_score < best_score - 1e-12
+            best_neighbor_center = neighbors.reshape(n_patterns, 8, 2)[pattern_ids, best_neighbor]
+            center = torch.where(improved[:, None], best_neighbor_center, center)
+            best_score = torch.where(improved, best_neighbor_score, best_score)
+    # Re-center each 3x3 patch on its integer minimum so the quadratic brackets it.
+    patch_centers = (center[:, None, :] + patch_offsets[None]).reshape(n_patterns * 9, 2)
+    patch_scores = score_at(pattern_ids_per_patch, patch_centers).reshape(n_patterns, 9)
+    center = patch_centers.reshape(n_patterns, 9, 2)[pattern_ids, patch_scores.argmin(dim=1)]
+    # Sub-pixel vertex from a 2D-quadratic fit to the final 3x3 of scores.
+    patch_centers = (center[:, None, :] + patch_offsets[None]).reshape(n_patterns * 9, 2)
+    score_patch = score_at(pattern_ids_per_patch, patch_centers).reshape(n_patterns, 3, 3)
+    subpixel_offset = _quadratic_subpixel_offset(score_patch).to(torch.float32)
+    return center + subpixel_offset

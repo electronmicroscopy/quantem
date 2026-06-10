@@ -6,7 +6,11 @@ from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.diffraction.polar import PairDistributionFunction
-from quantem.diffraction.polar_transform import auto_origin_id, polar_transform
+from quantem.diffraction.polar_transform import (
+    find_origin_angular_descent,
+    find_origin_angular_grid,
+    polar_transform,
+)
 
 # ============================================================================
 # Fixtures
@@ -98,52 +102,105 @@ class TestPairDistributionFunctionConstruction:
         with pytest.raises(RuntimeError, match="Use PairDistributionFunction.from_data"):
             PairDistributionFunction(polar=pdf_valid.polar, device="cpu")
 
-    def test_find_origin(self, synthetic_4dstem_dataset):
-        """Test automatic origin finding."""
-        origin_array = auto_origin_id(
-            synthetic_4dstem_dataset,
-        )
-        assert origin_array.shape == (3, 3, 2)  # (scan_y, scan_x, 2)
-        expected_center = 127.5
-        for iy in range(3):
-            for ix in range(3):
-                row, col = origin_array[iy, ix]
-                assert abs(row - expected_center) < 1
-                assert abs(col - expected_center) < 1
+    def test_from_data_origin_method(self, synthetic_4dstem_dataset):
+        """from_data routes origin_method to the two finders and rejects bad values."""
+        for method in ("grid", "descent"):
+            pdf = PairDistributionFunction.from_data(
+                synthetic_4dstem_dataset, find_origin=True, origin_method=method
+            )
+            assert pdf.polar.shape[:2] == (3, 3)
+        with pytest.raises(ValueError, match="origin_method"):
+            PairDistributionFunction.from_data(
+                synthetic_4dstem_dataset, find_origin=True, origin_method="bogus"
+            )
 
-    def test_find_origin_subpixel(self):
-        """Origin finding recovers known fractional* centers to sub-pixel
-        precision."""
-        ny = nx = 128
 
-        def ring_pattern(cy, cx):
-            y, x = np.ogrid[:ny, :nx]
-            r = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
-            p = np.zeros((ny, nx), dtype=np.float32)
-            for radius in (12, 24, 36, 48):  # concentric rings
-                p += 100.0 * np.exp(-((r - radius) ** 2) / (2 * 2.0**2))
-            p += 1000.0 * np.exp(-(r**2) / (2 * 3.0**2))  # central beam
-            return p.astype(np.float32)
+@pytest.mark.parametrize("finder", [find_origin_angular_grid, find_origin_angular_descent])
+class TestOriginFinding:
+    """Shared coverage for both origin finders (``find_origin_angular_grid`` and ``find_origin_angular_descent``). Each test runs against both."""
 
-        # Distinct fractional centers, one per scan position (also tests batching).
-        true_centers = [(63.3, 64.7), (64.6, 63.4), (62.8, 65.2), (65.1, 62.9)]
-        arr = np.stack([ring_pattern(cy, cx) for cy, cx in true_centers]).reshape(
-            2, 2, ny, nx
-        )
-        ds = Dataset4dstem.from_array(
+    @staticmethod
+    def _ring_pattern(ny, nx, cy, cx, radii=(12, 24, 36, 48), beam_sigma=3.0):
+        """Concentric circular rings + a central beam, centered at (cy, cx)."""
+        y, x = np.ogrid[:ny, :nx]
+        r = np.sqrt((y - cy) ** 2 + (x - cx) ** 2)
+        p = np.zeros((ny, nx), dtype=np.float32)
+        for radius in radii:
+            p += 100.0 * np.exp(-((r - radius) ** 2) / (2 * 2.0**2))
+        p += 1000.0 * np.exp(-(r**2) / (2 * beam_sigma**2))
+        return p.astype(np.float32)
+
+    @staticmethod
+    def _wrap(arr):
+        return Dataset4dstem.from_array(
             array=arr,
-            name="subpix_origin",
+            name="origin_test",
             origin=(0, 0, 0, 0),
             sampling=(1.0, 1.0, 1.0, 1.0),
             units=["nm", "nm", "1/Angstrom", "1/Angstrom"],
             signal_units="counts",
         )
-        origins = auto_origin_id(ds, device="cpu")
+
+    def test_recovers_center(self, finder, synthetic_4dstem_dataset):
+        """Recovers the known center of the shared 3x3 fixture."""
+        origins = finder(synthetic_4dstem_dataset, radial_min=4, radial_max=50, device="cpu")
+        assert origins.shape == (3, 3, 2)
+        assert np.all(np.abs(origins - 127.5) < 0.5)
+
+    def test_subpixel(self, finder):
+        """Recovers distinct fractional centers to sub-pixel precision (also
+        exercises per-position batching)."""
+        ny = nx = 128
+        true_centers = [(63.3, 64.7), (64.6, 63.4), (62.8, 65.2), (65.1, 62.9)]
+        arr = np.stack(
+            [self._ring_pattern(ny, nx, cy, cx) for cy, cx in true_centers]
+        ).reshape(2, 2, ny, nx)
+        origins = finder(self._wrap(arr), radial_min=4, radial_max=54, device="cpu")
         assert origins.shape == (2, 2, 2)
         for k, (cy, cx) in enumerate(true_centers):
             row, col = origins[k // 2, k % 2]
             err = float(np.hypot(row - cy, col - cx))
             assert err < 0.1, f"sub-pixel origin off by {err:.3f} px at position {k}"
+
+    def test_small_detector(self, finder):
+        """Works on a small (64 px) detector -- the regime where the grid finder's
+        fixed search margin used to collapse the search annulus."""
+        ny = nx = 64
+        cy, cx = 30.4, 30.6
+        arr = self._ring_pattern(ny, nx, cy, cx, radii=(8, 16, 24))[None, None]
+        origins = finder(self._wrap(arr), radial_min=3, radial_max=28, device="cpu")
+        assert origins.shape == (1, 1, 2)
+        assert float(np.hypot(origins[0, 0, 0] - cy, origins[0, 0, 1] - cx)) < 0.3
+
+    def test_accepts_tensor_backed_input(self, finder):
+        """Runs on a tensor-backed dataset (whose .array is None)."""
+        arr = self._ring_pattern(128, 128, 64.0, 64.0)[None, None]
+        ds_t = Dataset4dstem.from_tensor(torch.from_numpy(arr))
+        assert ds_t.array is None  # tensor-backed
+        origins = finder(ds_t, radial_min=4, radial_max=54, device="cpu")
+        assert origins.shape == (1, 1, 2)
+        assert float(np.hypot(origins[0, 0, 0] - 64.0, origins[0, 0, 1] - 64.0)) < 0.3
+
+    def test_ellipse_params(self, finder):
+        """ellipse_params is accepted and the center is recovered on an elliptical
+        ring when the correct correction is supplied."""
+        ny = nx = 128
+        cy, cx, theta_deg = 64.3, 63.7, 25.0
+        theta = np.radians(theta_deg)
+        a, b, ring_r = 40 * np.sqrt(1.6), 40 / np.sqrt(1.6), 40.0
+        y, x = np.ogrid[:ny, :nx]
+        u_col, u_row = x - cx, y - cy
+        u_a = u_col * np.cos(theta) + u_row * np.sin(theta)
+        u_b = -u_col * np.sin(theta) + u_row * np.cos(theta)
+        r_ell = np.sqrt((u_a / a) ** 2 + (u_b / b) ** 2)
+        p = 300.0 * np.exp(-(((r_ell - 1) * ring_r) ** 2) / (2 * 4.0**2))
+        p += 1000.0 * np.exp(-(u_col**2 + u_row**2) / (2 * 3.0**2))
+        ds = self._wrap(p.astype(np.float32)[None, None])
+        origins = finder(
+            ds, ellipse_params=(a, b, theta_deg), radial_min=8, radial_max=58, device="cpu"
+        )
+        err = float(np.hypot(origins[0, 0, 0] - cy, origins[0, 0, 1] - cx))
+        assert err < 0.3, f"elliptical origin off by {err:.3f} px"
 
 
 # ============================================================================
@@ -233,14 +290,6 @@ class TestRadialMeanCalculation:
         ik_np = pdf_np.calculate_radial_mean(returnval=True).cpu().numpy()
         ik_t = pdf_t.calculate_radial_mean(returnval=True).cpu().numpy()
         assert np.allclose(ik_np, ik_t, rtol=1e-5, atol=1e-6)
-
-    def test_find_origin_accepts_tensor_backed_input(self, synthetic_4dstem_dataset):
-        """auto_origin_id works on a tensor-backed dataset (whose .array is None)."""
-        ds_t = Dataset4dstem.from_tensor(
-            torch.from_numpy(synthetic_4dstem_dataset.array.copy())
-        )
-        origin_array = auto_origin_id(ds_t)
-        assert origin_array.shape == (3, 3, 2)
 
 
 # ============================================================================
