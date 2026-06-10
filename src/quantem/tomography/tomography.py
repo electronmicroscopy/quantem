@@ -258,14 +258,13 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
                     prev_R = R_now.clone()
 
+            # One stacked all_reduce and one host sync instead of three of each.
+            losses = torch.stack([total_loss, consistency_loss, epoch_soft_constraint_loss])
             if self.world_size > 1:
-                dist.all_reduce(total_loss, dist.ReduceOp.AVG)
-                dist.all_reduce(consistency_loss, dist.ReduceOp.AVG)
-                dist.all_reduce(epoch_soft_constraint_loss, dist.ReduceOp.AVG)
-
-            total_loss = total_loss.item() / len(self.dataloader)
-            consistency_loss = consistency_loss.item() / len(self.dataloader)
-            epoch_soft_constraint_loss = epoch_soft_constraint_loss.item() / len(self.dataloader)
+                dist.all_reduce(losses, dist.ReduceOp.AVG)
+            total_loss, consistency_loss, epoch_soft_constraint_loss = (
+                losses / len(self.dataloader)
+            ).tolist()
 
             self.step_schedulers(loss=total_loss)
             # TODO: Maybe reorganize the losses so that the order makes sense lol.
