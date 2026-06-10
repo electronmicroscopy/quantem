@@ -61,6 +61,27 @@ class TestSIRT:
         assert tomo.num_epochs == 2
 
 
+class TestInlineAlignment:
+    def test_alignment_corrects_misaligned_projection(
+        self, phantom_volume, tilt_series, tilt_angles
+    ):
+        """Regression: the aligned measurement was written into proj_forward, which
+        radon_torch overwrites immediately, so inline_alignment was a no-op."""
+        n = phantom_volume.shape[0]
+        shifted_series = tilt_series.copy()
+        shifted_series[4] = np.roll(shifted_series[4], shift=3, axis=1)
+
+        reference = _build(tilt_series, tilt_angles, n).dset.tilt_stack[4]
+        tomo = _build(shifted_series, tilt_angles, n)
+        misaligned_before = tomo.dset.tilt_stack[4].clone()
+        tomo.reconstruct(num_iter=3, mode="sirt", inline_alignment=True)
+        aligned_after = tomo.dset.tilt_stack[4]
+
+        err_before = float(((misaligned_before - reference) ** 2).mean())
+        err_after = float(((aligned_after - reference) ** 2).mean())
+        assert err_after < err_before  # the stack was actually re-aligned
+
+
 class TestFBP:
     def test_fbp_runs_single_epoch(self, phantom_volume, tilt_series, tilt_angles):
         n = phantom_volume.shape[0]
