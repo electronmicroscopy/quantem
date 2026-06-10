@@ -148,6 +148,17 @@ class TestObjectPixelatedConstraints:
         obj.constraints.tv_vol = 0.0
         assert float(obj.apply_soft_constraints(ctx).detach()) == 0.0
 
+    def test_soft_constraint_with_tv_on_backprops(self):
+        # Regression: soft_loss was a leaf tensor with requires_grad=True, so the
+        # in-place `+= tv_loss` raised RuntimeError whenever tv_vol > 0.
+        ctx = ReconstructionContext(obj=torch.rand(8, 8, 8).requires_grad_(True))
+        obj = ObjectPixelated.from_uniform(shape=(8, 8, 8), device="cpu")
+        obj.constraints.tv_vol = 1.0
+        loss = obj.apply_soft_constraints(ctx)
+        assert torch.isfinite(loss) and loss > 0.0
+        loss.backward()
+        assert ctx.obj.grad is not None
+
 
 class TestFactoryGuard:
     def test_objectbase_requires_token(self):
