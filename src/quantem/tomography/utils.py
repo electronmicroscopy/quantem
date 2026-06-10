@@ -5,10 +5,13 @@ import torch.nn.functional as F
 
 
 def rot_ZXZ(mags, z1, x, z3, device, mode="bilinear"):
-    if not isinstance(x, torch.Tensor) or not isinstance(z1, torch.Tensor):
-        z1 = torch.tensor(z1, dtype=torch.float32, device=device)
-        x = torch.tensor(x, dtype=torch.float32, device=device)
-        z3 = torch.tensor(z3, dtype=torch.float32, device=device)
+    # Convert each angle independently: re-wrapping an existing tensor with
+    # torch.tensor() copies and detaches it, silently cutting gradient flow
+    # through tensor angles whenever any other angle is passed as a float.
+    z1, x, z3 = (
+        a if isinstance(a, torch.Tensor) else torch.tensor(a, dtype=torch.float32, device=device)
+        for a in (z1, x, z3)
+    )
     curr_mags = mags
 
     curr_mags = differentiable_rotz_vectorized(curr_mags, z1, mode)
