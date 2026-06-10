@@ -213,6 +213,22 @@ class TestINRRayMath:
         assert torch.allclose(d2.z1_params.detach(), d.z1_params.detach())
 
 
+@pytest.mark.parametrize("cls", [TomographyPixDataset, TomographyINRDataset])
+def test_to_preserves_trained_pose_parameters(cls):
+    """Regression: to() rebuilt the pose parameters from the initial-value buffers,
+    so any device move after training (e.g. from_file(...).to(device)) silently
+    reset the learned pose to zero."""
+    d = cls.from_data(_stack(), np.linspace(-60, 60, 5, dtype="f4"))
+    d.to("cpu")
+    d.z1_params.data.fill_(0.37)
+    d.z3_params.data.fill_(-0.21)
+    d.shifts_params.data.fill_(1.5)
+
+    d.to("cpu")
+
+    assert torch.allclose(d.z1_params.detach(), torch.full_like(d.z1_params, 0.37))
+    assert torch.allclose(d.z3_params.detach(), torch.full_like(d.z3_params, -0.21))
+    assert torch.allclose(d.shifts_params.detach(), torch.full_like(d.shifts_params, 1.5))
 def test_learnable_tilts_is_read_only():
     """Regression: the old setter wrote a private attribute the getter never read,
     so assignment appeared to succeed while silently doing nothing."""

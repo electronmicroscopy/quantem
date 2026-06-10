@@ -240,6 +240,21 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         """
         return {self.DEFAULT_OPTIMIZER_KEY: list(self.parameters())}
 
+    def _materialize_pose_parameters(self, device: str | torch.device):
+        """Create the learnable pose parameters, or move the existing ones.
+
+        Once the parameters exist, their *current* (possibly trained) values are
+        moved; the initial-value buffers are only used on first materialization.
+        Rebuilding from the buffers on every call silently reset learned poses
+        whenever the dataset changed device (e.g. ``from_file(...).to(device)``).
+        """
+        z1 = self._z1_params.data if hasattr(self, "_z1_params") else self._z1_angles
+        z3 = self._z3_params.data if hasattr(self, "_z3_params") else self._z3_angles
+        shifts = self._shifts_params.data if hasattr(self, "_shifts_params") else self._shifts
+        self._z1_params = nn.Parameter(z1.detach().to(device))
+        self._z3_params = nn.Parameter(z3.detach().to(device))
+        self._shifts_params = nn.Parameter(shifts.detach().to(device))
+
     # --- Forward pass ---
     @abstractmethod
     def forward(
@@ -428,9 +443,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         self.tilt_stack = self.tilt_stack.to(device)
         self.tilt_angles = self.tilt_angles.to(device)
 
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        self._materialize_pose_parameters(device)
 
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)
@@ -633,9 +646,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         return self.tilt_stack.shape[0] * self.tilt_stack.shape[1] * self.tilt_stack.shape[2]
 
     def to(self, device: torch.device | str):
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        self._materialize_pose_parameters(device)
 
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)

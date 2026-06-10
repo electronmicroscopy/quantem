@@ -200,6 +200,15 @@ class KPlanes(PPLR, TensorDecompositionModel):
         self.concat_features = concat_features
         self.density_activation = density_activation
 
+        # All three planes share one (3, C, res[1], res[0]) tensor, which ignores
+        # res[2]: an anisotropic resolution would silently give the XZ/YZ planes the
+        # wrong grid along z. Refuse it rather than misallocate.
+        if len(set(self.resolution)) != 1:
+            raise ValueError(
+                f"KPlanes currently requires an isotropic resolution, got {self.resolution}; "
+                "the plane grids are allocated as (res[1], res[0]) for all three axis pairs."
+            )
+
         self.grids = nn.ParameterList()
         self.feature_dim = 0
         for res_mult in self.multiscale_res_multipliers:
