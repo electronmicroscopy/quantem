@@ -566,7 +566,10 @@ class TomographyConventional(TomographyBase):
         if inline_alignment:
             for ind in range(len(self.dset.tilt_angles)):
                 im_proj = proj_forward[:, ind, :]
-                im_meas = self.dset.forward(ind).target  # type: ignore
+                # proj_forward rows are volume slices (the tilt axis), i.e. the
+                # transpose of the stored tilt image -- the same orientation the
+                # error term below compares against.
+                im_meas = self.dset.forward(ind).target.T  # type: ignore
                 shift = torch_phase_cross_correlation(im_proj, im_meas)
                 if torch.linalg.norm(shift) <= 32:
                     shifted = torch.fft.ifft2(
@@ -585,7 +588,11 @@ class TomographyConventional(TomographyBase):
                         )
                     ).real
 
-                    proj_forward[:, ind, :] = shifted
+                    # Persist the aligned measurement in the tilt stack: the error
+                    # term reads the stack, and proj_forward is overwritten by
+                    # radon_torch below, so writing the aligned image there
+                    # silently discarded the alignment.
+                    self.dset.tilt_stack[ind] = shifted.T
 
         if mode == "sirt" or mode == "fbp":
             proj_forward = radon_torch(
