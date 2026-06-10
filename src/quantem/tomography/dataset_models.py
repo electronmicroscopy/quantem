@@ -302,11 +302,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     @property
     def learnable_tilts(self) -> int:
+        # Derived from the tilt series (all tilts minus the fixed reference); there is
+        # deliberately no setter -- the old one wrote a private attribute this getter
+        # never read, so assignments appeared to succeed while doing nothing.
         return self.tilt_angles.shape[0] - 1
-
-    @learnable_tilts.setter
-    def learnable_tilts(self, learnable_tilts: int):
-        self._learnable_tilts = learnable_tilts
 
     @property
     def z1_params(self) -> torch.nn.Parameter:
