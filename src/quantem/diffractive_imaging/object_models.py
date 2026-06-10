@@ -396,6 +396,30 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
         return loss
 
     def _calc_tv_loss(self, array: torch.Tensor, weight: tuple[float, float]) -> torch.Tensor:
+        # Identical math via the fused quantem-cuda L1 kernel when available.
+        # Weighted size-1 axes fall through to torch so degenerate inputs
+        # behave exactly as before.
+        if (
+            array.ndim == 3
+            and array.is_cuda
+            and array.dtype == torch.float32
+            and config.get("has_quantem_cuda")
+            and config.get("use_cuda_kernels", default=True)
+            and not (weight[0] > 0 and array.shape[0] == 1)
+            and not (weight[1] > 0 and (array.shape[1] == 1 or array.shape[2] == 1))
+        ):
+            from quantem.cuda.core import tv_loss_l1_3d
+
+            s, h, w_ = array.shape
+            wts = array.new_tensor([weight[0], weight[1], weight[1]])
+            active = int((wts > 0).sum())
+            if active == 0:
+                return self._get_zero_loss_tensor()
+            counts = array.new_tensor(
+                [(s - 1) * h * w_, s * (h - 1) * w_, s * h * (w_ - 1)]
+            ).clamp(min=1)
+            return (wts * tv_loss_l1_3d(array) / counts).sum() / active
+
         loss = self._get_zero_loss_tensor()
         calc_dim = 0
         for dim in range(array.ndim):
