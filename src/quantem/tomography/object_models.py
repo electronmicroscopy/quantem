@@ -916,7 +916,7 @@ class ObjectTensorDecomp(ObjectINR):
         soft_loss = torch.tensor(
             0.0, device=ctx.pred.device if ctx.pred is not None else self.device
         )
-        if self.constraints.tv_vol > 0:
+        if self.constraints.tv_plane > 0 or self.constraints.tv_vol > 0:
             assert ctx.coords is not None, "Coordinates must be provided for TV loss"
             assert ctx.pred is not None, "Prediction must be provided for TV loss"
             soft_loss += self.get_tv_loss(ctx)
@@ -942,8 +942,10 @@ class ObjectTensorDecomp(ObjectINR):
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.tensor(0.0, device=ctx.pred.device)
-        tv_loss += self._get_plane_tv_loss()
-        tv_loss += self.get_volume_tv_loss(ctx.coords)
+        if self.constraints.tv_plane > 0:
+            tv_loss += self._get_plane_tv_loss()
+        if self.constraints.tv_vol > 0:
+            tv_loss += self.get_volume_tv_loss(ctx.coords)
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
@@ -976,6 +978,10 @@ class ObjectTensorDecomp(ObjectINR):
         Isotropic volume TV via finite differences. Same form as the autograd
         version (L1 of gradient L2-norm) but avoids double-backward, so it
         works for KPlanesTILTED, CPTilted, and anything else.
+
+        The four finite-difference taps (base, +x, +y, +z) are evaluated in a
+        single batched 4N-point model call rather than four separate calls —
+        identical math, one kernel-launch sequence and one autograd subgraph.
         """
         num_tv_samples = min(10_000, coords.shape[0])
         tv_indices = torch.randperm(coords.shape[0], device=coords.device)[:num_tv_samples]
@@ -984,24 +990,26 @@ class ObjectTensorDecomp(ObjectINR):
         model = _unwrap(self.model)
         h = 2.0 / min(model.resolution)
 
-        pred = model(tv_coords)
-        if isinstance(pred, tuple):
-            pred = pred[0]
-        if pred.dim() == 1:
-            pred = pred.unsqueeze(-1)  # (N, 1)
+        ex = torch.zeros(3, device=tv_coords.device)
+        ex[0] = h
+        ey = torch.zeros(3, device=tv_coords.device)
+        ey[1] = h
+        ez = torch.zeros(3, device=tv_coords.device)
+        ez[2] = h
 
-        grads = []
-        for axis in range(3):
-            offset = torch.zeros(3, device=tv_coords.device)
-            offset[axis] = h
-            shifted_pred = self.model(tv_coords + offset)
-            if isinstance(shifted_pred, tuple):
-                shifted_pred = shifted_pred[0]
-            if shifted_pred.dim() == 1:
-                shifted_pred = shifted_pred.unsqueeze(-1)
-            grads.append((shifted_pred - pred) / h)  # (N, 1)
+        batched = torch.cat(
+            [tv_coords, tv_coords + ex, tv_coords + ey, tv_coords + ez], dim=0
+        )  # (4N, 3)
+        batched_pred = model(batched)
+        if isinstance(batched_pred, tuple):
+            batched_pred = batched_pred[0]
+        if batched_pred.dim() == 1:
+            batched_pred = batched_pred.unsqueeze(-1)  # (4N, C)
 
-        grad_stack = torch.stack(grads, dim=-1)  # (N, C, 3)
+        pred, px, py, pz = batched_pred.chunk(4, dim=0)  # each (N, C)
+        grad_stack = torch.stack(
+            [(px - pred) / h, (py - pred) / h, (pz - pred) / h], dim=-1
+        )  # (N, C, 3)
         grad_norm = torch.norm(grad_stack, dim=-1)  # (N, C)
 
         return self.constraints.tv_vol * grad_norm.mean()
