@@ -638,8 +638,18 @@ class DPAugmentor(RNGMixin):
 
         qxc = self.yshift / (height*0.1) if self.add_shift else 0
         qyc = self.xshift / (width*0.1) if self.add_shift else 0
-        
-        CBEDbg = 1.0 / ((qx+qxc)**2 + (qy+qyc)**2 + self.bkg_q**2)  # Plasmon form factor: 1/(q² + q₀²)
+
+        qx_s = qx + qxc
+        qy_s = qy + qyc
+
+        if self.add_ellipticity:
+            det = max(self.exx * self.eyy - self.exy ** 2, 1e-6)
+            qx_t = (self.eyy * qx_s - self.exy * qy_s) / det
+            qy_t = (-self.exy * qx_s + self.exx * qy_s) / det
+            CBEDbg = 1.0 / (qx_t**2 + qy_t**2 + self.bkg_q**2)
+        else:
+            CBEDbg = 1.0 / (qx_s**2 + qy_s**2 + self.bkg_q**2)  # Plasmon form factor: 1/(q² + q₀²)
+
         CBEDbg = CBEDbg.squeeze() / af.sum(CBEDbg.squeeze())
 
         if probe is not None:
