@@ -283,6 +283,17 @@ class TestObjectTensorDecompTV:
         assert loss.ndim == 0
         assert torch.isfinite(loss)
 
+    def test_soft_constraints_plane_tv_only(self, torch_device):
+        """Regression: tv_plane > 0 with tv_vol = 0 must still apply the plane TV.
+        The gate previously keyed on tv_vol alone, silently dropping plane-only TV."""
+        obj = self._obj(torch_device)
+        obj.constraints.tv_plane = 0.1
+        obj.constraints.tv_vol = 0.0
+        coords = torch.rand(64, 3, device=torch_device) * 2 - 1
+        ctx = ReconstructionContext(coords=coords, pred=torch.zeros(64, device=torch_device))
+        loss = obj.apply_soft_constraints(ctx)
+        assert float(loss.detach()) > 0.0
+
     def test_normalize_optimizer_params_rejects_non_dict(self, torch_device):
         from quantem.core.ml.optimizer_mixin import OptimizerParams
 

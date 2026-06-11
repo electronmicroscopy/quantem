@@ -921,7 +921,7 @@ class ObjectTensorDecomp(ObjectINR):
         soft_loss = torch.tensor(
             0.0, device=ctx.pred.device if ctx.pred is not None else self.device
         )
-        if self.constraints.tv_vol > 0:
+        if self.constraints.tv_vol > 0 or self.constraints.tv_plane > 0:
             assert ctx.coords is not None, "Coordinates must be provided for TV loss"
             assert ctx.pred is not None, "Prediction must be provided for TV loss"
             soft_loss += self.get_tv_loss(ctx)
@@ -947,8 +947,10 @@ class ObjectTensorDecomp(ObjectINR):
         assert ctx.coords is not None, "Coordinates must be provided for TV loss"
         assert ctx.pred is not None, "Prediction must be provided for TV loss"
         tv_loss = torch.tensor(0.0, device=ctx.pred.device)
-        tv_loss += self._get_plane_tv_loss()
-        tv_loss += self.get_volume_tv_loss(ctx.coords)
+        if self.constraints.tv_plane > 0:
+            tv_loss = tv_loss + self._get_plane_tv_loss()
+        if self.constraints.tv_vol > 0:
+            tv_loss = tv_loss + self.get_volume_tv_loss(ctx.coords)
         return tv_loss
 
     def _get_plane_tv_loss(self) -> torch.Tensor:
