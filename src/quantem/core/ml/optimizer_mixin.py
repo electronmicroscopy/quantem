@@ -672,15 +672,11 @@ class OptimizerMixin:
         so each group's ``lr`` etc. overrides the optimizer-level default. ``NoneOptimizer`` must
         have been filtered out by the caller.
         """
-        # Fused Adam/AdamW runs the whole step in one CUDA kernel (~2x faster than the
-        # default foreach path on large grids, same update rule); only valid when every
-        # parameter lives on a CUDA device.
-        fused = all(p.is_cuda for group in param_groups for p in group["params"])
         match opt_params:
             case OptimizerParams.Adam():
-                return torch.optim.Adam(param_groups, fused=fused)
+                return torch.optim.Adam(param_groups)
             case OptimizerParams.AdamW():
-                return torch.optim.AdamW(param_groups, fused=fused)
+                return torch.optim.AdamW(param_groups)
             case OptimizerParams.SGD():
                 return torch.optim.SGD(param_groups)
             case OptimizerParams.NoneOptimizer():

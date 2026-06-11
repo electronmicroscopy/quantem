@@ -733,28 +733,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             "target_value": self.tilt_stack[projection_idx, pixel_i, pixel_j],  # tensor
         }
 
-    def __getitems__(self, indices: list[int]) -> dict:
-        """
-        Vectorized batch fetch. Torch's DataLoader calls this with the whole batch of
-        indices when it exists, replacing one Python ``__getitem__`` call (plus dict and
-        collate work) per item with a few tensor ops. Returns the already-collated batch;
-        the dataloader must use a passthrough collate_fn (see ``DDPMixin.setup_dataloader``).
-        """
-        idx = torch.as_tensor(indices, dtype=torch.long)
-        pixels_per_projection = self.tilt_stack.shape[1] * self.tilt_stack.shape[2]
-        projection_idx = idx // pixels_per_projection
-        remaining = idx % pixels_per_projection
-        pixel_i = remaining // self.tilt_stack.shape[2]
-        pixel_j = remaining % self.tilt_stack.shape[2]
-
-        return {
-            "projection_idx": projection_idx,
-            "pixel_i": pixel_i,
-            "pixel_j": pixel_j,
-            "phi": self.tilt_angles[projection_idx],
-            "target_value": self.tilt_stack[projection_idx, pixel_i, pixel_j],
-        }
-
     def __len__(
         self,
     ):

@@ -12,14 +12,6 @@ def worker_init_fn(worker_id):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
-def _passthrough_collate(batch):
-    """Identity collate for datasets whose ``__getitems__`` already returns the batch.
-
-    Module-level (not a lambda) so spawn-context dataloader workers can pickle it.
-    """
-    return batch
-
-
 class DDPMixin:
     """
     Class for setting up all distributed training.
@@ -105,12 +97,6 @@ class DDPMixin:
             val_sampler = None
             shuffle = True
 
-        # Datasets that implement __getitems__ return an already-collated batch from a
-        # single vectorized call; pair them with a passthrough collate. (Gate on the
-        # original dataset: random_split's Subset defines __getitems__ unconditionally
-        # but only delegates the batched form when the wrapped dataset has it.)
-        collate_fn = _passthrough_collate if hasattr(dataset, "__getitems__") else None
-
         train_dataloader = DataLoader(
             train_dataset,  # type: ignore[reportArgumentType] --> Torch datasets do not have a len method, but still works.
             batch_size=batch_size,
@@ -122,7 +108,6 @@ class DDPMixin:
             persistent_workers=persist,
             multiprocessing_context=mp_ctx,
             worker_init_fn=worker_init_fn,
-            collate_fn=collate_fn,
         )
 
         if val_dataset:
@@ -137,8 +122,8 @@ class DDPMixin:
                 persistent_workers=persist,
                 multiprocessing_context=mp_ctx,
                 worker_init_fn=worker_init_fn,
-                collate_fn=collate_fn,
             )
+            val_dataloader = val_dataloader
         else:
             val_dataloader = None
 
