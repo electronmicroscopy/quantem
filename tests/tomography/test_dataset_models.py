@@ -58,6 +58,20 @@ class TestTomographyPixDataset:
         q95 = torch.quantile(d.tilt_stack, 0.95)
         assert torch.isclose(q95, torch.tensor(1.0), atol=1e-4)
 
+    def test_sparse_stack_normalisation_stays_finite(self):
+        # >95% zeros makes the 95th quantile 0; normalisation must not divide
+        # by it (inf/NaN targets poison every parameter on the first backward).
+        stack = np.zeros((5, 12, 12), dtype=np.float32)
+        stack[:, 5:7, 5:7] = 10.0
+        d = TomographyPixDataset.from_data(stack, np.linspace(-60, 60, 5).astype(np.float32))
+        assert torch.isfinite(d.tilt_stack).all()
+        assert d.tilt_stack.max() > 0
+
+    def test_all_zero_stack_raises(self):
+        stack = np.zeros((5, 12, 12), dtype=np.float32)
+        with pytest.raises(ValueError):
+            TomographyPixDataset.from_data(stack, np.linspace(-60, 60, 5).astype(np.float32))
+
     def test_reference_idx_and_learnable_tilts(self):
         # negated angles -> [40, 15, -10, -35, -60]; smallest |angle| is index 2.
         angles = np.linspace(-40, 60, 5).astype(np.float32)
@@ -229,6 +243,8 @@ def test_to_preserves_trained_pose_parameters(cls):
     assert torch.allclose(d.z1_params.detach(), torch.full_like(d.z1_params, 0.37))
     assert torch.allclose(d.z3_params.detach(), torch.full_like(d.z3_params, -0.21))
     assert torch.allclose(d.shifts_params.detach(), torch.full_like(d.shifts_params, 1.5))
+
+
 def test_learnable_tilts_is_read_only():
     """Regression: the old setter wrote a private attribute the getter never read,
     so assignment appeared to succeed while silently doing nothing."""

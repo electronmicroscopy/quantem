@@ -189,6 +189,12 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
         max_val = torch.quantile(tilt_stack, 0.95)
+        # A sparse stack (>95% zeros) has a zero 95th quantile; dividing by it
+        # would turn the targets into inf/NaN and poison the first backward.
+        if max_val <= 0:
+            max_val = tilt_stack.abs().max()
+        if max_val <= 0:
+            raise ValueError("tilt_stack is all zeros; cannot normalize.")
 
         # Tilt stack normalization
         tilt_stack = tilt_stack / max_val
@@ -792,6 +798,13 @@ class TomographyINRPretrainDataset(Dataset):
             data_quantile = torch.quantile(sampled_data, 0.95)
         else:
             data_quantile = torch.quantile(data, 0.95)
+
+        # Same guard as TomographyDatasetBase: a >95%-zero target has a zero
+        # 95th quantile and would normalize to inf/NaN.
+        if data_quantile <= 0:
+            data_quantile = data.abs().max()
+        if data_quantile <= 0:
+            raise ValueError("pretrain_target is all zeros; cannot normalize.")
 
         data = data / data_quantile
         data = torch.permute(data, (0, 3, 2, 1))
