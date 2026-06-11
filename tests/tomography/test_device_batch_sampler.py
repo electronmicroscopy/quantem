@@ -27,9 +27,14 @@ def test_batches_match_getitem():
     for batch in sampler:
         for k in range(len(batch["target_value"])):
             item = dset[seen + k]
+            # __getitem__ returns plain ints for the index keys (cheaper than
+            # 0-d tensors); coerce before comparing against the batched tensors.
             for key in ("projection_idx", "pixel_i", "pixel_j", "phi", "target_value"):
                 torch.testing.assert_close(
-                    batch[key][k], item[key].to(batch[key].dtype), rtol=0, atol=0
+                    batch[key][k],
+                    torch.as_tensor(item[key], dtype=batch[key].dtype),
+                    rtol=0,
+                    atol=0,
                 )
         seen += len(batch["target_value"])
 
