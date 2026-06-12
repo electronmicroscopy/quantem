@@ -1,13 +1,11 @@
 from itertools import permutations, product
 from typing import Self
 
-import matplotlib.pyplot as plt
-import numpy as np
 from numpy.typing import NDArray
 import scipy.ndimage as ndi
 from scipy.spatial.transform import Rotation
-from scipy.ndimage import gaussian_filter
 import torch
+import torch.nn.functional as F
 
 from quantem.core.datastructures.dataset import Dataset
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
@@ -34,6 +32,7 @@ class DiffractionTomography(AutoSerialize):
         self,
         dataset: Dataset6d,
         _token: object | None = None,
+        # device: str | int = "cpu",
     ):
         if _token is not self._token:
             raise RuntimeError(
@@ -44,7 +43,6 @@ class DiffractionTomography(AutoSerialize):
         self.dataset = dataset
 
     @classmethod
-    #might need to change so that type is NDArray and not torch tensor then convert to torch tensor with torch.from_numpy()
     def from_array(
         cls,
         array: NDArray,
@@ -192,44 +190,69 @@ class DiffractionTomography(AutoSerialize):
     def _sample_complex_volume_trilinear(
         volume: torch.Tensor,
         coords: torch.Tensor,
-        mode: str = "grid-wrap",
-        device: str | int = "cpu",
     ) -> torch.Tensor:
-        """Sample a complex 3D volume with trilinear interpolation.
-        
-        Defaults to `mode='grid-wrap'` for FFT-periodic data: a length-N array
-        repeats with period N (samples 0 and N are identified). SciPy's older
-        `mode='wrap'` uses period N-1 instead, which leaks the central peak
-        asymmetrically when sampling tilted slices through the SF volume.
-        """
-        volume_np = volume.to(torch.complex128).detach().cpu().numpy()
-        coords_np = coords.detach().cpu().numpy()
-        
-        # for i in range(coords_np.shape[0]):
-        #     coords_np[i] = np.remainder(coords_np[i], volume_np.shape[i])
+        # separates volume into real and imaginary for coordinate mapping
+        # pads volume for trilinear interpolation in grid_sample
+        vol = volume.to(torch.complex64)
+        real = vol.real[None, None, ...]
+        imag = vol.imag[None, None, ...]
 
-        real_mapped = ndi.map_coordinates(
-            volume_np.real,
-            coords_np,
-            order=1,
-            mode=mode,
-        )
+        # puts grid in order (x,y,z) mapped between values (-1, 1) for grid_sample
+        Nz, Ny, Nx = volume.shape
+        z = coords[0]
+        y = coords[1]
+        x = coords[2]
 
-        imag_mapped = ndi.map_coordinates(
-            volume_np.imag,
-            coords_np,
-            order=1,
-            mode=mode
-        )
-        return (torch.from_numpy(real_mapped) + 1j * torch.from_numpy(imag_mapped)).to(device)
+        gx = 2.0 * (x / (Nx-1.0))-1.0
+        gy = 2.0 * (y / (Ny-1.0))-1.0
+        gz = 2.0 * (z / (Nz-1.0))-1.0
+
+        grid = torch.stack((gx,gy,gz), dim = -1)[None, None, ...]
+        map_real = F.grid_sample(real, grid, mode='bilinear', padding_mode='zeros',align_corners=True)
+        map_imag = F.grid_sample(imag, grid, mode='bilinear', padding_mode='zeros',align_corners=True)
+
+        return map_real + 1j * map_imag
+
+    #     volume: torch.Tensor,
+    #     coords: torch.Tensor,
+    #     mode: str = "grid-wrap",
+    #     device: str | int = "cpu",
+    # ) -> torch.Tensor:
+    #     """Sample a complex 3D volume with trilinear interpolation.
+        
+    #     Defaults to `mode='grid-wrap'` for FFT-periodic data: a length-N array
+    #     repeats with period N (samples 0 and N are identified). SciPy's older
+    #     `mode='wrap'` uses period N-1 instead, which leaks the central peak
+    #     asymmetrically when sampling tilted slices through the SF volume.
+    #     """
+    #     volume_np = volume.to(torch.complex128).detach().cpu().numpy()
+    #     coords_np = coords.detach().cpu().numpy()
+        
+    #     # for i in range(coords_np.shape[0]):
+    #     #     coords_np[i] = np.remainder(coords_np[i], volume_np.shape[i])
+
+    #     real_mapped = ndi.map_coordinates(
+    #         volume_np.real,
+    #         coords_np,
+    #         order=1,
+    #         mode=mode,
+    #     )
+
+    #     imag_mapped = ndi.map_coordinates(
+    #         volume_np.imag,
+    #         coords_np,
+    #         order=1,
+    #         mode=mode
+    #     )
+    #     return (torch.from_numpy(real_mapped) + 1j * torch.from_numpy(imag_mapped)).to(device)
 
     @classmethod
     def _rotate_complex_volume_zxz(
         cls,
-        volume: torch.tensor,
-        sampling: tuple[float, float, float] | list[float] | torch.tensor,
-        zxz: torch.tensor,
-    ) -> torch.tensor:
+        volume: torch.Tensor,
+        sampling: tuple[float, float, float] | list[float] | torch.Tensor,
+        zxz: torch.Tensor,
+    ) -> torch.Tensor:
         """Rotate a complex reciprocal-space volume using ZXZ Euler angles."""
         if volume.dim() != 3:
             raise ValueError(f"volume must be 3D, got ndim={volume.dim()}")
@@ -252,7 +275,7 @@ class DiffractionTomography(AutoSerialize):
             axis=0,
         )
 
-        return cls._sample_complex_volume_trilinear(volume, coords, mode="grid-wrap")
+        return cls._sample_complex_volume_trilinear(volume, coords)
 
     @staticmethod
     def _make_vacuum_sf(
@@ -305,7 +328,7 @@ class DiffractionTomography(AutoSerialize):
         dk = torch.tensor(diffraction_sampling, dtype=torch.float32)
         # Phase-grating convention: amplitudes are purely imaginary so that
         # `t ≈ 1 + i*phi` linearizes a unitary `exp(i*phi)` transmission.
-        amp_scale = 1j * torch.float32(phase_scale)
+        amp_scale = 1j * phase_scale
 
         rot = (
             Rotation.from_euler("zxz", torch.tensor(zxz_deg, dtype=torch.float32), degrees=True)
@@ -319,7 +342,7 @@ class DiffractionTomography(AutoSerialize):
             # symmetry equivalent vectors --> sorting for unique combinations/permutations
             vec_set = sorted(
                 {
-                    tuple(torch.multiply(sign, perm))
+                    tuple(torch.multiply(torch.tensor(sign), torch.tensor(perm)))
                     for perm in set(permutations(hkl.tolist()))
                     for sign in product((-1, 1), repeat=3)
                 }
@@ -450,7 +473,17 @@ class DiffractionTomography(AutoSerialize):
 
     @property
     def array(self) -> torch.Tensor:
-        return torch.tensor(self.dataset.array)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # device = torch.device(device)
+        cached = getattr(self, "_array_cache", None)
+
+        if cached is None or cached.device != device:
+            data = self.dataset.array
+            if not isinstance(data, torch.Tensor):
+                data = torch.from_numpy(data)
+                self._array_cache = data.to(device)
+        
+        return self._array_cache
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -503,21 +536,25 @@ class DiffractionTomography(AutoSerialize):
         wave each propagation step and never separately. There is no
         per-slice mask on the transmission step.
         """
-
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # device = torch.device(device)
         if prop_distance is None:
             prop_distance = self.dataset.sampling[2]
         self.prop_distance = prop_distance
         if shape is None:
             shape = self.diffraction_shape[:2]
         ku, kv = self._make_planar_reciprocal_grids(shape, self.dataset.sampling[3:5])
-        bare_prop = torch.exp(-1j * torch.pi * self.wavelength * (ku**2 + kv**2) * prop_distance)
+        ku = ku.to(device)
+        kv = kv.to(device)
+        bare_prop = (torch.exp(-1j * torch.pi * self.wavelength * (ku**2 + kv**2) * prop_distance)).to(device)
         self.antialias_mask = self._make_antialias_mask(
             shape = shape,
             sampling = self.dataset.sampling[3:5],
             fraction = antialias_fraction,
             softness = antialias_softness,
-        )
+        ).to(device)
         self.prop = bare_prop * self.antialias_mask
+        return self.prop
 
     @staticmethod
     def _make_antialias_mask(
@@ -599,10 +636,14 @@ class DiffractionTomography(AutoSerialize):
         sampling_3d: tuple[float, float, float] | list[float] | torch.Tensor,
         shape_3d: tuple[int, int, int] | list[int] | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         ku, kv = cls._make_planar_reciprocal_grids(shape_2d, sampling_2d)
         ku2, kv2 = torch.broadcast_tensors(ku, kv)
-        u_proj = torch.asarray(u_proj, dtype=torch.float32)
-        v_proj = torch.asarray(v_proj, dtype=torch.float32)
+        ku2 = ku2.to(device)
+        kv2 = kv2.to(device)
+        u_proj = torch.asarray(u_proj, dtype=torch.float32, device=device)
+        v_proj = torch.asarray(v_proj, dtype=torch.float32, device=device)
         k_xyz = ku2[..., None] * u_proj[None, None, :] + kv2[..., None] * v_proj[None, None, :]
 
         dk = torch.asarray(sampling_3d, dtype=torch.float32)
@@ -631,11 +672,12 @@ class DiffractionTomography(AutoSerialize):
         z-axis only — `t` covers `z = 0 .. shape[2] - 1` — so tilted rays that
         leave the (x, y) footprint still produce slices. Callers are
         expected to treat those out-of-footprint slices as vacuum."""
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         r0 = torch.asarray(position, dtype=torch.float32)
-        w_proj = torch.asarray(direction, dtype=torch.float32)
-        shape = torch.asarray(shape, dtype=torch.int32)
-        sampling = torch.asarray(sampling, dtype=torch.float32)
+        w_proj = torch.asarray(direction, dtype=torch.float32, device = device)
+        shape = torch.asarray(shape, dtype=torch.int32, device = device)
+        sampling = torch.asarray(sampling, dtype=torch.float32, device = device)
 
         if r0.shape != (3,):
             raise ValueError(f"position must have shape (3,), got {r0.shape}")
@@ -675,22 +717,25 @@ class DiffractionTomography(AutoSerialize):
         if n_max < n_min:
             return torch.empty((0, 3), dtype=torch.float32)
 
-        steps = torch.arange(n_min, n_max + 1, dtype=torch.float32)[:, None]
+        steps = torch.arange(n_min, n_max + 1, dtype=torch.float32, device=device)[:, None]
         return r0[None, :] + steps * dr[None, :]
 
     @staticmethod
     def _trilinear_real_weights(position: torch.Tensor) -> list[tuple[tuple[int, int, int], float]]:
         """Return real-space trilinear neighbors and weights for one sample position."""
-        base = torch.floor(position).to(torch.int32)
-        frac = position - base
-        weights: list[tuple[tuple[int, int, int], float]] = []
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        base = torch.asarray(torch.floor(position), dtype = torch.int32, device = device)
+        pos = torch.asarray(position, device = device)
+        frac = pos - base
+        weights: torch.Tensor[tuple[tuple[int, int, int], float]] = []
         for dx in range(2):
             wx = frac[0] if dx else 1.0 - frac[0]
             for dy in range(2):
                 wy = frac[1] if dy else 1.0 - frac[1]
                 for dz in range(2):
                     wz = frac[2] if dz else 1.0 - frac[2]
-                    weights.append(((base[0] + dx, base[1] + dy, base[2] + dz), (wx * wy * wz).to(torch.float32)))
+                    weights.append(((int(base[0] + dx), int(base[1] + dy), int(base[2] + dz)), float(wx * wy * wz)))
+                    # weights.append(((base[0] + dx, base[1] + dy, base[2] + dz), (wx * wy * wz).to(torch.float32)))
         return weights
 
     def forward_prop(
@@ -700,14 +745,17 @@ class DiffractionTomography(AutoSerialize):
         u_proj = (1,0,0),
         v_proj = (0,1,0),
         phase_only: bool = True,
-        
     ):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        Psi0 = torch.as_tensor(Psi0, device=device)
+        position = torch.as_tensor(position, device=device)
+
         # projection vectors
-        u_proj = torch.asarray(u_proj,dtype=torch.float32)
-        v_proj = torch.asarray(v_proj,dtype=torch.float32)
+        u_proj = torch.tensor(u_proj,dtype=torch.float32, device = device)
+        v_proj = torch.tensor(v_proj,dtype=torch.float32, device = device)
         u_proj /= torch.linalg.norm(u_proj)
         v_proj /= torch.linalg.norm(v_proj)
-        w_proj = torch.cross(u_proj,v_proj)
+        w_proj = torch.linalg.cross(u_proj,v_proj)
         if torch.isclose(torch.linalg.norm(w_proj), torch.tensor(0.0)):
             raise ValueError("u_proj and v_proj must not be parallel")
         w_proj /= torch.linalg.norm(w_proj)
@@ -715,7 +763,7 @@ class DiffractionTomography(AutoSerialize):
 
         # generate real space coordinates passing through volume
         if not hasattr(self, "prop_distance"):
-            self.make_prop()
+            self.make_prop().to(device)
 
         position = torch.asarray(position, dtype=torch.float32).squeeze()
         if position.shape != (3,):
@@ -747,7 +795,7 @@ class DiffractionTomography(AutoSerialize):
         )
 
         # multislice propagation through volume
-        material_mask = self._get_material_mask()
+        material_mask = self._get_material_mask().to(device)
         material_slice_cache = getattr(self, "_material_slice_cache", None)
         Nx, Ny, Nz = self.real_shape
         Psi = Psi0.clone()
@@ -759,7 +807,7 @@ class DiffractionTomography(AutoSerialize):
             # them instead of calling `ndi.map_coordinates`. Material slices
             # may be precomputed once per `simulate_4dstem` tilt and looked up
             # from `self._material_slice_cache`.
-            SF = torch.zeros(Psi0.shape, dtype=self.array.dtype)
+            SF = torch.zeros(Psi0.shape, dtype=self.array.dtype, device = device)
             weight_sum = 0.0
             for (ix, iy, iz), weight in self._trilinear_real_weights(r):
                 if weight == 0.0:
@@ -774,8 +822,7 @@ class DiffractionTomography(AutoSerialize):
                         SF += weight * self._sample_complex_volume_trilinear(
                             self.array[ix, iy, iz],
                             k_slice_coords,
-                            mode="grid-wrap",
-                        ).to(torch.float32)
+                        ).to(SF.dtype)
                 else:
                     SF[0,0] += weight
 
@@ -786,14 +833,14 @@ class DiffractionTomography(AutoSerialize):
                 # `t_2d = 1` in real space. The 6D SF is stored normalized
                 # (`SF[..., 0, 0, 0] = 1` for vacuum), so we scale by
                 # `num_pixels` here to recover that convention.
-                num_pixels = Psi.size
+                num_pixels = Psi.numel()          # total number of elements (Nx*Ny)
                 T_2d = num_pixels * SF
                 t_real = torch.fft.ifft2(T_2d)
                 if phase_only:
                     # Enforce a unitary phase-grating transmission: `|t| = 1`
                     # everywhere, so probe norm is preserved per slice.
                     # Vacuum still falls out as identity (angle(1) = 0).
-                    t_real = torch.exp(1j * torch.angle(t_real))
+                    t_real = (torch.exp(1j * torch.angle(t_real))).to(device)
                 Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t_real)
             # else: ray is outside the slab footprint at this slice — vacuum,
             # so skip transmission and only apply Fresnel propagation below.
@@ -802,8 +849,6 @@ class DiffractionTomography(AutoSerialize):
             # so it is applied as part of propagation and only at that step.
             if ind < len(r_all) - 1:
                 Psi *= self.prop
-            
-            
 
         return Psi
     
@@ -835,9 +880,9 @@ class DiffractionTomography(AutoSerialize):
         zxz_arr = self._resolve_zxz_deg(tilt_x_deg, zxz_deg)
         rot = Rotation.from_euler("zxz", zxz_arr, degrees=True)
         # Lab→sample mapping: apply the inverse rotation to lab basis vectors.
-        u_proj = rot.inv().apply(torch.tensor([1.0, 0.0, 0.0]))
-        v_proj = rot.inv().apply(torch.tensor([0.0, 1.0, 0.0]))
-        w_proj = torch.cross(u_proj, v_proj)
+        u_proj = torch.tensor(rot.inv().apply([1.0, 0.0, 0.0]))
+        v_proj = torch.tensor(rot.inv().apply([0.0, 1.0, 0.0]))
+        w_proj = torch.linalg.cross(u_proj, v_proj)
         w_norm = torch.linalg.norm(w_proj)
         if w_norm == 0:
             raise ValueError("u_proj and v_proj must not be parallel")
@@ -870,11 +915,19 @@ class DiffractionTomography(AutoSerialize):
         plane, and the beam is the lab z axis; both are expressed in the
         sample-fixed 6D coordinate system before forward propagation.
         """
-        zxz_arr = self._resolve_zxz_deg(tilt_x_deg, zxz_deg)
-        u_proj, v_proj, w_proj = self.projection_axes(zxz_deg=zxz_arr)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
 
-        scan_step_arr = torch.atleast_1d(torch.asarray(scan_step, dtype=torch.float32))
-        if scan_step_arr.size == 1:
+        zxz_arr = self._resolve_zxz_deg(tilt_x_deg, zxz_deg) #formats rotation angles
+        u_proj, v_proj, w_proj = self.projection_axes(zxz_deg=zxz_arr) #applies rotation matrix to basis vectors
+        u_proj = u_proj.to(device)
+        v_proj = v_proj.to(device)
+        w_proj = w_proj.to(device)
+
+
+        #verifies scan step available for each direction in xy
+        scan_step_arr = torch.atleast_1d(torch.asarray(scan_step, dtype=torch.float32, device = device))
+        if scan_step_arr.shape == (1,):
             scan_step_arr = torch.tensor([float(scan_step_arr[0])] * 2)
         if scan_step_arr.shape != (2,):
             raise ValueError(
@@ -885,17 +938,18 @@ class DiffractionTomography(AutoSerialize):
         if n_slow <= 0 or n_fast <= 0:
             raise ValueError(f"scan_shape must be positive, got {scan_shape}")
 
-        sampling3 = torch.asarray(self.dataset.sampling[:3], dtype=torch.float32)
-        real_shape = torch.asarray(self.array.shape[:3], dtype=torch.float32)
+        #real space sampling and shape
+        sampling3 = torch.asarray(self.dataset.sampling[:3], dtype=torch.float32, device = device)
+        real_shape = torch.asarray(self.array.shape[:3], dtype=torch.float32, device = device)
         if scan_origin is None:
             scan_origin_arr = (real_shape - 1) / 2.0 * sampling3
         else:
-            scan_origin_arr = torch.asarray(scan_origin, dtype=torch.float32)
+            scan_origin_arr = torch.asarray(scan_origin, dtype=torch.float32, device = device)
             if scan_origin_arr.shape != (3,):
                 raise ValueError(
                     f"scan_origin must have shape (3,), got {scan_origin_arr.shape}"
                 )
-
+        #setting output diffraction shape
         diff_shape = self.diffraction_shape
         if dp_shape is None:
             dp_shape_out = (int(diff_shape[0]), int(diff_shape[1]))
@@ -907,7 +961,7 @@ class DiffractionTomography(AutoSerialize):
             probe_k_max=probe_k_max,
             dp_shape=dp_shape_out,
             normalize=True,
-        )
+        ).to(device)
 
         # Initialize Fresnel propagator for the chosen DP shape.
         self.make_prop(shape=dp_shape_out)
@@ -928,29 +982,28 @@ class DiffractionTomography(AutoSerialize):
         slice_cache = torch.zeros(
             (Nx, Ny, Nz, dp_shape_out[0], dp_shape_out[1]),
             dtype=self.array.dtype,
+            device = device,
         )
         material_idx = torch.argwhere(material_mask)
         for ix, iy, iz in material_idx:
             slice_cache[ix, iy, iz] = self._sample_complex_volume_trilinear(
                 self.array[ix, iy, iz],
                 k_slice_coords,
-                mode="grid-wrap",
             )
         # Forward_prop will pick up this attribute through getattr.
         self._material_slice_cache = slice_cache
 
+        #centers coordinates in fast and slow scan directions --> 0 at center with pos/neg values
         out = torch.empty((n_slow, n_fast, dp_shape_out[0], dp_shape_out[1]), dtype=torch.float64)
         slow_centered = torch.arange(n_slow, dtype=torch.float32) - (n_slow - 1) / 2.0
         fast_centered = torch.arange(n_fast, dtype=torch.float32) - (n_fast - 1) / 2.0
 
-        rotate_detector = not torch.isclose(detector_rotation_deg, torch.tensor(0.0))
-
+        rotate_detector = not torch.isclose(torch.tensor(detector_rotation_deg), torch.tensor(0.0))
         if progress_desc is None:
             zxz_arr = self._resolve_zxz_deg(tilt_x_deg, zxz_deg)
             progress_desc = (
                 f"4D-STEM ZXZ=({zxz_arr[0]:+.1f}, {zxz_arr[1]:+.1f}, {zxz_arr[2]:+.1f}) deg"
             )
-
         n_total = n_slow * n_fast
         if progress_bar is not None:
             # Caller supplied a persistent tqdm bar — reset and relabel it.
@@ -971,7 +1024,7 @@ class DiffractionTomography(AutoSerialize):
         else:
             iterator = product(range(n_slow), range(n_fast))
             external_bar = None
-
+        
         for j, i in iterator:
             sv = slow_centered[j]
             su = fast_centered[i]
@@ -984,6 +1037,7 @@ class DiffractionTomography(AutoSerialize):
                 v_proj=v_proj,
                 phase_only=phase_only,
             )
+            # need to fix the rotation below
             dp = torch.abs(Psi) ** 2
             if rotate_detector:
                 dp_shifted = torch.fft.fftshift(dp)
@@ -1001,7 +1055,6 @@ class DiffractionTomography(AutoSerialize):
             out[j, i] = dp
             if external_bar is not None:
                 external_bar.update(1)
-
         if external_bar is not None:
             external_bar.refresh()
 
@@ -1016,7 +1069,6 @@ class DiffractionTomography(AutoSerialize):
             float(self.dataset.sampling[4]),
         )
         units4 = ("A", "A", "A^-1", "A^-1")
-
         dp = Dataset4dstem.from_array(
             array=out,
             name=name,
@@ -1025,7 +1077,6 @@ class DiffractionTomography(AutoSerialize):
             units=units4,
             signal_units=signal_units,
         )
-
         dp.metadata.update(
             {
                 "zxz_deg": tuple(float(v) for v in zxz_arr),
