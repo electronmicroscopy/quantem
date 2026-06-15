@@ -189,6 +189,12 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
         max_val = torch.quantile(tilt_stack, 0.95)
+        # A sparse stack (>95% zeros) has a zero 95th quantile; dividing by it
+        # would turn the targets into inf/NaN and poison the first backward.
+        if max_val <= 0:
+            max_val = tilt_stack.abs().max()
+        if max_val <= 0:
+            raise ValueError("tilt_stack is all zeros; cannot normalize.")
 
         # Tilt stack normalization
         tilt_stack = tilt_stack / max_val
@@ -239,6 +245,21 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         matching the ``dict[str, list[tensor]]`` contract the object models use.
         """
         return {self.DEFAULT_OPTIMIZER_KEY: list(self.parameters())}
+
+    def _materialize_pose_parameters(self, device: str | torch.device):
+        """Create the learnable pose parameters, or move the existing ones.
+
+        Once the parameters exist, their *current* (possibly trained) values are
+        moved; the initial-value buffers are only used on first materialization.
+        Rebuilding from the buffers on every call silently reset learned poses
+        whenever the dataset changed device (e.g. ``from_file(...).to(device)``).
+        """
+        z1 = self._z1_params.data if hasattr(self, "_z1_params") else self._z1_angles
+        z3 = self._z3_params.data if hasattr(self, "_z3_params") else self._z3_angles
+        shifts = self._shifts_params.data if hasattr(self, "_shifts_params") else self._shifts
+        self._z1_params = nn.Parameter(z1.detach().to(device))
+        self._z3_params = nn.Parameter(z3.detach().to(device))
+        self._shifts_params = nn.Parameter(shifts.detach().to(device))
 
     # --- Forward pass ---
     @abstractmethod
@@ -302,11 +323,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
     @property
     def learnable_tilts(self) -> int:
+        # Derived from the tilt series (all tilts minus the fixed reference); there is
+        # deliberately no setter -- the old one wrote a private attribute this getter
+        # never read, so assignments appeared to succeed while doing nothing.
         return self.tilt_angles.shape[0] - 1
-
-    @learnable_tilts.setter
-    def learnable_tilts(self, learnable_tilts: int):
-        self._learnable_tilts = learnable_tilts
 
     @property
     def z1_params(self) -> torch.nn.Parameter:
@@ -429,15 +449,103 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         self.tilt_stack = self.tilt_stack.to(device)
         self.tilt_angles = self.tilt_angles.to(device)
 
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        self._materialize_pose_parameters(device)
 
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)
         self._shifts_ref = self._shifts_ref.to(device)
 
         self.device = device
+
+
+class DeviceBatchSampler:
+    """Epoch iterator that builds INR training batches directly on a device.
+
+    Replaces the per-pixel DataLoader path: the tilt stack and angles are
+    made resident on ``device`` once, so producing a batch is index
+    arithmetic plus two tensor lookups instead of ``batch_size`` Python
+    ``__getitem__`` calls, a collate, and a host-to-device copy per step.
+    On a GPU this removes the CPU dataloader bottleneck entirely.
+
+    Yields the same batch dicts as ``TomographyINRDataset.__getitem__``
+    under a DataLoader collate (``projection_idx``, ``pixel_i``,
+    ``pixel_j``, ``phi``, ``target_value``), with the train loader's
+    ``drop_last=True`` semantics.
+
+    Distributed runs: pass ``rank``/``world_size`` and every rank derives
+    the *same* epoch permutation from ``seed + epoch`` (CPU generator, so
+    it is identical across ranks and reproducible), then takes an
+    equal-size contiguous shard — equal so per-rank batch counts match and
+    DDP gradient sync cannot hang on a ragged tail. The training loop's
+    ``sampler.set_epoch(epoch)`` drives reshuffling, exactly like
+    ``DistributedSampler``; without ``set_epoch`` the epoch advances
+    automatically on each ``__iter__``.
+    """
+
+    def __init__(
+        self,
+        dset: "TomographyINRDataset",
+        batch_size: int,
+        device: torch.device | str,
+        indices: torch.Tensor | None = None,
+        shuffle: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+    ):
+        self.batch_size = batch_size
+        self.device = torch.device(device)
+        self.shuffle = shuffle
+        self.rank = rank
+        self.world_size = world_size
+        self.seed = seed
+        self._epoch = 0
+        self._stack = dset.tilt_stack.to(self.device)
+        self._angles = dset.tilt_angles.to(self.device)
+        # __getitem__ decodes flat indices with shape[1] for both rows and
+        # columns; replicate it exactly.
+        self._s1 = dset.tilt_stack.shape[1]
+        self._s2 = dset.tilt_stack.shape[2]
+        if indices is None:
+            indices = torch.arange(len(dset), dtype=torch.int64)
+        self._indices = indices.to(self.device)
+        self._per_rank = len(self._indices) // world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used to seed this epoch's shared permutation."""
+        self._epoch = epoch
+
+    def __len__(self) -> int:
+        return self._per_rank // self.batch_size  # drop_last=True
+
+    def _epoch_shard(self) -> torch.Tensor:
+        idx = self._indices
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self._epoch)
+            perm = torch.randperm(len(idx), generator=g).to(self.device)
+            idx = idx[perm]
+            self._epoch += 1  # auto-advance; set_epoch overrides per epoch
+        if self.world_size > 1:
+            idx = idx[self.rank * self._per_rank : (self.rank + 1) * self._per_rank]
+        return idx
+
+    def __iter__(self):
+        idx = self._epoch_shard()
+        per_proj = self._s1 * self._s2
+        for k in range(len(self)):
+            sel = idx[k * self.batch_size : (k + 1) * self.batch_size]
+            proj = sel // per_proj
+            rem = sel - proj * per_proj
+            pixel_i = rem // self._s1
+            pixel_j = rem - pixel_i * self._s1
+            yield {
+                "projection_idx": proj,
+                "pixel_i": pixel_i,
+                "pixel_j": pixel_j,
+                "phi": self._angles[proj],
+                "target_value": self._stack[proj, pixel_i, pixel_j],
+            }
 
 
 class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
@@ -550,37 +658,37 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         shift_x_norm = (shifts[:, 0:1] * sampling_rate * 2) / (N - 1)
         shift_y_norm = (shifts[:, 1:2] * sampling_rate * 2) / (N - 1)
 
-        rays_x = rays[:, :, 0] - shift_x_norm
-        rays_y = rays[:, :, 1] - shift_y_norm
-        rays_z = rays[:, :, 2]
+        shifted = torch.stack(
+            [rays[:, :, 0] - shift_x_norm, rays[:, :, 1] - shift_y_norm, rays[:, :, 2]],
+            dim=2,
+        )
 
-        theta = torch.deg2rad(-z3).view(-1, 1)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
+        # Compose the three Euler rotations Rz(-z1) @ Rx(x) @ Rz(-z3) into a single
+        # (B, 3, 3) matrix and apply it with one batched matmul, instead of nine
+        # elementwise passes over the full (B, S) ray tensors.
+        a = torch.deg2rad(-z3).view(-1)
+        b = torch.deg2rad(x).view(-1)
+        g = torch.deg2rad(-z1).view(-1)
+        zero = torch.zeros_like(a)
+        one = torch.ones_like(a)
 
-        rays_x_rot1 = cos_t * rays_x - sin_t * rays_y
-        rays_y_rot1 = sin_t * rays_x + cos_t * rays_y
-        rays_z_rot1 = rays_z
+        cos_a, sin_a = torch.cos(a), torch.sin(a)
+        cos_b, sin_b = torch.cos(b), torch.sin(b)
+        cos_g, sin_g = torch.cos(g), torch.sin(g)
 
-        theta = torch.deg2rad(x).view(-1, 1)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
+        rot_a = torch.stack(
+            [cos_a, -sin_a, zero, sin_a, cos_a, zero, zero, zero, one], dim=-1
+        ).view(-1, 3, 3)
+        rot_b = torch.stack(
+            [one, zero, zero, zero, cos_b, -sin_b, zero, sin_b, cos_b], dim=-1
+        ).view(-1, 3, 3)
+        rot_g = torch.stack(
+            [cos_g, -sin_g, zero, sin_g, cos_g, zero, zero, zero, one], dim=-1
+        ).view(-1, 3, 3)
 
-        rays_x_rot2 = rays_x_rot1
-        rays_y_rot2 = cos_t * rays_y_rot1 - sin_t * rays_z_rot1
-        rays_z_rot2 = sin_t * rays_y_rot1 + cos_t * rays_z_rot1
+        rot = rot_g @ rot_b @ rot_a  # (B, 3, 3)
 
-        theta = torch.deg2rad(-z1).view(-1, 1)
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
-
-        rays_x_final = cos_t * rays_x_rot2 - sin_t * rays_y_rot2
-        rays_y_final = sin_t * rays_x_rot2 + cos_t * rays_y_rot2
-        rays_z_final = rays_z_rot2
-
-        transformed_rays = torch.stack([rays_x_final, rays_y_final, rays_z_final], dim=2)
-
-        return transformed_rays
+        return shifted @ rot.transpose(1, 2)
 
     @staticmethod
     @torch.compile(mode="reduce-overhead")
@@ -611,13 +719,16 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         projection_idx = actual_idx // (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
         remaining = actual_idx % (self.tilt_stack.shape[1] * self.tilt_stack.shape[2])
 
-        pixel_i = remaining // self.tilt_stack.shape[1]
-        pixel_j = remaining % self.tilt_stack.shape[1]
+        pixel_i = remaining // self.tilt_stack.shape[2]
+        pixel_j = remaining % self.tilt_stack.shape[2]
 
+        # Plain ints for the index fields: default_collate builds one int64 tensor per
+        # batch either way, but wrapping each index in torch.tensor() here allocates
+        # three scalar tensors per item on the dataloader hot path.
         return {
-            "projection_idx": torch.tensor(projection_idx),
-            "pixel_i": torch.tensor(pixel_i),
-            "pixel_j": torch.tensor(pixel_j),
+            "projection_idx": projection_idx,
+            "pixel_i": pixel_i,
+            "pixel_j": pixel_j,
             "phi": self.tilt_angles[projection_idx],  # tensor
             "target_value": self.tilt_stack[projection_idx, pixel_i, pixel_j],  # tensor
         }
@@ -628,13 +739,10 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         """
         Returns the number of pixels in the tilt stack.
         """
-        N = max(self.tilt_stack.shape)
-        return self.tilt_stack.shape[0] * N * N
+        return self.tilt_stack.shape[0] * self.tilt_stack.shape[1] * self.tilt_stack.shape[2]
 
     def to(self, device: torch.device | str):
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        self._materialize_pose_parameters(device)
 
         self._z1_ref = self._z1_ref.to(device)
         self._z3_ref = self._z3_ref.to(device)
@@ -690,6 +798,13 @@ class TomographyINRPretrainDataset(Dataset):
             data_quantile = torch.quantile(sampled_data, 0.95)
         else:
             data_quantile = torch.quantile(data, 0.95)
+
+        # Same guard as TomographyDatasetBase: a >95%-zero target has a zero
+        # 95th quantile and would normalize to inf/NaN.
+        if data_quantile <= 0:
+            data_quantile = data.abs().max()
+        if data_quantile <= 0:
+            raise ValueError("pretrain_target is all zeros; cannot normalize.")
 
         data = data / data_quantile
         data = torch.permute(data, (0, 3, 2, 1))
