@@ -265,6 +265,22 @@ class DPAugmentor(RNGMixin):
         self.add_gaussian_noise = add_gaussian_noise
         self.gaussian_noise_mu = gaussian_noise_mu
         self.gaussian_noise_std = gaussian_noise_std
+        self.gaussian_noise_profiles = gaussian_noise_profiles
+        self._bkg_weight_spec = bkg_weight
+        self._bkg_q_spec = bkg_q
+        self._e_dose_spec = e_dose
+        self._xshift_spec = xshift
+        self._yshift_spec = yshift
+        self._ellipticity_scale_spec = ellipticity_scale
+        self._salt_and_pepper_spec = salt_and_pepper
+        self._gaussian_noise_mu_spec = gaussian_noise_mu
+        self._gaussian_noise_std_spec = gaussian_noise_std
+        self._gaussian_noise_profiles_spec = gaussian_noise_profiles
+        self._scale_spec = scale_factor
+        self._blur_spec = blur_sigma
+        self._rotation_range_spec = rotation_range
+        self._radius_factor_spec = radius_factor
+        self._aperture_shift_spec = aperture_shift
         self._gaussian_noise_profiles = self._check_gaussian_noise_profiles(
             gaussian_noise_profiles
         )
