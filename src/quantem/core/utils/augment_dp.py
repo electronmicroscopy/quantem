@@ -43,10 +43,6 @@ class DPAugmentor(RNGMixin):
         add_salt_and_pepper: bool = False,
         salt_and_pepper: list[float] | float | list[dict] = [0, 5e-4],
         add_gaussian_noise: bool = False,
-<<<<<<< Updated upstream
-=======
-        gaussian_noise_profiles: list[dict] | None = None,
->>>>>>> Stashed changes
         gaussian_noise_mu: list[float] | float | list[dict] = 0.0,
         gaussian_noise_std: list[float] | float | list[dict] = 1e-5,
         add_scale: bool = False,
@@ -59,12 +55,10 @@ class DPAugmentor(RNGMixin):
         log_file: os.PathLike | None = None,
         rng: np.random.Generator | int | None = None,
         device: str = "cpu",
-<<<<<<< Updated upstream
         add_aperture: bool = False,
         radius_factor: list[float] | float | list[dict] = [0.8, 1],
         aperture_shift: list[float] | float | list[dict] = [0, 10],
-=======
->>>>>>> Stashed changes
+        gaussian_noise_profiles: list[dict] | None = None,
     ):
         """
         Initialize diffraction pattern augmentor with configurable transformations.
@@ -113,6 +107,10 @@ class DPAugmentor(RNGMixin):
         gaussian_noise_std : list[float] | float | list[dict], defualt=1e-5
             Standard deviation for gaussian noise distribution.
             Scaled by electron dose. So value of 0.1 represents std. dev. = 10% of electron dose.
+        gaussian_noise_profiles : list[dict] | None, default=None
+            Optional weighted profiles for coupled Gaussian noise parameters. Each
+            entry should have weight, mu, and std fields, where mu/std can be
+            scalars or ranges. If provided, profiles override gaussian_noise_mu/std.
 
         add_scale : bool, default=False
             Enable uniform scaling of the diffraction pattern.
@@ -139,7 +137,6 @@ class DPAugmentor(RNGMixin):
         device : str, default="cpu"
             Device for computations ("cpu", "cuda", "cuda:0", etc.).
 
-<<<<<<< Updated upstream
         add_aperture : bool, default=False
             Enable circular aperture mask to simulate objective aperture effects.
         radius_factor : list[float] | float | list[dict], default=[0.8, 1]
@@ -150,16 +147,13 @@ class DPAugmentor(RNGMixin):
             Range for random shift of aperture center in pixels (applied with random sign
             to both x and y). Simulates misalignment of the objective aperture.
         
-=======
->>>>>>> Stashed changes
         Notes
         -----
-        - Augmentations are applied in order: flipshift → elastic → background →
+        - Augmentations are applied in order: flipshift → background → elastic →
           shot noise → blur → salt & pepper
         - For labels, only geometric transforms (flipshift, elastic) are applied
         - Ellipticity creates anisotropic scaling via exx, eyy, exy parameters
         - All ranges can be single values, val, or [min, max] for uniform sampling
-<<<<<<< Updated upstream
         - Additionally, any numeric parameter can be given as a weighted mixture of
           ranges/scalars, so different ranges can be sampled with different
           probabilities:
@@ -168,48 +162,43 @@ class DPAugmentor(RNGMixin):
           For each augmentation a mixture component is chosen proportional to its
           weight (weights need only be nonnegative with a positive sum), then a
           value is drawn uniformly from that component's range.
-=======
-        - Scalar/range parameters also accept weighted mixtures:
-            [{"weight": w, "value": val_or_range}, ...]
-        - Gaussian noise can be coupled using gaussian_noise_profiles:
-            [{"weight": w, "mu": val_or_range, "std": val_or_range}, ...]
-          If gaussian_noise_profiles is provided, it overrides gaussian_noise_mu/std.
->>>>>>> Stashed changes
+        - Gaussian noise can also be sampled from coupled weighted profiles:
+              [{"weight": w0, "mu": [min0, max0], "std": scalar0}, ...]
         """
         super().__init__(rng=rng)
         self._setup_device(device)
         self.log_file = log_file
 
-        # Setting parameters
-        self.add_bkg = add_bkg
-        self.add_shot = add_shot
-        self.add_shift = add_shift
-        self.add_ellipticity = add_ellipticity
-        self.add_ellipticity_to_label = add_ellipticity_to_label or []
-        self.add_salt_and_pepper = add_salt_and_pepper
-        self.add_gaussian_noise = add_gaussian_noise
-        self._gaussian_noise_mu_spec = gaussian_noise_mu
-        self._gaussian_noise_std_spec = gaussian_noise_std
-        self._gaussian_noise_profiles = gaussian_noise_profiles
-        self.add_scale = add_scale
-        self.add_blur = add_blur
-        self.add_flipshift = add_flipshift
-
-        self._bkg_weight_spec = bkg_weight
-        self._bkg_q_spec = bkg_q
-        self.apply_background_to_label = apply_background_to_label
-        self._e_dose_spec = e_dose
-        self._xshift_spec = xshift
-        self._yshift_spec = yshift
-        self._ellipticity_scale_spec = ellipticity_scale
-        self._salt_and_pepper_spec = salt_and_pepper
-        self._scale_spec = scale_factor
-        self._blur_spec = blur_sigma
-
-        self.free_rotation = free_rotation
-        self._rotation_range_spec = rotation_range
-
-        # Generate parameters from set parameters
+        self.set_params(
+            add_bkg,
+            bkg_weight,
+            bkg_q,
+            apply_background_to_label,
+            add_shot,
+            e_dose,
+            add_shift,
+            xshift,
+            yshift,
+            add_ellipticity,
+            ellipticity_scale,
+            add_ellipticity_to_label,
+            add_salt_and_pepper,
+            salt_and_pepper,
+            add_gaussian_noise,
+            gaussian_noise_mu,
+            gaussian_noise_std,
+            add_scale,
+            scale_factor,
+            add_blur,
+            blur_sigma,
+            add_flipshift,
+            free_rotation,
+            rotation_range,
+            add_aperture,
+            radius_factor,
+            aperture_shift,
+            gaussian_noise_profiles=gaussian_noise_profiles,
+        )
         self.generate_params()
         self._init_log_file()
 
@@ -235,10 +224,7 @@ class DPAugmentor(RNGMixin):
                     "rotation_angle,blur_sigma,salt_and_pepper,rng_seed\n"
                 )
 
-    def _is_weighted_spec(self, inp) -> bool:
-        return isinstance(inp, list) and len(inp) > 0 and isinstance(inp[0], dict)
 
-<<<<<<< Updated upstream
     def set_params(
         self,
         add_bkg: bool = False,
@@ -268,6 +254,7 @@ class DPAugmentor(RNGMixin):
         add_aperture: bool = False,
         radius_factor: list[float] | float | list[dict] = [0.8, 1],
         aperture_shift: list[float] | float | list[dict] = [0, 10],
+        gaussian_noise_profiles: list[dict] | None = None,
     ) -> None:
         self.add_bkg = add_bkg
         self.add_shot = add_shot
@@ -278,6 +265,9 @@ class DPAugmentor(RNGMixin):
         self.add_gaussian_noise = add_gaussian_noise
         self.gaussian_noise_mu = gaussian_noise_mu
         self.gaussian_noise_std = gaussian_noise_std
+        self._gaussian_noise_profiles = self._check_gaussian_noise_profiles(
+            gaussian_noise_profiles
+        )
         self.add_scale = add_scale
         self.add_blur = add_blur
         self.add_flipshift = add_flipshift
@@ -323,8 +313,13 @@ class DPAugmentor(RNGMixin):
         self._generate_flipshift_params()
 
         if self.add_gaussian_noise:
-            self.gaussian_noise_mu = self._sample(self._gaussian_noise_mu_range)
-            self.gaussian_noise_std = self._sample(self._gaussian_noise_std_range)
+            if self._gaussian_noise_profiles is not None:
+                self.gaussian_noise_mu, self.gaussian_noise_std = (
+                    self._sample_gaussian_noise_profile()
+                )
+            else:
+                self.gaussian_noise_mu = self._sample(self._gaussian_noise_mu_range)
+                self.gaussian_noise_std = self._sample(self._gaussian_noise_std_range)
         else:
             self.gaussian_noise_mu = 0.0
             self.gaussian_noise_std = 0.0
@@ -336,70 +331,8 @@ class DPAugmentor(RNGMixin):
 
         if self.add_aperture:
             self.radius_factor = self._sample(self._radius_range)
-=======
-    def _sample_from_spec(self, spec, *, context: str) -> float:
-        if self._is_weighted_spec(spec):
-            weights = np.array([float(d.get("weight", 1.0)) for d in spec], dtype=np.float64)
-            if np.any(weights < 0) or not np.isfinite(weights).all():
-                raise ValueError(f"{context}: weights must be finite and nonnegative. Got: {weights}")
-            s = float(weights.sum())
-            if s <= 0:
-                raise ValueError(f"{context}: weights must sum to > 0. Got sum={s}")
-            probs = weights / s
-            idx = int(self.rng.choice(len(spec), p=probs))
-            chosen = spec[idx]
-            if "value" not in chosen:
-                raise ValueError(f"{context}: weighted entry missing 'value': {chosen}")
-            return float(self.rng.uniform(*self._check_input(chosen["value"])))
-        return float(self.rng.uniform(*self._check_input(spec)))
-
-    def _choose_weighted_profile(self, profiles: list[dict], *, context: str) -> dict:
-        if len(profiles) == 0:
-            raise ValueError(f"{context}: gaussian_noise_profiles is empty")
-        weights = np.array([float(p.get("weight", 1.0)) for p in profiles], dtype=np.float64)
-        if np.any(weights < 0) or not np.isfinite(weights).all():
-            raise ValueError(f"{context}: weights must be finite and nonnegative. Got: {weights}")
-        s = float(weights.sum())
-        if s <= 0:
-            raise ValueError(f"{context}: weights must sum to > 0. Got sum={s}")
-        probs = weights / s
-        idx = int(self.rng.choice(len(profiles), p=probs))
-        prof = profiles[idx]
-        if "mu" not in prof or "std" not in prof:
-            raise ValueError(f"{context}: each profile must include 'mu' and 'std'. Got: {prof}")
-        return prof
-
-    def generate_params(self) -> None:
-        if self.add_bkg:
-            self.bkg_weight = self._sample_from_spec(self._bkg_weight_spec, context="bkg_weight")
-            self.bkg_q = self._sample_from_spec(self._bkg_q_spec, context="bkg_q")
         else:
-            self.bkg_weight = 0
-            self.bkg_q = 0
-
-        self.e_dose = self._sample_from_spec(self._e_dose_spec, context="e_dose") if self.add_shot else np.inf
-        self.salt_and_pepper = self._sample_from_spec(self._salt_and_pepper_spec, context="salt_and_pepper") if self.add_salt_and_pepper else 0
-        self.blur_sigma = self._sample_from_spec(self._blur_spec, context="blur_sigma") if self.add_blur else 0
-        self.xshift = self._sample_from_spec(self._xshift_spec, context="xshift") * self.rng.choice([1, -1]) if self.add_shift else 0
-        self.yshift = self._sample_from_spec(self._yshift_spec, context="yshift") * self.rng.choice([1, -1]) if self.add_shift else 0
-
-        self._generate_ellipticity_params()
-        self._generate_flipshift_params()
-
-        self.scale_factor = self._sample_from_spec(self._scale_spec, context="scale_factor") if self.add_scale else 0
-
-        if self.add_gaussian_noise:
-            if self._gaussian_noise_profiles is not None:
-                prof = self._choose_weighted_profile(self._gaussian_noise_profiles, context="gaussian_noise_profiles")
-                self.gaussian_noise_mu = float(self.rng.uniform(*self._check_input(prof["mu"])))
-                self.gaussian_noise_std = float(self.rng.uniform(*self._check_input(prof["std"])))
-            else:
-                self.gaussian_noise_mu = self._sample_from_spec(self._gaussian_noise_mu_spec, context="gaussian_noise_mu")
-                self.gaussian_noise_std = self._sample_from_spec(self._gaussian_noise_std_spec, context="gaussian_noise_std")
->>>>>>> Stashed changes
-        else:
-            self.gaussian_noise_mu = 0.0
-            self.gaussian_noise_std = 0.0
+            self.radius_factor = 0
 
     def _uniform_or_zero(self, range_vals: list, enabled: bool) -> float:
         return self._sample(range_vals) if enabled else 0
@@ -414,11 +347,7 @@ class DPAugmentor(RNGMixin):
 
     def _generate_ellipticity_params(self) -> None:
         if self.add_ellipticity:
-<<<<<<< Updated upstream
             self.ellipticity_scale = self._sample(self._ellipticity_scale_range)
-=======
-            self.ellipticity_scale = self._sample_from_spec(self._ellipticity_scale_spec, context="ellipticity_scale")
->>>>>>> Stashed changes
             exx = self.rng.normal(loc=1, scale=self.ellipticity_scale)
             eyy = self.rng.normal(loc=1, scale=self.ellipticity_scale)
             mval = (exx + eyy) / 2  # Normalize to preserve area
@@ -438,11 +367,7 @@ class DPAugmentor(RNGMixin):
 
             # Always apply rotation when flipshift is enabled
             if self.free_rotation:
-<<<<<<< Updated upstream
                 self.rotation_angle = self._sample(self._rotation_range)
-=======
-                self.rotation_angle = self._sample_from_spec(self._rotation_range_spec, context="rotation_range")
->>>>>>> Stashed changes
             else:
                 self.rotation_angle = self.rng.choice([0, 90, 180, 270])
         else:
@@ -474,7 +399,11 @@ class DPAugmentor(RNGMixin):
                 f"Flip: H={self.flip_horizontal}, V={self.flip_vertical}, Rot: {self.rotation_angle:.1f}°",
             ),
             ("Salt & pepper", self.add_salt_and_pepper, f"Amount: {self.salt_and_pepper:.2e}"),
-            ("Gaussian noise", self.add_gaussian_noise, f"Mean: {self.gaussian_noise_mu:.2e}", f"Std: {self.gaussian_noise_std:.2e}"),
+            (
+                "Gaussian noise",
+                self.add_gaussian_noise,
+                f"Mean: {self.gaussian_noise_mu:.2e}, Std: {self.gaussian_noise_std:.2e}",
+            ),
             ("Gaussian blur", self.add_blur, f"Sigma: {self.blur_sigma:.2f}"),
         ]
 
@@ -526,7 +455,7 @@ class DPAugmentor(RNGMixin):
         if probe_stack is not None and probe_stack.shape[0] != batch_size:
             raise ValueError(f"Probe stack size {probe_stack.shape[0]} != DP size {batch_size}")
         # Make exception for batch_size of 1
-        if batch_size == 1 and len(label_stack.shape) == 3:
+        if label_stack is not None and batch_size == 1 and len(label_stack.shape) == 3:
             pass
         elif label_stack is not None and label_stack.shape[0] != batch_size:
             raise ValueError(f"Label stack size {label_stack.shape[0]} != DP size {batch_size}")
@@ -611,6 +540,8 @@ class DPAugmentor(RNGMixin):
                     if len(transformed_label.shape) == 3:
                         transformed_label = self._apply_bkg_to_multichannel_label(transformed_label, probe)
         
+        if self.add_aperture: # currently input can only be Tensor
+            result = self._apply_aperture(result)
         if self.add_shot:
             result = self._apply_shot(result)
         if self.add_gaussian_noise:
@@ -711,6 +642,23 @@ class DPAugmentor(RNGMixin):
             image = (image - offset) / (image - offset).sum()
             return self.rng.poisson(image * self.e_dose) + offset
 
+    def _apply_aperture(self, inputs: "torch.Tensor") -> "torch.Tensor":
+        height, width = inputs.shape
+        device = inputs.device
+        y, x = torch.meshgrid(
+            torch.arange(height, dtype=torch.float32, device=device),
+            torch.arange(width, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+        y_center, x_center = height // 2, width // 2
+        y = y.clone() - y_center + self.yshiftapt
+        x = x.clone() - x_center + self.xshiftapt
+        r = torch.sqrt(x**2+y**2)
+
+        aperture_mask = (r <= self.radius_factor*np.sqrt(y_center**2+x_center**2)).float()
+        output = inputs * aperture_mask
+        return output
+
     def _apply_elastic(self, inputs: ArrayLike) -> ArrayLike:
         """Apply elastic transformations (scaling, translation)"""
         if self.use_torch:
@@ -777,14 +725,14 @@ class DPAugmentor(RNGMixin):
         qx = af.view(af.sort(af.fftfreq(height, 0.1, like=inputs), axis=0), (-1, 1))
         qy = af.view(af.sort(af.fftfreq(width, 0.1, like=inputs), axis=0), (1, -1))
 
-        qxc = self.yshift / (height*0.1) if self.add_shift else 0
-        qyc = self.xshift / (width*0.1) if self.add_shift else 0
+        qxc = self.yshift / (height * 0.1) if self.add_shift else 0
+        qyc = self.xshift / (width * 0.1) if self.add_shift else 0
 
         qx_s = qx + qxc
         qy_s = qy + qyc
 
         if self.add_ellipticity:
-            det = max(self.exx * self.eyy - self.exy ** 2, 1e-6)
+            det = max(self.exx * self.eyy - self.exy**2, 1e-6)
             qx_t = (self.eyy * qx_s - self.exy * qy_s) / det
             qy_t = (-self.exy * qx_s + self.exx * qy_s) / det
             CBEDbg = 1.0 / (qx_t**2 + qy_t**2 + self.bkg_q**2)
@@ -930,6 +878,44 @@ class DPAugmentor(RNGMixin):
         return float(inp), float(inp)
 
     @staticmethod
+    def _check_gaussian_noise_profiles(profiles: list[dict] | None):
+        if profiles is None:
+            return None
+        if not isinstance(profiles, list) or len(profiles) == 0:
+            raise ValueError("gaussian_noise_profiles must be a non-empty list of dicts.")
+
+        checked = []
+        weights = []
+        for i, profile in enumerate(profiles):
+            if not isinstance(profile, dict):
+                raise ValueError(
+                    f"Gaussian noise profile entries must be dicts; got {type(profile)} at index {i}"
+                )
+            if "mu" not in profile or "std" not in profile:
+                raise ValueError(
+                    f"Gaussian noise profile entry must include 'mu' and 'std' at index {i}: {profile}"
+                )
+
+            weight = float(profile.get("weight", 1.0))
+            weights.append(weight)
+            checked.append(
+                (
+                    weight,
+                    DPAugmentor._check_input(profile["mu"]),
+                    DPAugmentor._check_input(profile["std"]),
+                )
+            )
+
+        w_arr = np.asarray(weights, dtype=np.float64)
+        if not np.all(np.isfinite(w_arr)):
+            raise ValueError(f"Gaussian noise profile weights must be finite; got {weights}")
+        if np.any(w_arr < 0):
+            raise ValueError(f"Gaussian noise profile weights must be nonnegative; got {weights}")
+        if float(w_arr.sum()) <= 0:
+            raise ValueError(f"Gaussian noise profile weights must sum to > 0; got {weights}")
+        return checked
+
+    @staticmethod
     def _check_input(inp: list[float] | float | list[dict]) -> list[tuple[float, float, float]]:
         """
         Normalize a parameter spec into a canonical list of (weight, lo, hi) components.
@@ -985,6 +971,16 @@ class DPAugmentor(RNGMixin):
         idx = int(self.rng.choice(len(spec), p=probs))
         _, lo, hi = spec[idx]
         return float(self.rng.uniform(lo, hi))
+
+    def _sample_gaussian_noise_profile(self) -> tuple[float, float]:
+        assert self._gaussian_noise_profiles is not None
+        weights = np.asarray(
+            [profile[0] for profile in self._gaussian_noise_profiles], dtype=np.float64
+        )
+        probs = weights / weights.sum()
+        idx = int(self.rng.choice(len(self._gaussian_noise_profiles), p=probs))
+        _, mu_spec, std_spec = self._gaussian_noise_profiles[idx]
+        return self._sample(mu_spec), self._sample(std_spec)
 
     def _as_array(self, ar) -> ArrayLike:
         if self.use_torch:
@@ -1088,9 +1084,4 @@ class DPAugmentor(RNGMixin):
             self.exx, self.eyy, self.exy = orig_exx, orig_eyy, orig_exy
             return result
         else:
-<<<<<<< Updated upstream
             return self._apply_elastic(inputs)
-   
-=======
-            return self._apply_elastic(inputs)
->>>>>>> Stashed changes
