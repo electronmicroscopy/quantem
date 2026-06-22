@@ -749,6 +749,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         gaussian_maxfev: int = 100,
         progressbar: bool = True,
         device: str = "cpu",
+        batch_size: int | None = None
     ) -> "StrainMapAutocorrelation":
         """Fit the lattice vectors at every scan position (the heavy step).
 
@@ -844,6 +845,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 refine_all_peaks=refine_all_peaks,
                 peaks=self.mean_img_peaks if refine_all_peaks else None,
                 weights=self.mean_img_weights if refine_all_peaks else None,
+                batch_size = batch_size,
             )
         else:
             # Per-position fallback for DFT upsampling (refine_dft=True).
@@ -921,6 +923,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         refine_all_peaks: bool = False,
         peaks: NDArray | None = None,
         weights: NDArray | None = None,
+        batch_size: int | None = None,
     ) -> None:
         """Batched torch implementation of the non-DFT :meth:`fit_lattice_vectors` path.
 
@@ -975,7 +978,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             n_pk = peaks_arr.shape[0]
 
         # Match the correlation chunking heuristic (see BraggVectors._detect_positions).
-        batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
+        if batch_size is None:
+            batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
 
         starts = range(0, n_pos, batch_size)
         if progressbar:
