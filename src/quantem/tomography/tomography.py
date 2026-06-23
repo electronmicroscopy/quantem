@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.loss_functions import get_loss_module
+from quantem.core.ml.models.kplanes import CPTilted
 from quantem.core.utils.filter import gaussian_filter_2d_stack, gaussian_kernel_1d
 from quantem.core.utils.tomography_utils import torch_phase_cross_correlation
 from quantem.tomography.dataset_models import (
@@ -25,9 +26,11 @@ from quantem.tomography.object_models import (
     ObjConstraintsType,
     ObjectINR,
     ObjectPixelated,
+    ObjectTensorDecomp,
 )
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
+from quantem.tomography.tomography_context import ReconstructionContext
 from quantem.tomography.tomography_opt import TomographyOpt
 
 
@@ -41,7 +44,7 @@ class Tomography(TomographyOpt, TomographyBase):
     def from_models(
         cls,
         dset: DatasetModelType,
-        obj_model: ObjectINR,
+        obj_model: ObjectINR | ObjectTensorDecomp,
         logger: LoggerTomography | None = None,
         device: str = "cuda",
         verbose: int | bool = True,
@@ -140,7 +143,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     self.set_optimizers()
                 if scheduler_params is not None:
                     self.scheduler_params = scheduler_params
-                    self.set_schedulers(self.scheduler_params)
+                    self.set_schedulers(self.scheduler_params, num_iter=num_iter)
 
             self.dataloader, self.sampler, self.val_dataloader, self.val_sampler = (
                 self.setup_dataloader(
@@ -179,7 +182,9 @@ class Tomography(TomographyOpt, TomographyBase):
             consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = torch.tensor(0.0, device=self.device)
             epoch_soft_constraint_loss = torch.tensor(0.0, device=self.device)
-            if isinstance(self.obj_model, ObjectINR):
+            if isinstance(self.obj_model, ObjectINR) or isinstance(
+                self.obj_model, ObjectTensorDecomp
+            ):
                 self.obj_model.model.train()
             else:
                 raise NotImplementedError(
@@ -201,7 +206,7 @@ class Tomography(TomographyOpt, TomographyBase):
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.bfloat16,
-                    enabled=True,
+                    enabled=False,
                 ):
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
@@ -214,9 +219,14 @@ class Tomography(TomographyOpt, TomographyBase):
                     )
 
                 pred = integrated_densities.float()
-                soft_constraints_loss = 0.0
-                if self.num_epochs > 0:
-                    soft_constraints_loss = self.obj_model.apply_soft_constraints(all_coords, pred)
+
+                soft_constraints_loss = self.obj_model.apply_soft_constraints(
+                    ctx=ReconstructionContext(
+                        coords=all_coords,
+                        pred=pred,
+                        all_densities=all_densities,
+                    )
+                )
 
                 target = batch["target_value"].to(self.device, non_blocking=True).float()
 
@@ -234,6 +244,25 @@ class Tomography(TomographyOpt, TomographyBase):
                 self.step_optimizers()
                 total_loss += batch_loss.detach()
                 consistency_loss += batch_consistency_loss.detach()
+
+            if isinstance(self.obj_model.model, CPTilted):
+                if a0 == 0:
+                    prev_R = self.obj_model.model.so3.as_matrix().detach().clone()
+                elif (a0 + 1) % 20 == 0:
+                    R_now = self.obj_model.model.so3.as_matrix().detach()
+                    # Cumulative angular change per rotation over the last 20 iters.
+                    # trace(R_prev^T R_now) = 1 + 2*cos(theta), so theta = acos((trace - 1) / 2).
+                    rel_trace = torch.einsum("tij,tij->t", prev_R, R_now)
+                    angle = torch.acos(((rel_trace - 1) / 2).clamp(-1, 1))  # (T,) radians
+                    angle_deg = torch.rad2deg(angle)
+                    per_tau_str = ", ".join(f"{a:.2f}°" for a in angle_deg.tolist())
+                    print(
+                        f"iter {a0}: 20-iter τ change "
+                        f"max={angle_deg.max().item():.2f}°, "
+                        f"mean={angle_deg.mean().item():.2f}°, "
+                        f"per-τ=[{per_tau_str}]"
+                    )
+                    prev_R = R_now.clone()
 
             if self.world_size > 1:
                 dist.all_reduce(total_loss, dist.ReduceOp.AVG)

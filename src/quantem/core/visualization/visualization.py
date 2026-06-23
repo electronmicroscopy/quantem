@@ -40,10 +40,7 @@ ArrayLike: TypeAlias = Union[NDArray, torch.Tensor, "Dataset2d"]  # union requir
 # There might be a cleaner way to do this, but better to have it here than in the functions
 NormInputCell: TypeAlias = NormalizationConfig | ShowParams.Norm | dict | str
 Show2dNormInput: TypeAlias = (
-    NormInputCell
-    | None
-    | Sequence[NormInputCell]
-    | Sequence[Sequence[NormInputCell]]
+    NormInputCell | None | Sequence[NormInputCell] | Sequence[Sequence[NormInputCell]]
 )
 
 ScalebarInputCell: TypeAlias = ScalebarConfig | ShowParams.Scalebar | dict | bool | None
@@ -57,7 +54,7 @@ Show2dScalebarInput: TypeAlias = (
     | Sequence[Sequence[ScalebarInputCell]]
 )
 
-CmapType: TypeAlias = str | colors.Colormap 
+CmapType: TypeAlias = str | colors.Colormap
 
 
 def _show_2d_array(
