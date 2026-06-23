@@ -391,6 +391,7 @@ class BraggVectors(AutoSerialize):
         max_num_peaks: int = 1000,
         batch_size: int | None = None,
         progressbar: bool = True,
+        cache_to_gpu: bool = True,
     ) -> Vector:
         """Detect Bragg disks at every scan position (or a subset for testing).
 
@@ -445,6 +446,21 @@ class BraggVectors(AutoSerialize):
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
         )
+
+        if cache_to_gpu and self.device != "cpu":
+            if not hasattr(self, '_gpu_cache') or self._gpu_cache is None:
+                try:
+                    print(f"Loading dataset to {self.device}...", end=" ", flush=True)
+                    self._gpu_cache = torch.as_tensor(
+                        np.asarray(self.dataset.array),
+                        dtype=torch.float32,
+                        device=self.device
+                    )
+                    size_gb = self._gpu_cache.element_size() * self._gpu_cache.nelement() / 1e9
+                    print(f"✓ ({size_gb:.2f} GB)")
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    print(f"✗ (out of memory, will read per-batch)")
+                    self._gpu_cache = None
 
         if positions is not None:
             if len(positions) == 0:
@@ -1295,6 +1311,8 @@ class BraggVectors(AutoSerialize):
         H, W = int(self.dataset.shape[-2]), int(self.dataset.shape[-1])
         if batch_size is None:
             batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
+        
+        use_cache = hasattr(self, '_gpu_cache') and self._gpu_cache is not None
 
         it = range(0, len(coords), batch_size)
         if progressbar:
@@ -1310,17 +1328,18 @@ class BraggVectors(AutoSerialize):
         results: list[NDArray] = []
         for start in it:
             chunk = coords[start : start + batch_size]
-            dps = torch.stack(
-                [
-                    torch.as_tensor(
-                        np.asarray(self.dataset.array[r, c]),
-                        dtype=torch.float,
-                        device=self.device,
-                    )
-                    for r, c in chunk
-                ],
-                dim=0,
-            )
+        
+            if use_cache:
+                rows = [r for r, c in chunk]
+                cols = [c for r, c in chunk]
+                dps = self._gpu_cache[rows, cols]
+            else:
+                # SLOW PATH: Load from HDF5 (at least do it efficiently)
+                rows = np.array([r for r, c in chunk])
+                cols = np.array([c for r, c in chunk])
+                dps_np = self.dataset.array[rows, cols]
+                dps = torch.as_tensor(dps_np, dtype=torch.float32, device=self.device)
+
             out = detect_disks_batch(dps, self._template_ft, **detect_kwargs)
             results.extend(
                 arr if arr.shape[0] else np.empty((0, len(PEAK_FIELDS)), dtype=float)
