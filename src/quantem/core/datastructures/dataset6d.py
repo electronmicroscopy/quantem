@@ -35,6 +35,9 @@ class Dataset6d(Dataset):
             _token=_token,
         )
 
+    def __len__(self):
+        return int(self.array.shape)
+
     @classmethod
     def from_array(
         cls,
@@ -86,4 +89,4 @@ class Dataset6d(Dataset):
             signal_units=signal_units,
             metadata=metadata,
         )
-
+    
