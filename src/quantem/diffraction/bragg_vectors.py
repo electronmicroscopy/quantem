@@ -391,7 +391,7 @@ class BraggVectors(AutoSerialize):
         max_num_peaks: int = 1000,
         batch_size: int | None = None,
         progressbar: bool = True,
-        cache_to_gpu: bool = True,
+        save_to_gpu: bool = True,
     ) -> Vector:
         """Detect Bragg disks at every scan position (or a subset for testing).
 
@@ -447,7 +447,7 @@ class BraggVectors(AutoSerialize):
             max_num_peaks=max_num_peaks,
         )
 
-        if cache_to_gpu and self.device != "cpu":
+        if save_to_gpu and self.device != "cpu":
             if not hasattr(self, '_gpu_cache') or self._gpu_cache is None:
                 try:
                     print(f"Loading dataset to {self.device}...", end=" ", flush=True)
@@ -456,10 +456,8 @@ class BraggVectors(AutoSerialize):
                         dtype=torch.float32,
                         device=self.device
                     )
-                    size_gb = self._gpu_cache.element_size() * self._gpu_cache.nelement() / 1e9
-                    print(f"✓ ({size_gb:.2f} GB)")
                 except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                    print(f"✗ (out of memory, will read per-batch)")
+                    print(f"Out of memory, will read per-batch")
                     self._gpu_cache = None
 
         if positions is not None:

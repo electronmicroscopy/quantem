@@ -127,6 +127,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.u_array: np.ndarray | None = None
         self.v_array: np.ndarray | None = None
         self.mask_weight: np.ndarray | None = None
+        self._gpu_cache: torch.Tensor | None = None
 
     @classmethod
     def from_dataset(cls, dataset: Dataset4dstem, *, name: str | None = None) -> "StrainMapAutocorrelation":
@@ -749,7 +750,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         gaussian_maxfev: int = 100,
         progressbar: bool = True,
         device: str = "cpu",
-        batch_size: int | None = None
+        batch_size: int | None = None,
+        save_to_gpu: bool = True,
     ) -> "StrainMapAutocorrelation":
         """Fit the lattice vectors at every scan position (the heavy step).
 
@@ -846,6 +848,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 peaks=self.mean_img_peaks if refine_all_peaks else None,
                 weights=self.mean_img_weights if refine_all_peaks else None,
                 batch_size = batch_size,
+                save_to_gpu = save_to_gpu
             )
         else:
             # Per-position fallback for DFT upsampling (refine_dft=True).
@@ -924,6 +927,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         peaks: NDArray | None = None,
         weights: NDArray | None = None,
         batch_size: int | None = None,
+        save_to_gpu: bool = True,
     ) -> None:
         """Batched torch implementation of the non-DFT :meth:`fit_lattice_vectors` path.
 
@@ -964,7 +968,25 @@ class StrainMapAutocorrelation(AutoSerialize):
         dev = torch.device(device)
         mask = torch.as_tensor(self.mask_diffraction, dtype=torch.float64, device=dev)
         mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=torch.float64, device=dev)
-
+        use_cache = False
+        if save_to_gpu and str(dev) != "cpu":
+            if not hasattr(self, '_gpu_cache') or self._gpu_cache is None:
+                try:
+                    print(f"Loading dataset to {dev}", end = " ", flush = True)
+                    self._gpu_cache = torch.as_tensor(
+                        np.asarray(self.dataset.array),
+                        dtype = torch.float32,
+                        device=dev,
+                    )
+                    use_cache = True
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    print(f"Out of memory, will read per-batch")
+                    self._gpu_cache = None
+                    use_cache = False
+            else:
+                self._gpu_cache = None
+                use_cache = False
+            
         if refine_all_peaks:
             # Precompute the fixed pieces of the per-position all-peaks fit (these do not
             # change across scan positions): the detected peak seeds, their normalized
@@ -996,15 +1018,21 @@ class StrainMapAutocorrelation(AutoSerialize):
             stop = min(start + batch_size, n_pos)
             idxs = [(idx // scan_c, idx % scan_c) for idx in range(start, stop)]
 
-            dps = torch.stack(
-                [
-                    torch.as_tensor(
-                        np.asarray(self.dataset.array[r, c]), dtype=torch.float64, device=dev
-                    )
-                    for r, c in idxs
-                ],
-                dim=0,
-            )
+            if use_cache:
+                rows = [r for r, c in idxs]
+                cols = [c for r, c in idxs]
+                dps = self._gpu_cache[rows, cols]
+            else:
+                dps = torch.stack(
+                    [
+                        torch.as_tensor(
+                            np.asarray(self.dataset.array[r, c]), dtype=torch.float64, device=dev
+                        )
+                        for r, c in idxs
+                    ],
+                    dim=0,
+                )
+
             dpm = dps * mask + mask_inv
             if mode == "linear":
                 tr = dpm

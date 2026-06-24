@@ -626,6 +626,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         batch_size: int | None = None,
         frozen_components: list[str] | str | None = None,
         sample_trainability: dict[str, Any] | None = None,
+        save_to_gpu: bool = True,
         **_compat_kwargs: Any,
     ) -> "ModelDiffraction":
         if batch_size is not None:
@@ -643,6 +644,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 frozen_components=frozen_components,
                 sample_trainability=sample_trainability,
                 progress=progress,
+                save_to_gpu = save_to_gpu
             )
 
         if self.model is None or self.ctx is None or self.target_mean is None:
@@ -724,6 +726,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         frozen_components: list[str] | str | None = None,
         sample_trainability: dict[str, Any] | None = None,
         progress: bool = True,
+        save_to_gpu: bool = True,
     ) -> "ModelDiffraction":
         """
         Per-pattern fit, vectorized across a batch dimension on a single GPU.
@@ -827,17 +830,38 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         total_steps = len(positions) * n_steps
         pbar = tqdm(total=total_steps, desc="Fit individual (batched)", disable=not progress)
 
+
+        dataset_gpu: torch.Tensor | None = None
+        dev = self.ctx.device
+
+        if save_to_gpu and str(dev) != "cpu":
+            try:
+                print(f"Loading data to {dev}...", flush=True)
+                dataset_gpu = torch.as_tensor(
+                    self.dataset.array,
+                    device=dev,
+                    dtype=ctx.dtype
+                )
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                dataset_gpu = None
+
+
         for start in range(0, len(positions), int(batch_size)):
             chunk = positions[start:start + int(batch_size)]
             B = len(chunk)
 
-            targets = torch.stack(
-                [
-                    torch.as_tensor(self.dataset.array[r, c], device=ctx.device, dtype=ctx.dtype)
-                    for (r, c) in chunk
-                ],
-                dim=0,
-            )
+            if dataset_gpu is not None:
+                rows_batch = [r for r, c in chunk]
+                cols_batch = [c for r, c in chunk]
+                targets = dataset_gpu[rows_batch, cols_batch]
+            else:
+                targets = torch.stack(
+                    [
+                        torch.as_tensor(self.dataset.array[r, c], device=ctx.device, dtype=ctx.dtype)
+                        for (r, c) in chunk
+                    ],
+                    dim=0,
+                )
 
             stacked = plan.build_stacked_params(B)
 
