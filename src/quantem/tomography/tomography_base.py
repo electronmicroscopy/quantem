@@ -58,7 +58,11 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
                 print("Setting up DDP for obj_model")
 
         self.dset = dset
-        self.dset.to(device)
+        # Use self.device (set by setup_distributed to cuda:local_rank under DDP),
+        # NOT the local `device` arg, which stays "cuda:0" on every rank and would
+        # strand the dataset's pose params on cuda:0 while the model/sampler live
+        # on cuda:local_rank (device-mismatch in _apply_pose's batched matmul).
+        self.dset.to(self.device)
 
     # --- Properties ---
     @property

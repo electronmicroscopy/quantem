@@ -778,7 +778,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             coords_1d = torch.linspace(-1, 1, N)
             x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
             inputs = torch.stack([x, y, z], dim=-1).reshape(-1, 3)
-            model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+            model = _unwrap(self.model)
 
             inference_batch_size = 5 * N * N
             total_samples = N**3
@@ -957,10 +957,10 @@ class ObjectTensorDecomp(ObjectINR):
         """
         Gets the total-variation across the planes.
         """
-        is_tilted = self.model.tilted
+        model = _unwrap(self.model)
+        is_tilted = model.tilted
         per_level = []
 
-        model = _unwrap(self.model)
         for p in model.grids:
             # p: (3*T, C, H, W) for TILTED, (3, C, H, W) for KPlanes
             dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
@@ -968,7 +968,7 @@ class ObjectTensorDecomp(ObjectINR):
             per_plane = dh + dw  # (3*T,) or (3,)
 
             if is_tilted:
-                T = self.model.T
+                T = model.T
                 per_rotation = per_plane.view(T, 3).sum(dim=1)  # sum 3 planes per rotation
                 level_tv = per_rotation.mean()  # avg across rotations
             else:
