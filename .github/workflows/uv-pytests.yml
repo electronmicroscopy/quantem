@@ -26,6 +26,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Validate uv.lock
+        run: |
+          if grep -nE '^(<<<<<<<|=======|>>>>>>>)' uv.lock; then
+            echo "Unresolved merge markers found in uv.lock"
+            exit 1
+          fi
+
       - name: Install the project
         run: uv sync --locked --group test
 
