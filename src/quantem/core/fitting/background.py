@@ -60,11 +60,12 @@ class DCBackground(RenderComponent):
         )
 
 
-class GaussianBackground(RenderComponent):  # TODO this should be N dimensional by default
+class GaussianBackground(RenderComponent):
     def __init__(
         self,
         *,
         sigma: float | int | Sequence[float | int | None] = (40.0, 5.0, None),
+        sigma_col: float | int | Sequence[float | int | None] | None = None,
         intensity: float | int | Sequence[float | int | None] = 0.0,
         origin: OriginND | None = None,
         origin_key: str = "origin",
@@ -74,11 +75,22 @@ class GaussianBackground(RenderComponent):  # TODO this should be N dimensional 
         """
         Build a Gaussian background component centered at origin.
 
+        Parameters
+        ----------
+        sigma : float or sequence
+            Row-direction (and column-direction when ``sigma_col`` is None) width.
+            Accepts ``x``, ``(x0, delta)``, or ``(x0, lo, hi)``.
+        sigma_col : float or sequence or None
+            Column-direction width for an anisotropic (elliptical) Gaussian.
+            When ``None`` (default) the background is isotropic and ``sigma``
+            governs both axes.  Providing a value enables independent per-axis
+            widths, which is useful for tilted datasets where the transmitted-disk
+            background is elongated.
+
         Notes
         -----
-        ``sigma_raw`` and ``intensity_raw`` validity is enforced via hard
-        constraints/parameter bounds. Forward intentionally avoids hard clamps
-        for gradient flow.
+        ``sigma_raw``, ``sigma_col_raw`` (when present), and ``intensity_raw``
+        validity is enforced via hard constraints/parameter bounds.
         """
         super().__init__()
         self.name = str(name)
@@ -91,6 +103,15 @@ class GaussianBackground(RenderComponent):  # TODO this should be N dimensional 
         self.sigma_raw = nn.Parameter(torch.tensor(sigma_init, dtype=torch.float32))
         sigma_bounded_lo = 1e-6 if sigma_lo is None else max(float(sigma_lo), 1e-6)
         self.register_parameter_bounds("sigma_raw", sigma_bounded_lo, sigma_hi)
+
+        if sigma_col is not None:
+            sc_init, sc_lo, sc_hi = self.parse_bounded_init(sigma_col, name="sigma_col")
+            self.sigma_col_raw = nn.Parameter(torch.tensor(sc_init, dtype=torch.float32))
+            sc_bounded_lo = 1e-6 if sc_lo is None else max(float(sc_lo), 1e-6)
+            self.register_parameter_bounds("sigma_col_raw", sc_bounded_lo, sc_hi)
+        else:
+            self.sigma_col_raw = None
+
         self.intensity_raw = nn.Parameter(torch.tensor(intensity_init, dtype=torch.float32))
         intensity_bounded_lo = 0.0 if intensity_lo is None else max(float(intensity_lo), 0.0)
         self.register_parameter_bounds("intensity_raw", intensity_bounded_lo, intensity_hi)
@@ -102,14 +123,6 @@ class GaussianBackground(RenderComponent):  # TODO this should be N dimensional 
         self.origin = origin
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
-        """
-        Render Gaussian background from raw trainable parameters.
-
-        Notes
-        -----
-        Validity is enforced via hard constraints/parameter bounds, not via
-        forward-time hard clamps.
-        """
         if self.origin is None:
             raise RuntimeError("GaussianBackground requires an OriginND instance.")
 
@@ -117,16 +130,22 @@ class GaussianBackground(RenderComponent):  # TODO this should be N dimensional 
         cc = torch.arange(ctx.shape[1], device=ctx.device, dtype=ctx.dtype)[None, :]
         r0, c0 = self.origin.coords[0], self.origin.coords[1]
 
-        sigma = self.sigma_raw.to(device=ctx.device, dtype=ctx.dtype)
+        sigma_r = self.sigma_raw.to(device=ctx.device, dtype=ctx.dtype)
+        sigma_c = (
+            self.sigma_col_raw.to(device=ctx.device, dtype=ctx.dtype)
+            if self.sigma_col_raw is not None
+            else sigma_r
+        )
         inten = self.intensity_raw.to(device=ctx.device, dtype=ctx.dtype)
-        r2 = (rr - r0) ** 2 + (cc - c0) ** 2
-        return inten * torch.exp(-0.5 * r2 / (sigma * sigma))
+        r2 = (rr - r0) ** 2 / (sigma_r * sigma_r) + (cc - c0) ** 2 / (sigma_c * sigma_c)
+        return inten * torch.exp(-0.5 * r2)
 
     def forward_batched(
         self,
         ctx: RenderContext,
         *,
         sigma_raw_b: torch.Tensor,
+        sigma_col_raw_b: torch.Tensor | None = None,
         intensity_raw_b: torch.Tensor,
         origin_coords_b: torch.Tensor,
     ) -> torch.Tensor:
@@ -135,7 +154,8 @@ class GaussianBackground(RenderComponent):  # TODO this should be N dimensional 
         cc = torch.arange(ctx.shape[1], device=ctx.device, dtype=ctx.dtype).view(1, 1, ctx.shape[1])
         r0 = origin_coords_b[:, 0].view(B, 1, 1)
         c0 = origin_coords_b[:, 1].view(B, 1, 1)
-        sigma = sigma_raw_b.view(B, 1, 1)
+        sigma_r = sigma_raw_b.view(B, 1, 1)
+        sigma_c = sigma_col_raw_b.view(B, 1, 1) if sigma_col_raw_b is not None else sigma_r
         inten = intensity_raw_b.view(B, 1, 1)
-        r2 = (rr - r0) ** 2 + (cc - c0) ** 2
-        return inten * torch.exp(-0.5 * r2 / (sigma * sigma))
+        r2 = (rr - r0) ** 2 / (sigma_r * sigma_r) + (cc - c0) ** 2 / (sigma_c * sigma_c)
+        return inten * torch.exp(-0.5 * r2)

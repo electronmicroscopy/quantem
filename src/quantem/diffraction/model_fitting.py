@@ -900,8 +900,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 if isinstance(loss_fn, SqrtMSELoss):
                     gamma = float(loss_fn.gamma)
                     eps = 1.0
-                    pred_min = pred.amin(dim=(1, 2), keepdim=True)
-                    tgt_min = targets.amin(dim=(1, 2), keepdim=True)
+                    pred_min = pred.amin(dim=(1, 2), keepdim=True).detach()
+                    tgt_min = targets.amin(dim=(1, 2), keepdim=True).detach()
                     pred_mod = (pred - pred_min + eps) ** gamma
                     tgt_mod = (targets - tgt_min + eps) ** gamma
                     per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
@@ -1347,17 +1347,26 @@ class _BatchedPlan:
         if self.gaussbg is not None and self.gaussbg_idx is not None:
             lr = _lr_for_component(self.gaussbg, self.gaussbg_idx, optimizer_params, model)
             name = model._component_constraint_name(self.gaussbg, self.gaussbg_idx)
-            
+            gaussbg_keys: list[str] = []
+
             self._trainable_flags["gaussbg.sigma_raw"] = self.gaussbg.sigma_raw.requires_grad
-            self._trainable_flags["gaussbg.intensity_raw"] = self.gaussbg.intensity_raw.requires_grad
-            
             if self._trainable_flags["gaussbg.sigma_raw"]:
                 self.lrs["gaussbg.sigma_raw"] = lr
+                gaussbg_keys.append("gaussbg.sigma_raw")
+
+            if self.gaussbg.sigma_col_raw is not None:
+                self._trainable_flags["gaussbg.sigma_col_raw"] = self.gaussbg.sigma_col_raw.requires_grad
+                if self._trainable_flags["gaussbg.sigma_col_raw"]:
+                    self.lrs["gaussbg.sigma_col_raw"] = lr
+                    gaussbg_keys.append("gaussbg.sigma_col_raw")
+
+            self._trainable_flags["gaussbg.intensity_raw"] = self.gaussbg.intensity_raw.requires_grad
             if self._trainable_flags["gaussbg.intensity_raw"]:
                 self.lrs["gaussbg.intensity_raw"] = lr
-            
-            self.component_keys[name] = ["gaussbg.sigma_raw", "gaussbg.intensity_raw"]
-            self.component_keys[self.gaussbg.__class__.__name__] = list(self.component_keys[name])
+                gaussbg_keys.append("gaussbg.intensity_raw")
+
+            self.component_keys[name] = gaussbg_keys
+            self.component_keys[self.gaussbg.__class__.__name__] = list(gaussbg_keys)
             
         if self.lat is not None and self.lat_idx is not None:
             lr = _lr_for_component(self.lat, self.lat_idx, optimizer_params, model)
@@ -1416,6 +1425,8 @@ class _BatchedPlan:
         if self.gaussbg is not None:
             if self._trainable_flags.get("gaussbg.sigma_raw", False):
                 out["gaussbg.sigma_raw"] = self._stack(self.gaussbg.sigma_raw, B)
+            if self._trainable_flags.get("gaussbg.sigma_col_raw", False) and self.gaussbg.sigma_col_raw is not None:
+                out["gaussbg.sigma_col_raw"] = self._stack(self.gaussbg.sigma_col_raw, B)
             if self._trainable_flags.get("gaussbg.intensity_raw", False):
                 out["gaussbg.intensity_raw"] = self._stack(self.gaussbg.intensity_raw, B)
                 
@@ -1480,14 +1491,19 @@ class _BatchedPlan:
             sigma_b = stacked.get("gaussbg.sigma_raw")
             if sigma_b is None:
                 sigma_b = self.gaussbg.sigma_raw.unsqueeze(0).expand(B).clone()
-            
+
+            sigma_col_b = stacked.get("gaussbg.sigma_col_raw")
+            if sigma_col_b is None and self.gaussbg.sigma_col_raw is not None:
+                sigma_col_b = self.gaussbg.sigma_col_raw.unsqueeze(0).expand(B).clone()
+
             intensity_b = stacked.get("gaussbg.intensity_raw")
             if intensity_b is None:
                 intensity_b = self.gaussbg.intensity_raw.unsqueeze(0).expand(B).clone()
-            
+
             pred = pred + self.gaussbg.forward_batched(
                 ctx,
                 sigma_raw_b=sigma_b,
+                sigma_col_raw_b=sigma_col_b,
                 intensity_raw_b=intensity_b,
                 origin_coords_b=origin_b,
             )
@@ -1769,6 +1785,8 @@ class _BatchedPlan:
         if self.gaussbg is not None and self.gaussbg_idx is not None:
             if "gaussbg.sigma_raw" in stacked:
                 out[f"components.{self.gaussbg_idx}.sigma_raw"] = stacked["gaussbg.sigma_raw"][b].detach().clone()
+            if "gaussbg.sigma_col_raw" in stacked:
+                out[f"components.{self.gaussbg_idx}.sigma_col_raw"] = stacked["gaussbg.sigma_col_raw"][b].detach().clone()
             if "gaussbg.intensity_raw" in stacked:
                 out[f"components.{self.gaussbg_idx}.intensity_raw"] = stacked["gaussbg.intensity_raw"][b].detach().clone()
 
