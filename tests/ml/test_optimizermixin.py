@@ -348,3 +348,106 @@ class TestSchedulerParseDict:
     def test_parse_default_name_is_none(self):
         result = SchedulerParams.parse_dict({})
         assert isinstance(result, SchedulerParams.NoneScheduler)
+
+
+# ─── OptimizerMixin.set_optimizer / PPLR behavior ───────────────────────────
+
+from quantem.core import config  # noqa: E402
+from quantem.core.ml.optimizer_mixin import OptimizerMixin  # noqa: E402
+
+torch = pytest.importorskip("torch") if config.get("has_torch") else None
+requires_torch = pytest.mark.skipif(
+    not config.get("has_torch"), reason="requires torch"
+)
+
+
+def _param(value=1.0):
+    return torch.nn.Parameter(torch.tensor([value]))
+
+
+class _FakeModel(OptimizerMixin):
+    """Minimal concrete OptimizerMixin for exercising set_optimizer/reset_optimizer.
+
+    ``groups`` is the dict[str, list[Parameter]] returned by get_optimization_parameters.
+    Pass ``raise_on_params=True`` to prove the disable path short-circuits before the call.
+    """
+
+    def __init__(self, groups, raise_on_params=False):
+        super().__init__()
+        self._groups = groups
+        self._raise_on_params = raise_on_params
+
+    def get_optimization_parameters(self):
+        if self._raise_on_params:
+            raise AssertionError("get_optimization_parameters should not have been called")
+        return self._groups
+
+
+@requires_torch
+class TestSetOptimizer:
+    def test_single_optimizer_build(self):
+        model = _FakeModel({"default": [_param()]})
+        model.set_optimizer(OptimizerParams.Adam(lr=1e-3))
+        assert model.has_optimizer()
+        assert isinstance(model.optimizer, torch.optim.Adam)
+        assert len(model.optimizer.param_groups) == 1
+        assert model.optimizer.param_groups[0]["lr"] == 1e-3
+
+    def test_single_optimizer_dict_shorthand(self):
+        model = _FakeModel({"default": [_param()]})
+        model.set_optimizer({"name": "sgd", "lr": 5e-2, "momentum": 0.9})
+        assert isinstance(model.optimizer, torch.optim.SGD)
+        assert model.optimizer.param_groups[0]["lr"] == 5e-2
+        assert model.optimizer.param_groups[0]["momentum"] == 0.9
+
+    def test_none_optimizer_removes_without_touching_params(self):
+        # raise_on_params proves the disable path short-circuits before get_optimization_parameters
+        model = _FakeModel({"default": [_param()]}, raise_on_params=True)
+        model.set_optimizer(OptimizerParams.NoneOptimizer())
+        assert model.optimizer is None
+        assert not model.has_optimizer()
+        assert model.optimizer_params == {
+            OptimizerMixin.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()
+        }
+
+    def test_multi_group_pplr_applies_per_group_lr(self):
+        model = _FakeModel({"descan": [_param()], "scan_positions": [_param(2.0)]})
+        model.set_optimizer(
+            {"descan": OptimizerParams.SGD(lr=1e-2), "scan_positions": OptimizerParams.SGD(lr=1e-3)}
+        )
+        groups = model.optimizer.param_groups
+        assert len(groups) == 2
+        # key order is preserved (descan, then scan_positions)
+        assert groups[0]["lr"] == 1e-2
+        assert groups[1]["lr"] == 1e-3
+
+    def test_key_mismatch_raises(self):
+        model = _FakeModel({"default": [_param()]})
+        with pytest.raises(ValueError, match="do not match"):
+            model.set_optimizer(
+                {"descan": OptimizerParams.SGD(lr=1e-2), "scan_positions": OptimizerParams.SGD()}
+            )
+
+    def test_mixed_optimizer_classes_raises(self):
+        model = _FakeModel({"a": [_param()], "b": [_param()]})
+        with pytest.raises(ValueError, match="same optimizer type"):
+            model.set_optimizer(
+                {"a": OptimizerParams.Adam(lr=1e-3), "b": OptimizerParams.SGD(lr=1e-3)}
+            )
+
+    def test_reset_optimizer_on_unconfigured_model_is_noop(self):
+        model = _FakeModel({"default": [_param()]})
+        # fresh model defaults to {"default": NoneOptimizer()}
+        model.reset_optimizer()
+        assert model.optimizer is None
+        assert not model.has_optimizer()
+
+    def test_set_scheduler_base_lr_uses_max_group_lr(self):
+        model = _FakeModel({"descan": [_param()], "scan_positions": [_param(2.0)]})
+        model.set_optimizer(
+            {"descan": OptimizerParams.SGD(lr=1e-2), "scan_positions": OptimizerParams.SGD(lr=1e-3)}
+        )
+        model.set_scheduler(SchedulerParams.Plateau(), num_iter=10)
+        assert model.scheduler is not None
+        # Plateau min_lr defaults to base_LR / 20, with base_LR = max group lr (1e-2)
+        assert model.scheduler.min_lrs[0] == pytest.approx(1e-2 / 20)

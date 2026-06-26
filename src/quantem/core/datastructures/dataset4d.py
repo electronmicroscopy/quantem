@@ -1,6 +1,7 @@
 from typing import Any, Self, Union
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
@@ -21,11 +22,12 @@ class Dataset4d(Dataset):
 
     def __init__(
         self,
-        array: NDArray | Any,
-        name: str,
-        origin: NDArray | tuple | list | float | int,
-        sampling: NDArray | tuple | list | float | int,
-        units: list[str] | tuple | list,
+        array: NDArray | None = None,
+        tensor: torch.Tensor | None = None,
+        name: str = "",
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
         metadata: dict = {},
         _token: object | None = None,
@@ -34,8 +36,10 @@ class Dataset4d(Dataset):
 
         Parameters
         ----------
-        array : NDArray | Any
-            The underlying 3D array data
+        array : NDArray | None
+            The underlying 4D numpy array. Provide exactly one of ``array`` or ``tensor``.
+        tensor : torch.Tensor | None
+            The underlying 4D torch tensor (any device). Provide exactly one of ``array`` or ``tensor``.
         name : str
             A descriptive name for the dataset
         origin : NDArray | tuple | list | float | int
@@ -51,6 +55,7 @@ class Dataset4d(Dataset):
         """
         super().__init__(
             array=array,
+            tensor=tensor,
             name=name,
             origin=origin,
             sampling=sampling,

@@ -61,6 +61,10 @@ class DDPMixin:
     ):
         pin_mem = self.device.type == "cuda"
         persist = num_workers > 0
+        # ``multiprocessing_context`` is only valid for multi-process loading; passing it with
+        # num_workers=0 raises ValueError (and num_workers=0 keeps the dataset in-process, which
+        # is what CPU / coverage runs use).
+        mp_ctx = "spawn" if num_workers > 0 else None
 
         if val_fraction > 0.0:
             train_dataset, val_dataset = random_split(dataset, [1 - val_fraction, val_fraction])  # type: ignore[reportArgumentType] --> dataset inherits from torch Dataset so this is fine.
@@ -102,7 +106,7 @@ class DDPMixin:
             pin_memory=pin_mem,
             drop_last=True,
             persistent_workers=persist,
-            multiprocessing_context="spawn",
+            multiprocessing_context=mp_ctx,
             worker_init_fn=worker_init_fn,
         )
 
@@ -116,7 +120,7 @@ class DDPMixin:
                 pin_memory=pin_mem,
                 drop_last=False,
                 persistent_workers=persist,
-                multiprocessing_context="spawn",
+                multiprocessing_context=mp_ctx,
                 worker_init_fn=worker_init_fn,
             )
             val_dataloader = val_dataloader
