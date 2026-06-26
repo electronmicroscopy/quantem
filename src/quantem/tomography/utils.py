@@ -127,6 +127,9 @@ def get_TV_loss(tensor, factor=1e-3):
 
     return tv_loss * factor / (torch.prod(torch.tensor(tensor.shape)))
 
+
+def tv_loss_1d(x, reduction="mean"):
+    """
     Encourages piecewise smoothness by penalizing differences between
     adjacent elements.
 
