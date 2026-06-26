@@ -380,7 +380,7 @@ class Lattice(AutoSerialize):
             relative to the lattice origin r0 and basis vectors (u, v), and are used to tile the
             image with candidate atom centers at all visible integer translations.
         numbers : array-like of int, shape (S,), optional
-            Identifier per site (e.g., species or label). If None, uses 1..S. Used only for plotting
+            Identifier per site (e.g., species or label). If None, uses 0,1..,(S-1). Used only for plotting
             color coding; not used in detection logic.
         intensity_min : float, optional
             Minimum mean intensity inside the detection disk required to keep a candidate atom.
@@ -460,7 +460,7 @@ class Lattice(AutoSerialize):
         # VALIDATION: Check that lattice vectors have been defined
         if not hasattr(self, "_lat") or self._lat is None:
             raise ValueError(
-                "Lattice vectors have not been fitted. Please call define_lattice() first."
+                "Lattice vectors have not been fitted. Please call define_lattice_vectors() first."
             )
 
         # Initialize fractional positions and metadata
@@ -563,8 +563,10 @@ class Lattice(AutoSerialize):
         # Disk radius for intensity measurement (in pixels)
         r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
 
+        print(f"r_px : {r_px}")
+
         # Annulus radii for background contrast measurement (in pixels)
-        rin, rout = (1.5 * r_px, 3.0 * r_px) if annulus_radii is None else annulus_radii
+        rin, rout = (1.0 * r_px, 1.5 * r_px) if annulus_radii is None else annulus_radii
 
         # Precompute integer pixel ranges for disk and annulus (used in neighbor lookups)
         R_disk = int(np.ceil(r_px))
@@ -575,7 +577,7 @@ class Lattice(AutoSerialize):
 
         # PREPARE MASK AND DISTANCE TRANSFORM (if provided)
 
-        DT = None  # Distance transform of the mask (computed if mask is provided)
+        DT: None = None  # Distance transform of the mask (computed if mask is provided)
         if mask is not None:
             m = np.asarray(mask).astype(bool)
 
@@ -588,8 +590,13 @@ class Lattice(AutoSerialize):
                 from scipy.ndimage import distance_transform_edt
 
                 DT = distance_transform_edt(m)
-            except Exception:
+            except Exception as e:
                 # If distance_transform fails, fall back to pixel-level mask checking
+                import warnings
+
+                warnings.warn(
+                    f"distance_tranform failed with Exception:{e}. Defaulting to pixel-level mask checking."
+                )
                 DT = None
 
         # HELPER FUNCTIONS: Intensity Measurement
@@ -742,17 +749,20 @@ class Lattice(AutoSerialize):
                 # No mask: all candidates are mask-okay
                 mask_ok = np.ones_like(in_bounds, dtype=bool)
 
+            # FILTERING STAGE 3: Intensity and Contrast Thresholds
+
+            # Start with candidates that pass bounds, border, and mask checks
+            keep = in_bounds & border_ok & mask_ok
+
             # INTENSITY MEASUREMENT
 
             # Compute mean intensity in the detection disk for all candidates
             int_center = np.empty(xy.shape[0], dtype=float)
             for i in range(xy.shape[0]):
-                int_center[i] = mean_disk(x[i], y[i])
-
-            # FILTERING STAGE 3: Intensity and Contrast Thresholds
-
-            # Start with candidates that pass bounds, border, and mask checks
-            keep = in_bounds & border_ok & mask_ok
+                if keep[i]:
+                    int_center[i] = mean_disk(x[i], y[i])
+                else:
+                    int_center[i] = 0.0
 
             # Apply intensity minimum threshold (if provided)
             if intensity_min is not None:
@@ -763,7 +773,10 @@ class Lattice(AutoSerialize):
                 # Compute background intensity in the annulus for all candidates
                 bg_mean = np.empty(xy.shape[0], dtype=float)
                 for i in range(xy.shape[0]):
-                    bg_mean[i], _ = mean_std_annulus(x[i], y[i])
+                    if keep[i]:
+                        bg_mean[i], _ = mean_std_annulus(x[i], y[i])
+                    else:
+                        bg_mean[i] = np.inf
 
                 # Keep candidates where (disk mean - annulus mean) >= contrast_min
                 keep &= (int_center - bg_mean) >= float(contrast_min)
