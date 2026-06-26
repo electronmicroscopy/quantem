@@ -259,6 +259,7 @@ class SimDiffractionTomography(DiffractionTomography):
                 raise ValueError(
                     f"scan_origin must have shape (3,), got {scan_origin_arr.shape}"
                 )
+        print(f"{scan_origin_arr = }")
         #setting output diffraction shape
         diff_shape = self.diffraction_shape
         if dp_shape is None:
@@ -339,7 +340,7 @@ class SimDiffractionTomography(DiffractionTomography):
             su = fast_centered[i]
             offset_phys = sv * scan_step_arr[0] * v_proj + su * scan_step_arr[1] * u_proj
             position_index = (scan_origin_arr + offset_phys) / sampling3
-            print("pos index:",position_index)
+            print("pos index:",position_index, " shouldnt this be a int???")
             Psi = self.forward_prop(
                 Psi0,
                 position_index,

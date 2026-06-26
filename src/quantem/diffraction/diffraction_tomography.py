@@ -189,16 +189,31 @@ class DiffractionTomography(AutoSerialize):
         shape: tuple[int, int, int] | list[int] | torch.Tensor,
         sampling: tuple[float, float, float] | list[float] | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Creates reciprocal space grids based on diffraction shape and sampling.
+
+        Parameters
+        ----------
+        shape: torch.Tensor
+            3D diffraction shape (kz,ky,kx)
+        sampling: torch.Tensor
+            3D diffraction space sampling (kz,ky,kx)
+
+        Returns
+        -------
+        (kz, ky, kx): tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+            Reciprocal space grid
+        """
         shape = tuple(int(n) for n in shape)
         dk = torch.asarray(sampling, dtype=float)
         if len(shape) != 3:
             raise ValueError(f"shape must have length 3, got {shape}")
         if dk.shape != (3,):
             raise ValueError(f"sampling must have length 3, got shape={dk.shape}")
-        kx = torch.fft.fftfreq(shape[0], d=1 / (shape[0] * dk[0]))[:, None, None]
+        kx = torch.fft.fftfreq(shape[2], d=1 / (shape[2] * dk[2]))[None, None, :]
         ky = torch.fft.fftfreq(shape[1], d=1 / (shape[1] * dk[1]))[None, :, None]
-        kz = torch.fft.fftfreq(shape[2], d=1 / (shape[2] * dk[2]))[None, None, :]
-        return kx, ky, kz
+        kz = torch.fft.fftfreq(shape[0], d=1 / (shape[0] * dk[0]))[:, None, None]
+        return kz, ky, kx
 
     def _update_reciprocal_coordinates(self) -> None:
         self.kx, self.ky, self.kz = self._make_reciprocal_grids(
@@ -211,6 +226,21 @@ class DiffractionTomography(AutoSerialize):
         volume: torch.Tensor,
         coords: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Samples (6D) volume at specified grid points ((-1,-1): top left corner, (1,1): bottom right corner)
+        
+        Parameters
+        ----------
+        volume: torch.Tensor
+            Entire 6D volume 
+        coords: torch.Tensor
+            3D location of structure factor(s) being sampled in the full volume (x,y,z)
+
+        Returns
+        -------
+        mapped_grid: torch.Tensor
+            Sampled intensity value at each grid point
+        """
         # separates volume into real and imaginary for coordinate mapping
         # pads volume for trilinear interpolation in grid_sample
         vol = volume.to(torch.complex64)
@@ -222,11 +252,21 @@ class DiffractionTomography(AutoSerialize):
         # z = coords[0]
         # y = coords[1]
         # x = coords[2]
+        # grid = torch.stack(
+        #     (
+        #         2.0 * (coords[2] / (Nx-1.0))-1.0,
+        #         2.0 * (coords[1] / (Ny-1.0))-1.0,
+        #         2.0 * (coords[0] / (Nz-1.0))-1.0
+        #     ),
+        #     dim = -1
+        # )[None, None, ...]
+
+        # puts grid in order x,y,z --> output from coords is in shape x,y,z
         grid = torch.stack(
             (
-                2.0 * (coords[2] / (Nx-1.0))-1.0,
+                2.0 * (coords[0] / (Nx-1.0))-1.0,
                 2.0 * (coords[1] / (Ny-1.0))-1.0,
-                2.0 * (coords[0] / (Nz-1.0))-1.0
+                2.0 * (coords[2] / (Nz-1.0))-1.0
             ),
             dim = -1
         )[None, None, ...]
@@ -249,7 +289,23 @@ class DiffractionTomography(AutoSerialize):
         sampling: tuple[float, float, float] | list[float] | torch.Tensor,
         zxz: torch.Tensor,
     ) -> torch.Tensor:
-        """Rotate a complex reciprocal-space volume using ZXZ Euler angles."""
+        """
+        Rotate a complex reciprocal-space volume using ZXZ Euler angles.
+        
+        Parameters
+        ----------
+        volume: torch.Tensor
+            3D reciprocal space volume (z,y,x)
+        sampling: torch.Tensor
+            3D reciprocal space sampling (z,y,x)
+        zxz: torch.Tensor
+            Euler angles for rotation (zxz)
+
+        Returns
+        -------
+        sampled_grid: torch.Tensor
+            Sampled intensity values at each point specified by reciprocal grid from volume and sampling
+        """
         if volume.dim() != 3:
             raise ValueError(f"volume must be 3D, got ndim={volume.dim()}")
 
@@ -258,15 +314,17 @@ class DiffractionTomography(AutoSerialize):
             raise ValueError(f"sampling must have length 3, got shape={dk.shape}")
 
         shape = torch.tensor(volume.shape, dtype=torch.int32)
-        kx, ky, kz = cls._make_reciprocal_grids(shape, dk)
+        kz, ky, kx = cls._make_reciprocal_grids(shape, dk)
+        # kx, ky, kz = cls._make_reciprocal_grids(shape, dk)
         k_grid = torch.stack(torch.broadcast_tensors(kx, ky, kz), axis=-1)
 
         rot = Rotation.from_euler("zxz", zxz)
         k_source = rot.inv().apply(k_grid.reshape(-1, 3)).reshape(*volume.shape, 3)
         coords = torch.stack(
             [
-                torch.remainder(k_source[..., axis] / dk[axis], shape[axis])
-                for axis in range(3)
+                torch.remainder(k_source[..., 0] / dk[2], shape[2]),
+                torch.remainder(k_source[..., 1] / dk[1], shape[1]),
+                torch.remainder(k_source[..., 2] / dk[0], shape[0]),
             ],
             axis=0,
         )
@@ -278,7 +336,9 @@ class DiffractionTomography(AutoSerialize):
         diffraction_shape: tuple[int, int, int],
         dtype=torch.complex128,
     ) -> torch.Tensor:
-        """Structure factor of a vacuum cell — identity transmission in k-space."""
+        """
+        Structure factor of a vacuum cell — identity transmission in k-space.
+        """
         sf = torch.zeros(diffraction_shape, dtype=dtype)
         sf[0, 0, 0] = 1.0
         return sf
@@ -359,6 +419,10 @@ class DiffractionTomography(AutoSerialize):
     @property
     def diffraction_sampling(self) -> tuple[float, float, float]:
         return self.dataset.sampling[3:]
+    
+    @property
+    def real_sampling(self) -> tuple[float, float, float]:
+        return self.dataset.sampling[:3]
 
 
     def make_prop(
@@ -374,14 +438,32 @@ class DiffractionTomography(AutoSerialize):
         applied as part of the propagator only, so it is multiplied into the
         wave each propagation step and never separately. There is no
         per-slice mask on the transmission step.
+
+        Parameters
+        ----------
+        prop_distance: float
+            Z distance for multislice wave propagation
+        shape: torch.Tensor
+            3D diffraction shape
+        antialias_fraction: float
+            Cutoff relative to the Nyquist limit (2/3 by default, matching the standard multislice anti-aliasing rule)
+        antialias_softness: float
+            Amount of blurring for edges (roll-off width)
+
+        Returns
+        -------
+        prop: torch.Tensor
+            Returns propagator
         """
         device = torch.device(self.device)
         # device = torch.device(device)
         if prop_distance is None:
-            prop_distance = self.dataset.sampling[2]
+            # prop_distance = self.dataset.sampling[2]
+            prop_distance = self.dataset.sampling[0]
         self.prop_distance = prop_distance
         if shape is None:
-            shape = self.diffraction_shape[:2]
+            # shape = self.diffraction_shape[:2]
+            shape = self.diffraction_shape[1:]
         ku, kv = self._make_planar_reciprocal_grids(shape, self.dataset.sampling[3:5])
         ku = ku.to(device)
         kv = kv.to(device)
@@ -402,12 +484,24 @@ class DiffractionTomography(AutoSerialize):
         fraction: float = 2.0 / 3.0,
         softness: float = 0.05,
     ) -> torch.Tensor:
-        """Circular band-limit mask in k-space with a soft cosine roll-off.
+        """
+        Creates circular band-limit mask in k-space with a soft cosine roll-off.
 
-        `fraction` is the cutoff relative to the Nyquist limit (2/3 by default,
-        matching the standard multislice anti-aliasing rule). `softness` is the
-        roll-off width, also relative to Nyquist; setting it to 0 gives a hard
-        cutoff. The mask is 1 inside the cutoff, smoothly drops to 0 outside.
+        Paramaters
+        ----------
+        shape: torch.Tensor
+            2D diffraction shape (x,y)
+        sampling: torch.Tensor
+            2D reciprocal space sampling (x,y)
+        fraction: float
+            `Fraction` is the cutoff relative to the Nyquist limit (2/3 by default, matching the standard multislice anti-aliasing rule). 
+        softness: float    
+            `Softness` is the roll-off width, also relative to Nyquist; setting it to 0 gives a hard cutoff. The mask is 1 inside the cutoff, smoothly drops to 0 outside.
+        
+        Returns
+        -------
+        mask: torch.Tensor
+            Mask in k-space using soft cosine roll-off
         """
         ku, kv = DiffractionTomography._make_planar_reciprocal_grids(shape, sampling)
         k_radial = torch.sqrt(ku**2 + kv**2)
@@ -426,16 +520,29 @@ class DiffractionTomography(AutoSerialize):
     def make_probe_aperture(
         self,
         probe_k_max: float,
-        dp_shape: tuple[int, int] | None = None,
+        dp_shape: tuple[int, int] | torch.Tensor | None = None,
         normalize: bool = True,
     ) -> torch.Tensor:
         """Build a top-hat aperture probe in reciprocal space.
 
         With `normalize=True` (default), the returned probe satisfies
         `sum(|Psi|**2) = 1`. Vacuum propagation preserves this norm.
+
+        Parameters
+        ----------
+        probe_k_max: float
+            Max k-vector magnitude (A^-1)
+        dp_shape: torch.Tensor
+            3D diffraction shape
+
+        Returns
+        -------
+        Psi0: torch.Tensor
+            2D probe aperture
         """
         if dp_shape is None:
-            dp_shape = self.diffraction_shape[:2]
+            dp_shape = self.diffraction_shape[1:]
+            # dp_shape = self.diffraction_shape[:2]
         dp_shape = (int(dp_shape[0]), int(dp_shape[1]))
 
         ku, kv = self._make_planar_reciprocal_grids(dp_shape, self.dataset.sampling[3:5])
@@ -454,6 +561,23 @@ class DiffractionTomography(AutoSerialize):
         shape: tuple[int, int] | list[int] | torch.Tensor,
         sampling: tuple[float, float] | list[float] | torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Makes 2D reciprocal grids
+
+        Parameters
+        ----------
+        shape: torch.Tensor
+            2D reciprocal space shape (x,y)
+        sampling: torch.Tensor
+            2D reciprocal space sampling
+
+        Returns
+        -------
+        ku: torch.Tensor
+            Reciprocal basis vector in fast-scan direction
+        kv: torch.Tensor
+            Reciprocal basis vector in slow-scan direction
+        """
         shape = tuple(int(n) for n in shape)
         dk = torch.tensor(sampling, dtype=float)
         if len(shape) != 2:
@@ -463,6 +587,8 @@ class DiffractionTomography(AutoSerialize):
 
         ku = torch.fft.fftfreq(shape[0], d=1 / (shape[0] * dk[0]))[:, None]
         kv = torch.fft.fftfreq(shape[1], d=1 / (shape[1] * dk[1]))[None, :]
+        # ku = torch.fft.fftfreq(shape[0], d=1 / (shape[0] * dk[0]))[:, None]
+        # kv = torch.fft.fftfreq(shape[1], d=1 / (shape[1] * dk[1]))[None, :]
         return ku, kv
 
     @classmethod
@@ -478,20 +604,55 @@ class DiffractionTomography(AutoSerialize):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = torch.device(device)
 
-        ku, kv = cls._make_planar_reciprocal_grids(shape_2d, sampling_2d)
+        """
+        Determines which reciprocal space voxel (kz, ky, kx) is sampled for each diffraction pattern on the detector.
+
+        Parameters
+        ----------
+        shape_2d: torch.Tensor[int,int]
+            2D diffraction shape (ky, kx)
+        sampling_2d: torch.Tensor (float, float)
+            2D diffraction space sampling (dky, dkx)
+        u_proj: torch.Tensor[float, float, float]]
+            Unit vector in fast-scan direction (sample frame)
+        v_proj: torch.Tensor[float, float, float]
+            Unit vector in slow-scan direction (sample frame)
+        sampling_3d: torch.Tensor[float, float, float]
+            Sampling for 3d structure factor volume
+        shape_3d: torch.Tensor[int, int, int]
+            Shape of 3d structure factor volume
+        device: str or int
+            cpu or cuda:int
+
+        Returns
+        -------
+        coords: torch.Tensor
+            Locations of 2D slices of structure factor corresponding to specified detector pixel(s)
+            (kx, ky, kz) --> units of pixels
+        ku2: torch.Tensor
+            Detector coordinates (fast-scan direction)
+        kv2: torch.Tensor
+            Detector coordinates (slow-scan direction)
+        """
+        # converts to kz, ky and dkx, dky
+        shape2d = torch.asarray(shape_2d, device = device)
+        sampling2d = torch.asarray(sampling_2d, device = device)
+
+        ku, kv = cls._make_planar_reciprocal_grids(torch.flip(shape2d, dims = [0]), torch.flip(sampling2d, dims = [0])) # from zyx to xyz
         ku2, kv2 = torch.broadcast_tensors(ku, kv)
         ku2 = ku2.to(device)
         kv2 = kv2.to(device)
         u_proj = torch.asarray(u_proj, dtype=torch.float32, device=device)
         v_proj = torch.asarray(v_proj, dtype=torch.float32, device=device)
-        k_xyz = ku2[..., None] * u_proj[None, None, :] + kv2[..., None] * v_proj[None, None, :]
+        k_xyz = ku2[..., None] * u_proj[None, None, :] + kv2[..., None] * v_proj[None, None, :] # A^-1, xyz
 
-        dk = torch.asarray(sampling_3d, dtype=torch.float32)
+        dk = torch.asarray(sampling_3d, dtype=torch.float32) # in z,y,x
         shape_k = torch.asarray(shape_3d, dtype=torch.int32)
         coords = torch.stack(
             [
-                torch.remainder(k_xyz[..., axis] / dk[axis], shape_k[axis])
-                for axis in range(3)
+                torch.remainder(k_xyz[..., 0] / dk[2], shape_k[2]),
+                torch.remainder(k_xyz[..., 1] / dk[1], shape_k[1]),
+                torch.remainder(k_xyz[..., 2] / dk[0], shape_k[0]),
             ],
             axis=0,
         )
@@ -510,15 +671,36 @@ class DiffractionTomography(AutoSerialize):
 
         The slab is treated as a thin film of finite z-thickness whose (x, y)
         footprint is the material region. The ray's t-range is fixed by the
-        z-axis only — `t` covers `z = 0 .. shape[2] - 1` — so tilted rays that
+        z-axis only — `t` covers `z = 0 .. shape[0] - 1` — so tilted rays that
         leave the (x, y) footprint still produce slices. Callers are
-        expected to treat those out-of-footprint slices as vacuum."""
+        expected to treat those out-of-footprint slices as vacuum.
+        
+        Parameters
+        ----------
+        position: torch.Tensor
+            (x,y,z) position on 6D volume (where the propagation occurs)
+            Should be in the form (x,y,z) and in Angstroms
+        direction: torch.Tensor
+            Direction of vector propagating through the volume (based on tilt)
+            Should be in the form (x,y,z)
+        shape: torch.Tensor
+            3D real shape from 6D volume
+        sampling: torch.Tensor
+            3D real space sampling (units: A/px)
+        prop_distance: float
+            Distance between top (minimum z) and bottom (maximum z) of volume (units: A)
+
+        Returns
+        -------
+        ray_coords: torch.Tensor
+            Equispaced coordinates along ray specified by starting position, direction, and z extent of 6D volume
+        """
         device = torch.device(device)
 
-        r0 = torch.asarray(position, dtype=torch.float32)
-        w_proj = torch.asarray(direction, dtype=torch.float32, device = device)
-        shape = torch.asarray(shape, dtype=torch.int32, device = device)
-        sampling = torch.asarray(sampling, dtype=torch.float32, device = device)
+        r0 = torch.asarray(position, dtype=torch.float32) # still xyz
+        w_proj = torch.asarray(direction, dtype=torch.float32, device = device) # still xyz
+        shape = torch.flip(torch.asarray(shape, dtype=torch.int32, device = device), dims = [0]) # now xyz
+        sampling = torch.flip(torch.asarray(sampling, dtype=torch.float32, device = device), dims = [0]) # now xyz
 
         if r0.shape != (3,):
             raise ValueError(f"position must have shape (3,), got {r0.shape}")
@@ -543,39 +725,53 @@ class DiffractionTomography(AutoSerialize):
             # beam parallel to slab - cannot traverse z
             return torch.empty((0, 3), dtype=torch.float32)
 
-        t0 = (0.0 - r0[2]) / dr[2]
+        # (p0_z - r0_z)/d_z for top and bottom of volume
+        t0 = (0.0 - r0[2]) / dr[2] 
         t1 = ((shape[2] - 1) - r0[2]) / dr[2]
         t_min, t_max = (t0, t1) if t0 <= t1 else (t1, t0)
-
-        # if t_max < t_min:
-        #     return torch.empty((0, 3), dtype=float)
 
         # Sample the full line segment through the slab, including both negative
         # and positive steps from the itorchut position when they remain in bounds.
         eps = 1e-9
         n_min = int(torch.ceil(t_min - eps))
         n_max = int(torch.floor(t_max + eps))
-        if n_max < n_min:
+        if n_max <= n_min:
+        # if n_max < n_min:
             return torch.empty((0, 3), dtype=torch.float32)
 
         steps = torch.arange(n_min, n_max + 1, dtype=torch.float32, device=device)[:, None]
+        # print("steps test:", r0[None, :] + steps * dr[None, :])
         return r0[None, :] + steps * dr[None, :]
 
-    @staticmethod
-    def _trilinear_real_weights(position: torch.Tensor, device: str | int = 'cpu') -> list[tuple[tuple[int, int, int], float]]:
-        """Return real-space trilinear neighbors and weights for one sample position."""
-        device = torch.device(device)
+    # @staticmethod
+    def _trilinear_real_weights(self,position: torch.Tensor) -> list[tuple[tuple[int, int, int], float]]:
+        """Return real-space trilinear neighbors and weights for one sample position.
+        
+        Parameters
+        ----------
+        position: torch.Tensor
+            3D coordinate of position in volume 
+            Given as (x,y,z)
+        
+        Returns
+        -------
+        weights: list[tuple[tuple[int, int, int], float]]
+            Intensity weights and real-space trilinear neighbors from position as xyz
+        """
+        device = torch.device(self.device)
         base = torch.asarray(torch.floor(position), dtype = torch.int32, device = device)
         pos = torch.asarray(position, device = device)
         frac = pos - base
         weights: torch.Tensor[tuple[tuple[int, int, int], float]] = []
         for dx in range(2):
-            wx = frac[0] if dx else 1.0 - frac[0]
+            wx = frac[0].item() if dx else 1.0 - frac[0].item()
+            # wx = frac[0] if dx else 1.0 - frac[0]
             for dy in range(2):
-                wy = frac[1] if dy else 1.0 - frac[1]
+                wy = frac[1].item() if dy else 1.0 - frac[1].item()
                 for dz in range(2):
-                    wz = frac[2] if dz else 1.0 - frac[2]
-                    weights.append(((int(base[0] + dx), int(base[1] + dy), int(base[2] + dz)), float(wx * wy * wz)))
+                    wz = frac[2].item() if dz else 1.0 - frac[2].item()
+                    weights.append(((int(base[2] + dz), int(base[1] + dy), int(base[0] + dx)), float(wx * wy * wz)))
+                    # returns as z,y,x
                     # weights.append(((base[0] + dx, base[1] + dy, base[2] + dz), (wx * wy * wz).to(torch.float32)))
         return weights
 
@@ -586,6 +782,25 @@ class DiffractionTomography(AutoSerialize):
         u_proj = (1,0,0),
         v_proj = (0,1,0),
     ):
+        """
+        Returns coordinates along a ray for a given position and sample tilt.
+
+        Parameters
+        ----------
+        Psi0: torch.Tensor
+            Probe aperture
+        position: torch.Tensor
+            3D position in the real space volume as xyz
+        u_proj: torch.Tensor
+            Unit vector in fast-scan direction
+        v_proj
+            Unit vector in slow-scan direction
+
+        Returns 
+        -------
+        ray_coords_dict: dict{torch.Tensor}
+            Returns coordinates along rays ('ray_coords', xyz), structure factor slice coordinates ('k_slice_coords'), and unit vectors along fast-scan ('u_proj'), slow_scan ('v_proj'), and beam ('w_proj') directions
+        """
         device = torch.device(self.device)
         Psi0 = torch.as_tensor(Psi0, device=device)
         position = torch.as_tensor(position, device=device)
@@ -632,7 +847,12 @@ class DiffractionTomography(AutoSerialize):
             sampling=self.dataset.sampling[:3],
             prop_distance=self.prop_distance,
         )
-        return rays
+        return {'ray_coords': rays, 
+                'k_slice_coords': self.k_slice_coords,
+                'u_proj': u_proj,
+                'v_proj': v_proj,
+                'w_proj': w_proj,
+        }
 
     def forward_prop(
         self,
@@ -642,16 +862,34 @@ class DiffractionTomography(AutoSerialize):
         v_proj = (0,1,0),
         phase_only: bool = True,
     ):
+        """
+        Returns exit wave propagated through volume at specified position and tilt
+
+        Parameters
+        ----------
+        Psi0: torch.Tensor
+            Probe aperture
+        positions: torch.Tensor
+            3D position in the real space volume (xyz)
+        u_proj: torch.Tensor
+            Unit vector in fast-scan direction
+        v_proj
+            Unit vector in slow-scan direction
+
+        Returns
+        -------
+        Psi: torch.Tensor
+            Exit wave from Psi0 propagating through the volume at specified position and tilt
+        """
         device = torch.device(self.device)
         Psi0 = torch.as_tensor(Psi0, device=device)
         position = torch.as_tensor(position, device=device)
 
-        r_all = self.get_ray_coords(Psi0, position, u_proj, v_proj)
-
+        r_all = self.get_ray_coords(Psi0, position, u_proj, v_proj)['ray_coords']
         # multislice propagation through volume
         material_mask = self._get_material_mask().to(device)
         material_slice_cache = getattr(self, "_material_slice_cache", None)
-        Nx, Ny, Nz = self.real_shape
+        Nz, Ny, Nx = self.real_shape
         Psi = Psi0.clone()
 
         for ind, r in enumerate(r_all):
@@ -663,18 +901,21 @@ class DiffractionTomography(AutoSerialize):
             # from `self._material_slice_cache`.
             SF = torch.zeros(Psi0.shape, dtype=self.array.dtype, device = device)
             weight_sum = 0.0
-            for (ix, iy, iz), weight in self._trilinear_real_weights(r):
+            for (iz,iy,ix), weight in self._trilinear_real_weights(r):
                 if weight == 0.0:
                     continue
                 if not (0 <= ix < Nx and 0 <= iy < Ny and 0 <= iz < Nz):
                     continue
                 weight_sum += weight
-                if material_mask[ix, iy, iz]:
+                if material_mask[iz, iy, ix]:
+                # if material_mask[ix, iy, iz]:
                     if material_slice_cache is not None:
-                        SF += weight * material_slice_cache[ix, iy, iz]
+                        SF += weight * material_slice_cache[iz, iy, ix]
+                        # SF += weight * material_slice_cache[ix, iy, iz]
                     else:
                         SF += weight * self._sample_complex_volume_trilinear(
-                            self.array[ix, iy, iz],
+                            self.array[iz, iy, ix],
+                            # self.array[ix, iy, iz],
                             self.k_slice_coords,
                         ).to(SF.dtype)
                 else:
@@ -712,6 +953,25 @@ class DiffractionTomography(AutoSerialize):
         ray_coords,
         phase_only: bool = True,
     ):
+        """
+        Returns exit wave propagated through volume at specified tilt for precalculated ray coordinates
+
+        Parameters
+        ----------
+        Psi0: torch.Tensor
+            Probe aperture
+        ray_coords: torch.Tensor
+            Tensor of 3D positions in the real space volume (xyz)
+        u_proj: torch.Tensor
+            Unit vector in fast-scan direction
+        v_proj
+            Unit vector in slow-scan direction
+
+        Returns
+        -------
+        Psi: torch.Tensor
+            Exit wave from Psi0 propagating through the volume at specified position and tilt
+        """
         device = torch.device(self.device)
         Psi0 = torch.as_tensor(Psi0, device=device)
 
@@ -720,7 +980,7 @@ class DiffractionTomography(AutoSerialize):
         # multislice propagation through volume
         material_mask = self._get_material_mask().to(device)
         material_slice_cache = getattr(self, "_material_slice_cache", None)
-        Nx, Ny, Nz = self.real_shape
+        Nz, Ny, Nx = self.real_shape
         Psi = Psi0.clone()
 
         for ind, r in enumerate(r_all):
@@ -732,20 +992,18 @@ class DiffractionTomography(AutoSerialize):
             # from `self._material_slice_cache`.
             SF = torch.zeros(Psi0.shape, dtype=self.array.dtype, device = device)
             weight_sum = 0.0
-            for (ix, iy, iz), weight in self._trilinear_real_weights(r):
+            for (iz, iy, ix), weight in self._trilinear_real_weights(r):
                 if weight == 0.0:
                     continue
                 if not (0 <= ix < Nx and 0 <= iy < Ny and 0 <= iz < Nz):
                     continue
                 weight_sum += weight
-                if material_mask[ix, iy, iz]:
+                if material_mask[iz, iy, ix]:
                     if material_slice_cache is not None:
-                        SF += weight * material_slice_cache[ix, iy, iz]
+                        SF += weight * material_slice_cache[iz, iy, ix]
                     else:
-                        print(self.array[ix, iy, iz].shape,
-                            self.k_slice_coords.shape,)
                         SF += weight * self._sample_complex_volume_trilinear(
-                            self.array[ix, iy, iz],
+                            self.array[iz, iy, ix],
                             self.k_slice_coords,
                         ).to(SF.dtype)
                 else:
