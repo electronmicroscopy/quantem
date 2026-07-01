@@ -225,6 +225,31 @@ class SimDiffractionTomography(DiffractionTomography):
         an X-only tilt when `zxz_deg` is omitted). The scan plane is the lab xy
         plane, and the beam is the lab z axis; both are expressed in the
         sample-fixed 6D coordinate system before forward propagation.
+
+        Parameters 
+        ----------
+        tilt_x_deg: float
+            Defines rotation angle around x-axis (out of plane)
+        zxz_deg: torch.Tensor
+            Defines rotation angle around all Euler angles (zxz)
+        detector_rotation_deg: float
+            Defines rotation angle of detector
+        scan_step: tuple(float, float)
+            yx scan sampling in real space
+        scan_shape: tuple(int, int)
+            yx scan shape centered around scan_origin
+        scan_origin: torch.Tensor
+            yx location of center of scan area
+        probe_k_max: float
+            Max k-vector magnitude (A^-1)
+        dp_shape: tuple(int, int)
+            Diffraction pattern shape
+        
+        Returns
+        -------
+        dp: Dataset4dstem
+            Returns 4D STEM dataset
+
         """
         device = torch.device(self.device)
         print(f"Using device: {device}")
@@ -244,7 +269,7 @@ class SimDiffractionTomography(DiffractionTomography):
             raise ValueError(
                 f"scan_step must be a scalar or shape (2,), got shape={scan_step_arr.shape}"
             )
-        n_slow, n_fast = int(scan_shape[0]), int(scan_shape[1])
+        n_slow, n_fast = int(scan_shape[1]), int(scan_shape[0])
         if n_slow <= 0 or n_fast <= 0:
             raise ValueError(f"scan_shape must be positive, got {scan_shape}")
 
@@ -252,9 +277,14 @@ class SimDiffractionTomography(DiffractionTomography):
         sampling3 = torch.asarray(self.dataset.sampling[:3], dtype=torch.float32, device = device)
         real_shape = torch.asarray(self.array.shape[:3], dtype=torch.float32, device = device)
         if scan_origin is None:
-            scan_origin_arr = (real_shape - 1) / 2.0 * sampling3
+            # scan_origin_arr = torch.asarray((0,0,0), dtype= torch.int32, device=device)
+            scan_origin_arr = (real_shape[1:] - 1) / 2 * sampling3[1:]
+            z_origin = torch.tensor((0,))
+            scan_origin_arr = torch.cat((z_origin,scan_origin_arr))
         else:
-            scan_origin_arr = torch.asarray(scan_origin, dtype=torch.float32, device = device)
+            scan_origin_arr = torch.asarray(scan_origin, dtype=torch.int32, device = device)
+            z_origin = torch.tensor((0,))
+            scan_origin_arr = torch.cat((z_origin,scan_origin_arr))
             if scan_origin_arr.shape != (3,):
                 raise ValueError(
                     f"scan_origin must have shape (3,), got {scan_origin_arr.shape}"
@@ -263,7 +293,7 @@ class SimDiffractionTomography(DiffractionTomography):
         #setting output diffraction shape
         diff_shape = self.diffraction_shape
         if dp_shape is None:
-            dp_shape_out = (int(diff_shape[0]), int(diff_shape[1]))
+            dp_shape_out = (int(diff_shape[1]), int(diff_shape[2]))
         else:
             dp_shape_out = (int(dp_shape[0]), int(dp_shape[1]))
         # Probe aperture in reciprocal space, normalized to sum |Psi|^2 = 1.
@@ -288,9 +318,9 @@ class SimDiffractionTomography(DiffractionTomography):
         )
 
         material_mask = self._get_material_mask()
-        Nx, Ny, Nz = self.real_shape
+        Nz, Ny, Nx = self.real_shape
         slice_cache = torch.zeros(
-            (Nx, Ny, Nz, dp_shape_out[0], dp_shape_out[1]),
+            (Nz, Ny, Nx, dp_shape_out[0], dp_shape_out[1]),
             dtype=self.array.dtype,
             device = device,
         )
@@ -339,11 +369,12 @@ class SimDiffractionTomography(DiffractionTomography):
             sv = slow_centered[j]
             su = fast_centered[i]
             offset_phys = sv * scan_step_arr[0] * v_proj + su * scan_step_arr[1] * u_proj
-            position_index = (scan_origin_arr + offset_phys) / sampling3
-            print("pos index:",position_index, " shouldnt this be a int???")
+            offset_phys = torch.flip(offset_phys, dims = (0,))
+            position_index = torch.asarray((scan_origin_arr + offset_phys) / sampling3, dtype=torch.int32)
+            print("pos index:",position_index)
             Psi = self.forward_prop(
                 Psi0,
-                position_index,
+                torch.flip(position_index, dims=(0,)),
                 u_proj=u_proj,
                 v_proj=v_proj,
                 phase_only=phase_only,
@@ -376,8 +407,8 @@ class SimDiffractionTomography(DiffractionTomography):
         sampling4 = (
             float(scan_step_arr[0]),
             float(scan_step_arr[1]),
-            float(self.dataset.sampling[3]),
             float(self.dataset.sampling[4]),
+            float(self.dataset.sampling[5]),
         )
         units4 = ("A", "A", "A^-1", "A^-1")
         dp = Dataset4dstem.from_array(

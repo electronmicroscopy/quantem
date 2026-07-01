@@ -1076,8 +1076,7 @@ class DiffractionTomography(AutoSerialize):
             self,
             dataset: Dataset | DatasetModelType,
             batch_size: int = 1024,
-            num_workers: int = 32,
-            val_fraction: float = 0.15,
+            val_fraction: float = 0.0,
     ):
         pin_mem = self.device == 'cuda'
         generator = torch.Generator()
@@ -1096,22 +1095,18 @@ class DiffractionTomography(AutoSerialize):
         train_dataloader = DataLoader(
             train_dataset,
             batch_size = batch_size,
-            num_workers = num_workers,
             pin_memory=pin_mem,
             drop_last=False,
-            persistent_workers = num_workers > 0
             )
         val_dataloader = DataLoader(
             val_dataset,
             batch_size = batch_size * 4, # less memory than training
-            num_workers = num_workers,
             pin_memory=pin_mem,
             drop_last=False,
-            persistent_workers = num_workers > 0
             )
         return train_dataloader, val_dataloader
         
-    #  put this under DiffractionToomography?
+    #  put this under DiffractionTomography?
     def reconstruct_pix(
         self,
         probe_k_max: float = 0.10,
