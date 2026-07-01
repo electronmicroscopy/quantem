@@ -277,7 +277,7 @@ class MAPED(AutoSerialize):
             shift_rc, G_shift = weighted_cross_correlation_shift(
                 im_ref=G_ref,
                 im=G,
-                weight_real=im_weight * 0.0 + 1.0,
+                weight_real= 1.0,
                 upsample_factor=int(upsample_factor),
                 fft_input=True,
                 fft_output=True,
@@ -1166,19 +1166,32 @@ class MAPEDTorch(AutoSerialize):
 
     def diffraction_align(
         self,
+        num_iter: int = 5,
         edge_blend: float = 16.0,
         padding=None,
         pad_val: str | float = "min",
         upsample_factor: int = 100,
         weight_scale: float = 1 / 8,
+        max_shift=None,
         plot_aligned: bool = True,
         **plot_kwargs: Any,
     ) -> MAPED:
         """
-        Align mean diffraction patterns using weighted cross-correlation in Fourier space.
+        Align mean diffraction patterns using iterative average-reference
+        cross-correlation in Fourier space.
+
+        Each iteration phase-shifts every diffraction pattern by the current shift
+        estimate, forms a common average reference from all patterns, then
+        re-correlates each pattern against that reference and accumulates the
+        residual shift. This mirrors ``real_space_align`` so that after the first
+        iteration only small residual shifts are measured, where subpixel
+        cross-correlation is most accurate. A single pass (num_iter=1) reproduces
+        the old behavior of measuring each (large) shift once against a mean.
 
         Parameters
         ----------
+        num_iter : int
+            Number of refinement iterations.
         edge_blend : float
             Tukey window edge taper (pixels).
         padding : int or tuple, optional
@@ -1188,7 +1201,11 @@ class MAPEDTorch(AutoSerialize):
         upsample_factor : int
             Subpixel upsampling factor for correlation peak estimation.
         weight_scale : float
-            Radial weight falloff scale (fraction of mean DP size).
+            Radial weight falloff scale (fraction of mean DP size). Currently unused.
+        max_shift : float, optional
+            Largest expected shift magnitude (pixels), used to size the zero-padded
+            correlation canvas so large shifts do not wrap around. If None, it is
+            estimated from the spread of ``diffraction_origins``.
         plot_aligned : bool
             If True, plot aligned mean diffraction patterns.
         **plot_kwargs
@@ -1211,8 +1228,30 @@ class MAPEDTorch(AutoSerialize):
                 "Run diffraction_origin() first so self.diffraction_origins exists."
             )
 
-        H, W = self.dp_mean[0].shape
+        if int(num_iter) < 1:
+            raise ValueError("num_iter must be >= 1")
 
+        H, W = self.dp_mean[0].shape
+        n = len(self.dp_mean)
+
+        # Size the zero-padded canvas so shifts never wrap around. Use max_shift if
+        # given, otherwise estimate the largest shift from the spread of the beam
+        # origins (each pattern's shift is ~ -(origin - mean origin)).
+        origins = torch.stack(
+            [torch.as_tensor(o, device=self.device, dtype=torch.float32) for o in self.diffraction_origins]
+        )
+        if max_shift is not None:
+            max_shift_f = float(max_shift)
+        else:
+            max_shift_f = float((origins - origins.mean(dim=0, keepdim=True)).abs().max().item())
+        pad_cc = int(np.ceil(max_shift_f + float(edge_blend))) + 4
+
+        Hp = H + 2 * pad_cc
+        Wp = W + 2 * pad_cc
+        r0 = pad_cc
+        c0 = pad_cc
+
+        # Stationary Tukey window over the un-padded region, applied after shifting.
         w = (
             tukey_torch(
                 H,
@@ -1227,49 +1266,44 @@ class MAPEDTorch(AutoSerialize):
                 dtype=torch.float32,
             )[None, :]
         )
+        w_pad = torch.zeros((Hp, Wp), dtype=torch.float32, device=self.device)
+        w_pad[r0 : r0 + H, c0 : c0 + W] = w
+        w_sum = torch.sum(w_pad)
+        if w_sum <= 0:
+            raise RuntimeError("tukey window sum is zero")
 
-        r = torch.fft.fftfreq(H, 1.0 / float(H))[:, None]
-        c = torch.fft.fftfreq(W, 1.0 / float(W))[None, :]
+        base_pad = torch.zeros((n, Hp, Wp), dtype=torch.float32, device=self.device)
+        for i in range(n):
+            base_pad[i, r0 : r0 + H, c0 : c0 + W] = self.dp_mean[i].float()
 
-        n = len(self.dp_mean)
-        self.diffraction_shifts = torch.zeros((n, 2), device=self.device, dtype=torch.float32)
+        # Initialize from the beam origins (shift each pattern's origin onto the
+        # reference origin) so iteration only has to refine the subpixel residual.
+        shifts = origins[0][None, :] - origins
 
-        G_ref = torch.fft.fft2(w * self.dp_mean[0])
-        xy0 = self.diffraction_origins[0]
+        for _ in range(int(num_iter)):
+            # shift patterns to current guess in a zero-padded canvas (no wrap)
+            ims_a = shift_images_torch(base_pad, shifts)
+            ims_mean = torch.sum(ims_a * w_pad, dim=(1, 2)) / w_sum
+            ims_win = (ims_a - ims_mean[:, None, None]) * w_pad[None]
+            G_list = torch.fft.fft2(ims_win)
 
-        kr = torch.fft.fftfreq(H, device=self.device)[:, None]
-        kc = torch.fft.fftfreq(W, device=self.device)[None, :]
+            # common average reference from all (currently aligned) patterns
+            G_ref = torch.mean(G_list, dim=0)
 
-        for ind in range(1, n):
-            G = torch.fft.fft2(w * self.dp_mean[ind])
-            xy = self.diffraction_origins[ind]
+            for ind in range(1, n):
+                drc = cross_correlation_shift_torch(  # not torchified yet
+                    im_ref=G_ref,
+                    im=G_list[ind],
+                    upsample_factor=int(upsample_factor),
+                    fft_input=True,
+                )
+                shifts[ind, 0] += float(drc[0])
+                shifts[ind, 1] += float(drc[1])
 
-            dr2 = (r - xy0[0] + xy[0]) ** 2 + (c - xy0[1] + xy[1]) ** 2
-            im_weight = torch.clip(
-                1.0
-                - torch.sqrt(dr2)
-                / float(torch.mean(torch.tensor([H, W], device=self.device, dtype=torch.float32)))
-                / float(weight_scale),
-                0.0,
-                1.0,
-            )
-            im_weight = torch.sin(im_weight * torch.pi / 2.0) ** 2
-            shift_rc = cross_correlation_shift_torch(  # not torchified yet
-                im_ref=G_ref,
-                im=G,
-                # weight_real=im_weight * 0.0 + 1.0,
-                upsample_factor=int(upsample_factor),
-                fft_input=True,
-            )
+            shifts -= shifts[0].clone()[None, :]
 
-            phase_ramp = torch.exp(-2j * torch.pi * (kr * shift_rc[0] + kc * shift_rc[1]))
-
-            G_shift = G * phase_ramp
-            self.diffraction_shifts[ind, :] = shift_rc.clone()
-
-            G_ref = G_ref * (ind / (ind + 1)) + G_shift / (ind + 1)
-
-        self.diffraction_shifts -= torch.mean(self.diffraction_shifts, axis=0)[None, :]
+        shifts -= torch.mean(shifts, dim=0)[None, :]
+        self.diffraction_shifts = shifts
         if plot_aligned:
             im_aligned = shift_images_torch(
                 images=torch.stack(self.dp_mean),
