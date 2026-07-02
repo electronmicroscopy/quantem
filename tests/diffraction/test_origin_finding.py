@@ -272,6 +272,64 @@ def test_bragg_peak_polar_transform_inverts_ellipse_mapping():
     assert got[0, 1] == pytest.approx(0.0)
 
 
+def _bragg_orientation_histogram(theta_values, theta_step_deg=90):
+    ds = _dataset(np.zeros((1, 1, 8, 8), dtype=np.float32))
+    bp = BraggPeaksPolymer.from_data(
+        ds,
+        device="cpu",
+        compute_parameters=lambda x, **kwargs: (0.0, 1.0),
+        normalize_data=lambda x, lo, hi: x,
+    )
+    theta_values = np.asarray(theta_values, dtype=float)
+
+    polar = Vector.from_shape(
+        shape=(1, 1),
+        fields=["r_invA", "theta"],
+        units=["1/Å", "radians"],
+        name="polar_peaks",
+    )
+    polar.set_data(
+        np.column_stack([np.ones_like(theta_values), theta_values]),
+        0,
+        0,
+    )
+    intensities = Vector.from_shape(
+        shape=(1, 1),
+        fields=["intensities"],
+        units=["counts"],
+        name="peak_intensities",
+    )
+    intensities.set_data(np.ones((theta_values.size, 1), dtype=float), 0, 0)
+
+    bp.polar_peaks = polar
+    bp.peak_intensities = intensities
+    return bp.make_orientation_histogram(
+        radial_ranges=np.array([0.5, 1.5]),
+        upsample_factor=2,
+        theta_step_deg=theta_step_deg,
+        sigma_x=None,
+        sigma_y=None,
+        sigma_theta=None,
+        normalize_intensity_image=False,
+        normalize_intensity_stack=False,
+        progress_bar=False,
+    )
+
+
+def test_bragg_orientation_histogram_preserves_karen_angles():
+    hist = _bragg_orientation_histogram([0.0, np.pi / 2])
+
+    assert hist[0, 0, 0, 0] == pytest.approx(1.0)
+    assert hist[0, 0, 0, 1] == pytest.approx(1.0)
+
+
+def test_bragg_orientation_histogram_folds_unwrapped_angles():
+    hist = _bragg_orientation_histogram([0.0, np.pi, np.pi / 2, 3 * np.pi / 2])
+
+    assert hist[0, 0, 0, 0] == pytest.approx(2.0)
+    assert hist[0, 0, 0, 1] == pytest.approx(2.0)
+
+
 def test_bragg_private_helpers_characterize_shared_plotting_behavior():
     ds = _dataset(np.arange(2 * 2 * 4 * 4, dtype=np.float32).reshape(2, 2, 4, 4))
 
@@ -319,7 +377,7 @@ def test_bragg_private_helpers_characterize_shared_plotting_behavior():
     assert _central_peak_index(peaks_x, peaks_y, peaks_r, (3.0, 3.0)) == 1
     assert _central_peak_index(peaks_x, peaks_y, None, (3.0, 3.0)) == 0
 
-    cropped, zx, zy, zr, zi, zcentral = _zoom_peak_overlay(
+    cropped, zx, zy, zr, zi, zcentral, display_center = _zoom_peak_overlay(
         np.zeros((6, 6)),
         peaks_x,
         peaks_y,
@@ -335,6 +393,25 @@ def test_bragg_private_helpers_characterize_shared_plotting_behavior():
     assert np.allclose(zr, [1.0])
     assert np.allclose(zi, [10.0])
     assert zcentral == 0
+    assert display_center == pytest.approx((1.0, 1.0))
+
+    cropped, zx, zy, zr, zi, zcentral, display_center = _zoom_peak_overlay(
+        np.zeros((8, 8)),
+        np.array([1.0, 4.0]),
+        np.array([1.0, 4.0]),
+        np.array([0.1, 2.0]),
+        np.array([10.0, 20.0]),
+        0,
+        2,
+        (4.0, 4.0),
+    )
+    assert cropped.shape == (4, 4)
+    assert np.allclose(zx, [2.0])
+    assert np.allclose(zy, [2.0])
+    assert np.allclose(zr, [2.0])
+    assert np.allclose(zi, [20.0])
+    assert zcentral is None
+    assert display_center == pytest.approx((2.0, 2.0))
 
     r_bins, theta_bins = _polar_peak_bins(
         np.array([1.0, 2.0]),

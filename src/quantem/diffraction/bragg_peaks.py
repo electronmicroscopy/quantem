@@ -30,6 +30,7 @@ from IPython.display import clear_output
 from pathlib import Path
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from matplotlib.patches import Rectangle
+from matplotlib.colors import BoundaryNorm
 
 def _apply_zoom_crop(data, zoom_factor, center=None):
     """Crop data to center region based on zoom factor."""
@@ -161,14 +162,11 @@ def _zoom_peak_overlay(
     fallback_center,
 ):
     if zoom == 1:
-        return dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx
+        return dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, fallback_center
 
-    if central_idx is not None and _has_peak_positions(peaks_x, peaks_y):
-        center = (peaks_y[central_idx], peaks_x[central_idx])
-    else:
-        center = fallback_center
-    dp_data, ranges = _apply_zoom_crop(dp_data, zoom, center=center)
+    dp_data, ranges = _apply_zoom_crop(dp_data, zoom, center=fallback_center)
     top, bot, left, right = ranges
+    display_center = (fallback_center[0] - top, fallback_center[1] - left)
 
     if _has_peak_positions(peaks_x, peaks_y):
         mask = (top <= peaks_y) & (peaks_y < bot) & (left <= peaks_x) & (peaks_x < right)
@@ -181,7 +179,7 @@ def _zoom_peak_overlay(
         peaks_r_invA = peaks_r_invA[mask] if peaks_r_invA is not None else None
         peak_ints = peak_ints[mask] if peak_ints is not None else None
 
-    return dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx
+    return dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, display_center
 
 
 def _polar_peak_bins(
@@ -226,7 +224,24 @@ def _plot_bragg_peaks_on_ax(
     central_alpha=0.95,
     central_linewidth=2,
     add_colorbar=False,
+    center=None,
+    show_center=True,
 ):
+    plot_detected_center = center is None or not show_center
+    if center is not None and show_center:
+        center_y, center_x = center
+        ax.scatter(
+            center_x,
+            center_y,
+            s=120 * crosshair_scaling_central_beam,
+            alpha=central_alpha,
+            linewidths=central_linewidth,
+            edgecolors="k",
+            facecolors=central_beam_color,
+            marker="o",
+            zorder=10,
+        )
+
     if peaks_r_invA is None or len(peaks_r_invA) == 0:
         return
     if not _has_peak_positions(peaks_x, peaks_y):
@@ -243,7 +258,7 @@ def _plot_bragg_peaks_on_ax(
         mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
         if show_all_peaks and np.any(~mask):
             out_indices = np.where(~mask)[0]
-            if central_idx is not None and central_idx in out_indices:
+            if plot_detected_center and central_idx is not None and central_idx in out_indices:
                 ax.scatter(
                     peaks_x[central_idx],
                     peaks_y[central_idx],
@@ -274,14 +289,15 @@ def _plot_bragg_peaks_on_ax(
         peak_intensities = peak_intensities[mask] if peak_intensities is not None else None
 
     if central_idx is not None:
-        ax.scatter(
-            peaks_x[central_idx],
-            peaks_y[central_idx],
-            s=120 * crosshair_scaling_central_beam,
-            alpha=central_alpha,
-            linewidths=central_linewidth,
-            **central_style,
-        )
+        if plot_detected_center:
+            ax.scatter(
+                peaks_x[central_idx],
+                peaks_y[central_idx],
+                s=120 * crosshair_scaling_central_beam,
+                alpha=central_alpha,
+                linewidths=central_linewidth,
+                **central_style,
+            )
         non_central = np.ones(len(peaks_x), dtype=bool)
         non_central[central_idx] = False
     else:
@@ -415,6 +431,11 @@ class BraggPeaksPolymer(AutoSerialize):
         self.max_radius = None
         self.num_radial_bins = None
         self.num_annular_bins = None
+        # Cached dataset-level normalization stats (median, iqr). Computed once by
+        # find_peaks_model / ensure_normalization_params and reused for live inference
+        # so single-DP predictions reproduce the full-scan results exactly.
+        self._norm_median = None
+        self._norm_iqr = None
 
         if model is None:
             # Setup model
@@ -670,8 +691,101 @@ class BraggPeaksPolymer(AutoSerialize):
 
         return peak_coords, interpolated_intensities
 
+    def ensure_normalization_params(
+        self,
+        device: str = None,
+        n_normalize_samples: int = 1000,
+        scan_mask: ArrayLike = None,
+        recompute: bool = False,
+    ):
+        """Compute and cache the dataset-level (median, iqr) normalization stats.
+
+        These are estimated once from a random sample of valid diffraction patterns and
+        reused by both ``find_peaks_model`` (whole-scan) and ``infer_peaks_single``
+        (live). Caching guarantees live single-DP inference reproduces the full-scan
+        peaks exactly (same normalization). Returns the cached ``(median, iqr)``.
+        """
+        if not recompute and self._norm_median is not None and self._norm_iqr is not None:
+            return self._norm_median, self._norm_iqr
+
+        device = device or self.device
+        Ry, Rx, _, _ = self.dataset_cartesian.shape
+        if scan_mask is None:
+            scan_mask = np.ones((Ry, Rx), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+        valid_positions = np.argwhere(scan_mask)
+        n_valid = len(valid_positions)
+
+        n_normalize_samples = min(n_normalize_samples, n_valid)
+        sample_indices = np.random.choice(n_valid, size=n_normalize_samples, replace=False)
+
+        stats_patterns = np.array([
+            self.dataset_cartesian[ry, rx].array
+            for ry, rx in valid_positions[sample_indices]
+        ])
+
+        stats_patterns_resized = self.resize_images(stats_patterns, device=device)
+        median, iqr = self.compute_parameters(
+            stats_patterns_resized,
+            lower_percentile=self.normalize_parameter_lower_percentile,
+            upper_percentile=self.normalize_parameter_upper_percentile,
+        )
+        self._norm_median, self._norm_iqr = median, iqr
+        return median, iqr
+
+    def infer_peaks_single(
+        self,
+        ry: int,
+        rx: int,
+        *,
+        device: str = None,
+        sigma_peak_blur: float = 1.0,
+        threshold_peak: float = 0.5,
+        n_normalize_samples: int = 1000,
+    ):
+        """Run the model on the single diffraction pattern at (ry, rx).
+
+        Live counterpart of ``find_peaks_model`` for one scan position: resize ->
+        normalize (cached median/iqr) -> model forward -> decode -> rescale to detector
+        pixels. Returns a dict with keys ``"y_pixels"``, ``"x_pixels"``, ``"intensities"``
+        (empty arrays when no peaks are found), matching the columns/units of
+        ``peak_coordinates_cartesian`` / ``peak_intensities``.
+        """
+        device = device or self.device
+        median, iqr = self.ensure_normalization_params(
+            device=device, n_normalize_samples=n_normalize_samples
+        )
+
+        dp = np.asarray(self.dataset_cartesian[ry, rx].array)
+        resized = self.resize_images(dp[None], device=device, initial_chunk_size=1)
+        ins = torch.tensor(resized, dtype=torch.float32).to(device)
+        ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+
+        self.model.to(device)
+        self.model.eval()
+        with torch.no_grad():
+            out = self.model(ins_batch).detach().cpu().numpy()[0]  # (2, H, W)
+
+        peak_coords, peak_ints = self._postprocess_single(
+            out[0], out[1], sigma=sigma_peak_blur, threshold=threshold_peak
+        )
+        if len(peak_coords) == 0:
+            empty = np.array([])
+            return {"y_pixels": empty, "x_pixels": empty, "intensities": empty}
+
+        # Rescale from model-input pixels back to original detector pixels (matches
+        # the whole-scan rescale in find_peaks_model).
+        scale = self.dataset_cartesian.shape[2] / self.final_shape[0]
+        coords = np.asarray(peak_coords) * scale  # (N, 2) = [row=y, col=x]
+        return {
+            "y_pixels": coords[:, 0],
+            "x_pixels": coords[:, 1],
+            "intensities": np.asarray(peak_ints),
+        }
+
     def find_peaks_model(
-        self, 
+        self,
         device: str = "cuda:0",
         scan_mask: ArrayLike = None,
         n_normalize_samples: int = 1000,
@@ -713,21 +827,12 @@ class BraggPeaksPolymer(AutoSerialize):
         # ============================================
         # 1. Compute normalization parameters (only from valid positions)
         # ============================================
-        n_normalize_samples = min(n_normalize_samples, n_valid)
-        sample_indices = np.random.choice(n_valid, size=n_normalize_samples, replace=False)
-        
-        stats_patterns = np.array([
-            self.dataset_cartesian[ry, rx].array 
-            for ry, rx in valid_positions[sample_indices]
-        ])
-        
-        stats_patterns_resized = self.resize_images(stats_patterns, device=device)
-        median, iqr = self.compute_parameters(
-            stats_patterns_resized,
-            lower_percentile=self.normalize_parameter_lower_percentile,
-            upper_percentile=self.normalize_parameter_upper_percentile,
+        median, iqr = self.ensure_normalization_params(
+            device=device,
+            n_normalize_samples=n_normalize_samples,
+            scan_mask=scan_mask,
         )
-    
+
         # ============================================
         # 2. Process only valid positions with chunking
         # ============================================
@@ -2033,10 +2138,8 @@ class BraggPeaksPolymer(AutoSerialize):
                                     theta_radians *= -1
                                 # Add offset
                                 theta_radians += orientation_offset_degrees * np.pi / 180
+                                theta_radians = np.mod(theta_radians, np.pi)
                                 t = theta_radians / dtheta
-                                # # Fold to 0-180° range (0 to π)
-                                # theta_folded = np.mod(theta_radians, np.pi)
-                                # t = theta_folded / dtheta
                                 
                                 # Spread signal using peak sigma if requested
                                 if use_peak_sigma:
@@ -2558,6 +2661,18 @@ class BraggPeaksPolymer(AutoSerialize):
         except Exception as e:
             print(f"Error saving figures: {e}")
             
+    def show_widget(self, **kwargs):
+        """Open the interactive polymer 4D-STEM viewer (``quantem.widget``).
+
+        Thin wrapper over ``quantem.widget.show_polymer_4DSTEM``: drag the map to update
+        the Current/Lamellar/Backbone/pi-pi DP panels and the polar view, with detected
+        peaks overlaid when ``find_peaks_model`` has run. All ``**kwargs`` are forwarded
+        to the factory (e.g. ``intensity_map``, ``map_cmap``, ``dp_cmap``, ``show_polar``,
+        ``title``).
+        """
+        from quantem.widget import show_polymer_4DSTEM
+        return show_polymer_4DSTEM(self, **kwargs)
+
     def plot_interactive_peak_map(self, radial_range=None, intensity_map=None,
                                     ry=None, rx=None,
                                     vmax_cartesian=7, vmin_cartesian=0, show_all_peaks=True,
@@ -2611,7 +2726,17 @@ class BraggPeaksPolymer(AutoSerialize):
         vmax_polar = vmax_polar or vmax_cartesian
         
         # Peak plotting function
-        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, central_idx, ry_data, rx_data):
+        def plot_peaks_on_ax(
+            ax,
+            peaks_x,
+            peaks_y,
+            peaks_r_invA,
+            peak_intensities,
+            central_idx,
+            ry_data,
+            rx_data,
+            center=None,
+        ):
             _plot_bragg_peaks_on_ax(
                 ax,
                 peaks_x,
@@ -2633,6 +2758,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 crosshair_scaling_peaks=crosshair_scaling_peaks,
                 crosshair_scaling_central_beam=crosshair_scaling_central_beam,
                 add_colorbar=True,
+                center=center,
             )
         
         # Interactive callback
@@ -2722,7 +2848,15 @@ class BraggPeaksPolymer(AutoSerialize):
                 getattr(self, "image_centers", None), ry_data, rx_data, dp_data.shape
             )
             central_idx = _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center)
-            dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx = _zoom_peak_overlay(
+            (
+                dp_data,
+                peaks_x,
+                peaks_y,
+                peaks_r_invA,
+                peak_ints,
+                central_idx,
+                display_center,
+            ) = _zoom_peak_overlay(
                 dp_data,
                 peaks_x,
                 peaks_y,
@@ -2737,7 +2871,17 @@ class BraggPeaksPolymer(AutoSerialize):
             ax2.set_xticks([])
             ax2.set_yticks([])
                 
-            plot_peaks_on_ax(ax2, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, ry_data, rx_data)
+            plot_peaks_on_ax(
+                ax2,
+                peaks_x,
+                peaks_y,
+                peaks_r_invA,
+                peak_ints,
+                central_idx,
+                ry_data,
+                rx_data,
+                center=display_center,
+            )
             ax2.set_xlim(-0.5, dp_data.shape[1] - 0.5)
             ax2.set_ylim(dp_data.shape[0] - 0.5, -0.5)
             
@@ -2827,7 +2971,7 @@ class BraggPeaksPolymer(AutoSerialize):
         vmax_polar = vmax_polar or vmax_cartesian
         
         # Peak plotting function
-        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, central_idx):
+        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, central_idx, center=None):
             _plot_bragg_peaks_on_ax(
                 ax,
                 peaks_x,
@@ -2851,6 +2995,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 peak_alpha=peak_alpha,
                 central_alpha=peak_alpha,
                 central_linewidth=crosshair_width_peaks,
+                center=center,
             )
         
         # Create save directory
@@ -2878,7 +3023,15 @@ class BraggPeaksPolymer(AutoSerialize):
         center = _display_center(getattr(self, "image_centers", None), ry, rx, dp_data.shape)
         central_idx = _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center)
         
-        dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx = _zoom_peak_overlay(
+        (
+            dp_data,
+            peaks_x,
+            peaks_y,
+            peaks_r_invA,
+            peak_ints,
+            central_idx,
+            display_center,
+        ) = _zoom_peak_overlay(
             dp_data,
             peaks_x,
             peaks_y,
@@ -2948,7 +3101,7 @@ class BraggPeaksPolymer(AutoSerialize):
         ax.set_xticks([])
         ax.set_yticks([])
         if peaks_x is not None:
-            plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx)
+            plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, center=display_center)
         ax.set_xlim(-0.5, dp_data.shape[1] - 0.5)
         ax.set_ylim(dp_data.shape[0] - 0.5, -0.5)
         ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
@@ -2979,8 +3132,12 @@ class BraggPeaksPolymer(AutoSerialize):
                     
                     # Find central beam for polar
                     polar_central_idx = np.argmin(polar_r)
-                    if peaks_r_invA is not None:
-                        plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, peak_ints, polar_central_idx)
+                    # Use the full (unzoomed) intensities: polar_r / r_bins / theta_bins are read
+                    # from the full polar_peaks, whereas `peak_ints` may have been subset by
+                    # zoom > 1 for the Cartesian panel (length mismatch -> IndexError otherwise).
+                    polar_peak_ints = self.peak_intensities[intensity_field][ry, rx]
+                    if polar_r is not None and len(polar_r) > 0:
+                        plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, polar_peak_ints, polar_central_idx)
             fig_polar.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
             plt.close(fig_polar)
             print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_polar.pdf')
@@ -3314,41 +3471,24 @@ class BraggPeaksPolymer(AutoSerialize):
             # Calculate max_count early for use in both colorbar and statistics
             max_count = int(np.max(count_map))
             
-            # Plot
-            _, _ = show_2d(
+            # Plot as a true integer-count map. Avoid show_2d's default quantile
+            # normalization here: count maps are discrete, not continuous images.
+            boundaries = np.arange(-0.5, max_count + 1.5, 1)
+            norm = BoundaryNorm(boundaries, ncolors=plt.get_cmap(cmap).N, clip=True)
+            im = axes[idx].imshow(
                 count_map,
                 cmap=cmap,
-                title=f'Peak Count\n{q_min:.2f} - {q_max:.2f} 1/Å',
-                cbar=True,
-                show_ticks=True,
-                figax=(fig, axes[idx])
+                norm=norm,
+                interpolation='nearest',
+                origin='upper',
             )
-            
-            # Customize colorbar - get it from the axes image
-            try:
-                # Try to get colorbar from the image in the axes
-                im = axes[idx].images[0]
-                cbar = im.colorbar
-                
-                if cbar is not None:
-                    cbar.set_label('Number of Peaks', fontsize=10)
-                    
-                    # Set colorbar ticks to integers
-                    if max_count > 0:
-                        tick_spacing = max(1, max_count // 5)  # About 5 ticks
-                        ticks = np.arange(0, max_count + 1, tick_spacing)
-                        cbar.set_ticks(ticks)
-            except (AttributeError, IndexError):
-                # If colorbar access fails, create it manually
-                im = axes[idx].images[0]
-                cbar = plt.colorbar(im, ax=axes[idx])
-                cbar.set_label('Number of Peaks', fontsize=10)
-                
-                # Set colorbar ticks to integers
-                if max_count > 0:
-                    tick_spacing = max(1, max_count // 5)
-                    ticks = np.arange(0, max_count + 1, tick_spacing)
-                    cbar.set_ticks(ticks)
+            axes[idx].set_title(f'Peak Count\n{q_min:.2f} - {q_max:.2f} 1/Å', fontsize=14)
+            axes[idx].set_xlabel('Scan X', fontsize=12)
+            axes[idx].set_ylabel('Scan Y', fontsize=12)
+            axes[idx].set_xticks([])
+            axes[idx].set_yticks([])
+            cbar = plt.colorbar(im, ax=axes[idx], ticks=np.arange(max_count + 1))
+            cbar.set_label('Number of Peaks', fontsize=10)
             
             # Print statistics
             total_peaks = int(np.sum(count_map))
