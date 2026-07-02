@@ -918,10 +918,13 @@ class BraggPeaksPolymer(AutoSerialize):
         # ============================================
         # 1. Compute normalization parameters (only from valid positions)
         # ============================================
+        # recompute=True to preserve the original per-call semantics (find_peaks_model
+        # always recomputed the sample stats); the cache still serves infer/adapt.
         median, iqr = self.ensure_normalization_params(
             device=device,
             n_normalize_samples=n_normalize_samples,
             scan_mask=scan_mask,
+            recompute=True,
         )
 
         # Run in TRAIN mode on purpose. The model trains on synthetic data; on the
