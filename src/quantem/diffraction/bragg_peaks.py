@@ -226,9 +226,13 @@ def _plot_bragg_peaks_on_ax(
     add_colorbar=False,
     center=None,
     show_center=True,
+    show_central_beam=True,
 ):
-    plot_detected_center = center is None or not show_center
-    if center is not None and show_center:
+    # show_central_beam=False fully suppresses the central-beam marker (both the
+    # provided-center dot and the detected-central-peak dot); the central peak is
+    # still excluded from the open-circle set via non_central below.
+    plot_detected_center = (center is None or not show_center) and show_central_beam
+    if center is not None and show_center and show_central_beam:
         center_y, center_x = center
         ax.scatter(
             center_x,
@@ -436,6 +440,9 @@ class BraggPeaksPolymer(AutoSerialize):
         # so single-DP predictions reproduce the full-scan results exactly.
         self._norm_median = None
         self._norm_iqr = None
+        # True once BatchNorm running stats have been adapted to this dataset (for
+        # eval-mode single-DP inference); see adapt_batchnorm / infer_peaks_single.
+        self._bn_adapted = False
 
         if model is None:
             # Setup model
@@ -734,6 +741,82 @@ class BraggPeaksPolymer(AutoSerialize):
         self._norm_median, self._norm_iqr = median, iqr
         return median, iqr
 
+    def adapt_batchnorm(
+        self,
+        device: str = None,
+        n_samples: int = 1000,
+        scan_mask: ArrayLike = None,
+        chunk_size: int = 100,
+        recompute: bool = False,
+    ):
+        """Adapt the model's BatchNorm running statistics to THIS dataset, then eval.
+
+        The model trains on synthetic data, so its stored BatchNorm running stats do not
+        match the experimental scan; plain ``eval()`` inference then under-detects.
+        ``find_peaks_model`` sidesteps this by running in train mode (per-chunk batch
+        stats). For deterministic single-DP inference (``infer_peaks_single`` / the live
+        widget), we instead estimate the running stats *once* from a representative sample
+        of this dataset and freeze them: reset the BatchNorm buffers, run a sample through
+        the model in train mode with ``momentum=None`` (so the buffers accumulate the
+        cumulative mean/var over the sample), then switch to eval. Uses the same input
+        normalization pipeline (resize + ``normalize_data`` with the cached median/iqr).
+        Idempotent unless ``recompute=True``. Leaves the model in eval mode.
+        """
+        if self._bn_adapted and not recompute:
+            return
+        import torch.nn as nn
+
+        device = device or self.device
+        median, iqr = self.ensure_normalization_params(
+            device=device, n_normalize_samples=max(n_samples, 1000), scan_mask=scan_mask
+        )
+
+        Ry, Rx, _, _ = self.dataset_cartesian.shape
+        if scan_mask is None:
+            scan_mask = np.ones((Ry, Rx), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+        valid_positions = np.argwhere(scan_mask)
+        n_valid = len(valid_positions)
+        n_samples = min(n_samples, n_valid)
+        sample_indices = np.random.choice(n_valid, size=n_samples, replace=False)
+        sample_positions = valid_positions[sample_indices]
+
+        # Temporarily switch BatchNorm layers to cumulative-average mode so the running
+        # buffers become the exact mean/var over the sample (not an EMA of the last batch).
+        self.model.to(device)
+        bn_layers = [m for m in self.model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+        saved_momentum = [m.momentum for m in bn_layers]
+        for m in bn_layers:
+            m.reset_running_stats()
+            m.momentum = None  # cumulative moving average
+        self.model.train()
+        try:
+            with torch.no_grad():
+                for i in range(0, n_samples, chunk_size):
+                    chunk = np.array([
+                        self.dataset_cartesian[ry, rx].array
+                        for ry, rx in sample_positions[i : i + chunk_size]
+                    ])
+                    resized = self.resize_images(chunk, device=device, initial_chunk_size=chunk_size)
+                    ins = torch.tensor(resized, dtype=torch.float32).to(device)
+                    ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+                    self.model(ins_batch)  # updates BN running stats only
+        finally:
+            for m, mom in zip(bn_layers, saved_momentum):
+                m.momentum = mom
+            self.model.eval()
+        self._bn_adapted = True
+
+    def prepare_inference(self, device: str = None, n_samples: int = 1000, scan_mask: ArrayLike = None):
+        """Convenience: compute input-normalization stats + adapt BatchNorm in one call.
+
+        Run after the model weights are loaded to ready the object for deterministic
+        eval-mode single-DP inference (``infer_peaks_single``).
+        """
+        self.ensure_normalization_params(device=device, n_normalize_samples=n_samples, scan_mask=scan_mask)
+        self.adapt_batchnorm(device=device, n_samples=n_samples, scan_mask=scan_mask)
+
     def infer_peaks_single(
         self,
         ry: int,
@@ -751,11 +834,19 @@ class BraggPeaksPolymer(AutoSerialize):
         pixels. Returns a dict with keys ``"y_pixels"``, ``"x_pixels"``, ``"intensities"``
         (empty arrays when no peaks are found), matching the columns/units of
         ``peak_coordinates_cartesian`` / ``peak_intensities``.
+
+        Runs in eval mode using BatchNorm stats adapted to this dataset (see
+        ``adapt_batchnorm``): eval mode makes single-DP inference deterministic and
+        batch-independent, and the adapted stats supply the test-time domain adaptation
+        that ``find_peaks_model`` gets from its train-mode per-chunk stats. Adaptation is
+        performed lazily on first call (idempotent, cached).
         """
         device = device or self.device
         median, iqr = self.ensure_normalization_params(
             device=device, n_normalize_samples=n_normalize_samples
         )
+        # Domain-adapt BatchNorm to this dataset once, then infer in eval mode.
+        self.adapt_batchnorm(device=device, n_samples=n_normalize_samples)
 
         dp = np.asarray(self.dataset_cartesian[ry, rx].array)
         resized = self.resize_images(dp[None], device=device, initial_chunk_size=1)
@@ -833,11 +924,14 @@ class BraggPeaksPolymer(AutoSerialize):
             scan_mask=scan_mask,
         )
 
-        # Run inference in eval mode: BatchNorm uses the trained (checkpoint) running
-        # statistics rather than per-batch stats, so results are deterministic and
-        # batch-independent, and the checkpoint's running buffers are not overwritten.
-        self.model.to(device)
-        self.model.eval()
+        # Run in TRAIN mode on purpose. The model trains on synthetic data; on the
+        # (out-of-distribution) experimental scan, train-mode BatchNorm normalizes each
+        # chunk with the experimental data's own statistics — test-time domain adaptation
+        # that detects far better than eval mode (which would impose the synthetic-training
+        # population stats on real data). Set it explicitly so a prior eval() / adapt_batchnorm
+        # (e.g. from the live widget) can't leave the shared model in eval mode. The live
+        # single-DP path (infer_peaks_single) instead uses adapt_batchnorm + eval.
+        self.model.train()
 
         # ============================================
         # 2. Process only valid positions with chunking
@@ -2951,7 +3045,7 @@ class BraggPeaksPolymer(AutoSerialize):
                          peak_marker_facecolors='none', peak_marker_size=None, gaussian_filter_sigma=None,
                          zoom=1, peak_alpha=1.0,
                          peaks_x=None, peaks_y=None, peak_ints=None, peaks_r_invA=None,
-                         central_idx=None,
+                         central_idx=None, show_central_beam=True,
                          save_intensity_map=True, save_diffraction=True, save_polar=None):
         """
         Save peak-annotated diffraction figures for a specific scan position.
@@ -3020,6 +3114,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 central_alpha=peak_alpha,
                 central_linewidth=crosshair_width_peaks,
                 center=center,
+                show_central_beam=show_central_beam,
             )
         
         # Create save directory
