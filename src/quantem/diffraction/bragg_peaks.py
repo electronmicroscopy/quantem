@@ -2942,17 +2942,34 @@ class BraggPeaksPolymer(AutoSerialize):
                          crosshair_width=2, crosshair_size=15, crosshair_width_peaks=2,
                          crosshair_scaling_peaks=1, crosshair_scaling_central_beam=1, peak_marker="o",
                          peak_marker_facecolors='none', peak_marker_size=None, gaussian_filter_sigma=None,
-                         zoom=1, peak_alpha=1.0):
+                         zoom=1, peak_alpha=1.0,
+                         peaks_x=None, peaks_y=None, peak_ints=None, peaks_r_invA=None,
+                         central_idx=None,
+                         save_intensity_map=True, save_diffraction=True, save_polar=None):
         """
         Save peak-annotated diffraction figures for a specific scan position.
         Central beam (closest to image center) plotted in blue.
+
+        Peaks are read from the precomputed ``peak_coordinates_cartesian`` /
+        ``peak_intensities`` / ``polar_peaks`` by default. Pass ``peaks_x`` / ``peaks_y``
+        / ``peak_ints`` (and optionally ``peaks_r_invA`` / ``central_idx``) to inject
+        peaks directly instead — e.g. from live single-DP inference, where no scan-wide
+        peak arrays exist. ``save_intensity_map`` / ``save_diffraction`` / ``save_polar``
+        select which figures to write (``save_polar=None`` follows ``show_polar``); this
+        lets a caller save the context map once and the DP per panel.
         """
-        
-        Ry, Rx = self.peak_coordinates_cartesian.shape
-        
+
+        override_peaks = peaks_x is not None
+        if self.peak_coordinates_cartesian is not None:
+            Ry, Rx = self.peak_coordinates_cartesian.shape
+        else:
+            Ry, Rx = int(self.dataset_cartesian.shape[0]), int(self.dataset_cartesian.shape[1])
+
         if not (0 <= ry < Ry and 0 <= rx < Rx):
             raise ValueError(f"Coordinates ({ry}, {rx}) out of bounds")
-        
+
+        if save_polar is not None:
+            show_polar = bool(save_polar)
         if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
             print("Warning: polar_data not found. Skipping polar save.")
             show_polar = False
@@ -3002,11 +3019,21 @@ class BraggPeaksPolymer(AutoSerialize):
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
         
-        # Get peaks data once
-        peaks_r_invA = self.polar_peaks['r_invA'][ry, rx]
-        peaks_y = self.peak_coordinates_cartesian['y_pixels'][ry, rx]
-        peaks_x = self.peak_coordinates_cartesian['x_pixels'][ry, rx]
-        peak_ints = self.peak_intensities[intensity_field][ry, rx]
+        # Get peaks data once (injected overrides win; otherwise read precomputed).
+        if override_peaks:
+            peaks_x = np.asarray(peaks_x)
+            peaks_y = np.asarray(peaks_y)
+            peak_ints = None if peak_ints is None else np.asarray(peak_ints)
+            peaks_r_invA = None if peaks_r_invA is None else np.asarray(peaks_r_invA)
+        else:
+            peaks_y = self.peak_coordinates_cartesian['y_pixels'][ry, rx]
+            peaks_x = self.peak_coordinates_cartesian['x_pixels'][ry, rx]
+            peak_ints = self.peak_intensities[intensity_field][ry, rx]
+            peaks_r_invA = (
+                self.polar_peaks['r_invA'][ry, rx]
+                if getattr(self, 'polar_peaks', None) is not None
+                else None
+            )
         dp_data = _normalized_dp(
             self.dataset_cartesian,
             ry,
@@ -3021,7 +3048,8 @@ class BraggPeaksPolymer(AutoSerialize):
                 polar_im_data = gaussian_filter(polar_im_data, gaussian_filter_sigma)
 
         center = _display_center(getattr(self, "image_centers", None), ry, rx, dp_data.shape)
-        central_idx = _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center)
+        if central_idx is None:
+            central_idx = _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center)
         
         (
             dp_data,
@@ -3045,69 +3073,71 @@ class BraggPeaksPolymer(AutoSerialize):
         # Save intensity map
         if figsize_individual is None:
             figsize_individual = (6, 6)
-        fig_map, ax = plt.subplots(figsize=figsize_individual)
-        if vmin_intensity_map is None:
-            im = ax.imshow(intensity_map, cmap=map_cmap)
-        else:
-            im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-        
-        ry_slider = ry * upsample_factor
-        rx_slider = rx * upsample_factor
-        
-        ax.scatter(rx_slider, ry_slider, facecolor='none', edgecolor=crosshair_color, marker='o', s=crosshair_size, linewidth=crosshair_width)
-        
-        # Add inset
-        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-        axins = inset_axes(ax, width="30%", height="30%", loc='upper right', borderpad=1.5)
-        
-        margin = 4
-        ry_min = max(0, ry_slider - margin)
-        ry_max = min(intensity_map.shape[0], ry_slider + margin + 1)
-        rx_min = max(0, rx_slider - margin)
-        rx_max = min(intensity_map.shape[1], rx_slider + margin + 1)
-        
-        zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
-        
-        if vmin_intensity_map is None:
-            axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min], interpolation='nearest')
-        else:
-            axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min],
-                         vmin=vmin_intensity_map, vmax=vmax_intensity_map, interpolation='nearest')
-        
-        pixel_border = Rectangle((rx_slider, ry_slider), 1, 1, linewidth=2, edgecolor=crosshair_color, 
-                                 facecolor='none', zorder=10)
-        axins.add_patch(pixel_border)
-        
-        axins.set_xlim(rx_min, rx_max)
-        axins.set_ylim(ry_max, ry_min)
-        axins.set_xticks([])
-        axins.set_yticks([])
-        axins.set_title('9×9 zoom', fontsize=8, pad=2)
-        
-        rect = Rectangle((rx_min, ry_min), rx_max-rx_min, ry_max-ry_min,
-                         linewidth=1.5, edgecolor=crosshair_color, facecolor='none', linestyle='--', alpha=0.7)
-        ax.add_patch(rect)
-        
-        ax.set_title(map_title)
-        ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
-        ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-        fig_map.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
-        plt.close(fig_map)
-        print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_intensity_map.pdf')
-        
+        if save_intensity_map:
+            fig_map, ax = plt.subplots(figsize=figsize_individual)
+            if vmin_intensity_map is None:
+                im = ax.imshow(intensity_map, cmap=map_cmap)
+            else:
+                im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+
+            ry_slider = ry * upsample_factor
+            rx_slider = rx * upsample_factor
+
+            ax.scatter(rx_slider, ry_slider, facecolor='none', edgecolor=crosshair_color, marker='o', s=crosshair_size, linewidth=crosshair_width)
+
+            # Add inset
+            from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+            axins = inset_axes(ax, width="30%", height="30%", loc='upper right', borderpad=1.5)
+
+            margin = 4
+            ry_min = max(0, ry_slider - margin)
+            ry_max = min(intensity_map.shape[0], ry_slider + margin + 1)
+            rx_min = max(0, rx_slider - margin)
+            rx_max = min(intensity_map.shape[1], rx_slider + margin + 1)
+
+            zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
+
+            if vmin_intensity_map is None:
+                axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min], interpolation='nearest')
+            else:
+                axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min],
+                             vmin=vmin_intensity_map, vmax=vmax_intensity_map, interpolation='nearest')
+
+            pixel_border = Rectangle((rx_slider, ry_slider), 1, 1, linewidth=2, edgecolor=crosshair_color,
+                                     facecolor='none', zorder=10)
+            axins.add_patch(pixel_border)
+
+            axins.set_xlim(rx_min, rx_max)
+            axins.set_ylim(ry_max, ry_min)
+            axins.set_xticks([])
+            axins.set_yticks([])
+            axins.set_title('9×9 zoom', fontsize=8, pad=2)
+
+            rect = Rectangle((rx_min, ry_min), rx_max-rx_min, ry_max-ry_min,
+                             linewidth=1.5, edgecolor=crosshair_color, facecolor='none', linestyle='--', alpha=0.7)
+            ax.add_patch(rect)
+
+            ax.set_title(map_title)
+            ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            fig_map.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
+            plt.close(fig_map)
+            print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_intensity_map.pdf')
+
         # Save diffraction pattern with peaks
-        fig_diff, ax = plt.subplots(figsize=figsize_individual)
-        im = ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        if peaks_x is not None:
-            plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, center=display_center)
-        ax.set_xlim(-0.5, dp_data.shape[1] - 0.5)
-        ax.set_ylim(dp_data.shape[0] - 0.5, -0.5)
-        ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
-        fig_diff.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
-        plt.close(fig_diff)
-        print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_diffraction.pdf')
+        if save_diffraction:
+            fig_diff, ax = plt.subplots(figsize=figsize_individual)
+            im = ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if peaks_x is not None:
+                plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, center=display_center)
+            ax.set_xlim(-0.5, dp_data.shape[1] - 0.5)
+            ax.set_ylim(dp_data.shape[0] - 0.5, -0.5)
+            ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+            fig_diff.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf', format='pdf', bbox_inches='tight', pad_inches=0)
+            plt.close(fig_diff)
+            print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_diffraction.pdf')
         
         # Save polar transform with peaks
         if show_polar:
