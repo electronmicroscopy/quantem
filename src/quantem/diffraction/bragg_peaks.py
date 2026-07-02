@@ -833,6 +833,12 @@ class BraggPeaksPolymer(AutoSerialize):
             scan_mask=scan_mask,
         )
 
+        # Run inference in eval mode: BatchNorm uses the trained (checkpoint) running
+        # statistics rather than per-batch stats, so results are deterministic and
+        # batch-independent, and the checkpoint's running buffers are not overwritten.
+        self.model.to(device)
+        self.model.eval()
+
         # ============================================
         # 2. Process only valid positions with chunking
         # ============================================
@@ -878,7 +884,8 @@ class BraggPeaksPolymer(AutoSerialize):
                     dps_norm = self.normalize_data(ins, median, iqr)
                     ins_batch = dps_norm[:, None, ...]
                     
-                    outs = self.model(ins_batch).detach().cpu().numpy()
+                    with torch.no_grad():
+                        outs = self.model(ins_batch).detach().cpu().numpy()
                     
                     # ----------------------------------------
                     # 2e. Post-process each pattern in chunk
