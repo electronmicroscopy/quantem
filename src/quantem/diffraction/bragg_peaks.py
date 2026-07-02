@@ -443,6 +443,9 @@ class BraggPeaksPolymer(AutoSerialize):
         # True once BatchNorm running stats have been adapted to this dataset (for
         # eval-mode single-DP inference); see adapt_batchnorm / infer_peaks_single.
         self._bn_adapted = False
+        # Scan mask (region of interest) remembered from find_peaks_model / process_polar,
+        # so normalization + BN adaptation restrict to the sample ROI (see scan_mask).
+        self._scan_mask = None
 
         if model is None:
             # Setup model
@@ -501,7 +504,44 @@ class BraggPeaksPolymer(AutoSerialize):
     @final_shape.setter
     def final_shape(self, final_shape):
         self._final_shape = final_shape
-        
+
+    @property
+    def scan_mask(self):
+        """Boolean (Ry, Rx) region-of-interest mask, or None for the whole scan.
+
+        Remembered from ``find_peaks_model`` (and settable directly) so that
+        ``ensure_normalization_params`` / ``adapt_batchnorm`` estimate their statistics
+        from the sample ROI rather than off-sample regions (vacuum, edges, beam stop).
+        """
+        return self._scan_mask
+
+    @scan_mask.setter
+    def scan_mask(self, mask):
+        if mask is None:
+            new_mask = None
+        else:
+            new_mask = np.asarray(mask, dtype=bool)
+            Ry, Rx = int(self._dataset_cartesian.shape[0]), int(self._dataset_cartesian.shape[1])
+            if new_mask.shape != (Ry, Rx):
+                raise ValueError(
+                    f"scan_mask shape {new_mask.shape} must match scan shape ({Ry}, {Rx})"
+                )
+        # Only invalidate the lazily-cached stats if the mask actually changed, so
+        # re-running find_peaks_model with the same mask doesn't needlessly recompute.
+        changed = not (
+            (self._scan_mask is None and new_mask is None)
+            or (
+                self._scan_mask is not None
+                and new_mask is not None
+                and np.array_equal(self._scan_mask, new_mask)
+            )
+        )
+        self._scan_mask = new_mask
+        if changed:
+            self._norm_median = None
+            self._norm_iqr = None
+            self._bn_adapted = False
+
     @classmethod
     def from_file(
         cls,
@@ -717,6 +757,10 @@ class BraggPeaksPolymer(AutoSerialize):
 
         device = device or self.device
         Ry, Rx, _, _ = self.dataset_cartesian.shape
+        # Restrict to the stored ROI when no mask is passed explicitly (fall back to the
+        # whole scan only if none is set); estimate stats from the sample region.
+        if scan_mask is None:
+            scan_mask = self._scan_mask
         if scan_mask is None:
             scan_mask = np.ones((Ry, Rx), dtype=bool)
         else:
@@ -772,6 +816,9 @@ class BraggPeaksPolymer(AutoSerialize):
         )
 
         Ry, Rx, _, _ = self.dataset_cartesian.shape
+        # Restrict the adaptation sample to the stored ROI when none is passed.
+        if scan_mask is None:
+            scan_mask = self._scan_mask
         if scan_mask is None:
             scan_mask = np.ones((Ry, Rx), dtype=bool)
         else:
@@ -887,7 +934,12 @@ class BraggPeaksPolymer(AutoSerialize):
     ):
         Ry, Rx, Qy, Qx = self.dataset_cartesian.shape
         total_positions = Ry * Rx
-        
+
+        # Remember the ROI so later normalization / BN adaptation (and the live widget)
+        # restrict to the sample region. Storing the user-provided value (None stays the
+        # whole scan); the setter invalidates cached stats only if the mask changed.
+        self.scan_mask = scan_mask
+
         # ============================================
         # Handle scan_mask
         # ============================================
