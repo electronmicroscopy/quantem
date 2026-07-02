@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Self, Union, cast
 from warnings import warn
 
@@ -19,6 +19,7 @@ from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_cons
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import (
     OptimizerMixin,
+    OptimizerParams,
     OptimizerParamsType,
     SchedulerParamsType,
 )
@@ -33,10 +34,17 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
+from quantem.diffractive_imaging._natural_neighbors_interpolation import (
+    beamlet_weights,
+    one_hot_beamlet_weights,
+)
 from quantem.diffractive_imaging.complex_probe import (
     POLAR_ALIASES,
     POLAR_SYMBOLS,
+    fourier_space_probe,
     real_space_probe,
+    spatial_frequencies,
+    standardize_aberration_coefs,
 )
 from quantem.diffractive_imaging.ptycho_utils import (
     fourier_shift_expand,
@@ -459,6 +467,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         sampling: tuple[float, float] | np.ndarray,
         num_slices: int,
         slice_thicknesses: torch.Tensor | np.ndarray,
+        gpts: tuple[int, int] | np.ndarray | None = None,
     ) -> torch.Tensor:
         """
         Precomputes propagator arrays complex wave-function will be convolved by,
@@ -472,6 +481,8 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             number of slices
         slice_thicknesses: torch.Tensor | np.ndarray
             thickness of each slice in angstrom
+        gpts: tuple[int, int] | np.ndarray | None
+            grid shape the propagators act on; defaults to the probe roi_shape
 
         Returns
         -------
@@ -482,9 +493,9 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if num_slices == 1:
             return torch.tensor([])
 
-        kr, kc = tuple(
-            torch.fft.fftfreq(n, d, device=self.device) for n, d in zip(self.roi_shape, sampling)
-        )
+        if gpts is None:
+            gpts = self.roi_shape
+        kr, kc = tuple(torch.fft.fftfreq(n, d, device=self.device) for n, d in zip(gpts, sampling))
         k2 = (kr[:, None] ** 2 + kc[None] ** 2).to(torch.complex64)  # broadcasting to (Sr, Sc)
         probe_energy = self.probe_params["energy"]
         if probe_energy is None:
@@ -872,7 +883,7 @@ class ProbePixelated(ProbeConstraints):
         elif isinstance(vp, np.ndarray):
             vp2 = vp.astype(config.get("dtype_real"))
         elif isinstance(vp, (Dataset4dstem, Dataset2d)):
-            vp2 = cast(np.ndarray, vp.array) # TODO when finished Dataset->torch fix here
+            vp2 = cast(np.ndarray, vp.array)  # TODO when finished Dataset->torch fix here
         elif isinstance(vp, torch.Tensor):
             vp2 = vp.cpu().detach().numpy()
         else:
@@ -1066,7 +1077,7 @@ class ProbeParametric(ProbeConstraints):
         elif isinstance(vp, np.ndarray):
             vp2 = vp.astype(config.get("dtype_real"))
         elif isinstance(vp, (Dataset4dstem, Dataset2d)):
-            vp2 = cast(np.ndarray, vp.array) # TODO when finished Dataset->torch fix here
+            vp2 = cast(np.ndarray, vp.array)  # TODO when finished Dataset->torch fix here
         else:
             raise NotImplementedError(f"Unknown vacuum probe type: {type(vp)}")
 
@@ -1609,4 +1620,570 @@ class ProbeDIP(ProbeConstraints):
             )
 
 
-ProbeModelType = ProbePixelated | ProbeDIP
+def _prism_wave_vectors(
+    cutoff: float,
+    extent: np.ndarray | tuple[float, float],
+    wavelength: float,
+) -> np.ndarray:
+    """Dense beamlet wave vectors: all reciprocal-grid points inside the cutoff disk.
+
+    Parameters
+    ----------
+    cutoff : float
+        Convergence semi-angle cutoff in mrad.
+    extent : np.ndarray | tuple[float, float]
+        Real-space extent in Angstroms.
+    wavelength : float
+        Electron wavelength in Angstroms.
+
+    Returns
+    -------
+    np.ndarray
+        Wave vectors in inverse Angstroms, shape (num_beamlets, 2).
+    """
+    cutoff_rad = cutoff * 1e-3
+    n_max = int(np.ceil(cutoff_rad / (wavelength / extent[0])))
+    m_max = int(np.ceil(cutoff_rad / (wavelength / extent[1])))
+
+    kx = np.arange(-n_max, n_max + 1, dtype=np.float64) / extent[0]
+    ky = np.arange(-m_max, m_max + 1, dtype=np.float64) / extent[1]
+
+    mask = kx[:, None] ** 2 + ky[None, :] ** 2 < (cutoff_rad / wavelength) ** 2
+    kxg, kyg = np.meshgrid(kx, ky, indexing="ij")
+
+    return np.stack((kxg[mask], kyg[mask]), axis=-1)
+
+
+def _partitioned_prism_wave_vectors(
+    cutoff: float,
+    wavelength: float,
+    num_rings: int = 4,
+    num_points_per_ring: int = 6,
+) -> np.ndarray:
+    """Parent beam wave vectors: a center point plus hexagonal rings up to the cutoff.
+
+    Parameters
+    ----------
+    cutoff : float
+        Convergence semi-angle cutoff in mrad.
+    wavelength : float
+        Electron wavelength in Angstroms.
+    num_rings : int
+        Number of rings including the center point.
+    num_points_per_ring : int
+        Points on the innermost ring; each subsequent ring adds this many more.
+
+    Returns
+    -------
+    np.ndarray
+        Wave vectors in inverse Angstroms, shape (num_parent, 2).
+    """
+    if num_rings < 2:
+        raise ValueError(f"num_rings must be >= 2, got {num_rings}")
+
+    rings = [np.array([[0.0, 0.0]])]
+    n = num_points_per_ring
+
+    for r in np.linspace(cutoff / (num_rings - 1), cutoff, num_rings - 1):
+        angles = np.arange(n, dtype=np.float64) * 2 * np.pi / n + np.pi / 2
+        kx = r * np.sin(angles) / 1000.0 / wavelength
+        ky = r * np.cos(-angles) / 1000.0 / wavelength
+        rings.append(np.stack([kx, ky], axis=1))
+        n += num_points_per_ring
+
+    return np.vstack(rings)
+
+
+class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeBase):
+    """
+    Partitioned-PRISM probe model.
+
+    Instead of a converged probe, the probe is represented as a set of tilted plane
+    waves ("beamlets") inside the aperture, grouped under a sparse set of parent
+    beams via frozen Sibson natural-neighbor interpolation weights. The engine
+    (``PtychographyPRISM``) propagates the parent beams through the full object and
+    reduces them with the ROI-sized coefficient maps this model produces:
+
+        ``coef_map[p, b, n] = ifft2( CTF_p(k) * w_b(k) * c_pb * exp(-2 pi i k . dr_n) )``
+
+    Learnables (each gated by a flag):
+    - per-mode aberration coefficients (``learn_aberrations``)
+    - a free complex coefficient per parent beam per mode (``learn_beam_coefficients``),
+      initialized so the initial probe equals the aberrated CTF; these capture
+      partial coherence / mode structure.
+
+    A measured aperture can be supplied via ``vacuum_probe_intensity``
+    (corner-centered intensity; replaces the analytic soft/hard aperture, as in
+    ``ProbeParametric``). Since the aperture profile is otherwise frozen, this is
+    the way to reach exact agreement with data whose aperture edge differs from
+    the analytic model.
+
+    Notes
+    -----
+    ``forward`` returns ``(beamlets_fft, position_coefs)`` rather than the shifted
+    probe stack of the other probe models: materializing per-position probes would
+    defeat PRISM. This model therefore only works with ``PtychographyPRISM``.
+
+    The two learnable groups have vastly different gradient scales and MUST use
+    per-group learning rates (PPLR): aberration coefficients are Angstrom-scale
+    parameters with tiny gradients (SGD lr ~1e-1 works well), while beam
+    coefficients are O(1) parameters with O(0.1) gradients (SGD lr ~1e-3, or Adam
+    lr ~1e-2; a shared lr of 0.1 diverges immediately). For example::
+
+        optimizer_params={"probe": {
+            "aberrations": {"type": "SGD", "lr": 0.125},
+            "beam_coefficients": {"type": "SGD", "lr": 1e-3},
+        }}
+    """
+
+    DEFAULT_CONSTRAINTS: PtychoProbeConstraintParams.Parametric = (
+        PtychoProbeConstraintParams.Parametric()
+    )
+
+    def __init__(
+        self,
+        num_probes: int = 1,
+        probe_params: dict = {},
+        aberration_coefs: dict | list[dict] | None = None,
+        num_partitions: int = 4,
+        dense: bool = False,
+        learn_aberrations: bool = True,
+        learn_beam_coefficients: bool = False,
+        initial_probe_weights: list[float] | np.ndarray | None = None,
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
+        roi_shape: tuple[int, int] | np.ndarray | None = None,
+        vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        max_aberrations_order: int | None = None,
+        _token: object | None = None,
+    ):
+        super().__init__(
+            num_probes=num_probes,
+            probe_params=probe_params.copy(),
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
+            max_aberrations_order=max_aberrations_order,
+            roi_shape=roi_shape,
+            device=device,
+            rng=rng,
+            _token=_token,
+        )
+
+        if self.probe_params.get("energy", None) is None:
+            raise ValueError("probe_params must contain 'energy' for ProbePRISM")
+        if self.probe_params.get("semiangle_cutoff", None) is None:
+            raise ValueError("probe_params must contain 'semiangle_cutoff' for ProbePRISM")
+
+        self.num_partitions = num_partitions
+        self.dense = dense
+        self.learn_aberrations = learn_aberrations
+        self.learn_beam_coefficients = learn_beam_coefficients
+        self._vacuum_probe_intensity = None
+        self.vacuum_probe_intensity = vacuum_probe_intensity
+
+        # per-mode aberration coefficients; probe_params aberrations are the shared default
+        base_coefs = dict(self.probe_params.get("aberration_coefs", {}))
+        if aberration_coefs is None:
+            mode_coefs = [dict(base_coefs) for _ in range(num_probes)]
+        elif isinstance(aberration_coefs, dict):
+            merged = base_coefs | {
+                k: float(v) for k, v in standardize_aberration_coefs(aberration_coefs).items()
+            }
+            mode_coefs = [dict(merged) for _ in range(num_probes)]
+        else:
+            if len(aberration_coefs) != num_probes:
+                raise ValueError(
+                    f"aberration_coefs list length {len(aberration_coefs)} does not match "
+                    f"num_probes {num_probes}"
+                )
+            mode_coefs = [
+                base_coefs | {k: float(v) for k, v in standardize_aberration_coefs(d).items()}
+                for d in aberration_coefs
+            ]
+
+        self.aberration_coefs = nn.ModuleList()
+        for coefs in mode_coefs:
+            self.aberration_coefs.append(
+                nn.ParameterDict(
+                    {
+                        k: nn.Parameter(
+                            torch.tensor(float(v), dtype=torch.float32),
+                            requires_grad=learn_aberrations,
+                        )
+                        for k, v in coefs.items()
+                    }
+                )
+            )
+        for p, param_dict in enumerate(self.aberration_coefs):
+            for k, param in param_dict.items():
+                self.register_buffer(f"_initial_aberration_coefs_{p}_{k}", param.detach().clone())
+
+        weights = (
+            np.full(num_probes, 1.0 / num_probes)
+            if initial_probe_weights is None
+            else np.asarray(initial_probe_weights, dtype=np.float64)
+        )
+        if len(weights) != num_probes:
+            raise ValueError(
+                f"initial_probe_weights length {len(weights)} does not match "
+                f"num_probes {num_probes}"
+            )
+        self._initial_probe_weights = weights / weights.sum()
+
+    @property
+    def vacuum_probe_intensity(self) -> torch.Tensor | None:
+        """Measured aperture intensity (corner-centered); replaces the analytic aperture."""
+        return self._vacuum_probe_intensity
+
+    @vacuum_probe_intensity.setter
+    def vacuum_probe_intensity(self, vp: np.ndarray | torch.Tensor | Dataset4dstem | None):
+        if vp is None:
+            self._vacuum_probe_intensity = None
+            return
+        if isinstance(vp, (Dataset4dstem, Dataset2d)):
+            vp = cast(np.ndarray, vp.array)
+        vp_t = torch.as_tensor(np.asarray(vp), dtype=torch.float32)
+        if vp_t.ndim == 4:
+            vp_t = vp_t.mean(dim=(0, 1))
+        elif vp_t.ndim != 2:
+            raise ValueError(f"Unexpected shape for vacuum probe: {tuple(vp_t.shape)}")
+        self._vacuum_probe_intensity = vp_t.to(self.device)
+
+    @classmethod
+    def from_params(
+        cls,
+        probe_params: dict,
+        num_probes: int = 1,
+        aberration_coefs: dict | list[dict] | None = None,
+        num_partitions: int = 4,
+        dense: bool = False,
+        learn_aberrations: bool = True,
+        learn_beam_coefficients: bool = False,
+        initial_probe_weights: list[float] | np.ndarray | None = None,
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
+        roi_shape: tuple[int, int] | np.ndarray | None = None,
+        vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        max_aberrations_order: int | None = None,
+    ) -> "ProbePRISM":
+        return cls(
+            num_probes=num_probes,
+            probe_params=probe_params.copy(),
+            aberration_coefs=aberration_coefs,
+            num_partitions=num_partitions,
+            dense=dense,
+            learn_aberrations=learn_aberrations,
+            learn_beam_coefficients=learn_beam_coefficients,
+            initial_probe_weights=initial_probe_weights,
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
+            roi_shape=roi_shape,
+            vacuum_probe_intensity=vacuum_probe_intensity,
+            device=device,
+            rng=rng,
+            max_aberrations_order=max_aberrations_order,
+            _token=cls._token,
+        )
+
+    # region --- geometry ---
+
+    @property
+    def wavelength(self) -> float:
+        """Electron wavelength in Angstroms."""
+        return electron_wavelength_angstrom(self.probe_params["energy"])
+
+    @property
+    def extent(self) -> np.ndarray:
+        """Real-space ROI extent in Angstroms."""
+        return 1 / self.reciprocal_sampling
+
+    @property
+    def sampling(self) -> np.ndarray:
+        """Real-space sampling in Angstroms."""
+        return 1 / (self.roi_shape * self.reciprocal_sampling)
+
+    @property
+    def angular_sampling(self) -> np.ndarray:
+        """Angular sampling in mrad."""
+        return self.reciprocal_sampling * self.wavelength * 1e3
+
+    @property
+    def parent_wave_vectors(self) -> torch.Tensor:
+        """Parent beam wave vectors in inverse Angstroms, shape (num_parent, 2)."""
+        return self._parent_wave_vectors
+
+    @property
+    def beamlet_wave_vectors(self) -> torch.Tensor:
+        """Dense beamlet wave vectors in inverse Angstroms, shape (num_beamlets, 2)."""
+        return self._beamlet_wave_vectors
+
+    @property
+    def interpolation_weights(self) -> torch.Tensor:
+        """Frozen Sibson weight maps, shape (num_parent, *roi_shape)."""
+        return self._interpolation_weights
+
+    @property
+    def num_parent_beams(self) -> int:
+        return self._parent_wave_vectors.shape[0]
+
+    # endregion --- geometry ---
+
+    def _set_buffer(self, name: str, tensor: torch.Tensor) -> None:
+        """Register a buffer, replacing it if it already exists."""
+        if hasattr(self, name):
+            delattr(self, name)
+        self.register_buffer(name, tensor)
+
+    def set_initial_probe(
+        self,
+        roi_shape: np.ndarray | tuple,
+        reciprocal_sampling: np.ndarray,
+        mean_diffraction_intensity: float,
+        device: str | None = None,
+    ):
+        """Compute the PRISM beam geometry and initialize the learnable coefficients."""
+        super().set_initial_probe(
+            roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
+        )
+
+        gpts = tuple(self.roi_shape.astype(int))
+        sampling = self.sampling
+        cutoff = float(self.probe_params["semiangle_cutoff"]) + float(
+            np.linalg.norm(self.angular_sampling)
+        )
+
+        beamlet_kv = _prism_wave_vectors(cutoff, self.extent, self.wavelength)
+        if self.dense:
+            parent_kv = beamlet_kv
+            weights = one_hot_beamlet_weights(beamlet_kv, gpts, sampling)
+        else:
+            parent_kv = _partitioned_prism_wave_vectors(
+                cutoff, self.wavelength, num_rings=self.num_partitions
+            )
+            weights = beamlet_weights(parent_kv, beamlet_kv, gpts, sampling)
+
+        kxa, kya = spatial_frequencies(gpts, sampling, device=self.device)
+        self._set_buffer("_kxa", kxa.contiguous())
+        self._set_buffer("_kya", kya.contiguous())
+        self._set_buffer(
+            "_norm_factor",
+            torch.sqrt(
+                torch.tensor(mean_diffraction_intensity * gpts[0] * gpts[1], dtype=torch.float32)
+            ).to(self.device),
+        )
+
+        already_initialized = hasattr(
+            self, "_beam_coefficients"
+        ) and self._beam_coefficients.shape[1] == len(parent_kv)
+        if already_initialized:
+            return
+
+        def to_t(arr: np.ndarray) -> torch.Tensor:
+            return torch.from_numpy(np.ascontiguousarray(arr)).to(
+                device=self.device, dtype=torch.float32
+            )
+
+        self._set_buffer("_parent_wave_vectors", to_t(parent_kv))
+        self._set_buffer("_beamlet_wave_vectors", to_t(beamlet_kv))
+        self._set_buffer("_interpolation_weights", to_t(weights))
+
+        if self._vacuum_probe_intensity is not None:
+            # beamlets exist only inside the padded semiangle disk; a measured
+            # aperture extending beyond it would be silently truncated
+            vacuum = self._vacuum_probe_intensity
+            beamlet_support = self._interpolation_weights.sum(dim=0) > 0
+            covered = vacuum[beamlet_support].sum() / vacuum.sum().clamp_min(1e-12)
+            if covered < 0.999:
+                warn(
+                    f"vacuum_probe_intensity has {100 * (1 - covered.item()):.2f}% of its "
+                    "weight outside the beamlet disk (semiangle_cutoff + padding); "
+                    "increase semiangle_cutoff to cover the measured aperture."
+                )
+
+        beam_coefs = torch.zeros(self.num_probes, len(parent_kv), 2, dtype=torch.float32)
+        beam_coefs[:, :, 0] = torch.sqrt(
+            torch.from_numpy(self._initial_probe_weights).to(torch.float32)
+        )[:, None]
+        self._beam_coefficients = nn.Parameter(
+            beam_coefs.to(self.device), requires_grad=self.learn_beam_coefficients
+        )
+        self._set_buffer("_initial_beam_coefficients", beam_coefs.clone().to(self.device))
+
+    # region --- core compute ---
+
+    def _compute_beamlet_basis_fft(
+        self, accumulated_thickness: float | torch.Tensor = 0.0
+    ) -> torch.Tensor:
+        """CTF- and coefficient-weighted beamlet basis in reciprocal space.
+
+        Parameters
+        ----------
+        accumulated_thickness : float | torch.Tensor
+            Total specimen thickness in Angstroms, folded into defocus (C10) to
+            compensate the engine's back-propagation of the parent beams.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (num_probes, num_parent, *roi_shape), complex.
+        """
+        gpts = tuple(self.roi_shape.astype(int))
+        basis = []
+        for p in range(self.num_probes):
+            coefs: dict[str, Any] = {k: v for k, v in self.aberration_coefs[p].items()}
+            if not (isinstance(accumulated_thickness, float) and accumulated_thickness == 0.0):
+                coefs["C10"] = coefs.get("C10", 0.0) + accumulated_thickness
+            ctf = fourier_space_probe(
+                gpts=gpts,
+                sampling=tuple(self.sampling),
+                energy=self.probe_params["energy"],
+                semiangle_cutoff=float(self.probe_params["semiangle_cutoff"]),
+                soft_edges=self.probe_params["soft_edges"],
+                vacuum_probe_intensity=self._vacuum_probe_intensity,
+                aberration_coefs=coefs,
+                normalized=True,
+                device=self.device,
+            )
+            basis.append(ctf[None] * self._interpolation_weights)
+
+        beam_coefs = torch.view_as_complex(self._beam_coefficients)
+        return torch.stack(basis) * beam_coefs[:, :, None, None] * self._norm_factor
+
+    def _position_coefficients(self, fract_positions: torch.Tensor) -> torch.Tensor:
+        """Fractional-position phase ramps exp(-2 pi i k . dr), shape (batch, *roi_shape)."""
+        sampling = torch.as_tensor(self.sampling, dtype=self._kxa.dtype, device=self._kxa.device)
+        positions_A = fract_positions.to(self._kxa.device) * sampling[None]
+        phase = positions_A[:, 0, None, None] * self._kxa[None] + (
+            positions_A[:, 1, None, None] * self._kya[None]
+        )
+        return torch.exp(-2j * torch.pi * phase)
+
+    def forward(  # pyright: ignore[reportIncompatibleMethodOverride]  # PRISM returns basis + phases, engine owns the reduction
+        self, fract_positions: torch.Tensor, accumulated_thickness: float | torch.Tensor = 0.0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(beamlets_fft, position_coefs)`` for the PRISM engine's reduction.
+
+        Only consumed by ``PtychographyPRISM``; the base probe contract (shifted
+        probe stacks) is intentionally not implemented.
+        """
+        return (
+            self._compute_beamlet_basis_fft(accumulated_thickness),
+            self._position_coefficients(fract_positions),
+        )
+
+    # endregion --- core compute ---
+
+    # region --- contract ---
+
+    @property
+    def probe(self) -> torch.Tensor:
+        """Real-space probe stack (num_probes, *roi_shape): summed beamlet basis."""
+        return torch.fft.ifft2(self._compute_beamlet_basis_fft().sum(dim=1))
+
+    @property
+    def params(self) -> list[nn.Parameter]:
+        """Optimization parameters."""
+        params = super().params
+        if self.learn_aberrations:
+            params.extend(p for pd in self.aberration_coefs for p in pd.values())
+        if self.learn_beam_coefficients and hasattr(self, "_beam_coefficients"):
+            params.append(self._beam_coefficients)
+        return params
+
+    @property
+    def name(self) -> str:
+        return "ProbePRISM"
+
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """Aberrations / beam coefficients / probe tilt as separate PPLR groups.
+
+        Returns one group per *learnable* parameter set; ``{}`` when nothing is
+        learnable (``set_optimizer`` then short-circuits to removing the optimizer).
+        """
+        groups: dict[str, list[torch.Tensor]] = {}
+        if self.learn_aberrations:
+            aberrations = [p for pd in self.aberration_coefs for p in pd.values()]
+            if aberrations:
+                groups["aberrations"] = aberrations
+        if self.learn_beam_coefficients and hasattr(self, "_beam_coefficients"):
+            groups["beam_coefficients"] = [self._beam_coefficients]
+        if self.learn_probe_tilt:
+            groups["probe_tilt"] = [self._probe_tilt]
+        return groups
+
+    def _normalize_optimizer_params(self, params):
+        """Broadcast a single optimizer spec to the learnable PPLR groups.
+
+        A single ``OptimizerParamsType`` / single-optimizer dict (normalized to the
+        ``"default"`` key) is fanned out to whichever groups are currently learnable,
+        so the common single-LR caller keeps working. An explicit PPLR dict (keyed by
+        ``aberrations`` / ``beam_coefficients`` / ``probe_tilt``) passes through.
+        """
+        norm = super()._normalize_optimizer_params(params)
+        if set(norm) == {self.DEFAULT_OPTIMIZER_KEY}:
+            spec = norm[self.DEFAULT_OPTIMIZER_KEY]
+            active = list(self.get_optimization_parameters().keys())
+            if not active and not isinstance(spec, OptimizerParams.NoneOptimizer):
+                warn(
+                    f"{type(self).__name__}: an optimizer was requested but nothing is "
+                    "learnable; the optimizer will be removed. Enable learn_aberrations, "
+                    "learn_beam_coefficients and/or learn_probe_tilt to optimize.",
+                    stacklevel=2,
+                )
+            return {key: replace(spec) for key in active} if active else {}
+        return norm
+
+    def reset(self):
+        """Reset learnable parameters to their initial values."""
+        super().reset()
+        with torch.no_grad():
+            for p, param_dict in enumerate(self.aberration_coefs):
+                for k, param in param_dict.items():
+                    initial = getattr(self, f"_initial_aberration_coefs_{p}_{k}")
+                    param.data.copy_(initial)
+            if hasattr(self, "_beam_coefficients"):
+                self._beam_coefficients.data.copy_(
+                    self._initial_beam_coefficients.to(self._beam_coefficients.device)
+                )
+
+    def apply_hard_constraints(self, probe: torch.Tensor) -> torch.Tensor:
+        """Pixel-domain projections don't apply to coefficient-parameterized probes."""
+        return probe
+
+    def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
+        self.reset_soft_constraint_losses()
+        loss = self._get_zero_loss_tensor()
+        self.accumulate_constraint_losses()
+        return loss
+
+    # endregion --- contract ---
+
+    def show_interpolation_weights(self, ax: "plt.Axes | None" = None):
+        """RGB overlay of the per-parent Sibson weight maps."""
+        from matplotlib.colors import to_rgb
+
+        weights = to_numpy(self._interpolation_weights)
+
+        color_cycle = [["c", "r"], ["m", "g"], ["b", "y"]]
+        colors = ["w"]
+        i = 1
+        while len(colors) < len(weights):
+            colors += color_cycle[(i - 1) % 3] * (3 + (i - 1) * 3)
+            i += 1
+
+        rgb = np.array([to_rgb(color) for color in colors[: len(weights)]])
+        color_map = np.tensordot(weights.transpose(1, 2, 0), rgb, axes=([2], [0]))
+        color_map = np.fft.fftshift(color_map, axes=(0, 1))
+
+        if ax is None:
+            _, ax = plt.subplots()
+        ax.imshow(np.clip(color_map, 0, 1))
+        ax.set(xticks=[], yticks=[], title="PRISM interpolation weights")
+        return ax
+
+
+ProbeModelType = ProbePixelated | ProbeDIP | ProbePRISM
