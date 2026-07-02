@@ -406,18 +406,17 @@ class TestPRISMForwardEquivalence:
         torch.testing.assert_close(pred_prism / scale, pred_conv / scale, rtol=1e-4, atol=1e-5)
 
     def test_dense_multislice_thickness_compensation(self, ptycho_dataset, complex_obj):
-        """With compensation on, dense PRISM equals a conventional probe whose C10 is
-        offset by the total thickness (the back-propagator is a pure k-space phase)."""
+        """Thickness compensation (back-propagation to the entrance plane) is a pure
+        k-space phase in the far field, so dense PRISM with compensation on still
+        equals the conventional forward exactly."""
         rng = np.random.default_rng(7)
         obj = np.stack(
             [complex_obj, np.exp(0.5j * (rng.random((N, N)) - 0.5)).astype(np.complex64)]
         )
-        total_thickness = 20.0
         conventional, prism = _build_engines(
             ptycho_dataset,
             obj,
-            slice_thicknesses=total_thickness,
-            conventional_c10=C10 + total_thickness,
+            slice_thicknesses=20.0,
             dense=True,
         )
         prism.thickness_compensation = True

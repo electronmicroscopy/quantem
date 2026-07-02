@@ -42,11 +42,14 @@ class PtychographyPRISM(Ptychography):
     - ``use_checkpointing``: recompute each parent chunk during backward instead
       of retaining its activations (~halves peak memory at ~2x forward compute).
 
-    For multislice objects the parent waves are back-propagated over the total
-    thickness and the beamlet CTFs are defocus-compensated (``C10 += thickness``),
-    which keeps the parent-beam expansion accurate for thick specimens; disable
-    with ``thickness_compensation=False``. PRISM amortizes the per-batch
-    multislice of the parent beams best with large (ideally full) batch sizes.
+    For multislice objects the propagated parent waves are back-propagated over
+    the total thickness (refocused to the entrance plane). This is a pure
+    k-space phase in the far field — intensity-neutral in the dense limit — but
+    it removes the thickness-dependent quadratic phase across parents, which is
+    what keeps the parent-beam interpolation accurate for thick specimens;
+    disable with ``thickness_compensation=False``. PRISM amortizes the
+    per-batch multislice of the parent beams best with large (ideally full)
+    batch sizes.
     """
 
     _supports_prism_probe = True
@@ -122,8 +125,9 @@ class PtychographyPRISM(Ptychography):
         use_checkpointing : bool
             Gradient-checkpoint each parent chunk (recomputed during backward).
         thickness_compensation : bool
-            Back-propagate parent waves over the total thickness and compensate the
-            beamlet CTFs with a matching defocus offset (multislice only).
+            Back-propagate parent waves over the total thickness to the entrance
+            plane, keeping the partitioned interpolation accurate for thick
+            specimens (multislice only; intensity-neutral in the dense limit).
         """
         if not autograd:
             raise ValueError("PtychographyPRISM only supports autograd=True.")
@@ -205,14 +209,8 @@ class PtychographyPRISM(Ptychography):
         else:
             transmission = obj
 
-        accumulated_thickness = 0.0
-        if self.num_slices > 1 and self.thickness_compensation:
-            accumulated_thickness = float(np.sum(self.slice_thicknesses))
         self._compute_object_propagators()
-
-        beamlets_fft, position_coefs = self.probe_model.forward(
-            fract_positions, accumulated_thickness=accumulated_thickness
-        )
+        beamlets_fft, position_coefs = self.probe_model.forward(fract_positions)
 
         if self.num_slices == 1:
             # Fast path: without propagation every parent wave reduces to the

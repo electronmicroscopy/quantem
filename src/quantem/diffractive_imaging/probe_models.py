@@ -2004,10 +2004,11 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
                     "increase semiangle_cutoff to cover the measured aperture."
                 )
 
-        beam_coefs = torch.zeros(self.num_probes, len(parent_kv), 2, dtype=torch.float32)
-        beam_coefs[:, :, 0] = torch.sqrt(
+        mode_amplitudes = torch.sqrt(
             torch.from_numpy(self._initial_probe_weights).to(torch.float32)
-        )[:, None]
+        )
+        beam_coefs = torch.zeros(self.num_probes, len(parent_kv), 2, dtype=torch.float32)
+        beam_coefs[:, :, 0] = mode_amplitudes[:, None]
         self._beam_coefficients = nn.Parameter(
             beam_coefs.to(self.device), requires_grad=self.learn_beam_coefficients
         )
@@ -2015,16 +2016,8 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
 
     # region --- core compute ---
 
-    def _compute_beamlet_basis_fft(
-        self, accumulated_thickness: float | torch.Tensor = 0.0
-    ) -> torch.Tensor:
+    def _compute_beamlet_basis_fft(self) -> torch.Tensor:
         """CTF- and coefficient-weighted beamlet basis in reciprocal space.
-
-        Parameters
-        ----------
-        accumulated_thickness : float | torch.Tensor
-            Total specimen thickness in Angstroms, folded into defocus (C10) to
-            compensate the engine's back-propagation of the parent beams.
 
         Returns
         -------
@@ -2035,8 +2028,6 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         basis = []
         for p in range(self.num_probes):
             coefs: dict[str, Any] = {k: v for k, v in self.aberration_coefs[p].items()}
-            if not (isinstance(accumulated_thickness, float) and accumulated_thickness == 0.0):
-                coefs["C10"] = coefs.get("C10", 0.0) + accumulated_thickness
             ctf = fourier_space_probe(
                 gpts=gpts,
                 sampling=tuple(self.sampling),
@@ -2063,7 +2054,7 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         return torch.exp(-2j * torch.pi * phase)
 
     def forward(  # pyright: ignore[reportIncompatibleMethodOverride]  # PRISM returns basis + phases, engine owns the reduction
-        self, fract_positions: torch.Tensor, accumulated_thickness: float | torch.Tensor = 0.0
+        self, fract_positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(beamlets_fft, position_coefs)`` for the PRISM engine's reduction.
 
@@ -2071,7 +2062,7 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         probe stacks) is intentionally not implemented.
         """
         return (
-            self._compute_beamlet_basis_fft(accumulated_thickness),
+            self._compute_beamlet_basis_fft(),
             self._position_coefficients(fract_positions),
         )
 
