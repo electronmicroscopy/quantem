@@ -22,7 +22,11 @@ from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType, ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
+from quantem.diffractive_imaging.probe_models import (
+    ProbeModelType,
+    ProbeParametric,
+    ProbePRISM,
+)
 from quantem.diffractive_imaging.ptycho_losses import DataCriterion
 from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
@@ -121,6 +125,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
+        if isinstance(probe_model, ProbePRISM) and not getattr(
+            cls, "_supports_prism_probe", False
+        ):
+            raise TypeError(
+                "ProbePRISM requires the PRISM engine; use PtychographyPRISM.from_models(...)"
+            )
         return cls(
             dset=dset,
             obj_model=obj_model,
@@ -333,6 +343,32 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             _dist_world_size=world_size,
         )
 
+    def _forward_batch(
+        self, batch_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run the forward model for one batch of scan positions.
+
+        Returns the predicted intensities and an ``aux`` dict of intermediate
+        tensors consumed by the analytic-gradient ``backward`` path. Subclasses
+        with a different forward model (e.g. ``PtychographyPRISM``) override this.
+        """
+        patch_data, _positions_px, positions_px_fractional, descan_shifts = self.dset.forward(
+            batch_indices, self.obj_padding_px
+        )
+        shifted_probes = self.probe_model.forward(positions_px_fractional)
+        obj_patches = self.obj_model.forward(patch_data)
+        propagated_probes, overlap = self.forward_operator(
+            obj_patches, shifted_probes, descan_shifts
+        )
+        pred_intensities = self.detector_model.forward(overlap)
+        aux = {
+            "obj_patches": obj_patches,
+            "propagated_probes": propagated_probes,
+            "overlap": overlap,
+            "patch_indices": patch_data,
+        }
+        return pred_intensities, aux
+
     def _reconstruct_inner(
         self,
         num_iters: int = 0,
@@ -410,15 +446,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 self.zero_grad_all()
                 batch_indices = batch["index"].to(self._single_device)
                 targets = batch["target"].to(self._single_device, non_blocking=True)
-                patch_data, _positions_px, positions_px_fractional, descan_shifts = (
-                    self.dset.forward(batch_indices, self.obj_padding_px)
-                )
-                shifted_probes = self.probe_model.forward(positions_px_fractional)
-                obj_patches = self.obj_model.forward(patch_data)
-                propagated_probes, overlap = self.forward_operator(
-                    obj_patches, shifted_probes, descan_shifts
-                )
-                pred_intensities = self.detector_model.forward(overlap)
+                pred_intensities, aux = self._forward_batch(batch_indices)
 
                 batch_consistency_loss, targets = self.error_estimate(
                     pred_intensities,
@@ -432,10 +460,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 self.backward(
                     batch_loss,
                     autograd,
-                    obj_patches,
-                    propagated_probes,
-                    overlap,
-                    patch_data,
+                    aux.get("obj_patches"),
+                    aux.get("propagated_probes"),
+                    aux.get("overlap"),
+                    aux.get("patch_indices"),
                     targets,
                 )
                 if _dist_world_size > 1:
@@ -467,15 +495,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     for batch in val_loader:
                         batch_indices = batch["index"].to(self._single_device)
                         targets = batch["target"].to(self._single_device, non_blocking=True)
-                        patch_data, _positions_px, positions_px_fractional, descan_shifts = (
-                            self.dset.forward(batch_indices, self.obj_padding_px)
-                        )
-                        shifted_probes = self.probe_model.forward(positions_px_fractional)
-                        obj_patches = self.obj_model.forward(patch_data)
-                        _propagated_probes, overlap = self.forward_operator(
-                            obj_patches, shifted_probes, descan_shifts
-                        )
-                        pred_intensities = self.detector_model.forward(overlap)
+                        pred_intensities, _aux = self._forward_batch(batch_indices)
                         batch_val_loss, _ = self.error_estimate(
                             pred_intensities,
                             targets=targets,
