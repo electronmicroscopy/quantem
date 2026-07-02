@@ -2009,6 +2009,14 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         )
         beam_coefs = torch.zeros(self.num_probes, len(parent_kv), 2, dtype=torch.float32)
         beam_coefs[:, :, 0] = mode_amplitudes[:, None]
+        if self.num_probes > 1 and self.learn_beam_coefficients:
+            # identical initial modes have parallel gradients and can never
+            # differentiate under optimization; break the symmetry with a small
+            # deterministic per-parent perturbation (rng-seeded)
+            noise = torch.from_numpy(self.rng.standard_normal(tuple(beam_coefs.shape))).to(
+                torch.float32
+            )
+            beam_coefs = beam_coefs + 0.1 * mode_amplitudes[:, None, None] * noise
         self._beam_coefficients = nn.Parameter(
             beam_coefs.to(self.device), requires_grad=self.learn_beam_coefficients
         )
