@@ -141,14 +141,38 @@ def _has_peak_positions(peaks_x, peaks_y):
     )
 
 
-def _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center):
+def _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center, max_dist=None):
+    """Index of the detected central-beam peak, or ``None``.
+
+    Defined as the detected peak nearest the calibrated beam ``center`` (from
+    ``image_centers`` / ``find_central_beams_4d``), but only when it lies within
+    ``max_dist`` pixels of it. The filled central-beam marker itself is always drawn at
+    ``center``; this index only flags which detected peak, if any, to drop from the
+    open-circle set so a ring is not drawn on top of the beam.
+
+    ``peaks_r_invA`` is unused (kept for call-site compatibility): selecting the beam by
+    smallest polar radius made the marker jump to an off-center low-q Bragg peak when the
+    beam itself was not detected as a peak.
+    """
     if not _has_peak_positions(peaks_x, peaks_y):
         return None
-    if peaks_r_invA is not None and len(peaks_r_invA) > 0:
-        return int(np.argmin(peaks_r_invA))
     center_y, center_x = center
-    distances = np.sqrt((peaks_x - center_x) ** 2 + (peaks_y - center_y) ** 2)
-    return int(np.argmin(distances))
+    distances = np.sqrt(
+        (np.asarray(peaks_x) - center_x) ** 2 + (np.asarray(peaks_y) - center_y) ** 2
+    )
+    idx = int(np.argmin(distances))
+    if max_dist is not None and distances[idx] > max_dist:
+        return None
+    return idx
+
+
+def _central_beam_max_dist(image_shape):
+    """Pixel radius within which a detected peak counts as the central beam.
+
+    Small enough that finite-q Bragg peaks are never mistaken for the beam, generous
+    enough to absorb a few-pixel disagreement between center-finding and peak detection.
+    """
+    return max(4.0, 0.03 * min(image_shape[0], image_shape[1]))
 
 
 def _zoom_peak_overlay(
@@ -3003,7 +3027,10 @@ class BraggPeaksPolymer(AutoSerialize):
             center = _display_center(
                 getattr(self, "image_centers", None), ry_data, rx_data, dp_data.shape
             )
-            central_idx = _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center)
+            central_idx = _central_peak_index(
+                peaks_x, peaks_y, peaks_r_invA, center,
+                max_dist=_central_beam_max_dist(dp_data.shape),
+            )
             (
                 dp_data,
                 peaks_x,
@@ -3206,7 +3233,10 @@ class BraggPeaksPolymer(AutoSerialize):
 
         center = _display_center(getattr(self, "image_centers", None), ry, rx, dp_data.shape)
         if central_idx is None:
-            central_idx = _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center)
+            central_idx = _central_peak_index(
+                peaks_x, peaks_y, peaks_r_invA, center,
+                max_dist=_central_beam_max_dist(dp_data.shape),
+            )
         
         (
             dp_data,
