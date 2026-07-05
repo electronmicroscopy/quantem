@@ -20,7 +20,7 @@ from quantem.core.utils.imaging_utils import weighted_cross_correlation_shift
 from quantem.core.visualization import show_2d
 
 
-class MAPED(AutoSerialize):
+class MAPEDNumpy(AutoSerialize):
     """
     Merge-Averaged Precession Electron Diffraction (MAPED) helper.
 
@@ -897,7 +897,7 @@ def shift_images(
     return out
 
 
-class MAPEDTorch(AutoSerialize):
+class MAPED(AutoSerialize):
     """
     Merge-Averaged Precession Electron Diffraction (MAPED) helper coded in PyTorch.
 
