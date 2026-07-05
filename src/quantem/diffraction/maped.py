@@ -277,7 +277,7 @@ class MAPEDNumpy(AutoSerialize):
             shift_rc, G_shift = weighted_cross_correlation_shift(
                 im_ref=G_ref,
                 im=G,
-                weight_real= 1.0,
+                weight_real=1.0,
                 upsample_factor=int(upsample_factor),
                 fft_input=True,
                 fft_output=True,
@@ -301,11 +301,10 @@ class MAPEDNumpy(AutoSerialize):
 
         return self
 
-
     def real_space_align(
         self,
         num_images=None,
-        num_iter: int = 3,
+        num_iter: int = 15,
         edge_blend: float = 1.0,
         padding=None,
         pad_val: str | float = "median",
@@ -324,9 +323,9 @@ class MAPEDNumpy(AutoSerialize):
         Parameters
         ----------
         num_images
-            If provided, align only the first num_images images.
+            If provided, align only the first num_images images. Usually set to None to align all images.
         num_iter
-            Number of refinement iterations.
+            Number of refinement iterations. Usually 10 to 20 iterations is sufficient.
         edge_blend
             Used to set default correlation padding when max_shift is None.
         padding
@@ -334,17 +333,17 @@ class MAPEDNumpy(AutoSerialize):
         pad_val
             Passed to shift_images for plotting.
         upsample_factor
-            Subpixel upsampling factor for correlation peak estimation.
+            Subpixel upsampling factor for correlation peak estimation. 100 is usually sufficient.
         max_shift
             Optional maximum shift constraint passed to weighted_cross_correlation_shift.
         shift_method
             Passed to shift_images for plotting ('bilinear' or 'fourier').
         edge_filter
-            If True, correlate on gradient magnitude instead of raw intensity.
+            If True, correlate on gradient magnitude instead of raw intensity. 
         edge_sigma
-            Gaussian sigma applied to gradients when edge_filter is True.
+            Gaussian sigma applied to gradients when edge_filter is True. Depends on noise level and feature size but 1-3 pixels is usually sufficient.
         hanning_filter
-            If True, apply a Hanning window prior to FFT.
+            If True, apply a Hanning window prior to FFT. Recommended if the BF images have strong edge artifacts.
         plot_aligned
             If True, plot aligned mean BF images.
         **plot_kwargs
@@ -501,15 +500,15 @@ class MAPEDNumpy(AutoSerialize):
         real_space_padding
             Output scan padding in pixels (adds border to scan grid).
         real_space_edge_blend
-            Tukey taper width for scan-space interpolation weights.
+            Tukey taper width for scan-space interpolation weights. 1.0 is usually sufficient.
         diffraction_padding
-            Output diffraction padding in pixels (adds border around DPs).
+            Output diffraction padding in pixels (adds border around DPs). 0 is usually sufficient.
         diffraction_edge_blend
-            Tukey taper width for diffraction-space weights.
+            Tukey taper width for diffraction-space weights. 0.0 is usually sufficient.
         diffraction_pad_val
-            Pad value for diffraction padding ('min','max','mean','median' or float).
+            Pad value for diffraction padding ('min','max','mean','median' or float). "min" is usually sufficient.
         shift_method
-            Diffraction shift method: 'bilinear' or 'fourier'.
+            Diffraction shift method: 'bilinear' or 'fourier'. 'bilinear' is recommended.
         dtype
             Output dtype. If None, uses parent dtype.
         scale_output
@@ -906,6 +905,14 @@ class MAPED(AutoSerialize):
     - choose/find diffraction origins,
     - align diffraction space and real space,
     - merge datasets into a single composite Dataset4dstem.
+
+    The standard workflow is: 
+    1. Create a MAPED instance using `MAPED.from_datasets()`.
+    2. Call `preprocess()` to compute mean BF and DP summaries.
+    3. Call `diffraction_origin()` to choose or find diffraction origins.
+    4. Call `diffraction_align()` to align diffraction patterns.
+    5. Call `real_space_align()` to align real-space BF images.
+    6. Call `merge_datasets()` to merge the aligned datasets into a single Dataset4dstem.
     """
 
     _token = object()
@@ -1039,7 +1046,6 @@ class MAPED(AutoSerialize):
                 [f"{i} - Mean Bright Field", f"{i} - Mean Diffraction Pattern"] for i in range(n)
             ]
             show_2d(tiles, title=titles, **plot_kwargs)
-
         return self
 
     def diffraction_origin(
@@ -1124,7 +1130,6 @@ class MAPED(AutoSerialize):
                     raise ValueError("origins must have shape (n, 2) after conversion.")
 
         self.diffraction_origins = origins_arr
-
         if plot_origins:
             arrays = [np.asarray(self.dp_mean[i].cpu()) for i in plot_indices_list]
             titles = [f"{i} - Mean Diffraction Pattern" for i in plot_indices_list]
@@ -1133,7 +1138,6 @@ class MAPED(AutoSerialize):
             for j, i in enumerate(plot_indices_list):
                 r, c = self.diffraction_origins[i].cpu().numpy()
                 axs[j].plot([c], [r], marker="+", color="red", markersize=16, markeredgewidth=2)
-
         return self
 
     def dscan_align(
@@ -1147,6 +1151,46 @@ class MAPED(AutoSerialize):
         mode: str = "linear",
         batch_size: int | None = None,
     ):
+        """
+        Correct descan errors in each dataset by aligning its diffraction patterns.
+
+        Iterates over every dataset in ``self.datasets`` and calls
+        ``dscan_correct`` to estimate and remove per-scan-position shifts of the
+        diffraction patterns, then replaces each dataset in place with its aligned
+        version.
+
+        Parameters
+        ----------
+        iterations : int
+            Number of refinement iterations passed to ``dscan_correct``. Start with 1 and increase if the shifts are large or the diffraction patterns are noisy.
+        upsample_factor : int, optional
+            Subpixel upsampling factor for correlation peak estimation (default 100 is recommended).
+        method : str, optional
+            Shift-estimation method, ``"autocorrelation"`` or ``"cross_correlation"``
+            (default ``"autocorrelation"`` is recommended).
+        plot : bool, optional
+            If True, plot results after each iteration (default True is recommended).
+        edge_blend : float, optional
+            Tukey window edge taper (pixels) applied prior to correlation (default 2.0 is recommended).
+        fit_shifts : bool, optional
+            If True, fit the measured shifts to a smooth surface (default True is recommended).
+        mode : str, optional
+            Surface fit model when ``fit_shifts`` is True, ``"linear"`` or
+            ``"quadratic"`` (default ``"linear"`` is recommended).
+        batch_size : int, optional
+            Number of scan positions processed per batch. If None, chosen
+            automatically inside ``dscan_correct`` (default None).
+
+        Attributes
+        ----------
+        datasets : list[torch.Tensor]
+            Each dataset is replaced in place with its descan-corrected version.
+
+        Returns
+        -------
+        MAPED
+            self (updated instance)
+        """
         for i, dataset in enumerate(self.datasets):
             _, aligned_dataset = dscan_correct(
                 dataset,
@@ -1161,7 +1205,6 @@ class MAPED(AutoSerialize):
                 batch_size=batch_size,
             )
             self.datasets[i] = aligned_dataset
-
         return self
 
     def diffraction_align(
@@ -1171,7 +1214,6 @@ class MAPED(AutoSerialize):
         padding=None,
         pad_val: str | float = "min",
         upsample_factor: int = 100,
-        weight_scale: float = 1 / 8,
         max_shift=None,
         plot_aligned: bool = True,
         **plot_kwargs: Any,
@@ -1191,17 +1233,15 @@ class MAPED(AutoSerialize):
         Parameters
         ----------
         num_iter : int
-            Number of refinement iterations.
+            Number of refinement iterations. Usually 5 to 10 iterations is sufficient.
         edge_blend : float
-            Tukey window edge taper (pixels).
+            Tukey window edge taper (pixels). Roughly 10% of the diffraction pattern size is a good starting point.
         padding : int or tuple, optional
             Passed to shift_images for plotting.
         pad_val : str or float
             Passed to shift_images for plotting.
         upsample_factor : int
             Subpixel upsampling factor for correlation peak estimation.
-        weight_scale : float
-            Radial weight falloff scale (fraction of mean DP size). Currently unused.
         max_shift : float, optional
             Largest expected shift magnitude (pixels), used to size the zero-padded
             correlation canvas so large shifts do not wrap around. If None, it is
@@ -1277,7 +1317,6 @@ class MAPED(AutoSerialize):
             base_pad[i, r0 : r0 + H, c0 : c0 + W] = self.dp_mean[i].float()
 
         # Initialize from the beam origins (shift each pattern's origin onto the
-        # reference origin) so iteration only has to refine the subpixel residual.
         shifts = origins[0][None, :] - origins
 
         for _ in range(int(num_iter)):
@@ -1313,7 +1352,6 @@ class MAPED(AutoSerialize):
                 pad_val=pad_val,
             )
             show_2d(im_aligned.unbind(0), **plot_kwargs)
-
         return self
 
     def real_space_align(
@@ -1347,7 +1385,7 @@ class MAPED(AutoSerialize):
             Passed to shift_images for plotting.
         pad_val : float
             Passed to shift_images for plotting.
-        upsample_factor  : int
+        upsample_factor : int
             Subpixel upsampling factor for correlation peak estimation.
         max_shift : float
             Optional maximum shift constraint passed to weighted_cross_correlation_shift.
@@ -1395,7 +1433,7 @@ class MAPED(AutoSerialize):
 
         if int(num_iter) < 1:
             raise ValueError("num_iter must be >= 1")
-
+        
         if max_shift is not None:
             pad_cc = int(np.ceil(float(max_shift))) + 4
         else:
@@ -1430,7 +1468,6 @@ class MAPED(AutoSerialize):
         base_pad = torch.zeros((n, Hp, Wp), dtype=torch.float32, device=self.device)
         for i in range(n):
             im0 = self.im_bf[i].float()
-
             if edge_filter:
                 pad_symmetric = wx.shape[-1] // 2
                 im0_pad = F.pad(
@@ -1438,7 +1475,6 @@ class MAPED(AutoSerialize):
                     pad=(pad_symmetric, pad_symmetric, pad_symmetric, pad_symmetric),
                     mode="reflect",
                 )
-
                 gx = F.conv2d(im0_pad, wx.unsqueeze(0).unsqueeze(0))[0, 0]
                 gy = F.conv2d(im0_pad, wx.T.unsqueeze(0).unsqueeze(0))[0, 0]
 
@@ -1465,10 +1501,8 @@ class MAPED(AutoSerialize):
             # shift images to current guess
             ims_a = shift_images_torch(base_pad, shifts)
             ims_mean = torch.sum(ims_a * w_h_pad, dim=(1, 2)) / w_h_sum
-
             ims_win = (ims_a - ims_mean[:, None, None]) * w_h_pad[None]
             G_list = torch.fft.fft2(ims_win)
-
             G_ref = torch.mean(G_list, axis=0)
 
             # perform cross correlation again
@@ -1476,12 +1510,8 @@ class MAPED(AutoSerialize):
                 drc = cross_correlation_shift_torch(
                     im_ref=G_ref,
                     im=G_list[i],
-                    # weight_real=None,
                     upsample_factor=int(upsample_factor),
-                    # max_shift=max_shift,
                     fft_input=True,
-                    # fft_output=False,
-                    # return_shifted_image=False,
                 )
 
                 shifts[i, 0] += float(drc[0])
@@ -1490,7 +1520,6 @@ class MAPED(AutoSerialize):
             shifts -= shifts[0][None, :].clone()
 
         shifts -= torch.mean(shifts, dim=0)[None, :]
-
         self.real_space_shifts = torch.zeros((n_total, 2), dtype=torch.float32, device=self.device)
         self.real_space_shifts[:n, :] = shifts
 
@@ -1572,6 +1601,7 @@ class MAPED(AutoSerialize):
 
         arrays = self.datasets
         n = len(arrays)
+    
         if n == 0:
             raise RuntimeError("No datasets found in self.datasets.")
 
@@ -1595,10 +1625,8 @@ class MAPED(AutoSerialize):
 
         real_space_padding = int(real_space_padding)
         diffraction_padding = int(diffraction_padding)
-
         Rout = Rs + 2 * real_space_padding
         Cout = Cs + 2 * real_space_padding
-
         Hp = H + 2 * diffraction_padding
         Wp = W + 2 * diffraction_padding
         rp0 = diffraction_padding
@@ -1629,7 +1657,6 @@ class MAPED(AutoSerialize):
             )
         else:
             w_dp = torch.ones((H, W), dtype=torch.float32, device=self.device)
-
         v = torch.stack(self.dp_mean, axis=0).reshape(-1)
 
         if isinstance(diffraction_pad_val, str):
@@ -1651,8 +1678,8 @@ class MAPED(AutoSerialize):
 
         wdp_pad = torch.zeros((Hp, Wp), dtype=torch.float32, device=self.device)
         wdp_pad[rp0 : rp0 + H, cp0 : cp0 + W] = w_dp
-
         wdp_shifted = torch.zeros((n, Hp, Wp), dtype=torch.float32, device=self.device)
+
         if method == "fourier":
             kr = torch.fft.fftfreq(Hp, device=self.device)[:, None]
             kc = torch.fft.fftfreq(Wp, device=self.device)[None, :]
@@ -1660,7 +1687,6 @@ class MAPED(AutoSerialize):
             ramps: list[torch.Tensor] = []
             for i in range(n):
                 dr, dc = dp_shifts[i, 0], dp_shifts[i, 1]
-
                 ramp = torch.exp(-2j * torch.pi * (kr * dr + kc * dc))
                 ramps.append(ramp)
                 w_i = torch.fft.ifft2(Fw * ramp).real
@@ -1678,17 +1704,15 @@ class MAPED(AutoSerialize):
         coverage = torch.clip(torch.sum(wdp_shifted, dim=0), 0.0, 1.0)
         edge_w_dp = 1.0 - coverage
 
-        # Determine batch size (somewhat arbitrary)
+        # Determine batch size (somewhat arbitrary if not given)
         if batch_size is None:
             batch_size = max(1, min(32, Rout // 2))
 
         c_out = torch.arange(Cout, dtype=torch.float32, device=self.device)
         c_base = c_out - real_space_padding
-
         merged = torch.zeros((Rout, Cout, Hp, Wp), dtype=torch.float64, device=self.device)
 
         # start batching
-
         for batch_start in tqdm(
             range(0, Rout, batch_size),
             desc="Merging (batches)",
@@ -1717,20 +1741,13 @@ class MAPED(AutoSerialize):
                     a = torch.tensor(a, dtype=torch.float32, device=self.device)
 
                 r_in = r_base_batch.expand(-1, Cout) - rs_shifts[i, 0]  # (batch_size, Cout)
-                c_in = (
-                    c_base_batch.expand(batch_end - batch_start, -1) - rs_shifts[i, 1]
-                )  # (batch_size, Cout)
-
+                c_in = (c_base_batch.expand(batch_end - batch_start, -1) - rs_shifts[i, 1])
                 c_norm = 2.0 * c_in / (Cs - 1) - 1.0  # (batch_size, Cout)
                 r_norm = 2.0 * r_in / (Rs - 1) - 1.0  # (batch_size, Cout)
-
-                a_reshaped = (
-                    a.view(Rs, Cs, H * W).permute(2, 0, 1).unsqueeze(0)
-                )  # (1, H*W, Rs, Cs)
+                a_reshaped = (a.view(Rs, Cs, H * W).permute(2, 0, 1).unsqueeze(0))
 
                 # Reshape w_rs from (Rs, Cs) to (1, 1, Rs, Cs)
                 w_rs_reshaped = w_rs.unsqueeze(0).unsqueeze(0)  # (1, 1, Rs, Cs)
-
                 dp_interp_list = []
                 wi_list = []
 
@@ -1747,7 +1764,6 @@ class MAPED(AutoSerialize):
                         padding_mode="zeros",
                         align_corners=True,
                     )
-
                     wi_sample = torch.nn.functional.grid_sample(
                         w_rs_reshaped,
                         grid_batch,
@@ -1755,16 +1771,14 @@ class MAPED(AutoSerialize):
                         padding_mode="zeros",
                         align_corners=True,
                     )
-
                     dp_b = dp_sample.squeeze(0).squeeze(-1).view(H, W, Cout).permute(2, 0, 1)
                     wi_b = wi_sample.squeeze(0).squeeze(-1).squeeze(0)
-
+                    
                     dp_interp_list.append(dp_b)
                     wi_list.append(wi_b)
 
                 dp_interp = torch.stack(dp_interp_list)
                 wi = torch.stack(wi_list)
-
                 dp_padded = torch.zeros(
                     (batch_end - batch_start, Cout, Hp, Wp),
                     dtype=torch.float32,
@@ -1791,7 +1805,6 @@ class MAPED(AutoSerialize):
 
                 wi_exp = wi.unsqueeze(-1).unsqueeze(-1)
                 wdp_i = wdp_shifted[i].unsqueeze(0).unsqueeze(0)
-
                 num_batch += wi_exp * dp_shifted
                 den_batch += wi_exp * wdp_i
 
@@ -1814,7 +1827,6 @@ class MAPED(AutoSerialize):
 
         self.im_bf_merged = torch.mean(merged, dim=(2, 3))
         self.dp_mean_merged = torch.mean(merged, dim=(0, 1))
-
         self.im_bf_merged = torch.mean(merged, dim=(2, 3))
         self.dp_mean_merged = torch.mean(merged, dim=(0, 1))
 
@@ -1865,7 +1877,6 @@ class MAPED(AutoSerialize):
             )
 
         return dataset_merged
-
 
 def shift_images(
     images: list[np.ndarray],
@@ -2032,7 +2043,6 @@ def tukey_torch(N, alpha=0.5, device=None, dtype=torch.float32):
     right = n >= (N - 1 - edge)
 
     w[left] = 0.5 * (1 + torch.cos(torch.pi * (2 * n[left] / (alpha * (N - 1)) - 1)))
-
     w[right] = 0.5 * (1 + torch.cos(torch.pi * (2 * n[right] / (alpha * (N - 1)) - 2 / alpha + 1)))
 
     return w
@@ -2138,6 +2148,7 @@ def shift_images_torch(
     for ind in range(n):
         stack[ind, r0 : r0 + H, c0 : c0 + W] = images[ind].to(dtype=torch.float32) * w
         stack_w[ind, r0 : r0 + H, c0 : c0 + W] = w
+
     # shift both stack and stack_w using grid_sample on (n,1,Hp,Wp)
     imgs = stack.unsqueeze(1)
     imgs_w = stack_w.unsqueeze(1)
@@ -2406,14 +2417,12 @@ def dftUpsample_torch(
     colKern = torch.exp(factor_col * (col_freq[None, :, None] * col_coords[:, None, :])).to(
         imageCorr.dtype
     )
-
     factor_row = -2j * math.pi / (M * float(upsampleFactor))
     rowKern = torch.exp(factor_row * (row_coords[:, :, None] * row_freq[None, None, :])).to(
         imageCorr.dtype
     )
 
     imageUpsample = torch.matmul(torch.matmul(rowKern, imageCorr), colKern)
-
     result = imageUpsample.real
     return result[0] if squeeze_output else result
 
