@@ -281,16 +281,29 @@ class BraggVectors(AutoSerialize):
         BraggVectors
             ``self``, for method chaining.
         """
-        data = torch.as_tensor(
-            np.asarray(self.dataset.array), dtype=torch.float, device=self.device
-        )
-        if roi is None:
-            probe = data.mean(dim=(0, 1))
+        gpu_cache = getattr(self, "_gpu_cache", None)
+        if gpu_cache is not None:
+            # Dataset is already resident on self.device (e.g. from a prior
+            # detect_disks(save_to_gpu=True)) -- reuse it instead of transferring again.
+            if roi is None:
+                probe = gpu_cache.mean(dim=(0, 1))
+            else:
+                m = torch.as_tensor(np.asarray(roi) > 0, device=self.device)
+                if not bool(m.any()):
+                    raise ValueError("roi selects no scan positions.")
+                probe = gpu_cache[m].mean(dim=0)
         else:
-            m = torch.as_tensor(np.asarray(roi) > 0, device=self.device)
-            if not bool(m.any()):
-                raise ValueError("roi selects no scan positions.")
-            probe = data[m].mean(dim=0)
+            # Select the (small) ROI on the CPU first so we never have to put the
+            # full dataset on the device just to average a handful of positions.
+            array = np.asarray(self.dataset.array)
+            if roi is None:
+                probe_np = array.mean(axis=(0, 1))
+            else:
+                m = np.asarray(roi) > 0
+                if not m.any():
+                    raise ValueError("roi selects no scan positions.")
+                probe_np = array[m].mean(axis=0)
+            probe = torch.as_tensor(probe_np, dtype=torch.float, device=self.device)
         if center is None:
             center = probe_centroid(probe)
         self._set_template(probe, center=center, subtract_mean=subtract_mean)

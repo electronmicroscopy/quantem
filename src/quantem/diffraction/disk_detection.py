@@ -215,8 +215,8 @@ def probe_centroid(probe: torch.Tensor) -> tuple[float, float]:
     total = p.sum()
     if total <= 0:
         return (p.shape[0] / 2.0, p.shape[1] / 2.0)
-    rows = torch.arange(p.shape[0], dtype=torch.float).view(-1, 1)
-    cols = torch.arange(p.shape[1], dtype=torch.float).view(1, -1)
+    rows = torch.arange(p.shape[0], dtype=torch.float, device=p.device).view(-1, 1)
+    cols = torch.arange(p.shape[1], dtype=torch.float, device=p.device).view(1, -1)
     return (float((p * rows).sum() / total), float((p * cols).sum() / total))
 
 
