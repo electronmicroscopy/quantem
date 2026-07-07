@@ -1428,6 +1428,14 @@ class DiffractionTomography(AutoSerialize):
 
         return Psi
 
+    def _apply_band_limit(self) -> None:
+        """Zero the SF deviation outside the k-space band (see `k_band_limit`)."""
+        mask = getattr(self, "_band_mask", None)
+        if mask is None:
+            return
+        with torch.no_grad():
+            self.sf_learned.mul_(mask[None, None, None].to(self.sf_learned.dtype))
+
     def _apply_shrink(self, tau: float) -> None:
         """In-place complex soft-threshold of the non-origin k-voxels.
 
@@ -1461,6 +1469,7 @@ class DiffractionTomography(AutoSerialize):
         phase_only: bool = True,
         init_noise: float = 0.0,
         shrink: float = 0.0,
+        k_band_limit: float | None = None,
         loss_type: str = "amplitude",
         obj_constraints: dict | ObjConstraintsType | None = None,
         show_metrics: bool = True,
@@ -1504,6 +1513,13 @@ class DiffractionTomography(AutoSerialize):
             small threshold suppresses the diffuse backprojection fog that
             otherwise accumulates along the tilt rotation axis. Scaled by
             the current learning rate.
+        k_band_limit: float | None
+            If set (in A^-1), the structure-factor deviation of every cell is
+            hard-zeroed outside |k| <= k_band_limit after each step (and the
+            initial noise is confined there). Physically there is no Bragg
+            content beyond the highest reflection, so this removes the
+            high-spatial-frequency fog directly. The vacuum baseline pixel is
+            always retained.
         loss_type: str
             'amplitude' (default): MSE on sqrt-intensities — the standard
             ptychographic choice. Intensity loss has a vanishing first-order
@@ -1620,6 +1636,21 @@ class DiffractionTomography(AutoSerialize):
 
         use_fast = fast and sum(p["n_probes"] for p in tilt_packs) == n_samples
 
+        # k-space band-limit mask on each SF cell: the structure-factor
+        # deviation is physically confined to |k| <= k_band_limit (no Bragg
+        # content beyond the highest reflection), so voxels outside are
+        # unphysical fog. When set, the initial noise is confined to the band
+        # and the deviation is re-masked after every optimizer step.
+        band_mask = None
+        if k_band_limit is not None:
+            kx = self.kx.to(device).to(torch.float64)
+            ky = self.ky.to(device).to(torch.float64)
+            kz = self.kz.to(device).to(torch.float64)
+            k2 = kx ** 2 + ky ** 2 + kz ** 2           # (Dkx, Dky, Dkz) via broadcast
+            band_mask = (k2 <= float(k_band_limit) ** 2)
+            band_mask[0, 0, 0] = True                  # always keep the baseline
+        self._band_mask = band_mask
+
         # --- learnable volume ------------------------------------------------
         if reset or getattr(self, "sf_learned", None) is None:
             sf_init = self.array.detach().clone().to(device=device, dtype=torch.complex128)
@@ -1630,6 +1661,8 @@ class DiffractionTomography(AutoSerialize):
                     + 1j * torch.randn(sf_init.shape, generator=gen, dtype=torch.float64)
                 ).to(device=device, dtype=torch.complex128)
                 noise[..., 0, 0, 0] = 0.0  # keep the vacuum baseline exact
+                if band_mask is not None:
+                    noise = noise * band_mask[None, None, None]
                 sf_init = sf_init + noise
             self.sf_learned = sf_init.requires_grad_(True)
 
@@ -1710,6 +1743,8 @@ class DiffractionTomography(AutoSerialize):
                     self.optimizer.step()
                     if shrink > 0.0:
                         self._apply_shrink(shrink * lr_now)
+                    if band_mask is not None:
+                        self._apply_band_limit()
 
                 mean_loss = total_loss / n_samples
                 losses.append(mean_loss)
@@ -1747,6 +1782,8 @@ class DiffractionTomography(AutoSerialize):
                     self.optimizer.step()
                     if shrink > 0.0:
                         self._apply_shrink(shrink * lr_now)
+                    if band_mask is not None:
+                        self._apply_band_limit()
                     total_loss += batch_loss.item() * len(batch_idx)
 
                 mean_loss = total_loss / n_samples

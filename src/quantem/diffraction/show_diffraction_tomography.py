@@ -77,6 +77,7 @@ class DiffractionTomographyViewer(anywidget.AnyWidget):
     pts_range = traitlets.List(traitlets.Float(), default_value=[0.0, 1.0]).tag(sync=True)
     pts_power = traitlets.Float(0.25).tag(sync=True)
     pts_scale = traitlets.Float(1.0).tag(sync=True)
+    pts_floor = traitlets.Float(0.05).tag(sync=True)   # hide maxima below this * max
 
     # --- data (python -> js) ---------------------------------------------
     real_shape = traitlets.List(traitlets.Int()).tag(sync=True)
@@ -483,6 +484,12 @@ function render({ model, el: root }) {
   pSclSlider.addEventListener("input", () => {
     model.set("pts_scale", parseFloat(pSclSlider.value)); model.save_changes();
   });
+  const pFlrRow = ctrlRow(pR);
+  const pFlrLabel = el("span", { minWidth: "104px" }, pFlrRow);
+  const pFlrSlider = slider(pFlrRow, 0.0, 0.5, 0.005, "150px");
+  pFlrSlider.addEventListener("input", () => {
+    model.set("pts_floor", parseFloat(pFlrSlider.value)); model.save_changes();
+  });
   const histR = histPanel(pR, PW, "intensity range", (r) => {
     model.set("pts_range", r); model.save_changes();
   });
@@ -491,13 +498,15 @@ function render({ model, el: root }) {
     ctxR.fillStyle = "#ffffff";
     ctxR.fillRect(0, 0, PW, PW);
     const M = maxInt.length;
-    cntLabel.textContent = M + " maxima";
     const pPow = model.get("pts_power");
     const pScl = model.get("pts_scale");
+    const pFlr = model.get("pts_floor");
     pPowLabel.textContent = "size power = " + pPow.toFixed(2);
     pPowSlider.value = pPow;
     pSclLabel.textContent = "size scale = " + pScl.toFixed(1);
     pSclSlider.value = pScl;
+    pFlrLabel.textContent = "min = " + (100 * pFlr).toFixed(1) + "% max";
+    pFlrSlider.value = pFlr;
 
     const th = model.get("rot_theta") * Math.PI / 180;
     const ph = model.get("rot_phi") * Math.PI / 180;
@@ -510,6 +519,7 @@ function render({ model, el: root }) {
     if (mx <= mn) mx = mn + 1;
     const pr = model.get("pts_range");
     const lo = mn + pr[0] * (mx - mn), hi = mn + pr[1] * (mx - mn);
+    const floor = pFlr * mx;   // absolute noise cutoff, fraction of the brightest
 
     // axes: kx red, ky green, kz blue
     const axes = [[K0 / 2, 0, 0, "#d33"], [0, K1 / 2, 0, "#2a2"], [0, 0, K2 / 2, "#36c"]];
@@ -524,9 +534,11 @@ function render({ model, el: root }) {
     }
 
     const pts = [];
+    let shown = 0;
     for (let i = 0; i < M; i++) {
       const v = maxInt[i];
-      if (v < lo) continue;
+      if (v < lo || v < floor) continue;   // noise cutoff + display range
+      shown++;
       const x = maxPos[3 * i], y = maxPos[3 * i + 1], z = maxPos[3 * i + 2];
       const rx = ct * x - st * y, ry0 = st * x + ct * y;
       const ry = cp * ry0 - sp * z;
@@ -536,6 +548,7 @@ function render({ model, el: root }) {
       const area = Math.min(500, Math.max(6, 500 * pScl * tnorm));
       pts.push([rx, ry, rz, Math.sqrt(area / Math.PI), tnorm]);
     }
+    cntLabel.textContent = shown + " / " + M + " maxima";
     pts.sort((a, b) => a[2] - b[2]);
     for (const [rx, ry, , rad, t] of pts) {
       const c = cmap(0.15 + 0.75 * t);
@@ -590,7 +603,7 @@ function render({ model, el: root }) {
     "change:sum_axis change:view_mode change:power change:mid_range", () => { drawMid(); },
   );
   model.on(
-    "change:rot_theta change:rot_phi change:pts_range change:pts_power change:pts_scale",
+    "change:rot_theta change:rot_phi change:pts_range change:pts_power change:pts_scale change:pts_floor",
     () => { drawRight(); },
   );
   model.on("change:title", () => { title.textContent = model.get("title"); });
