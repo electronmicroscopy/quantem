@@ -1427,6 +1427,21 @@ class DiffractionTomography(AutoSerialize):
 
         return Psi
 
+    def _apply_shrink(self, tau: float) -> None:
+        """In-place complex soft-threshold of the non-origin k-voxels.
+
+        Proximal step for an L1 penalty on the structure-factor deviation:
+        each complex value keeps its phase and loses `tau` of magnitude
+        (clamped at zero). The vacuum baseline pixel [..., 0, 0, 0] is
+        never shrunk.
+        """
+        with torch.no_grad():
+            sf = self.sf_learned
+            mag = sf.abs()
+            scale = torch.clamp(1.0 - tau / mag.clamp_min(1e-30), min=0.0)
+            scale[..., 0, 0, 0] = 1.0
+            sf.mul_(scale.to(sf.dtype))
+
     def reconstruct(
         self,
         measurements: Sequence[Dataset4dstem],
@@ -1442,6 +1457,9 @@ class DiffractionTomography(AutoSerialize):
         lr_init: float = 1e-3,
         optimizer_params: dict | None = None,
         phase_only: bool = True,
+        init_noise: float = 0.0,
+        shrink: float = 0.0,
+        loss_type: str = "amplitude",
         obj_constraints: dict | ObjConstraintsType | None = None,
         show_metrics: bool = True,
         seed: int = 42,
@@ -1472,9 +1490,28 @@ class DiffractionTomography(AutoSerialize):
             diffraction patterns (tilt, row, col).
         reset: bool
             Re-initialize `sf_learned` from `self.array` (default True).
+        init_noise: float
+            Standard deviation of seeded complex Gaussian noise added to the
+            non-origin k-voxels of the initial volume. Breaking the exact
+            vacuum symmetry gives the optimizer's moment estimates real
+            statistics to calibrate on and speeds up early convergence.
+        shrink: float
+            Per-step complex soft-threshold applied to the non-origin
+            k-voxels (proximal L1 / sparsity regularization). The true
+            structure-factor deviation is sparse — a few Bragg peaks — so a
+            small threshold suppresses the diffuse backprojection fog that
+            otherwise accumulates along the tilt rotation axis. Scaled by
+            the current learning rate.
+        loss_type: str
+            'amplitude' (default): MSE on sqrt-intensities — the standard
+            ptychographic choice. Intensity loss has a vanishing first-order
+            gradient at dark detector pixels (no reference wave to interfere
+            with), which stalls recovery of Bragg peaks from a vacuum start;
+            the amplitude loss keeps a finite gradient there. 'intensity':
+            MSE on raw intensities.
         obj_constraints:
-            Placeholder for regularization (smoothing, shrinkage) — parsed but
-            not yet applied.
+            Placeholder for further regularization (real-space smoothing) —
+            parsed but not yet applied.
 
         Returns
         -------
@@ -1584,13 +1621,25 @@ class DiffractionTomography(AutoSerialize):
         # --- learnable volume ------------------------------------------------
         if reset or getattr(self, "sf_learned", None) is None:
             sf_init = self.array.detach().clone().to(device=device, dtype=torch.complex128)
+            if init_noise > 0.0:
+                gen = torch.Generator(device="cpu").manual_seed(seed)
+                noise = init_noise * (
+                    torch.randn(sf_init.shape, generator=gen, dtype=torch.float64)
+                    + 1j * torch.randn(sf_init.shape, generator=gen, dtype=torch.float64)
+                ).to(device=device, dtype=torch.complex128)
+                noise[..., 0, 0, 0] = 0.0  # keep the vacuum baseline exact
+                sf_init = sf_init + noise
             self.sf_learned = sf_init.requires_grad_(True)
 
         # Default weight_decay=0: AdamW's default decay would pull the vacuum
         # baseline (SF[..., 0, 0, 0] = 1) toward zero, which breaks the
         # physics. Shrinkage regularization belongs on the *deviation* from
         # vacuum, applied explicitly via obj_constraints (future work).
-        opt_params = {"weight_decay": 0.0}
+        # eps default: Adam's step is lr * m / (sqrt(v) + eps). The gradients
+        # of this problem are ~1e-10, so sqrt(v) ~ 1e-10 << the usual
+        # eps = 1e-8 — the default epsilon would dominate the denominator and
+        # throttle every step by ~100x (the "slow first 20 iterations").
+        opt_params = {"weight_decay": 0.0, "eps": 1e-30}
         opt_params.update(optimizer_params or {})
         self.optimizer = torch.optim.AdamW([self.sf_learned], lr=lr_init, **opt_params)
         loss_fxn = torch.nn.MSELoss()
@@ -1636,10 +1685,16 @@ class DiffractionTomography(AutoSerialize):
                         dp_pred = torch.abs(Psi) ** 2
                         # sum of per-DP mean-squared errors, scaled so the
                         # accumulated gradient equals the group-mean loss
-                        tilt_loss = ((dp_pred - tilt_packs[m]["targets"]) ** 2).mean(dim=(1, 2)).sum()
+                        if loss_type == "amplitude":
+                            resid = torch.sqrt(dp_pred + 1e-30) - torch.sqrt(tilt_packs[m]["targets"])
+                        else:
+                            resid = dp_pred - tilt_packs[m]["targets"]
+                        tilt_loss = (resid ** 2).mean(dim=(1, 2)).sum()
                         (tilt_loss / group_dps).backward()
                         total_loss += tilt_loss.item()
                     self.optimizer.step()
+                    if shrink > 0.0:
+                        self._apply_shrink(shrink * lr_init)
 
                 mean_loss = total_loss / n_samples
                 losses.append(mean_loss)
@@ -1662,10 +1717,18 @@ class DiffractionTomography(AutoSerialize):
                             k_slice_coords=kcoords_per_meas[sample_kcoords_idx[s]],
                         )
                         dp_pred = torch.abs(Psi) ** 2
-                        batch_loss = batch_loss + loss_fxn(dp_pred, sample_targets[s])
+                        if loss_type == "amplitude":
+                            batch_loss = batch_loss + loss_fxn(
+                                torch.sqrt(dp_pred + 1e-30),
+                                torch.sqrt(sample_targets[s]),
+                            )
+                        else:
+                            batch_loss = batch_loss + loss_fxn(dp_pred, sample_targets[s])
                     batch_loss = batch_loss / len(batch_idx)
                     batch_loss.backward()
                     self.optimizer.step()
+                    if shrink > 0.0:
+                        self._apply_shrink(shrink * lr_init)
                     total_loss += batch_loss.item() * len(batch_idx)
 
                 mean_loss = total_loss / n_samples

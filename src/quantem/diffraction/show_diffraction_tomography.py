@@ -75,6 +75,8 @@ class DiffractionTomographyViewer(anywidget.AnyWidget):
     left_range = traitlets.List(traitlets.Float(), default_value=[0.0, 1.0]).tag(sync=True)
     mid_range = traitlets.List(traitlets.Float(), default_value=[0.0, 1.0]).tag(sync=True)
     pts_range = traitlets.List(traitlets.Float(), default_value=[0.0, 1.0]).tag(sync=True)
+    pts_power = traitlets.Float(0.25).tag(sync=True)
+    pts_scale = traitlets.Float(1.0).tag(sync=True)
 
     # --- data (python -> js) ---------------------------------------------
     real_shape = traitlets.List(traitlets.Int()).tag(sync=True)
@@ -183,11 +185,40 @@ function el(tag, style, parent) {
   return e;
 }
 
+function styleButton(b, active) {
+  Object.assign(b.style, {
+    padding: "3px 10px",
+    marginRight: "4px",
+    border: active ? "1px solid #3b6fd4" : "1px solid #c5cbd6",
+    borderRadius: "4px",
+    background: active ? "#e3ecfb" : "#fafbfc",
+    color: active ? "#1d4ed8" : "#333",
+    fontWeight: active ? "600" : "400",
+    fontSize: "11px",
+    cursor: "pointer",
+  });
+}
+
+function ctrlRow(parent) {
+  return el("div", {
+    display: "flex", alignItems: "center", gap: "6px",
+    margin: "5px 0 0 0", fontSize: "11px", color: "#444",
+  }, parent);
+}
+
+function slider(parent, min, max, step, width) {
+  const s = el("input", { verticalAlign: "middle", width: width || "150px" }, parent);
+  s.type = "range"; s.min = min; s.max = max; s.step = step;
+  return s;
+}
+
 // histogram strip with two draggable range handles; onChange([lo, hi]) with
 // fractions of the data range
-function histPanel(parent, width, onChange) {
-  const H = 44;
-  const canvas = el("canvas", { display: "block", marginTop: "2px" }, parent);
+function histPanel(parent, width, label, onChange) {
+  const wrap = el("div", { marginTop: "5px" }, parent);
+  el("div", { fontSize: "10px", color: "#777" }, wrap).textContent = label;
+  const H = 40;
+  const canvas = el("canvas", { display: "block", borderRadius: "3px" }, wrap);
   canvas.width = width; canvas.height = H;
   const ctx = canvas.getContext("2d");
   let data = new Float32Array(0);
@@ -196,7 +227,7 @@ function histPanel(parent, width, onChange) {
 
   function draw() {
     ctx.clearRect(0, 0, width, H);
-    ctx.fillStyle = "#f2f2f2";
+    ctx.fillStyle = "#f4f5f7";
     ctx.fillRect(0, 0, width, H);
     if (data.length) {
       const nb = 64;
@@ -212,18 +243,17 @@ function histPanel(parent, width, onChange) {
       for (const b of bins) bmax = Math.max(bmax, b);
       ctx.fillStyle = "#9aa7bd";
       for (let i = 0; i < nb; i++) {
-        const h = bins[i] > 0 ? Math.max(2, (H - 10) * Math.log1p(bins[i]) / Math.log1p(bmax)) : 0;
-        ctx.fillRect(i * width / nb, H - 8 - h, width / nb - 1, h);
+        const h = bins[i] > 0 ? Math.max(2, (H - 8) * Math.log1p(bins[i]) / Math.log1p(bmax)) : 0;
+        ctx.fillRect(i * width / nb, H - 6 - h, width / nb - 1, h);
       }
     }
-    // selected range shading + handles
     const x0 = range[0] * width, x1 = range[1] * width;
     ctx.fillStyle = "rgba(70,130,220,0.15)";
-    ctx.fillRect(x0, 0, x1 - x0, H - 8);
+    ctx.fillRect(x0, 0, x1 - x0, H - 6);
     ctx.fillStyle = "#3b6fd4";
-    for (const x of [x0, x1]) ctx.fillRect(x - 2, 0, 4, H - 8);
-    ctx.fillStyle = "#666";
-    ctx.fillRect(0, H - 6, width, 1);
+    for (const x of [x0, x1]) ctx.fillRect(x - 2, 0, 4, H - 6);
+    ctx.fillStyle = "#999";
+    ctx.fillRect(0, H - 5, width, 1);
   }
 
   canvas.addEventListener("pointerdown", (ev) => {
@@ -250,12 +280,26 @@ function histPanel(parent, width, onChange) {
 }
 
 function render({ model, el: root }) {
-  root.style.fontFamily = "sans-serif";
+  root.style.fontFamily =
+    "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif";
   root.style.fontSize = "12px";
 
   const PW = 300;                 // panel width
-  const title = el("div", { fontWeight: "bold", margin: "2px 0 6px 0" }, root);
-  const row = el("div", { display: "flex", gap: "14px", alignItems: "flex-start" }, root);
+  const title = el("div", {
+    fontWeight: "600", fontSize: "13px", margin: "2px 0 8px 2px", color: "#222",
+  }, root);
+  const row = el("div", { display: "flex", gap: "18px", alignItems: "flex-start" }, root);
+
+  function makePanel(labelText) {
+    const p = el("div", {
+      background: "#fff", border: "1px solid #e2e5ea", borderRadius: "6px",
+      padding: "8px",
+    }, row);
+    el("div", {
+      fontWeight: "600", fontSize: "11.5px", color: "#333", marginBottom: "6px",
+    }, p).textContent = labelText;
+    return p;
+  }
 
   // ---------- shared state decoded from the model ----------
   let realShape = model.get("real_shape");
@@ -266,17 +310,19 @@ function render({ model, el: root }) {
   let maxInt = decodeF32(model.get("max_int"));
 
   // =====================  LEFT: real space  =====================
-  const pL = el("div", {}, row);
-  el("div", {}, pL).textContent = "real space: deviation intensity";
-  const zRow = el("div", { margin: "2px 0" }, pL);
-  const zLabel = el("span", { marginRight: "6px" }, zRow);
-  const zSlider = el("input", { verticalAlign: "middle", width: "200px" }, zRow);
-  zSlider.type = "range"; zSlider.min = 0; zSlider.step = 1;
-  const canL = el("canvas", { border: "1px solid #ccc", cursor: "crosshair" }, pL);
+  const pL = makePanel("real space \u2014 deviation intensity");
+  const canL = el("canvas", {
+    border: "1px solid #d6dae1", borderRadius: "3px", cursor: "crosshair", display: "block",
+  }, pL);
   canL.width = PW; canL.height = PW;
   const ctxL = canL.getContext("2d");
-  const histL = histPanel(pL, PW, (r) => { model.set("left_range", r); model.save_changes(); });
-  const voxLabel = el("div", { color: "#555", marginTop: "2px" }, pL);
+  const zRow = ctrlRow(pL);
+  const zLabel = el("span", { minWidth: "44px" }, zRow);
+  const zSlider = slider(zRow, 0, 1, 1, "200px");
+  const voxLabel = el("span", { color: "#777" }, zRow);
+  const histL = histPanel(pL, PW, "display range", (r) => {
+    model.set("left_range", r); model.save_changes();
+  });
 
   function drawLeft() {
     const [nx, ny, nz] = realShape;
@@ -302,7 +348,6 @@ function render({ model, el: root }) {
       }
     }
     ctxL.putImageData(img, 0, 0);
-    // selection marker (x horizontal, y vertical to match array indexing [x, y])
     const mxp = (model.get("sel_x") + 0.5) * sx, myp = (model.get("sel_y") + 0.5) * sy;
     ctxL.strokeStyle = "#00e5ff"; ctxL.lineWidth = 2;
     ctxL.strokeRect(mxp - sx / 2, myp - sy / 2, sx, sy);
@@ -330,35 +375,36 @@ function render({ model, el: root }) {
   });
 
   // =====================  MIDDLE: k space  =====================
-  const pM = el("div", {}, row);
-  el("div", {}, pM).textContent = "k space of selected voxel (fftshifted)";
-  const ctrlM = el("div", { margin: "2px 0" }, pM);
+  const pM = makePanel("k space of selected voxel (fftshifted)");
+  const canM = el("canvas", {
+    border: "1px solid #d6dae1", borderRadius: "3px", display: "block",
+  }, pM);
+  canM.width = PW; canM.height = PW;
+  const ctxM = canM.getContext("2d");
+  const axRow = ctrlRow(pM);
   const axBtns = [];
   for (const ax of [0, 1, 2]) {
-    const b = el("button", { marginRight: "4px" }, ctrlM);
+    const b = el("button", {}, axRow);
     b.textContent = "k" + ax;
     b.addEventListener("click", () => { model.set("sum_axis", ax); model.save_changes(); });
     axBtns.push(b);
   }
-  const modeBtn = el("button", { marginLeft: "8px" }, ctrlM);
+  const modeBtn = el("button", { marginLeft: "6px" }, axRow);
   modeBtn.addEventListener("click", () => {
     model.set("view_mode", model.get("view_mode") === "sum" ? "slice" : "sum");
     model.save_changes();
   });
-  const powRow = el("div", { margin: "2px 0" }, pM);
-  const powLabel = el("span", { marginRight: "6px" }, powRow);
-  const powSlider = el("input", { verticalAlign: "middle", width: "170px" }, powRow);
-  powSlider.type = "range"; powSlider.min = 0.1; powSlider.max = 1.0; powSlider.step = 0.05;
+  const powRow = ctrlRow(pM);
+  const powLabel = el("span", { minWidth: "84px" }, powRow);
+  const powSlider = slider(powRow, 0.05, 1.0, 0.05, "170px");
   powSlider.addEventListener("input", () => {
     model.set("power", parseFloat(powSlider.value)); model.save_changes();
   });
-  const canM = el("canvas", { border: "1px solid #ccc" }, pM);
-  canM.width = PW; canM.height = PW;
-  const ctxM = canM.getContext("2d");
-  const histM = histPanel(pM, PW, (r) => { model.set("mid_range", r); model.save_changes(); });
+  const histM = histPanel(pM, PW, "display range (after power)", (r) => {
+    model.set("mid_range", r); model.save_changes();
+  });
 
   function midImage() {
-    // sum over (or slice at the center of) the chosen k axis, then power
     const [K0, K1, K2] = kShape;
     const ax = model.get("sum_axis");
     const mode = model.get("view_mode");
@@ -387,8 +433,9 @@ function render({ model, el: root }) {
   function drawMid() {
     const ax = model.get("sum_axis");
     const mode = model.get("view_mode");
-    axBtns.forEach((b, i) => { b.style.fontWeight = i === ax ? "bold" : "normal"; });
-    modeBtn.textContent = mode === "sum" ? "mode: sum" : "mode: center slice";
+    axBtns.forEach((b, i) => styleButton(b, i === ax));
+    styleButton(modeBtn, mode === "slice");
+    modeBtn.textContent = mode === "sum" ? "sum" : "center slice";
     powLabel.textContent = "power = " + model.get("power").toFixed(2);
     powSlider.value = model.get("power");
 
@@ -415,23 +462,46 @@ function render({ model, el: root }) {
   }
 
   // =====================  RIGHT: 3D maxima  =====================
-  const pR = el("div", {}, row);
-  el("div", {}, pR).textContent = "k-space local maxima (drag to rotate)";
-  const cntLabel = el("div", { margin: "2px 0", color: "#555" }, pR);
-  const canR = el("canvas", { border: "1px solid #ccc", cursor: "grab" }, pR);
+  const pR = makePanel("k-space local maxima \u2014 drag to rotate");
+  const canR = el("canvas", {
+    border: "1px solid #d6dae1", borderRadius: "3px", cursor: "grab", display: "block",
+    background: "#ffffff",
+  }, pR);
   canR.width = PW; canR.height = PW;
   const ctxR = canR.getContext("2d");
-  const histR = histPanel(pR, PW, (r) => { model.set("pts_range", r); model.save_changes(); });
+  const cntRow = ctrlRow(pR);
+  const cntLabel = el("span", { color: "#777" }, cntRow);
+  const pPowRow = ctrlRow(pR);
+  const pPowLabel = el("span", { minWidth: "104px" }, pPowRow);
+  const pPowSlider = slider(pPowRow, 0.05, 1.0, 0.05, "150px");
+  pPowSlider.addEventListener("input", () => {
+    model.set("pts_power", parseFloat(pPowSlider.value)); model.save_changes();
+  });
+  const pSclRow = ctrlRow(pR);
+  const pSclLabel = el("span", { minWidth: "104px" }, pSclRow);
+  const pSclSlider = slider(pSclRow, 0.1, 10.0, 0.1, "150px");
+  pSclSlider.addEventListener("input", () => {
+    model.set("pts_scale", parseFloat(pSclSlider.value)); model.save_changes();
+  });
+  const histR = histPanel(pR, PW, "intensity range", (r) => {
+    model.set("pts_range", r); model.save_changes();
+  });
 
   function drawRight() {
-    ctxR.fillStyle = "#111";
+    ctxR.fillStyle = "#ffffff";
     ctxR.fillRect(0, 0, PW, PW);
     const M = maxInt.length;
     cntLabel.textContent = M + " maxima";
+    const pPow = model.get("pts_power");
+    const pScl = model.get("pts_scale");
+    pPowLabel.textContent = "size power = " + pPow.toFixed(2);
+    pPowSlider.value = pPow;
+    pSclLabel.textContent = "size scale = " + pScl.toFixed(1);
+    pSclSlider.value = pScl;
+
     const th = model.get("rot_theta") * Math.PI / 180;
     const ph = model.get("rot_phi") * Math.PI / 180;
     const ct = Math.cos(th), st = Math.sin(th), cp = Math.cos(ph), sp = Math.sin(ph);
-    // rotate about z by theta, then about the screen-x axis by phi
     const [K0, K1, K2] = kShape;
     const scale = (PW / 2 - 12) / (0.5 * Math.max(K0, K1, K2) * 1.15);
 
@@ -441,19 +511,18 @@ function render({ model, el: root }) {
     const pr = model.get("pts_range");
     const lo = mn + pr[0] * (mx - mn), hi = mn + pr[1] * (mx - mn);
 
-    // axes
-    const axes = [[K0 / 2, 0, 0, "#e55"], [0, K1 / 2, 0, "#5c5"], [0, 0, K2 / 2, "#59f"]];
+    // axes: kx red, ky green, kz blue
+    const axes = [[K0 / 2, 0, 0, "#d33"], [0, K1 / 2, 0, "#2a2"], [0, 0, K2 / 2, "#36c"]];
     for (const [x, y, z, col] of axes) {
       const rx = ct * x - st * y, ry0 = st * x + ct * y;
       const ry = cp * ry0 - sp * z;
-      ctxR.strokeStyle = col; ctxR.lineWidth = 1;
+      ctxR.strokeStyle = col; ctxR.lineWidth = 1.2;
       ctxR.beginPath();
       ctxR.moveTo(PW / 2, PW / 2);
       ctxR.lineTo(PW / 2 + rx * scale, PW / 2 - ry * scale);
       ctxR.stroke();
     }
 
-    // depth-sorted points
     const pts = [];
     for (let i = 0; i < M; i++) {
       const v = maxInt[i];
@@ -462,17 +531,21 @@ function render({ model, el: root }) {
       const rx = ct * x - st * y, ry0 = st * x + ct * y;
       const ry = cp * ry0 - sp * z;
       const rz = sp * ry0 + cp * z;
-      const tnorm = Math.min(1, (v - lo) / Math.max(hi - lo, 1e-30));
-      const area = Math.max(4, 500 * tnorm);              // capped marker area
+      const tlin = Math.min(1, (v - lo) / Math.max(hi - lo, 1e-30));
+      const tnorm = Math.pow(tlin, pPow);
+      const area = Math.min(500, Math.max(6, 500 * pScl * tnorm));
       pts.push([rx, ry, rz, Math.sqrt(area / Math.PI), tnorm]);
     }
     pts.sort((a, b) => a[2] - b[2]);
     for (const [rx, ry, , rad, t] of pts) {
-      const c = cmap(0.25 + 0.75 * t);
+      const c = cmap(0.15 + 0.75 * t);
       ctxR.fillStyle = "rgba(" + c[0] + "," + c[1] + "," + c[2] + ",0.85)";
+      ctxR.strokeStyle = "rgba(40,40,40,0.6)";
+      ctxR.lineWidth = 0.75;
       ctxR.beginPath();
       ctxR.arc(PW / 2 + rx * scale, PW / 2 - ry * scale, rad, 0, 2 * Math.PI);
       ctxR.fill();
+      ctxR.stroke();
     }
     histR.setData(maxInt);
     histR.setRange(pr);
@@ -517,7 +590,8 @@ function render({ model, el: root }) {
     "change:sum_axis change:view_mode change:power change:mid_range", () => { drawMid(); },
   );
   model.on(
-    "change:rot_theta change:rot_phi change:pts_range", () => { drawRight(); },
+    "change:rot_theta change:rot_phi change:pts_range change:pts_power change:pts_scale",
+    () => { drawRight(); },
   );
   model.on("change:title", () => { title.textContent = model.get("title"); });
 
