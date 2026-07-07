@@ -1,3 +1,4 @@
+import math
 from itertools import permutations, product
 from typing import Self, Any, Literal, Sequence
 
@@ -1455,6 +1456,7 @@ class DiffractionTomography(AutoSerialize):
         batch_size: int = 16,
         reset: bool = True,
         lr_init: float = 1e-3,
+        lr_final: float | None = None,
         optimizer_params: dict | None = None,
         phase_only: bool = True,
         init_noise: float = 0.0,
@@ -1644,6 +1646,16 @@ class DiffractionTomography(AutoSerialize):
         self.optimizer = torch.optim.AdamW([self.sf_learned], lr=lr_init, **opt_params)
         loss_fxn = torch.nn.MSELoss()
 
+        # Cosine learning-rate schedule from lr_init to lr_final. Early large
+        # steps explore quickly; annealing to a small lr suppresses the Adam
+        # step-noise that otherwise makes the stochastic mini-batch loss
+        # oscillate once it nears the solution. lr_final=None -> constant lr.
+        def _lr_at(it: int) -> float:
+            if lr_final is None or num_iters <= 1:
+                return lr_init
+            frac = it / (num_iters - 1)
+            return lr_final + 0.5 * (lr_init - lr_final) * (1.0 + math.cos(math.pi * frac))
+
         # --- optimization loop -----------------------------------------------
         generator = torch.Generator()
         generator.manual_seed(seed)
@@ -1658,7 +1670,10 @@ class DiffractionTomography(AutoSerialize):
             n_packs = len(tilt_packs)
             probes_per_pack = [p["n_probes"] for p in tilt_packs]
 
-            for it in tqdm.tqdm(range(num_iters), desc="reconstruct_pix", unit="iter"):
+            for it in tqdm.tqdm(range(num_iters), desc="reconstruct", unit="iter"):
+                lr_now = _lr_at(it)
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = lr_now
                 order = torch.randperm(n_packs, generator=generator).tolist()
                 total_loss = 0.0
                 self.optimizer.zero_grad()
@@ -1694,14 +1709,17 @@ class DiffractionTomography(AutoSerialize):
                         total_loss += tilt_loss.item()
                     self.optimizer.step()
                     if shrink > 0.0:
-                        self._apply_shrink(shrink * lr_init)
+                        self._apply_shrink(shrink * lr_now)
 
                 mean_loss = total_loss / n_samples
                 losses.append(mean_loss)
                 if show_metrics:
-                    print(f"Iter {it}: train loss = {mean_loss:.3e}")
+                    print(f"Iter {it}: train loss = {mean_loss:.3e}  (lr {lr_now:.2e})")
         else:
-            for it in tqdm.tqdm(range(num_iters), desc="reconstruct_pix", unit="iter"):
+            for it in tqdm.tqdm(range(num_iters), desc="reconstruct", unit="iter"):
+                lr_now = _lr_at(it)
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = lr_now
                 perm = torch.randperm(n_samples, generator=generator)
                 total_loss = 0.0
                 for start in range(0, n_samples, batch_size):
@@ -1728,7 +1746,7 @@ class DiffractionTomography(AutoSerialize):
                     batch_loss.backward()
                     self.optimizer.step()
                     if shrink > 0.0:
-                        self._apply_shrink(shrink * lr_init)
+                        self._apply_shrink(shrink * lr_now)
                     total_loss += batch_loss.item() * len(batch_idx)
 
                 mean_loss = total_loss / n_samples
