@@ -377,6 +377,173 @@ class TestLatticeAtoms:
         assert result is simple_lattice
 
 
+class TestLatticeAtomsSynGT:
+    """
+    End-to-end test of define_lattice_vectors -> add_atoms -> refine_atoms
+    against a synthetic image with known ground-truth atom positions.
+    """
+
+    @pytest.fixture
+    def synthetic_lattice_data(self):
+        """
+        Build a synthetic image from known lattice vectors (u, v) and a
+        known fractional basis, with a small random perturbation applied to
+        each atom's position before it is rendered as a Gaussian peak.
+
+        The perturbed position (not the ideal lattice site) is stored as
+        ground truth, since that is where the actual peak in the image sits.
+        Ideal lattice geometry is only used to seed define_lattice_vectors
+        and to tile candidate sites in add_atoms.
+
+        Unit-cell translations are tiled over whatever range fits inside the
+        image (projecting the image corners through the inverse lattice,
+        same approach used internally by add_atoms), rather than a fixed
+        a/b range. Sites within `margin` pixels of the border are dropped so
+        that rendered peaks are never clipped by the image edge.
+        """
+        rng = np.random.default_rng(42)
+
+        H, W = 150, 150
+        margin = 8  # pixels; also passed to add_atoms/refine_atoms below
+
+        # Ground-truth lattice geometry, in (row, col) pixel convention
+        r0_true = np.array([12.0, 10.0])
+        u_true = np.array([14.0, 1.0])
+        v_true = np.array([1.0, 13.0])
+
+        # Two-atom basis in fractional unit-cell coordinates, with distinct
+        # peak intensities per site
+        positions_frac = np.array([[0.0, 0.0], [0.5, 0.5]])
+        site_amplitudes = [1.0, 0.6]
+
+        # Determine the range of integer translations (a, b) that could fall
+        # inside the image, by projecting the image corners through the
+        # inverse lattice transform (same approach used in add_atoms).
+        A = np.column_stack((u_true, v_true))
+        corners = np.array([[0.0, 0.0], [float(H), 0.0], [0.0, float(W)], [float(H), float(W)]])
+        ab = np.linalg.lstsq(A, (corners - r0_true[None, :]).T, rcond=None)[0]
+        a_min, a_max = int(np.floor(ab[0].min())) - 1, int(np.ceil(ab[0].max())) + 1
+        b_min, b_max = int(np.floor(ab[1].min())) - 1, int(np.ceil(ab[1].max())) + 1
+
+        gauss_sigma = 1.2
+        perturb_scale = 1.2  # pixels; typical polarization values (~10%)
+
+        image = np.zeros((H, W))
+        rr_grid, cc_grid = np.mgrid[0:H, 0:W]  # rr = row index, cc = col index
+
+        # Maps (site_idx, a, b) -> true (perturbed) (x, y) = (row, col) position
+        ground_truth = {}
+
+        # Adding perturbations
+        # This is slightly inaccurate compared to realistic polarization values;
+        # Realistic values are more direction dependent and not uniformly random
+
+        for site_idx, ((da, db), amp) in enumerate(zip(positions_frac, site_amplitudes)):
+            for a in range(a_min, a_max + 1):
+                for b in range(b_min, b_max + 1):
+                    frac = np.array([a + da, b + db])
+                    pos_ideal = r0_true + frac[0] * u_true + frac[1] * v_true
+
+                    perturbation = rng.normal(scale=perturb_scale, size=2)
+                    x_true, y_true = pos_ideal + perturbation
+
+                    # Clip off any site whose (perturbed) peak would fall
+                    # too close to, or outside, the image border.
+                    if not (margin <= x_true <= H - margin and margin <= y_true <= W - margin):
+                        continue
+
+                    r2 = (rr_grid - x_true) ** 2 + (cc_grid - y_true) ** 2
+                    image += amp * np.exp(-0.5 * r2 / gauss_sigma**2)
+
+                    ground_truth[(site_idx, int(a), int(b))] = (x_true, y_true)
+
+        image += rng.normal(scale=0.01, size=image.shape)
+
+        return {
+            "image": image,
+            "r0_true": r0_true,
+            "u_true": u_true,
+            "v_true": v_true,
+            "positions_frac": positions_frac,
+            "ground_truth": ground_truth,
+            "margin": margin,
+        }
+
+    def test_recovers_known_atom_positions(self, synthetic_lattice_data):
+        """
+        Fit a lattice on synthetic data and check that refine_atoms() recovers
+        the true (perturbed) peak positions to sub-pixel accuracy.
+        """
+        data = synthetic_lattice_data
+        rng = np.random.default_rng(7)
+        margin = data["margin"]
+
+        lattice = Lattice.from_data(data["image"], normalize_min=False, normalize_max=False)
+
+        # Deliberately offset the initial guess from the true lattice so that
+        # refine_lattice has real work to do, rather than starting exact.
+        origin_guess = data["r0_true"] + rng.normal(scale=0.4, size=2)
+        u_guess = data["u_true"] + rng.normal(scale=0.3, size=2)
+        v_guess = data["v_true"] + rng.normal(scale=0.3, size=2)
+
+        lattice.define_lattice_vectors(
+            origin=origin_guess,
+            u=u_guess,
+            v=v_guess,
+            refine_lattice=True,
+        )
+
+        lattice.add_atoms(
+            data["positions_frac"],
+            intensity_radius=3.0,
+            edge_min_dist_px=margin,
+        )
+        lattice.refine_atoms(fit_radius=5.0, max_move_px=margin)
+
+        errors = []
+        n_matched = 0
+        n_total = 0
+
+        for site_idx, (da, db) in enumerate(data["positions_frac"]):
+            site_atoms = lattice.atoms[site_idx]
+
+            if isinstance(site_atoms.array, list) or site_atoms.array.size == 0:
+                continue
+
+            # Fetching all the data for all atoms of one site
+            # [:,0] simply converts (N,1) shape array to (N,) array
+            x_arr = site_atoms.select_fields("x").array[:, 0]
+            y_arr = site_atoms.select_fields("y").array[:, 0]
+            a_arr = site_atoms.select_fields("a").array[:, 0]
+            b_arr = site_atoms.select_fields("b").array[:, 0]
+
+            for x_fit, y_fit, a_val, b_val in zip(x_arr, y_arr, a_arr, b_arr):
+                a_int = int(round(a_val - da))
+                b_int = int(round(b_val - db))
+                key = (site_idx, a_int, b_int)
+
+                n_total += 1
+                if key not in data["ground_truth"]:
+                    continue
+
+                x_true, y_true = data["ground_truth"][key]
+                err = np.hypot(x_fit - x_true, y_fit - y_true)
+                errors.append(err)
+                n_matched += 1
+
+        errors = np.array(errors)
+
+        # Sanity: we should have matched the large majority of detected atoms
+        # back to a known ground-truth site.
+        assert n_total > 0
+        assert n_matched / n_total >= 0.9
+
+        # Accuracy: refined positions should be within a fraction of a pixel
+        # of the true (perturbed) peak centers on average, with no gross outliers.
+        assert errors.mean() < 0.3
+        assert errors.max() < 1.0
+
+
 class TestLatticeSerialize:
     """Test Lattice Autoserialize implementation."""
 

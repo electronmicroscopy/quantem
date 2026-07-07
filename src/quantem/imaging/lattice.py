@@ -563,8 +563,6 @@ class Lattice(AutoSerialize):
         # Disk radius for intensity measurement (in pixels)
         r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
 
-        print(f"r_px : {r_px}")
-
         # Annulus radii for background contrast measurement (in pixels)
         rin, rout = (1.0 * r_px, 1.5 * r_px) if annulus_radii is None else annulus_radii
 
@@ -953,7 +951,18 @@ class Lattice(AutoSerialize):
         R = int(np.ceil(r_fit))
 
         # Maximum allowed movement: defaults to fitting radius
-        max_move = float(max_move_px) if max_move_px is not None else r_fit
+        if max_move_px is not None:
+            if max_move_px <= r_fit:
+                max_move = float(max_move_px)
+            else:
+                import warnings
+
+                warnings.warn(
+                    "max_move_px cannot be larger than auto-estimated fitting radius. Reverting to default."
+                )
+                max_move = r_fit
+        else:
+            max_move = r_fit
 
         # ENSURE ADDITIONAL FIELDS EXIST
 
