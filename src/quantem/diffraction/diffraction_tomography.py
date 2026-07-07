@@ -1,6 +1,7 @@
 from itertools import permutations, product
 from typing import Self, Any, Literal, Sequence
 
+import numpy as np
 from numpy.typing import NDArray
 import scipy.ndimage as ndi
 from scipy.spatial.transform import Rotation
@@ -39,7 +40,7 @@ class DiffractionTomography(AutoSerialize):
 
     _token = object()
     default_energy = 300e3
-    axis_labels = ("x", "y", "z", "kx", "ky", "kz")
+    axis_labels = ("z", "y", "x", "kz", "ky", "kx")
 
     def __init__(
         self,
@@ -487,7 +488,7 @@ class DiffractionTomography(AutoSerialize):
         """
         Creates circular band-limit mask in k-space with a soft cosine roll-off.
 
-        Paramaters
+        Parameters
         ----------
         shape: torch.Tensor
             2D diffraction shape (x,y)
