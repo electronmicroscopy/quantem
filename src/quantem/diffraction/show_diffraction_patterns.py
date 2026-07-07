@@ -96,13 +96,13 @@ def show_diffraction_patterns(
     controls=None,
     title="",
     rot_k=2,
-    downsample=6,
-    image_plane_scale=1.6,
+    downsample=None,
+    image_plane_scale=2.4,
     l_above_phys=100.0,
     l_below_phys=150.0,
     camera_elev=15.0,
     camera_azim=0.0,
-    figsize=(15, 7.5),
+    figsize=(11, 5.5),
     dpi=120,
 ):
     """Display a linked 3D-schematic + tiled-pattern tilt-series viewer.
@@ -170,6 +170,12 @@ def show_diffraction_patterns(
     n_slow, n_fast = int(arrays[0].shape[0]), int(arrays[0].shape[1])
     step_voxel = scan_step / sampling3[0]
 
+    # Downsample the 3D image-plane texture only when the tiled image is large
+    # (plot_surface is slow at full res). For small tiles do NOT downsample —
+    # a fixed factor would crush single-pixel diffraction spots to nothing.
+    _tile_shape = _tile_4dstem(arrays[0], 1.0, rot_k).shape
+    ds_factor = downsample if downsample is not None else max(1, round(max(_tile_shape) / 256))
+
     view_center = (scan_origin_idx[0], scan_origin_idx[1], scan_origin_idx[2] + 5.0)
     view_halfrange = 0.5 * max(nx, ny, nz) + max(l_below_phys / sampling3[2], 6.0) * 0.35
 
@@ -230,7 +236,7 @@ def show_diffraction_patterns(
             image_plane_corners.append(np.array([img_xy[0], img_xy[1], z_below]))
 
         P00, P01, P11, P10 = _shift_corners(image_plane_corners, rot_k)
-        img_3d = _block_max(img_full, downsample)
+        img_3d = _block_max(img_full, ds_factor)
         H, W = img_3d.shape
         ss = np.linspace(0, 1, H + 1)
         tt = np.linspace(0, 1, W + 1)

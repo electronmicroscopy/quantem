@@ -77,7 +77,7 @@ class DiffractionTomographyViewer(anywidget.AnyWidget):
     pts_range = traitlets.List(traitlets.Float(), default_value=[0.0, 1.0]).tag(sync=True)
     pts_power = traitlets.Float(0.25).tag(sync=True)
     pts_scale = traitlets.Float(1.0).tag(sync=True)
-    pts_floor = traitlets.Float(0.05).tag(sync=True)   # hide maxima below this * max
+    pts_floor = traitlets.Float(0.1).tag(sync=True)   # hide maxima below this * (non-core) max
 
     # --- data (python -> js) ---------------------------------------------
     real_shape = traitlets.List(traitlets.Int()).tag(sync=True)
@@ -441,8 +441,19 @@ function render({ model, el: root }) {
     powSlider.value = model.get("power");
 
     const { out, dims } = midImage();
+    // Range/histogram exclude the origin pixel (center after fftshift): the
+    // vacuum baseline / direct beam lands there and would flatten the scale.
+    const oa = Math.floor(dims[0] / 2), ob = Math.floor(dims[1] / 2);
+    const originIdx = oa * dims[1] + ob;
     let mn = Infinity, mx = -Infinity;
-    for (const v of out) { if (v < mn) mn = v; if (v > mx) mx = v; }
+    const midVals = [];
+    for (let idx = 0; idx < out.length; idx++) {
+      if (idx === originIdx) continue;
+      const v = out[idx];
+      midVals.push(v);
+      if (v < mn) mn = v; if (v > mx) mx = v;
+    }
+    if (!isFinite(mn)) { mn = 0; mx = 1; }
     if (mx <= mn) mx = mn + 1;
     const mr = model.get("mid_range");
     const lo = mn + mr[0] * (mx - mn), hi = mn + mr[1] * (mx - mn);
@@ -458,7 +469,7 @@ function render({ model, el: root }) {
       }
     }
     ctxM.putImageData(img, 0, 0);
-    histM.setData(out);
+    histM.setData(Float32Array.from(midVals));
     histM.setRange(mr);
   }
 
@@ -559,7 +570,7 @@ function render({ model, el: root }) {
       const rz = sp * ry0 + cp * z;
       const tlin = Math.min(1, (v - lo) / Math.max(hi - lo, 1e-30));
       const tnorm = Math.pow(tlin, pPow);
-      const area = Math.min(500, Math.max(6, 500 * pScl * tnorm));
+      const area = Math.min(500, Math.max(4, 150 * pScl * tnorm));
       pts.push([rx, ry, rz, Math.sqrt(area / Math.PI), tnorm]);
     }
     cntLabel.textContent = shown + " / " + M + " maxima (origin cluster excluded from range)";
