@@ -8,3 +8,6 @@ from quantem.diffraction.show_diffraction_tomography import (
     show_diffraction_tomography as show_diffraction_tomography,
     DiffractionTomographyViewer as DiffractionTomographyViewer,
 )
+from quantem.diffraction.show_diffraction_patterns import (
+    show_diffraction_patterns as show_diffraction_patterns,
+)
