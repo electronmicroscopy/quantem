@@ -282,7 +282,8 @@ class SimDiffractionTomography(DiffractionTomography):
         #setting output diffraction shape
         diff_shape = self.diffraction_shape
         if dp_shape is None:
-            dp_shape_out = (int(diff_shape[1]), int(diff_shape[2]))
+            # detector plane = (kx, ky) = first two diffraction axes
+            dp_shape_out = (int(diff_shape[0]), int(diff_shape[1]))
         else:
             dp_shape_out = (int(dp_shape[0]), int(dp_shape[1]))
         # Probe aperture in reciprocal space, normalized to sum |Psi|^2 = 1.
@@ -307,9 +308,9 @@ class SimDiffractionTomography(DiffractionTomography):
         )
 
         material_mask = self._get_material_mask()
-        Nz, Ny, Nx = self.real_shape
+        Nx, Ny, Nz = self.real_shape
         slice_cache = torch.zeros(
-            (Nz, Ny, Nx, dp_shape_out[0], dp_shape_out[1]),
+            (Nx, Ny, Nz, dp_shape_out[0], dp_shape_out[1]),
             dtype=self.array.dtype,
             device = device,
         )
