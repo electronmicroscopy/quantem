@@ -514,12 +514,26 @@ function render({ model, el: root }) {
     const [K0, K1, K2] = kShape;
     const scale = (PW / 2 - 12) / (0.5 * Math.max(K0, K1, K2) * 1.15);
 
+    // Intensity range EXCLUDES the 3x3x3 cluster at the k-origin (the direct
+    // beam and its 26 neighbors), which is orders of magnitude brighter than
+    // the Bragg peaks and would otherwise flatten the whole scale.
+    const isCore = (i) =>
+      Math.abs(maxPos[3 * i]) <= 1 &&
+      Math.abs(maxPos[3 * i + 1]) <= 1 &&
+      Math.abs(maxPos[3 * i + 2]) <= 1;
     let mn = Infinity, mx = -Infinity;
-    for (const v of maxInt) { if (v < mn) mn = v; if (v > mx) mx = v; }
+    const rangeVals = [];
+    for (let i = 0; i < M; i++) {
+      if (isCore(i)) continue;
+      const v = maxInt[i];
+      rangeVals.push(v);
+      if (v < mn) mn = v; if (v > mx) mx = v;
+    }
+    if (!isFinite(mn)) { mn = 0; mx = 1; }
     if (mx <= mn) mx = mn + 1;
     const pr = model.get("pts_range");
     const lo = mn + pr[0] * (mx - mn), hi = mn + pr[1] * (mx - mn);
-    const floor = pFlr * mx;   // absolute noise cutoff, fraction of the brightest
+    const floor = mn + pFlr * (mx - mn);   // noise cutoff within the Bragg range
 
     // axes: kx red, ky green, kz blue
     const axes = [[K0 / 2, 0, 0, "#d33"], [0, K1 / 2, 0, "#2a2"], [0, 0, K2 / 2, "#36c"]];
@@ -548,7 +562,7 @@ function render({ model, el: root }) {
       const area = Math.min(500, Math.max(6, 500 * pScl * tnorm));
       pts.push([rx, ry, rz, Math.sqrt(area / Math.PI), tnorm]);
     }
-    cntLabel.textContent = shown + " / " + M + " maxima";
+    cntLabel.textContent = shown + " / " + M + " maxima (origin cluster excluded from range)";
     pts.sort((a, b) => a[2] - b[2]);
     for (const [rx, ry, , rad, t] of pts) {
       const c = cmap(0.15 + 0.75 * t);
@@ -560,7 +574,7 @@ function render({ model, el: root }) {
       ctxR.fill();
       ctxR.stroke();
     }
-    histR.setData(maxInt);
+    histR.setData(Float32Array.from(rangeVals));
     histR.setRange(pr);
   }
 
