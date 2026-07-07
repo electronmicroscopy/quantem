@@ -1293,6 +1293,140 @@ class DiffractionTomography(AutoSerialize):
             val_dataloader = None
         return train_dataloader, val_dataloader
         
+    def _precompute_tilt_packs(
+        self,
+        rays_per_probe: list[torch.Tensor],
+        targets: torch.Tensor,
+        kcoords: torch.Tensor,
+    ) -> list[dict]:
+        """Precompute vectorized trilinear geometry for one tilt.
+
+        Probes at a fixed tilt share the ray direction but can start at
+        different z (the slow-scan axis tips out of plane at nonzero tilt),
+        so step counts may differ by one. Probes are grouped by step count;
+        each group packs the trilinear neighbor indices and weights for every
+        (probe, step) into dense tensors so the multislice can run batched
+        over the group.
+
+        Weights are computed with the same float32-fraction-then-float64-
+        product recipe as `_trilinear_real_weights`, so the fast path matches
+        the per-sample path to the last ulp of each weight.
+        """
+        device = torch.device(self.device)
+        Nx, Ny, Nz = (int(n) for n in self.real_shape)
+        tgt_flat = targets.reshape(-1, *targets.shape[-2:])
+
+        by_steps: dict[int, list[int]] = {}
+        for i, r in enumerate(rays_per_probe):
+            if len(r) == 0:
+                continue
+            by_steps.setdefault(len(r), []).append(i)
+
+        packs: list[dict] = []
+        for S, keep in sorted(by_steps.items()):
+            rays = torch.stack([rays_per_probe[i].to(device) for i in keep])  # (P, S, 3) f32
+            P = rays.shape[0]
+
+            base32 = torch.floor(rays)                      # f32, matches slow path
+            frac32 = rays - base32                          # f32 subtraction, as in slow path
+            frac64 = frac32.to(torch.float64)
+            base = base32.to(torch.int64)                   # (P, S, 3)
+
+            # 8 trilinear corners in the same (dx, dy, dz) order as the slow path
+            corner = torch.tensor(
+                [[dx, dy, dz] for dx in (0, 1) for dy in (0, 1) for dz in (0, 1)],
+                dtype=torch.int64, device=device,
+            )                                               # (8, 3)
+            nbr = base[:, :, None, :] + corner[None, None]  # (P, S, 8, 3)
+
+            # per-axis weights: frac if corner==1 else 1-frac, in float64
+            w_axis = torch.where(
+                corner[None, None].bool(),
+                frac64[:, :, None, :],
+                1.0 - frac64[:, :, None, :],
+            )                                               # (P, S, 8, 3)
+            wval = (w_axis[..., 0] * w_axis[..., 1]) * w_axis[..., 2]  # (P, S, 8) f64
+
+            in_bounds = (
+                (nbr[..., 0] >= 0) & (nbr[..., 0] < Nx)
+                & (nbr[..., 1] >= 0) & (nbr[..., 1] < Ny)
+                & (nbr[..., 2] >= 0) & (nbr[..., 2] < Nz)
+            )
+            wval = wval * in_bounds.to(torch.float64)
+            flat = nbr[..., 0] * (Ny * Nz) + nbr[..., 1] * Nz + nbr[..., 2]
+            widx = torch.where(in_bounds, flat, torch.zeros_like(flat))   # (P, S, 8)
+            wsum = wval.sum(dim=-1)                                        # (P, S)
+
+            packs.append({
+                "kc": kcoords.to(device),
+                "targets": tgt_flat[keep].to(device),
+                "widx": widx,
+                "wval": wval,
+                "wsum": wsum,
+                "n_probes": P,
+                "n_steps": S,
+            })
+        return packs
+
+    def _forward_tilt_batch(
+        self,
+        Psi0: torch.Tensor,
+        volume: torch.Tensor,
+        pack: dict,
+        phase_only: bool = True,
+    ) -> torch.Tensor:
+        """Vectorized multislice for all probes of one tilt.
+
+        Numerically equivalent to calling `forward_prop_from_points(volume=...)`
+        per probe: the same deviation slices, vacuum-baseline placement,
+        per-step normalization, phase-only transmission, and propagator are
+        applied — just batched over probes, with all cell slices sampled in a
+        single grid_sample call.
+        """
+        device = torch.device(self.device)
+        H, W = Psi0.shape
+        P, S = pack["n_probes"], pack["n_steps"]
+        widx, wval, wsum = pack["widx"], pack["wval"], pack["wsum"]
+
+        vol_flat = volume.reshape(-1, *volume.shape[3:])            # (Nc, D0, D1, D2)
+        baselines = vol_flat[:, 0, 0, 0]                            # (Nc,) complex
+        delta3 = self._delta_volume(vol_flat[0])
+        deviations = vol_flat - baselines[:, None, None, None] * delta3[None]
+
+        # One batched grid_sample for every cell's deviation slice at this tilt.
+        slices = self._sample_complex_volume_trilinear_batch(
+            deviations, pack["kc"],
+        ).to(volume.dtype)                                          # (Nc, H, W)
+        slices_flat = slices.reshape(-1, H * W)
+
+        delta2 = self._delta_slice(slices[0])
+        num_pixels = H * W
+
+        Psi = Psi0[None].expand(P, H, W)
+        for s in range(S):
+            idx = widx[:, s]                                        # (P, 8)
+            w_c = wval[:, s].to(volume.dtype)                       # (P, 8) complex
+            SF = (w_c[..., None] * slices_flat[idx]).sum(dim=1).reshape(P, H, W)
+            SF = SF + (w_c * baselines[idx]).sum(dim=1)[:, None, None] * delta2[None]
+
+            # Steps with no in-bounds neighbors are pure vacuum: substituting
+            # the exact vacuum delta (baseline 1 at the central pixel) yields
+            # t = 1 — identical to the per-sample path skipping transmission.
+            ws = wsum[:, s]                                          # (P,) f64
+            empty = (ws == 0).to(torch.float64)
+            SF = SF + empty.to(volume.dtype)[:, None, None] * delta2[None]
+            ws_eff = (ws + empty).to(volume.dtype)
+
+            T_2d = num_pixels * SF / ws_eff[:, None, None]
+            t_real = torch.fft.ifft2(T_2d)
+            if phase_only:
+                t_real = torch.exp(1j * torch.angle(t_real))
+            Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t_real)
+            if s < S - 1:
+                Psi = Psi * self.prop
+
+        return Psi
+
     def reconstruct_pix(
         self,
         measurements: Sequence[Dataset4dstem],
@@ -1311,6 +1445,7 @@ class DiffractionTomography(AutoSerialize):
         obj_constraints: dict | ObjConstraintsType | None = None,
         show_metrics: bool = True,
         seed: int = 42,
+        fast: bool = True,
     ):
         """Pixelated (voxel-grid) reconstruction of the 6D structure factor.
 
@@ -1386,6 +1521,7 @@ class DiffractionTomography(AutoSerialize):
         sample_kcoords_idx: list[int] = []
         sample_targets: list[torch.Tensor] = []
         kcoords_per_meas: list[torch.Tensor] = []
+        tilt_packs: list[dict] = []
 
         for m_idx, meas in enumerate(measurements):
             u, v, w = self.projection_axes(zxz_deg=zxz_list[m_idx])
@@ -1417,6 +1553,7 @@ class DiffractionTomography(AutoSerialize):
             )
 
             targets = torch.as_tensor(meas.array, dtype=torch.float64, device=device)
+            rays_this_meas: list[torch.Tensor] = []
             for j in range(meas_scan_shape[0]):
                 for i in range(meas_scan_shape[1]):
                     rays = self._generate_slab_ray_coordinates(
@@ -1426,15 +1563,23 @@ class DiffractionTomography(AutoSerialize):
                         sampling=self.dataset.sampling[:3],
                         prop_distance=self.prop_distance,
                     )
+                    rays_this_meas.append(rays)
                     if len(rays) == 0:
                         continue
                     sample_rays.append(rays)
                     sample_kcoords_idx.append(m_idx)
                     sample_targets.append(targets[j, i])
 
+            if fast:
+                tilt_packs.extend(
+                    self._precompute_tilt_packs(rays_this_meas, targets, kcoords)
+                )
+
         n_samples = len(sample_rays)
         if n_samples == 0:
             raise ValueError("no valid probe positions found for reconstruction")
+
+        use_fast = fast and sum(p["n_probes"] for p in tilt_packs) == n_samples
 
         # --- learnable volume ------------------------------------------------
         if reset or getattr(self, "sf_learned", None) is None:
@@ -1455,32 +1600,78 @@ class DiffractionTomography(AutoSerialize):
         generator.manual_seed(seed)
         losses: list[float] = []
 
-        for it in tqdm.tqdm(range(num_iters), desc="reconstruct_pix", unit="iter"):
-            perm = torch.randperm(n_samples, generator=generator)
-            total_loss = 0.0
-            for start in range(0, n_samples, batch_size):
-                batch_idx = perm[start : start + batch_size]
-                self.optimizer.zero_grad()
-                batch_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
-                for s in batch_idx.tolist():
-                    Psi = self.forward_prop_from_points(
-                        Psi0,
-                        sample_rays[s],
-                        phase_only=phase_only,
-                        volume=self.sf_learned,
-                        k_slice_coords=kcoords_per_meas[sample_kcoords_idx[s]],
-                    )
-                    dp_pred = torch.abs(Psi) ** 2
-                    batch_loss = batch_loss + loss_fxn(dp_pred, sample_targets[s])
-                batch_loss = batch_loss / len(batch_idx)
-                batch_loss.backward()
-                self.optimizer.step()
-                total_loss += batch_loss.item() * len(batch_idx)
+        if use_fast:
+            # Vectorized path: one forward/backward per tilt (all probes of a
+            # tilt batched together; every cell's slice sampled in a single
+            # grid_sample). Gradients accumulate across tilts and the
+            # optimizer steps once ~batch_size diffraction patterns have
+            # contributed, so the update granularity matches the slow path.
+            n_packs = len(tilt_packs)
+            probes_per_pack = [p["n_probes"] for p in tilt_packs]
 
-            mean_loss = total_loss / n_samples
-            losses.append(mean_loss)
-            if show_metrics:
-                print(f"Iter {it}: train loss = {mean_loss:.3e}")
+            for it in tqdm.tqdm(range(num_iters), desc="reconstruct_pix", unit="iter"):
+                order = torch.randperm(n_packs, generator=generator).tolist()
+                total_loss = 0.0
+                self.optimizer.zero_grad()
+
+                # group shuffled tilts into optimizer steps of >= batch_size DPs
+                groups: list[list[int]] = [[]]
+                acc = 0
+                for m in order:
+                    groups[-1].append(m)
+                    acc += probes_per_pack[m]
+                    if acc >= batch_size:
+                        groups.append([])
+                        acc = 0
+                if not groups[-1]:
+                    groups.pop()
+
+                for group in groups:
+                    group_dps = sum(probes_per_pack[m] for m in group)
+                    self.optimizer.zero_grad()
+                    for m in group:
+                        Psi = self._forward_tilt_batch(
+                            Psi0, self.sf_learned, tilt_packs[m], phase_only=phase_only,
+                        )
+                        dp_pred = torch.abs(Psi) ** 2
+                        # sum of per-DP mean-squared errors, scaled so the
+                        # accumulated gradient equals the group-mean loss
+                        tilt_loss = ((dp_pred - tilt_packs[m]["targets"]) ** 2).mean(dim=(1, 2)).sum()
+                        (tilt_loss / group_dps).backward()
+                        total_loss += tilt_loss.item()
+                    self.optimizer.step()
+
+                mean_loss = total_loss / n_samples
+                losses.append(mean_loss)
+                if show_metrics:
+                    print(f"Iter {it}: train loss = {mean_loss:.3e}")
+        else:
+            for it in tqdm.tqdm(range(num_iters), desc="reconstruct_pix", unit="iter"):
+                perm = torch.randperm(n_samples, generator=generator)
+                total_loss = 0.0
+                for start in range(0, n_samples, batch_size):
+                    batch_idx = perm[start : start + batch_size]
+                    self.optimizer.zero_grad()
+                    batch_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
+                    for s in batch_idx.tolist():
+                        Psi = self.forward_prop_from_points(
+                            Psi0,
+                            sample_rays[s],
+                            phase_only=phase_only,
+                            volume=self.sf_learned,
+                            k_slice_coords=kcoords_per_meas[sample_kcoords_idx[s]],
+                        )
+                        dp_pred = torch.abs(Psi) ** 2
+                        batch_loss = batch_loss + loss_fxn(dp_pred, sample_targets[s])
+                    batch_loss = batch_loss / len(batch_idx)
+                    batch_loss.backward()
+                    self.optimizer.step()
+                    total_loss += batch_loss.item() * len(batch_idx)
+
+                mean_loss = total_loss / n_samples
+                losses.append(mean_loss)
+                if show_metrics:
+                    print(f"Iter {it}: train loss = {mean_loss:.3e}")
 
         self.recon_losses = losses
         return {
