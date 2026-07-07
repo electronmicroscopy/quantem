@@ -1427,7 +1427,7 @@ class DiffractionTomography(AutoSerialize):
 
         return Psi
 
-    def reconstruct_pix(
+    def reconstruct(
         self,
         measurements: Sequence[Dataset4dstem],
         tilt_x_deg: Sequence[float] | None = None,
@@ -1678,3 +1678,7 @@ class DiffractionTomography(AutoSerialize):
             "reconstructed_sf": self.sf_learned.detach().cpu(),
             "losses": losses,
         }
+
+    def reconstruct_pix(self, *args, **kwargs):
+        """Deprecated alias for :meth:`reconstruct`."""
+        return self.reconstruct(*args, **kwargs)
