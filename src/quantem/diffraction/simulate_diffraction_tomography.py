@@ -38,7 +38,7 @@ class SimDiffractionTomography(DiffractionTomography):
             _token: object | None = None,
             device: int | str = 'cpu',
     ):
-        super().__init__(dataset=dataset, _token=_token)
+        super().__init__(dataset=dataset, device=device, obj_model=obj_model, _token=_token)
 
     @classmethod
     def _make_au_structure_factor(
@@ -182,7 +182,6 @@ class SimDiffractionTomography(DiffractionTomography):
                 zxz_deg=zxz_deg,
             )
             tensor[mask] = sf_particle
-            print(tensor)
         # Output
         dataset = Dataset6d.from_array(
             array=tensor.detach().cpu().numpy(),
@@ -197,7 +196,7 @@ class SimDiffractionTomography(DiffractionTomography):
                 wavelength=wavelength,
             ),
         )
-        return cls.from_dataset(dataset, energy=energy, wavelength=wavelength)
+        return cls.from_dataset(dataset, energy=energy, wavelength=wavelength, device=device)
 
 
     def simulate_4dstem(
@@ -252,14 +251,12 @@ class SimDiffractionTomography(DiffractionTomography):
 
         """
         device = torch.device(self.device)
-        print(f"Using device: {device}")
 
         zxz_arr = self._resolve_zxz_deg(tilt_x_deg, zxz_deg) #formats rotation angles
         u_proj, v_proj, w_proj = self.projection_axes(zxz_deg=zxz_arr) #applies rotation matrix to basis vectors
-        u_proj = u_proj.to(device)
-        v_proj = v_proj.to(device)
-        w_proj = w_proj.to(device)
-
+        u_proj = u_proj.to(device=device, dtype=torch.float32)
+        v_proj = v_proj.to(device=device, dtype=torch.float32)
+        w_proj = w_proj.to(device=device, dtype=torch.float32)
 
         #verifies scan step available for each direction in xy
         scan_step_arr = torch.atleast_1d(torch.asarray(scan_step, dtype=torch.float32, device = device))
@@ -269,27 +266,19 @@ class SimDiffractionTomography(DiffractionTomography):
             raise ValueError(
                 f"scan_step must be a scalar or shape (2,), got shape={scan_step_arr.shape}"
             )
-        n_slow, n_fast = int(scan_shape[1]), int(scan_shape[0])
+        n_slow, n_fast = int(scan_shape[0]), int(scan_shape[1])
         if n_slow <= 0 or n_fast <= 0:
             raise ValueError(f"scan_shape must be positive, got {scan_shape}")
 
-        #real space sampling and shape
-        sampling3 = torch.asarray(self.dataset.sampling[:3], dtype=torch.float32, device = device)
-        real_shape = torch.asarray(self.array.shape[:3], dtype=torch.float32, device = device)
-        if scan_origin is None:
-            # scan_origin_arr = torch.asarray((0,0,0), dtype= torch.int32, device=device)
-            scan_origin_arr = (real_shape[1:] - 1) / 2 * sampling3[1:]
-            z_origin = torch.tensor((0,))
-            scan_origin_arr = torch.cat((z_origin,scan_origin_arr))
-        else:
-            scan_origin_arr = torch.asarray(scan_origin, dtype=torch.int32, device = device)
-            z_origin = torch.tensor((0,))
-            scan_origin_arr = torch.cat((z_origin,scan_origin_arr))
-            if scan_origin_arr.shape != (3,):
-                raise ValueError(
-                    f"scan_origin must have shape (3,), got {scan_origin_arr.shape}"
-                )
-        print(f"{scan_origin_arr = }")
+        # Scan positions shared with reconstruct_pix so forward simulation and
+        # reconstruction agree exactly on probe placement.
+        positions, scan_origin_arr = self._scan_position_indices(
+            scan_shape=(n_slow, n_fast),
+            scan_step=scan_step,
+            scan_origin=scan_origin,
+            u_proj=u_proj,
+            v_proj=v_proj,
+        )
         #setting output diffraction shape
         diff_shape = self.diffraction_shape
         if dp_shape is None:
@@ -326,17 +315,18 @@ class SimDiffractionTomography(DiffractionTomography):
         )
         material_idx = torch.argwhere(material_mask)
         for ix, iy, iz in material_idx:
+            # Cache the DEVIATION slice only: the vacuum baseline is placed
+            # analytically at the central pixel inside forward_prop.
+            deviation = self.array[ix, iy, iz].clone()
+            deviation[0, 0, 0] = 0.0
             slice_cache[ix, iy, iz] = self._sample_complex_volume_trilinear(
-                self.array[ix, iy, iz],
+                deviation,
                 k_slice_coords,
             )
         # Forward_prop will pick up this attribute through getattr.
         self._material_slice_cache = slice_cache
 
-        #centers coordinates in fast and slow scan directions --> 0 at center with pos/neg values
         out = torch.empty((n_slow, n_fast, dp_shape_out[0], dp_shape_out[1]), dtype=torch.float64)
-        slow_centered = torch.arange(n_slow, dtype=torch.float32) - (n_slow - 1) / 2.0
-        fast_centered = torch.arange(n_fast, dtype=torch.float32) - (n_fast - 1) / 2.0
 
         rotate_detector = not torch.isclose(torch.tensor(detector_rotation_deg), torch.tensor(0.0))
         if progress_desc is None:
@@ -366,15 +356,9 @@ class SimDiffractionTomography(DiffractionTomography):
             external_bar = None
         
         for j, i in iterator:
-            sv = slow_centered[j]
-            su = fast_centered[i]
-            offset_phys = sv * scan_step_arr[0] * v_proj + su * scan_step_arr[1] * u_proj
-            offset_phys = torch.flip(offset_phys, dims = (0,))
-            position_index = torch.asarray((scan_origin_arr + offset_phys) / sampling3, dtype=torch.int32)
-            print("pos index:",position_index)
             Psi = self.forward_prop(
                 Psi0,
-                torch.flip(position_index, dims=(0,)),
+                positions[j, i],
                 u_proj=u_proj,
                 v_proj=v_proj,
                 phase_only=phase_only,
