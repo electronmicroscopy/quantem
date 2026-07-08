@@ -354,70 +354,82 @@ class DiffractionTomography:
                             basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
         """Assemble the 2D transmission SF at one continuous ray point.
 
-        2x2x2 trilinear cluster -> 8 per-voxel transmission planes (each voxel's
-        orientation composed with the tilt) -> combine by trilinear weights ->
-        pin origin. Returns a (det_row, det_col) complex plane. Out-of-slab
-        neighbours contribute vacuum (a plane of zeros; origin pinned at the end).
+        The 2x2x2 trilinear cluster is handled in one batched ``grid_sample``:
+        each in-bounds voxel's orientation is composed with the tilt to give its
+        sampling plane through the bases, the resulting per-voxel transmission
+        planes are combined with the trilinear weights (in transmission space,
+        never on the angles), and the origin is pinned to 1 (vacuum baseline).
+        Out-of-slab neighbours contribute vacuum.
+
+        Parameters
+        ----------
+        point_zyx : torch.Tensor
+            ``(3,)`` continuous ray position in index space ``[z, y, x]``.
+        u, v : torch.Tensor
+            ``(3,)`` lab-frame detector column/row axes for this tilt.
+        basis : torch.Tensor
+            ``[N_kz, N_ky, N_kx, N_weights]`` complex bases.
+        R_all, W_all : torch.Tensor
+            Per-voxel rotations ``[N_z, N_y, N_x, 3, 3]`` and weights
+            ``[N_z, N_y, N_x, N_weights]``.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(det_row, det_col)`` complex transmission structure factor.
         """
         Nz, Ny, Nx = self.real_shape
+        Nkz, Nky, Nkx = self.k_shape
+        Nw = basis.shape[-1]
         dev = self.device
         p = point_zyx.to(dev)
         base = torch.floor(p).to(torch.int64)
         frac = p - base.to(p.dtype)                          # (3,)
 
-        # detector plane grid (row=v, col=u), A^-1
         kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")  # (R,C)
         det_row, det_col = kv.shape
-        dkz, dky, dkx = self.k_sampling
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=dev)
+        Nk = torch.tensor([Nkz, Nky, Nkx], dtype=torch.float32, device=dev)
+
+        # 2x2x2 cluster corners, trilinear weights, in-bounds mask
+        offs = torch.tensor([[dz, dy, dx] for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)],
+                            device=dev)                        # (8,3)
+        idxs = base[None, :] + offs                            # (8,3) [iz,iy,ix]
+        fw = torch.stack([torch.where(offs[:, a] == 1, frac[a], 1.0 - frac[a]) for a in range(3)], dim=1)
+        tw8 = fw.prod(dim=1)                                   # (8,)
+        inb = ((idxs[:, 0] >= 0) & (idxs[:, 0] < Nz) & (idxs[:, 1] >= 0) & (idxs[:, 1] < Ny)
+               & (idxs[:, 2] >= 0) & (idxs[:, 2] < Nx))
+        valid = inb & (tw8 > 0)
 
         acc = torch.zeros(det_row, det_col, dtype=torch.complex64, device=dev)
-        Nw = basis.shape[-1]
-        # basis as (Nw, Nkz, Nky, Nkx) real/imag for grid_sample
-        bre = basis.real.permute(3, 0, 1, 2)[:, None].to(torch.float32)   # (Nw,1,Nkz,Nky,Nkx)
-        bim = basis.imag.permute(3, 0, 1, 2)[:, None].to(torch.float32)
-        Nkz, Nky, Nkx = self.k_shape
-
-        for dz in range(2):
-            iz = base[0] + dz
-            wz = frac[0] if dz else (1.0 - frac[0])
-            for dy in range(2):
-                iy = base[1] + dy
-                wy = frac[1] if dy else (1.0 - frac[1])
-                for dx in range(2):
-                    ix = base[2] + dx
-                    wx = frac[2] if dx else (1.0 - frac[2])
-                    tw = (wz * wy * wx)
-                    if tw <= 0:
-                        continue
-                    inb = (0 <= iz < Nz) and (0 <= iy < Ny) and (0 <= ix < Nx)
-                    if not inb:
-                        continue                              # vacuum neighbour -> zero plane
-                    vidx = (int(iz) * Ny + int(iy)) * Nx + int(ix)
-                    R = R_all.reshape(-1, 3, 3)[vidx]         # (3,3) body->lab
-                    wvec = W_all.reshape(-1, Nw)[vidx]        # (Nw,)
-                    # rotate the detector plane axes into the voxel body frame
-                    u_b = R.t() @ u                            # (3,) [kz,ky,kx]
-                    v_b = R.t() @ v
-                    # plane points in A^-1 -> voxel index coords. Basis is stored
-                    # in fftfreq order (DC at index 0), so wrap k/dk into [0, N)
-                    # then normalise to [-1, 1] (align_corners=True). grid's last
-                    # dim is reversed: (x-axis, y-axis, z-axis).
-                    kxyz = ku[..., None] * u_b + kv[..., None] * v_b   # (R,C,3) [kz,ky,kx]
-                    cz = torch.remainder(kxyz[..., 0] / dkz, Nkz)
-                    cy = torch.remainder(kxyz[..., 1] / dky, Nky)
-                    cx = torch.remainder(kxyz[..., 2] / dkx, Nkx)
-                    grid = torch.stack((
-                        2.0 * cx / (Nkx - 1.0) - 1.0,
-                        2.0 * cy / (Nky - 1.0) - 1.0,
-                        2.0 * cz / (Nkz - 1.0) - 1.0,
-                    ), dim=-1)[None, None]                     # (1,1,R,C,3)
-                    grid = grid.expand(Nw, 1, det_row, det_col, 3).to(torch.float32)
-                    sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-                    sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-                    sampled = (sre + 1j * sim).reshape(Nw, det_row, det_col)  # (Nw,R,C)
-                    t_vox = (wvec.to(torch.complex64)[:, None, None] * sampled).sum(0)
-                    acc = acc + tw.to(torch.complex64) * t_vox
-        acc[0, 0] = 1.0                                       # pin the vacuum DC
+        if bool(valid.any()):
+            vsel = idxs[valid]                                 # (nv,3)
+            nv = vsel.shape[0]
+            tw = tw8[valid].to(torch.complex64)                # (nv,)
+            vidx = (vsel[:, 0] * Ny + vsel[:, 1]) * Nx + vsel[:, 2]
+            R = R_all.reshape(-1, 3, 3)[vidx]                  # (nv,3,3) body->lab
+            wv = W_all.reshape(-1, Nw)[vidx].to(torch.complex64)  # (nv,Nw)
+            # rotate the detector (u,v) axes into each voxel's body frame: R^T @ axis
+            u_b = torch.einsum("vij,i->vj", R, u)              # (nv,3) [kz,ky,kx]
+            v_b = torch.einsum("vij,i->vj", R, v)
+            # plane points (nv,R,C,3) in A^-1; basis is fftfreq-ordered so wrap
+            # k/dk into [0, N) then normalise to [-1, 1] (grid last dim reversed)
+            kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
+                    + kv[None, ..., None] * v_b[:, None, None, :])   # (nv,R,C,3)
+            c = torch.remainder(kxyz / dk, Nk)                 # (nv,R,C,3) [cz,cy,cx]
+            grid = torch.stack((
+                2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+                2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+                2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+            ), dim=-1)[:, None].to(torch.float32)              # (nv,1,R,C,3)
+            bre = basis.real.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
+            bim = basis.imag.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
+            sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+            sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+            sampled = (sre + 1j * sim).squeeze(2)              # (nv,Nw,R,C)
+            t_vox = (wv[:, :, None, None] * sampled).sum(1)    # (nv,R,C)
+            acc = (tw[:, None, None] * t_vox).sum(0)           # (R,C)
+        acc[0, 0] = 1.0                                        # pin the vacuum DC
         return acc
 
     def forward_ray(self, origin_zyx: torch.Tensor, tilt_x_deg: float,
