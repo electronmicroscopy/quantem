@@ -456,6 +456,116 @@ class DiffractionTomography:
         Psi = Psi * self.antialias_mask
         return Psi
 
+    def _transmission_planes_batch(self, points: torch.Tensor, u: torch.Tensor, v: torch.Tensor,
+                                   basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
+        """Transmission SF for a batch of ray points (one per probe), at one slice.
+
+        Same construction as :meth:`_transmission_plane` but vectorised over the
+        ``P`` probe points: loops the 8 cluster corners (cheap), each a single
+        ``grid_sample`` batched over all probes.
+
+        Parameters
+        ----------
+        points : torch.Tensor
+            ``(P, 3)`` continuous ray positions in index space ``[z, y, x]``.
+        u, v : torch.Tensor
+            ``(3,)`` lab-frame detector column/row axes for this tilt.
+        basis, R_all, W_all : torch.Tensor
+            As in :meth:`_transmission_plane`.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(P, det_row, det_col)`` complex transmission structure factors.
+        """
+        Nz, Ny, Nx = self.real_shape
+        Nkz, Nky, Nkx = self.k_shape
+        Nw = basis.shape[-1]
+        dev = self.device
+        P = points.shape[0]
+        base = torch.floor(points).to(torch.int64)             # (P,3)
+        frac = points - base.to(points.dtype)                  # (P,3)
+
+        kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")  # (R,C)
+        det_row, det_col = kv.shape
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=dev)
+        Nk = torch.tensor([Nkz, Nky, Nkx], dtype=torch.float32, device=dev)
+        lo = torch.tensor([0, 0, 0], device=dev)
+        hi = torch.tensor([Nz - 1, Ny - 1, Nx - 1], device=dev)
+        bre_full = basis.real.permute(3, 0, 1, 2)              # (Nw,Nkz,Nky,Nkx)
+        bim_full = basis.imag.permute(3, 0, 1, 2)
+
+        acc = torch.zeros(P, det_row, det_col, dtype=torch.complex64, device=dev)
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    off = torch.tensor([dz, dy, dx], device=dev)
+                    idx = base + off                            # (P,3)
+                    tw = (torch.where(off[0] == 1, frac[:, 0], 1.0 - frac[:, 0])
+                          * torch.where(off[1] == 1, frac[:, 1], 1.0 - frac[:, 1])
+                          * torch.where(off[2] == 1, frac[:, 2], 1.0 - frac[:, 2]))    # (P,)
+                    inb = ((idx >= lo) & (idx <= hi)).all(dim=1)   # (P,)
+                    tw = (tw * inb).to(torch.complex64)          # zero out-of-slab corners
+                    idxc = torch.minimum(torch.maximum(idx, lo), hi)   # clamp for the gather
+                    vidx = (idxc[:, 0] * Ny + idxc[:, 1]) * Nx + idxc[:, 2]
+                    R = R_all.reshape(-1, 3, 3)[vidx]            # (P,3,3)
+                    wv = W_all.reshape(-1, Nw)[vidx].to(torch.complex64)   # (P,Nw)
+                    u_b = torch.einsum("pij,i->pj", R, u)        # (P,3) = R^T u
+                    v_b = torch.einsum("pij,i->pj", R, v)
+                    kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
+                            + kv[None, ..., None] * v_b[:, None, None, :])   # (P,R,C,3)
+                    c = torch.remainder(kxyz / dk, Nk)
+                    grid = torch.stack((
+                        2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+                        2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+                        2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+                    ), dim=-1)[:, None].to(torch.float32)        # (P,1,R,C,3)
+                    bre = bre_full[None].expand(P, -1, -1, -1, -1).to(torch.float32)
+                    bim = bim_full[None].expand(P, -1, -1, -1, -1).to(torch.float32)
+                    sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+                    sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+                    sampled = (sre + 1j * sim).squeeze(2)        # (P,Nw,R,C)
+                    t_vox = (wv[:, :, None, None] * sampled).sum(1)   # (P,R,C)
+                    acc = acc + tw[:, None, None] * t_vox
+        acc[:, 0, 0] = 1.0                                       # pin the vacuum DC per probe
+        return acc
+
+    def forward_tilt(self, origins: torch.Tensor, tilt_x_deg: float,
+                     basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor,
+                     phase_only: bool = True) -> torch.Tensor:
+        """Multislice exit waves for *all* probes at one tilt (batched over probes).
+
+        Probes at a fixed tilt share the beam direction, so their rays span the
+        same z-steps; the wave is carried as ``(P, det, det)`` and every FFT,
+        propagation and transmission build is batched over ``P``.
+
+        Parameters
+        ----------
+        origins : torch.Tensor
+            ``(P, 3)`` probe positions in index space ``[z, y, x]``.
+        tilt_x_deg : float
+            X-axis tilt in degrees.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(P, det_row, det_col)`` complex exit waves.
+        """
+        u, v, w = self.tilt_axes(tilt_x_deg)
+        pts = torch.stack([self.ray_samples(o, w) for o in origins])   # (P, Ns, 3)
+        P, Ns = pts.shape[0], pts.shape[1]
+        Psi = self.Psi0[None].expand(P, -1, -1).clone()
+        num_pix = self.Psi0.numel()
+        for s in range(Ns):
+            SF = self._transmission_planes_batch(pts[:, s], u, v, basis, R_all, W_all)  # (P,det,det)
+            t_real = torch.fft.ifft2(num_pix * SF)
+            if phase_only:
+                t_real = torch.exp(1j * torch.angle(t_real))
+            Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t_real)
+            if s < Ns - 1:
+                Psi = Psi * self.prop
+        return Psi * self.antialias_mask
+
     def scan_positions(
         self,
         scan_shape: tuple[int, int],                 # (n_row, n_col)
@@ -497,13 +607,11 @@ class DiffractionTomography:
         basis = basis * self.sphere_mask[..., None]          # enforce spherical support
         pos = self.scan_positions(scan_shape, scan_step, scan_origin)
         n_row, n_col = pos.shape[:2]
+        origins = pos.reshape(-1, 3)                          # (P, 3)
         dp = torch.empty(len(tilts_deg), n_row, n_col, *self.det_shape, dtype=torch.float64)
         for ti, tilt in enumerate(tilts_deg):
-            for j in range(n_row):
-                for i in range(n_col):
-                    Psi = self.forward_ray(pos[j, i], float(tilt), basis, R_all, weights,
-                                           phase_only=phase_only)
-                    dp[ti, j, i] = (Psi.abs() ** 2).to(torch.float64)
+            Psi = self.forward_tilt(origins, float(tilt), basis, R_all, weights, phase_only=phase_only)
+            dp[ti] = (Psi.abs() ** 2).to(torch.float64).reshape(n_row, n_col, *self.det_shape)
         return dp
 
     def _reset_optimizer_state(self, opt, param, rows) -> None:
@@ -551,7 +659,6 @@ class DiffractionTomography:
         num_iters: int = 100,
         lr: float = 5e-3,
         lr_weights: float | None = None,
-        chunk: int = 64,
         phase_only: bool = True,
         reset_every: int = 10,
         reset_fraction_max: float = 0.05,
@@ -597,22 +704,24 @@ class DiffractionTomography:
         n_cap = max(1, int(reset_fraction_max * self.n_voxels))
         best = {"loss": float("inf"), "snap": None}
 
+        origins = pos.reshape(-1, 3)                          # (P, 3)
+        P = origins.shape[0]
+        n_tilt = len(tilts_deg)
         pbar = tqdm(range(num_iters), disable=not progress, desc="reconstruct", unit="it")
         for it in pbar:
             opt.zero_grad(set_to_none=True)
             total = 0.0
-            for c0 in range(0, n_dp, chunk):
-                basis = self.masked_basis()          # per-chunk -> independent graph -> bounded memory
+            for ti in range(n_tilt):
+                # one tilt at a time -> independent graph -> bounded memory, while
+                # all P probes of the tilt are batched through forward_tilt.
+                basis = self.masked_basis()
                 R_all = self.rotation_matrices()
-                cl = 0.0
-                for local, (ti, j, i) in enumerate(jobs[c0:c0 + chunk]):
-                    Psi = self.forward_ray(pos[j, i], float(tilts_deg[ti]), basis, R_all,
-                                           self.weights, phase_only=phase_only)
-                    r = ((Psi.abs() - meas_amp[ti, j, i]) ** 2).mean()
-                    cl = cl + r
-                    res_per_dp[c0 + local] = float(r)
-                (cl / n_dp).backward()
-                total += float(cl)
+                Psi = self.forward_tilt(origins, float(tilts_deg[ti]), basis, R_all,
+                                        self.weights, phase_only=phase_only)          # (P,det,det)
+                tl = ((Psi.abs() - meas_amp[ti].reshape(P, *self.det_shape)) ** 2).mean(dim=(1, 2))
+                (tl.sum() / n_dp).backward()
+                res_per_dp[ti * P:(ti + 1) * P] = tl.detach()
+                total += float(tl.sum())
             mean_loss = total / n_dp
             losses.append(mean_loss)
             if mean_loss < best["loss"]:
