@@ -2,7 +2,11 @@ from collections.abc import Mapping
 
 import torch
 
-from quantem.core.ml.optimizer_mixin import OptimizerParams, OptimizerType, SchedulerType
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerParams,
+    OptimizerParamsType,
+    SchedulerParamsType,
+)
 from quantem.tomography.tomography_base import TomographyBase
 
 
@@ -12,7 +16,7 @@ class TomographyOpt(TomographyBase):
     """
 
     OPTIMIZABLE_VALS = ["object", "pose"]
-    DEFAULT_OPTIMIZER_TYPE = "adam"
+    DEFAULT_OPTIMIZER_TYPE: OptimizerParamsType = OptimizerParams.Adam()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -27,7 +31,7 @@ class TomographyOpt(TomographyBase):
             raise ValueError(f"Unknown optimization key: {key}")
 
     @property
-    def optimizer_params(self) -> dict[str, OptimizerType]:
+    def optimizer_params(self) -> dict[str, OptimizerParamsType | dict[str, OptimizerParamsType]]:
         return {
             key: params
             for key, params in [
@@ -38,7 +42,7 @@ class TomographyOpt(TomographyBase):
         }
 
     @optimizer_params.setter
-    def optimizer_params(self, d: dict[str, OptimizerType] | dict[str, dict]):
+    def optimizer_params(self, d: dict[str, OptimizerParamsType] | dict[str, dict]):
         """Set the optimizer parameters."""
         if isinstance(d, (tuple, list)):
             d = {k: {} for k in d}
@@ -52,8 +56,8 @@ class TomographyOpt(TomographyBase):
             if k not in targets:
                 raise ValueError(f"Unknown optimization key: {k}")
 
-            if not isinstance(v, OptimizerType):
-                v = OptimizerParams.parse_dict(v)
+            # if not isinstance(v, OptimizerParamsType):
+            #     v = OptimizerParams.parse_dict(v)
 
             targets[k].optimizer_params = v
 
@@ -100,7 +104,7 @@ class TomographyOpt(TomographyBase):
             raise ValueError(f"Unknown optimization key: {key}")
 
     @property
-    def scheduler_params(self) -> dict[str, SchedulerType]:
+    def scheduler_params(self) -> dict[str, SchedulerParamsType]:
         """Returns the parameters used to set the schedulers."""
         return {
             "object": self.obj_model.scheduler_params,
@@ -110,7 +114,8 @@ class TomographyOpt(TomographyBase):
     @scheduler_params.setter
     def scheduler_params(self, d: dict):
         """Set the scheduler parameters."""
-        self._scheduler_params = d.copy() if d else {}
+        d = dict(d) if d else {}
+        self._scheduler_params = d.copy()
 
         for key in self.OPTIMIZABLE_VALS:
             if key not in d:
@@ -136,7 +141,7 @@ class TomographyOpt(TomographyBase):
         return schedulers
 
     def set_schedulers(
-        self, params: Mapping[str, SchedulerType | dict], num_iter: int | None = None
+        self, params: Mapping[str, SchedulerParamsType | dict], num_iter: int | None = None
     ):
         for key, scheduler_params in params.items():
             if key == "object":
@@ -148,21 +153,21 @@ class TomographyOpt(TomographyBase):
 
     def step_optimizers(self):
         for key in self.optimizer_params.keys():
-            if self.obj_model.has_optimizer():
-                self.obj_model.step_optimizer()
-            if self.dset.has_optimizer():
-                self.dset.step_optimizer()
             if key not in self.OPTIMIZABLE_VALS:
                 raise ValueError(f"Unknown optimization key: {key}")
+            if key == "object" and self.obj_model.has_optimizer():
+                self.obj_model.step_optimizer()
+            elif key == "pose" and self.dset.has_optimizer():
+                self.dset.step_optimizer()
 
     def zero_grad_all(self):
         for key in self.optimizer_params.keys():
-            if self.obj_model.has_optimizer():
-                self.obj_model.zero_optimizer_grad()
-            if self.dset.has_optimizer():
-                self.dset.zero_optimizer_grad()
             if key not in self.OPTIMIZABLE_VALS:
                 raise ValueError(f"Unknown optimization key: {key}")
+            if key == "object" and self.obj_model.has_optimizer():
+                self.obj_model.zero_optimizer_grad()
+            elif key == "pose" and self.dset.has_optimizer():
+                self.dset.zero_optimizer_grad()
 
     def step_schedulers(self, loss: float | None = None):
         for key in self.scheduler_params.keys():

@@ -1,24 +1,12 @@
-from importlib.metadata import version
-import pathlib
-import anywidget
-import traitlets
+from importlib.metadata import PackageNotFoundError, version
 
-__version__ = version("quantem.widget")
+from quantem.widget.show2d import Show2D
+from quantem.widget.show4dstem import Show4DSTEM
 
-_static = pathlib.Path(__file__).parent / "static"
+try:
+    __version__ = version("quantem.widget")
+except PackageNotFoundError:
+    # Source-tree imports (e.g. `PYTHONPATH=src pytest`) skip pip install.
+    __version__ = "0.0.0+local"
 
-
-class CounterWidget(anywidget.AnyWidget):
-    _esm = _static / "index.js"
-
-    count = traitlets.Int(0).tag(sync=True)
-
-
-def show4dstem():
-    # TODO: Implement 4D-STEM visualization widget
-    print("show4dstem: not yet implemented")
-
-
-def counter():
-    """Create a minimal counter widget for testing."""
-    return CounterWidget()
+__all__ = ["Show2D", "Show4DSTEM"]
