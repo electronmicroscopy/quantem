@@ -318,6 +318,69 @@ def section_multislice(p: Params, args, rng) -> None:
         print(f"    {tag:34s} {loss:10.3e} {s:10.4f} {t:8.2f} {mem_s}")
 
 
+def build_prism_scheme(p: Params, pdset, device, **scheme_kwargs):
+    """A single PRISM engine for an arbitrary interpolation scheme (probe frozen)."""
+    prism = PtychographyPRISM.from_models(
+        dset=pdset,
+        obj_model=ObjectPixelated.from_uniform(
+            num_slices=p.num_slices, obj_type="complex", slice_thicknesses=p.dz
+        ),
+        probe_model=ProbePRISM.from_params(
+            num_probes=1,
+            probe_params=p.probe_params,
+            learn_aberrations=False,
+            **scheme_kwargs,
+        ),
+        detector_model=DetectorPixelated(),
+        rng=42,
+        verbose=False,
+        device=device,
+    ).preprocess(obj_padding_px=(0, 0), plot_rotation=False, plot_com=False)
+    return prism
+
+
+# (parent_layout, interpolation, knob-name, knob-values) for the scheme sweep; each
+# scheme is reduced from the parents it builds, so P (reported) is the multislice cost
+_FORWARD_SCHEMES = [
+    ("rings", "sibson", "num_partitions", [2, 3, 4, 5]),
+    ("grid", "sibson", "interpolation_factor", [4, 3, 2]),
+    ("grid", "fourier", "interpolation_factor", [4, 3, 2]),
+    ("grid", "nearest", "interpolation_factor", [4, 3, 2]),
+]
+
+
+def section_scheme_sweep(
+    p: Params, args, rng, p_thick, pdset, transmissions, batch_indices, dense_pred
+) -> None:
+    """Forward error vs the dense reference across interpolation schemes, at matched
+    parent budgets, with thickness compensation on and off."""
+    print("\n=== 2b. Forward error vs interpolation scheme (pure forward) ===")
+    print(
+        "    grid+nearest is classic Fourier-interpolation PRISM (crop window); the\n"
+        "    full-aperture interpolants (sibson/fourier) avoid its replica-overlap error."
+    )
+    header = (
+        f"    {'scheme':>22s} {'knob':>6s} {'P':>5s} {'err comp ON':>13s} {'err comp OFF':>13s}"
+    )
+    print(header)
+    for layout, interp, knob, values in _FORWARD_SCHEMES:
+        for v in values:
+            kwargs = {"parent_layout": layout, "interpolation": interp, knob: v}
+            errs = []
+            P = None
+            for compensation in (True, False):
+                prism = build_prism_scheme(p_thick, pdset, args.device, **kwargs)
+                prism.obj_model._obj.data = torch.tensor(
+                    transmissions, dtype=torch.complex64, device=prism._single_device
+                )
+                prism.thickness_compensation = compensation
+                pred = forward_intensities(prism, batch_indices)
+                errs.append(((pred - dense_pred).norm() / dense_pred.norm()).item())
+                P = prism.probe_model.num_parent_beams
+            tag = f"{layout}+{interp}"
+            print(f"    {tag:>22s} {v:>6d} {P:>5d} {errs[0]:>13.3e} {errs[1]:>13.3e}")
+
+
 def section_forward_error(p: Params, args, rng) -> None:
     print("\n=== 2. Partitioned forward error vs num_partitions (pure forward) ===")
     num_slices = max(4, p.num_slices)
@@ -370,6 +433,8 @@ def section_forward_error(p: Params, args, rng) -> None:
             pred = prism_forward(False, parts, compensation)
             errs.append(((pred - dense_pred).norm() / dense_pred.norm()).item())
         print(f"    {parts:>10d} {errs[0]:>18.3e} {errs[1]:>19.3e}")
+
+    section_scheme_sweep(p, args, rng, p_thick, pdset, transmissions, batch_indices, dense_pred)
 
 
 def make_source_blur_modes(p: Params, blur_px: float = 0.8) -> tuple[list, np.ndarray]:
