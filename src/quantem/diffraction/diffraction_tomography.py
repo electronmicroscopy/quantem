@@ -1497,6 +1497,7 @@ class DiffractionTomography(AutoSerialize):
         lr_schedule: str = "plateau",
         lr_factor: float = 0.5,
         lr_patience: int = 10,
+        lr_threshold: float = 1e-2,
         lr_min: float = 1e-7,
         lr_final: float | None = None,
         optimizer_params: dict | None = None,
@@ -1738,7 +1739,7 @@ class DiffractionTomography(AutoSerialize):
         if lr_schedule == "plateau":
             plateau_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode="min", factor=lr_factor,
-                patience=lr_patience, min_lr=lr_min,
+                patience=lr_patience, threshold=lr_threshold, min_lr=lr_min,
             )
 
         def _lr_at(it: int) -> float:
