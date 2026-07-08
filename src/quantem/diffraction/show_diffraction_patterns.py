@@ -95,6 +95,7 @@ def show_diffraction_patterns(
     scan_step=None,
     controls=None,
     title="",
+    show_3d=False,
     rot_k=2,
     downsample=None,
     image_plane_scale=2.4,
@@ -102,8 +103,8 @@ def show_diffraction_patterns(
     l_below_phys=150.0,
     camera_elev=15.0,
     camera_azim=0.0,
-    figsize=(11, 5.5),
-    dpi=120,
+    figsize=None,
+    dpi=110,
 ):
     """Display a linked 3D-schematic + tiled-pattern tilt-series viewer.
 
@@ -128,6 +129,11 @@ def show_diffraction_patterns(
         comparison) instead of creating its own.
     title:
         Label shown above the panels.
+    show_3d:
+        If True, add the 3D lab-frame schematic panel alongside the tiled
+        patterns. Off by default — the flat tiled panel alone is compact
+        enough that two linked viewers (e.g. ground truth and reconstruction)
+        fit on screen together.
 
     Returns
     -------
@@ -191,9 +197,24 @@ def show_diffraction_patterns(
 
         R_sample = Rotation.from_euler("zxz", [0.0, tilt, 0.0], degrees=True)
 
-        fig = plt.figure(figsize=figsize, dpi=dpi)
-        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
-        ax2d = fig.add_subplot(1, 2, 2)
+        fs = figsize if figsize is not None else ((11, 5.5) if show_3d else (5.5, 5.5))
+        fig = plt.figure(figsize=fs, dpi=dpi)
+        if show_3d:
+            ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+            ax2d = fig.add_subplot(1, 2, 2)
+        else:
+            ax3d = None
+            ax2d = fig.add_subplot(1, 1, 1)
+
+        if not show_3d:
+            _title = f"{title}  (tilt = {tilt:+.1f} deg)" if title else f"tilt = {tilt:+.1f} deg"
+            ax2d.imshow(img_full, cmap="inferno", vmin=disp_vmin, vmax=disp_vmax,
+                        interpolation="nearest")
+            ax2d.set_title(f"{_title}   [{int(tilt_idx)}/{n_tilts - 1}]", fontsize=11)
+            ax2d.axis("off")
+            plt.tight_layout()
+            plt.show()
+            return
 
         corners_rot = _rotate_around(_box_corners(nx, ny, nz), R_sample, scan_origin_idx)
         for edges, ls in [(_BOX_EDGES_SOLID, "-"), (_BOX_EDGES_DASHED, (0, (4, 3)))]:

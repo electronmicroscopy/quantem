@@ -37,6 +37,7 @@ _LINKED_TRAITS = (
     "sel_z",
     "sum_axis",
     "view_mode",
+    "slice_idx",
     "power",
     "rot_theta",
     "rot_phi",
@@ -66,6 +67,7 @@ class DiffractionTomographyViewer(anywidget.AnyWidget):
     sel_z = traitlets.Int(0).tag(sync=True)
     sum_axis = traitlets.Int(2).tag(sync=True)          # k axis to sum over
     view_mode = traitlets.Unicode("sum").tag(sync=True)  # 'sum' | 'slice'
+    slice_idx = traitlets.Int(-1).tag(sync=True)         # slice pos along sum_axis; -1 = center
     power = traitlets.Float(0.5).tag(sync=True)
     rot_theta = traitlets.Float(-60.0).tag(sync=True)   # deg, azimuth
     rot_phi = traitlets.Float(20.0).tag(sync=True)      # deg, elevation
@@ -77,7 +79,7 @@ class DiffractionTomographyViewer(anywidget.AnyWidget):
     pts_range = traitlets.List(traitlets.Float(), default_value=[0.0, 1.0]).tag(sync=True)
     pts_power = traitlets.Float(0.25).tag(sync=True)
     pts_scale = traitlets.Float(1.0).tag(sync=True)
-    pts_floor = traitlets.Float(0.1).tag(sync=True)   # hide maxima below this * (non-core) max
+    pts_floor = traitlets.Float(0.25).tag(sync=True)  # hide maxima below this * (non-core) max
 
     # --- data (python -> js) ---------------------------------------------
     real_shape = traitlets.List(traitlets.Int()).tag(sync=True)
@@ -401,9 +403,22 @@ function render({ model, el: root }) {
   powSlider.addEventListener("input", () => {
     model.set("power", parseFloat(powSlider.value)); model.save_changes();
   });
+  const slcRow = ctrlRow(pM);
+  const slcLabel = el("span", { minWidth: "84px" }, slcRow);
+  const slcSlider = slider(slcRow, 0, 1, 1, "170px");   // max set per sum_axis
+  slcSlider.addEventListener("input", () => {
+    model.set("slice_idx", parseInt(slcSlider.value)); model.save_changes();
+  });
   const histM = histPanel(pM, PW, "display range (after power)", (r) => {
     model.set("mid_range", r); model.save_changes();
   });
+
+  function sliceIndex(ax) {
+    const K = [kShape[0], kShape[1], kShape[2]][ax];
+    let s = model.get("slice_idx");
+    if (s < 0 || s >= K) s = Math.floor(K / 2);   // -1 sentinel or stale -> center
+    return s;
+  }
 
   function midImage() {
     const [K0, K1, K2] = kShape;
@@ -411,7 +426,7 @@ function render({ model, el: root }) {
     const mode = model.get("view_mode");
     const dims = [[K1, K2], [K0, K2], [K0, K1]][ax];
     const out = new Float32Array(dims[0] * dims[1]);
-    const c = [Math.floor(K0 / 2), Math.floor(K1 / 2), Math.floor(K2 / 2)];
+    const si = sliceIndex(ax);
     const p = model.get("power");
     for (let a = 0; a < dims[0]; a++) {
       for (let b = 0; b < dims[1]; b++) {
@@ -421,9 +436,9 @@ function render({ model, el: root }) {
           else if (ax === 1) { for (let k = 0; k < K1; k++) s += kVol[(a * K1 + k) * K2 + b]; }
           else { for (let k = 0; k < K2; k++) s += kVol[(a * K1 + b) * K2 + k]; }
         } else {
-          if (ax === 0) s = kVol[(c[0] * K1 + a) * K2 + b];
-          else if (ax === 1) s = kVol[(a * K1 + c[1]) * K2 + b];
-          else s = kVol[(a * K1 + b) * K2 + c[2]];
+          if (ax === 0) s = kVol[(si * K1 + a) * K2 + b];
+          else if (ax === 1) s = kVol[(a * K1 + si) * K2 + b];
+          else s = kVol[(a * K1 + b) * K2 + si];
         }
         out[a * dims[1] + b] = Math.pow(s, p);
       }
@@ -434,24 +449,47 @@ function render({ model, el: root }) {
   function drawMid() {
     const ax = model.get("sum_axis");
     const mode = model.get("view_mode");
+    const K = [kShape[0], kShape[1], kShape[2]][ax];
     axBtns.forEach((b, i) => styleButton(b, i === ax));
     styleButton(modeBtn, mode === "slice");
-    modeBtn.textContent = mode === "sum" ? "sum" : "center slice";
+    modeBtn.textContent = mode === "sum" ? "sum" : "slice";
     powLabel.textContent = "power = " + model.get("power").toFixed(2);
     powSlider.value = model.get("power");
+    const si = sliceIndex(ax);
+    slcSlider.max = K - 1; slcSlider.value = si;
+    slcSlider.disabled = (mode !== "slice");
+    slcLabel.textContent = mode === "slice"
+      ? "k" + ax + " slice = " + (si - Math.floor(K / 2))
+      : "(slice off)";
+    slcLabel.style.color = mode === "slice" ? "#444" : "#bbb";
 
     const { out, dims } = midImage();
-    // Range/histogram exclude the origin pixel (center after fftshift): the
-    // vacuum baseline / direct beam lands there and would flatten the scale.
     const oa = Math.floor(dims[0] / 2), ob = Math.floor(dims[1] / 2);
     const originIdx = oa * dims[1] + ob;
+
+    // Range/histogram exclude the origin (center after fftshift). In slice
+    // mode the range is taken over the FULL k-volume (power-scaled, origin
+    // dropped) so it stays fixed as the slice is scrubbed through z; in sum
+    // mode it is taken over the summed image.
     let mn = Infinity, mx = -Infinity;
     const midVals = [];
-    for (let idx = 0; idx < out.length; idx++) {
-      if (idx === originIdx) continue;
-      const v = out[idx];
-      midVals.push(v);
-      if (v < mn) mn = v; if (v > mx) mx = v;
+    if (mode === "slice") {
+      const p = model.get("power");
+      const oc = [Math.floor(kShape[0] / 2), Math.floor(kShape[1] / 2), Math.floor(kShape[2] / 2)];
+      const oIdx = (oc[0] * kShape[1] + oc[1]) * kShape[2] + oc[2];
+      for (let idx = 0; idx < kVol.length; idx++) {
+        if (idx === oIdx) continue;
+        const v = Math.pow(kVol[idx], p);
+        midVals.push(v);
+        if (v < mn) mn = v; if (v > mx) mx = v;
+      }
+    } else {
+      for (let idx = 0; idx < out.length; idx++) {
+        if (idx === originIdx) continue;
+        const v = out[idx];
+        midVals.push(v);
+        if (v < mn) mn = v; if (v > mx) mx = v;
+      }
     }
     if (!isFinite(mn)) { mn = 0; mx = 1; }
     if (mx <= mn) mx = mn + 1;
@@ -495,11 +533,13 @@ function render({ model, el: root }) {
   pSclSlider.addEventListener("input", () => {
     model.set("pts_scale", parseFloat(pSclSlider.value)); model.save_changes();
   });
+  // cutoff on a log scale (10^-3 .. 10^0 of the non-core max) so it reaches
+  // both far below and up near 100%.
   const pFlrRow = ctrlRow(pR);
   const pFlrLabel = el("span", { minWidth: "104px" }, pFlrRow);
-  const pFlrSlider = slider(pFlrRow, 0.0, 0.5, 0.005, "150px");
+  const pFlrSlider = slider(pFlrRow, -3, 0, 0.05, "150px");
   pFlrSlider.addEventListener("input", () => {
-    model.set("pts_floor", parseFloat(pFlrSlider.value)); model.save_changes();
+    model.set("pts_floor", Math.pow(10, parseFloat(pFlrSlider.value))); model.save_changes();
   });
   const histR = histPanel(pR, PW, "intensity range", (r) => {
     model.set("pts_range", r); model.save_changes();
@@ -516,8 +556,8 @@ function render({ model, el: root }) {
     pPowSlider.value = pPow;
     pSclLabel.textContent = "size scale = " + pScl.toFixed(1);
     pSclSlider.value = pScl;
-    pFlrLabel.textContent = "min = " + (100 * pFlr).toFixed(1) + "% max";
-    pFlrSlider.value = pFlr;
+    pFlrLabel.textContent = "min = " + (100 * pFlr).toFixed(2) + "% max";
+    pFlrSlider.value = Math.log10(Math.max(pFlr, 1e-4));
 
     const th = model.get("rot_theta") * Math.PI / 180;
     const ph = model.get("rot_phi") * Math.PI / 180;
@@ -625,7 +665,8 @@ function render({ model, el: root }) {
     "change:sel_x change:sel_y change:sel_z change:left_range", () => { drawLeft(); },
   );
   model.on(
-    "change:sum_axis change:view_mode change:power change:mid_range", () => { drawMid(); },
+    "change:sum_axis change:view_mode change:slice_idx change:power change:mid_range",
+    () => { drawMid(); },
   );
   model.on(
     "change:rot_theta change:rot_phi change:pts_range change:pts_power change:pts_scale change:pts_floor",

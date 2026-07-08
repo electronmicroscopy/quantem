@@ -1451,6 +1451,36 @@ class DiffractionTomography(AutoSerialize):
             scale[..., 0, 0, 0] = 1.0
             sf.mul_(scale.to(sf.dtype))
 
+    def _apply_smooth(self, sigma: float) -> None:
+        """Separable Gaussian smoothing of `sf_learned` along the real-space axes.
+
+        Neighboring real-space voxels of a physical particle share the same
+        structure factor, so a gentle 3-tap Gaussian (weight
+        `w = exp(-1/(2 sigma^2))` at distance one, replicate edges) across the
+        (x, y, z) axes couples them together. Combined with the k-space
+        shrinkage this sharpens the recovered Bragg peaks. The reciprocal-space
+        axes are left untouched; the vacuum baseline (1 everywhere) is
+        preserved by the smoothing.
+        """
+        w = float(math.exp(-1.0 / (2.0 * sigma * sigma)))
+        norm = 1.0 + 2.0 * w
+        with torch.no_grad():
+            vol = self.sf_learned
+            for axis in (0, 1, 2):
+                n = vol.shape[axis]
+                if n < 2:
+                    continue
+                dev = vol.device
+                prev = torch.tensor([0] + list(range(n - 1)), device=dev)   # i-1, edge replicate
+                nxt = torch.tensor(list(range(1, n)) + [n - 1], device=dev)  # i+1, edge replicate
+                smoothed = (
+                    w * vol.index_select(axis, prev)
+                    + vol
+                    + w * vol.index_select(axis, nxt)
+                ) / norm
+                vol = smoothed
+            self.sf_learned.copy_(vol)
+
     def reconstruct(
         self,
         measurements: Sequence[Dataset4dstem],
@@ -1464,11 +1494,16 @@ class DiffractionTomography(AutoSerialize):
         batch_size: int = 16,
         reset: bool = True,
         lr_init: float = 1e-3,
+        lr_schedule: str = "plateau",
+        lr_factor: float = 0.5,
+        lr_patience: int = 10,
+        lr_min: float = 1e-7,
         lr_final: float | None = None,
         optimizer_params: dict | None = None,
         phase_only: bool = True,
         init_noise: float = 0.0,
         shrink: float = 0.0,
+        smooth_sigma: float = 0.0,
         k_band_limit: float | None = None,
         loss_type: str = "amplitude",
         obj_constraints: dict | ObjConstraintsType | None = None,
@@ -1513,6 +1548,19 @@ class DiffractionTomography(AutoSerialize):
             small threshold suppresses the diffuse backprojection fog that
             otherwise accumulates along the tilt rotation axis. Scaled by
             the current learning rate.
+        lr_schedule: str
+            'plateau' (default): drop the lr by `lr_factor` after `lr_patience`
+            iterations without loss improvement (ReduceLROnPlateau), down to
+            `lr_min` — robust and does not force the lr to zero on a fixed
+            timeline. 'cosine': anneal lr_init -> lr_final over num_iters.
+            'constant': hold lr_init.
+        smooth_sigma: float
+            If > 0, apply a separable Gaussian smoothing of this sigma across
+            the real-space (x, y, z) axes after each step. Neighboring voxels
+            of a physical particle share a structure factor, so this spatial
+            coherence prior, together with the k-space shrinkage, sharpens the
+            recovered Bragg peaks. Reciprocal-space axes and the vacuum
+            baseline are untouched.
         k_band_limit: float | None
             If set (in A^-1), the structure-factor deviation of every cell is
             hard-zeroed outside |k| <= k_band_limit after each step (and the
@@ -1679,20 +1727,32 @@ class DiffractionTomography(AutoSerialize):
         self.optimizer = torch.optim.AdamW([self.sf_learned], lr=lr_init, **opt_params)
         loss_fxn = torch.nn.MSELoss()
 
-        # Cosine learning-rate schedule from lr_init to lr_final. Early large
-        # steps explore quickly; annealing to a small lr suppresses the Adam
-        # step-noise that otherwise makes the stochastic mini-batch loss
-        # oscillate once it nears the solution. lr_final=None -> constant lr.
+        # Learning-rate schedule. 'plateau' (default) drops the lr by
+        # `lr_factor` whenever the loss stops improving for `lr_patience`
+        # iterations — robust and self-tuning, and (unlike a fixed cosine
+        # anneal) it does not force the lr to zero on a preset timeline, so it
+        # cannot get "stuck" cooling down before the reconstruction has
+        # actually converged. 'cosine' keeps the old lr_init->lr_final anneal;
+        # 'constant' holds lr_init.
+        plateau_sched = None
+        if lr_schedule == "plateau":
+            plateau_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode="min", factor=lr_factor,
+                patience=lr_patience, min_lr=lr_min,
+            )
+
         def _lr_at(it: int) -> float:
-            if lr_final is None or num_iters <= 1:
-                return lr_init
-            frac = it / (num_iters - 1)
-            return lr_final + 0.5 * (lr_init - lr_final) * (1.0 + math.cos(math.pi * frac))
+            if lr_schedule == "cosine" and lr_final is not None and num_iters > 1:
+                frac = it / (num_iters - 1)
+                return lr_final + 0.5 * (lr_init - lr_final) * (1.0 + math.cos(math.pi * frac))
+            # 'plateau' reads the scheduler-managed lr; 'constant' holds lr_init
+            return float(self.optimizer.param_groups[0]["lr"])
 
         # --- optimization loop -----------------------------------------------
         generator = torch.Generator()
         generator.manual_seed(seed)
         losses: list[float] = []
+        lrs: list[float] = []
 
         if use_fast:
             # Vectorized path: one forward/backward per tilt (all probes of a
@@ -1704,9 +1764,11 @@ class DiffractionTomography(AutoSerialize):
             probes_per_pack = [p["n_probes"] for p in tilt_packs]
 
             for it in tqdm.tqdm(range(num_iters), desc="reconstruct", unit="iter"):
-                lr_now = _lr_at(it)
-                for pg in self.optimizer.param_groups:
-                    pg["lr"] = lr_now
+                if lr_schedule == "cosine":
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] = _lr_at(it)
+                lr_now = float(self.optimizer.param_groups[0]["lr"])
+                lrs.append(lr_now)
                 order = torch.randperm(n_packs, generator=generator).tolist()
                 total_loss = 0.0
                 self.optimizer.zero_grad()
@@ -1741,6 +1803,8 @@ class DiffractionTomography(AutoSerialize):
                         (tilt_loss / group_dps).backward()
                         total_loss += tilt_loss.item()
                     self.optimizer.step()
+                    if smooth_sigma > 0.0:
+                        self._apply_smooth(smooth_sigma)
                     if shrink > 0.0:
                         self._apply_shrink(shrink * lr_now)
                     if band_mask is not None:
@@ -1748,13 +1812,17 @@ class DiffractionTomography(AutoSerialize):
 
                 mean_loss = total_loss / n_samples
                 losses.append(mean_loss)
+                if plateau_sched is not None:
+                    plateau_sched.step(mean_loss)
                 if show_metrics:
                     print(f"Iter {it}: train loss = {mean_loss:.3e}  (lr {lr_now:.2e})")
         else:
             for it in tqdm.tqdm(range(num_iters), desc="reconstruct", unit="iter"):
-                lr_now = _lr_at(it)
-                for pg in self.optimizer.param_groups:
-                    pg["lr"] = lr_now
+                if lr_schedule == "cosine":
+                    for pg in self.optimizer.param_groups:
+                        pg["lr"] = _lr_at(it)
+                lr_now = float(self.optimizer.param_groups[0]["lr"])
+                lrs.append(lr_now)
                 perm = torch.randperm(n_samples, generator=generator)
                 total_loss = 0.0
                 for start in range(0, n_samples, batch_size):
@@ -1780,6 +1848,8 @@ class DiffractionTomography(AutoSerialize):
                     batch_loss = batch_loss / len(batch_idx)
                     batch_loss.backward()
                     self.optimizer.step()
+                    if smooth_sigma > 0.0:
+                        self._apply_smooth(smooth_sigma)
                     if shrink > 0.0:
                         self._apply_shrink(shrink * lr_now)
                     if band_mask is not None:
@@ -1788,13 +1858,16 @@ class DiffractionTomography(AutoSerialize):
 
                 mean_loss = total_loss / n_samples
                 losses.append(mean_loss)
+                if plateau_sched is not None:
+                    plateau_sched.step(mean_loss)
                 if show_metrics:
-                    print(f"Iter {it}: train loss = {mean_loss:.3e}")
+                    print(f"Iter {it}: train loss = {mean_loss:.3e}  (lr {lr_now:.2e})")
 
         self.recon_losses = losses
         return {
             "reconstructed_sf": self.sf_learned.detach().cpu(),
             "losses": losses,
+            "lrs": lrs,
         }
 
     def reconstruct_pix(self, *args, **kwargs):
