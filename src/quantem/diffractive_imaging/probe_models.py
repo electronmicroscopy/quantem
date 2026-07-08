@@ -36,6 +36,7 @@ from quantem.core.utils.validators import (
 from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging._natural_neighbors_interpolation import (
     beamlet_weights,
+    fourier_beamlet_weights,
     one_hot_beamlet_weights,
 )
 from quantem.diffractive_imaging.complex_probe import (
@@ -1694,6 +1695,75 @@ def _partitioned_prism_wave_vectors(
     return np.vstack(rings)
 
 
+# coarse grid parents are kept within this normalized radius beyond the aperture
+# edge (unity at the cutoff), or one coarse cell, whichever is larger; matches
+# abTEM's disk-shaped coarse support (C-PRISM PR #318).
+_GRID_SUPPORT_MARGIN = 0.45
+
+
+def _grid_prism_wave_vectors(
+    cutoff: float,
+    extent: np.ndarray | tuple[float, float],
+    wavelength: float,
+    interpolation_factor: int,
+    margin: float = _GRID_SUPPORT_MARGIN,
+) -> np.ndarray:
+    """Parent beams on a regular reciprocal sublattice ``k = f n / extent``.
+
+    Used by the Fourier-interpolation (``"fourier"``, ``"nearest"``) and grid
+    Sibson PRISM schemes. The lattice is subsampled by ``interpolation_factor``
+    relative to the dense beamlet grid and restricted to a disk around the
+    aperture (radius ``1 + max(coarse_cell, margin)``, unity at the cutoff), so the
+    dropped rectangle corners are neither built (multislice cost) nor overfit by
+    the interpolation. Pass ``margin=0`` for the one-hot classic-PRISM parents,
+    where beams beyond the aperture carry ~zero CTF weight.
+
+    Parameters
+    ----------
+    cutoff : float
+        Convergence semi-angle cutoff in mrad.
+    extent : np.ndarray | tuple[float, float]
+        Real-space extent in Angstroms.
+    wavelength : float
+        Electron wavelength in Angstroms.
+    interpolation_factor : int
+        Coarse-lattice subsampling factor ``f`` (>= 1).
+    margin : float
+        Support margin beyond the aperture edge, in normalized radius.
+
+    Returns
+    -------
+    np.ndarray
+        Wave vectors in inverse Angstroms, shape (num_parent, 2).
+    """
+    f = int(interpolation_factor)
+    if f < 1:
+        raise ValueError(f"interpolation_factor must be >= 1, got {f}")
+
+    cutoff_rad = cutoff * 1e-3
+    n_max = int(np.ceil(cutoff_rad / (wavelength / extent[0])))
+    m_max = int(np.ceil(cutoff_rad / (wavelength / extent[1])))
+
+    bx = -(n_max // -f) + 1  # ceil(n_max / f) + 1
+    by = -(m_max // -f) + 1
+
+    n = np.arange(-bx, bx + 1)
+    m = np.arange(-by, by + 1)
+
+    kx = f * n / extent[0]
+    ky = f * m / extent[1]
+
+    radius_x = (n * f) / max(1, n_max)
+    radius_y = (m * f) / max(1, m_max)
+    radius = np.sqrt(radius_x[:, None] ** 2 + radius_y[None, :] ** 2)
+
+    cell = max(f / max(1, n_max), f / max(1, m_max))
+    keep = radius <= 1.0 + max(cell, margin)
+
+    kxg, kyg = np.meshgrid(kx, ky, indexing="ij")
+    return np.stack((kxg[keep], kyg[keep]), axis=-1)
+
+
 class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeBase):
     """
     Partitioned-PRISM probe model.
@@ -1705,6 +1775,25 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
     reduces them with the ROI-sized coefficient maps this model produces:
 
         ``coef_map[p, b, n] = ifft2( CTF_p(k) * w_b(k) * c_pb * exp(-2 pi i k . dr_n) )``
+
+    Interpolation schemes (``parent_layout`` x ``interpolation``) map onto the PRISM
+    literature; all share the same reduction, differing only in the frozen weight
+    maps and (for ``"nearest"``) a real-space crop window:
+
+    ======================  =============  ===============  ==========================
+    scheme                  parent_layout  interpolation    notes
+    ======================  =============  ===============  ==========================
+    partitioned PRISM       ``"rings"``    ``"sibson"``     default; hexagonal parents
+    PRISM (Ophus 2017)      ``"grid"``     ``"nearest"``    one-hot + crop window
+    C-PRISM w/o SVD (#318)  ``"grid"``     ``"fourier"``    trig. interp., full aperture
+    grid ablation           ``"grid"``     ``"sibson"``     isolates interpolant/layout
+    ======================  =============  ===============  ==========================
+
+    C-PRISM's phase-removal tricks are already handled by the engine
+    (carrier removal at parent propagation, ``thickness_compensation`` back-
+    propagation); its SVD compression stage is intentionally not implemented (it
+    adds no accuracy and its build-once/reduce-many amortization is broken by
+    per-iteration object updates).
 
     Learnables (each gated by a flag):
     - per-mode aberration coefficients (``learn_aberrations``)
@@ -1747,6 +1836,9 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         aberration_coefs: dict | list[dict] | None = None,
         num_partitions: int = 4,
         dense: bool = False,
+        parent_layout: str = "rings",
+        interpolation: str = "sibson",
+        interpolation_factor: int | None = None,
         learn_aberrations: bool = True,
         learn_beam_coefficients: bool = False,
         initial_probe_weights: list[float] | np.ndarray | None = None,
@@ -1776,8 +1868,30 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         if self.probe_params.get("semiangle_cutoff", None) is None:
             raise ValueError("probe_params must contain 'semiangle_cutoff' for ProbePRISM")
 
+        if parent_layout not in ("rings", "grid"):
+            raise ValueError(f"parent_layout must be 'rings' or 'grid', got {parent_layout!r}")
+        if interpolation not in ("sibson", "fourier", "nearest"):
+            raise ValueError(
+                f"interpolation must be 'sibson', 'fourier', or 'nearest', got {interpolation!r}"
+            )
+        if interpolation in ("fourier", "nearest") and parent_layout != "grid":
+            raise ValueError(
+                f"interpolation={interpolation!r} requires parent_layout='grid' "
+                "(ring parents are off the reciprocal sublattice)"
+            )
+        if parent_layout == "grid":
+            if interpolation_factor is None:
+                raise ValueError("parent_layout='grid' requires interpolation_factor")
+            if int(interpolation_factor) < 1:
+                raise ValueError(f"interpolation_factor must be >= 1, got {interpolation_factor}")
+
         self.num_partitions = num_partitions
         self.dense = dense
+        self.parent_layout = parent_layout
+        self.interpolation = interpolation
+        self.interpolation_factor = (
+            None if interpolation_factor is None else int(interpolation_factor)
+        )
         self.learn_aberrations = learn_aberrations
         self.learn_beam_coefficients = learn_beam_coefficients
         self._vacuum_probe_intensity = None
@@ -1859,6 +1973,9 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         aberration_coefs: dict | list[dict] | None = None,
         num_partitions: int = 4,
         dense: bool = False,
+        parent_layout: str = "rings",
+        interpolation: str = "sibson",
+        interpolation_factor: int | None = None,
         learn_aberrations: bool = True,
         learn_beam_coefficients: bool = False,
         initial_probe_weights: list[float] | np.ndarray | None = None,
@@ -1876,6 +1993,9 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
             aberration_coefs=aberration_coefs,
             num_partitions=num_partitions,
             dense=dense,
+            parent_layout=parent_layout,
+            interpolation=interpolation,
+            interpolation_factor=interpolation_factor,
             learn_aberrations=learn_aberrations,
             learn_beam_coefficients=learn_beam_coefficients,
             initial_probe_weights=initial_probe_weights,
@@ -1930,6 +2050,41 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
     def num_parent_beams(self) -> int:
         return self._parent_wave_vectors.shape[0]
 
+    @property
+    def coefficient_window(self) -> torch.Tensor | None:
+        """Real-space crop mask for the classic ('nearest') scheme, else ``None``.
+
+        The engine multiplies the reduced coefficient maps by this corner-centered
+        box to discard the ghost probes that the one-hot coarse aperture replicates.
+        """
+        if getattr(self, "_has_coefficient_window", False):
+            return self._coefficient_window_mask
+        return None
+
+    def _make_coefficient_window(self, gpts: tuple[int, int], f: int) -> torch.Tensor:
+        """Corner-centered box mask of size ``gpts // f`` (classic-PRISM crop)."""
+        wx = max(1, gpts[0] // f)
+        wy = max(1, gpts[1] // f)
+        # signed offset from the corner, where the (corner-centered) probe sits
+        ox = ((torch.arange(gpts[0]) + gpts[0] // 2) % gpts[0]) - gpts[0] // 2
+        oy = ((torch.arange(gpts[1]) + gpts[1] // 2) % gpts[1]) - gpts[1] // 2
+        mask = (ox.abs()[:, None] <= wx // 2) & (oy.abs()[None, :] <= wy // 2)
+        return mask.to(torch.float32)
+
+    def _nearest_norm_correction(self) -> float:
+        """Frozen scalar rescaling the windowed one-hot probe to the mean intensity.
+
+        The one-hot ('nearest') aperture is subsampled by the interpolation factor
+        and its probe is cropped to :attr:`coefficient_window`; both change the
+        probe power relative to the dense aperture that ``_norm_factor`` assumes.
+        """
+        with torch.no_grad():
+            basis_sum = (self._mode_ctf(0)[None] * self._interpolation_weights).sum(0)
+            probe = torch.fft.ifft2(basis_sum * self._norm_factor) * self._coefficient_window_mask
+            intensity = torch.sum(torch.abs(torch.fft.fft2(probe, norm="ortho")).square())
+            target = torch.as_tensor(self.mean_diffraction_intensity, dtype=intensity.dtype)
+            return float(torch.sqrt(target / intensity.clamp_min(1e-12)))
+
     # endregion --- geometry ---
 
     def _set_buffer(self, name: str, tensor: torch.Tensor) -> None:
@@ -1957,14 +2112,36 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         )
 
         beamlet_kv = _prism_wave_vectors(cutoff, self.extent, self.wavelength)
+        coefficient_window: torch.Tensor | None = None
+        f = self.interpolation_factor
         if self.dense:
             parent_kv = beamlet_kv
             weights = one_hot_beamlet_weights(beamlet_kv, gpts, sampling)
-        else:
+        elif self.parent_layout == "rings":
             parent_kv = _partitioned_prism_wave_vectors(
                 cutoff, self.wavelength, num_rings=self.num_partitions
             )
             weights = beamlet_weights(parent_kv, beamlet_kv, gpts, sampling)
+        elif self.interpolation == "nearest":
+            # classic Fourier-interpolation PRISM: one-hot coarse beams (no dense
+            # interpolation), the approximation is the real-space crop window
+            parent_kv = _grid_prism_wave_vectors(
+                cutoff, self.extent, self.wavelength, f, margin=0.0
+            )
+            weights = one_hot_beamlet_weights(parent_kv, gpts, sampling)
+            coefficient_window = self._make_coefficient_window(gpts, f)
+        elif self.interpolation == "fourier":
+            # C-PRISM interpolant (minus SVD): trigonometric interpolation of the
+            # coarse grid up to the full dense aperture
+            parent_kv = _grid_prism_wave_vectors(cutoff, self.extent, self.wavelength, f)
+            weights = fourier_beamlet_weights(parent_kv, beamlet_kv, gpts, sampling, f)
+        else:  # grid parents with Sibson weights (ablation)
+            parent_kv = _grid_prism_wave_vectors(cutoff, self.extent, self.wavelength, f)
+            weights = beamlet_weights(parent_kv, beamlet_kv, gpts, sampling)
+
+        self._has_coefficient_window = coefficient_window is not None
+        if coefficient_window is not None:
+            self._set_buffer("_coefficient_window_mask", coefficient_window.to(self.device))
 
         kxa, kya = spatial_frequencies(gpts, sampling, device=self.device)
         self._set_buffer("_kxa", kxa.contiguous())
@@ -2007,8 +2184,14 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         mode_amplitudes = torch.sqrt(
             torch.from_numpy(self._initial_probe_weights).to(torch.float32)
         )
+        # the one-hot 'nearest' scheme subsamples the aperture and crops the probe,
+        # so its (windowed) probe power differs from the dense aperture; a frozen
+        # init-time scalar rescales it to the mean diffraction intensity
+        norm_correction = 1.0
+        if self._has_coefficient_window:
+            norm_correction = self._nearest_norm_correction()
         beam_coefs = torch.zeros(self.num_probes, len(parent_kv), 2, dtype=torch.float32)
-        beam_coefs[:, :, 0] = mode_amplitudes[:, None]
+        beam_coefs[:, :, 0] = mode_amplitudes[:, None] * norm_correction
         if self.num_probes > 1 and self.learn_beam_coefficients:
             # identical initial modes have parallel gradients and can never
             # differentiate under optimization; break the symmetry with a small
@@ -2032,25 +2215,27 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         torch.Tensor
             Shape (num_probes, num_parent, *roi_shape), complex.
         """
-        gpts = tuple(self.roi_shape.astype(int))
-        basis = []
-        for p in range(self.num_probes):
-            coefs: dict[str, Any] = {k: v for k, v in self.aberration_coefs[p].items()}
-            ctf = fourier_space_probe(
-                gpts=gpts,
-                sampling=tuple(self.sampling),
-                energy=self.probe_params["energy"],
-                semiangle_cutoff=float(self.probe_params["semiangle_cutoff"]),
-                soft_edges=self.probe_params["soft_edges"],
-                vacuum_probe_intensity=self._vacuum_probe_intensity,
-                aberration_coefs=coefs,
-                normalized=True,
-                device=self.device,
-            )
-            basis.append(ctf[None] * self._interpolation_weights)
+        basis = [
+            self._mode_ctf(p)[None] * self._interpolation_weights for p in range(self.num_probes)
+        ]
 
         beam_coefs = torch.view_as_complex(self._beam_coefficients)
         return torch.stack(basis) * beam_coefs[:, :, None, None] * self._norm_factor
+
+    def _mode_ctf(self, p: int) -> torch.Tensor:
+        """Aberrated (normalized) Fourier-space aperture for probe mode ``p``."""
+        coefs: dict[str, Any] = {k: v for k, v in self.aberration_coefs[p].items()}
+        return fourier_space_probe(
+            gpts=tuple(self.roi_shape.astype(int)),
+            sampling=tuple(self.sampling),
+            energy=self.probe_params["energy"],
+            semiangle_cutoff=float(self.probe_params["semiangle_cutoff"]),
+            soft_edges=self.probe_params["soft_edges"],
+            vacuum_probe_intensity=self._vacuum_probe_intensity,
+            aberration_coefs=coefs,
+            normalized=True,
+            device=self.device,
+        )
 
     def _position_coefficients(self, fract_positions: torch.Tensor) -> torch.Tensor:
         """Fractional-position phase ramps exp(-2 pi i k . dr), shape (batch, *roi_shape)."""
@@ -2080,8 +2265,16 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
 
     @property
     def probe(self) -> torch.Tensor:
-        """Real-space probe stack (num_probes, *roi_shape): summed beamlet basis."""
-        return torch.fft.ifft2(self._compute_beamlet_basis_fft().sum(dim=1))
+        """Real-space probe stack (num_probes, *roi_shape): summed beamlet basis.
+
+        For the classic ('nearest') scheme the corner-centered crop window is
+        applied, matching what the engine reduces (and discarding the ghost copies).
+        """
+        probe = torch.fft.ifft2(self._compute_beamlet_basis_fft().sum(dim=1))
+        window = self.coefficient_window
+        if window is not None:
+            probe = probe * window[None]
+        return probe
 
     @property
     def params(self) -> list[nn.Parameter]:
