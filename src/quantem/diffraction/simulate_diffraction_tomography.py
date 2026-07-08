@@ -13,7 +13,7 @@ from quantem.core.datastructures.dataset6d import Dataset6d
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.utils import electron_wavelength_angstrom, tqdmnd
 from quantem.core.utils.validators import validate_gt
-from quantem.diffraction.diffraction_tomography import DiffractionTomography
+from quantem.diffraction.full_diffraction_tomography import DiffractionTomography
 from quantem.tomography.object_models import (
     ObjectModelType,
     ObjectPixelated,
