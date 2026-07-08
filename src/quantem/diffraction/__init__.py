@@ -14,3 +14,6 @@ from quantem.diffraction.show_diffraction_patterns import (
 from quantem.diffraction.diffraction_tomography import (
     DiffractionTomography as DiffractionTomography,
 )
+from quantem.diffraction.show_factorized_tomography import (
+    show_factorized_tomography as show_factorized_tomography,
+)
