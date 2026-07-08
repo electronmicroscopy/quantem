@@ -2,7 +2,7 @@
 
 Replaces the explicit 6D structure-factor volume with a low-rank factorization:
 
-  * ``basis``   -- ``N_weights`` shared complex 3D k-space structure factors,
+  * ``basis``   -- ``num_structures`` shared complex 3D k-space structure factors,
     shape ``[N_kz, N_ky, N_kx, N_weights]``, spherically band-limited.
   * ``weights`` -- per real-space voxel mixing coefficients,
     shape ``[N_z, N_y, N_x, N_weights]``.
@@ -59,37 +59,61 @@ class DiffractionTomography:
         k_shape: tuple[int, int, int],
         real_sampling: tuple[float, float, float],
         k_sampling: tuple[float, float, float],
-        n_weights: int = 1,
+        num_structures: int = 1,
         energy: float = 3.0e5,
+        probe_k_max: float = 0.10,
+        basis: torch.Tensor | None = None,
+        learn_basis: bool = True,
+        angles=None,
+        learn_angles: bool = True,
+        noise: float = 1e-6,
+        antialias_fraction: float = 0.9,
+        antialias_softness: float = 0.05,
         device: str = "cpu",
         seed: int = 0,
     ):
         """
         Parameters
         ----------
-        real_shape : tuple[int, int, int]
-            Real-space voxel grid ``(N_z, N_y, N_x)``; the beam runs along +z.
-        k_shape : tuple[int, int, int]
-            Reciprocal / basis grid ``(N_kz, N_ky, N_kx)``.
-        real_sampling : tuple[float, float, float]
-            Real-space sampling ``(dz, dy, dx)`` in Angstrom/pixel; ``dz`` is the
-            multislice slice thickness.
-        k_sampling : tuple[float, float, float]
-            Reciprocal-space sampling ``(dkz, dky, dkx)`` in inverse Angstrom.
-        n_weights : int, default 1
-            Number of shared 3D bases (and per-voxel weights).
+        real_shape, k_shape : tuple[int, int, int]
+            Real-space voxel grid ``(N_z, N_y, N_x)`` (beam along +z) and the
+            reciprocal / basis grid ``(N_kz, N_ky, N_kx)``.
+        real_sampling, k_sampling : tuple[float, float, float]
+            Real-space ``(dz, dy, dx)`` [A/px] (dz = slice thickness) and
+            reciprocal ``(dkz, dky, dkx)`` [1/A] sampling.
+        num_structures : int, default 1
+            Number of shared 3D structure-factor bases (and per-voxel weights).
         energy : float, default 3e5
             Beam energy in eV (sets the electron wavelength).
+        probe_k_max : float, default 0.10
+            Probe aperture radius [1/A].
+        basis : torch.Tensor, optional
+            Seed for the k-space bases; if None, small complex noise.
+        learn_basis, learn_angles : bool, default True
+            Whether the basis / per-voxel orientations are optimised.
+        angles : optional
+            Initial per-voxel orientation: a single ``(3, 3)`` rotation, a
+            ``(n_voxels, 3, 3)`` stack, or None (random). Pass the known
+            orientation with ``learn_angles=False`` to isolate basis recovery.
+        noise : float, default 1e-6
+            Init amplitude for the noise basis / weights.
+        antialias_fraction, antialias_softness : float
+            Fresnel-propagator circular anti-alias envelope.
         device : str, default "cpu"
-            Torch device.
         seed : int, default 0
             Seed for parameter initialisation and the reset generator.
+
+        Notes
+        -----
+        The constructor fully sets the model up -- probe aperture, propagator and
+        learnable parameters. Call :meth:`make_probe`, :meth:`make_propagator` or
+        :meth:`init_parameters` again only to reconfigure.
         """
         self.real_shape = tuple(int(n) for n in real_shape)
         self.k_shape = tuple(int(n) for n in k_shape)
         self.real_sampling = tuple(float(s) for s in real_sampling)
         self.k_sampling = tuple(float(s) for s in k_sampling)
-        self.n_weights = int(n_weights)
+        self.num_structures = int(num_structures)
         self.energy = float(energy)
         self.wavelength = float(electron_wavelength_angstrom(self.energy))
         self.device = torch.device(device)
@@ -97,12 +121,15 @@ class DiffractionTomography:
 
         Nz, Ny, Nx = self.real_shape
         self.n_voxels = Nz * Ny * Nx
-
         # detector plane = in-plane part of the basis: (N_ky, N_kx) == [row, col]
         self.det_shape = (self.k_shape[1], self.k_shape[2])
 
         self._build_reciprocal_grids()
         self._build_sphere_mask()
+        self.make_probe(probe_k_max)
+        self.make_propagator(antialias_fraction, antialias_softness)
+        self.init_parameters(basis=basis, learn_basis=learn_basis, noise=noise,
+                             angles=angles, learn_angles=learn_angles)
 
     def _build_reciprocal_grids(self) -> None:
         Nkz, Nky, Nkx = self.k_shape
@@ -134,15 +161,31 @@ class DiffractionTomography:
         basis: torch.Tensor | None = None,
         learn_basis: bool = True,
         noise: float = 1e-6,
+        angles=None,
+        learn_angles: bool = True,
     ) -> None:
         """Create the learnable ``basis``, ``weights`` and ``angles`` params.
 
-        ``basis`` optionally seeds the k-space bases (else small complex noise
-        with the origin pinned to 1).  ``learn_basis=False`` freezes it.
+        Parameters
+        ----------
+        basis : torch.Tensor, optional
+            Seeds the k-space bases; if None, small complex noise (origin
+            pinned to 1).
+        learn_basis : bool, default True
+            Optimise the basis (False freezes it).
+        noise : float, default 1e-6
+            Init amplitude for the noise basis / weights.
+        angles : optional
+            Initial per-voxel orientation: a ``(3, 3)`` rotation (broadcast to
+            all voxels), a ``(n_voxels, 3, 3)`` stack, or None (random SO(3)).
+        learn_angles : bool, default True
+            Optimise the orientations. Set False (with ``angles`` = the known
+            ground-truth orientation) to isolate whether the basis alone can
+            recover the Bragg peaks.
         """
         Nz, Ny, Nx = self.real_shape
         Nkz, Nky, Nkx = self.k_shape
-        Nw = self.n_weights
+        Nw = self.num_structures
         dev = self.device
         gen = torch.Generator(device="cpu").manual_seed(self.seed)
 
@@ -167,14 +210,27 @@ class DiffractionTomography:
             noise * torch.randn(Nz, Ny, Nx, Nw, generator=gen, dtype=torch.float64)
         ).to(dev).requires_grad_(True)
 
-        # per-voxel SO(3) orientation (R9+SVD), random init
-        torch.manual_seed(self.seed)
-        self.angles = SO3ParamR9SVD(self.n_voxels, init="random").to(dev)
+        # per-voxel SO(3) orientation (R9+SVD)
+        if angles is None:
+            torch.manual_seed(self.seed)
+            self.angles = SO3ParamR9SVD(self.n_voxels, init="random").to(dev)
+        else:
+            R = torch.as_tensor(angles, dtype=torch.float32)
+            if R.ndim == 2:
+                R = R[None].expand(self.n_voxels, 3, 3).contiguous()
+            assert R.shape == (self.n_voxels, 3, 3), f"angles shape {R.shape}"
+            self.angles = SO3ParamR9SVD.from_matrix(R).to(dev)
+        self.learn_angles = learn_angles
+        if not learn_angles:
+            for p in self.angles.parameters():
+                p.requires_grad_(False)
 
     def parameters(self) -> list[torch.Tensor]:
-        ps = [self.weights, *self.angles.parameters()]
+        ps = [self.weights]
         if self.learn_basis:
             ps = [self.basis, *ps]
+        if self.learn_angles:
+            ps = [*ps, *self.angles.parameters()]
         return ps
 
     def rotation_matrices(self) -> torch.Tensor:
@@ -212,7 +268,7 @@ class DiffractionTomography:
         from the norm.
         """
         with torch.no_grad():
-            sq_all = (self.basis.abs() ** 2).reshape(-1, self.n_weights).sum(0)
+            sq_all = (self.basis.abs() ** 2).reshape(-1, self.num_structures).sum(0)
             sq_origin = self.basis[0, 0, 0, :].abs() ** 2
             bn = torch.sqrt((sq_all - sq_origin).clamp_min(1e-24))       # (Nw,)
             self.basis /= bn
@@ -642,7 +698,8 @@ class DiffractionTomography:
         """Adam with a higher lr on the weights: with the basis L2-normalised,
         a material weight must travel from ~0 to the basis amplitude while the
         basis and rotations are already unit-scale, so it needs a faster rate."""
-        rest = ([self.basis] if self.learn_basis else []) + list(self.angles.parameters())
+        rest = ([self.basis] if self.learn_basis else []) \
+            + (list(self.angles.parameters()) if self.learn_angles else [])
         return torch.optim.Adam(
             [{"params": [self.weights], "lr": lr_weights},
              {"params": rest, "lr": lr}],
@@ -730,7 +787,8 @@ class DiffractionTomography:
             opt.step()
 
             n_res = 0
-            if reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
+            # the reset escapes stuck orientations; skip it when angles are frozen
+            if self.learn_angles and reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
                 # roll back to the best-so-far if we've drifted above it
                 if best["snap"] is not None and mean_loss > best["loss"] * (1.0 + revert_slack):
                     self._restore(best["snap"])
@@ -750,7 +808,7 @@ class DiffractionTomography:
                         # equalize the flipped voxels' weights across bases but
                         # PRESERVE each voxel's own magnitude, so a near-vacuum
                         # voxel stays near vacuum (we only re-roll its angle).
-                        Wf = self.weights.reshape(self.n_voxels, self.n_weights)
+                        Wf = self.weights.reshape(self.n_voxels, self.num_structures)
                         Wf[bad] = Wf[bad].mean(dim=1, keepdim=True)
                         self._reset_optimizer_state(opt, self.angles.M, bad)
                         self._reset_optimizer_state(opt, self.weights, bad)
