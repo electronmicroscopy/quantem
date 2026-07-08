@@ -17,3 +17,6 @@ from quantem.diffraction.diffraction_tomography import (
 from quantem.diffraction.show_factorized_tomography import (
     show_factorized_tomography as show_factorized_tomography,
 )
+from quantem.diffraction.show_diffraction_tilts import (
+    show_diffraction_tilts as show_diffraction_tilts,
+)

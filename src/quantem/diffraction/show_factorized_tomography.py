@@ -119,9 +119,13 @@ def show_factorized_tomography(dt, spot_floor: float = 0.1, power: float = 0.5):
         "basis": basis, "left": left, "zsl": zsl, "kax": kax, "kmode": kmode,
         "ksl": ksl, "pw": pw, "flr": flr, "azim": azim, "elev": elev,
     })
-    controls = widgets.VBox([
-        widgets.HBox([basis, left, zsl]),
-        widgets.HBox([kax, kmode, ksl, pw]),
-        widgets.HBox([flr, azim, elev]),
-    ])
+    # group each panel's controls in a column above that panel (left | middle | right)
+    col = widgets.Layout(width="390px")
+    for s in (basis, left, zsl, kax, kmode, ksl, pw, flr, azim, elev):
+        s.style = {"description_width": "70px"}
+        s.layout = widgets.Layout(width="360px")
+    left_ctrl = widgets.VBox([widgets.HTML("<b>weights (left)</b>"), left, zsl], layout=col)
+    mid_ctrl = widgets.VBox([widgets.HTML("<b>basis (middle)</b>"), basis, kax, kmode, ksl, pw], layout=col)
+    right_ctrl = widgets.VBox([widgets.HTML("<b>SF spots (right)</b>"), flr, azim, elev], layout=col)
+    controls = widgets.HBox([left_ctrl, mid_ctrl, right_ctrl])
     return widgets.VBox([controls, out])
