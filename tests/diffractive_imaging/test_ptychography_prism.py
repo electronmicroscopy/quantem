@@ -12,13 +12,19 @@ from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffractive_imaging._natural_neighbors_interpolation import (
     beamlet_weights,
+    fourier_beamlet_weights,
     one_hot_beamlet_weights,
     pairwise_weights,
 )
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.object_models import ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeParametric, ProbePRISM
+from quantem.diffractive_imaging.probe_models import (
+    ProbeParametric,
+    ProbePRISM,
+    _grid_prism_wave_vectors,
+    _prism_wave_vectors,
+)
 from quantem.diffractive_imaging.ptychography import Ptychography
 from quantem.diffractive_imaging.ptychography_prism import PtychographyPRISM
 
@@ -697,3 +703,195 @@ class TestPRISMIntegration:
             atol=0,
         )
         assert probe_model.aberration_coefs[0]["C10"].item() == pytest.approx(C10 - 10)
+
+
+def _thick_object(num_slices: int, seed: int = 7) -> np.ndarray:
+    """Thick multislice white-noise transmission stack for forward-error tests."""
+    rng = np.random.default_rng(seed)
+    phases = (rng.random((num_slices, N, N)).astype(np.float32) - 0.5) * (1.0 / num_slices)
+    return np.exp(1j * phases).astype(np.complex64)
+
+
+def _scheme_forward_error(ptycho_dataset, obj, dense_pred, **scheme_kwargs) -> float:
+    """Relative intensity error of a PRISM scheme vs the dense-PRISM reference."""
+    _, prism = _build_engines(ptycho_dataset, obj, slice_thicknesses=20.0, **scheme_kwargs)
+    pred = _forward_intensities(prism, BATCH_INDICES)
+    return ((pred - dense_pred).norm() / dense_pred.norm()).item()
+
+
+class TestFourierInterpolation:
+    """Fourier-interpolation ('fourier'), grid-Sibson, and classic ('nearest') PRISM
+    schemes on the shared ProbePRISM machinery (abTEM C-PRISM PR #318)."""
+
+    def test_fourier_weights_partition_of_unity(self):
+        """Nearest-fill trigonometric interpolation of a constant is a constant:
+        the weights sum to one over parents at every beamlet."""
+        gpts = (N, N)
+        sampling = tuple(1 / (RECIPROCAL_SAMPLING * N))
+        extent = np.array(gpts) * np.array(sampling)
+        wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+        cutoff = SEMIANGLE_CUTOFF + float(np.linalg.norm(RECIPROCAL_SAMPLING * wavelength * 1e3))
+
+        beamlets = _prism_wave_vectors(cutoff, extent, wavelength)
+        for f in (2, 3, 4):
+            parents = _grid_prism_wave_vectors(cutoff, extent, wavelength, f)
+            weights = fourier_beamlet_weights(parents, beamlets, gpts, sampling, f)
+            beamlet_support = weights.sum(axis=0)  # (N, N)
+            # partition of unity exactly on the beamlet pixels
+            n_int = np.rint(beamlets * extent).astype(int)
+            bp = beamlet_support[n_int[:, 0] % N, n_int[:, 1] % N]
+            np.testing.assert_allclose(bp, 1.0, atol=1e-6)
+
+    def test_fourier_f1_matches_dense_forward(self, ptycho_dataset, complex_obj):
+        """At interpolation factor 1 the coarse grid is the dense grid, so the
+        Fourier scheme reproduces the dense-PRISM forward exactly."""
+        obj = complex_obj[None]
+        _, dense = _build_engines(ptycho_dataset, obj, dense=True)
+        _, fourier = _build_engines(
+            ptycho_dataset,
+            obj,
+            parent_layout="grid",
+            interpolation="fourier",
+            interpolation_factor=1,
+        )
+        pred_dense = _forward_intensities(dense, BATCH_INDICES)
+        pred_fourier = _forward_intensities(fourier, BATCH_INDICES)
+        scale = pred_dense.abs().max()
+        torch.testing.assert_close(pred_fourier / scale, pred_dense / scale, rtol=1e-4, atol=1e-4)
+
+    def test_nearest_f1_matches_dense_forward(self, ptycho_dataset, complex_obj):
+        """Classic PRISM at factor 1 (full aperture, full window) is the identity."""
+        obj = complex_obj[None]
+        _, dense = _build_engines(ptycho_dataset, obj, dense=True)
+        _, nearest = _build_engines(
+            ptycho_dataset,
+            obj,
+            parent_layout="grid",
+            interpolation="nearest",
+            interpolation_factor=1,
+        )
+        pred_dense = _forward_intensities(dense, BATCH_INDICES)
+        pred_nearest = _forward_intensities(nearest, BATCH_INDICES)
+        scale = pred_dense.abs().max()
+        torch.testing.assert_close(pred_nearest / scale, pred_dense / scale, rtol=1e-4, atol=1e-4)
+
+    def test_fourier_error_decreases_with_parents(self, ptycho_dataset):
+        """More coarse beams (smaller factor) -> smaller forward error vs dense."""
+        obj = _thick_object(4)
+        _, dense = _build_engines(ptycho_dataset, obj, slice_thicknesses=20.0, dense=True)
+        dense_pred = _forward_intensities(dense, BATCH_INDICES)
+        errs = [
+            _scheme_forward_error(
+                ptycho_dataset,
+                obj,
+                dense_pred,
+                parent_layout="grid",
+                interpolation="fourier",
+                interpolation_factor=f,
+            )
+            for f in (4, 3, 2)
+        ]
+        assert errs[0] > errs[1] > errs[2]
+        assert errs[-1] < 1e-2  # full-aperture interpolation is accurate
+
+    def test_full_aperture_beats_nearest(self, ptycho_dataset):
+        """The full-aperture interpolants reduce from the whole aperture and avoid the
+        replica-overlap error of the classic crop; at a ptychographic ROI they are
+        an order of magnitude more accurate than 'nearest' at the same factor."""
+        obj = _thick_object(4)
+        _, dense = _build_engines(ptycho_dataset, obj, slice_thicknesses=20.0, dense=True)
+        dense_pred = _forward_intensities(dense, BATCH_INDICES)
+
+        fourier = _scheme_forward_error(
+            ptycho_dataset,
+            obj,
+            dense_pred,
+            parent_layout="grid",
+            interpolation="fourier",
+            interpolation_factor=2,
+        )
+        sibson = _scheme_forward_error(
+            ptycho_dataset,
+            obj,
+            dense_pred,
+            parent_layout="grid",
+            interpolation="sibson",
+            interpolation_factor=2,
+        )
+        nearest = _scheme_forward_error(
+            ptycho_dataset,
+            obj,
+            dense_pred,
+            parent_layout="grid",
+            interpolation="nearest",
+            interpolation_factor=2,
+        )
+        assert fourier < 0.02 and sibson < 0.02
+        assert nearest > 0.05
+        assert fourier < 0.1 * nearest and sibson < 0.1 * nearest
+
+    def test_coefficient_window_only_for_nearest(self):
+        """Only the classic scheme carries a real-space crop window."""
+        cases = [
+            (dict(parent_layout="rings", interpolation="sibson", num_partitions=3), False),
+            (dict(parent_layout="grid", interpolation="fourier", interpolation_factor=2), False),
+            (dict(parent_layout="grid", interpolation="sibson", interpolation_factor=2), False),
+            (dict(parent_layout="grid", interpolation="nearest", interpolation_factor=2), True),
+        ]
+        for kwargs, has_window in cases:
+            probe = ProbePRISM.from_params(probe_params=PROBE_PARAMS, **kwargs)
+            probe.set_initial_probe((N, N), RECIPROCAL_SAMPLING, MEAN_DIFFRACTION_INTENSITY)
+            window = probe.coefficient_window
+            if has_window:
+                assert window is not None and tuple(window.shape) == (N, N)
+                assert 0 < float(window.sum()) < N * N  # a proper crop
+            else:
+                assert window is None
+
+    def test_invalid_scheme_combinations_raise(self):
+        with pytest.raises(ValueError, match="parent_layout='grid'"):
+            ProbePRISM.from_params(probe_params=PROBE_PARAMS, interpolation="fourier")
+        with pytest.raises(ValueError, match="requires interpolation_factor"):
+            ProbePRISM.from_params(probe_params=PROBE_PARAMS, parent_layout="grid")
+        with pytest.raises(ValueError, match="interpolation must be"):
+            ProbePRISM.from_params(probe_params=PROBE_PARAMS, interpolation="spline")
+
+    def test_fourier_weights_reject_off_lattice_parents(self):
+        """Parents whose reciprocal-grid indices are not divisible by the factor are
+        not on the coarse sublattice."""
+        gpts = (N, N)
+        sampling = tuple(1 / (RECIPROCAL_SAMPLING * N))
+        extent = np.array(gpts) * np.array(sampling)
+        wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+        cutoff = SEMIANGLE_CUTOFF
+        beamlets = _prism_wave_vectors(cutoff, extent, wavelength)
+        # dense beamlets are on the f=1 lattice, hence not divisible by f=2
+        with pytest.raises(ValueError, match="coarse sublattice"):
+            fourier_beamlet_weights(beamlets, beamlets, gpts, sampling, 2)
+
+    def test_mixed_state_grid_fourier_trains(self, ptycho_dataset):
+        """Learnable per-parent beam coefficients on the Fourier scheme optimize
+        without diverging (PPLR groups are scheme-independent)."""
+        obj = np.exp(0.1j * np.random.default_rng(0).random((N, N))).astype(np.complex64)[None]
+        _, prism = _build_engines(
+            ptycho_dataset,
+            obj,
+            num_probes=2,
+            parent_layout="grid",
+            interpolation="fourier",
+            interpolation_factor=2,
+            learn_beam_coefficients=True,
+            learn_aberrations=False,
+        )
+        prism.reconstruct(
+            num_iters=4,
+            reset=True,
+            batch_size=512,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 5e-3},
+                "probe": {"beam_coefficients": {"name": "adam", "lr": 1e-2}},
+            },
+        )
+        losses = np.asarray(prism._iter_losses)
+        assert np.all(np.isfinite(losses))
+        assert losses[-1] <= losses[0] * 1.5  # not diverging
