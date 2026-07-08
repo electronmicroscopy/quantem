@@ -1223,13 +1223,15 @@ class DiffractionTomography(AutoSerialize):
         real_shape = torch.asarray(
             self.array.shape[:3], dtype=torch.float32, device=device
         )
-        # scan_origin in physical (x, y, z): defaults to the (x, y) center of
-        # the volume at the beam entrance plane z = 0.
+        # scan_origin in physical (x, y, z): defaults to the center of the
+        # volume in all three axes, including mid-thickness z = (Nz-1)/2, so
+        # sample tilts pivot about the specimen center and growing the slab
+        # (either thickness or lateral extent) stays symmetric about the
+        # origin. The beam still physically enters at the z = 0 face; only the
+        # lateral reference plane moves, so the nominal (x, y) probe position
+        # marks where the ray crosses the specimen mid-plane.
         if scan_origin is None:
-            scan_origin_xyz = (real_shape[:2] - 1) / 2 * sampling3[:2]
-            scan_origin_xyz = torch.cat(
-                (scan_origin_xyz, torch.zeros(1, dtype=torch.float32, device=device))
-            )
+            scan_origin_xyz = (real_shape - 1) / 2 * sampling3
         else:
             scan_origin_xyz = torch.asarray(
                 scan_origin, dtype=torch.float32, device=device
