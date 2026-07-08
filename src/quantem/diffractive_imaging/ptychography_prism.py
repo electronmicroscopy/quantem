@@ -224,6 +224,9 @@ class PtychographyPRISM(Ptychography):
                 transmission_flat.imag[:, patch_indices],
             )  # (1, batch, *roi_shape)
             probes = torch.fft.ifft2(beamlets_fft.sum(dim=1)[:, None] * position_coefs[None])
+            window = self.probe_model.coefficient_window
+            if window is not None:  # classic 'nearest' scheme: crop the ghost copies
+                probes = probes * window
             exit_waves = obj_patches * probes
         else:
             parent_wave_vectors = self.probe_model.parent_wave_vectors
@@ -276,6 +279,9 @@ class PtychographyPRISM(Ptychography):
         coef_maps = torch.fft.ifft2(
             beamlets_fft[:, :, None] * position_coefs[None, None]
         )  # (num_probes, chunk, batch, *roi_shape)
+        window = self.probe_model.coefficient_window
+        if window is not None:  # classic 'nearest' scheme: crop the ghost copies
+            coef_maps = coef_maps * window
         return (coef_maps * patches[None]).sum(dim=1)
 
     def _propagate_parent_waves(
