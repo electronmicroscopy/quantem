@@ -234,8 +234,18 @@ class DiffractionTomography:
         return ps
 
     def rotation_matrices(self) -> torch.Tensor:
-        """(N_z, N_y, N_x, 3, 3) per-voxel rotation matrices (body->lab)."""
-        R = self.angles.as_matrix()                 # (T, 3, 3)
+        """(N_z, N_y, N_x, 3, 3) per-voxel rotation matrices (body->lab).
+
+        The R9+SVD projection can fail when a voxel's M drifts toward repeated
+        singular values (LAPACK non-convergence); a tiny in-place jitter breaks
+        the degeneracy and the projection is retried.
+        """
+        try:
+            R = self.angles.as_matrix()             # (T, 3, 3)
+        except Exception:
+            with torch.no_grad():
+                self.angles.M.add_(1e-4 * torch.randn_like(self.angles.M))
+            R = self.angles.as_matrix()
         return R.reshape(*self.real_shape, 3, 3)
 
     def masked_basis(self) -> torch.Tensor:
@@ -305,22 +315,29 @@ class DiffractionTomography:
                 for sign in product((-1, 1), repeat=3)
             })
             for vec in vec_set:
-                # peak in (kx, ky, kz) physical -> place at [kz, ky, kx] index
+                # peak in (kx, ky, kz) physical -> nearest [kz, ky, kx] voxel.
+                # Each Bragg reflection is a single delta spike: spreading it
+                # over a trilinear cluster distorts the diffracted disks (the
+                # transmission peak becomes a multi-pixel blob) and makes the
+                # structure factor read as several bright voxels per peak.
                 kx, ky, kz = (v / a_Au for v in vec)
-                gz, gy, gx = kz / dkz, ky / dky, kx / dkx
-                for dz in range(2):
-                    bz = int(math.floor(gz)); wz = (gz - bz) if dz else (1.0 - (gz - bz)); iz = (bz + dz) % Nkz
-                    for dy in range(2):
-                        by = int(math.floor(gy)); wy = (gy - by) if dy else (1.0 - (gy - by)); iy = (by + dy) % Nky
-                        for dx in range(2):
-                            bx = int(math.floor(gx)); wx = (gx - bx) if dx else (1.0 - (gx - bx)); ix = (bx + dx) % Nkx
-                            sf[iz, iy, ix] += amp * wz * wy * wx
+                iz = int(round(kz / dkz)) % Nkz
+                iy = int(round(ky / dky)) % Nky
+                ix = int(round(kx / dkx)) % Nkx
+                sf[iz, iy, ix] += amp
         return sf
 
     def make_probe(self, probe_k_max: float, normalize: bool = True) -> torch.Tensor:
-        """Top-hat aperture probe, 2D detector plane [row, col] = [ky, kx]."""
+        """Aperture probe with a sub-pixel anti-aliased edge, [row, col] = [ky, kx].
+
+        The edge ramps linearly over one k-pixel (partial pixel coverage), so
+        the direct and diffracted disks render as circles on the coarse
+        detector grid instead of chunky hard-threshold polygons.
+        """
         kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
-        aperture = (torch.sqrt(kv ** 2 + ku ** 2) <= probe_k_max).to(torch.complex128)
+        k_rad = torch.sqrt(kv ** 2 + ku ** 2)
+        dk_pix = min(self.k_sampling[1], self.k_sampling[2])
+        aperture = torch.clamp((probe_k_max - k_rad) / dk_pix + 0.5, 0.0, 1.0).to(torch.complex128)
         if normalize:
             aperture = aperture / torch.sqrt((aperture.abs() ** 2).sum())
         self.Psi0 = aperture.to(self.device)
@@ -650,24 +667,61 @@ class DiffractionTomography:
 
     def simulate(
         self,
-        basis: torch.Tensor,
-        weights: torch.Tensor,
-        R_all: torch.Tensor,
-        tilts_deg,
-        scan_shape: tuple[int, int],
-        scan_step: float | tuple[float, float] = 1.0,
+        basis: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+        R_all: torch.Tensor | None = None,
+        tilts_deg=None,
+        scan_shape: tuple[int, int] | None = None,
+        scan_step: float | tuple[float, float] | None = None,
         scan_origin=None,
         phase_only: bool = True,
+        progress: bool = True,
     ) -> torch.Tensor:
-        """Forward tilt series -> (n_tilt, n_row, n_col, det_row, det_col) intensities."""
+        """Forward tilt series -> (n_tilt, n_row, n_col, det_row, det_col) intensities.
+
+        Every argument is optional: parameters default to the model's own
+        (current basis / weights / orientations), and the scan geometry
+        defaults to the one recorded by the last :meth:`reconstruct` call (or
+        must be given for a fresh simulation). So the predicted patterns of a
+        reconstruction are simply ``recon.simulate()``.
+
+        Parameters
+        ----------
+        basis, weights, R_all : torch.Tensor, optional
+            Object parameters; default to the model's own.
+        tilts_deg, scan_shape, scan_step, scan_origin : optional
+            Tilt series and scan raster; default to the geometry stored by the
+            last reconstruction.
+        phase_only : bool, default True
+            Unitary phase-grating transmission.
+        progress : bool, default True
+            Show a tqdm bar over the tilt series.
+        """
+        if basis is None:
+            basis = self.masked_basis().detach()
+        if weights is None:
+            weights = self.weights.detach()
+        if R_all is None:
+            R_all = self.rotation_matrices().detach()
+        geo = getattr(self, "_scan_geometry", {})
+        tilts_deg = geo.get("tilts_deg") if tilts_deg is None else tilts_deg
+        scan_shape = geo.get("scan_shape") if scan_shape is None else scan_shape
+        scan_step = geo.get("scan_step", 1.0) if scan_step is None else scan_step
+        scan_origin = geo.get("scan_origin") if scan_origin is None else scan_origin
+        if tilts_deg is None or scan_shape is None:
+            raise ValueError(
+                "No scan geometry: pass tilts_deg + scan_shape, or run reconstruct() first."
+            )
         basis = basis * self.sphere_mask[..., None]          # enforce spherical support
         pos = self.scan_positions(scan_shape, scan_step, scan_origin)
         n_row, n_col = pos.shape[:2]
         origins = pos.reshape(-1, 3)                          # (P, 3)
         dp = torch.empty(len(tilts_deg), n_row, n_col, *self.det_shape, dtype=torch.float64)
-        for ti, tilt in enumerate(tilts_deg):
-            Psi = self.forward_tilt(origins, float(tilt), basis, R_all, weights, phase_only=phase_only)
-            dp[ti] = (Psi.abs() ** 2).to(torch.float64).reshape(n_row, n_col, *self.det_shape)
+        with torch.no_grad():
+            for ti in tqdm(range(len(tilts_deg)), disable=not progress, desc="simulate", unit="tilt"):
+                Psi = self.forward_tilt(origins, float(tilts_deg[ti]), basis, R_all, weights,
+                                        phase_only=phase_only)
+                dp[ti] = (Psi.abs() ** 2).to(torch.float64).reshape(n_row, n_col, *self.det_shape)
         return dp
 
     def _reset_optimizer_state(self, opt, param, rows) -> None:
@@ -693,6 +747,45 @@ class DiffractionTomography:
             self.basis.copy_(snap["basis"])
             self.weights.copy_(snap["weights"])
             self.angles.M.copy_(snap["M"])
+
+    def _sanitize(self, opt, gen) -> int:
+        """Repair non-finite parameters (and their Adam state) in place.
+
+        The SVD backward of the R9 rotation parameterisation is singular when a
+        voxel's M has (near-)repeated singular values; one such step writes NaN
+        into M and Adam's moments, which then poisons every later iteration.
+        Non-finite M rows get a fresh random rotation, non-finite weights the
+        current mean, non-finite basis entries zero; the corresponding Adam
+        moments are zeroed. Returns the number of repaired voxels.
+        """
+        n_fix = 0
+        with torch.no_grad():
+            badM = ~torch.isfinite(self.angles.M).reshape(self.n_voxels, -1).all(dim=1)
+            if bool(badM.any()):
+                idx = torch.nonzero(badM).flatten()
+                n_fix = int(idx.numel())
+                for v in idx.tolist():
+                    self.angles.M[v] = (torch.eye(3)
+                                        + 0.1 * torch.randn(3, 3, generator=gen)).to(self.device)
+                self._reset_optimizer_state(opt, self.angles.M, idx)
+            badW = ~torch.isfinite(self.weights).reshape(self.n_voxels, -1).all(dim=1)
+            if bool(badW.any()):
+                idx = torch.nonzero(badW).flatten()
+                n_fix += int(idx.numel())
+                w_ok = self.weights[torch.isfinite(self.weights)]
+                fill = w_ok.mean() if w_ok.numel() else 0.0
+                self.weights.reshape(self.n_voxels, self.num_structures)[idx] = fill
+                self._reset_optimizer_state(opt, self.weights, idx)
+            if not bool(torch.isfinite(self.basis.real).all() & torch.isfinite(self.basis.imag).all()):
+                bad = ~(torch.isfinite(self.basis.real) & torch.isfinite(self.basis.imag))
+                self.basis[bad] = 0.0
+                st = opt.state.get(self.basis, None)
+                if st:
+                    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                        if key in st:
+                            st[key].zero_()
+                n_fix += 1
+        return n_fix
 
     def _make_optimizer(self, lr: float, lr_weights: float):
         """Adam with a higher lr on the weights: with the basis L2-normalised,
@@ -741,6 +834,10 @@ class DiffractionTomography:
         Set ``progress=False`` to hide the bar; ``print_every>0`` also prints
         the loss every N iters.
         """
+        # record the geometry so simulate() can reproduce the predicted patterns
+        # with no arguments after reconstruction
+        self._scan_geometry = {"tilts_deg": list(tilts_deg), "scan_shape": tuple(scan_shape),
+                               "scan_step": scan_step, "scan_origin": scan_origin}
         pos = self.scan_positions(scan_shape, scan_step, scan_origin)
         n_row, n_col = pos.shape[:2]
         meas_amp = measurements.to(self.device).clamp_min(0).sqrt()
@@ -780,10 +877,11 @@ class DiffractionTomography:
                 total += float(tl.sum())
             mean_loss = total / n_dp
             losses.append(mean_loss)
-            if mean_loss < best["loss"]:
+            if np.isfinite(mean_loss) and mean_loss < best["loss"]:
                 best = {"loss": mean_loss, "snap": self._snapshot()}
 
             opt.step()
+            self._sanitize(opt, gen)     # repair NaN/Inf params (degenerate SVD backward)
 
             n_res = 0
             # the reset escapes stuck orientations; skip it when angles are frozen
