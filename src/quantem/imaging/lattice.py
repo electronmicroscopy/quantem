@@ -584,8 +584,8 @@ class Lattice(AutoSerialize):
 
         def _resolve_radius(value: float) -> float:
             """Convert a user-supplied radius value to pixels given radius_units."""
-            if not value > 0.0:
-                raise ValueError("Radius must be positive.")
+            if not value > 1.0:
+                raise ValueError("Radius must be atleast 1 px.")
             return float(value) * auto_r if radius_units == "auto" else float(value)
 
         # Disk radius for intensity measurement (in pixels)
@@ -1007,7 +1007,7 @@ class Lattice(AutoSerialize):
         # Fitting radius: auto-estimate or user-provided
         r_fit = (
             float(fit_radius)
-            if fit_radius is not None and fit_radius <= _auto_radius_px()
+            if fit_radius is not None and fit_radius <= _auto_radius_px() and fit_radius > 1.0
             else _auto_radius_px()
         )
 
@@ -1117,7 +1117,7 @@ class Lattice(AutoSerialize):
                 amp0 = max(float(np.max(patch[mask]) - bg0), 1e-6)
 
                 # Gaussian width: one-fourth the fitting radius (with safety floor)
-                sig0 = max(r_fit * 0.25, 0.5)
+                sig0 = max(r_fit * 0.5, 0.5)
 
                 # Extract coordinates of pixels in the mask
                 x_coords = II[mask].astype(float).ravel()
@@ -1166,7 +1166,7 @@ class Lattice(AutoSerialize):
                     x_ub,
                     y_ub,
                     pmax + (pmax - pmin),
-                    max(0.6 * r_fit if fit_radius is None else 1.5 * r_fit, 1.0),
+                    max(1.1 * r_fit if fit_radius is None else 1.5 * r_fit, 1.0),
                     pmax + (pmax - pmin),
                 ]
 
