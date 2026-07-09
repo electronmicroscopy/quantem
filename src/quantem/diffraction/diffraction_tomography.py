@@ -1,6 +1,6 @@
-"""Factorized diffraction tomography.
+"""Diffraction tomography.
 
-Replaces the explicit 6D structure-factor volume with a low-rank factorization:
+The object is represented compactly instead of as an explicit 6D structure-factor volume:
 
   * ``basis``   -- ``num_structures`` shared complex 3D k-space structure factors,
     shape ``[N_kz, N_ky, N_kx, N_weights]``, spherically band-limited.
@@ -43,7 +43,7 @@ from quantem.core.utils.utils import electron_wavelength_angstrom
 
 
 class DiffractionTomography:
-    """Factorized 6D diffraction tomography (see the module docstring).
+    """6D diffraction tomography (see the module docstring).
 
     The object is a set of shared 3D k-space bases, a per-voxel weight over
     those bases, and a per-voxel SO(3) orientation, in place of an explicit 6D
@@ -719,6 +719,8 @@ class DiffractionTomography:
         phase_only: bool = True,
         reset_every: int = 10,
         reset_fraction: float = 0.1,
+        reset_neighbor: float = 0.5,
+        reset_taper: bool = True,
         progress: bool = True,
         print_every: int = 0,
     ) -> dict:
@@ -727,10 +729,14 @@ class DiffractionTomography:
         Full-batch gradient (bounded memory, one tilt at a time) + amplitude
         (sqrt-intensity) loss, with a **bad-voxel reset** every ``reset_every``
         iters: the worst ``reset_fraction`` of voxels (by residual error carried
-        along their rays) get a fresh random orientation *and* a material-scale
-        weight -- the aggressive "orientation + weight jumps" that let stuck
-        voxels escape wrong orientations so the sparse Bragg solution can emerge.
-        The lowest-loss state seen is snapshotted and returned.
+        along their rays) get an orientation + weight jump so stuck voxels can
+        escape wrong orientations. Each flipped voxel either **adopts a random
+        real-space neighbor's orientation and weight** (probability
+        ``reset_neighbor`` -- grains are contiguous, so neighbor adoption grows
+        correctly-oriented regions) or takes a fresh random orientation with a
+        material-scale weight. With ``reset_taper`` the number flipped decreases
+        linearly to zero over the run (explore early, refine late). The
+        lowest-loss state seen is snapshotted and returned.
 
         Set ``progress=False`` to hide the bar; ``print_every>0`` also prints
         the loss every N iters.
@@ -782,19 +788,38 @@ class DiffractionTomography:
             n_res = 0
             # the reset escapes stuck orientations; skip it when angles are frozen
             if self.learn_angles and reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
-                # the worst voxels (by residual error along their rays) get a fresh
-                # random orientation AND a material-scale weight -- the aggressive
-                # jumps that let stuck voxels find the right orientation.
-                err_vox = Wmat.t() @ res_per_dp
-                n_res = max(1, int(round(reset_fraction * self.n_voxels)))
-                bad = torch.topk(err_vox, n_res).indices
-                with torch.no_grad():
-                    newM = torch.eye(3).reshape(1, 3, 3).repeat(n_res, 1, 1) \
-                        + 0.1 * torch.randn(n_res, 3, 3, generator=gen)
-                    self.angles.M[bad] = newM.to(self.device)
-                    self.weights.reshape(self.n_voxels, self.num_structures)[bad] = self.weights.mean()
-                    self._reset_optimizer_state(opt, self.angles.M, bad)
-                    self._reset_optimizer_state(opt, self.weights, bad)
+                # the worst voxels (by residual error along their rays) get an
+                # orientation + weight jump: adopt a random real-space neighbor
+                # (grain growth) or take a fresh random orientation. The number
+                # flipped tapers to zero over the run (explore early, refine late).
+                taper = (1.0 - it / num_iters) if reset_taper else 1.0
+                n_res = int(round(reset_fraction * self.n_voxels * taper))
+                if n_res > 0:
+                    err_vox = Wmat.t() @ res_per_dp
+                    bad = torch.topk(err_vox, n_res).indices
+                    Nz, Ny, Nx = self.real_shape
+                    with torch.no_grad():
+                        Wf = self.weights.reshape(self.n_voxels, self.num_structures)
+                        w_mean = self.weights.mean()
+                        for v in bad.tolist():
+                            if float(torch.rand(1, generator=gen)) < reset_neighbor:
+                                # adopt a random in-bounds 6-neighbor's orientation + weight
+                                iz, iy, ix = v // (Ny * Nx), (v // Nx) % Ny, v % Nx
+                                nbrs = [(iz + dz, iy + dy, ix + dx)
+                                        for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                                                           (0, -1, 0), (0, 0, 1), (0, 0, -1))
+                                        if 0 <= iz + dz < Nz and 0 <= iy + dy < Ny and 0 <= ix + dx < Nx]
+                                jz, jy, jx = nbrs[int(torch.randint(len(nbrs), (1,), generator=gen))]
+                                nb = (jz * Ny + jy) * Nx + jx
+                                self.angles.M[v] = self.angles.M[nb] \
+                                    + 0.02 * torch.randn(3, 3, generator=gen).to(self.device)
+                                Wf[v] = Wf[nb]
+                            else:
+                                self.angles.M[v] = (torch.eye(3)
+                                                    + 0.1 * torch.randn(3, 3, generator=gen)).to(self.device)
+                                Wf[v] = w_mean
+                        self._reset_optimizer_state(opt, self.angles.M, bad)
+                        self._reset_optimizer_state(opt, self.weights, bad)
             if print_every and (it % print_every == 0 or it == num_iters - 1):
                 print(f"  it {it:4d}  loss {mean_loss:.4e}  best {best['loss']:.4e}"
                       + (f"  reset {n_res}" if n_res else ""), flush=True)
@@ -803,7 +828,38 @@ class DiffractionTomography:
         if best["snap"] is not None:
             self._restore(best["snap"])              # return the best-ever state
         self.normalize_gauge()                        # physical unit-norm bases (fit unchanged)
+        self.losses = losses
+        self.best_loss = best["loss"]
         return {"losses": losses, "best_loss": best["loss"],
                 "basis": self.masked_basis().detach(),
                 "weights": self.weights.detach(),
                 "rotations": self.rotation_matrices().detach()}
+
+    def plot_loss(self, figsize: tuple[float, float] = (5.5, 3.4)):
+        """Semilog plot of the most recent reconstruction's loss history.
+
+        Parameters
+        ----------
+        figsize : tuple[float, float], default (5.5, 3.4)
+            Figure size in inches.
+
+        Returns
+        -------
+        fig, ax
+            The matplotlib figure and axis.
+        """
+        import matplotlib.pyplot as plt
+
+        losses = getattr(self, "losses", None)
+        if not losses:
+            raise RuntimeError("No loss history -- run reconstruct() first.")
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        ax.semilogy(np.arange(len(losses)), losses, "-", color="C0")
+        ax.axhline(self.best_loss, color="C1", lw=1.0, ls="--", label="best")
+        ax.set_xlabel("iteration")
+        ax.set_ylabel("mean amplitude MSE")
+        ax.xaxis.get_major_locator().set_params(integer=True)
+        ax.set_title("reconstruction loss")
+        ax.legend(loc="upper right", fontsize=8)
+        plt.show()
+        return fig, ax

@@ -22,7 +22,7 @@ import torch
 
 
 def show_diffraction_tilts(series, tilts, labels=None, probe_step=1,
-                           origin_radius=2, kpow=2, power=0.5):
+                           origin_radius=2, kpow=0, power=0.5):
     """Build the tilt-series viewer.
 
     Parameters
@@ -40,8 +40,11 @@ def show_diffraction_tilts(series, tilts, labels=None, probe_step=1,
     origin_radius : int, default 2
         Initial radius (detector pixels) of the central region excluded when
         setting the intensity scale (the direct beam).
-    kpow : int, default 2
+    kpow : int, default 0
         Initial radial weighting ``|k|**kpow`` applied for display (0/1/2).
+        Off by default -- multiplying the image by ``|k|**2`` distorts the
+        (few-pixel) probe disk and Bragg spots; the off-origin display range
+        already handles the direct beam.
     power : float, default 0.5
         Initial display power law.
 
