@@ -1271,10 +1271,12 @@ class DiffractionTomography:
         phase_only: bool = True,
         nonneg_weights: bool = False,
         shrink_weights: float = 0.0,
+        smooth_weights: float = 0.0,
         shrink_basis: float = 0.0,
         basis_topk: int | None = None,
         angle_smooth: float = 0.0,
         reset_every: int = 10,
+        reset_protect_vacuum: bool = True,
         reset_fraction: float = 0.1,
         reset_neighbor: float = 0.5,
         reset_taper: bool = True,
@@ -1402,6 +1404,22 @@ class DiffractionTomography:
                             mask = self.basis[..., s].abs() >= thr
                             self.basis[..., s] *= mask
                         self.basis[0, 0, 0, s] = keep_origin
+            if smooth_weights > 0.0:
+                # real-space coherence on the WEIGHT field only (angles are
+                # discontinuous at grain boundaries and must not be smoothed):
+                # separable 3-tap Gaussian into the 6 neighbors each step.
+                with torch.no_grad():
+                    wgt = float(np.exp(-1.0 / (2.0 * smooth_weights ** 2)))
+                    norm = 1.0 + 2.0 * wgt
+                    W = self.weights
+                    for axis in range(3):
+                        n = W.shape[axis]
+                        if n < 2:
+                            continue
+                        idx_p = torch.arange(-1, n - 1, device=W.device).clamp(min=0)
+                        idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
+                        W.copy_((wgt * W.index_select(axis, idx_p) + W
+                                 + wgt * W.index_select(axis, idx_n)) / norm)
             if shrink_basis > 0.0 and self.learn_basis:
                 # proximal L1 on the basis' off-origin content: a structure
                 # factor is a few sharp Bragg spots, so soft-thresholding kills
@@ -1426,6 +1444,13 @@ class DiffractionTomography:
                 n_res = int(round(reset_fraction * self.n_voxels * taper))
                 if n_res > 0:
                     err_vox = Wmat.t() @ res_per_dp
+                    if reset_protect_vacuum:
+                        # settled vacuum voxels (near-zero weight) are doing
+                        # their job -- strongly de-prioritize flipping them, so
+                        # the jumps concentrate on misfit MATERIAL voxels.
+                        wmag = self.weights.detach().abs().sum(-1).flatten()
+                        vac = wmag < 0.15 * wmag.max().clamp_min(1e-30)
+                        err_vox = err_vox * torch.where(vac, 0.2, 1.0)
                     bad = torch.topk(err_vox, n_res).indices
                     Nz, Ny, Nx = self.real_shape
                     with torch.no_grad():
