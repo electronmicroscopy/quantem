@@ -363,6 +363,7 @@ class Lattice(AutoSerialize):
         mask=None,
         contrast_min=None,
         annulus_radii=None,
+        radius_units: str = "px",
         **kwargs,
     ) -> "Lattice":
         """
@@ -403,6 +404,23 @@ class Lattice(AutoSerialize):
         annulus_radii : tuple of float, optional
             Inner and outer radii (in pixels) of the background annulus used for contrast estimation.
             If None, defaults to (1.5 * intensity_radius, 3.0 * intensity_radius).
+        radius_units : {"px", "auto"}, default "px"
+            Units for `intensity_radius` and `annulus_radii`.
+            - "px": values are absolute pixel radii (previous behavior).
+            - "auto": values are multipliers of the automatic radius estimate
+              (`_auto_radius_px()`), which is defined as half the distance to the
+              nearest neighboring atom site (in pixels). For example,
+              intensity_radius=0.8 with radius_units="auto" resolves to
+              0.8 * _auto_radius_px(), i.e. 40% of the nearest-neighbor spacing.
+            This only affects how intensity_radius and annulus_radii are interpreted when
+            provided; it has no effect when both are left as None, since the automatic
+            defaults already derive from _auto_radius_px().
+
+        Raises
+        ------
+        ValueError
+            If a provided mask does not match the image shape (H, W), or if radius_units
+            is not one of "px" or "auto".
 
         Returns
         -------
@@ -459,6 +477,9 @@ class Lattice(AutoSerialize):
             raise ValueError(
                 "Lattice vectors have not been fitted. Please call define_lattice_vectors() first."
             )
+
+        if radius_units not in ("px", "auto"):
+            raise ValueError(f"radius_units must be 'px' or 'auto', got {radius_units!r}")
 
         # Initialize fractional positions and metadata
 
@@ -557,11 +578,53 @@ class Lattice(AutoSerialize):
 
         # SETUP DETECTION PARAMETERS
 
+        # Resolve the automatic radius once so both intensity and annulus scaling
+        # (in "auto" mode) share a consistent reference value.
+        auto_r = _auto_radius_px()
+
+        def _resolve_radius(value: float) -> float:
+            """Convert a user-supplied radius value to pixels given radius_units."""
+            if not value > 0.0:
+                raise ValueError("Radius must be positive.")
+            return float(value) * auto_r if radius_units == "auto" else float(value)
+
         # Disk radius for intensity measurement (in pixels)
-        r_px = float(intensity_radius) if intensity_radius is not None else _auto_radius_px()
+        if intensity_radius is not None:
+            r_px = _resolve_radius(intensity_radius)
+        else:
+            r_px = 0.8 * auto_r
 
         # Annulus radii for background contrast measurement (in pixels)
-        rin, rout = (1.0 * r_px, 1.5 * r_px) if annulus_radii is None else annulus_radii
+        if annulus_radii is None:
+            rin, rout = 1.0 * auto_r, 1.7 * auto_r
+        else:
+            rin_raw, rout_raw = annulus_radii
+            rin, rout = _resolve_radius(rin_raw), _resolve_radius(rout_raw)
+
+        # Sanity checks for radii
+        if not rin < rout:
+            if rin - rout < 1:  # Floating point equality check for pixel values
+                raise ValueError("annulus_radii cannot be equal.")
+            # Swap
+            temp = rin
+            rin = rout
+            rout = temp
+        if not r_px <= rin and r_px < rout:
+            raise ValueError("intensity_radius must be smaller than or equal to annulus_radii.")
+        # Range check
+        if r_px / auto_r > 1.0:
+            import warnings
+
+            warnings.warn(
+                "intensity_radius is larger than half the interatomic separation. Can lead to potential errors."
+            )
+        if rout / auto_r > 2.0:
+            import warnings
+
+            warnings.warn(
+                "Outer annulus radius is larger than interatomic separation. Background may include other atoms. Can lead to potential errors."
+            )
+        # Creating warnings instead of raising errors, as hard caps are difficult to enforce for different datasets
 
         # Precompute integer pixel ranges for disk and annulus (used in neighbor lookups)
         R_disk = int(np.ceil(r_px))

@@ -274,7 +274,7 @@ class TestLatticeAtoms:
             edge_min_dist_px=5,
             mask=mask,
             contrast_min=0.2,
-            annulus_radii=(3, 6),
+            annulus_radii=(5, 10),
         )
 
         assert result is simple_lattice
@@ -343,7 +343,7 @@ class TestLatticeAtoms:
             edge_min_dist_px=5,
             mask=mask,
             contrast_min=0.2,
-            annulus_radii=(3, 6),
+            annulus_radii=(5, 10),
         ).refine_atoms(
             fit_radius=15.0,
             max_nfev=250,
@@ -370,7 +370,7 @@ class TestLatticeAtoms:
             edge_min_dist_px=5,
             mask=mask,
             contrast_min=0.2,
-            annulus_radii=(3, 6),
+            annulus_radii=(5, 10),
             refine_atoms=True,
             fit_radius=15.0,
             max_nfev=250,
