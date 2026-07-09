@@ -36,9 +36,35 @@ class PtychographyPRISM(Ptychography):
     effective CTF before the ifft2), matching the conventional engine's speed; the
     per-parent machinery below only runs for multislice objects.
 
-    Memory knobs (all settable via ``reconstruct``; multislice path only):
-    - ``batch_size``: scan positions per batch (inherited).
-    - ``parent_batch_size``: parent beams reduced per chunk.
+    When PRISM pays off
+    -------------------
+    The parent multislice propagates all P parent beams through the *full* (padded)
+    object, which is much larger than a conventional per-position ROI propagation,
+    and it re-runs every batch (the object updates per batch). So the two costs are
+    the parent multislice (``num_batches x P x num_slices`` full-object FFTs) and the
+    reduction (``P x num_positions`` ROI FFTs). PRISM beats conventional multislice
+    when these amortize:
+    - **Large batches** — the full-object parent multislice is shared across all
+      positions in a batch, so it only amortizes when ``batch_size`` is large
+      (roughly above ``P x object_area / roi_area``). Small batches on a large field
+      of view are the pathological case (a warning is emitted).
+    - **Frozen scan positions** — the reduction kernels are then deduplicated to the
+      unique sub-pixel offsets (one per commensurate scan), collapsing the reduction
+      FFTs from ``P x num_positions`` to ``P x num_unique_offsets``.
+    - **Many slices / mixed states** — the parent multislice is independent of the
+      number of probe modes, so it amortizes over modes as well as positions.
+    Conversely, a single mode with few slices, small batches, and learnable positions
+    is conventional multislice's sweet spot; use it there. P scales as ``1 /
+    interpolation_factor^2`` and grows with the ROI, so raise ``interpolation_factor``
+    for large ROIs.
+
+    Memory / performance knobs (all settable via ``reconstruct``; multislice path only):
+    - ``batch_size``: scan positions per batch (inherited). Large is best for PRISM.
+    - ``parent_batch_size``: parent beams propagated/reduced per chunk.
+    - ``position_batch_size``: scan positions reduced at a time within a batch; bounds
+      the peak (parents x positions x roi) tensor so a large ``batch_size`` fits.
+    - ``position_quantization``: with frozen positions, round sub-pixel offsets to
+      ``1/Q`` px to bound the number of unique reduction kernels for rotated scans.
     - ``use_checkpointing``: recompute each parent chunk during backward instead
       of retaining its activations (~halves peak memory at ~2x forward compute).
 
@@ -46,15 +72,15 @@ class PtychographyPRISM(Ptychography):
     over the total thickness (refocused to the entrance plane). This is a pure
     k-space phase in the far field — intensity-neutral in the dense limit — but it
     removes the thickness-dependent quadratic phase across parents, which is what
-    keeps the parent-beam interpolation accurate for thick specimens. PRISM
-    amortizes the per-batch multislice of the parent beams best with large
-    (ideally full) batch sizes.
+    keeps the parent-beam interpolation accurate for thick specimens.
     """
 
     _supports_prism_probe = True
 
     # class-level defaults so objects loaded from file (which skip __init__) behave
     parent_batch_size: int | None = None
+    position_batch_size: int | None = None
+    position_quantization: int | None = None
     use_checkpointing: bool = False
 
     @classmethod
@@ -105,6 +131,8 @@ class PtychographyPRISM(Ptychography):
         constraints: dict[str, Any] | None = None,
         batch_size: int | None = None,
         parent_batch_size: int | None = None,
+        position_batch_size: int | None = None,
+        position_quantization: int | None = None,
         use_checkpointing: bool | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
@@ -119,6 +147,17 @@ class PtychographyPRISM(Ptychography):
 
         parent_batch_size : int | None
             Number of parent beams propagated/reduced per chunk (None = all at once).
+        position_batch_size : int | None
+            Number of scan positions reduced at a time within a batch (None = all at
+            once). Bounds the peak (parents x positions x roi) reduction tensor so a
+            large ``batch_size`` can be used to amortize the per-batch parent
+            multislice without running out of memory.
+        position_quantization : int | None
+            When scan positions are frozen, round each fractional (sub-pixel) offset to
+            ``1 / position_quantization`` of a pixel before deduplicating the reduction
+            kernels, bounding the number of unique offsets to at most its square (max
+            error ``1 / (2 * position_quantization)`` px). None keeps exact offsets
+            (grid-commensurate scans already collapse to a single kernel).
         use_checkpointing : bool
             Gradient-checkpoint each parent chunk (recomputed during backward).
         """
@@ -129,8 +168,14 @@ class PtychographyPRISM(Ptychography):
 
         if parent_batch_size is not None:
             self.parent_batch_size = int(parent_batch_size)
+        if position_batch_size is not None:
+            self.position_batch_size = int(position_batch_size)
+        if position_quantization is not None:
+            self.position_quantization = int(position_quantization)
         if use_checkpointing is not None:
             self.use_checkpointing = bool(use_checkpointing)
+
+        self._warn_if_slow_config(batch_size)
 
         return super().reconstruct(
             num_iters=num_iters,
@@ -146,6 +191,27 @@ class PtychographyPRISM(Ptychography):
             loss_type=loss_type,
             num_workers=num_workers,
         )
+
+    def _warn_if_slow_config(self, batch_size: int | None) -> None:
+        """Warn when the PRISM forward will not amortize (large field of view + small
+        batch): the full-object parent multislice re-runs every batch, so it only pays
+        off above ``P x object_area / roi_area`` positions per batch."""
+        if self.num_slices == 1:
+            return
+        bs = batch_size if batch_size is not None else getattr(self, "batch_size", None)
+        if not bs:
+            return
+        num_parent = self.probe_model.num_parent_beams
+        obj_ratio = float(np.prod(self.obj_shape_full[-2:]) / np.prod(self.roi_shape))
+        crossover = num_parent * obj_ratio
+        if bs < crossover:
+            self.vprint(
+                f"Warning: PRISM re-propagates {num_parent} parent beams through the full "
+                f"object every batch; with batch_size={bs} (< ~{crossover:.0f}) this multislice "
+                "is not amortized and will likely be slower than conventional multislice. "
+                "Prefer a larger batch_size, a larger interpolation_factor (fewer parents), or "
+                "frozen scan positions (enables the deduplicated reduction)."
+            )
 
     @property
     def probe_model(self) -> ProbePRISM:
@@ -201,24 +267,15 @@ class PtychographyPRISM(Ptychography):
             transmission = obj
 
         self._compute_object_propagators()
-        beamlets_fft, position_coefs = self.probe_model.forward(fract_positions)
+        # Build one reduction kernel per *unique* sub-pixel offset when the scan is
+        # frozen (positions reused across the scan), else one per position.
+        unique_fracs, offset_ids = self._reduction_offsets(fract_positions)
+        beamlets_fft, position_coefs = self.probe_model.forward(unique_fracs)
 
         if self.num_slices == 1:
-            # Fast path: without propagation every parent wave reduces to the
-            # transmission function, so the parent sum folds into a single
-            # effective CTF before the ifft2 — one FFT per position instead of
-            # one per (parent, position). Mathematically identical (gradients
-            # to aberrations and beam coefficients flow through the sum).
-            transmission_flat = transmission.reshape(1, -1)
-            obj_patches = torch.complex(
-                transmission_flat.real[:, patch_indices],
-                transmission_flat.imag[:, patch_indices],
-            )  # (1, batch, *roi_shape)
-            probes = torch.fft.ifft2(beamlets_fft.sum(dim=1)[:, None] * position_coefs[None])
-            window = self.probe_model.coefficient_window
-            if window is not None:  # classic 'nearest' scheme: crop the ghost copies
-                probes = probes * window
-            exit_waves = obj_patches * probes
+            exit_waves = self._reduce_single_slice(
+                transmission, beamlets_fft, position_coefs, offset_ids, patch_indices
+            )
         else:
             parent_wave_vectors = self.probe_model.parent_wave_vectors
             num_parent = parent_wave_vectors.shape[0]
@@ -231,6 +288,7 @@ class PtychographyPRISM(Ptychography):
                     parent_wave_vectors[start:end],
                     beamlets_fft[:, start:end],
                     position_coefs,
+                    offset_ids,
                     patch_indices,
                 )
                 if self.use_checkpointing and torch.is_grad_enabled():
@@ -245,35 +303,114 @@ class PtychographyPRISM(Ptychography):
             exit_waves = exit_waves * shifts[None]
         return exit_waves
 
+    def _reduction_offsets(
+        self, fract_positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Sub-pixel offsets to build reduction kernels for, plus the per-position index
+        into them.
+
+        Frozen scans reuse a small set of unique offsets (``offset_ids`` maps each
+        position to its kernel), collapsing the O(P x positions) reduction FFTs to
+        O(P x unique); grid-commensurate scans reduce to a single kernel. Learnable
+        scans keep per-position offsets (``offset_ids is None``) so the analytic
+        position phases stay differentiable.
+        """
+        if self.dset.learn_scan_positions:
+            return fract_positions, None
+        fracs = fract_positions.detach()
+        if self.position_quantization:
+            q = float(self.position_quantization)
+            fracs = torch.round(fracs * q) / q
+        else:  # round to a tight tolerance so exactly-equal offsets group
+            fracs = torch.round(fracs * 1.0e6) / 1.0e6
+        unique, inverse = torch.unique(fracs, dim=0, return_inverse=True)
+        return unique.to(fract_positions.dtype), inverse
+
+    def _position_chunks(self, batch: int):
+        yield from generate_batches(batch, max_batch=self.position_batch_size or batch)
+
+    def _reduce_single_slice(
+        self,
+        transmission: torch.Tensor,
+        beamlets_fft: torch.Tensor,
+        position_coefs: torch.Tensor,
+        offset_ids: torch.Tensor | None,
+        patch_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-slice fast path: the parent sum folds into one effective aperture, so
+        the reduction is one FFT per (unique) offset instead of per (parent, position)."""
+        eff = beamlets_fft.sum(dim=1)  # (num_probes, *roi_shape)
+        transmission_flat = transmission.reshape(1, -1)
+        window = self.probe_model.coefficient_window
+        batch = patch_indices.shape[0]
+
+        probe_unique = None
+        if offset_ids is not None:  # frozen: one probe per unique offset, reused
+            probe_unique = torch.fft.ifft2(eff[:, None] * position_coefs[None])
+            if window is not None:
+                probe_unique = probe_unique * window
+
+        chunks = []
+        for p0, p1 in self._position_chunks(batch):
+            if probe_unique is not None:
+                probes = probe_unique[:, offset_ids[p0:p1]]
+            else:
+                probes = torch.fft.ifft2(eff[:, None] * position_coefs[p0:p1][None])
+                if window is not None:
+                    probes = probes * window
+            obj_patches = torch.complex(
+                transmission_flat.real[:, patch_indices[p0:p1]],
+                transmission_flat.imag[:, patch_indices[p0:p1]],
+            )  # (1, pos_chunk, *roi_shape)
+            chunks.append(obj_patches * probes)
+        return torch.cat(chunks, dim=1)
+
     def _reduce_parent_chunk(
         self,
         transmission: torch.Tensor,
         parent_wave_vectors: torch.Tensor,
         beamlets_fft: torch.Tensor,
         position_coefs: torch.Tensor,
+        offset_ids: torch.Tensor | None,
         patch_indices: torch.Tensor,
     ) -> torch.Tensor:
         """Propagate a chunk of parent waves and reduce them to ROI exit waves.
 
-        The checkpointable unit: gathers ROI patches of the propagated parent
-        waves *before* the reduction, so no full-object per-position tensor is
-        ever materialized.
+        The checkpointable unit: propagates the chunk once, then reduces the scan
+        positions in sub-chunks (``position_batch_size``), gathering ROI patches of the
+        propagated parents before the reduction so no full-object per-position tensor is
+        materialized. When the scan is frozen the per-parent coefficient maps are built
+        once per unique offset and reused across positions.
         """
         propagated = self._propagate_parent_waves(parent_wave_vectors, transmission)
         propagated_flat = propagated.reshape(propagated.shape[0], -1)
-        # MPS does not support complex gather kernels
-        patches = torch.complex(
-            propagated_flat.real[:, patch_indices],
-            propagated_flat.imag[:, patch_indices],
-        )  # (chunk, batch, *roi_shape)
-
-        coef_maps = torch.fft.ifft2(
-            beamlets_fft[:, :, None] * position_coefs[None, None]
-        )  # (num_probes, chunk, batch, *roi_shape)
         window = self.probe_model.coefficient_window
-        if window is not None:  # classic 'nearest' scheme: crop the ghost copies
-            coef_maps = coef_maps * window
-        return (coef_maps * patches[None]).sum(dim=1)
+        batch = patch_indices.shape[0]
+
+        coef_unique = None
+        if offset_ids is not None:  # frozen: coef maps per unique offset, reused
+            coef_unique = torch.fft.ifft2(beamlets_fft[:, :, None] * position_coefs[None, None])
+            if window is not None:
+                coef_unique = coef_unique * window
+
+        chunks = []
+        for p0, p1 in self._position_chunks(batch):
+            # MPS does not support complex gather kernels
+            patches = torch.complex(
+                propagated_flat.real[:, patch_indices[p0:p1]],
+                propagated_flat.imag[:, patch_indices[p0:p1]],
+            )  # (parent_chunk, pos_chunk, *roi_shape)
+            if coef_unique is not None:
+                coef_maps = coef_unique[:, :, offset_ids[p0:p1]]
+            else:
+                coef_maps = torch.fft.ifft2(
+                    beamlets_fft[:, :, None] * position_coefs[p0:p1][None, None]
+                )
+                if window is not None:
+                    coef_maps = coef_maps * window
+            # (num_probes, parent_chunk, pos_chunk, *roi_shape) x patches -> sum parents
+            chunks.append((coef_maps * patches[None]).sum(dim=1))
+        return torch.cat(chunks, dim=1)
 
     def _propagate_parent_waves(
         self, parent_wave_vectors: torch.Tensor, transmission: torch.Tensor
