@@ -5,7 +5,7 @@ import numpy as np
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.patches import FancyArrowPatch
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 from quantem.core.visualization.visualization_utils import ScalebarConfig, add_scalebar_to_ax
 
@@ -31,6 +31,9 @@ def plot_strain_panels(
     cmap_strain: str = "RdBu_r",
     cmap_rotation: str = "PiYG",
     layout: str = "horizontal",
+    rotate_strain: bool = False,
+    rotate_title: bool = False,
+    plot_dilation: bool = False,
     figsize: tuple[float, float] | None = None,
     panel_titles: tuple[str, str, str] | None = None,
     **kwargs,
@@ -69,6 +72,11 @@ def plot_strain_panels(
 
     ncols = 4 if plot_rotation else 3
     is_horizontal = layout == "horizontal"
+    if plot_dilation:
+        ncols=3
+        plot_rotation = True
+
+    n_strain = 2 if plot_dilation else 3
 
     if figsize is None:
         figsize = (8, 3) if is_horizontal else (6, 6)
@@ -105,26 +113,54 @@ def plot_strain_panels(
     evv_disp = _roi_compose(norm_strain(evv_pct), cm_strain)
     euv_disp = _roi_compose(norm_strain(euv_pct), cm_strain)
 
-    title_fs = 16
-    ax[0].imshow(euu_disp * mask[:, :, np.newaxis])
-    ax[1].imshow(evv_disp * mask[:, :, np.newaxis])
-    ax[2].imshow(euv_disp * mask[:, :, np.newaxis])
+    if rotate_strain:
+        euu_disp = euu_disp.transpose(1,0,2)
+        evv_disp = evv_disp.transpose(1,0,2)
+        euv_disp = euv_disp.transpose(1,0,2)
+        mask = mask.T
+    
+    if plot_dilation:
+        etot_pct = (e_uu + e_vv) * 100
+        etot_disp = _roi_compose(norm_strain(etot_pct), cm_strain)
+        if rotate_strain:
+            etot_disp = etot_disp.transpose(1,0,2)
+        ax[0].imshow(euu_disp * mask[:, :, np.newaxis])
+        ax[1].imshow(euv_disp * mask[:, :, np.newaxis])
+    else:
+        ax[0].imshow(euu_disp * mask[:, :, np.newaxis])
+        ax[1].imshow(evv_disp * mask[:, :, np.newaxis])
+        ax[2].imshow(euv_disp * mask[:, :, np.newaxis])
 
-    if panel_titles is None:
+    ref_dim = figsize[1] if is_horizontal else figsize[0]
+    fs_threshold = 3.0
+    fs_scale = min(1.0, max(0.5, ref_dim / fs_threshold))
+    title_fs = 16 * fs_scale
+    tick_fs = 12 * fs_scale
+    title_val = 'vertical' if rotate_title else 'horizontal'
+    if panel_titles is None and not plot_dilation:
         panel_titles = (
             r"$\epsilon_{uu}$ $\updownarrow$",
             r"$\epsilon_{vv}$ $\leftrightarrow$",
-            r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
+            r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\searrow$",
         )
-    ax[0].set_title(panel_titles[0], fontsize=title_fs)
-    ax[1].set_title(panel_titles[1], fontsize=title_fs)
-    ax[2].set_title(panel_titles[2], fontsize=title_fs)
+        ax[0].set_title(panel_titles[0], fontsize=title_fs, rotation=title_val)
+        ax[1].set_title(panel_titles[1], fontsize=title_fs, rotation=title_val)
+        ax[2].set_title(panel_titles[2], fontsize=title_fs, rotation=title_val)
+    if plot_dilation and panel_titles is None:
+        panel_titles = (
+            r"$\epsilon_{uu} + \epsilon_{vv}$",
+            r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
+            ""
+        )
+        ax[0].set_title(panel_titles[0], fontsize=title_fs, rotation=title_val)
+        ax[1].set_title(panel_titles[1], fontsize=title_fs, rotation=title_val)
 
     if plot_rotation:
         norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
         rot_disp = _roi_compose(norm_rot(rot_deg), cm_rot)
-        ax[3].imshow(rot_disp * mask[:, :, np.newaxis])
-        ax[3].set_title(r"Rotation $\circlearrowleft$", fontsize=title_fs)
+        if rotate_strain: rot_disp = rot_disp.transpose(1,0,2)
+        ax[-1].imshow(rot_disp * mask[:, :, np.newaxis])
+        ax[-1].set_title(r"Rotation $\circlearrowleft$", fontsize=title_fs, rotation=title_val)
 
     for a in ax:
         a.set_xticks([])
@@ -168,6 +204,7 @@ def plot_strain_panels(
 
     cb_size = 0.02
     cb_pad = 0.03
+    cb_min_len = 0.16
 
     def _finalize_layout():
         # set_aspect("equal") only resizes/recenters each panel at draw time, so
@@ -189,19 +226,22 @@ def plot_strain_panels(
         if plot_rotation:
             # nudge the rotation panel right for a visual gap from the strain panels;
             # 0.03 stays inside the reserved right band so nothing is clipped.
-            pos3 = ax[3].get_position()
-            ax[3].set_position([pos3.x0 + 0.03, pos3.y0, pos3.width, pos3.height])
+            pos3 = ax[-1].get_position()
+            ax[-1].set_position([pos3.x0 + 0.03, pos3.y0, pos3.width, pos3.height])
         _finalize_layout()
 
         cb_orientation = "horizontal"
         b0 = ax[0].get_position()
-        b2 = ax[2].get_position()
+        b2 = ax[n_strain - 1].get_position()
         cb_y = b2.y0 - cb_pad - cb_size
         strain_cb_pos = [b0.x0, cb_y, b2.x1 - b0.x0, cb_size]
 
         if plot_rotation:
-            b3 = ax[3].get_position()
-            rot_cb_pos = [b3.x0, cb_y, b3.x1 - b3.x0, cb_size]
+            b3 = ax[-1].get_position()
+            rot_cb_w = max(b3.x1 - b3.x0, cb_min_len)
+            rot_cb_cx = 0.5 * (b3.x0 + b3.x1)
+            rot_cb_x0 = min(max(rot_cb_cx - 0.5 * rot_cb_w, 0.0), 0.99 - rot_cb_w)
+            rot_cb_pos = [rot_cb_x0, cb_y, rot_cb_w, cb_size]
             last_pos = b3
         else:
             rot_cb_pos = None
@@ -214,12 +254,15 @@ def plot_strain_panels(
 
         cb_orientation = "vertical"
         b0 = ax[0].get_position()
-        b2 = ax[2].get_position()
+        b2 = ax[n_strain - 1].get_position()
         strain_cb_pos = [b0.x1 + cb_pad, b2.y0, cb_size, b0.y1 - b2.y0]
 
         if plot_rotation:
-            b3 = ax[3].get_position()
-            rot_cb_pos = [b0.x1 + cb_pad, b3.y0, cb_size, b3.y1 - b3.y0]
+            b3 = ax[-1].get_position()
+            rot_cb_h = max(b3.y1 - b3.y0, cb_min_len)
+            rot_cb_cy = 0.5 * (b3.y0 + b3.y1)
+            rot_cb_y0 = min(max(rot_cb_cy - 0.5 * rot_cb_h, 0.0), 0.99 - rot_cb_h)
+            rot_cb_pos = [b0.x1 + cb_pad, rot_cb_y0, cb_size, rot_cb_h]
             last_pos = b3
         else:
             rot_cb_pos = None
@@ -231,7 +274,7 @@ def plot_strain_panels(
     cbar1.set_label("Strain", fontsize=title_fs)
     cbar1.formatter = FuncFormatter(lambda v, _pos: f"{v:g}%")
     cbar1.update_ticks()
-    cbar1.ax.tick_params(labelsize=12)
+    cbar1.ax.tick_params(labelsize=tick_fs)
 
     if plot_rotation and rot_cb_pos is not None:
         cax2 = fig.add_axes(rot_cb_pos)
@@ -239,8 +282,9 @@ def plot_strain_panels(
         cbar2 = fig.colorbar(sm_rot, cax=cax2, orientation=cb_orientation)
         cbar2.set_label("Rotation", fontsize=title_fs)
         cbar2.formatter = FuncFormatter(lambda v, _pos: f"{v:g}°")
+        cbar2.locator = MaxNLocator(nbins=2)
         cbar2.update_ticks()
-        cbar2.ax.tick_params(labelsize=12)
+        cbar2.ax.tick_params(labelsize=tick_fs)
 
     if plot_gvecs:
         if u_ref is None or v_ref is None:

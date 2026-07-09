@@ -917,7 +917,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
                 total_loss = per_sample_loss.sum()
 
-                grads_list = list(torch.autograd.grad(total_loss, list(stacked.values())))
+                grads_list = list(torch.autograd.grad(total_loss, list(stacked.values()), allow_unused=True))
 
                 # Apply trainability masks: zero out per-sample gradient entries
                 # for frozen samples/params before the Adam step.
@@ -1274,15 +1274,18 @@ class _BatchedPlan:
         self.origin: OriginND | None = None
         self.disk: DiskTemplate | None = None
         self.dcbg: DCBackground | None = None
-        self.gaussbg: GaussianBackground | None = None
-        self.lat: SyntheticDiskLattice | None = None
         self.disk_idx: int | None = None
         self.dcbg_idx: int | None = None
-        self.gaussbg_idx: int | None = None
-        self.lat_idx: int | None = None
         self.lrs: dict[str, float] = {}
         self.scheduler_specs: dict[str, dict[str, Any]] = {}
         self.component_keys: dict[str, list[str]] = {}
+        self.lats: list[SyntheticDiskLattice] = []
+        self.lat_idxs: list[int] = []
+        self.lat_names: list[str] = []
+        self.lat_disk_key: dict[str, str] = {}
+        self.gaussbgs: list[GaussianBackground] = []
+        self.gaussbg_idxs: list[int] = []
+        self.gaussbg_names: list[str] = []
         
         self._trainable_flags: dict[str, bool] = {}
 
@@ -1303,12 +1306,12 @@ class _BatchedPlan:
             elif isinstance(comp, DCBackground) and self.dcbg is None:
                 self.dcbg = comp
                 self.dcbg_idx = idx
-            elif isinstance(comp, GaussianBackground) and self.gaussbg is None:
-                self.gaussbg = comp
-                self.gaussbg_idx = idx
-            elif isinstance(comp, SyntheticDiskLattice) and self.lat is None:
-                self.lat = comp
-                self.lat_idx = idx
+            elif isinstance(comp, GaussianBackground) :
+                self.gaussbgs.append(comp)
+                self.gaussbg_idxs.append(idx)
+            elif isinstance(comp, SyntheticDiskLattice):
+                self.lats.append(comp)
+                self.lat_idxs.append(idx)  
             else:
                 raise TypeError(
                     f"Batched fit does not yet support component type {type(comp).__name__} "
@@ -1344,55 +1347,93 @@ class _BatchedPlan:
             self.component_keys[name] = ["dcbg.intensity_raw"]
             self.component_keys[self.dcbg.__class__.__name__] = list(self.component_keys[name])
             
-        if self.gaussbg is not None and self.gaussbg_idx is not None:
-            lr = _lr_for_component(self.gaussbg, self.gaussbg_idx, optimizer_params, model)
-            name = model._component_constraint_name(self.gaussbg, self.gaussbg_idx)
-            gaussbg_keys: list[str] = []
+        if self.gaussbgs:
+            seen_prefixes: set[str] = set()
+            for gaussbg, gaussbg_idx in zip(self.gaussbgs, self.gaussbg_idxs):
+                lr = _lr_for_component(gaussbg, gaussbg_idx, optimizer_params, model)
+                canonical_name = model._component_constraint_name(gaussbg, gaussbg_idx)
+                key_prefix = "gaussbg" if len(self.gaussbgs) == 1 else canonical_name
+                if key_prefix in seen_prefixes:
+                    raise ValueError(
+                        f"Multiple GaussianBackground components resolve to the same name "
+                        f"'{key_prefix}'. Pass a distinct name=... to each GaussianBackground."
+                    )
+                seen_prefixes.add(key_prefix)
+                self.gaussbg_names.append(key_prefix)
 
-            self._trainable_flags["gaussbg.sigma_raw"] = self.gaussbg.sigma_raw.requires_grad
-            if self._trainable_flags["gaussbg.sigma_raw"]:
-                self.lrs["gaussbg.sigma_raw"] = lr
-                gaussbg_keys.append("gaussbg.sigma_raw")
+                gaussbg_keys: list[str] = []
 
-            if self.gaussbg.sigma_col_raw is not None:
-                self._trainable_flags["gaussbg.sigma_col_raw"] = self.gaussbg.sigma_col_raw.requires_grad
-                if self._trainable_flags["gaussbg.sigma_col_raw"]:
-                    self.lrs["gaussbg.sigma_col_raw"] = lr
-                    gaussbg_keys.append("gaussbg.sigma_col_raw")
+                sigma_key = f"{key_prefix}.sigma_raw"
+                self._trainable_flags[sigma_key] = gaussbg.sigma_raw.requires_grad
+                if self._trainable_flags[sigma_key]:
+                    self.lrs[sigma_key] = lr
+                    gaussbg_keys.append(sigma_key)
 
-            self._trainable_flags["gaussbg.intensity_raw"] = self.gaussbg.intensity_raw.requires_grad
-            if self._trainable_flags["gaussbg.intensity_raw"]:
-                self.lrs["gaussbg.intensity_raw"] = lr
-                gaussbg_keys.append("gaussbg.intensity_raw")
+                if gaussbg.sigma_col_raw is not None:
+                    sigma_col_key = f"{key_prefix}.sigma_col_raw"
+                    self._trainable_flags[sigma_col_key] = gaussbg.sigma_col_raw.requires_grad
+                    if self._trainable_flags[sigma_col_key]:
+                        self.lrs[sigma_col_key] = lr
+                        gaussbg_keys.append(sigma_col_key)
 
-            self.component_keys[name] = gaussbg_keys
-            self.component_keys[self.gaussbg.__class__.__name__] = list(gaussbg_keys)
+                intensity_key = f"{key_prefix}.intensity_raw"
+                self._trainable_flags[intensity_key] = gaussbg.intensity_raw.requires_grad
+                if self._trainable_flags[intensity_key]:
+                    self.lrs[intensity_key] = lr
+                    gaussbg_keys.append(intensity_key)
+
+                self.component_keys[canonical_name] = gaussbg_keys
+                cls_key = gaussbg.__class__.__name__
+                bucket = self.component_keys.setdefault(cls_key, [])
+                for k in gaussbg_keys:
+                    if k not in bucket:
+                        bucket.append(k)
             
-        if self.lat is not None and self.lat_idx is not None:
-            lr = _lr_for_component(self.lat, self.lat_idx, optimizer_params, model)
-            name = model._component_constraint_name(self.lat, self.lat_idx)
-            lat_keys = []
-            
-            for k in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
-                full_key = f"lat.{k}"
-                param = getattr(self.lat, k, None)
-                if param is not None:
-                    is_trainable = param.requires_grad if isinstance(param, torch.nn.Parameter) else False
-                    self._trainable_flags[full_key] = is_trainable
-                    if is_trainable:
-                        self.lrs[full_key] = lr
-                        lat_keys.append(full_key)
-            
-            # Origin uses the lattice's LR
+        if self.lats:
+            first_lr = None
+            for lat, lat_idx in zip(self.lats, self.lat_idxs):
+                lr = _lr_for_component(lat, lat_idx, optimizer_params, model)
+                if first_lr is None:
+                    first_lr = lr
+                canonical_name = model._component_constraint_name(lat, lat_idx)
+                key_prefix = "lat" if len(self.lats) == 1 else canonical_name
+                self.lat_names.append(key_prefix)
+
+                # Resolve which tracked disk this lattice shares (by identity).
+                if self.disk is not None and lat.disk is self.disk:
+                    self.lat_disk_key[key_prefix] = "disk"
+                else:
+                    raise NotImplementedError(
+                        f"Batched fit requires lattice '{canonical_name}' to share the "
+                        f"single tracked DiskTemplate component; found a different/untracked disk."
+                    )
+
+                lat_keys = []
+                for k in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
+                    full_key = f"{key_prefix}.{k}"
+                    param = getattr(lat, k, None)
+                    if param is not None:
+                        is_trainable = param.requires_grad if isinstance(param, torch.nn.Parameter) else False
+                        self._trainable_flags[full_key] = is_trainable
+                        if is_trainable:
+                            self.lrs[full_key] = lr
+                            lat_keys.append(full_key)
+
+                self.component_keys[canonical_name] = lat_keys
+                cls_key = lat.__class__.__name__
+                bucket = self.component_keys.setdefault(cls_key, [])
+                for k in lat_keys:
+                    if k not in bucket:
+                        bucket.append(k)
+
+            # Origin uses the first lattice's LR (origin is shared/global).
             self._trainable_flags["origin.coords"] = self.origin.coords.requires_grad
             if self._trainable_flags["origin.coords"]:
-                self.lrs["origin.coords"] = lr
-            
-            self.component_keys[name] = lat_keys
-            self.component_keys[self.lat.__class__.__name__] = list(lat_keys)
-        elif self.gaussbg is not None:
-            if self._trainable_flags.get("gaussbg.intensity_raw", False):
-                self.lrs["origin.coords"] = self.lrs["gaussbg.intensity_raw"]
+                self.lrs["origin.coords"] = first_lr
+        elif self.gaussbgs:
+            intensity_key = f"{self.gaussbg_names[0]}.intensity_raw"
+            if self._trainable_flags.get(intensity_key, False):
+                self.lrs["origin.coords"] = self.lrs[intensity_key]
         else:
             if self.origin.coords.requires_grad:
                 self.lrs["origin.coords"] = 1e-2
@@ -1422,25 +1463,30 @@ class _BatchedPlan:
             if self._trainable_flags.get("dcbg.intensity_raw", False):
                 out["dcbg.intensity_raw"] = self._stack(self.dcbg.intensity_raw, B)
                 
-        if self.gaussbg is not None:
-            if self._trainable_flags.get("gaussbg.sigma_raw", False):
-                out["gaussbg.sigma_raw"] = self._stack(self.gaussbg.sigma_raw, B)
-            if self._trainable_flags.get("gaussbg.sigma_col_raw", False) and self.gaussbg.sigma_col_raw is not None:
-                out["gaussbg.sigma_col_raw"] = self._stack(self.gaussbg.sigma_col_raw, B)
-            if self._trainable_flags.get("gaussbg.intensity_raw", False):
-                out["gaussbg.intensity_raw"] = self._stack(self.gaussbg.intensity_raw, B)
+        if self.gaussbgs is not None:
+            for gaussbg_name, gaussbg in zip(self.gaussbg_names, self.gaussbgs):
+                sigma_key = f"{gaussbg_name}.sigma_raw"
+                if self._trainable_flags.get(sigma_key, False):
+                    out[sigma_key] = self._stack(gaussbg.sigma_raw, B)
+                sigma_col_key = f"{gaussbg_name}.sigma_col_raw"
+                if self._trainable_flags.get(sigma_col_key, False) and gaussbg.sigma_col_raw is not None:
+                    out[sigma_col_key] = self._stack(gaussbg.sigma_col_raw, B)
+                intensity_key = f"{gaussbg_name}.intensity_raw"
+                if self._trainable_flags.get(intensity_key, False):
+                    out[intensity_key] = self._stack(gaussbg.intensity_raw, B)
                 
-        if self.lat is not None:
-            for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw"):
-                t = getattr(self.lat, attr)
-                key = f"lat.{attr}"
-                if t is not None and self._trainable_flags.get(key, False):
-                    out[key] = self._stack(t, B)
-            for attr in ("ir", "ic", "irr", "icc", "irc"):
-                t = getattr(self.lat, attr, None)
-                key = f"lat.{attr}"
-                if t is not None and self._trainable_flags.get(key, False):
-                    out[key] = self._stack(t, B)
+        if self.lats is not None:
+            for lat_name, lat in zip(self.lat_names, self.lats):
+                for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw"):
+                    t = getattr(lat, attr)
+                    key = f"{lat_name}.{attr}"
+                    if t is not None and self._trainable_flags.get(key, False):
+                        out[key] = self._stack(t, B)
+                for attr in ("ir", "ic", "irr", "icc", "irc"):
+                    t = getattr(lat, attr, None)
+                    key = f"{lat_name}.{attr}"
+                    if t is not None and self._trainable_flags.get(key, False):
+                        out[key] = self._stack(t, B)
                     
         return out
 
@@ -1487,20 +1533,20 @@ class _BatchedPlan:
                 intensity_b = self.dcbg.intensity_raw.unsqueeze(0).expand(B).clone()
             pred = pred + self.dcbg.forward_batched(ctx, intensity_raw_b=intensity_b)
             
-        if self.gaussbg is not None:
-            sigma_b = stacked.get("gaussbg.sigma_raw")
+        for gaussbg_name, gaussbg in zip(self.gaussbg_names, self.gaussbgs):
+            sigma_b = stacked.get(f"{gaussbg_name}.sigma_raw")
             if sigma_b is None:
-                sigma_b = self.gaussbg.sigma_raw.unsqueeze(0).expand(B).clone()
+                sigma_b = gaussbg.sigma_raw.unsqueeze(0).expand(B).clone()
 
-            sigma_col_b = stacked.get("gaussbg.sigma_col_raw")
-            if sigma_col_b is None and self.gaussbg.sigma_col_raw is not None:
-                sigma_col_b = self.gaussbg.sigma_col_raw.unsqueeze(0).expand(B).clone()
+            sigma_col_b = stacked.get(f"{gaussbg_name}.sigma_col_raw")
+            if sigma_col_b is None and gaussbg.sigma_col_raw is not None:
+                sigma_col_b = gaussbg.sigma_col_raw.unsqueeze(0).expand(B).clone()
 
-            intensity_b = stacked.get("gaussbg.intensity_raw")
+            intensity_b = stacked.get(f"{gaussbg_name}.intensity_raw")
             if intensity_b is None:
-                intensity_b = self.gaussbg.intensity_raw.unsqueeze(0).expand(B).clone()
+                intensity_b = gaussbg.intensity_raw.unsqueeze(0).expand(B).clone()
 
-            pred = pred + self.gaussbg.forward_batched(
+            pred = pred + gaussbg.forward_batched(
                 ctx,
                 sigma_raw_b=sigma_b,
                 sigma_col_raw_b=sigma_col_b,
@@ -1508,69 +1554,68 @@ class _BatchedPlan:
                 origin_coords_b=origin_b,
             )
             
-        if self.lat is not None:
-            # Lattice requires all params - expand frozen ones
-            u_row_b = stacked.get("lat.u_row")
-            if u_row_b is None:
-                u_row_b = self.lat.u_row.unsqueeze(0).expand(B).clone()
-            
-            u_col_b = stacked.get("lat.u_col")
-            if u_col_b is None:
-                u_col_b = self.lat.u_col.unsqueeze(0).expand(B).clone()
-            
-            v_row_b = stacked.get("lat.v_row")
-            if v_row_b is None:
-                v_row_b = self.lat.v_row.unsqueeze(0).expand(B).clone()
-            
-            v_col_b = stacked.get("lat.v_col")
-            if v_col_b is None:
-                v_col_b = self.lat.v_col.unsqueeze(0).expand(B).clone()
-            
-            i0_raw_b = stacked.get("lat.i0_raw")
-            if i0_raw_b is None:
-                i0_raw_b = self.lat.i0_raw.unsqueeze(0).expand(B, *self.lat.i0_raw.shape).clone()
-            
-            # Optional params
-            ir_b = stacked.get("lat.ir")
-            if ir_b is None and self.lat.ir is not None:
-                ir_b = self.lat.ir.unsqueeze(0).expand(B, *self.lat.ir.shape).clone()
-            
-            ic_b = stacked.get("lat.ic")
-            if ic_b is None and self.lat.ic is not None:
-                ic_b = self.lat.ic.unsqueeze(0).expand(B, *self.lat.ic.shape).clone()
-            
-            irr_b = stacked.get("lat.irr")
-            if irr_b is None and self.lat.irr is not None:
-                irr_b = self.lat.irr.unsqueeze(0).expand(B, *self.lat.irr.shape).clone()
-            
-            icc_b = stacked.get("lat.icc")
-            if icc_b is None and self.lat.icc is not None:
-                icc_b = self.lat.icc.unsqueeze(0).expand(B, *self.lat.icc.shape).clone()
-            
-            irc_b = stacked.get("lat.irc")
-            if irc_b is None and self.lat.irc is not None:
-                irc_b = self.lat.irc.unsqueeze(0).expand(B, *self.lat.irc.shape).clone()
-            
-            # Template (from disk)
+        if self.lats:
+            # Template (from disk) — resolved once, shared by every lattice.
             template_b = stacked.get("disk.template_raw")
             if template_b is None and self.disk is not None:
                 template_b = self.disk.template_raw.unsqueeze(0).expand(B, *self.disk.template_raw.shape).clone()
-            
-            pred = pred + self.lat.forward_batched(
-                ctx,
-                u_row_b=u_row_b,
-                u_col_b=u_col_b,
-                v_row_b=v_row_b,
-                v_col_b=v_col_b,
-                i0_raw_b=i0_raw_b,
-                ir_b=ir_b,
-                ic_b=ic_b,
-                irr_b=irr_b,
-                icc_b=icc_b,
-                irc_b=irc_b,
-                template_raw_b=template_b,
-                origin_coords_b=origin_b,
-            )
+
+            for lat_name, lat in zip(self.lat_names, self.lats):
+                u_row_b = stacked.get(f"{lat_name}.u_row")
+                if u_row_b is None:
+                    u_row_b = lat.u_row.unsqueeze(0).expand(B).clone()
+
+                u_col_b = stacked.get(f"{lat_name}.u_col")
+                if u_col_b is None:
+                    u_col_b = lat.u_col.unsqueeze(0).expand(B).clone()
+
+                v_row_b = stacked.get(f"{lat_name}.v_row")
+                if v_row_b is None:
+                    v_row_b = lat.v_row.unsqueeze(0).expand(B).clone()
+
+                v_col_b = stacked.get(f"{lat_name}.v_col")
+                if v_col_b is None:
+                    v_col_b = lat.v_col.unsqueeze(0).expand(B).clone()
+
+                i0_raw_b = stacked.get(f"{lat_name}.i0_raw")
+                if i0_raw_b is None:
+                    i0_raw_b = lat.i0_raw.unsqueeze(0).expand(B, *lat.i0_raw.shape).clone()
+
+                ir_b = stacked.get(f"{lat_name}.ir")
+                if ir_b is None and lat.ir is not None:
+                    ir_b = lat.ir.unsqueeze(0).expand(B, *lat.ir.shape).clone()
+
+                ic_b = stacked.get(f"{lat_name}.ic")
+                if ic_b is None and lat.ic is not None:
+                    ic_b = lat.ic.unsqueeze(0).expand(B, *lat.ic.shape).clone()
+
+                irr_b = stacked.get(f"{lat_name}.irr")
+                if irr_b is None and lat.irr is not None:
+                    irr_b = lat.irr.unsqueeze(0).expand(B, *lat.irr.shape).clone()
+
+                icc_b = stacked.get(f"{lat_name}.icc")
+                if icc_b is None and lat.icc is not None:
+                    icc_b = lat.icc.unsqueeze(0).expand(B, *lat.icc.shape).clone()
+
+                irc_b = stacked.get(f"{lat_name}.irc")
+                if irc_b is None and lat.irc is not None:
+                    irc_b = lat.irc.unsqueeze(0).expand(B, *lat.irc.shape).clone()
+
+                pred = pred + lat.forward_batched(
+                    ctx,
+                    u_row_b=u_row_b,
+                    u_col_b=u_col_b,
+                    v_row_b=v_row_b,
+                    v_col_b=v_col_b,
+                    i0_raw_b=i0_raw_b,
+                    ir_b=ir_b,
+                    ic_b=ic_b,
+                    irr_b=irr_b,
+                    icc_b=icc_b,
+                    irc_b=irc_b,
+                    template_raw_b=template_b,
+                    origin_coords_b=origin_b,
+                )
         return pred
 
     def apply_hard_constraints(
@@ -1596,16 +1641,19 @@ class _BatchedPlan:
                 key = f"dcbg.{pname}"
                 if key in stacked and key not in skip_keys:
                     self._clamp_bounds_inplace(stacked[key], lo, hi)
-        if self.gaussbg is not None:
-            for pname, (lo, hi) in self.gaussbg.parameter_bounds.items():
-                key = f"gaussbg.{pname}"
+
+        for gaussbg_name, gaussbg in zip(self.gaussbg_names, self.gaussbgs):
+            for pname, (lo, hi) in gaussbg.parameter_bounds.items():
+                key = f"{gaussbg_name}.{pname}"
                 if key in stacked and key not in skip_keys:
                     self._clamp_bounds_inplace(stacked[key], lo, hi)
-        if self.lat is not None:
-            for pname, (lo, hi) in self.lat.parameter_bounds.items():
-                key = f"lat.{pname}"
-                if key in stacked and key not in skip_keys:
-                    self._clamp_bounds_inplace(stacked[key], lo, hi)
+
+        if self.lats is not None:
+            for lat_name, lat in zip(self.lat_names, self.lats):
+                for pname, (lo, hi) in lat.parameter_bounds.items():
+                    key = f"{lat_name}.{pname}"
+                    if key in stacked and key not in skip_keys:
+                        self._clamp_bounds_inplace(stacked[key], lo, hi)
 
         disk_template_frozen = "disk.template_raw" in skip_keys
         disk_intensity_frozen = "disk.intensity_raw" in skip_keys
@@ -1631,14 +1679,12 @@ class _BatchedPlan:
                 if bool(self.disk.hard_constraints.get("force_norm", False)):
                     self._batched_enforce_norm(template)
 
-        if (
-            self.lat is not None
-            and "lat.i0_raw" not in skip_keys
-            and bool(self.lat.hard_constraints.get("force_positive_intensity", False))
-        ):
-            i0 = stacked.get("lat.i0_raw")
-            if i0 is not None:
-                i0.clamp_(min=0.0)
+        for lat_name, lat in zip(self.lat_names, self.lats):
+            key = f"{lat_name}.i0_raw"
+            if key not in skip_keys and bool(lat.hard_constraints.get("force_positive_intensity", False)):
+                i0 = stacked.get(key)
+                if i0 is not None:
+                    i0.clamp_(min=0.0)
 
     @staticmethod
     def _clamp_bounds_inplace(t: torch.Tensor, lo: float | None, hi: float | None) -> None:
@@ -1766,11 +1812,12 @@ class _BatchedPlan:
                         out[key] = t_val.clone()
             
             if i_val is not None:
-                for key in (
-                    f"components.{self.disk_idx}.intensity_raw",
-                    f"components.{self.lat_idx}.disk.intensity_raw" if self.lat_idx is not None else None,
-                ):
-                    if key is not None and key in out:
+                keys = [f"components.{self.disk_idx}.intensity_raw"]
+                for lat_name, lat_idx in zip(self.lat_names, self.lat_idxs):
+                    if self.lat_disk_key.get(lat_name) == "disk":
+                        keys.append(f"components.{lat_idx}.disk.intensity_raw")
+                for key in keys:
+                    if key in out:
                         out[key] = i_val.clone()
 
         # DCBackground
@@ -1782,22 +1829,26 @@ class _BatchedPlan:
                 pass
 
         # GaussianBackground
-        if self.gaussbg is not None and self.gaussbg_idx is not None:
-            if "gaussbg.sigma_raw" in stacked:
-                out[f"components.{self.gaussbg_idx}.sigma_raw"] = stacked["gaussbg.sigma_raw"][b].detach().clone()
-            if "gaussbg.sigma_col_raw" in stacked:
-                out[f"components.{self.gaussbg_idx}.sigma_col_raw"] = stacked["gaussbg.sigma_col_raw"][b].detach().clone()
-            if "gaussbg.intensity_raw" in stacked:
-                out[f"components.{self.gaussbg_idx}.intensity_raw"] = stacked["gaussbg.intensity_raw"][b].detach().clone()
+        for gaussbg_name, gaussbg_idx in zip(self.gaussbg_names, self.gaussbg_idxs):
+            sigma_key = f"{gaussbg_name}.sigma_raw"
+            if sigma_key in stacked:
+                out[f"components.{gaussbg_idx}.sigma_raw"] = stacked[sigma_key][b].detach().clone()
+            sigma_col_key = f"{gaussbg_name}.sigma_col_raw"
+            if sigma_col_key in stacked:
+                out[f"components.{gaussbg_idx}.sigma_col_raw"] = stacked[sigma_col_key][b].detach().clone()
+            intensity_key = f"{gaussbg_name}.intensity_raw"
+            if intensity_key in stacked:
+                out[f"components.{gaussbg_idx}.intensity_raw"] = stacked[intensity_key][b].detach().clone()
 
         # SyntheticDiskLattice scalar + tensor params
-        if self.lat is not None and self.lat_idx is not None:
-            for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
-                key = f"components.{self.lat_idx}.{attr}"
-                stacked_key = f"lat.{attr}"
-                if key in out and stacked_key in stacked:
-                    out[key] = stacked[stacked_key][b].detach().clone()
-                # else: was frozen, keep init value
+        if self.lats is not None and self.lat_idxs is not None:
+            for lat_name, lat_idx in zip(self.lat_names, self.lat_idxs):
+                for attr in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
+                    key = f"components.{lat_idx}.{attr}"
+                    stacked_key = f"{lat_name}.{attr}"
+                    if key in out and stacked_key in stacked:
+                        out[key] = stacked[stacked_key][b].detach().clone()
+                    # else: was frozen, keep init value
                 
         return out
     
