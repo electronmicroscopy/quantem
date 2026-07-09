@@ -45,10 +45,9 @@ class Lattice(AutoSerialize):
           scaling is skipped to avoid invalid operations.
 
         Notes:
-        - Non-2D inputs and empty arrays raise a ValueError.
+        - Non-2D inputs, empty arrays and arrays with all values NaN raise a ValueError.
         - Inputs with boolean dtype are safely converted to float before normalization.
-        - NaN values are ignored when computing min/max (using nanmin/nanmax). If the
-          data is all-NaN, normalization is skipped.
+        - NaN values are ignored when computing min/max (using nanmin/nanmax).
         """
         if isinstance(image, Dataset2d):
             ds2d = image
@@ -59,6 +58,9 @@ class Lattice(AutoSerialize):
                 raise ValueError("Input image must be a 2D array.")
             if ds2d.array.size == 0:
                 raise ValueError("Input image array must not be empty.")
+            # Validate not all-NaN
+            if np.all(np.isnan(ds2d.array)):
+                raise ValueError("Input image array does not have any valid values.")
         else:
             # Validate dimensionality and emptiness before any processing
             arr = np.asarray(image)
@@ -72,27 +74,22 @@ class Lattice(AutoSerialize):
                 ds2d = Dataset2d.from_array(arr)  # type: ignore[attr-defined]
             else:
                 ds2d = Dataset2d(arr)  # type: ignore[call-arg]
+            # Validate not all-NaN
+            if np.all(np.isnan(arr)):
+                raise ValueError("Input image array does not have any valid values.")
 
         # Normalization (robust to constant, NaN, and bool inputs)
         if normalize_min:
-            # Use nanmin to ignore NaNs; if all-NaN, skip
-            try:
-                min_val = np.nanmin(ds2d.array)
-                if np.isfinite(min_val):
-                    ds2d.array = ds2d.array - min_val
-            except ValueError:
-                # Raised when all values are NaN; skip
-                pass
+            # Use nanmin to ignore NaNs
+            min_val = np.nanmin(ds2d.array)
+            if np.isfinite(min_val):
+                ds2d.array = ds2d.array - min_val
 
         if normalize_max:
             # Use nanmax to ignore NaNs; skip division if max <= 0 or not finite
-            try:
-                max_val = np.nanmax(ds2d.array)
-                if np.isfinite(max_val) and max_val > 0.0:
-                    ds2d.array = ds2d.array / max_val
-            except ValueError:
-                # Raised when all values are NaN; skip
-                pass
+            max_val = np.nanmax(ds2d.array)
+            if np.isfinite(max_val) and max_val > 0.0:
+                ds2d.array = ds2d.array / max_val
 
         return cls(image=ds2d, _token=cls._token)
 
@@ -945,7 +942,11 @@ class Lattice(AutoSerialize):
         # SETUP FITTING PARAMETERS
 
         # Fitting radius: auto-estimate or user-provided
-        r_fit = float(fit_radius) if fit_radius is not None else _auto_radius_px()
+        r_fit = (
+            float(fit_radius)
+            if fit_radius is not None and fit_radius <= _auto_radius_px()
+            else _auto_radius_px()
+        )
 
         # Integer pixel range for patch extraction (used in neighborhood lookups)
         R = int(np.ceil(r_fit))
@@ -1044,13 +1045,16 @@ class Lattice(AutoSerialize):
                 pmin, pmax = float(vals.min()), float(vals.max())
 
                 # Background: median of pixels outside the circular mask (or full patch if none)
-                bg0 = float(np.median(patch[~mask])) if np.any(~mask) else float(np.median(patch))
+                bg0 = max(
+                    float(np.median(patch[~mask])) if np.any(~mask) else float(np.median(patch)),
+                    0.0,
+                )
 
-                # Amplitude: central pixel value minus background (with safety floor)
-                amp0 = max(float(im[np.clip(ix0, 0, H - 1), np.clip(iy0, 0, W - 1)] - bg0), 1e-6)
+                # Amplitude: maximum pixel value minus background, i.e. max - median; (with safety floor)
+                amp0 = max(float(np.max(patch[mask]) - bg0), 1e-6)
 
-                # Gaussian width: half the fitting radius (with safety floor)
-                sig0 = max(r_fit * 0.5, 0.5)
+                # Gaussian width: one-fourth the fitting radius (with safety floor)
+                sig0 = max(r_fit * 0.25, 0.5)
 
                 # Extract coordinates of pixels in the mask
                 x_coords = II[mask].astype(float).ravel()
@@ -1094,12 +1098,12 @@ class Lattice(AutoSerialize):
                 y_ub = min(y0 + max_move, W - 1.0)
 
                 # Lower and upper bounds for all five parameters
-                lb = [x_lb, y_lb, 0.0, 0.25, pmin - (pmax - pmin)]
+                lb = [x_lb, y_lb, 0.0, 0.25, 0.0]
                 ub = [
                     x_ub,
                     y_ub,
-                    max(pmax - pmin, amp0 * 4.0),
-                    max(2.0 * r_fit, 1.0),
+                    pmax + (pmax - pmin),
+                    max(0.6 * r_fit if fit_radius is None else 1.5 * r_fit, 1.0),
                     pmax + (pmax - pmin),
                 ]
 

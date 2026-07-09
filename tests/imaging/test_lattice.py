@@ -65,6 +65,9 @@ class TestLatticeInit:
         with pytest.raises(ValueError, match="must not be empty"):
             Lattice.from_data(np.array([[]]))
 
+        with pytest.raises(ValueError, match="does not have any valid values"):
+            Lattice.from_data(np.full((3, 3), np.nan))
+
 
 class TestLatticeImage:
     """Test image property getter and setter."""
