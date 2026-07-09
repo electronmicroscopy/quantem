@@ -611,6 +611,55 @@ def section_basis_modes(p: Params, args, rng) -> None:
     print_mixed_rows(rows)
 
 
+def section_large_fov(p: Params, args, rng) -> None:
+    """Per-iteration wall time vs batch size and frozen-scan deduplication. PRISM's
+    full-object parent multislice only amortizes at large batch; frozen positions then
+    collapse the reduction to the unique sub-pixel offsets. Opt-in (--sections 5)."""
+    print("\n=== 5. Large-FOV per-iteration timing (batch size x frozen dedup) ===")
+    phases = multislice_truth(p, rng)
+    transmissions = np.exp(1j * phases)
+    probe = p.real_probe(p.ctf())
+    intensities = simulate_multislice_intensities(
+        transmissions, [probe], np.array([1.0]), p.dz, p.wavelength, p.sampling
+    )
+    pdset = make_pdset(intensities, p.n, p.sampling, p.reciprocal_sampling, p.energy)
+    n_pos = p.n**2
+    factor = args.factors[0]
+    opt = {"object": {"type": "SGD", "lr": 0.125}}
+
+    def time_iters(engine, batch_size, niters=2):
+        reset_gpu_mem(args.device)
+        t0 = time.perf_counter()
+        engine.reconstruct(
+            num_iters=niters, reset=True, optimizer_params=opt, batch_size=batch_size
+        )
+        return (time.perf_counter() - t0) / niters, peak_gpu_mem_mb(args.device)
+
+    batch_sizes = sorted({p.batch_size, min(n_pos, 2048), n_pos})
+    rows = []
+    conv, _ = build_multislice_engines(p, pdset, args.device)
+    conv.probe_model._probe.requires_grad_(False)
+    t, mem = time_iters(conv, min(n_pos, 2048))
+    rows.append(("conventional multislice", None, min(n_pos, 2048), t, mem))
+
+    for frozen in (True, False):
+        for bs in batch_sizes:
+            _, prism = build_multislice_engines(p, pdset, args.device, interpolation_factor=factor)
+            prism.dset.learn_scan_positions = not frozen
+            prism.position_batch_size = 256  # bound reduction memory for big batches
+            P = prism.probe_model.num_parent_beams
+            t, mem = time_iters(prism, bs)
+            tag = f"PRISM f={factor} {'frozen' if frozen else 'learn'}-pos"
+            rows.append((tag, P, bs, t, mem))
+
+    print(f"    n={p.n}, slices={p.num_slices}, positions={n_pos}, factor={factor}")
+    print(f"    {'config':30s} {'P':>5s} {'batch':>7s} {'s/iter':>8s} {'GPU MB':>8s}")
+    for tag, P, bs, t, mem in rows:
+        p_s = "    -" if P is None else f"{P:5d}"
+        mem_s = "     n/a" if mem is None else f"{mem:8.0f}"
+        print(f"    {tag:30s} {p_s} {bs:>7d} {t:>8.2f} {mem_s}")
+
+
 # endregion
 
 
@@ -638,6 +687,7 @@ def main() -> None:
         "2": section_forward_error,
         "3": section_source_blur,
         "4": section_basis_modes,
+        "5": section_large_fov,
     }
     for key in args.sections.split(","):
         sections[key.strip()](p, args, rng)
