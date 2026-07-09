@@ -5,11 +5,11 @@ clean synthetic ground truths in the spirit of the white-noise object test:
 
 1. Multislice reconstruction: white-noise phase slices, data simulated by an
    independent numpy multislice; loss / per-slice SSIM / wall time / peak GPU
-   memory for the conventional engine vs PRISM over a num_partitions sweep.
-2. Forward error vs num_partitions (pure forward, no reconstruction): relative
-   intensity error of partitioned PRISM against the dense forward on a thick
-   object, with thickness compensation on and off; plus dense PRISM vs the
-   independent numpy simulation.
+   memory for the conventional engine vs PRISM over an interpolation_factor sweep.
+2. Forward error vs interpolation_factor (pure forward, no reconstruction):
+   relative intensity error of the default (grid+fourier) PRISM against the dense
+   forward on a thick object, plus dense PRISM vs the independent numpy
+   simulation; section 2b sweeps all interpolation schemes at matched factors.
 3. Mixed-state, source-size blur (physical): incoherent sum of sub-pixel
    shifted probes; K-mode PRISM with learnable beam coefficients vs a
    single-mode PRISM and a pixelated mixed-state baseline.
@@ -41,12 +41,11 @@ from quantem.diffractive_imaging import (
     PtychographyDatasetRaster,
     PtychographyPRISM,
 )
-from quantem.diffractive_imaging._natural_neighbors_interpolation import beamlet_weights
 from quantem.diffractive_imaging.complex_probe import fourier_space_probe
-from quantem.diffractive_imaging.probe_models import (
-    _partitioned_prism_wave_vectors,
-    _prism_wave_vectors,
-)
+
+# rings scheme (~4 rings at this grid) for the mixed-state sections, matching the
+# old num_partitions=4 default; few-parent so the reconstructions stay quick.
+MIXED_SCHEME = dict(parent_layout="rings", interpolation="sibson", interpolation_factor=8)
 
 # region --- simulation helpers ---
 
@@ -226,9 +225,10 @@ def forward_intensities(engine, batch_indices: torch.Tensor) -> torch.Tensor:
 # region --- sections ---
 
 
-def build_multislice_engines(p: Params, pdset, num_partitions, device, dense=False):
+def build_multislice_engines(p: Params, pdset, device, dense=False, **scheme):
     """Conventional engine and one PRISM engine sharing probe params; probe frozen
-    at the true aberrations to isolate multislice object recovery."""
+    at the true aberrations to isolate multislice object recovery. Without a scheme
+    the PRISM engine uses the default (grid + Fourier interpolation)."""
 
     def obj_model():
         return ObjectPixelated.from_uniform(
@@ -253,9 +253,9 @@ def build_multislice_engines(p: Params, pdset, num_partitions, device, dense=Fal
         probe_model=ProbePRISM.from_params(
             num_probes=1,
             probe_params=p.probe_params,
-            num_partitions=num_partitions,
             dense=dense,
             learn_aberrations=False,
+            **scheme,
         ),
         detector_model=DetectorPixelated(),
         rng=42,
@@ -296,18 +296,20 @@ def section_multislice(p: Params, args, rng) -> None:
         mem = peak_gpu_mem_mb(args.device)
         rows.append((tag, engine._iter_losses[-1], np.mean(ssims), dt / args.num_iters, mem))
 
-    conventional, _ = build_multislice_engines(p, pdset, 3, args.device)
+    conventional, _ = build_multislice_engines(p, pdset, args.device)
     run(conventional, "conventional multislice")
 
-    for parts in args.partitions:
-        _, prism = build_multislice_engines(p, pdset, parts, args.device)
-        run(prism, f"PRISM partitions={parts}", parent_batch_size=args.parent_batch_size)
+    for f in args.factors:
+        _, prism = build_multislice_engines(p, pdset, args.device, interpolation_factor=f)
+        run(prism, f"PRISM grid+fourier f={f}", parent_batch_size=args.parent_batch_size)
 
     if args.checkpointing:
-        _, prism = build_multislice_engines(p, pdset, max(args.partitions), args.device)
+        _, prism = build_multislice_engines(
+            p, pdset, args.device, interpolation_factor=min(args.factors)
+        )
         run(
             prism,
-            f"PRISM partitions={max(args.partitions)} +ckpt",
+            f"PRISM grid+fourier f={min(args.factors)} +ckpt",
             parent_batch_size=args.parent_batch_size,
             use_checkpointing=True,
         )
@@ -339,13 +341,13 @@ def build_prism_scheme(p: Params, pdset, device, **scheme_kwargs):
     return prism
 
 
-# (parent_layout, interpolation, knob-name, knob-values) for the scheme sweep; each
+# (parent_layout, interpolation, interpolation_factors) for the scheme sweep; every
 # scheme is reduced from the parents it builds, so P (reported) is the multislice cost
 _FORWARD_SCHEMES = [
-    ("rings", "sibson", "num_partitions", [2, 3, 4, 5]),
-    ("grid", "sibson", "interpolation_factor", [4, 3, 2]),
-    ("grid", "fourier", "interpolation_factor", [4, 3, 2]),
-    ("grid", "nearest", "interpolation_factor", [4, 3, 2]),
+    ("rings", "sibson", [4, 3, 2]),
+    ("grid", "sibson", [4, 3, 2]),
+    ("grid", "fourier", [4, 3, 2]),
+    ("grid", "nearest", [4, 3, 2]),
 ]
 
 
@@ -353,36 +355,34 @@ def section_scheme_sweep(
     p: Params, args, rng, p_thick, pdset, transmissions, batch_indices, dense_pred
 ) -> None:
     """Forward error vs the dense reference across interpolation schemes, at matched
-    parent budgets, with thickness compensation on and off."""
+    interpolation factors (always-on thickness compensation)."""
     print("\n=== 2b. Forward error vs interpolation scheme (pure forward) ===")
     print(
         "    grid+nearest is classic Fourier-interpolation PRISM (crop window); the\n"
         "    full-aperture interpolants (sibson/fourier) avoid its replica-overlap error."
     )
-    header = (
-        f"    {'scheme':>22s} {'knob':>6s} {'P':>5s} {'err comp ON':>13s} {'err comp OFF':>13s}"
-    )
-    print(header)
-    for layout, interp, knob, values in _FORWARD_SCHEMES:
-        for v in values:
-            kwargs = {"parent_layout": layout, "interpolation": interp, knob: v}
-            errs = []
-            P = None
-            for compensation in (True, False):
-                prism = build_prism_scheme(p_thick, pdset, args.device, **kwargs)
-                prism.obj_model._obj.data = torch.tensor(
-                    transmissions, dtype=torch.complex64, device=prism._single_device
-                )
-                prism.thickness_compensation = compensation
-                pred = forward_intensities(prism, batch_indices)
-                errs.append(((pred - dense_pred).norm() / dense_pred.norm()).item())
-                P = prism.probe_model.num_parent_beams
-            tag = f"{layout}+{interp}"
-            print(f"    {tag:>22s} {v:>6d} {P:>5d} {errs[0]:>13.3e} {errs[1]:>13.3e}")
+    print(f"    {'scheme':>22s} {'factor':>6s} {'P':>5s} {'rel err vs dense':>16s}")
+    for layout, interp, factors in _FORWARD_SCHEMES:
+        for f in factors:
+            prism = build_prism_scheme(
+                p_thick,
+                pdset,
+                args.device,
+                parent_layout=layout,
+                interpolation=interp,
+                interpolation_factor=f,
+            )
+            prism.obj_model._obj.data = torch.tensor(
+                transmissions, dtype=torch.complex64, device=prism._single_device
+            )
+            pred = forward_intensities(prism, batch_indices)
+            err = ((pred - dense_pred).norm() / dense_pred.norm()).item()
+            P = prism.probe_model.num_parent_beams
+            print(f"    {layout + '+' + interp:>22s} {f:>6d} {P:>5d} {err:>16.3e}")
 
 
 def section_forward_error(p: Params, args, rng) -> None:
-    print("\n=== 2. Partitioned forward error vs num_partitions (pure forward) ===")
+    print("\n=== 2. Default (grid+fourier) forward error vs factor (pure forward) ===")
     num_slices = max(4, p.num_slices)
     dz = 25.0
     print(f"    n={p.n}, slices={num_slices}, dz={dz} A (thick on purpose)")
@@ -398,15 +398,16 @@ def section_forward_error(p: Params, args, rng) -> None:
     pdset = make_pdset(intensities, p.n, p.sampling, p.reciprocal_sampling, p.energy)
     batch_indices = torch.arange(0, p.n**2, max(1, p.n**2 // 256))
 
-    def prism_forward(dense, parts, compensation):
-        _, prism = build_multislice_engines(p_thick, pdset, parts, args.device, dense=dense)
+    def prism_forward(dense, factor):
+        _, prism = build_multislice_engines(
+            p_thick, pdset, args.device, dense=dense, interpolation_factor=factor
+        )
         prism.obj_model._obj.data = torch.tensor(
             transmissions, dtype=torch.complex64, device=prism._single_device
         )
-        prism.thickness_compensation = compensation
         return forward_intensities(prism, batch_indices)
 
-    dense_pred = prism_forward(True, 3, True)
+    dense_pred = prism_forward(True, 2)
 
     # cross-check both engines' forwards (ground-truth object) against the stored
     # targets (amplitude space), which came from the independent numpy simulation;
@@ -415,7 +416,7 @@ def section_forward_error(p: Params, args, rng) -> None:
     targets = pdset._targets[batch_indices].to(dense_pred.device)
     dense_vs_numpy = ((dense_pred.sqrt() - targets).norm() / targets.norm()).item()
 
-    conventional, _ = build_multislice_engines(p_thick, pdset, 3, args.device)
+    conventional, _ = build_multislice_engines(p_thick, pdset, args.device)
     conventional.obj_model._obj.data = torch.tensor(
         transmissions, dtype=torch.complex64, device=conventional._single_device
     )
@@ -426,13 +427,11 @@ def section_forward_error(p: Params, args, rng) -> None:
     print(f"    dense PRISM  vs independent numpy simulation: rel err {dense_vs_numpy:.2e}")
     print(f"    dense PRISM  vs conventional (intensities):   rel err {dense_vs_conv:.2e}")
 
-    print(f"    {'partitions':>10s} {'rel err (comp ON)':>18s} {'rel err (comp OFF)':>19s}")
-    for parts in args.partitions:
-        errs = []
-        for compensation in (True, False):
-            pred = prism_forward(False, parts, compensation)
-            errs.append(((pred - dense_pred).norm() / dense_pred.norm()).item())
-        print(f"    {parts:>10d} {errs[0]:>18.3e} {errs[1]:>19.3e}")
+    print(f"    {'factor':>10s} {'rel err vs dense':>18s}")
+    for f in args.factors:
+        pred = prism_forward(False, f)
+        err = ((pred - dense_pred).norm() / dense_pred.norm()).item()
+        print(f"    {f:>10d} {err:>18.3e}")
 
     section_scheme_sweep(p, args, rng, p_thick, pdset, transmissions, batch_indices, dense_pred)
 
@@ -453,8 +452,19 @@ def make_source_blur_modes(p: Params, blur_px: float = 0.8) -> tuple[list, np.nd
     return probes, weights
 
 
-def make_basis_modes(p: Params, K: int, rng) -> tuple[list, np.ndarray]:
-    """K source modes expressible exactly as CTF x Sibson weights x per-parent coefs.
+def _partitioned_weight_maps(p: Params, scheme: dict) -> np.ndarray:
+    """The frozen (num_parent, n, n) weight maps of a scheme's probe, read from a
+    bare ProbePRISM so mode construction shares the reconstruction basis exactly."""
+    probe = ProbePRISM.from_params(probe_params=p.probe_params, learn_aberrations=False, **scheme)
+    probe.set_initial_probe((p.n, p.n), np.array([p.reciprocal_sampling] * 2), 1.0)
+    return probe.interpolation_weights.cpu().numpy()
+
+
+def make_basis_modes(
+    p: Params, K: int, rng, scheme: dict = MIXED_SCHEME
+) -> tuple[list, np.ndarray]:
+    """K source modes expressible exactly as CTF x weights x per-parent coefs, built
+    on the reconstruction probe's own basis (so the data is exactly representable).
 
     The modes are gentle, non-orthogonal perturbations of the plain CTF (mixed
     states only depend on the density matrix, so orthogonality of the *source*
@@ -462,15 +472,12 @@ def make_basis_modes(p: Params, K: int, rng) -> tuple[list, np.ndarray]:
     top-K eigenmodes, whose dominant mode stays CTF-like and reachable from the
     CTF initialization.
     """
-    cutoff = p.semiangle + float(np.linalg.norm([p.reciprocal_sampling * p.wavelength * 1e3] * 2))
-    extent = np.array([p.n * p.sampling] * 2)
-    parents = _partitioned_prism_wave_vectors(cutoff, p.wavelength, num_rings=3)
-    beamlets = _prism_wave_vectors(cutoff, extent, p.wavelength)
-    weight_maps = beamlet_weights(parents, beamlets, (p.n, p.n), (p.sampling, p.sampling))
+    weight_maps = _partitioned_weight_maps(p, scheme)
+    num_parents = len(weight_maps)
 
     ctf = p.ctf()
     coefs = 1.0 + 0.35 * (
-        rng.standard_normal((K, len(parents))) + 1j * rng.standard_normal((K, len(parents)))
+        rng.standard_normal((K, num_parents)) + 1j * rng.standard_normal((K, num_parents))
     ) / np.sqrt(2)
     kmodes = np.einsum("kb,bxy->kxy", coefs, weight_maps) * ctf[None]
     kmodes /= np.linalg.norm(kmodes.reshape(K, -1), axis=1)[:, None, None]  # unit power each
@@ -480,17 +487,19 @@ def make_basis_modes(p: Params, K: int, rng) -> tuple[list, np.ndarray]:
     return probes, mode_weights
 
 
-def run_mixed_state(p, args, pdset, num_probes, num_partitions, dense, tag, rows, true_kmodes):
+def run_mixed_state(
+    p, args, pdset, num_probes, dense, tag, rows, true_kmodes, scheme=MIXED_SCHEME
+):
     prism = PtychographyPRISM.from_models(
         dset=pdset,
         obj_model=ObjectPixelated.from_uniform(num_slices=1, obj_type="complex"),
         probe_model=ProbePRISM.from_params(
             num_probes=num_probes,
             probe_params=p.probe_params,
-            num_partitions=num_partitions,
             dense=dense,
             learn_aberrations=False,
             learn_beam_coefficients=True,
+            **scheme,
         ),
         detector_model=DetectorPixelated(),
         rng=42,
@@ -551,12 +560,9 @@ def section_source_blur(p: Params, args, rng) -> None:
     true_kmodes = top_k_eigenmodes(probes, weights, 3)
 
     rows = []
-    run_mixed_state(p, args, pdset, 1, 3, False, "PRISM K=1 (coherent)", rows, true_kmodes)
-    run_mixed_state(p, args, pdset, 3, 3, False, "PRISM K=3 partitions=3", rows, true_kmodes)
-    run_mixed_state(p, args, pdset, 3, 4, False, "PRISM K=3 partitions=4", rows, true_kmodes)
-    run_mixed_state(
-        p, args, pdset, 3, 3, True, "PRISM K=3 dense (representable)", rows, true_kmodes
-    )
+    run_mixed_state(p, args, pdset, 1, False, "PRISM K=1 (coherent)", rows, true_kmodes)
+    run_mixed_state(p, args, pdset, 3, False, "PRISM K=3 (rings)", rows, true_kmodes)
+    run_mixed_state(p, args, pdset, 3, True, "PRISM K=3 dense (representable)", rows, true_kmodes)
 
     # pixelated mixed-state baseline
     conventional = Ptychography.from_models(
@@ -601,9 +607,7 @@ def section_basis_modes(p: Params, args, rng) -> None:
     true_kmodes = top_k_eigenmodes(probes, weights, 3)
 
     rows = []
-    run_mixed_state(
-        p, args, pdset, 3, 3, False, "PRISM K=3 partitions=3 (exact rep.)", rows, true_kmodes
-    )
+    run_mixed_state(p, args, pdset, 3, False, "PRISM K=3 (exact rep.)", rows, true_kmodes)
     print_mixed_rows(rows)
 
 
@@ -615,12 +619,14 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--large", action="store_true", help="n=128, 8 slices (GPU scale)")
     parser.add_argument("--num-iters", type=int, default=50)
-    parser.add_argument("--partitions", default="2,3,4")
+    parser.add_argument(
+        "--factors", default="4,2", help="interpolation_factor sweep (coarser = fewer parents)"
+    )
     parser.add_argument("--parent-batch-size", type=int, default=None)
     parser.add_argument("--checkpointing", action="store_true")
     parser.add_argument("--sections", default="1,2,3,4")
     args = parser.parse_args()
-    args.partitions = [int(s) for s in args.partitions.split(",")]
+    args.factors = [int(s) for s in args.factors.split(",")]
 
     if args.device != "cpu" and config.NUM_DEVICES > 0:
         config.set_device("gpu")
