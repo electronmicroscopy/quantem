@@ -285,6 +285,76 @@ class DiffractionTomography:
             self.weights *= bn
 
     @classmethod
+    def from_test(
+        cls,
+        real_shape: tuple[int, int, int] = (6, 12, 12),
+        k_shape: tuple[int, int, int] = (31, 31, 31),
+        real_sampling: tuple[float, float, float] = (10.0, 10.0, 10.0),
+        k_sampling: tuple[float, float, float] = (0.05, 0.05, 0.05),
+        particle_centers=((1, 3, 4), (2, 7, 8), (3, 9, 2), (4, 4, 9)),
+        particle_zxz_deg=((0.0, 0.0, 0.0), (45.0, 54.7, 15.0),
+                          (0.0, 45.0, -10.0), (12.0, 23.0, 54.0)),
+        particle_radius: float = 1.6,
+        energy: float = 3.0e5,
+        probe_k_max: float = 0.10,
+        seed: int = 0,
+        **kwargs,
+    ) -> "DiffractionTomography":
+        """Create ground-truth test data: hard-sphere Au particles in vacuum.
+
+        Each particle shares the same (single) Au structure factor and differs
+        only by its ZXZ orientation. The returned model carries the true
+        weights (1 inside the spheres), per-voxel orientations, and the frozen
+        Au basis, ready for :meth:`simulate`.
+
+        Parameters
+        ----------
+        real_shape : tuple[int, int, int]
+            Real-space voxel grid ``(N_z, N_y, N_x)``.
+        k_shape, real_sampling, k_sampling, energy, probe_k_max, seed
+            As in the constructor.
+        particle_centers : sequence of (z, y, x)
+            Sphere centers in voxel indices.
+        particle_zxz_deg : sequence of (a, b, c)
+            Per-particle ZXZ Euler angles in degrees.
+        particle_radius : float, default 1.6
+            Hard-sphere radius in voxels.
+
+        Notes
+        -----
+        The particle mask and grain index are kept on the returned model as
+        ``particle_mask`` (bool ``[N_z, N_y, N_x]``) and ``grain_id`` (long,
+        -1 for vacuum), for use in accuracy metrics.
+        """
+        from scipy.spatial.transform import Rotation
+
+        Nz, Ny, Nx = (int(n) for n in real_shape)
+        au = cls.make_au_basis(k_shape, k_sampling)[..., None]
+        zz, yy, xx = torch.meshgrid(torch.arange(Nz), torch.arange(Ny),
+                                    torch.arange(Nx), indexing="ij")
+        weights = torch.zeros(Nz, Ny, Nx, 1, dtype=torch.float64)
+        R_all = torch.eye(3).reshape(1, 3, 3).repeat(Nz * Ny * Nx, 1, 1)
+        grain_id = -torch.ones(Nz, Ny, Nx, dtype=torch.long)
+        for g, ((pz, py, px), euler) in enumerate(zip(particle_centers, particle_zxz_deg)):
+            mask = (torch.sqrt((zz - pz) ** 2 + (yy - py) ** 2 + (xx - px) ** 2)
+                    <= particle_radius)
+            weights[mask] = 1.0
+            grain_id[mask] = g
+            R = torch.tensor(Rotation.from_euler("zxz", euler, degrees=True).as_matrix(),
+                             dtype=torch.float32)
+            R_all[mask.flatten()] = R
+
+        gt = cls(real_shape=real_shape, k_shape=k_shape, real_sampling=real_sampling,
+                 k_sampling=k_sampling, num_structures=1, energy=energy,
+                 probe_k_max=probe_k_max, basis=au, learn_basis=False,
+                 angles=R_all, learn_angles=False, seed=seed, **kwargs)
+        with torch.no_grad():
+            gt.weights.copy_(weights)
+        gt.particle_mask = grain_id >= 0
+        gt.grain_id = grain_id
+        return gt
+
+    @classmethod
     def make_au_basis(
         cls,
         k_shape: tuple[int, int, int],
