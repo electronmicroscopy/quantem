@@ -724,6 +724,281 @@ class DiffractionTomography:
                 dp[ti] = (Psi.abs() ** 2).to(torch.float64).reshape(n_row, n_col, *self.det_shape)
         return dp
 
+    @staticmethod
+    def _cubic_ops() -> np.ndarray:
+        """The 24 proper rotations of the cubic point group, (24, 3, 3)."""
+        ops = []
+        for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+            for sx in (1, -1):
+                for sy in (1, -1):
+                    for sz in (1, -1):
+                        M = np.zeros((3, 3))
+                        M[0, perm[0]], M[1, perm[1]], M[2, perm[2]] = sx, sy, sz
+                        if np.linalg.det(M) > 0.5:
+                            ops.append(M)
+        return np.stack(ops)
+
+    @classmethod
+    def _miso_deg(cls, dR: np.ndarray) -> float:
+        """Cubic-symmetry-reduced misorientation angle (deg) of a relative rotation."""
+        if not hasattr(cls, "_ops_cache"):
+            cls._ops_cache = cls._cubic_ops()
+        tr = np.einsum("sij,ji->s", cls._ops_cache, dR)
+        c = np.clip((tr.max() - 1.0) / 2.0, -1.0, 1.0)
+        return float(np.degrees(np.arccos(c)))
+
+    def _spot_geometry(self, cands: np.ndarray, g: np.ndarray, tilts_deg, sigma_e: float):
+        """Per-tilt predicted-spot geometry with smooth excitation weighting.
+
+        For every candidate rotation and template reflection: a Gaussian
+        excitation-error weight exp(-(g.w)^2 / 2 sigma_e^2) and a sub-pixel
+        (bilinear) detector position, so the indexing score varies smoothly
+        with orientation (a binary on/off tolerance would quantize it at
+        ~sigma_e/|g|, blinding sub-degree refinement).
+        """
+        det_r, det_c = self.det_shape
+        dkr, dkc = self.k_sampling[1], self.k_sampling[2]
+        cr, cc = det_r // 2, det_c // 2
+        geo = []
+        for tilt in tilts_deg:
+            u, v, w = (t.cpu().numpy() for t in self.tilt_axes(float(tilt)))
+            g_lab = np.einsum("cij,mj->cmi", cands, g)
+            exc = np.exp(-0.5 * (g_lab @ w) ** 2 / sigma_e ** 2)
+            col = (g_lab @ u) / dkc + cc
+            row = (g_lab @ v) / dkr + cr
+            inb = (col >= 0) & (col <= det_c - 1) & (row >= 0) & (row <= det_r - 1)
+            exc = exc * inb
+            c0 = np.clip(np.floor(col).astype(int), 0, det_c - 2)
+            r0 = np.clip(np.floor(row).astype(int), 0, det_r - 2)
+            fc = np.clip(col - c0, 0.0, 1.0)
+            fr = np.clip(row - r0, 0.0, 1.0)
+            idx = np.stack([r0 * det_c + c0, r0 * det_c + c0 + 1,
+                            (r0 + 1) * det_c + c0, (r0 + 1) * det_c + c0 + 1], axis=-1)
+            wbl = np.stack([(1 - fr) * (1 - fc), (1 - fr) * fc,
+                            fr * (1 - fc), fr * fc], axis=-1)
+            geo.append((idx, wbl, exc, exc.sum(axis=1)))
+        return geo
+
+    @staticmethod
+    def _uniform_rotations(n: int, seed: int) -> np.ndarray:
+        """(n, 3, 3) uniform SO(3) samples (Shoemake quaternions)."""
+        rng = np.random.default_rng(seed)
+        u = rng.random((n, 3))
+        q = np.stack([np.sqrt(1 - u[:, 0]) * np.sin(2 * np.pi * u[:, 1]),
+                      np.sqrt(1 - u[:, 0]) * np.cos(2 * np.pi * u[:, 1]),
+                      np.sqrt(u[:, 0]) * np.sin(2 * np.pi * u[:, 2]),
+                      np.sqrt(u[:, 0]) * np.cos(2 * np.pi * u[:, 2])], axis=1)
+        x, y, z, w = q.T
+        return np.stack([
+            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+        ], axis=-1).reshape(n, 3, 3)
+
+    @staticmethod
+    def _rot_perturbations(sigma_deg: float, n: int, seed: int) -> np.ndarray:
+        """(n, 3, 3) small random rotations with angle scale sigma_deg."""
+        rng = np.random.default_rng(seed)
+        ax = rng.normal(size=(n, 3))
+        ax /= np.linalg.norm(ax, axis=1, keepdims=True)
+        th = np.radians(sigma_deg) * rng.normal(size=n)
+        K = np.zeros((n, 3, 3))
+        K[:, 0, 1], K[:, 0, 2] = -ax[:, 2], ax[:, 1]
+        K[:, 1, 0], K[:, 1, 2] = ax[:, 2], -ax[:, 0]
+        K[:, 2, 0], K[:, 2, 1] = -ax[:, 1], ax[:, 0]
+        I = np.eye(3)[None]
+        return I + np.sin(th)[:, None, None] * K + (1 - np.cos(th))[:, None, None] * (K @ K)
+
+    def index_orientations(
+        self,
+        measurements: torch.Tensor,
+        tilts_deg,
+        scan_shape: tuple[int, int] | None = None,
+        scan_step: float | tuple[float, float] = 1.0,
+        scan_origin=None,
+        template: np.ndarray | torch.Tensor | None = None,
+        template_weights: np.ndarray | None = None,
+        n_template: int = 40,
+        sigma_e: float | None = None,
+        n_cand: int = 4000,
+        cluster_deg: float = 6.0,
+        peel_rounds: int = 2,
+        icm_lambda: float = 0.15,
+        seed: int | None = None,
+    ) -> dict:
+        """Seed the per-voxel orientations by spot indexing the measurements.
+
+        EBSD-style two-stage indexing:
+
+        1. **Modes**: every probe column (fixed scan position, all tilts) is
+           indexed independently -- a column passes through only 1-2 grains, so
+           its tilt-aggregated score is clean. Column winners are found by a
+           coarse SO(3) bank + hierarchical refinement (with per-column spot
+           peeling to catch a second grain), then clustered by cubic-reduced
+           misorientation into candidate grain orientations ("modes"), each
+           re-refined on the sum of its member columns.
+        2. **Assignment**: each voxel is classified among the few modes using
+           the ray->voxel weight matrix with explaining-away normalization (a
+           pattern dominated by one grain is not counted as evidence for the
+           others), followed by a few Potts/ICM sweeps (grains are contiguous).
+
+        The reflection ``template`` defaults to the local maxima of the model's
+        own current basis, so a short joint reconstruction to bootstrap the
+        basis makes the procedure fully self-contained.
+
+        Returns
+        -------
+        dict
+            ``angles``: (n_voxels, 3, 3) seeded rotations (torch);
+            ``modes``: (n_modes, 3, 3) grain orientations, strongest first;
+            ``labels``: (n_voxels,) mode index per voxel.
+        """
+        from scipy.ndimage import maximum_filter
+
+        seed = self.seed + 3 if seed is None else int(seed)
+        dp = measurements.detach().cpu().numpy()
+        n_tilt = dp.shape[0]
+        if scan_shape is None:
+            scan_shape = (dp.shape[1], dp.shape[2])
+        n_row, n_col = scan_shape
+        P = n_row * n_col
+        det_r, det_c = self.det_shape
+        dkr, dkc = self.k_sampling[1], self.k_sampling[2]
+        if sigma_e is None:
+            sigma_e = 0.6 * min(dkr, dkc)
+
+        # --- reflection template ------------------------------------------
+        if template is None:
+            B = np.fft.fftshift(np.abs(self.masked_basis().detach().cpu().numpy()).sum(-1))
+            czi, cyi, cxi = (s // 2 for s in self.k_shape)
+            B[czi, cyi, cxi] = 0.0
+            peaks = (B == maximum_filter(B, size=3)) & (B > 0.05 * B.max())
+            zz, yy, xx = np.where(peaks)
+            vals = B[zz, yy, xx]
+            order = np.argsort(-vals)[:n_template]
+            dkz = self.k_sampling[0]
+            g = np.stack([(zz - czi) * dkz, (yy - cyi) * dkr, (xx - cxi) * dkc], axis=1)[order]
+            gw = vals[order]
+        else:
+            g = np.asarray(template, dtype=np.float64)
+            gw = (np.ones(len(g)) if template_weights is None
+                  else np.asarray(template_weights, dtype=np.float64))
+
+        # --- per-column indexing ------------------------------------------
+        base = self._uniform_rotations(n_cand, seed)
+        base_geo = self._spot_geometry(base, g, tilts_deg, sigma_e)
+        cols = dp.transpose(1, 2, 0, 3, 4).reshape(P, n_tilt, det_r, det_c)
+        cols = np.fft.fftshift(cols, axes=(-2, -1)).reshape(P, n_tilt, -1)
+
+        def col_scores(col_work, geo):
+            s = 0.0
+            for ti, (idx, wbl, exc, n_eff) in enumerate(geo):
+                vals = col_work[ti][idx.reshape(-1)].reshape(*idx.shape)
+                spot = (vals * wbl).sum(axis=-1)
+                s = s + (spot * exc * gw[None, :]).sum(axis=1) / np.maximum(n_eff, 1e-9)
+            return s
+
+        winners, strengths = [], []
+        for p in range(P):
+            work = cols[p].copy()
+            for r in range(peel_rounds):
+                s = col_scores(work, base_geo)
+                R = base[int(s.argmax())]
+                for sigma in (6.0, 2.0, 0.7):
+                    pert = self._rot_perturbations(sigma, 120, seed + 13 * p + r + int(sigma * 10))
+                    bank = np.einsum("ij,pjk->pik", R, pert)
+                    geo = self._spot_geometry(bank, g, tilts_deg, sigma_e)
+                    R = bank[int(col_scores(work, geo).argmax())]
+                strength = float(col_scores(work, self._spot_geometry(R[None], g, tilts_deg, sigma_e))[0])
+                winners.append(R)
+                strengths.append(strength)
+                geo1 = self._spot_geometry(R[None], g, tilts_deg, sigma_e)
+                for ti, (idx, wbl, exc, _) in enumerate(geo1):
+                    img = work[ti].reshape(det_r, det_c)
+                    for mi in np.where(exc[0] > 0.3)[0]:
+                        r0, c0 = divmod(int(idx[0, mi, 0]), det_c)
+                        img[max(0, r0 - 2):r0 + 4, max(0, c0 - 2):c0 + 4] = 0.0
+
+        # --- cluster winners into modes ------------------------------------
+        order = np.argsort(-np.asarray(strengths))
+        modes, mode_strength = [], []
+        for i in order:
+            R, s = winners[i], strengths[i]
+            if s <= 0:
+                continue
+            placed = False
+            for mi, Rm in enumerate(modes):
+                if self._miso_deg(Rm.T @ R) < cluster_deg:
+                    mode_strength[mi] += s
+                    placed = True
+                    break
+            if not placed:
+                modes.append(R)
+                mode_strength.append(s)
+        order = np.argsort(-np.asarray(mode_strength))
+        modes = np.stack([modes[i] for i in order])
+        mode_strength = np.asarray(mode_strength)[order]
+        keep = mode_strength > 0.15 * mode_strength[0]
+        modes, mode_strength = modes[keep], mode_strength[keep]
+
+        # re-refine each mode on the sum of its member columns
+        refined = []
+        for mi, Rm in enumerate(modes):
+            members = sorted({i // peel_rounds for i, R in enumerate(winners)
+                              if strengths[i] > 0 and self._miso_deg(Rm.T @ R) < cluster_deg})
+            stack = cols[members or range(P)].sum(axis=0)
+            R = Rm
+            for sigma in (2.0, 0.7, 0.25):
+                pert = self._rot_perturbations(sigma, 150, seed + 29 * mi + int(sigma * 10))
+                bank = np.einsum("ij,pjk->pik", R, pert)
+                geo = self._spot_geometry(bank, g, tilts_deg, sigma_e)
+                R = bank[int(col_scores(stack, geo).argmax())]
+            refined.append(R)
+        modes = np.stack(refined)
+
+        # --- per-voxel assignment ------------------------------------------
+        pos = self.scan_positions(scan_shape, scan_step, scan_origin)
+        jobs = [(ti, j, i) for ti in range(n_tilt) for j in range(n_row) for i in range(n_col)]
+        Wmat = torch.stack([self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti]))
+                            for (ti, j, i) in jobs]).cpu().numpy()
+        dps_flat = np.stack([
+            np.fft.fftshift(dp[ti].reshape(P, det_r, det_c), axes=(-2, -1)).reshape(P, -1)
+            for ti in range(n_tilt)
+        ]).reshape(n_tilt * P, -1)
+        geo = self._spot_geometry(modes, g, tilts_deg, sigma_e)
+        s_dp = np.zeros((n_tilt * P, len(modes)))
+        for ti, (idx, wbl, exc, n_eff) in enumerate(geo):
+            dps = dps_flat[ti * P:(ti + 1) * P]
+            vals = dps[:, idx.reshape(-1)].reshape(P, *idx.shape)
+            spot = (vals * wbl[None]).sum(axis=-1)
+            s = (spot * (exc * gw[None, :])[None]).sum(axis=2)
+            s = np.where(n_eff[None, :] >= 1.5, s / np.maximum(n_eff[None, :], 1e-9), 0.0)
+            s_dp[ti * P:(ti + 1) * P] = s
+        # explaining-away: a DP dominated by one grain is weak evidence for others
+        tot = s_dp.sum(axis=1, keepdims=True)
+        s_rel = s_dp / (tot + 1e-30) * np.sqrt(np.maximum(tot, 0.0))
+        vox_score = Wmat.T @ s_rel
+
+        # Potts / ICM smoothing (grains are contiguous)
+        Nz, Ny, Nx = self.real_shape
+        norm = vox_score / (vox_score.max() + 1e-30)
+        labels = norm.argmax(axis=1).reshape(Nz, Ny, Nx)
+        for _ in range(3):
+            for z in range(Nz):
+                for y in range(Ny):
+                    for x in range(Nx):
+                        votes = np.zeros(len(modes))
+                        for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                                           (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+                            z2, y2, x2 = z + dz, y + dy, x + dx
+                            if 0 <= z2 < Nz and 0 <= y2 < Ny and 0 <= x2 < Nx:
+                                votes[labels[z2, y2, x2]] += 1
+                        labels[z, y, x] = int(np.argmax(
+                            norm[(z * Ny + y) * Nx + x] + icm_lambda * votes / 6.0))
+        labels = labels.flatten()
+        R_seed = torch.tensor(modes[labels], dtype=torch.float32)
+        return {"angles": R_seed, "modes": modes, "labels": labels}
+
     def _reset_optimizer_state(self, opt, param, rows) -> None:
         """Zero Adam moments for selected voxel rows of a parameter.
 
@@ -827,10 +1102,13 @@ class DiffractionTomography:
         lr_angles: float | None = None,
         phase_only: bool = True,
         nonneg_weights: bool = False,
+        shrink_weights: float = 0.0,
+        shrink_basis: float = 0.0,
         reset_every: int = 10,
         reset_fraction: float = 0.1,
         reset_neighbor: float = 0.5,
         reset_taper: bool = True,
+        reset_modes: torch.Tensor | None = None,
         progress: bool = True,
         print_every: int = 0,
     ) -> dict:
@@ -903,6 +1181,27 @@ class DiffractionTomography:
             if nonneg_weights:
                 with torch.no_grad():
                     self.weights.clamp_(min=0.0)   # proximal projection: weights >= 0
+            if shrink_weights > 0.0:
+                # proximal L1 (soft-threshold) on the weight field: the material
+                # is sparse (few voxels), so fog weights are pushed to exactly
+                # zero while real ones survive. tau scales with the weight lr,
+                # mirroring the explicit-6D model's shrink.
+                with torch.no_grad():
+                    tau = shrink_weights * lr_weights
+                    self.weights.copy_(torch.sign(self.weights)
+                                       * torch.clamp(self.weights.abs() - tau, min=0.0))
+            if shrink_basis > 0.0 and self.learn_basis:
+                # proximal L1 on the basis' off-origin content: a structure
+                # factor is a few sharp Bragg spots, so soft-thresholding kills
+                # the k-space fog that otherwise fits the data with rings
+                # instead of spots (the same cure the explicit-6D model needed).
+                with torch.no_grad():
+                    tau = shrink_basis * lr
+                    mag = self.basis.abs()
+                    keep = self.basis[0, 0, 0, :].clone()
+                    self.basis.copy_(self.basis / mag.clamp_min(1e-30)
+                                     * torch.clamp(mag - tau, min=0.0))
+                    self.basis[0, 0, 0, :] = keep          # origin (vacuum) untouched
 
             n_res = 0
             # the reset escapes stuck orientations; skip it when angles are frozen
@@ -933,6 +1232,14 @@ class DiffractionTomography:
                                 self.angles.M[v] = self.angles.M[nb] \
                                     + 0.02 * torch.randn(3, 3, generator=gen).to(self.device)
                                 Wf[v] = Wf[nb]
+                            elif reset_modes is not None:
+                                # jump to a random discovered orientation mode:
+                                # the indexing stage's mode list is a far better
+                                # proposal distribution than uniform SO(3)
+                                mi = int(torch.randint(reset_modes.shape[0], (1,), generator=gen))
+                                self.angles.M[v] = reset_modes[mi].to(self.device) \
+                                    + 0.03 * torch.randn(3, 3, generator=gen).to(self.device)
+                                Wf[v] = w_mean
                             else:
                                 self.angles.M[v] = (torch.eye(3)
                                                     + 0.1 * torch.randn(3, 3, generator=gen)).to(self.device)
