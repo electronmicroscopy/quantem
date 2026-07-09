@@ -787,17 +787,32 @@ class DiffractionTomography:
                 n_fix += 1
         return n_fix
 
-    def _make_optimizer(self, lr: float, lr_weights: float):
-        """Adam with a higher lr on the weights: with the basis L2-normalised,
-        a material weight must travel from ~0 to the basis amplitude while the
-        basis and rotations are already unit-scale, so it needs a faster rate."""
-        rest = ([self.basis] if self.learn_basis else []) \
-            + (list(self.angles.parameters()) if self.learn_angles else [])
-        return torch.optim.Adam(
-            [{"params": [self.weights], "lr": lr_weights},
-             {"params": rest, "lr": lr}],
-            eps=1e-30,
-        )
+    def _make_optimizer(self, lr: float, lr_weights: float, lr_angles: float):
+        """Adam with per-parameter-group learning rates (eps=1e-30 because the
+        phase-object gradients are ~1e-10 and the default eps would throttle
+        every step ~100x)."""
+        groups = [{"params": [self.weights], "lr": lr_weights}]
+        if self.learn_basis:
+            groups.append({"params": [self.basis], "lr": lr})
+        if self.learn_angles:
+            groups.append({"params": list(self.angles.parameters()), "lr": lr_angles})
+        return torch.optim.Adam(groups, eps=1e-30)
+
+    def set_learnable(self, basis: bool | None = None, angles: bool | None = None) -> None:
+        """Freeze / unfreeze the basis or the per-voxel orientations in place.
+
+        Used for curriculum (staged) optimization: e.g. explore jointly, then
+        freeze the angles and refine only the basis + weights, then release.
+        Takes effect on the next :meth:`reconstruct` call. Weights are always
+        learnable.
+        """
+        if basis is not None:
+            self.learn_basis = bool(basis)
+            self.basis.requires_grad_(self.learn_basis)
+        if angles is not None:
+            self.learn_angles = bool(angles)
+            for p in self.angles.parameters():
+                p.requires_grad_(self.learn_angles)
 
     def reconstruct(
         self,
@@ -809,7 +824,9 @@ class DiffractionTomography:
         num_iters: int = 100,
         lr: float = 5e-3,
         lr_weights: float | None = None,
+        lr_angles: float | None = None,
         phase_only: bool = True,
+        nonneg_weights: bool = False,
         reset_every: int = 10,
         reset_fraction: float = 0.1,
         reset_neighbor: float = 0.5,
@@ -846,7 +863,8 @@ class DiffractionTomography:
         # eps=1e-30: the phase-object gradients are ~1e-10, so the default
         # eps=1e-8 would swamp sqrt(v) and throttle every Adam step ~100x.
         lr_weights = lr if lr_weights is None else lr_weights
-        opt = self._make_optimizer(lr, lr_weights)
+        lr_angles = lr if lr_angles is None else lr_angles
+        opt = self._make_optimizer(lr, lr_weights, lr_angles)
         gen = torch.Generator(device="cpu").manual_seed(self.seed + 1)
         losses = []
         # fixed geometry: per-DP -> per-voxel deposited trilinear weight, used to
@@ -882,6 +900,9 @@ class DiffractionTomography:
 
             opt.step()
             self._sanitize(opt, gen)     # repair NaN/Inf params (degenerate SVD backward)
+            if nonneg_weights:
+                with torch.no_grad():
+                    self.weights.clamp_(min=0.0)   # proximal projection: weights >= 0
 
             n_res = 0
             # the reset escapes stuck orientations; skip it when angles are frozen
