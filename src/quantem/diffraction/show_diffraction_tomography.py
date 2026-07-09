@@ -58,10 +58,10 @@ class CompactTomographyViewer(anywidget.AnyWidget):
     # embedded data (client-side rendering only, no python round trips)
     real_shape = traitlets.List(traitlets.Int()).tag(sync=True)     # [Nz, Ny, Nx]
     n_struct = traitlets.Int(1).tag(sync=True)
-    w_map = traitlets.Bytes().tag(sync=True)                        # f32 (Nz*Ny*Nx)
-    orient_rgb = traitlets.Bytes().tag(sync=True)                   # f32 (Nz*Ny*Nx*3)
+    w_map = traitlets.Unicode("").tag(sync=True)                    # b64 f32 (Nz*Ny*Nx)
+    orient_rgb = traitlets.Unicode("").tag(sync=True)               # b64 f32 (Nz*Ny*Nx*3)
     k_shape = traitlets.List(traitlets.Int()).tag(sync=True)        # [Nkz, Nky, Nkx]
-    k_vol = traitlets.Bytes().tag(sync=True)                        # f32 (Ns*Nkz*Nky*Nkx), fftshifted
+    k_vol = traitlets.Unicode("").tag(sync=True)                    # b64 f32 (Ns*Nkz*Nky*Nkx), fftshifted
 
     def __init__(self, dt, **kwargs):
         W = dt.weights.detach().abs().cpu().numpy()                 # [Nz,Ny,Nx,Ns]
@@ -76,13 +76,15 @@ class CompactTomographyViewer(anywidget.AnyWidget):
         rgb = beam * (w_sum / max(w_sum.max(), 1e-30))[..., None]
         kv = np.fft.fftshift(B, axes=(0, 1, 2)).transpose(3, 0, 1, 2)  # (Ns,Kz,Ky,Kx)
 
+        import base64
+        b64 = lambda a: base64.b64encode(a.astype(np.float32).copy().tobytes()).decode("ascii")
         super().__init__(
             real_shape=[Nz, Ny, Nx],
             n_struct=Ns,
-            w_map=w_sum.astype(np.float32).tobytes(),
-            orient_rgb=rgb.astype(np.float32).tobytes(),
+            w_map=b64(w_sum),
+            orient_rgb=b64(rgb),
             k_shape=list(B.shape[:3]),
-            k_vol=kv.astype(np.float32).copy().tobytes(),
+            k_vol=b64(kv),
             sel_z=Nz // 2,
             **kwargs,
         )
@@ -90,6 +92,13 @@ class CompactTomographyViewer(anywidget.AnyWidget):
     _esm = r"""
 function decodeF32(view) {
   if (view == null) return new Float32Array(0);
+  if (typeof view === "string") {                    // base64 (JSON-safe, survives saved state)
+    if (!view.length) return new Float32Array(0);
+    const bin = atob(view);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return new Float32Array(u8.buffer);
+  }
   const b = view.buffer !== undefined ? view : new DataView(view);
   return new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
 }
