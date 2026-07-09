@@ -1272,6 +1272,8 @@ class DiffractionTomography:
         nonneg_weights: bool = False,
         shrink_weights: float = 0.0,
         shrink_basis: float = 0.0,
+        basis_topk: int | None = None,
+        angle_smooth: float = 0.0,
         reset_every: int = 10,
         reset_fraction: float = 0.1,
         reset_neighbor: float = 0.5,
@@ -1311,6 +1313,9 @@ class DiffractionTomography:
         lr_weights = lr if lr_weights is None else lr_weights
         lr_angles = lr if lr_angles is None else lr_angles
         opt = self._make_optimizer(lr, lr_weights, lr_angles)
+        group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
+            + (["angles"] if self.learn_angles else [])
+        lrs: list[list[float]] = []
         gen = torch.Generator(device="cpu").manual_seed(self.seed + 1)
         losses = []
         # fixed geometry: per-DP -> per-voxel deposited trilinear weight, used to
@@ -1339,8 +1344,29 @@ class DiffractionTomography:
                 (tl.sum() / n_dp).backward()
                 res_per_dp[ti * P:(ti + 1) * P] = tl.detach()
                 total += float(tl.sum())
+            if angle_smooth > 0.0 and self.learn_angles:
+                # angle-coherence prior: grains are contiguous, so neighboring
+                # material voxels should share an orientation. Penalize the
+                # weight-coupled Frobenius misfit of neighbor rotations -- this
+                # makes the shared-basis factorization identifiable (without it
+                # the data can be fit by giving every voxel its own orientation
+                # of a smeared basis, and the true spike structure never forms).
+                R_all = self.rotation_matrices().reshape(*self.real_shape, 3, 3)
+                wmag = self.weights.detach().abs().sum(-1)
+                wmax = wmag.max().clamp_min(1e-30)
+                pen = 0.0
+                for axis in (0, 1, 2):
+                    r0 = R_all.narrow(axis, 0, R_all.shape[axis] - 1)
+                    r1 = R_all.narrow(axis, 1, R_all.shape[axis] - 1)
+                    w0 = wmag.narrow(axis, 0, wmag.shape[axis] - 1)
+                    w1 = wmag.narrow(axis, 1, wmag.shape[axis] - 1)
+                    wpair = (w0 * w1) / (wmax * wmax)
+                    pen = pen + (wpair * ((r0 - r1) ** 2).sum(dim=(-2, -1))).mean()
+                (angle_smooth * pen).backward()
+
             mean_loss = total / n_dp
             losses.append(mean_loss)
+            lrs.append([float(g["lr"]) for g in opt.param_groups])
             if np.isfinite(mean_loss) and mean_loss < best["loss"]:
                 best = {"loss": mean_loss, "snap": self._snapshot()}
 
@@ -1358,6 +1384,24 @@ class DiffractionTomography:
                     tau = shrink_weights * lr_weights
                     self.weights.copy_(torch.sign(self.weights)
                                        * torch.clamp(self.weights.abs() - tau, min=0.0))
+            if basis_topk and self.learn_basis:
+                # iterative hard thresholding: keep only the K largest-magnitude
+                # off-origin basis voxels (K annealed 10x -> 1x over the run).
+                # Unlike a fixed L1 threshold this is self-scaling -- it always
+                # preserves the strongest signal however small -- while forcing
+                # the structure factor toward a few sharp spots. Zeroed entries
+                # keep their Adam state and may revive if the data demands it.
+                with torch.no_grad():
+                    frac = it / max(num_iters - 1, 1)
+                    K = int(round(basis_topk * 10.0 ** (1.0 - frac)))
+                    for s in range(self.num_structures):
+                        keep_origin = self.basis[0, 0, 0, s].clone()
+                        mag = self.basis[..., s].abs().flatten()
+                        if K < mag.numel():
+                            thr = torch.topk(mag, K).values.min()
+                            mask = self.basis[..., s].abs() >= thr
+                            self.basis[..., s] *= mask
+                        self.basis[0, 0, 0, s] = keep_origin
             if shrink_basis > 0.0 and self.learn_basis:
                 # proximal L1 on the basis' off-origin content: a structure
                 # factor is a few sharp Bragg spots, so soft-thresholding kills
@@ -1424,7 +1468,9 @@ class DiffractionTomography:
         self.normalize_gauge()                        # physical unit-norm bases (fit unchanged)
         self.losses = losses
         self.best_loss = best["loss"]
-        return {"losses": losses, "best_loss": best["loss"],
+        self.lrs = lrs
+        self.lr_group_names = group_names
+        return {"losses": losses, "lrs": lrs, "best_loss": best["loss"],
                 "basis": self.masked_basis().detach(),
                 "weights": self.weights.detach(),
                 "rotations": self.rotation_matrices().detach()}
@@ -1448,12 +1494,28 @@ class DiffractionTomography:
         if not losses:
             raise RuntimeError("No loss history -- run reconstruct() first.")
         fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-        ax.semilogy(np.arange(len(losses)), losses, "-", color="C0")
-        ax.axhline(self.best_loss, color="C1", lw=1.0, ls="--", label="best")
+        it = np.arange(len(losses))
+        ax.semilogy(it, losses, "-", color="C0", label="loss")
+        ax.axhline(self.best_loss, color="C0", lw=1.0, ls="--", label="best")
         ax.set_xlabel("iteration")
-        ax.set_ylabel("mean amplitude MSE")
+        ax.set_ylabel("mean amplitude MSE", color="C0")
+        ax.tick_params(axis="y", labelcolor="C0")
         ax.xaxis.get_major_locator().set_params(integer=True)
-        ax.set_title("reconstruction loss")
-        ax.legend(loc="upper right", fontsize=8)
+
+        lrs = getattr(self, "lrs", None)
+        if lrs:
+            arr = np.asarray(lrs)                       # (n_it, n_groups)
+            names = getattr(self, "lr_group_names", [f"group {i}" for i in range(arr.shape[1])])
+            axr = ax.twinx()
+            if np.allclose(arr, arr[:, :1]):            # all groups share one lr
+                axr.semilogy(it, arr[:, 0], "--", color="C1", label="lr")
+            else:
+                for gi, nm in enumerate(names):
+                    axr.semilogy(it, arr[:, gi], "--", label=f"lr ({nm})")
+            axr.set_ylabel("learning rate", color="C1")
+            axr.tick_params(axis="y", labelcolor="C1")
+            axr.legend(loc="upper right", fontsize=8)
+        ax.set_title("reconstruction loss + learning rate")
+        ax.legend(loc="lower left", fontsize=8)
         plt.show()
         return fig, ax
