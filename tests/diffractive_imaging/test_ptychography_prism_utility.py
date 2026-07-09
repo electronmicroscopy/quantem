@@ -24,12 +24,7 @@ from quantem.diffractive_imaging import (
     PtychographyDatasetRaster,
     PtychographyPRISM,
 )
-from quantem.diffractive_imaging._natural_neighbors_interpolation import beamlet_weights
 from quantem.diffractive_imaging.complex_probe import fourier_space_probe
-from quantem.diffractive_imaging.probe_models import (
-    _partitioned_prism_wave_vectors,
-    _prism_wave_vectors,
-)
 
 N = 64
 K_MAX = 2.0  # inverse Angstroms
@@ -44,6 +39,11 @@ BATCH_SIZE = N**2 // 8
 
 ABERRATIONS = {"C10": 100.0, "C12": 50.0, "phi12": float(np.deg2rad(11))}
 PROBE_PARAMS = {"energy": ENERGY, "semiangle_cutoff": SEMIANGLE, **ABERRATIONS}
+
+# rings scheme with ~4 rings (interpolation_factor 5 on this grid's aperture),
+# matching the old num_partitions=4 default; kept few-parent so the slow
+# reconstruction tests stay fast (the flagship grid+fourier default uses ~10x more).
+PARTITIONED_SCHEME = dict(parent_layout="rings", interpolation="sibson", interpolation_factor=5)
 
 
 # region --- simulation helpers (mirroring scripts/benchmark_prism.py) ---
@@ -131,21 +131,28 @@ def make_pdset(intensities: np.ndarray) -> PtychographyDatasetRaster:
     return pdset
 
 
+def _partitioned_weight_maps(scheme: dict = PARTITIONED_SCHEME) -> np.ndarray:
+    """The frozen (num_parent, N, N) interpolation weight maps of a scheme's probe,
+    read from a bare ProbePRISM so mode construction shares the reconstruction basis
+    exactly (independent of how the parent geometry is derived)."""
+    probe = ProbePRISM.from_params(probe_params=PROBE_PARAMS, learn_aberrations=False, **scheme)
+    probe.set_initial_probe((N, N), RECIPROCAL_SAMPLING, 1.0)
+    return probe.interpolation_weights.cpu().numpy()
+
+
 def make_basis_modes(K: int, rng: np.random.Generator) -> tuple[list, np.ndarray]:
-    """K source modes expressible exactly as CTF x Sibson weights x parent coefs.
+    """K source modes expressible exactly as CTF x weights x parent coefs, built on
+    the reconstruction probe's own basis (so the data is exactly representable).
 
     Gentle, non-orthogonal perturbations of the plain CTF: mixed states only
     depend on the density matrix, and this keeps the dominant eigenmode CTF-like
     and reachable from the CTF initialization.
     """
-    cutoff = SEMIANGLE + float(np.linalg.norm([RECIPROCAL_SAMPLING * WAVELENGTH * 1e3] * 2))
-    extent = np.array([N * SAMPLING] * 2)
-    parents = _partitioned_prism_wave_vectors(cutoff, WAVELENGTH, num_rings=3)
-    beamlets = _prism_wave_vectors(cutoff, extent, WAVELENGTH)
-    weight_maps = beamlet_weights(parents, beamlets, (N, N), (SAMPLING, SAMPLING))
+    weight_maps = _partitioned_weight_maps()
+    num_parents = len(weight_maps)
 
     coefs = 1.0 + 0.35 * (
-        rng.standard_normal((K, len(parents))) + 1j * rng.standard_normal((K, len(parents)))
+        rng.standard_normal((K, num_parents)) + 1j * rng.standard_normal((K, num_parents))
     ) / np.sqrt(2)
     kmodes = np.einsum("kb,bxy->kxy", coefs, weight_maps) * quantem_ctf()[None]
     kmodes /= np.linalg.norm(kmodes.reshape(K, -1), axis=1)[:, None, None]
@@ -191,9 +198,9 @@ def build_prism(
     num_slices: int = 1,
     dz: float | None = None,
     num_probes: int = 1,
-    num_partitions: int = 3,
     dense: bool = False,
     learn_beam_coefficients: bool = False,
+    **scheme,
 ) -> PtychographyPRISM:
     return PtychographyPRISM.from_models(
         dset=pdset,
@@ -203,10 +210,10 @@ def build_prism(
         probe_model=ProbePRISM.from_params(
             num_probes=num_probes,
             probe_params=PROBE_PARAMS,
-            num_partitions=num_partitions,
             dense=dense,
             learn_aberrations=False,
             learn_beam_coefficients=learn_beam_coefficients,
+            **(scheme or PARTITIONED_SCHEME),
         ),
         detector_model=DetectorPixelated(),
         rng=42,
@@ -251,40 +258,37 @@ def multislice_data():
 class TestPartitionedForwardError:
     """Forward-only utility properties of the partitioned approximation."""
 
-    def test_error_decreases_with_partitions_and_compensation_helps(self, multislice_data):
+    def test_error_decreases_with_parents(self, multislice_data):
         phases, dz, pdset = multislice_data
         num_slices = phases.shape[0]
         transmissions = torch.tensor(np.exp(1j * phases), dtype=torch.complex64)
         batch_indices = torch.arange(0, N**2, 16)
 
-        def forward(dense, parts, compensation):
-            prism = build_prism(
-                pdset, num_slices=num_slices, dz=dz, num_partitions=parts, dense=dense
-            )
+        def forward(dense=False, **scheme):
+            prism = build_prism(pdset, num_slices=num_slices, dz=dz, dense=dense, **scheme)
             prism.obj_model._obj.data = transmissions.clone()
-            prism.thickness_compensation = compensation
             with torch.no_grad():
                 pred, _ = prism._forward_batch(batch_indices)
             return pred
 
-        dense_pred = forward(True, 3, False)
+        dense_pred = forward(dense=True)
 
         # dense limit is exact: matches the independent numpy targets (amplitudes)
         targets = pdset._targets[batch_indices]
         dense_err = ((dense_pred.sqrt() - targets).norm() / targets.norm()).item()
         assert dense_err < 1e-4
 
-        errors_on, errors_off = [], []
-        for parts in (2, 3, 4):
-            for compensation, errors in ((True, errors_on), (False, errors_off)):
-                pred = forward(False, parts, compensation)
-                errors.append(((pred - dense_pred).norm() / dense_pred.norm()).item())
-
-        # accuracy improves monotonically with partitions (compensated)
-        assert errors_on[0] > errors_on[1] > errors_on[2]
-        # thickness compensation is what makes the partitioned expansion viable
-        for err_on, err_off in zip(errors_on, errors_off):
-            assert err_on < 0.1 * err_off
+        # smaller interpolation_factor -> more parents -> smaller error (rings),
+        # with the always-on thickness compensation keeping the expansion viable
+        errors = [
+            (
+                (forward(**dict(PARTITIONED_SCHEME, interpolation_factor=f)) - dense_pred).norm()
+                / dense_pred.norm()
+            ).item()
+            for f in (12, 8, 5)
+        ]
+        assert errors[0] > errors[1] > errors[2]
+        assert errors[-1] < 0.1
 
 
 @pytest.mark.slow
@@ -310,7 +314,7 @@ class TestMultisliceReconstruction:
             num_iters=num_iters, reset=True, optimizer_params=opt, batch_size=BATCH_SIZE
         )
 
-        prism = build_prism(pdset, num_slices=num_slices, dz=dz, num_partitions=4)
+        prism = build_prism(pdset, num_slices=num_slices, dz=dz)
         prism.reconstruct(
             num_iters=num_iters, reset=True, optimizer_params=opt, batch_size=BATCH_SIZE
         )
@@ -340,7 +344,7 @@ class TestMixedState:
         )
         true_kmodes = top_k_eigenmodes(probes, weights, 3)
 
-        prism = build_prism(pdset, num_probes=3, num_partitions=3, learn_beam_coefficients=True)
+        prism = build_prism(pdset, num_probes=3, learn_beam_coefficients=True)
         reconstruct_mixed(prism, self.NUM_ITERS)
 
         assert prism._iter_losses[-1] < 5e-3
@@ -361,9 +365,7 @@ class TestMixedState:
 
         losses = {}
         for num_probes in (1, 3):
-            prism = build_prism(
-                pdset, num_probes=num_probes, num_partitions=4, learn_beam_coefficients=True
-            )
+            prism = build_prism(pdset, num_probes=num_probes, learn_beam_coefficients=True)
             reconstruct_mixed(prism, self.NUM_ITERS)
             losses[num_probes] = prism._iter_losses[-1]
 

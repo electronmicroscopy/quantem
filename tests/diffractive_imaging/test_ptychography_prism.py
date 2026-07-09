@@ -45,12 +45,17 @@ PROBE_PARAMS = {
 }
 
 
-def make_prism_probe(num_probes=1, dense=False, num_partitions=3, **kwargs) -> ProbePRISM:
+# A cheap rings scheme (~3 rings / ~19 parents on this grid) so unit and
+# reconstruction tests stay fast; the default grid+fourier uses many more parents
+# (P~429) than these correctness checks need.
+PARTITIONED_SCHEME = dict(parent_layout="rings", interpolation="sibson", interpolation_factor=12)
+
+
+def make_prism_probe(num_probes=1, dense=False, **kwargs) -> ProbePRISM:
     probe_model = ProbePRISM.from_params(
         probe_params=PROBE_PARAMS,
         num_probes=num_probes,
         dense=dense,
-        num_partitions=num_partitions,
         **kwargs,
     )
     probe_model.set_initial_probe((N, N), RECIPROCAL_SAMPLING, MEAN_DIFFRACTION_INTENSITY)
@@ -135,10 +140,11 @@ class TestProbePRISM:
         return probe_model.probe
 
     def test_probe_matches_parametric_partitioned(self):
-        """Sibson weights sum to 1 over the CTF support, so the summed beamlet basis
-        reproduces the aberrated CTF probe exactly for any partitioning."""
+        """Partition-of-unity weights (Sibson or Fourier) sum to 1 over the CTF
+        support, so the summed beamlet basis reproduces the aberrated CTF probe
+        exactly for any partitioning scheme."""
         reference = self._parametric_probe()
-        for kwargs in ({"dense": True}, {"dense": False, "num_partitions": 3}):
+        for kwargs in ({"dense": True}, PARTITIONED_SCHEME, {"interpolation": "fourier"}):
             prism = make_prism_probe(**kwargs)
             probe = prism.probe
             assert probe.shape == (1, N, N)
@@ -195,7 +201,7 @@ class TestProbePRISM:
         np.testing.assert_allclose(ratios, weights, rtol=1e-4)
 
     def test_forward_returns_basis_and_phases(self):
-        prism = make_prism_probe(num_probes=2, num_partitions=3)
+        prism = make_prism_probe(num_probes=2, **PARTITIONED_SCHEME)
         fract_positions = torch.tensor([[0.25, -0.4], [0.0, 0.0], [0.5, 0.1]])
         beamlets_fft, position_coefs = prism.forward(fract_positions)
         assert beamlets_fft.shape == (2, prism.num_parent_beams, N, N)
@@ -395,26 +401,10 @@ class TestPRISMForwardEquivalence:
         scale = pred_conv.abs().max()
         torch.testing.assert_close(pred_prism / scale, pred_conv / scale, rtol=1e-4, atol=1e-5)
 
-    def test_dense_multislice_no_compensation(self, ptycho_dataset, complex_obj):
-        rng = np.random.default_rng(7)
-        obj = np.stack(
-            [complex_obj, np.exp(0.5j * (rng.random((N, N)) - 0.5)).astype(np.complex64)]
-        )
-        conventional, prism = _build_engines(
-            ptycho_dataset, obj, slice_thicknesses=20.0, dense=True
-        )
-        prism.thickness_compensation = False
-
-        pred_conv = _forward_intensities(conventional, BATCH_INDICES)
-        pred_prism = _forward_intensities(prism, BATCH_INDICES)
-
-        scale = pred_conv.abs().max()
-        torch.testing.assert_close(pred_prism / scale, pred_conv / scale, rtol=1e-4, atol=1e-5)
-
     def test_dense_multislice_thickness_compensation(self, ptycho_dataset, complex_obj):
-        """Thickness compensation (back-propagation to the entrance plane) is a pure
-        k-space phase in the far field, so dense PRISM with compensation on still
-        equals the conventional forward exactly."""
+        """Thickness compensation (always-on back-propagation to the entrance plane)
+        is a pure k-space phase in the far field, so dense PRISM still equals the
+        conventional multislice forward exactly."""
         rng = np.random.default_rng(7)
         obj = np.stack(
             [complex_obj, np.exp(0.5j * (rng.random((N, N)) - 0.5)).astype(np.complex64)]
@@ -425,7 +415,6 @@ class TestPRISMForwardEquivalence:
             slice_thicknesses=20.0,
             dense=True,
         )
-        prism.thickness_compensation = True
 
         pred_conv = _forward_intensities(conventional, BATCH_INDICES)
         pred_prism = _forward_intensities(prism, BATCH_INDICES)
@@ -436,7 +425,7 @@ class TestPRISMForwardEquivalence:
     def test_partitioned_close_to_conventional(self, ptycho_dataset, complex_obj):
         """Partitioned PRISM is an approximation; sanity-check it stays close."""
         conventional, prism = _build_engines(
-            ptycho_dataset, complex_obj[None], dense=False, num_partitions=4
+            ptycho_dataset, complex_obj[None], dense=False, **PARTITIONED_SCHEME
         )
 
         pred_conv = _forward_intensities(conventional, BATCH_INDICES)
@@ -461,7 +450,7 @@ class TestPRISMGradients:
             ptycho_dataset,
             complex_obj[None],
             dense=False,
-            num_partitions=3,
+            **PARTITIONED_SCHEME,
             learn_aberrations=True,
             learn_beam_coefficients=True,
         )
@@ -523,7 +512,7 @@ class TestPRISMMemoryKnobs:
             obj,
             slice_thicknesses=20.0,
             dense=False,
-            num_partitions=3,
+            **PARTITIONED_SCHEME,
             learn_aberrations=True,
             learn_beam_coefficients=True,
         )
@@ -626,7 +615,7 @@ class TestPRISMIntegration:
         # learning has something to do
         probe_model = ProbePRISM.from_params(
             probe_params=dict(PROBE_PARAMS, C10=C10 - 10),
-            num_partitions=3,
+            **PARTITIONED_SCHEME,
             learn_aberrations=True,
             learn_beam_coefficients=True,
         )
@@ -683,7 +672,9 @@ class TestPRISMIntegration:
             rtol=0,
             atol=0,
         )
-        assert reloaded_probe.num_partitions == probe_model.num_partitions
+        assert reloaded_probe.parent_layout == probe_model.parent_layout
+        assert reloaded_probe.interpolation == probe_model.interpolation
+        assert reloaded_probe.interpolation_factor == probe_model.interpolation_factor
         assert reloaded_probe.learn_beam_coefficients == probe_model.learn_beam_coefficients
 
         # continue training after reload
@@ -833,7 +824,7 @@ class TestFourierInterpolation:
     def test_coefficient_window_only_for_nearest(self):
         """Only the classic scheme carries a real-space crop window."""
         cases = [
-            (dict(parent_layout="rings", interpolation="sibson", num_partitions=3), False),
+            (dict(parent_layout="rings", interpolation="sibson", interpolation_factor=8), False),
             (dict(parent_layout="grid", interpolation="fourier", interpolation_factor=2), False),
             (dict(parent_layout="grid", interpolation="sibson", interpolation_factor=2), False),
             (dict(parent_layout="grid", interpolation="nearest", interpolation_factor=2), True),
@@ -849,12 +840,16 @@ class TestFourierInterpolation:
                 assert window is None
 
     def test_invalid_scheme_combinations_raise(self):
-        with pytest.raises(ValueError, match="parent_layout='grid'"):
-            ProbePRISM.from_params(probe_params=PROBE_PARAMS, interpolation="fourier")
-        with pytest.raises(ValueError, match="requires interpolation_factor"):
-            ProbePRISM.from_params(probe_params=PROBE_PARAMS, parent_layout="grid")
+        with pytest.raises(ValueError, match="requires parent_layout='grid'"):
+            ProbePRISM.from_params(
+                probe_params=PROBE_PARAMS, parent_layout="rings", interpolation="fourier"
+            )
         with pytest.raises(ValueError, match="interpolation must be"):
             ProbePRISM.from_params(probe_params=PROBE_PARAMS, interpolation="spline")
+        with pytest.raises(ValueError, match="parent_layout must be"):
+            ProbePRISM.from_params(probe_params=PROBE_PARAMS, parent_layout="hex")
+        with pytest.raises(ValueError, match="interpolation_factor must be >= 1"):
+            ProbePRISM.from_params(probe_params=PROBE_PARAMS, interpolation_factor=0)
 
     def test_fourier_weights_reject_off_lattice_parents(self):
         """Parents whose reciprocal-grid indices are not divisible by the factor are
