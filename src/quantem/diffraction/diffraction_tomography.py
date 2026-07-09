@@ -718,25 +718,19 @@ class DiffractionTomography:
         lr_weights: float | None = None,
         phase_only: bool = True,
         reset_every: int = 10,
-        reset_fraction_max: float = 0.05,
-        reset_tol: float = 0.25,
-        revert_slack: float = 0.05,
+        reset_fraction: float = 0.1,
         progress: bool = True,
         print_every: int = 0,
     ) -> dict:
         """Fit basis + weights + angles to the measured tilt series (Adam).
 
-        Full-batch gradient (chunk-accumulated, bounded memory) + amplitude
-        (sqrt-intensity) loss. Two aids for the non-convex per-voxel angles:
-
-        * keep-best: the lowest-loss state is snapshotted and returned at the
-          end; if the loss drifts above ``best*(1+revert_slack)`` at a reset
-          point we roll back to it (with a fresh optimizer).
-        * bad-voxel reset: every ``reset_every`` iters, voxels whose rays carry
-          the most residual error (and exceed ``reset_tol * max``) get a fresh
-          random orientation + equalized weights. The number flipped is capped
-          at ``reset_fraction_max`` of all voxels and scaled by the loss ratio,
-          so fewer voxels flip as we converge and none once nearly converged.
+        Full-batch gradient (bounded memory, one tilt at a time) + amplitude
+        (sqrt-intensity) loss, with a **bad-voxel reset** every ``reset_every``
+        iters: the worst ``reset_fraction`` of voxels (by residual error carried
+        along their rays) get a fresh random orientation *and* a material-scale
+        weight -- the aggressive "orientation + weight jumps" that let stuck
+        voxels escape wrong orientations so the sparse Bragg solution can emerge.
+        The lowest-loss state seen is snapshotted and returned.
 
         Set ``progress=False`` to hide the bar; ``print_every>0`` also prints
         the loss every N iters.
@@ -758,7 +752,6 @@ class DiffractionTomography:
             self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti])) for (ti, j, i) in jobs
         ])                                                            # (n_dp, n_voxels)
         res_per_dp = torch.zeros(n_dp, dtype=torch.float64, device=self.device)
-        n_cap = max(1, int(reset_fraction_max * self.n_voxels))
         best = {"loss": float("inf"), "snap": None}
 
         origins = pos.reshape(-1, 3)                          # (P, 3)
@@ -789,29 +782,19 @@ class DiffractionTomography:
             n_res = 0
             # the reset escapes stuck orientations; skip it when angles are frozen
             if self.learn_angles and reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
-                # roll back to the best-so-far if we've drifted above it
-                if best["snap"] is not None and mean_loss > best["loss"] * (1.0 + revert_slack):
-                    self._restore(best["snap"])
-                    opt = self._make_optimizer(lr, lr_weights)
-                # error-based, tolerance-gated, decaying, capped reset
+                # the worst voxels (by residual error along their rays) get a fresh
+                # random orientation AND a material-scale weight -- the aggressive
+                # jumps that let stuck voxels find the right orientation.
                 err_vox = Wmat.t() @ res_per_dp
-                decay = min(1.0, mean_loss / max(losses[0], 1e-300))
-                emax = float(err_vox.max())
-                eligible = int((err_vox > reset_tol * emax).sum()) if emax > 0 else 0
-                n_res = max(0, min(int(round(n_cap * decay)), n_cap, eligible))
-                if n_res > 0:
-                    bad = torch.topk(err_vox, n_res).indices
-                    with torch.no_grad():
-                        newM = torch.eye(3).reshape(1, 3, 3).repeat(n_res, 1, 1) \
-                            + 0.1 * torch.randn(n_res, 3, 3, generator=gen)
-                        self.angles.M[bad] = newM.to(self.device)
-                        # equalize the flipped voxels' weights across bases but
-                        # PRESERVE each voxel's own magnitude, so a near-vacuum
-                        # voxel stays near vacuum (we only re-roll its angle).
-                        Wf = self.weights.reshape(self.n_voxels, self.num_structures)
-                        Wf[bad] = Wf[bad].mean(dim=1, keepdim=True)
-                        self._reset_optimizer_state(opt, self.angles.M, bad)
-                        self._reset_optimizer_state(opt, self.weights, bad)
+                n_res = max(1, int(round(reset_fraction * self.n_voxels)))
+                bad = torch.topk(err_vox, n_res).indices
+                with torch.no_grad():
+                    newM = torch.eye(3).reshape(1, 3, 3).repeat(n_res, 1, 1) \
+                        + 0.1 * torch.randn(n_res, 3, 3, generator=gen)
+                    self.angles.M[bad] = newM.to(self.device)
+                    self.weights.reshape(self.n_voxels, self.num_structures)[bad] = self.weights.mean()
+                    self._reset_optimizer_state(opt, self.angles.M, bad)
+                    self._reset_optimizer_state(opt, self.weights, bad)
             if print_every and (it % print_every == 0 or it == num_iters - 1):
                 print(f"  it {it:4d}  loss {mean_loss:.4e}  best {best['loss']:.4e}"
                       + (f"  reset {n_res}" if n_res else ""), flush=True)

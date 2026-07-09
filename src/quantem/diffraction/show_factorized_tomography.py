@@ -49,6 +49,11 @@ def show_factorized_tomography(dt, spot_floor: float = 0.1, power: float = 0.5):
     Nz, Ny, Nx, Nw = W.shape
     Nkz, Nky, Nkx = B.shape[:3]
     cz, cy, cx = Nkz // 2, Nky // 2, Nkx // 2
+    # fftshifted radial |k| (pixels) for optional radial weighting -- suppresses
+    # the strong near-origin (low-frequency envelope) content so the Bragg peaks
+    # stand out in the basis panels.
+    ZZ, YY, XX = np.meshgrid(np.arange(Nkz) - cz, np.arange(Nky) - cy, np.arange(Nkx) - cx, indexing="ij")
+    krad3 = np.sqrt(ZZ ** 2 + YY ** 2 + XX ** 2)
 
     def maxima(vol, floor_frac):
         v = vol.copy()
@@ -69,11 +74,12 @@ def show_factorized_tomography(dt, spot_floor: float = 0.1, power: float = 0.5):
     kmode = widgets.Dropdown(options=["slice", "sum"], value="slice", description="mid")
     ksl = widgets.IntSlider(value=cz, min=0, max=Nkz - 1, step=1, description="k-slice")
     pw = widgets.FloatSlider(value=power, min=0.1, max=1.0, step=0.05, description="power")
+    kpow = widgets.Dropdown(options=[("none", 0), ("×k", 1), ("×k²", 2)], value=2, description="radial")
     flr = widgets.FloatSlider(value=spot_floor, min=0.01, max=1.0, step=0.01, description="spot floor")
     azim = widgets.IntSlider(value=30, min=-180, max=180, step=5, description="azim")
     elev = widgets.IntSlider(value=20, min=-90, max=90, step=5, description="elev")
 
-    def render(basis, left, zsl, kax, kmode, ksl, pw, flr, azim, elev):
+    def render(basis, left, zsl, kax, kmode, ksl, pw, kpow, flr, azim, elev):
         fig = plt.figure(figsize=(12, 4), constrained_layout=True)
         a1 = fig.add_subplot(1, 3, 1)
         a2 = fig.add_subplot(1, 3, 2)
@@ -92,8 +98,8 @@ def show_factorized_tomography(dt, spot_floor: float = 0.1, power: float = 0.5):
             a1.imshow(wv[zsl], origin="lower", cmap="magma")
             a1.set_title(f"weights [{left}]  z={zsl}", fontsize=9)
 
-        # MIDDLE: basis |SF| slice or sum along the chosen k axis
-        b = B[..., basis]
+        # MIDDLE: basis |SF| (radially weighted) slice or sum along the chosen k axis
+        b = B[..., basis] * (krad3 ** kpow)
         ax = {"kz": 0, "ky": 1, "kx": 2}[kax]
         if kmode == "sum":
             img = b.sum(axis=ax)
@@ -104,8 +110,8 @@ def show_factorized_tomography(dt, spot_floor: float = 0.1, power: float = 0.5):
         a2.imshow(img ** pw, cmap="inferno")
         a2.set_title(f"|basis {basis}|  {kax} {kmode}", fontsize=9)
 
-        # RIGHT: 3D scatter of this basis's local maxima
-        xx, yy, zz, ii = maxima(B[..., basis], flr)
+        # RIGHT: 3D scatter of this basis's local maxima (radially weighted)
+        xx, yy, zz, ii = maxima(B[..., basis] * (krad3 ** kpow), flr)
         if len(ii):
             s = 6 + 240 * (ii / ii.max())
             a3.scatter(xx, yy, zz, s=s, c=ii, cmap="inferno", depthshade=True)
@@ -117,15 +123,15 @@ def show_factorized_tomography(dt, spot_floor: float = 0.1, power: float = 0.5):
 
     out = widgets.interactive_output(render, {
         "basis": basis, "left": left, "zsl": zsl, "kax": kax, "kmode": kmode,
-        "ksl": ksl, "pw": pw, "flr": flr, "azim": azim, "elev": elev,
+        "ksl": ksl, "pw": pw, "kpow": kpow, "flr": flr, "azim": azim, "elev": elev,
     })
     # group each panel's controls in a column above that panel (left | middle | right)
     col = widgets.Layout(width="390px")
-    for s in (basis, left, zsl, kax, kmode, ksl, pw, flr, azim, elev):
+    for s in (basis, left, zsl, kax, kmode, ksl, pw, kpow, flr, azim, elev):
         s.style = {"description_width": "70px"}
         s.layout = widgets.Layout(width="360px")
     left_ctrl = widgets.VBox([widgets.HTML("<b>weights (left)</b>"), left, zsl], layout=col)
-    mid_ctrl = widgets.VBox([widgets.HTML("<b>basis (middle)</b>"), basis, kax, kmode, ksl, pw], layout=col)
+    mid_ctrl = widgets.VBox([widgets.HTML("<b>basis (middle)</b>"), basis, kax, kmode, ksl, pw, kpow], layout=col)
     right_ctrl = widgets.VBox([widgets.HTML("<b>SF spots (right)</b>"), flr, azim, elev], layout=col)
     controls = widgets.HBox([left_ctrl, mid_ctrl, right_ctrl])
     return widgets.VBox([controls, out])
