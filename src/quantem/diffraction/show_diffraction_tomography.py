@@ -335,11 +335,13 @@ function render({ model, el: root }) {
       const w = kp === 0 ? 1 : (kp === 1 ? kRad[i] : kRad[i] * kRad[i]);
       out[i] = (src ? src[i] : kVolAll[base + i]) * w;
     }
-    // zero the origin (vacuum baseline) so it never sets the display scale
-    const c = (Math.floor(Kz / 2) * Ky + Math.floor(Ky / 2)) * Kx + Math.floor(Kx / 2);
-    out[c] = 0;
     wVolKey = key; wVol = out;
     return out;
+  }
+
+  function originIdx() {
+    const [Kz, Ky, Kx] = kShape;
+    return (Math.floor(Kz / 2) * Ky + Math.floor(Ky / 2)) * Kx + Math.floor(Kx / 2);
   }
 
   // =====================  LEFT: real space  =====================
@@ -553,14 +555,25 @@ function render({ model, el: root }) {
     // over the whole power-scaled volume so it stays fixed while scrubbing
     let mn = Infinity, mx = -Infinity;
     const midVals = [];
+    const oIdx = originIdx();
     if (mode === "slice") {
       for (let i = 0; i < vol.length; i++) {
+        if (i === oIdx) continue;                     // origin (=1) never sets the scale
         const v = Math.pow(vol[i], p);
         midVals.push(v);
         if (v < mn) mn = v; if (v > mx) mx = v;
       }
     } else {
-      for (const v of out) { midVals.push(v); if (v < mn) mn = v; if (v > mx) mx = v; }
+      const [KzS, KyS, KxS] = kShape;
+      const axS = model.get("sum_axis");
+      const oab = [[Math.floor(KyS/2), Math.floor(KxS/2)], [Math.floor(KzS/2), Math.floor(KxS/2)],
+                   [Math.floor(KzS/2), Math.floor(KyS/2)]][axS];
+      const oFlat = oab[0] * dims[1] + oab[1];
+      for (let i = 0; i < out.length; i++) {
+        if (i === oFlat) continue;
+        const v = out[i];
+        midVals.push(v); if (v < mn) mn = v; if (v > mx) mx = v;
+      }
     }
     if (!isFinite(mn)) { mn = 0; mx = 1; }
     if (mx <= mn) mx = mn + 1;
@@ -638,6 +651,7 @@ function render({ model, el: root }) {
                 if (vol[((z + dz) * Ky + (y + dy)) * Kx + (x + dx)] > v) { isMax = false; break; }
               }
           if (isMax) {
+            if (z === cz && y === cy && x === cx) continue;   // origin: not a Bragg spot
             pos.push([x - cx, y - cy, z - cz]);   // (kx, ky, kz) centered
             val.push(v);
           }

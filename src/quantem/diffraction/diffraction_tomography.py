@@ -144,7 +144,14 @@ class DiffractionTomography:
         self.det_ku = (torch.fft.fftfreq(Nkx, d=1.0 / (Nkx * dkx)).to(dev))  # col
 
     def _build_sphere_mask(self) -> None:
-        """Boolean mask, True inside the inscribed sphere of the k cube."""
+        """Boolean mask of the basis support.
+
+        The radius is the smaller of the inscribed sphere and the DATA-VISIBLE
+        radius set by the propagator's anti-alias envelope: beyond the envelope
+        cutoff neither the measurements nor the predictions carry intensity, so
+        basis voxels there are invisible to the loss and would only accumulate
+        never-corrected fog at the shell.
+        """
         Nkz, Nky, Nkx = self.k_shape
         dev = self.device
         # index-space radii from the (fft) origin, in *pixels*
@@ -152,7 +159,10 @@ class DiffractionTomography:
         iy = torch.fft.fftfreq(Nky, d=1.0 / Nky).to(dev)[None, :, None]
         ix = torch.fft.fftfreq(Nkx, d=1.0 / Nkx).to(dev)[None, None, :]
         r_pix = torch.sqrt(iz ** 2 + iy ** 2 + ix ** 2)
-        r_max = (min(self.k_shape) - 1) / 2.0        # inscribed radius, e.g. 20 for 41
+        r_max = (min(self.k_shape) - 1) / 2.0        # inscribed radius
+        vis = getattr(self, "_visible_k_max", None)  # A^-1, set by make_propagator
+        if vis is not None:
+            r_max = min(r_max, vis / min(self.k_sampling))
         self.sphere_mask = (r_pix <= r_max)          # [Nkz, Nky, Nkx] bool
         self.sphere_radius_pix = float(r_max)
 
@@ -269,20 +279,25 @@ class DiffractionTomography:
     def normalize_gauge(self) -> None:
         """Fix the weight/basis scale degeneracy in place, physically.
 
-        Each basis is L2-normalised over its off-origin (Bragg) content so that
-        ``sum |basis|**2 == 1`` there, and the scale is absorbed into the
-        corresponding weights. Every ``weight * basis`` product is preserved, so
-        the forward model and the data fit are unchanged -- only the gauge
-        (physical, unit-norm bases; weights carrying the amplitude) changes. The
-        origin pixel is overwritten during transmission assembly and is excluded
-        from the norm.
+        Convention: each structure factor is a unit-energy field whose origin
+        (vacuum baseline) dominates -- the origin is restored to 1, the whole
+        basis is divided by ``sqrt(1 + E)`` with ``E`` the off-origin energy,
+        and ``sqrt(1 + E)`` is absorbed into the weights. This gives exactly
+
+            sum |basis|**2 == 1   and   basis[origin] == sqrt(1 - sum |off|**2)
+
+        with weak off-origin Bragg peaks, while every ``weight * basis``
+        product (and therefore the data fit) is unchanged -- the transmission
+        assembly pins the DC term, so only the off-origin content enters the
+        forward model.
         """
         with torch.no_grad():
-            sq_all = (self.basis.abs() ** 2).reshape(-1, self.num_structures).sum(0)
-            sq_origin = self.basis[0, 0, 0, :].abs() ** 2
-            bn = torch.sqrt((sq_all - sq_origin).clamp_min(1e-24))       # (Nw,)
-            self.basis /= bn
-            self.weights *= bn
+            self.basis[0, 0, 0, :] = 1.0
+            sq_off = ((self.basis.abs() ** 2).reshape(-1, self.num_structures).sum(0)
+                      - self.basis[0, 0, 0, :].abs() ** 2)
+            s = torch.sqrt(1.0 + sq_off.clamp_min(0.0))                  # (Ns,)
+            self.basis /= s
+            self.weights *= s
 
     @classmethod
     def from_test(
@@ -429,6 +444,8 @@ class DiffractionTomography:
         self.antialias_mask = mask.to(self.device)          # circular k envelope
         self.prop = (bare * self.antialias_mask)
         self.prop_distance = dz
+        self._visible_k_max = float(cutoff + width)         # data carries no intensity beyond
+        self._build_sphere_mask()                            # clip basis support to it
         return self.prop
 
     def tilt_axes(self, tilt_x_deg: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
