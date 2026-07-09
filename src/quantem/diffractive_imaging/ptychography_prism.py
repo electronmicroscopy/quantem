@@ -42,14 +42,13 @@ class PtychographyPRISM(Ptychography):
     - ``use_checkpointing``: recompute each parent chunk during backward instead
       of retaining its activations (~halves peak memory at ~2x forward compute).
 
-    For multislice objects the propagated parent waves are back-propagated over
-    the total thickness (refocused to the entrance plane). This is a pure
-    k-space phase in the far field — intensity-neutral in the dense limit — but
-    it removes the thickness-dependent quadratic phase across parents, which is
-    what keeps the parent-beam interpolation accurate for thick specimens;
-    disable with ``thickness_compensation=False``. PRISM amortizes the
-    per-batch multislice of the parent beams best with large (ideally full)
-    batch sizes.
+    For multislice objects the propagated parent waves are always back-propagated
+    over the total thickness (refocused to the entrance plane). This is a pure
+    k-space phase in the far field — intensity-neutral in the dense limit — but it
+    removes the thickness-dependent quadratic phase across parents, which is what
+    keeps the parent-beam interpolation accurate for thick specimens. PRISM
+    amortizes the per-batch multislice of the parent beams best with large
+    (ideally full) batch sizes.
     """
 
     _supports_prism_probe = True
@@ -57,7 +56,6 @@ class PtychographyPRISM(Ptychography):
     # class-level defaults so objects loaded from file (which skip __init__) behave
     parent_batch_size: int | None = None
     use_checkpointing: bool = False
-    thickness_compensation: bool = True
 
     @classmethod
     def from_models(
@@ -108,7 +106,6 @@ class PtychographyPRISM(Ptychography):
         batch_size: int | None = None,
         parent_batch_size: int | None = None,
         use_checkpointing: bool | None = None,
-        thickness_compensation: bool | None = None,
         store_snapshots: bool | None = None,
         store_snapshots_every: int | None = None,
         device: str | int | list[int] | None = None,
@@ -124,10 +121,6 @@ class PtychographyPRISM(Ptychography):
             Number of parent beams propagated/reduced per chunk (None = all at once).
         use_checkpointing : bool
             Gradient-checkpoint each parent chunk (recomputed during backward).
-        thickness_compensation : bool
-            Back-propagate parent waves over the total thickness to the entrance
-            plane, keeping the partitioned interpolation accurate for thick
-            specimens (multislice only; intensity-neutral in the dense limit).
         """
         if not autograd:
             raise ValueError("PtychographyPRISM only supports autograd=True.")
@@ -138,8 +131,6 @@ class PtychographyPRISM(Ptychography):
             self.parent_batch_size = int(parent_batch_size)
         if use_checkpointing is not None:
             self.use_checkpointing = bool(use_checkpointing)
-        if thickness_compensation is not None:
-            self.thickness_compensation = bool(thickness_compensation)
 
         return super().reconstruct(
             num_iters=num_iters,
@@ -330,12 +321,11 @@ class PtychographyPRISM(Ptychography):
         self._obj_propagators = self.probe_model._compute_propagator_arrays(
             self.sampling, self.num_slices, self.slice_thicknesses, gpts=gpts
         )
-        if self.thickness_compensation:
-            total_thickness = float(np.sum(self.slice_thicknesses))
-            self._total_back_propagator = self.probe_model._compute_propagator_arrays(
-                self.sampling, 2, [-total_thickness], gpts=gpts
-            )[0]
-        else:
-            self._total_back_propagator = None
+        # always refocus the parent waves to the entrance plane (removes the
+        # thickness-dependent quadratic phase that would spoil the interpolation)
+        total_thickness = float(np.sum(self.slice_thicknesses))
+        self._total_back_propagator = self.probe_model._compute_propagator_arrays(
+            self.sampling, 2, [-total_thickness], gpts=gpts
+        )[0]
 
     # endregion --- forward model ---
