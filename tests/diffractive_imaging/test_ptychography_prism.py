@@ -546,6 +546,62 @@ class TestPRISMMemoryKnobs:
                 torch.testing.assert_close(grad / scale, grad_ref / scale, rtol=1e-4, atol=1e-5)
 
 
+class TestPRISMFrozenScanReduction:
+    """Frozen scans deduplicate the reduction kernels to the unique sub-pixel offsets
+    and reduce positions in memory-bounded chunks; both must match the exact
+    per-position path, and quantization error must be bounded."""
+
+    def _multislice_engine(self, ptycho_dataset, complex_obj, **kw):
+        rng = np.random.default_rng(7)
+        obj = np.stack(
+            [complex_obj, np.exp(0.5j * (rng.random((N, N)) - 0.5)).astype(np.complex64)]
+        )
+        _, prism = _build_engines(
+            ptycho_dataset,
+            obj,
+            slice_thicknesses=20.0,
+            parent_layout="grid",
+            interpolation="fourier",
+            interpolation_factor=2,
+            **kw,
+        )
+        return prism
+
+    def test_frozen_dedup_matches_per_position(self, ptycho_dataset, complex_obj):
+        prism = self._multislice_engine(ptycho_dataset, complex_obj)
+        with torch.no_grad():
+            prism.dset._scan_positions_px += torch.tensor([0.3, -0.2])  # nonzero sub-pixel
+            prism.dset.learn_scan_positions = True  # exact per-position path
+            ref = _forward_intensities(prism, BATCH_INDICES).detach()
+            prism.dset.learn_scan_positions = False  # deduplicated path
+            dedup = _forward_intensities(prism, BATCH_INDICES).detach()
+        torch.testing.assert_close(dedup, ref, rtol=1e-4, atol=1e-5)
+
+    def test_position_batch_size_invariant(self, ptycho_dataset, complex_obj):
+        prism = self._multislice_engine(ptycho_dataset, complex_obj)
+        prism.dset.learn_scan_positions = False
+        with torch.no_grad():
+            full = _forward_intensities(prism, BATCH_INDICES).detach()
+            prism.position_batch_size = 5
+            chunked = _forward_intensities(prism, BATCH_INDICES).detach()
+        torch.testing.assert_close(chunked, full, rtol=0, atol=0)
+
+    def test_quantization_error_bounded(self, ptycho_dataset, complex_obj):
+        prism = self._multislice_engine(ptycho_dataset, complex_obj)
+        gen = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            # varied sub-pixel offsets so quantization actually groups distinct kernels
+            prism.dset._scan_positions_px += (
+                torch.rand(prism.dset.num_positions, 2, generator=gen) - 0.5
+            )
+            prism.dset.learn_scan_positions = False
+            exact = _forward_intensities(prism, BATCH_INDICES).detach()
+            prism.position_quantization = 8
+            quant = _forward_intensities(prism, BATCH_INDICES).detach()
+        rel = ((quant - exact).norm() / exact.norm()).item()
+        assert rel < 0.05  # ~1/(2*8) px offset error -> small intensity error
+
+
 class TestParametricAberrationLearning:
     """Regression: the conventional engine's autograd backward used to rescale
     ProbeParametric gradients by sqrt(mean_diffraction_intensity), which sent
