@@ -999,6 +999,104 @@ class DiffractionTomography:
         R_seed = torch.tensor(modes[labels], dtype=torch.float32)
         return {"angles": R_seed, "modes": modes, "labels": labels}
 
+    def init_from_spots(
+        self,
+        measurements: torch.Tensor,
+        tilts_deg,
+        scan_shape: tuple[int, int] | None = None,
+        scan_step: float | tuple[float, float] = 1.0,
+        scan_origin=None,
+        spot_threshold: float = 0.15,
+        ray_weight_min: float = 0.2,
+        basis_scale: float = 0.01,
+        beam_radius: float | None = None,
+    ) -> None:
+        """Directly initialise the weights and basis from the measured spots.
+
+        Uses the model's *current* per-voxel orientations (typically seeded by
+        :meth:`index_orientations`), so together the two methods give a full
+        direct (non-iterative) estimate of every parameter:
+
+        * **weights** <- the virtual dark-field map: each pattern's off-beam
+          (diffracted) energy distributed onto the voxels its ray samples.
+        * **basis** <- tomographic spot backprojection: every off-beam spot
+          pixel lies at a known in-plane ``k_lab``; for each voxel the ray
+          samples, ``R_v^T k_lab`` is a body-frame position, and the spot
+          amplitudes accumulate there (correct orientations reinforce the
+          Bragg spikes, misassignments average into weak fog).
+
+        Gradient refinement should then keep the basis frozen (or nearly so):
+        the joint amplitude-loss landscape prefers k-space fog that fits the
+        data over sharp spikes, and free basis refinement erases the spike
+        structure even from a good initialisation.
+        """
+        dp = measurements.detach().cpu().numpy()
+        n_tilt = dp.shape[0]
+        if scan_shape is None:
+            scan_shape = (dp.shape[1], dp.shape[2])
+        n_row, n_col = scan_shape
+        P = n_row * n_col
+        det_r, det_c = self.det_shape
+        dkr, dkc = self.k_sampling[1], self.k_sampling[2]
+        Nkz, Nky, Nkx = self.k_shape
+        cr, cc = det_r // 2, det_c // 2
+        if beam_radius is None:
+            beam = np.fft.fftshift(np.abs(self.Psi0.cpu().numpy()) > 0)
+            rr_b = np.sqrt((np.arange(det_r)[:, None] - cr) ** 2
+                           + (np.arange(det_c)[None, :] - cc) ** 2)
+            beam_radius = float(rr_b[beam].max()) + 2.0
+        rr = np.sqrt((np.arange(det_r)[:, None] - cr) ** 2
+                     + (np.arange(det_c)[None, :] - cc) ** 2)
+        off_beam = rr > beam_radius
+
+        pos = self.scan_positions(scan_shape, scan_step, scan_origin)
+        jobs = [(ti, j, i) for ti in range(n_tilt) for j in range(n_row) for i in range(n_col)]
+        Wmat = torch.stack([self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti]))
+                            for (ti, j, i) in jobs]).cpu().numpy()
+        R_all = self.rotation_matrices().detach().cpu().numpy().reshape(-1, 3, 3)
+
+        # weights: virtual dark field
+        dps_all = np.fft.fftshift(dp.reshape(-1, det_r, det_c), axes=(-2, -1))
+        vdf = Wmat.T @ (dps_all * off_beam).sum(axis=(-2, -1))
+        vdf = vdf / max(vdf.max(), 1e-30)
+        W0 = np.repeat(vdf.reshape(*self.real_shape, 1), self.num_structures, axis=-1)
+
+        # basis: spot backprojection through the per-voxel orientations
+        acc = np.zeros(self.k_shape)
+        cnt = np.zeros(self.k_shape)
+        for ti in range(n_tilt):
+            u, v, w = (t.cpu().numpy() for t in self.tilt_axes(float(tilts_deg[ti])))
+            dps = np.fft.fftshift(dp[ti].reshape(P, det_r, det_c), axes=(-2, -1))
+            for p in range(P):
+                img = dps[p] * off_beam
+                thr = spot_threshold * img.max()
+                if thr <= 0:
+                    continue
+                rows, cols = np.where(img > thr)
+                amps = np.sqrt(img[rows, cols])
+                k_lab = (((cols - cc)[:, None] * dkc) * u[None, :]
+                         + ((rows - cr)[:, None] * dkr) * v[None, :])
+                wrow = Wmat[ti * P + p]
+                for vi in np.where(wrow > ray_weight_min)[0]:
+                    k_body = k_lab @ R_all[vi]
+                    idx = np.rint(k_body / np.array(self.k_sampling)).astype(int) \
+                        + np.array([Nkz // 2, Nky // 2, Nkx // 2])
+                    ok = np.all((idx >= 0) & (idx < np.array(self.k_shape)), axis=1)
+                    for (iz, iy, ix), a in zip(idx[ok], amps[ok] * wrow[vi]):
+                        acc[iz, iy, ix] += a
+                        cnt[iz, iy, ix] += wrow[vi]
+        bp = np.where(cnt > 0, acc / np.maximum(cnt, 1e-9), 0.0)
+        bp = np.fft.ifftshift(bp) / max(bp.max(), 1e-30) * basis_scale
+
+        with torch.no_grad():
+            self.weights.copy_(torch.tensor(W0, dtype=self.weights.dtype))
+            b = torch.tensor(1j * bp, dtype=self.basis.dtype)[..., None]
+            b = b.expand(*self.k_shape, self.num_structures).contiguous()
+            b[0, 0, 0, :] = 1.0
+            b = b * self.sphere_mask[..., None]
+            b[0, 0, 0, :] = 1.0
+            self.basis.copy_(b)
+
     def _reset_optimizer_state(self, opt, param, rows) -> None:
         """Zero Adam moments for selected voxel rows of a parameter.
 
