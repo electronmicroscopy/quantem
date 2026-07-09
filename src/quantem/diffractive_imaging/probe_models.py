@@ -1783,17 +1783,25 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
     ======================  =============  ===============  ==========================
     scheme                  parent_layout  interpolation    notes
     ======================  =============  ===============  ==========================
-    partitioned PRISM       ``"rings"``    ``"sibson"``     default; hexagonal parents
+    C-PRISM w/o SVD (#318)  ``"grid"``     ``"fourier"``    default; trig. interp.
+    partitioned PRISM       ``"rings"``    ``"sibson"``     hexagonal parents
     PRISM (Ophus 2017)      ``"grid"``     ``"nearest"``    one-hot + crop window
-    C-PRISM w/o SVD (#318)  ``"grid"``     ``"fourier"``    trig. interp., full aperture
     grid ablation           ``"grid"``     ``"sibson"``     isolates interpolant/layout
     ======================  =============  ===============  ==========================
 
-    C-PRISM's phase-removal tricks are already handled by the engine
-    (carrier removal at parent propagation, ``thickness_compensation`` back-
-    propagation); its SVD compression stage is intentionally not implemented (it
-    adds no accuracy and its build-once/reduce-many amortization is broken by
-    per-iteration object updates).
+    ``interpolation_factor`` sets the coarseness for every layout: it is the parent
+    spacing in reciprocal-grid steps, so higher = coarser = fewer parents = cheaper
+    but less accurate (P, the parent count, is the dominant per-iteration cost). For
+    ``"rings"`` the number of rings is derived from it (~ aperture-radius / factor).
+    The full-aperture interpolants (``"fourier"``, ``"sibson"``) reduce from the
+    whole aperture and scale to low error; the classic crop (``"nearest"``) suffers
+    real-space replica overlap and is inaccurate at ptychographic ROI sizes.
+
+    C-PRISM's phase-removal tricks are already handled by the engine (carrier
+    removal at parent propagation, always-on total-thickness back-propagation); its
+    SVD compression stage is intentionally not implemented (it adds no accuracy and
+    its build-once/reduce-many amortization is broken by per-iteration object
+    updates).
 
     Learnables (each gated by a flag):
     - per-mode aberration coefficients (``learn_aberrations``)
@@ -1834,11 +1842,10 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         num_probes: int = 1,
         probe_params: dict = {},
         aberration_coefs: dict | list[dict] | None = None,
-        num_partitions: int = 4,
         dense: bool = False,
-        parent_layout: str = "rings",
-        interpolation: str = "sibson",
-        interpolation_factor: int | None = None,
+        parent_layout: str = "grid",
+        interpolation: str = "fourier",
+        interpolation_factor: int = 2,
         learn_aberrations: bool = True,
         learn_beam_coefficients: bool = False,
         initial_probe_weights: list[float] | np.ndarray | None = None,
@@ -1879,19 +1886,13 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
                 f"interpolation={interpolation!r} requires parent_layout='grid' "
                 "(ring parents are off the reciprocal sublattice)"
             )
-        if parent_layout == "grid":
-            if interpolation_factor is None:
-                raise ValueError("parent_layout='grid' requires interpolation_factor")
-            if int(interpolation_factor) < 1:
-                raise ValueError(f"interpolation_factor must be >= 1, got {interpolation_factor}")
+        if int(interpolation_factor) < 1:
+            raise ValueError(f"interpolation_factor must be >= 1, got {interpolation_factor}")
 
-        self.num_partitions = num_partitions
         self.dense = dense
         self.parent_layout = parent_layout
         self.interpolation = interpolation
-        self.interpolation_factor = (
-            None if interpolation_factor is None else int(interpolation_factor)
-        )
+        self.interpolation_factor = int(interpolation_factor)
         self.learn_aberrations = learn_aberrations
         self.learn_beam_coefficients = learn_beam_coefficients
         self._vacuum_probe_intensity = None
@@ -1971,11 +1972,10 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
         probe_params: dict,
         num_probes: int = 1,
         aberration_coefs: dict | list[dict] | None = None,
-        num_partitions: int = 4,
         dense: bool = False,
-        parent_layout: str = "rings",
-        interpolation: str = "sibson",
-        interpolation_factor: int | None = None,
+        parent_layout: str = "grid",
+        interpolation: str = "fourier",
+        interpolation_factor: int = 2,
         learn_aberrations: bool = True,
         learn_beam_coefficients: bool = False,
         initial_probe_weights: list[float] | np.ndarray | None = None,
@@ -1991,7 +1991,6 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
             num_probes=num_probes,
             probe_params=probe_params.copy(),
             aberration_coefs=aberration_coefs,
-            num_partitions=num_partitions,
             dense=dense,
             parent_layout=parent_layout,
             interpolation=interpolation,
@@ -2118,8 +2117,14 @@ class ProbePRISM(BaseConstraints[PtychoProbeConstraintParams.Parametric], ProbeB
             parent_kv = beamlet_kv
             weights = one_hot_beamlet_weights(beamlet_kv, gpts, sampling)
         elif self.parent_layout == "rings":
+            # unify the coarseness control with the grid schemes: interpolation_factor
+            # is the parent spacing in reciprocal-grid steps, so the number of rings
+            # spanning the aperture radius (n_max px) is ~ n_max / f (higher f =
+            # coarser = fewer rings), matching the grid sublattice at the same factor
+            n_max = int(np.max(np.abs(np.rint(beamlet_kv * self.extent[None]))))
+            num_rings = max(2, round(n_max / f) + 1)
             parent_kv = _partitioned_prism_wave_vectors(
-                cutoff, self.wavelength, num_rings=self.num_partitions
+                cutoff, self.wavelength, num_rings=num_rings
             )
             weights = beamlet_weights(parent_kv, beamlet_kv, gpts, sampling)
         elif self.interpolation == "nearest":
