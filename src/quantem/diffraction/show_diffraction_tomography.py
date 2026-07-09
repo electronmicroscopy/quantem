@@ -28,8 +28,9 @@ import torch
 import traitlets
 
 _LINKED_TRAITS = (
-    "left_mode", "sel_z", "structure", "sum_axis", "view_mode", "slice_idx",
-    "power", "kpow", "pts_power", "pts_scale", "pts_floor", "rot_theta", "rot_phi",
+    "left_mode", "sel_z", "sel_y", "sel_x", "mid_mode", "structure", "sum_axis",
+    "view_mode", "slice_idx", "power", "kpow", "pts_power", "pts_scale",
+    "pts_floor", "rot_theta", "rot_phi",
 )
 
 
@@ -40,6 +41,9 @@ class CompactTomographyViewer(anywidget.AnyWidget):
     title = traitlets.Unicode("").tag(sync=True)
     left_mode = traitlets.Unicode("weights").tag(sync=True)   # 'weights' | 'orientation'
     sel_z = traitlets.Int(0).tag(sync=True)
+    sel_y = traitlets.Int(0).tag(sync=True)
+    sel_x = traitlets.Int(0).tag(sync=True)
+    mid_mode = traitlets.Unicode("voxel").tag(sync=True)      # 'voxel' | 'basis'
     structure = traitlets.Int(0).tag(sync=True)
     sum_axis = traitlets.Int(0).tag(sync=True)                # 0=kz 1=ky 2=kx
     view_mode = traitlets.Unicode("slice").tag(sync=True)     # 'slice' | 'sum'
@@ -62,6 +66,7 @@ class CompactTomographyViewer(anywidget.AnyWidget):
     orient_rgb = traitlets.Unicode("").tag(sync=True)               # b64 f32 (Nz*Ny*Nx*3)
     k_shape = traitlets.List(traitlets.Int()).tag(sync=True)        # [Nkz, Nky, Nkx]
     k_vol = traitlets.Unicode("").tag(sync=True)                    # b64 f32 (Ns*Nkz*Nky*Nkx), fftshifted
+    rot_flat = traitlets.Unicode("").tag(sync=True)                 # b64 f32 (n_voxels*9), body->lab
 
     def __init__(self, dt, **kwargs):
         W = dt.weights.detach().abs().cpu().numpy()                 # [Nz,Ny,Nx,Ns]
@@ -78,6 +83,7 @@ class CompactTomographyViewer(anywidget.AnyWidget):
 
         import base64
         b64 = lambda a: base64.b64encode(a.astype(np.float32).copy().tobytes()).decode("ascii")
+        zi, yi, xi = np.unravel_index(int(w_sum.argmax()), w_sum.shape)
         super().__init__(
             real_shape=[Nz, Ny, Nx],
             n_struct=Ns,
@@ -85,7 +91,10 @@ class CompactTomographyViewer(anywidget.AnyWidget):
             orient_rgb=b64(rgb),
             k_shape=list(B.shape[:3]),
             k_vol=b64(kv),
-            sel_z=Nz // 2,
+            rot_flat=b64(R.reshape(-1, 9)),
+            sel_z=int(zi),
+            sel_y=int(yi),
+            sel_x=int(xi),
             **kwargs,
         )
 
@@ -247,6 +256,7 @@ function render({ model, el: root }) {
   let wMap = decodeF32(model.get("w_map"));
   let orientRGB = decodeF32(model.get("orient_rgb"));
   let kVolAll = decodeF32(model.get("k_vol"));    // Ns * Kz*Ky*Kx
+  let rotFlat = decodeF32(model.get("rot_flat")); // n_voxels * 9, body->lab
 
   // radial |k| in pixels (centered), shared by mid/right weighting
   function radial3() {
@@ -262,20 +272,68 @@ function render({ model, el: root }) {
   }
   let kRad = radial3();
 
-  // current structure volume with the radial display weight applied
+  function selVoxIdx() {
+    const [Nz, Ny, Nx] = realShape;
+    const z = Math.min(model.get("sel_z"), Nz - 1);
+    const y = Math.min(model.get("sel_y"), Ny - 1);
+    const x = Math.min(model.get("sel_x"), Nx - 1);
+    return (z * Ny + y) * Nx + x;
+  }
+
+  // trilinear sample of the (fftshifted) structure volume at R_v^T k for every
+  // output voxel: the selected voxel's structure factor, rendered client-side
+  function rotatedVol(s, vidx) {
+    const [Kz, Ky, Kx] = kShape;
+    const n = Kz * Ky * Kx;
+    const base = s * n;
+    const R = rotFlat.subarray(9 * vidx, 9 * vidx + 9);   // row-major body->lab
+    const cz = Math.floor(Kz / 2), cy = Math.floor(Ky / 2), cx = Math.floor(Kx / 2);
+    const out = new Float32Array(n);
+    let i = 0;
+    for (let z = 0; z < Kz; z++) {
+      const dz = z - cz;
+      for (let y = 0; y < Ky; y++) {
+        const dy = y - cy;
+        for (let x = 0; x < Kx; x++, i++) {
+          const dx = x - cx;
+          // body = R^T [dz, dy, dx]
+          const bz = R[0] * dz + R[3] * dy + R[6] * dx + cz;
+          const by = R[1] * dz + R[4] * dy + R[7] * dx + cy;
+          const bx = R[2] * dz + R[5] * dy + R[8] * dx + cx;
+          const z0 = Math.floor(bz), y0 = Math.floor(by), x0 = Math.floor(bx);
+          if (z0 < 0 || z0 >= Kz - 1 || y0 < 0 || y0 >= Ky - 1 || x0 < 0 || x0 >= Kx - 1) continue;
+          const fz = bz - z0, fy = by - y0, fx = bx - x0;
+          const i000 = (z0 * Ky + y0) * Kx + x0 + base;
+          const v =
+            (1 - fz) * ((1 - fy) * ((1 - fx) * kVolAll[i000] + fx * kVolAll[i000 + 1])
+                        + fy * ((1 - fx) * kVolAll[i000 + Kx] + fx * kVolAll[i000 + Kx + 1]))
+            + fz * ((1 - fy) * ((1 - fx) * kVolAll[i000 + Ky * Kx] + fx * kVolAll[i000 + Ky * Kx + 1])
+                    + fy * ((1 - fx) * kVolAll[i000 + Ky * Kx + Kx] + fx * kVolAll[i000 + Ky * Kx + Kx + 1]));
+          out[i] = v;
+        }
+      }
+    }
+    return out;
+  }
+
+  // current display volume: raw basis or the selected voxel's rotated SF,
+  // with the radial display weight applied
   let wVol = null, wVolKey = "";
   function weightedVol() {
     const s = Math.min(model.get("structure"), nStruct - 1);
     const kp = model.get("kpow");
-    const key = s + "_" + kp;
+    const mm = model.get("mid_mode");
+    const vidx = mm === "voxel" ? selVoxIdx() : -1;
+    const key = s + "_" + kp + "_" + mm + "_" + vidx;
     if (wVolKey === key && wVol) return wVol;
     const [Kz, Ky, Kx] = kShape;
     const n = Kz * Ky * Kx;
-    const out = new Float32Array(n);
     const base = s * n;
+    const src = vidx >= 0 ? rotatedVol(s, vidx) : null;
+    const out = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       const w = kp === 0 ? 1 : (kp === 1 ? kRad[i] : kRad[i] * kRad[i]);
-      out[i] = kVolAll[base + i] * w;
+      out[i] = (src ? src[i] : kVolAll[base + i]) * w;
     }
     // zero the origin (vacuum baseline) so it never sets the display scale
     const c = (Math.floor(Kz / 2) * Ky + Math.floor(Ky / 2)) * Kx + Math.floor(Kx / 2);
@@ -285,9 +343,9 @@ function render({ model, el: root }) {
   }
 
   // =====================  LEFT: real space  =====================
-  const pL = makePanel("real space — weights / orientation");
+  const pL = makePanel("real space — weights / orientation (click to pick voxel)");
   const canL = el("canvas", {
-    border: "1px solid #d6dae1", borderRadius: "3px", display: "block",
+    border: "1px solid #d6dae1", borderRadius: "3px", display: "block", cursor: "crosshair",
   }, pL);
   canL.width = PW; canL.height = PW;
   const ctxL = canL.getContext("2d");
@@ -305,6 +363,20 @@ function render({ model, el: root }) {
   const histL = histPanel(pL, PW, "display range", (r) => {
     model.set("left_range", r); model.save_changes();
   });
+
+  function pickVoxel(ev) {
+    const r = canL.getBoundingClientRect();
+    const [Nz, Ny, Nx] = realShape;
+    const ix = Math.max(0, Math.min(Nx - 1, Math.floor((ev.clientX - r.left) / (PW / Nx))));
+    const iy = Math.max(0, Math.min(Ny - 1, Math.floor((ev.clientY - r.top) / (PW / Ny))));
+    if (ix !== model.get("sel_x") || iy !== model.get("sel_y")) {
+      model.set("sel_x", ix); model.set("sel_y", iy); model.save_changes();
+    }
+  }
+  let dragL = false;
+  canL.addEventListener("pointerdown", (ev) => { dragL = true; canL.setPointerCapture(ev.pointerId); pickVoxel(ev); });
+  canL.addEventListener("pointermove", (ev) => { if (dragL) pickVoxel(ev); });
+  canL.addEventListener("pointerup", () => { dragL = false; });
 
   function drawLeft() {
     const [Nz, Ny, Nx] = realShape;
@@ -351,6 +423,11 @@ function render({ model, el: root }) {
       histL.setRange(model.get("left_range"));
     }
     ctxL.putImageData(img, 0, 0);
+    // selection marker
+    const msx = PW / Nx, msy = PW / Ny;
+    const mx = (model.get("sel_x") + 0.5) * msx, my = (model.get("sel_y") + 0.5) * msy;
+    ctxL.strokeStyle = "#00e5ff"; ctxL.lineWidth = 2;
+    ctxL.strokeRect(mx - msx / 2, my - msy / 2, msx, msy);
   }
 
   // =====================  MIDDLE: structure factor  =====================
@@ -360,6 +437,12 @@ function render({ model, el: root }) {
   }, pM);
   canM.width = PW; canM.height = PW;
   const ctxM = canM.getContext("2d");
+  const mmRow = ctrlRow(pM);
+  const vBtn = el("button", {}, mmRow); vBtn.textContent = "voxel SF";
+  const bBtn = el("button", {}, mmRow); bBtn.textContent = "basis";
+  const voxLabel = el("span", { color: "#777", marginLeft: "6px" }, mmRow);
+  vBtn.addEventListener("click", () => { model.set("mid_mode", "voxel"); model.save_changes(); });
+  bBtn.addEventListener("click", () => { model.set("mid_mode", "basis"); model.save_changes(); });
   const sRow = ctrlRow(pM);
   const sLabel = el("span", { minWidth: "84px" }, sRow);
   const sSlider = slider(sRow, 0, Math.max(0, nStruct - 1), 1, "170px");
@@ -417,6 +500,19 @@ function render({ model, el: root }) {
     const mode = model.get("view_mode");
     axBtns.forEach((b, i) => styleButton(b, i === ax));
     kpBtns.forEach((b, i) => styleButton(b, i === model.get("kpow")));
+    const mm = model.get("mid_mode");
+    styleButton(vBtn, mm === "voxel");
+    styleButton(bBtn, mm === "basis");
+    if (mm === "voxel") {
+      const [Nz2, Ny2, Nx2] = realShape;
+      const z = Math.min(model.get("sel_z"), Nz2 - 1);
+      const y = Math.min(model.get("sel_y"), Ny2 - 1);
+      const x = Math.min(model.get("sel_x"), Nx2 - 1);
+      const wv = wMap[(z * Ny2 + y) * Nx2 + x];
+      voxLabel.textContent = "voxel (" + z + ", " + y + ", " + x + ")  w = " + wv.toPrecision(3);
+    } else {
+      voxLabel.textContent = "(shared basis)";
+    }
     styleButton(modeBtn, mode === "slice");
     modeBtn.textContent = mode === "sum" ? "sum" : "slice";
     sLabel.textContent = "structure = " + Math.min(model.get("structure"), nStruct - 1);
@@ -654,6 +750,7 @@ function render({ model, el: root }) {
     wMap = decodeF32(model.get("w_map"));
     orientRGB = decodeF32(model.get("orient_rgb"));
     kVolAll = decodeF32(model.get("k_vol"));
+    rotFlat = decodeF32(model.get("rot_flat"));
     kRad = radial3();
     wVolKey = ""; maximaKey = "";
   }
@@ -663,8 +760,9 @@ function render({ model, el: root }) {
   }
 
   model.on("change:w_map change:orient_rgb change:k_vol", () => { refreshData(); drawAll(); });
-  model.on("change:left_mode change:sel_z change:left_range", () => { drawLeft(); });
-  model.on("change:structure change:kpow", () => { drawMid(); drawRight(); });
+  model.on("change:left_mode change:left_range", () => { drawLeft(); });
+  model.on("change:sel_z change:sel_y change:sel_x", () => { drawLeft(); drawMid(); drawRight(); });
+  model.on("change:structure change:kpow change:mid_mode", () => { drawMid(); drawRight(); });
   model.on(
     "change:sum_axis change:view_mode change:slice_idx change:power change:mid_range",
     () => { drawMid(); },
