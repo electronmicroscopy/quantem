@@ -1564,6 +1564,7 @@ class DiffractionTomography:
         shrink_weights: float = 0.0,
         smooth_weights: float = 0.0,
         shrink_basis: float = 0.0,
+        smooth_basis: float = 0.0,
         shrink_beam_zone: float = 1.0,
         basis_topk: int | None = None,
         friedel_basis: bool = False,
@@ -1733,6 +1734,27 @@ class DiffractionTomography:
                     keep = self.basis[0, 0, 0, :].clone()
                     self.basis.copy_(0.5 * (self.basis - flip.conj()))
                     self.basis[0, 0, 0, :] = keep
+            if smooth_basis > 0.0 and self.learn_basis:
+                # reciprocal-space coherence: a gentle 3-tap Gaussian each step
+                # pools intensity split across neighboring k voxels into one
+                # spike, so the shrinkage threshold sees a strong peak instead
+                # of fragments, while incoherent fog averages down. Frequency
+                # neighbors wrap across index 0 (unshifted storage); the origin
+                # is held out entirely -- its vacuum amplitude is ~10x the
+                # peaks and would bleed into the surrounding cluster.
+                with torch.no_grad():
+                    wgt = float(np.exp(-1.0 / (2.0 * smooth_basis ** 2)))
+                    norm = 1.0 + 2.0 * wgt
+                    Bv = self.basis
+                    keep = Bv[0, 0, 0, :].clone()
+                    Bv[0, 0, 0, :] = 0.0
+                    for axis in range(3):
+                        n = Bv.shape[axis]
+                        idx_p = torch.arange(-1, n - 1, device=Bv.device) % n
+                        idx_n = torch.arange(1, n + 1, device=Bv.device) % n
+                        Bv.copy_((wgt * Bv.index_select(axis, idx_p) + Bv
+                                  + wgt * Bv.index_select(axis, idx_n)) / norm)
+                    Bv[0, 0, 0, :] = keep
             if shrink_basis > 0.0 and self.learn_basis:
                 # proximal L1 on the basis' off-origin content: a structure
                 # factor is a few sharp Bragg spots, so soft-thresholding kills
