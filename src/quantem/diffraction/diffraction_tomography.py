@@ -442,6 +442,8 @@ class DiffractionTomography:
         width = max(antialias_softness * k_nyq, 1e-12)
         mask = 0.5 * (1.0 - torch.cos(torch.pi * torch.clip((cutoff + width - k_rad) / width, 0.0, 1.0)))
         self.antialias_mask = mask.to(self.device)          # circular k envelope
+        self._bare_prop = bare.to(self.device)              # unit-modulus Fresnel factor
+        self._prop_pow_cache = {}
         self.prop = (bare * self.antialias_mask)
         self.prop_distance = dz
         self._visible_k_max = float(cutoff + width)         # data carries no intensity beyond
@@ -690,14 +692,113 @@ class DiffractionTomography:
         acc[:, 0, 0] = 1.0                                       # pin the vacuum DC per probe
         return acc
 
+    def _tilt_geometry(self, origins: torch.Tensor, tilt_x_deg: float) -> dict:
+        """Fixed sampling geometry for one tilt, cached across iterations.
+
+        For every slice along the rays: the 2x2x2 cluster corners' flat voxel
+        indices ``vidx (P, 8)`` (clamped in-bounds) and trilinear weights
+        ``tw (P, 8)`` (zeroed for out-of-slab corners). Pure geometry -- it
+        depends only on the scan/tilt, never on the parameters -- so computing
+        it once removes the largest per-iteration tensor-op overhead.
+        """
+        key = (round(float(tilt_x_deg), 6), origins.shape[0],
+               hash(origins.cpu().numpy().tobytes()))
+        cache = getattr(self, "_geo_cache", None)
+        if cache is None:
+            cache = self._geo_cache = {}
+        if key in cache:
+            return cache[key]
+        Nz, Ny, Nx = self.real_shape
+        dev = self.device
+        u, v, w = self.tilt_axes(tilt_x_deg)
+        pts = torch.stack([self.ray_samples(o, w) for o in origins])   # (P, Ns, 3)
+        P, Ns = pts.shape[0], pts.shape[1]
+        offs = torch.tensor([[dz, dy, dx] for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)],
+                            device=dev)                                 # (8, 3)
+        lo = torch.zeros(3, dtype=torch.long, device=dev)
+        hi = torch.tensor([Nz - 1, Ny - 1, Nx - 1], device=dev)
+        slices = []
+        for s in range(Ns):
+            p = pts[:, s]
+            base = torch.floor(p).to(torch.int64)                      # (P, 3)
+            frac = (p - base.to(p.dtype))                               # (P, 3)
+            idx = base[:, None, :] + offs[None, :, :]                   # (P, 8, 3)
+            fw = torch.where(offs[None, :, :] == 1, frac[:, None, :], 1.0 - frac[:, None, :])
+            tw = fw.prod(dim=-1)                                        # (P, 8)
+            inb = ((idx >= lo) & (idx <= hi)).all(dim=-1)               # (P, 8)
+            tw = tw * inb
+            idxc = torch.minimum(torch.maximum(idx, lo), hi)
+            vidx = (idxc[..., 0] * Ny + idxc[..., 1]) * Nx + idxc[..., 2]  # (P, 8)
+            slices.append((vidx, tw.to(torch.complex64)))
+        kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
+        geo = {"u": u, "v": v, "slices": slices, "ku": ku, "kv": kv}
+        cache[key] = geo
+        return geo
+
+    def _prop_power(self, g: int) -> torch.Tensor:
+        """Fresnel propagator over ``g`` slice thicknesses (antialias applied once)."""
+        cache = getattr(self, "_prop_pow_cache", None)
+        if cache is None:
+            cache = self._prop_pow_cache = {}
+        if g not in cache:
+            cache[g] = (self._bare_prop ** g) * self.antialias_mask
+        return cache[g]
+
+    def _transmission_planes_fused(self, vidx: torch.Tensor, tw: torch.Tensor,
+                                   geo: dict, basis: torch.Tensor,
+                                   R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
+        """Transmission SF deviation for all probes at one slice, one fused call.
+
+        All ``P x 8`` cluster corners go through a single grid build and one
+        ``grid_sample`` per real/imag part (the per-corner Python loop cost --
+        and its 8x autograd graph fan-out -- dominated the profile). Returns
+        ``(P, det_row, det_col)`` WITHOUT the DC pin (the caller pins once per
+        superslice group).
+        """
+        Nkz, Nky, Nkx = self.k_shape
+        Nw = basis.shape[-1]
+        P = vidx.shape[0]
+        V = P * 8
+        vflat = vidx.reshape(V)
+        R = R_all.reshape(-1, 3, 3)[vflat]                              # (V, 3, 3)
+        wv = W_all.reshape(-1, Nw)[vflat].to(torch.complex64)           # (V, Nw)
+        u_lab, v_lab = geo["u"], geo["v"]
+        if u_lab.ndim == 1:                                             # one shared tilt
+            u_b = torch.einsum("vij,i->vj", R, u_lab)                   # (V, 3) = R^T u
+            v_b = torch.einsum("vij,i->vj", R, v_lab)
+        else:                                                            # per-ray axes (tilt batch)
+            u_b = torch.einsum("vij,vi->vj", R, u_lab)
+            v_b = torch.einsum("vij,vi->vj", R, v_lab)
+        ku, kv = geo["ku"], geo["kv"]                                   # (Rr, Cc)
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
+        Nk = torch.tensor([Nkz, Nky, Nkx], dtype=torch.float32, device=self.device)
+        kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
+                + kv[None, ..., None] * v_b[:, None, None, :])          # (V, Rr, Cc, 3)
+        c = torch.remainder(kxyz / dk, Nk)
+        grid = torch.stack((
+            2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+            2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+            2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+        ), dim=-1)[:, None].to(torch.float32)                           # (V, 1, Rr, Cc, 3)
+        bre = basis.real.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
+        bim = basis.imag.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
+        sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        sampled = (sre + 1j * sim).squeeze(2)                           # (V, Nw, Rr, Cc)
+        t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V, Rr, Cc)
+        det_r, det_c = self.det_shape
+        return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
+
     def forward_tilt(self, origins: torch.Tensor, tilt_x_deg: float,
                      basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor,
-                     phase_only: bool = True) -> torch.Tensor:
+                     phase_only: bool = True, superslice: int = 1) -> torch.Tensor:
         """Multislice exit waves for *all* probes at one tilt (batched over probes).
 
         Probes at a fixed tilt share the beam direction, so their rays span the
         same z-steps; the wave is carried as ``(P, det, det)`` and every FFT,
-        propagation and transmission build is batched over ``P``.
+        propagation and transmission build is batched over ``P``. The sampling
+        geometry is cached across calls (:meth:`_tilt_geometry`) and all
+        cluster corners of a slice go through one fused ``grid_sample``.
 
         Parameters
         ----------
@@ -705,26 +806,107 @@ class DiffractionTomography:
             ``(P, 3)`` probe positions in index space ``[z, y, x]``.
         tilt_x_deg : float
             X-axis tilt in degrees.
+        superslice : int, default 1
+            Group this many consecutive slices into one transmission event:
+            within a group the sampled k-space planes are summed (projection
+            approximation, ``prod exp(i V_j) ~ exp(i sum V_j)``) and a single
+            ifft/phase/fft chain is applied, with one propagation over the
+            group thickness. ``1`` is the exact per-slice multislice.
 
         Returns
         -------
         torch.Tensor
             ``(P, det_row, det_col)`` complex exit waves.
         """
-        u, v, w = self.tilt_axes(tilt_x_deg)
-        pts = torch.stack([self.ray_samples(o, w) for o in origins])   # (P, Ns, 3)
-        P, Ns = pts.shape[0], pts.shape[1]
+        geo = self._tilt_geometry(origins, tilt_x_deg)
+        slices = geo["slices"]
+        Ns = len(slices)
+        P = origins.shape[0]
         Psi = self.Psi0[None].expand(P, -1, -1).clone()
         num_pix = self.Psi0.numel()
-        for s in range(Ns):
-            SF = self._transmission_planes_batch(pts[:, s], u, v, basis, R_all, W_all)  # (P,det,det)
+        groups = [list(range(s, min(s + max(1, superslice), Ns)))
+                  for s in range(0, Ns, max(1, superslice))]
+        for gi, grp in enumerate(groups):
+            SF = None
+            for s in grp:
+                vidx, tw = slices[s]
+                sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                SF = sf_s if SF is None else SF + sf_s
+            SF[:, 0, 0] = 1.0                       # vacuum DC, once per group
             t_real = torch.fft.ifft2(num_pix * SF)
             if phase_only:
                 t_real = torch.exp(1j * torch.angle(t_real))
             Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t_real)
-            if s < Ns - 1:
-                Psi = Psi * self.prop
+            if gi < len(groups) - 1:
+                Psi = Psi * self._prop_power(len(grp))
         return Psi * self.antialias_mask
+
+    def _tilt_group_geometry(self, origins: torch.Tensor, tilts) -> dict:
+        """Concatenated geometry for a GROUP of tilts (see ``tilt_batch``).
+
+        Stacks each tilt's cached slice geometry along the ray axis and builds
+        per-corner lab axes, so the whole group runs through one fused
+        transmission call and one autograd graph per iteration chunk.
+        """
+        key = ("grp", origins.shape[0], hash(origins.cpu().numpy().tobytes()),
+               tuple(round(float(t), 6) for t in tilts))
+        cache = getattr(self, "_geo_cache", None)
+        if cache is None:
+            cache = self._geo_cache = {}
+        if key in cache:
+            return cache[key]
+        geos = [self._tilt_geometry(origins, float(t)) for t in tilts]
+        P = origins.shape[0]
+        Ns = len(geos[0]["slices"])
+        slices = []
+        for s in range(Ns):
+            vidx = torch.cat([g["slices"][s][0] for g in geos])          # (T*P, 8)
+            tw = torch.cat([g["slices"][s][1] for g in geos])
+            slices.append((vidx, tw))
+        u_all = torch.cat([g["u"][None].expand(P * 8, 3) for g in geos])  # (T*P*8, 3)
+        v_all = torch.cat([g["v"][None].expand(P * 8, 3) for g in geos])
+        geo = {"u": u_all, "v": v_all, "slices": slices,
+               "ku": geos[0]["ku"], "kv": geos[0]["kv"]}
+        cache[key] = geo
+        return geo
+
+    def forward_tilts(self, origins: torch.Tensor, tilts, basis: torch.Tensor,
+                      R_all: torch.Tensor, W_all: torch.Tensor,
+                      phase_only: bool = True, superslice: int = 1) -> torch.Tensor:
+        """Exit waves for a GROUP of tilts in one batched pass.
+
+        Identical physics to calling :meth:`forward_tilt` per tilt; all tilts'
+        probes travel together as one ``(T*P, det, det)`` wave, so one autograd
+        graph (and one backward) covers the whole group.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(T, P, det_row, det_col)`` complex exit waves.
+        """
+        geo = self._tilt_group_geometry(origins, tilts)
+        slices = geo["slices"]
+        Ns = len(slices)
+        P = origins.shape[0]
+        T = len(tilts)
+        Psi = self.Psi0[None].expand(T * P, -1, -1).clone()
+        num_pix = self.Psi0.numel()
+        groups = [list(range(s, min(s + max(1, superslice), Ns)))
+                  for s in range(0, Ns, max(1, superslice))]
+        for gi, grp in enumerate(groups):
+            SF = None
+            for s in grp:
+                vidx, tw = slices[s]
+                sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                SF = sf_s if SF is None else SF + sf_s
+            SF[:, 0, 0] = 1.0
+            t_real = torch.fft.ifft2(num_pix * SF)
+            if phase_only:
+                t_real = torch.exp(1j * torch.angle(t_real))
+            Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t_real)
+            if gi < len(groups) - 1:
+                Psi = Psi * self._prop_power(len(grp))
+        return (Psi * self.antialias_mask).reshape(T, P, *self.det_shape)
 
     def scan_positions(
         self,
@@ -762,6 +944,7 @@ class DiffractionTomography:
         scan_step: float | tuple[float, float] | None = None,
         scan_origin=None,
         phase_only: bool = True,
+        superslice: int = 1,
         progress: bool = True,
     ) -> torch.Tensor:
         """Forward tilt series -> (n_tilt, n_row, n_col, det_row, det_col) intensities.
@@ -807,7 +990,7 @@ class DiffractionTomography:
         with torch.no_grad():
             for ti in tqdm(range(len(tilts_deg)), disable=not progress, desc="simulate", unit="tilt"):
                 Psi = self.forward_tilt(origins, float(tilts_deg[ti]), basis, R_all, weights,
-                                        phase_only=phase_only)
+                                        phase_only=phase_only, superslice=superslice)
                 dp[ti] = (Psi.abs() ** 2).to(torch.float64).reshape(n_row, n_col, *self.det_shape)
         return dp
 
@@ -1286,6 +1469,8 @@ class DiffractionTomography:
         lr_weights: float | None = None,
         lr_angles: float | None = None,
         phase_only: bool = True,
+        superslice: int = 1,
+        tilt_batch: int = 1,
         nonneg_weights: bool = False,
         shrink_weights: float = 0.0,
         smooth_weights: float = 0.0,
@@ -1352,16 +1537,22 @@ class DiffractionTomography:
         for it in pbar:
             opt.zero_grad(set_to_none=True)
             total = 0.0
-            for ti in range(n_tilt):
-                # one tilt at a time -> independent graph -> bounded memory, while
-                # all P probes of the tilt are batched through forward_tilt.
+            for t0 in range(0, n_tilt, max(1, tilt_batch)):
+                # tilts are processed in groups of tilt_batch: one autograd
+                # graph (and one backward) per group. tilt_batch trades memory
+                # for speed; gradients still accumulate into one full-batch
+                # optimizer step per iteration.
+                t_grp = list(range(t0, min(t0 + max(1, tilt_batch), n_tilt)))
                 basis = self.masked_basis()
                 R_all = self.rotation_matrices()
-                Psi = self.forward_tilt(origins, float(tilts_deg[ti]), basis, R_all,
-                                        self.weights, phase_only=phase_only)          # (P,det,det)
-                tl = ((Psi.abs() - meas_amp[ti].reshape(P, *self.det_shape)) ** 2).mean(dim=(1, 2))
+                Psi = self.forward_tilts(origins, [float(tilts_deg[ti]) for ti in t_grp],
+                                         basis, R_all, self.weights,
+                                         phase_only=phase_only,
+                                         superslice=superslice)                       # (T,P,det,det)
+                tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape)
+                tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2, 3))                        # (T,P)
                 (tl.sum() / n_dp).backward()
-                res_per_dp[ti * P:(ti + 1) * P] = tl.detach()
+                res_per_dp[t_grp[0] * P:(t_grp[-1] + 1) * P] = tl.detach().reshape(-1)
                 total += float(tl.sum())
             if angle_smooth > 0.0 and self.learn_angles:
                 # angle-coherence prior: grains are contiguous, so neighboring
