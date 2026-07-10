@@ -299,6 +299,58 @@ class DiffractionTomography:
             self.basis /= s
             self.weights *= s
 
+    def lab_structure_factor(
+        self,
+        voxel: int | tuple[int, int, int] = 0,
+        keep_origin: bool = True,
+    ) -> torch.Tensor:
+        """One voxel's structure factor resampled on the lab k grid.
+
+        The model stores structure factors in each voxel's body frame; this
+        returns the weighted sum of structures rotated by the voxel's
+        orientation (trilinear, the same sampling the forward model uses for
+        its tilt planes). Reconstructions with different orientation gauges
+        can then be compared on a common grid.
+
+        Parameters
+        ----------
+        voxel : int or (int, int, int)
+            Flat index or ``[z, y, x]`` index of the voxel.
+        keep_origin : bool, default True
+            With False the origin (vacuum baseline) is removed BEFORE the
+            rotation. The origin is ~100x brighter than the Bragg peaks, so
+            resampling bleeds it into the surrounding voxel cluster; remove it
+            here rather than zeroing the center of the result when comparing
+            or displaying off-origin content.
+
+        Returns
+        -------
+        torch.Tensor
+            ``[N_kz, N_ky, N_kx]`` complex lab-frame structure factor, in the
+            same (unshifted) frequency ordering as ``basis``.
+        """
+        if isinstance(voxel, (tuple, list)):
+            voxel = int(np.ravel_multi_index(tuple(int(v) for v in voxel), self.real_shape))
+        R = self.rotation_matrices().reshape(-1, 3, 3)[voxel].detach()
+        W = self.weights.reshape(-1, self.num_structures)[voxel].detach()
+        body = (self.masked_basis().detach() * W).sum(-1)
+        if not keep_origin:
+            body = body.clone()
+            body[0, 0, 0] = 0.0
+        sf = torch.fft.fftshift(body, dim=(0, 1, 2))
+        dev = sf.device
+        ctr = torch.tensor([n // 2 for n in self.k_shape], dtype=torch.float32, device=dev)
+        axes = [torch.arange(n, dtype=torch.float32, device=dev) - n // 2 for n in self.k_shape]
+        QZ, QY, QX = torch.meshgrid(*axes, indexing="ij")
+        q = torch.stack([QZ, QY, QX], -1).reshape(-1, 3)
+        p = q @ R.to(torch.float32)                     # rows are R^T q: lab -> body frame
+        size = torch.tensor([float(n) for n in self.k_shape], device=dev)
+        gn = 2.0 * (p + ctr) / (size - 1.0) - 1.0
+        grid = gn.flip(-1).reshape(1, *self.k_shape, 3)  # grid_sample wants (x, y, z)
+        vol = torch.stack([sf.real, sf.imag], 0)[None].to(torch.float32)
+        out = F.grid_sample(vol, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0]
+        return torch.fft.ifftshift(torch.complex(out[0], out[1]), dim=(0, 1, 2))
+
     @classmethod
     def from_test(
         cls,
@@ -1478,6 +1530,7 @@ class DiffractionTomography:
         smooth_weights: float = 0.0,
         shrink_basis: float = 0.0,
         basis_topk: int | None = None,
+        friedel_basis: bool = False,
         angle_smooth: float = 0.0,
         reset_every: int = 10,
         reset_protect_vacuum: bool = True,
@@ -1630,6 +1683,20 @@ class DiffractionTomography:
                         idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
                         W.copy_((wgt * W.index_select(axis, idx_p) + W
                                  + wgt * W.index_select(axis, idx_n)) / norm)
+            if friedel_basis and self.learn_basis:
+                # the basis is the transmission's structure factor: for the
+                # phase grating of a real potential the off-origin content is
+                # anti-Hermitian, F(-k) = -conj(F(k)) (peaks purely imaginary,
+                # as in make_au_basis). Every tilt plane contains both members
+                # of a Friedel pair, so the data never constrains the Hermitian
+                # component -- project it away. The origin (vacuum baseline,
+                # real) is preserved separately.
+                with torch.no_grad():
+                    flip = torch.roll(torch.flip(self.basis, dims=(0, 1, 2)),
+                                      shifts=(1, 1, 1), dims=(0, 1, 2))
+                    keep = self.basis[0, 0, 0, :].clone()
+                    self.basis.copy_(0.5 * (self.basis - flip.conj()))
+                    self.basis[0, 0, 0, :] = keep
             if shrink_basis > 0.0 and self.learn_basis:
                 # proximal L1 on the basis' off-origin content: a structure
                 # factor is a few sharp Bragg spots, so soft-thresholding kills
