@@ -9,8 +9,11 @@ The object is represented compactly instead of as an explicit 6D structure-facto
   * ``angles``  -- per real-space voxel SO(3) orientation (R9+SVD param),
     one rotation per voxel (``T = N_z * N_y * N_x``).
 
-Each voxel's 3D structure factor is ``sum_i weight_i * Rotate(basis_i)`` with an
-implicit vacuum baseline (the DC / origin pixel is pinned to 1).
+Each voxel's 3D structure factor is ``sum_i weight_i * Rotate(basis_i)``; the
+vacuum baseline enters as an explicit delta weighted by the material complement,
+``(1 - sum_i weight_i) * delta(k)``, so a voxel blends linearly from pure vacuum
+(weight 0) to pure material transmission (weight 1) and the basis DC is a
+learned, data-constrained quantity.
 
 Indexing convention (new): real space is ``[z, y, x]`` (beam along +z = axis 0),
 reciprocal space is ``[kz, ky, kx]``.  Any 2D quantity (detector plane, scan
@@ -24,7 +27,8 @@ Forward pass (per ray, multislice):
      orientation composed with the tilt),
   3. combine the 8 planes with the trilinear weights (interpolation happens in
      *transmission* space, never on the angles),
-  4. pin the origin (0,0) = 1.0 (vacuum baseline; keeps the DC beam),
+  4. add the vacuum delta ``(1 - w_eff)`` at the origin, ``w_eff`` = the
+     trilinearly interpolated total material weight of the cluster,
   5. apply as a phase grating and Fresnel-propagate to the next slice.
 """
 
@@ -179,8 +183,8 @@ class DiffractionTomography:
         Parameters
         ----------
         basis : torch.Tensor, optional
-            Seeds the k-space bases; if None, small complex noise (origin
-            pinned to 1).
+            Seeds the k-space bases; if None, small complex noise with the
+            origin (transmission DC) starting at 1.
         learn_basis : bool, default True
             Optimise the basis (False freezes it).
         noise : float, default 1e-6
@@ -261,12 +265,10 @@ class DiffractionTomography:
     def masked_basis(self) -> torch.Tensor:
         """Basis with the spherical support re-imposed (differentiable).
 
-        The basis is deliberately *not* normalised here. Forcing unit norm
-        inside the forward makes the basis learn a unit direction on a
-        high-dimensional sphere, which converges far slower than additive
-        growth. The scale degeneracy is instead fixed as a gauge projection on
-        the result (:meth:`normalize_gauge`, applied at the end of
-        :meth:`reconstruct`), which leaves the forward model unchanged.
+        The basis is deliberately *not* normalised. The vacuum delta in the
+        transmission assembly carries the material complement ``(1 - w_eff)``,
+        so the weight/basis split is physical, not a gauge: scaling the basis
+        up and the weights down changes the vacuum mix and therefore the fit.
 
         Returns
         -------
@@ -275,29 +277,6 @@ class DiffractionTomography:
             inscribed sphere zeroed.
         """
         return self.basis * self.sphere_mask[..., None]
-
-    def normalize_gauge(self) -> None:
-        """Fix the weight/basis scale degeneracy in place, physically.
-
-        Convention: each structure factor is a unit-energy field whose origin
-        (vacuum baseline) dominates -- the origin is restored to 1, the whole
-        basis is divided by ``sqrt(1 + E)`` with ``E`` the off-origin energy,
-        and ``sqrt(1 + E)`` is absorbed into the weights. This gives exactly
-
-            sum |basis|**2 == 1   and   basis[origin] == sqrt(1 - sum |off|**2)
-
-        with weak off-origin Bragg peaks, while every ``weight * basis``
-        product (and therefore the data fit) is unchanged -- the transmission
-        assembly pins the DC term, so only the off-origin content enters the
-        forward model.
-        """
-        with torch.no_grad():
-            self.basis[0, 0, 0, :] = 1.0
-            sq_off = ((self.basis.abs() ** 2).reshape(-1, self.num_structures).sum(0)
-                      - self.basis[0, 0, 0, :].abs() ** 2)
-            s = torch.sqrt(1.0 + sq_off.clamp_min(0.0))                  # (Ns,)
-            self.basis /= s
-            self.weights *= s
 
     def lab_structure_factor(
         self,
@@ -471,6 +450,7 @@ class DiffractionTomography:
         the direct and diffracted disks render as circles on the coarse
         detector grid instead of chunky hard-threshold polygons.
         """
+        self.probe_k_max = float(probe_k_max)
         kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
         k_rad = torch.sqrt(kv ** 2 + ku ** 2)
         dk_pix = min(self.k_sampling[1], self.k_sampling[2])
@@ -572,8 +552,8 @@ class DiffractionTomography:
         each in-bounds voxel's orientation is composed with the tilt to give its
         sampling plane through the bases, the resulting per-voxel transmission
         planes are combined with the trilinear weights (in transmission space,
-        never on the angles), and the origin is pinned to 1 (vacuum baseline).
-        Out-of-slab neighbours contribute vacuum.
+        never on the angles), and the vacuum delta ``(1 - w_eff)`` is added at
+        the origin. Out-of-slab neighbours contribute vacuum.
 
         Parameters
         ----------
@@ -616,6 +596,7 @@ class DiffractionTomography:
         valid = inb & (tw8 > 0)
 
         acc = torch.zeros(det_row, det_col, dtype=torch.complex64, device=dev)
+        w_eff = torch.zeros((), dtype=torch.float64, device=dev)
         if bool(valid.any()):
             vsel = idxs[valid]                                 # (nv,3)
             nv = vsel.shape[0]
@@ -623,6 +604,7 @@ class DiffractionTomography:
             vidx = (vsel[:, 0] * Ny + vsel[:, 1]) * Nx + vsel[:, 2]
             R = R_all.reshape(-1, 3, 3)[vidx]                  # (nv,3,3) body->lab
             wv = W_all.reshape(-1, Nw)[vidx].to(torch.complex64)  # (nv,Nw)
+            w_eff = (tw8[valid].to(torch.float64) * W_all.reshape(-1, Nw)[vidx].sum(-1)).sum()
             # rotate the detector (u,v) axes into each voxel's body frame: R^T @ axis
             u_b = torch.einsum("vij,i->vj", R, u)              # (nv,3) [kz,ky,kx]
             v_b = torch.einsum("vij,i->vj", R, v)
@@ -643,7 +625,9 @@ class DiffractionTomography:
             sampled = (sre + 1j * sim).squeeze(2)              # (nv,Nw,R,C)
             t_vox = (wv[:, :, None, None] * sampled).sum(1)    # (nv,R,C)
             acc = (tw[:, None, None] * t_vox).sum(0)           # (R,C)
-        acc[0, 0] = 1.0                                        # pin the vacuum DC
+        # vacuum delta carries the material complement: weight 0 -> pure
+        # vacuum, weight 1 -> pure basis transmission (its DC included)
+        acc[0, 0] = acc[0, 0] + (1.0 - w_eff).to(acc.dtype)
         return acc
 
     def forward_ray(self, origin_zyx: torch.Tensor, tilt_x_deg: float,
@@ -710,6 +694,7 @@ class DiffractionTomography:
         bim_full = basis.imag.permute(3, 0, 1, 2)
 
         acc = torch.zeros(P, det_row, det_col, dtype=torch.complex64, device=dev)
+        w_eff = torch.zeros(P, dtype=torch.float64, device=dev)
         for dz in (0, 1):
             for dy in (0, 1):
                 for dx in (0, 1):
@@ -741,7 +726,9 @@ class DiffractionTomography:
                     sampled = (sre + 1j * sim).squeeze(2)        # (P,Nw,R,C)
                     t_vox = (wv[:, :, None, None] * sampled).sum(1)   # (P,R,C)
                     acc = acc + tw[:, None, None] * t_vox
-        acc[:, 0, 0] = 1.0                                       # pin the vacuum DC per probe
+                    w_eff = w_eff + tw.real.to(w_eff.dtype) * W_all.reshape(-1, Nw)[vidx].sum(-1)
+        # vacuum delta carries the material complement per probe
+        acc[:, 0, 0] = acc[:, 0, 0] + (1.0 - w_eff).to(acc.dtype)
         return acc
 
     def _tilt_geometry(self, origins: torch.Tensor, tilt_x_deg: float) -> dict:
@@ -787,6 +774,36 @@ class DiffractionTomography:
         cache[key] = geo
         return geo
 
+    def _shrink_beam_zone(self, boost: float = 5.0) -> torch.Tensor:
+        """L1-threshold scale for the direct-beam overlap zone of k space.
+
+        A transmission harmonic within twice the probe aperture radius of the
+        origin diffracts a disk that overlaps the direct beam, so the data
+        barely distinguishes it from a beam-amplitude wiggle -- and every tilt
+        shares this zone, making it the cheapest place for the fit to park
+        compensation fog (a bright segment along the tilt axle). Boosting the
+        shrink threshold there during a FINAL polish stage clears the fog and
+        forces its explanatory load back onto the Bragg peaks; boosting from
+        the start stalls convergence (the zone is scaffolding for the beam
+        residual early on). Instrument geometry only.
+
+        Returns
+        -------
+        torch.Tensor
+            ``[N_kz, N_ky, N_kx, 1]`` threshold scale: ``boost`` inside
+            ``|k| < 2 * probe_k_max``, 1 outside.
+        """
+        cached = getattr(self, "_beam_zone", None)
+        if cached is not None and cached[0] == boost:
+            return cached[1]
+        ks = [torch.fft.fftfreq(n, d=1.0 / (n * s), device=self.device)
+              for n, s in zip(self.k_shape, self.k_sampling)]
+        KZ, KY, KX = torch.meshgrid(*ks, indexing="ij")
+        k_rad = torch.sqrt(KZ**2 + KY**2 + KX**2)
+        scale = torch.where(k_rad < 2.0 * self.probe_k_max, boost, 1.0)[..., None]
+        self._beam_zone = (boost, scale)
+        return scale
+
     def _prop_power(self, g: int) -> torch.Tensor:
         """Fresnel propagator over ``g`` slice thicknesses (antialias applied once)."""
         cache = getattr(self, "_prop_pow_cache", None)
@@ -806,8 +823,8 @@ class DiffractionTomography:
         All ``P x 8`` cluster corners go through a single grid build and one
         ``grid_sample`` per real/imag part (the per-corner Python loop cost --
         and its 8x autograd graph fan-out -- dominated the profile). Returns
-        ``(P, det_row, det_col)`` WITHOUT the DC pin (the caller pins once per
-        superslice group).
+        ``(P, det_row, det_col)`` WITHOUT the vacuum delta (the caller adds
+        ``(1 - w_eff)`` at the origin once per superslice group).
         """
         Nkz, Nky, Nkx = self.k_shape
         Nw = basis.shape[-1]
@@ -878,15 +895,19 @@ class DiffractionTomography:
         P = origins.shape[0]
         Psi = self.Psi0[None].expand(P, -1, -1).clone()
         num_pix = self.Psi0.numel()
+        wsum = W_all.reshape(-1, W_all.shape[-1]).sum(-1)      # (n_voxels,)
         groups = [list(range(s, min(s + max(1, superslice), Ns)))
                   for s in range(0, Ns, max(1, superslice))]
         for gi, grp in enumerate(groups):
-            SF = None
+            SF, Wg = None, None
             for s in grp:
                 vidx, tw = slices[s]
                 sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (P,)
                 SF = sf_s if SF is None else SF + sf_s
-            SF[:, 0, 0] = 1.0                       # vacuum DC, once per group
+                Wg = w_s if Wg is None else Wg + w_s
+            # vacuum delta carries the material complement, once per group
+            SF[:, 0, 0] = SF[:, 0, 0] + (1.0 - Wg).to(SF.dtype)
             t_real = torch.fft.ifft2(num_pix * SF)
             if phase_only:
                 t_real = torch.exp(1j * torch.angle(t_real))
@@ -945,15 +966,18 @@ class DiffractionTomography:
         T = len(tilts)
         Psi = self.Psi0[None].expand(T * P, -1, -1).clone()
         num_pix = self.Psi0.numel()
+        wsum = W_all.reshape(-1, W_all.shape[-1]).sum(-1)      # (n_voxels,)
         groups = [list(range(s, min(s + max(1, superslice), Ns)))
                   for s in range(0, Ns, max(1, superslice))]
         for gi, grp in enumerate(groups):
-            SF = None
+            SF, Wg = None, None
             for s in grp:
                 vidx, tw = slices[s]
                 sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (T*P,)
                 SF = sf_s if SF is None else SF + sf_s
-            SF[:, 0, 0] = 1.0
+                Wg = w_s if Wg is None else Wg + w_s
+            SF[:, 0, 0] = SF[:, 0, 0] + (1.0 - Wg).to(SF.dtype)
             t_real = torch.fft.ifft2(num_pix * SF)
             if phase_only:
                 t_real = torch.exp(1j * torch.angle(t_real))
@@ -1529,6 +1553,7 @@ class DiffractionTomography:
         shrink_weights: float = 0.0,
         smooth_weights: float = 0.0,
         shrink_basis: float = 0.0,
+        shrink_beam_zone: float = 1.0,
         basis_topk: int | None = None,
         friedel_basis: bool = False,
         angle_smooth: float = 0.0,
@@ -1704,6 +1729,8 @@ class DiffractionTomography:
                 # instead of spots (the same cure the explicit-6D model needed).
                 with torch.no_grad():
                     tau = shrink_basis * lr
+                    if shrink_beam_zone != 1.0:
+                        tau = tau * self._shrink_beam_zone(shrink_beam_zone)
                     mag = self.basis.abs()
                     keep = self.basis[0, 0, 0, :].clone()
                     self.basis.copy_(self.basis / mag.clamp_min(1e-30)
@@ -1767,7 +1794,6 @@ class DiffractionTomography:
 
         if best["snap"] is not None:
             self._restore(best["snap"])              # return the best-ever state
-        self.normalize_gauge()                        # physical unit-norm bases (fit unchanged)
         self.losses = losses
         self.best_loss = best["loss"]
         self.lrs = lrs
