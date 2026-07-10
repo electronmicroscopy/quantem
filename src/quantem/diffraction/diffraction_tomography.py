@@ -362,7 +362,10 @@ class DiffractionTomography:
         particle_centers : sequence of (z, y, x)
             Sphere centers in voxel indices.
         particle_zxz_deg : sequence of (a, b, c)
-            Per-particle ZXZ Euler angles in degrees.
+            Per-particle intrinsic ZXZ Euler angles in degrees: ``a`` (about
+            the beam) and ``b`` (polar, about x) select which zone axis lies
+            along the beam at zero tilt; ``c`` is the in-plane rotation of the
+            zero-tilt diffraction pattern.
         particle_radius : float, default 1.6
             Hard-sphere radius in voxels.
 
@@ -386,8 +389,13 @@ class DiffractionTomography:
                     <= particle_radius)
             weights[mask] = 1.0
             grain_id[mask] = g
-            R = torch.tensor(Rotation.from_euler("zxz", euler, degrees=True).as_matrix(),
-                             dtype=torch.float32)
+            # scipy matrices act on (x, y, z) components; this class stores
+            # vectors as [z, y, x]. Conjugate by the axis reversal (M[::-1,
+            # ::-1]) and transpose so the stored body->lab rotation gives
+            # pattern(k) = basis(Rz(a) Rx(b) Rz(g) k): a and b select the zone
+            # axis along the beam, g spins the zero-tilt pattern in plane.
+            M = Rotation.from_euler("ZXZ", euler, degrees=True).as_matrix()
+            R = torch.tensor(M.T[::-1, ::-1].copy(), dtype=torch.float32)
             R_all[mask.flatten()] = R
 
         gt = cls(real_shape=real_shape, k_shape=k_shape, real_sampling=real_sampling,
