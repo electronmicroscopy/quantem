@@ -583,7 +583,6 @@ class DiffractionTomography:
         kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")  # (R,C)
         det_row, det_col = kv.shape
         dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=dev)
-        Nk = torch.tensor([Nkz, Nky, Nkx], dtype=torch.float32, device=dev)
 
         # 2x2x2 cluster corners, trilinear weights, in-bounds mask
         offs = torch.tensor([[dz, dy, dx] for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)],
@@ -612,14 +611,17 @@ class DiffractionTomography:
             # k/dk into [0, N) then normalise to [-1, 1] (grid last dim reversed)
             kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
                     + kv[None, ..., None] * v_b[:, None, None, :])   # (nv,R,C,3)
-            c = torch.remainder(kxyz / dk, Nk)                 # (nv,R,C,3) [cz,cy,cx]
+            # centered (fftshift) sampling space -- see _transmission_planes_fused
+            ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32, device=dev)
+            c = kxyz / dk + ctr                                # (nv,R,C,3) [cz,cy,cx]
             grid = torch.stack((
                 2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
                 2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
                 2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
             ), dim=-1)[:, None].to(torch.float32)              # (nv,1,R,C,3)
-            bre = basis.real.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
-            bim = basis.imag.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
+            basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2))
+            bre = basis_c.real.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
+            bim = basis_c.imag.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
             sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
             sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
             sampled = (sre + 1j * sim).squeeze(2)              # (nv,Nw,R,C)
@@ -687,11 +689,11 @@ class DiffractionTomography:
         kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")  # (R,C)
         det_row, det_col = kv.shape
         dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=dev)
-        Nk = torch.tensor([Nkz, Nky, Nkx], dtype=torch.float32, device=dev)
         lo = torch.tensor([0, 0, 0], device=dev)
         hi = torch.tensor([Nz - 1, Ny - 1, Nx - 1], device=dev)
-        bre_full = basis.real.permute(3, 0, 1, 2)              # (Nw,Nkz,Nky,Nkx)
-        bim_full = basis.imag.permute(3, 0, 1, 2)
+        basis_cs = torch.fft.fftshift(basis, dim=(0, 1, 2))    # centered sampling space
+        bre_full = basis_cs.real.permute(3, 0, 1, 2)           # (Nw,Nkz,Nky,Nkx)
+        bim_full = basis_cs.imag.permute(3, 0, 1, 2)
 
         acc = torch.zeros(P, det_row, det_col, dtype=torch.complex64, device=dev)
         w_eff = torch.zeros(P, dtype=torch.float64, device=dev)
@@ -713,7 +715,9 @@ class DiffractionTomography:
                     v_b = torch.einsum("pij,i->pj", R, v)
                     kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
                             + kv[None, ..., None] * v_b[:, None, None, :])   # (P,R,C,3)
-                    c = torch.remainder(kxyz / dk, Nk)
+                    # centered (fftshift) sampling space -- see _transmission_planes_fused
+                    ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32, device=dev)
+                    c = kxyz / dk + ctr
                     grid = torch.stack((
                         2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
                         2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
@@ -842,17 +846,24 @@ class DiffractionTomography:
             v_b = torch.einsum("vij,vi->vj", R, v_lab)
         ku, kv = geo["ku"], geo["kv"]                                   # (Rr, Cc)
         dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
-        Nk = torch.tensor([Nkz, Nky, Nkx], dtype=torch.float32, device=self.device)
         kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
                 + kv[None, ..., None] * v_b[:, None, None, :])          # (V, Rr, Cc, 3)
-        c = torch.remainder(kxyz / dk, Nk)
+        # sample in CENTERED (fftshift) space: fractional coordinates near the
+        # frequency-zero planes then interpolate their true neighbors, and the
+        # wrap seam moves beyond the spherical support where samples are zero.
+        # (Unshifted remainder-wrap sampling attenuated every rotated read with
+        # a coordinate component in (-1, 0) -- an axis-aligned seam cross.)
+        ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2],
+                           dtype=torch.float32, device=self.device)
+        c = kxyz / dk + ctr
         grid = torch.stack((
             2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
             2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
             2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
         ), dim=-1)[:, None].to(torch.float32)                           # (V, 1, Rr, Cc, 3)
-        bre = basis.real.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
-        bim = basis.imag.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
+        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2))
+        bre = basis_c.real.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
+        bim = basis_c.imag.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
         sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
         sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
         sampled = (sre + 1j * sim).squeeze(2)                           # (V, Nw, Rr, Cc)
