@@ -741,6 +741,8 @@ class DiffractionTomography:
         if cache is None:
             cache = self._prop_pow_cache = {}
         if g not in cache:
+            if not hasattr(self, "_bare_prop"):
+                self.make_propagator()          # object predates the refactor
             cache[g] = (self._bare_prop ** g) * self.antialias_mask
         return cache[g]
 
