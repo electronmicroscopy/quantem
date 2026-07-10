@@ -1609,6 +1609,9 @@ class DiffractionTomography:
                                "scan_step": scan_step, "scan_origin": scan_origin}
         pos = self.scan_positions(scan_shape, scan_step, scan_origin)
         n_row, n_col = pos.shape[:2]
+        if reset_modes is not None:
+            reset_modes = torch.as_tensor(np.asarray(reset_modes), dtype=torch.float32,
+                                          device=self.device)
         meas_amp = measurements.to(self.device).clamp_min(0).sqrt()
         jobs = [(ti, j, i) for ti in range(len(tilts_deg)) for j in range(n_row) for i in range(n_col)]
         n_dp = len(jobs)
