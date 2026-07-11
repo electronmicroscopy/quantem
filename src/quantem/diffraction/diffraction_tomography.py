@@ -1847,6 +1847,236 @@ class DiffractionTomography:
                 "weights": self.weights.detach(),
                 "rotations": self.rotation_matrices().detach()}
 
+    def _local_ray_map(self, tilts_deg, scan_shape, scan_step=1.0, w_min=0.45):
+        """voxel -> list of (tilt_index, probe_index) rays that intercept it.
+
+        A ray counts for a voxel when any slice sample gives the voxel a
+        trilinear weight above ``w_min``. 0.45 (not 0.5): even-N_z slabs put
+        ray samples at half-integer z, where the two co-dominant corners each
+        carry exactly 0.5.
+        """
+        pos = self.scan_positions(scan_shape, scan_step).reshape(-1, 3)
+        vox_rays = [set() for _ in range(self.n_voxels)]
+        for ti, t in enumerate(tilts_deg):
+            geo = self._tilt_geometry(pos, float(t))
+            for vidx, tw in geo["slices"]:
+                for p, v in zip(*torch.nonzero(tw.real > w_min, as_tuple=True)):
+                    vox_rays[int(vidx[p, v])].add((ti, int(p)))
+        return [sorted(s) for s in vox_rays], pos
+
+    def _orientation_planes(self, basis_sum_c, R_bank, U, V, ku, kv):
+        """Centered-basis plane samples for (n_R x n_tilt) rotation/axis pairs."""
+        Nkz, Nky, Nkx = self.k_shape
+        nR, nT = len(R_bank), U.shape[0]
+        R = torch.as_tensor(np.asarray(R_bank), dtype=torch.float32, device=self.device)
+        u_b = torch.einsum("rij,ti->rtj", R, U)
+        v_b = torch.einsum("rij,ti->rtj", R, V)
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
+        kxyz = (ku[None, None, ..., None] * u_b[:, :, None, None, :]
+                + kv[None, None, ..., None] * v_b[:, :, None, None, :])
+        ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32,
+                           device=self.device)
+        c = kxyz / dk + ctr
+        grid = torch.stack((
+            2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+            2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+            2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+        ), dim=-1).reshape(nR * nT, 1, *ku.shape, 3).to(torch.float32)
+        bre = basis_sum_c.real[None, None].expand(nR * nT, 1, -1, -1, -1).to(torch.float32)
+        bim = basis_sum_c.imag[None, None].expand(nR * nT, 1, -1, -1, -1).to(torch.float32)
+        sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros",
+                            align_corners=True)
+        sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros",
+                            align_corners=True)
+        return (sre + 1j * sim)[:, 0, 0].reshape(nR, nT, *ku.shape)
+
+    def local_search(
+        self,
+        measurements: torch.Tensor,
+        tilts_deg,
+        scan_shape: tuple[int, int],
+        scan_step: float | tuple[float, float] = 1.0,
+        n_rand: int = 8,
+        neighbors: int = 18,
+        w_min: float = 0.45,
+        accept: float = 0.95,
+        order: str = "error",
+        seed: int = 0,
+    ) -> dict:
+        """One voxel-at-a-time local-search sweep (no gradients, no GT).
+
+        Visits voxels one at a time (worst residual first with
+        ``order='error'``, else random order) and, for each, trials the
+        rotation and weight of its ``neighbors`` nearest voxels, the
+        incumbent, ``n_rand`` random rotations, and weight-only moves. The
+        judge is the exact forward amplitude loss over ONLY the rays that
+        intercept the voxel with trilinear weight above ``w_min`` -- on that
+        restricted set the voxel's contribution dominates, so single-voxel
+        evidence is decisive (a full-pattern loss dilutes it). A trial is
+        adopted only when it beats the incumbent by the ``accept`` margin;
+        without a real margin, sweeps churn and re-absorb freed grains.
+
+        Alternated with short :meth:`reconstruct` stages, sweeps typically
+        reach a stable fixed point (no accepted moves) in ~3 rounds. Which
+        fixed point is reached depends on the preceding optimization
+        trajectory; the data loss ranks trajectories, so a few restarts with
+        the best kept by loss is the robust protocol.
+
+        Per voxel visit, everything is batched: one fused sampling of the
+        base slice planes over its rays, one grid_sample for all trial
+        rotations x tilts, one FFT chain over (trials x rays).
+
+        Returns
+        -------
+        dict
+            ``n_changed``, ``n_visited``.
+        """
+        rng = np.random.default_rng(seed)
+        dpt = measurements if torch.is_tensor(measurements) else torch.as_tensor(measurements)
+        meas_amp = dpt.to(self.device).clamp_min(0).sqrt()
+        vox_rays, pos = self._local_ray_map(tilts_deg, scan_shape, scan_step, w_min)
+        Nz, Ny, Nx = self.real_shape
+        n_col = scan_shape[1]
+        geo_by_tilt = [self._tilt_geometry(pos, float(t)) for t in tilts_deg]
+        Ns = len(geo_by_tilt[0]["slices"])
+        num_pix = self.Psi0.numel()
+
+        def ray_geometry(rays):
+            parts = [[] for _ in range(Ns)]
+            tw_parts = [[] for _ in range(Ns)]
+            t_idx = []
+            for ti, p in rays:
+                g = geo_by_tilt[ti]
+                for s in range(Ns):
+                    vidx, tw = g["slices"][s]
+                    parts[s].append(vidx[p])
+                    tw_parts[s].append(tw[p])
+                t_idx.append(ti)
+            return ([torch.stack(ps) for ps in parts],
+                    [torch.stack(ps) for ps in tw_parts], np.array(t_idx))
+
+        def neighbor_ids(v):
+            z, y, x = v // (Ny * Nx), (v // Nx) % Ny, v % Nx
+            out = []
+            for dz in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if (dz, dy, dx) == (0, 0, 0):
+                            continue
+                        md = abs(dz) + abs(dy) + abs(dx)
+                        if (neighbors == 6 and md != 1) or (neighbors == 18 and md > 2):
+                            continue
+                        zz, yy, xx = z + dz, y + dy, x + dx
+                        if 0 <= zz < Nz and 0 <= yy < Ny and 0 <= xx < Nx:
+                            out.append((zz * Ny + yy) * Nx + xx)
+            return out
+
+        if order == "error":
+            # visit the worst-fit voxels first: forward residual per ray,
+            # averaged over each voxel's intercepting rays
+            with torch.no_grad():
+                B0, R0, W0 = self.masked_basis().detach(), \
+                    self.rotation_matrices().detach(), self.weights.detach()
+                ray_err = {}
+                for ti, t in enumerate(tilts_deg):
+                    psi = self.forward_tilt(pos, float(t), B0, R0, W0)
+                    amp = (psi.abs() ** 2).clamp_min(0).sqrt()
+                    m = meas_amp[ti].reshape(-1, *self.det_shape)
+                    e = ((amp - m) ** 2).mean(dim=(-1, -2))
+                    for p in range(pos.shape[0]):
+                        ray_err[(ti, p)] = float(e[p])
+            vox_err = np.array([np.mean([ray_err[r] for r in rays]) if rays else -1.0
+                                for rays in vox_rays])
+            visit = np.argsort(vox_err)[::-1]
+        else:
+            visit = rng.permutation(self.n_voxels)
+
+        n_changed = n_visited = 0
+        with torch.no_grad():
+            for v in visit:
+                rays = vox_rays[v]
+                if not rays:
+                    continue
+                n_visited += 1
+                R_all = self.rotation_matrices().detach()
+                W_all = self.weights.detach()
+                wsum_flat = W_all.reshape(-1, W_all.shape[-1]).sum(-1)
+                R_flat = R_all.reshape(-1, 3, 3)
+                basis = self.masked_basis().detach()
+                basis_sum_c = torch.fft.fftshift(basis.sum(-1), dim=(0, 1, 2))
+                w_v = float(wsum_flat[v])
+                mat = wsum_flat.abs() > 0.25 * wsum_flat.abs().max()
+                w_mean = float(wsum_flat[mat].mean()) if mat.any() else 1.0
+
+                trials = [(R_flat[v].cpu().numpy(), w_v)]
+                trials += [(R_flat[u].cpu().numpy(), float(wsum_flat[u]))
+                           for u in neighbor_ids(v)]
+                bank = self._uniform_rotations(n_rand, seed + int(v))
+                trials += [(B, w_mean if w_v < 0.2 * w_mean else w_v) for B in bank]
+                trials += [(R_flat[v].cpu().numpy(), w_mean),
+                           (R_flat[v].cpu().numpy(), 0.0)]
+                K = len(trials)
+
+                vidx_s, tw_s, t_idx = ray_geometry(rays)
+                nray = len(rays)
+                tilts_used = sorted(set(t_idx))
+                tmap = {ti: j for j, ti in enumerate(tilts_used)}
+                U = torch.stack([geo_by_tilt[ti]["u"] for ti in tilts_used])
+                V = torch.stack([geo_by_tilt[ti]["v"] for ti in tilts_used])
+                ku, kv = geo_by_tilt[0]["ku"], geo_by_tilt[0]["kv"]
+                planes_R = self._orientation_planes(basis_sum_c,
+                                                    [T[0] for T in trials], U, V, ku, kv)
+                ray_t = torch.tensor([tmap[ti] for ti in t_idx])
+                trial_planes = planes_R[:, ray_t]               # (K, nray, det, det)
+
+                base_planes, base_wsums, v_tw = [], [], []
+                geo_stub = {"u": U[ray_t].repeat_interleave(8, 0),
+                            "v": V[ray_t].repeat_interleave(8, 0),
+                            "ku": ku, "kv": kv}
+                for s in range(Ns):
+                    pl = self._transmission_planes_fused(vidx_s[s], tw_s[s],
+                                                         geo_stub, basis, R_all, W_all)
+                    base_planes.append(pl)
+                    base_wsums.append((tw_s[s].real.to(wsum_flat.dtype)
+                                       * wsum_flat[vidx_s[s]]).sum(-1))
+                    hit = (vidx_s[s] == v) & (tw_s[s].real > 0)
+                    v_tw.append(torch.where(hit, tw_s[s].real, 0.0).sum(-1))
+
+                Psi = self.Psi0[None, None].expand(K, nray, -1, -1).reshape(
+                    K * nray, *self.det_shape).clone()
+                inc = trial_planes[0]
+                w_ts = torch.tensor([w for _, w in trials],
+                                    dtype=torch.float64)[:, None, None, None]
+                for s in range(Ns):
+                    tww = v_tw[s][None, :, None, None]
+                    SF = (base_planes[s][None] - tww * w_v * inc[None]
+                          + tww * w_ts * trial_planes)
+                    dc = (base_wsums[s][None, :] - v_tw[s][None, :] * w_v
+                          + v_tw[s][None, :] * w_ts[:, :, 0, 0])
+                    SF = SF.reshape(K * nray, *self.det_shape).clone()
+                    SF[:, 0, 0] = SF[:, 0, 0] + (1.0 - dc.reshape(-1)).to(SF.dtype)
+                    t = torch.fft.ifft2(num_pix * SF)
+                    t = torch.exp(1j * torch.angle(t))
+                    Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t)
+                    if s < Ns - 1:
+                        Psi = Psi * self._prop_power(1)
+                Psi = Psi * self.antialias_mask
+                amp = (Psi.abs() ** 2).clamp_min(0).sqrt().reshape(
+                    K, nray, *self.det_shape)
+                m = torch.stack([meas_amp[ti, p // n_col, p % n_col]
+                                 for ti, p in rays])
+                losses = ((amp - m[None]) ** 2).mean(dim=(1, 2, 3)).cpu().numpy()
+
+                best = int(np.argmin(losses))
+                if best != 0 and losses[best] < accept * losses[0]:
+                    R_b, w_b = trials[best]
+                    self.angles.M[v] = torch.as_tensor(R_b, dtype=torch.float32,
+                                                       device=self.device)
+                    ns = self.weights.shape[-1]
+                    self.weights.reshape(-1, ns)[v] = w_b / ns
+                    n_changed += 1
+        return {"n_changed": n_changed, "n_visited": n_visited}
+
     def plot_loss(self, figsize: tuple[float, float] = (5.5, 3.4)):
         """Semilog plot of the most recent reconstruction's loss history.
 
