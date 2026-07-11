@@ -781,8 +781,24 @@ class DiffractionTomography:
             idxc = torch.minimum(torch.maximum(idx, lo), hi)
             vidx = (idxc[..., 0] * Ny + idxc[..., 1]) * Nx + idxc[..., 2]  # (P, 8)
             slices.append((vidx, tw.to(torch.complex64)))
+        # unique-voxel assembly (PRISM-style factorization): each distinct
+        # struck voxel's plane is sampled ONCE per tilt and every probe's
+        # slice SF is assembled by the constant trilinear matrix T -- the
+        # same algebra as the per-corner path, reordered, so probes stop
+        # re-sampling the voxels they share.
+        uslices = []
+        for vidx, tw in slices:
+            twr = tw.real
+            m = (twr > 0).reshape(-1)
+            uv = torch.unique(vidx.reshape(-1)[m])
+            lookup = torch.full((self.n_voxels,), 0, dtype=torch.long, device=dev)
+            lookup[uv] = torch.arange(uv.numel(), device=dev)
+            T = torch.zeros(P, max(int(uv.numel()), 1), device=dev)
+            T.scatter_add_(1, lookup[vidx], twr * (twr > 0))
+            uslices.append((uv, T))
         kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
-        geo = {"u": u, "v": v, "slices": slices, "ku": ku, "kv": kv}
+        geo = {"u": u, "v": v, "slices": slices, "uslices": uslices,
+               "ku": ku, "kv": kv}
         cache[key] = geo
         return geo
 
@@ -879,6 +895,54 @@ class DiffractionTomography:
         det_r, det_c = self.det_shape
         return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
 
+    def _transmission_planes_unique(self, uv: torch.Tensor, T: torch.Tensor,
+                                    geo: dict, basis: torch.Tensor,
+                                    R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
+        """Slice SF for all probes via the unique-voxel factorization.
+
+        PRISM-adapted reuse: at one tilt every ray-corner touching voxel ``v``
+        needs the SAME plane (the basis sampled at ``R_v^T k``), so the
+        ``n_unique`` struck voxels are sampled once and each probe's slice SF
+        is assembled by the constant trilinear matrix ``T`` (``(P, n_unique)``,
+        from the geometry cache): ``SF = T @ (w_v * plane_v)``. Identical
+        algebra to the per-corner path, reordered; the sampling work and the
+        autograd graph shrink by the corner-sharing factor (~10-60x for
+        one-probe-per-voxel scans). Returns ``(P, det_r, det_c)`` WITHOUT the
+        vacuum delta.
+        """
+        det_r, det_c = self.det_shape
+        P = T.shape[0]
+        if uv.numel() == 0:
+            return torch.zeros(P, det_r, det_c, dtype=torch.complex64,
+                               device=self.device)
+        Nkz, Nky, Nkx = self.k_shape
+        Nw = basis.shape[-1]
+        V = uv.numel()
+        R = R_all.reshape(-1, 3, 3)[uv]                                 # (V,3,3)
+        wv = W_all.reshape(-1, Nw)[uv].to(torch.complex64)              # (V,Nw)
+        u_b = torch.einsum("vij,i->vj", R, geo["u"])                    # R^T u
+        v_b = torch.einsum("vij,i->vj", R, geo["v"])
+        ku, kv = geo["ku"], geo["kv"]
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
+        kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
+                + kv[None, ..., None] * v_b[:, None, None, :])          # (V,r,c,3)
+        ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2],
+                           dtype=torch.float32, device=self.device)
+        c = kxyz / dk + ctr
+        grid = torch.stack((
+            2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+            2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+            2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+        ), dim=-1)[:, None].to(torch.float32)                           # (V,1,r,c,3)
+        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2))
+        bre = basis_c.real.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
+        bim = basis_c.imag.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
+        sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+        sampled = (sre + 1j * sim).squeeze(2)                           # (V,Nw,r,c)
+        t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V,r,c)
+        return (T.to(torch.complex64) @ t_vox.reshape(V, -1)).reshape(P, det_r, det_c)
+
     def forward_tilt(self, origins: torch.Tensor, tilt_x_deg: float,
                      basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor,
                      phase_only: bool = True, superslice: int = 1) -> torch.Tensor:
@@ -921,7 +985,8 @@ class DiffractionTomography:
             SF, Wg = None, None
             for s in grp:
                 vidx, tw = slices[s]
-                sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                uv, T = geo["uslices"][s]
+                sf_s = self._transmission_planes_unique(uv, T, geo, basis, R_all, W_all)
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (P,)
                 SF = sf_s if SF is None else SF + sf_s
                 Wg = w_s if Wg is None else Wg + w_s
@@ -960,7 +1025,7 @@ class DiffractionTomography:
         u_all = torch.cat([g["u"][None].expand(P * 8, 3) for g in geos])  # (T*P*8, 3)
         v_all = torch.cat([g["v"][None].expand(P * 8, 3) for g in geos])
         geo = {"u": u_all, "v": v_all, "slices": slices,
-               "ku": geos[0]["ku"], "kv": geos[0]["kv"]}
+               "tilt_geos": geos, "ku": geos[0]["ku"], "kv": geos[0]["kv"]}
         cache[key] = geo
         return geo
 
@@ -992,7 +1057,12 @@ class DiffractionTomography:
             SF, Wg = None, None
             for s in grp:
                 vidx, tw = slices[s]
-                sf_s = self._transmission_planes_fused(vidx, tw, geo, basis, R_all, W_all)
+                # per-tilt unique-voxel assembly, concatenated over the group
+                sf_s = torch.cat([
+                    self._transmission_planes_unique(
+                        g["uslices"][s][0], g["uslices"][s][1], g,
+                        basis, R_all, W_all)
+                    for g in geo["tilt_geos"]])
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (T*P,)
                 SF = sf_s if SF is None else SF + sf_s
                 Wg = w_s if Wg is None else Wg + w_s
