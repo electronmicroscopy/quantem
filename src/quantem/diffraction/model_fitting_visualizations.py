@@ -153,7 +153,6 @@ class ModelDiffractionVisualizations:
         pattern_row: int = 0,
         pattern_col: int = 0,
         power: float = 1,
-        cbar: bool = False,
         axsize: tuple[int, int] = (6, 6),
         overlay: bool = True,
         overlay_origin: bool = True,
@@ -161,6 +160,8 @@ class ModelDiffractionVisualizations:
         overlay_on: Literal["model", "both"] = "model",
         origin_marker_kwargs: dict[str, Any] | None = None,
         disk_marker_kwargs: dict[str, Any] | None = None,
+        figsize: tuple[int, int] = (12,7),
+        **kwargs
     ) -> tuple[Any, Any]:
         """
         Visualize fit losses with reference/model image panels.
@@ -207,7 +208,7 @@ class ModelDiffractionVisualizations:
         if md.dataset.shape[0] <= pattern_row or md.dataset.shape[1] <= pattern_col:
             raise ValueError("individual row or column outside bounds of dataset")
 
-        fig = plt.figure(figsize=(12, 7))
+        fig = plt.figure(figsize=figsize)
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax_top = fig.add_subplot(gs[0])
         md.plot_losses(figax=(fig, ax_top), plot_lrs=True, plot_individual=individual_loss,individual_row=pattern_row,individual_col=pattern_col)
@@ -221,23 +222,22 @@ class ModelDiffractionVisualizations:
         
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
-        vmin = float(min(refp.min(), predp.min()))
-        vmax = float(max(refp.max(), predp.max()))
+        kwargs.setdefault("vmin", float(min(refp.min(), predp.min())))
+        kwargs.setdefault("vmax", float(max(refp.max(), predp.max())))
 
         gs_bot = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[1], wspace=0.15)
         axs = np.array(
             [fig.add_subplot(gs_bot[0, 0]), fig.add_subplot(gs_bot[0, 1])], dtype=object
         )
+
+        kwargs.setdefault("cmap", config.get("viz.cmap"))
         show_2d(
             [refp, predp],
             figax=(fig, axs),
             title=["image_ref", "model"],
-            cmap=config.get("viz.cmap"),
-            cbar=bool(cbar),
             returnfig=False,
             axsize=axsize,
-            vmin=vmin,
-            vmax=vmax,
+            **kwargs
         )
 
         if overlay:
@@ -343,8 +343,8 @@ class ModelDiffractionVisualizations:
 
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
-        vmin = float(min(refp.min(), predp.min()))
-        vmax = float(max(refp.max(), predp.max()))
+        kwargs.setdefault("vmin", float(min(refp.min(), predp.min())))
+        kwargs.setdefault("vmax", float(max(refp.max(), predp.max())))
 
         t1 = kwargs.pop("title", "")
         fig, ax = show_2d(
@@ -354,8 +354,6 @@ class ModelDiffractionVisualizations:
             cbar=True,
             returnfig=True,
             axsize=axsize,
-            vmin=vmin,
-            vmax=vmax,
             **kwargs, 
         )
         if overlay:
