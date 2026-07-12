@@ -278,6 +278,68 @@ class DiffractionTomography:
         """
         return self.basis * self.sphere_mask[..., None]
 
+    def structure_score(self, miso_deg: float = 7.0, min_cluster: int = 3) -> dict:
+        """Structure diagnostics computed from the model alone (no ground truth).
+
+        For ranking independent reconstruction restarts: the data loss alone
+        inverts against structure at long budgets (overfitting the
+        underdetermined directions), while these two statistics directly
+        detect the known failure modes:
+
+        * ``basis_ipr`` -- inverse participation ratio of the off-origin
+          basis energy, ``sum p_i^2`` with ``p_i = |B_i|^2 / sum |B|^2``.
+          Scale-free sparsity: a basis doubled over two orientations spreads
+          its energy over twice the spikes and scores roughly half a clean
+          single-orientation basis. No reflection count is assumed.
+        * ``grain_coherence`` -- fraction of material voxels (weight above a
+          quarter of the maximum) belonging to misorientation-connected
+          6-neighbor clusters of at least ``min_cluster`` voxels. Grains are
+          contiguous, so orientation salt-and-pepper scores low.
+
+        Returns
+        -------
+        dict
+            ``basis_ipr``, ``grain_coherence``, and ``n_material``.
+        """
+        with torch.no_grad():
+            B = self.masked_basis().detach().clone()
+            B[0, 0, 0, :] = 0
+            p = (B.abs() ** 2).reshape(-1)
+            p = p / p.sum().clamp_min(1e-30)
+            ipr = float((p ** 2).sum())
+
+            W = self.weights.detach().abs().sum(-1).reshape(-1)
+            material = W > 0.25 * W.max().clamp_min(1e-30)
+            R = self.rotation_matrices().detach().reshape(-1, 3, 3).cpu().numpy()
+            Nz, Ny, Nx = self.real_shape
+            mat = material.cpu().numpy()
+            lbl = -np.ones(self.n_voxels, dtype=int)
+            nlab = 0
+            for v0 in range(self.n_voxels):
+                if lbl[v0] >= 0 or not mat[v0]:
+                    continue
+                stack = [v0]
+                lbl[v0] = nlab
+                while stack:
+                    v = stack.pop()
+                    z, y, x = v // (Ny * Nx), (v // Nx) % Ny, v % Nx
+                    for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                                       (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+                        zz, yy, xx = z + dz, y + dy, x + dx
+                        if 0 <= zz < Nz and 0 <= yy < Ny and 0 <= xx < Nx:
+                            u = (zz * Ny + yy) * Nx + xx
+                            if lbl[u] < 0 and mat[u] and \
+                               self._miso_deg(R[v] @ R[u].T) < miso_deg:
+                                lbl[u] = nlab
+                                stack.append(u)
+                nlab += 1
+            sizes = np.bincount(lbl[lbl >= 0], minlength=max(nlab, 1))
+            in_big = sum(int(sz) for sz in sizes if sz >= min_cluster)
+            n_mat = int(mat.sum())
+            coh = in_big / n_mat if n_mat else 0.0
+        return {"basis_ipr": ipr, "grain_coherence": float(coh),
+                "n_material": n_mat}
+
     def lab_structure_factor(
         self,
         voxel: int | tuple[int, int, int] = 0,
