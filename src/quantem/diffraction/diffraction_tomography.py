@@ -2165,8 +2165,16 @@ class DiffractionTomography:
             vox_err = np.array([np.mean([ray_err[r] for r in rays]) if rays else -1.0
                                 for rays in vox_rays])
             visit = np.argsort(vox_err)[::-1]
+            # jitter only the misfit voxels: it is an escape/refine mechanism,
+            # so a voxel that already fits its rays gains nothing from it. Gate
+            # on above-median residual (among voxels with rays) -- this keeps
+            # the confusion-case rescue at a fraction of the cost.
+            withrays = vox_err[vox_err >= 0]
+            err_gate = float(np.median(withrays)) if withrays.size else np.inf
+            jitter_ok = vox_err >= err_gate
         else:
             visit = rng.permutation(self.n_voxels)
+            jitter_ok = np.ones(self.n_voxels, dtype=bool)
 
         n_changed = n_visited = 0
         with torch.no_grad():
@@ -2193,10 +2201,12 @@ class DiffractionTomography:
                 trials += [(B, w_mean if w_v < 0.2 * w_mean else w_v) for B in bank]
                 # multi-scale jitter of the incumbent (lab-frame perturbation):
                 # refine a nearly-right voxel and hop adjacent basins without
-                # an explicit search
-                for si, sig in enumerate(jitter_deg):
-                    for P in self._rot_perturbations(sig, n_jitter, seed + 991 * (si + 1) + int(v)):
-                        trials.append((P @ R_v, w_v))
+                # an explicit search -- only for misfit voxels (jitter_ok), a
+                # well-fit voxel gains nothing and would just pay the cost
+                if n_jitter and jitter_ok[v]:
+                    for si, sig in enumerate(jitter_deg):
+                        for P in self._rot_perturbations(sig, n_jitter, seed + 991 * (si + 1) + int(v)):
+                            trials.append((P @ R_v, w_v))
                 trials += [(R_v, w_mean), (R_v, 0.0)]
                 K = len(trials)
 
