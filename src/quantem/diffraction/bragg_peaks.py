@@ -4071,7 +4071,7 @@ class BraggPeaksPolymer(AutoSerialize):
         orient_flowlines,
         int_range=[0, 0.2],
         sym_rotation_order=2,
-        theta_offset=0.0,
+        theta_offset=np.pi,
         greyscale=False,
         greyscale_max=True,
         white_background=False,
@@ -4089,6 +4089,9 @@ class BraggPeaksPolymer(AutoSerialize):
             int_range (float)           2 element array giving the intensity range
             sym_rotation_order (int):   rotational symmety for colouring
             theta_offset (float):       Offset the anglular coloring by this value in radians.
+                                        Default pi rotates the hue mapping by 90deg (nematic
+                                        sym=2) so color tracks the drawn flowline direction:
+                                        cyan for vertical lines, red for horizontal.
             greyscale (bool):           Set to False for color output, True for greyscale output.
             greyscale_max (bool):       If output is greyscale, use max instead of mean for overlapping flowlines.
             white_background (bool):    For either color or greyscale output, switch to white background (from black).
