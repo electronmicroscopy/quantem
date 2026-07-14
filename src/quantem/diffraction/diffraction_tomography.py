@@ -1732,7 +1732,8 @@ class DiffractionTomography:
         smooth_basis: float = 0.0,
         shrink_beam_zone: float = 1.0,
         basis_topk: int | None = None,
-        friedel_basis: bool = False,
+        friedel_basis: bool = True,
+        loss_kpow: float = 0.0,
         angle_smooth: float = 0.0,
         reset_every: int = 10,
         reset_protect_vacuum: bool = True,
@@ -1770,6 +1771,16 @@ class DiffractionTomography:
             reset_modes = torch.as_tensor(np.asarray(reset_modes), dtype=torch.float32,
                                           device=self.device)
         meas_amp = measurements.to(self.device).clamp_min(0).sqrt()
+        # optional radial loss weighting: emphasize the high-|k| (weak) Bragg
+        # disks over the direct-beam region. The origin (vacuum baseline) is
+        # pinned regardless, so down-weighting it costs no constraint. Mean-1
+        # normalized so the loss scale is unchanged. loss_kpow=0 is a no-op.
+        kw2d = None
+        if loss_kpow > 0.0:
+            kv2, ku2 = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
+            krad = torch.sqrt(kv2 ** 2 + ku2 ** 2).to(self.device)
+            kw2d = krad ** loss_kpow
+            kw2d = (kw2d / kw2d.mean()).to(meas_amp.dtype)
         jobs = [(ti, j, i) for ti in range(len(tilts_deg)) for j in range(n_row) for i in range(n_col)]
         n_dp = len(jobs)
         # eps=1e-30: the phase-object gradients are ~1e-10, so the default
@@ -1810,7 +1821,10 @@ class DiffractionTomography:
                                          phase_only=phase_only,
                                          superslice=superslice)                       # (T,P,det,det)
                 tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape)
-                tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2, 3))                        # (T,P)
+                resid = (Psi.abs() - tgt) ** 2
+                if kw2d is not None:
+                    resid = resid * kw2d
+                tl = resid.mean(dim=(2, 3))                                           # (T,P)
                 (tl.sum() / n_dp).backward()
                 res_per_dp[t_grp[0] * P:(t_grp[-1] + 1) * P] = tl.detach().reshape(-1)
                 total += float(tl.sum())
@@ -2054,6 +2068,8 @@ class DiffractionTomography:
         scan_shape: tuple[int, int],
         scan_step: float | tuple[float, float] = 1.0,
         n_rand: int = 8,
+        n_jitter: int = 6,
+        jitter_deg: tuple = (2.0, 8.0),
         neighbors: int = 18,
         w_min: float = 0.45,
         accept: float = 0.95,
@@ -2065,7 +2081,11 @@ class DiffractionTomography:
         Visits voxels one at a time (worst residual first with
         ``order='error'``, else random order) and, for each, trials the
         rotation and weight of its ``neighbors`` nearest voxels, the
-        incumbent, ``n_rand`` random rotations, and weight-only moves. The
+        incumbent, ``n_rand`` random rotations, ``n_jitter`` small
+        perturbations of the incumbent at each angular scale in ``jitter_deg``
+        (local refinement -- a nearly-right voxel walks to the exact
+        orientation without an explicit grid search; the coarse scale also
+        hops between adjacent basins), and weight-only moves. The
         judge is the exact forward amplitude loss over ONLY the rays that
         intercept the voxel with trilinear weight above ``w_min`` -- on that
         restricted set the voxel's contribution dominates, so single-voxel
@@ -2165,13 +2185,19 @@ class DiffractionTomography:
                 mat = wsum_flat.abs() > 0.25 * wsum_flat.abs().max()
                 w_mean = float(wsum_flat[mat].mean()) if mat.any() else 1.0
 
-                trials = [(R_flat[v].cpu().numpy(), w_v)]
+                R_v = R_flat[v].cpu().numpy()
+                trials = [(R_v, w_v)]
                 trials += [(R_flat[u].cpu().numpy(), float(wsum_flat[u]))
                            for u in neighbor_ids(v)]
                 bank = self._uniform_rotations(n_rand, seed + int(v))
                 trials += [(B, w_mean if w_v < 0.2 * w_mean else w_v) for B in bank]
-                trials += [(R_flat[v].cpu().numpy(), w_mean),
-                           (R_flat[v].cpu().numpy(), 0.0)]
+                # multi-scale jitter of the incumbent (lab-frame perturbation):
+                # refine a nearly-right voxel and hop adjacent basins without
+                # an explicit search
+                for si, sig in enumerate(jitter_deg):
+                    for P in self._rot_perturbations(sig, n_jitter, seed + 991 * (si + 1) + int(v)):
+                        trials.append((P @ R_v, w_v))
+                trials += [(R_v, w_mean), (R_v, 0.0)]
                 K = len(trials)
 
                 vidx_s, tw_s, t_idx = ray_geometry(rays)
