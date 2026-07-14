@@ -2069,7 +2069,7 @@ class DiffractionTomography:
         scan_step: float | tuple[float, float] = 1.0,
         n_rand: int = 8,
         n_jitter: int = 6,
-        jitter_deg: tuple = (2.0, 8.0),
+        jitter_deg: tuple = (2.0, 8.0, 20.0),
         neighbors: int = 18,
         w_min: float = 0.45,
         accept: float = 0.95,
