@@ -527,6 +527,11 @@ class DiffractionTomography:
         aperture = torch.clamp((probe_k_max - k_rad) / dk_pix + 0.5, 0.0, 1.0).to(torch.complex128)
         if normalize:
             aperture = aperture / torch.sqrt((aperture.abs() ** 2).sum())
+        # single-precision wave optics: the learnable basis/weights stay double
+        # (precise Adam accumulation) but the FFT chain and its backward run in
+        # complex64. The dominant sampling path was already float32, so the
+        # forward is effectively single precision -- this just stops the FFTs
+        # from up-casting the whole wave to complex128.
         self.Psi0 = aperture.to(self.device)
         return self.Psi0
 
@@ -543,10 +548,10 @@ class DiffractionTomography:
         cutoff = antialias_fraction * k_nyq
         width = max(antialias_softness * k_nyq, 1e-12)
         mask = 0.5 * (1.0 - torch.cos(torch.pi * torch.clip((cutoff + width - k_rad) / width, 0.0, 1.0)))
-        self.antialias_mask = mask.to(self.device)          # circular k envelope
-        self._bare_prop = bare.to(self.device)              # unit-modulus Fresnel factor
+        self.antialias_mask = mask.to(self.device)   # circular k envelope
+        self._bare_prop = bare.to(self.device)       # unit-modulus Fresnel factor
         self._prop_pow_cache = {}
-        self.prop = (bare * self.antialias_mask)
+        self.prop = (self._bare_prop * self.antialias_mask)
         self.prop_distance = dz
         self._visible_k_max = float(cutoff + width)         # data carries no intensity beyond
         self._build_sphere_mask()                            # clip basis support to it
@@ -957,8 +962,22 @@ class DiffractionTomography:
         det_r, det_c = self.det_shape
         return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
 
+    def _basis_sample_vol(self, basis: torch.Tensor) -> torch.Tensor:
+        """Centered, channel-packed basis volume for grid_sample, once per forward.
+
+        Returns ``(1, 2*Nw, N_kz, N_ky, N_kx)`` float32: the fftshifted basis
+        with real parts in the first ``Nw`` channels and imaginary in the last
+        ``Nw``. Hoisting this out of the per-slice/per-tilt sampling loop
+        computes the shift + permute + cast ONCE per forward instead of once
+        per (slice, tilt), collapsing that many redundant autograd nodes.
+        """
+        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2))
+        re = basis_c.real.permute(3, 0, 1, 2)                          # (Nw,kz,ky,kx)
+        im = basis_c.imag.permute(3, 0, 1, 2)
+        return torch.cat([re, im], 0)[None].to(torch.float32)
+
     def _transmission_planes_unique(self, uv: torch.Tensor, T: torch.Tensor,
-                                    geo: dict, basis: torch.Tensor,
+                                    geo: dict, vol: torch.Tensor, Nw: int,
                                     R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
         """Slice SF for all probes via the unique-voxel factorization.
 
@@ -969,8 +988,12 @@ class DiffractionTomography:
         from the geometry cache): ``SF = T @ (w_v * plane_v)``. Identical
         algebra to the per-corner path, reordered; the sampling work and the
         autograd graph shrink by the corner-sharing factor (~10-60x for
-        one-probe-per-voxel scans). Returns ``(P, det_r, det_c)`` WITHOUT the
-        vacuum delta.
+        one-probe-per-voxel scans).
+
+        ``vol`` is the channel-packed basis from :meth:`_basis_sample_vol`; all
+        ``V`` unique voxels are sampled from that single volume in one
+        ``grid_sample`` (real and imaginary as packed channels). Returns
+        ``(P, det_r, det_c)`` WITHOUT the vacuum delta.
         """
         det_r, det_c = self.det_shape
         P = T.shape[0]
@@ -978,10 +1001,9 @@ class DiffractionTomography:
             return torch.zeros(P, det_r, det_c, dtype=torch.complex64,
                                device=self.device)
         Nkz, Nky, Nkx = self.k_shape
-        Nw = basis.shape[-1]
         V = uv.numel()
         R = R_all.reshape(-1, 3, 3)[uv]                                 # (V,3,3)
-        wv = W_all.reshape(-1, Nw)[uv].to(torch.complex64)              # (V,Nw)
+        wv = W_all.reshape(-1, Nw)[uv].to(torch.complex64)             # (V,Nw)
         u_b = torch.einsum("vij,i->vj", R, geo["u"])                    # R^T u
         v_b = torch.einsum("vij,i->vj", R, geo["v"])
         ku, kv = geo["ku"], geo["kv"]
@@ -995,13 +1017,12 @@ class DiffractionTomography:
             2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
             2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
             2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
-        ), dim=-1)[:, None].to(torch.float32)                           # (V,1,r,c,3)
-        basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2))
-        bre = basis_c.real.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
-        bim = basis_c.imag.permute(3, 0, 1, 2)[None].expand(V, -1, -1, -1, -1).to(torch.float32)
-        sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-        sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
-        sampled = (sre + 1j * sim).squeeze(2)                           # (V,Nw,r,c)
+        ), dim=-1)[None].to(torch.float32)                              # (1,V,r,c,3)
+        # one grid_sample reads the single volume; V rotations along output
+        # depth, real/imag along channels
+        out = F.grid_sample(vol, grid, mode="bilinear", padding_mode="zeros",
+                            align_corners=True)[0]                     # (2Nw,V,r,c)
+        sampled = torch.complex(out[:Nw], out[Nw:]).permute(1, 0, 2, 3)  # (V,Nw,r,c)
         t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V,r,c)
         return (T.to(torch.complex64) @ t_vox.reshape(V, -1)).reshape(P, det_r, det_c)
 
@@ -1041,6 +1062,8 @@ class DiffractionTomography:
         Psi = self.Psi0[None].expand(P, -1, -1).clone()
         num_pix = self.Psi0.numel()
         wsum = W_all.reshape(-1, W_all.shape[-1]).sum(-1)      # (n_voxels,)
+        Nw = basis.shape[-1]
+        vol = self._basis_sample_vol(basis)                   # once per forward
         groups = [list(range(s, min(s + max(1, superslice), Ns)))
                   for s in range(0, Ns, max(1, superslice))]
         for gi, grp in enumerate(groups):
@@ -1048,7 +1071,7 @@ class DiffractionTomography:
             for s in grp:
                 vidx, tw = slices[s]
                 uv, T = geo["uslices"][s]
-                sf_s = self._transmission_planes_unique(uv, T, geo, basis, R_all, W_all)
+                sf_s = self._transmission_planes_unique(uv, T, geo, vol, Nw, R_all, W_all)
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (P,)
                 SF = sf_s if SF is None else SF + sf_s
                 Wg = w_s if Wg is None else Wg + w_s
@@ -1113,6 +1136,8 @@ class DiffractionTomography:
         Psi = self.Psi0[None].expand(T * P, -1, -1).clone()
         num_pix = self.Psi0.numel()
         wsum = W_all.reshape(-1, W_all.shape[-1]).sum(-1)      # (n_voxels,)
+        Nw = basis.shape[-1]
+        vol = self._basis_sample_vol(basis)                   # once per forward
         groups = [list(range(s, min(s + max(1, superslice), Ns)))
                   for s in range(0, Ns, max(1, superslice))]
         for gi, grp in enumerate(groups):
@@ -1123,7 +1148,7 @@ class DiffractionTomography:
                 sf_s = torch.cat([
                     self._transmission_planes_unique(
                         g["uslices"][s][0], g["uslices"][s][1], g,
-                        basis, R_all, W_all)
+                        vol, Nw, R_all, W_all)
                     for g in geo["tilt_geos"]])
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (T*P,)
                 SF = sf_s if SF is None else SF + sf_s
