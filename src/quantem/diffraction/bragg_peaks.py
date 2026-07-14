@@ -3901,7 +3901,7 @@ class BraggPeaksPolymer(AutoSerialize):
     
                 # forward direction
                 t = t0
-                v0 = np.array((np.cos(t), np.sin(t)))
+                v0 = np.array((np.cos(t), -np.sin(t)))
                 v = v0 * step_size
                 xy = xy0
                 int_val = self.get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
@@ -3972,7 +3972,7 @@ class BraggPeaksPolymer(AutoSerialize):
     
                 # reverse direction
                 t = t0 + np.pi
-                v0 = np.array((np.cos(t), np.sin(t)))
+                v0 = np.array((np.cos(t), -np.sin(t)))
                 v = v0 * step_size
                 xy = xy0
                 int_val = self.get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
@@ -4030,8 +4030,8 @@ class BraggPeaksPolymer(AutoSerialize):
                         )
                         theta_crop = theta[inds_theta]
                         t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop) + np.pi
-                        v = np.array((np.cos(t), np.sin(t))) * step_size
-                        v = np.array((np.cos(t), np.sin(t))) * step_size
+                        v = np.array((np.cos(t), -np.sin(t))) * step_size
+                        v = np.array((np.cos(t), -np.sin(t))) * step_size
                         # v = np.array((-np.sin(t), np.cos(t))) * step_size
     
                         xy_t_int_rev[count_rev, 0:2] = xy
