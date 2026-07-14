@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Literal, Sequence, cast
 
 import numpy as np
@@ -14,9 +15,11 @@ from quantem.core.fitting.background import DCBackground, GaussianBackground
 from quantem.core.fitting.base import (
     AdditiveRenderModel,
     FitBase,
+    LogMSELoss,
     OriginND,
     RenderComponent,
     RenderContext,
+    SqrtMSELoss,
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
@@ -622,6 +625,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         constraint_config_params: dict[str, Any] | None = None,
+        edge_weight: float = 0.0,
         progress: bool = True,
         batch_size: int | None = None,
         frozen_components: list[str] | str | None = None,
@@ -640,6 +644,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 constraint_weight=float(constraint_weight),
                 constraint_params=constraint_params,
                 constraint_config_params=constraint_config_params,
+                edge_weight=float(edge_weight),
                 frozen_components=frozen_components,
                 sample_trainability=sample_trainability,
                 progress=progress,
@@ -721,6 +726,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         constraint_config_params: dict[str, Any] | None = None,
+        edge_weight: float = 0.0,
         frozen_components: list[str] | str | None = None,
         sample_trainability: dict[str, Any] | None = None,
         progress: bool = True,
@@ -763,12 +769,17 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             raise RuntimeError("Call .define_model(...) first.")
         if not isinstance(self.dataset, Dataset4d):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
-        if reset not in ("initialized", "mean_refined"):
-            raise ValueError("reset must be 'initialized' or 'mean_refined'.")
+        if reset not in ("initialized", "mean_refined", "individual"):
+            raise ValueError("reset must be 'initialized', 'mean_refined', or 'individual'.")
 
         # Choose initialization state and load into the live model so we can
         # read current parameter values + constraint settings off the modules.
-        if reset == "mean_refined":
+        # For reset="individual" each position warm-starts from its own
+        # previously refined state (state_individual_refined); the live model
+        # is loaded from mean_refined (or initialized) only to resolve the
+        # plan layout and constraint settings.
+        warm_start = reset == "individual"
+        if reset == "mean_refined" or (warm_start and self.state_mean_refined is not None):
             if self.state_mean_refined is None:
                 raise RuntimeError("mean_refined state is unavailable. Run fit_mean_diffraction_pattern first.")
             init_state = self._clone_state_dict(self.state_mean_refined)
@@ -777,6 +788,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 raise RuntimeError("initialized state is unavailable. Call define_model first.")
             init_state = self._clone_state_dict(self.state_initialized)
         self._load_model_state_dict_copy(init_state)
+        if warm_start and self.state_individual_refined is None:
+            raise RuntimeError(
+                "reset='individual' requires a previous per-position fit "
+                "(run fit_individual_diffraction_pattern first)."
+            )
 
         if constraint_params is not None:
             self.model.apply_constraint_params(constraint_params, strict=True)
@@ -839,7 +855,22 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 dim=0,
             )
 
-            stacked = plan.build_stacked_params(B)
+            if warm_start:
+                prev_states = []
+                for (r, c) in chunk:
+                    st = self.state_individual_refined[r, c]
+                    if st is None:
+                        raise RuntimeError(
+                            f"reset='individual': position ({r}, {c}) has no previous "
+                            "per-position state to warm-start from."
+                        )
+                    prev_states.append(st)
+                stacked, fixed_b = plan.build_stacked_params_from_states(
+                    prev_states, device=ctx.device, dtype=ctx.dtype
+                )
+            else:
+                stacked = plan.build_stacked_params(B)
+                fixed_b = None
 
             adam_state: dict[str, dict[str, torch.Tensor]] = {
                 name: {
@@ -866,30 +897,51 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                         mixed_trainable_keys.append(key)
                         init_snapshots[key] = stacked[key].detach().clone()
 
+            # Hoist target-only loss terms out of the step loop: these depend on
+            # `targets` (constant for the chunk), not on `pred`, so recomputing
+            # them every step wastes a full-frame amin+pow (SqrtMSE) or log1p.
+            is_sqrt = isinstance(loss_fn, SqrtMSELoss)
+            is_log = isinstance(loss_fn, LogMSELoss)
+            cw = float(constraint_weight)
+            ew = float(edge_weight)
+            if is_sqrt:
+                sqrt_gamma = float(loss_fn.gamma)
+                tgt_mod = (targets - targets.amin(dim=(1, 2), keepdim=True) + 1.0) ** sqrt_gamma
+            elif is_log:
+                tgt_log = torch.log1p(targets)
+                tgt_mod = tgt_log
+            else:
+                tgt_mod = targets
+            if ew > 0.0:
+                # Edge term compares spatial gradients of the (compressed) images.
+                # Disk-position information is concentrated at the aperture edges,
+                # while per-disk intensity tilts act on disk interiors, so this
+                # term anchors the lattice geometry against tilt-shift mimicry.
+                tgt_dr = tgt_mod[:, 1:, :] - tgt_mod[:, :-1, :]
+                tgt_dc = tgt_mod[:, :, 1:] - tgt_mod[:, :, :-1]
+
             for step in range(int(n_steps)):
-                pred = plan.batched_forward(ctx, stacked)
-                # Per-sample fidelity loss summed → scalar with per-sample grads
-                diff2 = (pred.float() - targets.float())
-                # Match SqrtMSELoss behavior approximately when loss_fn is SqrtMSELoss:
-                # gamma-power transform of (x - min(x) + 1), per-sample independently.
-                from quantem.core.fitting.base import SqrtMSELoss, LogMSELoss
-                if isinstance(loss_fn, SqrtMSELoss):
-                    gamma = float(loss_fn.gamma)
-                    eps = 1.0
-                    pred_min = pred.amin(dim=(1, 2), keepdim=True)
-                    tgt_min = targets.amin(dim=(1, 2), keepdim=True)
-                    pred_mod = (pred - pred_min + eps) ** gamma
-                    tgt_mod = (targets - tgt_min + eps) ** gamma
-                    per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
-                elif isinstance(loss_fn, LogMSELoss):
-                    per_sample_loss = ((torch.log1p(pred) - torch.log1p(targets)) ** 2).mean(dim=(1, 2))
+                pred = plan.batched_forward(ctx, stacked, fixed=fixed_b)
+                # Per-sample fidelity loss summed → scalar with per-sample grads.
+                if is_sqrt:
+                    pred_mod = (pred - pred.amin(dim=(1, 2), keepdim=True) + 1.0) ** sqrt_gamma
+                elif is_log:
+                    pred_mod = torch.log1p(pred)
                 else:
-                    per_sample_loss = (diff2 * diff2).mean(dim=(1, 2))
+                    pred_mod = pred
+                per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
+                if ew > 0.0:
+                    pr_dr = pred_mod[:, 1:, :] - pred_mod[:, :-1, :]
+                    pr_dc = pred_mod[:, :, 1:] - pred_mod[:, :, :-1]
+                    per_sample_loss = per_sample_loss + ew * (
+                        ((pr_dr - tgt_dr) ** 2).mean(dim=(1, 2))
+                        + ((pr_dc - tgt_dc) ** 2).mean(dim=(1, 2))
+                    )
 
                 # Add per-sample soft constraint loss.
-                if float(constraint_weight) != 0.0:
+                if cw != 0.0:
                     constraint_per_sample = plan.batched_constraint_loss(ctx, stacked)
-                    per_sample_loss = per_sample_loss + float(constraint_weight) * constraint_per_sample
+                    per_sample_loss = per_sample_loss + cw * constraint_per_sample
 
                 total_loss = per_sample_loss.sum()
 
@@ -931,9 +983,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
                 pbar.update(B)
 
-            # Unstack each sample back into a state_dict and store
+            # Unstack each sample back into a state_dict and store. Warm starts
+            # keep each sample's own previous state as the base so frozen
+            # parameters retain their per-position values.
             for b, (r, c) in enumerate(chunk):
-                sample_state = plan.build_sample_state_dict(init_state, stacked, b)
+                base_state = prev_states[b] if warm_start else init_state
+                sample_state = plan.build_sample_state_dict(base_state, stacked, b)
                 self.state_individual_refined[r, c] = sample_state
 
         pbar.close()
@@ -1409,6 +1464,70 @@ class _BatchedPlan:
                     
         return out
 
+    def _stacked_key_to_state_key(self, key: str) -> str | None:
+        """Map a stacked-param key to its canonical model state-dict key."""
+        if key == "origin.coords":
+            return "origin.coords"
+        prefix, pname = key.split(".", 1)
+        idx = {
+            "disk": self.disk_idx,
+            "dcbg": self.dcbg_idx,
+            "gaussbg": self.gaussbg_idx,
+            "lat": self.lat_idx,
+        }.get(prefix)
+        if idx is None:
+            return None
+        return f"components.{idx}.{pname}"
+
+    def _all_plan_keys(self) -> list[str]:
+        keys = ["origin.coords"]
+        if self.disk is not None:
+            keys += ["disk.template_raw", "disk.intensity_raw"]
+        if self.dcbg is not None:
+            keys += ["dcbg.intensity_raw"]
+        if self.gaussbg is not None:
+            keys += ["gaussbg.sigma_raw", "gaussbg.intensity_raw"]
+        if self.lat is not None:
+            for a in ("u_row", "u_col", "v_row", "v_col", "i0_raw", "ir", "ic", "irr", "icc", "irc"):
+                if getattr(self.lat, a, None) is not None:
+                    keys.append(f"lat.{a}")
+        return keys
+
+    def build_stacked_params_from_states(
+        self,
+        states: list[dict[str, torch.Tensor]],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """
+        Build per-sample parameter stacks from previously refined states.
+
+        Returns
+        -------
+        (stacked, fixed) : tuple of dict
+            ``stacked`` holds the trainable keys (requires_grad), initialized
+            from each sample's own state; ``fixed`` holds every other
+            plan-known key as a per-sample constant stack, so frozen
+            parameters keep their per-position values instead of collapsing
+            to the shared live-model value.
+        """
+        stacked: dict[str, torch.Tensor] = {}
+        fixed: dict[str, torch.Tensor] = {}
+        for key in self._all_plan_keys():
+            skey = self._stacked_key_to_state_key(key)
+            if skey is None or skey not in states[0]:
+                continue
+            vals = torch.stack(
+                [st[skey].to(device=device, dtype=dtype) for st in states], dim=0
+            ).contiguous()
+            if self._trainable_flags.get(key, False):
+                vals.requires_grad_(True)
+                stacked[key] = vals
+            else:
+                fixed[key] = vals
+        return stacked, fixed
+
     @staticmethod
     def _stack(p: torch.Tensor, B: int) -> torch.Tensor:
         x = p.detach().clone().unsqueeze(0).expand(B, *p.shape).contiguous()
@@ -1416,9 +1535,18 @@ class _BatchedPlan:
         return x
 
     def batched_forward(
-        self, ctx: RenderContext, stacked: dict[str, torch.Tensor]
+        self,
+        ctx: RenderContext,
+        stacked: dict[str, torch.Tensor],
+        fixed: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Batched forward with frozen parameter support."""
+        """Batched forward with frozen parameter support.
+
+        ``fixed`` optionally supplies per-sample constant stacks for frozen
+        keys (warm starts); lookups fall back stacked -> fixed -> live module.
+        """
+        if fixed:
+            stacked = {**fixed, **stacked}
         B = next(iter(stacked.values())).shape[0] if stacked else 1
         
         # Get origin (might be frozen)
@@ -1511,11 +1639,17 @@ class _BatchedPlan:
             if irc_b is None and self.lat.irc is not None:
                 irc_b = self.lat.irc.unsqueeze(0).expand(B, *self.lat.irc.shape).clone()
             
-            # Template (from disk)
-            template_b = stacked.get("disk.template_raw")
-            if template_b is None and self.disk is not None:
-                template_b = self.disk.template_raw.unsqueeze(0).expand(B, *self.disk.template_raw.shape).clone()
-            
+            # Template for the lattice. With own_template the lattice renders
+            # its own (per-position frozen) template, distinct from the center
+            # disk; otherwise it shares the center-disk template.
+            if getattr(self.lat, "own_template", False):
+                lt = self.lat.disk.template_raw
+                template_b = lt.unsqueeze(0).expand(B, *lt.shape).clone()
+            else:
+                template_b = stacked.get("disk.template_raw")
+                if template_b is None and self.disk is not None:
+                    template_b = self.disk.template_raw.unsqueeze(0).expand(B, *self.disk.template_raw.shape).clone()
+
             pred = pred + self.lat.forward_batched(
                 ctx,
                 u_row_b=u_row_b,
@@ -1591,14 +1725,31 @@ class _BatchedPlan:
                 if bool(self.disk.hard_constraints.get("force_norm", False)):
                     self._batched_enforce_norm(template)
 
-        if (
-            self.lat is not None
-            and "lat.i0_raw" not in skip_keys
-            and bool(self.lat.hard_constraints.get("force_positive_intensity", False))
+        if self.lat is not None and bool(
+            self.lat.hard_constraints.get("force_positive_intensity", False)
         ):
             i0 = stacked.get("lat.i0_raw")
-            if i0 is not None:
+            if i0 is not None and "lat.i0_raw" not in skip_keys:
                 i0.clamp_(min=0.0)
+            # Optional slope-magnitude cap (see SyntheticDiskLattice.max_slope_ratio).
+            ir = stacked.get("lat.ir")
+            ic = stacked.get("lat.ic")
+            if (
+                self.lat.max_slope_ratio is not None
+                and ir is not None
+                and ic is not None
+                and "lat.ir" not in skip_keys
+                and "lat.ic" not in skip_keys
+            ):
+                if i0 is None:
+                    i0 = self.lat.i0_raw.detach().to(ir.device, ir.dtype).expand_as(ir)
+                radius = self.lat._slope_support_radius()
+                if radius > 0.0:
+                    slope = torch.sqrt(ir * ir + ic * ic)
+                    limit = float(self.lat.max_slope_ratio) * i0 / radius
+                    scale = torch.clamp(limit / slope.clamp(min=1e-12), max=1.0)
+                    ir.mul_(scale)
+                    ic.mul_(scale)
 
     @staticmethod
     def _clamp_bounds_inplace(t: torch.Tensor, lo: float | None, hi: float | None) -> None:
@@ -1721,8 +1872,14 @@ class _BatchedPlan:
                     i_val = i_val.detach().clone()
             
             if t_val is not None:
+                # Overwrite only the center-disk template key(s). When the
+                # lattice owns a separate template it is frozen per-position and
+                # must be preserved from the base state, not clobbered here.
+                center_keys = {f"components.{self.disk_idx}.template_raw"}
+                if not getattr(self.lat, "own_template", False) and self.lat_idx is not None:
+                    center_keys.add(f"components.{self.lat_idx}.disk.template_raw")
                 for key in list(out.keys()):
-                    if key.endswith(".template_raw"):
+                    if key.endswith(".template_raw") and key in center_keys:
                         out[key] = t_val.clone()
             
             if i_val is not None:
@@ -1815,7 +1972,6 @@ class _BatchedPlan:
                     T_max = 1
                 eta_min = float(spec.get("eta_min", 1e-7))
                 s = max(step - 1, 0)
-                import math
                 lr = eta_min + 0.5 * (base_lr - eta_min) * (1.0 + math.cos(math.pi * s / T_max))
                 out[key] = float(lr)
             elif t == "exponential":
@@ -1846,6 +2002,14 @@ class _BatchedPlan:
             template_b = stacked.get("disk.template_raw")
             if template_b is not None:
                 out = out + self.disk.constraint_loss_batched(ctx, template_raw_b=template_b)
+        # Per-sample soft L2 prior on the lattice tilt slopes (see
+        # SyntheticDiskLattice.slope_l2_weight).
+        if self.lat is not None and float(getattr(self.lat, "slope_l2_weight", 0.0)) > 0.0:
+            ir = stacked.get("lat.ir")
+            ic = stacked.get("lat.ic")
+            if ir is not None and ic is not None:
+                w = float(self.lat.slope_l2_weight)
+                out = out + w * (ir * ir + ic * ic).mean(dim=1)
         return out
 
     def resolve_component_keys(self, components: Any) -> list[str]:
