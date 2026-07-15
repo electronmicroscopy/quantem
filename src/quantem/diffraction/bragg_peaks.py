@@ -4135,7 +4135,9 @@ class BraggPeaksPolymer(AutoSerialize):
     
             # angles
             theta = np.linspace(0, np.pi, size_input[3], endpoint=False)
-            theta_color = theta * sym_rotation_order
+            # Negate so the hue handedness matches the drawn flowline direction in the
+            # displayed (y-down) map: red horizontal, cyan vertical, "/" yellow, "\\" purple.
+            theta_color = -theta * sym_rotation_order
     
             if size_input[0] > 1 and len(theta_offset) == 1:
                 theta_offset = np.ones(size_input[0]) * theta_offset
