@@ -1262,6 +1262,55 @@ class DiffractionTomography:
                             ops.append(M)
         return np.stack(ops)
 
+    def _cubic_grid_ops(self):
+        """Cubic point-group operations as (permute, flip) on the k grid.
+
+        Each of the 24 proper cubic rotations is a signed axis permutation, so
+        on a (cubic) k grid it acts by permuting the three axes and flipping
+        the negated ones. In centered (fftshifted) space a flip maps k -> -k
+        exactly for the odd grid sizes used here. Cached: pure geometry.
+        """
+        cached = getattr(self, "_cubic_grid_ops_cache", None)
+        if cached is not None:
+            return cached
+        ops = []
+        for M in self._cubic_ops():
+            Mt = M.T
+            perm = tuple(int(np.argmax(np.abs(Mt[o]))) for o in range(3))
+            flip = tuple(a for a in range(3) if Mt[a, perm[a]] < 0)
+            ops.append((perm, flip))
+        self._cubic_grid_ops_cache = ops
+        return ops
+
+    def symmetrize_basis(self) -> None:
+        """Project the basis onto cubic point-group symmetry, in place.
+
+        Averages the basis over the 24 proper cubic rotations (grid axis
+        permutations + flips), enforcing that every symmetry-equivalent
+        reflection carries the same amplitude. For a cubic crystal aligned to
+        the grid's cardinal directions this is the material's exact symmetry:
+        each Bragg peak is reinforced by its whole orbit, so partial data (a
+        few grains/tilts sampling a few of the equivalents) determines them
+        all, and every voxel's orientation search sees a full, clean set of
+        peaks to fall into. Combined with :meth:`reconstruct`'s Friedel
+        projection this is the full ``m-3m`` point group.
+
+        Enforcing it from a random start pins the basis to the cardinal-cubic
+        gauge throughout (the free global rotation makes cardinal alignment
+        always an available gauge), so no separate alignment step is needed;
+        the per-voxel rotations express each grain relative to that reference.
+        """
+        ops = self._cubic_grid_ops()
+        with torch.no_grad():
+            Bc = torch.fft.fftshift(self.basis, dim=(0, 1, 2))
+            acc = torch.zeros_like(Bc)
+            for perm, flip in ops:
+                T = Bc.permute(perm[0], perm[1], perm[2], 3)
+                if flip:
+                    T = torch.flip(T, dims=flip)
+                acc = acc + T
+            self.basis.copy_(torch.fft.ifftshift(acc / len(ops), dim=(0, 1, 2)))
+
     @classmethod
     def _miso_deg(cls, dR: np.ndarray) -> float:
         """Cubic-symmetry-reduced misorientation angle (deg) of a relative rotation."""
@@ -1733,6 +1782,7 @@ class DiffractionTomography:
         shrink_beam_zone: float = 1.0,
         basis_topk: int | None = None,
         friedel_basis: bool = True,
+        cubic_symmetry: bool = False,
         loss_kpow: float = 0.0,
         angle_smooth: float = 0.0,
         reset_every: int = 10,
@@ -1902,6 +1952,13 @@ class DiffractionTomography:
                         idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
                         W.copy_((wgt * W.index_select(axis, idx_p) + W
                                  + wgt * W.index_select(axis, idx_n)) / norm)
+            if cubic_symmetry and self.learn_basis:
+                # project the basis onto cubic point-group symmetry each step:
+                # every Bragg peak is forced equal to its whole 24-fold orbit,
+                # so a peak seen by any grain/tilt is filled in for all
+                # equivalents and the rotation search sees a full clean target.
+                # Pins the basis to the cardinal-cubic gauge from the start.
+                self.symmetrize_basis()
             if friedel_basis and self.learn_basis:
                 # the basis is the transmission's structure factor: for the
                 # phase grating of a real potential the off-origin content is
