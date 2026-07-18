@@ -1577,7 +1577,11 @@ class DiffractionTomography:
                 # its neighbors / jittered-incumbent / random rotations judged
                 # on only the rays that strike it. Evidence-based, so it finds
                 # grains the blind reset cannot; the changed voxels' stale Adam
-                # moments are cleared.
+                # moments are cleared. Each sweep transiently raises the loss
+                # (the basis/weights must re-adapt to the new orientations)
+                # before falling below the previous best -- that "spike" IS the
+                # grain discovery, so it runs to the end; the lowest-loss state
+                # over the whole run is snapshotted and returned.
                 self.local_search(measurements, tilts_deg, scan_shape, scan_step,
                                   accept=0.95, order="error", seed=it)
                 allv = torch.arange(self.n_voxels, device=self.device)

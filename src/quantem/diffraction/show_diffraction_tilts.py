@@ -81,12 +81,20 @@ def show_diffraction_tilts(series, tilts, labels=None, probe_step=None,
     p_str = max(probe_step, int(np.ceil(max(n_row, n_col) / 8)))
     sub = [np.fft.fftshift(s[::t_str, ::p_str, ::p_str], axes=(-2, -1)) for s in S]
 
-    # auto-detect the direct-beam disk so it never sets the display scale: the
-    # central bright blob of the mean pattern (plus its Fresnel skirt) is
-    # excluded via its radius + a 2-pixel margin.
+    # auto-detect the direct-beam disk so it never sets the display scale. The
+    # beam is the bright central blob; its skirt is far brighter than the
+    # Bragg disks, so a tight threshold on the core leaks the skirt into the
+    # scale and washes out the diffracted peaks. Use the azimuthal profile:
+    # walk out from the center and cut at the first radius where the mean
+    # pattern falls below 5% of the central value (the beam+skirt edge), then
+    # a 2-pixel margin. Everything beyond is diffracted signal.
     mean_dp = np.mean([s.mean(axis=(0, 1, 2)) for s in sub], axis=0)
-    beam_pix = mean_dp > 0.5 * mean_dp[cr, cc]
-    beam_r = float(rr[beam_pix].max()) + 2.0
+    rint = np.round(rr).astype(int)
+    prof = np.array([mean_dp[rint == r].mean() if np.any(rint == r) else 0.0
+                     for r in range(int(rr.max()) + 1)])
+    thr = 0.05 * prof[0]
+    below = np.where(prof < thr)[0]
+    beam_r = float(below[0]) + 2.0 if below.size else 4.0
     off_beam = rr > beam_r
     offvals0 = np.concatenate([s[..., off_beam].ravel() for s in sub])
     offvals0 = np.clip(offvals0, 0.0, None)
