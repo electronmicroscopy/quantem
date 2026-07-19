@@ -1790,11 +1790,16 @@ class DiffractionTomography:
 
         # skip vacuum voxels: a near-zero-weight voxel contributes ~0 to any of
         # its rays regardless of orientation, so no trial ever beats its
-        # incumbent -- sweeping it is pure cost. Restrict to voxels above a
-        # small fraction of the max material weight; fall back to the worst
-        # ~64 by error if the weight field hasn't formed yet (very early).
-        wsum0 = self.weights.detach().abs().sum(-1).reshape(-1)
-        material = (wsum0 > w_material * wsum0.max().clamp_min(1e-30)).cpu().numpy()
+        # incumbent -- sweeping it is pure cost. Keep a voxel only if its
+        # strongest basis weight exceeds w_material * (max over voxels), i.e.
+        # a RELATIVE threshold (testing > 0 alone would still sweep the many
+        # tiny fog weights). Relative, not absolute, because under phase_only
+        # the weight scale is a soft gauge -- the learned weights settle at
+        # whatever magnitude (e.g. ~0.03, not ~1) trades off against the basis,
+        # so a fixed absolute cut would exclude everything. Fall back to the
+        # worst ~64 by error before the weight field forms.
+        wmax0 = self.weights.detach().abs().reshape(self.n_voxels, -1).max(-1).values
+        material = (wmax0 > w_material * wmax0.max().clamp_min(1e-30)).cpu().numpy()
         keep = material[visit]
         if keep.sum() < 64:
             keep[:64] = True                          # early-phase fallback
