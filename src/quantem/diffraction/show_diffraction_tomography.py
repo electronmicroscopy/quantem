@@ -27,10 +27,14 @@ import numpy as np
 import torch
 import traitlets
 
+# NOTE: the display-range / point-filter controls (left_range, mid_range,
+# pts_range, pts_floor) are deliberately NOT linked -- the reconstruction has
+# spurious peaks that must be thresholded away independently of the ground
+# truth. Only navigation/view state and the shared power laws are linked.
 _LINKED_TRAITS = (
     "left_mode", "sel_z", "sel_y", "sel_x", "mid_mode", "structure", "sum_axis",
     "view_mode", "slice_idx", "power", "kpow", "pts_power", "pts_scale",
-    "pts_floor", "rot_theta", "rot_phi",
+    "rot_theta", "rot_phi",
 )
 
 

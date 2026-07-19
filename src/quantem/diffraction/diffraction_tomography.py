@@ -1368,6 +1368,7 @@ class DiffractionTomography:
         search_every: int = 0,
         reset_every: int = 10,
         phase_only: bool = True,
+        resume: bool = False,
         progress: bool = True,
         print_every: int = 0,
     ) -> dict:
@@ -1399,6 +1400,14 @@ class DiffractionTomography:
           The cheap complement to ``search_every`` -- enough on its own for
           one/few grains.
 
+        ``resume=True`` continues a previous ``reconstruct`` call: the Adam
+        momentum and the accumulated loss history carry over (so ``plot_loss``
+        shows the whole run and keep-best never rolls back below where the
+        last call ended). The basis/weights/angles always carry over regardless
+        of ``resume``; only the optimizer state and loss history need it. Use it
+        to add iterations incrementally (run N, inspect, run N more) -- the same
+        as one long call, but you can look in between.
+
         Set ``progress=False`` to hide the bar; ``print_every>0`` prints the
         loss every N iters.
         """
@@ -1413,7 +1422,14 @@ class DiffractionTomography:
         n_dp = len(jobs)
         # eps=1e-30: the phase-object gradients are ~1e-10, so the default
         # eps=1e-8 would swamp sqrt(v) and throttle every Adam step ~100x.
-        opt = self._make_optimizer(lr, lr, lr)
+        # resume=True reuses the Adam state (momentum) from the previous call
+        # so a second reconstruct() continues smoothly instead of restarting
+        # the optimizer; the params always carry over regardless.
+        if resume and getattr(self, "_opt", None) is not None:
+            opt = self._opt
+        else:
+            opt = self._make_optimizer(lr, lr, lr)
+        self._opt = opt
         group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
             + (["angles"] if self.learn_angles else [])
         lrs: list[list[float]] = []
@@ -1425,7 +1441,10 @@ class DiffractionTomography:
             self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti])) for (ti, j, i) in jobs
         ])                                                            # (n_dp, n_voxels)
         res_per_dp = torch.zeros(n_dp, dtype=torch.float64, device=self.device)
-        best = {"loss": float("inf"), "snap": None}
+        # on resume, carry the best-loss forward so keep-best never rolls the
+        # continued run back below where the previous call left off
+        best = {"loss": self.best_loss if resume and hasattr(self, "best_loss")
+                else float("inf"), "snap": None}
 
         origins = pos.reshape(-1, 3)                          # (P, 3)
         P = origins.shape[0]
@@ -1594,11 +1613,17 @@ class DiffractionTomography:
 
         if best["snap"] is not None:
             self._restore(best["snap"])              # return the best-ever state
-        self.losses = losses
+        # accumulate the loss / lr history across resumed calls so plot_loss
+        # shows the whole run, not just the latest call
+        if resume and getattr(self, "losses", None):
+            self.losses = self.losses + losses
+            self.lrs = (self.lrs + lrs) if getattr(self, "lrs", None) else lrs
+        else:
+            self.losses = losses
+            self.lrs = lrs
         self.best_loss = best["loss"]
-        self.lrs = lrs
         self.lr_group_names = group_names
-        return {"losses": losses, "lrs": lrs, "best_loss": best["loss"],
+        return {"losses": self.losses, "lrs": self.lrs, "best_loss": best["loss"],
                 "basis": self.masked_basis().detach(),
                 "weights": self.weights.detach(),
                 "rotations": self.rotation_matrices().detach()}
