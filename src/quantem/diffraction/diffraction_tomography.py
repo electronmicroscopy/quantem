@@ -1602,7 +1602,7 @@ class DiffractionTomography:
                 # grain discovery, so it runs to the end; the lowest-loss state
                 # over the whole run is snapshotted and returned.
                 self.local_search(measurements, tilts_deg, scan_shape, scan_step,
-                                  accept=0.95, order="error", seed=it)
+                                  accept=0.95, order="error", seed=it, progress=progress)
                 allv = torch.arange(self.n_voxels, device=self.device)
                 self._reset_optimizer_state(opt, self.angles.M, allv)
                 self._reset_optimizer_state(opt, self.weights, allv)
@@ -1682,8 +1682,10 @@ class DiffractionTomography:
         jitter_deg: tuple = (2.0, 8.0, 20.0),
         neighbors: int = 18,
         w_min: float = 0.45,
+        w_material: float = 0.05,
         accept: float = 0.95,
         order: str = "error",
+        progress: bool = False,
         seed: int = 0,
     ) -> dict:
         """One voxel-at-a-time local-search sweep (no gradients, no GT).
@@ -1786,9 +1788,22 @@ class DiffractionTomography:
             visit = rng.permutation(self.n_voxels)
             jitter_ok = np.ones(self.n_voxels, dtype=bool)
 
+        # skip vacuum voxels: a near-zero-weight voxel contributes ~0 to any of
+        # its rays regardless of orientation, so no trial ever beats its
+        # incumbent -- sweeping it is pure cost. Restrict to voxels above a
+        # small fraction of the max material weight; fall back to the worst
+        # ~64 by error if the weight field hasn't formed yet (very early).
+        wsum0 = self.weights.detach().abs().sum(-1).reshape(-1)
+        material = (wsum0 > w_material * wsum0.max().clamp_min(1e-30)).cpu().numpy()
+        keep = material[visit]
+        if keep.sum() < 64:
+            keep[:64] = True                          # early-phase fallback
+        visit = visit[keep]
+
         n_changed = n_visited = 0
+        _iter = tqdm(visit, disable=not progress, desc="local_search", unit="vox", leave=False)
         with torch.no_grad():
-            for v in visit:
+            for v in _iter:
                 rays = vox_rays[v]
                 if not rays:
                     continue
