@@ -304,7 +304,8 @@ class StrainMap(AutoSerialize):
 
     def plot_strain(
         self,
-        rotation_angle: float = 20.0,
+        rotation_angle_deg: float = 0.0,
+        transpose: bool = False,
         strain_range_percent: tuple[float, float] = (-3.0, 3.0),
         rotation_range_degrees: tuple[float, float] = (-2.0, 2.0),
         mask_range: tuple[float, float] = (0.0, 1.0),
@@ -324,9 +325,15 @@ class StrainMap(AutoSerialize):
 
         Parameters
         ----------
-        rotation_angle : float, default=20.0
+        rotation_angle_deg : float, default=0.0
             Angle (degrees) by which the strain tensor is rotated into the display
             frame before plotting.
+        transpose : bool, default=False
+            If ``True``, transpose the detector (row/col) axes before rotating,
+            matching the DPC convention (see
+            :func:`~quantem.diffraction.strain_autocorrelation._raw_vec_to_display`):
+            transpose first, then rotate. This swaps the normal strain components,
+            leaves the shear unchanged, and reverses the sign of the rotation field.
         strain_range_percent : tuple of float, default=(-3.0, 3.0)
             Symmetric color range for the strain panels, in percent.
         rotation_range_degrees : tuple of float, default=(-2.0, 2.0)
@@ -359,12 +366,23 @@ class StrainMap(AutoSerialize):
         tuple
             ``(fig, ax)`` from :func:`plot_strain_panels`.
         """
-        e_uu, e_vv, e_uv = self.rotate_strain(rotation_angle)
+        e_rr = self.e_rr.array
+        e_cc = self.e_cc.array
+        e_rc = self.e_rc.array
+        phi = self.phi.array
+        if transpose:
+            # Detector-axis transpose, applied BEFORE the rotation to match the DPC
+            # convention shared across quantem (see _raw_vec_to_display): swapping the
+            # (row, col) axes swaps the normal strains, keeps the shear unchanged, and
+            # reverses the sense of the rotation field.
+            e_rr, e_cc = e_cc, e_rr
+            phi = -phi
+        e_uu, e_vv, e_uv = _rotate_strain_tensor(e_rr, e_cc, e_rc, rotation_angle_deg)
         return plot_strain_panels(
             e_uu,
             e_vv,
             e_uv,
-            self.phi.array,
+            phi,
             self.mask,
             self.u_ref,
             self.v_ref,
