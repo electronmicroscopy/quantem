@@ -530,6 +530,7 @@ class SyntheticDiskLattice(RenderComponent):
         center_intensity_0: float | Sequence[float] | None = None,
         exclude_indices: Iterable[tuple[int, int]] | None = None,
         boundary_px: float = 0.0,
+        min_frac_inside_mask: float | None = None,
         origin: OriginND | None = None,
         origin_key: str = "origin",
         constraint_params: dict[str, Any] | None = None,
@@ -586,6 +587,12 @@ class SyntheticDiskLattice(RenderComponent):
         self.u_max = int(u_max)
         self.v_max = int(v_max)
         self.boundary_px = float(boundary_px)
+        # Drop a lattice disk from the render/fit when less than this fraction
+        # of its (circular) template patch falls inside ctx.mask -- i.e. the disk
+        # has too little illuminated data to constrain it. None disables it.
+        self.min_frac_inside_mask = (
+            None if min_frac_inside_mask is None else float(min_frac_inside_mask)
+        )
 
         if max_intensity_order is None:
             max_intensity_order = 1 if bool(per_disk_slopes) else 0
@@ -748,6 +755,36 @@ class SyntheticDiskLattice(RenderComponent):
         super().enforce_hard_constraints(ctx)
 
 
+    def _mask_keep(
+        self, ctx: RenderContext, centers_r: torch.Tensor, centers_c: torch.Tensor
+    ) -> torch.Tensor | None:
+        """
+        Per-disk keep mask from ``min_frac_inside_mask``.
+
+        Returns a boolean tensor shaped like ``centers_r`` that is True where at
+        least ``min_frac_inside_mask`` of the disk's circular template patch lands
+        on a True pixel of ``ctx.mask``; returns None when the filter is disabled
+        or no mask is set. Off-frame patch pixels count as outside the mask.
+        """
+        if self.min_frac_inside_mask is None or ctx.mask is None:
+            return None
+        mask = ctx.mask
+        h, w = int(mask.shape[0]), int(mask.shape[1])
+        dr = cast(torch.Tensor, self.disk.dr).to(device=ctx.device)
+        dc = cast(torch.Tensor, self.disk.dc).to(device=ctx.device)
+        tv = self.disk.patch_values().detach()
+        supp = tv > 0.5 * tv.max().clamp(min=1e-12)
+        drs = dr[supp]
+        dcs = dc[supp]
+        if drs.numel() == 0:
+            return None
+        rr = (centers_r.reshape(-1)[:, None] + drs[None, :]).round().to(torch.long)
+        cc = (centers_c.reshape(-1)[:, None] + dcs[None, :]).round().to(torch.long)
+        in_frame = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+        mval = mask[rr.clamp(0, h - 1), cc.clamp(0, w - 1)].to(torch.bool) & in_frame
+        frac = mval.to(torch.float32).mean(dim=1)
+        return (frac >= self.min_frac_inside_mask).reshape(centers_r.shape)
+
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
             raise RuntimeError("SyntheticDiskLattice requires an OriginND instance.")
@@ -767,6 +804,9 @@ class SyntheticDiskLattice(RenderComponent):
         b = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
         keep = (centers_r >= b) & (centers_r <= (ctx.shape[0] - 1) - b)
         keep = keep & (centers_c >= b) & (centers_c <= (ctx.shape[1] - 1) - b)
+        mk = self._mask_keep(ctx, centers_r, centers_c)
+        if mk is not None:
+            keep = keep & mk
         if not torch.any(keep):
             return out
         
@@ -869,6 +909,9 @@ class SyntheticDiskLattice(RenderComponent):
         bb = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
         keep = (r0_kb >= bb) & (r0_kb <= (ctx.shape[0] - 1) - bb)
         keep = keep & (c0_kb >= bb) & (c0_kb <= (ctx.shape[1] - 1) - bb)
+        mk = self._mask_keep(ctx, r0_kb, c0_kb)
+        if mk is not None:
+            keep = keep & mk
         keep_f = keep.to(dtype=ctx.dtype)
 
         active_order = int(

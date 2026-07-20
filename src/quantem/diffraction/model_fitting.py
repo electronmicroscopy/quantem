@@ -306,6 +306,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 )
                 keep = (centers_r >= b) & (centers_r <= (self.ctx.shape[0] - 1) - b)
                 keep = keep & (centers_c >= b) & (centers_c <= (self.ctx.shape[1] - 1) - b)
+                mk = component._mask_keep(self.ctx, centers_r, centers_c)
+                if mk is not None:
+                    keep = keep & mk
                 if torch.any(keep):
                     rc = torch.stack((centers_r[keep], centers_c[keep]), dim=1)
                     centers.append(rc.detach().cpu().numpy().astype(np.float32, copy=False))
@@ -907,6 +910,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                     per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
                 elif isinstance(loss_fn, LogMSELoss):
                     per_sample_loss = ((torch.log1p(pred) - torch.log1p(targets)) ** 2).mean(dim=(1, 2))
+                elif isinstance(loss_fn, torch.nn.L1Loss):
+                    per_sample_loss = diff2.abs().mean(dim=(1, 2))
                 else:
                     per_sample_loss = (diff2 * diff2).mean(dim=(1, 2))
 
