@@ -1,0 +1,5030 @@
+# from collections.abc import Sequence
+import warnings
+from typing import Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+from numpy.typing import ArrayLike
+from scipy.ndimage import gaussian_filter, map_coordinates, label
+from tqdm import tqdm
+import torch
+from quantem.core.datastructures.dataset3d import Dataset3d
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.io.serialize import AutoSerialize
+from quantem.diffraction.polymer_models import (
+    PAPER_MODEL_ID,
+    PAPER_MODEL_VERSION,
+    MultiChannelCNN2d,
+    build_polymer_model,
+    resolve_polymer_model,
+)
+from quantem.core.datastructures import Vector
+from quantem.core.visualization import show_2d
+from quantem.diffraction.polar_transform import (
+    find_origin as find_origin_angular_uniformity,
+    polar_transform as karen_polar_transform,
+    polar_transform_peaks as karen_polar_transform_peaks,
+)
+from quantem.diffraction.peak_detection import detect_blobs, find_central_beam_from_peaks
+from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.diffraction.polymer_utils import parse_reciprocal_units, sample_average_from_image
+from emdfile import tqdmnd
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import find_peaks, peak_widths
+import ipywidgets as widgets
+from ipywidgets import IntSlider, Button, HBox, VBox, interactive_output
+from IPython.display import clear_output
+from pathlib import Path
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from matplotlib.patches import Rectangle
+from matplotlib.colors import BoundaryNorm
+
+def _apply_zoom_crop(data, zoom_factor, center=None):
+    """Crop data to center region based on zoom factor."""
+    if zoom_factor == 1.0:
+        return data, (0, data.shape[0], 0, data.shape[1])
+
+    h, w = data.shape
+    new_h, new_w = int(h / zoom_factor), int(w / zoom_factor)
+    new_h = max(1, min(h, new_h))
+    new_w = max(1, min(w, new_w))
+    
+    if center is None:
+        center_y, center_x = (h - 1) / 2, (w - 1) / 2
+    else:
+        center_y, center_x = center
+
+    top = int(round(center_y - (new_h - 1) / 2))
+    left = int(round(center_x - (new_w - 1) / 2))
+    top = min(max(top, 0), h - new_h)
+    left = min(max(left, 0), w - new_w)
+    
+    return data[top:top+new_h, left:left+new_w], (top, top+new_h, left, left+new_w)
+
+
+def _mean_intensity_map(dataset_cartesian, scan_shape):
+    Ry, Rx = scan_shape
+    return np.array(
+        [
+            [np.mean(dataset_cartesian[i, j].array) for j in range(Rx)]
+            for i in range(Ry)
+        ]
+    )
+
+
+def _resolve_intensity_map(
+    dataset_cartesian,
+    intensity_map,
+    scan_shape,
+    *,
+    validate=True,
+    announce_upsample=False,
+):
+    Ry, Rx = scan_shape
+    if intensity_map is None:
+        return _mean_intensity_map(dataset_cartesian, scan_shape), 1
+
+    map_shape = intensity_map.shape[:2]
+    upsample_factor = map_shape[0] // Ry
+    if validate:
+        if upsample_factor != map_shape[1] // Rx:
+            raise ValueError("Inconsistent upsample factors")
+        if map_shape[0] % Ry != 0 or map_shape[1] % Rx != 0:
+            raise ValueError(
+                f"intensity_map shape {intensity_map.shape} not integer multiple of ({Ry}, {Rx})"
+            )
+    if announce_upsample:
+        print(f"Auto-detected upsample_factor: {upsample_factor}")
+    return intensity_map, upsample_factor
+
+
+def _intensity_display_limits(intensity_map):
+    is_rgb_map = intensity_map.ndim == 3 and intensity_map.shape[2] in (3, 4)
+    if is_rgb_map:
+        return is_rgb_map, None, None
+    finite = np.isfinite(intensity_map)
+    if not np.any(finite):
+        return is_rgb_map, 0.0, 1.0
+    vmin, vmax = np.quantile(intensity_map[finite], [0.01, 0.99])
+    return is_rgb_map, vmin, vmax
+
+
+def _normalized_dp(
+    dataset_cartesian,
+    ry_data,
+    rx_data,
+    *,
+    norm_upper_quantile=None,
+    norm_power=1.0,
+    copy_data=True,
+):
+    dp_data = dataset_cartesian[ry_data, rx_data].array
+    if copy_data:
+        dp_data = dp_data.copy()
+    if norm_upper_quantile is not None:
+        dp_data = np.clip(dp_data, 0, np.quantile(dp_data, norm_upper_quantile))
+    if norm_power != 1.0:
+        m = np.nanmax(dp_data)
+        if np.isfinite(m) and m > 0:
+            dp_data = (dp_data / m) ** norm_power * m
+    return dp_data
+
+
+def _display_center(image_centers, ry_data, rx_data, image_shape):
+    center_y, center_x = image_shape[0] / 2, image_shape[1] / 2
+    if image_centers is not None:
+        stored_center = image_centers[:, ry_data, rx_data]
+        if np.all(np.isfinite(stored_center)) and not np.allclose(stored_center, 0):
+            center_y, center_x = stored_center
+    return center_y, center_x
+
+
+def _has_peak_positions(peaks_x, peaks_y):
+    return (
+        peaks_x is not None
+        and peaks_y is not None
+        and len(peaks_x) > 0
+        and len(peaks_y) > 0
+    )
+
+
+def _vector_field_flat(vector, field):
+    """Return one current-Vector field as a one-dimensional NumPy array."""
+    return vector.select_fields(field).flatten()[:, 0]
+
+
+def _vector_field_cell(vector, field, row, col):
+    """Return one current-Vector field from a scan cell as a 1D array."""
+    return vector.select_fields(field)[row, col].array[:, 0]
+
+
+def _central_peak_index(peaks_x, peaks_y, peaks_r_invA, center, max_dist=None):
+    """Index of the detected central-beam peak, or ``None``.
+
+    Defined as the detected peak nearest the calibrated beam ``center`` (from
+    ``image_centers`` / ``find_central_beams_4d``), but only when it lies within
+    ``max_dist`` pixels of it. The filled central-beam marker itself is always drawn at
+    ``center``; this index only flags which detected peak, if any, to drop from the
+    open-circle set so a ring is not drawn on top of the beam.
+
+    ``peaks_r_invA`` is unused (kept for call-site compatibility): selecting the beam by
+    smallest polar radius made the marker jump to an off-center low-q Bragg peak when the
+    beam itself was not detected as a peak.
+    """
+    if not _has_peak_positions(peaks_x, peaks_y):
+        return None
+    center_y, center_x = center
+    distances = np.sqrt(
+        (np.asarray(peaks_x) - center_x) ** 2 + (np.asarray(peaks_y) - center_y) ** 2
+    )
+    idx = int(np.argmin(distances))
+    if max_dist is not None and distances[idx] > max_dist:
+        return None
+    return idx
+
+
+def _central_beam_max_dist(image_shape):
+    """Pixel radius within which a detected peak counts as the central beam.
+
+    Small enough that finite-q Bragg peaks are never mistaken for the beam, generous
+    enough to absorb a few-pixel disagreement between center-finding and peak detection.
+    """
+    return max(4.0, 0.03 * min(image_shape[0], image_shape[1]))
+
+
+def _zoom_peak_overlay(
+    dp_data,
+    peaks_x,
+    peaks_y,
+    peaks_r_invA,
+    peak_ints,
+    central_idx,
+    zoom,
+    fallback_center,
+):
+    if zoom == 1:
+        return dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, fallback_center
+
+    dp_data, ranges = _apply_zoom_crop(dp_data, zoom, center=fallback_center)
+    top, bot, left, right = ranges
+    display_center = (fallback_center[0] - top, fallback_center[1] - left)
+
+    if _has_peak_positions(peaks_x, peaks_y):
+        mask = (top <= peaks_y) & (peaks_y < bot) & (left <= peaks_x) & (peaks_x < right)
+        kept_indices = np.flatnonzero(mask)
+        if central_idx is not None:
+            central_matches = np.flatnonzero(kept_indices == central_idx)
+            central_idx = int(central_matches[0]) if len(central_matches) else None
+        peaks_y = peaks_y[mask] - top
+        peaks_x = peaks_x[mask] - left
+        peaks_r_invA = peaks_r_invA[mask] if peaks_r_invA is not None else None
+        peak_ints = peak_ints[mask] if peak_ints is not None else None
+
+    return dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, display_center
+
+
+def _polar_peak_bins(
+    polar_r,
+    polar_theta,
+    max_radius_invA,
+    num_radial_bins,
+    num_annular_bins,
+    two_fold_symmetry,
+):
+    r_bins = polar_r / max_radius_invA * num_radial_bins
+    theta_period = np.pi if two_fold_symmetry else 2 * np.pi
+    theta_bins = polar_theta / theta_period * num_annular_bins
+    return r_bins, theta_bins
+
+
+def _plot_bragg_peaks_on_ax(
+    ax,
+    peaks_x,
+    peaks_y,
+    peaks_r_invA,
+    peak_intensities,
+    central_idx,
+    *,
+    radial_range=None,
+    show_all_peaks=False,
+    selected_peak_color="red",
+    other_peak_color="gray",
+    central_beam_color="red",
+    peak_intensity_mode="size",
+    peak_size_range=(30, 300),
+    peak_cmap="hot",
+    peak_vmin=None,
+    peak_vmax=None,
+    crosshair_width_peaks=2,
+    crosshair_scaling_peaks=1,
+    crosshair_scaling_central_beam=1,
+    peak_marker="o",
+    peak_marker_facecolors="none",
+    peak_marker_size=None,
+    peak_alpha=0.8,
+    central_alpha=0.95,
+    central_linewidth=2,
+    add_colorbar=False,
+    center=None,
+    show_center=True,
+    show_central_beam=True,
+):
+    # show_central_beam=False fully suppresses the central-beam marker (both the
+    # provided-center dot and the detected-central-peak dot); the central peak is
+    # still excluded from the open-circle set via non_central below.
+    plot_detected_center = (center is None or not show_center) and show_central_beam
+    if center is not None and show_center and show_central_beam:
+        center_y, center_x = center
+        ax.scatter(
+            center_x,
+            center_y,
+            s=120 * crosshair_scaling_central_beam,
+            alpha=central_alpha,
+            linewidths=central_linewidth,
+            edgecolors="k",
+            facecolors=central_beam_color,
+            marker="o",
+            zorder=10,
+        )
+
+    if peaks_r_invA is None or len(peaks_r_invA) == 0:
+        return
+    if not _has_peak_positions(peaks_x, peaks_y):
+        return
+
+    central_style = dict(
+        edgecolors="k",
+        facecolors=central_beam_color,
+        marker="o",
+        zorder=10,
+    )
+
+    if radial_range is not None:
+        mask = (peaks_r_invA >= radial_range[0]) & (peaks_r_invA < radial_range[1])
+        if show_all_peaks and np.any(~mask):
+            out_indices = np.where(~mask)[0]
+            if plot_detected_center and central_idx is not None and central_idx in out_indices:
+                ax.scatter(
+                    peaks_x[central_idx],
+                    peaks_y[central_idx],
+                    s=30,
+                    alpha=0.95,
+                    linewidths=2,
+                    **central_style,
+                )
+            other_out_mask = out_indices != central_idx
+            if np.any(other_out_mask):
+                ax.scatter(
+                    peaks_x[out_indices[other_out_mask]],
+                    peaks_y[out_indices[other_out_mask]],
+                    c=other_peak_color,
+                    s=30,
+                    alpha=0.5,
+                    marker="x",
+                    linewidths=1.5,
+                )
+        if not np.any(mask):
+            return
+        in_range_indices = np.where(mask)[0]
+        if central_idx is not None and central_idx in in_range_indices:
+            central_idx = np.where(in_range_indices == central_idx)[0][0]
+        else:
+            central_idx = None
+        peaks_x, peaks_y = peaks_x[mask], peaks_y[mask]
+        peak_intensities = peak_intensities[mask] if peak_intensities is not None else None
+
+    if central_idx is not None:
+        if plot_detected_center:
+            ax.scatter(
+                peaks_x[central_idx],
+                peaks_y[central_idx],
+                s=120 * crosshair_scaling_central_beam,
+                alpha=central_alpha,
+                linewidths=central_linewidth,
+                **central_style,
+            )
+        non_central = np.ones(len(peaks_x), dtype=bool)
+        non_central[central_idx] = False
+    else:
+        non_central = np.ones(len(peaks_x), dtype=bool)
+
+    if not np.any(non_central):
+        return
+
+    if peak_intensities is not None and peak_intensity_mode is not None:
+        int_subset = peak_intensities[non_central]
+        int_min = peak_vmin if peak_vmin is not None else np.min(int_subset)
+        int_max = peak_vmax if peak_vmax is not None else np.max(int_subset)
+        norm_int = (
+            (int_subset - int_min) / (int_max - int_min)
+            if int_max > int_min
+            else np.ones_like(int_subset)
+        )
+        if peak_intensity_mode == "color":
+            colors, sizes = plt.cm.get_cmap(peak_cmap)(norm_int), 100
+        elif peak_intensity_mode == "size":
+            colors = selected_peak_color
+            sizes = peak_size_range[0] + norm_int * (peak_size_range[1] - peak_size_range[0])
+        elif peak_intensity_mode == "both":
+            colors = plt.cm.get_cmap(peak_cmap)(norm_int)
+            sizes = peak_size_range[0] + norm_int * (peak_size_range[1] - peak_size_range[0])
+        else:
+            colors, sizes = selected_peak_color, 100
+        if peak_marker_size is not None:
+            sizes = peak_marker_size
+
+        scatter_kwargs = dict(
+            s=sizes * crosshair_scaling_peaks,
+            alpha=peak_alpha,
+            marker=peak_marker,
+            facecolors=peak_marker_facecolors,
+            linewidths=crosshair_width_peaks,
+            zorder=5,
+        )
+        if peak_marker_facecolors == "none":
+            ax.scatter(
+                peaks_x[non_central],
+                peaks_y[non_central],
+                edgecolors=colors,
+                **scatter_kwargs,
+            )
+        else:
+            ax.scatter(
+                peaks_x[non_central],
+                peaks_y[non_central],
+                c=colors,
+                **scatter_kwargs,
+            )
+
+        if peak_intensity_mode in ["color", "both"]:
+            sm = plt.cm.ScalarMappable(
+                cmap=peak_cmap, norm=plt.Normalize(vmin=int_min, vmax=int_max)
+            )
+            sm.set_array([])
+            if add_colorbar:
+                plt.colorbar(sm, ax=ax, pad=0.02, fraction=0.046).set_label(
+                    "Peak Intensity", fontsize=8
+                )
+    else:
+        scatter_kwargs = dict(
+            s=100,
+            alpha=peak_alpha,
+            marker=peak_marker,
+            facecolors=peak_marker_facecolors,
+            linewidths=2,
+            zorder=5,
+        )
+        if peak_marker_facecolors == "none":
+            ax.scatter(
+                peaks_x[non_central],
+                peaks_y[non_central],
+                edgecolors=selected_peak_color,
+                **scatter_kwargs,
+            )
+        else:
+            ax.scatter(
+                peaks_x[non_central],
+                peaks_y[non_central],
+                c=selected_peak_color,
+                **scatter_kwargs,
+            )
+
+
+# TODO: Likely dataset4dSTEM rather than dataset4d input class
+# Bragg peaks from crystalline vs polymer
+# 
+# TODO: "BraggPeaksPolymer" vs "BraggPeaksCrystal"
+class BraggPeaksPolymer(AutoSerialize):
+    """
+    
+    """
+
+    _token = object()
+
+    def __init__(
+        self,
+        dataset_cartesian: Dataset4dstem,
+        compute_parameters: callable,
+        normalize_data: callable,
+        model: MultiChannelCNN2d = None,
+        final_shape: Tuple[int, int] = (256, 256),
+        device: str = 'cpu',
+        normalize_parameter_lower_percentile: float = 1.0,
+        normalize_parameter_upper_percentile: float = 99.0,
+        _token: object | None = None,
+    ):
+        if _token is not self._token:
+            raise RuntimeError(
+                "Use BraggPeaks.from_data() or .from_file() to instantiate this class."
+            )
+
+        self._dataset_cartesian = dataset_cartesian
+        self._device = device
+        self._final_shape = final_shape
+        # Setting functions for normalization
+        self.compute_parameters = compute_parameters
+        self.normalize_data = normalize_data
+        self.normalize_parameter_lower_percentile = normalize_parameter_lower_percentile
+        self.normalize_parameter_upper_percentile = normalize_parameter_upper_percentile
+        # To be set by class methods
+        # self.resized_cartesian_data = None
+        self.peak_coordinates_cartesian = None
+        self.peak_intensities = None
+        self.image_centers = None
+        self.polar_data = None
+        self.polar_peaks = None
+        self.max_radius = None
+        self.num_radial_bins = None
+        self.num_annular_bins = None
+        # Cached dataset-level normalization stats (median, iqr). Computed once by
+        # find_peaks_model / ensure_normalization_params and reused for live inference
+        # so single-DP predictions reproduce the full-scan results exactly.
+        self._norm_median = None
+        self._norm_iqr = None
+        # True once BatchNorm running stats have been adapted to this dataset (for
+        # eval-mode single-DP inference); see adapt_batchnorm / infer_peaks_single.
+        self._bn_adapted = False
+        # Set when an angular detector calibration must be converted to reciprocal
+        # length. None means that the documented 300 kV default has not yet been
+        # accepted or overridden by the user.
+        self._accelerating_voltage_kv = None
+        # Cache of the most recent train-mode chunk output for live inference
+        # (bn_mode="train_batch"): (chunk_start, chunk_size, outs). Lets neighbouring
+        # cursor positions in the same find_peaks_model chunk reuse one forward pass.
+        self._live_chunk_cache = None
+        # Scan mask (region of interest) remembered from find_peaks_model / process_polar,
+        # so normalization + BN adaptation restrict to the sample ROI (see scan_mask).
+        self._scan_mask = None
+
+        if model is None:
+            # Setup model
+            input_channels = 1  # 1 for a greyscale image, 3 for RGB, 4 for RGBA, etc.
+            k_size = 3
+            # k_size = 7
+            num_layers = 4
+            start_filters = 32
+            num_per_layer = 3
+            # num_per_layer = 2
+            use_skip_connections = True
+            dtype = torch.float32
+            # The immutable paper checkpoint was trained with dropout disabled.
+            dropout = 0.0
+            model = MultiChannelCNN2d(
+                in_channels=input_channels,
+                out_channels=2,
+                start_filters=start_filters,
+                num_layers=num_layers,
+                num_per_layer=num_per_layer,
+                use_skip_connections=use_skip_connections,
+                dtype=dtype,
+                dropout=dropout,
+                final_activations=["sigmoid", "sigmoid"],
+                conv_kernel_size=k_size,
+            )
+        self._model = model
+
+    @property
+    def model(self) -> MultiChannelCNN2d:
+        return self._model
+    
+    @model.setter
+    def model(self, model):
+        self._model = model
+
+    @property
+    def device(self) -> str:
+        return self._device
+
+    @device.setter
+    def device(self, device):
+        self._device = device
+
+    @property
+    def dataset_cartesian(self) -> Dataset4dstem:
+        return self._dataset_cartesian
+
+    @dataset_cartesian.setter
+    def dataset_cartesian(self, dataset_cartesian):
+        self._dataset_cartesian = dataset_cartesian
+
+    @property
+    def final_shape(self) -> str:
+        return self._final_shape
+
+    @final_shape.setter
+    def final_shape(self, final_shape):
+        self._final_shape = final_shape
+
+    @property
+    def scan_mask(self):
+        """Boolean (Ry, Rx) region-of-interest mask, or None for the whole scan.
+
+        Remembered from ``find_peaks_model`` (and settable directly) so that
+        ``ensure_normalization_params`` / ``adapt_batchnorm`` estimate their statistics
+        from the sample ROI rather than off-sample regions (vacuum, edges, beam stop).
+        """
+        return self._scan_mask
+
+    @scan_mask.setter
+    def scan_mask(self, mask):
+        if mask is None:
+            new_mask = None
+        else:
+            new_mask = np.asarray(mask, dtype=bool)
+            Ry, Rx = int(self._dataset_cartesian.shape[0]), int(self._dataset_cartesian.shape[1])
+            if new_mask.shape != (Ry, Rx):
+                raise ValueError(
+                    f"scan_mask shape {new_mask.shape} must match scan shape ({Ry}, {Rx})"
+                )
+        # Only invalidate the lazily-cached stats if the mask actually changed, so
+        # re-running find_peaks_model with the same mask doesn't needlessly recompute.
+        changed = not (
+            (self._scan_mask is None and new_mask is None)
+            or (
+                self._scan_mask is not None
+                and new_mask is not None
+                and np.array_equal(self._scan_mask, new_mask)
+            )
+        )
+        self._scan_mask = new_mask
+        if changed:
+            self._norm_median = None
+            self._norm_iqr = None
+            self._bn_adapted = False
+            self._live_chunk_cache = None
+
+    @classmethod
+    def from_file(
+        cls,
+        file_path: str,
+        device: str,
+        compute_parameters: callable,
+        normalize_data: callable,
+        file_type: str | None = None,
+        normalize_parameter_lower_percentile: float = 1.0,
+        normalize_parameter_upper_percentile: float = 99.0,
+    ) -> "BraggPeaksPolymer":
+        dataset_cartesian = Dataset4dstem.from_file(file_path, file_type=file_type)
+        return cls.from_data(
+            dataset_cartesian=dataset_cartesian,
+            device=device,
+            compute_parameters=compute_parameters,
+            normalize_data=normalize_data,
+            normalize_parameter_lower_percentile=normalize_parameter_lower_percentile,
+            normalize_parameter_upper_percentile=normalize_parameter_upper_percentile,
+        )
+
+    @classmethod
+    def from_data(
+        cls,
+        dataset_cartesian: Dataset4dstem,
+        device: str,
+        compute_parameters: callable,
+        normalize_data: callable,
+        normalize_parameter_lower_percentile: float = 1.0,
+        normalize_parameter_upper_percentile: float = 99.0,
+    ) -> "BraggPeaksPolymer":
+        return cls(
+            dataset_cartesian=dataset_cartesian,
+            _token=cls._token,
+            device=device,
+            compute_parameters=compute_parameters,
+            normalize_data=normalize_data,
+            normalize_parameter_lower_percentile=normalize_parameter_lower_percentile,
+            normalize_parameter_upper_percentile=normalize_parameter_upper_percentile,
+        )
+
+    def pixels_to_inv_A(self, accelerating_voltage_kv: float = None):
+        """Return the detector-pixel sampling in inverse angstroms.
+
+        Angular calibrations in mrad require the electron wavelength. If no voltage
+        has previously been supplied, 300 kV is assumed with an explicit warning.
+        Supplying a voltage stores it for subsequent reciprocal-space operations.
+        """
+        unit = str(self.dataset_cartesian.units[2]).strip().lower()
+        sampling = self.dataset_cartesian.sampling[2]
+
+        if unit == "mrad":
+            if accelerating_voltage_kv is None:
+                accelerating_voltage_kv = self._accelerating_voltage_kv
+            if accelerating_voltage_kv is None:
+                accelerating_voltage_kv = 300.0
+                warnings.warn(
+                    "Detector calibration is in mrad; assuming an accelerating "
+                    "voltage of 300 kV for conversion to 1/Å. Pass "
+                    "accelerating_voltage_kv to find_peaks_model() to override it.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if not np.isfinite(accelerating_voltage_kv) or accelerating_voltage_kv <= 0:
+                raise ValueError("accelerating_voltage_kv must be a positive finite value")
+
+            self._accelerating_voltage_kv = float(accelerating_voltage_kv)
+            wavelength_angstrom = electron_wavelength_angstrom(
+                self._accelerating_voltage_kv * 1e3
+            )
+            return sampling / (1e3 * wavelength_angstrom)
+
+        _, sampling_angstrom_conversion_factor = parse_reciprocal_units(
+            self.dataset_cartesian.units[2]
+        )
+        return sampling * sampling_angstrom_conversion_factor
+    
+    def preprocess(self):
+        print(self.device)
+        # self.resize_data(device=self.device)
+
+    def resize_data(self, device:str = "cuda:0"):
+        print(device)
+        Ry, Rx, Qy, Qx = self._dataset_cartesian.shape
+        scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
+        resized_data = np.zeros((Ry, Rx, self._final_shape[0], self._final_shape[1]))
+        for i in tqdm(range(Ry), desc='rows'):
+            inp = torch.tensor(self._dataset_cartesian[i].array, dtype=torch.float32).to(device)
+            inp = torch.nn.functional.interpolate(inp[None, ...], size=self._final_shape, mode='bilinear', align_corners=False) * scale_factor
+            resized_data[i, :, :, :] = inp.squeeze().detach().cpu().numpy()
+        self.resized_cartesian_data = resized_data
+
+    def resize_images(self, images, device: str = "cuda:0", initial_chunk_size: int = 100, show_progress=False):
+        # Handle Dataset objects - extract array
+        if hasattr(images, 'array'):
+            images = images.array
+        elif isinstance(images, Dataset3d):
+            # If it's a Dataset3d, get the underlying array
+            images = np.array([images[i].array for i in range(images.shape[0])])
+        
+        N, Qy, Qx = images.shape
+        scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
+        resized_data = np.zeros((N, self._final_shape[0], self._final_shape[1]))
+        
+        chunk_size = initial_chunk_size
+        i = 0
+        
+        with tqdm(total=N, desc='images', disable=not show_progress) as pbar:
+            while i < N:
+                try:
+                    # Determine the end index for this chunk
+                    end_idx = min(i + chunk_size, N)
+                    chunk = images[i:end_idx]
+                    
+                    # Process chunk on GPU
+                    inp = torch.tensor(chunk, dtype=torch.float32).to(device)
+                    inp = torch.nn.functional.interpolate(
+                        inp.unsqueeze(1),  # Add channel dimension
+                        size=self._final_shape, 
+                        mode='bilinear', 
+                        align_corners=False
+                    ) * scale_factor
+                    
+                    resized_data[i:end_idx, :, :] = inp.squeeze(1).detach().cpu().numpy()
+                    
+                    # Clear GPU cache
+                    del inp
+                    if 'cuda' in device:
+                        torch.cuda.empty_cache()
+                    
+                    # Update progress and move to next chunk
+                    pbar.update(end_idx - i)
+                    i = end_idx
+                    
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        # Clear cache and reduce chunk size
+                        if 'cuda' in device:
+                            torch.cuda.empty_cache()
+                        
+                        chunk_size = max(1, chunk_size // 2)
+                        print(f"\nGPU OOM! Reducing chunk size to {chunk_size}")
+                        
+                        if chunk_size == 1:
+                            # If even single image fails, fall back to CPU
+                            print("Falling back to CPU processing")
+                            device = "cpu"
+                    else:
+                        raise e
+        
+        return resized_data
+
+    def set_model_weights(
+        self,
+        path_to_weights: str = None,
+        *,
+        model_id: str = PAPER_MODEL_ID,
+        version: str | None = None,
+        latest: bool = False,
+        local_model_dir: str | None = None,
+        cache_dir: str | None = None,
+    ) -> "BraggPeaksPolymer":
+        """Load explicit weights or a checksum-verified named model.
+
+        Explicit paths retain the historical behavior. Without a path, the
+        immutable paper model is selected; ``latest=True`` is opt-in.
+        """
+        if path_to_weights is None:
+            resolution = resolve_polymer_model(
+                model_id=model_id,
+                version=version,
+                latest=latest,
+                local_model_dir=local_model_dir,
+                cache_dir=cache_dir,
+            )
+            self._model = build_polymer_model(resolution.specification)
+            path_to_weights = str(resolution.weights_path)
+            self.model_resolution = resolution
+        self._model.load_state_dict(
+            torch.load(path_to_weights, weights_only=True, map_location=self.device)
+        )
+        self._model.to(self.device)
+        return self
+
+    def _postprocess_single(self, position_map, intensity_map, sigma=1.0, threshold=0.25, show=False):
+        """Process a single 2D image"""
+        # Find peaks with subpixel-refinement
+        peak_coords, peak_position_signal_intensities, refinement_success = detect_blobs(
+            position_map,
+            sigma=sigma,  # Sigma for Gaussian smoothing used in processing
+            threshold=threshold,  # Threshold for strength of peak position signal to be valid peak
+        )
+
+        # If no peaks found, return empty lists
+        if len(peak_coords) == 0:
+            return np.array([]), np.array([])
+
+        # map_coordinates expects coordinates in (row, col) = (y, x) order
+        # peak_coords is already in [row, col] format from detect_blobs
+        interpolated_intensities = map_coordinates(
+            intensity_map, 
+            peak_coords.T,  # Transpose to get [[all_y], [all_x]]
+            order=1,  # 1 = bilinear interpolation
+            mode='nearest'  # How to handle edges
+        )
+        
+        # Optional: filter out peaks that were not successfully refined
+        if np.any(refinement_success):
+            pass
+        
+        if show:
+            # Peak positions only
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.imshow(position_map, cmap='gray', alpha=0.8)
+            ax.set_title("Input Position Map with Marked Peaks")
+            ax.scatter(peak_coords[:, 1], peak_coords[:, 0], s=10, c='r', label="Peaks")
+            ax.legend()
+            plt.tight_layout()
+            plt.show()
+
+            # Peak positions with color representing intensity
+            fig, ax = plt.subplots(figsize=(10, 8))
+            im = ax.imshow(position_map, cmap='gray', alpha=0.8)
+            scatter = ax.scatter(
+                peak_coords[:, 1],  # x coordinates
+                peak_coords[:, 0],  # y coordinates
+                c=interpolated_intensities,      # color by intensity
+                s=10,
+                cmap='turbo',    
+                edgecolors='black', # white border for visibility
+                linewidths=2,
+                alpha=0.9,
+                marker='o'
+            )
+            cbar = plt.colorbar(scatter, ax=ax)
+            cbar.set_label('Intensity', fontsize=12)
+            ax.set_title('Peak Positions and Intensities', fontsize=14)
+            ax.axis('off')
+            plt.tight_layout()
+            plt.show()
+
+        return peak_coords, interpolated_intensities
+
+    def ensure_normalization_params(
+        self,
+        device: str = None,
+        n_normalize_samples: int = 1000,
+        scan_mask: ArrayLike = None,
+        recompute: bool = False,
+    ):
+        """Compute and cache the dataset-level (median, iqr) normalization stats.
+
+        These are estimated once from a random sample of valid diffraction patterns and
+        reused by both ``find_peaks_model`` (whole-scan) and ``infer_peaks_single``
+        (live). Caching guarantees live single-DP inference reproduces the full-scan
+        peaks exactly (same normalization). Returns the cached ``(median, iqr)``.
+        """
+        if not recompute and self._norm_median is not None and self._norm_iqr is not None:
+            return self._norm_median, self._norm_iqr
+
+        device = device or self.device
+        Ry, Rx, _, _ = self.dataset_cartesian.shape
+        # Restrict to the stored ROI when no mask is passed explicitly (fall back to the
+        # whole scan only if none is set); estimate stats from the sample region.
+        if scan_mask is None:
+            scan_mask = self._scan_mask
+        if scan_mask is None:
+            scan_mask = np.ones((Ry, Rx), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+        valid_positions = np.argwhere(scan_mask)
+        n_valid = len(valid_positions)
+
+        n_normalize_samples = min(n_normalize_samples, n_valid)
+        sample_indices = np.random.choice(n_valid, size=n_normalize_samples, replace=False)
+
+        stats_patterns = np.array([
+            self.dataset_cartesian[ry, rx].array
+            for ry, rx in valid_positions[sample_indices]
+        ])
+
+        stats_patterns_resized = self.resize_images(stats_patterns, device=device)
+        median, iqr = self.compute_parameters(
+            stats_patterns_resized,
+            lower_percentile=self.normalize_parameter_lower_percentile,
+            upper_percentile=self.normalize_parameter_upper_percentile,
+        )
+        self._norm_median, self._norm_iqr = median, iqr
+        return median, iqr
+
+    def adapt_batchnorm(
+        self,
+        device: str = None,
+        n_samples: int = 1000,
+        scan_mask: ArrayLike = None,
+        chunk_size: int = 100,
+        recompute: bool = False,
+    ):
+        """Adapt the model's BatchNorm running statistics to THIS dataset, then eval.
+
+        The model trains on synthetic data, so its stored BatchNorm running stats do not
+        match the experimental scan; plain ``eval()`` inference then under-detects.
+        ``find_peaks_model`` sidesteps this by running in train mode (per-chunk batch
+        stats). For deterministic single-DP inference (``infer_peaks_single`` / the live
+        widget), we instead estimate the running stats *once* from a representative sample
+        of this dataset and freeze them: reset the BatchNorm buffers, run a sample through
+        the model in train mode with ``momentum=None`` (so the buffers accumulate the
+        cumulative mean/var over the sample), then switch to eval. Uses the same input
+        normalization pipeline (resize + ``normalize_data`` with the cached median/iqr).
+        Idempotent unless ``recompute=True``. Leaves the model in eval mode.
+        """
+        if self._bn_adapted and not recompute:
+            return
+        import torch.nn as nn
+
+        device = device or self.device
+        median, iqr = self.ensure_normalization_params(
+            device=device, n_normalize_samples=max(n_samples, 1000), scan_mask=scan_mask
+        )
+
+        Ry, Rx, _, _ = self.dataset_cartesian.shape
+        # Restrict the adaptation sample to the stored ROI when none is passed.
+        if scan_mask is None:
+            scan_mask = self._scan_mask
+        if scan_mask is None:
+            scan_mask = np.ones((Ry, Rx), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+        valid_positions = np.argwhere(scan_mask)
+        n_valid = len(valid_positions)
+        n_samples = min(n_samples, n_valid)
+        sample_indices = np.random.choice(n_valid, size=n_samples, replace=False)
+        sample_positions = valid_positions[sample_indices]
+
+        # Temporarily switch BatchNorm layers to cumulative-average mode so the running
+        # buffers become the exact mean/var over the sample (not an EMA of the last batch).
+        self.model.to(device)
+        bn_layers = [m for m in self.model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+        saved_momentum = [m.momentum for m in bn_layers]
+        for m in bn_layers:
+            m.reset_running_stats()
+            m.momentum = None  # cumulative moving average
+        self.model.train()
+        try:
+            with torch.no_grad():
+                for i in range(0, n_samples, chunk_size):
+                    chunk = np.array([
+                        self.dataset_cartesian[ry, rx].array
+                        for ry, rx in sample_positions[i : i + chunk_size]
+                    ])
+                    resized = self.resize_images(chunk, device=device, initial_chunk_size=chunk_size)
+                    ins = torch.tensor(resized, dtype=torch.float32).to(device)
+                    ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+                    self.model(ins_batch)  # updates BN running stats only
+        finally:
+            for m, mom in zip(bn_layers, saved_momentum):
+                m.momentum = mom
+            self.model.eval()
+        self._bn_adapted = True
+
+    def prepare_inference(self, device: str = None, n_samples: int = 1000, scan_mask: ArrayLike = None):
+        """Convenience: compute input-normalization stats + adapt BatchNorm in one call.
+
+        Run after the model weights are loaded to ready the object for deterministic
+        eval-mode single-DP inference (``infer_peaks_single``).
+        """
+        self.ensure_normalization_params(device=device, n_normalize_samples=n_samples, scan_mask=scan_mask)
+        self.adapt_batchnorm(device=device, n_samples=n_samples, scan_mask=scan_mask)
+
+    def _infer_train_batch_output(
+        self, ry, rx, *, device, median, iqr, chunk_size=100, scan_mask=None
+    ):
+        """Model output ``(2, H, W)`` for the DP at (ry, rx), computed exactly as
+        ``find_peaks_model`` does.
+
+        The DP is run inside its train-mode ``find_peaks_model`` chunk, so BatchNorm
+        normalizes it with the same ~``chunk_size`` real-DP statistics (the train-mode
+        test-time domain adaptation). This reproduces the precomputed detection for that
+        position -- unlike the eval + ``adapt_batchnorm`` path, whose global running stats
+        differ from the chunk-local stats and over-detect on this OOD scan.
+
+        The chunk is the same slice of ``np.argwhere(scan_mask)`` (row-major) that
+        ``find_peaks_model`` would place (ry, rx) in; the resulting output is cached so
+        neighbouring cursor positions in the same chunk reuse one forward pass.
+        """
+        Ry, Rx, _, _ = self.dataset_cartesian.shape
+        if scan_mask is None:
+            scan_mask = self._scan_mask
+        if scan_mask is None:
+            scan_mask = np.ones((Ry, Rx), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+        valid = np.argwhere(scan_mask)  # row-major: matches find_peaks_model's iteration
+        match = np.where((valid[:, 0] == ry) & (valid[:, 1] == rx))[0]
+        if len(match):
+            qi = int(match[0])
+            start = (qi // chunk_size) * chunk_size
+            chunk_positions = valid[start : start + chunk_size]
+            local_i = qi - start
+        else:
+            # (ry, rx) is outside the ROI -- find_peaks_model never processes it. Still give
+            # a faithful readout by running it at the head of a representative ROI chunk.
+            start = -1  # never matches a real chunk_start -> not cacheable across positions
+            head = valid[: max(0, chunk_size - 1)]
+            chunk_positions = (
+                np.concatenate([[[ry, rx]], head], axis=0) if len(head) else np.array([[ry, rx]])
+            )
+            local_i = 0
+
+        cache = self._live_chunk_cache
+        if start >= 0 and cache is not None and cache[0] == start and cache[1] == chunk_size:
+            return cache[2][local_i]
+
+        chunk = np.array([self.dataset_cartesian[r, c].array for r, c in chunk_positions])
+        resized = self.resize_images(chunk, device=device, initial_chunk_size=len(chunk))
+        ins = torch.tensor(resized, dtype=torch.float32).to(device)
+        ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+        self.model.to(device)
+        self.model.train()  # per-chunk BatchNorm stats, exactly like find_peaks_model
+        with torch.no_grad():
+            outs = self.model(ins_batch).detach().cpu().numpy()  # (n, 2, H, W)
+        if start >= 0:
+            self._live_chunk_cache = (start, chunk_size, outs)
+        return outs[local_i]
+
+    def infer_peaks_single(
+        self,
+        ry: int,
+        rx: int,
+        *,
+        device: str = None,
+        sigma_peak_blur: float = 1.0,
+        threshold_peak: float = 0.5,
+        n_normalize_samples: int = 1000,
+        bn_mode: str = "train_batch",
+        chunk_size: int = 100,
+        scan_mask: ArrayLike = None,
+    ):
+        """Run the model on the single diffraction pattern at (ry, rx).
+
+        Live counterpart of ``find_peaks_model`` for one scan position: resize ->
+        normalize (cached median/iqr) -> model forward -> decode -> rescale to detector
+        pixels. Returns a dict with keys ``"y_pixels"``, ``"x_pixels"``, ``"intensities"``
+        (empty arrays when no peaks are found), matching the columns/units of
+        ``peak_coordinates_cartesian`` / ``peak_intensities``.
+
+        ``bn_mode`` selects the BatchNorm regime:
+
+        - ``"train_batch"`` (default): run the DP inside its train-mode ``find_peaks_model``
+          chunk so it gets the same per-chunk domain adaptation. Output **matches the
+          precomputed find_peaks_model detection** for that position. Deterministic given
+          the ROI + chunk_size.
+        - ``"eval_adapt"``: eval mode using dataset-adapted BatchNorm running stats (see
+          ``adapt_batchnorm``, lazy + cached). Faster (single-DP forward) but an
+          approximation that over-detects on this out-of-distribution scan.
+        """
+        device = device or self.device
+        median, iqr = self.ensure_normalization_params(
+            device=device, n_normalize_samples=n_normalize_samples, scan_mask=scan_mask
+        )
+
+        if bn_mode == "train_batch":
+            out = self._infer_train_batch_output(
+                ry, rx, device=device, median=median, iqr=iqr,
+                chunk_size=chunk_size, scan_mask=scan_mask,
+            )
+        elif bn_mode == "eval_adapt":
+            # Domain-adapt BatchNorm to this dataset once, then infer in eval mode.
+            self.adapt_batchnorm(device=device, n_samples=n_normalize_samples, scan_mask=scan_mask)
+            dp = np.asarray(self.dataset_cartesian[ry, rx].array)
+            resized = self.resize_images(dp[None], device=device, initial_chunk_size=1)
+            ins = torch.tensor(resized, dtype=torch.float32).to(device)
+            ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+            self.model.to(device)
+            self.model.eval()
+            with torch.no_grad():
+                out = self.model(ins_batch).detach().cpu().numpy()[0]  # (2, H, W)
+        else:
+            raise ValueError(
+                f"bn_mode must be 'train_batch' or 'eval_adapt', got {bn_mode!r}"
+            )
+
+        peak_coords, peak_ints = self._postprocess_single(
+            out[0], out[1], sigma=sigma_peak_blur, threshold=threshold_peak
+        )
+        if len(peak_coords) == 0:
+            empty = np.array([])
+            return {"y_pixels": empty, "x_pixels": empty, "intensities": empty}
+
+        # Rescale from model-input pixels back to original detector pixels (matches
+        # the whole-scan rescale in find_peaks_model).
+        scale = self.dataset_cartesian.shape[2] / self.final_shape[0]
+        coords = np.asarray(peak_coords) * scale  # (N, 2) = [row=y, col=x]
+        return {
+            "y_pixels": coords[:, 0],
+            "x_pixels": coords[:, 1],
+            "intensities": np.asarray(peak_ints),
+        }
+
+    def find_peaks_model(
+        self,
+        device: str = "cuda:0",
+        scan_mask: ArrayLike = None,
+        n_normalize_samples: int = 1000,
+        initial_chunk_size: int = 100,
+        sigma_peak_blur: float = 1.0,
+        threshold_peak: float = 0.5,
+        show_plots=False,
+        accelerating_voltage_kv: float = None,
+    ):
+        """Detect peaks throughout the scan with the trained model.
+
+        Parameters
+        ----------
+        accelerating_voltage_kv
+            Electron accelerating voltage used to convert detector sampling from
+            mrad to inverse angstroms. For mrad data, the default is 300 kV and an
+            explicit warning is emitted. Ignored for reciprocal-length calibration.
+        """
+        Ry, Rx, Qy, Qx = self.dataset_cartesian.shape
+        total_positions = Ry * Rx
+
+        # Resolve this once per run, both to avoid repeated unit parsing and to retain
+        # the selected voltage for later polar-coordinate operations.
+        sampling_inv_A = self.pixels_to_inv_A(accelerating_voltage_kv)
+
+        # Remember the ROI so later normalization / BN adaptation (and the live widget)
+        # restrict to the sample region. Storing the user-provided value (None stays the
+        # whole scan); the setter invalidates cached stats only if the mask changed.
+        self.scan_mask = scan_mask
+
+        # ============================================
+        # Handle scan_mask
+        # ============================================
+        if scan_mask is None:
+            scan_mask = np.ones((Ry, Rx), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+            if scan_mask.shape != (Ry, Rx):
+                raise ValueError(f"scan_mask shape {scan_mask.shape} must match scan shape ({Ry}, {Rx})")
+        
+        # Get list of valid positions
+        valid_positions = np.argwhere(scan_mask)  # Returns array of (ry, rx) pairs
+        n_valid = len(valid_positions)
+        
+        peaks = Vector.from_shape(
+            shape=(Ry, Rx),
+            fields=["y_pixels", "x_pixels", "y_invA", "x_invA"],
+            name="peaks_vector",
+            units=["Pixels", "Pixels", "1/Å", "1/Å"],
+        )
+        intensities = Vector.from_shape(
+            shape=(Ry, Rx),
+            fields=["intensities", "intensities_sampled_from_dp"],
+            name="intensities_vector",
+            units=["Normalized", "Normalized"],
+        )
+        
+        # ============================================
+        # 1. Compute normalization parameters (only from valid positions)
+        # ============================================
+        # recompute=True to preserve the original per-call semantics (find_peaks_model
+        # always recomputed the sample stats); the cache still serves infer/adapt.
+        median, iqr = self.ensure_normalization_params(
+            device=device,
+            n_normalize_samples=n_normalize_samples,
+            scan_mask=scan_mask,
+            recompute=True,
+        )
+
+        # Run in TRAIN mode on purpose. The model trains on synthetic data; on the
+        # (out-of-distribution) experimental scan, train-mode BatchNorm normalizes each
+        # chunk with the experimental data's own statistics — test-time domain adaptation
+        # that detects far better than eval mode (which would impose the synthetic-training
+        # population stats on real data). Set it explicitly so a prior eval() / adapt_batchnorm
+        # (e.g. from the live widget) can't leave the shared model in eval mode. The live
+        # single-DP path (infer_peaks_single) instead uses adapt_batchnorm + eval.
+        self.model.train()
+
+        # ============================================
+        # 2. Process only valid positions with chunking
+        # ============================================
+        chunk_size = initial_chunk_size
+        pos_idx = 0
+        
+        with tqdm(total=n_valid, desc="Processing patterns") as pbar:
+            while pos_idx < n_valid:
+                try:
+                    # ----------------------------------------
+                    # 2a. Determine chunk boundaries
+                    # ----------------------------------------
+                    end_pos_idx = min(pos_idx + chunk_size, n_valid)
+                    actual_chunk_size = end_pos_idx - pos_idx
+                    
+                    # ----------------------------------------
+                    # 2b. Extract chunk data (only valid positions)
+                    # ----------------------------------------
+                    chunk_data = []
+                    chunk_positions = []
+                    
+                    for i in range(pos_idx, end_pos_idx):
+                        ry, rx = valid_positions[i]
+                        chunk_data.append(self.dataset_cartesian[ry, rx].array)
+                        chunk_positions.append((ry, rx))
+                    
+                    chunk_array = np.array(chunk_data)
+                    
+                    # ----------------------------------------
+                    # 2c. Resize chunk
+                    # ----------------------------------------
+                    # self.model.to(device)
+                    chunk_resized = self.resize_images(
+                        chunk_array, 
+                        device=device, 
+                        initial_chunk_size=actual_chunk_size
+                    )
+                    
+                    # ----------------------------------------
+                    # 2d. Normalize and run model
+                    # ----------------------------------------
+                    ins = torch.tensor(chunk_resized, dtype=torch.float32).to(device)
+                    dps_norm = self.normalize_data(ins, median, iqr)
+                    ins_batch = dps_norm[:, None, ...]
+                    
+                    with torch.no_grad():
+                        outs = self.model(ins_batch).detach().cpu().numpy()
+                    
+                    # ----------------------------------------
+                    # 2e. Post-process each pattern in chunk
+                    # ----------------------------------------
+                    for k in range(outs.shape[0]):
+                        ry, rx = chunk_positions[k]
+                        
+                        peak_coords, peak_intensities = self._postprocess_single(
+                            outs[k, 0], 
+                            outs[k, 1],
+                            show=show_plots,
+                            sigma=sigma_peak_blur,
+                            threshold=threshold_peak,
+                        )
+                        
+                        if len(peak_coords) > 0:
+                            peak_intensity_averages = sample_average_from_image(
+                                ins_batch[k].squeeze().detach().cpu().numpy(), 
+                                peak_coords
+                            )
+                            peak_intensities_data = np.column_stack([
+                                peak_intensities,
+                                peak_intensity_averages,
+                            ])
+                            
+                            peak_coords_original = peak_coords * (
+                                self.dataset_cartesian.shape[2] / self.final_shape[0]
+                            )
+                            
+                            peak_data = np.column_stack([
+                                peak_coords_original,
+                                peak_coords_original * sampling_inv_A
+                            ])
+                            
+                            peaks[ry, rx] = peak_data
+                            intensities[ry, rx] = peak_intensities_data
+                    
+                    # ----------------------------------------
+                    # 2f. Memory cleanup
+                    # ----------------------------------------
+                    del ins, dps_norm, ins_batch, outs, chunk_array, chunk_resized
+                    if 'cuda' in device:
+                        torch.cuda.empty_cache()
+                    
+                    # ----------------------------------------
+                    # 2g. Update progress and move to next chunk
+                    # ----------------------------------------
+                    pbar.update(actual_chunk_size)
+                    pos_idx = end_pos_idx
+                    
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        if 'cuda' in device:
+                            torch.cuda.empty_cache()
+                        
+                        chunk_size = max(1, chunk_size // 2)
+                        print(f"\nGPU OOM! Reducing chunk size to {chunk_size}")
+                        
+                        if chunk_size == 1:
+                            print("Falling back to CPU processing")
+                            device = "cpu"
+                    else:
+                        raise e
+        
+        print('Done!')
+        self.peak_coordinates_cartesian = peaks
+        self.peak_intensities = intensities
+
+    def save_cartesian_peaks(self, filepath):
+        np.save(filepath, self.peak_coordinates_cartesian)
+
+    def load_cartesian_peaks(self, filepath):
+        peak_coordinates_cartesian = np.load(filepath, allow_pickle=True)
+        if isinstance(peak_coordinates_cartesian, np.ndarray) and peak_coordinates_cartesian.dtype == object and peak_coordinates_cartesian.size == 1:
+            peak_coordinates_cartesian = peak_coordinates_cartesian.item()
+        self.peak_coordinates_cartesian = peak_coordinates_cartesian
+    
+    def save_polar_peaks(self, filepath):
+        np.save(filepath, self.polar_peaks)
+
+    def save_polar_data(self, filepath):
+        np.save(filepath, self.polar_data)
+
+    def load_polar_peaks(self, filepath):
+        polar_peaks = np.load(filepath, allow_pickle=True)
+        if isinstance(polar_peaks, np.ndarray) and polar_peaks.dtype == object and polar_peaks.size == 1:
+            polar_peaks = polar_peaks.item()
+        self.polar_peaks = polar_peaks
+
+    def load_polar_data(self, filepath):
+        obj = np.load(filepath, allow_pickle=True)
+        if isinstance(obj, np.ndarray) and obj.dtype == object and obj.shape == ():
+            obj = obj.item()
+        self.polar_data = obj
+    
+        # Populate attributes expected elsewhere
+        r_grid = self.polar_data['r_invA']
+        self.max_radius_invA = float(np.max(r_grid))
+        self.num_radial_bins = int(r_grid.shape[0])
+        self.num_annular_bins = int(r_grid.shape[1])
+
+    def save_peak_intensities(self, filepath):
+        np.save(filepath, self.peak_intensities)
+
+    def load_peak_intensities(self, filepath):
+        peak_intensities = np.load(filepath, allow_pickle=True)
+        if isinstance(peak_intensities, np.ndarray) and peak_intensities.dtype == object and peak_intensities.size == 1:
+            peak_intensities = peak_intensities.item()
+        self.peak_intensities = peak_intensities
+
+    def save_image_centers(self, filepath):
+        np.save(filepath, self.image_centers)
+
+    def load_image_centers(self, filepath):
+        image_centers = np.load(filepath, allow_pickle=True)
+        if isinstance(image_centers, np.ndarray) and image_centers.dtype == object and image_centers.size == 1:
+            image_centers = image_centers.item()
+        self.image_centers = image_centers
+    
+    def process_polar(
+        self,
+        scan_mask: ArrayLike = None,
+        two_fold_symmetry: bool = True,
+        center_method: str = "descent",
+        center_radial_min: float = 4.0,
+        center_radial_max: float | None = None,
+        center_radial_step: float = 1.0,
+        center_num_annular_bins: int = 180,
+        center_n_phi: int = 120,
+        center_kpow: float = 0.0,
+        center_ellipse_params: tuple[float, float, float] | None = None,
+        center_device: str | None = None,
+        center_batch_size: int = 16,
+        center_local_margin: int = 40,
+        fallback_to_peaks: bool = True,
+    ):
+        """Find image centers, then return polar transforms of data and peaks.
+
+        ``center_method`` defaults to Karen Ehrhardt's angular-uniformity descent
+        method. Use ``center_method="grid"`` for the slower coarse-to-fine
+        search, or ``center_method="peaks"`` to force the previous peak-based
+        central-beam heuristic.
+        """
+        self.image_centers = self.find_central_beams_4d(
+            scan_mask=scan_mask,
+            center_method=center_method,
+            radial_min=center_radial_min,
+            radial_max=center_radial_max,
+            radial_step=center_radial_step,
+            num_annular_bins=center_num_annular_bins,
+            n_phi=center_n_phi,
+            kpow=center_kpow,
+            ellipse_params=center_ellipse_params,
+            center_device=center_device,
+            center_batch_size=center_batch_size,
+            local_margin=center_local_margin,
+            fallback_to_peaks=fallback_to_peaks,
+        )
+        self.polar_peaks = self.polar_transform_peaks(
+            cartesian_peaks=self.peak_coordinates_cartesian,
+            centers=self.image_centers,
+            scan_mask=scan_mask,
+            two_fold_symmetry=two_fold_symmetry,
+            ellipse_params=center_ellipse_params,
+        )
+        self.polar_data = self.polar_transform_4d(
+            self.dataset_cartesian,
+            centers=self.image_centers,
+            scan_mask=scan_mask,
+            two_fold_symmetry=two_fold_symmetry,
+            ellipse_params=center_ellipse_params,
+        )
+    
+    def find_central_beams_4d(
+        self,
+        scan_mask: ArrayLike = None,
+        intensity_threshold=0.3,
+        distance_weight=0.5,
+        sampling_radius=2,
+        debug=False,
+        use_tqdm=True,
+        center_method: str = "descent",
+        radial_min: float = 4.0,
+        radial_max: float | None = None,
+        radial_step: float = 1.0,
+        num_annular_bins: int = 180,
+        n_phi: int = 120,
+        kpow: float = 0.0,
+        ellipse_params: tuple[float, float, float] | None = None,
+        center_device: str | None = None,
+        center_batch_size: int = 16,
+        local_margin: int = 40,
+        fallback_to_peaks: bool = True,
+    ):
+        """
+        Fast central beam finding for entire 4D dataset.
+        
+        Parameters:
+        -----------
+        scan_mask : ArrayLike, optional
+            Boolean mask (Ry, Rx) indicating which positions to process
+        use_tqdm : bool
+            Show progress bar
+        
+        Returns:
+        --------
+        centers : ndarray, shape (2, scan_y, scan_x)
+            Center coordinates (y, x) for each scan position
+        """
+        center_method = center_method.lower()
+        if center_method == "peaks":
+            return self._find_central_beams_from_peaks_4d(
+                scan_mask=scan_mask,
+                intensity_threshold=intensity_threshold,
+                distance_weight=distance_weight,
+                sampling_radius=sampling_radius,
+                debug=debug,
+                use_tqdm=use_tqdm,
+            )
+        if center_method not in ("descent", "grid"):
+            raise ValueError(
+                "center_method must be 'descent', 'grid', or 'peaks', "
+                f"got {center_method!r}."
+            )
+
+        scan_y, scan_x, _det_y, _det_x = self.dataset_cartesian.shape
+        if scan_mask is None:
+            scan_mask_arr = np.ones((scan_y, scan_x), dtype=bool)
+        else:
+            scan_mask_arr = np.asarray(scan_mask, dtype=bool)
+            if scan_mask_arr.shape != (scan_y, scan_x):
+                raise ValueError(
+                    f"scan_mask shape {scan_mask_arr.shape} must match {(scan_y, scan_x)}"
+                )
+
+        device = center_device if center_device is not None else self.device
+        try:
+            origins = find_origin_angular_uniformity(
+                self.dataset_cartesian,
+                method=center_method,
+                ellipse_params=ellipse_params,
+                radial_min=radial_min,
+                radial_max=radial_max,
+                radial_step=radial_step,
+                num_annular_bins=num_annular_bins,
+                n_phi=n_phi,
+                kpow=kpow,
+                device=device,
+                batch_size=center_batch_size,
+                local_margin=local_margin,
+            )
+        except Exception as exc:
+            if not fallback_to_peaks:
+                raise
+            warnings.warn(
+                "Angular-uniformity center finding failed; falling back to "
+                f"peak-based central-beam heuristic. Original error: {exc}",
+                stacklevel=2,
+            )
+            return self._find_central_beams_from_peaks_4d(
+                scan_mask=scan_mask_arr,
+                intensity_threshold=intensity_threshold,
+                distance_weight=distance_weight,
+                sampling_radius=sampling_radius,
+                debug=debug,
+                use_tqdm=use_tqdm,
+            )
+
+        if origins.shape != (scan_y, scan_x, 2):
+            raise ValueError(
+                f"Origin finder returned shape {origins.shape}; expected {(scan_y, scan_x, 2)}."
+            )
+        centers = np.moveaxis(np.asarray(origins, dtype=float), -1, 0)
+        centers[:, ~scan_mask_arr] = 0.0
+        return centers
+
+    def _find_central_beams_from_peaks_4d(
+        self,
+        scan_mask: ArrayLike = None,
+        intensity_threshold=0.3,
+        distance_weight=0.5,
+        sampling_radius=2,
+        debug=False,
+        use_tqdm=True,
+    ):
+        """Previous central-beam heuristic based on detected peak locations."""
+        scan_y, scan_x, det_y, det_x = self.dataset_cartesian.shape
+        centers = np.zeros((2, scan_y, scan_x))
+        
+        # Handle scan_mask
+        if scan_mask is None:
+            scan_mask = np.ones((scan_y, scan_x), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+        
+        iterator = tqdm(range(scan_y), disable=not use_tqdm, desc="Finding centers")
+        
+        for i in iterator:
+            for j in range(scan_x):
+                if not scan_mask[i, j]:
+                    continue
+                if self.peak_coordinates_cartesian[i, j] is None:
+                    print(f"None at i={i}, j={j}")
+                centers[:, i, j] = find_central_beam_from_peaks(
+                    peak_coords=self.peak_coordinates_cartesian[i, j],
+                    peak_intensities=None,
+                    image_shape=(det_y, det_x),
+                    intensity_threshold=intensity_threshold,
+                    distance_weight=distance_weight,
+                    debug=debug,
+                    image=self.dataset_cartesian[i, j].array.squeeze(),
+                    sampling_radius=sampling_radius
+                )
+        return centers
+    
+    def polar_transform_peaks(
+        self,
+        cartesian_peaks,
+        centers,
+        scan_mask: ArrayLike = None,
+        two_fold_symmetry=True,
+        ellipse_params: tuple[float, float, float] | None = None,
+        use_tqdm: bool=True,
+    ):
+        """Transform detected Cartesian peak coordinates with Karen's polar convention.
+
+        Peaks are preserved one-to-one. With two-fold symmetry, theta is folded
+        modulo pi while partner detections remain separate rows.
+        """
+        return karen_polar_transform_peaks(
+            cartesian_peaks,
+            centers,
+            scan_mask=scan_mask,
+            sampling_conversion_factor=self.pixels_to_inv_A(),
+            two_fold_rotation_symmetry=two_fold_symmetry,
+            ellipse_params=ellipse_params,
+            use_tqdm=use_tqdm,
+        )
+    
+    def polar_transform_4d(
+        self,
+        data,
+        centers,
+        scan_mask: ArrayLike = None,
+        num_r=None,
+        num_theta=360,
+        two_fold_symmetry=True,
+        ellipse_params: tuple[float, float, float] | None = None,
+        device: str | None = None,
+        batch_size: int = 128,
+        use_tqdm: bool=True,
+    ):
+        """
+        Perform polar transform on the last two axes of a 4D array.
+        
+        Parameters:
+        -----------
+        data : ndarray, shape (N, M, H, W)
+            4D input array where H, W are the axes to transform
+        centers : ndarray, shape (2, N, M)
+            Center of each diffraction pattern (usually determined by central beam)
+        scan_mask : ArrayLike, optional
+            Boolean mask (N, M) indicating which positions to process
+        num_r : int, optional
+            Number of radial bins. If None, uses max radius across all patterns
+        num_theta : int, optional
+            Number of angular bins (default: 360)
+        two_fold_symmetry : bool, optional
+            If True, applies 2-fold symmetry by summing opposite angles (default: True).
+            Samples the full [0, 2π] range but folds it to [0, π] by summing
+            theta and theta+π positions.
+        use_tqdm : bool, optional
+            Whether to show progress bar (default: True)
+        
+        Returns:
+        --------
+        polar_data : dict
+            Dictionary containing polar-transformed data with keys:
+            - 'r_pixels': radial coordinates in pixels
+            - 'theta': angular coordinates in radians [0, π] if two_fold_symmetry, else [0, 2π]
+            - 'r_invA': radial coordinates in 1/Å
+            - 'intensity': transformed intensity data
+        
+        Notes:
+        ------
+        Also sets the following attributes on self:
+        - self.max_radius_pixels : maximum radius in pixels
+        - self.max_radius_invA : maximum radius in 1/Å
+        - self.num_radial_bins : number of radial bins
+        - self.num_annular_bins : number of angular bins (after symmetry folding)
+        - self.two_fold_symmetry : whether 2-fold symmetry was used
+        """
+        N, M, H, W = data.shape
+        
+        # Handle scan_mask
+        if scan_mask is None:
+            scan_mask = np.ones((N, M), dtype=bool)
+        else:
+            scan_mask = np.asarray(scan_mask, dtype=bool)
+            if scan_mask.shape != (N, M):
+                raise ValueError(f"scan_mask shape {scan_mask.shape} must match {(N, M)}")
+        if not np.any(scan_mask):
+            raise ValueError("scan_mask must include at least one scan position.")
+
+        centers = np.asarray(centers, dtype=float)
+        if centers.shape == (2, N, M):
+            centers_karen = np.moveaxis(centers, 0, -1)
+            centers_bragg = centers
+        elif centers.shape == (N, M, 2):
+            centers_karen = centers
+            centers_bragg = np.moveaxis(centers, -1, 0)
+        else:
+            raise ValueError(
+                f"centers must have shape {(2, N, M)} or {(N, M, 2)}, got {centers.shape}"
+            )
+        if two_fold_symmetry and num_theta % 2 != 0:
+            raise ValueError("num_theta must be even when two_fold_symmetry=True.")
+        
+        # Calculate consistent max_radius across entire dataset (only from masked positions)
+        valid_centers_0 = centers_bragg[0][scan_mask]
+        valid_centers_1 = centers_bragg[1][scan_mask]
+        dist_to_origin_sq = (valid_centers_0**2 + valid_centers_1**2).min()
+        dist_to_corner_sq = ((H-1 - valid_centers_0)**2 + (W-1 - valid_centers_1)**2).max()
+        max_radius_pixels = np.sqrt(max(dist_to_origin_sq, dist_to_corner_sq))
+        
+        if num_r is None:
+            num_r = int(np.ceil(max_radius_pixels))
+        num_r = max(1, int(num_r))
+        radial_step = max_radius_pixels / num_r if max_radius_pixels > 0 else 1.0
+        
+        # Calculate maximum radius in inverse angstroms
+        max_radius_invA = max_radius_pixels * self.pixels_to_inv_A()
+        
+        polar_full = karen_polar_transform(
+            data,
+            origin_array=centers_karen,
+            ellipse_params=ellipse_params,
+            num_annular_bins=num_theta,
+            radial_min=0.0,
+            radial_max=max_radius_pixels,
+            radial_step=radial_step,
+            two_fold_rotation_symmetry=False,
+            device=device if device is not None else self.device,
+            batch_size=batch_size,
+            show_progress=use_tqdm,
+        )
+        polar_intensity_full = np.asarray(polar_full.array, dtype=np.float32).transpose(0, 1, 3, 2)
+        polar_intensity_full[~scan_mask] = 0.0
+
+        # Pre-calculate coordinate arrays in both units using Karen's radial bins.
+        num_r_actual = polar_intensity_full.shape[2]
+        r_pixels = np.arange(num_r_actual, dtype=float) * radial_step
+        theta_full = np.linspace(0, 2*np.pi, polar_intensity_full.shape[-1], endpoint=False)
+        r_grid_full, theta_grid_full = np.meshgrid(r_pixels, theta_full, indexing='ij')
+        
+        # Apply 2-fold symmetry if requested
+        if two_fold_symmetry:
+            # Fold to [0, π]
+            num_theta_folded = polar_intensity_full.shape[-1] // 2
+            theta_folded = np.linspace(0, np.pi, num_theta_folded, endpoint=False)
+
+            # Create output arrays
+            r_grid, theta_grid = np.meshgrid(r_pixels, theta_folded, indexing='ij')
+            r_invA_grid = r_grid * self.pixels_to_inv_A()
+            polar_intensity = (
+                polar_intensity_full[:, :, :, :num_theta_folded]
+                + polar_intensity_full[:, :, :, num_theta_folded:]
+            )
+            
+            num_annular_bins = num_theta_folded
+        else:
+            # Use full range
+            theta_grid = theta_grid_full
+            r_grid = r_grid_full
+            r_invA_grid = r_grid * self.pixels_to_inv_A()
+            polar_intensity = polar_intensity_full
+            num_annular_bins = num_theta
+        
+        # Store metadata
+        self.max_radius_pixels = max_radius_pixels
+        self.max_radius_invA = max_radius_invA
+        self.num_radial_bins = num_r_actual
+        self.num_annular_bins = num_annular_bins
+        self.two_fold_symmetry = two_fold_symmetry
+        
+        polar_data = {
+            "r_pixels": r_grid,
+            "theta": theta_grid,
+            "r_invA": r_invA_grid,
+            "intensity": polar_intensity,
+        }
+        
+        return polar_data
+
+    def visualize_peak_detection(self, n_images=10, indices=None, images_per_row=5, figsize_per_image=(3.2, 3), vmax_polar=20, vmax_cartesian=None):
+        """
+        Visualize peak detection results for multiple diffraction patterns.
+        
+        Parameters:
+        -----------
+        self : BraggPeaksPolymer
+            BraggPeaksPolymer object with processed data
+        n_images : int
+            Number of images to display (ignored if indices is provided)
+        indices : list of tuples, optional
+            List of (ind_y, ind_x) coordinates to visualize. If None, random indices are selected.
+        images_per_row : int
+            Number of images per row (default: 5)
+        figsize_per_image : tuple
+            Size of each subplot (width, height)
+        vmax_polar : float
+            Maximum value for polar data colormap
+        vmax_cartesian : float
+            Maximum value for cartesian data colormap
+        
+        Returns:
+        --------
+        fig, axes : matplotlib figure and axes
+        """
+        
+        # Generate or validate indices
+        if indices is None:
+            Ry, Rx = self.dataset_cartesian.shape[:2]
+            # Generate random indices
+            flat_indices = np.random.choice(Ry * Rx, size=min(n_images, Ry * Rx), replace=False)
+            indices = [(idx // Rx, idx % Rx) for idx in flat_indices]
+        else:
+            n_images = len(indices)
+        
+        # Calculate grid dimensions
+        n_rows = int(np.ceil(n_images / images_per_row))
+        n_cols = 5  # 5 types of visualizations per pattern
+        actual_cols = images_per_row * n_cols
+        
+        # Create figure
+        fig_width = figsize_per_image[0] * actual_cols
+        fig_height = figsize_per_image[1] * n_rows
+        fig, axes = plt.subplots(n_rows, actual_cols, figsize=(fig_width, fig_height))
+        
+        # Handle single row case
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        
+        # Column titles (only for first row)
+        col_titles = [
+            "Polar Transform",
+            "Polar + Peaks",
+            "Cartesian + Peaks",
+            "Cartesian Original",
+            "Cartesian Normalized"
+        ]
+        
+        # Process each image
+        for img_idx, (ind_y, ind_x) in enumerate(indices):
+            row = img_idx // images_per_row
+            col_offset = (img_idx % images_per_row) * n_cols
+            
+            # Check if peaks exist for this pattern
+            has_peaks = (self.peak_coordinates_cartesian[ind_y, ind_x] is not None and 
+                         len(self.peak_coordinates_cartesian[ind_y, ind_x]) > 0)
+            
+            # 1. Polar Transform
+            ax = axes[row, col_offset]
+            print(self.polar_data["intensity"][ind_y, ind_x].shape)
+            im = ax.matshow(self.polar_data["intensity"][ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+            if row == 0:
+                ax.set_title(col_titles[0], fontsize=10, pad=10)
+            ax.text(0.05, 0.95, f'({ind_y},{ind_x})', transform=ax.transAxes, 
+                    fontsize=8, va='top', ha='left', color='white', 
+                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.5))
+            ax.set_axis_off()
+            
+            # 2. Polar Transform with Peaks
+            ax = axes[row, col_offset + 1]
+            ax.matshow(self.polar_data["intensity"][ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+            if has_peaks and self.polar_peaks[ind_y, ind_x] is not None and len(self.polar_peaks[ind_y, ind_x]) > 0:
+                # Convert radial coordinates to bin indices
+                r_coords = self.polar_peaks[ind_y, ind_x][:, 0]
+                theta_coords = self.polar_peaks[ind_y, ind_x][:, 1]
+                
+                # Convert theta from radians to angular bins (0 to num_annular_bins)
+                theta_period = np.pi if getattr(self, "two_fold_symmetry", False) else 2 * np.pi
+                theta_bins = theta_coords * (self.num_annular_bins / theta_period)
+                
+                ax.scatter(theta_bins, r_coords, c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
+            if row == 0:
+                ax.set_title(col_titles[1], fontsize=10, pad=10)
+            ax.set_axis_off()
+            
+            # 3. Cartesian with Peaks and Center
+            img = self.dataset_cartesian[ind_y, ind_x].array
+            lower_q = 0.01
+            upper_q = 0.99
+            vmin, vmax = np.quantile(img[np.isfinite(img)], [lower_q, upper_q])
+            if vmax_cartesian is None:
+                vmax_cartesian = vmax
+            ax = axes[row, col_offset + 2]
+            ax.matshow(img, cmap="gray", vmin=vmin, vmax=vmax_cartesian)
+            # ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
+            # ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            if has_peaks:
+                ax.scatter(self.peak_coordinates_cartesian[ind_y, ind_x][:, 1], 
+                          self.peak_coordinates_cartesian[ind_y, ind_x][:, 0], 
+                          c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
+            ax.scatter(self.image_centers[1, ind_y, ind_x], 
+                      self.image_centers[0, ind_y, ind_x], 
+                      c='red', s=500, marker='x', linewidths=2)
+            if row == 0:
+                ax.set_title(col_titles[2], fontsize=10, pad=10)
+            ax.set_axis_off()
+            
+            # 4. Original Cartesian
+            ax = axes[row, col_offset + 3]
+            im = ax.matshow(img, cmap="gray", vmin=vmin, vmax=vmax_cartesian)
+            # im = ax.matshow(self.dataset_cartesian[ind_y, ind_x].array, cmap="gray", vmax=vmax_cartesian)
+            # im = ax.matshow(self.resized_cartesian_data[ind_y, ind_x], cmap="gray", vmax=vmax_cartesian)
+            if row == 0:
+                ax.set_title(col_titles[3], fontsize=10, pad=10)
+            ax.set_axis_off()
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            
+            # # 5. Normalized Cartesian
+            # ax = axes[row, col_offset + 4]
+            # im = ax.matshow(self.normalized_dps_array[ind_y, ind_x], cmap="gray")
+            # if row == 0:
+            #     ax.set_title(col_titles[4], fontsize=10, pad=10)
+            # ax.set_axis_off()
+            # plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        
+        # Hide unused subplots
+        total_plots = n_images
+        for idx in range(total_plots, n_rows * images_per_row):
+            row = idx // images_per_row
+            col_offset = (idx % images_per_row) * n_cols
+            for col in range(n_cols):
+                axes[row, col_offset + col].set_visible(False)
+        
+        fig.tight_layout()
+        return fig, axes
+
+    def estimate_peak_windows(
+        self,
+        num_bins=200,
+        q_min=None,
+        q_max=None,
+        n_peaks=5,
+        height_percentile=10,
+        prominence_factor=0.1,
+        width_factor=2.0,
+        min_width=0.05,
+        smoothing_sigma=2.0,
+        intensity_field='intensities',
+    ):
+        """
+        Automatically detect the top N most prominent peaks and estimate their windows.
+        
+        Parameters
+        ----------
+        num_bins : int
+            Number of radial bins
+        q_min : float, optional
+            Minimum q value for binning
+        q_max : float, optional
+            Maximum q value for binning
+        n_peaks : int
+            Number of top peaks to detect
+        height_percentile : float
+            Percentile threshold for peak height (peaks below this are ignored)
+        prominence_factor : float
+            Factor of max intensity for minimum peak prominence
+        width_factor : float
+            Multiplier for estimating peak window width from FWHM
+        min_width : float
+            Minimum window width in 1/Å
+        smoothing_sigma : float
+            Gaussian smoothing sigma for noise reduction before peak detection
+            
+        Returns
+        -------
+        peak_centers : array
+            q-values for peak centers (shape: n_peaks)
+        peak_windows : array
+            Window boundaries for each peak (shape: n_peaks, 2)
+            Each row is [q_min, q_max] for that peak
+        peak_info : dict
+            Additional information about detected peaks including:
+            - 'heights': peak heights
+            - 'prominences': peak prominences
+            - 'widths': estimated peak widths (FWHM)
+        """
+        
+        # Get radial intensity profile
+        all_r = _vector_field_flat(self.polar_peaks, "r_invA")
+        all_intensity = _vector_field_flat(self.peak_intensities, intensity_field)
+        
+        if q_min is None:
+            q_min = 0
+        if q_max is None:
+            q_max = np.max(all_r)
+        
+        r_bins = np.linspace(q_min, q_max, num_bins + 1)
+        intensity_sum, _ = np.histogram(all_r, bins=r_bins, weights=all_intensity)
+        r_centers = (r_bins[:-1] + r_bins[1:]) / 2
+        
+        # Smooth the data to reduce noise
+        if smoothing_sigma > 0:
+            intensity_smooth = gaussian_filter1d(intensity_sum, smoothing_sigma)
+        else:
+            intensity_smooth = intensity_sum
+        
+        # Calculate thresholds
+        height_threshold = np.percentile(intensity_smooth, height_percentile)
+        prominence_threshold = prominence_factor * np.max(intensity_smooth)
+        
+        # Find peaks
+        peaks_indices, properties = find_peaks(
+            intensity_smooth,
+            height=height_threshold,
+            prominence=prominence_threshold,
+            distance=int(min_width / (r_centers[1] - r_centers[0]))  # Minimum separation
+        )
+        
+        if len(peaks_indices) == 0:
+            print("No peaks found with current parameters!")
+            return np.array([]), np.array([]).reshape(0, 2), {}
+        
+        # Sort by prominence and take top N
+        prominences = properties['prominences']
+        sorted_indices = np.argsort(prominences)[::-1][:n_peaks]
+        top_peak_indices = peaks_indices[sorted_indices]
+        top_peak_indices = np.sort(top_peak_indices)  # Re-sort by position
+        
+        # Get peak centers
+        peak_centers = r_centers[top_peak_indices]
+        
+        # Calculate peak widths (FWHM)
+        widths_data = peak_widths(intensity_smooth, top_peak_indices, rel_height=0.5)
+        fwhm_bins = widths_data[0]  # Width in bins
+        fwhm_invA = fwhm_bins * (r_centers[1] - r_centers[0])  # Convert to 1/Å
+        
+        # Estimate windows: center ± width_factor * FWHM/2, with minimum width
+        half_widths = np.maximum(width_factor * fwhm_invA / 2, min_width / 2)
+        peak_windows = np.column_stack([
+            peak_centers - half_widths,
+            peak_centers + half_widths
+        ])
+        
+        # Clip windows to data range
+        peak_windows[:, 0] = np.maximum(peak_windows[:, 0], q_min)
+        peak_windows[:, 1] = np.minimum(peak_windows[:, 1], q_max)
+        
+        # Collect additional info
+        peak_info = {
+            'heights': intensity_smooth[top_peak_indices],
+            'prominences': prominences[sorted_indices],
+            'widths_fwhm': fwhm_invA,
+            'intensity_profile': intensity_smooth,
+            'r_centers': r_centers,
+        }
+        
+        # Print summary
+        print(f"Detected {len(peak_centers)} peaks:")
+        for i, (center, window, height, prom, width) in enumerate(zip(
+            peak_centers, peak_windows, peak_info['heights'], 
+            peak_info['prominences'], peak_info['widths_fwhm']
+        )):
+            print(f"  Peak {i+1}: center={center:.3f} 1/Å, "
+                  f"window=[{window[0]:.3f}, {window[1]:.3f}] 1/Å, "
+                  f"height={height:.1f}, prominence={prom:.1f}, FWHM={width:.3f} 1/Å")
+        
+        return peak_centers, peak_windows, peak_info
+
+    def peak_radial_intensity_plot(
+        self,
+        num_bins=200,
+        q_min=None,
+        q_max=None,
+        ROI_xs=None,
+        ROI_ys=None,
+        peak_centers=None,
+        peak_windows=None,
+        vlines=None,
+        vline_colors=None,
+        vline_labels=None,
+        window_alpha=0.3,
+        window_color='red',
+        fill_alpha=0.5,
+        fill_color=None,
+        plot=True,
+        return_data=False,
+        intensity_field='intensities',
+    ):
+        """
+        Create radial intensity line plot summarizing polar peaks.
+        
+        Parameters
+        ----------
+        num_bins : int
+            Number of radial bins
+        q_min : float, optional
+            Minimum q value for binning
+        q_max : float, optional
+            Maximum q value for binning
+        ROI_xs : tuple, optional
+            X range for region of interest (not yet implemented)
+        ROI_ys : tuple, optional
+            Y range for region of interest (not yet implemented)
+        peak_centers : array, optional
+            1D array of peak center positions to mark with vertical lines
+        peak_windows : array, optional
+            2D array (N, 2) of [q_min, q_max] for each peak window to highlight
+        vlines : list of lists/arrays, optional
+            Additional vertical lines to plot. Each element is a list/array of x-positions.
+        vline_colors : list of colors, optional
+            Colors for each group of vertical lines
+        vline_labels : list of str, optional
+            Labels for each group of vertical lines (for legend)
+        window_alpha : float
+            Transparency for peak window background highlighting (0-1)
+        window_color : str or color
+            Color for peak window background highlighting
+        fill_alpha : float
+            Transparency for filled area under curve within windows (0-1)
+        fill_color : str or color, optional
+            Color for filled area under curve. If None, uses window_color
+        plot : bool
+            Whether to display the plot
+        return_data : bool
+            Whether to return the binned data
+            
+        Returns
+        -------
+        r_centers : array (optional)
+            Radial bin centers
+        intensity_sum : array (optional)
+            Integrated intensity per bin
+        """
+        all_r = _vector_field_flat(self.polar_peaks, "r_invA")
+        all_intensity = _vector_field_flat(self.peak_intensities, intensity_field)
+        
+        if q_min is None:
+            q_min = 0
+        if q_max is None:
+            q_max = np.max(all_r)
+        r_bins = np.linspace(q_min, q_max, num_bins + 1)
+    
+        # Histogram the data
+        intensity_sum, _ = np.histogram(all_r, bins=r_bins, weights=all_intensity)
+        counts, _ = np.histogram(all_r, bins=r_bins)
+    
+        # Bin centers
+        r_centers = (r_bins[:-1] + r_bins[1:]) / 2
+        
+        # Use window_color for fill if not specified
+        if fill_color is None:
+            fill_color = window_color
+    
+        if plot:
+            # Create line plot
+            fig, ax = plt.subplots()
+            ax.plot(r_centers, intensity_sum, linewidth=2, label='Intensity', color='black')
+            ax.set_xlabel('Radial Distance (1/Å)', fontsize=12)
+            ax.set_ylabel('Integrated Intensity', fontsize=12)
+            ax.set_title('Radial Intensity Profile (All Patterns)', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            
+            # Add peak windows as filled regions and fill under curve
+            if peak_windows is not None:
+                peak_windows = np.atleast_2d(peak_windows)
+                for i, (q_min_win, q_max_win) in enumerate(peak_windows):
+                    # Background window highlight
+                    ax.axvspan(q_min_win, q_max_win, alpha=window_alpha, 
+                              color=window_color, zorder=0,
+                              label='Peak windows' if i == 0 else None)
+                    
+                    # Fill under the curve within this window
+                    # Find indices within the window
+                    mask = (r_centers >= q_min_win) & (r_centers <= q_max_win)
+                    if np.any(mask):
+                        r_window = r_centers[mask]
+                        intensity_window = intensity_sum[mask]
+                        ax.fill_between(r_window, 0, intensity_window, 
+                                       alpha=fill_alpha, color=fill_color,
+                                       label='Peak intensity' if i == 0 else None,
+                                       zorder=1)
+            
+            # Add peak centers as vertical lines
+            if peak_centers is not None:
+                peak_centers = np.atleast_1d(peak_centers)
+                for i, center in enumerate(peak_centers):
+                    ax.axvline(center, color=window_color, linestyle='-', 
+                              linewidth=2, alpha=0.8,
+                              label='Peak centers' if i == 0 else None, zorder=2)
+            
+            # Add additional vertical lines if provided
+            if vlines is not None:
+                # Convert to list of lists if needed
+                if not isinstance(vlines[0], (list, np.ndarray)):
+                    vlines = [vlines]
+                
+                # Default colors if not provided
+                if vline_colors is None:
+                    default_colors = plt.cm.tab10(np.linspace(0, 1, len(vlines)))
+                    vline_colors = default_colors
+                
+                # Ensure vline_colors is a list
+                if not isinstance(vline_colors, list):
+                    vline_colors = [vline_colors]
+                
+                # Check length match
+                if len(vline_colors) != len(vlines):
+                    raise ValueError(
+                        f"Number of vline_colors ({len(vline_colors)}) must match "
+                        f"number of vline groups ({len(vlines)})"
+                    )
+                
+                # Plot each group of vertical lines
+                for i, (vline_group, color) in enumerate(zip(vlines, vline_colors)):
+                    # Get label if provided
+                    label = vline_labels[i] if vline_labels is not None and i < len(vline_labels) else None
+                    
+                    # Plot each line in the group
+                    for j, x_pos in enumerate(vline_group):
+                        # Only add label to first line in group (for legend)
+                        line_label = label if j == 0 else None
+                        ax.axvline(x_pos, color=color, linestyle='--', 
+                                  linewidth=1.5, alpha=0.7, label=line_label, zorder=2)
+            
+                # Add legend
+                ax.legend()
+            elif peak_centers is not None or peak_windows is not None:
+                # Add legend for peak markers if present
+                ax.legend()
+            
+            fig.tight_layout()
+            plt.show()
+        
+        if return_data:
+            return r_centers, intensity_sum
+
+    def peak_radial_count_plot(
+        self,
+        num_bins=200,
+        q_min=None,
+        q_max=None,
+        ROI_xs=None,
+        ROI_ys=None,
+        peak_centers=None,
+        peak_windows=None,
+        vlines=None,
+        vline_colors=None,
+        vline_labels=None,
+        window_alpha=0.3,
+        window_color='red',
+        fill_alpha=0.5,
+        fill_color=None,
+        plot=True,
+        return_data=False,
+    ):
+        """
+        Create radial peak count line plot summarizing polar peaks.
+    
+        Parameters
+        ----------
+        num_bins : int
+            Number of radial bins
+        q_min : float, optional
+            Minimum q value for binning
+        q_max : float, optional
+            Maximum q value for binning
+        ROI_xs : tuple, optional
+            X range for region of interest (not yet implemented)
+        ROI_ys : tuple, optional
+            Y range for region of interest (not yet implemented)
+        peak_centers : array, optional
+            1D array of peak center positions to mark with vertical lines
+        peak_windows : array, optional
+            2D array (N, 2) of [q_min, q_max] for each peak window to highlight
+        vlines : list of lists/arrays, optional
+            Additional vertical lines to plot. Each element is a list/array of x-positions.
+        vline_colors : list of colors, optional
+            Colors for each group of vertical lines
+        vline_labels : list of str, optional
+            Labels for each group of vertical lines (for legend)
+        window_alpha : float
+            Transparency for peak window background highlighting (0-1)
+        window_color : str or color
+            Color for peak window background highlighting
+        fill_alpha : float
+            Transparency for filled area under curve within windows (0-1)
+        fill_color : str or color, optional
+            Color for filled area under curve. If None, uses window_color
+        plot : bool
+            Whether to display the plot
+        return_data : bool
+            Whether to return the binned data
+            
+        Returns
+        -------
+        r_centers : array (optional)
+            Radial bin centers
+        peak_counts : array (optional)
+            Number of peaks per bin
+        """
+        all_r = _vector_field_flat(self.polar_peaks, "r_invA")
+        
+        if q_min is None:
+            q_min = 0
+        if q_max is None:
+            q_max = np.max(all_r)
+        r_bins = np.linspace(q_min, q_max, num_bins + 1)
+    
+        # Histogram the data - counts only, no weights
+        peak_counts, _ = np.histogram(all_r, bins=r_bins)
+    
+        # Bin centers
+        r_centers = (r_bins[:-1] + r_bins[1:]) / 2
+        
+        # Use window_color for fill if not specified
+        if fill_color is None:
+            fill_color = window_color
+    
+        if plot:
+            # Create line plot
+            fig, ax = plt.subplots()
+            ax.plot(r_centers, peak_counts, linewidth=2, label='Peak Count', color='black')
+            ax.set_xlabel('Radial Distance (1/Å)', fontsize=12)
+            ax.set_ylabel('Number of Peaks', fontsize=12)
+            ax.set_title('Radial Peak Count Profile (All Patterns)', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            
+            # Add peak windows as filled regions and fill under curve
+            if peak_windows is not None:
+                peak_windows = np.atleast_2d(peak_windows)
+                for i, (q_min_win, q_max_win) in enumerate(peak_windows):
+                    # Background window highlight
+                    ax.axvspan(q_min_win, q_max_win, alpha=window_alpha, 
+                              color=window_color, zorder=0,
+                              label='Peak windows' if i == 0 else None)
+                    
+                    # Fill under the curve within this window
+                    # Find indices within the window
+                    mask = (r_centers >= q_min_win) & (r_centers <= q_max_win)
+                    if np.any(mask):
+                        r_window = r_centers[mask]
+                        counts_window = peak_counts[mask]
+                        ax.fill_between(r_window, 0, counts_window, 
+                                       alpha=fill_alpha, color=fill_color,
+                                       label='Peak counts' if i == 0 else None,
+                                       zorder=1)
+            
+            # Add peak centers as vertical lines
+            if peak_centers is not None:
+                peak_centers = np.atleast_1d(peak_centers)
+                for i, center in enumerate(peak_centers):
+                    ax.axvline(center, color=window_color, linestyle='-', 
+                              linewidth=2, alpha=0.8,
+                              label='Peak centers' if i == 0 else None, zorder=2)
+            
+            # Add additional vertical lines if provided
+            if vlines is not None:
+                # Convert to list of lists if needed
+                if not isinstance(vlines[0], (list, np.ndarray)):
+                    vlines = [vlines]
+                
+                # Default colors if not provided
+                if vline_colors is None:
+                    default_colors = plt.cm.tab10(np.linspace(0, 1, len(vlines)))
+                    vline_colors = default_colors
+                
+                # Ensure vline_colors is a list
+                if not isinstance(vline_colors, list):
+                    vline_colors = [vline_colors]
+                
+                # Check length match
+                if len(vline_colors) != len(vlines):
+                    raise ValueError(
+                        f"Number of vline_colors ({len(vline_colors)}) must match "
+                        f"number of vline groups ({len(vlines)})"
+                    )
+                
+                # Plot each group of vertical lines
+                for i, (vline_group, color) in enumerate(zip(vlines, vline_colors)):
+                    # Get label if provided
+                    label = vline_labels[i] if vline_labels is not None and i < len(vline_labels) else None
+                    
+                    # Plot each line in the group
+                    for j, x_pos in enumerate(vline_group):
+                        # Only add label to first line in group (for legend)
+                        line_label = label if j == 0 else None
+                        ax.axvline(x_pos, color=color, linestyle='--', 
+                                  linewidth=1.5, alpha=0.7, label=line_label, zorder=2)
+            
+                # Add legend
+                ax.legend()
+            elif peak_centers is not None or peak_windows is not None:
+                # Add legend for peak markers if present
+                ax.legend()
+            
+            fig.tight_layout()
+            plt.show()
+        
+        if return_data:
+            return r_centers, peak_counts
+
+    def make_orientation_histogram(
+        self,
+        radial_ranges: np.ndarray = None,
+        orientation_map=None,
+        orientation_ind: int = 0,
+        orientation_growth_angles: np.array = 0.0,
+        orientation_separate_bins: bool = False,
+        orientation_flip_sign: bool = False,
+        orientation_offset_degrees: float = 0.0,
+        upsample_factor: float = 4.0,
+        theta_step_deg: float = 1.0,
+        sigma_x: float = 1.0,
+        sigma_y: float = 1.0,
+        sigma_theta: float = 3.0,
+        use_peak_sigma: bool = False,
+        peak_sigma_samples: int = 6,
+        normalize_intensity_image: bool = False,
+        normalize_intensity_stack: bool = True,
+        progress_bar: bool = True,
+        r_field: str = "r_invA",
+        theta_field: str = "theta",
+        intensity_field: str = "intensities",
+        # intensity_field: str = "intensities_sampled_from_dp",
+    ):
+        """
+        Create a 3D or 4D orientation histogram from bragg peaks.
+        
+        Can generate histograms from either:
+        1. Polar peak data with radial ranges
+        2. Orientation map with Euler angles (for fiber textures)
+    
+        Parameters
+        ----------
+        radial_ranges : np.ndarray, optional
+            Size (N x 2) array for N radial bins, or (2,) for a single bin.
+        orientation_map : OrientationMap, optional
+            Class containing Euler angles to generate a flowline map.
+        orientation_ind : int
+            Index of the orientation map (default 0)
+        orientation_growth_angles : np.array
+            Angles to place into histogram, relative to orientation.
+        orientation_separate_bins : bool
+            Whether to place multiple angles into multiple radial bins.
+        orientation_flip_sign : bool
+            Flip the direction of theta
+        orientation_offset_degrees : float
+            Offset for orientation angles in degrees
+        upsample_factor : float
+            Upsample factor for output histogram
+        theta_step_deg : float
+            Step size along annular direction in degrees
+        sigma_x : float
+            Smoothing in x direction before upsample
+        sigma_y : float
+            Smoothing in y direction before upsample
+        sigma_theta : float
+            Smoothing in annular direction (units of bins, periodic)
+        use_peak_sigma : bool
+            Spread signal along annular direction using measured peak width
+        peak_sigma_samples : int
+            Number of samples for peak sigma spreading
+        normalize_intensity_image : bool
+            Normalize to max peak intensity = 1, per image
+        normalize_intensity_stack : bool
+            Normalize to max peak intensity = 1, all images
+        progress_bar : bool
+            Enable progress bar
+        r_field : str
+            Name of radial coordinate field
+        theta_field : str
+            Name of angular coordinate field
+        intensity_field : str
+            Name of intensity field
+    
+        Returns
+        -------
+        orient_hist : np.ndarray
+            4D array containing Bragg peak intensity histogram
+            [radial_bin, x_probe, y_probe, theta]
+        """
+        # Coordinates
+        theta = np.arange(0, 180, theta_step_deg) * np.pi / 180.0
+        dtheta = theta[1] - theta[0]
+        dtheta_deg = dtheta * 180 / np.pi
+        num_theta_bins = np.size(theta)
+        
+        # Setup for peak sigma spreading
+        if use_peak_sigma:
+            v_sigma = np.linspace(-2, 2, 2 * peak_sigma_samples + 1)
+            w_sigma = np.exp(-(v_sigma**2) / 2)
+    
+        if orientation_map is None:
+            # Input bins
+            radial_ranges = np.array(radial_ranges)
+            if radial_ranges.ndim == 1:
+                radial_ranges = radial_ranges[None, :]
+            radial_ranges_2 = radial_ranges**2
+            num_radii = radial_ranges.shape[0]
+            size_input = self.polar_peaks.shape
+        else:
+            orientation_growth_angles = np.atleast_1d(orientation_growth_angles)
+            num_angles = orientation_growth_angles.shape[0]
+            size_input = [orientation_map.num_x, orientation_map.num_y]
+            if orientation_separate_bins is False:
+                num_radii = 1
+            else:
+                num_radii = num_angles
+    
+        size_output = np.round(
+            np.array(size_input).astype("float") * upsample_factor
+        ).astype("int")
+    
+        # Output init
+        orient_hist = np.zeros([num_radii, size_output[0], size_output[1], num_theta_bins])
+    
+        # Loop over all probe positions
+        for a0 in range(num_radii):
+            t = "Generating histogram " + str(a0)
+            for rx, ry in tqdmnd(
+                *size_input, desc=t, unit=" probe positions", disable=not progress_bar
+            ):
+                x = (rx + 0.5) * upsample_factor - 0.5
+                y = (ry + 0.5) * upsample_factor - 0.5
+                x = np.clip(x, 0, size_output[0] - 2)
+                y = np.clip(y, 0, size_output[1] - 2)
+                xF = np.floor(x).astype("int")
+                yF = np.floor(y).astype("int")
+                dx = x - xF
+                dy = y - yF
+    
+                add_data = False
+    
+                if orientation_map is None:
+                    p_r = _vector_field_cell(self.polar_peaks, r_field, rx, ry)
+                    p_theta = _vector_field_cell(self.polar_peaks, theta_field, rx, ry)
+                    
+                    if p_r is not None and len(p_r) > 0:
+                        r2 = p_r**2
+                        sub = np.logical_and(
+                            r2 >= radial_ranges_2[a0, 0], 
+                            r2 < radial_ranges_2[a0, 1]
+                        )
+                        if np.any(sub):
+                            intensity_data = _vector_field_cell(
+                                self.peak_intensities, intensity_field, rx, ry
+                            )
+                            if intensity_data is not None and len(intensity_data) > 0:
+                                add_data = True
+                                intensity = intensity_data[sub]
+                                
+                                # Get theta values
+                                theta_radians = p_theta[sub]
+                                if orientation_flip_sign:
+                                    theta_radians *= -1
+                                # Add offset
+                                theta_radians += orientation_offset_degrees * np.pi / 180
+                                theta_radians = np.mod(theta_radians, np.pi)
+                                t = theta_radians / dtheta
+                                
+                                # Spread signal using peak sigma if requested
+                                if use_peak_sigma:
+                                    # Try to get sigma values if available
+                                    if 'sigma_theta' in self.polar_peaks.fields:
+                                        theta_std = _vector_field_cell(
+                                            self.polar_peaks, "sigma_theta", rx, ry
+                                        )[sub] / dtheta
+                                        t = (t[:, None] + theta_std[:, None] * v_sigma[None, :]).ravel()
+                                        intensity = (intensity[:, None] * w_sigma[None, :]).ravel()
+                else:
+                    if orientation_map.corr[rx, ry, orientation_ind] > 0:
+                        if orientation_separate_bins is False:
+                            if orientation_flip_sign:
+                                t = (
+                                    np.array(
+                                        [
+                                            (
+                                                -orientation_map.angles[
+                                                    rx, ry, orientation_ind, 0
+                                                ]
+                                                - orientation_map.angles[
+                                                    rx, ry, orientation_ind, 2
+                                                ]
+                                            )
+                                            / dtheta
+                                        ]
+                                    )
+                                    + orientation_growth_angles
+                                )
+                            else:
+                                t = (
+                                    np.array(
+                                        [
+                                            (
+                                                orientation_map.angles[
+                                                    rx, ry, orientation_ind, 0
+                                                ]
+                                                + orientation_map.angles[
+                                                    rx, ry, orientation_ind, 2
+                                                ]
+                                            )
+                                            / dtheta
+                                        ]
+                                    )
+                                    + orientation_growth_angles
+                                )
+                            # Add offset
+                            t += orientation_offset_degrees / dtheta_deg
+                            intensity = (
+                                np.ones(num_angles)
+                                * orientation_map.corr[rx, ry, orientation_ind]
+                            )
+                            add_data = True
+                        else:
+                            if orientation_flip_sign:
+                                t = (
+                                    np.array(
+                                        [
+                                            (
+                                                -orientation_map.angles[
+                                                    rx, ry, orientation_ind, 0
+                                                ]
+                                                - orientation_map.angles[
+                                                    rx, ry, orientation_ind, 2
+                                                ]
+                                            )
+                                            / dtheta
+                                        ]
+                                    )
+                                    + orientation_growth_angles[a0]
+                                )
+                            else:
+                                t = (
+                                    np.array(
+                                        [
+                                            (
+                                                orientation_map.angles[
+                                                    rx, ry, orientation_ind, 0
+                                                ]
+                                                + orientation_map.angles[
+                                                    rx, ry, orientation_ind, 2
+                                                ]
+                                            )
+                                            / dtheta
+                                        ]
+                                    )
+                                    + orientation_growth_angles[a0]
+                                )
+                            # Add offset
+                            t += orientation_offset_degrees / dtheta_deg
+                            intensity = orientation_map.corr[rx, ry, orientation_ind]
+                            add_data = True
+    
+                if add_data:
+                    tF = np.floor(t).astype("int")
+                    dt = t - tF
+    
+                    orient_hist[a0, xF, yF, :] = orient_hist[a0, xF, yF, :] + np.bincount(
+                        np.mod(tF, num_theta_bins),
+                        weights=(1 - dx) * (1 - dy) * (1 - dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+                    orient_hist[a0, xF, yF, :] = orient_hist[a0, xF, yF, :] + np.bincount(
+                        np.mod(tF + 1, num_theta_bins),
+                        weights=(1 - dx) * (1 - dy) * (dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+    
+                    orient_hist[a0, xF + 1, yF, :] = orient_hist[
+                        a0, xF + 1, yF, :
+                    ] + np.bincount(
+                        np.mod(tF, num_theta_bins),
+                        weights=(dx) * (1 - dy) * (1 - dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+                    orient_hist[a0, xF + 1, yF, :] = orient_hist[
+                        a0, xF + 1, yF, :
+                    ] + np.bincount(
+                        np.mod(tF + 1, num_theta_bins),
+                        weights=(dx) * (1 - dy) * (dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+    
+                    orient_hist[a0, xF, yF + 1, :] = orient_hist[
+                        a0, xF, yF + 1, :
+                    ] + np.bincount(
+                        np.mod(tF, num_theta_bins),
+                        weights=(1 - dx) * (dy) * (1 - dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+                    orient_hist[a0, xF, yF + 1, :] = orient_hist[
+                        a0, xF, yF + 1, :
+                    ] + np.bincount(
+                        np.mod(tF + 1, num_theta_bins),
+                        weights=(1 - dx) * (dy) * (dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+    
+                    orient_hist[a0, xF + 1, yF + 1, :] = orient_hist[
+                        a0, xF + 1, yF + 1, :
+                    ] + np.bincount(
+                        np.mod(tF, num_theta_bins),
+                        weights=(dx) * (dy) * (1 - dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+                    orient_hist[a0, xF + 1, yF + 1, :] = orient_hist[
+                        a0, xF + 1, yF + 1, :
+                    ] + np.bincount(
+                        np.mod(tF + 1, num_theta_bins),
+                        weights=(dx) * (dy) * (dt) * intensity,
+                        minlength=num_theta_bins,
+                    )
+    
+        # Smoothing / interpolation
+        if (sigma_x is not None) or (sigma_y is not None) or (sigma_theta is not None):
+            if num_radii > 1:
+                print("Interpolating orientation matrices ...", end="")
+            else:
+                print("Interpolating orientation matrix ...", end="")
+            if sigma_x is not None and sigma_x > 0:
+                orient_hist = gaussian_filter1d(
+                    orient_hist,
+                    sigma_x * upsample_factor,
+                    mode="nearest",
+                    axis=1,
+                    truncate=3.0,
+                )
+            if sigma_y is not None and sigma_y > 0:
+                orient_hist = gaussian_filter1d(
+                    orient_hist,
+                    sigma_y * upsample_factor,
+                    mode="nearest",
+                    axis=2,
+                    truncate=3.0,
+                )
+            if sigma_theta is not None and sigma_theta > 0:
+                orient_hist = gaussian_filter1d(
+                    orient_hist, sigma_theta / dtheta_deg, mode="wrap", axis=3, truncate=2.0
+                )
+            print(" done.")
+    
+        # Normalization
+        if normalize_intensity_stack is True:
+            orient_hist = orient_hist / np.max(orient_hist)
+        elif normalize_intensity_image is True:
+            for a0 in range(num_radii):
+                orient_hist[a0, :, :, :] = orient_hist[a0, :, :, :] / np.max(
+                    orient_hist[a0, :, :, :]
+                )
+    
+        return orient_hist
+
+    def plot_interactive_image_map(self, ry=None, rx=None, intensity_map=None, vmax_cartesian=None, vmin_cartesian=None, 
+                                    map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
+                                    norm_upper_quantile=None, norm_power=1.0,
+                                    show_polar=True, vmax_polar=None, crosshair_color='r', figsize=None, 
+                                    crosshair_width=2, crosshair_size=15, gaussian_filter_sigma=None):
+        """
+        Interactive plot for browsing diffraction patterns with optional intensity map.
+        
+        Parameters
+        ----------
+        intensity_map : array, optional
+            2D array to display as reference map. Can be upsampled relative to dataset.
+            If None, shows mean intensity at original resolution.
+            Upsample factor is automatically detected from array dimensions.
+        vmax_cartesian : float
+            Maximum value for diffraction pattern display
+        vmin_cartesian : float
+            Minimum value for diffraction pattern display
+        map_cmap : str
+            Colormap for the intensity map
+        map_title : str
+            Title for the intensity map panel
+        dp_cmap : str
+            Colormap for diffraction patterns
+        norm_upper_quantile : float, optional
+            Upper quantile for normalization (0-1). If None, not used.
+        norm_power : float
+            Power law normalization exponent
+        show_polar : bool
+            Whether to show the polar transformed data panel
+        vmax_polar : float, optional
+            Maximum value for polar pattern display. If None, uses vmax_cartesian.
+        """
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Check polar data availability
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
+            print("Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first.")
+            show_polar = False
+        
+        intensity_map, upsample_factor = _resolve_intensity_map(
+            self.dataset_cartesian,
+            intensity_map,
+            (Ry, Rx),
+            validate=True,
+            announce_upsample=intensity_map is not None,
+        )
+        
+        # Compute intensity map display limits
+        _is_rgb_map, vmin_intensity_map, vmax_intensity_map = _intensity_display_limits(
+            intensity_map
+        )
+        
+        vmax_polar = vmax_polar or vmax_cartesian
+        slider_Ry, slider_Rx = Ry * upsample_factor, Rx * upsample_factor
+        
+        # ---- Create figure and axes once ----
+        if show_polar:
+            if figsize is None:
+                figsize=(15, 4)
+            fig, (ax_map, ax_diff, ax_polar) = plt.subplots(1, 3, figsize=figsize)
+        else:
+            if figsize is None:
+                figsize=(12, 5)
+            fig, (ax_map, ax_diff) = plt.subplots(1, 2, figsize=figsize)
+            ax_polar = None
+        
+        # Initialize image objects
+        if vmin_intensity_map is None:
+            im_map = ax_map.imshow(intensity_map, cmap=map_cmap)
+        else:
+            im_map = ax_map.imshow(intensity_map, cmap=map_cmap, 
+                                  vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+        line_marker, = ax_map.plot([], [], color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
+        ax_map.set_title(map_title)
+        ax_map.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+        ax_map.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+        cbar_map = plt.colorbar(im_map, ax=ax_map)
+        
+        # Diffraction pattern (initialize with zeros)
+        im_diff = ax_diff.imshow(np.zeros((10, 10)), cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+        ax_diff.set_title('Diffraction Pattern')
+        ax_diff.set_xticks([])
+        ax_diff.set_yticks([])
+        cbar_diff = plt.colorbar(im_diff, ax=ax_diff)
+        
+        # Polar transform
+        if show_polar:
+            # ax_polar.set_aspect('equal', adjustable='box')
+            im_polar = ax_polar.imshow(np.zeros((10, 10)), cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+            ax_polar.set_title('Polar Transform')
+            ax_polar.set_xlabel('Radius (bins)')
+            ax_polar.set_ylabel('Theta (bins)')
+            cbar_polar = plt.colorbar(im_polar, ax=ax_polar)
+        
+        plt.tight_layout()
+        plt.close(fig)
+        
+        # ---- Interactive display callback (updates only) ----
+        def show_pattern(ry_slider, rx_slider):
+            ry_data = ry_slider // upsample_factor
+            rx_data = rx_slider // upsample_factor
+            
+            # Update marker
+            line_marker.set_data([rx_slider], [ry_slider])
+            
+            # Update diffraction pattern
+            dp_data = _normalized_dp(
+                self.dataset_cartesian,
+                ry_data,
+                rx_data,
+                norm_upper_quantile=norm_upper_quantile,
+                norm_power=norm_power,
+                copy_data=False,
+            )
+            im_polar_data = self.polar_data['intensity'][ry_data, rx_data].T if show_polar else None
+            if gaussian_filter_sigma is not None:
+                dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
+                if show_polar:
+                    im_polar_data = gaussian_filter(im_polar_data, gaussian_filter_sigma)
+                
+            im_diff.set_data(dp_data)
+            ax_diff.set_title(f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})')
+            
+            # Update polar transform
+            if show_polar:
+                im_polar.set_data(im_polar_data)
+                ax_polar.set_title(f'Polar Transform (Ry={ry_data}, Rx={rx_data})')
+            
+            clear_output(wait=True)
+            display(fig)
+        
+        # Create widgets
+        if ry is None:
+            ry = slider_Ry//2
+        if rx is None:
+            rx = slider_Rx//2
+        ry_slider = IntSlider(min=0, max=slider_Ry-1, value=ry, description='Ry:', continuous_update=False)
+        rx_slider = IntSlider(min=0, max=slider_Rx-1, value=rx, description='Rx:', continuous_update=False)
+        
+        controls = VBox([HBox([ry_slider, rx_slider])])
+        interactive_plot = interactive_output(show_pattern, {'ry_slider': ry_slider, 'rx_slider': rx_slider})
+        display(controls, interactive_plot)
+
+    def save_diffraction_figures(self, ry, rx, intensity_map=None, prefix='diffraction', save_dir='.', 
+                                vmax_cartesian=None, vmin_cartesian=None,
+                                map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
+                                norm_upper_quantile=None, norm_power=1.0,
+                                show_polar=True, vmax_polar=None, crosshair_color='r', 
+                                figsize_individual=None, figsize_combined=None, crosshair_width=2, crosshair_size=15,
+                                gaussian_filter_sigma=None):
+        """
+        Save diffraction pattern figures for a specific scan position.
+        
+        Parameters
+        ----------
+        ry : int
+            Y position in original dataset coordinates
+        rx : int
+            X position in original dataset coordinates
+        intensity_map : array, optional
+            2D array to display as reference map. If None, shows mean intensity.
+        prefix : str
+            Filename prefix for saved files
+        save_dir : str
+            Directory path for saving files
+        vmax_cartesian : float
+            Maximum value for diffraction pattern display
+        vmin_cartesian : float
+            Minimum value for diffraction pattern display
+        map_cmap : str
+            Colormap for the intensity map
+        map_title : str
+            Title for the intensity map panel
+        dp_cmap : str
+            Colormap for diffraction patterns
+        norm_upper_quantile : float, optional
+            Upper quantile for normalization (0-1). If None, not used.
+        norm_power : float
+            Power law normalization exponent
+        show_polar : bool
+            Whether to save the polar transformed data
+        vmax_polar : float, optional
+            Maximum value for polar pattern display. If None, uses vmax_cartesian.
+        """
+        
+        from pathlib import Path
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Validate coordinates
+        if not (0 <= ry < Ry and 0 <= rx < Rx):
+            raise ValueError(f"Coordinates ({ry}, {rx}) out of bounds for dataset shape ({Ry}, {Rx})")
+        
+        # Check polar data availability
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
+            print("Warning: polar_data not found. Skipping polar transform save.")
+            show_polar = False
+        
+        intensity_map, upsample_factor = _resolve_intensity_map(
+            self.dataset_cartesian,
+            intensity_map,
+            (Ry, Rx),
+            validate=True,
+        )
+        
+        # Compute intensity map display limits
+        _is_rgb_map, vmin_intensity_map, vmax_intensity_map = _intensity_display_limits(
+            intensity_map
+        )
+        
+        vmax_polar = vmax_polar or vmax_cartesian
+        
+        # Create save directory
+        save_path = Path(save_dir)
+        try:
+            save_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"Error creating directory: {e}")
+            return
+        
+        # Calculate marker positions
+        marker_ry = ry * upsample_factor
+        marker_rx = rx * upsample_factor
+        
+        try:
+            # Save intensity map
+            if figsize_individual is None:
+                figsize_individual = (6, 6)
+            fig_map, ax = plt.subplots(figsize=figsize_individual)
+            if vmin_intensity_map is None:
+                im = ax.imshow(intensity_map, cmap=map_cmap)
+            else:
+                im = ax.imshow(intensity_map, cmap=map_cmap, 
+                              vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+            ax.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
+            ax.set_title(map_title)
+            ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            filename = save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf'
+            fig_map.savefig(filename, format='pdf', bbox_inches='tight', pad_inches=0)
+            plt.close(fig_map)
+            print(f'✓ Saved: {filename}')
+            
+            # Save diffraction pattern
+            fig_diff, ax = plt.subplots(figsize=figsize_individual)
+            dp_data = _normalized_dp(
+                self.dataset_cartesian,
+                ry,
+                rx,
+                norm_upper_quantile=norm_upper_quantile,
+                norm_power=norm_power,
+            )
+            polar_im_data = self.polar_data['intensity'][ry, rx].T if show_polar else None
+            if gaussian_filter_sigma is not None:
+                dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
+                if show_polar:
+                    polar_im_data = gaussian_filter(polar_im_data, gaussian_filter_sigma)
+            
+            im = ax.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+            ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            filename = save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf'
+            fig_diff.savefig(filename, format='pdf', bbox_inches='tight', pad_inches=0)
+            plt.close(fig_diff)
+            print(f'✓ Saved: {filename}')
+            
+            # Save polar transform
+            if show_polar:
+                fig_polar, ax = plt.subplots(figsize=figsize_individual)
+                im = ax.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+                # ax.set_aspect('equal', adjustable='box')
+                ax.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
+                ax.set_xlabel('Radius (bins)')
+                ax.set_ylabel('Theta (bins)')
+                filename = save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf'
+                fig_polar.savefig(filename, format='pdf', bbox_inches='tight', pad_inches=0)
+                plt.close(fig_polar)
+                print(f'✓ Saved: {filename}')
+            
+            # Save combined figure
+            if show_polar:
+                if figsize_combined is None:
+                    figsize_combined = (15, 4)
+                fig_combined, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=figsize_combined)
+            else:
+                if figsize_combined is None:
+                    figszie_combined = (12, 5)
+                fig_combined, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize_combined)
+                ax3 = None
+            
+            # Plot intensity map
+            if vmin_intensity_map is None:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap)
+            else:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap, 
+                                vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+            ax1.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
+            ax1.set_title(map_title)
+            ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            
+            # Plot diffraction pattern
+            im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+            ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+            ax2.set_xticks([])
+            ax2.set_yticks([])
+            
+            # Plot polar transform
+            if show_polar:
+                im3 = ax3.imshow(polar_im_data, 
+                                cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+                # ax3.set_aspect('equal', adjustable='box')
+                ax3.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
+                ax3.set_xlabel('Radius (bins)')
+                ax3.set_ylabel('Theta (bins)')
+            
+            plt.tight_layout()
+            filename = save_path / f'{prefix}_ry{ry}_rx{rx}_combined.pdf'
+            fig_combined.savefig(filename, format='pdf', bbox_inches='tight', pad_inches=0)
+            plt.close(fig_combined)
+            print(f'✓ Saved: {filename}')
+            
+            print(f'\nAll figures saved successfully to: {save_path}')
+            
+        except Exception as e:
+            print(f"Error saving figures: {e}")
+            
+    def show_widget(self, **kwargs):
+        """Open the interactive polymer 4D-STEM viewer (``quantem.widget``).
+
+        Thin wrapper over ``quantem.widget.show_polymer_4DSTEM``: drag the map to update
+        the Current/Lamellar/Backbone/pi-pi DP panels and the polar view, with detected
+        peaks overlaid when ``find_peaks_model`` has run. All ``**kwargs`` are forwarded
+        to the factory (e.g. ``intensity_map``, ``map_cmap``, ``dp_cmap``, ``show_polar``,
+        ``title``).
+        """
+        from quantem.widget import show_polymer_4DSTEM
+        return show_polymer_4DSTEM(self, **kwargs)
+
+    def plot_interactive_peak_map(self, radial_range=None, intensity_map=None,
+                                    ry=None, rx=None,
+                                    vmax_cartesian=7, vmin_cartesian=0, show_all_peaks=True,
+                                    selected_peak_color='red', other_peak_color='gray',
+                                    central_beam_color='red',
+                                    norm_upper_quantile=None, norm_power=1.0,
+                                    peak_intensity_mode='size', peak_size_range=(30, 300),
+                                    peak_cmap='hot', peak_vmin=None, peak_vmax=None,
+                                    show_polar=True, vmax_polar=None, two_fold_symmetry=True,
+                                    map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',
+                                    crosshair_color='r', figsize=None, crosshair_width=2, crosshair_size=15,
+                                    crosshair_width_peaks=2, crosshair_scaling_peaks=1, crosshair_scaling_central_beam=1,
+                                    gaussian_filter_sigma=None, zoom=1):
+        """
+        Interactive plot for browsing diffraction patterns with peak overlay.
+        Central beam (closest to image center) plotted in blue.
+        """
+        if figsize is None:
+            if show_polar:
+                figsize = (15, 4)
+            else:
+                figsize = (12, 5)
+        Ry, Rx = self.peak_coordinates_cartesian.shape
+        
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
+            print("Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first.")
+            show_polar = False
+        
+        # Setup intensity map
+        if intensity_map is not None:
+            intensity_map, upsample_factor = _resolve_intensity_map(
+                self.dataset_cartesian,
+                intensity_map,
+                (Ry, Rx),
+                validate=False,
+            )
+            map_title = f'Custom Map ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else 'Custom Map'
+        else:
+            intensity_map, upsample_factor = _resolve_intensity_map(
+                self.dataset_cartesian,
+                intensity_map,
+                (Ry, Rx),
+                validate=False,
+            )
+            map_title = f'Peak Map ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else 'Peak Map'
+        
+        is_rgb_map, vmin_intensity_map, vmax_intensity_map = _intensity_display_limits(
+            intensity_map
+        )
+        
+        vmax_polar = vmax_polar or vmax_cartesian
+        
+        # Peak plotting function
+        def plot_peaks_on_ax(
+            ax,
+            peaks_x,
+            peaks_y,
+            peaks_r_invA,
+            peak_intensities,
+            central_idx,
+            ry_data,
+            rx_data,
+            center=None,
+        ):
+            _plot_bragg_peaks_on_ax(
+                ax,
+                peaks_x,
+                peaks_y,
+                peaks_r_invA,
+                peak_intensities,
+                central_idx,
+                radial_range=radial_range,
+                show_all_peaks=show_all_peaks,
+                selected_peak_color=selected_peak_color,
+                other_peak_color=other_peak_color,
+                central_beam_color=central_beam_color,
+                peak_intensity_mode=peak_intensity_mode,
+                peak_size_range=peak_size_range,
+                peak_cmap=peak_cmap,
+                peak_vmin=peak_vmin,
+                peak_vmax=peak_vmax,
+                crosshair_width_peaks=crosshair_width_peaks,
+                crosshair_scaling_peaks=crosshair_scaling_peaks,
+                crosshair_scaling_central_beam=crosshair_scaling_central_beam,
+                add_colorbar=True,
+                center=center,
+            )
+        
+        # Interactive callback
+        def show_pattern(ry_slider, rx_slider):
+            ry_data = ry_slider // upsample_factor
+            rx_data = rx_slider // upsample_factor
+            fig, axes = plt.subplots(1, 3 if show_polar else 2, figsize=figsize)
+            ax1, ax2 = axes[0], axes[1]
+            ax3 = axes[2] if show_polar else None
+            
+            # Intensity map
+            if vmin_intensity_map is None:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap)
+            else:
+                im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+            ax1.scatter(rx_slider, ry_slider,  facecolor='none', edgecolor=crosshair_color, marker='o', s=crosshair_size, linewidth=crosshair_width)
+            ax1.set_title(map_title)
+            ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            if not is_rgb_map:
+                plt.colorbar(im1, ax=ax1)
+            
+            # Create inset axes for the zoomed view
+            axins = inset_axes(ax1, width="30%", height="30%", loc='upper right', 
+                               borderpad=1.5)
+            
+            # Calculate 9x9 region with selected pixel at center (4 pixels margin each side)
+            margin = 4
+            ry_min = max(0, ry_slider - margin)
+            ry_max = min(intensity_map.shape[0], ry_slider + margin + 1)
+            rx_min = max(0, rx_slider - margin)
+            rx_max = min(intensity_map.shape[1], rx_slider + margin + 1)
+            
+            # Extract and display the zoomed region
+            zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
+            
+            if vmin_intensity_map is None:
+                axins.imshow(zoomed_region, cmap=map_cmap, 
+                             extent=[rx_min, rx_max, ry_max, ry_min], 
+                             interpolation='nearest')
+            else:
+                axins.imshow(zoomed_region, cmap=map_cmap, 
+                             extent=[rx_min, rx_max, ry_max, ry_min],
+                             vmin=vmin_intensity_map, vmax=vmax_intensity_map,
+                             interpolation='nearest')
+            
+            # Draw border around the selected (central) pixel
+            pixel_border = Rectangle((rx_slider, ry_slider), 1, 1,
+                                     linewidth=2, edgecolor=crosshair_color, 
+                                     facecolor='none', zorder=10)
+            axins.add_patch(pixel_border)
+            
+            # Set limits and styling
+            axins.set_xlim(rx_min, rx_max)
+            axins.set_ylim(ry_max, ry_min)
+            axins.set_xticks([])
+            axins.set_yticks([])
+            axins.set_title('9×9 zoom', fontsize=8, pad=2)
+            
+            # Optional: Add a rectangle on main plot showing zoomed region
+            rect = Rectangle((rx_min, ry_min), rx_max-rx_min, ry_max-ry_min,
+                             linewidth=1.5, edgecolor=crosshair_color, 
+                             facecolor='none', linestyle='--', alpha=0.7)
+            ax1.add_patch(rect)
+
+            
+            # Diffraction pattern
+            dp_data = _normalized_dp(
+                self.dataset_cartesian,
+                ry_data,
+                rx_data,
+                norm_upper_quantile=norm_upper_quantile,
+                norm_power=norm_power,
+            )
+            im_polar_data = self.polar_data['intensity'][ry_data, rx_data].T if show_polar else None
+            if gaussian_filter_sigma is not None:
+                dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
+                if show_polar:
+                    im_polar_data = gaussian_filter(im_polar_data, gaussian_filter_sigma)
+            
+            peaks_r_invA = _vector_field_cell(self.polar_peaks, "r_invA", ry_data, rx_data)
+            peaks_y = _vector_field_cell(
+                self.peak_coordinates_cartesian, "y_pixels", ry_data, rx_data
+            )
+            peaks_x = _vector_field_cell(
+                self.peak_coordinates_cartesian, "x_pixels", ry_data, rx_data
+            )
+            peak_ints = _vector_field_cell(
+                self.peak_intensities, intensity_field, ry_data, rx_data
+            )
+            has_peak_positions = _has_peak_positions(peaks_x, peaks_y)
+            center = _display_center(
+                getattr(self, "image_centers", None), ry_data, rx_data, dp_data.shape
+            )
+            central_idx = _central_peak_index(
+                peaks_x, peaks_y, peaks_r_invA, center,
+                max_dist=_central_beam_max_dist(dp_data.shape),
+            )
+            (
+                dp_data,
+                peaks_x,
+                peaks_y,
+                peaks_r_invA,
+                peak_ints,
+                central_idx,
+                display_center,
+            ) = _zoom_peak_overlay(
+                dp_data,
+                peaks_x,
+                peaks_y,
+                peaks_r_invA,
+                peak_ints,
+                central_idx,
+                zoom,
+                center,
+            )
+
+            im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
+            ax2.set_xticks([])
+            ax2.set_yticks([])
+                
+            plot_peaks_on_ax(
+                ax2,
+                peaks_x,
+                peaks_y,
+                peaks_r_invA,
+                peak_ints,
+                central_idx,
+                ry_data,
+                rx_data,
+                center=display_center,
+            )
+            ax2.set_xlim(-0.5, dp_data.shape[1] - 0.5)
+            ax2.set_ylim(dp_data.shape[0] - 0.5, -0.5)
+            
+            title = f'Diffraction Pattern (Ry={ry_data}, Rx={rx_data})'
+            if radial_range:
+                title += f'\n{radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å'
+            if not has_peak_positions:
+                title += '\nNo peaks at this scan position'
+            ax2.set_title(title)
+            
+            # Polar transform
+            if show_polar:
+                im3 = ax3.imshow(im_polar_data, 
+                                cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+                # ax3.set_aspect('equal', adjustable='box')                
+                ax3.set_xlabel('Radius (bins)')
+                ax3.set_ylabel('Theta (bins)')
+                ax3.set_title(f'Polar (Ry={ry_data}, Rx={rx_data})')
+                
+                if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
+                    polar_r = _vector_field_cell(
+                        self.polar_peaks, "r_invA", ry_data, rx_data
+                    )
+                    polar_theta = _vector_field_cell(
+                        self.polar_peaks, "theta", ry_data, rx_data
+                    )
+                    if polar_r is not None and len(polar_r) > 0:
+                        r_bins, theta_bins = _polar_peak_bins(
+                            polar_r,
+                            polar_theta,
+                            self.max_radius_invA,
+                            self.num_radial_bins,
+                            self.num_annular_bins,
+                            two_fold_symmetry,
+                        )
+                        plot_peaks_on_ax(ax3, r_bins, theta_bins, polar_r, peak_ints, central_idx, ry_data, rx_data)
+            
+            plt.tight_layout()
+            plt.show()
+        
+        # Widgets
+        if ry is None:
+            ry = Ry*upsample_factor//2
+        if rx is None:
+            rx = Rx*upsample_factor//2
+        ry_slider = IntSlider(min=0, max=Ry*upsample_factor-1, value=ry, description='Ry:', continuous_update=False)
+        rx_slider = IntSlider(min=0, max=Rx*upsample_factor-1, value=rx, description='Rx:', continuous_update=False)
+        interactive_plot = interactive_output(show_pattern, {'ry_slider': ry_slider, 'rx_slider': rx_slider})
+        display(VBox([HBox([ry_slider, rx_slider]), interactive_plot]))
+        
+    def save_peak_figures(self, ry, rx, intensity_map=None,
+                         map_title="", prefix='peaks', save_dir='.',
+                         vmax_cartesian=7, vmin_cartesian=0,
+                         selected_peak_color='red',
+                         central_beam_color='red',
+                         norm_upper_quantile=None, norm_power=1.0,
+                         peak_intensity_mode='size', peak_size_range=(30, 300),
+                         peak_cmap='hot', peak_vmin=None, peak_vmax=None,
+                         show_polar=True, vmax_polar=None, two_fold_symmetry=True,
+                         map_cmap="viridis", dp_cmap="gray", intensity_field='intensities',
+                         crosshair_color='r', figsize_individual=None, figsize_combined=None, 
+                         crosshair_width=2, crosshair_size=15, crosshair_width_peaks=2,
+                         crosshair_scaling_peaks=1, crosshair_scaling_central_beam=1, peak_marker="o",
+                         peak_marker_facecolors='none', peak_marker_size=None, gaussian_filter_sigma=None,
+                         zoom=1, peak_alpha=1.0, central_linewidth=None,
+                         peaks_x=None, peaks_y=None, peak_ints=None, peaks_r_invA=None,
+                         central_idx=None, show_central_beam=True,
+                         save_intensity_map=True, save_diffraction=True, save_polar=None,
+                         dpi=400):
+        """
+        Save peak-annotated diffraction figures for a specific scan position.
+        Central beam (closest to image center) plotted in blue.
+
+        Peaks are read from the precomputed ``peak_coordinates_cartesian`` /
+        ``peak_intensities`` / ``polar_peaks`` by default. Pass ``peaks_x`` / ``peaks_y``
+        / ``peak_ints`` (and optionally ``peaks_r_invA`` / ``central_idx``) to inject
+        peaks directly instead — e.g. from live single-DP inference, where no scan-wide
+        peak arrays exist. ``save_intensity_map`` / ``save_diffraction`` / ``save_polar``
+        select which figures to write (``save_polar=None`` follows ``show_polar``); this
+        lets a caller save the context map once and the DP per panel.
+        """
+
+        override_peaks = peaks_x is not None
+        if self.peak_coordinates_cartesian is not None:
+            Ry, Rx = self.peak_coordinates_cartesian.shape
+        else:
+            Ry, Rx = int(self.dataset_cartesian.shape[0]), int(self.dataset_cartesian.shape[1])
+
+        if not (0 <= ry < Ry and 0 <= rx < Rx):
+            raise ValueError(f"Coordinates ({ry}, {rx}) out of bounds")
+
+        if save_polar is not None:
+            show_polar = bool(save_polar)
+        if show_polar and not (hasattr(self, 'polar_data') and self.polar_data is not None):
+            print("Warning: polar_data not found. Skipping polar save.")
+            show_polar = False
+        
+        intensity_map, upsample_factor = _resolve_intensity_map(
+            self.dataset_cartesian,
+            intensity_map,
+            (Ry, Rx),
+            validate=False,
+        )
+        
+        _is_rgb_map, vmin_intensity_map, vmax_intensity_map = _intensity_display_limits(
+            intensity_map
+        )
+        
+        vmax_polar = vmax_polar or vmax_cartesian
+        
+        # Peak plotting function
+        def plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_intensities, central_idx, center=None):
+            _plot_bragg_peaks_on_ax(
+                ax,
+                peaks_x,
+                peaks_y,
+                peaks_r_invA,
+                peak_intensities,
+                central_idx,
+                selected_peak_color=selected_peak_color,
+                central_beam_color=central_beam_color,
+                peak_intensity_mode=peak_intensity_mode,
+                peak_size_range=peak_size_range,
+                peak_cmap=peak_cmap,
+                peak_vmin=peak_vmin,
+                peak_vmax=peak_vmax,
+                crosshair_width_peaks=crosshair_width_peaks,
+                crosshair_scaling_peaks=crosshair_scaling_peaks,
+                crosshair_scaling_central_beam=crosshair_scaling_central_beam,
+                peak_marker=peak_marker,
+                peak_marker_facecolors=peak_marker_facecolors,
+                peak_marker_size=peak_marker_size,
+                peak_alpha=peak_alpha,
+                central_alpha=peak_alpha,
+                central_linewidth=(
+                    crosshair_width_peaks if central_linewidth is None else central_linewidth
+                ),
+                center=center,
+                show_central_beam=show_central_beam,
+            )
+        
+        # Create save directory
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        # Get peaks data once (injected overrides win; otherwise read precomputed).
+        if override_peaks:
+            peaks_x = np.asarray(peaks_x)
+            peaks_y = np.asarray(peaks_y)
+            peak_ints = None if peak_ints is None else np.asarray(peak_ints)
+            peaks_r_invA = None if peaks_r_invA is None else np.asarray(peaks_r_invA)
+        else:
+            peaks_y = _vector_field_cell(self.peak_coordinates_cartesian, "y_pixels", ry, rx)
+            peaks_x = _vector_field_cell(self.peak_coordinates_cartesian, "x_pixels", ry, rx)
+            peak_ints = _vector_field_cell(self.peak_intensities, intensity_field, ry, rx)
+            peaks_r_invA = (
+                _vector_field_cell(self.polar_peaks, "r_invA", ry, rx)
+                if getattr(self, 'polar_peaks', None) is not None
+                else None
+            )
+        dp_data = _normalized_dp(
+            self.dataset_cartesian,
+            ry,
+            rx,
+            norm_upper_quantile=norm_upper_quantile,
+            norm_power=norm_power,
+        )
+        polar_im_data = self.polar_data['intensity'][ry, rx].T if show_polar else None
+        if gaussian_filter_sigma is not None:
+            dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
+            if show_polar:
+                polar_im_data = gaussian_filter(polar_im_data, gaussian_filter_sigma)
+
+        center = _display_center(getattr(self, "image_centers", None), ry, rx, dp_data.shape)
+        if central_idx is None:
+            central_idx = _central_peak_index(
+                peaks_x, peaks_y, peaks_r_invA, center,
+                max_dist=_central_beam_max_dist(dp_data.shape),
+            )
+        
+        (
+            dp_data,
+            peaks_x,
+            peaks_y,
+            peaks_r_invA,
+            peak_ints,
+            central_idx,
+            display_center,
+        ) = _zoom_peak_overlay(
+            dp_data,
+            peaks_x,
+            peaks_y,
+            peaks_r_invA,
+            peak_ints,
+            central_idx,
+            zoom,
+            center,
+        )
+            
+        # Save intensity map
+        if figsize_individual is None:
+            figsize_individual = (6, 6)
+        if save_intensity_map:
+            fig_map, ax = plt.subplots(figsize=figsize_individual)
+            if vmin_intensity_map is None:
+                im = ax.imshow(intensity_map, cmap=map_cmap)
+            else:
+                im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
+
+            ry_slider = ry * upsample_factor
+            rx_slider = rx * upsample_factor
+
+            ax.scatter(rx_slider, ry_slider, facecolor='none', edgecolor=crosshair_color, marker='o', s=crosshair_size, linewidth=crosshair_width)
+
+            # Add inset
+            from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+            axins = inset_axes(ax, width="30%", height="30%", loc='upper right', borderpad=1.5)
+
+            margin = 4
+            ry_min = max(0, ry_slider - margin)
+            ry_max = min(intensity_map.shape[0], ry_slider + margin + 1)
+            rx_min = max(0, rx_slider - margin)
+            rx_max = min(intensity_map.shape[1], rx_slider + margin + 1)
+
+            zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
+
+            if vmin_intensity_map is None:
+                axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min], interpolation='nearest')
+            else:
+                axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min],
+                             vmin=vmin_intensity_map, vmax=vmax_intensity_map, interpolation='nearest')
+
+            pixel_border = Rectangle((rx_slider, ry_slider), 1, 1, linewidth=2, edgecolor=crosshair_color,
+                                     facecolor='none', zorder=10)
+            axins.add_patch(pixel_border)
+
+            axins.set_xlim(rx_min, rx_max)
+            axins.set_ylim(ry_max, ry_min)
+            axins.set_xticks([])
+            axins.set_yticks([])
+            axins.set_title('9×9 zoom', fontsize=8, pad=2)
+
+            rect = Rectangle((rx_min, ry_min), rx_max-rx_min, ry_max-ry_min,
+                             linewidth=1.5, edgecolor=crosshair_color, facecolor='none', linestyle='--', alpha=0.7)
+            ax.add_patch(rect)
+
+            ax.set_title(map_title)
+            ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
+            ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
+            fig_map.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_intensity_map.pdf', format='pdf', bbox_inches='tight', pad_inches=0, dpi=dpi)
+            plt.close(fig_map)
+            print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_intensity_map.pdf')
+
+        # Save diffraction pattern with peaks
+        if save_diffraction:
+            fig_diff, ax = plt.subplots(figsize=figsize_individual)
+            im = ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if peaks_x is not None:
+                plot_peaks_on_ax(ax, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx, center=display_center)
+            ax.set_xlim(-0.5, dp_data.shape[1] - 0.5)
+            ax.set_ylim(dp_data.shape[0] - 0.5, -0.5)
+            ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
+            fig_diff.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_diffraction.pdf', format='pdf', bbox_inches='tight', pad_inches=0, dpi=dpi)
+            plt.close(fig_diff)
+            print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_diffraction.pdf')
+        
+        # Save polar transform with peaks
+        if show_polar:
+            fig_polar, ax = plt.subplots(figsize=figsize_individual)
+            im = ax.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+            ax.set_title(f'Polar (Ry={ry}, Rx={rx})')
+            ax.set_xlabel('Radius (bins)')
+            ax.set_ylabel('Theta (bins)')
+            
+            if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
+                polar_r = _vector_field_cell(self.polar_peaks, "r_invA", ry, rx)
+                polar_theta = _vector_field_cell(self.polar_peaks, "theta", ry, rx)
+                if polar_r is not None and len(polar_r) > 0:
+                    r_bins, theta_bins = _polar_peak_bins(
+                        polar_r,
+                        polar_theta,
+                        self.max_radius_invA,
+                        self.num_radial_bins,
+                        self.num_annular_bins,
+                        two_fold_symmetry,
+                    )
+                    
+                    # Find central beam for polar
+                    polar_central_idx = np.argmin(polar_r)
+                    # Use the full (unzoomed) intensities: polar_r / r_bins / theta_bins are read
+                    # from the full polar_peaks, whereas `peak_ints` may have been subset by
+                    # zoom > 1 for the Cartesian panel (length mismatch -> IndexError otherwise).
+                    polar_peak_ints = _vector_field_cell(
+                        self.peak_intensities, intensity_field, ry, rx
+                    )
+                    if polar_r is not None and len(polar_r) > 0:
+                        plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, polar_peak_ints, polar_central_idx)
+            fig_polar.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf', format='pdf', bbox_inches='tight', pad_inches=0, dpi=dpi)
+            plt.close(fig_polar)
+            print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_polar.pdf')
+    
+    def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,
+                                         reference_image=None, overlay_alpha=0.3, crosshair_width=2, crosshair_size=15):
+        """
+        Interactive mask creation with sliders for circular region selection.
+        
+        Parameters
+        ----------
+        initial_x0 : int, optional
+            Initial x center position. If None, uses center of scan.
+        initial_y0 : int, optional
+            Initial y center position. If None, uses center of scan.
+        initial_r : int, optional
+            Initial radius. If None, uses 1/3 of minimum scan dimension.
+        reference_image : array, optional
+            2D array (Ry, Rx) to display as reference. If None, uses virtual image.
+        overlay_alpha : float
+            Transparency for mask overlay (0=transparent, 1=opaque)
+        
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+            - 'mask': final boolean mask array
+            - 'x0', 'y0', 'r': final circle parameters
+        """
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Set defaults
+        if initial_x0 is None:
+            initial_x0 = Ry // 2
+        if initial_y0 is None:
+            initial_y0 = Rx // 2
+        if initial_r is None:
+            initial_r = min(Ry, Rx) // 3
+        
+        # Get reference image and ensure it's a proper numpy array
+        if reference_image is None:
+            if hasattr(self.dataset_cartesian, 'virtual_images') and 'virtual_image' in self.dataset_cartesian.virtual_images:
+                vimg = self.dataset_cartesian.virtual_images['virtual_image']
+                # Extract array from Dataset2d object
+                if hasattr(vimg, 'array'):
+                    reference_image = vimg.array
+                elif hasattr(vimg, 'data'):
+                    reference_image = vimg.data
+                else:
+                    reference_image = np.array(vimg)
+            else:
+                # Create mean intensity image
+                print("Creating reference image from mean intensities...")
+                reference_image = np.zeros((Ry, Rx), dtype=float)
+                for i in range(Ry):
+                    for j in range(Rx):
+                        dp = self.dataset_cartesian[i, j]
+                        if hasattr(dp, 'array'):
+                            reference_image[i, j] = np.mean(dp.array)
+                        else:
+                            reference_image[i, j] = np.mean(dp)
+        
+        # Ensure it's a float array
+        reference_image = np.asarray(reference_image, dtype=float)
+        
+        # Verify reference_image is valid
+        if reference_image.shape != (Ry, Rx):
+            raise ValueError(f"reference_image shape {reference_image.shape} must match scan shape ({Ry}, {Rx})")
+        
+        # Store current state
+        result = {'mask': None, 'x0': initial_x0, 'y0': initial_y0, 'r': initial_r}
+        
+        # Create sliders with proper orientation
+        # X slider is inverted so bottom = 0, top = Ry-1
+        x0_slider = widgets.IntSlider(
+            min=0, max=Ry-1, step=1, value=Ry-1-initial_x0,  # Inverted initial value
+            description='X (vert):',
+            orientation='vertical',
+            continuous_update=False,
+            style={'description_width': '60px'},
+            layout=widgets.Layout(height='300px'),
+            readout=False  # We'll use custom label
+        )
+        
+        # Custom label to show actual (inverted) value
+        x0_label = widgets.Label(value=f'{initial_x0}')
+        x0_label.layout.width = '60px'
+        
+        y0_slider = widgets.IntSlider(
+            min=0, max=Rx-1, step=1, value=initial_y0,
+            description='Y (horiz):',
+            orientation='horizontal',
+            continuous_update=False,
+            style={'description_width': '80px'},
+            layout=widgets.Layout(width='400px')
+        )
+        
+        r_slider = widgets.IntSlider(
+            min=1, max=max(Ry, Rx), step=1, value=initial_r,
+            description='Radius:',
+            orientation='horizontal',
+            continuous_update=False,
+            style={'description_width': '80px'},
+            layout=widgets.Layout(width='400px')
+        )
+        
+        output = widgets.Output()
+        
+        def update_mask(change=None):
+            x0 = Ry - 1 - x0_slider.value  # Invert the slider value
+            y0 = y0_slider.value
+            r = r_slider.value
+            
+            # Update custom label
+            x0_label.value = f'{x0}'
+            
+            # Create mask
+            x = np.arange(Ry)[:, None]
+            y = np.arange(Rx)[None, :]
+            mask = (x - x0)**2 + (y - y0)**2 < r**2
+            
+            # Update result
+            result['mask'] = mask
+            result['x0'] = x0
+            result['y0'] = y0
+            result['r'] = r
+            
+            # Create matplotlib figure directly
+            with output:
+                output.clear_output(wait=True)
+                fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+                
+                # Plot 1: Reference image with circle outline
+                im0 = axs[0].imshow(reference_image, cmap='gray')
+                circle = plt.Circle((y0, x0), r, color='red', fill=False, linewidth=2, linestyle='--')
+                axs[0].add_patch(circle)
+                axs[0].plot(y0, x0, 'r+', markersize=crosshair_size, markeredgewidth=crosshair_width)
+                axs[0].set_title('Reference Image')
+                axs[0].set_xlabel('Rx')
+                axs[0].set_ylabel('Ry')
+                plt.colorbar(im0, ax=axs[0])
+                
+                # Plot 2: Mask only
+                im1 = axs[1].imshow(mask.astype(float), cmap='Reds')
+                axs[1].set_title('Mask')
+                axs[1].set_xlabel('Rx')
+                axs[1].set_ylabel('Ry')
+                axs[1].text(0.02, 0.98, f'Center: ({x0}, {y0})\nRadius: {r}\nPixels: {mask.sum()}',
+                           transform=axs[1].transAxes, fontsize=10, verticalalignment='top',
+                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                
+                # Plot 3: Overlay
+                im2 = axs[2].imshow(reference_image, cmap='gray')
+                axs[2].imshow(mask.astype(float), alpha=overlay_alpha, cmap='Reds')
+                axs[2].set_title('Overlay')
+                axs[2].set_xlabel('Rx')
+                axs[2].set_ylabel('Ry')
+                plt.colorbar(im2, ax=axs[2])
+                
+                plt.tight_layout()
+                plt.show()
+        
+        # Link sliders to update function
+        x0_slider.observe(update_mask, names='value')
+        y0_slider.observe(update_mask, names='value')
+        r_slider.observe(update_mask, names='value')
+        
+        # Create layout: vertical slider with label on left, horizontal sliders and output stacked on right
+        x0_controls = widgets.VBox([
+            x0_slider,
+            x0_label
+        ], layout=widgets.Layout(align_items='center'))
+        
+        ui = widgets.HBox([
+            x0_controls,
+            widgets.VBox([
+                y0_slider,
+                r_slider,
+                output
+            ])
+        ])
+        
+        # Initial plot
+        update_mask()
+        
+        # Display the widget
+        display(ui)
+        
+        return result
+
+    def plot_peak_histogram_map(
+        self, 
+        intensity_threshold=None,
+        intensity_percentile=None,
+        figsize=(8, 6), 
+        cmap='viridis',
+        return_values=False,
+        intensity_field='intensities',
+    ):
+        """
+        Plot 2D map showing the number of peaks found at each scan position.
+        
+        Parameters:
+        -----------
+        intensity_threshold : float, optional
+            Absolute intensity threshold. Only count peaks above this value.
+        intensity_percentile : float, optional
+            Percentile threshold (0-100). Overrides intensity_threshold.
+        figsize : tuple
+            Figure size (width, height)
+        cmap : str
+            Colormap to use
+        return_values : bool
+            If True, return figure, axes, and count_map
+        
+        Returns:
+        --------
+        fig, ax, count_map : (optional) matplotlib figure, axes, and count array
+        """
+        Ry, Rx = self.peak_coordinates_cartesian.shape
+        
+        # Convert percentile to threshold if needed
+        if intensity_percentile is not None:
+            all_intensities = [
+                values
+                for i in range(Ry)
+                for j in range(Rx)
+                if len(
+                    values := _vector_field_cell(
+                        self.peak_intensities, intensity_field, i, j
+                    )
+                )
+            ]
+            if all_intensities:
+                intensity_threshold = np.percentile(np.concatenate(all_intensities), intensity_percentile)
+        
+        # Build count map
+        count_map = np.zeros((Ry, Rx))
+        for i in range(Ry):
+            for j in range(Rx):
+                peaks = self.peak_coordinates_cartesian[i, j].array
+                if len(peaks) == 0:
+                    continue
+                
+                if intensity_threshold is None:
+                    count_map[i, j] = len(peaks)
+                else:
+                    intensities = _vector_field_cell(
+                        self.peak_intensities, intensity_field, i, j
+                    )
+                    if len(intensities):
+                        count_map[i, j] = np.sum(intensities >= intensity_threshold)
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.imshow(count_map, cmap=cmap, origin='lower')
+        
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Number of Peaks', fontsize=12)
+        
+        # Integer colorbar ticks
+        max_count = int(np.max(count_map))
+        if max_count > 0:
+            ticks = np.arange(0, max_count + 1, max(1, max_count // 5))
+            cbar.set_ticks(ticks)
+        
+        # Title
+        title = 'Peak Count per Scan Position'
+        if intensity_threshold is not None:
+            title += f'\n(intensity ≥ {intensity_threshold:.3f})'
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel('Scan X', fontsize=12)
+        ax.set_ylabel('Scan Y', fontsize=12)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        if return_values:
+            return fig, ax, count_map
+            
+    def plot_peak_count_map(self, q_ranges, figsize_per_map=(5, 4), cmap='viridis', return_values=False):
+        """
+        Plot 2D maps showing the number of peaks in specified q-ranges.
+        
+        Parameters:
+        -----------
+        q_ranges : list of tuples or single tuple
+            Either a single (q_min, q_max) tuple or a list of tuples for multiple ranges.
+            Example: (2.8, 3.2) or [(0.3, 0.7), (2.8, 3.2), (5.0, 5.4)]
+        figsize_per_map : tuple
+            Size of each subplot (width, height)
+        cmap : str
+            Colormap to use
+        
+        Returns:
+        --------
+        fig, axes : matplotlib figure and axes
+        count_maps : list of ndarrays
+            The count maps for each q-range
+        """
+        # Handle single range or list of ranges
+        if isinstance(q_ranges, tuple):
+            q_ranges = [q_ranges]
+        
+        Ry, Rx = self.peak_coordinates_cartesian.shape
+        n_ranges = len(q_ranges)
+        
+        # Create figure
+        n_cols = min(3, n_ranges)  # Max 3 columns
+        n_rows = int(np.ceil(n_ranges / n_cols))
+        fig, axes = plt.subplots(n_rows, n_cols, 
+                                 figsize=(figsize_per_map[0]*n_cols, figsize_per_map[1]*n_rows))
+        
+        # Handle single subplot case
+        if n_ranges == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        count_maps = []
+        
+        for idx, (q_min, q_max) in enumerate(q_ranges):
+            # Create count map
+            count_map = np.zeros((Ry, Rx))
+            
+            for i in range(Ry):
+                for j in range(Rx):
+                    peaks_r_invA = _vector_field_cell(self.polar_peaks, "r_invA", i, j)
+                    if peaks_r_invA is not None and len(peaks_r_invA) > 0:
+                        # Get radial distances in 1/Å
+                        distances = peaks_r_invA
+                        # Count peaks in range
+                        mask = (distances >= q_min) & (distances < q_max)
+                        count_map[i, j] = np.sum(mask)
+            
+            count_maps.append(count_map)
+            
+            # Calculate max_count early for use in both colorbar and statistics
+            max_count = int(np.max(count_map))
+            
+            # Plot as a true integer-count map. Avoid show_2d's default quantile
+            # normalization here: count maps are discrete, not continuous images.
+            boundaries = np.arange(-0.5, max_count + 1.5, 1)
+            norm = BoundaryNorm(boundaries, ncolors=plt.get_cmap(cmap).N, clip=True)
+            im = axes[idx].imshow(
+                count_map,
+                cmap=cmap,
+                norm=norm,
+                interpolation='nearest',
+                origin='upper',
+            )
+            axes[idx].set_title(f'Peak Count\n{q_min:.2f} - {q_max:.2f} 1/Å', fontsize=14)
+            axes[idx].set_xlabel('Scan X', fontsize=12)
+            axes[idx].set_ylabel('Scan Y', fontsize=12)
+            axes[idx].set_xticks([])
+            axes[idx].set_yticks([])
+            cbar = plt.colorbar(im, ax=axes[idx], ticks=np.arange(max_count + 1))
+            cbar.set_label('Number of Peaks', fontsize=10)
+            
+            # Print statistics
+            total_peaks = int(np.sum(count_map))
+            positions_with_peaks = np.sum(count_map > 0)
+            print(f"Range {q_min:.2f}-{q_max:.2f} 1/Å:")
+            print(f"  Total peaks: {total_peaks}")
+            print(f"  Positions with peaks: {positions_with_peaks}/{Ry*Rx}")
+            print(f"  Max peaks at one position: {max_count}")
+            print(f"  Mean peaks per position: {np.mean(count_map):.2f}")
+            print()
+        
+        # Hide unused subplots
+        for idx in range(n_ranges, len(axes)):
+            axes[idx].set_visible(False)
+        
+        plt.tight_layout()
+        plt.show()
+
+        if return_values:
+            return fig, axes, count_maps
+
+    def make_flowline_map(
+        self,
+        orient_hist,
+        thresh_seed=0.2,
+        thresh_grow=0.05,
+        thresh_collision=0.001,
+        sep_seeds=None,
+        sep_xy=6.0,
+        sep_theta=5.0,
+        sort_seeds="intensity",
+        linewidth=2.0,
+        step_size=0.5,
+        min_steps=4,
+        max_steps=1000,
+        sigma_x=1.0,
+        sigma_y=1.0,
+        sigma_theta=2.0,
+        progress_bar: bool = True,
+    ):
+        """
+        Create an 3D or 4D orientation flowline map - essentially a pixelated "stream map" which represents diffraction data.
+    
+        Args:
+            orient_hist (array):        Histogram of all orientations with coordinates
+                                        [radial_bin x_probe y_probe theta]
+                                        We assume theta bin ranges from 0 to 180 degrees and is periodic.
+            thresh_seed (float):        Threshold for seed generation in histogram.
+            thresh_grow (float):        Threshold for flowline growth in histogram.
+            thresh_collision (float):   Threshold for termination of flowline growth in histogram.
+            sep_seeds (float):          Initial seed separation in bins - set to None to use default value,
+                                        which is equal to 0.5*sep_xy.
+            sep_xy (float):             Search radius for flowline direction in x and y.
+            sep_theta = (float):        Search radius for flowline direction in theta.
+            sort_seeds (str):           How to sort the initial seeds for growth:
+                                            None - no sorting
+                                            'intensity' - sort by histogram intensity
+                                            'random' - random order
+            linewidth (float):          Thickness of the flowlines in pixels.
+            step_size (float):          Step size for flowline growth in pixels.
+            min_steps (int):            Minimum number of steps for a flowline to be drawn.
+            max_steps (int):            Maximum number of steps for a flowline to be drawn.
+            sigma_x (float):            Weighted sigma in x direction for direction update.
+            sigma_y (float):            Weighted sigma in y direction for direction update.
+            sigma_theta (float):        Weighted sigma in theta for direction update.
+            progress_bar (bool):        Enable progress bar
+    
+        Returns:
+            orient_flowlines (array):   4D array containing flowlines
+                                        [radial_bin x_probe y_probe theta]
+        """
+    
+        # Ensure sep_xy and sep_theta are arrays
+        sep_xy = np.atleast_1d(sep_xy)
+        sep_theta = np.atleast_1d(sep_theta)
+    
+        # number of radial bins
+        num_radii = orient_hist.shape[0]
+        if num_radii > 1 and len(sep_xy) == 1:
+            sep_xy = np.ones(num_radii) * sep_xy
+        if num_radii > 1 and len(sep_theta) == 1:
+            sep_theta = np.ones(num_radii) * sep_theta
+    
+        # Default seed separation
+        if sep_seeds is None:
+            sep_seeds = np.round(np.min(sep_xy) / 2 + 0.5).astype("int")
+        else:
+            sep_seeds = np.atleast_1d(sep_seeds).astype("int")
+            if num_radii > 1 and len(sep_seeds) == 1:
+                sep_seeds = (np.ones(num_radii) * sep_seeds).astype("int")
+    
+        # coordinates
+        theta = np.linspace(0, np.pi, orient_hist.shape[3], endpoint=False)
+        dtheta = theta[1] - theta[0]
+        size_3D = np.array(
+            [
+                orient_hist.shape[1],
+                orient_hist.shape[2],
+                orient_hist.shape[3],
+            ]
+        )
+    
+        # initialize weighting array
+        vx = np.arange(-np.ceil(2 * sigma_x), np.ceil(2 * sigma_x) + 1)
+        vy = np.arange(-np.ceil(2 * sigma_y), np.ceil(2 * sigma_y) + 1)
+        vt = np.arange(-np.ceil(2 * sigma_theta), np.ceil(2 * sigma_theta) + 1)
+        ay, ax, at = np.meshgrid(vy, vx, vt)
+        k = (
+            np.exp(ax**2 / (-2 * sigma_x**2))
+            * np.exp(ay**2 / (-2 * sigma_y**2))
+            * np.exp(at**2 / (-2 * sigma_theta**2))
+        )
+        k = k / np.sum(k)
+        vx = vx[:, None, None].astype("int")
+        vy = vy[None, :, None].astype("int")
+        vt = vt[None, None, :].astype("int")
+    
+        # initalize flowline array
+        orient_flowlines = np.zeros_like(orient_hist)
+    
+        # initialize output
+        xy_t_int = np.zeros((max_steps + 1, 4))
+        xy_t_int_rev = np.zeros((max_steps + 1, 4))
+    
+        # Loop over radial bins
+        for a0 in range(num_radii):
+            # initialize collision check array
+            cr = np.arange(-np.ceil(sep_xy[a0]), np.ceil(sep_xy[a0]) + 1)
+            ct = np.arange(-np.ceil(sep_theta[a0]), np.ceil(sep_theta[a0]) + 1)
+            ay, ax, at = np.meshgrid(cr, cr, ct)
+            c_mask = (
+                (ax**2 + ay**2) / sep_xy[a0] ** 2 + at**2 / sep_theta[a0] ** 2
+                <= (1 + 1 / sep_xy[a0]) ** 2
+            )[None, :, :, :]
+            cx = cr[None, :, None, None].astype("int")
+            cy = cr[None, None, :, None].astype("int")
+            ct = ct[None, None, None, :].astype("int")
+    
+            # Find all seed locations
+            orient = orient_hist[a0, :, :, :]
+            sub_seeds = np.logical_and(
+                np.logical_and(
+                    orient >= np.roll(orient, 1, axis=2),
+                    orient >= np.roll(orient, -1, axis=2),
+                ),
+                orient >= thresh_seed,
+            )
+    
+            # Separate seeds
+            if sep_seeds > 0:
+                for a1 in range(sep_seeds - 1):
+                    sub_seeds[a1::sep_seeds, :, :] = False
+                    sub_seeds[:, a1::sep_seeds, :] = False
+    
+            # Index seeds
+            x_inds, y_inds, t_inds = np.where(sub_seeds)
+            if sort_seeds is not None:
+                if sort_seeds == "intensity":
+                    inds_sort = np.argsort(orient[sub_seeds])[::-1]
+                elif sort_seeds == "random":
+                    inds_sort = np.random.permutation(np.count_nonzero(sub_seeds))
+                x_inds = x_inds[inds_sort]
+                y_inds = y_inds[inds_sort]
+                t_inds = t_inds[inds_sort]
+    
+            # for a1 in tqdmnd(range(0,40), desc="Drawing flowlines",unit=" seeds", disable=not progress_bar):
+            t = "Drawing flowlines " + str(a0)
+            for a1 in tqdmnd(
+                range(0, x_inds.shape[0]), desc=t, unit=" seeds", disable=not progress_bar
+            ):
+                # initial coordinate and intensity
+                xy0 = np.array((x_inds[a1], y_inds[a1]))
+                t0 = theta[t_inds[a1]]
+    
+                # init theta
+                inds_theta = np.mod(
+                    np.round(t0 / dtheta).astype("int") + vt, orient.shape[2]
+                )
+                orient_crop = (
+                    k
+                    * orient[
+                        np.clip(
+                            np.round(xy0[0]).astype("int") + vx, 0, orient.shape[0] - 1
+                        ),
+                        np.clip(
+                            np.round(xy0[1]).astype("int") + vy, 0, orient.shape[1] - 1
+                        ),
+                        inds_theta,
+                    ]
+                )
+                theta_crop = theta[inds_theta]
+                t0 = np.sum(orient_crop * theta_crop) / np.sum(orient_crop)
+    
+                # forward direction
+                t = t0
+                v0 = np.array((np.cos(t), -np.sin(t)))
+                v = v0 * step_size
+                xy = xy0
+                int_val = self.get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
+                xy_t_int[0, 0:2] = xy0
+                xy_t_int[0, 2] = t / dtheta
+                xy_t_int[0, 3] = int_val
+                # main loop
+                grow = True
+                count = 0
+                while grow is True:
+                    count += 1
+    
+                    # update position and intensity
+                    xy = xy + v
+                    int_val = self.get_intensity(orient, xy[0], xy[1], t / dtheta)
+    
+                    # check for collision
+                    flow_crop = orient_flowlines[
+                        a0,
+                        np.clip(np.round(xy[0]).astype("int") + cx, 0, orient.shape[0] - 1),
+                        np.clip(np.round(xy[1]).astype("int") + cy, 0, orient.shape[1] - 1),
+                        np.mod(np.round(t / dtheta).astype("int") + ct, orient.shape[2]),
+                    ]
+                    int_flow = np.max(flow_crop[c_mask])
+    
+                    if (
+                        xy[0] < 0
+                        or xy[1] < 0
+                        or xy[0] > orient.shape[0]
+                        or xy[1] > orient.shape[1]
+                        or int_val < thresh_grow
+                        or int_flow > thresh_collision
+                    ):
+                        grow = False
+                    else:
+                        # update direction
+                        inds_theta = np.mod(
+                            np.round(t / dtheta).astype("int") + vt, orient.shape[2]
+                        )
+                        orient_crop = (
+                            k
+                            * orient[
+                                np.clip(
+                                    np.round(xy[0]).astype("int") + vx,
+                                    0,
+                                    orient.shape[0] - 1,
+                                ),
+                                np.clip(
+                                    np.round(xy[1]).astype("int") + vy,
+                                    0,
+                                    orient.shape[1] - 1,
+                                ),
+                                inds_theta,
+                            ]
+                        )
+                        theta_crop = theta[inds_theta]
+                        t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop)
+                        # v = np.array((np.cos(t), np.sin(t))) * step_size
+                        # v = np.array((np.sin(t), np.cos(t))) * step_size
+                        # v = np.array((-np.sin(t), np.cos(t))) * step_size
+    
+                        xy_t_int[count, 0:2] = xy
+                        xy_t_int[count, 2] = t / dtheta
+                        xy_t_int[count, 3] = int_val
+    
+                        if count > max_steps - 1:
+                            grow = False
+    
+                # reverse direction
+                t = t0 + np.pi
+                v0 = np.array((np.cos(t), -np.sin(t)))
+                v = v0 * step_size
+                xy = xy0
+                int_val = self.get_intensity(orient, xy0[0], xy0[1], t0 / dtheta)
+                xy_t_int_rev[0, 0:2] = xy0
+                xy_t_int_rev[0, 2] = t / dtheta
+                xy_t_int_rev[0, 3] = int_val
+                # main loop
+                grow = True
+                count_rev = 0
+                while grow is True:
+                    count_rev += 1
+    
+                    # update position and intensity
+                    xy = xy + v
+                    int_val = self.get_intensity(orient, xy[0], xy[1], t / dtheta)
+    
+                    # check for collision
+                    flow_crop = orient_flowlines[
+                        a0,
+                        np.clip(np.round(xy[0]).astype("int") + cx, 0, orient.shape[0] - 1),
+                        np.clip(np.round(xy[1]).astype("int") + cy, 0, orient.shape[1] - 1),
+                        np.mod(np.round(t / dtheta).astype("int") + ct, orient.shape[2]),
+                    ]
+                    int_flow = np.max(flow_crop[c_mask])
+    
+                    if (
+                        xy[0] < 0
+                        or xy[1] < 0
+                        or xy[0] > orient.shape[0]
+                        or xy[1] > orient.shape[1]
+                        or int_val < thresh_grow
+                        or int_flow > thresh_collision
+                    ):
+                        grow = False
+                    else:
+                        # update direction
+                        inds_theta = np.mod(
+                            np.round(t / dtheta).astype("int") + vt, orient.shape[2]
+                        )
+                        orient_crop = (
+                            k
+                            * orient[
+                                np.clip(
+                                    np.round(xy[0]).astype("int") + vx,
+                                    0,
+                                    orient.shape[0] - 1,
+                                ),
+                                np.clip(
+                                    np.round(xy[1]).astype("int") + vy,
+                                    0,
+                                    orient.shape[1] - 1,
+                                ),
+                                inds_theta,
+                            ]
+                        )
+                        theta_crop = theta[inds_theta]
+                        t = np.sum(orient_crop * theta_crop) / np.sum(orient_crop) + np.pi
+                        v = np.array((np.cos(t), -np.sin(t))) * step_size
+                        v = np.array((np.cos(t), -np.sin(t))) * step_size
+                        # v = np.array((-np.sin(t), np.cos(t))) * step_size
+    
+                        xy_t_int_rev[count_rev, 0:2] = xy
+                        xy_t_int_rev[count_rev, 2] = t / dtheta
+                        xy_t_int_rev[count_rev, 3] = int_val
+    
+                        if count_rev > max_steps - 1:
+                            grow = False
+    
+                # write into output array
+                if count + count_rev > min_steps:
+                    if count > 0:
+                        orient_flowlines[a0, :, :, :] = self.set_intensity(
+                            orient_flowlines[a0, :, :, :], xy_t_int[1:count, :]
+                        )
+                    if count_rev > 1:
+                        orient_flowlines[a0, :, :, :] = self.set_intensity(
+                            orient_flowlines[a0, :, :, :], xy_t_int_rev[1:count_rev, :]
+                        )
+    
+        # normalize to step size
+        orient_flowlines = orient_flowlines * step_size
+    
+        # linewidth
+        if linewidth > 1.0:
+            s = linewidth - 1.0
+    
+            orient_flowlines = gaussian_filter1d(orient_flowlines, s, axis=1, truncate=3.0)
+            orient_flowlines = gaussian_filter1d(orient_flowlines, s, axis=2, truncate=3.0)
+            orient_flowlines = orient_flowlines * (s**2)
+    
+        return orient_flowlines
+    
+    
+    def make_flowline_rainbow_image(
+        self,
+        orient_flowlines,
+        int_range=[0, 0.2],
+        sym_rotation_order=2,
+        theta_offset=np.pi,
+        greyscale=False,
+        greyscale_max=True,
+        white_background=False,
+        power_scaling=1.0,
+        sum_radial_bins=False,
+        plot_images=True,
+        figsize=None,
+    ):
+        """
+        Generate RGB output images from the flowline arrays.
+    
+        Args:
+            orient_flowline (array):    Histogram of all orientations with coordinates [x y radial_bin theta]
+                                        We assume theta bin ranges from 0 to 180 degrees and is periodic.
+            int_range (float)           2 element array giving the intensity range
+            sym_rotation_order (int):   rotational symmety for colouring
+            theta_offset (float):       Offset the anglular coloring by this value in radians.
+                                        Default pi rotates the hue mapping by 90deg (nematic
+                                        sym=2) so color tracks the drawn flowline direction:
+                                        cyan for vertical lines, red for horizontal.
+            greyscale (bool):           Set to False for color output, True for greyscale output.
+            greyscale_max (bool):       If output is greyscale, use max instead of mean for overlapping flowlines.
+            white_background (bool):    For either color or greyscale output, switch to white background (from black).
+            power_scaling (float):      Power law scaling for flowline intensity output.
+            sum_radial_bins (bool):     Sum all radial bins (alternative is to output separate images).
+            plot_images (bool):         Plot the outputs for quick visualization.
+            figsize (2-tuple):          Size of output figure.
+    
+        Returns:
+            im_flowline (array):        3D or 4D array containing flowline images
+        """
+    
+        # init array
+        size_input = orient_flowlines.shape
+        size_output = np.array([size_input[0], size_input[1], size_input[2], 3])
+        im_flowline = np.zeros(size_output)
+        theta_offset = np.atleast_1d(theta_offset)
+    
+        if greyscale is True:
+            for a0 in range(size_input[0]):
+                if greyscale_max is True:
+                    im = np.max(orient_flowlines[a0, :, :, :], axis=2)
+                else:
+                    im = np.mean(orient_flowlines[a0, :, :, :], axis=2)
+    
+                sig = np.clip((im - int_range[0]) / (int_range[1] - int_range[0]), 0, 1)
+    
+                if power_scaling != 1:
+                    sig = sig**power_scaling
+    
+                if white_background is False:
+                    im_flowline[a0, :, :, :] = sig[:, :, None]
+                else:
+                    im_flowline[a0, :, :, :] = 1 - sig[:, :, None]
+    
+        else:
+            # Color basis
+            c0 = np.array([1.0, 0.0, 0.0])
+            c1 = np.array([0.0, 0.7, 0.0])
+            c2 = np.array([0.0, 0.3, 1.0])
+    
+            # angles
+            theta = np.linspace(0, np.pi, size_input[3], endpoint=False)
+            # Negate so the hue handedness matches the drawn flowline direction in the
+            # displayed (y-down) map: red horizontal, cyan vertical, "/" yellow, "\" purple.
+            theta_color = -theta * sym_rotation_order
+    
+            if size_input[0] > 1 and len(theta_offset) == 1:
+                theta_offset = np.ones(size_input[0]) * theta_offset
+    
+            for a0 in range(size_input[0]):
+                # color projections
+                b0 = np.maximum(
+                    1
+                    - np.abs(
+                        np.mod(theta_offset[a0] + theta_color + np.pi, 2 * np.pi) - np.pi
+                    )
+                    ** 2
+                    / (np.pi * 2 / 3) ** 2,
+                    0,
+                )
+                b1 = np.maximum(
+                    1
+                    - np.abs(
+                        np.mod(
+                            theta_offset[a0] + theta_color - np.pi * 2 / 3 + np.pi,
+                            2 * np.pi,
+                        )
+                        - np.pi
+                    )
+                    ** 2
+                    / (np.pi * 2 / 3) ** 2,
+                    0,
+                )
+                b2 = np.maximum(
+                    1
+                    - np.abs(
+                        np.mod(
+                            theta_offset[a0] + theta_color - np.pi * 4 / 3 + np.pi,
+                            2 * np.pi,
+                        )
+                        - np.pi
+                    )
+                    ** 2
+                    / (np.pi * 2 / 3) ** 2,
+                    0,
+                )
+    
+                sig = np.clip(
+                    (orient_flowlines[a0, :, :, :] - int_range[0])
+                    / (int_range[1] - int_range[0]),
+                    0,
+                    1,
+                )
+                if power_scaling != 1:
+                    sig = sig**power_scaling
+    
+                im_flowline[a0, :, :, :] = (
+                    np.sum(sig * b0[None, None, :], axis=2)[:, :, None] * c0[None, None, :]
+                    + np.sum(sig * b1[None, None, :], axis=2)[:, :, None]
+                    * c1[None, None, :]
+                    + np.sum(sig * b2[None, None, :], axis=2)[:, :, None]
+                    * c2[None, None, :]
+                )
+    
+                # clip limits
+                im_flowline[a0, :, :, :] = np.clip(im_flowline[a0, :, :, :], 0, 1)
+    
+                # contrast flip
+                if white_background is True:
+                    im = rgb_to_hsv(im_flowline[a0])
+                    im_v = im[:, :, 2]
+                    im[:, :, 1] = im_v
+                    im[:, :, 2] = 1
+                    im_flowline[a0] = hsv_to_rgb(im)
+    
+        if sum_radial_bins is True:
+            if white_background is False:
+                im_flowline = np.clip(np.sum(im_flowline, axis=0), 0, 1)[None, :, :, :]
+            else:
+                # im_flowline = np.clip(np.sum(im_flowline,axis=0)+1-im_flowline.shape[0],0,1)[None,:,:,:]
+                im_flowline = np.min(im_flowline, axis=0)[None, :, :, :]
+    
+        if plot_images is True:
+            if figsize is None:
+                fig, ax = plt.subplots(
+                    im_flowline.shape[0], 1, figsize=(10, im_flowline.shape[0] * 10)
+                )
+            else:
+                fig, ax = plt.subplots(im_flowline.shape[0], 1, figsize=figsize)
+    
+            if im_flowline.shape[0] > 1:
+                for a0 in range(im_flowline.shape[0]):
+                    ax[a0].imshow(im_flowline[a0])
+                    # ax[a0].axis('off')
+                plt.subplots_adjust(wspace=0, hspace=0.02)
+            else:
+                ax.imshow(im_flowline[0])
+                # ax.axis('off')
+            plt.show()
+    
+        return im_flowline
+    
+    
+    def make_flowline_rainbow_legend(
+        self,
+        im_size=np.array([256, 256]),
+        sym_rotation_order=2,
+        theta_offset_degrees=0.0,
+        white_background=False,
+        return_image=False,
+        radial_range=np.array([0.45, 0.9]),
+        plot_legend=True,
+        figsize=(4, 4),
+    ):
+        """
+        This function generates a legend for a the rainbow colored flowline maps, and returns it as an RGB image.
+    
+        Parameters
+        ----------
+        im_size (np.array):
+            Size of legend image in pixels.
+        sym_rotation_order (int):
+            rotational symmety for colouring
+        theta_offset_degrees (float):
+            Offset the anglular coloring by this value in degrees.
+            Rotation is Q with respect to R, in the positive (counter clockwise) direction.
+        white_background (bool):
+            For either color or greyscale output, switch to white background (from black).
+        return_image (bool):
+            Return the image array.
+        radial_range (np.array):
+            Inner and outer radius for the legend ring.
+        plot_legend (bool):
+            Plot the generated legend.
+        figsize (tuple or list):
+            Size of the plotted legend.
+    
+        Returns
+        ----------
+    
+        im_legend (array):
+            Image array for the legend.
+        """
+    
+        # Coordinates
+        x = np.linspace(-1, 1, im_size[0])
+        y = np.linspace(-1, 1, im_size[1])
+        ya, xa = np.meshgrid(y, x)
+        # TODO: Can replace with squared term? ra2? Faster
+        # ra = np.sqrt(xa**2 + ya**2)
+        ra2 = xa**2 + ya**2
+        ta = np.arctan2(ya, xa) + np.deg2rad(theta_offset_degrees)
+        ta_sym = ta * sym_rotation_order
+    
+        # mask
+        mask = np.logical_and(ra2 > radial_range[0]**2, ra2 < radial_range[1]**2)
+        # mask = np.logical_and(ra > radial_range[0], ra < radial_range[1])
+    
+        # rgb image
+        z = mask * np.exp(1j * ta_sym)
+        # hue_offset = 0
+        amp = np.abs(z)
+        vmin = np.min(amp)
+        vmax = np.max(amp)
+        ph = np.angle(z)  # + hue_offset
+        h = np.mod(ph / (2 * np.pi), 1)
+        s = 0.85 * np.ones_like(h)
+        v = (amp - vmin) / (vmax - vmin)
+        im_legend = hsv_to_rgb(np.dstack((h, s, v)))
+    
+        if white_background is True:
+            im_legend[im_legend.sum(2) == 0] = 1
+    
+        # plotting
+        if plot_legend:
+            fig, ax = plt.subplots(1, 1, figsize=figsize)
+            ax.imshow(im_legend)
+            ax.invert_yaxis()
+            # ax.set_axis_off()
+            ax.axis("off")
+    
+        if return_image:
+            return im_legend
+    
+    
+    def make_flowline_combined_image(
+        self,
+        orient_flowlines,
+        int_range=[0, 0.2],
+        cvals=np.array(
+            [
+                [0.0, 0.7, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.7, 1.0],
+            ]
+        ),
+        white_background=False,
+        power_scaling=1.0,
+        sum_radial_bins=True,
+        plot_images=True,
+        figsize=None,
+    ):
+        """
+        Generate RGB output images from the flowline arrays.
+    
+        Args:
+            orient_flowline (array):    Histogram of all orientations with coordinates [x y radial_bin theta]
+                                        We assume theta bin ranges from 0 to 180 degrees and is periodic.
+            int_range (float)           2 element array giving the intensity range
+            cvals (array):              Nx3 size array containing RGB colors for different radial ibns.
+            white_background (bool):    For either color or greyscale output, switch to white background (from black).
+            power_scaling (float):      Power law scaling for flowline intensities.
+            sum_radial_bins (bool):     Sum outputs over radial bins.
+            plot_images (bool):         Plot the output images for quick visualization.
+            figsize (2-tuple):          Size of output figure.
+    
+        Returns:
+            im_flowline (array):        flowline images
+        """
+    
+        # init array
+        size_input = orient_flowlines.shape
+        size_output = np.array([size_input[0], size_input[1], size_input[2], 3])
+        im_flowline = np.zeros(size_output)
+        cvals = np.array(cvals)
+    
+        # Generate all color images
+        for a0 in range(size_input[0]):
+            sig = np.clip(
+                (np.sum(orient_flowlines[a0, :, :, :], axis=2) - int_range[0])
+                / (int_range[1] - int_range[0]),
+                0,
+                1,
+            )
+            if power_scaling != 1:
+                sig = sig**power_scaling
+    
+            if white_background:
+                im_flowline[a0, :, :, :] = 1 - sig[:, :, None] * (
+                    1 - cvals[a0, :][None, None, :]
+                )
+            else:
+                im_flowline[a0, :, :, :] = sig[:, :, None] * cvals[a0, :][None, None, :]
+    
+            # # contrast flip
+            # if white_background is True:
+            #     im = rgb_to_hsv(im_flowline[a0,:,:,:])
+            #     # im_s = im[:,:,1]
+            #     im_v = im[:,:,2]
+            #     v_range = [np.min(im_v), np.max(im_v)]
+            #     print(v_range)
+    
+            #     im[:,:,1] = im_v
+            #     im[:,:,2] = 1
+            #     im_flowline[a0,:,:,:] = hsv_to_rgb(im)
+    
+        if sum_radial_bins is True:
+            if white_background is False:
+                im_flowline = np.clip(np.sum(im_flowline, axis=0), 0, 1)[None, :, :, :]
+            else:
+                # im_flowline = np.clip(np.sum(im_flowline,axis=0)+1-im_flowline.shape[0],0,1)[None,:,:,:]
+                im_flowline = np.min(im_flowline, axis=0)[None, :, :, :]
+    
+        if plot_images is True:
+            if figsize is None:
+                fig, ax = plt.subplots(
+                    im_flowline.shape[0], 1, figsize=(10, im_flowline.shape[0] * 10)
+                )
+            else:
+                fig, ax = plt.subplots(im_flowline.shape[0], 1, figsize=figsize)
+    
+            if im_flowline.shape[0] > 1:
+                for a0 in range(im_flowline.shape[0]):
+                    ax[a0].imshow(im_flowline[a0])
+                    ax[a0].axis("off")
+                plt.subplots_adjust(wspace=0, hspace=0.02)
+            else:
+                ax.imshow(im_flowline[0])
+                ax.axis("off")
+            plt.show()
+    
+        return im_flowline
+
+    def get_intensity(
+        self, 
+        orient, 
+        x, 
+        y, 
+        t
+    ):
+        # utility function to get histogram intensites
+    
+        x = np.clip(x, 0, orient.shape[0] - 2)
+        y = np.clip(y, 0, orient.shape[1] - 2)
+    
+        xF = np.floor(x).astype("int")
+        yF = np.floor(y).astype("int")
+        tF = np.floor(t).astype("int")
+        dx = x - xF
+        dy = y - yF
+        dt = t - tF
+        t1 = np.mod(tF, orient.shape[2])
+        t2 = np.mod(tF + 1, orient.shape[2])
+    
+        int_vals = (
+            orient[xF, yF, t1] * ((1 - dx) * (1 - dy) * (1 - dt))
+            + orient[xF, yF, t2] * ((1 - dx) * (1 - dy) * (dt))
+            + orient[xF, yF + 1, t1] * ((1 - dx) * (dy) * (1 - dt))
+            + orient[xF, yF + 1, t2] * ((1 - dx) * (dy) * (dt))
+            + orient[xF + 1, yF, t1] * ((dx) * (1 - dy) * (1 - dt))
+            + orient[xF + 1, yF, t2] * ((dx) * (1 - dy) * (dt))
+            + orient[xF + 1, yF + 1, t1] * ((dx) * (dy) * (1 - dt))
+            + orient[xF + 1, yF + 1, t2] * ((dx) * (dy) * (dt))
+        )
+    
+        return int_vals
+    
+    
+    def set_intensity(
+        self, 
+        orient, 
+        xy_t_int
+    ):
+        # utility function to set flowline intensites
+    
+        xF = np.floor(xy_t_int[:, 0]).astype("int")
+        yF = np.floor(xy_t_int[:, 1]).astype("int")
+        tF = np.floor(xy_t_int[:, 2]).astype("int")
+        dx = xy_t_int[:, 0] - xF
+        dy = xy_t_int[:, 1] - yF
+        dt = xy_t_int[:, 2] - tF
+    
+        inds_1D = np.ravel_multi_index(
+            [xF, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            1 - dy
+        ) * (1 - dt)
+        inds_1D = np.ravel_multi_index(
+            [xF, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            1 - dy
+        ) * (dt)
+        inds_1D = np.ravel_multi_index(
+            [xF, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            dy
+        ) * (1 - dt)
+        inds_1D = np.ravel_multi_index(
+            [xF, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
+            dy
+        ) * (dt)
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (
+            1 - dy
+        ) * (1 - dt)
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (
+            1 - dy
+        ) * (dt)
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (
+            1 - dt
+        )
+        inds_1D = np.ravel_multi_index(
+            [xF + 1, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+        )
+        orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (
+            dt
+        )
+    
+        return orient
+
+    def interactive_probe_selector(self, probe_map=None, figsize=(14, 8), cmap='viridis'):
+        """
+        Interactive GUI to select probe positions and view diffraction patterns.
+        
+        Parameters
+        ----------
+        probe_map : ndarray, optional
+            2D array to display as the probe position map. If None, uses mean diffraction intensity.
+        figsize : tuple
+            Figure size (width, height)
+        cmap : str
+            Colormap for the probe map
+            
+        Returns
+        -------
+        selected_positions : list of tuples
+            List of (ry, rx) coordinates of selected positions
+        """
+        from matplotlib.widgets import Button
+        from matplotlib.patches import Circle
+        import ipywidgets as widgets
+        from IPython.display import display, clear_output
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Create default probe map if not provided
+        if probe_map is None:
+            probe_map = np.mean(self.dataset_cartesian.array, axis=(2, 3))
+        
+        # Storage for selected positions
+        selected_positions = []
+        markers = []
+        
+        # Create figure
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(2, 3, width_ratios=[2, 2, 1], height_ratios=[1, 1], 
+                              hspace=0.3, wspace=0.3)
+        
+        # Probe map axis
+        ax_probe = fig.add_subplot(gs[:, 0])
+        im_probe = ax_probe.imshow(probe_map, cmap=cmap, origin='lower', 
+                                    interpolation='nearest', aspect='auto')
+        ax_probe.set_title('Probe Position Map\n(Click to add point)', fontsize=12)
+        ax_probe.set_xlabel('Rx')
+        ax_probe.set_ylabel('Ry')
+        plt.colorbar(im_probe, ax=ax_probe, label='Intensity')
+        
+        # Diffraction pattern axes
+        ax_dp1 = fig.add_subplot(gs[0, 1])
+        ax_dp2 = fig.add_subplot(gs[1, 1])
+        ax_dp1.set_title('Diffraction Pattern 1')
+        ax_dp2.set_title('Diffraction Pattern 2')
+        ax_dp1.axis('off')
+        ax_dp2.axis('off')
+        
+        # Text area for position list
+        ax_list = fig.add_subplot(gs[:, 2])
+        ax_list.axis('off')
+        ax_list.set_title('Selected Positions', fontsize=11, fontweight='bold')
+        
+        # Add clear all button
+        ax_button = plt.axes([0.7, 0.02, 0.1, 0.04])
+        btn_clear = Button(ax_button, 'Clear All')
+        
+        def update_display():
+            """Update the position list and diffraction patterns."""
+            # Clear position list
+            ax_list.clear()
+            ax_list.axis('off')
+            ax_list.set_title('Selected Positions', fontsize=11, fontweight='bold')
+            
+            # Display positions
+            y_pos = 0.95
+            for idx, (ry, rx) in enumerate(selected_positions):
+                text = f"{idx+1}. ({ry}, {rx})"
+                ax_list.text(0.1, y_pos, text, fontsize=10, transform=ax_list.transAxes,
+                            verticalalignment='top')
+                y_pos -= 0.08
+            
+            # Update diffraction patterns
+            if len(selected_positions) >= 1:
+                ry, rx = selected_positions[-1]
+                dp = self.dataset_cartesian[ry, rx].array
+                ax_dp1.clear()
+                ax_dp1.imshow(dp, cmap='gray')
+                ax_dp1.set_title(f'DP at ({ry}, {rx})')
+                ax_dp1.axis('off')
+            
+            if len(selected_positions) >= 2:
+                ry, rx = selected_positions[-2]
+                dp = self.dataset_cartesian[ry, rx].array
+                ax_dp2.clear()
+                ax_dp2.imshow(dp, cmap='gray')
+                ax_dp2.set_title(f'DP at ({ry}, {rx})')
+                ax_dp2.axis('off')
+            
+            fig.canvas.draw_idle()
+        
+        def onclick(event):
+            """Handle click events on probe map."""
+            if event.inaxes == ax_probe and event.button == 1:  # Left click
+                rx = int(np.round(event.xdata))
+                ry = int(np.round(event.ydata))
+                
+                # Check bounds
+                if 0 <= ry < Ry and 0 <= rx < Rx:
+                    selected_positions.append((ry, rx))
+                    
+                    # Add marker
+                    marker = Circle((rx, ry), radius=0.5, color='red', 
+                                   fill=True, zorder=10)
+                    ax_probe.add_patch(marker)
+                    markers.append(marker)
+                    
+                    # Add label
+                    label = ax_probe.text(rx, ry, str(len(selected_positions)), 
+                                         color='white', fontsize=8, ha='center', 
+                                         va='center', fontweight='bold', zorder=11)
+                    markers.append(label)
+                    
+                    update_display()
+        
+        def clear_all(event):
+            """Clear all selected positions."""
+            selected_positions.clear()
+            for marker in markers:
+                marker.remove()
+            markers.clear()
+            ax_dp1.clear()
+            ax_dp1.axis('off')
+            ax_dp2.clear()
+            ax_dp2.axis('off')
+            update_display()
+        
+        # Connect events
+        fig.canvas.mpl_connect('button_press_event', onclick)
+        btn_clear.on_clicked(clear_all)
+        
+        plt.show()
+        
+        return selected_positions
+    
+    
+    def visualize_selected_patterns(self, positions, ncols=4, figsize_per_pattern=(3, 3), 
+                                     cmap='gray', vmax=None):
+        """
+        Display diffraction patterns at selected probe positions in a grid.
+        
+        Parameters
+        ----------
+        positions : list of tuples
+            List of (ry, rx) coordinates
+        ncols : int
+            Number of columns in the grid
+        figsize_per_pattern : tuple
+            Size of each subplot (width, height)
+        cmap : str
+            Colormap for diffraction patterns
+        vmax : float, optional
+            Maximum value for colormap normalization
+            
+        Returns
+        -------
+        fig, axes : matplotlib figure and axes
+        """
+        n_positions = len(positions)
+        nrows = int(np.ceil(n_positions / ncols))
+        
+        fig, axes = plt.subplots(nrows, ncols, 
+                                figsize=(figsize_per_pattern[0]*ncols, 
+                                        figsize_per_pattern[1]*nrows))
+        
+        # Handle single subplot case
+        if n_positions == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+        
+        for idx, (ry, rx) in enumerate(positions):
+            dp = self.dataset_cartesian[ry, rx].array
+            
+            im = axes[idx].imshow(dp, cmap=cmap, vmax=vmax)
+            axes[idx].set_title(f'({ry}, {rx})', fontsize=10)
+            axes[idx].axis('off')
+            plt.colorbar(im, ax=axes[idx], fraction=0.046, pad=0.04)
+        
+        # Hide unused subplots
+        for idx in range(n_positions, len(axes)):
+            axes[idx].set_visible(False)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return fig, axes
+    
+    
+    def interactive_probe_selector_widget(self, probe_map=None, cmap='viridis'):
+        """
+        Enhanced interactive GUI using ipywidgets for fine-tuning positions.
+        
+        Parameters
+        ----------
+        probe_map : ndarray, optional
+            2D array to display as the probe position map
+        cmap : str
+            Colormap for the probe map
+            
+        Returns
+        -------
+        selected_positions : list of tuples
+            List of (ry, rx) coordinates of selected positions
+        """
+        import ipywidgets as widgets
+        from IPython.display import display, clear_output
+        
+        Ry, Rx = self.dataset_cartesian.shape[:2]
+        
+        # Create default probe map if not provided
+        if probe_map is None:
+            probe_map = np.mean(self.dataset_cartesian.array, axis=(2, 3))
+        
+        # Storage
+        selected_positions = []
+        
+        # Create output widgets
+        output_plot = widgets.Output()
+        output_list = widgets.Output()
+        
+        def update_plot():
+            """Update the main plot with markers."""
+            with output_plot:
+                clear_output(wait=True)
+                fig, ax = plt.subplots(figsize=(8, 6))
+                
+                im = ax.imshow(probe_map, cmap=cmap, origin='lower', 
+                              interpolation='nearest', aspect='auto')
+                ax.set_title('Probe Position Map (Click to add point)', fontsize=12)
+                ax.set_xlabel('Rx')
+                ax.set_ylabel('Ry')
+                plt.colorbar(im, ax=ax, label='Intensity')
+                
+                # Add markers
+                for idx, (ry, rx) in enumerate(selected_positions):
+                    circle = Circle((rx, ry), radius=0.5, color='red', 
+                                   fill=True, zorder=10)
+                    ax.add_patch(circle)
+                    ax.text(rx, ry, str(idx+1), color='white', fontsize=8, 
+                           ha='center', va='center', fontweight='bold', zorder=11)
+                
+                def onclick(event):
+                    if event.inaxes == ax and event.button == 1:
+                        rx = int(np.round(event.xdata))
+                        ry = int(np.round(event.ydata))
+                        if 0 <= ry < Ry and 0 <= rx < Rx:
+                            selected_positions.append((ry, rx))
+                            update_plot()
+                            update_list()
+                
+                fig.canvas.mpl_connect('button_press_event', onclick)
+                plt.show()
+        
+        def update_list():
+            """Update the position list with controls."""
+            with output_list:
+                clear_output(wait=True)
+                
+                if not selected_positions:
+                    print("No positions selected")
+                    return
+                
+                for idx, (ry, rx) in enumerate(selected_positions):
+                    print(f"--- Position {idx+1} ---")
+                    
+                    # Create sliders for fine-tuning
+                    ry_slider = widgets.IntSlider(
+                        value=ry, min=0, max=Ry-1, step=1,
+                        description=f'Ry {idx+1}:', continuous_update=False
+                    )
+                    rx_slider = widgets.IntSlider(
+                        value=rx, min=0, max=Rx-1, step=1,
+                        description=f'Rx {idx+1}:', continuous_update=False
+                    )
+                    
+                    def make_update(i):
+                        def update_position(change):
+                            selected_positions[i] = (ry_slider.value, rx_slider.value)
+                            update_plot()
+                        return update_position
+                    
+                    ry_slider.observe(make_update(idx), names='value')
+                    rx_slider.observe(make_update(idx), names='value')
+                    
+                    # Delete button
+                    delete_btn = widgets.Button(description=f'Delete {idx+1}', 
+                                                button_style='danger')
+                    
+                    def make_delete(i):
+                        def delete_position(b):
+                            del selected_positions[i]
+                            update_plot()
+                            update_list()
+                        return delete_position
+                    
+                    delete_btn.on_click(make_delete(idx))
+                    
+                    display(widgets.HBox([ry_slider, rx_slider, delete_btn]))
+                
+                # Clear all button
+                clear_btn = widgets.Button(description='Clear All', button_style='warning')
+                def clear_all(b):
+                    selected_positions.clear()
+                    update_plot()
+                    update_list()
+                clear_btn.on_click(clear_all)
+                
+                display(clear_btn)
+        
+        # Layout
+        ui = widgets.VBox([
+            widgets.HBox([output_plot, output_list])
+        ])
+        
+        display(ui)
+        update_plot()
+        update_list()
+        
+        return selected_positions
