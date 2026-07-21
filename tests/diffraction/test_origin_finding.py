@@ -264,7 +264,7 @@ def test_bragg_peak_polar_transform_inverts_ellipse_mapping():
     assert got[0, 1] == pytest.approx(0.0)
 
 
-def _bragg_orientation_histogram(theta_values, theta_step_deg=90):
+def _bragg_orientation_histogram(theta_values, theta_step_deg=90, normalize_stack=False):
     ds = _dataset(np.zeros((1, 1, 8, 8), dtype=np.float32))
     bp = BraggPeaksPolymer.from_data(
         ds,
@@ -299,7 +299,7 @@ def _bragg_orientation_histogram(theta_values, theta_step_deg=90):
         sigma_y=None,
         sigma_theta=None,
         normalize_intensity_image=False,
-        normalize_intensity_stack=False,
+        normalize_intensity_stack=normalize_stack,
         progress_bar=False,
     )
 
@@ -316,6 +316,12 @@ def test_bragg_orientation_histogram_folds_unwrapped_angles():
 
     assert hist[0, 0, 0, 0] == pytest.approx(2.0)
     assert hist[0, 0, 0, 1] == pytest.approx(2.0)
+
+
+def test_bragg_orientation_histogram_empty_input_remains_finite():
+    hist = _bragg_orientation_histogram([], normalize_stack=True)
+    assert np.isfinite(hist).all()
+    assert not np.any(hist)
 
 
 def test_bragg_private_helpers_characterize_shared_plotting_behavior():

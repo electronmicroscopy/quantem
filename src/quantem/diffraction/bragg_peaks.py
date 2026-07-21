@@ -37,7 +37,7 @@ from IPython.display import clear_output
 from pathlib import Path
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from matplotlib.patches import Rectangle
-from matplotlib.colors import BoundaryNorm
+from matplotlib.colors import BoundaryNorm, hsv_to_rgb, rgb_to_hsv
 
 def _apply_zoom_crop(data, zoom_factor, center=None):
     """Crop data to center region based on zoom factor."""
@@ -2666,12 +2666,14 @@ class BraggPeaksPolymer(AutoSerialize):
     
         # Normalization
         if normalize_intensity_stack is True:
-            orient_hist = orient_hist / np.max(orient_hist)
+            stack_max = np.max(orient_hist)
+            if stack_max > 0:
+                orient_hist = orient_hist / stack_max
         elif normalize_intensity_image is True:
             for a0 in range(num_radii):
-                orient_hist[a0, :, :, :] = orient_hist[a0, :, :, :] / np.max(
-                    orient_hist[a0, :, :, :]
-                )
+                image_max = np.max(orient_hist[a0, :, :, :])
+                if image_max > 0:
+                    orient_hist[a0, :, :, :] /= image_max
     
         return orient_hist
 
