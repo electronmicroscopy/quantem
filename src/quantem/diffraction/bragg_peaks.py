@@ -2070,6 +2070,8 @@ class BraggPeaksPolymer(AutoSerialize):
         min_width=0.05,
         smoothing_sigma=2.0,
         intensity_field='intensities',
+        mode='intensity',
+        log_scale=False,
     ):
         """
         Automatically detect the top N most prominent peaks and estimate their windows.
@@ -2094,6 +2096,12 @@ class BraggPeaksPolymer(AutoSerialize):
             Minimum window width in 1/Å
         smoothing_sigma : float
             Gaussian smoothing sigma for noise reduction before peak detection
+        mode : {'intensity', 'count'}
+            Radial profile to detect peaks on: intensity-weighted histogram of peak q
+            ('intensity', default) or the number of detected peaks per bin ('count').
+        log_scale : bool
+            If True, detect peaks on log1p(profile) so small peaks are not dominated
+            by large ones.
             
         Returns
         -------
@@ -2109,9 +2117,11 @@ class BraggPeaksPolymer(AutoSerialize):
             - 'widths': estimated peak widths (FWHM)
         """
         
-        # Get radial intensity profile
+        if mode not in ('intensity', 'count'):
+            raise ValueError(f"mode must be 'intensity' or 'count', got {mode!r}")
+
+        # Get radial profile (intensity-weighted or peak-count)
         all_r = _vector_field_flat(self.polar_peaks, "r_invA")
-        all_intensity = _vector_field_flat(self.peak_intensities, intensity_field)
         
         if q_min is None:
             q_min = 0
@@ -2119,14 +2129,22 @@ class BraggPeaksPolymer(AutoSerialize):
             q_max = np.max(all_r)
         
         r_bins = np.linspace(q_min, q_max, num_bins + 1)
-        intensity_sum, _ = np.histogram(all_r, bins=r_bins, weights=all_intensity)
+        if mode == 'intensity':
+            all_intensity = _vector_field_flat(self.peak_intensities, intensity_field)
+            profile, _ = np.histogram(all_r, bins=r_bins, weights=all_intensity)
+        else:  # 'count'
+            profile, _ = np.histogram(all_r, bins=r_bins)
         r_centers = (r_bins[:-1] + r_bins[1:]) / 2
-        
+
+        # Optional log compression so small peaks are not dominated by large ones
+        if log_scale:
+            profile = np.log1p(profile)
+
         # Smooth the data to reduce noise
         if smoothing_sigma > 0:
-            intensity_smooth = gaussian_filter1d(intensity_sum, smoothing_sigma)
+            intensity_smooth = gaussian_filter1d(profile, smoothing_sigma)
         else:
-            intensity_smooth = intensity_sum
+            intensity_smooth = profile
         
         # Calculate thresholds
         height_threshold = np.percentile(intensity_smooth, height_percentile)
@@ -2175,7 +2193,10 @@ class BraggPeaksPolymer(AutoSerialize):
             'prominences': prominences[sorted_indices],
             'widths_fwhm': fwhm_invA,
             'intensity_profile': intensity_smooth,
+            'profile': intensity_smooth,
             'r_centers': r_centers,
+            'mode': mode,
+            'log_scale': log_scale,
         }
         
         # Print summary
@@ -2209,6 +2230,8 @@ class BraggPeaksPolymer(AutoSerialize):
         plot=True,
         return_data=False,
         intensity_field='intensities',
+        log_scale=False,
+        show_d_spacing=False,
     ):
         """
         Create radial intensity line plot summarizing polar peaks.
@@ -2283,6 +2306,21 @@ class BraggPeaksPolymer(AutoSerialize):
             ax.set_ylabel('Integrated Intensity', fontsize=12)
             ax.set_title('Radial Intensity Profile (All Patterns)', fontsize=14)
             ax.grid(True, alpha=0.3)
+
+            fill_base = 0
+            if log_scale:
+                ax.set_yscale('log')
+                _pos = intensity_sum[intensity_sum > 0]
+                fill_base = (_pos.min() if _pos.size else 1e-9)
+
+            if show_d_spacing:
+                # top axis: real-space d-spacing (Å) = 1 / q (1/Å)
+                secax = ax.secondary_xaxis(
+                    'top',
+                    functions=(lambda q: 1.0 / np.clip(q, 1e-12, None),
+                               lambda d: 1.0 / np.clip(d, 1e-12, None)),
+                )
+                secax.set_xlabel('d-spacing (Å)', fontsize=12)
             
             # Add peak windows as filled regions and fill under curve
             if peak_windows is not None:
@@ -2299,7 +2337,7 @@ class BraggPeaksPolymer(AutoSerialize):
                     if np.any(mask):
                         r_window = r_centers[mask]
                         intensity_window = intensity_sum[mask]
-                        ax.fill_between(r_window, 0, intensity_window, 
+                        ax.fill_between(r_window, fill_base, intensity_window,
                                        alpha=fill_alpha, color=fill_color,
                                        label='Peak intensity' if i == 0 else None,
                                        zorder=1)
@@ -2376,6 +2414,8 @@ class BraggPeaksPolymer(AutoSerialize):
         fill_color=None,
         plot=True,
         return_data=False,
+        log_scale=False,
+        show_d_spacing=False,
     ):
         """
         Create radial peak count line plot summarizing polar peaks.
@@ -2448,6 +2488,21 @@ class BraggPeaksPolymer(AutoSerialize):
             ax.set_ylabel('Number of Peaks', fontsize=12)
             ax.set_title('Radial Peak Count Profile (All Patterns)', fontsize=14)
             ax.grid(True, alpha=0.3)
+
+            fill_base = 0
+            if log_scale:
+                ax.set_yscale('log')
+                _pos = peak_counts[peak_counts > 0]
+                fill_base = (_pos.min() if _pos.size else 1e-9)
+
+            if show_d_spacing:
+                # top axis: real-space d-spacing (Å) = 1 / q (1/Å)
+                secax = ax.secondary_xaxis(
+                    'top',
+                    functions=(lambda q: 1.0 / np.clip(q, 1e-12, None),
+                               lambda d: 1.0 / np.clip(d, 1e-12, None)),
+                )
+                secax.set_xlabel('d-spacing (Å)', fontsize=12)
             
             # Add peak windows as filled regions and fill under curve
             if peak_windows is not None:
@@ -2464,7 +2519,7 @@ class BraggPeaksPolymer(AutoSerialize):
                     if np.any(mask):
                         r_window = r_centers[mask]
                         counts_window = peak_counts[mask]
-                        ax.fill_between(r_window, 0, counts_window, 
+                        ax.fill_between(r_window, fill_base, counts_window,
                                        alpha=fill_alpha, color=fill_color,
                                        label='Peak counts' if i == 0 else None,
                                        zorder=1)
