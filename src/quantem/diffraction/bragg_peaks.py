@@ -2201,12 +2201,14 @@ class BraggPeaksPolymer(AutoSerialize):
         
         # Print summary
         print(f"Detected {len(peak_centers)} peaks:")
+        _to_d = lambda q: (1.0 / q if q > 0 else float('inf'))  # d-spacing (Å) = 1 / q (1/Å)
         for i, (center, window, height, prom, width) in enumerate(zip(
-            peak_centers, peak_windows, peak_info['heights'], 
+            peak_centers, peak_windows, peak_info['heights'],
             peak_info['prominences'], peak_info['widths_fwhm']
         )):
-            print(f"  Peak {i+1}: center={center:.3f} 1/Å, "
-                  f"window=[{window[0]:.3f}, {window[1]:.3f}] 1/Å, "
+            print(f"  Peak {i+1}: center={center:.3f} 1/Å (d={_to_d(center):.2f} Å), "
+                  f"window=[{window[0]:.3f}, {window[1]:.3f}] 1/Å "
+                  f"(d=[{_to_d(window[1]):.2f}, {_to_d(window[0]):.2f}] Å), "
                   f"height={height:.1f}, prominence={prom:.1f}, FWHM={width:.3f} 1/Å")
         
         return peak_centers, peak_windows, peak_info
@@ -4362,7 +4364,12 @@ class BraggPeaksPolymer(AutoSerialize):
                 interpolation='nearest',
                 origin='upper',
             )
-            axes[idx].set_title(f'Peak Count\n{q_min:.2f} - {q_max:.2f} 1/Å', fontsize=14)
+            _dlo = (1.0 / q_max) if q_max > 0 else float('inf')  # d-spacing (Å) = 1 / q (1/Å)
+            _dhi = (1.0 / q_min) if q_min > 0 else float('inf')
+            axes[idx].set_title(
+                f'Peak Count\n{q_min:.2f} - {q_max:.2f} 1/Å\n'
+                f'd = {_dlo:.2f} - {_dhi:.2f} Å',
+                fontsize=14)
             axes[idx].set_xlabel('Scan X', fontsize=12)
             axes[idx].set_ylabel('Scan Y', fontsize=12)
             axes[idx].set_xticks([])
