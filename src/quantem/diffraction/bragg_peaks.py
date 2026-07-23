@@ -878,11 +878,33 @@ class BraggPeaksPolymer(AutoSerialize):
             self.origin_com_measured = np.moveaxis(measured, -1, 0)  # (2, Ry, Rx)
             results["origin_com_measured"] = self.origin_com_measured
 
+            # Restrict the descan/rotation fit to the ROI: out-of-mask patterns
+            # (vacuum/substrate) have meaningless CoM that drags a global plane, leaving a
+            # uniform residual inside the ROI. Fit the plane over in-mask patterns only
+            # (sigma-clipped to reject hot/dead-pixel CoM outliers), push it back into the
+            # CoM model, and zero the residual outside the ROI so the detector-rotation
+            # curl isn't contaminated by junk patterns either.
+            roi = (
+                np.asarray(scan_mask, dtype=bool)
+                if scan_mask is not None
+                else np.ones((Ry, Rx), dtype=bool)
+            )
             if estimate_descan or estimate_detector_rotation or center_source == "descan":
-                com_model.fit_origin_background(fit_method=descan_fit_method)
-                fitted = com_model.origin_fitted.detach().cpu().numpy().reshape(Ry, Rx, 2)
+                import torch
+
+                fitted = self._fit_origin_roi(measured, roi, fit_method=descan_fit_method)
                 self.descan_origin = np.moveaxis(fitted, -1, 0)  # (2, Ry, Rx)
                 results["descan_origin"] = self.descan_origin
+
+                dev = com_model.device
+                com_model.origin_fitted = torch.as_tensor(
+                    fitted.reshape(-1, 2), dtype=torch.float, device=dev
+                )
+                meas_clean = measured.copy()
+                meas_clean[~roi] = fitted[~roi]  # residual := 0 outside the ROI
+                com_model.origin_measured = torch.as_tensor(
+                    meas_clean.reshape(-1, 2), dtype=torch.float, device=dev
+                )
 
             if estimate_detector_rotation:
                 com_model.estimate_detector_rotation()
@@ -968,6 +990,47 @@ class BraggPeaksPolymer(AutoSerialize):
                 print(f"  sampling       {self.sampling_inv_A:.5g} 1/A per pixel")
 
         return results
+
+    def _fit_origin_roi(self, measured, mask, fit_method="plane", clip_sigma=5.0, n_iter=2):
+        """Fit the smooth CoM-origin background over the ROI (scan mask) only.
+
+        ``measured`` is the per-pattern CoM origin ``(Ry, Rx, 2)``; ``mask`` is the
+        ``(Ry, Rx)`` scan ROI. Fitting over the whole scan lets out-of-ROI patterns
+        (vacuum/substrate, whose CoM is meaningless) drag the plane, leaving a uniform
+        residual inside the ROI. Each component is fit independently: ``"plane"`` does an
+        ordinary least-squares ``z = a + b*row + c*col`` with ``n_iter`` sigma-clip passes
+        to reject hot/dead-pixel CoM outliers; ``"constant"`` uses the ROI mean. Returns
+        the fitted field ``(Ry, Rx, 2)`` evaluated at every scan position.
+        """
+        measured = np.asarray(measured, dtype=float)
+        Ry, Rx, ncomp = measured.shape
+        m0 = np.asarray(mask, dtype=bool)
+        yy, xx = np.mgrid[0:Ry, 0:Rx].astype(float)
+        fitted = np.empty_like(measured)
+        for c in range(ncomp):
+            z = measured[..., c]
+            if fit_method == "constant":
+                ref = z[m0] if m0.any() else z
+                fitted[..., c] = float(np.nanmean(ref))
+                continue
+            use = m0 & np.isfinite(z)
+            plane = np.full((Ry, Rx), float(np.nanmean(z[use])) if use.any() else 0.0)
+            for _ in range(max(1, n_iter)):
+                if int(use.sum()) < 3:
+                    break
+                A = np.stack([np.ones(int(use.sum())), xx[use], yy[use]], axis=1)
+                coef, *_ = np.linalg.lstsq(A, z[use], rcond=None)
+                plane = coef[0] + coef[1] * xx + coef[2] * yy
+                resid = z - plane
+                s = float(np.std(resid[use]))
+                if s == 0:
+                    break
+                new_use = m0 & np.isfinite(z) & (np.abs(resid) < clip_sigma * s)
+                if int(new_use.sum()) == int(use.sum()) or int(new_use.sum()) < 8:
+                    break
+                use = new_use
+            fitted[..., c] = plane
+        return fitted
 
     def _centered_dp_mean(self, image_centers, com_model=None):
         """Mean diffraction pattern with every pattern shifted so its central beam
