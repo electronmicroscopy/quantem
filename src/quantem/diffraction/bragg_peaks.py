@@ -978,17 +978,21 @@ class BraggPeaksPolymer(AutoSerialize):
         central beam. Aligning each pattern first yields a sharp, concentric ring.
 
         When a fitted ``CenterOfMassOriginModel`` is available (the default path, which
-        also produces the descan estimate) each pattern is integer-rolled so its fitted
-        origin lands on the detector center and the mean is accumulated in batches, all
-        on-device. Otherwise we fall back to translating the plain mean DP by the average
-        center offset: enough to put the beam at the detector center, though it cannot
-        undo per-pattern drift without the CoM model.
+        also produces the descan estimate) each pattern is SUB-PIXEL shifted (bilinear)
+        so its fitted origin lands exactly on the detector center, and the mean is
+        accumulated in batches, all on-device. Otherwise we fall back to translating the
+        plain mean DP by the average center offset: enough to put the beam at the detector
+        center, though it cannot undo per-pattern drift without the CoM model.
+
+        Sub-pixel matters: plain integer rolls leave a per-pattern residual of up to 0.5 px
+        that does NOT average out when the origin spread is narrow (all patterns round to
+        the same integer), so the mean beam ends up biased off-center by a fraction of a
+        pixel. Bilinear splatting removes that bias.
 
         We deliberately avoid ``CenterOfMassOriginModel.shift_origin_to`` here: it
         materialises a full second copy of the 4D stack *plus* a per-pattern sampling
-        grid, which OOMs on large scans. Integer rolls (whose sub-pixel error averages
-        out over thousands of patterns, leaving the ellipse fit unaffected) need only a
-        ``(Qy, Qx)`` accumulator plus one batch of patterns at a time.
+        grid, which OOMs on large scans. The bilinear accumulator needs only a
+        ``(Qy, Qx)`` buffer plus one batch of patterns at a time.
         """
         Qy, Qx = self._dataset_cartesian.shape[-2:]
         center = ((Qy - 1) / 2.0, (Qx - 1) / 2.0)
@@ -999,29 +1003,51 @@ class BraggPeaksPolymer(AutoSerialize):
                 flat = com_model.tensor.reshape(-1, Qy, Qx)
                 n = int(flat.shape[0])
                 coord = torch.tensor(center, dtype=torch.float, device=flat.device)
-                # roll shift that moves each fitted origin -> detector center, (y, x)
-                shifts = torch.round(coord - com_model.origin_fitted.to(flat.device)).long()
+                # continuous shift moving each fitted origin -> detector center, (y, x),
+                # split into integer floor + fractional part for bilinear splatting.
+                shift = coord - com_model.origin_fitted.to(flat.device).float()  # (n, 2)
+                floor = torch.floor(shift)
+                frac = shift - floor
+                floor = floor.long()
                 acc = torch.zeros((Qy, Qx), dtype=torch.float32, device=flat.device)
                 batch = 256
                 for start in range(0, n, batch):
                     stop = min(start + batch, n)
-                    chunk = flat[start:stop].float()
-                    # Descan drift is smooth, so a batch holds only a few distinct
-                    # integer shifts: sum each group once, then roll the 2D sum.
-                    uniq, inv = torch.unique(shifts[start:stop], dim=0, return_inverse=True)
+                    chunk = flat[start:stop].float()          # (b, Qy, Qx)
+                    fb = floor[start:stop]                     # (b, 2) integer floor shift
+                    gy = frac[start:stop, 0]
+                    gx = frac[start:stop, 1]
+                    # bilinear weights for the 4 integer-shift corners around the fraction
+                    corner_w = {
+                        (0, 0): (1 - gy) * (1 - gx),
+                        (0, 1): (1 - gy) * gx,
+                        (1, 0): gy * (1 - gx),
+                        (1, 1): gy * gx,
+                    }
+                    # Descan drift is smooth, so a batch holds only a few distinct floor
+                    # shifts: for each group, weight-sum then roll each of the 4 corners.
+                    uniq, inv = torch.unique(fb, dim=0, return_inverse=True)
                     for k in range(int(uniq.shape[0])):
-                        s = chunk[inv == k].sum(0)
-                        acc += torch.roll(
-                            s, shifts=(int(uniq[k, 0]), int(uniq[k, 1])), dims=(0, 1)
-                        )
+                        m = inv == k
+                        cg = chunk[m]                          # (g, Qy, Qx)
+                        fy = int(uniq[k, 0])
+                        fx = int(uniq[k, 1])
+                        for (dy, dx), wt in corner_w.items():
+                            s = (cg * wt[m][:, None, None]).sum(0)
+                            acc += torch.roll(s, shifts=(fy + dy, fx + dx), dims=(0, 1))
                 dp = (acc / max(n, 1)).detach().cpu().numpy()
             return np.asarray(dp, dtype=float)
         # Fallback: translate the raw mean DP so the average beam center is centered.
+        # image_centers is 0 outside the scan mask (find_central_beams_4d), so average
+        # over valid (non-zero) positions only to avoid a bias toward the origin.
         from scipy.ndimage import shift as ndi_shift
 
         dp = np.asarray(self._dataset_cartesian.get_dp_mean().array, dtype=float)
-        dy = center[0] - float(np.mean(image_centers[0]))
-        dx = center[1] - float(np.mean(image_centers[1]))
+        valid = (image_centers[0] != 0) | (image_centers[1] != 0)
+        if not valid.any():
+            valid = np.ones_like(image_centers[0], dtype=bool)
+        dy = center[0] - float(image_centers[0][valid].mean())
+        dx = center[1] - float(image_centers[1][valid].mean())
         return ndi_shift(dp, (dy, dx), order=1, mode="constant", cval=0.0)
 
     def _fit_ellipse_from_ring(
