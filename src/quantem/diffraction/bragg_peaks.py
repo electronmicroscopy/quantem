@@ -430,6 +430,71 @@ def _plot_bragg_peaks_on_ax(
             )
 
 
+def _draw_peaks_data_circles(
+    ax,
+    peaks_x,
+    peaks_y,
+    peak_intensities,
+    central_idx,
+    center,
+    *,
+    marker_scaled=True,
+    marker_size=8.0,
+    marker_size_min=4.0,
+    marker_size_max=16.0,
+    selected_peak_color="red",
+    central_beam_color="red",
+    show_central_beam=True,
+    central_size=5.0,
+    peak_linewidth=2.0,
+    central_linewidth=1.5,
+):
+    """Draw Bragg-peak markers as circles in DATA coordinates (radius in detector
+    pixels).
+
+    Unlike ``_plot_bragg_peaks_on_ax`` (which sizes markers in fixed points**2, so they
+    do not track the figure size), these circles are in data units and therefore cover a
+    constant fraction of the diffraction pattern at any panel size -- matching the widget
+    canvas, where the overlay sizes markers in data pixels scaled to the display (js
+    ``drawDot`` / peak rings). Open circles for detected peaks (skipping the central-beam
+    peak) plus a filled dot at the calibrated beam ``center`` (row, col).
+    """
+    from matplotlib.patches import Circle
+
+    if _has_peak_positions(peaks_x, peaks_y):
+        px = np.asarray(peaks_x)
+        py = np.asarray(peaks_y)
+        idxs = [
+            i for i in range(len(px))
+            if i != central_idx and np.isfinite(px[i]) and np.isfinite(py[i])
+        ]
+        ints = None if peak_intensities is None else np.asarray(peak_intensities, dtype=float)
+        use_scaled = marker_scaled and ints is not None and len(idxs) > 0
+        if use_scaled:
+            vals = ints[idxs]
+            imin, imax = float(np.nanmin(vals)), float(np.nanmax(vals))
+            rng = (imax - imin) if imax > imin else 1.0
+        for i in idxs:
+            if use_scaled:
+                norm = (ints[i] - imin) / rng
+                if not np.isfinite(norm):
+                    norm = 0.5
+                r = marker_size_min + norm * (marker_size_max - marker_size_min)
+            else:
+                r = marker_size
+            ax.add_patch(Circle(
+                (px[i], py[i]), radius=r, fill=False,
+                edgecolor=selected_peak_color, linewidth=peak_linewidth, zorder=5,
+            ))
+
+    if show_central_beam and center is not None:
+        cy, cx = center
+        ax.add_patch(Circle(
+            (cx, cy), radius=central_size, facecolor=central_beam_color,
+            edgecolor="k", linewidth=central_linewidth, zorder=10,
+        ))
+
+
 # TODO: Likely dataset4dSTEM rather than dataset4d input class
 # Bragg peaks from crystalline vs polymer
 # 
@@ -706,27 +771,30 @@ class BraggPeaksPolymer(AutoSerialize):
         ``process_polar(center_ellipse_params=bp.ellipse_params)`` and the cached
         ``image_centers`` will be reused.
 
-        Steps performed (each individually toggleable):
+        Steps performed (each individually toggleable). Order matters: centering runs
+        first so the ellipse is measured on an already-centered mean DP -- fitting the
+        ellipse on the raw mean DP smears the ring by the descan drift and biases the
+        fit toward the central beam.
 
-        1. **Mean diffraction pattern** -- ``dataset_cartesian.get_dp_mean()`` as the
-           reference image for ellipse fitting.
-        2. **Ellipticity** (``fit_ellipse``) -- ``fit_probe_ellipse`` on the mean DP,
-           stored as ``self.ellipse_params = (a, b, theta_deg)`` and (optionally) into
-           ``dataset_cartesian.metadata["ellipticity"]``.
-        3. **Descan / detector rotation** (``estimate_descan`` /
+        1. **Descan / detector rotation** (``estimate_descan`` /
            ``estimate_detector_rotation``) -- a ``CenterOfMassOriginModel`` measures the
            per-pattern centre of mass, fits a smooth background across scan positions
            (``descan_fit_method``), and estimates the r->q detector rotation + transpose.
            Results are cached on ``self.descan_origin`` (2, Ry, Rx),
            ``self.detector_rotation_deg``, ``self.detector_transpose`` and (optionally)
            ``dataset_cartesian.metadata["r_to_q_rotation_cw_deg"]``.
-        4. **Image centers** -- ``self.image_centers`` (2, Ry, Rx), the per-pattern
+        2. **Image centers** -- ``self.image_centers`` (2, Ry, Rx), the per-pattern
            origins consumed by the polar transforms. ``center_source`` selects the
            estimator: ``"descent"`` / ``"grid"`` / ``"peaks"`` use
            ``find_central_beams_4d`` (angular-uniformity, the pipeline default),
            ``"com"`` uses the raw centre of mass, ``"descan"`` uses the plane-fitted
            (descanned) origin field.
-        5. **Reciprocal sampling** -- caches ``self.sampling_inv_A`` via
+        3. **Ellipticity** (``fit_ellipse``), fit LAST -- ``fit_probe_ellipse`` on a
+           *centered* mean DP (each pattern shifted so its central beam sits at the
+           detector center, then averaged; see ``_centered_dp_mean``), stored as
+           ``self.ellipse_params = (a, b, theta_deg)`` and (optionally) into
+           ``dataset_cartesian.metadata["ellipticity"]``.
+        4. **Reciprocal sampling** -- caches ``self.sampling_inv_A`` via
            ``pixels_to_inv_A`` (accepts ``accelerating_voltage_kv`` for mrad detectors).
 
         Parameters
@@ -780,29 +848,14 @@ class BraggPeaksPolymer(AutoSerialize):
 
         results: dict = {}
 
-        # 1. Reference mean diffraction pattern.
-        dp_mean = np.asarray(self._dataset_cartesian.get_dp_mean().array, dtype=float)
-
-        # 2. Ellipticity from the mean DP -> (a, b, theta_deg).
-        self.ellipse_params = None
-        if fit_ellipse:
-            from quantem.core.utils.diffractive_imaging_utils import fit_probe_ellipse
-
-            yc, xc, a_axis, b_axis, theta_rad = fit_probe_ellipse(
-                dp_mean, threshold=ellipse_threshold, show=show
-            )
-            self.ellipse_params = (float(a_axis), float(b_axis), float(np.degrees(theta_rad)))
-            self.ellipse_center = (float(yc), float(xc))
-            results["ellipse_params"] = self.ellipse_params
-            results["ellipse_center"] = self.ellipse_center
-            if store_metadata:
-                self._dataset_cartesian.metadata["ellipticity"] = self.ellipse_params
-
-        # 3. Descan (CoM + background fit) and detector rotation.
+        # 1. Descan (CoM + background fit) and detector rotation come FIRST: the
+        #    per-pattern central-beam CoM and its smooth drift model are what let us
+        #    build a properly centered mean DP for the ellipse fit in step 3.
         self.descan_origin = None
         self.origin_com_measured = None
         self.detector_rotation_deg = None
         self.detector_transpose = None
+        com_model = None
         if need_com:
             from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
 
@@ -832,12 +885,14 @@ class BraggPeaksPolymer(AutoSerialize):
                         self.detector_rotation_deg
                     )
 
-        # 4. Per-pattern image centers consumed by the polar transforms.
+        # 2. Per-pattern image centers consumed by the polar transforms. Centering
+        #    runs BEFORE the ellipse fit (ellipse_params intentionally None here) so
+        #    the ellipse is measured on an already-centered mean DP, not the reverse.
         if center_source in ("descent", "grid", "peaks"):
             self.image_centers = self.find_central_beams_4d(
                 scan_mask=scan_mask,
                 center_method=center_source,
-                ellipse_params=self.ellipse_params,
+                ellipse_params=None,
                 center_device=center_device,
             )
         elif center_source == "com":
@@ -846,7 +901,25 @@ class BraggPeaksPolymer(AutoSerialize):
             self.image_centers = self.descan_origin.copy()
         results["image_centers"] = self.image_centers
 
-        # 5. Reciprocal-space sampling (pixels -> 1/A).
+        # 3. Ellipticity LAST, fit on a mean DP that has been centered so the central
+        #    beam sits at the detector center and the diffraction ring is concentric.
+        self.ellipse_params = None
+        self.ellipse_center = None
+        if fit_ellipse:
+            from quantem.core.utils.diffractive_imaging_utils import fit_probe_ellipse
+
+            dp_mean = self._centered_dp_mean(self.image_centers, com_model=com_model)
+            yc, xc, a_axis, b_axis, theta_rad = fit_probe_ellipse(
+                dp_mean, threshold=ellipse_threshold, show=show
+            )
+            self.ellipse_params = (float(a_axis), float(b_axis), float(np.degrees(theta_rad)))
+            self.ellipse_center = (float(yc), float(xc))
+            results["ellipse_params"] = self.ellipse_params
+            results["ellipse_center"] = self.ellipse_center
+            if store_metadata:
+                self._dataset_cartesian.metadata["ellipticity"] = self.ellipse_params
+
+        # 4. Reciprocal-space sampling (pixels -> 1/A).
         try:
             self.sampling_inv_A = float(self.pixels_to_inv_A(accelerating_voltage_kv))
             results["sampling_inv_A"] = self.sampling_inv_A
@@ -872,6 +945,61 @@ class BraggPeaksPolymer(AutoSerialize):
                 print(f"  sampling       {self.sampling_inv_A:.5g} 1/A per pixel")
 
         return results
+
+    def _centered_dp_mean(self, image_centers, com_model=None):
+        """Mean diffraction pattern with every pattern shifted so its central beam
+        lands at the detector center.
+
+        Averaging the raw patterns smears the diffraction ring by the descan drift and
+        leaves the central beam off-center, which biases an ellipse fit toward the
+        central beam. Aligning each pattern first yields a sharp, concentric ring.
+
+        When a fitted ``CenterOfMassOriginModel`` is available (the default path, which
+        also produces the descan estimate) each pattern is integer-rolled so its fitted
+        origin lands on the detector center and the mean is accumulated in batches, all
+        on-device. Otherwise we fall back to translating the plain mean DP by the average
+        center offset: enough to put the beam at the detector center, though it cannot
+        undo per-pattern drift without the CoM model.
+
+        We deliberately avoid ``CenterOfMassOriginModel.shift_origin_to`` here: it
+        materialises a full second copy of the 4D stack *plus* a per-pattern sampling
+        grid, which OOMs on large scans. Integer rolls (whose sub-pixel error averages
+        out over thousands of patterns, leaving the ellipse fit unaffected) need only a
+        ``(Qy, Qx)`` accumulator plus one batch of patterns at a time.
+        """
+        Qy, Qx = self._dataset_cartesian.shape[-2:]
+        center = ((Qy - 1) / 2.0, (Qx - 1) / 2.0)
+        if com_model is not None and getattr(com_model, "origin_fitted", None) is not None:
+            import torch
+
+            with torch.no_grad():
+                flat = com_model.tensor.reshape(-1, Qy, Qx)
+                n = int(flat.shape[0])
+                coord = torch.tensor(center, dtype=torch.float, device=flat.device)
+                # roll shift that moves each fitted origin -> detector center, (y, x)
+                shifts = torch.round(coord - com_model.origin_fitted.to(flat.device)).long()
+                acc = torch.zeros((Qy, Qx), dtype=torch.float32, device=flat.device)
+                batch = 256
+                for start in range(0, n, batch):
+                    stop = min(start + batch, n)
+                    chunk = flat[start:stop].float()
+                    # Descan drift is smooth, so a batch holds only a few distinct
+                    # integer shifts: sum each group once, then roll the 2D sum.
+                    uniq, inv = torch.unique(shifts[start:stop], dim=0, return_inverse=True)
+                    for k in range(int(uniq.shape[0])):
+                        s = chunk[inv == k].sum(0)
+                        acc += torch.roll(
+                            s, shifts=(int(uniq[k, 0]), int(uniq[k, 1])), dims=(0, 1)
+                        )
+                dp = (acc / max(n, 1)).detach().cpu().numpy()
+            return np.asarray(dp, dtype=float)
+        # Fallback: translate the raw mean DP so the average beam center is centered.
+        from scipy.ndimage import shift as ndi_shift
+
+        dp = np.asarray(self._dataset_cartesian.get_dp_mean().array, dtype=float)
+        dy = center[0] - float(np.mean(image_centers[0]))
+        dx = center[1] - float(np.mean(image_centers[1]))
+        return ndi_shift(dp, (dy, dx), order=1, mode="constant", cval=0.0)
 
     def resize_data(self, device:str = "cuda:0"):
         print(device)
