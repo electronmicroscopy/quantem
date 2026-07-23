@@ -1907,8 +1907,19 @@ class BraggPeaksPolymer(AutoSerialize):
         self.peak_coordinates_cartesian = peaks
         self.peak_intensities = intensities
 
+    @staticmethod
+    def _save_object(filepath, obj):
+        # Wrap in a 0-d object array so np.save pickles the WHOLE object. A canon Vector is
+        # array-like, so np.save(vector) would otherwise flatten it to an (Ry, Rx) object
+        # array of cells that loses the Vector's fields/units and can't be reconstructed
+        # (breaks polar_transform_peaks, which needs a Vector). The 0-d wrapper round-trips
+        # via the size-1 .item() unwrap in the load_* methods.
+        arr = np.empty((), dtype=object)
+        arr[()] = obj
+        np.save(filepath, arr, allow_pickle=True)
+
     def save_cartesian_peaks(self, filepath):
-        np.save(filepath, self.peak_coordinates_cartesian)
+        self._save_object(filepath, self.peak_coordinates_cartesian)
 
     def load_cartesian_peaks(self, filepath):
         peak_coordinates_cartesian = np.load(filepath, allow_pickle=True)
@@ -1917,10 +1928,10 @@ class BraggPeaksPolymer(AutoSerialize):
         self.peak_coordinates_cartesian = peak_coordinates_cartesian
     
     def save_polar_peaks(self, filepath):
-        np.save(filepath, self.polar_peaks)
+        self._save_object(filepath, self.polar_peaks)
 
     def save_polar_data(self, filepath):
-        np.save(filepath, self.polar_data)
+        self._save_object(filepath, self.polar_data)
 
     def load_polar_peaks(self, filepath):
         polar_peaks = np.load(filepath, allow_pickle=True)
@@ -1941,7 +1952,7 @@ class BraggPeaksPolymer(AutoSerialize):
         self.num_annular_bins = int(r_grid.shape[1])
 
     def save_peak_intensities(self, filepath):
-        np.save(filepath, self.peak_intensities)
+        self._save_object(filepath, self.peak_intensities)
 
     def load_peak_intensities(self, filepath):
         peak_intensities = np.load(filepath, allow_pickle=True)
