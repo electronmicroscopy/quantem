@@ -471,6 +471,15 @@ class BraggPeaksPolymer(AutoSerialize):
         self.peak_coordinates_cartesian = None
         self.peak_intensities = None
         self.image_centers = None
+        # Calibration parameters cached by preprocess() (lazy: applied downstream by
+        # the polar transforms, the raw 4D data is left untouched).
+        self.ellipse_params = None          # (a, b, theta_deg)
+        self.ellipse_center = None          # (row, col) of the mean-DP ellipse fit
+        self.descan_origin = None           # (2, Ry, Rx) plane-fitted CoM background
+        self.origin_com_measured = None     # (2, Ry, Rx) raw per-pattern CoM
+        self.detector_rotation_deg = None   # r->q rotation (clockwise, degrees)
+        self.detector_transpose = None      # detector transpose flag
+        self.sampling_inv_A = None          # detector-pixel sampling in 1/A
         self.polar_data = None
         self.polar_peaks = None
         self.max_radius = None
@@ -670,9 +679,199 @@ class BraggPeaksPolymer(AutoSerialize):
         )
         return sampling * sampling_angstrom_conversion_factor
     
-    def preprocess(self):
-        print(self.device)
-        # self.resize_data(device=self.device)
+    def preprocess(
+        self,
+        accelerating_voltage_kv: float | None = None,
+        *,
+        center_source: str = "descent",
+        fit_ellipse: bool = True,
+        ellipse_threshold: float | None = None,
+        estimate_descan: bool = True,
+        descan_fit_method: str = "plane",
+        estimate_detector_rotation: bool = True,
+        scan_mask: ArrayLike = None,
+        center_device: str | None = None,
+        com_device: str | None = None,
+        com_batch_size: int | None = None,
+        store_metadata: bool = True,
+        show: bool = False,
+        verbose: bool = True,
+    ):
+        """Calibrate the 4D-STEM scan (centers, ellipticity, descan, detector rotation).
+
+        This mirrors the lazy design of the rest of the class: it *measures and caches*
+        calibration parameters rather than re-warping the raw diffraction data (the ML
+        peak-finder runs on raw patterns; centers/ellipticity are applied downstream by
+        ``process_polar`` / the polar transforms). After ``preprocess`` you can call
+        ``process_polar(center_ellipse_params=bp.ellipse_params)`` and the cached
+        ``image_centers`` will be reused.
+
+        Steps performed (each individually toggleable):
+
+        1. **Mean diffraction pattern** -- ``dataset_cartesian.get_dp_mean()`` as the
+           reference image for ellipse fitting.
+        2. **Ellipticity** (``fit_ellipse``) -- ``fit_probe_ellipse`` on the mean DP,
+           stored as ``self.ellipse_params = (a, b, theta_deg)`` and (optionally) into
+           ``dataset_cartesian.metadata["ellipticity"]``.
+        3. **Descan / detector rotation** (``estimate_descan`` /
+           ``estimate_detector_rotation``) -- a ``CenterOfMassOriginModel`` measures the
+           per-pattern centre of mass, fits a smooth background across scan positions
+           (``descan_fit_method``), and estimates the r->q detector rotation + transpose.
+           Results are cached on ``self.descan_origin`` (2, Ry, Rx),
+           ``self.detector_rotation_deg``, ``self.detector_transpose`` and (optionally)
+           ``dataset_cartesian.metadata["r_to_q_rotation_cw_deg"]``.
+        4. **Image centers** -- ``self.image_centers`` (2, Ry, Rx), the per-pattern
+           origins consumed by the polar transforms. ``center_source`` selects the
+           estimator: ``"descent"`` / ``"grid"`` / ``"peaks"`` use
+           ``find_central_beams_4d`` (angular-uniformity, the pipeline default),
+           ``"com"`` uses the raw centre of mass, ``"descan"`` uses the plane-fitted
+           (descanned) origin field.
+        5. **Reciprocal sampling** -- caches ``self.sampling_inv_A`` via
+           ``pixels_to_inv_A`` (accepts ``accelerating_voltage_kv`` for mrad detectors).
+
+        Parameters
+        ----------
+        accelerating_voltage_kv : float, optional
+            Beam voltage for mrad->1/A conversion (see ``pixels_to_inv_A``).
+        center_source : {"descent", "grid", "peaks", "com", "descan"}
+            Estimator backing ``self.image_centers``. Default "descent".
+        fit_ellipse : bool
+            Fit ellipticity from the mean DP. Default True.
+        ellipse_threshold : float, optional
+            Binarisation threshold for ``fit_probe_ellipse`` (Otsu if None).
+        estimate_descan : bool
+            Run the CoM + background-fit descan estimate. Default True.
+        descan_fit_method : {"plane", "constant"}
+            Background model for the descan fit. Default "plane".
+        estimate_detector_rotation : bool
+            Estimate the r->q detector rotation + transpose (requires the CoM model,
+            so it forces ``estimate_descan``). Default True.
+        scan_mask : ArrayLike, optional
+            Boolean (Ry, Rx) ROI passed to ``find_central_beams_4d``.
+        center_device, com_device : str, optional
+            Device overrides for the angular-uniformity finder and the CoM model
+            respectively (both default to ``self.device``). Note the CoM model loads
+            the whole 4D tensor onto its device at once.
+        com_batch_size : int, optional
+            Batch size for the CoM origin calculation (whole scan if None).
+        store_metadata : bool
+            Write ellipticity / rotation into ``dataset_cartesian.metadata``. Default True.
+        show : bool
+            Show the ellipse-fit overlay. Default False.
+        verbose : bool
+            Print a short calibration summary. Default True.
+
+        Returns
+        -------
+        dict
+            The calibration parameters that were computed.
+        """
+        center_source = center_source.lower()
+        valid_sources = ("descent", "grid", "peaks", "com", "descan")
+        if center_source not in valid_sources:
+            raise ValueError(f"center_source must be one of {valid_sources}, got {center_source!r}")
+
+        Ry, Rx, Qy, Qx = self._dataset_cartesian.shape
+        need_com = (
+            estimate_descan
+            or estimate_detector_rotation
+            or center_source in ("com", "descan")
+        )
+
+        results: dict = {}
+
+        # 1. Reference mean diffraction pattern.
+        dp_mean = np.asarray(self._dataset_cartesian.get_dp_mean().array, dtype=float)
+
+        # 2. Ellipticity from the mean DP -> (a, b, theta_deg).
+        self.ellipse_params = None
+        if fit_ellipse:
+            from quantem.core.utils.diffractive_imaging_utils import fit_probe_ellipse
+
+            yc, xc, a_axis, b_axis, theta_rad = fit_probe_ellipse(
+                dp_mean, threshold=ellipse_threshold, show=show
+            )
+            self.ellipse_params = (float(a_axis), float(b_axis), float(np.degrees(theta_rad)))
+            self.ellipse_center = (float(yc), float(xc))
+            results["ellipse_params"] = self.ellipse_params
+            results["ellipse_center"] = self.ellipse_center
+            if store_metadata:
+                self._dataset_cartesian.metadata["ellipticity"] = self.ellipse_params
+
+        # 3. Descan (CoM + background fit) and detector rotation.
+        self.descan_origin = None
+        self.origin_com_measured = None
+        self.detector_rotation_deg = None
+        self.detector_transpose = None
+        if need_com:
+            from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
+
+            com_dev = com_device if com_device is not None else self.device
+            com_model = CenterOfMassOriginModel.from_dataset(
+                self._dataset_cartesian, device=com_dev
+            )
+            com_model.calculate_origin(max_batch_size=com_batch_size)
+            measured = com_model.origin_measured.detach().cpu().numpy().reshape(Ry, Rx, 2)
+            self.origin_com_measured = np.moveaxis(measured, -1, 0)  # (2, Ry, Rx)
+            results["origin_com_measured"] = self.origin_com_measured
+
+            if estimate_descan or estimate_detector_rotation or center_source == "descan":
+                com_model.fit_origin_background(fit_method=descan_fit_method)
+                fitted = com_model.origin_fitted.detach().cpu().numpy().reshape(Ry, Rx, 2)
+                self.descan_origin = np.moveaxis(fitted, -1, 0)  # (2, Ry, Rx)
+                results["descan_origin"] = self.descan_origin
+
+            if estimate_detector_rotation:
+                com_model.estimate_detector_rotation()
+                self.detector_rotation_deg = float(com_model.detector_rotation_deg)
+                self.detector_transpose = bool(com_model.detector_transpose)
+                results["detector_rotation_deg"] = self.detector_rotation_deg
+                results["detector_transpose"] = self.detector_transpose
+                if store_metadata:
+                    self._dataset_cartesian.metadata["r_to_q_rotation_cw_deg"] = (
+                        self.detector_rotation_deg
+                    )
+
+        # 4. Per-pattern image centers consumed by the polar transforms.
+        if center_source in ("descent", "grid", "peaks"):
+            self.image_centers = self.find_central_beams_4d(
+                scan_mask=scan_mask,
+                center_method=center_source,
+                ellipse_params=self.ellipse_params,
+                center_device=center_device,
+            )
+        elif center_source == "com":
+            self.image_centers = self.origin_com_measured.copy()
+        else:  # "descan"
+            self.image_centers = self.descan_origin.copy()
+        results["image_centers"] = self.image_centers
+
+        # 5. Reciprocal-space sampling (pixels -> 1/A).
+        try:
+            self.sampling_inv_A = float(self.pixels_to_inv_A(accelerating_voltage_kv))
+            results["sampling_inv_A"] = self.sampling_inv_A
+        except Exception as exc:  # calibration/units may be unavailable
+            self.sampling_inv_A = None
+            if verbose:
+                print(f"preprocess: reciprocal calibration skipped ({exc})")
+
+        if verbose:
+            print(f"preprocess: device={self.device}, scan=({Ry}, {Rx}), detector=({Qy}, {Qx})")
+            print(f"  image_centers  <- {center_source}  shape {self.image_centers.shape}")
+            if self.ellipse_params is not None:
+                a, b, th = self.ellipse_params
+                print(f"  ellipticity    a={a:.3f} b={b:.3f} theta={th:.2f} deg (a/b={a / b:.4f})")
+            if self.descan_origin is not None:
+                print(f"  descan         {descan_fit_method}-fit CoM background")
+            if self.detector_rotation_deg is not None:
+                print(
+                    f"  r->q rotation  {self.detector_rotation_deg:.2f} deg "
+                    f"(transpose={self.detector_transpose})"
+                )
+            if self.sampling_inv_A is not None:
+                print(f"  sampling       {self.sampling_inv_A:.5g} 1/A per pixel")
+
+        return results
 
     def resize_data(self, device:str = "cuda:0"):
         print(device)
