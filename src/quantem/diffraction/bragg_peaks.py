@@ -3739,6 +3739,227 @@ class BraggPeaksPolymer(AutoSerialize):
             plt.close(fig_polar)
             print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_polar.pdf')
     
+    def save_peak_animation(
+        self,
+        path,
+        *,
+        region=None,
+        step=1,
+        bidirectional=True,
+        fps=10,
+        intensity_map=None,
+        map_title="",
+        map_cmap="viridis",
+        crosshair_color="r",
+        crosshair_size=80,
+        crosshair_width=2,
+        dp_cmap="gray",
+        vmin_cartesian=0,
+        vmax_cartesian=7,
+        norm_upper_quantile=None,
+        norm_power=1.0,
+        gaussian_filter_sigma=None,
+        zoom=1,
+        show_peaks=True,
+        selected_peak_color="red",
+        central_beam_color="red",
+        show_central_beam=True,
+        peak_intensity_mode="size",
+        peak_size_range=(30, 300),
+        peak_marker_size=None,
+        crosshair_width_peaks=2,
+        crosshair_scaling_central_beam=1,
+        peak_alpha=1.0,
+        central_linewidth=None,
+        intensity_field="intensities",
+        live_inference=False,
+        infer_device=None,
+        sigma_peak_blur=1.0,
+        threshold_peak=0.5,
+        figsize=(10, 5),
+        dpi=100,
+        progress=True,
+    ):
+        """Render a snaking-cursor animation to an animated GIF.
+
+        Walks a boustrophedon (snake) path over the scan and, for each position,
+        renders one combined frame: the real-space intensity map with a cursor
+        crosshair at the current position (left) beside that position's diffraction
+        pattern with detected Bragg peaks overlaid (right). Frames are assembled into
+        a looping GIF. This reuses the same rendering primitives as
+        :meth:`save_peak_figures` so frames match the per-position saved figures.
+
+        Parameters
+        ----------
+        path : str | pathlib.Path
+            Output ``.gif`` path.
+        region : tuple[int, int, int, int] | None
+            ``(ry0, ry1, rx0, rx1)`` half-open scan bounds to snake over; ``None``
+            covers the whole scan.
+        step : int
+            Stride between visited positions (>= 1).
+        bidirectional : bool
+            Snake/boustrophedon path (alternate row direction). ``False`` scans every
+            row left->right.
+        fps : float
+            Playback frames per second.
+        intensity_map : np.ndarray | None
+            Real-space map to display (computed once). ``None`` uses the mean-intensity
+            virtual image. May be scalar ``(H, W)`` or RGB ``(H, W, 3|4)``.
+        live_inference : bool
+            Run the model per position via :meth:`infer_peaks_single` instead of reading
+            precomputed ``peak_coordinates_cartesian`` (slow over large regions).
+
+        Returns
+        -------
+        pathlib.Path
+            The written GIF path.
+        """
+        from PIL import Image
+
+        Ry, Rx = int(self.dataset_cartesian.shape[0]), int(self.dataset_cartesian.shape[1])
+
+        # Resolve the real-space map ONCE; _mean_intensity_map rescans every DP, so
+        # rebuilding it per frame would be quadratic in scan size.
+        intensity_map, upsample_factor = _resolve_intensity_map(
+            self.dataset_cartesian, intensity_map, (Ry, Rx), validate=False,
+        )
+        is_rgb_map, map_vmin, map_vmax = _intensity_display_limits(intensity_map)
+
+        # Boustrophedon path over the requested region (mirrors Show4DSTEM.raster).
+        if region is None:
+            ry0, ry1, rx0, rx1 = 0, Ry, 0, Rx
+        else:
+            ry0, ry1, rx0, rx1 = region
+            ry0, ry1 = max(0, int(ry0)), min(Ry, int(ry1))
+            rx0, rx1 = max(0, int(rx0)), min(Rx, int(rx1))
+        if ry1 <= ry0 or rx1 <= rx0:
+            raise ValueError(f"Empty region {region!r} for scan shape ({Ry}, {Rx})")
+        step = max(1, int(step))
+        points = []
+        for i, ry in enumerate(range(ry0, ry1, step)):
+            cols = list(range(rx0, rx1, step))
+            if bidirectional and i % 2 == 1:
+                cols = cols[::-1]
+            points.extend((ry, rx) for rx in cols)
+
+        has_precomputed = (not live_inference) and self.peak_coordinates_cartesian is not None
+        has_polar_peaks = getattr(self, "polar_peaks", None) is not None
+
+        fig, (ax_map, ax_dp) = plt.subplots(1, 2, figsize=figsize, dpi=dpi)
+        frames = []
+        try:
+            for ry, rx in tqdm(points, desc="Rendering snake", disable=not progress):
+                dp_data = _normalized_dp(
+                    self.dataset_cartesian, ry, rx,
+                    norm_upper_quantile=norm_upper_quantile, norm_power=norm_power,
+                )
+                if gaussian_filter_sigma is not None:
+                    dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
+
+                peaks_x = peaks_y = peak_ints = peaks_r_invA = None
+                if show_peaks:
+                    if live_inference:
+                        res = self.infer_peaks_single(
+                            ry, rx, device=infer_device,
+                            sigma_peak_blur=sigma_peak_blur, threshold_peak=threshold_peak,
+                        )
+                        peaks_x, peaks_y, peak_ints = (
+                            res["x_pixels"], res["y_pixels"], res["intensities"],
+                        )
+                    elif has_precomputed:
+                        peaks_y = _vector_field_cell(self.peak_coordinates_cartesian, "y_pixels", ry, rx)
+                        peaks_x = _vector_field_cell(self.peak_coordinates_cartesian, "x_pixels", ry, rx)
+                        if self.peak_intensities is not None:
+                            peak_ints = _vector_field_cell(self.peak_intensities, intensity_field, ry, rx)
+                        if has_polar_peaks:
+                            peaks_r_invA = _vector_field_cell(self.polar_peaks, "r_invA", ry, rx)
+
+                center = _display_center(getattr(self, "image_centers", None), ry, rx, dp_data.shape)
+                # _plot_bragg_peaks_on_ax draws no rings when peaks_r_invA is None. When
+                # there is no polar transform, fall back to the pixel radius from center so
+                # the rings still render (r_invA is otherwise only used for radial filtering,
+                # which this call does not use).
+                if peaks_r_invA is None and _has_peak_positions(peaks_x, peaks_y):
+                    peaks_r_invA = np.sqrt(
+                        (np.asarray(peaks_x) - center[1]) ** 2
+                        + (np.asarray(peaks_y) - center[0]) ** 2
+                    )
+                central_idx = _central_peak_index(
+                    peaks_x, peaks_y, peaks_r_invA, center,
+                    max_dist=_central_beam_max_dist(dp_data.shape),
+                )
+                (
+                    dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints,
+                    central_idx, display_center,
+                ) = _zoom_peak_overlay(
+                    dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints,
+                    central_idx, zoom, center,
+                )
+
+                ax_map.clear()
+                ax_dp.clear()
+
+                if is_rgb_map:
+                    ax_map.imshow(intensity_map)
+                elif map_vmin is None:
+                    ax_map.imshow(intensity_map, cmap=map_cmap)
+                else:
+                    ax_map.imshow(intensity_map, cmap=map_cmap, vmin=map_vmin, vmax=map_vmax)
+                ax_map.scatter(
+                    rx * upsample_factor, ry * upsample_factor,
+                    facecolor="none", edgecolor=crosshair_color, marker="o",
+                    s=crosshair_size, linewidth=crosshair_width, zorder=10,
+                )
+                ax_map.set_title(map_title)
+                ax_map.set_xticks([])
+                ax_map.set_yticks([])
+
+                ax_dp.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+                if show_peaks and peaks_x is not None:
+                    _plot_bragg_peaks_on_ax(
+                        ax_dp, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx,
+                        selected_peak_color=selected_peak_color,
+                        central_beam_color=central_beam_color,
+                        peak_intensity_mode=peak_intensity_mode,
+                        peak_size_range=peak_size_range,
+                        peak_marker_size=peak_marker_size,
+                        crosshair_width_peaks=crosshair_width_peaks,
+                        crosshair_scaling_central_beam=crosshair_scaling_central_beam,
+                        peak_alpha=peak_alpha,
+                        central_alpha=peak_alpha,
+                        central_linewidth=(
+                            crosshair_width_peaks if central_linewidth is None else central_linewidth
+                        ),
+                        center=display_center,
+                        show_central_beam=show_central_beam,
+                    )
+                ax_dp.set_xlim(-0.5, dp_data.shape[1] - 0.5)
+                ax_dp.set_ylim(dp_data.shape[0] - 0.5, -0.5)
+                ax_dp.set_xticks([])
+                ax_dp.set_yticks([])
+                ax_dp.set_title(f"Ry={ry}, Rx={rx}")
+
+                fig.canvas.draw()
+                rgba = np.asarray(fig.canvas.buffer_rgba())
+                frames.append(Image.fromarray(rgba[..., :3].copy()))
+        finally:
+            plt.close(fig)
+
+        if not frames:
+            raise ValueError("Snake path is empty; check region / step.")
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        duration_ms = max(10, int(round(1000.0 / max(0.1, fps))))
+        frames[0].save(
+            str(path), save_all=True, append_images=frames[1:],
+            duration=duration_ms, loop=0, optimize=True, disposal=2,
+        )
+        if progress:
+            print(f"✓ Saved {len(frames)}-frame animation: {path.resolve()}")
+        return path
+
     def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,
                                          reference_image=None, overlay_alpha=0.3, crosshair_width=2, crosshair_size=15):
         """
