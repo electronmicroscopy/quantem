@@ -751,6 +751,9 @@ class BraggPeaksPolymer(AutoSerialize):
         center_source: str = "descent",
         fit_ellipse: bool = True,
         ellipse_threshold: float | None = None,
+        ellipse_radial_min: float | None = None,
+        ellipse_radial_max: float | None = None,
+        ellipse_device: str | None = None,
         estimate_descan: bool = True,
         descan_fit_method: str = "plane",
         estimate_detector_rotation: bool = True,
@@ -789,11 +792,18 @@ class BraggPeaksPolymer(AutoSerialize):
            ``find_central_beams_4d`` (angular-uniformity, the pipeline default),
            ``"com"`` uses the raw centre of mass, ``"descan"`` uses the plane-fitted
            (descanned) origin field.
-        3. **Ellipticity** (``fit_ellipse``), fit LAST -- ``fit_probe_ellipse`` on a
-           *centered* mean DP (each pattern shifted so its central beam sits at the
-           detector center, then averaged; see ``_centered_dp_mean``), stored as
+        3. **Ellipticity** (``fit_ellipse``), fit LAST -- a *ring* fit (Karen Ehrhardt's
+           angular-uniformity criterion; see ``_fit_ellipse_from_ring``): on a *centered*
+           mean DP (each pattern shifted so its central beam sits at the detector center,
+           then averaged; see ``_centered_dp_mean``), search ``(b/a, theta)`` to minimise
+           the azimuthal variance of the diffraction-ring annulus. Unlike a probe-blob
+           fit this ignores the central beam entirely, so a smeared/off-center beam does
+           not bias it. The centered mean DP is cached on ``self.dp_mean_centered``;
+           ``ellipse_radial_min`` / ``ellipse_radial_max`` bound the ring band (auto-
+           detected from the radial profile when None). Stored as
            ``self.ellipse_params = (a, b, theta_deg)`` and (optionally) into
-           ``dataset_cartesian.metadata["ellipticity"]``.
+           ``dataset_cartesian.metadata["ellipticity"]``. ``ellipse_threshold`` is kept
+           for backward compatibility but is unused by the ring fit.
         4. **Reciprocal sampling** -- caches ``self.sampling_inv_A`` via
            ``pixels_to_inv_A`` (accepts ``accelerating_voltage_kv`` for mrad detectors).
 
@@ -903,19 +913,32 @@ class BraggPeaksPolymer(AutoSerialize):
 
         # 3. Ellipticity LAST, fit on a mean DP that has been centered so the central
         #    beam sits at the detector center and the diffraction ring is concentric.
+        #    The fit is a ring/angular-variance fit (Karen Ehrhardt criterion), NOT a
+        #    probe-blob fit -- it ignores the central beam entirely.
         self.ellipse_params = None
         self.ellipse_center = None
+        self.dp_mean_centered = None
         if fit_ellipse:
-            from quantem.core.utils.diffractive_imaging_utils import fit_probe_ellipse
-
-            dp_mean = self._centered_dp_mean(self.image_centers, com_model=com_model)
-            yc, xc, a_axis, b_axis, theta_rad = fit_probe_ellipse(
-                dp_mean, threshold=ellipse_threshold, show=show
+            self.dp_mean_centered = self._centered_dp_mean(
+                self.image_centers, com_model=com_model
             )
-            self.ellipse_params = (float(a_axis), float(b_axis), float(np.degrees(theta_rad)))
-            self.ellipse_center = (float(yc), float(xc))
+            Qy, Qx = self._dataset_cartesian.shape[-2:]
+            center = ((Qy - 1) / 2.0, (Qx - 1) / 2.0)  # _centered_dp_mean puts the beam here
+            a_axis, b_axis, theta_deg, ring_band = self._fit_ellipse_from_ring(
+                self.dp_mean_centered,
+                center,
+                radial_min=ellipse_radial_min,
+                radial_max=ellipse_radial_max,
+                device=ellipse_device if ellipse_device is not None else "cpu",
+                show=show,
+                verbose=verbose,
+            )
+            self.ellipse_params = (float(a_axis), float(b_axis), float(theta_deg))
+            self.ellipse_center = (float(center[0]), float(center[1]))
+            self.ellipse_ring_band = ring_band
             results["ellipse_params"] = self.ellipse_params
             results["ellipse_center"] = self.ellipse_center
+            results["ellipse_ring_band"] = ring_band
             if store_metadata:
                 self._dataset_cartesian.metadata["ellipticity"] = self.ellipse_params
 
@@ -1000,6 +1023,174 @@ class BraggPeaksPolymer(AutoSerialize):
         dy = center[0] - float(np.mean(image_centers[0]))
         dx = center[1] - float(np.mean(image_centers[1]))
         return ndi_shift(dp, (dy, dx), order=1, mode="constant", cval=0.0)
+
+    def _fit_ellipse_from_ring(
+        self,
+        dp,
+        center,
+        *,
+        radial_min=None,
+        radial_max=None,
+        radial_step=1.0,
+        num_annular_bins=180,
+        ratio_range=(0.85, 1.18),
+        n_ratio=12,
+        n_theta=24,
+        refine=True,
+        device="cpu",
+        show=False,
+        verbose=False,
+    ):
+        """Fit ring ellipticity ``(a, b, theta_deg)`` by minimising the azimuthal variance
+        of a diffraction-ring annulus at a FIXED center -- Karen Ehrhardt's angular-
+        uniformity criterion (see ``quantem.diffraction.polar_transform``).
+
+        Unlike a probe-blob fit (``fit_probe_ellipse``) this samples an annulus out at the
+        ring radius and never touches the central beam, so a smeared / off-center / doubled
+        central beam does not bias the result. Only the axis ratio ``b/a`` and orientation
+        ``theta`` are identifiable from a single ring, so the returned ``(a, b)`` are
+        normalised to the ring radius (``a ~ R0``); downstream consumers (``polar_transform``
+        / ``find_central_beams_4d``) use only ``b/a`` and ``theta``.
+
+        Parameters
+        ----------
+        dp : ndarray
+            Centered mean diffraction pattern (beam at ``center``).
+        center : (float, float)
+            Fixed origin ``(y, x)`` in detector pixels.
+        radial_min, radial_max : float, optional
+            Ring band in pixels. If either is None the band is auto-detected from the
+            circular radial profile (strongest peak beyond the central beam).
+        ratio_range, n_ratio, n_theta, refine :
+            Coarse grid over ``b/a`` and ``theta`` (degrees), then a local refine pass.
+
+        Returns
+        -------
+        (a, b, theta_deg, (radial_min, radial_max))
+        """
+        from quantem.diffraction.polar_transform import polar_transform
+
+        dp = np.asarray(dp, dtype=float)
+        Qy, Qx = dp.shape
+        origin = np.asarray(center, dtype=float)
+
+        def _polar(ellipse_params, rmin, rmax):
+            # polar_transform returns (n_phi, n_r) when scan_pos is given.
+            return np.asarray(
+                polar_transform(
+                    dp,
+                    origin_array=origin,
+                    ellipse_params=ellipse_params,
+                    num_annular_bins=num_annular_bins,
+                    radial_min=float(rmin),
+                    radial_max=float(rmax),
+                    radial_step=radial_step,
+                    scan_pos=(0, 0),
+                    device=device,
+                    show_progress=False,
+                ),
+                dtype=float,
+            )
+
+        # 1. Auto-detect the ring band if not supplied: circular radial profile, take the
+        #    strongest peak beyond the central beam.
+        r_hi = float(min(Qy, Qx) / 2.0 - 1.0)
+        if radial_min is None or radial_max is None:
+            from scipy.ndimage import uniform_filter1d
+
+            prof = _polar((1.0, 1.0, 0.0), 0.0, r_hi)  # (n_phi, n_r)
+            radial_profile = uniform_filter1d(prof.mean(axis=0), size=5)
+            r_axis = np.arange(radial_profile.size) * radial_step
+            # The central beam is the global max, so we can't just argmax: skip past it to
+            # the first trough (slope turns positive), then take the strongest ring beyond.
+            r_exclude = max(6.0, 0.06 * r_hi)
+            i0 = int(r_exclude / radial_step)
+            slope = np.diff(radial_profile)
+            trough = i0
+            for i in range(i0, slope.size):
+                if slope[i] > 0:
+                    trough = i
+                    break
+            seg = radial_profile.copy()
+            seg[:trough] = -np.inf
+            r0 = float(r_axis[int(np.argmax(seg))])
+            half = max(6.0, 0.20 * r0)  # wide enough that the ring stays in-band as b/a varies
+            if radial_min is None:
+                radial_min = max(r_exclude, r0 - half)
+            if radial_max is None:
+                radial_max = min(r_hi, r0 + half)
+            if verbose:
+                print(
+                    f"  ellipse ring band auto-detected: r0={r0:.1f} px, "
+                    f"band=[{radial_min:.1f}, {radial_max:.1f}] px"
+                )
+
+        def _score(ellipse_params):
+            polar = _polar(ellipse_params, radial_min, radial_max)  # (n_phi, n_r)
+            # normalised azimuthal std summed over the ring band (Ehrhardt criterion):
+            # minimal when the ring is angularly uniform, i.e. the ellipse is corrected.
+            return float(polar.std(axis=0).sum() / (np.abs(polar.mean(axis=0)).sum() + 1e-6))
+
+        def _search(ratios, thetas):
+            best = (np.inf, 1.0, 0.0)
+            for th in thetas:
+                for rat in ratios:
+                    s = _score((1.0, float(rat), float(th)))
+                    if s < best[0]:
+                        best = (s, float(rat), float(th))
+            return best
+
+        # 2. Coarse grid over (b/a, theta), then a local refine around the best.
+        coarse_ratios = np.linspace(ratio_range[0], ratio_range[1], n_ratio)
+        coarse_thetas = np.linspace(0.0, 180.0, n_theta, endpoint=False)
+        best = _search(coarse_ratios, coarse_thetas)
+        if refine:
+            _, rat0, th0 = best
+            dr = (ratio_range[1] - ratio_range[0]) / max(n_ratio - 1, 1)
+            dth = 180.0 / n_theta
+            fine = _search(
+                np.linspace(rat0 - dr, rat0 + dr, 11),
+                np.linspace(th0 - dth, th0 + dth, 11),
+            )
+            best = min(best, fine, key=lambda t: t[0])
+        score, ratio, theta_deg = best
+
+        # 3. Normalise (a, b) to the ring radius; only b/a and theta are identifiable.
+        r0 = 0.5 * (radial_min + radial_max)
+        a_axis, b_axis = r0, r0 * ratio
+        # Canonicalise so a is the MAJOR semi-axis (a/b >= 1): the (a, b, theta) and
+        # (b, a, theta+90) parametrisations describe the same ellipse, so pick the one
+        # with a >= b for an unambiguous a/b >= 1 readout.
+        if b_axis > a_axis:
+            a_axis, b_axis = b_axis, a_axis
+            theta_deg += 90.0
+        theta_deg = float(theta_deg % 180.0)
+        if verbose:
+            print(
+                f"  ellipse ring fit: a/b={a_axis / b_axis:.4f} "
+                f"theta={theta_deg:.2f} deg (score={score:.4g})"
+            )
+
+        if show:
+            import matplotlib.pyplot as plt
+
+            circ = _polar((1.0, 1.0, 0.0), radial_min, radial_max)
+            corr = _polar((a_axis, b_axis, theta_deg), radial_min, radial_max)
+            fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+            axes[0].imshow(dp, cmap="magma")
+            axes[0].plot([origin[1]], [origin[0]], "c+", ms=10)
+            axes[0].set_title("centered mean DP")
+            axes[1].imshow(circ, aspect="auto", cmap="magma")
+            axes[1].set_title("polar: circular (before)")
+            axes[2].imshow(corr, aspect="auto", cmap="magma")
+            axes[2].set_title(f"polar: ellipse-corrected\na/b={a_axis / b_axis:.4f}, θ={theta_deg:.1f}°")
+            for ax in axes[1:]:
+                ax.set_xlabel("radius (band)")
+                ax.set_ylabel("φ bin")
+            plt.tight_layout()
+            plt.show()
+
+        return float(a_axis), float(b_axis), float(theta_deg), (float(radial_min), float(radial_max))
 
     def resize_data(self, device:str = "cuda:0"):
         print(device)
