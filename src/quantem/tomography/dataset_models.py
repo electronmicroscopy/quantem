@@ -169,6 +169,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         AutoSerialize.__init__(self)
@@ -178,7 +179,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
         if not (
-            tilt_stack.shape[0] < tilt_stack.shape[1] or tilt_stack.shape[0] < tilt_stack.shape[2]
+            tilt_stack.shape[0] == tilt_angles.shape[0]
         ):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
@@ -188,7 +189,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_stack = torch.from_numpy(tilt_stack)
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
-        max_val = torch.quantile(tilt_stack, 0.95)
+        if norm_quantile:
+            max_val = torch.quantile(tilt_stack, 0.95)
+        else:
+            max_val = torch.max(tilt_stack)
 
         # Tilt stack normalization
         tilt_stack = tilt_stack / max_val
@@ -221,22 +225,26 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
     ):
         return cls(
             tilt_stack=tilt_stack,
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=cls._token,
         )
 
     # --- Optimization Parameters ---
 
-    def get_optimization_parameters(self) -> list[nn.Parameter]:
+    def get_optimization_parameters(self) -> dict[str, list[torch.Tensor]]:
+        """Single param group keyed by DEFAULT_OPTIMIZER_KEY.
+
+        Hyperparameters are baked by ``set_optimizer``, not here — return only the tensors,
+        matching the ``dict[str, list[tensor]]`` contract the object models use.
         """
-        Get the parameters that should be optimized for this model.
-        """
-        return list(self.parameters())
+        return {self.DEFAULT_OPTIMIZER_KEY: list(self.parameters())}
 
     # --- Forward pass ---
     @abstractmethod
@@ -395,6 +403,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         super().__init__(
@@ -402,6 +411,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
             tilt_angles=-tilt_angles,  # TODO: Flip the tilt angles to be negative to match the convention of INR.
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=_token,
         )
 
@@ -454,10 +464,18 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         seed: int = 42,
         _token: object | None = None,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token=_token)
+        super().__init__(
+            tilt_stack,
+            tilt_angles,
+            learn_shift,
+            learn_tilt_axis,
+            norm_quantile,
+            _token=_token,
+        )
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):
@@ -484,8 +502,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             return shifts, torch.zeros_like(z1), torch.zeros_like(z3)
         elif self.learn_tilt_axis:
             return torch.zeros_like(shifts), z1, z3
-        elif self.learn_shift and self.learn_tilt_axis:
-            return shifts, z1, z3
         else:
             return torch.zeros_like(shifts), torch.zeros_like(z1), torch.zeros_like(z3)
 
@@ -642,6 +658,32 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 
         self.device = device
         self.reconnect_optimizer_to_parameters()
+
+    # --- Save learned parameters ---
+
+    def save_parameters(self, path: str):
+        """
+        Saves the learned parameters to a file.
+        """
+        torch.save(
+            {
+                "z1": self._z1_params.detach().cpu(),
+                "z3": self._z3_params.detach().cpu(),
+                "shifts": self._shifts_params.detach().cpu(),
+            },
+            path,
+        )
+
+    def load_parameters(self, path: str):
+        """
+        Loads the learned parameters from a file.
+        """
+        data = torch.load(path)
+        self._z1_params = nn.Parameter(data["z1"]).to(self.device)
+        self._z3_params = nn.Parameter(data["z3"]).to(self.device)
+        self._shifts_params = nn.Parameter(data["shifts"]).to(self.device)
+        if self.optimizer is not None:
+            self.reconnect_optimizer_to_parameters()
 
 
 class TomographyINRPretrainDataset(Dataset):

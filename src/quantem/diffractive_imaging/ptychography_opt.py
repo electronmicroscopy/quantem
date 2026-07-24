@@ -4,9 +4,9 @@ from typing import TYPE_CHECKING
 from quantem.core import config
 from quantem.core.ml.optimizer_mixin import (
     OptimizerParams,
-    OptimizerType,
+    OptimizerParamsType,
     SchedulerParams,
-    SchedulerType,
+    SchedulerParamsType,
 )
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 
@@ -23,7 +23,7 @@ class PtychographyOpt(PtychographyBase):
     """
 
     OPTIMIZABLE_VALS = ["object", "probe", "dataset"]
-    DEFAULT_OPTIMIZER_TYPE: OptimizerType = OptimizerParams.Adam()
+    DEFAULT_OPTIMIZER_TYPE: OptimizerParamsType = OptimizerParams.Adam()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -42,7 +42,7 @@ class PtychographyOpt(PtychographyBase):
     # region --- explicit properties and setters ---
 
     @property
-    def optimizer_params(self) -> dict[str, OptimizerType]:
+    def optimizer_params(self) -> dict[str, OptimizerParamsType | dict[str, OptimizerParamsType]]:
         return {
             key: params
             for key, params in [
@@ -56,7 +56,7 @@ class PtychographyOpt(PtychographyBase):
     @optimizer_params.setter
     def optimizer_params(self, d: dict) -> None:
         """
-        Takes a dictionary mapping optimizable keys to either an ``OptimizerType``
+        Takes a dictionary mapping optimizable keys to either an ``OptimizerParamsType``
         dataclass or a plain dict (with optional ``"name"``/``"type"`` and ``"lr"``
         keys).  Missing ``"name"`` / ``"lr"`` are filled from ``DEFAULT_OPTIMIZER_TYPE``
         and ``_get_default_lr`` respectively.
@@ -71,7 +71,7 @@ class PtychographyOpt(PtychographyBase):
             d = {k: {} for k in d}
 
         for k, v in d.items():
-            if isinstance(v, OptimizerType):
+            if isinstance(v, OptimizerParamsType):
                 pass  # already a dataclass, pass through
             elif isinstance(v, dict):
                 if not v:
@@ -82,7 +82,7 @@ class PtychographyOpt(PtychographyBase):
                     if "lr" not in v:
                         v["lr"] = self._get_default_lr(k)
             else:
-                raise TypeError(f"Expected OptimizerType or dict for key '{k}', got {type(v)}")
+                raise TypeError(f"Expected OptimizerParamsType or dict for key '{k}', got {type(v)}")
 
             if k == "object":
                 self.obj_model.optimizer_params = v
@@ -131,7 +131,7 @@ class PtychographyOpt(PtychographyBase):
             self.dset.remove_optimizer()
 
     @property
-    def scheduler_params(self) -> dict[str, SchedulerType]:
+    def scheduler_params(self) -> dict[str, SchedulerParamsType]:
         """Returns the parameters used to set the schedulers."""
         return {
             "object": self.obj_model.scheduler_params,
@@ -142,7 +142,7 @@ class PtychographyOpt(PtychographyBase):
     @scheduler_params.setter
     def scheduler_params(self, d: dict) -> None:
         """
-        Takes a dictionary mapping optimizable keys to either a ``SchedulerType``
+        Takes a dictionary mapping optimizable keys to either a ``SchedulerParamsType``
         dataclass or a plain dict.  Keys not present in ``d`` are set to
         ``SchedulerParams.NoneScheduler()`` (disables scheduling for that model).
 
@@ -178,7 +178,7 @@ class PtychographyOpt(PtychographyBase):
             schedulers["dataset"] = self.dset.scheduler
         return schedulers
 
-    def set_schedulers(self, params: dict[str, SchedulerType], num_iter: int | None = None):
+    def set_schedulers(self, params: dict[str, SchedulerParamsType], num_iter: int | None = None):
         """Set schedulers for each model."""
         for key, scheduler_params in params.items():
             if key not in self.OPTIMIZABLE_VALS:

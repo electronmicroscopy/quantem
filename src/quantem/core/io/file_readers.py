@@ -15,6 +15,7 @@ def read_4dstem(
     file_path: str | PathLike,
     file_type: str | None = None,
     dataset_index: int | None = None,
+    hot_pixel_filter: bool = False,
     **kwargs,
 ) -> Dataset4dstem:
     """
@@ -30,6 +31,11 @@ def read_4dstem(
     dataset_index: int, optional
         Index of the dataset to load if file contains multiple datasets.
         If None, automatically selects the first 4D dataset found.
+    hot_pixel_filter: bool, optional
+        If True, detect and replace hot detector pixels immediately after
+        loading using `quantem.core.utils.filter.filter_hot_pixels` with its
+        default parameters. For custom thresholds, call `filter_hot_pixels`
+        directly on the array.
     **kwargs: dict
         Additional keyword arguments to pass to the file reader.
 
@@ -49,6 +55,26 @@ def read_4dstem(
     Returns
     --------
     Dataset4dstem
+
+    Examples
+    --------
+    Load a raw Arina 4D-STEM master file:
+
+    >>> from quantem.core.io import read_4dstem
+    >>> ds = read_4dstem(
+    ...     '/path/to/gold_013_master.h5',
+    ...     file_type='arina',
+    ... )
+    >>> ds.array.shape
+    (256, 256, 192, 192)
+
+    Enable the hot pixel filter to repair stuck detector pixels on load:
+
+    >>> ds = read_4dstem(
+    ...     '/path/to/gold_013_master.h5',
+    ...     file_type='arina',
+    ...     hot_pixel_filter=True,
+    ... )
     """
     if file_type is None:
         file_type = Path(file_path).suffix.lower().lstrip(".")
@@ -104,8 +130,14 @@ def read_4dstem(
         else ["pixels" if ax["units"] == "1" else ax["units"] for ax in imported_axes]
     )
 
+    array = imported_data["data"]
+    if hot_pixel_filter:
+        from quantem.core.utils.filter import filter_hot_pixels
+
+        array = filter_hot_pixels(array)
+
     dataset = Dataset4dstem.from_array(
-        array=imported_data["data"],
+        array=array,
         sampling=sampling,
         origin=origin,
         units=units,
