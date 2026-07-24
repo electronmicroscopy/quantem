@@ -42,6 +42,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
+from quantem.core.ml.inr import HSiren
 from quantem.core.ml.models.so3params import SO3ParamR9SVD
 from quantem.core.utils.utils import electron_wavelength_angstrom
 
@@ -1219,6 +1220,58 @@ class DiffractionTomography:
                 acc = acc + T
             self.basis.copy_(torch.fft.ifftshift(acc / len(ops), dim=(0, 1, 2)))
 
+    def measured_support(self, tilts_deg=None, w_rel: float = 0.15,
+                         halfwidth: float = 1.5) -> torch.Tensor:
+        """Body-frame k support actually constrained by the tilt series.
+
+        The data samples the basis only along each tilt's central plane,
+        pulled back through each material voxel's orientation; everywhere
+        else the loss is blind. A pixel basis under ``shrink_basis`` decays
+        to zero there, but an INR freely extrapolates smooth content into the
+        unmeasured complement. This mask -- pure acquisition geometry plus
+        the converged orientations, no ground truth -- marks the union of
+        sampled planes; multiply the basis by it before display or
+        comparison to remove the unconstrained content.
+
+        Parameters
+        ----------
+        tilts_deg : sequence, optional
+            Defaults to the tilts recorded by the last :meth:`reconstruct`.
+        w_rel : float, default 0.15
+            Voxels with total ``|weight|`` above ``w_rel`` times the max
+            contribute their orientation (vacuum voxels' orientations are
+            meaningless).
+        halfwidth : float, default 1.5
+            Plane half-thickness in k voxels (trilinear sampling reach).
+
+        Returns
+        -------
+        torch.Tensor
+            ``[N_kz, N_ky, N_kx]`` bool, unshifted frequency order (matches
+            ``basis``).
+        """
+        if tilts_deg is None:
+            tilts_deg = self._scan_geometry["tilts_deg"]
+        with torch.no_grad():
+            R = self.rotation_matrices().reshape(-1, 3, 3)
+            wmag = self.weights.detach().abs().sum(-1).reshape(-1)
+            mat = wmag > w_rel * wmag.max().clamp_min(1e-30)
+            if bool(mat.any()):
+                R = R[mat]
+            n_lab = torch.stack([self.tilt_axes(float(t))[2] for t in tilts_deg])
+            nb = torch.einsum("vij,ti->vtj", R.to(torch.float32), n_lab)  # R^T n
+            nb = torch.unique(torch.round(nb.reshape(-1, 3) * 200.0) / 200.0, dim=0)
+            dev = self.device
+            axes = [(torch.arange(n, device=dev, dtype=torch.float32) - n // 2) * dk
+                    for n, dk in zip(self.k_shape, self.k_sampling)]
+            KZ, KY, KX = torch.meshgrid(*axes, indexing="ij")
+            K = torch.stack([KZ, KY, KX], -1).reshape(-1, 3)
+            tau = halfwidth * min(self.k_sampling)
+            sup = torch.zeros(K.shape[0], dtype=torch.bool, device=dev)
+            for c0 in range(0, nb.shape[0], 256):
+                sup |= ((K @ nb[c0:c0 + 256].T).abs() < tau).any(-1)
+            return torch.fft.ifftshift(sup.reshape(self.k_shape), dim=(0, 1, 2))
+
     @classmethod
     def _miso_deg(cls, dR: np.ndarray) -> float:
         """Cubic-symmetry-reduced misorientation angle (deg) of a relative rotation."""
@@ -1272,15 +1325,21 @@ class DiffractionTomography:
                 st[key].reshape(self.n_voxels, -1)[rows] = 0.0
 
     def _snapshot(self) -> dict:
-        return {"basis": self.basis.detach().clone(),
+        snap = {"basis": self.basis.detach().clone(),
                 "weights": self.weights.detach().clone(),
                 "M": self.angles.M.detach().clone()}
+        if getattr(self, "basis_inr", None) is not None:
+            snap["inr"] = {k: v.detach().clone()
+                           for k, v in self.basis_inr.state_dict().items()}
+        return snap
 
     def _restore(self, snap: dict) -> None:
         with torch.no_grad():
             self.basis.copy_(snap["basis"])
             self.weights.copy_(snap["weights"])
             self.angles.M.copy_(snap["M"])
+            if "inr" in snap and getattr(self, "basis_inr", None) is not None:
+                self.basis_inr.load_state_dict(snap["inr"])
 
     def _sanitize(self, opt, gen) -> int:
         """Repair non-finite parameters (and their Adam state) in place.
@@ -1321,15 +1380,22 @@ class DiffractionTomography:
                 n_fix += 1
         return n_fix
 
-    def _make_optimizer(self, lr: float, lr_weights: float, lr_angles: float):
+    def _make_optimizer(self, lr: float, lr_weights: float, lr_angles: float,
+                        inr_lr: float | None = None):
         """Adam with per-parameter-group learning rates (eps=1e-30 because the
         phase-object gradients are ~1e-10 and the default eps would throttle
-        every step ~100x)."""
-        groups = [{"params": [self.weights], "lr": lr_weights}]
+        every step ~100x). With ``inr_lr`` the basis group is the INR network's
+        parameters instead of the explicit basis tensor."""
+        groups = [{"params": [self.weights], "lr": lr_weights, "name": "weights"}]
         if self.learn_basis:
-            groups.append({"params": [self.basis], "lr": lr})
+            if inr_lr is not None:
+                groups.append({"params": list(self.basis_inr.parameters()),
+                               "lr": inr_lr, "name": "inr"})
+            else:
+                groups.append({"params": [self.basis], "lr": lr, "name": "basis"})
         if self.learn_angles:
-            groups.append({"params": list(self.angles.parameters()), "lr": lr_angles})
+            groups.append({"params": list(self.angles.parameters()),
+                           "lr": lr_angles, "name": "angles"})
         return torch.optim.Adam(groups, eps=1e-30)
 
 
@@ -1348,6 +1414,105 @@ class DiffractionTomography:
             self.learn_angles = bool(angles)
             for p in self.angles.parameters():
                 p.requires_grad_(self.learn_angles)
+
+    def _inr_setup(self, width: int, depth: int, omega: float,
+                   space: str = "r", periodic: bool = False) -> None:
+        """Create the basis INR (an HSiren MLP) and cache its input coords.
+
+        ``space="r"``: the network represents the body-frame *real-space*
+        phase field ``u(r)`` (one real output per structure) on the k-shaped
+        grid; the basis is ``i * FFT(u)``. A crystal potential is a smooth,
+        band-limited sum of a few sinusoids -- exactly a SIREN's natural
+        output -- whereas the k-space spikes it transforms to are a SIREN's
+        worst case. A real ``u`` also makes the basis exactly anti-Hermitian
+        (Friedel) by construction.
+
+        ``space="k"``: the network maps centered k-grid coordinates to
+        ``2 * num_structures`` outputs (real/imaginary per structure)
+        directly.
+
+        Inputs are grid coordinates normalized to ``[-1, 1]^3``; with
+        ``periodic=True`` (r-space only) they are lifted to torus features
+        ``(cos, sin)`` of one box period, making ``u`` exactly periodic on
+        the supercell the DFT already assumes -- the true function class of a
+        band-limited grid field, with no crystallographic assumption. Seeded
+        from ``self.seed`` inside a forked RNG so runs stay bit-reproducible
+        without disturbing the global generator.
+        """
+        assert space in ("r", "k")
+        self._inr_space = space
+        self._inr_periodic = bool(periodic) and space == "r"
+        n_out = self.num_structures if space == "r" else 2 * self.num_structures
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(self.seed + 11)
+            self.basis_inr = HSiren(
+                in_features=6 if self._inr_periodic else 3,
+                out_features=n_out,
+                hidden_layers=depth,
+                hidden_features=width,
+                first_omega_0=omega,
+                hidden_omega_0=omega,
+                final_activation="identity",
+            ).to(self.device)
+        axes = [torch.linspace(-1.0, 1.0, n, device=self.device) for n in self.k_shape]
+        ZZ, YY, XX = torch.meshgrid(*axes, indexing="ij")
+        c = torch.stack((ZZ, YY, XX), dim=-1).reshape(-1, 3).to(torch.float32)
+        if self._inr_periodic:
+            # one box period spans the grid's N samples, i.e. N/(N-1) of the
+            # linspace range -- use the DFT's own angular step so index 0 and
+            # index N (one past the last sample) coincide on the torus.
+            w = torch.tensor([2.0 * math.pi * (n - 1) / (2.0 * n) for n in self.k_shape],
+                             device=self.device)
+            th = c * w
+            c = torch.cat([torch.cos(th), torch.sin(th)], dim=-1)
+        self._inr_coords = c
+
+    def _inr_basis(self, friedel: bool = True, cubic: bool = False) -> torch.Tensor:
+        """Generate the basis volume from the INR, differentiably.
+
+        Evaluates the network on the full centered k grid, reassembles the
+        complex volume, shifts to storage (unshifted) frequency order and
+        applies the spherical support plus the optional Friedel / cubic
+        projections as differentiable ops -- under the INR these symmetries
+        are enforced on the *generated* volume each evaluation instead of as
+        proximal steps on a parameter tensor. Returns ``[N_kz, N_ky, N_kx,
+        N_w]`` complex, same layout/dtype as :meth:`masked_basis`.
+        """
+        Nw = self.num_structures
+        if getattr(self, "_inr_space", "k") == "r":
+            # real field u(r) -> basis = i * FFT(u): anti-Hermitian (Friedel)
+            # by construction, and the network fits the smooth band-limited
+            # potential instead of its spiky transform. norm="forward" keeps
+            # the basis at the field's amplitude scale.
+            u = self.basis_inr(self._inr_coords).reshape(*self.k_shape, Nw)
+            u = u.permute(3, 0, 1, 2).to(torch.float64)
+            Bk = 1j * torch.fft.fftn(u, dim=(1, 2, 3), norm="forward")
+            Bc = torch.fft.fftshift(Bk, dim=(1, 2, 3)).permute(1, 2, 3, 0)
+        else:
+            out = self.basis_inr(self._inr_coords).reshape(*self.k_shape, 2, Nw)
+            Bc = torch.complex(out[..., 0, :], out[..., 1, :])      # centered order
+        if cubic:
+            acc = torch.zeros_like(Bc)
+            for perm, flip in self._cubic_grid_ops():
+                T = Bc.permute(perm[0], perm[1], perm[2], 3)
+                if flip:
+                    T = torch.flip(T, dims=flip)
+                acc = acc + T
+            Bc = acc / 24.0
+        B = torch.fft.ifftshift(Bc, dim=(0, 1, 2)).to(self.basis.dtype)
+        B = B * self.sphere_mask[..., None]
+        if friedel and getattr(self, "_inr_space", "k") == "k":
+            # r-space nets are anti-Hermitian by construction; project only
+            # the direct k-space parameterization.
+            # transmission SF off-origin is anti-Hermitian, F(-k) = -conj(F(k));
+            # keep the network's own (real-valued-free) origin sample.
+            flipc = torch.roll(torch.flip(B, dims=(0, 1, 2)),
+                               shifts=(1, 1, 1), dims=(0, 1, 2)).conj()
+            proj = 0.5 * (B - flipc)
+            mask = torch.zeros(self.k_shape, dtype=torch.bool, device=self.device)
+            mask[0, 0, 0] = True
+            B = torch.where(mask[..., None], B, proj)
+        return B
 
     def reconstruct(
         self,
@@ -1368,6 +1533,8 @@ class DiffractionTomography:
         search_every: int = 0,
         reset_every: int = 10,
         phase_only: bool = True,
+        inr: bool = False,
+        inr_lr: float = 1e-3,
         resume: bool = False,
         progress: bool = True,
         print_every: int = 0,
@@ -1400,6 +1567,21 @@ class DiffractionTomography:
           The cheap complement to ``search_every`` -- enough on its own for
           one/few grains.
 
+        ``inr=True`` swaps the explicit basis tensor for an implicit neural
+        representation: an HSiren MLP (coordinates -> complex structure
+        factor) is evaluated on the k grid each iteration and the generated
+        volume flows through the same forward model. Weights and angles stay
+        explicit per-voxel parameters, so the reset / search machinery is
+        unchanged. ``friedel_basis`` / ``cubic_symmetry`` are enforced on the
+        generated volume (differentiably); ``shrink_basis`` becomes an L1
+        penalty on the off-origin volume; ``smooth_basis`` is ignored (the
+        network is the smoothness prior). ``inr_lr`` is the network's Adam
+        learning rate (``lr`` still drives weights/angles). The network
+        persists on ``self.basis_inr`` and ``self.basis`` mirrors the
+        generated volume, so viewers, ``local_search`` and ``simulate`` work
+        as usual. Call :meth:`_inr_setup` first to choose a custom
+        width/depth/omega; otherwise a default network is created.
+
         ``resume=True`` continues a previous ``reconstruct`` call: the Adam
         momentum and the accumulated loss history carry over (so ``plot_loss``
         shows the whole run and keep-best never rolls back below where the
@@ -1420,17 +1602,21 @@ class DiffractionTomography:
         meas_amp = measurements.to(self.device).clamp_min(0).sqrt()
         jobs = [(ti, j, i) for ti in range(len(tilts_deg)) for j in range(n_row) for i in range(n_col)]
         n_dp = len(jobs)
+        if inr and getattr(self, "basis_inr", None) is None:
+            self._inr_setup(width=128, depth=3, omega=30.0, space="r", periodic=True)
         # eps=1e-30: the phase-object gradients are ~1e-10, so the default
         # eps=1e-8 would swamp sqrt(v) and throttle every Adam step ~100x.
         # resume=True reuses the Adam state (momentum) from the previous call
         # so a second reconstruct() continues smoothly instead of restarting
         # the optimizer; the params always carry over regardless.
-        if resume and getattr(self, "_opt", None) is not None:
+        if (resume and getattr(self, "_opt", None) is not None
+                and getattr(self, "_opt_inr", None) == inr):
             opt = self._opt
         else:
-            opt = self._make_optimizer(lr, lr, lr)
+            opt = self._make_optimizer(lr, lr, lr, inr_lr=inr_lr if inr else None)
         self._opt = opt
-        group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
+        self._opt_inr = inr
+        group_names = ["weights"] + (["inr" if inr else "basis"] if self.learn_basis else []) \
             + (["angles"] if self.learn_angles else [])
         lrs: list[list[float]] = []
         gen = torch.Generator(device="cpu").manual_seed(self.seed + 1)
@@ -1453,13 +1639,34 @@ class DiffractionTomography:
         for it in pbar:
             opt.zero_grad(set_to_none=True)
             total = 0.0
+            basis_leaf = None
+            if inr:
+                # cosine-decay the network lr to a 5% floor over the call: the
+                # shared parameterization thrashes late in the run at a fixed
+                # step size (every basis element moves with every step), while
+                # the per-voxel params keep their constant lr.
+                fac = 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * it / max(1, num_iters)))
+                for g in opt.param_groups:
+                    if g.get("name") == "inr":
+                        g["lr"] = inr_lr * fac
+            if inr:
+                # one network evaluation per iteration: the generated volume is
+                # detached into a leaf that every tilt group backprops into, and
+                # the accumulated leaf gradient is relayed through the network
+                # once at the end (otherwise each group's backward would need
+                # its own network graph). self.basis mirrors the volume so the
+                # sweep/reset machinery and the viewers see the current state.
+                gen_basis = self._inr_basis(friedel_basis, cubic_symmetry)
+                with torch.no_grad():
+                    self.basis.copy_(gen_basis.detach())
+                basis_leaf = gen_basis.detach().requires_grad_(True)
             for t0 in range(0, n_tilt, max(1, tilt_batch)):
                 # tilts are processed in groups of tilt_batch: one autograd
                 # graph (and one backward) per group. tilt_batch trades memory
                 # for speed; gradients still accumulate into one full-batch
                 # optimizer step per iteration.
                 t_grp = list(range(t0, min(t0 + max(1, tilt_batch), n_tilt)))
-                basis = self.masked_basis()
+                basis = basis_leaf if inr else self.masked_basis()
                 R_all = self.rotation_matrices()
                 Psi = self.forward_tilts(origins, [float(tilts_deg[ti]) for ti in t_grp],
                                          basis, R_all, self.weights,
@@ -1470,6 +1677,24 @@ class DiffractionTomography:
                 (tl.sum() / n_dp).backward()
                 res_per_dp[t_grp[0] * P:(t_grp[-1] + 1) * P] = tl.detach().reshape(-1)
                 total += float(tl.sum())
+            if inr:
+                if shrink_basis > 0.0 and basis_leaf.grad is not None:
+                    # proximal L1 has no meaning for network weights; apply the
+                    # sparsity prior as a penalty routed through the same leaf,
+                    # auto-scaled to the data gradient (a fixed coefficient is
+                    # either invisible or crushes the signal): tau = a fraction
+                    # of the strong data gradients, so data-defended peaks
+                    # out-pull the penalty while unconstrained fog decays.
+                    # smoothed |.| -- exact complex abs has NaN grad at the
+                    # (masked, exactly zero) off-sphere entries.
+                    gmag = basis_leaf.grad.abs()
+                    tau = shrink_basis * 0.1 * torch.quantile(
+                        gmag[gmag > 0].to(torch.float32), 0.9).to(gmag.dtype)
+                    off = (basis_leaf.real ** 2 + basis_leaf.imag ** 2 + 1e-30).sqrt()
+                    pen = tau * (off.sum() - off[0, 0, 0, :].sum())
+                    pen.backward()
+                if basis_leaf.grad is not None:
+                    gen_basis.backward(basis_leaf.grad)
 
             mean_loss = total / n_dp
             losses.append(mean_loss)
@@ -1495,14 +1720,14 @@ class DiffractionTomography:
                         idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
                         W.copy_((wgt * W.index_select(axis, idx_p) + W
                                  + wgt * W.index_select(axis, idx_n)) / norm)
-            if cubic_symmetry and self.learn_basis:
+            if cubic_symmetry and self.learn_basis and not inr:
                 # project the basis onto cubic point-group symmetry each step:
                 # every Bragg peak is forced equal to its whole 24-fold orbit,
                 # so a peak seen by any grain/tilt is filled in for all
                 # equivalents and the rotation search sees a full clean target.
                 # Pins the basis to the cardinal-cubic gauge from the start.
                 self.symmetrize_basis()
-            if friedel_basis and self.learn_basis:
+            if friedel_basis and self.learn_basis and not inr:
                 # the basis is the transmission's structure factor: for the
                 # phase grating of a real potential the off-origin content is
                 # anti-Hermitian, F(-k) = -conj(F(k)) (peaks purely imaginary,
@@ -1516,7 +1741,7 @@ class DiffractionTomography:
                     keep = self.basis[0, 0, 0, :].clone()
                     self.basis.copy_(0.5 * (self.basis - flip.conj()))
                     self.basis[0, 0, 0, :] = keep
-            if smooth_basis > 0.0 and self.learn_basis:
+            if smooth_basis > 0.0 and self.learn_basis and not inr:
                 # reciprocal-space coherence: a gentle 3-tap Gaussian each step
                 # pools intensity split across neighboring k voxels into one
                 # spike, so the shrinkage threshold sees a strong peak instead
@@ -1537,7 +1762,7 @@ class DiffractionTomography:
                         Bv.copy_((wgt * Bv.index_select(axis, idx_p) + Bv
                                   + wgt * Bv.index_select(axis, idx_n)) / norm)
                     Bv[0, 0, 0, :] = keep
-            if shrink_basis > 0.0 and self.learn_basis:
+            if shrink_basis > 0.0 and self.learn_basis and not inr:
                 # proximal L1 on the basis' off-origin content: a structure
                 # factor is a few sharp Bragg spots, so soft-thresholding kills
                 # the k-space fog that otherwise fits the data with rings
