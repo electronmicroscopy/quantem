@@ -38,10 +38,6 @@ import math
 from itertools import permutations, product
 
 import numpy as np
-from numpy.typing import NDArray
-import scipy.ndimage as ndi
-from scipy.spatial.transform import Rotation
-import tqdm
 import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
@@ -60,10 +56,6 @@ class DiffractionTomography:
     the wave optics, then :meth:`simulate` (forward) or :meth:`reconstruct`
     (inverse).
     """
-
-    _token = object()
-    default_energy = 300e3
-    axis_labels = ("z", "y", "x", "kz", "ky", "kx")
 
     def __init__(
         self,
@@ -293,14 +285,12 @@ class DiffractionTomography:
     ) -> torch.Tensor:
         """One voxel's structure factor resampled on the lab k grid.
 
-    @staticmethod
-    def _sample_complex_volume_trilinear(
-        volume: torch.Tensor,
-        coords: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Samples (6D) volume at specified grid points ((-1,-1): top left corner, (1,1): bottom right corner)
-        
+        The model stores structure factors in each voxel's body frame; this
+        returns the weighted sum of structures rotated by the voxel's
+        orientation (trilinear, the same sampling the forward model uses for
+        its tilt planes). Reconstructions with different orientation gauges
+        can then be compared on a common grid.
+
         Parameters
         ----------
         voxel : int or (int, int, int)
@@ -363,27 +353,6 @@ class DiffractionTomography:
         weights (1 inside the spheres), per-voxel orientations, and the frozen
         Au basis, ready for :meth:`simulate`.
 
-        # gx = 2.0 * (x / (Nx-1.0))-1.0
-        # gy = 2.0 * (y / (Ny-1.0))-1.0
-        # gz = 2.0 * (z / (Nz-1.0))-1.0
-
-        # grid = torch.stack((gx,gy,gz), dim = -1)[None, None, ...]
-        map_real = F.grid_sample(real, grid, mode='bilinear', padding_mode='zeros',align_corners=True)
-        map_imag = F.grid_sample(imag, grid, mode='bilinear', padding_mode='zeros',align_corners=True)
-
-        return (map_real + 1j * map_imag).squeeze()
-        # return map_real + 1j * map_imag
-
-    @classmethod
-    def _rotate_complex_volume_zxz(
-        cls,
-        volume: torch.Tensor,
-        sampling: tuple[float, float, float] | list[float] | torch.Tensor,
-        zxz: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Rotate a complex reciprocal-space volume using ZXZ Euler angles.
-        
         Parameters
         ----------
         real_shape : tuple[int, int, int]
@@ -439,55 +408,154 @@ class DiffractionTomography:
         gt.grain_id = grain_id
         return gt
 
-        rot = Rotation.from_euler("zxz", zxz)
-        k_source = rot.inv().apply(k_grid.reshape(-1, 3)).reshape(*volume.shape, 3)
-        coords = torch.stack(
-            [
-                torch.remainder(k_source[..., 0] / dk[2], shape[2]),
-                torch.remainder(k_source[..., 1] / dk[1], shape[1]),
-                torch.remainder(k_source[..., 2] / dk[0], shape[0]),
-            ],
-            axis=0,
-        )
-
-        return cls._sample_complex_volume_trilinear(volume, coords)
-
-    @staticmethod
-    def _make_vacuum_sf(
-        diffraction_shape: tuple[int, int, int],
+    @classmethod
+    def make_au_basis(
+        cls,
+        k_shape: tuple[int, int, int],
+        k_sampling: tuple[float, float, float],
+        a_Au: float = 4.08,
+        phase_scale: float = 0.10,
+        hkl_amplitudes=((1, 1, 1, 0.10), (2, 0, 0, 0.06), (2, 2, 0, 0.03),
+                        (3, 1, 1, 0.05), (2, 2, 2, 0.04)),
         dtype=torch.complex128,
     ) -> torch.Tensor:
+        """Canonical (unrotated) Au structure factor in ``[kz, ky, kx]`` order.
+
+        Bragg peaks carry small purely-imaginary amplitudes (linearized
+        ``exp(i*phi)`` phase grating); the origin is the vacuum baseline (1).
+        The per-voxel SO(3) orientation supplies the actual grain rotation.
         """
-        Structure factor of a vacuum cell — identity transmission in k-space.
-        """
-        sf = torch.zeros(diffraction_shape, dtype=dtype)
+        Nkz, Nky, Nkx = (int(n) for n in k_shape)
+        dkz, dky, dkx = (float(s) for s in k_sampling)
+        sf = torch.zeros(Nkz, Nky, Nkx, dtype=dtype)
         sf[0, 0, 0] = 1.0
+        amp_scale = 1j * phase_scale
+        for row in hkl_amplitudes:
+            h, k, l, a = row
+            amp = amp_scale * float(a)
+            vec_set = sorted({
+                tuple(s * p for s, p in zip(sign, perm))
+                for perm in set(permutations((int(h), int(k), int(l))))
+                for sign in product((-1, 1), repeat=3)
+            })
+            for vec in vec_set:
+                # peak in (kx, ky, kz) physical -> nearest [kz, ky, kx] voxel.
+                # Each Bragg reflection is a single delta spike: spreading it
+                # over a trilinear cluster distorts the diffracted disks (the
+                # transmission peak becomes a multi-pixel blob) and makes the
+                # structure factor read as several bright voxels per peak.
+                kx, ky, kz = (v / a_Au for v in vec)
+                iz = int(round(kz / dkz)) % Nkz
+                iy = int(round(ky / dky)) % Nky
+                ix = int(round(kx / dkx)) % Nkx
+                sf[iz, iy, ix] += amp
         return sf
+
+    def make_probe(self, probe_k_max: float, normalize: bool = True) -> torch.Tensor:
+        """Aperture probe with a sub-pixel anti-aliased edge, [row, col] = [ky, kx].
+
+        The edge ramps linearly over one k-pixel (partial pixel coverage), so
+        the direct and diffracted disks render as circles on the coarse
+        detector grid instead of chunky hard-threshold polygons.
+        """
+        self.probe_k_max = float(probe_k_max)
+        kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
+        k_rad = torch.sqrt(kv ** 2 + ku ** 2)
+        dk_pix = min(self.k_sampling[1], self.k_sampling[2])
+        aperture = torch.clamp((probe_k_max - k_rad) / dk_pix + 0.5, 0.0, 1.0).to(torch.complex128)
+        if normalize:
+            aperture = aperture / torch.sqrt((aperture.abs() ** 2).sum())
+        # single-precision wave optics: the learnable basis/weights stay double
+        # (precise Adam accumulation) but the FFT chain and its backward run in
+        # complex64. The dominant sampling path was already float32, so the
+        # forward is effectively single precision -- this just stops the FFTs
+        # from up-casting the whole wave to complex128.
+        self.Psi0 = aperture.to(self.device)
+        return self.Psi0
+
+    def make_propagator(self, antialias_fraction: float = 0.9, antialias_softness: float = 0.05):
+        """Fresnel propagator exp(-i pi lambda dz |k|^2) with a soft circular
+        anti-alias mask folded in.  dz = real-space z sampling."""
+        dz = self.real_sampling[0]
+        kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
+        k2 = kv ** 2 + ku ** 2
+        bare = torch.exp(-1j * torch.pi * self.wavelength * k2 * dz)
+        # soft circular anti-alias mask
+        k_rad = torch.sqrt(k2)
+        k_nyq = min(self.det_kv.abs().max().item(), self.det_ku.abs().max().item())
+        cutoff = antialias_fraction * k_nyq
+        width = max(antialias_softness * k_nyq, 1e-12)
+        mask = 0.5 * (1.0 - torch.cos(torch.pi * torch.clip((cutoff + width - k_rad) / width, 0.0, 1.0)))
+        self.antialias_mask = mask.to(self.device)   # circular k envelope
+        self._bare_prop = bare.to(self.device)       # unit-modulus Fresnel factor
+        self._prop_pow_cache = {}
+        self.prop = (self._bare_prop * self.antialias_mask)
+        self.prop_distance = dz
+        self._visible_k_max = float(cutoff + width)         # data carries no intensity beyond
+        self._build_sphere_mask()                            # clip basis support to it
+        return self.prop
+
+    def tilt_axes(self, tilt_x_deg: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lab-frame (u, v, w) unit vectors for an X-axis tilt, in [z, y, x] comps.
+
+        u = detector col (x), v = detector row (y), w = beam (nominally +z).
+        Tilt about x rotates the (z, y) plane.
+        """
+        th = math.radians(float(tilt_x_deg))
+        c, s = math.cos(th), math.sin(th)
+        dev = self.device
+        w = torch.tensor([c, s, 0.0], dtype=torch.float32, device=dev)   # beam
+        u = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=dev)  # col = x
+        v = torch.tensor([-s, c, 0.0], dtype=torch.float32, device=dev)   # row = y
+        return u, v, w
+
+    def _ray_voxel_weights(self, origin_zyx: torch.Tensor, tilt_x_deg: float) -> torch.Tensor:
+        """Total trilinear weight this ray deposits in each voxel, (n_voxels,).
+
+        Geometry only (no basis sampling) -- used to distribute per-DP residual
+        onto voxels for the bad-voxel error metric. Fixed across optimization.
+        """
+        Nz, Ny, Nx = self.real_shape
+        _, _, w = self.tilt_axes(tilt_x_deg)
+        pts = self.ray_samples(origin_zyx, w)
+        wv = torch.zeros(self.n_voxels, dtype=torch.float64, device=self.device)
+        for s in range(pts.shape[0]):
+            p = pts[s]
+            base = torch.floor(p).to(torch.int64)
+            frac = p - base.to(p.dtype)
+            for dz in range(2):
+                iz = int(base[0]) + dz; wz = float(frac[0]) if dz else 1.0 - float(frac[0])
+                for dy in range(2):
+                    iy = int(base[1]) + dy; wy = float(frac[1]) if dy else 1.0 - float(frac[1])
+                    for dx in range(2):
+                        ix = int(base[2]) + dx; wx = float(frac[2]) if dx else 1.0 - float(frac[2])
+                        tw = wz * wy * wx
+                        if tw > 0 and (0 <= iz < Nz) and (0 <= iy < Ny) and (0 <= ix < Nx):
+                            wv[(iz * Ny + iy) * Nx + ix] += tw
+        return wv
 
     def ray_samples(self, origin_zyx: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Index-space sample points along a ray through the slab z-extent.
 
-    @dataset.setter
-    def dataset(self, value: Dataset6d):
-        if not isinstance(value, Dataset6d):
-            raise TypeError(f"dataset must be a Dataset6d, got {type(value)}")
-        self._dataset = value
-        self._update_reciprocal_coordinates()
-        # Invalidate the material-vs-vacuum cell cache used by forward_prop.
-        self._material_mask_cache: torch.Tensor | None = None
-
-    def _get_material_mask(self, tol: float = 1e-9) -> torch.Tensor:
-        """Bool array marking which (ix, iy, iz) real-space cells contain material.
-
-        A vacuum cell stores `SF[0, 0, 0] = 1` and zeros elsewhere, so the
-        absolute-sum over the diffraction axes equals 1. Material cells exceed
-        this baseline. The result is cached and invalidated when `dataset` is
-        reassigned.
+        origin_zyx: (3,) probe position in index space [z, y, x].
+        Returns (Ns, 3) points, one per traversed z-layer (beam steps by 1 in z).
         """
-        if getattr(self, "_material_mask_cache", None) is None:
-            abs_sum = torch.abs(self.array).sum(axis=(3, 4, 5))
-            self._material_mask_cache = abs_sum > 1.0 + tol
-        return self._material_mask_cache
+        Nz = self.real_shape[0]
+        dev = self.device
+        r0 = origin_zyx.to(dev).to(torch.float32)
+        # dr scaled so the z-component advances by exactly one voxel per step
+        wz = w[0]
+        if torch.abs(wz) < 1e-8:
+            return r0[None, :]
+        dr = w / wz                                   # step with dz = 1
+        # span z = 0 .. Nz-1
+        t0 = (0.0 - r0[0]) / dr[0]
+        t1 = ((Nz - 1) - r0[0]) / dr[0]
+        t_lo, t_hi = (t0, t1) if t0 <= t1 else (t1, t0)
+        n_lo = int(math.ceil(t_lo.item() - 1e-6))
+        n_hi = int(math.floor(t_hi.item() + 1e-6))
+        steps = torch.arange(n_lo, n_hi + 1, dtype=torch.float32, device=dev)[:, None]
+        return r0[None, :] + steps * dr[None, :]
 
     def _transmission_plane(self, point_zyx: torch.Tensor, u: torch.Tensor, v: torch.Tensor,
                             basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
@@ -499,61 +567,6 @@ class DiffractionTomography:
         planes are combined with the trilinear weights (in transmission space,
         never on the angles), and the vacuum delta ``(1 - w_eff)`` is added at
         the origin. Out-of-slab neighbours contribute vacuum.
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self.dataset.shape
-
-    @property
-    def energy(self) -> float | None:
-        return self.dataset.metadata.get("energy")
-
-    @energy.setter
-    def energy(self, value: float | None):
-        self.set_beam_parameters(energy=value)
-
-    @property
-    def wavelength(self) -> float | None:
-        wavelength = self.dataset.metadata.get("wavelength")
-        if wavelength is None and self.energy is not None:
-            wavelength = float(electron_wavelength_angstrom(self.energy))
-            self.dataset.metadata["wavelength"] = wavelength
-        return wavelength
-
-    @wavelength.setter
-    def wavelength(self, value: float | None):
-        self.set_beam_parameters(wavelength=value)
-
-    @property
-    def real_shape(self) -> tuple[int, int, int]:
-        return self.shape[:3]
-
-    @property
-    def diffraction_shape(self) -> tuple[int, int, int]:
-        return self.shape[3:]
-    
-    @property
-    def diffraction_sampling(self) -> tuple[float, float, float]:
-        return self.dataset.sampling[3:]
-    
-    @property
-    def real_sampling(self) -> tuple[float, float, float]:
-        return self.dataset.sampling[:3]
-
-
-    def make_prop(
-        self,
-        prop_distance = None,
-        shape: tuple[int, int] | list[int] | torch.Tensor | None = None,
-        antialias_fraction: float = 0.9,
-        antialias_softness: float = 0.05,
-    ):
-        """Build the Fresnel propagator with anti-aliasing folded in to prevent undersampling.
-
-        The anti-aliasing band-limit (default cutoff = 0.9 * k_Nyquist) is
-        applied as part of the propagator only, so it is multiplied into the
-        wave each propagation step and never separately. There is no
-        per-slice mask on the transmission step.
 
         Parameters
         ----------
@@ -572,31 +585,97 @@ class DiffractionTomography:
         torch.Tensor
             ``(det_row, det_col)`` complex transmission structure factor.
         """
-        device = torch.device(self.device)
-        # device = torch.device(device)
-        if prop_distance is None:
-            # prop_distance = self.dataset.sampling[2]
-            prop_distance = self.dataset.sampling[0]
-        self.prop_distance = prop_distance
-        if shape is None:
-            # shape = self.diffraction_shape[:2]
-            shape = self.diffraction_shape[1:]
-        ku, kv = self._make_planar_reciprocal_grids(shape, self.dataset.sampling[3:5])
-        ku = ku.to(device)
-        kv = kv.to(device)
-        bare_prop = (torch.exp(-1j * torch.pi * self.wavelength * (ku**2 + kv**2) * prop_distance)).to(device)
-        self.antialias_mask = self._make_antialias_mask(
-            shape = shape,
-            sampling = self.dataset.sampling[3:5],
-            fraction = antialias_fraction,
-            softness = antialias_softness,
-        ).to(device)
-        self.prop = bare_prop * self.antialias_mask
-        return self.prop
+        Nz, Ny, Nx = self.real_shape
+        Nkz, Nky, Nkx = self.k_shape
+        Nw = basis.shape[-1]
+        dev = self.device
+        p = point_zyx.to(dev)
+        base = torch.floor(p).to(torch.int64)
+        frac = p - base.to(p.dtype)                          # (3,)
+
+        kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")  # (R,C)
+        det_row, det_col = kv.shape
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=dev)
+
+        # 2x2x2 cluster corners, trilinear weights, in-bounds mask
+        offs = torch.tensor([[dz, dy, dx] for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)],
+                            device=dev)                        # (8,3)
+        idxs = base[None, :] + offs                            # (8,3) [iz,iy,ix]
+        fw = torch.stack([torch.where(offs[:, a] == 1, frac[a], 1.0 - frac[a]) for a in range(3)], dim=1)
+        tw8 = fw.prod(dim=1)                                   # (8,)
+        inb = ((idxs[:, 0] >= 0) & (idxs[:, 0] < Nz) & (idxs[:, 1] >= 0) & (idxs[:, 1] < Ny)
+               & (idxs[:, 2] >= 0) & (idxs[:, 2] < Nx))
+        valid = inb & (tw8 > 0)
+
+        acc = torch.zeros(det_row, det_col, dtype=torch.complex64, device=dev)
+        w_eff = torch.zeros((), dtype=torch.float64, device=dev)
+        if bool(valid.any()):
+            vsel = idxs[valid]                                 # (nv,3)
+            nv = vsel.shape[0]
+            tw = tw8[valid].to(torch.complex64)                # (nv,)
+            vidx = (vsel[:, 0] * Ny + vsel[:, 1]) * Nx + vsel[:, 2]
+            R = R_all.reshape(-1, 3, 3)[vidx]                  # (nv,3,3) body->lab
+            wv = W_all.reshape(-1, Nw)[vidx].to(torch.complex64)  # (nv,Nw)
+            w_eff = (tw8[valid].to(torch.float64) * W_all.reshape(-1, Nw)[vidx].sum(-1)).sum()
+            # rotate the detector (u,v) axes into each voxel's body frame: R^T @ axis
+            u_b = torch.einsum("vij,i->vj", R, u)              # (nv,3) [kz,ky,kx]
+            v_b = torch.einsum("vij,i->vj", R, v)
+            # plane points (nv,R,C,3) in A^-1; basis is fftfreq-ordered so wrap
+            # k/dk into [0, N) then normalise to [-1, 1] (grid last dim reversed)
+            kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
+                    + kv[None, ..., None] * v_b[:, None, None, :])   # (nv,R,C,3)
+            # centered (fftshift) sampling space -- see _transmission_planes_fused
+            ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32, device=dev)
+            c = kxyz / dk + ctr                                # (nv,R,C,3) [cz,cy,cx]
+            grid = torch.stack((
+                2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+                2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+                2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+            ), dim=-1)[:, None].to(torch.float32)              # (nv,1,R,C,3)
+            basis_c = torch.fft.fftshift(basis, dim=(0, 1, 2))
+            bre = basis_c.real.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
+            bim = basis_c.imag.permute(3, 0, 1, 2)[None].expand(nv, -1, -1, -1, -1).to(torch.float32)
+            sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+            sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+            sampled = (sre + 1j * sim).squeeze(2)              # (nv,Nw,R,C)
+            t_vox = (wv[:, :, None, None] * sampled).sum(1)    # (nv,R,C)
+            acc = (tw[:, None, None] * t_vox).sum(0)           # (R,C)
+        # vacuum delta carries the material complement: weight 0 -> pure
+        # vacuum, weight 1 -> pure basis transmission (its DC included)
+        acc[0, 0] = acc[0, 0] + (1.0 - w_eff).to(acc.dtype)
+        return acc
+
+    def forward_ray(self, origin_zyx: torch.Tensor, tilt_x_deg: float,
+                    basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor,
+                    phase_only: bool = True) -> torch.Tensor:
+        """Multislice exit wave for one probe at one tilt."""
+        u, v, w = self.tilt_axes(tilt_x_deg)
+        pts = self.ray_samples(origin_zyx, w)                 # (Ns,3)
+        Psi = self.Psi0.clone()
+        num_pix = Psi.numel()
+        Ns = pts.shape[0]
+        for s in range(Ns):
+            SF = self._transmission_plane(pts[s], u, v, basis, R_all, W_all)
+            T2d = num_pix * SF
+            t_real = torch.fft.ifft2(T2d)
+            if phase_only:
+                t_real = torch.exp(1j * torch.angle(t_real))
+            Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t_real)
+            if s < Ns - 1:
+                Psi = Psi * self.prop
+        # Band-limit the exit wave with the same circular k-envelope. The last
+        # slice is not propagated, so its phase-grating harmonics beyond the
+        # antialias cutoff would otherwise leak into the detector corners.
+        Psi = Psi * self.antialias_mask
+        return Psi
 
     def _transmission_planes_batch(self, points: torch.Tensor, u: torch.Tensor, v: torch.Tensor,
                                    basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
         """Transmission SF for a batch of ray points (one per probe), at one slice.
+
+        Same construction as :meth:`_transmission_plane` but vectorised over the
+        ``P`` probe points: loops the 8 cluster corners (cheap), each a single
+        ``grid_sample`` batched over all probes.
 
         Parameters
         ----------
@@ -629,27 +708,120 @@ class DiffractionTomography:
         bre_full = basis_cs.real.permute(3, 0, 1, 2)           # (Nw,Nkz,Nky,Nkx)
         bim_full = basis_cs.imag.permute(3, 0, 1, 2)
 
-        width = max(float(softness) * k_nyquist, torch.finfo(float).eps)
-        mask = 0.5 * (1.0 - torch.cos(torch.pi * torch.clip((cutoff + width - k_radial) / width, 0.0, 1.0)))
-        return mask
+        acc = torch.zeros(P, det_row, det_col, dtype=torch.complex64, device=dev)
+        w_eff = torch.zeros(P, dtype=torch.float64, device=dev)
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    off = torch.tensor([dz, dy, dx], device=dev)
+                    idx = base + off                            # (P,3)
+                    tw = (torch.where(off[0] == 1, frac[:, 0], 1.0 - frac[:, 0])
+                          * torch.where(off[1] == 1, frac[:, 1], 1.0 - frac[:, 1])
+                          * torch.where(off[2] == 1, frac[:, 2], 1.0 - frac[:, 2]))    # (P,)
+                    inb = ((idx >= lo) & (idx <= hi)).all(dim=1)   # (P,)
+                    tw = (tw * inb).to(torch.complex64)          # zero out-of-slab corners
+                    idxc = torch.minimum(torch.maximum(idx, lo), hi)   # clamp for the gather
+                    vidx = (idxc[:, 0] * Ny + idxc[:, 1]) * Nx + idxc[:, 2]
+                    R = R_all.reshape(-1, 3, 3)[vidx]            # (P,3,3)
+                    wv = W_all.reshape(-1, Nw)[vidx].to(torch.complex64)   # (P,Nw)
+                    u_b = torch.einsum("pij,i->pj", R, u)        # (P,3) = R^T u
+                    v_b = torch.einsum("pij,i->pj", R, v)
+                    kxyz = (ku[None, ..., None] * u_b[:, None, None, :]
+                            + kv[None, ..., None] * v_b[:, None, None, :])   # (P,R,C,3)
+                    # centered (fftshift) sampling space -- see _transmission_planes_fused
+                    ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32, device=dev)
+                    c = kxyz / dk + ctr
+                    grid = torch.stack((
+                        2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+                        2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+                        2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+                    ), dim=-1)[:, None].to(torch.float32)        # (P,1,R,C,3)
+                    bre = bre_full[None].expand(P, -1, -1, -1, -1).to(torch.float32)
+                    bim = bim_full[None].expand(P, -1, -1, -1, -1).to(torch.float32)
+                    sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+                    sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+                    sampled = (sre + 1j * sim).squeeze(2)        # (P,Nw,R,C)
+                    t_vox = (wv[:, :, None, None] * sampled).sum(1)   # (P,R,C)
+                    acc = acc + tw[:, None, None] * t_vox
+                    w_eff = w_eff + tw.real.to(w_eff.dtype) * W_all.reshape(-1, Nw)[vidx].sum(-1)
+        # vacuum delta carries the material complement per probe
+        acc[:, 0, 0] = acc[:, 0, 0] + (1.0 - w_eff).to(acc.dtype)
+        return acc
 
-    def make_probe_aperture(
-        self,
-        probe_k_max: float,
-        dp_shape: tuple[int, int] | torch.Tensor | None = None,
-        normalize: bool = True,
-    ) -> torch.Tensor:
-        """Build a top-hat aperture probe in reciprocal space.
+    def _tilt_geometry(self, origins: torch.Tensor, tilt_x_deg: float) -> dict:
+        """Fixed sampling geometry for one tilt, cached across iterations.
 
-        With `normalize=True` (default), the returned probe satisfies
-        `sum(|Psi|**2) = 1`. Vacuum propagation preserves this norm.
+        For every slice along the rays: the 2x2x2 cluster corners' flat voxel
+        indices ``vidx (P, 8)`` (clamped in-bounds) and trilinear weights
+        ``tw (P, 8)`` (zeroed for out-of-slab corners). Pure geometry -- it
+        depends only on the scan/tilt, never on the parameters -- so computing
+        it once removes the largest per-iteration tensor-op overhead.
+        """
+        key = (round(float(tilt_x_deg), 6), origins.shape[0],
+               hash(origins.cpu().numpy().tobytes()))
+        cache = getattr(self, "_geo_cache", None)
+        if cache is None:
+            cache = self._geo_cache = {}
+        if key in cache:
+            return cache[key]
+        Nz, Ny, Nx = self.real_shape
+        dev = self.device
+        u, v, w = self.tilt_axes(tilt_x_deg)
+        pts = torch.stack([self.ray_samples(o, w) for o in origins])   # (P, Ns, 3)
+        P, Ns = pts.shape[0], pts.shape[1]
+        offs = torch.tensor([[dz, dy, dx] for dz in (0, 1) for dy in (0, 1) for dx in (0, 1)],
+                            device=dev)                                 # (8, 3)
+        lo = torch.zeros(3, dtype=torch.long, device=dev)
+        hi = torch.tensor([Nz - 1, Ny - 1, Nx - 1], device=dev)
+        slices = []
+        for s in range(Ns):
+            p = pts[:, s]
+            base = torch.floor(p).to(torch.int64)                      # (P, 3)
+            frac = (p - base.to(p.dtype))                               # (P, 3)
+            idx = base[:, None, :] + offs[None, :, :]                   # (P, 8, 3)
+            fw = torch.where(offs[None, :, :] == 1, frac[:, None, :], 1.0 - frac[:, None, :])
+            tw = fw.prod(dim=-1)                                        # (P, 8)
+            inb = ((idx >= lo) & (idx <= hi)).all(dim=-1)               # (P, 8)
+            tw = tw * inb
+            idxc = torch.minimum(torch.maximum(idx, lo), hi)
+            vidx = (idxc[..., 0] * Ny + idxc[..., 1]) * Nx + idxc[..., 2]  # (P, 8)
+            slices.append((vidx, tw.to(torch.complex64)))
+        # unique-voxel assembly (PRISM-style factorization): each distinct
+        # struck voxel's plane is sampled ONCE per tilt and every probe's
+        # slice SF is assembled by the constant trilinear matrix T -- the
+        # same algebra as the per-corner path, reordered, so probes stop
+        # re-sampling the voxels they share.
+        uslices = []
+        for vidx, tw in slices:
+            twr = tw.real
+            m = (twr > 0).reshape(-1)
+            uv = torch.unique(vidx.reshape(-1)[m])
+            lookup = torch.full((self.n_voxels,), 0, dtype=torch.long, device=dev)
+            lookup[uv] = torch.arange(uv.numel(), device=dev)
+            T = torch.zeros(P, max(int(uv.numel()), 1), device=dev)
+            T.scatter_add_(1, lookup[vidx], twr * (twr > 0))
+            uslices.append((uv, T))
+        kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
+        geo = {"u": u, "v": v, "slices": slices, "uslices": uslices,
+               "ku": ku, "kv": kv}
+        cache[key] = geo
+        return geo
 
-        Parameters
-        ----------
-        probe_k_max: float
-            Max k-vector magnitude (A^-1)
-        dp_shape: torch.Tensor
-            3D diffraction shape
+    def _prop_power(self, g: int) -> torch.Tensor:
+        """Fresnel propagator over ``g`` slice thicknesses (antialias applied once)."""
+        cache = getattr(self, "_prop_pow_cache", None)
+        if cache is None:
+            cache = self._prop_pow_cache = {}
+        if g not in cache:
+            if not hasattr(self, "_bare_prop"):
+                self.make_propagator()          # object predates the refactor
+            cache[g] = (self._bare_prop ** g) * self.antialias_mask
+        return cache[g]
+
+    def _transmission_planes_fused(self, vidx: torch.Tensor, tw: torch.Tensor,
+                                   geo: dict, basis: torch.Tensor,
+                                   R_all: torch.Tensor, W_all: torch.Tensor) -> torch.Tensor:
+        """Transmission SF deviation for all probes at one slice, one fused call.
 
         All ``P x 8`` cluster corners go through a single grid build and one
         ``grid_sample`` per real/imag part (the per-corner Python loop cost --
@@ -698,16 +870,8 @@ class DiffractionTomography:
         det_r, det_c = self.det_shape
         return (tw.reshape(V)[:, None, None] * t_vox).reshape(P, 8, det_r, det_c).sum(1)
 
-        ku, kv = self._make_planar_reciprocal_grids(dp_shape, self.dataset.sampling[3:5])
-        k_radial = torch.sqrt(ku**2 + kv**2)
-        dk = float(self.dataset.sampling[3])
-        aper = torch.clip((probe_k_max - k_radial) / dk + 0.5, 0.0, 1.0)
-        Psi0 = aper.to(torch.complex128)
-        if normalize:
-            norm = float(torch.sqrt(torch.sum(torch.abs(Psi0) ** 2)))
-            if norm > 0.0:
-                Psi0 = Psi0 / norm
-        return Psi0
+    def _basis_sample_vol(self, basis: torch.Tensor) -> torch.Tensor:
+        """Centered, channel-packed basis volume for grid_sample, once per forward.
 
         Returns ``(1, 2*Nw, N_kz, N_ky, N_kx)`` float32: the fftshifted basis
         with real parts in the first ``Nw`` channels and imaginary in the last
@@ -858,16 +1022,14 @@ class DiffractionTomography:
         cache[key] = geo
         return geo
 
-    @staticmethod
-    def _generate_slab_ray_coordinates(
-        position: torch.Tensor,
-        direction: torch.Tensor,
-        shape: tuple[int, int, int] | list[int] | torch.Tensor,
-        sampling: tuple[float, float, float] | list[float] | torch.Tensor,
-        prop_distance: float,
-        device: str | int = 'cpu',
-    ) -> torch.Tensor:
-        """Generate (equally spaced) index-space samples along a ray spanning the slab z-extent.
+    def forward_tilts(self, origins: torch.Tensor, tilts, basis: torch.Tensor,
+                      R_all: torch.Tensor, W_all: torch.Tensor,
+                      phase_only: bool = True, superslice: int = 1) -> torch.Tensor:
+        """Exit waves for a GROUP of tilts in one batched pass.
+
+        Identical physics to calling :meth:`forward_tilt` per tilt; all tilts'
+        probes travel together as one ``(T*P, det, det)`` wave, so one autograd
+        graph (and one backward) covers the whole group.
 
         Returns
         -------
@@ -908,66 +1070,16 @@ class DiffractionTomography:
                 Psi = Psi * self._prop_power(len(grp))
         return (Psi * self.antialias_mask).reshape(T, P, *self.det_shape)
 
-        r0 = torch.asarray(position, dtype=torch.float32) # still xyz
-        w_proj = torch.asarray(direction, dtype=torch.float32, device = device) # still xyz
-        shape = torch.flip(torch.asarray(shape, dtype=torch.int32, device = device), dims = [0]) # now xyz
-        sampling = torch.flip(torch.asarray(sampling, dtype=torch.float32, device = device), dims = [0]) # now xyz
+    def scan_positions(
+        self,
+        scan_shape: tuple[int, int],                 # (n_row, n_col)
+        scan_step: float | tuple[float, float] = 1.0,  # voxels, [row, col]
+        scan_origin: tuple[float, float] | None = None,  # [row, col] index; default center
+    ) -> torch.Tensor:
+        """Lab-frame probe positions, (n_row, n_col, 3) in index space [z, y, x].
 
-        if r0.shape != (3,):
-            raise ValueError(f"position must have shape (3,), got {r0.shape}")
-        if w_proj.shape != (3,):
-            raise ValueError(f"direction must have shape (3,), got {w_proj.shape}")
-        if shape.shape != (3,):
-            raise ValueError(f"shape must have length 3, got {shape}")
-        if sampling.shape != (3,):
-            raise ValueError(f"sampling must have length 3, got {sampling.shape}")
-
-        w_norm = torch.linalg.norm(w_proj)
-        if w_norm == 0:
-            raise ValueError("direction must be non-zero")
-        w_proj = w_proj / w_norm
-
-        dr = prop_distance * w_proj / sampling
-
-        # t_min = -torch.inf
-        # t_max = torch.inf
-        # for axis in range(3):
-        if torch.isclose(dr[2], torch.tensor(0.0)):
-            # beam parallel to slab - cannot traverse z
-            return torch.empty((0, 3), dtype=torch.float32)
-
-        # (p0_z - r0_z)/d_z for top and bottom of volume
-        t0 = (0.0 - r0[2]) / dr[2] 
-        t1 = ((shape[2] - 1) - r0[2]) / dr[2]
-        t_min, t_max = (t0, t1) if t0 <= t1 else (t1, t0)
-
-        # Sample the full line segment through the slab, including both negative
-        # and positive steps from the itorchut position when they remain in bounds.
-        eps = 1e-9
-        n_min = int(torch.ceil(t_min - eps))
-        n_max = int(torch.floor(t_max + eps))
-        if n_max <= n_min:
-        # if n_max < n_min:
-            return torch.empty((0, 3), dtype=torch.float32)
-
-        steps = torch.arange(n_min, n_max + 1, dtype=torch.float32, device=device)[:, None]
-        # print("steps test:", r0[None, :] + steps * dr[None, :])
-        return r0[None, :] + steps * dr[None, :]
-
-    # @staticmethod
-    def _trilinear_real_weights(self,position: torch.Tensor) -> list[tuple[tuple[int, int, int], float]]:
-        """Return real-space trilinear neighbors and weights for one sample position.
-        
-        Parameters
-        ----------
-        position: torch.Tensor
-            3D coordinate of position in volume 
-            Given as (x,y,z)
-        
-        Returns
-        -------
-        weights: list[tuple[tuple[int, int, int], float]]
-            Intensity weights and real-space trilinear neighbors from position as xyz
+        The raster lives in the fixed lab (row=y, col=x) plane at mid-thickness
+        z; the sample tilt only changes the beam direction, not the raster.
         """
         Nz, Ny, Nx = self.real_shape
         n_row, n_col = int(scan_shape[0]), int(scan_shape[1])
@@ -986,13 +1098,18 @@ class DiffractionTomography:
 
     def simulate(
         self,
-        Psi0,
-        position,
-        u_proj = (1,0,0),
-        v_proj = (0,1,0),
-    ):
-        """
-        Returns coordinates along a ray for a given position and sample tilt.
+        basis: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+        R_all: torch.Tensor | None = None,
+        tilts_deg=None,
+        scan_shape: tuple[int, int] | None = None,
+        scan_step: float | tuple[float, float] | None = None,
+        scan_origin=None,
+        phase_only: bool = True,
+        superslice: int = 1,
+        progress: bool = True,
+    ) -> torch.Tensor:
+        """Forward tilt series -> (n_tilt, n_row, n_col, det_row, det_col) intensities.
 
         Every argument is optional: parameters default to the model's own
         (current basis / weights / orientations), and the scan geometry
@@ -1102,60 +1219,44 @@ class DiffractionTomography:
                 acc = acc + T
             self.basis.copy_(torch.fft.ifftshift(acc / len(ops), dim=(0, 1, 2)))
 
-        r_all = self.get_ray_coords(Psi0, position, u_proj, v_proj)['ray_coords']
-        # multislice propagation through volume
-        material_mask = self._get_material_mask().to(device)
-        material_slice_cache = getattr(self, "_material_slice_cache", None)
-        Nz, Ny, Nx = self.real_shape
-        Psi = Psi0.clone()
+    @classmethod
+    def _miso_deg(cls, dR: np.ndarray) -> float:
+        """Cubic-symmetry-reduced misorientation angle (deg) of a relative rotation."""
+        if not hasattr(cls, "_ops_cache"):
+            cls._ops_cache = cls._cubic_ops()
+        tr = np.einsum("sij,ji->s", cls._ops_cache, dR)
+        c = np.clip((tr.max() - 1.0) / 2.0, -1.0, 1.0)
+        return float(np.degrees(np.arccos(c)))
 
-        for ind, r in enumerate(r_all):
-            # trilinear interpolation of structure factor slice from 6D volume for
-            # this ray position. Vacuum cells (SF = delta at the origin) only
-            # contribute `weight` to the central pixel, so we short-circuit
-            # them instead of calling `ndi.map_coordinates`. Material slices
-            # may be precomputed once per `simulate_4dstem` tilt and looked up
-            # from `self._material_slice_cache`.
-            SF = torch.zeros(Psi0.shape, dtype=self.array.dtype, device = device)
-            weight_sum = 0.0
-            for (iz,iy,ix), weight in self._trilinear_real_weights(r):
-                if weight == 0.0:
-                    continue
-                if not (0 <= ix < Nx and 0 <= iy < Ny and 0 <= iz < Nz):
-                    continue
-                weight_sum += weight
-                if material_mask[iz, iy, ix]:
-                # if material_mask[ix, iy, iz]:
-                    if material_slice_cache is not None:
-                        SF += weight * material_slice_cache[iz, iy, ix]
-                        # SF += weight * material_slice_cache[ix, iy, iz]
-                    else:
-                        SF += weight * self._sample_complex_volume_trilinear(
-                            self.array[iz, iy, ix],
-                            # self.array[ix, iy, iz],
-                            self.k_slice_coords,
-                        ).to(SF.dtype)
-                else:
-                    SF[0,0] += weight
+    @staticmethod
+    def _uniform_rotations(n: int, seed: int) -> np.ndarray:
+        """(n, 3, 3) uniform SO(3) samples (Shoemake quaternions)."""
+        rng = np.random.default_rng(seed)
+        u = rng.random((n, 3))
+        q = np.stack([np.sqrt(1 - u[:, 0]) * np.sin(2 * np.pi * u[:, 1]),
+                      np.sqrt(1 - u[:, 0]) * np.cos(2 * np.pi * u[:, 1]),
+                      np.sqrt(u[:, 0]) * np.sin(2 * np.pi * u[:, 2]),
+                      np.sqrt(u[:, 0]) * np.cos(2 * np.pi * u[:, 2])], axis=1)
+        x, y, z, w = q.T
+        return np.stack([
+            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+        ], axis=-1).reshape(n, 3, 3)
 
-            if weight_sum > 0.0:
-                SF /= weight_sum
-                # Convention: the 2D transmission function `T_2d` satisfies
-                # `T_2d[0, 0] = num_pixels` for vacuum, which corresponds to
-                # `t_2d = 1` in real space. The 6D SF is stored normalized
-                # (`SF[..., 0, 0, 0] = 1` for vacuum), so we scale by
-                # `num_pixels` here to recover that convention.
-                num_pixels = Psi.numel()          # total number of elements (Nx*Ny)
-                T_2d = num_pixels * SF
-                t_real = torch.fft.ifft2(T_2d)
-                if phase_only:
-                    # Enforce a unitary phase-grating transmission: `|t| = 1`
-                    # everywhere, so probe norm is preserved per slice.
-                    # Vacuum still falls out as identity (angle(1) = 0).
-                    t_real = (torch.exp(1j * torch.angle(t_real))).to(device)
-                Psi = torch.fft.fft2(torch.fft.ifft2(Psi) * t_real)
-            # else: ray is outside the slab footprint at this slice — vacuum,
-            # so skip transmission and only apply Fresnel propagation below.
+    @staticmethod
+    def _rot_perturbations(sigma_deg: float, n: int, seed: int) -> np.ndarray:
+        """(n, 3, 3) small random rotations with angle scale sigma_deg."""
+        rng = np.random.default_rng(seed)
+        ax = rng.normal(size=(n, 3))
+        ax /= np.linalg.norm(ax, axis=1, keepdims=True)
+        th = np.radians(sigma_deg) * rng.normal(size=n)
+        K = np.zeros((n, 3, 3))
+        K[:, 0, 1], K[:, 0, 2] = -ax[:, 2], ax[:, 1]
+        K[:, 1, 0], K[:, 1, 2] = ax[:, 2], -ax[:, 0]
+        K[:, 2, 0], K[:, 2, 1] = -ax[:, 1], ax[:, 0]
+        I = np.eye(3)[None]
+        return I + np.sin(th)[:, None, None] * K + (1 - np.cos(th))[:, None, None] * (K @ K)
 
     def _reset_optimizer_state(self, opt, param, rows) -> None:
         """Zero Adam moments for selected voxel rows of a parameter.
@@ -1235,81 +1336,342 @@ class DiffractionTomography:
     def set_learnable(self, basis: bool | None = None, angles: bool | None = None) -> None:
         """Freeze / unfreeze the basis or the per-voxel orientations in place.
 
-        return Psi
-    
-    @staticmethod
-    def _resolve_zxz_deg(
-        tilt_x_deg: float | None,
-        zxz_deg: torch.Tensor | tuple | list | None,
-    ) -> torch.Tensor:
-        """Normalize tilt/zxz inputs to a length-3 ZXZ vector in degrees."""
-        if zxz_deg is not None:
-            zxz_arr = torch.asarray(zxz_deg, dtype=torch.float32)
-            if zxz_arr.shape != (3,):
-                raise ValueError(f"zxz_deg must have shape (3,), got {zxz_arr.shape}")
-            return zxz_arr
-        return torch.tensor([0.0, float(tilt_x_deg or 0.0), 0.0], dtype=torch.float32)
-
-    def projection_axes(
-        self,
-        tilt_x_deg: float | None = 0.0,
-        zxz_deg: torch.Tensor | tuple | list | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (u_proj, v_proj, w_proj) in sample-frame coordinates.
-
-        `u_proj` is the fast-scan direction, `v_proj` the slow-scan direction,
-        and `w_proj` the beam direction. The sample is rotated by the given
-        ZXZ Euler angles relative to the (lab, beam-down-z) frame; the lab
-        axes (1,0,0), (0,1,0), (0,0,1) are then expressed in the sample frame.
+        Used for curriculum (staged) optimization: e.g. explore jointly, then
+        freeze the angles and refine only the basis + weights, then release.
+        Takes effect on the next :meth:`reconstruct` call. Weights are always
+        learnable.
         """
-        zxz_arr = self._resolve_zxz_deg(tilt_x_deg, zxz_deg)
-        rot = Rotation.from_euler("zxz", zxz_arr, degrees=True)
-        # Lab→sample mapping: apply the inverse rotation to lab basis vectors.
-        u_proj = torch.tensor(rot.inv().apply([1.0, 0.0, 0.0]))
-        v_proj = torch.tensor(rot.inv().apply([0.0, 1.0, 0.0]))
-        w_proj = torch.linalg.cross(u_proj, v_proj)
-        w_norm = torch.linalg.norm(w_proj)
-        if w_norm == 0:
-            raise ValueError("u_proj and v_proj must not be parallel")
-        w_proj /= w_norm
-        return u_proj, v_proj, w_proj
+        if basis is not None:
+            self.learn_basis = bool(basis)
+            self.basis.requires_grad_(self.learn_basis)
+        if angles is not None:
+            self.learn_angles = bool(angles)
+            for p in self.angles.parameters():
+                p.requires_grad_(self.learn_angles)
 
-    def setup_dataloader(
-            self,
-            dataset: Dataset | DatasetModelType,
-            batch_size: int = 1024,
-            val_fraction: float = 0.0,
-    ):
-        pin_mem = self.device == 'cuda'
-        generator = torch.Generator()
-        generator.manual_seed(42)
-        dataset_size = len(dataset)
-        print((1-val_fraction)*dataset_size)
+    def reconstruct(
+        self,
+        measurements: torch.Tensor,                 # (n_tilt, n_row, n_col, det, det) intensities
+        tilts_deg,
+        scan_shape: tuple[int, int],
+        scan_step: float | tuple[float, float] = 1.0,
+        scan_origin=None,
+        num_iters: int = 100,
+        lr: float = 5e-3,
+        superslice: int = 1,
+        tilt_batch: int = 1,
+        shrink_basis: float = 0.0,
+        smooth_basis: float = 0.0,
+        smooth_weights: float = 0.0,
+        friedel_basis: bool = True,
+        cubic_symmetry: bool = False,
+        search_every: int = 0,
+        reset_every: int = 10,
+        phase_only: bool = True,
+        resume: bool = False,
+        progress: bool = True,
+        print_every: int = 0,
+    ) -> dict:
+        """Fit basis + weights + angles to the measured tilt series (Adam).
 
-        if val_fraction > 0.0:
-            train_size = int((1-val_fraction)*dataset_size)
-            train_dataset, val_dataset = random_split(dataset, [train_size, dataset_size-train_size], generator=generator)
-            # train_dataset, val_dataset = random_split(dataset, [(1-val_fraction)*dataset_size, val_fraction*dataset_size], generator=generator)
+        Full-batch amplitude (sqrt-intensity) loss, one tilt group at a time.
+        The lowest-loss state is snapshotted and returned. Priors and search,
+        all optional and applied each step:
+
+        * ``shrink_basis`` -- proximal L1 on the off-origin basis (sharpens
+          Bragg spots, kills k-space fog).
+        * ``smooth_basis`` -- gentle reciprocal-space Gaussian (pools split
+          intensity into single peaks).
+        * ``smooth_weights`` -- real-space Gaussian on the weight field only
+          (angles are discontinuous at grain boundaries and never smoothed).
+        * ``friedel_basis`` -- project the off-origin basis onto the
+          anti-Hermitian symmetry of a real potential's phase grating
+          (always-true physics; on by default).
+        * ``cubic_symmetry`` -- project the basis onto the cubic point group
+          (see :meth:`symmetrize_basis`). Reinforces each Bragg peak with its
+          whole orbit; a big win when many grains sample k-space, but it can
+          hurt a single sparse grain (it symmetrizes an under-determined
+          basis), so leave it off for one/few grains.
+        * ``search_every`` -- every N iters run a :meth:`local_search`
+          orientation sweep (exact-forward, evidence-based). Needed to discover
+          the orientations of *many* grains; unnecessary (and slower) for one.
+        * ``reset_every`` -- every N iters give the worst-fit voxels a cheap
+          stochastic orientation/weight jump (neighbor adoption or random).
+          The cheap complement to ``search_every`` -- enough on its own for
+          one/few grains.
+
+        ``resume=True`` continues a previous ``reconstruct`` call: the Adam
+        momentum and the accumulated loss history carry over (so ``plot_loss``
+        shows the whole run and keep-best never rolls back below where the
+        last call ended). The basis/weights/angles always carry over regardless
+        of ``resume``; only the optimizer state and loss history need it. Use it
+        to add iterations incrementally (run N, inspect, run N more) -- the same
+        as one long call, but you can look in between.
+
+        Set ``progress=False`` to hide the bar; ``print_every>0`` prints the
+        loss every N iters.
+        """
+        # record the geometry so simulate() can reproduce the predicted patterns
+        # with no arguments after reconstruction
+        self._scan_geometry = {"tilts_deg": list(tilts_deg), "scan_shape": tuple(scan_shape),
+                               "scan_step": scan_step, "scan_origin": scan_origin}
+        pos = self.scan_positions(scan_shape, scan_step, scan_origin)
+        n_row, n_col = pos.shape[:2]
+        meas_amp = measurements.to(self.device).clamp_min(0).sqrt()
+        jobs = [(ti, j, i) for ti in range(len(tilts_deg)) for j in range(n_row) for i in range(n_col)]
+        n_dp = len(jobs)
+        # eps=1e-30: the phase-object gradients are ~1e-10, so the default
+        # eps=1e-8 would swamp sqrt(v) and throttle every Adam step ~100x.
+        # resume=True reuses the Adam state (momentum) from the previous call
+        # so a second reconstruct() continues smoothly instead of restarting
+        # the optimizer; the params always carry over regardless.
+        if resume and getattr(self, "_opt", None) is not None:
+            opt = self._opt
         else:
-            train_dataset = dataset
-            val_dataset = None
+            opt = self._make_optimizer(lr, lr, lr)
+        self._opt = opt
+        group_names = ["weights"] + (["basis"] if self.learn_basis else []) \
+            + (["angles"] if self.learn_angles else [])
+        lrs: list[list[float]] = []
+        gen = torch.Generator(device="cpu").manual_seed(self.seed + 1)
+        losses = []
+        # fixed geometry: per-DP -> per-voxel deposited trilinear weight, used to
+        # attribute each DP's residual to the voxels its ray strikes (reset metric)
+        Wmat = torch.stack([
+            self._ray_voxel_weights(pos[j, i], float(tilts_deg[ti])) for (ti, j, i) in jobs
+        ])                                                            # (n_dp, n_voxels)
+        res_per_dp = torch.zeros(n_dp, dtype=torch.float64, device=self.device)
+        # on resume, carry the best-loss forward so keep-best never rolls the
+        # continued run back below where the previous call left off
+        best = {"loss": self.best_loss if resume and hasattr(self, "best_loss")
+                else float("inf"), "snap": None}
 
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size = batch_size,
-            pin_memory=pin_mem,
-            drop_last=False,
-            )
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size = batch_size * 4, # less memory than training
-            pin_memory=pin_mem,
-            drop_last=False,
-            )
-        return train_dataloader, val_dataloader
-        
-    #  put this under DiffractionTomography?
-    def reconstruct_pix(
+        origins = pos.reshape(-1, 3)                          # (P, 3)
+        P = origins.shape[0]
+        n_tilt = len(tilts_deg)
+        pbar = tqdm(range(num_iters), disable=not progress, desc="reconstruct", unit="it")
+        for it in pbar:
+            opt.zero_grad(set_to_none=True)
+            total = 0.0
+            for t0 in range(0, n_tilt, max(1, tilt_batch)):
+                # tilts are processed in groups of tilt_batch: one autograd
+                # graph (and one backward) per group. tilt_batch trades memory
+                # for speed; gradients still accumulate into one full-batch
+                # optimizer step per iteration.
+                t_grp = list(range(t0, min(t0 + max(1, tilt_batch), n_tilt)))
+                basis = self.masked_basis()
+                R_all = self.rotation_matrices()
+                Psi = self.forward_tilts(origins, [float(tilts_deg[ti]) for ti in t_grp],
+                                         basis, R_all, self.weights,
+                                         phase_only=phase_only,
+                                         superslice=superslice)                       # (T,P,det,det)
+                tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape)
+                tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2, 3))                        # (T,P)
+                (tl.sum() / n_dp).backward()
+                res_per_dp[t_grp[0] * P:(t_grp[-1] + 1) * P] = tl.detach().reshape(-1)
+                total += float(tl.sum())
+
+            mean_loss = total / n_dp
+            losses.append(mean_loss)
+            lrs.append([float(g["lr"]) for g in opt.param_groups])
+            if np.isfinite(mean_loss) and mean_loss < best["loss"]:
+                best = {"loss": mean_loss, "snap": self._snapshot()}
+
+            opt.step()
+            self._sanitize(opt, gen)     # repair NaN/Inf params (degenerate SVD backward)
+            if smooth_weights > 0.0:
+                # real-space coherence on the WEIGHT field only (angles are
+                # discontinuous at grain boundaries and must not be smoothed):
+                # separable 3-tap Gaussian into the 6 neighbors each step.
+                with torch.no_grad():
+                    wgt = float(np.exp(-1.0 / (2.0 * smooth_weights ** 2)))
+                    norm = 1.0 + 2.0 * wgt
+                    W = self.weights
+                    for axis in range(3):
+                        n = W.shape[axis]
+                        if n < 2:
+                            continue
+                        idx_p = torch.arange(-1, n - 1, device=W.device).clamp(min=0)
+                        idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
+                        W.copy_((wgt * W.index_select(axis, idx_p) + W
+                                 + wgt * W.index_select(axis, idx_n)) / norm)
+            if cubic_symmetry and self.learn_basis:
+                # project the basis onto cubic point-group symmetry each step:
+                # every Bragg peak is forced equal to its whole 24-fold orbit,
+                # so a peak seen by any grain/tilt is filled in for all
+                # equivalents and the rotation search sees a full clean target.
+                # Pins the basis to the cardinal-cubic gauge from the start.
+                self.symmetrize_basis()
+            if friedel_basis and self.learn_basis:
+                # the basis is the transmission's structure factor: for the
+                # phase grating of a real potential the off-origin content is
+                # anti-Hermitian, F(-k) = -conj(F(k)) (peaks purely imaginary,
+                # as in make_au_basis). Every tilt plane contains both members
+                # of a Friedel pair, so the data never constrains the Hermitian
+                # component -- project it away. The origin (vacuum baseline,
+                # real) is preserved separately.
+                with torch.no_grad():
+                    flip = torch.roll(torch.flip(self.basis, dims=(0, 1, 2)),
+                                      shifts=(1, 1, 1), dims=(0, 1, 2))
+                    keep = self.basis[0, 0, 0, :].clone()
+                    self.basis.copy_(0.5 * (self.basis - flip.conj()))
+                    self.basis[0, 0, 0, :] = keep
+            if smooth_basis > 0.0 and self.learn_basis:
+                # reciprocal-space coherence: a gentle 3-tap Gaussian each step
+                # pools intensity split across neighboring k voxels into one
+                # spike, so the shrinkage threshold sees a strong peak instead
+                # of fragments, while incoherent fog averages down. Frequency
+                # neighbors wrap across index 0 (unshifted storage); the origin
+                # is held out entirely -- its vacuum amplitude is ~10x the
+                # peaks and would bleed into the surrounding cluster.
+                with torch.no_grad():
+                    wgt = float(np.exp(-1.0 / (2.0 * smooth_basis ** 2)))
+                    norm = 1.0 + 2.0 * wgt
+                    Bv = self.basis
+                    keep = Bv[0, 0, 0, :].clone()
+                    Bv[0, 0, 0, :] = 0.0
+                    for axis in range(3):
+                        n = Bv.shape[axis]
+                        idx_p = torch.arange(-1, n - 1, device=Bv.device) % n
+                        idx_n = torch.arange(1, n + 1, device=Bv.device) % n
+                        Bv.copy_((wgt * Bv.index_select(axis, idx_p) + Bv
+                                  + wgt * Bv.index_select(axis, idx_n)) / norm)
+                    Bv[0, 0, 0, :] = keep
+            if shrink_basis > 0.0 and self.learn_basis:
+                # proximal L1 on the basis' off-origin content: a structure
+                # factor is a few sharp Bragg spots, so soft-thresholding kills
+                # the k-space fog that otherwise fits the data with rings
+                # instead of spots (the same cure the explicit-6D model needed).
+                with torch.no_grad():
+                    tau = shrink_basis * lr
+                    mag = self.basis.abs()
+                    keep = self.basis[0, 0, 0, :].clone()
+                    self.basis.copy_(self.basis / mag.clamp_min(1e-30)
+                                     * torch.clamp(mag - tau, min=0.0))
+                    self.basis[0, 0, 0, :] = keep          # origin (vacuum) untouched
+
+            n_res = 0
+            # cheap stochastic escape (complements search_every): every
+            # reset_every iters the worst voxels (by residual error along their
+            # rays) get an orientation + weight jump -- adopt a random real-space
+            # neighbor (grain growth) or a fresh random orientation. The count
+            # tapers to zero over the run (explore early, refine late), and
+            # settled vacuum voxels are de-prioritized so jumps hit misfit
+            # material. Skipped when angles are frozen.
+            if self.learn_angles and reset_every and (it + 1) % reset_every == 0 and it < num_iters - 1:
+                taper = 1.0 - it / num_iters
+                n_res = int(round(0.1 * self.n_voxels * taper))
+                if n_res > 0:
+                    err_vox = Wmat.t() @ res_per_dp
+                    wmag = self.weights.detach().abs().sum(-1).flatten()
+                    vac = wmag < 0.15 * wmag.max().clamp_min(1e-30)
+                    err_vox = err_vox * torch.where(vac, 0.2, 1.0)
+                    bad = torch.topk(err_vox, n_res).indices
+                    Nz, Ny, Nx = self.real_shape
+                    with torch.no_grad():
+                        Wf = self.weights.reshape(self.n_voxels, self.num_structures)
+                        w_mean = self.weights.mean()
+                        for v in bad.tolist():
+                            if float(torch.rand(1, generator=gen)) < 0.5:
+                                # adopt a random in-bounds 6-neighbor's orientation + weight
+                                iz, iy, ix = v // (Ny * Nx), (v // Nx) % Ny, v % Nx
+                                nbrs = [(iz + dz, iy + dy, ix + dx)
+                                        for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                                                           (0, -1, 0), (0, 0, 1), (0, 0, -1))
+                                        if 0 <= iz + dz < Nz and 0 <= iy + dy < Ny and 0 <= ix + dx < Nx]
+                                jz, jy, jx = nbrs[int(torch.randint(len(nbrs), (1,), generator=gen))]
+                                nb = (jz * Ny + jy) * Nx + jx
+                                self.angles.M[v] = self.angles.M[nb] \
+                                    + 0.02 * torch.randn(3, 3, generator=gen).to(self.device)
+                                Wf[v] = Wf[nb]
+                            else:
+                                self.angles.M[v] = (torch.eye(3)
+                                                    + 0.1 * torch.randn(3, 3, generator=gen)).to(self.device)
+                                Wf[v] = w_mean
+                        self._reset_optimizer_state(opt, self.angles.M, bad)
+                        self._reset_optimizer_state(opt, self.weights, bad)
+            if (search_every and self.learn_angles and (it + 1) % search_every == 0
+                    and it < num_iters - 1):
+                # exact-forward orientation sweep: each voxel keeps the best of
+                # its neighbors / jittered-incumbent / random rotations judged
+                # on only the rays that strike it. Evidence-based, so it finds
+                # grains the blind reset cannot; the changed voxels' stale Adam
+                # moments are cleared. Each sweep transiently raises the loss
+                # (the basis/weights must re-adapt to the new orientations)
+                # before falling below the previous best -- that "spike" IS the
+                # grain discovery, so it runs to the end; the lowest-loss state
+                # over the whole run is snapshotted and returned.
+                self.local_search(measurements, tilts_deg, scan_shape, scan_step,
+                                  accept=0.95, order="error", seed=it, progress=progress)
+                allv = torch.arange(self.n_voxels, device=self.device)
+                self._reset_optimizer_state(opt, self.angles.M, allv)
+                self._reset_optimizer_state(opt, self.weights, allv)
+            if print_every and (it % print_every == 0 or it == num_iters - 1):
+                print(f"  it {it:4d}  loss {mean_loss:.4e}  best {best['loss']:.4e}"
+                      + (f"  reset {n_res}" if n_res else ""), flush=True)
+            pbar.set_postfix(loss=f"{mean_loss:.3e}", best=f"{best['loss']:.3e}")
+
+        if best["snap"] is not None:
+            self._restore(best["snap"])              # return the best-ever state
+        # accumulate the loss / lr history across resumed calls so plot_loss
+        # shows the whole run, not just the latest call
+        if resume and getattr(self, "losses", None):
+            self.losses = self.losses + losses
+            self.lrs = (self.lrs + lrs) if getattr(self, "lrs", None) else lrs
+        else:
+            self.losses = losses
+            self.lrs = lrs
+        self.best_loss = best["loss"]
+        self.lr_group_names = group_names
+        return {"losses": self.losses, "lrs": self.lrs, "best_loss": best["loss"],
+                "basis": self.masked_basis().detach(),
+                "weights": self.weights.detach(),
+                "rotations": self.rotation_matrices().detach()}
+
+    def _local_ray_map(self, tilts_deg, scan_shape, scan_step=1.0, w_min=0.45):
+        """voxel -> list of (tilt_index, probe_index) rays that intercept it.
+
+        A ray counts for a voxel when any slice sample gives the voxel a
+        trilinear weight above ``w_min``. 0.45 (not 0.5): even-N_z slabs put
+        ray samples at half-integer z, where the two co-dominant corners each
+        carry exactly 0.5.
+        """
+        pos = self.scan_positions(scan_shape, scan_step).reshape(-1, 3)
+        vox_rays = [set() for _ in range(self.n_voxels)]
+        for ti, t in enumerate(tilts_deg):
+            geo = self._tilt_geometry(pos, float(t))
+            for vidx, tw in geo["slices"]:
+                for p, v in zip(*torch.nonzero(tw.real > w_min, as_tuple=True)):
+                    vox_rays[int(vidx[p, v])].add((ti, int(p)))
+        return [sorted(s) for s in vox_rays], pos
+
+    def _orientation_planes(self, basis_sum_c, R_bank, U, V, ku, kv):
+        """Centered-basis plane samples for (n_R x n_tilt) rotation/axis pairs."""
+        Nkz, Nky, Nkx = self.k_shape
+        nR, nT = len(R_bank), U.shape[0]
+        R = torch.as_tensor(np.asarray(R_bank), dtype=torch.float32, device=self.device)
+        u_b = torch.einsum("rij,ti->rtj", R, U)
+        v_b = torch.einsum("rij,ti->rtj", R, V)
+        dk = torch.tensor(self.k_sampling, dtype=torch.float32, device=self.device)
+        kxyz = (ku[None, None, ..., None] * u_b[:, :, None, None, :]
+                + kv[None, None, ..., None] * v_b[:, :, None, None, :])
+        ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32,
+                           device=self.device)
+        c = kxyz / dk + ctr
+        grid = torch.stack((
+            2.0 * c[..., 2] / (Nkx - 1.0) - 1.0,
+            2.0 * c[..., 1] / (Nky - 1.0) - 1.0,
+            2.0 * c[..., 0] / (Nkz - 1.0) - 1.0,
+        ), dim=-1).reshape(nR * nT, 1, *ku.shape, 3).to(torch.float32)
+        bre = basis_sum_c.real[None, None].expand(nR * nT, 1, -1, -1, -1).to(torch.float32)
+        bim = basis_sum_c.imag[None, None].expand(nR * nT, 1, -1, -1, -1).to(torch.float32)
+        sre = F.grid_sample(bre, grid, mode="bilinear", padding_mode="zeros",
+                            align_corners=True)
+        sim = F.grid_sample(bim, grid, mode="bilinear", padding_mode="zeros",
+                            align_corners=True)
+        return (sre + 1j * sim)[:, 0, 0].reshape(nR, nT, *ku.shape)
+
+    def local_search(
         self,
         measurements: torch.Tensor,
         tilts_deg,
@@ -1565,6 +1927,20 @@ class DiffractionTomography:
         ax.tick_params(axis="y", labelcolor="C0")
         ax.xaxis.get_major_locator().set_params(integer=True)
 
-        return {'reconstructed_sf': self.sf_learned.detach().cpu(),
-        'training_losses': total_loss,
-        'validation_losses': avg_val_loss,}
+        lrs = getattr(self, "lrs", None)
+        if lrs:
+            arr = np.asarray(lrs)                       # (n_it, n_groups)
+            names = getattr(self, "lr_group_names", [f"group {i}" for i in range(arr.shape[1])])
+            axr = ax.twinx()
+            if np.allclose(arr, arr[:, :1]):            # all groups share one lr
+                axr.semilogy(it, arr[:, 0], "--", color="C1", label="lr")
+            else:
+                for gi, nm in enumerate(names):
+                    axr.semilogy(it, arr[:, gi], "--", label=f"lr ({nm})")
+            axr.set_ylabel("learning rate", color="C1")
+            axr.tick_params(axis="y", labelcolor="C1")
+            axr.legend(loc="upper right", fontsize=8)
+        ax.set_title("reconstruction loss + learning rate")
+        ax.legend(loc="lower left", fontsize=8)
+        plt.show()
+        return fig, ax
