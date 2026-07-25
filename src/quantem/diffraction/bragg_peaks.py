@@ -48,6 +48,15 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from matplotlib.patches import Ellipse, Rectangle
 from matplotlib.colors import BoundaryNorm, hsv_to_rgb, rgb_to_hsv
 
+# Default 1/e decay length for the orientation-correlation slope fit, as a
+# fraction of the fitted lobe's distance span. Chosen on real scan data
+# (pg3T2 07-03-2024/61): it holds the fitted intercept within ~1.7 degrees of
+# the measured boundary at zero separation across all six ring pairs, versus
+# up to 7 degrees for an unweighted fit, while keeping enough effective points
+# for a stable slope. See plot_orientation_correlation(slope_weight_scale=...).
+SLOPE_WEIGHT_FRACTION = 0.10
+
+
 def _apply_zoom_crop(data, zoom_factor, center=None):
     """Crop data to center region based on zoom factor."""
     if zoom_factor == 1.0:
@@ -5203,6 +5212,7 @@ class BraggPeaksPolymer(AutoSerialize):
         figsize=None,
         show_metrics=True,
         return_metrics=False,
+        slope_weight_scale=None,
     ):
         """Plot distance-orientation correlations using Matplotlib.
 
@@ -5211,6 +5221,28 @@ class BraggPeaksPolymer(AutoSerialize):
         radial and annular 50% distances. The signed slope is fitted separately
         to the primary correlation-equals-one boundary between positive
         correlation and anticorrelation.
+
+        Parameters
+        ----------
+        slope_weight_scale : float, optional
+            1/e decay length, in ``pixel_units``, of the exponential weighting
+            applied to the slope fit. The correlation-equals-one boundary
+            saturates with distance, so an unweighted straight line over the
+            whole lobe is dominated by the flat tail: it biases the slope low
+            and pushes the fitted intercept off the measured boundary at zero
+            separation. Weighting towards short distances makes ``slope`` the
+            near-origin tangent instead. Defaults to
+            ``SLOPE_WEIGHT_FRACTION`` times the fitted distance span. Pass
+            ``numpy.inf`` to restore the previous unweighted full-lobe fit.
+
+        Notes
+        -----
+        Each metrics entry reports ``slope_fit_intercept_degrees`` (compare it
+        against the boundary at zero separation to check the fit),
+        ``slope_fit_effective_point_count`` (Kish effective sample size, which
+        falls as the weighting sharpens), and the resolved
+        ``slope_weight_scale``. ``slope_fit_r_squared`` is weighted with the
+        same weights, so it is not comparable to an unweighted R-squared.
         """
         from matplotlib.colors import LinearSegmentedColormap, LogNorm
         from matplotlib.lines import Line2D
@@ -5338,6 +5370,9 @@ class BraggPeaksPolymer(AutoSerialize):
             slope = np.nan
             slope_fit_r_squared = np.nan
             slope_fit_point_count = 0
+            slope_fit_intercept = np.nan
+            slope_fit_effective_count = np.nan
+            weight_scale = np.nan
             fit_distances = np.array([])
             fit_angles = np.array([])
             if np.isfinite(half_probability):
@@ -5434,21 +5469,57 @@ class BraggPeaksPolymer(AutoSerialize):
                         ]
             if primary_indices.size:
                 fit_distances = distances[primary_indices]
-                fit_slope, fit_intercept = np.polyfit(
-                    fit_distances, baseline_boundary[primary_indices], 1
+                fit_values = baseline_boundary[primary_indices]
+
+                # The correlation=1 boundary saturates: it climbs steeply near the
+                # origin and flattens at large separation. An unweighted straight
+                # line over the whole lobe is therefore dominated by the flat tail,
+                # which drags the intercept off the measured boundary at d=0 (up to
+                # ~7 degrees on real data, visibly landing in the blue region) and
+                # biases the slope low. Weight the fit towards short distances so
+                # `slope` is the near-origin tangent, which is the physically
+                # meaningful quantity.
+                fit_span = float(fit_distances.max() - fit_distances.min())
+                if slope_weight_scale is None:
+                    weight_scale = SLOPE_WEIGHT_FRACTION * fit_span
+                else:
+                    weight_scale = float(slope_weight_scale)
+                if not np.isfinite(weight_scale) or weight_scale <= 0:
+                    # np.inf (or a non-positive scale) restores the legacy
+                    # unweighted fit over the full lobe.
+                    fit_weights = np.ones_like(fit_distances)
+                    weight_scale = np.inf
+                else:
+                    fit_weights = np.exp(
+                        -(fit_distances - fit_distances.min()) / weight_scale
+                    )
+
+                root_weights = np.sqrt(fit_weights)
+                design = (
+                    np.vstack([fit_distances, np.ones_like(fit_distances)]).T
+                    * root_weights[:, None]
                 )
+                fit_slope, fit_intercept = np.linalg.lstsq(
+                    design, fit_values * root_weights, rcond=None
+                )[0]
                 fit_angles = fit_intercept + fit_slope * fit_distances
                 slope = float(fit_slope)
+                slope_fit_intercept = float(fit_intercept)
                 slope_fit_point_count = int(fit_distances.size)
-                fit_residuals = (
-                    baseline_boundary[primary_indices] - fit_angles
+                # Kish effective sample size: how many points the weighting really
+                # uses, so a too-aggressive scale is visible rather than silent.
+                slope_fit_effective_count = float(
+                    fit_weights.sum() ** 2 / np.sum(fit_weights**2)
                 )
-                fit_total = (
-                    baseline_boundary[primary_indices]
-                    - np.mean(baseline_boundary[primary_indices])
+                weight_mean = float(
+                    np.average(fit_values, weights=fit_weights)
                 )
-                residual_sum_squares = float(np.sum(fit_residuals**2))
-                total_sum_squares = float(np.sum(fit_total**2))
+                residual_sum_squares = float(
+                    np.sum(fit_weights * (fit_values - fit_angles) ** 2)
+                )
+                total_sum_squares = float(
+                    np.sum(fit_weights * (fit_values - weight_mean) ** 2)
+                )
                 slope_fit_r_squared = (
                     1.0 - residual_sum_squares / total_sum_squares
                     if total_sum_squares > 0
@@ -5456,7 +5527,19 @@ class BraggPeaksPolymer(AutoSerialize):
                 )
 
             if fit_distances.size:
-                visible_fit = (fit_angles >= 0) & (fit_angles <= 180)
+                # Draw only where the weighting actually constrains the line. Past
+                # ~3 decay lengths the boundary has saturated away from this
+                # tangent, and extending the line there would misrepresent the fit.
+                if np.isfinite(weight_scale):
+                    drawn = fit_distances <= (
+                        fit_distances.min() + 3.0 * weight_scale
+                    )
+                    if drawn.sum() < 2:
+                        drawn = np.zeros_like(fit_distances, dtype=bool)
+                        drawn[: min(2, drawn.size)] = True
+                else:
+                    drawn = np.ones_like(fit_distances, dtype=bool)
+                visible_fit = drawn & (fit_angles >= 0) & (fit_angles <= 180)
                 ax.plot(
                     fit_distances[visible_fit],
                     fit_angles[visible_fit],
@@ -5490,7 +5573,7 @@ class BraggPeaksPolymer(AutoSerialize):
                         [0],
                         color="#ffe600",
                         linewidth=2.5,
-                        label="signed baseline fit",
+                        label="near-origin baseline fit",
                     ),
                 ],
                 loc="lower right",
@@ -5507,6 +5590,11 @@ class BraggPeaksPolymer(AutoSerialize):
                 "slope_degrees_per_unit": float(slope),
                 "slope_fit_r_squared": float(slope_fit_r_squared),
                 "slope_fit_point_count": slope_fit_point_count,
+                "slope_fit_intercept_degrees": float(slope_fit_intercept),
+                "slope_fit_effective_point_count": float(
+                    slope_fit_effective_count
+                ),
+                "slope_weight_scale": float(weight_scale),
                 "slope_contour_probability": 1.0,
                 "distance_units": pixel_units,
             }
