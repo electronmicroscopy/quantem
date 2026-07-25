@@ -1576,8 +1576,18 @@ class DiffractionTomography:
         groups = [{"params": [self.weights], "lr": lr_weights, "name": "weights"}]
         if self.learn_basis:
             if inr_lr is not None:
-                groups.append({"params": list(self.basis_inr.parameters()),
-                               "lr": inr_lr, "name": "inr"})
+                # the peak model's lattice moves every reflection at once, so
+                # it needs a far smaller step than the amplitudes (at equal lr
+                # it runs away); it is only in the optimizer at all when the
+                # caller left it learnable.
+                cell = [p for n, p in self.basis_inr.named_parameters()
+                        if n == "B_rec" and p.requires_grad]
+                rest = [p for n, p in self.basis_inr.named_parameters()
+                        if n != "B_rec"]
+                groups.append({"params": rest, "lr": inr_lr, "name": "inr"})
+                if cell:
+                    groups.append({"params": cell, "lr": inr_lr * 1e-3,
+                                   "name": "cell"})
             else:
                 groups.append({"params": [self.basis], "lr": lr, "name": "basis"})
         if self.learn_angles:
@@ -1775,7 +1785,7 @@ class DiffractionTomography:
     def fit_peak_basis(self, a_min: float = 3.0, a_max: float = 6.0,
                        n_scan: int = 60, scan_iters: int = 150,
                        iters: int = 1500, lr: float = 3e-3, clean: float = 0.1,
-                       progress: bool = False) -> dict:
+                       freeze_cell: bool = True, progress: bool = False) -> dict:
         """Fit the parametric peak basis (:class:`_PeakBasis`) to the current basis.
 
         Scans the cubic cell edge over ``[a_min, a_max]``, distilling briefly
@@ -1812,10 +1822,14 @@ class DiffractionTomography:
         with torch.no_grad():                  # carry the learned vacuum baseline
             self.basis_inr.origin.copy_(origin.real.to(self.basis_inr.origin.dtype))
             self.basis.copy_(self._inr_basis().detach())
-        # freeze the lattice for the wave-optics phase: it is determined here to
-        # a fraction of a percent, and left learnable it runs away (measured
-        # 4.09 -> 2.83 A) because every amplitude can chase a moving peak
-        self.basis_inr.B_rec.requires_grad_(False)
+        # The lattice is frozen for the wave-optics phase by default: at the
+        # optimizer's normal step size it runs away (measured 4.09 -> 2.83 A),
+        # because every amplitude can chase a moving peak. With
+        # ``freeze_cell=False`` it stays learnable and :meth:`_make_optimizer`
+        # gives it a 1000x smaller step, so the data itself refines the cell --
+        # worth it when the basis-fit estimate is off by a percent or more,
+        # which displaces the outer reflections by a fraction of a k voxel.
+        self.basis_inr.B_rec.requires_grad_(not freeze_cell)
         a_fit = float(1.0 / self.basis_inr.B_rec[0].norm())
         return {"a": a_fit, "a_scan": a_best, "loss": loss, "scan": scan}
 
