@@ -1310,6 +1310,100 @@ class DiffractionTomography:
                 sup |= ((K @ nb[c0:c0 + 256].T).abs() < tau).any(-1)
             return torch.fft.ifftshift(sup.reshape(self.k_shape), dim=(0, 1, 2))
 
+    def consolidate_grains(self, tol_deg: float = 10.0, w_rel: float = 0.15,
+                           min_size: int = 2) -> dict:
+        """Project the orientation field onto piecewise-constant grains.
+
+        A polycrystal's orientation field is not smooth but *piecewise
+        constant*: every voxel of a grain shares one rotation. The per-voxel
+        parameterization does not know this, so each voxel converges to its
+        own slightly different orientation and the per-grain structure factor
+        blurs. This groups material voxels into spatially connected clusters
+        of similar orientation (misorientation below ``tol_deg``, reduced by
+        cubic symmetry) and replaces every member's rotation with the cluster
+        mean -- a projection onto the physical model that both sharpens the
+        recovered structure factors and collapses ~3 x n_voxels orientation
+        degrees of freedom to ~3 per grain.
+
+        Members are symmetry-aligned to their cluster seed before averaging
+        (the equivalence class of a rotation is ``R S^T`` over the 24 proper
+        cubic operations, so raw averaging of equivalent-but-different
+        matrices would cancel), and the mean is projected back onto SO(3).
+
+        Parameters
+        ----------
+        tol_deg : float, default 10.0
+            Maximum symmetry-reduced misorientation between neighbors of the
+            same grain.
+        w_rel : float, default 0.15
+            Material threshold as a fraction of the maximum voxel weight
+            (vacuum voxels have no meaningful orientation).
+        min_size : int, default 2
+            Clusters smaller than this keep their own orientations.
+
+        Returns
+        -------
+        dict
+            ``n_grains``, ``sizes`` and ``spread_deg`` (mean pre-projection
+            misorientation to the cluster mean, i.e. how much was collapsed).
+        """
+        Nz, Ny, Nx = self.real_shape
+        R = self.rotation_matrices().detach().cpu().numpy().reshape(-1, 3, 3)
+        wmag = self.weights.detach().abs().sum(-1).reshape(-1).cpu().numpy()
+        material = wmag > w_rel * max(wmag.max(), 1e-30)
+        ops = self._cubic_ops()
+
+        lab = -np.ones(self.n_voxels, dtype=int)
+        clusters: list[list[int]] = []
+        for v0 in np.nonzero(material)[0]:
+            if lab[v0] >= 0:
+                continue
+            comp, stack = [], [int(v0)]
+            lab[v0] = len(clusters)
+            while stack:
+                v = stack.pop()
+                comp.append(v)
+                iz, iy, ix = v // (Ny * Nx), (v // Nx) % Ny, v % Nx
+                for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0),
+                                   (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+                    jz, jy, jx = iz + dz, iy + dy, ix + dx
+                    if not (0 <= jz < Nz and 0 <= jy < Ny and 0 <= jx < Nx):
+                        continue
+                    u = (jz * Ny + jy) * Nx + jx
+                    if not material[u] or lab[u] >= 0:
+                        continue
+                    if self._miso_deg(R[v].T @ R[u]) < tol_deg:
+                        lab[u] = lab[v0]
+                        stack.append(u)
+            clusters.append(comp)
+
+        sizes, spreads = [], []
+        with torch.no_grad():
+            for comp in clusters:
+                if len(comp) < min_size:
+                    continue
+                seed = R[comp[0]]
+                aligned = []
+                for v in comp:
+                    # pick the symmetry copy R_v S^T closest to the seed
+                    best, best_tr = None, -np.inf
+                    for S in ops:
+                        cand = R[v] @ S.T
+                        tr = float(np.einsum("ij,ij->", cand, seed))
+                        if tr > best_tr:
+                            best, best_tr = cand, tr
+                    aligned.append(best)
+                A = np.mean(aligned, axis=0)
+                U, _, Vt = np.linalg.svd(A)                 # nearest rotation
+                Rm = U @ np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+                spreads.append(float(np.mean([self._miso_deg(Rm.T @ a) for a in aligned])))
+                sizes.append(len(comp))
+                Rt = torch.as_tensor(Rm, dtype=self.angles.M.dtype, device=self.device)
+                for v in comp:
+                    self.angles.M[v] = Rt
+        return {"n_grains": len(sizes), "sizes": sizes,
+                "spread_deg": float(np.mean(spreads)) if spreads else 0.0}
+
     @classmethod
     def _miso_deg(cls, dR: np.ndarray) -> float:
         """Cubic-symmetry-reduced misorientation angle (deg) of a relative rotation."""
@@ -1626,13 +1720,18 @@ class DiffractionTomography:
         shrink_basis: float = 0.0,
         smooth_basis: float = 0.0,
         smooth_weights: float = 0.0,
+        shrink_weights: float = 0.0,
         friedel_basis: bool = True,
         cubic_symmetry: bool = False,
         search_every: int = 0,
         reset_every: int = 10,
+        consolidate_every: int = 0,
         phase_only: bool = True,
+        beam_weight: float = 1.0,
         inr: bool = False,
         inr_lr: float = 1e-3,
+        inr_prox_every: int = 0,
+        inr_prox_frac: float = 0.05,
         tilt_sample: int = 0,
         resume: bool = False,
         progress: bool = True,
@@ -1665,6 +1764,24 @@ class DiffractionTomography:
           stochastic orientation/weight jump (neighbor adoption or random).
           The cheap complement to ``search_every`` -- enough on its own for
           one/few grains.
+        * ``shrink_weights`` -- proximal L1 on the weight field, thresholded
+          RELATIVE to the current maximum weight (the weight scale is a soft
+          gauge under ``phase_only``). A particle fills a few percent of the
+          volume, so this clears the low-level weight that otherwise bleeds
+          into vacuum.
+        * ``consolidate_every`` -- every N iters project the orientation
+          field onto piecewise-constant grains (:meth:`consolidate_grains`).
+          A grain's voxels physically share one rotation; averaging over the
+          grain cuts per-voxel orientation noise by ~sqrt(n_voxels), which
+          matters most on fine k grids where a 1 deg error already shifts a
+          high-order peak by a third of a voxel.
+        * ``inr_prox_every`` / ``inr_prox_frac`` (INR only) -- every N iters
+          soft-threshold the generated basis at ``inr_prox_frac`` of its
+          maximum and re-distill the network onto the sparsified volume.
+          A gradient L1 penalty cannot sparsify a smooth shared network the
+          way a proximal step sparsifies free pixels; this projects the
+          network itself onto the sparse set, which is how the pixel model
+          keeps k-space fog out.
 
         ``inr=True`` swaps the explicit basis tensor for an implicit neural
         representation: an HSiren MLP (coordinates -> complex structure
@@ -1680,6 +1797,14 @@ class DiffractionTomography:
         generated volume, so viewers, ``local_search`` and ``simulate`` work
         as usual. Call :meth:`_inr_setup` first to choose a custom
         width/depth/omega; otherwise a default network is created.
+
+        ``beam_weight`` scales the direct-beam pixels' contribution to the
+        loss. The unscattered disk carries most of the intensity but almost
+        no orientation information (it reports the projected weight), so at
+        1.0 the fit is dominated by pixels that cannot distinguish grains;
+        ~0.1 rebalances it toward the Bragg disks. Keep it fixed across
+        resumed calls -- it changes the objective, so losses (and keep-best)
+        are only comparable at one setting.
 
         ``tilt_sample=k`` turns each iteration into a stochastic step over
         ``k`` random tilts instead of all of them (the wave-optics forward is
@@ -1743,6 +1868,16 @@ class DiffractionTomography:
         origins = pos.reshape(-1, 3)                          # (P, 3)
         P = origins.shape[0]
         n_tilt = len(tilts_deg)
+        # detector loss weighting: down-weight the unscattered disk (it holds
+        # most of the intensity but no orientation information). Normalized to
+        # unit mean so the loss stays on the same scale as the unweighted one.
+        lw = None
+        if beam_weight != 1.0:
+            kv, ku = torch.meshgrid(self.det_kv, self.det_ku, indexing="ij")
+            disk = torch.sqrt(kv ** 2 + ku ** 2) <= self.probe_k_max * 1.2
+            lw = torch.where(disk, torch.as_tensor(float(beam_weight)),
+                             torch.as_tensor(1.0)).to(self.device)
+            lw = (lw / lw.mean()).to(torch.float64)
         pbar = tqdm(range(num_iters), disable=not progress, desc="reconstruct", unit="it")
         for it in pbar:
             opt.zero_grad(set_to_none=True)
@@ -1793,7 +1928,8 @@ class DiffractionTomography:
                 tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape) \
                     if t_grp == list(range(t_grp[0], t_grp[-1] + 1)) else \
                     meas_amp[t_grp].reshape(len(t_grp), P, *self.det_shape)
-                tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2, 3))                        # (T,P)
+                err = (Psi.abs() - tgt) ** 2
+                tl = (err if lw is None else err * lw).mean(dim=(2, 3))               # (T,P)
                 (tl.sum() / n_eff).backward()
                 for j, ti in enumerate(t_grp):
                     res_per_dp[ti * P:(ti + 1) * P] = tl[j].detach()
@@ -1843,6 +1979,15 @@ class DiffractionTomography:
                         idx_n = torch.arange(1, n + 1, device=W.device).clamp(max=n - 1)
                         W.copy_((wgt * W.index_select(axis, idx_p) + W
                                  + wgt * W.index_select(axis, idx_n)) / norm)
+            if shrink_weights > 0.0:
+                # proximal L1 on the weight field. The threshold is relative
+                # to the current max weight: under phase_only the weight scale
+                # is a soft gauge (learned weights sit ~0.03, not GT's 1.0), so
+                # an absolute threshold either does nothing or erases the field.
+                with torch.no_grad():
+                    W = self.weights
+                    tau = shrink_weights * lr * W.detach().abs().max().clamp_min(1e-30)
+                    W.copy_(torch.sign(W) * torch.clamp(W.abs() - tau, min=0.0))
             if cubic_symmetry and self.learn_basis and not inr:
                 # project the basis onto cubic point-group symmetry each step:
                 # every Bragg peak is forced equal to its whole 24-fold orbit,
@@ -1938,6 +2083,23 @@ class DiffractionTomography:
                                 Wf[v] = w_mean
                         self._reset_optimizer_state(opt, self.angles.M, bad)
                         self._reset_optimizer_state(opt, self.weights, bad)
+            if (inr and inr_prox_every and self.learn_basis
+                    and (it + 1) % inr_prox_every == 0 and it < num_iters - 1):
+                # project the NETWORK onto the sparse set: soft-threshold the
+                # generated volume, then re-fit the net to it. The Adam state
+                # is dropped (the parameters have moved discontinuously).
+                with torch.no_grad():
+                    B = self._inr_basis(friedel_basis, cubic_symmetry).detach()
+                    keep = B[0, 0, 0, :].clone()
+                    mag = B.abs()
+                    tau = inr_prox_frac * mag.max().clamp_min(1e-30)
+                    B = B / mag.clamp_min(1e-30) * torch.clamp(mag - tau, min=0.0)
+                    B[0, 0, 0, :] = keep
+                self.distill_inr(target=B, iters=150, lr=inr_lr)
+                for grp in opt.param_groups:      # net params moved discontinuously
+                    if grp.get("name") == "inr":
+                        for prm in grp["params"]:
+                            opt.state.pop(prm, None)
             if (search_every and self.learn_angles and (it + 1) % search_every == 0
                     and it < num_iters - 1):
                 # exact-forward orientation sweep: each voxel keeps the best of
@@ -1954,6 +2116,13 @@ class DiffractionTomography:
                 allv = torch.arange(self.n_voxels, device=self.device)
                 self._reset_optimizer_state(opt, self.angles.M, allv)
                 self._reset_optimizer_state(opt, self.weights, allv)
+            if (consolidate_every and self.learn_angles
+                    and (it + 1) % consolidate_every == 0 and it < num_iters - 1):
+                # piecewise-constant projection: every grain's voxels share
+                # one rotation (see consolidate_grains)
+                self.consolidate_grains()
+                allv = torch.arange(self.n_voxels, device=self.device)
+                self._reset_optimizer_state(opt, self.angles.M, allv)
             if print_every and (it % print_every == 0 or it == num_iters - 1):
                 print(f"  it {it:4d}  loss {mean_loss:.4e}  best {best['loss']:.4e}"
                       + (f"  reset {n_res}" if n_res else ""), flush=True)
