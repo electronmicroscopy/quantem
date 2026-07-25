@@ -467,16 +467,27 @@ class DiffractionTomography:
                 for sign in product((-1, 1), repeat=3)
             })
             for vec in vec_set:
-                # peak in (kx, ky, kz) physical -> nearest [kz, ky, kx] voxel.
-                # Each Bragg reflection is a single delta spike: spreading it
-                # over a trilinear cluster distorts the diffracted disks (the
-                # transmission peak becomes a multi-pixel blob) and makes the
-                # structure factor read as several bright voxels per peak.
+                # peak in (kx, ky, kz) physical -> trilinear splat onto the
+                # [kz, ky, kx] grid. Splatting keeps every reflection's
+                # CENTROID at its exact reciprocal position (a peak reads as
+                # a 2x2x2 cluster instead of one bright voxel), whereas
+                # nearest-voxel snapping moved each reflection independently
+                # by up to half a cell -- on coarse grids (dk = 0.10) that
+                # made the test "crystal" internally inconsistent (111 and
+                # 200 implied different cells), silently breaking any
+                # lattice-based validation or indexing.
                 kx, ky, kz = (v / a_Au for v in vec)
-                iz = int(round(kz / dkz)) % Nkz
-                iy = int(round(ky / dky)) % Nky
-                ix = int(round(kx / dkx)) % Nkx
-                sf[iz, iy, ix] += amp
+                cz, cy, cx = kz / dkz, ky / dky, kx / dkx
+                z0, y0, x0 = math.floor(cz), math.floor(cy), math.floor(cx)
+                fz, fy, fx = cz - z0, cy - y0, cx - x0
+                for oz, wz in ((0, 1.0 - fz), (1, fz)):
+                    for oy, wy in ((0, 1.0 - fy), (1, fy)):
+                        for ox, wx in ((0, 1.0 - fx), (1, fx)):
+                            w = wz * wy * wx
+                            if w == 0.0:
+                                continue
+                            sf[(z0 + oz) % Nkz, (y0 + oy) % Nky,
+                               (x0 + ox) % Nkx] += amp * w
         return sf
 
     def make_probe(self, probe_k_max: float, normalize: bool = True) -> torch.Tensor:
