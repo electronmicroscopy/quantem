@@ -74,6 +74,53 @@ class _PeakBasis(torch.nn.Module):
                                         requires_grad=bool(learn_cell))
         self.amp = torch.nn.Parameter(torch.full((n_shells, n_struct), 1e-3))
         self.origin = torch.nn.Parameter(torch.ones(n_struct))
+        # free (off-lattice) peaks, born from residuals: fixed positions
+        # [A^-1, (z,y,x)], learnable amplitudes; empty by default
+        self.register_buffer("g_free", torch.zeros(0, 3))
+        self.amp_free = torch.nn.Parameter(torch.zeros(0, n_struct))
+
+    def untie_shells(self) -> None:
+        """Release the shell tying: one learnable amplitude per reflection.
+
+        Amplitudes are copied to every member, so the generated basis is
+        unchanged at the moment of release; the data can then differentiate
+        reflections the symmetry tied together, and unsupported ones can
+        decay to zero and be pruned (the 'death' half of adaptive peaks).
+        """
+        with torch.no_grad():
+            per_peak = self.amp[self.shell_idx].detach().clone()
+        self.amp = torch.nn.Parameter(per_peak)
+        self.shell_idx = torch.arange(self.hkl.shape[0], device=self.hkl.device)
+
+    def prune(self, min_frac: float = 0.02) -> int:
+        """Drop reflections below ``min_frac`` of the maximum amplitude.
+
+        Requires untied shells (each reflection owns its amplitude). Free
+        peaks are pruned by the same rule. Returns the number removed.
+        """
+        assert self.amp.shape[0] == self.hkl.shape[0], "untie_shells() first"
+        with torch.no_grad():
+            ref = torch.cat([self.amp.abs().amax(1), self.amp_free.abs().amax(1)])
+            tau = min_frac * ref.max().clamp_min(1e-30)
+            keep = self.amp.abs().amax(1) >= tau
+            keep_f = self.amp_free.abs().amax(1) >= tau
+            n_drop = int((~keep).sum() + (~keep_f).sum())
+            self.hkl = self.hkl[keep]
+            self.shell_idx = torch.arange(int(keep.sum()), device=self.hkl.device)
+            self.amp = torch.nn.Parameter(self.amp[keep].detach().clone())
+            self.g_free = self.g_free[keep_f]
+            self.amp_free = torch.nn.Parameter(self.amp_free[keep_f].detach().clone())
+        return n_drop
+
+    def add_free_peaks(self, g_new: torch.Tensor, amp0: float = 1e-3) -> None:
+        """Append off-lattice peaks at fixed positions ``g_new`` ((M, 3) A^-1)."""
+        with torch.no_grad():
+            n_struct = self.amp.shape[1]
+            self.g_free = torch.cat([self.g_free, g_new.to(self.g_free)])
+            grown = torch.cat([self.amp_free.detach(),
+                               torch.full((g_new.shape[0], n_struct), amp0,
+                                          device=self.amp_free.device)])
+        self.amp_free = torch.nn.Parameter(grown)
 
     def volume(self, k_shape, k_sampling, device) -> torch.Tensor:
         """Splat the peaks onto the centered k grid -> (Nkz, Nky, Nkx, Nw)."""
@@ -82,11 +129,15 @@ class _PeakBasis(torch.nn.Module):
         dk = torch.tensor(k_sampling, dtype=torch.float32, device=device)
         ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32,
                            device=device)
-        c = (self.hkl @ self.B_rec) / dk + ctr              # (P, 3) voxel coords
+        g = self.hkl @ self.B_rec                           # (P, 3) lattice peaks
+        a_pk = self.amp[self.shell_idx]                     # (P, Nw)
+        if self.g_free.shape[0]:
+            g = torch.cat([g, self.g_free])
+            a_pk = torch.cat([a_pk, self.amp_free])
+        c = g / dk + ctr                                    # voxel coords
         base = torch.floor(c)
         frac = c - base
         base = base.to(torch.long)
-        a_pk = self.amp[self.shell_idx]                     # (P, Nw)
         vol = torch.zeros(Nkz * Nky * Nkx, Nw, dtype=torch.float32, device=device)
         for oz in (0, 1):
             for oy in (0, 1):
@@ -1832,6 +1883,73 @@ class DiffractionTomography:
         self.basis_inr.B_rec.requires_grad_(not freeze_cell)
         a_fit = float(1.0 / self.basis_inr.B_rec[0].norm())
         return {"a": a_fit, "a_scan": a_best, "loss": loss, "scan": scan}
+
+    def adapt_peaks(self, reference: torch.Tensor | None = None,
+                    prune: float = 0.02, birth: int = 0,
+                    birth_frac: float = 0.1) -> dict:
+        """Gaussian-splatting-style update of the peak list: release, prune, birth.
+
+        Answers "how do we know the number of peaks is correct?" by not
+        assuming it: shell tying is released (each reflection owns its
+        amplitude), reflections the data does not support decay and are
+        **pruned**, and if a ``reference`` volume (typically the pixel-phase
+        basis) holds significant off-comb residual mass, free peaks are
+        **born** at its strongest residual maxima -- catching superstructure
+        reflections or second phases the assumed lattice cannot express.
+
+        Parameters
+        ----------
+        reference : torch.Tensor, optional
+            ``[N_kz, N_ky, N_kx, N_w]`` volume to search for missing peaks
+            (unshifted order). Default: the current ``self.basis`` mirror.
+        prune : float, default 0.02
+            Drop reflections below this fraction of the max amplitude.
+        birth : int, default 0
+            Maximum number of free peaks to add (0 disables birth).
+        birth_frac : float, default 0.1
+            Only residual maxima above this fraction of the reference's
+            strongest peak spawn a free peak.
+
+        Returns
+        -------
+        dict
+            ``n_peaks``, ``n_pruned``, ``n_born``.
+        """
+        assert isinstance(self.basis_inr, _PeakBasis), "peak basis required"
+        pb = self.basis_inr
+        if pb.amp.shape[0] != pb.hkl.shape[0]:
+            pb.untie_shells()
+        n_pruned = pb.prune(prune)
+        n_born = 0
+        if birth > 0:
+            ref = (self.basis if reference is None else reference).detach()
+            with torch.no_grad():
+                res = (ref - self._inr_basis().detach()).abs().sum(-1)
+                res[0, 0, 0] = 0.0
+                resc = torch.fft.fftshift(res, dim=(0, 1, 2))
+                # threshold against the strongest OFF-ORIGIN content (the
+                # vacuum origin is ~100x the peaks and would mask everything)
+                ref_off = ref.abs().sum(-1).clone()
+                ref_off[0, 0, 0] = 0.0
+                thr = birth_frac * ref_off.amax()
+                dk = torch.tensor(self.k_sampling, device=self.device)
+                ctr = torch.tensor([n // 2 for n in self.k_shape], device=self.device)
+                born = []
+                for _ in range(birth):
+                    idx = torch.nonzero(resc == resc.max(), as_tuple=False)[0]
+                    if resc[tuple(idx)] < thr:
+                        break
+                    born.append((idx.to(dk) - ctr) * dk)
+                    # clear a 3-voxel neighborhood so the next max is distinct
+                    sl = tuple(slice(max(0, int(i) - 1), int(i) + 2) for i in idx)
+                    resc[sl] = 0.0
+                if born:
+                    pb.add_free_peaks(torch.stack(born))
+                    n_born = len(born)
+        # optimizer groups reference dead parameter objects after the rebuild
+        self._opt = None
+        return {"n_peaks": int(pb.hkl.shape[0] + pb.g_free.shape[0]),
+                "n_pruned": n_pruned, "n_born": n_born}
 
     def distill_inr(self, target: torch.Tensor | None = None, iters: int = 800,
                     lr: float = 1e-3, skip_origin: bool = False,
