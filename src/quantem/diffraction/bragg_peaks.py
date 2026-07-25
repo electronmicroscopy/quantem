@@ -1,5 +1,6 @@
 # from collections.abc import Sequence
 import warnings
+import tempfile
 from typing import Tuple
 
 import matplotlib.pyplot as plt
@@ -18,6 +19,11 @@ from quantem.diffraction.polymer_models import (
     build_polymer_model,
     resolve_polymer_model,
 )
+from quantem.diffraction.polymer_normalization import (
+    LegacyNormalizationAdapter,
+    NormalizationStrategy,
+    resolve_normalization_strategy,
+)
 from quantem.core.datastructures import Vector
 from quantem.core.visualization import show_2d
 from quantem.diffraction.polar_transform import (
@@ -26,6 +32,9 @@ from quantem.diffraction.polar_transform import (
     polar_transform_peaks as karen_polar_transform_peaks,
 )
 from quantem.diffraction.peak_detection import detect_blobs, find_central_beam_from_peaks
+from quantem.diffraction.orientation_correlation import (
+    calculate_orientation_correlation as _calculate_orientation_correlation,
+)
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.polymer_utils import parse_reciprocal_units, sample_average_from_image
 from emdfile import tqdmnd
@@ -33,10 +42,10 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
 import ipywidgets as widgets
 from ipywidgets import IntSlider, Button, HBox, VBox, interactive_output
-from IPython.display import clear_output
+from IPython.display import clear_output, display
 from pathlib import Path
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Ellipse, Rectangle
 from matplotlib.colors import BoundaryNorm, hsv_to_rgb, rgb_to_hsv
 
 def _apply_zoom_crop(data, zoom_factor, center=None):
@@ -495,6 +504,894 @@ def _draw_peaks_data_circles(
         ))
 
 
+class ScanMaskEditor:
+    """Interactive, persistent circular scan-mask editor.
+
+    The horizontal X control maps directly to the scan-column coordinate. The
+    vertical Y control is visually inverted relative to the array row index so
+    moving the slider upward moves the probe marker upward on an ``origin="upper"``
+    scan image.
+    """
+
+    SCHEMA_VERSION = 2
+    GEOMETRIES = ("circle", "ellipse", "square", "rectangle")
+
+    def __init__(
+        self,
+        analysis,
+        *,
+        initial_x=None,
+        initial_y=None,
+        initial_radius=None,
+        initial_geometry="circle",
+        initial_size_x=None,
+        initial_size_y=None,
+        reference_image=None,
+        state_path=None,
+        overlay_alpha=0.28,
+        crosshair_width=2,
+        crosshair_size=12,
+        autosave=False,
+        display_widget=True,
+    ):
+        self.analysis = analysis
+        self.scan_shape = tuple(int(v) for v in analysis.dataset_cartesian.shape[:2])
+        self.state_path = None if state_path is None else Path(state_path)
+        self.autosave = bool(autosave)
+        self.overlay_alpha = float(overlay_alpha)
+        self.crosshair_width = float(crosshair_width)
+        self.crosshair_size = float(crosshair_size)
+        self._syncing = False
+        self._dirty = False
+        self._saved = False
+        self._loaded = False
+
+        rows, columns = self.scan_shape
+        center_row = rows // 2 if initial_y is None else int(initial_y)
+        center_column = columns // 2 if initial_x is None else int(initial_x)
+        radius = (
+            max(1, min(rows, columns) // 3)
+            if initial_radius is None
+            else int(initial_radius)
+        )
+        geometry = str(initial_geometry).lower()
+        size_x = radius if initial_size_x is None else int(initial_size_x)
+        size_y = radius if initial_size_y is None else int(initial_size_y)
+        loaded_mask = None
+        if self.state_path is not None and self.state_path.is_file():
+            state = self._read_state(self.state_path)
+            center_row = state["center_row"]
+            center_column = state["center_column"]
+            geometry = state["geometry"]
+            size_x = state["size_x"]
+            size_y = state["size_y"]
+            loaded_mask = state["mask"]
+            self._loaded = True
+            self._saved = True
+
+        self._validate_geometry(
+            center_row, center_column, geometry, size_x, size_y
+        )
+        self.reference_image = self._resolve_reference_image(reference_image)
+        self._preview_mask = (
+            loaded_mask.copy()
+            if loaded_mask is not None
+            else self._geometry_mask(
+                center_row, center_column, geometry, size_x, size_y
+            )
+        )
+
+        maximum_radius = int(np.ceil(np.hypot(rows - 1, columns - 1))) + 1
+        self.x_slider = widgets.IntSlider(
+            value=center_column,
+            min=0,
+            max=columns - 1,
+            step=1,
+            description="X",
+            continuous_update=True,
+            readout=False,
+            style={"description_width": "18px"},
+            layout=widgets.Layout(width="375px"),
+        )
+        # Slider value increases upward, while array row indices increase downward.
+        self.y_slider = widgets.IntSlider(
+            value=rows - 1 - center_row,
+            min=0,
+            max=rows - 1,
+            step=1,
+            description="Y",
+            orientation="vertical",
+            continuous_update=True,
+            readout=False,
+            style={"description_width": "18px"},
+            layout=widgets.Layout(height="281px", width="52px"),
+        )
+        self.geometry_selector = widgets.Dropdown(
+            options=[
+                ("Circular", "circle"),
+                ("Elliptical", "ellipse"),
+                ("Square", "square"),
+                ("Rectangular", "rectangle"),
+            ],
+            value=geometry,
+            description="Shape",
+            style={"description_width": "42px"},
+            layout=widgets.Layout(width="155px"),
+        )
+        self.size_x_slider = widgets.IntSlider(
+            value=size_x,
+            min=1,
+            max=maximum_radius,
+            step=1,
+            description="Radius",
+            continuous_update=True,
+            readout=False,
+            style={"description_width": "55px"},
+            layout=widgets.Layout(width="375px"),
+        )
+        self.size_y_slider = widgets.IntSlider(
+            value=size_y,
+            min=1,
+            max=maximum_radius,
+            step=1,
+            description="Y radius",
+            continuous_update=True,
+            readout=False,
+            style={"description_width": "68px"},
+            layout=widgets.Layout(width="375px"),
+        )
+        # Historical public attribute retained for callers that customize it.
+        self.radius_slider = self.size_x_slider
+        self.x_input = widgets.BoundedIntText(
+            value=center_column,
+            min=0,
+            max=columns - 1,
+            description="X column",
+            style={"description_width": "62px"},
+            layout=widgets.Layout(width="150px"),
+        )
+        self.y_input = widgets.BoundedIntText(
+            value=center_row,
+            min=0,
+            max=rows - 1,
+            description="Y row",
+            style={"description_width": "52px"},
+            layout=widgets.Layout(width="140px"),
+        )
+        self.size_x_input = widgets.BoundedIntText(
+            value=size_x,
+            min=1,
+            max=maximum_radius,
+            description="Radius",
+            style={"description_width": "48px"},
+            layout=widgets.Layout(width="130px"),
+        )
+        self.size_y_input = widgets.BoundedIntText(
+            value=size_y,
+            min=1,
+            max=maximum_radius,
+            description="Y radius",
+            style={"description_width": "58px"},
+            layout=widgets.Layout(width="140px"),
+        )
+        self.radius_input = self.size_x_input
+
+        self.apply_button = widgets.Button(
+            description="Apply",
+            icon="check",
+            button_style="primary",
+            tooltip="Commit the preview mask to BraggPeaksPolymer.scan_mask",
+            layout=widgets.Layout(width="72px"),
+        )
+        self.save_button = widgets.Button(
+            description="Apply & Save",
+            icon="save",
+            button_style="success",
+            tooltip="Commit and save this mask for the next notebook run",
+            disabled=self.state_path is None,
+            layout=widgets.Layout(width="105px"),
+        )
+        self.center_button = widgets.Button(
+            description="Center",
+            icon="crosshairs",
+            tooltip="Center the circle",
+            layout=widgets.Layout(width="75px"),
+        )
+        self.full_button = widgets.Button(
+            description="Full",
+            icon="expand",
+            tooltip="Include the entire scan",
+            layout=widgets.Layout(width="70px"),
+        )
+        self.reset_button = widgets.Button(
+            description="Reset",
+            icon="undo",
+            tooltip="Restore the loaded/default state",
+            layout=widgets.Layout(width="72px"),
+        )
+        self.status = widgets.HTML(layout=widgets.Layout(width="500px"))
+        self.output = widgets.Output(
+            layout=widgets.Layout(
+                width="438px",
+                height="356px",
+                max_width="438px",
+                overflow="hidden",
+            )
+        )
+
+        self.figure, self.ax = plt.subplots(figsize=(4.0, 3.25))
+        finite = self.reference_image[np.isfinite(self.reference_image)]
+        if finite.size:
+            vmin, vmax = np.percentile(finite, [1.0, 99.0])
+            if not vmax > vmin:
+                vmin, vmax = float(np.min(finite)), float(np.max(finite) + 1.0)
+        else:
+            vmin, vmax = 0.0, 1.0
+        self.image_artist = self.ax.imshow(
+            self.reference_image,
+            cmap="gray",
+            origin="upper",
+            vmin=vmin,
+            vmax=vmax,
+            interpolation="nearest",
+        )
+        self.mask_artist = self.ax.imshow(
+            np.ma.masked_where(~self._preview_mask, self._preview_mask),
+            cmap="Reds",
+            origin="upper",
+            alpha=self.overlay_alpha,
+            vmin=0,
+            vmax=1,
+            interpolation="nearest",
+        )
+        self.boundary_artist = None
+        self.circle_artist = None
+        self._replace_boundary_artist()
+        (self.center_artist,) = self.ax.plot(
+            center_column,
+            center_row,
+            marker="+",
+            color="#ff3030",
+            markersize=self.crosshair_size,
+            markeredgewidth=self.crosshair_width,
+        )
+        self.ax.set(
+            title="Scan-mask editor",
+            xlabel="X — scan column",
+            ylabel="Y — scan row",
+            xlim=(-0.5, columns - 0.5),
+            ylim=(rows - 0.5, -0.5),
+        )
+        self.ax.title.set_fontsize(10)
+        self.ax.xaxis.label.set_fontsize(9)
+        self.ax.yaxis.label.set_fontsize(9)
+        self.ax.tick_params(labelsize=8)
+        self.figure.tight_layout()
+
+        self.x_slider.observe(self._on_x_slider, names="value")
+        self.y_slider.observe(self._on_y_slider, names="value")
+        self.geometry_selector.observe(self._on_geometry, names="value")
+        self.size_x_slider.observe(self._on_size_x_slider, names="value")
+        self.size_y_slider.observe(self._on_size_y_slider, names="value")
+        self.x_input.observe(self._on_x_input, names="value")
+        self.y_input.observe(self._on_y_input, names="value")
+        self.size_x_input.observe(self._on_size_x_input, names="value")
+        self.size_y_input.observe(self._on_size_y_input, names="value")
+        self.apply_button.on_click(lambda _: self.apply())
+        self.save_button.on_click(lambda _: self.save())
+        self.center_button.on_click(
+            lambda _: self.set_mask(x=columns // 2, y=rows // 2)
+        )
+        self.full_button.on_click(lambda _: self._set_full_scan())
+        self.reset_button.on_click(lambda _: self._restore_initial())
+
+        self._initial_geometry = (
+            center_column, center_row, geometry, size_x, size_y
+        )
+        self._initial_mask = self._preview_mask.copy()
+        # A loaded/default mask is immediately usable by Run All. Slider edits
+        # remain previews until Apply, preventing repeated inference-cache invalidation.
+        self.analysis.scan_mask = self._preview_mask.copy()
+        self._render()
+        self._refresh_status("Loaded saved mask" if self._loaded else "Default mask applied")
+
+        position_row = widgets.HBox(
+            [self.geometry_selector, self.x_input, self.y_input],
+            layout=widgets.Layout(width="500px"),
+        )
+        self.size_input_row = widgets.HBox(
+            [self.size_x_input, self.size_y_input],
+            layout=widgets.Layout(width="500px"),
+        )
+        toolbar = widgets.HBox(
+            [
+                self.apply_button,
+                self.save_button,
+                self.center_button,
+                self.full_button,
+                self.reset_button,
+            ],
+            layout=widgets.Layout(flex_flow="row wrap"),
+        )
+        plot_row = widgets.HBox(
+            [self.y_slider, self.output],
+            layout=widgets.Layout(
+                align_items="center", width="500px", overflow="hidden"
+            ),
+        )
+        self.size_x_row = widgets.HBox(
+            [
+                widgets.Box(layout=widgets.Layout(width="52px")),
+                self.size_x_slider,
+            ],
+            layout=widgets.Layout(align_items="center", width="500px"),
+        )
+        self.size_y_row = widgets.HBox(
+            [
+                widgets.Box(layout=widgets.Layout(width="52px")),
+                self.size_y_slider,
+            ],
+            layout=widgets.Layout(align_items="center", width="500px"),
+        )
+        x_row = widgets.HBox(
+            [
+                widgets.Box(layout=widgets.Layout(width="52px")),
+                self.x_slider,
+            ],
+            layout=widgets.Layout(align_items="center", width="500px"),
+        )
+        self.widget = widgets.VBox(
+            [
+                toolbar,
+                position_row,
+                self.size_input_row,
+                self.size_x_row,
+                self.size_y_row,
+                plot_row,
+                x_row,
+                self.status,
+            ],
+            layout=widgets.Layout(width="500px", max_width="500px"),
+        )
+        self._refresh_geometry_controls()
+        # Prevent the inline Matplotlib backend from appending a second copy of
+        # the figure after the widget cell. The explicitly displayed Output copy
+        # remains live and continues to update.
+        plt.close(self.figure)
+        if display_widget:
+            display(self.widget)
+
+    @property
+    def x(self):
+        """Horizontal scan-column coordinate."""
+        return int(self.x_slider.value)
+
+    @property
+    def y(self):
+        """Vertical scan-row coordinate."""
+        return int(self.scan_shape[0] - 1 - self.y_slider.value)
+
+    @property
+    def radius(self):
+        """Circle radius / square half-width compatibility value."""
+        return self.size_x
+
+    @property
+    def geometry(self):
+        return str(self.geometry_selector.value)
+
+    @property
+    def size_x(self):
+        """Horizontal radius or half-width in scan pixels."""
+        return int(self.size_x_slider.value)
+
+    @property
+    def size_y(self):
+        """Vertical radius or half-height in scan pixels."""
+        if self.geometry in {"circle", "square"}:
+            return self.size_x
+        return int(self.size_y_slider.value)
+
+    @property
+    def mask(self):
+        """Current preview mask."""
+        return self._preview_mask.copy()
+
+    @property
+    def applied_mask(self):
+        return None if self.analysis.scan_mask is None else self.analysis.scan_mask.copy()
+
+    def _effective_mask(self):
+        """Return the committed mask for ndarray-style compatibility."""
+        mask = self.analysis.scan_mask
+        return self._preview_mask if mask is None else np.asarray(mask, dtype=bool)
+
+    @property
+    def shape(self):
+        return self.scan_shape
+
+    @property
+    def dtype(self):
+        return np.dtype(bool)
+
+    @property
+    def size(self):
+        return int(np.prod(self.scan_shape))
+
+    @property
+    def ndim(self):
+        return 2
+
+    def __array__(self, dtype=None, copy=None):
+        array = np.asarray(self._effective_mask(), dtype=dtype)
+        if copy:
+            array = array.copy()
+        return array
+
+    def __len__(self):
+        return self.scan_shape[0]
+
+    def sum(self, *args, **kwargs):
+        """NumPy-compatible sum for legacy ``mask_arr = editor`` cells."""
+        return self._effective_mask().sum(*args, **kwargs)
+
+    def astype(self, *args, **kwargs):
+        return self._effective_mask().astype(*args, **kwargs)
+
+    def copy(self):
+        return self._effective_mask().copy()
+
+    def __getitem__(self, key):
+        if not isinstance(key, str):
+            return self._effective_mask()[key]
+        # Compatibility with the historical returned dictionary. Its x0/y0
+        # names represented row/column respectively despite their labels.
+        values = {
+            "mask": self.mask,
+            "x0": self.y,
+            "y0": self.x,
+            "r": self.radius,
+            "center_row": self.y,
+            "center_column": self.x,
+            "geometry": self.geometry,
+            "size_x": self.size_x,
+            "size_y": self.size_y,
+        }
+        return values[key]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def _validate_geometry(self, row, column, geometry, size_x, size_y):
+        rows, columns = self.scan_shape
+        if not 0 <= row < rows or not 0 <= column < columns:
+            raise ValueError(
+                f"Mask center (row={row}, column={column}) is outside scan shape "
+                f"{self.scan_shape}."
+            )
+        if geometry not in self.GEOMETRIES:
+            raise ValueError(
+                f"Unknown mask geometry {geometry!r}; choose one of "
+                f"{', '.join(self.GEOMETRIES)}."
+            )
+        if size_x < 1 or size_y < 1:
+            raise ValueError("Mask half-sizes must be at least one scan pixel.")
+        maximum_radius = int(np.ceil(np.hypot(rows - 1, columns - 1))) + 1
+        if size_x > maximum_radius or size_y > maximum_radius:
+            raise ValueError(
+                f"Mask half-size ({size_x}, {size_y}) exceeds the supported maximum "
+                f"{maximum_radius} for scan shape {self.scan_shape}."
+            )
+
+    def _geometry_mask(self, row, column, geometry, size_x, size_y):
+        yy, xx = np.ogrid[: self.scan_shape[0], : self.scan_shape[1]]
+        dy = yy - row
+        dx = xx - column
+        if geometry == "circle":
+            return dy**2 + dx**2 <= size_x**2
+        if geometry == "ellipse":
+            return (dx / size_x) ** 2 + (dy / size_y) ** 2 <= 1
+        if geometry == "square":
+            return (np.abs(dx) <= size_x) & (np.abs(dy) <= size_x)
+        if geometry == "rectangle":
+            return (np.abs(dx) <= size_x) & (np.abs(dy) <= size_y)
+        raise ValueError(f"Unknown mask geometry {geometry!r}.")
+
+    def _resolve_reference_image(self, reference_image):
+        if reference_image is None:
+            virtual_images = getattr(self.analysis.dataset_cartesian, "virtual_images", {})
+            if "virtual_image" in virtual_images:
+                reference_image = virtual_images["virtual_image"]
+                reference_image = getattr(
+                    reference_image,
+                    "array",
+                    getattr(reference_image, "data", reference_image),
+                )
+            else:
+                dataset = self.analysis.dataset_cartesian
+                array = getattr(dataset, "array", None)
+                if array is not None:
+                    reference_image = np.asarray(array).mean(axis=(-2, -1))
+                else:
+                    reference_image = (
+                        dataset.tensor.float().mean(dim=(-2, -1)).detach().cpu().numpy()
+                    )
+        reference_image = np.asarray(reference_image, dtype=float)
+        if reference_image.shape != self.scan_shape:
+            raise ValueError(
+                f"reference_image shape {reference_image.shape} must match "
+                f"scan shape {self.scan_shape}."
+            )
+        return reference_image
+
+    def _read_state(self, path):
+        try:
+            with np.load(path, allow_pickle=False) as state:
+                version = int(state["schema_version"])
+                shape = tuple(int(v) for v in state["scan_shape"])
+                if version not in {1, self.SCHEMA_VERSION}:
+                    raise ValueError(
+                        f"Unsupported scan-mask schema {version}; expected "
+                        f"1 or {self.SCHEMA_VERSION}."
+                    )
+                if shape != self.scan_shape:
+                    raise ValueError(
+                        f"Saved scan-mask shape {shape} does not match current "
+                        f"scan shape {self.scan_shape}."
+                    )
+                mask = np.asarray(state["mask"], dtype=bool)
+                if mask.shape != self.scan_shape:
+                    raise ValueError(
+                        f"Saved mask array shape {mask.shape} does not match "
+                        f"scan shape {self.scan_shape}."
+                    )
+                if version == 1:
+                    geometry = "circle"
+                    size_x = size_y = int(state["radius"])
+                else:
+                    geometry = str(state["geometry"].item())
+                    size_x = int(state["size_x"])
+                    size_y = int(state["size_y"])
+                return {
+                    "center_row": int(state["center_row"]),
+                    "center_column": int(state["center_column"]),
+                    "geometry": geometry,
+                    "size_x": size_x,
+                    "size_y": size_y,
+                    "mask": mask,
+                }
+        except (OSError, KeyError) as exc:
+            raise ValueError(f"Could not load scan-mask state from {path}: {exc}") from exc
+
+    def set_mask(
+        self,
+        *,
+        x=None,
+        y=None,
+        geometry=None,
+        size_x=None,
+        size_y=None,
+    ):
+        self._syncing = True
+        try:
+            if geometry is not None:
+                geometry = str(geometry).lower()
+                if geometry not in self.GEOMETRIES:
+                    raise ValueError(
+                        f"Unknown mask geometry {geometry!r}; choose one of "
+                        f"{', '.join(self.GEOMETRIES)}."
+                    )
+                self.geometry_selector.value = geometry
+            if x is not None:
+                self.x_slider.value = int(x)
+                self.x_input.value = int(x)
+            if y is not None:
+                self.y_slider.value = self.scan_shape[0] - 1 - int(y)
+                self.y_input.value = int(y)
+            if size_x is not None:
+                self.size_x_slider.value = int(size_x)
+                self.size_x_input.value = int(size_x)
+            if size_y is not None:
+                self.size_y_slider.value = int(size_y)
+                self.size_y_input.value = int(size_y)
+            if self.geometry in {"circle", "square"}:
+                self.size_y_slider.value = self.size_x
+                self.size_y_input.value = self.size_x
+        finally:
+            self._syncing = False
+        self._refresh_geometry_controls()
+        self._update_preview()
+        return self
+
+    def set_circle(self, *, x=None, y=None, radius=None):
+        """Compatibility helper that explicitly selects circular geometry."""
+        return self.set_mask(
+            x=x,
+            y=y,
+            geometry="circle",
+            size_x=radius,
+            size_y=radius,
+        )
+
+    def apply(self):
+        self.analysis.scan_mask = self._preview_mask.copy()
+        self._dirty = False
+        self._refresh_status("Mask applied")
+        if self.autosave and self.state_path is not None:
+            self.save(apply_first=False)
+        return self.applied_mask
+
+    def save(self, path=None, *, apply_first=True):
+        path = self.state_path if path is None else Path(path)
+        if path is None:
+            raise ValueError("No scan-mask state_path was configured.")
+        if apply_first:
+            self.apply()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sampling = np.asarray(self.analysis.dataset_cartesian.sampling[:2], dtype=float)
+        units = np.asarray(
+            [str(value) for value in self.analysis.dataset_cartesian.units[:2]],
+            dtype="U32",
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".npz", dir=path.parent, delete=False
+        ) as stream:
+            temporary_path = Path(stream.name)
+            np.savez_compressed(
+                stream,
+                schema_version=np.asarray(self.SCHEMA_VERSION, dtype=np.int64),
+                mask=self._preview_mask.astype(bool),
+                mask_type=np.asarray(self.geometry),
+                geometry=np.asarray(self.geometry),
+                center_row=np.asarray(self.y, dtype=np.int64),
+                center_column=np.asarray(self.x, dtype=np.int64),
+                radius=np.asarray(self.radius, dtype=np.int64),
+                size_x=np.asarray(self.size_x, dtype=np.int64),
+                size_y=np.asarray(self.size_y, dtype=np.int64),
+                scan_shape=np.asarray(self.scan_shape, dtype=np.int64),
+                sampling=sampling,
+                units=units,
+            )
+        temporary_path.replace(path)
+        self.state_path = path
+        self.save_button.disabled = False
+        self._saved = True
+        self._dirty = False
+        self._refresh_status(f"Applied and saved to {path}")
+        return path
+
+    def close(self):
+        plt.close(self.figure)
+
+    def _restore_initial(self):
+        x, y, geometry, size_x, size_y = self._initial_geometry
+        self.set_mask(
+            x=x,
+            y=y,
+            geometry=geometry,
+            size_x=size_x,
+            size_y=size_y,
+        )
+        self._preview_mask = self._initial_mask.copy()
+        self._dirty = True
+        self._render()
+        self._refresh_status("Initial state restored; click Apply")
+
+    def _set_full_scan(self):
+        rows, columns = self.scan_shape
+        if self.geometry == "circle":
+            size_x = size_y = (
+                int(np.ceil(np.hypot(rows - 1, columns - 1))) + 1
+            )
+        elif self.geometry == "ellipse":
+            size_x, size_y = columns, rows
+        elif self.geometry == "square":
+            size_x = size_y = max(rows, columns)
+        else:
+            size_x, size_y = columns, rows
+        self.set_mask(
+            x=columns // 2,
+            y=rows // 2,
+            size_x=size_x,
+            size_y=size_y,
+        )
+
+    def _on_x_slider(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.x_input.value = int(change["new"])
+        self._syncing = False
+        self._update_preview()
+
+    def _on_y_slider(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.y_input.value = self.scan_shape[0] - 1 - int(change["new"])
+        self._syncing = False
+        self._update_preview()
+
+    def _on_geometry(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            if change["new"] in {"circle", "square"}:
+                self.size_y_slider.value = self.size_x
+                self.size_y_input.value = self.size_x
+        finally:
+            self._syncing = False
+        self._refresh_geometry_controls()
+        self._update_preview()
+
+    def _on_size_x_slider(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.size_x_input.value = int(change["new"])
+            if self.geometry in {"circle", "square"}:
+                self.size_y_slider.value = int(change["new"])
+                self.size_y_input.value = int(change["new"])
+        finally:
+            self._syncing = False
+        self._update_preview()
+
+    def _on_size_y_slider(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.size_y_input.value = int(change["new"])
+        self._syncing = False
+        self._update_preview()
+
+    def _on_x_input(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.x_slider.value = int(change["new"])
+        self._syncing = False
+        self._update_preview()
+
+    def _on_y_input(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.y_slider.value = self.scan_shape[0] - 1 - int(change["new"])
+        self._syncing = False
+        self._update_preview()
+
+    def _on_size_x_input(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.size_x_slider.value = int(change["new"])
+            if self.geometry in {"circle", "square"}:
+                self.size_y_slider.value = int(change["new"])
+                self.size_y_input.value = int(change["new"])
+        finally:
+            self._syncing = False
+        self._update_preview()
+
+    def _on_size_y_input(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        self.size_y_slider.value = int(change["new"])
+        self._syncing = False
+        self._update_preview()
+
+    def _update_preview(self):
+        self._preview_mask = self._geometry_mask(
+            self.y, self.x, self.geometry, self.size_x, self.size_y
+        )
+        self._dirty = True
+        self._saved = False
+        self._render()
+        self._refresh_status("Preview changed; click Apply or Apply & Save")
+
+    def _refresh_geometry_controls(self):
+        labels = {
+            "circle": ("Radius", None),
+            "ellipse": ("X radius", "Y radius"),
+            "square": ("Half-size", None),
+            "rectangle": ("Half-width", "Half-height"),
+        }
+        x_label, y_label = labels[self.geometry]
+        self.size_x_slider.description = x_label
+        self.size_x_input.description = x_label
+        if y_label is None:
+            self.size_y_slider.layout.display = "none"
+            self.size_y_input.layout.display = "none"
+            self.size_y_row.layout.display = "none"
+        else:
+            self.size_y_slider.description = y_label
+            self.size_y_input.description = y_label
+            self.size_y_slider.layout.display = ""
+            self.size_y_input.layout.display = ""
+            self.size_y_row.layout.display = ""
+
+    def _replace_boundary_artist(self):
+        if self.boundary_artist is not None:
+            self.boundary_artist.remove()
+        style = {
+            "fill": False,
+            "edgecolor": "#ff3030",
+            "linewidth": 1.05,
+            "linestyle": (0, (1.2, 5.5)),
+            "alpha": 0.9,
+        }
+        if self.geometry in {"circle", "ellipse"}:
+            size_y = self.size_x if self.geometry == "circle" else self.size_y
+            artist = Ellipse(
+                (self.x, self.y),
+                width=2 * self.size_x,
+                height=2 * size_y,
+                **style,
+            )
+        else:
+            size_y = self.size_x if self.geometry == "square" else self.size_y
+            artist = Rectangle(
+                (self.x - self.size_x - 0.5, self.y - size_y - 0.5),
+                width=2 * self.size_x + 1,
+                height=2 * size_y + 1,
+                **style,
+            )
+        self.ax.add_patch(artist)
+        self.boundary_artist = artist
+        # Compatibility name retained even when the selected geometry is not circular.
+        self.circle_artist = artist
+
+    def _render(self):
+        self.mask_artist.set_data(
+            np.ma.masked_where(~self._preview_mask, self._preview_mask)
+        )
+        self._replace_boundary_artist()
+        self.center_artist.set_data([self.x], [self.y])
+        self.figure.canvas.draw_idle()
+        with self.output:
+            clear_output(wait=True)
+            display(self.figure)
+
+    def _refresh_status(self, message):
+        count = int(self._preview_mask.sum())
+        total = int(self._preview_mask.size)
+        physical = ""
+        try:
+            row_sampling, column_sampling = (
+                float(v) for v in self.analysis.dataset_cartesian.sampling[:2]
+            )
+            row_unit, column_unit = (
+                str(v) for v in self.analysis.dataset_cartesian.units[:2]
+            )
+            if np.isclose(row_sampling, column_sampling) and row_unit == column_unit:
+                if self.geometry == "circle":
+                    physical = (
+                        f" · radius ≈ {self.size_x * row_sampling:.4g} {row_unit}"
+                    )
+                else:
+                    physical = (
+                        f" · half-size ≈ "
+                        f"{self.size_x * column_sampling:.4g} × "
+                        f"{self.size_y * row_sampling:.4g} {row_unit}"
+                    )
+        except (TypeError, ValueError):
+            pass
+        save_state = "saved" if self._saved else "not saved"
+        self.status.value = (
+            f"<b>{message}</b><br>"
+            f"{self.geometry.title()} · X column {self.x} · Y row {self.y} · "
+            f"half-size {self.size_x} × {self.size_y} px"
+            f"{physical} · {count:,}/{total:,} positions "
+            f"({100.0 * count / total:.1f}%) · {save_state}"
+        )
+
+
 # TODO: Likely dataset4dSTEM rather than dataset4d input class
 # Bragg peaks from crystalline vs polymer
 # 
@@ -509,8 +1406,9 @@ class BraggPeaksPolymer(AutoSerialize):
     def __init__(
         self,
         dataset_cartesian: Dataset4dstem,
-        compute_parameters: callable,
-        normalize_data: callable,
+        compute_parameters: callable = None,
+        normalize_data: callable = None,
+        normalization_strategy: NormalizationStrategy | str | dict | None = None,
         model: MultiChannelCNN2d = None,
         final_shape: Tuple[int, int] = (256, 256),
         device: str = 'cpu',
@@ -526,11 +1424,37 @@ class BraggPeaksPolymer(AutoSerialize):
         self._dataset_cartesian = dataset_cartesian
         self._device = device
         self._final_shape = final_shape
-        # Setting functions for normalization
-        self.compute_parameters = compute_parameters
-        self.normalize_data = normalize_data
         self.normalize_parameter_lower_percentile = normalize_parameter_lower_percentile
         self.normalize_parameter_upper_percentile = normalize_parameter_upper_percentile
+        if (compute_parameters is None) != (normalize_data is None):
+            raise ValueError(
+                "compute_parameters and normalize_data must be supplied together."
+            )
+        if normalization_strategy is not None and compute_parameters is not None:
+            raise ValueError(
+                "Pass normalization_strategy or the legacy callback pair, not both."
+            )
+        if compute_parameters is not None:
+            warnings.warn(
+                "compute_parameters and normalize_data are deprecated; pass a "
+                "normalization_strategy instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            normalization_strategy = LegacyNormalizationAdapter(
+                compute_parameters,
+                normalize_data,
+                normalize_parameter_lower_percentile,
+                normalize_parameter_upper_percentile,
+            )
+        self.compute_parameters = compute_parameters
+        self.normalize_data = normalize_data
+        self._normalization_strategy = (
+            resolve_normalization_strategy(normalization_strategy)
+            if normalization_strategy is not None
+            else None
+        )
+        self._normalization_is_explicit = normalization_strategy is not None
         # To be set by class methods
         # self.resized_cartesian_data = None
         self.peak_coordinates_cartesian = None
@@ -550,9 +1474,13 @@ class BraggPeaksPolymer(AutoSerialize):
         self.max_radius = None
         self.num_radial_bins = None
         self.num_annular_bins = None
+        self.orient_corr = None
+        self.orient_corr_pairs = None
         # Cached dataset-level normalization stats (median, iqr). Computed once by
         # find_peaks_model / ensure_normalization_params and reused for live inference
         # so single-DP predictions reproduce the full-scan results exactly.
+        self._normalization_parameters = None
+        # Deprecated cache aliases retained for serialized historical objects.
         self._norm_median = None
         self._norm_iqr = None
         # True once BatchNorm running stats have been adapted to this dataset (for
@@ -604,6 +1532,40 @@ class BraggPeaksPolymer(AutoSerialize):
     @model.setter
     def model(self, model):
         self._model = model
+        self._invalidate_inference_caches()
+
+    @property
+    def normalization_strategy(self):
+        return self._normalization_strategy
+
+    @normalization_strategy.setter
+    def normalization_strategy(self, strategy):
+        self._set_normalization_strategy(strategy, explicit=True)
+
+    def _set_normalization_strategy(self, strategy, *, explicit):
+        resolved = (
+            resolve_normalization_strategy(strategy) if strategy is not None else None
+        )
+        if resolved != getattr(self, "_normalization_strategy", None):
+            self._normalization_strategy = resolved
+            self._invalidate_inference_caches()
+        self._normalization_is_explicit = explicit
+
+    def _invalidate_inference_caches(self):
+        self._normalization_parameters = None
+        self._norm_median = None
+        self._norm_iqr = None
+        self._bn_adapted = False
+        self._live_chunk_cache = None
+
+    def _require_normalization_strategy(self):
+        if self._normalization_strategy is None:
+            raise RuntimeError(
+                "No inference normalization is configured. Load a registered model, "
+                "or pass normalization_strategy (or the legacy compute_parameters and "
+                "normalize_data callbacks) when using a custom checkpoint."
+            )
+        return self._normalization_strategy
 
     @property
     def device(self) -> str:
@@ -662,18 +1624,16 @@ class BraggPeaksPolymer(AutoSerialize):
         )
         self._scan_mask = new_mask
         if changed:
-            self._norm_median = None
-            self._norm_iqr = None
-            self._bn_adapted = False
-            self._live_chunk_cache = None
+            self._invalidate_inference_caches()
 
     @classmethod
     def from_file(
         cls,
         file_path: str,
-        device: str,
-        compute_parameters: callable,
-        normalize_data: callable,
+        device: str = "cpu",
+        compute_parameters: callable = None,
+        normalize_data: callable = None,
+        normalization_strategy: NormalizationStrategy | str | dict | None = None,
         file_type: str | None = None,
         normalize_parameter_lower_percentile: float = 1.0,
         normalize_parameter_upper_percentile: float = 99.0,
@@ -684,6 +1644,7 @@ class BraggPeaksPolymer(AutoSerialize):
             device=device,
             compute_parameters=compute_parameters,
             normalize_data=normalize_data,
+            normalization_strategy=normalization_strategy,
             normalize_parameter_lower_percentile=normalize_parameter_lower_percentile,
             normalize_parameter_upper_percentile=normalize_parameter_upper_percentile,
         )
@@ -692,9 +1653,10 @@ class BraggPeaksPolymer(AutoSerialize):
     def from_data(
         cls,
         dataset_cartesian: Dataset4dstem,
-        device: str,
-        compute_parameters: callable,
-        normalize_data: callable,
+        device: str = "cpu",
+        compute_parameters: callable = None,
+        normalize_data: callable = None,
+        normalization_strategy: NormalizationStrategy | str | dict | None = None,
         normalize_parameter_lower_percentile: float = 1.0,
         normalize_parameter_upper_percentile: float = 99.0,
     ) -> "BraggPeaksPolymer":
@@ -704,6 +1666,7 @@ class BraggPeaksPolymer(AutoSerialize):
             device=device,
             compute_parameters=compute_parameters,
             normalize_data=normalize_data,
+            normalization_strategy=normalization_strategy,
             normalize_parameter_lower_percentile=normalize_parameter_lower_percentile,
             normalize_parameter_upper_percentile=normalize_parameter_upper_percentile,
         )
@@ -940,6 +1903,7 @@ class BraggPeaksPolymer(AutoSerialize):
         self.ellipse_params = None
         self.ellipse_center = None
         self.dp_mean_centered = None
+        self.ellipse_fit_diagnostics = None
         if fit_ellipse:
             self.dp_mean_centered = self._centered_dp_mean(
                 self.image_centers, com_model=com_model
@@ -961,6 +1925,7 @@ class BraggPeaksPolymer(AutoSerialize):
             results["ellipse_params"] = self.ellipse_params
             results["ellipse_center"] = self.ellipse_center
             results["ellipse_ring_band"] = ring_band
+            results["ellipse_fit_diagnostics"] = self.ellipse_fit_diagnostics
             if store_metadata:
                 self._dataset_cartesian.metadata["ellipticity"] = self.ellipse_params
 
@@ -1139,6 +2104,10 @@ class BraggPeaksPolymer(AutoSerialize):
         n_ratio=12,
         n_theta=24,
         refine=True,
+        max_ring_candidates=3,
+        min_fit_improvement=0.005,
+        max_fit_score=0.25,
+        min_angular_coverage=0.55,
         device="cpu",
         show=False,
         verbose=False,
@@ -1162,9 +2131,18 @@ class BraggPeaksPolymer(AutoSerialize):
             Fixed origin ``(y, x)`` in detector pixels.
         radial_min, radial_max : float, optional
             Ring band in pixels. If either is None the band is auto-detected from the
-            circular radial profile (strongest peak beyond the central beam).
+            circular median radial profile and several prominent candidates are fitted
+            and quality-ranked.
         ratio_range, n_ratio, n_theta, refine :
-            Coarse grid over ``b/a`` and ``theta`` (degrees), then a local refine pass.
+            Coarse grid over ``b/a`` and ``theta`` (degrees), then a clipped local
+            refinement pass.
+        max_ring_candidates : int
+            Maximum prominent radial-profile peaks evaluated when the ring band is
+            selected automatically.
+        min_fit_improvement, max_fit_score, min_angular_coverage : float
+            Quality gates. Fits that do not improve held-out angular alignment, retain
+            excessive raw angular variance, lack ring coverage, or hit a ratio boundary
+            fall back to a circular correction with a warning.
 
         Returns
         -------
@@ -1176,11 +2154,11 @@ class BraggPeaksPolymer(AutoSerialize):
         Qy, Qx = dp.shape
         origin = np.asarray(center, dtype=float)
 
-        def _polar(ellipse_params, rmin, rmax):
+        def _polar(image, ellipse_params, rmin, rmax):
             # polar_transform returns (n_phi, n_r) when scan_pos is given.
             return np.asarray(
                 polar_transform(
-                    dp,
+                    image,
                     origin_array=origin,
                     ellipse_params=ellipse_params,
                     num_annular_bins=num_annular_bins,
@@ -1194,71 +2172,223 @@ class BraggPeaksPolymer(AutoSerialize):
                 dtype=float,
             )
 
-        # 1. Auto-detect the ring band if not supplied: circular radial profile, take the
-        #    strongest peak beyond the central beam.
+        # Log compression plus global winsorisation strongly reduces the leverage of
+        # isolated Bragg spots without erasing the broad diffuse calibration ring.
+        fit_dp = np.log1p(np.clip(dp, 0.0, None))
+        finite_fit = fit_dp[np.isfinite(fit_dp)]
+        if finite_fit.size:
+            fit_dp = np.minimum(fit_dp, np.percentile(finite_fit, 99.5))
+
+        # 1. Find several plausible diffuse-ring bands. A median angular profile is much
+        #    less likely than a mean profile to select a sparse constellation of Bragg
+        #    spots. Candidate fits are quality-ranked below rather than trusting the
+        #    single strongest radial feature.
         r_hi = float(min(Qy, Qx) / 2.0 - 1.0)
+        explicit_band = radial_min is not None and radial_max is not None
+        candidate_bands = []
         if radial_min is None or radial_max is None:
             from scipy.ndimage import uniform_filter1d
 
-            prof = _polar((1.0, 1.0, 0.0), 0.0, r_hi)  # (n_phi, n_r)
-            radial_profile = uniform_filter1d(prof.mean(axis=0), size=5)
+            prof = _polar(fit_dp, (1.0, 1.0, 0.0), 0.0, r_hi)
+            radial_profile = uniform_filter1d(np.median(prof, axis=0), size=5)
             r_axis = np.arange(radial_profile.size) * radial_step
-            # The central beam is the global max, so we can't just argmax: skip past it to
-            # the first trough (slope turns positive), then take the strongest ring beyond.
             r_exclude = max(6.0, 0.06 * r_hi)
             i0 = int(r_exclude / radial_step)
-            slope = np.diff(radial_profile)
-            trough = i0
-            for i in range(i0, slope.size):
-                if slope[i] > 0:
-                    trough = i
-                    break
-            seg = radial_profile.copy()
-            seg[:trough] = -np.inf
-            r0 = float(r_axis[int(np.argmax(seg))])
-            half = max(6.0, 0.20 * r0)  # wide enough that the ring stays in-band as b/a varies
-            if radial_min is None:
-                radial_min = max(r_exclude, r0 - half)
-            if radial_max is None:
-                radial_max = min(r_hi, r0 + half)
-            if verbose:
-                print(
-                    f"  ellipse ring band auto-detected: r0={r0:.1f} px, "
-                    f"band=[{radial_min:.1f}, {radial_max:.1f}] px"
+            search_profile = radial_profile.copy()
+            search_profile[:i0] = np.min(search_profile)
+            prominence_floor = max(
+                1e-9, 0.03 * float(np.ptp(search_profile[i0:]))
+            )
+            peak_indices, properties = find_peaks(
+                search_profile,
+                prominence=prominence_floor,
+                distance=max(3, int(round(6.0 / radial_step))),
+            )
+            valid = (
+                (peak_indices >= i0)
+                & (r_axis[peak_indices] <= 0.92 * r_hi)
+            )
+            peak_indices = peak_indices[valid]
+            prominences = properties["prominences"][valid]
+            if not peak_indices.size:
+                peak_indices = np.asarray(
+                    [i0 + int(np.argmax(search_profile[i0:]))]
                 )
+                prominences = np.asarray([1.0])
+            order = np.argsort(prominences)[::-1][:max_ring_candidates]
+            for index in peak_indices[order]:
+                r0 = float(r_axis[index])
+                half = max(6.0, 0.20 * r0)
+                band_min = (
+                    max(r_exclude, r0 - half)
+                    if radial_min is None
+                    else float(radial_min)
+                )
+                band_max = (
+                    min(r_hi, r0 + half)
+                    if radial_max is None
+                    else float(radial_max)
+                )
+                if band_max > band_min:
+                    candidate_bands.append((band_min, band_max, r0))
+        else:
+            candidate_bands.append(
+                (float(radial_min), float(radial_max),
+                 0.5 * (float(radial_min) + float(radial_max)))
+            )
 
-        def _score(ellipse_params):
-            polar = _polar(ellipse_params, radial_min, radial_max)  # (n_phi, n_r)
-            # normalised azimuthal std summed over the ring band (Ehrhardt criterion):
-            # minimal when the ring is angularly uniform, i.e. the ellipse is corrected.
-            return float(polar.std(axis=0).sum() / (np.abs(polar.mean(axis=0)).sum() + 1e-6))
+        # Deduplicate overlapping candidates created by broad/shouldered peaks.
+        unique_bands = []
+        for band in candidate_bands:
+            if not any(abs(band[2] - other[2]) < 3.0 for other in unique_bands):
+                unique_bands.append(band)
+        candidate_bands = unique_bands
 
-        def _search(ratios, thetas):
+        fit_angles = (np.arange(num_annular_bins) // 6) % 2 == 0
+        validation_angles = ~fit_angles
+
+        def _robust_score(ellipse_params, band, angle_mask):
+            polar = _polar(
+                fit_dp, ellipse_params, band[0], band[1]
+            )[angle_mask]
+            if not polar.size:
+                return np.inf
+            # Per-radius clipping removes angularly isolated hot pixels. Per-angle
+            # normalisation then scores radial alignment rather than polymer texture.
+            upper = np.percentile(polar, 90.0, axis=0, keepdims=True)
+            polar = np.minimum(polar, upper)
+            polar = polar - np.percentile(
+                polar, 10.0, axis=1, keepdims=True
+            )
+            polar = np.clip(polar, 0.0, None)
+            scale = np.percentile(polar, 90.0, axis=1, keepdims=True)
+            valid_scale = scale[:, 0] > 1e-9
+            if np.count_nonzero(valid_scale) < 4:
+                return np.inf
+            polar = polar[valid_scale] / (scale[valid_scale] + 1e-9)
+            reference = np.median(polar, axis=0)
+            return float(
+                np.median(np.abs(polar - reference), axis=0).sum()
+                / (np.abs(reference).sum() + 1e-9)
+            )
+
+        def _raw_score(ellipse_params, band):
+            polar = _polar(dp, ellipse_params, band[0], band[1])
+            return float(
+                polar.std(axis=0).sum()
+                / (np.abs(polar.mean(axis=0)).sum() + 1e-6)
+            )
+
+        def _angular_coverage(ellipse_params, band):
+            polar = _polar(fit_dp, ellipse_params, band[0], band[1])
+            contrast = np.percentile(polar, 95.0, axis=1) - np.percentile(
+                polar, 20.0, axis=1
+            )
+            reference = np.percentile(contrast, 90.0)
+            if not np.isfinite(reference) or reference <= 1e-9:
+                return 0.0
+            return float(np.mean(contrast >= 0.15 * reference))
+
+        def _search(ratios, thetas, band):
             best = (np.inf, 1.0, 0.0)
             for th in thetas:
                 for rat in ratios:
-                    s = _score((1.0, float(rat), float(th)))
+                    s = _robust_score(
+                        (1.0, float(rat), float(th)), band, fit_angles
+                    )
                     if s < best[0]:
                         best = (s, float(rat), float(th))
             return best
 
-        # 2. Coarse grid over (b/a, theta), then a local refine around the best.
+        # 2. Fit every candidate, clip refinement to the declared search range, and
+        #    validate on held-out angular blocks.
         coarse_ratios = np.linspace(ratio_range[0], ratio_range[1], n_ratio)
         coarse_thetas = np.linspace(0.0, 180.0, n_theta, endpoint=False)
-        best = _search(coarse_ratios, coarse_thetas)
-        if refine:
-            _, rat0, th0 = best
-            dr = (ratio_range[1] - ratio_range[0]) / max(n_ratio - 1, 1)
-            dth = 180.0 / n_theta
-            fine = _search(
-                np.linspace(rat0 - dr, rat0 + dr, 11),
-                np.linspace(th0 - dth, th0 + dth, 11),
+        diagnostics = []
+        ratio_step = (
+            (ratio_range[1] - ratio_range[0]) / max(n_ratio - 1, 1)
+        )
+        for band in candidate_bands:
+            best = _search(coarse_ratios, coarse_thetas, band)
+            if refine:
+                _, rat0, th0 = best
+                dth = 180.0 / n_theta
+                fine_ratios = np.unique(np.clip(
+                    np.linspace(rat0 - ratio_step, rat0 + ratio_step, 11),
+                    ratio_range[0],
+                    ratio_range[1],
+                ))
+                fine_thetas = (
+                    np.linspace(th0 - dth, th0 + dth, 11) % 180.0
+                )
+                fine = _search(fine_ratios, fine_thetas, band)
+                best = min(best, fine, key=lambda item: item[0])
+            fit_score, ratio, theta = best
+            circle_validation = _robust_score(
+                (1.0, 1.0, 0.0), band, validation_angles
             )
-            best = min(best, fine, key=lambda t: t[0])
-        score, ratio, theta_deg = best
+            ellipse_validation = _robust_score(
+                (1.0, ratio, theta), band, validation_angles
+            )
+            improvement = (
+                (circle_validation - ellipse_validation)
+                / max(abs(circle_validation), 1e-9)
+            )
+            raw_score = _raw_score((1.0, ratio, theta), band)
+            coverage = _angular_coverage((1.0, ratio, theta), band)
+            boundary_limited = (
+                ratio <= ratio_range[0] + 0.25 * ratio_step
+                or ratio >= ratio_range[1] - 0.25 * ratio_step
+            )
+            accepted = (
+                np.isfinite(fit_score)
+                and improvement >= min_fit_improvement
+                and raw_score <= max_fit_score
+                and coverage >= min_angular_coverage
+                and not boundary_limited
+            )
+            diagnostics.append({
+                "band": (float(band[0]), float(band[1])),
+                "r0": float(band[2]),
+                "ratio_b_over_a": float(ratio),
+                "theta_deg": float(theta % 180.0),
+                "fit_score": float(fit_score),
+                "raw_score": float(raw_score),
+                "validation_improvement": float(improvement),
+                "angular_coverage": float(coverage),
+                "boundary_limited": bool(boundary_limited),
+                "accepted": bool(accepted),
+            })
 
-        # 3. Normalise (a, b) to the ring radius; only b/a and theta are identifiable.
-        r0 = 0.5 * (radial_min + radial_max)
+        accepted_candidates = [item for item in diagnostics if item["accepted"]]
+        if accepted_candidates:
+            selected = min(
+                accepted_candidates,
+                key=lambda item: (
+                    item["raw_score"],
+                    -item["validation_improvement"],
+                ),
+            )
+            fit_accepted = True
+        else:
+            selected = min(
+                diagnostics,
+                key=lambda item: (
+                    item["boundary_limited"],
+                    item["raw_score"],
+                    -item["validation_improvement"],
+                ),
+            )
+            fit_accepted = False
+
+        radial_min, radial_max = selected["band"]
+        r0 = selected["r0"]
+        ratio = selected["ratio_b_over_a"] if fit_accepted else 1.0
+        theta_deg = selected["theta_deg"] if fit_accepted else 0.0
+        score = selected["raw_score"]
+
+        # 3. Normalise (a, b) to the selected ring radius; only b/a and theta are
+        #    identifiable. A rejected fit deliberately becomes a circular correction.
         a_axis, b_axis = r0, r0 * ratio
         # Canonicalise so a is the MAJOR semi-axis (a/b >= 1): the (a, b, theta) and
         # (b, a, theta+90) parametrisations describe the same ellipse, so pick the one
@@ -1267,17 +2397,62 @@ class BraggPeaksPolymer(AutoSerialize):
             a_axis, b_axis = b_axis, a_axis
             theta_deg += 90.0
         theta_deg = float(theta_deg % 180.0)
+        self.ellipse_fit_diagnostics = {
+            "accepted": fit_accepted,
+            "selected": selected,
+            "candidates": diagnostics,
+            "explicit_band": explicit_band,
+            "rejection_reasons": [],
+            "quality_thresholds": {
+                "min_fit_improvement": float(min_fit_improvement),
+                "max_fit_score": float(max_fit_score),
+                "min_angular_coverage": float(min_angular_coverage),
+                "ratio_range": tuple(float(v) for v in ratio_range),
+            },
+        }
+        if not fit_accepted:
+            reasons = []
+            if selected["boundary_limited"]:
+                reasons.append("ratio search boundary")
+            if selected["validation_improvement"] < min_fit_improvement:
+                reasons.append(
+                    f"held-out improvement {selected['validation_improvement']:.3g}"
+                )
+            if selected["raw_score"] > max_fit_score:
+                reasons.append(f"raw score {selected['raw_score']:.3g}")
+            if selected["angular_coverage"] < min_angular_coverage:
+                reasons.append(
+                    f"angular coverage {selected['angular_coverage']:.1%}"
+                )
+            message = (
+                "Ellipse fit rejected; using a circular correction"
+                + (f" ({', '.join(reasons)})." if reasons else ".")
+            )
+            self.ellipse_fit_diagnostics["rejection_reasons"] = reasons
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
         if verbose:
+            bands_text = ", ".join(
+                f"{item['r0']:.1f}" for item in diagnostics
+            )
             print(
-                f"  ellipse ring fit: a/b={a_axis / b_axis:.4f} "
-                f"theta={theta_deg:.2f} deg (score={score:.4g})"
+                f"  ellipse ring candidates: r0=[{bands_text}] px; "
+                f"selected band=[{radial_min:.1f}, {radial_max:.1f}] px"
+            )
+            print(
+                f"  ellipse ring fit: {'accepted' if fit_accepted else 'rejected'} "
+                f"a/b={a_axis / b_axis:.4f} theta={theta_deg:.2f} deg "
+                f"(score={score:.4g}, held-out improvement="
+                f"{selected['validation_improvement']:.2%}, "
+                f"coverage={selected['angular_coverage']:.1%})"
             )
 
         if show:
             import matplotlib.pyplot as plt
 
-            circ = _polar((1.0, 1.0, 0.0), radial_min, radial_max)
-            corr = _polar((a_axis, b_axis, theta_deg), radial_min, radial_max)
+            circ = _polar(dp, (1.0, 1.0, 0.0), radial_min, radial_max)
+            corr = _polar(
+                dp, (a_axis, b_axis, theta_deg), radial_min, radial_max
+            )
             fig, axes = plt.subplots(1, 3, figsize=(13, 4))
             axes[0].imshow(dp, cmap="magma")
             axes[0].plot([origin[1]], [origin[0]], "c+", ms=10)
@@ -1389,13 +2564,62 @@ class BraggPeaksPolymer(AutoSerialize):
                 cache_dir=cache_dir,
             )
             self._model = build_polymer_model(resolution.specification)
+            if not self._normalization_is_explicit:
+                normalization_config = resolution.specification.get(
+                    "experimental_normalization"
+                )
+                if normalization_config is None:
+                    raise RuntimeError(
+                        f"Registered model {resolution.model_id!r} does not declare "
+                        "experimental_normalization."
+                    )
+                self._set_normalization_strategy(normalization_config, explicit=False)
             path_to_weights = str(resolution.weights_path)
             self.model_resolution = resolution
         self._model.load_state_dict(
             torch.load(path_to_weights, weights_only=True, map_location=self.device)
         )
         self._model.to(self.device)
+        self._invalidate_inference_caches()
         return self
+
+    def detect_ice(
+        self,
+        *,
+        params=None,
+        scan_mask=None,
+        intensity_threshold_global=None,
+        return_debug=False,
+    ):
+        """Detect ice peaks from this analysis's polar peaks and intensities."""
+
+        from quantem.diffraction.polymer_ice import IceFlaggerParams, detect_ice
+
+        if self.polar_peaks is None or self.peak_intensities is None:
+            raise RuntimeError(
+                "detect_ice() requires polar_peaks and peak_intensities to be computed first."
+            )
+        return detect_ice(
+            self.polar_peaks,
+            self.peak_intensities,
+            params=IceFlaggerParams() if params is None else params,
+            scan_mask=self.scan_mask if scan_mask is None else scan_mask,
+            intensity_threshold_global=intensity_threshold_global,
+            return_debug=return_debug,
+        )
+
+    def plot_q_intensity_density(self, **kwargs):
+        """Plot q/intensity density from this analysis's aligned peak vectors."""
+
+        from quantem.diffraction.polymer_ice import plot_q_intensity_density
+
+        if self.polar_peaks is None or self.peak_intensities is None:
+            raise RuntimeError(
+                "plot_q_intensity_density() requires polar_peaks and peak_intensities."
+            )
+        return plot_q_intensity_density(
+            self.polar_peaks, self.peak_intensities, **kwargs
+        )
 
     def _postprocess_single(self, position_map, intensity_map, sigma=1.0, threshold=0.25, show=False):
         """Process a single 2D image"""
@@ -1463,15 +2687,16 @@ class BraggPeaksPolymer(AutoSerialize):
         scan_mask: ArrayLike = None,
         recompute: bool = False,
     ):
-        """Compute and cache the dataset-level (median, iqr) normalization stats.
+        """Fit and cache the configured inference-normalization parameters.
 
         These are estimated once from a random sample of valid diffraction patterns and
         reused by both ``find_peaks_model`` (whole-scan) and ``infer_peaks_single``
         (live). Caching guarantees live single-DP inference reproduces the full-scan
-        peaks exactly (same normalization). Returns the cached ``(median, iqr)``.
+        peaks exactly (same normalization). Parameters are intentionally opaque.
         """
-        if not recompute and self._norm_median is not None and self._norm_iqr is not None:
-            return self._norm_median, self._norm_iqr
+        strategy = self._require_normalization_strategy()
+        if not recompute and self._normalization_parameters is not None:
+            return self._normalization_parameters
 
         device = device or self.device
         Ry, Rx, _, _ = self.dataset_cartesian.shape
@@ -1495,13 +2720,13 @@ class BraggPeaksPolymer(AutoSerialize):
         ])
 
         stats_patterns_resized = self.resize_images(stats_patterns, device=device)
-        median, iqr = self.compute_parameters(
-            stats_patterns_resized,
-            lower_percentile=self.normalize_parameter_lower_percentile,
-            upper_percentile=self.normalize_parameter_upper_percentile,
-        )
-        self._norm_median, self._norm_iqr = median, iqr
-        return median, iqr
+        parameters = strategy.fit(stats_patterns_resized)
+        self._normalization_parameters = parameters
+        if isinstance(parameters, tuple) and len(parameters) == 2:
+            self._norm_median, self._norm_iqr = parameters
+        else:
+            self._norm_median = self._norm_iqr = None
+        return parameters
 
     def adapt_batchnorm(
         self,
@@ -1529,9 +2754,10 @@ class BraggPeaksPolymer(AutoSerialize):
         import torch.nn as nn
 
         device = device or self.device
-        median, iqr = self.ensure_normalization_params(
+        parameters = self.ensure_normalization_params(
             device=device, n_normalize_samples=max(n_samples, 1000), scan_mask=scan_mask
         )
+        strategy = self._require_normalization_strategy()
 
         Ry, Rx, _, _ = self.dataset_cartesian.shape
         # Restrict the adaptation sample to the stored ROI when none is passed.
@@ -1565,7 +2791,7 @@ class BraggPeaksPolymer(AutoSerialize):
                     ])
                     resized = self.resize_images(chunk, device=device, initial_chunk_size=chunk_size)
                     ins = torch.tensor(resized, dtype=torch.float32).to(device)
-                    ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+                    ins_batch = strategy.transform(ins, parameters)[:, None, ...]
                     self.model(ins_batch)  # updates BN running stats only
         finally:
             for m, mom in zip(bn_layers, saved_momentum):
@@ -1583,7 +2809,7 @@ class BraggPeaksPolymer(AutoSerialize):
         self.adapt_batchnorm(device=device, n_samples=n_samples, scan_mask=scan_mask)
 
     def _infer_train_batch_output(
-        self, ry, rx, *, device, median, iqr, chunk_size=100, scan_mask=None
+        self, ry, rx, *, device, parameters, chunk_size=100, scan_mask=None
     ):
         """Model output ``(2, H, W)`` for the DP at (ry, rx), computed exactly as
         ``find_peaks_model`` does.
@@ -1629,7 +2855,9 @@ class BraggPeaksPolymer(AutoSerialize):
         chunk = np.array([self.dataset_cartesian[r, c].array for r, c in chunk_positions])
         resized = self.resize_images(chunk, device=device, initial_chunk_size=len(chunk))
         ins = torch.tensor(resized, dtype=torch.float32).to(device)
-        ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+        ins_batch = self._require_normalization_strategy().transform(
+            ins, parameters
+        )[:, None, ...]
         self.model.to(device)
         self.model.train()  # per-chunk BatchNorm stats, exactly like find_peaks_model
         with torch.no_grad():
@@ -1670,13 +2898,13 @@ class BraggPeaksPolymer(AutoSerialize):
           approximation that over-detects on this out-of-distribution scan.
         """
         device = device or self.device
-        median, iqr = self.ensure_normalization_params(
+        parameters = self.ensure_normalization_params(
             device=device, n_normalize_samples=n_normalize_samples, scan_mask=scan_mask
         )
 
         if bn_mode == "train_batch":
             out = self._infer_train_batch_output(
-                ry, rx, device=device, median=median, iqr=iqr,
+                ry, rx, device=device, parameters=parameters,
                 chunk_size=chunk_size, scan_mask=scan_mask,
             )
         elif bn_mode == "eval_adapt":
@@ -1685,7 +2913,9 @@ class BraggPeaksPolymer(AutoSerialize):
             dp = np.asarray(self.dataset_cartesian[ry, rx].array)
             resized = self.resize_images(dp[None], device=device, initial_chunk_size=1)
             ins = torch.tensor(resized, dtype=torch.float32).to(device)
-            ins_batch = self.normalize_data(ins, median, iqr)[:, None, ...]
+            ins_batch = self._require_normalization_strategy().transform(
+                ins, parameters
+            )[:, None, ...]
             self.model.to(device)
             self.model.eval()
             with torch.no_grad():
@@ -1776,7 +3006,7 @@ class BraggPeaksPolymer(AutoSerialize):
         # ============================================
         # recompute=True to preserve the original per-call semantics (find_peaks_model
         # always recomputed the sample stats); the cache still serves infer/adapt.
-        median, iqr = self.ensure_normalization_params(
+        parameters = self.ensure_normalization_params(
             device=device,
             n_normalize_samples=n_normalize_samples,
             scan_mask=scan_mask,
@@ -1834,7 +3064,9 @@ class BraggPeaksPolymer(AutoSerialize):
                     # 2d. Normalize and run model
                     # ----------------------------------------
                     ins = torch.tensor(chunk_resized, dtype=torch.float32).to(device)
-                    dps_norm = self.normalize_data(ins, median, iqr)
+                    dps_norm = self._require_normalization_strategy().transform(
+                        ins, parameters
+                    )
                     ins_batch = dps_norm[:, None, ...]
                     
                     with torch.no_grad():
@@ -3365,6 +4597,466 @@ class BraggPeaksPolymer(AutoSerialize):
     
         return orient_hist
 
+    def calculate_orientation_correlation(
+        self,
+        orient_hist,
+        radius_max=None,
+        pairs="all",
+        backend="auto",
+        device=None,
+        mode_batch_size=None,
+        pair_batch_size=None,
+        max_memory_fraction=0.6,
+        dtype="float32",
+        workers=None,
+        zero_policy="nan",
+        return_numpy=True,
+        store_result=True,
+        progress_bar=True,
+    ):
+        """
+        Calculate distance-angle correlations from an orientation histogram.
+
+        This method is mathematically equivalent to constructing the full
+        ``(dx, dy, relative_theta)`` correlation volume, but processes angular
+        Fourier modes in batches and performs the radial integration before the
+        angular inverse transform. This substantially reduces peak memory and
+        allows the FFT work to run on a GPU.
+
+        Parameters
+        ----------
+        orient_hist : numpy.ndarray or torch.Tensor
+            Histogram with shape ``(radial_bin, scan_x, scan_y, theta)``.
+            A three-dimensional ``(scan_x, scan_y, theta)`` input is treated as
+            a single radial bin.
+        radius_max : int, optional
+            Maximum spatial separation in orientation-histogram pixels.
+            Defaults to half of the smaller scan dimension.
+        pairs : {"all", "autocorrelation"} or sequence of tuple[int, int]
+            Radial-bin pairs to correlate. ``"all"`` uses upper-triangular
+            ordering; ``"autocorrelation"`` calculates only ``(i, i)``.
+        backend : {"auto", "numpy", "torch"}
+            ``"auto"`` uses PyTorch when CUDA is available and NumPy otherwise.
+        device : str or torch.device, optional
+            PyTorch device. Defaults to CUDA when available, otherwise CPU.
+        mode_batch_size, pair_batch_size : int, optional
+            Angular-frequency and radial-pair batch sizes. CUDA mode batching is
+            automatically sized from available memory when omitted.
+        max_memory_fraction : float
+            Fraction of currently free CUDA memory available to automatic
+            batching.
+        dtype : {"float32", "float64"}
+            Real computation dtype. ``float32`` is recommended for CUDA.
+        workers : int, optional
+            Number of SciPy FFT workers for the NumPy backend.
+        zero_policy : {"nan", "zero", "raise"}
+            Handling for radial distances with no normalization signal.
+        return_numpy : bool
+            Convert PyTorch output to a NumPy array before returning.
+        store_result : bool
+            Store output in ``self.orient_corr`` and its radial-bin mapping in
+            ``self.orient_corr_pairs``.
+        progress_bar : bool
+            Display progress over angular-mode and radial-pair batches.
+
+        Returns
+        -------
+        numpy.ndarray or torch.Tensor
+            Array with shape
+            ``(num_pairs, num_theta // 2 + 1, radius_max + 1)`` in multiples of
+            a random distribution. A value of 1 indicates random association.
+
+        Notes
+        -----
+        The full ``pairs="all"`` output uses upper-triangular radial-bin pair
+        ordering. Use ``self.orient_corr_pairs`` to label the first output axis.
+        """
+        orient_corr, pair_indices = _calculate_orientation_correlation(
+            orient_hist,
+            radius_max=radius_max,
+            pairs=pairs,
+            backend=backend,
+            device=device,
+            mode_batch_size=mode_batch_size,
+            pair_batch_size=pair_batch_size,
+            max_memory_fraction=max_memory_fraction,
+            dtype=dtype,
+            workers=workers,
+            zero_policy=zero_policy,
+            return_numpy=return_numpy,
+            progress_bar=progress_bar,
+        )
+        if store_result:
+            self.orient_corr = orient_corr
+            self.orient_corr_pairs = pair_indices
+        return orient_corr
+
+    def plot_orientation_correlation(
+        self,
+        orient_corr=None,
+        *,
+        pair_indices=None,
+        pixel_size=1.0,
+        pixel_units="scan pixels",
+        probability_range=(0.5, 2.0),
+        cmap="correlation",
+        figsize=None,
+        show_metrics=True,
+        return_metrics=False,
+    ):
+        """Plot distance-orientation correlations using Matplotlib.
+
+        The 50% boundary is halfway between the correlation at zero separation
+        and the random-association baseline of one. Its intercepts give the
+        radial and annular 50% distances. The signed slope is fitted separately
+        to the primary correlation-equals-one boundary between positive
+        correlation and anticorrelation.
+        """
+        from matplotlib.colors import LinearSegmentedColormap, LogNorm
+        from matplotlib.lines import Line2D
+
+        def crossing(coordinates, profile, level):
+            profile = np.asarray(profile, dtype=float)
+            coordinates = np.asarray(coordinates, dtype=float)
+            if not np.isfinite(profile[0]):
+                return np.nan
+            initial_side = profile[0] - level
+            if initial_side == 0:
+                return float(coordinates[0])
+            for point in range(1, len(profile)):
+                before, after = profile[point - 1], profile[point]
+                if not np.isfinite(before) or not np.isfinite(after):
+                    continue
+                before_side = before - level
+                after_side = after - level
+                if before_side == 0:
+                    return float(coordinates[point - 1])
+                if before_side * after_side <= 0:
+                    if before == after:
+                        return float(coordinates[point])
+                    fraction = -before_side / (after_side - before_side)
+                    return float(
+                        coordinates[point - 1]
+                        + fraction * (coordinates[point] - coordinates[point - 1])
+                    )
+            return np.nan
+
+        values = self.orient_corr if orient_corr is None else orient_corr
+        if values is None:
+            raise RuntimeError(
+                "No orientation correlation is available. Run "
+                "calculate_orientation_correlation() first or pass orient_corr."
+            )
+        values = np.asarray(values)
+        if values.ndim != 3:
+            raise ValueError(
+                "orient_corr must have shape (pair, relative_angle, distance)."
+            )
+        if values.shape[0] == 0:
+            raise ValueError("orient_corr must contain at least one radial-bin pair.")
+        if values.shape[1] < 2 or values.shape[2] < 2:
+            raise ValueError(
+                "orient_corr requires at least two angle and two distance samples."
+            )
+        labels = self.orient_corr_pairs if pair_indices is None else pair_indices
+        if labels is not None:
+            labels = np.asarray(labels)
+            if labels.shape != (values.shape[0], 2):
+                raise ValueError(
+                    f"pair_indices must have shape ({values.shape[0]}, 2)."
+                )
+
+        panel_count = values.shape[0]
+        column_count = min(3, max(1, panel_count))
+        row_count = int(np.ceil(panel_count / column_count))
+        if figsize is None:
+            figsize = (4.5 * column_count, 3.8 * row_count)
+        fig, axes = plt.subplots(
+            row_count,
+            column_count,
+            figsize=figsize,
+            squeeze=False,
+            constrained_layout=True,
+        )
+        lower, upper = map(float, probability_range)
+        if not 0 < lower < upper:
+            raise ValueError("probability_range must satisfy 0 < lower < upper.")
+        if cmap == "correlation":
+            cmap = LinearSegmentedColormap.from_list(
+                "quantem_correlation",
+                [
+                    (0.00, "#002b9a"),
+                    (0.32, "#1769e8"),
+                    (0.50, "#b8b8b8"),
+                    (0.68, "#f23838"),
+                    (1.00, "#9e0015"),
+                ],
+            )
+        distance_max = (values.shape[2] - 1) * float(pixel_size)
+        distances = np.arange(values.shape[2], dtype=float) * float(pixel_size)
+        angles = np.linspace(0.0, 180.0, values.shape[1])
+        image = None
+        metrics = []
+        for index, ax in enumerate(axes.flat):
+            if index >= panel_count:
+                ax.set_visible(False)
+                continue
+            image = ax.imshow(
+                values[index],
+                origin="lower",
+                aspect="auto",
+                extent=(0, distance_max, 0, 180),
+                norm=LogNorm(vmin=lower, vmax=upper),
+                cmap=cmap,
+            )
+            if labels is None:
+                title = f"Ring pair {index}"
+                pair = (index, index)
+            else:
+                pair = tuple(int(value) for value in labels[index])
+                title = (
+                    f"Autocorrelation of Ring {pair[0]}"
+                    if pair[0] == pair[1]
+                    else f"Correlation of Rings {pair[0]} and {pair[1]}"
+                )
+            ax.set(
+                title=title,
+                xlabel=f"distance ({pixel_units})",
+                ylabel="relative orientation (degrees)",
+            )
+            panel = np.asarray(values[index], dtype=float)
+            origin_probability = panel[0, 0]
+            half_probability = (
+                1.0 + 0.5 * (origin_probability - 1.0)
+                if np.isfinite(origin_probability)
+                and origin_probability > 0.0
+                and not np.isclose(origin_probability, 1.0)
+                else np.nan
+            )
+            radial_distance = np.nan
+            annular_distance = np.nan
+            slope = np.nan
+            slope_fit_r_squared = np.nan
+            slope_fit_point_count = 0
+            fit_distances = np.array([])
+            fit_angles = np.array([])
+            if np.isfinite(half_probability):
+                radial_distance = crossing(
+                    distances, panel[0, :], half_probability
+                )
+                annular_distance = crossing(
+                    angles, panel[:, 0], half_probability
+                )
+                if np.isfinite(radial_distance):
+                    ax.scatter(
+                        [radial_distance],
+                        [0],
+                        marker="o",
+                        s=45,
+                        facecolor="white",
+                        edgecolor="black",
+                        linewidth=0.8,
+                        zorder=5,
+                    )
+                if np.isfinite(annular_distance):
+                    ax.scatter(
+                        [0],
+                        [annular_distance],
+                        marker="D",
+                        s=40,
+                        facecolor="white",
+                        edgecolor="black",
+                        linewidth=0.8,
+                        zorder=5,
+                    )
+
+            # The slope belongs to the gray probability/random = 1 boundary, not
+            # the half-maximum contour used for the two distance intercepts.
+            baseline_boundary = np.array(
+                [
+                    crossing(angles, panel[:, radius], 1.0)
+                    for radius in range(panel.shape[1])
+                ]
+            )
+            baseline_radial_intercept = crossing(distances, panel[0, :], 1.0)
+            valid = np.isfinite(baseline_boundary)
+            if np.isfinite(baseline_radial_intercept):
+                valid &= distances <= baseline_radial_intercept + float(pixel_size)
+
+            # Select the earliest contiguous run: this follows the principal
+            # red/blue lobe from the angular axis and rejects remote closed loops.
+            valid_indices = np.flatnonzero(valid)
+            primary_indices = np.array([], dtype=int)
+            if valid_indices.size:
+                angular_jump = np.abs(
+                    np.diff(baseline_boundary[valid_indices])
+                )
+                maximum_step = max(15.0, 4.0 * (angles[1] - angles[0]))
+                split_points = np.flatnonzero(
+                    (np.diff(valid_indices) > 1) | (angular_jump > maximum_step)
+                ) + 1
+                segments = np.split(
+                    valid_indices, split_points
+                )
+                primary_indices = next(
+                    (segment for segment in segments if len(segment) >= 2),
+                    np.array([], dtype=int),
+                )
+            if primary_indices.size >= 5:
+                # A connected correlation=1 contour can rise away from the
+                # origin, turn around at large distance, and return as part of
+                # the same loop. Fitting that entire loop can reverse the sign
+                # of the visually obvious near-origin boundary. Stop at the
+                # first sustained turning point while tolerating isolated
+                # pixel-scale contour noise.
+                boundary_run = baseline_boundary[primary_indices]
+                smoothing_sigma = min(3.0, max(0.75, len(boundary_run) / 100.0))
+                boundary_smooth = gaussian_filter1d(
+                    boundary_run, sigma=smoothing_sigma, mode="nearest"
+                )
+                boundary_gradient = np.gradient(boundary_smooth)
+                initial_count = min(20, max(3, len(boundary_run) // 10))
+                initial_trend = float(
+                    np.median(boundary_gradient[:initial_count])
+                )
+                if not np.isclose(initial_trend, 0.0):
+                    reversal = boundary_gradient * np.sign(initial_trend) < 0
+                    persistence = min(5, max(2, len(boundary_run) // 20))
+                    sustained = np.convolve(
+                        reversal.astype(int),
+                        np.ones(persistence, dtype=int),
+                        mode="valid",
+                    )
+                    turning_points = np.flatnonzero(sustained == persistence)
+                    if turning_points.size and turning_points[0] >= 2:
+                        primary_indices = primary_indices[
+                            : turning_points[0] + 1
+                        ]
+            if primary_indices.size:
+                fit_distances = distances[primary_indices]
+                fit_slope, fit_intercept = np.polyfit(
+                    fit_distances, baseline_boundary[primary_indices], 1
+                )
+                fit_angles = fit_intercept + fit_slope * fit_distances
+                slope = float(fit_slope)
+                slope_fit_point_count = int(fit_distances.size)
+                fit_residuals = (
+                    baseline_boundary[primary_indices] - fit_angles
+                )
+                fit_total = (
+                    baseline_boundary[primary_indices]
+                    - np.mean(baseline_boundary[primary_indices])
+                )
+                residual_sum_squares = float(np.sum(fit_residuals**2))
+                total_sum_squares = float(np.sum(fit_total**2))
+                slope_fit_r_squared = (
+                    1.0 - residual_sum_squares / total_sum_squares
+                    if total_sum_squares > 0
+                    else np.nan
+                )
+
+            if fit_distances.size:
+                visible_fit = (fit_angles >= 0) & (fit_angles <= 180)
+                ax.plot(
+                    fit_distances[visible_fit],
+                    fit_angles[visible_fit],
+                    color="#ffe600",
+                    linestyle="-",
+                    linewidth=2.5,
+                    zorder=6,
+                )
+            ax.legend(
+                handles=[
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="none",
+                        markerfacecolor="white",
+                        markeredgecolor="black",
+                        label="50% radial intercept",
+                    ),
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="D",
+                        color="none",
+                        markerfacecolor="white",
+                        markeredgecolor="black",
+                        label="50% annular intercept",
+                    ),
+                    Line2D(
+                        [0],
+                        [0],
+                        color="#ffe600",
+                        linewidth=2.5,
+                        label="signed baseline fit",
+                    ),
+                ],
+                loc="lower right",
+                fontsize=7,
+                framealpha=0.82,
+            )
+
+            panel_metrics = {
+                "pair": pair,
+                "title": title,
+                "half_probability": float(half_probability),
+                "radial_distance": float(radial_distance),
+                "annular_distance_degrees": float(annular_distance),
+                "slope_degrees_per_unit": float(slope),
+                "slope_fit_r_squared": float(slope_fit_r_squared),
+                "slope_fit_point_count": slope_fit_point_count,
+                "slope_contour_probability": 1.0,
+                "distance_units": pixel_units,
+            }
+            metrics.append(panel_metrics)
+            if show_metrics:
+                radial_text = (
+                    f"{radial_distance:.2f} {pixel_units}"
+                    if np.isfinite(radial_distance)
+                    else "not resolved"
+                )
+                annular_text = (
+                    f"{annular_distance:.2f} degrees"
+                    if np.isfinite(annular_distance)
+                    else "not resolved"
+                )
+                slope_text = (
+                    f"{slope:.2f} degrees/{pixel_units}"
+                    if np.isfinite(slope)
+                    else "not resolved"
+                )
+                ax.text(
+                    0.98,
+                    0.98,
+                    "50% radial distance = "
+                    + radial_text
+                    + "\n50% annular distance = "
+                    + annular_text
+                    + "\nslope = "
+                    + slope_text,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=8,
+                    bbox={
+                        "boxstyle": "round,pad=0.35",
+                        "facecolor": "white",
+                        "edgecolor": "black",
+                        "alpha": 0.82,
+                    },
+                )
+        if image is not None:
+            fig.colorbar(
+                image,
+                ax=[ax for ax in axes.flat if ax.get_visible()],
+                label="probability / random",
+            )
+        if return_metrics:
+            return fig, axes, metrics
+        return fig, axes
+
     def plot_interactive_image_map(self, ry=None, rx=None, intensity_map=None, vmax_cartesian=None, vmin_cartesian=None, 
                                     map_cmap='viridis', map_title='Intensity Map', dp_cmap="gray",
                                     norm_upper_quantile=None, norm_power=1.0,
@@ -4265,7 +5957,8 @@ class BraggPeaksPolymer(AutoSerialize):
         infer_device=None,
         sigma_peak_blur=1.0,
         threshold_peak=0.5,
-        figsize=(10, 5),
+        panels=None,
+        figsize=None,
         dpi=100,
         progress=True,
     ):
@@ -4273,9 +5966,9 @@ class BraggPeaksPolymer(AutoSerialize):
 
         Walks a boustrophedon (snake) path over the scan and, for each position,
         renders one combined frame: the real-space intensity map with a cursor
-        crosshair at the current position (left) beside that position's diffraction
-        pattern with detected Bragg peaks overlaid (right). Frames are assembled into
-        a looping GIF. This reuses the same rendering primitives as
+        crosshair at the current position (left) beside one or more diffraction-pattern
+        panels with detected Bragg peaks overlaid (right). Frames are assembled into a
+        looping GIF. This reuses the same rendering primitives as
         :meth:`save_peak_figures` so frames match the per-position saved figures.
 
         Parameters
@@ -4295,9 +5988,21 @@ class BraggPeaksPolymer(AutoSerialize):
         intensity_map : np.ndarray | None
             Real-space map to display (computed once). ``None`` uses the mean-intensity
             virtual image. May be scalar ``(H, W)`` or RGB ``(H, W, 3|4)``.
+        panels : list[dict] | None
+            One dict per diffraction-pattern panel to draw beside the map, each holding
+            that panel's display settings (any of: ``title``, ``dp_cmap``,
+            ``vmin_cartesian``, ``vmax_cartesian``, ``norm_upper_quantile``,
+            ``norm_power``, ``gaussian_filter_sigma``, ``zoom``, ``selected_peak_color``,
+            ``central_beam_color``, ``show_central_beam``, ``peak_intensity_mode``,
+            ``peak_size_range``, ``peak_marker_size``, ``crosshair_width_peaks``,
+            ``crosshair_scaling_central_beam``, ``peak_alpha``, ``central_linewidth``).
+            Missing keys fall back to the corresponding top-level argument. ``None``
+            (default) draws a single panel from the top-level arguments.
         live_inference : bool
             Run the model per position via :meth:`infer_peaks_single` instead of reading
             precomputed ``peak_coordinates_cartesian`` (slow over large regions).
+        figsize : tuple | None
+            Figure size. ``None`` auto-sizes to ``(5 * (1 + n_panels), 5)``.
 
         Returns
         -------
@@ -4306,7 +6011,34 @@ class BraggPeaksPolymer(AutoSerialize):
         """
         from PIL import Image
 
+        # A single top-level panel spec unless the caller passes an explicit list.
+        if panels is None:
+            panels = [dict(
+                title=None,
+                dp_cmap=dp_cmap,
+                vmin_cartesian=vmin_cartesian,
+                vmax_cartesian=vmax_cartesian,
+                norm_upper_quantile=norm_upper_quantile,
+                norm_power=norm_power,
+                gaussian_filter_sigma=gaussian_filter_sigma,
+                zoom=zoom,
+                selected_peak_color=selected_peak_color,
+                central_beam_color=central_beam_color,
+                show_central_beam=show_central_beam,
+                peak_intensity_mode=peak_intensity_mode,
+                peak_size_range=peak_size_range,
+                peak_marker_size=peak_marker_size,
+                crosshair_width_peaks=crosshair_width_peaks,
+                crosshair_scaling_central_beam=crosshair_scaling_central_beam,
+                peak_alpha=peak_alpha,
+                central_linewidth=central_linewidth,
+            )]
+        n_panels = len(panels)
+        if n_panels == 0:
+            raise ValueError("panels must contain at least one DP panel spec")
+
         Ry, Rx = int(self.dataset_cartesian.shape[0]), int(self.dataset_cartesian.shape[1])
+        base_shape = (int(self.dataset_cartesian.shape[2]), int(self.dataset_cartesian.shape[3]))
 
         # Resolve the real-space map ONCE; _mean_intensity_map rescans every DP, so
         # rebuilding it per frame would be quadratic in scan size.
@@ -4335,17 +6067,16 @@ class BraggPeaksPolymer(AutoSerialize):
         has_precomputed = (not live_inference) and self.peak_coordinates_cartesian is not None
         has_polar_peaks = getattr(self, "polar_peaks", None) is not None
 
-        fig, (ax_map, ax_dp) = plt.subplots(1, 2, figsize=figsize, dpi=dpi)
+        if figsize is None:
+            figsize = (5 * (1 + n_panels), 5)
+        fig, axes = plt.subplots(1, 1 + n_panels, figsize=figsize, dpi=dpi)
+        ax_map = axes[0]
+        dp_axes = axes[1:]
         frames = []
         try:
             for ry, rx in tqdm(points, desc="Rendering snake", disable=not progress):
-                dp_data = _normalized_dp(
-                    self.dataset_cartesian, ry, rx,
-                    norm_upper_quantile=norm_upper_quantile, norm_power=norm_power,
-                )
-                if gaussian_filter_sigma is not None:
-                    dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
-
+                # Peaks + beam center are fetched ONCE per position; each panel then
+                # applies its own normalization / zoom crop below.
                 peaks_x = peaks_y = peak_ints = peaks_r_invA = None
                 if show_peaks:
                     if live_inference:
@@ -4364,7 +6095,7 @@ class BraggPeaksPolymer(AutoSerialize):
                         if has_polar_peaks:
                             peaks_r_invA = _vector_field_cell(self.polar_peaks, "r_invA", ry, rx)
 
-                center = _display_center(getattr(self, "image_centers", None), ry, rx, dp_data.shape)
+                center = _display_center(getattr(self, "image_centers", None), ry, rx, base_shape)
                 # _plot_bragg_peaks_on_ax draws no rings when peaks_r_invA is None. When
                 # there is no polar transform, fall back to the pixel radius from center so
                 # the rings still render (r_invA is otherwise only used for radial filtering,
@@ -4376,19 +6107,10 @@ class BraggPeaksPolymer(AutoSerialize):
                     )
                 central_idx = _central_peak_index(
                     peaks_x, peaks_y, peaks_r_invA, center,
-                    max_dist=_central_beam_max_dist(dp_data.shape),
-                )
-                (
-                    dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints,
-                    central_idx, display_center,
-                ) = _zoom_peak_overlay(
-                    dp_data, peaks_x, peaks_y, peaks_r_invA, peak_ints,
-                    central_idx, zoom, center,
+                    max_dist=_central_beam_max_dist(base_shape),
                 )
 
                 ax_map.clear()
-                ax_dp.clear()
-
                 if is_rgb_map:
                     ax_map.imshow(intensity_map)
                 elif map_vmin is None:
@@ -4400,34 +6122,77 @@ class BraggPeaksPolymer(AutoSerialize):
                     facecolor="none", edgecolor=crosshair_color, marker="o",
                     s=crosshair_size, linewidth=crosshair_width, zorder=10,
                 )
-                ax_map.set_title(map_title)
+                ax_map.set_title(f"{map_title}  Ry={ry}, Rx={rx}" if map_title else f"Ry={ry}, Rx={rx}")
                 ax_map.set_xticks([])
                 ax_map.set_yticks([])
 
-                ax_dp.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
-                if show_peaks and peaks_x is not None:
-                    _plot_bragg_peaks_on_ax(
-                        ax_dp, peaks_x, peaks_y, peaks_r_invA, peak_ints, central_idx,
-                        selected_peak_color=selected_peak_color,
-                        central_beam_color=central_beam_color,
-                        peak_intensity_mode=peak_intensity_mode,
-                        peak_size_range=peak_size_range,
-                        peak_marker_size=peak_marker_size,
-                        crosshair_width_peaks=crosshair_width_peaks,
-                        crosshair_scaling_central_beam=crosshair_scaling_central_beam,
-                        peak_alpha=peak_alpha,
-                        central_alpha=peak_alpha,
-                        central_linewidth=(
-                            crosshair_width_peaks if central_linewidth is None else central_linewidth
-                        ),
-                        center=display_center,
-                        show_central_beam=show_central_beam,
+                for ax, spec in zip(dp_axes, panels):
+                    npow = spec.get("norm_power", norm_power)
+                    npow = 1.0 if npow is None else npow
+                    sigma = spec.get("gaussian_filter_sigma", gaussian_filter_sigma)
+                    dp_p = _normalized_dp(
+                        self.dataset_cartesian, ry, rx,
+                        norm_upper_quantile=spec.get("norm_upper_quantile", norm_upper_quantile),
+                        norm_power=npow,
                     )
-                ax_dp.set_xlim(-0.5, dp_data.shape[1] - 0.5)
-                ax_dp.set_ylim(dp_data.shape[0] - 0.5, -0.5)
-                ax_dp.set_xticks([])
-                ax_dp.set_yticks([])
-                ax_dp.set_title(f"Ry={ry}, Rx={rx}")
+                    if sigma is not None:
+                        dp_p = gaussian_filter(dp_p, sigma)
+                    (
+                        dp_p, px, py, r_invA, pint, cidx, disp_center,
+                    ) = _zoom_peak_overlay(
+                        dp_p, peaks_x, peaks_y, peaks_r_invA, peak_ints,
+                        central_idx, spec.get("zoom", zoom), center,
+                    )
+                    ax.clear()
+                    ax.imshow(
+                        dp_p, cmap=spec.get("dp_cmap", dp_cmap),
+                        vmin=spec.get("vmin_cartesian", vmin_cartesian),
+                        vmax=spec.get("vmax_cartesian", vmax_cartesian),
+                    )
+                    if show_peaks and px is not None:
+                        cwp = spec.get("crosshair_width_peaks", crosshair_width_peaks)
+                        clw = spec.get("central_linewidth", central_linewidth)
+                        if ("marker_size" in spec) or ("central_size" in spec):
+                            # Data-proportional circles (radius in detector px) so markers
+                            # cover the same fraction of the pattern as the widget canvas
+                            # (which scales its px marker radii to the display).
+                            _draw_peaks_data_circles(
+                                ax, px, py, pint, cidx, disp_center,
+                                marker_scaled=spec.get("marker_scaled", True),
+                                marker_size=spec.get("marker_size", 8.0),
+                                marker_size_min=spec.get("marker_size_min", 4.0),
+                                marker_size_max=spec.get("marker_size_max", 16.0),
+                                selected_peak_color=spec.get("selected_peak_color", selected_peak_color),
+                                central_beam_color=spec.get("central_beam_color", central_beam_color),
+                                show_central_beam=spec.get("show_central_beam", show_central_beam),
+                                central_size=spec.get("central_size", 5.0),
+                                peak_linewidth=cwp,
+                                central_linewidth=(cwp if clw is None else clw),
+                            )
+                        else:
+                            palpha = spec.get("peak_alpha", peak_alpha)
+                            _plot_bragg_peaks_on_ax(
+                                ax, px, py, r_invA, pint, cidx,
+                                selected_peak_color=spec.get("selected_peak_color", selected_peak_color),
+                                central_beam_color=spec.get("central_beam_color", central_beam_color),
+                                peak_intensity_mode=spec.get("peak_intensity_mode", peak_intensity_mode),
+                                peak_size_range=spec.get("peak_size_range", peak_size_range),
+                                peak_marker_size=spec.get("peak_marker_size", peak_marker_size),
+                                crosshair_width_peaks=cwp,
+                                crosshair_scaling_central_beam=spec.get(
+                                    "crosshair_scaling_central_beam", crosshair_scaling_central_beam
+                                ),
+                                peak_alpha=palpha,
+                                central_alpha=palpha,
+                                central_linewidth=(cwp if clw is None else clw),
+                                center=disp_center,
+                                show_central_beam=spec.get("show_central_beam", show_central_beam),
+                            )
+                    ax.set_xlim(-0.5, dp_p.shape[1] - 0.5)
+                    ax.set_ylim(dp_p.shape[0] - 0.5, -0.5)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    ax.set_title(spec.get("title") or "")
 
                 fig.canvas.draw()
                 rgba = np.asarray(fig.canvas.buffer_rgba())
@@ -4449,192 +6214,78 @@ class BraggPeaksPolymer(AutoSerialize):
             print(f"✓ Saved {len(frames)}-frame animation: {path.resolve()}")
         return path
 
-    def create_interactive_circular_mask(self, initial_x0=None, initial_y0=None, initial_r=None,
-                                         reference_image=None, overlay_alpha=0.3, crosshair_width=2, crosshair_size=15):
+    def edit_scan_mask(
+        self,
+        *,
+        initial_x=None,
+        initial_y=None,
+        initial_radius=None,
+        initial_geometry="circle",
+        initial_size_x=None,
+        initial_size_y=None,
+        reference_image=None,
+        state_path=None,
+        overlay_alpha=0.28,
+        crosshair_width=2,
+        crosshair_size=12,
+        autosave=False,
+        display_widget=True,
+    ):
+        """Create an interactive scan-mask editor.
+
+        X is the horizontal scan-column coordinate and Y is the vertical
+        scan-row coordinate. Circle, ellipse, square, and rectangle geometries
+        are available. Sizes are radii for round geometries and half-sizes for
+        rectangular geometries. A saved ``state_path`` is loaded automatically.
         """
-        Interactive mask creation with sliders for circular region selection.
-        
-        Parameters
-        ----------
-        initial_x0 : int, optional
-            Initial x center position. If None, uses center of scan.
-        initial_y0 : int, optional
-            Initial y center position. If None, uses center of scan.
-        initial_r : int, optional
-            Initial radius. If None, uses 1/3 of minimum scan dimension.
-        reference_image : array, optional
-            2D array (Ry, Rx) to display as reference. If None, uses virtual image.
-        overlay_alpha : float
-            Transparency for mask overlay (0=transparent, 1=opaque)
-        
-        Returns
-        -------
-        dict
-            Dictionary with keys:
-            - 'mask': final boolean mask array
-            - 'x0', 'y0', 'r': final circle parameters
+        return ScanMaskEditor(
+            self,
+            initial_x=initial_x,
+            initial_y=initial_y,
+            initial_radius=initial_radius,
+            initial_geometry=initial_geometry,
+            initial_size_x=initial_size_x,
+            initial_size_y=initial_size_y,
+            reference_image=reference_image,
+            state_path=state_path,
+            overlay_alpha=overlay_alpha,
+            crosshair_width=crosshair_width,
+            crosshair_size=crosshair_size,
+            autosave=autosave,
+            display_widget=display_widget,
+        )
+
+    def create_interactive_circular_mask(
+        self,
+        initial_x0=None,
+        initial_y0=None,
+        initial_r=None,
+        reference_image=None,
+        overlay_alpha=0.3,
+        crosshair_width=2,
+        crosshair_size=15,
+        state_path=None,
+        autosave=False,
+        display_widget=True,
+    ):
+        """Compatibility wrapper for :meth:`edit_scan_mask`.
+
+        Historically ``initial_x0`` represented the array row and
+        ``initial_y0`` represented the array column. New code should use
+        ``edit_scan_mask(initial_x=column, initial_y=row, ...)``.
         """
-        
-        Ry, Rx = self.dataset_cartesian.shape[:2]
-        
-        # Set defaults
-        if initial_x0 is None:
-            initial_x0 = Ry // 2
-        if initial_y0 is None:
-            initial_y0 = Rx // 2
-        if initial_r is None:
-            initial_r = min(Ry, Rx) // 3
-        
-        # Get reference image and ensure it's a proper numpy array
-        if reference_image is None:
-            if hasattr(self.dataset_cartesian, 'virtual_images') and 'virtual_image' in self.dataset_cartesian.virtual_images:
-                vimg = self.dataset_cartesian.virtual_images['virtual_image']
-                # Extract array from Dataset2d object
-                if hasattr(vimg, 'array'):
-                    reference_image = vimg.array
-                elif hasattr(vimg, 'data'):
-                    reference_image = vimg.data
-                else:
-                    reference_image = np.array(vimg)
-            else:
-                # Create mean intensity image
-                print("Creating reference image from mean intensities...")
-                reference_image = np.zeros((Ry, Rx), dtype=float)
-                for i in range(Ry):
-                    for j in range(Rx):
-                        dp = self.dataset_cartesian[i, j]
-                        if hasattr(dp, 'array'):
-                            reference_image[i, j] = np.mean(dp.array)
-                        else:
-                            reference_image[i, j] = np.mean(dp)
-        
-        # Ensure it's a float array
-        reference_image = np.asarray(reference_image, dtype=float)
-        
-        # Verify reference_image is valid
-        if reference_image.shape != (Ry, Rx):
-            raise ValueError(f"reference_image shape {reference_image.shape} must match scan shape ({Ry}, {Rx})")
-        
-        # Store current state
-        result = {'mask': None, 'x0': initial_x0, 'y0': initial_y0, 'r': initial_r}
-        
-        # Create sliders with proper orientation
-        # X slider is inverted so bottom = 0, top = Ry-1
-        x0_slider = widgets.IntSlider(
-            min=0, max=Ry-1, step=1, value=Ry-1-initial_x0,  # Inverted initial value
-            description='X (vert):',
-            orientation='vertical',
-            continuous_update=False,
-            style={'description_width': '60px'},
-            layout=widgets.Layout(height='300px'),
-            readout=False  # We'll use custom label
+        return self.edit_scan_mask(
+            initial_x=initial_y0,
+            initial_y=initial_x0,
+            initial_radius=initial_r,
+            reference_image=reference_image,
+            state_path=state_path,
+            overlay_alpha=overlay_alpha,
+            crosshair_width=crosshair_width,
+            crosshair_size=crosshair_size,
+            autosave=autosave,
+            display_widget=display_widget,
         )
-        
-        # Custom label to show actual (inverted) value
-        x0_label = widgets.Label(value=f'{initial_x0}')
-        x0_label.layout.width = '60px'
-        
-        y0_slider = widgets.IntSlider(
-            min=0, max=Rx-1, step=1, value=initial_y0,
-            description='Y (horiz):',
-            orientation='horizontal',
-            continuous_update=False,
-            style={'description_width': '80px'},
-            layout=widgets.Layout(width='400px')
-        )
-        
-        r_slider = widgets.IntSlider(
-            min=1, max=max(Ry, Rx), step=1, value=initial_r,
-            description='Radius:',
-            orientation='horizontal',
-            continuous_update=False,
-            style={'description_width': '80px'},
-            layout=widgets.Layout(width='400px')
-        )
-        
-        output = widgets.Output()
-        
-        def update_mask(change=None):
-            x0 = Ry - 1 - x0_slider.value  # Invert the slider value
-            y0 = y0_slider.value
-            r = r_slider.value
-            
-            # Update custom label
-            x0_label.value = f'{x0}'
-            
-            # Create mask
-            x = np.arange(Ry)[:, None]
-            y = np.arange(Rx)[None, :]
-            mask = (x - x0)**2 + (y - y0)**2 < r**2
-            
-            # Update result
-            result['mask'] = mask
-            result['x0'] = x0
-            result['y0'] = y0
-            result['r'] = r
-            
-            # Create matplotlib figure directly
-            with output:
-                output.clear_output(wait=True)
-                fig, axs = plt.subplots(1, 3, figsize=(15, 4))
-                
-                # Plot 1: Reference image with circle outline
-                im0 = axs[0].imshow(reference_image, cmap='gray')
-                circle = plt.Circle((y0, x0), r, color='red', fill=False, linewidth=2, linestyle='--')
-                axs[0].add_patch(circle)
-                axs[0].plot(y0, x0, 'r+', markersize=crosshair_size, markeredgewidth=crosshair_width)
-                axs[0].set_title('Reference Image')
-                axs[0].set_xlabel('Rx')
-                axs[0].set_ylabel('Ry')
-                plt.colorbar(im0, ax=axs[0])
-                
-                # Plot 2: Mask only
-                im1 = axs[1].imshow(mask.astype(float), cmap='Reds')
-                axs[1].set_title('Mask')
-                axs[1].set_xlabel('Rx')
-                axs[1].set_ylabel('Ry')
-                axs[1].text(0.02, 0.98, f'Center: ({x0}, {y0})\nRadius: {r}\nPixels: {mask.sum()}',
-                           transform=axs[1].transAxes, fontsize=10, verticalalignment='top',
-                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-                
-                # Plot 3: Overlay
-                im2 = axs[2].imshow(reference_image, cmap='gray')
-                axs[2].imshow(mask.astype(float), alpha=overlay_alpha, cmap='Reds')
-                axs[2].set_title('Overlay')
-                axs[2].set_xlabel('Rx')
-                axs[2].set_ylabel('Ry')
-                plt.colorbar(im2, ax=axs[2])
-                
-                plt.tight_layout()
-                plt.show()
-        
-        # Link sliders to update function
-        x0_slider.observe(update_mask, names='value')
-        y0_slider.observe(update_mask, names='value')
-        r_slider.observe(update_mask, names='value')
-        
-        # Create layout: vertical slider with label on left, horizontal sliders and output stacked on right
-        x0_controls = widgets.VBox([
-            x0_slider,
-            x0_label
-        ], layout=widgets.Layout(align_items='center'))
-        
-        ui = widgets.HBox([
-            x0_controls,
-            widgets.VBox([
-                y0_slider,
-                r_slider,
-                output
-            ])
-        ])
-        
-        # Initial plot
-        update_mask()
-        
-        # Display the widget
-        display(ui)
-        
-        return result
 
     def plot_peak_histogram_map(
         self, 
