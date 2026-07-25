@@ -1713,6 +1713,7 @@ class BraggPeaksPolymer(AutoSerialize):
         *,
         center_source: str = "descent",
         fit_ellipse: bool = True,
+        ellipse_fit_method: str = "angular_variance",
         ellipse_threshold: float | None = None,
         ellipse_radial_min: float | None = None,
         ellipse_radial_max: float | None = None,
@@ -1755,15 +1756,18 @@ class BraggPeaksPolymer(AutoSerialize):
            ``find_central_beams_4d`` (angular-uniformity, the pipeline default),
            ``"com"`` uses the raw centre of mass, ``"descan"`` uses the plane-fitted
            (descanned) origin field.
-        3. **Ellipticity** (``fit_ellipse``), fit LAST -- a *ring* fit (Karen Ehrhardt's
-           angular-uniformity criterion; see ``_fit_ellipse_from_ring``): on a *centered*
-           mean DP (each pattern shifted so its central beam sits at the detector center,
-           then averaged; see ``_centered_dp_mean``), search ``(b/a, theta)`` to minimise
-           the azimuthal variance of the diffraction-ring annulus. Unlike a probe-blob
-           fit this ignores the central beam entirely, so a smeared/off-center beam does
-           not bias it. The centered mean DP is cached on ``self.dp_mean_centered``;
-           ``ellipse_radial_min`` / ``ellipse_radial_max`` bound the ring band (auto-
-           detected from the radial profile when None). Stored as
+        3. **Ellipticity** (``fit_ellipse``), fit LAST -- a diffuse-ring fit on a
+           *centered* mean DP (each pattern shifted so its central beam sits at the
+           detector center, then averaged; see ``_centered_dp_mean``). The
+           ``"angular_variance"`` method searches ``(b/a, theta)`` to minimise the
+           annulus' azimuthal variance. The ``"ridge"`` method extracts the ring radius
+           independently at each azimuth, uses its first two harmonics to initialise the
+           center and ellipse, and accepts a robust joint refinement only when it
+           improves held-out angular sectors over a circle. Both methods ignore the
+           central beam itself. The centered mean DP is cached on
+           ``self.dp_mean_centered``; ``ellipse_radial_min`` /
+           ``ellipse_radial_max`` bound the ring band (auto-detected from the radial
+           profile when None). Stored as
            ``self.ellipse_params = (a, b, theta_deg)`` and (optionally) into
            ``dataset_cartesian.metadata["ellipticity"]``. ``ellipse_threshold`` is kept
            for backward compatibility but is unused by the ring fit.
@@ -1778,6 +1782,9 @@ class BraggPeaksPolymer(AutoSerialize):
             Estimator backing ``self.image_centers``. Default "descent".
         fit_ellipse : bool
             Fit ellipticity from the mean DP. Default True.
+        ellipse_fit_method : {"angular_variance", "ridge"}
+            Angular-variance search or robust diffuse-ring ridge refinement.
+            Default ``"angular_variance"`` during ridge-method validation.
         ellipse_threshold : float, optional
             Binarisation threshold for ``fit_probe_ellipse`` (Otsu if None).
         estimate_descan : bool
@@ -1811,6 +1818,12 @@ class BraggPeaksPolymer(AutoSerialize):
         valid_sources = ("descent", "grid", "peaks", "com", "descan")
         if center_source not in valid_sources:
             raise ValueError(f"center_source must be one of {valid_sources}, got {center_source!r}")
+        ellipse_fit_method = str(ellipse_fit_method).lower()
+        if ellipse_fit_method not in {"angular_variance", "ridge"}:
+            raise ValueError(
+                "ellipse_fit_method must be 'angular_variance' or 'ridge', "
+                f"got {ellipse_fit_method!r}"
+            )
 
         Ry, Rx, Qy, Qx = self._dataset_cartesian.shape
         need_com = (
@@ -1898,8 +1911,8 @@ class BraggPeaksPolymer(AutoSerialize):
 
         # 3. Ellipticity LAST, fit on a mean DP that has been centered so the central
         #    beam sits at the detector center and the diffraction ring is concentric.
-        #    The fit is a ring/angular-variance fit (Karen Ehrhardt criterion), NOT a
-        #    probe-blob fit -- it ignores the central beam entirely.
+        #    Both supported methods fit the diffuse ring rather than the probe blob;
+        #    the ridge method may additionally remove a small residual center offset.
         self.ellipse_params = None
         self.ellipse_center = None
         self.dp_mean_centered = None
@@ -1910,7 +1923,12 @@ class BraggPeaksPolymer(AutoSerialize):
             )
             Qy, Qx = self._dataset_cartesian.shape[-2:]
             center = ((Qy - 1) / 2.0, (Qx - 1) / 2.0)  # _centered_dp_mean puts the beam here
-            a_axis, b_axis, theta_deg, ring_band = self._fit_ellipse_from_ring(
+            fit_function = (
+                self._fit_ellipse_from_ridge
+                if ellipse_fit_method == "ridge"
+                else self._fit_ellipse_from_ring
+            )
+            a_axis, b_axis, theta_deg, ring_band = fit_function(
                 self.dp_mean_centered,
                 center,
                 radial_min=ellipse_radial_min,
@@ -1920,12 +1938,31 @@ class BraggPeaksPolymer(AutoSerialize):
                 verbose=verbose,
             )
             self.ellipse_params = (float(a_axis), float(b_axis), float(theta_deg))
-            self.ellipse_center = (float(center[0]), float(center[1]))
+            refined_center = self.ellipse_fit_diagnostics.get(
+                "center_refined", center
+            )
+            self.ellipse_center = tuple(float(value) for value in refined_center)
+            if (
+                ellipse_fit_method == "ridge"
+                and self.ellipse_fit_diagnostics["accepted"]
+            ):
+                center_delta = np.asarray(self.ellipse_center) - np.asarray(center)
+                self.image_centers = np.asarray(
+                    self.image_centers, dtype=float
+                ).copy()
+                valid_centers = (
+                    (self.image_centers[0] != 0)
+                    | (self.image_centers[1] != 0)
+                )
+                self.image_centers[0, valid_centers] += center_delta[0]
+                self.image_centers[1, valid_centers] += center_delta[1]
+                results["image_centers"] = self.image_centers
             self.ellipse_ring_band = ring_band
             results["ellipse_params"] = self.ellipse_params
             results["ellipse_center"] = self.ellipse_center
             results["ellipse_ring_band"] = ring_band
             results["ellipse_fit_diagnostics"] = self.ellipse_fit_diagnostics
+            results["ellipse_fit_method"] = ellipse_fit_method
             if store_metadata:
                 self._dataset_cartesian.metadata["ellipticity"] = self.ellipse_params
 
@@ -2398,10 +2435,13 @@ class BraggPeaksPolymer(AutoSerialize):
             theta_deg += 90.0
         theta_deg = float(theta_deg % 180.0)
         self.ellipse_fit_diagnostics = {
+            "method": "angular_variance",
             "accepted": fit_accepted,
             "selected": selected,
             "candidates": diagnostics,
             "explicit_band": explicit_band,
+            "center_initial": tuple(float(v) for v in center),
+            "center_refined": tuple(float(v) for v in center),
             "rejection_reasons": [],
             "quality_thresholds": {
                 "min_fit_improvement": float(min_fit_improvement),
@@ -2468,6 +2508,466 @@ class BraggPeaksPolymer(AutoSerialize):
             plt.show()
 
         return float(a_axis), float(b_axis), float(theta_deg), (float(radial_min), float(radial_max))
+
+    def _fit_ellipse_from_ridge(
+        self,
+        dp,
+        center,
+        *,
+        radial_min=None,
+        radial_max=None,
+        radial_step=1.0,
+        num_annular_bins=180,
+        ratio_range=(0.85, 1.0),
+        center_search_radius=2.5,
+        max_ring_candidates=3,
+        min_angular_coverage=0.55,
+        min_validation_improvement=0.05,
+        max_validation_residual=2.5,
+        device="cpu",
+        show=False,
+        verbose=False,
+    ):
+        """Jointly refine ring center and ellipticity from a robust radial ridge.
+
+        The diffuse-ring radius is measured independently at each azimuth after
+        log compression and hot-spot clipping. A first/second-harmonic model
+        initializes center and ellipse terms, followed by bounded robust geometric
+        least squares. Fits are accepted only when held-out azimuthal sectors improve
+        over an independently refined circle.
+        """
+        from scipy.optimize import least_squares
+        from quantem.diffraction.polar_transform import polar_transform
+
+        dp = np.asarray(dp, dtype=float)
+        origin = np.asarray(center, dtype=float)
+        qy, qx = dp.shape
+        r_hi = float(min(qy, qx) / 2.0 - 1.0)
+        fit_dp = np.log1p(np.clip(dp, 0.0, None))
+        finite = fit_dp[np.isfinite(fit_dp)]
+        if finite.size:
+            fit_dp = np.minimum(fit_dp, np.percentile(finite, 99.5))
+
+        def polar_at(image, candidate_center, rmin, rmax):
+            return np.asarray(
+                polar_transform(
+                    image,
+                    origin_array=np.asarray(candidate_center, dtype=float),
+                    ellipse_params=(1.0, 1.0, 0.0),
+                    num_annular_bins=num_annular_bins,
+                    radial_min=float(rmin),
+                    radial_max=float(rmax),
+                    radial_step=radial_step,
+                    scan_pos=(0, 0),
+                    device=device,
+                    show_progress=False,
+                ),
+                dtype=float,
+            )
+
+        # Candidate rings from an angular median profile; sparse Bragg spots largely
+        # disappear in the median rather than becoming the selected calibration ring.
+        explicit_band = radial_min is not None and radial_max is not None
+        if explicit_band:
+            bands = [(
+                float(radial_min),
+                float(radial_max),
+                0.5 * (float(radial_min) + float(radial_max)),
+            )]
+        else:
+            full = polar_at(fit_dp, origin, 0.0, r_hi)
+            profile = gaussian_filter1d(np.median(full, axis=0), 2.0)
+            r_axis = np.arange(profile.size, dtype=float) * radial_step
+            exclude = max(6.0, 0.06 * r_hi)
+            start = int(np.ceil(exclude / radial_step))
+            prominence = max(1e-9, 0.03 * np.ptp(profile[start:]))
+            indices, properties = find_peaks(
+                profile,
+                prominence=prominence,
+                distance=max(3, int(round(6.0 / radial_step))),
+            )
+            valid_peaks = (
+                (indices >= start) & (r_axis[indices] <= 0.92 * r_hi)
+            )
+            indices = indices[valid_peaks]
+            prominences = properties["prominences"][valid_peaks]
+            if not indices.size:
+                indices = np.asarray([start + np.argmax(profile[start:])])
+                prominences = np.ones(1)
+            order = np.argsort(prominences)[::-1][:max_ring_candidates]
+            bands = []
+            for index in indices[order]:
+                r0 = float(r_axis[index])
+                half = max(6.0, 0.20 * r0)
+                low = max(exclude, r0 - half) if radial_min is None else float(radial_min)
+                high = min(r_hi, r0 + half) if radial_max is None else float(radial_max)
+                if high > low and not any(abs(r0 - old[2]) < 3.0 for old in bands):
+                    bands.append((low, high, r0))
+            if not bands:
+                fallback_r0 = float(np.clip(r_axis[start], exclude, 0.92 * r_hi))
+                fallback_half = max(6.0, 0.20 * fallback_r0)
+                bands = [(
+                    max(exclude, fallback_r0 - fallback_half),
+                    min(r_hi, fallback_r0 + fallback_half),
+                    fallback_r0,
+                )]
+
+        phi = np.linspace(0.0, 2.0 * np.pi, num_annular_bins, endpoint=False)
+        block_fit = (np.arange(num_annular_bins) // 6) % 2 == 0
+
+        def extract_ridge(band):
+            polar = polar_at(fit_dp, origin, band[0], band[1])
+            polar = np.minimum(
+                polar, np.percentile(polar, 90.0, axis=0, keepdims=True)
+            )
+            smooth = gaussian_filter1d(polar, 1.25, axis=1, mode="nearest")
+            baseline = np.percentile(smooth, 20.0, axis=1, keepdims=True)
+            signal = np.clip(smooth - baseline, 0.0, None)
+            peak_index = np.argmax(signal, axis=1)
+            ridge = np.empty(num_annular_bins, dtype=float)
+            confidence = np.empty(num_annular_bins, dtype=float)
+            for index in range(num_annular_bins):
+                lo = max(0, peak_index[index] - 2)
+                hi = min(signal.shape[1], peak_index[index] + 3)
+                weights = signal[index, lo:hi]
+                bins = np.arange(lo, hi, dtype=float)
+                ridge[index] = (
+                    np.average(bins, weights=weights)
+                    if weights.sum() > 1e-12
+                    else float(peak_index[index])
+                )
+                noise = (
+                    1.4826 * np.median(np.abs(np.diff(smooth[index])))
+                    + 1e-9
+                )
+                confidence[index] = signal[index, peak_index[index]] / noise
+            ridge = band[0] + ridge * radial_step
+            valid = np.isfinite(ridge) & (confidence >= 2.0)
+            if np.count_nonzero(valid) >= 12:
+                design = np.column_stack([
+                    np.ones(num_annular_bins),
+                    np.cos(phi),
+                    np.sin(phi),
+                    np.cos(2 * phi),
+                    np.sin(2 * phi),
+                ])
+                weights = np.clip(confidence / 10.0, 0.05, 1.0)
+                beta = np.zeros(5)
+                for _ in range(5):
+                    use = valid & np.isfinite(weights)
+                    root_weight = np.sqrt(weights[use])
+                    beta = np.linalg.lstsq(
+                        design[use] * root_weight[:, None],
+                        ridge[use] * root_weight,
+                        rcond=None,
+                    )[0]
+                    residual = ridge - design @ beta
+                    scale = 1.4826 * np.median(
+                        np.abs(residual[use] - np.median(residual[use]))
+                    ) + 1e-6
+                    robust = np.minimum(1.0, 1.5 * scale / (np.abs(residual) + 1e-9))
+                    weights = np.clip(confidence / 10.0, 0.05, 1.0) * robust
+                valid &= np.abs(ridge - design @ beta) <= max(3.0, 4.0 * scale)
+            else:
+                beta = np.asarray([np.nan] * 5)
+                weights = np.zeros_like(confidence)
+            return ridge, confidence, valid, beta, weights
+
+        def ellipse_residual(parameters, x, y, weights):
+            cy, cx, axis_a, ratio, theta = parameters
+            dx, dy = x - cx, y - cy
+            cosine, sine = np.cos(theta), np.sin(theta)
+            major = dx * cosine + dy * sine
+            minor = -dx * sine + dy * cosine
+            geometric = (
+                np.sqrt(
+                    (major / axis_a) ** 2
+                    + (minor / (axis_a * ratio)) ** 2
+                )
+                - 1.0
+            ) * axis_a
+            return geometric * np.sqrt(np.clip(weights, 1e-3, None))
+
+        def circle_residual(parameters, x, y, weights):
+            cy, cx, radius = parameters
+            return (
+                np.hypot(x - cx, y - cy) - radius
+            ) * np.sqrt(np.clip(weights, 1e-3, None))
+
+        evaluated = []
+        for band in bands:
+            ridge, confidence, valid, harmonic, weights = extract_ridge(band)
+            coverage = float(np.mean(valid))
+            if np.count_nonzero(valid) < 12:
+                evaluated.append({
+                    "band": tuple(float(v) for v in band[:2]),
+                    "r0": float(band[2]),
+                    "accepted": False,
+                    "angular_coverage": coverage,
+                    "rejection_reasons": ["insufficient ridge points"],
+                })
+                continue
+
+            x = origin[1] + ridge * np.cos(phi)
+            y = origin[0] + ridge * np.sin(phi)
+            fit = valid & block_fit
+            validate = valid & ~block_fit
+            if np.count_nonzero(validate) < 6:
+                fit = valid
+                validate = valid
+
+            r0, c1, s1, c2, s2 = harmonic
+            center_initial = np.asarray([
+                origin[0] + np.clip(s1, -center_search_radius, center_search_radius),
+                origin[1] + np.clip(c1, -center_search_radius, center_search_radius),
+            ])
+            second = float(np.hypot(c2, s2))
+            ratio_initial = np.clip(
+                (max(r0, 1.0) - second) / (max(r0, 1.0) + second),
+                ratio_range[0],
+                ratio_range[1],
+            )
+            theta_initial = 0.5 * np.arctan2(s2, c2)
+            center_low = origin - center_search_radius
+            center_high = origin + center_search_radius
+            axis_low = max(2.0, 0.65 * band[0])
+            axis_high = min(r_hi * 1.5, 1.45 * band[1])
+
+            circle = least_squares(
+                circle_residual,
+                [*center_initial, np.median(ridge[fit])],
+                args=(x[fit], y[fit], weights[fit]),
+                bounds=([
+                    center_low[0], center_low[1], axis_low
+                ], [
+                    center_high[0], center_high[1], axis_high
+                ]),
+                loss="soft_l1",
+                f_scale=1.0,
+            )
+            ellipse = least_squares(
+                ellipse_residual,
+                [
+                    *center_initial,
+                    np.clip(np.max(ridge[fit]), axis_low, axis_high),
+                    ratio_initial,
+                    theta_initial,
+                ],
+                args=(x[fit], y[fit], weights[fit]),
+                bounds=([
+                    center_low[0], center_low[1], axis_low,
+                    ratio_range[0], -np.pi,
+                ], [
+                    center_high[0], center_high[1], axis_high,
+                    ratio_range[1], np.pi,
+                ]),
+                loss="soft_l1",
+                f_scale=1.0,
+            )
+            circle_validation = np.median(np.abs(circle_residual(
+                circle.x, x[validate], y[validate], np.ones(np.count_nonzero(validate))
+            )))
+            ellipse_validation = np.median(np.abs(ellipse_residual(
+                ellipse.x, x[validate], y[validate], np.ones(np.count_nonzero(validate))
+            )))
+            improvement = float(
+                (circle_validation - ellipse_validation)
+                / max(circle_validation, 1e-9)
+            )
+            center_boundary = bool(np.any(
+                np.isclose(ellipse.x[:2], center_low, atol=0.05)
+                | np.isclose(ellipse.x[:2], center_high, atol=0.05)
+            ))
+            ratio_boundary = bool(
+                ellipse.x[3] <= ratio_range[0] + 0.005
+                or ellipse.x[3] >= ratio_range[1] - 0.001
+            )
+            reasons = []
+            if coverage < min_angular_coverage:
+                reasons.append(f"angular coverage {coverage:.1%}")
+            if improvement < min_validation_improvement:
+                reasons.append(f"held-out improvement {improvement:.2%}")
+            if ellipse_validation > max_validation_residual:
+                reasons.append(
+                    f"held-out residual {ellipse_validation:.2f} px"
+                )
+            if center_boundary:
+                reasons.append("center search boundary")
+            if ratio_boundary:
+                reasons.append("ratio search boundary")
+            if not reasons:
+                ellipse = least_squares(
+                    ellipse_residual,
+                    ellipse.x,
+                    args=(x[valid], y[valid], weights[valid]),
+                    bounds=([
+                        center_low[0], center_low[1], axis_low,
+                        ratio_range[0], -np.pi,
+                    ], [
+                        center_high[0], center_high[1], axis_high,
+                        ratio_range[1], np.pi,
+                    ]),
+                    loss="soft_l1",
+                    f_scale=1.0,
+                )
+                center_boundary = bool(np.any(
+                    np.isclose(ellipse.x[:2], center_low, atol=0.05)
+                    | np.isclose(ellipse.x[:2], center_high, atol=0.05)
+                ))
+                ratio_boundary = bool(
+                    ellipse.x[3] <= ratio_range[0] + 0.005
+                    or ellipse.x[3] >= ratio_range[1] - 0.001
+                )
+                if center_boundary:
+                    reasons.append("center search boundary after full refit")
+                if ratio_boundary:
+                    reasons.append("ratio search boundary after full refit")
+            evaluated.append({
+                "band": tuple(float(v) for v in band[:2]),
+                "r0": float(band[2]),
+                "accepted": not reasons,
+                "angular_coverage": coverage,
+                "center_initial": tuple(float(v) for v in center_initial),
+                "center_refined": tuple(float(v) for v in ellipse.x[:2]),
+                "a_pixels": float(ellipse.x[2]),
+                "b_pixels": float(ellipse.x[2] * ellipse.x[3]),
+                "ratio_b_over_a": float(ellipse.x[3]),
+                "theta_deg": float(np.rad2deg(ellipse.x[4]) % 180.0),
+                "circle_validation_residual": float(circle_validation),
+                "ellipse_validation_residual": float(ellipse_validation),
+                "validation_improvement": improvement,
+                "center_boundary": center_boundary,
+                "ratio_boundary": ratio_boundary,
+                "ridge_point_count": int(np.count_nonzero(valid)),
+                "rejection_reasons": reasons,
+                "_ridge": ridge,
+                "_valid": valid,
+                "_x": x,
+                "_y": y,
+            })
+
+        accepted = [item for item in evaluated if item["accepted"]]
+        candidates_with_fit = [item for item in evaluated if "a_pixels" in item]
+        if accepted:
+            selected = min(
+                accepted,
+                key=lambda item: (
+                    item["ellipse_validation_residual"],
+                    -item["validation_improvement"],
+                ),
+            )
+            fit_accepted = True
+        elif candidates_with_fit:
+            selected = min(
+                candidates_with_fit,
+                key=lambda item: item["ellipse_validation_residual"],
+            )
+            fit_accepted = False
+        else:
+            selected = evaluated[0]
+            fit_accepted = False
+
+        public_candidates = [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in evaluated
+        ]
+        if fit_accepted:
+            a_axis = selected["a_pixels"]
+            b_axis = selected["b_pixels"]
+            theta_deg = selected["theta_deg"]
+            refined_center = selected["center_refined"]
+        else:
+            a_axis = b_axis = selected["r0"]
+            theta_deg = 0.0
+            refined_center = tuple(float(v) for v in origin)
+            reasons = selected.get("rejection_reasons", ["no valid ridge fit"])
+            warnings.warn(
+                "Ridge ellipse fit rejected; using a circular correction "
+                f"({', '.join(reasons)}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        selected_public = {
+            key: value for key, value in selected.items() if not key.startswith("_")
+        }
+        self.ellipse_fit_diagnostics = {
+            "method": "ridge",
+            "accepted": fit_accepted,
+            "selected": selected_public,
+            "candidates": public_candidates,
+            "explicit_band": explicit_band,
+            "center_initial": tuple(float(v) for v in origin),
+            "center_refined": tuple(float(v) for v in refined_center),
+            "rejection_reasons": (
+                [] if fit_accepted else selected_public.get("rejection_reasons", [])
+            ),
+        }
+
+        if verbose:
+            print(
+                "  ridge ellipse candidates: "
+                + ", ".join(f"{item['r0']:.1f}" for item in public_candidates)
+                + " px"
+            )
+            print(
+                f"  ridge ellipse fit: {'accepted' if fit_accepted else 'rejected'} "
+                f"a/b={a_axis / b_axis:.4f} theta={theta_deg:.2f} deg "
+                f"center=({refined_center[0]:.2f}, {refined_center[1]:.2f})"
+            )
+
+        if show and "_ridge" in selected:
+            fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+            axes[0].imshow(np.log1p(np.clip(dp, 0, None)), cmap="magma")
+            axes[0].scatter(
+                selected["_x"][selected["_valid"]],
+                selected["_y"][selected["_valid"]],
+                s=5,
+                c="cyan",
+                alpha=0.7,
+                label="ridge inliers",
+            )
+            axes[0].add_patch(Ellipse(
+                (refined_center[1], refined_center[0]),
+                2 * a_axis,
+                2 * b_axis,
+                angle=theta_deg,
+                fill=False,
+                color="lime",
+                linewidth=1.5,
+                label="ridge fit",
+            ))
+            axes[0].legend(fontsize=8)
+            axes[0].set_title("diffuse-ring ridge and robust ellipse")
+            before = polar_at(dp, origin, selected["band"][0], selected["band"][1])
+            after = np.asarray(
+                polar_transform(
+                    dp,
+                    origin_array=np.asarray(refined_center),
+                    ellipse_params=(a_axis, b_axis, theta_deg),
+                    num_annular_bins=num_annular_bins,
+                    radial_min=selected["band"][0],
+                    radial_max=selected["band"][1],
+                    radial_step=radial_step,
+                    scan_pos=(0, 0),
+                    device=device,
+                    show_progress=False,
+                )
+            )
+            axes[1].imshow(before, aspect="auto", cmap="magma")
+            axes[1].set_title("circular polar before")
+            axes[2].imshow(after, aspect="auto", cmap="magma")
+            axes[2].set_title("ridge-refined polar after")
+            fig.tight_layout()
+            plt.show()
+
+        band = selected["band"]
+        return (
+            float(a_axis),
+            float(b_axis),
+            float(theta_deg),
+            (float(band[0]), float(band[1])),
+        )
 
     def resize_data(self, device:str = "cuda:0"):
         print(device)
