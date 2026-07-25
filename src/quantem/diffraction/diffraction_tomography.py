@@ -122,6 +122,12 @@ class _PeakBasis(torch.nn.Module):
                                           device=self.amp_free.device)])
         self.amp_free = torch.nn.Parameter(grown)
 
+    def coupling_table(self) -> dict:
+        """Integer (h, k, l) -> amplitude row (grad-carrying), for couplings."""
+        hkl = self.hkl.to(torch.long)
+        return {tuple(int(x) for x in hkl[i]): self.amp[self.shell_idx[i]]
+                for i in range(hkl.shape[0])}
+
     def volume(self, k_shape, k_sampling, device) -> torch.Tensor:
         """Splat the peaks onto the centered k grid -> (Nkz, Nky, Nkx, Nw)."""
         Nkz, Nky, Nkx = k_shape
@@ -1079,6 +1085,114 @@ class DiffractionTomography:
         t_vox = (wv[:, :, None, None] * sampled).sum(1)                 # (V,r,c)
         return (T.to(torch.complex64) @ t_vox.reshape(V, -1)).reshape(P, det_r, det_c)
 
+    def _planes_assembly(self, uv: torch.Tensor, T: torch.Tensor, planes: dict,
+                         W_all: torch.Tensor) -> torch.Tensor:
+        """Assemble per-probe slice SF from per-voxel planes (bloch path).
+
+        Mirrors :meth:`_transmission_planes_unique`'s tail: the slice SF is
+        ``T @ (w_v * plane_v)`` with the same trilinear matrix ``T``.
+        """
+        det_r, det_c = self.det_shape
+        P = T.shape[0]
+        if uv.numel() == 0:
+            return torch.zeros(P, det_r, det_c, dtype=torch.complex64,
+                               device=self.device)
+        wv = W_all.reshape(-1, W_all.shape[-1])[uv, 0].to(torch.complex64)
+        stack = torch.stack([planes[int(v)] for v in uv])          # (V,r,c)
+        t_vox = wv[:, None, None] * stack
+        return (T.to(torch.complex64) @ t_vox.reshape(uv.numel(), -1)
+                ).reshape(P, det_r, det_c)
+
+    def _bloch_tilt_planes(self, tilt_x_deg: float, vox: torch.Tensor,
+                           R_all: torch.Tensor, s_max: float = 0.12) -> dict:
+        """Dynamical (Sturkey) transmission planes per unique voxel, one tilt.
+
+        For each distinct orientation among ``vox``: excited beams = the peak
+        model's reciprocal lattice rotated to the lab frame, kept when the
+        excitation error ``|s_g| < s_max``; structure matrix ``A`` with
+        couplings = peak amplitudes at difference vectors (phase per Angstrom
+        / pi lambda) and diagonal ``2 k s_g``; slab transmission ``D = expm(i
+        pi lambda t A)`` (torch.matrix_exp -- differentiable, so gradients
+        reach the amplitudes and, if learnable, the cell); the deviation
+        ``D psi0 - psi0`` is splatted onto the detector plane. Replaces the
+        flat-Ewald sampling of the splatted 3D basis with true multi-beam
+        intra-slab physics; everything downstream (trilinear transmission
+        mixing, vacuum delta, FFT chain, Fresnel between slabs) is unchanged.
+
+        Voxels sharing a rotation (after grain consolidation) share one
+        matrix exponential. Returns ``{flat_voxel_index: (det, det)}``
+        complex64 planes in unshifted frequency order.
+        """
+        assert isinstance(self.basis_inr, _PeakBasis), "bloch needs the peak basis"
+        pb = self.basis_inr
+        lam = self.wavelength
+        k0 = 1.0 / lam
+        t_slab = float(self.real_sampling[0])
+        det_r, det_c = self.det_shape
+        u, v, w = self.tilt_axes(float(tilt_x_deg))
+        kvec = (k0 * w).to(torch.float32)
+        G_body = (pb.hkl @ pb.B_rec)                       # (P, 3) [z,y,x]
+        amp = pb.amp[pb.shell_idx][:, 0]                   # (P,) first structure
+        tab = pb.coupling_table()
+        hkl_int = pb.hkl.to(torch.long)
+        R = R_all.reshape(-1, 3, 3)
+        keys = {}
+        for vi in vox.tolist():
+            keys.setdefault(R[vi].detach().round(decimals=3).cpu().numpy().tobytes(),
+                            []).append(vi)
+        planes = {}
+        dku = float(self.k_sampling[2])
+        for kb, members in keys.items():
+            Rv = R[members[0]].to(torch.float32)
+            g_lab = G_body.to(torch.float32) @ Rv.T        # rows R g_body
+            s = -(2.0 * (g_lab @ kvec) + (g_lab * g_lab).sum(-1)) / (2.0 * k0)
+            sel = (s.abs() < s_max) & (g_lab.norm(dim=-1) < 1.02 * self.sphere_radius_pix
+                                       * min(self.k_sampling))
+            idx = torch.nonzero(sel).flatten()
+            nb = int(idx.numel()) + 1
+            A = torch.zeros(nb, nb, dtype=torch.complex128, device=self.device)
+            gsel = g_lab[idx]
+            hsel = hkl_int[idx]
+            # diagonal: 2 k s_g (beam 0 = direct, s = 0)
+            diag = torch.zeros(nb, dtype=torch.float64, device=self.device)
+            diag[1:] = 2.0 * k0 * s[idx].to(torch.float64)
+            A = A + torch.diag(diag).to(torch.complex128)
+            # couplings: amplitude at hkl difference (phase/A / pi lambda);
+            # the amplitudes are stored as i*a (imaginary SF), the structure
+            # matrix wants the real potential coefficient a
+            hs = [(0, 0, 0)] + [tuple(int(x) for x in hsel[i]) for i in range(nb - 1)]
+            for i in range(nb):
+                for j in range(nb):
+                    if i == j:
+                        continue
+                    dh = (hs[i][0] - hs[j][0], hs[i][1] - hs[j][1], hs[i][2] - hs[j][2])
+                    a_ij = tab.get(dh)
+                    if a_ij is not None:
+                        A[i, j] = (a_ij[0] / t_slab / (math.pi * lam)).to(torch.complex128)
+            D = torch.linalg.matrix_exp(1j * math.pi * lam * t_slab * A)
+            psi = D[:, 0]                                   # D @ psi0
+            dpsi = psi - torch.eye(nb, dtype=psi.dtype, device=self.device)[:, 0]
+            # splat deviations at in-plane beam positions (direct beam at 0)
+            gu = torch.cat([torch.zeros(1, device=self.device), gsel @ u])
+            gv = torch.cat([torch.zeros(1, device=self.device), gsel @ v])
+            ci = gv / dku + det_r // 2
+            cj = gu / dku + det_c // 2
+            i0, j0 = torch.floor(ci), torch.floor(cj)
+            fi, fj = ci - i0, cj - j0
+            plane = torch.zeros(det_r * det_c, dtype=torch.complex64, device=self.device)
+            for oi in (0, 1):
+                for oj in (0, 1):
+                    wgt = ((fi if oi else 1 - fi) * (fj if oj else 1 - fj))
+                    ii = (i0 + oi).to(torch.long)
+                    jj = (j0 + oj).to(torch.long)
+                    ok = (ii >= 0) & (ii < det_r) & (jj >= 0) & (jj < det_c)
+                    plane = plane.index_add(0, (ii[ok] * det_c + jj[ok]),
+                                            (dpsi[ok] * wgt[ok]).to(torch.complex64))
+            plane = torch.fft.ifftshift(plane.reshape(det_r, det_c), dim=(0, 1))
+            for vi in members:
+                planes[vi] = plane
+        return planes
+
     def forward_tilt(self, origins: torch.Tensor, tilt_x_deg: float,
                      basis: torch.Tensor, R_all: torch.Tensor, W_all: torch.Tensor,
                      phase_only: bool = True, superslice: int = 1) -> torch.Tensor:
@@ -1169,7 +1283,8 @@ class DiffractionTomography:
 
     def forward_tilts(self, origins: torch.Tensor, tilts, basis: torch.Tensor,
                       R_all: torch.Tensor, W_all: torch.Tensor,
-                      phase_only: bool = True, superslice: int = 1) -> torch.Tensor:
+                      phase_only: bool = True, superslice: int = 1,
+                      bloch: bool = False) -> torch.Tensor:
         """Exit waves for a GROUP of tilts in one batched pass.
 
         Identical physics to calling :meth:`forward_tilt` per tilt; all tilts'
@@ -1190,7 +1305,15 @@ class DiffractionTomography:
         num_pix = self.Psi0.numel()
         wsum = W_all.reshape(-1, W_all.shape[-1]).sum(-1)      # (n_voxels,)
         Nw = basis.shape[-1]
-        vol = self._basis_sample_vol(basis)                   # once per forward
+        vol = None if bloch else self._basis_sample_vol(basis)  # once per forward
+        if bloch:
+            # dynamical slab planes, one matrix exponential per distinct
+            # orientation per tilt (slice-independent, so computed up front)
+            bplanes = []
+            for ti, g in enumerate(geo["tilt_geos"]):
+                need = torch.unique(torch.cat([g["uslices"][s][0]
+                                               for s in range(Ns)]))
+                bplanes.append(self._bloch_tilt_planes(float(tilts[ti]), need, R_all))
         groups = [list(range(s, min(s + max(1, superslice), Ns)))
                   for s in range(0, Ns, max(1, superslice))]
         for gi, grp in enumerate(groups):
@@ -1199,10 +1322,12 @@ class DiffractionTomography:
                 vidx, tw = slices[s]
                 # per-tilt unique-voxel assembly, concatenated over the group
                 sf_s = torch.cat([
+                    self._planes_assembly(g["uslices"][s][0], g["uslices"][s][1],
+                                          bplanes[ti], W_all) if bloch else
                     self._transmission_planes_unique(
                         g["uslices"][s][0], g["uslices"][s][1], g,
                         vol, Nw, R_all, W_all)
-                    for g in geo["tilt_geos"]])
+                    for ti, g in enumerate(geo["tilt_geos"])])
                 w_s = (tw.real.to(wsum.dtype) * wsum[vidx]).sum(-1)   # (T*P,)
                 SF = sf_s if SF is None else SF + sf_s
                 Wg = w_s if Wg is None else Wg + w_s
@@ -1252,6 +1377,7 @@ class DiffractionTomography:
         scan_origin=None,
         phase_only: bool = True,
         superslice: int = 1,
+        bloch: bool = False,
         progress: bool = True,
     ) -> torch.Tensor:
         """Forward tilt series -> (n_tilt, n_row, n_col, det_row, det_col) intensities.
@@ -1296,7 +1422,11 @@ class DiffractionTomography:
         dp = torch.empty(len(tilts_deg), n_row, n_col, *self.det_shape, dtype=torch.float64)
         with torch.no_grad():
             for ti in tqdm(range(len(tilts_deg)), disable=not progress, desc="simulate", unit="tilt"):
-                Psi = self.forward_tilt(origins, float(tilts_deg[ti]), basis, R_all, weights,
+                Psi = self.forward_tilts(origins, [float(tilts_deg[ti])], basis,
+                                         R_all, weights, phase_only=phase_only,
+                                         superslice=superslice, bloch=True)[0] \
+                    if bloch else \
+                    self.forward_tilt(origins, float(tilts_deg[ti]), basis, R_all, weights,
                                         phase_only=phase_only, superslice=superslice)
                 dp[ti] = (Psi.abs() ** 2).to(torch.float64).reshape(n_row, n_col, *self.det_shape)
         return dp
@@ -2031,6 +2161,7 @@ class DiffractionTomography:
         inr_lr: float = 1e-3,
         inr_prox_every: int = 0,
         inr_prox_frac: float = 0.05,
+        bloch: bool = False,
         tilt_sample: int = 0,
         resume: bool = False,
         progress: bool = True,
@@ -2205,10 +2336,12 @@ class DiffractionTomography:
                 # once at the end (otherwise each group's backward would need
                 # its own network graph). self.basis mirrors the volume so the
                 # sweep/reset machinery and the viewers see the current state.
+                # (bloch: the S-matrix path differentiates the peak model
+                # directly inside forward_tilts -- no leaf, mirror only.)
                 gen_basis = self._inr_basis(friedel_basis, cubic_symmetry)
                 with torch.no_grad():
                     self.basis.copy_(gen_basis.detach())
-                basis_leaf = gen_basis.detach().requires_grad_(True)
+                basis_leaf = None if bloch else gen_basis.detach().requires_grad_(True)
             # tilt selection: full batch, or (tilt_sample) a random subset with
             # a full-batch anchor every 10th iteration for keep-best/logging.
             full_iter = (not tilt_sample or tilt_sample >= n_tilt
@@ -2225,12 +2358,13 @@ class DiffractionTomography:
                 # backward) per group. tilt_batch trades memory for speed;
                 # gradients still accumulate into one optimizer step.
                 t_grp = t_sel[c0:c0 + grp_sz]
-                basis = basis_leaf if inr else self.masked_basis()
+                basis = self.basis.detach() if (inr and bloch) else (
+                    basis_leaf if inr else self.masked_basis())
                 R_all = self.rotation_matrices()
                 Psi = self.forward_tilts(origins, [float(tilts_deg[ti]) for ti in t_grp],
                                          basis, R_all, self.weights,
                                          phase_only=phase_only,
-                                         superslice=superslice)                       # (T,P,det,det)
+                                         superslice=superslice, bloch=bloch)          # (T,P,det,det)
                 tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape) \
                     if t_grp == list(range(t_grp[0], t_grp[-1] + 1)) else \
                     meas_amp[t_grp].reshape(len(t_grp), P, *self.det_shape)
@@ -2240,7 +2374,7 @@ class DiffractionTomography:
                 for j, ti in enumerate(t_grp):
                     res_per_dp[ti * P:(ti + 1) * P] = tl[j].detach()
                 total += float(tl.sum())
-            if inr:
+            if inr and basis_leaf is not None:
                 if shrink_basis > 0.0 and basis_leaf.grad is not None:
                     # proximal L1 has no meaning for network weights; apply the
                     # sparsity prior as a penalty routed through the same leaf,
