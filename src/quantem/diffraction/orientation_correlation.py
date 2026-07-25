@@ -316,10 +316,41 @@ def _calculate_torch(
 
     if mode_batch_size is None:
         if device.type == "cuda":
-            free_memory, _ = torch.cuda.mem_get_info(device)
+            free_memory, total_memory = torch.cuda.mem_get_info(device)
+            # cudaMemGetInfo reports memory free on the *device*, which ignores
+            # any per-process cap from torch.cuda.set_per_process_memory_fraction.
+            # Budgeting off the device figure under a cap sizes batches for
+            # headroom this process may not allocate, and the fft2 below then
+            # raises OutOfMemoryError while the device still looks mostly free.
+            # Take whichever allowance is smaller.
+            try:
+                process_fraction = torch.cuda.get_per_process_memory_fraction(device)
+            except (AttributeError, RuntimeError, TypeError):
+                process_fraction = 1.0
             complex_bytes = 8 if complex_dtype == torch.complex64 else 16
             padded_pixels = int(np.prod(geometry["padded_shape"]))
-            memory_budget = int(free_memory * max_memory_fraction)
+            # theta_spectrum is allocated after this estimate, so reserve room for
+            # it up front rather than discovering the shortfall mid-loop.
+            spectrum_bytes = (
+                histogram.numel() // num_theta * (num_theta // 2 + 1)
+            ) * complex_bytes
+
+            def available_bytes():
+                budget = free_memory
+                if 0.0 < process_fraction < 1.0:
+                    # Headroom is measured against *allocated*, not *reserved*:
+                    # blocks the caching allocator holds but no tensor is using
+                    # are reusable, and after a failed run they can account for
+                    # most of the cap. Counting them as spent wrongly reports a
+                    # zero budget.
+                    remaining = (
+                        process_fraction * total_memory
+                        - torch.cuda.memory_allocated(device)
+                    )
+                    budget = min(budget, max(0, int(remaining)))
+                return max(0, budget - spectrum_bytes)
+
+            memory_budget = int(available_bytes() * max_memory_fraction)
 
             def estimate_bytes_per_mode(batch_size):
                 return (
@@ -334,13 +365,34 @@ def _calculate_torch(
                     pair_batch_size = max(1, pair_batch_size // 2)
                     bytes_per_mode = estimate_bytes_per_mode(pair_batch_size)
             if bytes_per_mode > memory_budget:
-                required_gib = bytes_per_mode / 1024**3
-                budget_gib = memory_budget / 1024**3
+                # A previous failure can leave the cap saturated with cached
+                # blocks. Return them and re-measure before giving up.
+                torch.cuda.empty_cache()
+                free_memory, total_memory = torch.cuda.mem_get_info(device)
+                memory_budget = int(available_bytes() * max_memory_fraction)
+                if not pair_batch_was_requested:
+                    while pair_batch_size > 1 and bytes_per_mode > memory_budget:
+                        pair_batch_size = max(1, pair_batch_size // 2)
+                        bytes_per_mode = estimate_bytes_per_mode(pair_batch_size)
+            if bytes_per_mode > memory_budget:
+                allocated_gib = torch.cuda.memory_allocated(device) / 1024**3
+                cap_text = (
+                    f"{process_fraction * total_memory / 1024**3:.2f} GiB "
+                    "(torch.cuda.set_per_process_memory_fraction)"
+                    if 0.0 < process_fraction < 1.0
+                    else f"{total_memory / 1024**3:.2f} GiB (device total, no cap)"
+                )
                 raise MemoryError(
                     "A single angular-mode batch is estimated to require "
-                    f"{required_gib:.2f} GiB, but the configured CUDA memory "
-                    f"budget is {budget_gib:.2f} GiB. Reduce radius_max, the "
-                    "orientation-histogram upsampling, or pair_batch_size."
+                    f"{bytes_per_mode / 1024**3:.2f} GiB, but the CUDA memory "
+                    f"budget is only {memory_budget / 1024**3:.2f} GiB "
+                    f"(max_memory_fraction={max_memory_fraction}). This process "
+                    f"is capped at {cap_text}, currently holds "
+                    f"{allocated_gib:.2f} GiB live, and must also reserve "
+                    f"{spectrum_bytes / 1024**3:.2f} GiB for the angular "
+                    f"spectrum; {free_memory / 1024**3:.2f} GiB is free on the "
+                    "device. Raise the per-process cap or max_memory_fraction, "
+                    "or reduce radius_max or the orientation-histogram upsampling."
                 )
             mode_batch_size = max(
                 1,
