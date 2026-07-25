@@ -1535,6 +1535,7 @@ class DiffractionTomography:
         phase_only: bool = True,
         inr: bool = False,
         inr_lr: float = 1e-3,
+        tilt_sample: int = 0,
         resume: bool = False,
         progress: bool = True,
         print_every: int = 0,
@@ -1581,6 +1582,15 @@ class DiffractionTomography:
         generated volume, so viewers, ``local_search`` and ``simulate`` work
         as usual. Call :meth:`_inr_setup` first to choose a custom
         width/depth/omega; otherwise a default network is created.
+
+        ``tilt_sample=k`` turns each iteration into a stochastic step over
+        ``k`` random tilts instead of all of them (the wave-optics forward is
+        ~80% of an iteration, so this buys nearly ``n_tilt/k`` per step).
+        Every 10th iteration remains full-batch: it anchors keep-best (a
+        subset loss is not comparable) and the loss log. Between anchors the
+        logged loss is the noisy subset mean. Most useful with ``inr=True``,
+        whose shared parameterization averages the minibatch noise; the
+        per-voxel reset metric simply reuses each tilt's latest residual.
 
         ``resume=True`` continues a previous ``reconstruct`` call: the Adam
         momentum and the accumulated loss history carry over (so ``plot_loss``
@@ -1660,22 +1670,35 @@ class DiffractionTomography:
                 with torch.no_grad():
                     self.basis.copy_(gen_basis.detach())
                 basis_leaf = gen_basis.detach().requires_grad_(True)
-            for t0 in range(0, n_tilt, max(1, tilt_batch)):
-                # tilts are processed in groups of tilt_batch: one autograd
-                # graph (and one backward) per group. tilt_batch trades memory
-                # for speed; gradients still accumulate into one full-batch
-                # optimizer step per iteration.
-                t_grp = list(range(t0, min(t0 + max(1, tilt_batch), n_tilt)))
+            # tilt selection: full batch, or (tilt_sample) a random subset with
+            # a full-batch anchor every 10th iteration for keep-best/logging.
+            full_iter = (not tilt_sample or tilt_sample >= n_tilt
+                         or it % 10 == 0 or it == num_iters - 1)
+            if full_iter:
+                t_sel, grp_sz, n_eff = list(range(n_tilt)), max(1, tilt_batch), n_dp
+            else:
+                t_sel = sorted(torch.randperm(n_tilt, generator=gen)[:tilt_sample].tolist())
+                # single-tilt groups keep the geometry cache to n_tilt entries
+                # (random subsets as batch keys would grow it combinatorially)
+                grp_sz, n_eff = 1, len(t_sel) * P
+            for c0 in range(0, len(t_sel), grp_sz):
+                # tilts are processed in groups: one autograd graph (and one
+                # backward) per group. tilt_batch trades memory for speed;
+                # gradients still accumulate into one optimizer step.
+                t_grp = t_sel[c0:c0 + grp_sz]
                 basis = basis_leaf if inr else self.masked_basis()
                 R_all = self.rotation_matrices()
                 Psi = self.forward_tilts(origins, [float(tilts_deg[ti]) for ti in t_grp],
                                          basis, R_all, self.weights,
                                          phase_only=phase_only,
                                          superslice=superslice)                       # (T,P,det,det)
-                tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape)
+                tgt = meas_amp[t_grp[0]:t_grp[-1] + 1].reshape(len(t_grp), P, *self.det_shape) \
+                    if t_grp == list(range(t_grp[0], t_grp[-1] + 1)) else \
+                    meas_amp[t_grp].reshape(len(t_grp), P, *self.det_shape)
                 tl = ((Psi.abs() - tgt) ** 2).mean(dim=(2, 3))                        # (T,P)
-                (tl.sum() / n_dp).backward()
-                res_per_dp[t_grp[0] * P:(t_grp[-1] + 1) * P] = tl.detach().reshape(-1)
+                (tl.sum() / n_eff).backward()
+                for j, ti in enumerate(t_grp):
+                    res_per_dp[ti * P:(ti + 1) * P] = tl[j].detach()
                 total += float(tl.sum())
             if inr:
                 if shrink_basis > 0.0 and basis_leaf.grad is not None:
@@ -1696,10 +1719,12 @@ class DiffractionTomography:
                 if basis_leaf.grad is not None:
                     gen_basis.backward(basis_leaf.grad)
 
-            mean_loss = total / n_dp
+            mean_loss = total / n_eff
             losses.append(mean_loss)
             lrs.append([float(g["lr"]) for g in opt.param_groups])
-            if np.isfinite(mean_loss) and mean_loss < best["loss"]:
+            # subset losses are not comparable to the full objective, so only
+            # full-batch iterations can claim the keep-best snapshot
+            if full_iter and np.isfinite(mean_loss) and mean_loss < best["loss"]:
                 best = {"loss": mean_loss, "snap": self._snapshot()}
 
             opt.step()
