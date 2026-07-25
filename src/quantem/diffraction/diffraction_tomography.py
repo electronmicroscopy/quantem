@@ -47,6 +47,61 @@ from quantem.core.ml.models.so3params import SO3ParamR9SVD
 from quantem.core.utils.utils import electron_wavelength_angstrom
 
 
+class _PeakBasis(torch.nn.Module):
+    """Parametric Bragg-peak basis: amplitudes on a learnable reciprocal lattice.
+
+    The whole structure factor is ``sum_hkl i * a(hkl) * splat(G_hkl)`` with
+    ``G_hkl = hkl @ B_rec`` -- a few dozen parameters (9 lattice + one
+    amplitude per symmetry shell) instead of ``N_k^3`` pixels or ~50k network
+    weights. Peaks land at continuous positions via trilinear splatting (the
+    same placement the test data uses), so there is **no spectral leakage**:
+    a real-space field parameterization leaks across all of k-space unless
+    the box is an exact multiple of the unit cell (measured: an ideal crystal
+    u-field on a 20 A box holding 4.9 cells already produces 51% off-peak
+    mass), which is what limits the network's structure-factor fidelity.
+
+    Purely imaginary amplitudes shared over each ``sorted(|h|,|k|,|l|)``
+    shell build in both Friedel (``F(-k) = -conj F(k)``) and the cubic point
+    group exactly, for a centrosymmetric crystal aligned to the grid axes.
+    """
+
+    def __init__(self, hkl: torch.Tensor, shell_idx: torch.Tensor, n_shells: int,
+                 B_rec: torch.Tensor, n_struct: int, learn_cell: bool = True):
+        super().__init__()
+        self.register_buffer("hkl", hkl.to(torch.float32))
+        self.register_buffer("shell_idx", shell_idx.to(torch.long))
+        self.B_rec = torch.nn.Parameter(B_rec.to(torch.float32),
+                                        requires_grad=bool(learn_cell))
+        self.amp = torch.nn.Parameter(torch.full((n_shells, n_struct), 1e-3))
+        self.origin = torch.nn.Parameter(torch.ones(n_struct))
+
+    def volume(self, k_shape, k_sampling, device) -> torch.Tensor:
+        """Splat the peaks onto the centered k grid -> (Nkz, Nky, Nkx, Nw)."""
+        Nkz, Nky, Nkx = k_shape
+        Nw = self.amp.shape[1]
+        dk = torch.tensor(k_sampling, dtype=torch.float32, device=device)
+        ctr = torch.tensor([Nkz // 2, Nky // 2, Nkx // 2], dtype=torch.float32,
+                           device=device)
+        c = (self.hkl @ self.B_rec) / dk + ctr              # (P, 3) voxel coords
+        base = torch.floor(c)
+        frac = c - base
+        base = base.to(torch.long)
+        a_pk = self.amp[self.shell_idx]                     # (P, Nw)
+        vol = torch.zeros(Nkz * Nky * Nkx, Nw, dtype=torch.float32, device=device)
+        for oz in (0, 1):
+            for oy in (0, 1):
+                for ox in (0, 1):
+                    w = ((frac[:, 0] if oz else 1 - frac[:, 0])
+                         * (frac[:, 1] if oy else 1 - frac[:, 1])
+                         * (frac[:, 2] if ox else 1 - frac[:, 2]))
+                    iz, iy, ix = base[:, 0] + oz, base[:, 1] + oy, base[:, 2] + ox
+                    ok = ((iz >= 0) & (iz < Nkz) & (iy >= 0) & (iy < Nky)
+                          & (ix >= 0) & (ix < Nkx))
+                    flat = (iz[ok] * Nky + iy[ok]) * Nkx + ix[ok]
+                    vol.index_add_(0, flat, a_pk[ok] * w[ok, None])
+        return vol.reshape(Nkz, Nky, Nkx, Nw)
+
+
 class _LatticeMotifINR(torch.nn.Module):
     """Lattice-periodic INR: a motif network over one (learnable) unit cell.
 
@@ -1580,8 +1635,31 @@ class DiffractionTomography:
         from ``self.seed`` inside a forked RNG so runs stay bit-reproducible
         without disturbing the global generator.
         """
-        assert space in ("r", "k", "lattice")
+        assert space in ("r", "k", "lattice", "peaks")
         self._inr_space = space
+        if space == "peaks":
+            assert cell is not None, "space='peaks' needs cell= (Angstroms)"
+            A = torch.as_tensor(cell, dtype=torch.float32)
+            B_rec = torch.eye(3) / A if A.ndim == 0 else torch.linalg.inv(A).T
+            kmax = self.sphere_radius_pix * min(self.k_sampling)
+            hmax = int(np.ceil(kmax * float(A if A.ndim == 0 else A.diagonal().max()))) + 1
+            hkls, keys = [], []
+            for h in range(-hmax, hmax + 1):
+                for k in range(-hmax, hmax + 1):
+                    for l in range(-hmax, hmax + 1):
+                        if (h, k, l) == (0, 0, 0):
+                            continue
+                        G = torch.tensor([float(h), float(k), float(l)]) @ B_rec
+                        if float(G.norm()) <= kmax:
+                            hkls.append((h, k, l))
+                            keys.append(tuple(sorted((abs(h), abs(k), abs(l)))))
+            uniq = sorted(set(keys))
+            shell_idx = torch.tensor([uniq.index(k) for k in keys])
+            self.basis_inr = _PeakBasis(torch.tensor(hkls), shell_idx, len(uniq),
+                                        B_rec, self.num_structures,
+                                        learn_cell).to(self.device)
+            self._peak_shells = uniq
+            return
         self._inr_periodic = bool(periodic) and space == "r"
         n_out = self.num_structures if space in ("r", "lattice") else 2 * self.num_structures
         with torch.random.fork_rng(devices=[]):
@@ -1632,6 +1710,16 @@ class DiffractionTomography:
         N_w]`` complex, same layout/dtype as :meth:`masked_basis`.
         """
         Nw = self.num_structures
+        if getattr(self, "_inr_space", "k") == "peaks":
+            # amplitudes splatted straight onto the reciprocal lattice: no
+            # spectral leakage, Friedel + cubic symmetry exact by construction
+            im = self.basis_inr.volume(self.k_shape, self.k_sampling, self.device)
+            Bc = torch.complex(torch.zeros_like(im), im)
+            B = torch.fft.ifftshift(Bc, dim=(0, 1, 2)).to(self.basis.dtype)
+            B = B * self.sphere_mask[..., None]
+            B = B.clone()
+            B[0, 0, 0, :] = self.basis_inr.origin.to(B.dtype)
+            return B
         if getattr(self, "_inr_space", "k") in ("r", "lattice"):
             # real field u(r) -> basis = i * FFT(u): anti-Hermitian (Friedel)
             # by construction, and the network fits the smooth band-limited
@@ -1684,8 +1772,56 @@ class DiffractionTomography:
         eps = reweight * mag.max().clamp_min(1e-30)
         return tau * (eps / (mag + eps))
 
+    def fit_peak_basis(self, a_min: float = 3.0, a_max: float = 6.0,
+                       n_scan: int = 60, scan_iters: int = 150,
+                       iters: int = 1500, lr: float = 3e-3, clean: float = 0.1,
+                       progress: bool = False) -> dict:
+        """Fit the parametric peak basis (:class:`_PeakBasis`) to the current basis.
+
+        Scans the cubic cell edge over ``[a_min, a_max]``, distilling briefly
+        at each candidate (no wave optics -- this is a supervised fit to the
+        basis the reconstruction already recovered, so it uses no ground
+        truth), keeps the best, then refines lattice + amplitudes together.
+        Installs the result as ``self.basis_inr`` so ``reconstruct(inr=True)``
+        continues in the peak parameterization.
+
+        The scan target is *cleaned* first: everything below ``clean`` times
+        the maximum magnitude is zeroed. Fitting the raw basis instead
+        systematically prefers a too-large cell, because a denser reciprocal
+        lattice can also absorb the diffuse fog; against a cleaned target the
+        extra predicted reflections have to fit zero, which they cannot do
+        while also fitting the real peaks.
+
+        Returns ``{"a": cell edge, "loss": final L2, "scan": [(a, loss), ...]}``.
+        """
+        target = self.masked_basis().detach().clone()
+        origin = target[0, 0, 0, :].clone()
+        tgt_clean = target.clone()
+        tgt_clean[0, 0, 0, :] = 0.0            # fit the Bragg content only: the
+        mag = tgt_clean.abs()                  # vacuum origin is ~100x the peaks
+        tgt_clean[mag < clean * mag.max()] = 0.0
+        scan = []
+        for a in np.linspace(a_min, a_max, n_scan):
+            self._inr_setup(0, 0, 0.0, space="peaks", cell=float(a), learn_cell=False)
+            scan.append((float(a), self.distill_inr(target=tgt_clean, iters=scan_iters,
+                                                    lr=lr, skip_origin=True)))
+        a_best = min(scan, key=lambda t: t[1])[0]
+        self._inr_setup(0, 0, 0.0, space="peaks", cell=a_best, learn_cell=True)
+        loss = self.distill_inr(target=tgt_clean, iters=iters, lr=lr,
+                                skip_origin=True, progress=progress)
+        with torch.no_grad():                  # carry the learned vacuum baseline
+            self.basis_inr.origin.copy_(origin.real.to(self.basis_inr.origin.dtype))
+            self.basis.copy_(self._inr_basis().detach())
+        # freeze the lattice for the wave-optics phase: it is determined here to
+        # a fraction of a percent, and left learnable it runs away (measured
+        # 4.09 -> 2.83 A) because every amplitude can chase a moving peak
+        self.basis_inr.B_rec.requires_grad_(False)
+        a_fit = float(1.0 / self.basis_inr.B_rec[0].norm())
+        return {"a": a_fit, "a_scan": a_best, "loss": loss, "scan": scan}
+
     def distill_inr(self, target: torch.Tensor | None = None, iters: int = 800,
-                    lr: float = 1e-3, progress: bool = False) -> float:
+                    lr: float = 1e-3, skip_origin: bool = False,
+                    progress: bool = False) -> float:
         """Fit the basis INR to a target volume (default: the current basis).
 
         The bridge of the **pixel-bootstrap** recipe for fine k grids: a short
@@ -1710,12 +1846,26 @@ class DiffractionTomography:
         if getattr(self, "basis_inr", None) is None:
             self._inr_setup(width=128, depth=3, omega=30.0, space="r", periodic=True)
         tgt = (self.masked_basis() if target is None else target).detach().clone()
-        opt = torch.optim.Adam(self.basis_inr.parameters(), lr=lr)
+        # the peak model's lattice is far more sensitive than its amplitudes
+        # (moving G by a fraction of a voxel changes every peak), so it gets a
+        # 10x smaller step
+        cell_p = [p for n, p in self.basis_inr.named_parameters() if n == "B_rec"]
+        rest = [p for n, p in self.basis_inr.named_parameters() if n != "B_rec"]
+        groups = [{"params": rest, "lr": lr}]
+        if cell_p:
+            groups.append({"params": cell_p, "lr": lr * 0.1})
+        opt = torch.optim.Adam(groups)
         bar = tqdm(range(iters), disable=not progress, desc="distill", unit="it")
         loss = torch.tensor(0.0)
         for _ in bar:
             opt.zero_grad(set_to_none=True)
-            loss = (self._inr_basis() - tgt).abs().pow(2).mean()
+            diff = self._inr_basis() - tgt
+            if skip_origin:
+                # the vacuum baseline is ~100x the Bragg peaks; including it
+                # makes one voxel dominate the fit
+                diff = diff.clone()
+                diff[0, 0, 0, :] = 0.0
+            loss = diff.abs().pow(2).mean()
             loss.backward()
             opt.step()
         with torch.no_grad():
