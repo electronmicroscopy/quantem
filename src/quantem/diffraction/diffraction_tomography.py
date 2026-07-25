@@ -1563,6 +1563,44 @@ class DiffractionTomography:
             B = torch.where(mask[..., None], B, proj)
         return B
 
+    def distill_inr(self, target: torch.Tensor | None = None, iters: int = 800,
+                    lr: float = 1e-3, progress: bool = False) -> float:
+        """Fit the basis INR to a target volume (default: the current basis).
+
+        The bridge of the **pixel-bootstrap** recipe for fine k grids: a short
+        pixel ``reconstruct`` discovers the grains (its proximal-shrink basis
+        sharpens immediately, so the orientation sweep has a clean target),
+        this distills that basis into the network, and an ``inr=True``
+        ``reconstruct`` then refines far past the pixel model's quality
+        ceiling. Supervised on the grid, no wave optics -- seconds to a
+        minute. Creates the default network via :meth:`_inr_setup` if none
+        exists. Returns the final L2.
+
+        Example (full-resolution multi-grain recipe)::
+
+            recon.reconstruct(dp, tilts, ..., num_iters=60,
+                              shrink_basis=0.3, smooth_basis=0.35,
+                              cubic_symmetry=True, search_every=10)
+            recon.distill_inr()
+            recon.reconstruct(dp, tilts, ..., num_iters=150, inr=True,
+                              shrink_basis=0.3, cubic_symmetry=True,
+                              search_every=10)
+        """
+        if getattr(self, "basis_inr", None) is None:
+            self._inr_setup(width=128, depth=3, omega=30.0, space="r", periodic=True)
+        tgt = (self.masked_basis() if target is None else target).detach().clone()
+        opt = torch.optim.Adam(self.basis_inr.parameters(), lr=lr)
+        bar = tqdm(range(iters), disable=not progress, desc="distill", unit="it")
+        loss = torch.tensor(0.0)
+        for _ in bar:
+            opt.zero_grad(set_to_none=True)
+            loss = (self._inr_basis() - tgt).abs().pow(2).mean()
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            self.basis.copy_(self._inr_basis().detach())
+        return float(loss)
+
     def reconstruct(
         self,
         measurements: torch.Tensor,                 # (n_tilt, n_row, n_col, det, det) intensities
