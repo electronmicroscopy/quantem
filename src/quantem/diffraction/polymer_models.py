@@ -271,7 +271,7 @@ _PAPER_SPEC: dict[str, Any] = {
         "p_upper": 3.394,
     },
     "experimental_normalization": {
-        "mode": "per_scan_percentile",
+        "mode": "per_image_minmax_percentile",
         "lower_percentile": 1.0,
         "upper_percentile": 99.0,
     },
