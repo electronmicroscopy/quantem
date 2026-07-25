@@ -1668,6 +1668,22 @@ class DiffractionTomography:
             B = torch.where(mask[..., None], B, proj)
         return B
 
+    @staticmethod
+    def _l1_weighting(tau, mag: torch.Tensor, reweight: float):
+        """Per-element L1 threshold, optionally iteratively reweighted.
+
+        With ``reweight > 0`` the threshold is scaled by ``eps / (|x| + eps)``
+        with ``eps = reweight * max|x|`` (Candes-Wakin-Boyd reweighting,
+        normalized so the largest threshold is ``tau``): strong Bragg peaks
+        are barely touched while low-level fog gets the full threshold. Plain
+        L1 has to shave the peaks to reach the fog, which is why a single
+        global threshold never sparsified the shared/network basis cleanly.
+        """
+        if reweight <= 0.0:
+            return tau
+        eps = reweight * mag.max().clamp_min(1e-30)
+        return tau * (eps / (mag + eps))
+
     def distill_inr(self, target: torch.Tensor | None = None, iters: int = 800,
                     lr: float = 1e-3, progress: bool = False) -> float:
         """Fit the basis INR to a target volume (default: the current basis).
@@ -1721,6 +1737,7 @@ class DiffractionTomography:
         smooth_basis: float = 0.0,
         smooth_weights: float = 0.0,
         shrink_weights: float = 0.0,
+        reweight_l1: float = 0.0,
         friedel_basis: bool = True,
         cubic_symmetry: bool = False,
         search_every: int = 0,
@@ -1769,6 +1786,13 @@ class DiffractionTomography:
           gauge under ``phase_only``). A particle fills a few percent of the
           volume, so this clears the low-level weight that otherwise bleeds
           into vacuum.
+        * ``reweight_l1`` -- turn ``shrink_basis`` / ``shrink_weights`` into
+          *iteratively reweighted* L1 (see :meth:`_l1_weighting`): the
+          threshold is scaled down where the current magnitude is large, so
+          Bragg peaks and material voxels keep their amplitude while fog and
+          vacuum get the full threshold. The value is the reweighting floor
+          ``eps`` as a fraction of the maximum magnitude (0.05 is a good
+          start; 0 = plain L1).
         * ``consolidate_every`` -- every N iters project the orientation
           field onto piecewise-constant grains (:meth:`consolidate_grains`).
           A grain's voxels physically share one rotation; averaging over the
@@ -1948,7 +1972,9 @@ class DiffractionTomography:
                     tau = shrink_basis * 0.1 * torch.quantile(
                         gmag[gmag > 0].to(torch.float32), 0.9).to(gmag.dtype)
                     off = (basis_leaf.real ** 2 + basis_leaf.imag ** 2 + 1e-30).sqrt()
-                    pen = tau * (off.sum() - off[0, 0, 0, :].sum())
+                    tau = self._l1_weighting(tau, off.detach(), reweight_l1)
+                    pen = (tau * off).sum() - (tau * off)[0, 0, 0, :].sum() \
+                        if torch.is_tensor(tau) else tau * (off.sum() - off[0, 0, 0, :].sum())
                     pen.backward()
                 if basis_leaf.grad is not None:
                     gen_basis.backward(basis_leaf.grad)
@@ -1986,7 +2012,9 @@ class DiffractionTomography:
                 # an absolute threshold either does nothing or erases the field.
                 with torch.no_grad():
                     W = self.weights
-                    tau = shrink_weights * lr * W.detach().abs().max().clamp_min(1e-30)
+                    mag = W.detach().abs()
+                    tau = shrink_weights * lr * mag.max().clamp_min(1e-30)
+                    tau = self._l1_weighting(tau, mag, reweight_l1)
                     W.copy_(torch.sign(W) * torch.clamp(W.abs() - tau, min=0.0))
             if cubic_symmetry and self.learn_basis and not inr:
                 # project the basis onto cubic point-group symmetry each step:
@@ -2036,8 +2064,8 @@ class DiffractionTomography:
                 # the k-space fog that otherwise fits the data with rings
                 # instead of spots (the same cure the explicit-6D model needed).
                 with torch.no_grad():
-                    tau = shrink_basis * lr
                     mag = self.basis.abs()
+                    tau = self._l1_weighting(shrink_basis * lr, mag, reweight_l1)
                     keep = self.basis[0, 0, 0, :].clone()
                     self.basis.copy_(self.basis / mag.clamp_min(1e-30)
                                      * torch.clamp(mag - tau, min=0.0))
