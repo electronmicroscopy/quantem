@@ -47,6 +47,33 @@ from quantem.core.ml.models.so3params import SO3ParamR9SVD
 from quantem.core.utils.utils import electron_wavelength_angstrom
 
 
+class _LatticeMotifINR(torch.nn.Module):
+    """Lattice-periodic INR: a motif network over one (learnable) unit cell.
+
+    The field is ``u(x) = net(cos 2 pi f, sin 2 pi f)`` with fractional
+    coordinates ``f = x A^-1`` -- exactly periodic under the Bravais lattice
+    whose ROW vectors are ``A`` (Angstroms, body frame), for ANY ``A``. Peak
+    positions in k become continuous functions of the cell instead of being
+    quantized to the k grid, and content between reciprocal-lattice points is
+    structurally impossible (the fog an unconstrained INR paints there).
+    ``A`` can be refined by gradient (``learn_cell``); the crystal system is
+    then *diagnosed* from the converged metric tensor rather than assumed.
+    """
+
+    def __init__(self, net: torch.nn.Module, cell, learn_cell: bool = False):
+        super().__init__()
+        self.net = net
+        A = torch.as_tensor(cell, dtype=torch.float32)
+        if A.ndim == 0:
+            A = torch.eye(3) * A
+        self.A = torch.nn.Parameter(A, requires_grad=bool(learn_cell))
+
+    def forward(self, xyz: torch.Tensor) -> torch.Tensor:
+        f = xyz @ torch.linalg.inv(self.A)          # fractional coords
+        th = 2.0 * math.pi * f
+        return self.net(torch.cat([torch.cos(th), torch.sin(th)], dim=-1))
+
+
 class DiffractionTomography:
     """6D diffraction tomography (see the module docstring).
 
@@ -1416,7 +1443,8 @@ class DiffractionTomography:
                 p.requires_grad_(self.learn_angles)
 
     def _inr_setup(self, width: int, depth: int, omega: float,
-                   space: str = "r", periodic: bool = False) -> None:
+                   space: str = "r", periodic: bool = False,
+                   cell=None, learn_cell: bool = False) -> None:
         """Create the basis INR (an HSiren MLP) and cache its input coords.
 
         ``space="r"``: the network represents the body-frame *real-space*
@@ -1431,6 +1459,14 @@ class DiffractionTomography:
         ``2 * num_structures`` outputs (real/imaginary per structure)
         directly.
 
+        ``space="lattice"``: like ``"r"``, but the field is a motif network
+        over one unit cell (:class:`_LatticeMotifINR`) -- exactly periodic
+        under the Bravais lattice ``cell`` ((3, 3) rows in Angstroms, or a
+        scalar for a cubic cell). Content away from the reciprocal lattice
+        is structurally impossible, and with ``learn_cell=True`` the cell
+        refines by gradient. Estimate the cell from the data (diffraction
+        ring radii), never from ground truth.
+
         Inputs are grid coordinates normalized to ``[-1, 1]^3``; with
         ``periodic=True`` (r-space only) they are lifted to torus features
         ``(cos, sin)`` of one box period, making ``u`` exactly periodic on
@@ -1439,14 +1475,14 @@ class DiffractionTomography:
         from ``self.seed`` inside a forked RNG so runs stay bit-reproducible
         without disturbing the global generator.
         """
-        assert space in ("r", "k")
+        assert space in ("r", "k", "lattice")
         self._inr_space = space
         self._inr_periodic = bool(periodic) and space == "r"
-        n_out = self.num_structures if space == "r" else 2 * self.num_structures
+        n_out = self.num_structures if space in ("r", "lattice") else 2 * self.num_structures
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(self.seed + 11)
-            self.basis_inr = HSiren(
-                in_features=6 if self._inr_periodic else 3,
+            net = HSiren(
+                in_features=6 if (self._inr_periodic or space == "lattice") else 3,
                 out_features=n_out,
                 hidden_layers=depth,
                 hidden_features=width,
@@ -1454,6 +1490,18 @@ class DiffractionTomography:
                 hidden_omega_0=omega,
                 final_activation="identity",
             ).to(self.device)
+        if space == "lattice":
+            assert cell is not None, "space='lattice' needs cell= (Angstroms)"
+            self.basis_inr = _LatticeMotifINR(net, cell, learn_cell).to(self.device)
+            # physical body-frame positions of the u-field grid (Angstroms):
+            # the box the DFT assumes has period L_i = 1/dk_i
+            axes = [(torch.arange(n, device=self.device, dtype=torch.float32) - n // 2)
+                    * (1.0 / dk / n)
+                    for n, dk in zip(self.k_shape, self.k_sampling)]
+            ZZ, YY, XX = torch.meshgrid(*axes, indexing="ij")
+            self._inr_coords = torch.stack((ZZ, YY, XX), dim=-1).reshape(-1, 3)
+            return
+        self.basis_inr = net
         axes = [torch.linspace(-1.0, 1.0, n, device=self.device) for n in self.k_shape]
         ZZ, YY, XX = torch.meshgrid(*axes, indexing="ij")
         c = torch.stack((ZZ, YY, XX), dim=-1).reshape(-1, 3).to(torch.float32)
@@ -1479,11 +1527,12 @@ class DiffractionTomography:
         N_w]`` complex, same layout/dtype as :meth:`masked_basis`.
         """
         Nw = self.num_structures
-        if getattr(self, "_inr_space", "k") == "r":
+        if getattr(self, "_inr_space", "k") in ("r", "lattice"):
             # real field u(r) -> basis = i * FFT(u): anti-Hermitian (Friedel)
             # by construction, and the network fits the smooth band-limited
             # potential instead of its spiky transform. norm="forward" keeps
-            # the basis at the field's amplitude scale.
+            # the basis at the field's amplitude scale. ("lattice": u is
+            # motif(frac coords) -- exactly lattice-periodic.)
             u = self.basis_inr(self._inr_coords).reshape(*self.k_shape, Nw)
             u = u.permute(3, 0, 1, 2).to(torch.float64)
             Bk = 1j * torch.fft.fftn(u, dim=(1, 2, 3), norm="forward")
