@@ -2012,7 +2012,14 @@ class DiffractionTomography:
         # which displaces the outer reflections by a fraction of a k voxel.
         self.basis_inr.B_rec.requires_grad_(not freeze_cell)
         a_fit = float(1.0 / self.basis_inr.B_rec[0].norm())
-        return {"a": a_fit, "a_scan": a_best, "loss": loss, "scan": scan}
+        # scan contrast: a real lattice shows a sharp minimum; a diffuse or
+        # multi-grain-inconsistent basis fits every candidate about equally
+        # (measured: a collapsed flat recon on dynamical data gave a wrong
+        # cell with contrast ~1). Treat < ~2 as "do not trust this cell".
+        losses_scan = np.array([l for _, l in scan])
+        contrast = float(np.median(losses_scan) / max(losses_scan.min(), 1e-30))
+        return {"a": a_fit, "a_scan": a_best, "loss": loss, "scan": scan,
+                "contrast": contrast, "reliable": contrast > 2.0}
 
     def adapt_peaks(self, reference: torch.Tensor | None = None,
                     prune: float = 0.02, birth: int = 0,
@@ -2555,7 +2562,12 @@ class DiffractionTomography:
                 # before falling below the previous best -- that "spike" IS the
                 # grain discovery, so it runs to the end; the lowest-loss state
                 # over the whole run is snapshotted and returned.
+                # shrink_weights suppresses not-yet-found grains toward zero
+                # weight; with the default visit threshold the sweep would then
+                # never revisit them (vacuum-skip lock-in), so under weight
+                # shrinking the sweep visits every voxel that has any weight.
                 self.local_search(measurements, tilts_deg, scan_shape, scan_step,
+                                  w_material=0.01 if shrink_weights > 0 else 0.05,
                                   accept=0.95, order="error", seed=it, progress=progress)
                 allv = torch.arange(self.n_voxels, device=self.device)
                 self._reset_optimizer_state(opt, self.angles.M, allv)
