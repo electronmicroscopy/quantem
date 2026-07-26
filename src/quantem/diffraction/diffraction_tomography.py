@@ -1142,37 +1142,57 @@ class DiffractionTomography:
                             []).append(vi)
         planes = {}
         dku = float(self.k_sampling[2])
-        for kb, members in keys.items():
-            Rv = R[members[0]].to(torch.float32)
-            g_lab = G_body.to(torch.float32) @ Rv.T        # rows R g_body
+        kmax = 1.02 * self.sphere_radius_pix * min(self.k_sampling)
+        # coupling lookup: encoded hkl difference -> potential coefficient
+        # (tensorized; a python double loop over beam pairs dominated the
+        # profile once gradient steps made every voxel's rotation distinct)
+        lut = torch.zeros(17 ** 3, dtype=torch.complex128, device=self.device)
+        for (h_, k_, l_), a_row in tab.items():
+            if max(abs(h_), abs(k_), abs(l_)) <= 8:
+                lut[(h_ + 8) * 289 + (k_ + 8) * 17 + (l_ + 8)] = \
+                    (a_row[0] / t_slab / (math.pi * lam)).to(torch.complex128)
+        # per-rotation beam sets, padded to a common count and exponentiated
+        # in ONE batched matrix_exp (zero-coupled padding -> identity block,
+        # exact); after a gradient step every voxel is its own rotation, so
+        # the batch dimension is what keeps bloch iterations tractable
+        groups = list(keys.items())
+        sels, glabs = [], []
+        for kb, members in groups:
+            Rv = R[members[0]].detach().to(torch.float32)
+            g_lab = G_body.to(torch.float32).detach() @ Rv.T
             s = -(2.0 * (g_lab @ kvec) + (g_lab * g_lab).sum(-1)) / (2.0 * k0)
-            sel = (s.abs() < s_max) & (g_lab.norm(dim=-1) < 1.02 * self.sphere_radius_pix
-                                       * min(self.k_sampling))
-            idx = torch.nonzero(sel).flatten()
-            nb = int(idx.numel()) + 1
-            A = torch.zeros(nb, nb, dtype=torch.complex128, device=self.device)
-            gsel = g_lab[idx]
-            hsel = hkl_int[idx]
-            # diagonal: 2 k s_g (beam 0 = direct, s = 0)
-            diag = torch.zeros(nb, dtype=torch.float64, device=self.device)
-            diag[1:] = 2.0 * k0 * s[idx].to(torch.float64)
-            A = A + torch.diag(diag).to(torch.complex128)
-            # couplings: amplitude at hkl difference (phase/A / pi lambda);
-            # the amplitudes are stored as i*a (imaginary SF), the structure
-            # matrix wants the real potential coefficient a
-            hs = [(0, 0, 0)] + [tuple(int(x) for x in hsel[i]) for i in range(nb - 1)]
-            for i in range(nb):
-                for j in range(nb):
-                    if i == j:
-                        continue
-                    dh = (hs[i][0] - hs[j][0], hs[i][1] - hs[j][1], hs[i][2] - hs[j][2])
-                    a_ij = tab.get(dh)
-                    if a_ij is not None:
-                        A[i, j] = (a_ij[0] / t_slab / (math.pi * lam)).to(torch.complex128)
-            D = torch.linalg.matrix_exp(1j * math.pi * lam * t_slab * A)
-            psi = D[:, 0]                                   # D @ psi0
-            dpsi = psi - torch.eye(nb, dtype=psi.dtype, device=self.device)[:, 0]
-            # splat deviations at in-plane beam positions (direct beam at 0)
+            sel = torch.nonzero((s.abs() < s_max)
+                                & (g_lab.norm(dim=-1) < kmax)).flatten()
+            sels.append(sel)
+            glabs.append(g_lab)
+        nb_max = max((int(s_.numel()) for s_ in sels), default=0) + 1
+        K = len(groups)
+        Ab = torch.zeros(K, nb_max, nb_max, dtype=torch.complex128, device=self.device)
+        for gi_, (kb, members) in enumerate(groups):
+            # recompute with grad where it matters: g_lab through R (angles)
+            Rv = R[members[0]].to(torch.float32)
+            g_lab = G_body.to(torch.float32) @ Rv.T
+            glabs[gi_] = g_lab                    # grad-carrying, for the splat
+            sel = sels[gi_]
+            nloc = int(sel.numel()) + 1
+            hs_t = torch.cat([torch.zeros(1, 3, dtype=torch.long, device=self.device),
+                              hkl_int[sel]])
+            dh = hs_t[:, None, :] - hs_t[None, :, :]
+            key = ((dh[..., 0] + 8) * 289 + (dh[..., 1] + 8) * 17 + (dh[..., 2] + 8))
+            Aloc = lut[key.clamp(0, lut.numel() - 1)]
+            Aloc = Aloc - torch.diag(torch.diag(Aloc))
+            gl = torch.cat([torch.zeros(1, 3, device=self.device), g_lab[sel]])
+            s = -(2.0 * (gl @ kvec) + (gl * gl).sum(-1)) / (2.0 * k0)
+            Aloc = Aloc + torch.diag((2.0 * k0 * s).to(torch.complex128))
+            Ab[gi_, :nloc, :nloc] = Aloc
+        Db = torch.linalg.matrix_exp(1j * math.pi * lam * t_slab * Ab)
+        for gi_, (kb, members) in enumerate(groups):
+            sel = sels[gi_]
+            nloc = int(sel.numel()) + 1
+            psi = Db[gi_, :nloc, 0]
+            dpsi = psi.clone()
+            dpsi[0] = dpsi[0] - 1.0
+            gsel = glabs[gi_][sel]
             gu = torch.cat([torch.zeros(1, device=self.device), gsel @ u])
             gv = torch.cat([torch.zeros(1, device=self.device), gsel @ v])
             ci = gv / dku + det_r // 2
@@ -1189,7 +1209,7 @@ class DiffractionTomography:
                     plane = plane.index_add(0, (ii[ok] * det_c + jj[ok]),
                                             (dpsi[ok] * wgt[ok]).to(torch.complex64))
             plane = torch.fft.ifftshift(plane.reshape(det_r, det_c), dim=(0, 1))
-            for vi in members:
+            for vi in groups[gi_][1]:
                 planes[vi] = plane
         return planes
 
