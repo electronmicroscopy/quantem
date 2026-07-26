@@ -2562,12 +2562,13 @@ class DiffractionTomography:
                 # before falling below the previous best -- that "spike" IS the
                 # grain discovery, so it runs to the end; the lowest-loss state
                 # over the whole run is snapshotted and returned.
-                # shrink_weights suppresses not-yet-found grains toward zero
-                # weight; with the default visit threshold the sweep would then
-                # never revisit them (vacuum-skip lock-in), so under weight
-                # shrinking the sweep visits every voxel that has any weight.
+                # (A lower visit floor under shrink_weights was tested against
+                # the seed-1 dead-grain failure: a full-visit sweep DOES revive
+                # weak grains from a given state, but changing the in-loop
+                # floor just reshuffles the chaotic from-scratch trajectory --
+                # no average improvement, so the validated default stands.
+                # The robust cure is multi-seed consensus, not sweep tuning.)
                 self.local_search(measurements, tilts_deg, scan_shape, scan_step,
-                                  w_material=0.01 if shrink_weights > 0 else 0.05,
                                   accept=0.95, order="error", seed=it, progress=progress)
                 allv = torch.arange(self.n_voxels, device=self.device)
                 self._reset_optimizer_state(opt, self.angles.M, allv)
