@@ -2981,6 +2981,7 @@ class BraggPeaksPolymer(AutoSerialize):
         initial_geometry="circle",
         initial_size_x=None,
         initial_size_y=None,
+        initial_angle=None,
         reference_image=None,
         state_path=None,
         overlay_alpha=0.28,
@@ -2993,7 +2994,8 @@ class BraggPeaksPolymer(AutoSerialize):
 
         X is the horizontal scan-column coordinate and Y is the vertical
         scan-row coordinate. Circle, ellipse, square, and rectangle geometries
-        are available. Sizes are radii for round geometries and half-sizes for
+        are available, and all but the circle can be rotated by ``initial_angle``
+        (degrees anticlockwise) or with the Angle slider. Sizes are radii for round geometries and half-sizes for
         rectangular geometries. A saved ``state_path`` is loaded automatically.
         """
         return ScanMaskEditor(
@@ -3004,6 +3006,7 @@ class BraggPeaksPolymer(AutoSerialize):
             initial_geometry=initial_geometry,
             initial_size_x=initial_size_x,
             initial_size_y=initial_size_y,
+            initial_angle=initial_angle,
             reference_image=reference_image,
             state_path=state_path,
             overlay_alpha=overlay_alpha,

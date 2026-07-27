@@ -40,9 +40,13 @@ def test_controls_follow_probe_directions_and_apply_is_explicit():
         assert editor.circle_artist.get_linewidth() == pytest.approx(1.05)
         assert editor.circle_artist.get_linestyle() != "-"
         assert editor.figure.number not in plt.get_fignums()
-        # Radius is the row immediately above the image/Y-slider row.
-        assert editor.radius_slider in editor.widget.children[3].children
-        assert editor.output in editor.widget.children[5].children
+        # Shape controls sit above the image/Y-slider row, in order:
+        # radius, second size, angle, then the image.
+        rows = editor.widget.children
+        assert editor.radius_slider in rows[3].children
+        assert editor.size_y_slider in rows[4].children
+        assert editor.angle_slider in rows[5].children
+        assert editor.output in rows[6].children
 
         editor.x_slider.value += 1
         assert editor.x == 5
@@ -206,3 +210,119 @@ def test_geometry_selector_builds_expected_masks(
             assert editor.size_y_row.layout.display != "none"
     finally:
         editor.close()
+
+
+def _editor(**kwargs):
+    """A headless editor over a square scan, for geometry checks."""
+    return ScanMaskEditor(_analysis(scan_shape=(41, 41)), display_widget=False, **kwargs)
+
+
+def test_rotating_an_ellipse_moves_its_long_axis():
+    """A 90 degree turn should swap which axis is long."""
+    editor = _editor(initial_geometry="ellipse", initial_x=20, initial_y=20,
+                     initial_size_x=12, initial_size_y=4)
+    upright = np.asarray(editor.mask)
+    # Wide and short: more columns spanned than rows.
+    assert upright[20, :].sum() > upright[:, 20].sum()
+
+    editor.set_mask(angle=90)
+    turned = np.asarray(editor.mask)
+    assert turned[20, :].sum() < turned[:, 20].sum()
+    # Area is preserved to within the pixellation of a 90 degree turn.
+    assert turned.sum() == pytest.approx(upright.sum(), rel=0.15)
+    editor.close()
+
+
+def test_a_diagonal_ellipse_is_neither_axis_aligned():
+    editor = _editor(initial_geometry="ellipse", initial_x=20, initial_y=20,
+                     initial_size_x=14, initial_size_y=3, initial_angle=45)
+    mask = np.asarray(editor.mask)
+
+    rows = np.flatnonzero(mask.any(axis=1))
+    columns = np.flatnonzero(mask.any(axis=0))
+    # A 45 degree ellipse spans both directions nearly equally...
+    assert abs(len(rows) - len(columns)) <= 2
+    # ...and its extent exceeds the short semi-axis in both, unlike an upright one.
+    assert len(rows) > 2 * 3 and len(columns) > 2 * 3
+    # The long axis runs along increasing row and column together. Which screen
+    # diagonal that is depends on the display origin; what matters is that the
+    # outline agrees, which test_outline_matches_the_mask_at_every_angle checks.
+    assert mask[20 + 6, 20 + 6] and not mask[20 - 6, 20 + 6]
+    editor.close()
+
+
+@pytest.mark.parametrize("geometry,size_x,size_y", [
+    ("ellipse", 14, 3), ("rectangle", 12, 4), ("square", 9, 9),
+])
+@pytest.mark.parametrize("angle", [0, 30, 45, 120])
+def test_outline_matches_the_mask_at_every_angle(geometry, size_x, size_y, angle):
+    """The drawn outline must agree with what will actually be selected.
+
+    This is the invariant that matters: a rotation applied to the mask but not the
+    overlay (or with the opposite sign) would silently mislead. Rectangles are held
+    to a looser bound because the mask is inclusive on both edges while the patch is
+    drawn a half pixel outside, which shows along a rotated edge.
+    """
+    editor = _editor(initial_geometry=geometry, initial_x=20, initial_y=20,
+                     initial_size_x=size_x, initial_size_y=size_y, initial_angle=angle)
+    mask = np.asarray(editor.mask)
+    patch = editor.boundary_artist
+    yy, xx = np.mgrid[0:41, 0:41]
+    inside = patch.get_path().contains_points(
+        np.column_stack([xx.ravel(), yy.ravel()]),
+        transform=patch.get_patch_transform(),
+    ).reshape(41, 41)
+
+    assert (inside == mask).mean() > (0.99 if geometry == "ellipse" else 0.96)
+    editor.close()
+
+
+def test_rectangle_and_square_rotate_too():
+    for geometry, size_y in (("rectangle", 4), ("square", 10)):
+        editor = _editor(initial_geometry=geometry, initial_x=20, initial_y=20,
+                         initial_size_x=10, initial_size_y=size_y)
+        upright = np.asarray(editor.mask)
+        editor.set_mask(angle=45)
+        turned = np.asarray(editor.mask)
+
+        assert not np.array_equal(upright, turned), geometry
+        # A rotated square still reaches its corners on the diagonal.
+        if geometry == "square":
+            assert turned[20, 20 + 13] and not upright[20, 20 + 13]
+        editor.close()
+
+
+def test_a_circle_ignores_rotation_and_hides_the_control():
+    editor = _editor(initial_geometry="circle", initial_x=20, initial_y=20,
+                     initial_size_x=8, initial_angle=37)
+
+    assert editor.angle == 0.0
+    assert editor.angle_row.layout.display == "none"
+    before = np.asarray(editor.mask).copy()
+    editor.set_mask(angle=63)
+    np.testing.assert_array_equal(np.asarray(editor.mask), before)
+    editor.close()
+
+
+def test_angle_wraps_at_180_degrees():
+    editor = _editor(initial_geometry="rectangle", initial_x=20, initial_y=20,
+                     initial_size_x=10, initial_size_y=4, initial_angle=200)
+
+    assert editor.angle == pytest.approx(20.0)
+    editor.close()
+
+
+def test_angle_round_trips_through_a_saved_state(tmp_path):
+    path = tmp_path / "mask_state.npz"
+    editor = _editor(initial_geometry="ellipse", initial_x=20, initial_y=20,
+                     initial_size_x=12, initial_size_y=4, initial_angle=30,
+                     state_path=path)
+    saved_mask = np.asarray(editor.mask).copy()
+    editor.save()
+    editor.close()
+
+    reloaded = _editor(state_path=path)
+    assert reloaded.angle == pytest.approx(30.0)
+    assert reloaded.geometry == "ellipse"
+    np.testing.assert_array_equal(np.asarray(reloaded.mask), saved_mask)
+    reloaded.close()
