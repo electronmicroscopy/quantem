@@ -3115,6 +3115,27 @@ class BraggPeaksPolymer(AutoSerialize):
             scan_mask=self.scan_mask if scan_mask is None else scan_mask,
             intensity_threshold_global=intensity_threshold_global,
             return_debug=return_debug,
+            polar_data=getattr(self, "polar_data", None),
+            # process_polar(two_fold_symmetry=True) folded theta to [0, 180).
+            theta_period_deg=180.0 if getattr(self, "two_fold_symmetry", False) else 360.0,
+        )
+
+    def measure_ice_peak_widths(self, *, params=None, scan_mask=None, **kwargs):
+        """Radial/annular widths of this analysis's peaks, for tuning the sharpness gate."""
+
+        from quantem.diffraction.polymer_ice import IceFlaggerParams, collect_peak_widths
+
+        if self.polar_peaks is None or self.peak_intensities is None or getattr(self, "polar_data", None) is None:
+            raise RuntimeError(
+                "measure_ice_peak_widths() requires polar_peaks, peak_intensities and polar_data."
+            )
+        return collect_peak_widths(
+            self.polar_peaks,
+            self.peak_intensities,
+            self.polar_data,
+            params=IceFlaggerParams() if params is None else params,
+            scan_mask=self.scan_mask if scan_mask is None else scan_mask,
+            **kwargs,
         )
 
     def plot_q_intensity_density(self, **kwargs):
