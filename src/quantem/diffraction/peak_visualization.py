@@ -30,6 +30,7 @@ __all__ = [
     "plot_peak_count_map",
     "plot_peak_histogram_map",
     "save_diffraction_figures",
+    "visualize_peak_detection",
     "visualize_selected_patterns",
 ]
 
@@ -1060,4 +1061,164 @@ def visualize_selected_patterns(
     plt.tight_layout()
     plt.show()
     
+    return fig, axes
+
+
+def visualize_peak_detection(
+    dataset,
+    peaks,
+    polar_peaks,
+    polar_data,
+    image_centers,
+    num_annular_bins,
+    two_fold_symmetry=False,
+    n_images=10, indices=None, images_per_row=5, figsize_per_image=(3.2, 3), vmax_polar=20, vmax_cartesian=None):
+    """
+    Visualize peak detection results for multiple diffraction patterns.
+    
+    Parameters:
+    -----------
+    dataset : Dataset4dstem
+        The 4D-STEM data the patterns are drawn from.
+    peaks, polar_peaks : Vector
+        Detected peaks in cartesian and polar coordinates.
+    polar_data : dict
+        Polar transform, as produced by ``process_polar``.
+    image_centers : ndarray
+        Beam centre per scan position, ``(2, Ry, Rx)``.
+    num_annular_bins : int
+        Annular bin count of the polar transform, for placing polar peaks.
+    two_fold_symmetry : bool
+        Whether the polar transform folded theta to [0, pi).
+    n_images : int
+        Number of images to display (ignored if indices is provided)
+    indices : list of tuples, optional
+        List of (ind_y, ind_x) coordinates to visualize. If None, random indices are selected.
+    images_per_row : int
+        Number of images per row (default: 5)
+    figsize_per_image : tuple
+        Size of each subplot (width, height)
+    vmax_polar : float
+        Maximum value for polar data colormap
+    vmax_cartesian : float
+        Maximum value for cartesian data colormap
+    
+    Returns:
+    --------
+    fig, axes : matplotlib figure and axes
+    """
+    
+    # Generate or validate indices
+    if indices is None:
+        Ry, Rx = dataset.shape[:2]
+        # Generate random indices
+        flat_indices = np.random.choice(Ry * Rx, size=min(n_images, Ry * Rx), replace=False)
+        indices = [(idx // Rx, idx % Rx) for idx in flat_indices]
+    else:
+        n_images = len(indices)
+    
+    # Calculate grid dimensions
+    n_rows = int(np.ceil(n_images / images_per_row))
+    n_cols = 5  # 5 types of visualizations per pattern
+    actual_cols = images_per_row * n_cols
+    
+    # Create figure
+    fig_width = figsize_per_image[0] * actual_cols
+    fig_height = figsize_per_image[1] * n_rows
+    fig, axes = plt.subplots(n_rows, actual_cols, figsize=(fig_width, fig_height))
+    
+    # Handle single row case
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    # Column titles (only for first row)
+    col_titles = [
+        "Polar Transform",
+        "Polar + Peaks",
+        "Cartesian + Peaks",
+        "Cartesian Original",
+        "Cartesian Normalized"
+    ]
+    
+    # Process each image
+    for img_idx, (ind_y, ind_x) in enumerate(indices):
+        row = img_idx // images_per_row
+        col_offset = (img_idx % images_per_row) * n_cols
+        
+        # Check if peaks exist for this pattern
+        has_peaks = (peaks[ind_y, ind_x] is not None and
+                     len(peaks[ind_y, ind_x].array) > 0)
+        
+        # 1. Polar Transform
+        ax = axes[row, col_offset]
+        im = ax.matshow(polar_data["intensity"][ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+        if row == 0:
+            ax.set_title(col_titles[0], fontsize=10, pad=10)
+        ax.text(0.05, 0.95, f'({ind_y},{ind_x})', transform=ax.transAxes, 
+                fontsize=8, va='top', ha='left', color='white', 
+                bbox=dict(boxstyle='round', facecolor='black', alpha=0.5))
+        ax.set_axis_off()
+        
+        # 2. Polar Transform with Peaks
+        ax = axes[row, col_offset + 1]
+        ax.matshow(polar_data["intensity"][ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
+        if (has_peaks and polar_peaks[ind_y, ind_x] is not None
+                and len(polar_peaks[ind_y, ind_x].array) > 0):
+            # Convert radial coordinates to bin indices
+            r_coords = polar_peaks[ind_y, ind_x].array[:, 0]
+            theta_coords = polar_peaks[ind_y, ind_x].array[:, 1]
+            
+            # Convert theta from radians to angular bins (0 to num_annular_bins)
+            theta_period = np.pi if two_fold_symmetry else 2 * np.pi
+            theta_bins = theta_coords * (num_annular_bins / theta_period)
+            
+            ax.scatter(theta_bins, r_coords, c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
+        if row == 0:
+            ax.set_title(col_titles[1], fontsize=10, pad=10)
+        ax.set_axis_off()
+        
+        # 3. Cartesian with Peaks and Center
+        img = dataset[ind_y, ind_x].array
+        lower_q = 0.01
+        upper_q = 0.99
+        vmin, vmax = np.quantile(img[np.isfinite(img)], [lower_q, upper_q])
+        if vmax_cartesian is None:
+            vmax_cartesian = vmax
+        ax = axes[row, col_offset + 2]
+        ax.matshow(img, cmap="gray", vmin=vmin, vmax=vmax_cartesian)
+        if has_peaks:
+            ax.scatter(peaks[ind_y, ind_x].array[:, 1],
+                      peaks[ind_y, ind_x].array[:, 0],
+                      c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
+        ax.scatter(image_centers[1, ind_y, ind_x], 
+                  image_centers[0, ind_y, ind_x], 
+                  c='red', s=500, marker='x', linewidths=2)
+        if row == 0:
+            ax.set_title(col_titles[2], fontsize=10, pad=10)
+        ax.set_axis_off()
+        
+        # 4. Original Cartesian
+        ax = axes[row, col_offset + 3]
+        im = ax.matshow(img, cmap="gray", vmin=vmin, vmax=vmax_cartesian)
+        if row == 0:
+            ax.set_title(col_titles[3], fontsize=10, pad=10)
+        ax.set_axis_off()
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        
+        # # 5. Normalized Cartesian
+        # ax = axes[row, col_offset + 4]
+        # if row == 0:
+        #     ax.set_title(col_titles[4], fontsize=10, pad=10)
+        # ax.set_axis_off()
+        # plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    
+    # Hide unused subplots
+    total_plots = n_images
+    for idx in range(total_plots, n_rows * images_per_row):
+        row = idx // images_per_row
+        col_offset = (idx % images_per_row) * n_cols
+        for col in range(n_cols):
+            axes[row, col_offset + col].set_visible(False)
+    
+    fig.tight_layout()
     return fig, axes
