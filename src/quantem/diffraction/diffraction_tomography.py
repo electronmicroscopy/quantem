@@ -2041,6 +2041,148 @@ class DiffractionTomography:
         return {"a": a_fit, "a_scan": a_best, "loss": loss, "scan": scan,
                 "contrast": contrast, "reliable": contrast > 2.0}
 
+    def auto_index(self, measurements: torch.Tensor, tilts_deg,
+                   scan_shape: tuple[int, int], scan_step: float = 1.0,
+                   spot_rel: float = 0.15, g_min: float = 0.36,
+                   tol: float = 0.045, max_grains: int = 6,
+                   min_inliers: int = 5) -> dict:
+        """Serial-crystallography-style orientation seeding from Bragg spots.
+
+        Uses ONLY the data and the already-fitted peak model (its reciprocal
+        lattice from :meth:`fit_peak_basis` -- no reference tables): extracts
+        spot maxima from every pattern, lifts them to 3D lab k via the tilt
+        axes, and sequentially RANSACs rotations that map the pooled cloud
+        onto the fitted comb (strongest-pair hypotheses, Kabsch, inlier
+        refinement, inlier removal between rounds). Each spot is then labeled
+        by its best rotation, labels vote onto voxels along the rays that
+        crossed them, and every voxel's orientation is initialized to its
+        winning rotation (~10 deg accuracy; the normal refinement takes it
+        sub-degree). Replaces sweep-based discovery: seconds of geometry
+        instead of many exact-forward sweeps.
+
+        Returns ``{"n_orient", "rotations", "n_spots", "voted"}``.
+        """
+        import scipy.ndimage as ndi
+        assert isinstance(self.basis_inr, _PeakBasis), "run fit_peak_basis first"
+        det_r, det_c = self.det_shape
+        c0r, c0c = det_r // 2, det_c // 2
+        dk = float(self.k_sampling[2])
+        yy, xx = np.mgrid[:det_r, :det_c]
+        beam = np.hypot(yy - c0r, xx - c0c) < max(3.0, self.probe_k_max / dk * 2)
+        spots = []
+        n_row, n_col = scan_shape
+        for ti, t in enumerate(tilts_deg):
+            u, v, w = (x.cpu().numpy() for x in self.tilt_axes(float(t)))
+            D = torch.fft.fftshift(measurements[ti], dim=(-2, -1)).cpu().numpy()
+            for r_ in range(n_row):
+                for cc in range(n_col):
+                    m = np.where(beam, 0.0, D[r_, cc])
+                    if m.max() <= 0:
+                        continue
+                    mx = (m == ndi.maximum_filter(m, size=3)) & (m > spot_rel * m.max())
+                    for i, j in np.argwhere(mx):
+                        if i in (0, det_r - 1) or j in (0, det_c - 1):
+                            continue
+                        g = ((j - c0c) * dk) * u + ((i - c0r) * dk) * v
+                        if np.linalg.norm(g) > g_min:
+                            spots.append((ti, r_ * n_col + cc, g, m[i, j]))
+        if not spots:
+            return {"n_orient": 0, "rotations": [], "n_spots": 0, "voted": 0}
+        G_all = np.array([s[2] for s in spots])
+        I_all = np.array([s[3] for s in spots])
+        with torch.no_grad():
+            ref = (self.basis_inr.hkl @ self.basis_inr.B_rec).cpu().numpy()
+        kmax = self.sphere_radius_pix * min(self.k_sampling)
+        ref = ref[np.linalg.norm(ref, axis=1) <= 0.98 * kmax]
+        Lref = np.linalg.norm(ref, axis=1)
+
+        def kabsch(P, Q):
+            U, _, Vt = np.linalg.svd(P.T @ Q)
+            return U @ np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))]) @ Vt
+
+        def count(Gc, Rm):
+            return np.linalg.norm((Gc @ Rm)[:, None] - ref[None],
+                                  axis=-1).min(axis=1) < tol
+
+        def match(Gc, Ic):
+            order = np.argsort(-Ic)[:16]
+            best, tried = (None, -1), 0
+            for oi in range(len(order)):
+                for oj in range(oi + 1, len(order)):
+                    gi, gj = Gc[order[oi]], Gc[order[oj]]
+                    if np.linalg.norm(np.cross(gi, gj)) < 0.05 or tried > 400:
+                        continue
+                    li, lj = np.linalg.norm(gi), np.linalg.norm(gj)
+                    ang = np.dot(gi, gj) / (li * lj)
+                    for a_i in np.where(np.abs(Lref - li) < tol)[0]:
+                        for b_i in np.where(np.abs(Lref - lj) < tol)[0]:
+                            ca = np.dot(ref[a_i], ref[b_i]) / (Lref[a_i] * Lref[b_i])
+                            if abs(ca - ang) > 0.07:
+                                continue
+                            tried += 1
+                            Rm = kabsch(np.stack([gi, gj, np.cross(gi, gj)]),
+                                        np.stack([ref[a_i], ref[b_i],
+                                                  np.cross(ref[a_i], ref[b_i])]))
+                            n = int(count(Gc, Rm).sum())
+                            if n > best[1]:
+                                best = (Rm, n)
+            Rm = best[0]
+            if Rm is None:
+                return None, None
+            for _ in range(2):
+                m = count(Gc, Rm)
+                if m.sum() < 3:
+                    break
+                nn = np.linalg.norm((Gc[m] @ Rm)[:, None] - ref[None],
+                                    axis=-1).argmin(1)
+                Rm = kabsch(Gc[m], ref[nn])
+            return Rm, count(Gc, Rm)
+
+        key = np.round(G_all / 0.02).astype(int)
+        _, uidx = np.unique(key, axis=0, return_index=True)
+        Gd, Id = G_all[uidx], I_all[uidx]
+        R_hats = []
+        inliers = []
+        act = np.ones(len(Gd), bool)
+        for _ in range(max_grains):
+            if act.sum() < 6:
+                break
+            Rm, m = match(Gd[act], Id[act])
+            if Rm is None or m.sum() < min_inliers:
+                break
+            R_hats.append(Rm)
+            inliers.append(int(m.sum()))
+            idx = np.where(act)[0]
+            act[idx[m]] = False
+        voted = 0
+        if R_hats:
+            lab = np.full(len(spots), -1)
+            d_each = np.stack([np.linalg.norm((G_all @ Rm)[:, None] - ref[None],
+                                              axis=-1).min(1) for Rm in R_hats])
+            ok = d_each.min(0) < tol
+            lab[ok] = d_each[:, ok].argmin(0)
+            vox_rays, _ = self._local_ray_map(tilts_deg, scan_shape, scan_step)
+            votes = np.zeros((self.n_voxels, len(R_hats)))
+            by_ray = {}
+            for si, (ti, p, g, inten) in enumerate(spots):
+                if lab[si] >= 0:
+                    by_ray.setdefault((ti, p), []).append((lab[si], inten))
+            for vi, rays in enumerate(vox_rays):
+                for (ti, p) in rays:
+                    for (li, inten) in by_ray.get((ti, p), []):
+                        votes[vi, li] += inten
+            with torch.no_grad():
+                M = torch.zeros(self.n_voxels, 3, 3)
+                for vi in range(self.n_voxels):
+                    ci = int(votes[vi].argmax()) if votes[vi].max() > 0 else 0
+                    M[vi] = torch.as_tensor(R_hats[ci], dtype=torch.float32)
+                self.angles.M.copy_((M + 0.01 * torch.randn(self.n_voxels, 3, 3))
+                                    .to(self.device))
+                voted = int((votes.max(1) > 0).sum())
+            self._opt = None          # orientations moved discontinuously
+        return {"n_orient": len(R_hats), "rotations": R_hats,
+                "inliers": inliers, "n_spots": len(spots), "voted": voted}
+
     def adapt_peaks(self, reference: torch.Tensor | None = None,
                     prune: float = 0.02, birth: int = 0,
                     birth_frac: float = 0.1) -> dict:
