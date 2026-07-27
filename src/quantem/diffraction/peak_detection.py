@@ -1,6 +1,10 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+
+from quantem.core.datastructures.dataset3d import Dataset3d
+from scipy.ndimage import map_coordinates
+from tqdm import tqdm
 from typing import List, Tuple
 from scipy.spatial import cKDTree
 from scipy.ndimage import gaussian_filter, maximum_filter, grey_dilation, map_coordinates
@@ -750,3 +754,133 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
         plt.show()
     
     return (float(central_beam_coords[0]), float(central_beam_coords[1]))
+
+
+# ---------------------------------------------------------------------------
+# Model-based detection: input preparation and output post-processing
+#
+# The two ends of a CNN peak-detection pass. Neither needs the analysis object --
+# one takes the target shape, the other takes the network's two output channels --
+# so they sit beside the blob detection and refinement they feed into.
+# ---------------------------------------------------------------------------
+
+
+def resize_images_for_model(final_shape, images, device: str = "cuda:0", initial_chunk_size: int = 100, show_progress=False):
+    # Handle Dataset objects - extract array
+    if hasattr(images, 'array'):
+        images = images.array
+    elif isinstance(images, Dataset3d):
+        # If it's a Dataset3d, get the underlying array
+        images = np.array([images[i].array for i in range(images.shape[0])])
+    
+    N, Qy, Qx = images.shape
+    scale_factor = (final_shape[0] * final_shape[1]) / (Qy * Qx)
+    resized_data = np.zeros((N, final_shape[0], final_shape[1]))
+    
+    chunk_size = initial_chunk_size
+    i = 0
+    
+    with tqdm(total=N, desc='images', disable=not show_progress) as pbar:
+        while i < N:
+            try:
+                # Determine the end index for this chunk
+                end_idx = min(i + chunk_size, N)
+                chunk = images[i:end_idx]
+                
+                # Process chunk on GPU
+                inp = torch.tensor(chunk, dtype=torch.float32).to(device)
+                inp = torch.nn.functional.interpolate(
+                    inp.unsqueeze(1),  # Add channel dimension
+                    size=final_shape, 
+                    mode='bilinear', 
+                    align_corners=False
+                ) * scale_factor
+                
+                resized_data[i:end_idx, :, :] = inp.squeeze(1).detach().cpu().numpy()
+                
+                # Clear GPU cache
+                del inp
+                if 'cuda' in device:
+                    torch.cuda.empty_cache()
+                
+                # Update progress and move to next chunk
+                pbar.update(end_idx - i)
+                i = end_idx
+                
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    # Clear cache and reduce chunk size
+                    if 'cuda' in device:
+                        torch.cuda.empty_cache()
+                    
+                    chunk_size = max(1, chunk_size // 2)
+                    print(f"\nGPU OOM! Reducing chunk size to {chunk_size}")
+                    
+                    if chunk_size == 1:
+                        # If even single image fails, fall back to CPU
+                        print("Falling back to CPU processing")
+                        device = "cpu"
+                else:
+                    raise e
+    
+    return resized_data
+
+
+def peaks_from_model_output(position_map, intensity_map, sigma=1.0, threshold=0.25, show=False):
+    """Process a single 2D image"""
+    # Find peaks with subpixel-refinement
+    peak_coords, peak_position_signal_intensities, refinement_success = detect_blobs(
+        position_map,
+        sigma=sigma,  # Sigma for Gaussian smoothing used in processing
+        threshold=threshold,  # Threshold for strength of peak position signal to be valid peak
+    )
+
+    # If no peaks found, return empty lists
+    if len(peak_coords) == 0:
+        return np.array([]), np.array([])
+
+    # map_coordinates expects coordinates in (row, col) = (y, x) order
+    # peak_coords is already in [row, col] format from detect_blobs
+    interpolated_intensities = map_coordinates(
+        intensity_map, 
+        peak_coords.T,  # Transpose to get [[all_y], [all_x]]
+        order=1,  # 1 = bilinear interpolation
+        mode='nearest'  # How to handle edges
+    )
+    
+    # Optional: filter out peaks that were not successfully refined
+    if np.any(refinement_success):
+        pass
+    
+    if show:
+        # Peak positions only
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.imshow(position_map, cmap='gray', alpha=0.8)
+        ax.set_title("Input Position Map with Marked Peaks")
+        ax.scatter(peak_coords[:, 1], peak_coords[:, 0], s=10, c='r', label="Peaks")
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # Peak positions with color representing intensity
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(position_map, cmap='gray', alpha=0.8)
+        scatter = ax.scatter(
+            peak_coords[:, 1],  # x coordinates
+            peak_coords[:, 0],  # y coordinates
+            c=interpolated_intensities,      # color by intensity
+            s=10,
+            cmap='turbo',    
+            edgecolors='black', # white border for visibility
+            linewidths=2,
+            alpha=0.9,
+            marker='o'
+        )
+        cbar = plt.colorbar(scatter, ax=ax)
+        cbar.set_label('Intensity', fontsize=12)
+        ax.set_title('Peak Positions and Intensities', fontsize=14)
+        ax.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+    return peak_coords, interpolated_intensities
