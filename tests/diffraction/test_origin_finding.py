@@ -8,16 +8,19 @@ import matplotlib.pyplot as plt
 from quantem.core.datastructures import Vector
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 import quantem.diffraction.bragg_peaks as bragg_peaks_module
+import quantem.diffraction.peak_visualization as peak_visualization_module
 from quantem.diffraction.bragg_peaks import (
     BraggPeaksPolymer,
     _central_peak_index,
     _display_center,
+    _polar_peak_bins,
+    _zoom_peak_overlay,
+)
+from quantem.diffraction.peak_visualization import (
     _intensity_display_limits,
     _mean_intensity_map,
     _normalized_dp,
-    _polar_peak_bins,
     _resolve_intensity_map,
-    _zoom_peak_overlay,
 )
 from quantem.diffraction.polar_transform import (
     find_origin,
@@ -430,9 +433,10 @@ def test_bragg_plotting_and_save_smoke(monkeypatch, tmp_path):
         fn(**{name: widget.value for name, widget in controls.items()})
         return bragg_peaks_module.widgets.Output()
 
-    monkeypatch.setattr(bragg_peaks_module, "interactive_output", fake_interactive_output)
-    monkeypatch.setattr(bragg_peaks_module, "display", lambda *args, **kwargs: None, raising=False)
-    monkeypatch.setattr(bragg_peaks_module, "clear_output", lambda *args, **kwargs: None)
+    for module in (bragg_peaks_module, peak_visualization_module):
+        monkeypatch.setattr(module, "interactive_output", fake_interactive_output, raising=False)
+        monkeypatch.setattr(module, "display", lambda *args, **kwargs: None, raising=False)
+        monkeypatch.setattr(module, "clear_output", lambda *args, **kwargs: None, raising=False)
 
     bp.plot_interactive_image_map(ry=0, rx=0, show_polar=False)
     bp.plot_interactive_peak_map(ry=0, rx=0, show_polar=True)
