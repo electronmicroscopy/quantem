@@ -35,7 +35,7 @@ class ScanMaskEditor:
     scan image.
     """
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
     GEOMETRIES = ("circle", "ellipse", "square", "rectangle")
 
     def __init__(
@@ -48,6 +48,7 @@ class ScanMaskEditor:
         initial_geometry="circle",
         initial_size_x=None,
         initial_size_y=None,
+        initial_angle=None,
         reference_image=None,
         state_path=None,
         overlay_alpha=0.28,
@@ -79,6 +80,8 @@ class ScanMaskEditor:
         geometry = str(initial_geometry).lower()
         size_x = radius if initial_size_x is None else int(initial_size_x)
         size_y = radius if initial_size_y is None else int(initial_size_y)
+        # Rotation, degrees anticlockwise; wrapped since 180 is the same selection as 0.
+        angle = 0.0 if initial_angle is None else float(initial_angle) % 180.0
         loaded_mask = None
         if self.state_path is not None and self.state_path.is_file():
             state = self._read_state(self.state_path)
@@ -87,6 +90,7 @@ class ScanMaskEditor:
             geometry = state["geometry"]
             size_x = state["size_x"]
             size_y = state["size_y"]
+            angle = state["angle"]
             loaded_mask = state["mask"]
             self._loaded = True
             self._saved = True
@@ -99,7 +103,7 @@ class ScanMaskEditor:
             loaded_mask.copy()
             if loaded_mask is not None
             else self._geometry_mask(
-                center_row, center_column, geometry, size_x, size_y
+                center_row, center_column, geometry, size_x, size_y, angle
             )
         )
 
@@ -162,6 +166,17 @@ class ScanMaskEditor:
             style={"description_width": "68px"},
             layout=widgets.Layout(width="375px"),
         )
+        self.angle_slider = widgets.FloatSlider(
+            value=angle,
+            min=0.0,
+            max=180.0,
+            step=1.0,
+            description="Angle",
+            continuous_update=True,
+            readout=False,
+            style={"description_width": "55px"},
+            layout=widgets.Layout(width="375px"),
+        )
         # Historical public attribute retained for callers that customize it.
         self.radius_slider = self.size_x_slider
         self.x_input = widgets.BoundedIntText(
@@ -195,6 +210,15 @@ class ScanMaskEditor:
             description="Y radius",
             style={"description_width": "58px"},
             layout=widgets.Layout(width="140px"),
+        )
+        self.angle_input = widgets.BoundedFloatText(
+            value=angle,
+            min=0.0,
+            max=180.0,
+            step=1.0,
+            description="Angle deg",
+            style={"description_width": "70px"},
+            layout=widgets.Layout(width="150px"),
         )
         self.radius_input = self.size_x_input
 
@@ -299,6 +323,8 @@ class ScanMaskEditor:
         self.y_input.observe(self._on_y_input, names="value")
         self.size_x_input.observe(self._on_size_x_input, names="value")
         self.size_y_input.observe(self._on_size_y_input, names="value")
+        self.angle_slider.observe(self._on_angle_slider, names="value")
+        self.angle_input.observe(self._on_angle_input, names="value")
         self.apply_button.on_click(lambda _: self.apply())
         self.save_button.on_click(lambda _: self.save())
         self.center_button.on_click(
@@ -308,7 +334,7 @@ class ScanMaskEditor:
         self.reset_button.on_click(lambda _: self._restore_initial())
 
         self._initial_geometry = (
-            center_column, center_row, geometry, size_x, size_y
+            center_column, center_row, geometry, size_x, size_y, angle
         )
         self._initial_mask = self._preview_mask.copy()
         # A loaded/default mask is immediately usable by Run All. Slider edits
@@ -355,6 +381,13 @@ class ScanMaskEditor:
             ],
             layout=widgets.Layout(align_items="center", width="500px"),
         )
+        self.angle_row = widgets.HBox(
+            [
+                widgets.Box(layout=widgets.Layout(width="52px")),
+                self.angle_slider,
+            ],
+            layout=widgets.Layout(align_items="center", width="500px"),
+        )
         x_row = widgets.HBox(
             [
                 widgets.Box(layout=widgets.Layout(width="52px")),
@@ -369,6 +402,7 @@ class ScanMaskEditor:
                 self.size_input_row,
                 self.size_x_row,
                 self.size_y_row,
+                self.angle_row,
                 plot_row,
                 x_row,
                 self.status,
@@ -413,6 +447,11 @@ class ScanMaskEditor:
         if self.geometry in {"circle", "square"}:
             return self.size_x
         return int(self.size_y_slider.value)
+
+    @property
+    def angle(self):
+        """Rotation of the selection, degrees anticlockwise. Always 0 for a circle."""
+        return 0.0 if self.geometry == "circle" else float(self.angle_slider.value)
 
     @property
     def mask(self):
@@ -508,10 +547,20 @@ class ScanMaskEditor:
                 f"{maximum_radius} for scan shape {self.scan_shape}."
             )
 
-    def _geometry_mask(self, row, column, geometry, size_x, size_y):
+    def _geometry_mask(self, row, column, geometry, size_x, size_y, angle=0.0):
+        """Boolean mask for one geometry, rotated ``angle`` degrees anticlockwise.
+
+        The shape is rotated by rotating the sampling grid the other way, so the
+        axis-aligned inside-tests below are unchanged. A circle is invariant, so
+        the rotation is skipped for it.
+        """
         yy, xx = np.ogrid[: self.scan_shape[0], : self.scan_shape[1]]
         dy = yy - row
         dx = xx - column
+        if angle and geometry != "circle":
+            radians = np.deg2rad(float(angle))
+            cos, sin = np.cos(radians), np.sin(radians)
+            dx, dy = dx * cos + dy * sin, -dx * sin + dy * cos
         if geometry == "circle":
             return dy**2 + dx**2 <= size_x**2
         if geometry == "ellipse":
@@ -554,10 +603,10 @@ class ScanMaskEditor:
             with np.load(path, allow_pickle=False) as state:
                 version = int(state["schema_version"])
                 shape = tuple(int(v) for v in state["scan_shape"])
-                if version not in {1, self.SCHEMA_VERSION}:
+                if version not in {1, 2, self.SCHEMA_VERSION}:
                     raise ValueError(
                         f"Unsupported scan-mask schema {version}; expected "
-                        f"1 or {self.SCHEMA_VERSION}."
+                        f"1, 2 or {self.SCHEMA_VERSION}."
                     )
                 if shape != self.scan_shape:
                     raise ValueError(
@@ -577,12 +626,15 @@ class ScanMaskEditor:
                     geometry = str(state["geometry"].item())
                     size_x = int(state["size_x"])
                     size_y = int(state["size_y"])
+                # Rotation arrived in schema 3; older files are axis-aligned.
+                angle = float(state["angle"]) if version >= 3 else 0.0
                 return {
                     "center_row": int(state["center_row"]),
                     "center_column": int(state["center_column"]),
                     "geometry": geometry,
                     "size_x": size_x,
                     "size_y": size_y,
+                    "angle": angle,
                     "mask": mask,
                 }
         except (OSError, KeyError) as exc:
@@ -596,6 +648,7 @@ class ScanMaskEditor:
         geometry=None,
         size_x=None,
         size_y=None,
+        angle=None,
     ):
         self._syncing = True
         try:
@@ -619,6 +672,10 @@ class ScanMaskEditor:
             if size_y is not None:
                 self.size_y_slider.value = int(size_y)
                 self.size_y_input.value = int(size_y)
+            if angle is not None:
+                wrapped = float(angle) % 180.0
+                self.angle_slider.value = wrapped
+                self.angle_input.value = wrapped
             if self.geometry in {"circle", "square"}:
                 self.size_y_slider.value = self.size_x
                 self.size_y_input.value = self.size_x
@@ -673,6 +730,7 @@ class ScanMaskEditor:
                 radius=np.asarray(self.radius, dtype=np.int64),
                 size_x=np.asarray(self.size_x, dtype=np.int64),
                 size_y=np.asarray(self.size_y, dtype=np.int64),
+                angle=np.asarray(self.angle, dtype=np.float64),
                 scan_shape=np.asarray(self.scan_shape, dtype=np.int64),
                 sampling=sampling,
                 units=units,
@@ -689,13 +747,14 @@ class ScanMaskEditor:
         plt.close(self.figure)
 
     def _restore_initial(self):
-        x, y, geometry, size_x, size_y = self._initial_geometry
+        x, y, geometry, size_x, size_y, angle = self._initial_geometry
         self.set_mask(
             x=x,
             y=y,
             geometry=geometry,
             size_x=size_x,
             size_y=size_y,
+            angle=angle,
         )
         self._preview_mask = self._initial_mask.copy()
         self._dirty = True
@@ -808,9 +867,29 @@ class ScanMaskEditor:
         self._syncing = False
         self._update_preview()
 
+    def _on_angle_slider(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.angle_input.value = float(change["new"])
+        finally:
+            self._syncing = False
+        self._update_preview()
+
+    def _on_angle_input(self, change):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            self.angle_slider.value = float(change["new"])
+        finally:
+            self._syncing = False
+        self._update_preview()
+
     def _update_preview(self):
         self._preview_mask = self._geometry_mask(
-            self.y, self.x, self.geometry, self.size_x, self.size_y
+            self.y, self.x, self.geometry, self.size_x, self.size_y, self.angle
         )
         self._dirty = True
         self._saved = False
@@ -825,6 +904,9 @@ class ScanMaskEditor:
             "rectangle": ("Half-width", "Half-height"),
         }
         x_label, y_label = labels[self.geometry]
+        rotatable = self.geometry != "circle"
+        for control in (self.angle_slider, self.angle_input, self.angle_row):
+            control.layout.display = "" if rotatable else "none"
         self.size_x_slider.description = x_label
         self.size_x_input.description = x_label
         if y_label is None:
@@ -854,6 +936,7 @@ class ScanMaskEditor:
                 (self.x, self.y),
                 width=2 * self.size_x,
                 height=2 * size_y,
+                angle=self.angle,
                 **style,
             )
         else:
@@ -862,6 +945,9 @@ class ScanMaskEditor:
                 (self.x - self.size_x - 0.5, self.y - size_y - 0.5),
                 width=2 * self.size_x + 1,
                 height=2 * size_y + 1,
+                angle=self.angle,
+                # Rotate about the selection centre, not the corner the xy names.
+                rotation_point="center",
                 **style,
             )
         self.ax.add_patch(artist)
