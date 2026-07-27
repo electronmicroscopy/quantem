@@ -373,3 +373,61 @@ def test_min_peaks_per_arm_combines_with_min_matches():
                                 min_matches=3, min_peaks_per_arm=2),
         theta_period_deg=180.0)
     assert strict.flagged_peaks_count_map[0, 0] == 0
+
+
+def _folded_with_unfolded(pairs):
+    """pairs: list of (folded_deg, unfolded_deg) as polar_transform_peaks records them."""
+    polar = Vector.from_shape(
+        shape=(1, 1),
+        fields=["r_invA", "theta", "theta_unfolded"],
+        units=["1/A", "rad", "rad"],
+    )
+    intensity = Vector.from_shape(shape=(1, 1), fields=["intensities"], units=["normalized"])
+    polar[0, 0] = np.column_stack([
+        np.full(len(pairs), 1.61),
+        np.deg2rad([f for f, _ in pairs]),
+        np.deg2rad([u for _, u in pairs]),
+    ])
+    intensity[0, 0] = np.full((len(pairs), 1), 0.9)
+    return polar, intensity
+
+
+def test_require_friedel_pair_distinguishes_a_true_pair_from_two_near_peaks():
+    """min_peaks_per_arm cannot tell these apart; the unfolded angle can."""
+    common = dict(intensity_cutoff=0.5, dtheta_deg=6.0, min_matches=1,
+                  min_peaks_per_arm=2, require_friedel_pair=True)
+
+    # Genuinely opposed: 5 and 185 deg, both folding to 5.
+    true_pair, ints = _folded_with_unfolded([(5.0, 5.0), (5.0, 185.0)])
+    assert detect_ice(true_pair, ints, params=IceFlaggerParams(**common),
+                      theta_period_deg=180.0).flagged_peaks_count_map[0, 0] == 2
+
+    # Two peaks on the same side, 3 deg apart: same arm, same folded angle, not a pair.
+    near, ints2 = _folded_with_unfolded([(5.0, 5.0), (8.0, 8.0)])
+    assert detect_ice(near, ints2, params=IceFlaggerParams(**common),
+                      theta_period_deg=180.0).flagged_peaks_count_map[0, 0] == 0
+
+    # Without the strict test, min_peaks_per_arm=2 accepts the near pair.
+    loose = dict(common, require_friedel_pair=False)
+    assert detect_ice(near, ints2, params=IceFlaggerParams(**loose),
+                      theta_period_deg=180.0).flagged_peaks_count_map[0, 0] == 2
+
+
+def test_require_friedel_pair_without_the_field_fails_clearly():
+    polar, intensity = _folded([5.0, 5.0])           # no theta_unfolded column
+    with pytest.raises(ValueError, match="theta_unfolded"):
+        detect_ice(
+            polar, intensity,
+            params=IceFlaggerParams(intensity_cutoff=0.5, require_friedel_pair=True),
+            theta_period_deg=180.0)
+
+
+def test_unfolded_field_is_optional_when_not_required():
+    """Vectors predating theta_unfolded still work for everything else."""
+    polar, intensity = _folded([5.0, 5.0])
+    result = detect_ice(
+        polar, intensity,
+        params=IceFlaggerParams(intensity_cutoff=0.5, dtheta_deg=6.0,
+                                min_matches=1, min_peaks_per_arm=2),
+        theta_period_deg=180.0)
+    assert result.flagged_peaks_count_map[0, 0] == 2

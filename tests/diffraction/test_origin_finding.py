@@ -259,9 +259,13 @@ def test_bragg_peak_polar_transform_inverts_ellipse_mapping():
     )
 
     got = polar[0, 0].array
-    assert got.shape == (1, 3)
+    # r_pixels, theta, r_invA, theta_unfolded
+    assert polar.fields == ["r_pixels", "theta", "r_invA", "theta_unfolded"]
+    assert got.shape == (1, 4)
     assert got[0, 0] == pytest.approx(3.0)
     assert got[0, 1] == pytest.approx(0.0)
+    # Unfolded theta agrees with theta here because two_fold_symmetry=False.
+    assert got[0, 3] == pytest.approx(0.0)
 
 
 def _bragg_orientation_histogram(theta_values, theta_step_deg=90, normalize_stack=False):
