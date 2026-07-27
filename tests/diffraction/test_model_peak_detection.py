@@ -46,9 +46,22 @@ def test_resize_images_shape_and_intensity_convention(bp):
     Bilinear interpolation to half the linear size already divides the sum by 4
     (each output pixel is the mean of its neighbourhood). The code then multiplies
     by ``scale_factor = (16*16)/(32*32) = 1/4`` as well, so the total comes out
-    16x smaller, not preserved. Conserving counts would require multiplying by 4,
-    the reciprocal. Whether that is intended presumably depends on the convention
-    the network was trained under -- pinned here as-is, not changed.
+    16x smaller. Conserving counts would need the reciprocal, x4.
+
+    This has no effect on results, and not merely because training and inference
+    share the pipeline: the factor is *annihilated* downstream. Resizing happens
+    before normalization everywhere, and every normalization strategy here begins
+    with a per-image min-max -- ``(x - min) / (max - min)`` is invariant under any
+    positive uniform scaling, since min and max scale with it. Both reported
+    intensity fields are post-normalization too (one from the model's intensity
+    channel, one sampled from the already-normalized input), so no pre-normalization
+    absolute intensity reaches any output.
+
+    Worth keeping in mind only as latent fragility: ``scale_factor`` depends on the
+    input detector size, so it is not constant across datasets. Harmless under any
+    scale-equivariant normalization (per-image min-max and median/IQR both are), but
+    a normalization with a fixed absolute divisor would make it matter, and matter
+    differently per dataset.
     """
     images = np.stack([_blob((32, 32)), _blob((32, 32), centres=((5.0, 5.0),))])
     resized = bp.resize_images(images, device="cpu", initial_chunk_size=2)
