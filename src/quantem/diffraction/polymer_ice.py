@@ -1,4 +1,32 @@
-"""Ice-peak detection for polymer diffraction analyses."""
+"""Ice-peak detection for polymer diffraction analyses.
+
+Crystalline ice contaminating a polymer 4D-STEM scan produces six-fold sets of
+reflections. Separating them from the polymer signal is awkward because the
+strongest ice ring (d ~ 3.66 A) sits on top of the pi-pi stacking peak, so q
+alone cannot do it. ``detect_ice`` therefore tests each peak against four
+criteria in turn, cheapest first:
+
+1. **q window** -- within ``dq_invA`` of ``q_target_invA``.
+2. **Sharpness** -- radial/annular FWHM measured from the polar volume against
+   the ``max_width_*`` ceilings. Ice is annularly sharp, both as compact dots
+   and as radial streaks; polymer at the same q is an annularly broad arc, so
+   the annular ceiling is the discriminating one.
+3. **Intensity** -- at or above ``intensity_cutoff`` (or a scan-wide percentile).
+4. **Six-fold geometry** -- the surviving candidates must align to a lattice of
+   arms 60 degrees apart, with at least ``min_matches`` arms populated. This is
+   the only criterion that tests structure rather than appearance, and the one
+   that separates ice from a sharp polymer reflection.
+
+Sharpness is applied before the geometry search so broad peaks cannot drag the
+lattice orientation around. Several passes can run per pattern
+(``max_crystallites``) for scans holding crystallites at unrelated orientations.
+
+Two properties of the input matter throughout. ``process_polar(two_fold_symmetry
+=True)`` folds theta to [0, 180), collapsing each Friedel pair onto one angle --
+so only three of the six arms are distinguishable and ``min_matches`` cannot
+exceed 3. The unfolded angle survives in the ``theta_unfolded`` field, which
+``require_friedel_pair`` uses to demand genuinely opposed spots.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +35,7 @@ from typing import Literal
 
 import numpy as np
 from matplotlib.colors import LogNorm
+from scipy.ndimage import gaussian_filter1d
 from matplotlib.patches import Rectangle
 from numpy.typing import NDArray
 
@@ -26,29 +55,46 @@ class IceFlaggerParams:
     conservative: bool = True
 
     # --- Sharpness gate ---------------------------------------------------
-    # Ice reflections are small and sharp; polymer signal is a larger dot or a
-    # broad diffuse region. Widths are full-width-at-half-maximum measured on
-    # the polar intensity volume at each candidate's (r, theta), radially in
-    # 1/A and annularly in degrees. Both ceilings default to None, which
-    # disables the gate entirely and reproduces the previous behaviour.
+    # Ice reflections are annularly sharp -- both the compact dots and the radial
+    # streaks, which are narrow in theta and extended in q. Polymer signal at the
+    # same q is an annularly broad arc. Widths are full-width-at-half-maximum
+    # measured on the polar intensity volume at each candidate's (r, theta).
+    #
+    # max_width_theta_deg is the discriminating one: it separates ice from polymer
+    # for dots and streaks alike. max_width_r_invA is available but rarely useful --
+    # ice dots and polymer arcs have similar radial widths, so it separates streaks
+    # from dots (a distinction within ice) rather than ice from polymer. Ceilings
+    # are ANDed; None on either leaves that axis ungated, which is the default.
     max_width_r_invA: float | None = None
     max_width_theta_deg: float | None = None
-    # "both"   -- a candidate must be sharp radially AND annularly (compact dots).
-    # "either" -- sharp in one direction is enough, which also keeps the thin
-    #             streaks that are narrow across their length but not along it.
-    sharpness_mode: Literal["both", "either"] = "both"
     # Half-width of the search window used to measure each FWHM. A candidate
     # whose profile never falls to half maximum inside the window is reported
     # as wider than the window, i.e. broad, and is rejected.
     sharpness_window_r_invA: float = 0.06
-    sharpness_window_theta_deg: float = 40.0
+    # Must comfortably exceed the broadest feature you want to measure: a window that the
+    # feature fills makes the baseline below sit partway up the feature, which drives the
+    # half-maximum level up and reports the width as far too small. 90 degrees covers the
+    # whole folded annulus, so nothing saturates.
+    sharpness_window_theta_deg: float = 90.0
     # Local background level, as a quantile of the windowed profile. The half
     # maximum is taken above this, so a peak riding on the amorphous ring is
-    # measured against the ring rather than against zero.
-    sharpness_baseline_quantile: float = 0.25
+    # measured against the ring rather than against zero. Keep it low: a high
+    # quantile on a window containing a broad feature reads that feature as
+    # background and under-reports its width.
+    sharpness_baseline_quantile: float = 0.05
     # Bins of local argmax refinement, to absorb the sub-bin offset between a
     # detected peak position and the polar volume's sampling grid.
     sharpness_refine_bins: int = 2
+    # Noise robustness. A half-maximum walk that stops at the FIRST sample below
+    # half is fooled by a weak, diffuse arc: one downward fluctuation ends it a few
+    # bins out, so a broad noisy feature reports as narrow as a sharp one. The
+    # profile is Gaussian-smoothed with this sigma (in bins), and the crossing must
+    # stay below half for `sharpness_crossing_persistence` samples to count. The
+    # kernel width is then removed in quadrature -- exact for a Gaussian convolved
+    # with a Gaussian, which is why this is a Gaussian and not a boxcar. Set the
+    # sigma to 0 and the persistence to 1 for the raw first-crossing behaviour.
+    sharpness_smooth_sigma_bins: float = 1.0
+    sharpness_crossing_persistence: int = 3
 
     # --- Multiple crystallites -------------------------------------------
     # One pattern can contain several ice crystallites at unrelated orientations,
@@ -60,6 +106,55 @@ class IceFlaggerParams:
     # count as separate crystallites. None uses dtheta_deg, i.e. lattices that the
     # matcher could not tell apart anyway are not treated as distinct.
     min_phi_separation_deg: float | None = None
+
+    def __post_init__(self):
+        """Reject parameter values that could only ever produce nonsense.
+
+        These are cheap to check here and expensive to diagnose downstream, where
+        a bad value shows up as "nothing was flagged" rather than as an error.
+        """
+        positive = {
+            "dq_invA": self.dq_invA,
+            "dtheta_deg": self.dtheta_deg,
+            "sharpness_window_r_invA": self.sharpness_window_r_invA,
+            "sharpness_window_theta_deg": self.sharpness_window_theta_deg,
+        }
+        for name, value in positive.items():
+            if not value > 0:
+                raise ValueError(f"{name} must be positive; got {value!r}")
+        at_least_one = {
+            "min_matches": self.min_matches,
+            "min_peaks_per_arm": self.min_peaks_per_arm,
+            "max_crystallites": self.max_crystallites,
+            "sharpness_crossing_persistence": self.sharpness_crossing_persistence,
+        }
+        for name, value in at_least_one.items():
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1; got {value!r}")
+        optional_positive = {
+            "max_width_r_invA": self.max_width_r_invA,
+            "max_width_theta_deg": self.max_width_theta_deg,
+            "min_phi_separation_deg": self.min_phi_separation_deg,
+            "theta_period_deg": self.theta_period_deg,
+        }
+        for name, value in optional_positive.items():
+            if value is not None and not value > 0:
+                raise ValueError(f"{name} must be positive when set; got {value!r}")
+        if not 0.0 <= self.sharpness_baseline_quantile < 1.0:
+            raise ValueError(
+                "sharpness_baseline_quantile must be in [0, 1); got "
+                f"{self.sharpness_baseline_quantile!r}"
+            )
+        if self.sharpness_smooth_sigma_bins < 0:
+            raise ValueError(
+                "sharpness_smooth_sigma_bins must be non-negative; got "
+                f"{self.sharpness_smooth_sigma_bins!r}"
+            )
+        if self.intensity_cutoff_mode not in ("absolute", "percentile"):
+            raise ValueError(
+                "intensity_cutoff_mode must be 'absolute' or 'percentile'; got "
+                f"{self.intensity_cutoff_mode!r}"
+            )
     # Angular period of the peak thetas, in degrees. process_polar(two_fold_symmetry=True)
     # folds theta to [0, 180), collapsing every Friedel pair onto one angle, so only three
     # of the six lattice arms are distinguishable and min_matches cannot exceed 3. None lets
@@ -144,29 +239,74 @@ class IceDetectionResult:
         return out
 
 
-def _half_width_bins(profile: NDArray[np.floating], center: int, direction: int, half: float) -> float:
-    """Bins from ``center`` to where ``profile`` first falls to ``half``, interpolated.
+def _smooth_profile(profile: NDArray[np.floating], sigma_bins: float) -> NDArray[np.floating]:
+    """Gaussian smoothing along a windowed profile, with edge-clamped padding."""
 
-    Returns the window half-length when no crossing is found, so a profile that
-    never comes back down reads as at least as broad as the window.
+    if sigma_bins <= 0 or len(profile) < 3:
+        return profile
+    return gaussian_filter1d(profile, float(sigma_bins), mode="nearest", truncate=3.0)
+
+
+def _smoothing_fwhm_bins(sigma_bins: float) -> float:
+    """FWHM of the smoothing kernel, in bins.
+
+    Subtracted in quadrature from the measured width. A Gaussian convolved with a
+    Gaussian is exactly Gaussian with FWHM = sqrt(w^2 + k^2), so the correction is
+    exact rather than approximate -- unlike a boxcar, which leaves a residual bias.
     """
 
+    return 0.0 if sigma_bins <= 0 else 2.3548 * float(sigma_bins)
+
+
+def _half_width_bins(
+    profile: NDArray[np.floating],
+    center: int,
+    direction: int,
+    half: float,
+    persistence: int = 1,
+) -> float:
+    """Bins from ``center`` to where ``profile`` drops below ``half`` and stays there.
+
+    Requiring the crossing to persist for ``persistence`` samples is what stops a
+    single noise dip on a broad, weak feature from ending the walk early. Returns
+    the window half-length when no crossing is found, so a profile that never comes
+    back down reads as at least as broad as the window.
+    """
+
+    n = len(profile)
+    need = max(1, int(persistence))
     previous = float(profile[center])
-    for step in range(1, len(profile)):
+    for step in range(1, n):
         index = center + direction * step
-        if index < 0 or index >= len(profile):
+        if index < 0 or index >= n:
             return float(step - 1)
         value = float(profile[index])
         if not np.isfinite(value) or value <= half:
-            span = previous - value
-            fraction = (previous - half) / span if span > 0 else 0.0
-            return (step - 1) + float(np.clip(fraction, 0.0, 1.0))
+            run = True
+            for ahead in range(1, need):
+                probe = center + direction * (step + ahead)
+                if probe < 0 or probe >= n:
+                    break          # window edge: treat the run as sustained
+                nxt = float(profile[probe])
+                if np.isfinite(nxt) and nxt > half:
+                    run = False
+                    break
+            if run:
+                span = previous - value
+                fraction = (previous - half) / span if span > 0 else 0.0
+                return (step - 1) + float(np.clip(fraction, 0.0, 1.0))
         previous = value
-    return float(len(profile))
+    return float(n)
 
 
 def _profile_fwhm(
-    profile: NDArray[np.floating], center: int, *, baseline_quantile: float, refine_bins: int
+    profile: NDArray[np.floating],
+    center: int,
+    *,
+    baseline_quantile: float,
+    refine_bins: int,
+    smooth_sigma_bins: float = 0.0,
+    persistence: int = 1,
 ) -> tuple[float, int]:
     """FWHM of ``profile`` in bins about ``center``, plus the refined peak bin.
 
@@ -174,6 +314,12 @@ def _profile_fwhm(
     its end means "wider than the window" rather than "edge of the detector".
     """
 
+    finite = profile[np.isfinite(profile)]
+    if not len(finite):
+        return float("inf"), center
+    # Smooth first: the argmax refinement below must not latch onto a noise spike,
+    # which would raise the half-maximum level and end the walk prematurely.
+    profile = _smooth_profile(profile, smooth_sigma_bins)
     finite = profile[np.isfinite(profile)]
     if not len(finite):
         return float("inf"), center
@@ -186,9 +332,13 @@ def _profile_fwhm(
     if not np.isfinite(peak) or peak <= baseline:
         return float("inf"), center
     half = baseline + 0.5 * (peak - baseline)
-    left = _half_width_bins(profile, center, -1, half)
-    right = _half_width_bins(profile, center, +1, half)
-    return left + right, center
+    left = _half_width_bins(profile, center, -1, half, persistence)
+    right = _half_width_bins(profile, center, +1, half, persistence)
+    # Remove the smoothing kernel in quadrature so sharp peaks stay unbiased.
+    measured = left + right
+    kernel = _smoothing_fwhm_bins(smooth_sigma_bins)
+    deconvolved = np.sqrt(max(measured**2 - kernel**2, 0.0))
+    return float(deconvolved), center
 
 
 def measure_peak_widths(
@@ -222,6 +372,9 @@ def measure_peak_widths(
     # Window half-widths in bins; at least 2 so a FWHM is measurable at all.
     window_r = max(2, int(np.ceil(params.sharpness_window_r_invA / max(r_step, 1e-12))))
     window_theta = max(2, int(np.ceil(params.sharpness_window_theta_deg / max(theta_step_deg, 1e-12))))
+    # The annular axis wraps, so a window wider than the circle would repeat bins and let
+    # the outward walk run back into the peak it started from.
+    window_theta = min(window_theta, max(1, (n_theta - 1) // 2))
     theta_period = float(theta_axis[-1] - theta_axis[0]) + (theta_axis[1] - theta_axis[0])
 
     for index in range(radius.size):
@@ -241,6 +394,8 @@ def measure_peak_widths(
             window_theta,
             baseline_quantile=params.sharpness_baseline_quantile,
             refine_bins=params.sharpness_refine_bins,
+            smooth_sigma_bins=params.sharpness_smooth_sigma_bins,
+            persistence=params.sharpness_crossing_persistence,
         )
         theta_bin = int(theta_indices[min(refined, len(theta_indices) - 1)])
 
@@ -251,6 +406,8 @@ def measure_peak_widths(
             r_bin - low,
             baseline_quantile=params.sharpness_baseline_quantile,
             refine_bins=params.sharpness_refine_bins,
+            smooth_sigma_bins=params.sharpness_smooth_sigma_bins,
+            persistence=params.sharpness_crossing_persistence,
         )
         width_r[index] = fwhm_r * r_step
         width_theta[index] = fwhm_theta * theta_step_deg
@@ -274,9 +431,10 @@ def sharpness_mask(
 ) -> NDArray[np.bool_]:
     """Which peaks pass the configured width ceilings.
 
-    Public so a tuning preview can apply exactly the gate the flagger applies,
-    rather than reimplementing it. Non-finite widths fail any ceiling that is set,
-    and pass an axis with no ceiling.
+    The ceilings are ANDed; an axis with no ceiling passes everything, so setting
+    only ``max_width_theta_deg`` gates on annular sharpness alone. Public so a
+    tuning preview can apply exactly the gate the flagger applies, rather than
+    reimplementing it. Non-finite widths fail any ceiling that is set.
     """
 
     radial_ok = (
@@ -289,17 +447,7 @@ def sharpness_mask(
         if params.max_width_theta_deg is None
         else width_theta <= params.max_width_theta_deg
     )
-    if params.sharpness_mode == "both":
-        return radial_ok & annular_ok
-    if params.sharpness_mode == "either":
-        # With only one ceiling set, "either" would pass everything through the
-        # unset direction; fall back to the ceiling that was actually given.
-        if params.max_width_r_invA is None:
-            return annular_ok
-        if params.max_width_theta_deg is None:
-            return radial_ok
-        return radial_ok | annular_ok
-    raise ValueError("sharpness_mode must be 'both' or 'either'.")
+    return radial_ok & annular_ok
 
 
 def _angle_distance(

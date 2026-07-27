@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from quantem.core.datastructures import Vector
-from quantem.diffraction import IceFlaggerParams, detect_ice
+from quantem.diffraction import (IceFlaggerParams, detect_ice,
+                                 measure_peak_widths, sharpness_mask)
 
 
 def _vectors(shape=(1, 2)):
@@ -70,7 +71,7 @@ def test_misaligned_ragged_vectors_fail_clearly():
         )
 
 
-def _polar_volume(peaks, *, shape=(1, 1), n_r=120, n_theta=180, r_max=3.0):
+def _polar_volume(peaks, *, shape=(1, 1), n_r=600, n_theta=180, r_max=3.0):
     """Polar volume with a Gaussian blob per (q, theta_deg, width_q, width_deg)."""
     r_axis = np.linspace(0.0, r_max, n_r)
     theta_axis = np.linspace(0.0, np.pi, n_theta, endpoint=False)
@@ -133,24 +134,26 @@ def test_sharpness_gate_keeps_sharp_ice_and_spares_broad_peaks():
     assert gated.flagged_peaks_count_map[0, 0] == 0
 
 
-def test_either_mode_keeps_a_radially_sharp_streak():
-    """A streak is narrow across its width but long around the ring."""
-    streak = (1.61, 5.0, 0.04, 50.0)
-    polar_data = _polar_volume([streak])
-    polar, intensity = _vectors((1, 1))
-    polar[0, 0] = np.column_stack([[streak[0]], np.deg2rad([streak[1]])])
-    intensity[0, 0] = np.array([[0.9]])
-    common = dict(
-        intensity_cutoff=0.5, min_matches=1, dtheta_deg=6.0, q_target_invA=1.61,
-        max_width_r_invA=0.10, max_width_theta_deg=15.0,
-    )
-    both = detect_ice(polar, intensity, params=IceFlaggerParams(**common),
-                      polar_data=polar_data)
-    either = detect_ice(polar, intensity,
-                        params=IceFlaggerParams(**common, sharpness_mode="either"),
-                        polar_data=polar_data)
-    assert both.flagged_peaks_count_map[0, 0] == 0
-    assert either.flagged_peaks_count_map[0, 0] == 1
+def test_annular_only_gate_keeps_dots_and_radial_streaks():
+    """Ice is annularly sharp whether it is a dot or a radial streak.
+
+    A radial streak is narrow in theta and extended in q, so a radial ceiling
+    would reject it; gating on the annular width alone keeps both ice shapes and
+    still rejects the annularly broad polymer arc at the same q.
+    """
+    dot = (1.61, 5.0, 0.02, 5.0)
+    streak = (1.61, 5.0, 0.12, 5.0)
+    arc = (1.61, 5.0, 0.02, 30.0)
+    params = IceFlaggerParams(max_width_theta_deg=12.0, sharpness_window_r_invA=0.30)
+    for label, (q, theta_deg, width_q, width_deg), expected in (
+        ("dot", dot, True), ("streak", streak, True), ("arc", arc, False)
+    ):
+        polar_data = _polar_volume([(q, theta_deg, width_q, width_deg)])
+        width_r, width_theta = measure_peak_widths(
+            [q], [np.deg2rad(theta_deg)], polar_data["intensity"][0, 0],
+            polar_data["r_invA"][:, 0], polar_data["theta"][0, :], params=params,
+        )
+        assert bool(sharpness_mask(width_r, width_theta, params)[0]) is expected, label
 
 
 def test_sharpness_ceiling_without_polar_data_fails_clearly():
@@ -431,3 +434,130 @@ def test_unfolded_field_is_optional_when_not_required():
                                 min_matches=1, min_peaks_per_arm=2),
         theta_period_deg=180.0)
     assert result.flagged_peaks_count_map[0, 0] == 2
+
+
+def _annular_arc(fwhm_deg, q=0.27, theta_deg=45.0, n_theta=90, n_r=200, seed=0):
+    theta_axis = np.deg2rad(np.arange(0, 180, 180 / n_theta))
+    r_axis = np.linspace(0.0, 1.0, n_r)
+    grid_r, grid_t = np.meshgrid(r_axis, theta_axis, indexing="ij")
+    sigma_q = 0.02 / (2 * np.sqrt(2 * np.log(2)))
+    sigma_t = np.deg2rad(fwhm_deg) / (2 * np.sqrt(2 * np.log(2)))
+    delta = np.abs(grid_t - np.deg2rad(theta_deg))
+    delta = np.minimum(delta, np.pi - delta)
+    image = np.exp(-0.5 * (((grid_r - q) / sigma_q) ** 2 + (delta / sigma_t) ** 2))
+    image += np.random.default_rng(seed).normal(0, 0.02, image.shape)
+    return image, r_axis, theta_axis, q, theta_deg
+
+
+@pytest.mark.parametrize("true_fwhm", [6.0, 30.0, 60.0, 100.0])
+def test_annular_width_tracks_broad_arcs_not_just_sharp_ones(true_fwhm):
+    """The default window must not saturate: a broad arc has to read broad.
+
+    With a 40 degree window and a 0.25 baseline quantile, a 60 degree arc measured
+    ~37 degrees and a 100 degree arc ~39 -- both look sharper than a real threshold.
+    """
+    from quantem.diffraction.polymer_ice import measure_peak_widths
+
+    image, r_axis, theta_axis, q, theta_deg = _annular_arc(true_fwhm)
+    _, width_theta = measure_peak_widths(
+        [q], [np.deg2rad(theta_deg)], image, r_axis, theta_axis,
+        params=IceFlaggerParams(),
+    )
+    assert width_theta[0] == pytest.approx(true_fwhm, rel=0.15)
+
+
+def test_annular_window_cannot_wrap_onto_itself():
+    """A window wider than the annulus must be clamped, not allowed to repeat bins."""
+    from quantem.diffraction.polymer_ice import measure_peak_widths
+
+    image, r_axis, theta_axis, q, theta_deg = _annular_arc(6.0)
+    _, width_theta = measure_peak_widths(
+        [q], [np.deg2rad(theta_deg)], image, r_axis, theta_axis,
+        params=IceFlaggerParams(sharpness_window_theta_deg=10_000.0),
+    )
+    assert width_theta[0] == pytest.approx(6.0, rel=0.2)
+
+
+@pytest.mark.parametrize("amplitude,noise,true_fwhm", [
+    (1.0, 0.01, 5.0),    # sharp and clean
+    (1.0, 0.01, 40.0),   # broad and clean
+    (0.3, 0.05, 40.0),   # broad and weak -- the case that used to read as sharp
+])
+def test_annular_width_survives_noise(amplitude, noise, true_fwhm):
+    """A weak, diffuse arc must not measure as narrow as a sharp peak.
+
+    A half-maximum walk that stops at the first sample below half is ended early by
+    one downward fluctuation, so before smoothing + persistent crossings a true 40
+    degree arc at low SNR measured ~10-30 degrees.
+    """
+    from quantem.diffraction.polymer_ice import measure_peak_widths
+
+    n_theta = 90
+    theta_axis = np.deg2rad(np.arange(0, 180, 2.0))
+    r_axis = np.linspace(0.0, 1.0, 300)
+    grid_r, grid_t = np.meshgrid(r_axis, theta_axis, indexing="ij")
+    delta = np.abs(grid_t - np.deg2rad(45.0))
+    delta = np.minimum(delta, np.pi - delta)
+    sigma_t = np.deg2rad(true_fwhm) / 2.3548
+    image = amplitude * np.exp(
+        -0.5 * (((grid_r - 0.27) / (0.02 / 2.3548)) ** 2 + (delta / sigma_t) ** 2)
+    )
+    image += 0.3 * np.exp(-0.5 * ((grid_r - 0.27) / (0.05 / 2.3548)) ** 2)  # amorphous ring
+
+    measured = []
+    for seed in range(8):
+        noisy = image + np.random.default_rng(seed).normal(0, noise, image.shape)
+        _, width_theta = measure_peak_widths(
+            [0.27], [np.deg2rad(45.0)], noisy, r_axis, theta_axis,
+            params=IceFlaggerParams(),
+        )
+        measured.append(width_theta[0])
+    assert np.median(measured) == pytest.approx(true_fwhm, rel=0.25)
+
+
+def test_smoothing_is_deconvolved_so_sharp_peaks_stay_unbiased():
+    """The Gaussian kernel is removed in quadrature, exactly for Gaussian peaks."""
+    from quantem.diffraction.polymer_ice import measure_peak_widths
+
+    theta_axis = np.deg2rad(np.arange(0, 180, 2.0))
+    r_axis = np.linspace(0.0, 1.0, 300)
+    grid_r, grid_t = np.meshgrid(r_axis, theta_axis, indexing="ij")
+    delta = np.abs(grid_t - np.deg2rad(45.0))
+    delta = np.minimum(delta, np.pi - delta)
+    image = np.exp(-0.5 * (((grid_r - 0.27) / (0.02 / 2.3548)) ** 2
+                           + (delta / (np.deg2rad(6.0) / 2.3548)) ** 2))
+    smoothed, raw = (
+        measure_peak_widths([0.27], [np.deg2rad(45.0)], image, r_axis, theta_axis,
+                            params=p)[1][0]
+        for p in (IceFlaggerParams(),
+                  IceFlaggerParams(sharpness_smooth_sigma_bins=0.0,
+                                   sharpness_crossing_persistence=1))
+    )
+    # Deconvolution keeps the smoothed estimate within a bin of the raw one.
+    assert abs(smoothed - raw) < 2.0
+
+
+@pytest.mark.parametrize("kwargs,match", [
+    ({"dq_invA": 0}, "dq_invA must be positive"),
+    ({"dtheta_deg": -1}, "dtheta_deg must be positive"),
+    ({"min_matches": 0}, "min_matches must be at least 1"),
+    ({"min_peaks_per_arm": 0}, "min_peaks_per_arm must be at least 1"),
+    ({"max_crystallites": 0}, "max_crystallites must be at least 1"),
+    ({"sharpness_crossing_persistence": 0}, "sharpness_crossing_persistence"),
+    ({"max_width_theta_deg": 0}, "max_width_theta_deg must be positive when set"),
+    ({"sharpness_baseline_quantile": 1.0}, "must be in \\[0, 1\\)"),
+    ({"sharpness_smooth_sigma_bins": -1}, "must be non-negative"),
+    ({"intensity_cutoff_mode": "nope"}, "must be 'absolute' or 'percentile'"),
+])
+def test_invalid_params_are_rejected_at_construction(kwargs, match):
+    """A bad value here would otherwise surface as 'nothing was flagged'."""
+    with pytest.raises(ValueError, match=match):
+        IceFlaggerParams(**kwargs)
+
+
+def test_valid_edge_values_are_accepted():
+    IceFlaggerParams(
+        max_width_r_invA=None, max_width_theta_deg=None,
+        sharpness_baseline_quantile=0.0, sharpness_smooth_sigma_bins=0.0,
+        min_matches=1, min_peaks_per_arm=1, max_crystallites=1,
+    )
