@@ -71,6 +71,11 @@ class IceFlaggerParams:
     # Caveat: two peaks that merely fall within dtheta_deg/dq_invA of each other also
     # satisfy it; folding makes them indistinguishable from a true opposed pair.
     min_peaks_per_arm: int = 1
+    # Demand a genuine opposed pair on each arm: two peaks whose UNFOLDED angles differ
+    # by 180 +/- dtheta_deg. Unlike min_peaks_per_arm this cannot be satisfied by two
+    # peaks that merely sit close together, but it needs the "theta_unfolded" field that
+    # polar_transform_peaks records -- re-run it if polar_peaks predates that field.
+    require_friedel_pair: bool = False
 
 
 @dataclass(frozen=True)
@@ -310,6 +315,18 @@ def _angle_distance(
     return np.minimum(delta, period - delta)
 
 
+def _has_friedel_pair(unfolded_deg: NDArray[np.floating], tolerance_deg: float) -> bool:
+    """True when two of these peaks lie 180 degrees apart on the unfolded circle."""
+
+    finite = unfolded_deg[np.isfinite(unfolded_deg)]
+    if len(finite) < 2:
+        return False
+    # Separation of every ordered pair on the full circle; a Friedel pair is 180 apart.
+    delta = np.abs(np.mod(finite[:, None], 360.0) - np.mod(finite[None, :], 360.0))
+    delta = np.minimum(delta, 360.0 - delta)
+    return bool(np.any(np.abs(delta - 180.0) <= tolerance_deg))
+
+
 def _phi_distance(first: float, second: float) -> float:
     """Separation of two six-fold orientations, which live on a 0-60 degree wedge."""
 
@@ -370,6 +387,7 @@ def flag_ice_peaks_in_pattern(
     r_axis: NDArray[np.floating] | None = None,
     theta_axis: NDArray[np.floating] | None = None,
     theta_period_deg: float | None = None,
+    theta_unfolded_rad=None,
 ):
     """Flag peaks belonging to an aligned, possibly incomplete six-fold ice pattern.
 
@@ -437,6 +455,10 @@ def flag_ice_peaks_in_pattern(
     # because each arm and its Friedel partner share one angle.
     period = _resolve_theta_period(params, theta_period_deg)
     n_arms = max(1, int(round(period / 60.0)))
+    unfolded_deg = (
+        None if theta_unfolded_rad is None
+        else np.mod(np.rad2deg(np.asarray(theta_unfolded_rad, dtype=float)), 360.0)
+    )
     remaining = candidate_indices
     for _ in range(max(1, params.max_crystallites)):
         if not len(remaining):
@@ -469,6 +491,24 @@ def flag_ice_peaks_in_pattern(
         if len(good_arms) < params.min_matches:
             break
         aligned &= np.isin(closest, good_arms)
+        if params.require_friedel_pair:
+            # Keep only arms holding two peaks genuinely 180 degrees apart. Folding
+            # cannot tell that from two nearby peaks; the unfolded angle can.
+            if unfolded_deg is None:
+                raise ValueError(
+                    "require_friedel_pair needs the 'theta_unfolded' field on polar_peaks. "
+                    "Re-run polar_transform_peaks (or process_polar) to record it."
+                )
+            paired = [
+                arm for arm in good_arms
+                if _has_friedel_pair(
+                    unfolded_deg[remaining[aligned & (closest == arm)]], params.dtheta_deg
+                )
+            ]
+            if len(paired) < params.min_matches:
+                break
+            good_arms = np.asarray(paired, dtype=int)
+            aligned &= np.isin(closest, good_arms)
         lattice_bins = sorted(good_arms.tolist())
 
         result[remaining[aligned]] = True
@@ -584,6 +624,18 @@ def detect_ice(
     records = {} if return_debug else None
     r_index = polar_peaks.fields.index("r_invA")
     theta_index = polar_peaks.fields.index("theta")
+    # Optional: recorded by polar_transform_peaks so folding does not lose the half-circle.
+    unfolded_index = (
+        polar_peaks.fields.index("theta_unfolded")
+        if "theta_unfolded" in polar_peaks.fields
+        else None
+    )
+    if params.require_friedel_pair and unfolded_index is None:
+        raise ValueError(
+            "require_friedel_pair needs the 'theta_unfolded' field on polar_peaks, which "
+            "this vector predates. Re-run bp.polar_transform_peaks(...) (cheap) or "
+            "process_polar(...) to record it, or use min_peaks_per_arm instead."
+        )
     intensity_index = peak_intensities.fields.index(params.intensity_field)
     for iy, ix in np.argwhere(selected):
         iy, ix = int(iy), int(ix)
@@ -607,6 +659,10 @@ def detect_ice(
             r_axis=r_axis,
             theta_axis=theta_axis,
             theta_period_deg=period,
+            theta_unfolded_rad=(
+                None if unfolded_index is None
+                else np.asarray(polar_cell)[:, unfolded_index]
+            ),
         )
         if len(flags):
             mask[iy, ix] = flags[:, None]

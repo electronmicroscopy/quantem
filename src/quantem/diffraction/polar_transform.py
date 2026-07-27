@@ -282,10 +282,13 @@ def polar_transform_peaks(
         idx for idx in range(len(cartesian_vector.fields))
         if idx not in (x_idx, y_idx)
     ]
-    output_fields = ["r_pixels", "theta", "r_invA"] + [
+    # ``theta`` is folded when two_fold_rotation_symmetry is set, which maps each
+    # Friedel pair onto one angle. ``theta_unfolded`` keeps the full 0-2pi angle so
+    # that information is not lost; peaks are small, so the extra column is cheap.
+    output_fields = ["r_pixels", "theta", "r_invA", "theta_unfolded"] + [
         cartesian_vector.fields[idx] for idx in extra_indices
     ]
-    output_units = [r_unit, theta_unit, "1/Å"] + [
+    output_units = [r_unit, theta_unit, "1/Å", theta_unit] + [
         cartesian_vector.units[idx] for idx in extra_indices
     ]
     polar_vector = Vector.from_shape(
@@ -312,10 +315,11 @@ def polar_transform_peaks(
             dx = cartesian_data[:, x_idx] - center_x
             dy = cartesian_data[:, y_idx] - center_y
             r_pixels, theta = _cartesian_offsets_to_polar(dx, dy, ellipse_params)
+            theta_unfolded = np.mod(theta, 2.0 * np.pi)
             theta = np.mod(theta, theta_period)
             r_invA = r_pixels * sampling_conversion_factor
 
-            polar_data = np.column_stack([r_pixels, theta, r_invA])
+            polar_data = np.column_stack([r_pixels, theta, r_invA, theta_unfolded])
             if extra_indices:
                 polar_data = np.column_stack([polar_data, cartesian_data[:, extra_indices]])
             polar_vector[i, j] = polar_data
