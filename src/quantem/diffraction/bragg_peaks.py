@@ -39,6 +39,7 @@ from quantem.diffraction.scan_mask_editor import ScanMaskEditor
 from quantem.diffraction.peak_detection import (
     detect_blobs,
     find_central_beam_from_peaks,
+    estimate_peak_windows as _estimate_peak_windows,
     peaks_from_model_output as _peaks_from_model_output,
     resize_images_for_model as _resize_images_for_model,
 )
@@ -2104,160 +2105,17 @@ class BraggPeaksPolymer(AutoSerialize):
         fig.tight_layout()
         return fig, axes
 
-    def estimate_peak_windows(
-        self,
-        num_bins=200,
-        q_min=None,
-        q_max=None,
-        n_peaks=5,
-        height_percentile=10,
-        prominence_factor=0.1,
-        width_factor=2.0,
-        min_width=0.05,
-        smoothing_sigma=2.0,
-        intensity_field='intensities',
-        mode='intensity',
-        log_scale=False,
-    ):
+    def estimate_peak_windows(self, *args, **kwargs):
+        """Detect the radial peak families and estimate their q-windows.
+
+        Forwards to
+        :func:`quantem.diffraction.peak_detection.estimate_peak_windows`,
+        supplying this analysis's polar peaks and intensities.
         """
-        Automatically detect the top N most prominent peaks and estimate their windows.
-        
-        Parameters
-        ----------
-        num_bins : int
-            Number of radial bins
-        q_min : float, optional
-            Minimum q value for binning
-        q_max : float, optional
-            Maximum q value for binning
-        n_peaks : int
-            Number of top peaks to detect
-        height_percentile : float
-            Percentile threshold for peak height (peaks below this are ignored)
-        prominence_factor : float
-            Factor of max intensity for minimum peak prominence
-        width_factor : float
-            Multiplier for estimating peak window width from FWHM
-        min_width : float
-            Minimum window width in 1/Å
-        smoothing_sigma : float
-            Gaussian smoothing sigma for noise reduction before peak detection
-        mode : {'intensity', 'count'}
-            Radial profile to detect peaks on: intensity-weighted histogram of peak q
-            ('intensity', default) or the number of detected peaks per bin ('count').
-        log_scale : bool
-            If True, detect peaks on log1p(profile) so small peaks are not dominated
-            by large ones.
-            
-        Returns
-        -------
-        peak_centers : array
-            q-values for peak centers (shape: n_peaks)
-        peak_windows : array
-            Window boundaries for each peak (shape: n_peaks, 2)
-            Each row is [q_min, q_max] for that peak
-        peak_info : dict
-            Additional information about detected peaks including:
-            - 'heights': peak heights
-            - 'prominences': peak prominences
-            - 'widths': estimated peak widths (FWHM)
-        """
-        
-        if mode not in ('intensity', 'count'):
-            raise ValueError(f"mode must be 'intensity' or 'count', got {mode!r}")
 
-        # Get radial profile (intensity-weighted or peak-count)
-        all_r = _vector_field_flat(self.polar_peaks, "r_invA")
-        
-        if q_min is None:
-            q_min = 0
-        if q_max is None:
-            q_max = np.max(all_r)
-        
-        r_bins = np.linspace(q_min, q_max, num_bins + 1)
-        if mode == 'intensity':
-            all_intensity = _vector_field_flat(self.peak_intensities, intensity_field)
-            profile, _ = np.histogram(all_r, bins=r_bins, weights=all_intensity)
-        else:  # 'count'
-            profile, _ = np.histogram(all_r, bins=r_bins)
-        r_centers = (r_bins[:-1] + r_bins[1:]) / 2
-
-        # Optional log compression so small peaks are not dominated by large ones
-        if log_scale:
-            profile = np.log1p(profile)
-
-        # Smooth the data to reduce noise
-        if smoothing_sigma > 0:
-            intensity_smooth = gaussian_filter1d(profile, smoothing_sigma)
-        else:
-            intensity_smooth = profile
-        
-        # Calculate thresholds
-        height_threshold = np.percentile(intensity_smooth, height_percentile)
-        prominence_threshold = prominence_factor * np.max(intensity_smooth)
-        
-        # Find peaks
-        peaks_indices, properties = find_peaks(
-            intensity_smooth,
-            height=height_threshold,
-            prominence=prominence_threshold,
-            distance=int(min_width / (r_centers[1] - r_centers[0]))  # Minimum separation
+        return _estimate_peak_windows(
+            self.polar_peaks, self.peak_intensities, *args, **kwargs
         )
-        
-        if len(peaks_indices) == 0:
-            print("No peaks found with current parameters!")
-            return np.array([]), np.array([]).reshape(0, 2), {}
-        
-        # Sort by prominence and take top N
-        prominences = properties['prominences']
-        sorted_indices = np.argsort(prominences)[::-1][:n_peaks]
-        top_peak_indices = peaks_indices[sorted_indices]
-        top_peak_indices = np.sort(top_peak_indices)  # Re-sort by position
-        
-        # Get peak centers
-        peak_centers = r_centers[top_peak_indices]
-        
-        # Calculate peak widths (FWHM)
-        widths_data = peak_widths(intensity_smooth, top_peak_indices, rel_height=0.5)
-        fwhm_bins = widths_data[0]  # Width in bins
-        fwhm_invA = fwhm_bins * (r_centers[1] - r_centers[0])  # Convert to 1/Å
-        
-        # Estimate windows: center ± width_factor * FWHM/2, with minimum width
-        half_widths = np.maximum(width_factor * fwhm_invA / 2, min_width / 2)
-        peak_windows = np.column_stack([
-            peak_centers - half_widths,
-            peak_centers + half_widths
-        ])
-        
-        # Clip windows to data range
-        peak_windows[:, 0] = np.maximum(peak_windows[:, 0], q_min)
-        peak_windows[:, 1] = np.minimum(peak_windows[:, 1], q_max)
-        
-        # Collect additional info
-        peak_info = {
-            'heights': intensity_smooth[top_peak_indices],
-            'prominences': prominences[sorted_indices],
-            'widths_fwhm': fwhm_invA,
-            'intensity_profile': intensity_smooth,
-            'profile': intensity_smooth,
-            'r_centers': r_centers,
-            'mode': mode,
-            'log_scale': log_scale,
-        }
-        
-        # Print summary
-        print(f"Detected {len(peak_centers)} peaks:")
-        _to_d = lambda q: (1.0 / q if q > 0 else float('inf'))  # d-spacing (Å) = 1 / q (1/Å)
-        for i, (center, window, height, prom, width) in enumerate(zip(
-            peak_centers, peak_windows, peak_info['heights'],
-            peak_info['prominences'], peak_info['widths_fwhm']
-        )):
-            print(f"  Peak {i+1}: center={center:.3f} 1/Å (d={_to_d(center):.2f} Å), "
-                  f"window=[{window[0]:.3f}, {window[1]:.3f}] 1/Å "
-                  f"(d=[{_to_d(window[1]):.2f}, {_to_d(window[0]):.2f}] Å), "
-                  f"height={height:.1f}, prominence={prom:.1f}, FWHM={width:.3f} 1/Å")
-        
-        return peak_centers, peak_windows, peak_info
 
     def peak_radial_intensity_plot(self, *args, **kwargs):
         """Radial peak-intensity profile.
