@@ -31,11 +31,12 @@ def plot_strain_panels(
     cmap_strain: str = "RdBu_r",
     cmap_rotation: str = "PiYG",
     layout: str = "horizontal",
-    rotate_strain: bool = False,
+    transpose_image: bool = False,
     rotate_title: bool = False,
     plot_dilation: bool = False,
     figsize: tuple[float, float] | None = None,
     panel_titles: tuple[str, str, str] | None = None,
+    strain_rotation_angle: float = 0.0,
     **kwargs,
 ):
     """Render strain (e_uu, e_vv, e_uv) and rotation panels.
@@ -113,7 +114,7 @@ def plot_strain_panels(
     evv_disp = _roi_compose(norm_strain(evv_pct), cm_strain)
     euv_disp = _roi_compose(norm_strain(euv_pct), cm_strain)
 
-    if rotate_strain:
+    if transpose_image:
         euu_disp = euu_disp.transpose(1,0,2)
         evv_disp = evv_disp.transpose(1,0,2)
         euv_disp = euv_disp.transpose(1,0,2)
@@ -122,7 +123,7 @@ def plot_strain_panels(
     if plot_dilation:
         etot_pct = (e_uu + e_vv) * 100
         etot_disp = _roi_compose(norm_strain(etot_pct), cm_strain)
-        if rotate_strain:
+        if transpose_image:
             etot_disp = etot_disp.transpose(1,0,2)
         ax[0].imshow(etot_disp * mask[:, :, np.newaxis])
         ax[1].imshow(euv_disp * mask[:, :, np.newaxis])
@@ -131,6 +132,18 @@ def plot_strain_panels(
         ax[1].imshow(evv_disp * mask[:, :, np.newaxis])
         ax[2].imshow(euv_disp * mask[:, :, np.newaxis])
 
+
+    def _add_title_arrow(ax, angle_deg, x=0.80, y=1.06, length=0.045,
+                        color="black", lw=1.5):
+        a = np.deg2rad(angle_deg)
+        dx, dy = length * np.cos(a), length * np.sin(a)
+        ax.annotate(
+            "",
+            xy=(x + dx, y + dy), xytext=(x - dx, y - dy),
+            xycoords="axes fraction",
+            annotation_clip=False,
+            arrowprops=dict(arrowstyle="<->", color=color, lw=lw),
+        )
     ref_dim = figsize[1] if is_horizontal else figsize[0]
     fs_threshold = 3.0
     fs_scale = min(1.0, max(0.5, ref_dim / fs_threshold))
@@ -144,20 +157,28 @@ def plot_strain_panels(
                 r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
                 "",
             )
+            title_arrow_angles = (None, -45 + strain_rotation_angle, None)
         else:
             panel_titles = (
                 r"$\epsilon_{uu}$ $\updownarrow$",
                 r"$\epsilon_{vv}$ $\leftrightarrow$",
                 r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\searrow$",
             )
+            title_arrow_angles = (90 + strain_rotation_angle, 0 + strain_rotation_angle, -45 + strain_rotation_angle)
+    else:
+            title_arrow_angles = (None, None, None)
+
     # apply to the strain panels whether panel_titles was defaulted or passed in
     for i in range(n_strain):
         ax[i].set_title(panel_titles[i], fontsize=title_fs, rotation=title_val)
+        angle = title_arrow_angles[i]
+        if angle is not None:
+            _add_title_arrow(ax[i], angle, color="black")
 
     if plot_rotation:
         norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
         rot_disp = _roi_compose(norm_rot(rot_deg), cm_rot)
-        if rotate_strain: rot_disp = rot_disp.transpose(1,0,2)
+        if transpose_image: rot_disp = rot_disp.transpose(1,0,2)
         ax[-1].imshow(rot_disp * mask[:, :, np.newaxis])
         ax[-1].set_title(r"Rotation $\circlearrowleft$", fontsize=title_fs, rotation=title_val)
 

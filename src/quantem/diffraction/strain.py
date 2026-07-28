@@ -207,7 +207,7 @@ class StrainMap(AutoSerialize):
         cmap_rotation: str = "PiYG",
         strain_range_percent: tuple[float, float] | None = None,
         rotation_range_degrees: tuple[float, float] | None = None,
-        rotate_strain: bool = False,
+        transpose_image: bool = False,
         rotate_title: bool = False,
         plot_dilation: bool = False,
         layout: str = "horizontal",
@@ -285,7 +285,7 @@ class StrainMap(AutoSerialize):
             cmap_strain=cmap_strain,
             cmap_rotation=cmap_rotation,
             layout=layout,
-            rotate_strain = rotate_strain,
+            transpose_image = transpose_image,
             rotate_title = rotate_title,
             plot_dilation = plot_dilation,
             figsize=figsize,
@@ -309,7 +309,8 @@ class StrainMap(AutoSerialize):
         cmap_strain: str = "RdBu_r",
         cmap_rotation: str = "PiYG",
         layout: str = "horizontal",
-        rotate_strain: bool = False,
+        transpose_image: bool = False,
+        transpose_strain: bool = False,
         rotate_title: bool = False,
         plot_dilation: bool = False,
         figsize: tuple[float, float] | None = None,
@@ -322,7 +323,7 @@ class StrainMap(AutoSerialize):
         rotation_angle_deg : float, default=0.0
             Angle (degrees) by which the strain tensor is rotated into the display
             frame before plotting.
-        transpose : bool, default=False
+        transpose_strain : bool, default=False
             If ``True``, transpose the detector (row/col) axes before rotating,
             matching the DPC convention (see
             :func:`~quantem.diffraction.strain_autocorrelation._raw_vec_to_display`):
@@ -364,14 +365,14 @@ class StrainMap(AutoSerialize):
         e_cc = self.e_cc.array
         e_rc = self.e_rc.array
         phi = self.phi.array
-        if transpose:
+        if transpose_strain:
             # Detector-axis transpose, applied BEFORE the rotation to match the DPC
             # convention shared across quantem (see _raw_vec_to_display): swapping the
             # (row, col) axes swaps the normal strains, keeps the shear unchanged, and
             # reverses the sense of the rotation field.
             e_rr, e_cc = e_cc, e_rr
             phi = -phi
-        e_uu, e_vv, e_uv = _rotate_strain_tensor(e_rr, e_cc, e_rc, rotation_angle_deg)
+        e_uu, e_vv, e_uv = _rotate_strain_tensor(e_rr, e_cc, e_rc, rotation_angle)
         return plot_strain_panels(
             e_uu,
             e_vv,
@@ -392,10 +393,11 @@ class StrainMap(AutoSerialize):
             cmap_strain=cmap_strain,
             cmap_rotation=cmap_rotation,
             layout=layout,
-            rotate_strain = rotate_strain,
+            transpose_image = transpose_image,
             rotate_title = rotate_title,
             plot_dilation = plot_dilation,
             figsize=figsize,
+            strain_rotation_angle=rotation_angle,
             **kwargs,
         )
 
