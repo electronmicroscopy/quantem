@@ -48,12 +48,72 @@ def _splat_patch(
     put(r0i + 1, c0i + 1, w11)
 
 
+def _splat_patch_batched(
+    shape: tuple[int, int],
+    *,
+    r0: torch.Tensor,
+    c0: torch.Tensor,
+    vals: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    h, w = int(shape[0]), int(shape[1])
+    B, N = r0.shape
+
+    r_base = torch.floor(r0)
+    c_base = torch.floor(c0)
+    fr = r0 - r_base
+    fc = c0 - c_base
+    r0i = r_base.to(torch.long)
+    c0i = c_base.to(torch.long)
+
+    w00 = (1.0 - fr) * (1.0 - fc)
+    w01 = (1.0 - fr) * fc
+    w10 = fr * (1.0 - fc)
+    w11 = fr * fc
+
+    rr = torch.stack([r0i, r0i, r0i + 1, r0i + 1], dim=0)
+    cc = torch.stack([c0i, c0i + 1, c0i, c0i + 1], dim=0)
+    ww = torch.stack([w00, w01, w10, w11], dim=0)
+
+    keep = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+    weighted = ww * vals.unsqueeze(0) * keep.to(dtype)
+
+    rr_c = rr.clamp(0, h - 1)
+    cc_c = cc.clamp(0, w - 1)
+    flat_idx = rr_c * w + cc_c
+
+    flat_idx_b = flat_idx.permute(1, 0, 2).reshape(B, -1)
+    weighted_b = weighted.permute(1, 0, 2).reshape(B, -1)
+
+    out_flat = torch.zeros(B, h * w, device=device, dtype=dtype)
+    out_flat.scatter_add_(1, flat_idx_b, weighted_b)
+    return out_flat.reshape(B, h, w)
+
+
 class DiskTemplate(RenderComponent):
     DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
         "force_center": False,
         "force_positive": True,
+        "force_norm": True, # force range [0,1]
+        "force_shrinkage": False,
+        "force_cutoff": False,
+        "force_circular_mask": True,
     }
-    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {"tv_weight": 0.0}
+    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {
+        "tv_weight": 0.0,
+        "cutoff_weight": 0.0,
+        "circular_weight": 0.0,
+    }
+    DEFAULT_CONSTRAINT_CONFIG: dict[str, float] = {
+        "soft_cutoff_threshold": 0.0,
+        "soft_cutoff_target_ratio": 0.1,
+        "hard_cutoff_threshold": 0.35,
+        "shrinkage_amount": 0.25,
+        "circular_mask_radius_fraction": 0.95,
+        "circular_mask_sharpness": 0,
+        "soft_circular_mask": False,
+    }
 
     def __init__(
         self,
@@ -66,6 +126,7 @@ class DiskTemplate(RenderComponent):
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config: dict[str, Any] | None = None,
     ):
         """
         Build a disk template renderer centered at the shared origin.
@@ -125,10 +186,17 @@ class DiskTemplate(RenderComponent):
         cc = cc.astype(np.float32) - (wt - 1) * 0.5
         self.register_buffer("dr", torch.as_tensor(rr.ravel(), dtype=torch.float32))
         self.register_buffer("dc", torch.as_tensor(cc.ravel(), dtype=torch.float32))
+
+        self.constraint_config = self.DEFAULT_CONSTRAINT_CONFIG.copy()
+        if constraint_config is not None:
+            self.constraint_config.update(constraint_config)
+        
         if constraint_params is not None:
             self.apply_constraint_params(constraint_params, strict=True)
         if bool(self.hard_constraints.get("force_positive", False)):
             self._enforce_positivity()
+        if bool(self.hard_constraints.get("force_shrinkage", False)) and bool(self.hard_constraints.get("force_positive", True)):
+            raise RuntimeWarning("Setting shrinkage true and positivity false might cause negative values in disk template")
 
     @classmethod
     def from_array(
@@ -142,6 +210,8 @@ class DiskTemplate(RenderComponent):
         origin_key: str = "origin",
         intensity: float | Sequence[float] = 1.0,
         constraint_params: dict[str, Any] | None = None,
+        constraint_config: dict[str, Any] | None = None,
+
     ) -> "DiskTemplate":
         return cls(
             name=name,
@@ -152,6 +222,8 @@ class DiskTemplate(RenderComponent):
             origin_key=origin_key,
             intensity=intensity,
             constraint_params=constraint_params,
+            constraint_config=constraint_config,
+
         )
 
     def set_origin(self, origin: OriginND) -> None:
@@ -198,6 +270,25 @@ class DiskTemplate(RenderComponent):
         self.add_patch(out, r0=r0, c0=c0, scale=scale)
         return out
 
+    def forward_batched(
+        self,
+        ctx: RenderContext,
+        *,
+        template_raw_b: torch.Tensor,
+        intensity_raw_b: torch.Tensor,
+        origin_coords_b: torch.Tensor,
+    ) -> torch.Tensor:
+        B = template_raw_b.shape[0]
+        N = int(cast(torch.Tensor, self.dr).numel())
+        dr = cast(torch.Tensor, self.dr).to(device=ctx.device, dtype=ctx.dtype)
+        dc = cast(torch.Tensor, self.dc).to(device=ctx.device, dtype=ctx.dtype)
+        r0 = origin_coords_b[:, 0:1] + dr.unsqueeze(0)
+        c0 = origin_coords_b[:, 1:2] + dc.unsqueeze(0)
+        vals = template_raw_b.reshape(B, N) * intensity_raw_b.view(B, 1)
+        return _splat_patch_batched(
+            ctx.shape, r0=r0, c0=c0, vals=vals, device=ctx.device, dtype=ctx.dtype
+        )
+
     def _center_disk(self) -> None:
         with torch.no_grad():
             template = self.template_raw
@@ -238,12 +329,52 @@ class DiskTemplate(RenderComponent):
         with torch.no_grad():
             self.template_raw.clamp_(min=0.0)
             self.intensity_raw.clamp_(min=0.0)
+    
+    def _enforce_norm(self) -> None: # pick value and cut off 5 percent of mean, or every iteration shrinkage, every iteration just subtract a valye of 0.01
+        with torch.no_grad():
+            self.template_raw -= self.template_raw.min()
+            self.template_raw /= self.template_raw.max()
+    
+    def _enforce_shrinkage(self) -> None:
+        with torch.no_grad():
+            self.template_raw -= self.constraint_config["shrinkage_amount"]
+    
+    def _enforce_cutoff(self) -> None:
+        with torch.no_grad():
+            mean_val = torch.max(self.template_raw) * self.constraint_config["hard_cutoff_threshold"]
+            self.template_raw[self.template_raw <= mean_val] = 0
+    
+    def _enforce_circular_mask(self) -> None:
+        with torch.no_grad():
+            h, w = self.template_raw.shape
+            radius = (min(h, w) / 2.0) * self.constraint_config["circular_mask_radius_fraction"]
+            
+            r = torch.arange(-h/2, h/2, device=self.template_raw.device, dtype=self.template_raw.dtype)
+            c = torch.arange(-w/2, w/2, device=self.template_raw.device, dtype=self.template_raw.dtype)
+            rr, cc = torch.meshgrid(r, c, indexing='ij')
+            circle_matrix = torch.sqrt(rr**2 + cc**2)
+            
+            if self.constraint_config["soft_circular_mask"]:
+                mask = torch.sigmoid(self.constraint_config["circular_mask_sharpness"]*(radius-circle_matrix))
+            else:
+                mask = circle_matrix <= radius
+            self.template_raw *= mask
+
 
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:
         if bool(self.hard_constraints.get("force_center", False)):
             self._center_disk()
+        if bool(self.hard_constraints.get("force_cutoff", False)):
+            self._enforce_cutoff()
+        if bool(self.hard_constraints.get("force_circular_mask", False)):
+            self._enforce_circular_mask()
+        if bool(self.hard_constraints.get("force_shrinkage", False)):
+            self._enforce_shrinkage()
         if bool(self.hard_constraints.get("force_positive", False)):
             self._enforce_positivity()
+        if bool(self.hard_constraints.get("force_norm", False)): # could be put in positivity
+            self._enforce_norm()
+        
         super().enforce_hard_constraints(ctx)
 
     def constraint_loss(
@@ -251,8 +382,17 @@ class DiskTemplate(RenderComponent):
     ) -> torch.Tensor:
         cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
         tv_weight = float(cfg.get("tv_weight", 0.0))
+        cutoff_weight = float(cfg.get("cutoff_weight", 0.0))
+        circular_weight = float(cfg.get("circular_weight", 0.0))
+        
         if tv_weight <= 0.0:
-            return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+            tv_weight = 0.0
+        if cutoff_weight <= 0.0:
+            cutoff_weight = 0.0
+        if circular_weight <= 0.0:
+            circular_weight = 0.0
+
+        # tv loss calculation
         template = self.template_raw.to(device=ctx.device, dtype=ctx.dtype)
         tv_r = (
             torch.mean(torch.abs(template[1:, :] - template[:-1, :]))
@@ -264,7 +404,101 @@ class DiskTemplate(RenderComponent):
             if template.shape[1] > 1
             else torch.zeros((), device=ctx.device, dtype=ctx.dtype)
         )
-        return torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
+        tv_loss = torch.as_tensor(tv_weight, device=ctx.device, dtype=ctx.dtype) * (tv_r + tv_c)
+
+        # Cutoff loss calculation
+        num_px = torch.prod(torch.tensor(template.shape))
+        px_under_threshold = torch.sum(template <= torch.mean(template)*self.constraint_config["soft_cutoff_threshold"])/num_px
+        cutoff_loss = torch.as_tensor(cutoff_weight, device=ctx.device, dtype=ctx.dtype) * torch.maximum(
+            px_under_threshold-self.constraint_config["soft_cutoff_target_ratio"], torch.as_tensor(0.0, device=ctx.device, dtype=ctx.dtype))
+        
+        # circular loss calculation
+        h, w = template.shape
+        radius = (min(h, w) / 2.0) * self.constraint_config["circular_mask_radius_fraction"]
+
+        r = torch.arange(h, device=ctx.device, dtype=ctx.dtype) - h / 2.0
+        c = torch.arange(w, device=ctx.device, dtype=ctx.dtype) - w / 2.0
+        rr, cc = torch.meshgrid(r, c, indexing='ij')
+        
+        circle_mask = torch.sqrt(rr**2 + cc**2)
+
+        dist_from_radius = torch.abs(circle_mask - radius)
+        dist_from_radius = torch.relu(dist_from_radius)
+        circular_err = torch.mean(dist_from_radius * template)
+        
+        circular_loss = torch.as_tensor(circular_weight, device=ctx.device, dtype=ctx.dtype) * circular_err
+
+        return cutoff_loss + tv_loss + circular_loss
+
+    def constraint_loss_batched(
+        self,
+        ctx: RenderContext,
+        *,
+        template_raw_b: torch.Tensor,
+        params: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        """
+        Per-sample analogue of ``constraint_loss`` for stacked templates.
+
+        Parameters
+        ----------
+        template_raw_b : torch.Tensor
+            Stacked templates with shape ``(B, H_t, W_t)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-sample soft-constraint losses with shape ``(B,)``. Identical
+            semantics to ``constraint_loss`` on each slice, but reductions are
+            taken over ``dim=(1, 2)`` only.
+        """
+        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
+        tv_weight = max(float(cfg.get("tv_weight", 0.0)), 0.0)
+        cutoff_weight = max(float(cfg.get("cutoff_weight", 0.0)), 0.0)
+        circular_weight = max(float(cfg.get("circular_weight", 0.0)), 0.0)
+
+        template = template_raw_b.to(device=ctx.device, dtype=ctx.dtype)
+        B, h, w = template.shape
+
+        if h > 1:
+            tv_r = torch.mean(torch.abs(template[:, 1:, :] - template[:, :-1, :]), dim=(1, 2))
+        else:
+            tv_r = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+        if w > 1:
+            tv_c = torch.mean(torch.abs(template[:, :, 1:] - template[:, :, :-1]), dim=(1, 2))
+        else:
+            tv_c = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+        tv_loss = tv_weight * (tv_r + tv_c)
+
+        # Per-sample cutoff (note: hard `<=` is non-differentiable; matches serial).
+        per_sample_mean = template.mean(dim=(1, 2), keepdim=True)
+        thresh = per_sample_mean * float(self.constraint_config["soft_cutoff_threshold"])
+        frac_under = (template <= thresh).to(dtype=ctx.dtype).mean(dim=(1, 2))
+        target_ratio = float(self.constraint_config["soft_cutoff_target_ratio"])
+        cutoff_loss = cutoff_weight * torch.relu(frac_under - target_ratio)
+
+        # Per-sample circular: mask depends only on (H, W), so build once.
+        radius = (min(h, w) / 2.0) * float(self.constraint_config["circular_mask_radius_fraction"])
+        r = torch.arange(h, device=ctx.device, dtype=ctx.dtype) - h / 2.0
+        c = torch.arange(w, device=ctx.device, dtype=ctx.dtype) - w / 2.0
+        rr, cc = torch.meshgrid(r, c, indexing="ij")
+        circle_mask = torch.sqrt(rr * rr + cc * cc)
+        dist_from_radius = torch.relu(torch.abs(circle_mask - radius))  # (H, W)
+        circular_err = (dist_from_radius.unsqueeze(0) * template).mean(dim=(1, 2))
+        circular_loss = circular_weight * circular_err
+
+        return tv_loss + cutoff_loss + circular_loss
+
+    def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
+        params = []
+        for name, param in self.named_parameters(recurse=True):
+            if not name.startswith('origin.') and param.requires_grad:
+                params.append(param)
+        if not params:
+            return {}
+        return {'default': params}
+
+        
 
 
 class SyntheticDiskLattice(RenderComponent):
@@ -296,6 +530,7 @@ class SyntheticDiskLattice(RenderComponent):
         center_intensity_0: float | Sequence[float] | None = None,
         exclude_indices: Iterable[tuple[int, int]] | None = None,
         boundary_px: float = 0.0,
+        min_frac_inside_mask: float | None = None,
         origin: OriginND | None = None,
         origin_key: str = "origin",
         constraint_params: dict[str, Any] | None = None,
@@ -352,6 +587,12 @@ class SyntheticDiskLattice(RenderComponent):
         self.u_max = int(u_max)
         self.v_max = int(v_max)
         self.boundary_px = float(boundary_px)
+        # Drop a lattice disk from the render/fit when less than this fraction
+        # of its (circular) template patch falls inside ctx.mask -- i.e. the disk
+        # has too little illuminated data to constrain it. None disables it.
+        self.min_frac_inside_mask = (
+            None if min_frac_inside_mask is None else float(min_frac_inside_mask)
+        )
 
         if max_intensity_order is None:
             max_intensity_order = 1 if bool(per_disk_slopes) else 0
@@ -513,6 +754,37 @@ class SyntheticDiskLattice(RenderComponent):
                     self.i0_raw[idx].clamp_(max=float(hi))
         super().enforce_hard_constraints(ctx)
 
+
+    def _mask_keep(
+        self, ctx: RenderContext, centers_r: torch.Tensor, centers_c: torch.Tensor
+    ) -> torch.Tensor | None:
+        """
+        Per-disk keep mask from ``min_frac_inside_mask``.
+
+        Returns a boolean tensor shaped like ``centers_r`` that is True where at
+        least ``min_frac_inside_mask`` of the disk's circular template patch lands
+        on a True pixel of ``ctx.mask``; returns None when the filter is disabled
+        or no mask is set. Off-frame patch pixels count as outside the mask.
+        """
+        if self.min_frac_inside_mask is None or ctx.mask is None:
+            return None
+        mask = ctx.mask
+        h, w = int(mask.shape[0]), int(mask.shape[1])
+        dr = cast(torch.Tensor, self.disk.dr).to(device=ctx.device)
+        dc = cast(torch.Tensor, self.disk.dc).to(device=ctx.device)
+        tv = self.disk.patch_values().detach()
+        supp = tv > 0.5 * tv.max().clamp(min=1e-12)
+        drs = dr[supp]
+        dcs = dc[supp]
+        if drs.numel() == 0:
+            return None
+        rr = (centers_r.reshape(-1)[:, None] + drs[None, :]).round().to(torch.long)
+        cc = (centers_c.reshape(-1)[:, None] + dcs[None, :]).round().to(torch.long)
+        in_frame = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+        mval = mask[rr.clamp(0, h - 1), cc.clamp(0, w - 1)].to(torch.bool) & in_frame
+        frac = mval.to(torch.float32).mean(dim=1)
+        return (frac >= self.min_frac_inside_mask).reshape(centers_r.shape)
+
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
             raise RuntimeError("SyntheticDiskLattice requires an OriginND instance.")
@@ -532,9 +804,16 @@ class SyntheticDiskLattice(RenderComponent):
         b = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
         keep = (centers_r >= b) & (centers_r <= (ctx.shape[0] - 1) - b)
         keep = keep & (centers_c >= b) & (centers_c <= (ctx.shape[1] - 1) - b)
-        keep_idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
-        if keep_idx.numel() == 0:
+        mk = self._mask_keep(ctx, centers_r, centers_c)
+        if mk is not None:
+            keep = keep & mk
+        if not torch.any(keep):
             return out
+        
+        centers_r = centers_r[keep]
+        centers_c = centers_c[keep]
+        keep_idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
+        num_disks = centers_r.shape[0]
 
         active_order = int(
             ctx.fields.get(
@@ -543,39 +822,150 @@ class SyntheticDiskLattice(RenderComponent):
         )
         active_order = max(0, min(active_order, self.max_intensity_order))
 
-        dr, dc = self.disk.patch_offsets()
-        dr = dr.to(device=ctx.device, dtype=ctx.dtype)
-        dc = dc.to(device=ctx.device, dtype=ctx.dtype)
-        dr2 = dr * dr
-        dc2 = dc * dc
-        drdc = dr * dc
+        dr = cast(torch.Tensor, self.disk.dr).to(device=ctx.device, dtype=ctx.dtype)
+        dc = cast(torch.Tensor, self.disk.dc).to(device=ctx.device, dtype=ctx.dtype)
+        patch_vals = self.disk.patch_values().to(device=ctx.device, dtype=ctx.dtype)
+        num_pixels = patch_vals.shape[0]
 
-        for j in keep_idx:
-            rr0 = centers_r[j]
-            cc0 = centers_c[j]
-
-            if self.per_disk_intensity:
-                inten = self.i0_raw[j]
-                if active_order >= 1 and self.ir is not None and self.ic is not None:
-                    inten = inten + self.ir[j] * dr + self.ic[j] * dc
-                if (
-                    active_order >= 2
-                    and self.irr is not None
-                    and self.icc is not None
-                    and self.irc is not None
-                ):
-                    inten = inten + self.irr[j] * dr2 + self.icc[j] * dc2 + self.irc[j] * drdc
-            else:
-                inten = self.i0_raw
-                if active_order >= 1:
-                    assert self.ir is not None and self.ic is not None
-                    inten = inten + self.ir * rr0 + self.ic * cc0
-                if active_order >= 2:
-                    assert self.irr is not None and self.icc is not None and self.irc is not None
-                    inten = (
-                        inten + self.irr * rr0 * rr0 + self.icc * cc0 * cc0 + self.irc * rr0 * cc0
-                    )
-
-            self.disk.add_patch(out, r0=rr0, c0=cc0, scale=inten)
-
+        if self.per_disk_intensity:
+            i0 = self.i0_raw[keep_idx][:, None]
+            inten = i0.expand(-1, num_pixels)
+            
+            if active_order >= 1 and self.ir is not None:
+                ir = self.ir[keep_idx][:, None]
+                ic = self.ic[keep_idx][:, None]
+                inten = inten + ir * dr[None, :] + ic * dc[None, :]
+            
+            if active_order >= 2 and self.irr is not None:
+                irr = self.irr[keep_idx][:, None]
+                icc = self.icc[keep_idx][:, None]
+                irc = self.irc[keep_idx][:, None]
+                inten = inten + irr * (dr*dr)[None, :] + icc * (dc*dc)[None, :] + irc * (dr*dc)[None, :]
+        else:
+            inten = self.i0_raw if isinstance(self.i0_raw, torch.Tensor) else self.i0_raw
+            if active_order >= 1:
+                inten = inten + self.ir * centers_r + self.ic * centers_c
+            if active_order >= 2:
+                inten = inten + self.irr * centers_r**2 + self.icc * centers_c**2 + self.irc * centers_r * centers_c
+        
+        inten = inten[:, None].expand(-1, num_pixels) if inten.ndim == 1 else inten.expand(num_disks, num_pixels)
+        total_pixels = num_disks * num_pixels
+        r0_all = centers_r[:, None].expand(-1, num_pixels).reshape(total_pixels)
+        c0_all = centers_c[:, None].expand(-1, num_pixels).reshape(total_pixels)
+        dr_all = dr[None, :].expand(num_disks, -1).reshape(total_pixels)
+        dc_all = dc[None, :].expand(num_disks, -1).reshape(total_pixels)
+        vals_all = (patch_vals[None, :] * inten).reshape(total_pixels)
+        _splat_patch(
+            out,
+            r0=r0_all,
+            c0=c0_all,
+            patch_vals=vals_all,
+            dr=dr_all,
+            dc=dc_all,
+            scale=torch.ones_like(vals_all)
+        )
         return out
+
+    def forward_batched(
+        self,
+        ctx: RenderContext,
+        *,
+        u_row_b: torch.Tensor,
+        u_col_b: torch.Tensor,
+        v_row_b: torch.Tensor,
+        v_col_b: torch.Tensor,
+        i0_raw_b: torch.Tensor,
+        ir_b: torch.Tensor | None,
+        ic_b: torch.Tensor | None,
+        irr_b: torch.Tensor | None,
+        icc_b: torch.Tensor | None,
+        irc_b: torch.Tensor | None,
+        template_raw_b: torch.Tensor,
+        origin_coords_b: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.origin is None:
+            raise RuntimeError("SyntheticDiskLattice requires an OriginND instance.")
+
+        B = u_row_b.shape[0]
+        uv = cast(torch.Tensor, self.uv_indices).to(device=ctx.device)
+        K = int(uv.shape[0])
+        if K == 0:
+            return torch.zeros(B, ctx.shape[0], ctx.shape[1], device=ctx.device, dtype=ctx.dtype)
+
+        u = uv[:, 0].to(dtype=ctx.dtype)
+        v = uv[:, 1].to(dtype=ctx.dtype)
+
+        r0_kb = (
+            origin_coords_b[:, 0:1]
+            + u.unsqueeze(0) * u_row_b.unsqueeze(1)
+            + v.unsqueeze(0) * v_row_b.unsqueeze(1)
+        )
+        c0_kb = (
+            origin_coords_b[:, 1:2]
+            + u.unsqueeze(0) * u_col_b.unsqueeze(1)
+            + v.unsqueeze(0) * v_col_b.unsqueeze(1)
+        )
+
+        bb = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
+        keep = (r0_kb >= bb) & (r0_kb <= (ctx.shape[0] - 1) - bb)
+        keep = keep & (c0_kb >= bb) & (c0_kb <= (ctx.shape[1] - 1) - bb)
+        mk = self._mask_keep(ctx, r0_kb, c0_kb)
+        if mk is not None:
+            keep = keep & mk
+        keep_f = keep.to(dtype=ctx.dtype)
+
+        active_order = int(
+            ctx.fields.get(
+                "lattice_intensity_order_override", self.default_pattern_intensity_order
+            )
+        )
+        active_order = max(0, min(active_order, self.max_intensity_order))
+
+        dr = cast(torch.Tensor, self.disk.dr).to(device=ctx.device, dtype=ctx.dtype)
+        dc = cast(torch.Tensor, self.disk.dc).to(device=ctx.device, dtype=ctx.dtype)
+        N_pix = int(dr.numel())
+        patch_vals = template_raw_b.reshape(B, N_pix)
+
+        if self.per_disk_intensity:
+            inten = i0_raw_b.unsqueeze(2).expand(B, K, N_pix)
+            if active_order >= 1 and ir_b is not None and ic_b is not None:
+                inten = inten + ir_b.unsqueeze(2) * dr.view(1, 1, N_pix) + ic_b.unsqueeze(2) * dc.view(1, 1, N_pix)
+            if active_order >= 2 and irr_b is not None and icc_b is not None and irc_b is not None:
+                inten = (
+                    inten
+                    + irr_b.unsqueeze(2) * (dr * dr).view(1, 1, N_pix)
+                    + icc_b.unsqueeze(2) * (dc * dc).view(1, 1, N_pix)
+                    + irc_b.unsqueeze(2) * (dr * dc).view(1, 1, N_pix)
+                )
+        else:
+            inten = i0_raw_b.view(B, 1, 1).expand(B, K, N_pix).clone()
+            if active_order >= 1 and ir_b is not None and ic_b is not None:
+                inten = inten + ir_b.view(B, 1, 1) * r0_kb.unsqueeze(2) + ic_b.view(B, 1, 1) * c0_kb.unsqueeze(2)
+            if active_order >= 2 and irr_b is not None and icc_b is not None and irc_b is not None:
+                inten = (
+                    inten
+                    + irr_b.view(B, 1, 1) * (r0_kb * r0_kb).unsqueeze(2)
+                    + icc_b.view(B, 1, 1) * (c0_kb * c0_kb).unsqueeze(2)
+                    + irc_b.view(B, 1, 1) * (r0_kb * c0_kb).unsqueeze(2)
+                )
+
+        inten = inten * keep_f.unsqueeze(2)
+        vals = patch_vals.unsqueeze(1) * inten
+
+        r0_full = (r0_kb.unsqueeze(2) + dr.view(1, 1, N_pix)).reshape(B, K * N_pix)
+        c0_full = (c0_kb.unsqueeze(2) + dc.view(1, 1, N_pix)).reshape(B, K * N_pix)
+        vals_full = vals.reshape(B, K * N_pix)
+
+        return _splat_patch_batched(
+            ctx.shape, r0=r0_full, c0=c0_full, vals=vals_full,
+            device=ctx.device, dtype=ctx.dtype,
+        )
+
+    def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
+        params = []
+        for name, param in self.named_parameters(recurse=True):
+            if not name.startswith('disk.') and param.requires_grad:
+                params.append(param)
+        if not params:
+            return {}
+        return {'default': params}
