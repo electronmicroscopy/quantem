@@ -605,6 +605,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             if (individual_row >= self.state_individual_refined.shape[0]) or (individual_col >= self.state_individual_refined.shape[1]):
                 raise ValueError("row and column values not in range")
             state = self.state_individual_refined[individual_row, individual_col]
+            if state is None:
+                raise RuntimeError(
+                    f"No refined state for position ({individual_row}, {individual_col}). "
+                    "Run fit_individual_diffraction_pattern(...) for that row and column first."
+                )
             if reset_history:
                 self._clear_fit_history_all()
         else:
@@ -1007,8 +1012,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             for c in range(scan_c):
                 pos_state = self.state_individual_refined[r,c]
                 if pos_state is None:
-                    self.u_array[r,c,:] = None
-                    self.v_array[r,c,:] = None
+                    self.u_array[r,c,:] = np.nan
+                    self.v_array[r,c,:] = np.nan
+                    continue
                 for key in pos_state.keys():
                     key_parts = key.split('.')
                     if(key_parts[-1] == 'u_row'):
