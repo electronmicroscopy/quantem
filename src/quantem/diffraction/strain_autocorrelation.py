@@ -981,8 +981,11 @@ class StrainMapAutocorrelation(AutoSerialize):
         gamma = float(self.metadata["gamma"]) if mode == "gamma" else None
 
         dev = torch.device(device)
-        mask = torch.as_tensor(self.mask_diffraction, dtype=torch.float64, device=dev)
-        mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=torch.float64, device=dev)
+        # float32: supported on every backend (MPS has no float64, and float64 is
+        # ~30x slower on consumer CUDA cards); precision is ample for the ~0.01 px
+        # peak-fit noise floor.
+        mask = torch.as_tensor(self.mask_diffraction, dtype=torch.float32, device=dev)
+        mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=torch.float32, device=dev)
 
         if refine_all_peaks:
             # Precompute the fixed pieces of the per-position all-peaks fit (these do not
@@ -1017,7 +1020,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             dps = torch.stack(
                 [
                     torch.as_tensor(
-                        np.asarray(self.dataset.array[r, c]), dtype=torch.float64, device=dev
+                        np.asarray(self.dataset.array[r, c]), dtype=torch.float32, device=dev
                     )
                     for r, c in idxs
                 ],
