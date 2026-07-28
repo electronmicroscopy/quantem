@@ -124,7 +124,7 @@ def plot_strain_panels(
         etot_disp = _roi_compose(norm_strain(etot_pct), cm_strain)
         if rotate_strain:
             etot_disp = etot_disp.transpose(1,0,2)
-        ax[0].imshow(euu_disp * mask[:, :, np.newaxis])
+        ax[0].imshow(etot_disp * mask[:, :, np.newaxis])
         ax[1].imshow(euv_disp * mask[:, :, np.newaxis])
     else:
         ax[0].imshow(euu_disp * mask[:, :, np.newaxis])
@@ -137,23 +137,22 @@ def plot_strain_panels(
     title_fs = 16 * fs_scale
     tick_fs = 12 * fs_scale
     title_val = 'vertical' if rotate_title else 'horizontal'
-    if panel_titles is None and not plot_dilation:
-        panel_titles = (
-            r"$\epsilon_{uu}$ $\updownarrow$",
-            r"$\epsilon_{vv}$ $\leftrightarrow$",
-            r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\searrow$",
-        )
-        ax[0].set_title(panel_titles[0], fontsize=title_fs, rotation=title_val)
-        ax[1].set_title(panel_titles[1], fontsize=title_fs, rotation=title_val)
-        ax[2].set_title(panel_titles[2], fontsize=title_fs, rotation=title_val)
-    if plot_dilation and panel_titles is None:
-        panel_titles = (
-            r"$\epsilon_{uu} + \epsilon_{vv}$",
-            r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
-            ""
-        )
-        ax[0].set_title(panel_titles[0], fontsize=title_fs, rotation=title_val)
-        ax[1].set_title(panel_titles[1], fontsize=title_fs, rotation=title_val)
+    if panel_titles is None:
+        if plot_dilation:
+            panel_titles = (
+                r"$\epsilon_{uu} + \epsilon_{vv}$",
+                r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
+                "",
+            )
+        else:
+            panel_titles = (
+                r"$\epsilon_{uu}$ $\updownarrow$",
+                r"$\epsilon_{vv}$ $\leftrightarrow$",
+                r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\searrow$",
+            )
+    # apply to the strain panels whether panel_titles was defaulted or passed in
+    for i in range(n_strain):
+        ax[i].set_title(panel_titles[i], fontsize=title_fs, rotation=title_val)
 
     if plot_rotation:
         norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])

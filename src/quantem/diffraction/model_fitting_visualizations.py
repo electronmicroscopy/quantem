@@ -6,6 +6,11 @@ from matplotlib import pyplot as plt
 
 from quantem.core import config
 from quantem.core.visualization import show_2d
+from quantem.core.visualization.custom_normalizations import (
+    CustomNormalization,
+    _resolve_normalization,
+)
+
 
 if TYPE_CHECKING:
     from quantem.diffraction.model_fitting import ModelDiffraction
@@ -343,8 +348,41 @@ class ModelDiffractionVisualizations:
 
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
-        kwargs.setdefault("vmin", float(min(refp.min(), predp.min())))
-        kwargs.setdefault("vmax", float(max(refp.max(), predp.max())))
+        # kwargs.setdefault("vmin", float(min(refp.min(), predp.min())))
+        # kwargs.setdefault("vmax", float(max(refp.max(), predp.max())))
+
+        norm = kwargs.get("norm", None)
+        if norm is None:
+            kwargs.setdefault("vmin", float(min(refp.min(), predp.min())))
+            kwargs.setdefault("vmax", float(max(refp.max(), predp.max())))
+        else:
+            # Force both panels onto one shared interval, derived from the
+            # reference image (the model may be uninitialized -> bad scale).
+            cfg = _resolve_normalization(norm)
+            cnorm = CustomNormalization(
+                interval_type=cfg.interval_type,
+                stretch_type=cfg.stretch_type,
+                lower_quantile=cfg.lower_quantile,
+                upper_quantile=cfg.upper_quantile,
+                vmin=cfg.vmin,
+                vmax=cfg.vmax,
+                vcenter=cfg.vcenter,
+                half_range=cfg.half_range,
+                power=cfg.power,
+                logarithmic_index=cfg.logarithmic_index,
+                asinh_linear_range=cfg.asinh_linear_range,
+            )
+            vmin_shared, vmax_shared = cnorm.interval.get_limits(np.asarray(refp))
+            kwargs["norm"] = {
+                "interval_type": "manual",
+                "stretch_type": cfg.stretch_type,
+                "vmin": float(vmin_shared),
+                "vmax": float(vmax_shared),
+                "power": cfg.power,
+                "logarithmic_index": cfg.logarithmic_index,
+                "asinh_linear_range": cfg.asinh_linear_range,
+            }
+
 
         t1 = kwargs.pop("title", "")
         fig, ax = show_2d(

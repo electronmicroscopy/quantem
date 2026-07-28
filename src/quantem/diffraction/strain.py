@@ -92,13 +92,6 @@ class StrainMap(AutoSerialize):
         self.ds_sampling = 1.0 if ds_sampling is None else ds_sampling
         self.ds_units = "pixels" if ds_units is None else ds_units
 
-        # Per-position weighting / ROI in [0, 1]. The mask producers
-        # (BraggVectors.fit_lattice, StrainMapAutocorrelation.create_mask) already emit a
-        # [0, 1] weight, so a well-formed mask is taken as-is: re-normalizing it here
-        # would collide with that scaling -- a near-constant mask (e.g. the radial
-        # cepstral weight) would be squashed to ~0 and blank the strain display. Only a
-        # mask that falls outside [0, 1] (e.g. a raw-intensity ROI) is rescaled, and a
-        # constant / empty / all-NaN mask falls back to uniform full weight.
         m = np.ones(ds_shape[:2], dtype=float) if mask is None else np.asarray(mask, dtype=float)
         m_lo = np.nanmin(m)
         m_hi = np.nanmax(m)
@@ -212,6 +205,8 @@ class StrainMap(AutoSerialize):
         plot_rotation: bool = True,
         cmap_strain: str = "RdBu_r",
         cmap_rotation: str = "PiYG",
+        strain_range_percent: tuple[float, float] | None = None,
+        rotation_range_degrees: tuple[float, float] | None = None,
         rotate_strain: bool = False,
         rotate_title: bool = False,
         plot_dilation: bool = False,
@@ -283,8 +278,8 @@ class StrainMap(AutoSerialize):
             self.ds_shape,
             ds_sampling=self.ds_sampling,
             ds_units=self.ds_units,
-            strain_range_percent=(-smax, smax),
-            rotation_range_degrees=(-rmax, rmax),
+            strain_range_percent=(-smax, smax) if strain_range_percent is None else strain_range_percent,
+            rotation_range_degrees=(-rmax, rmax) if rotation_range_degrees is None else rotation_range_degrees,
             roi=inside,
             plot_rotation=plot_rotation,
             cmap_strain=cmap_strain,
@@ -304,8 +299,7 @@ class StrainMap(AutoSerialize):
 
     def plot_strain(
         self,
-        rotation_angle_deg: float = 0.0,
-        transpose: bool = False,
+        rotation_angle: float = 0.0,
         strain_range_percent: tuple[float, float] = (-3.0, 3.0),
         rotation_range_degrees: tuple[float, float] = (-2.0, 2.0),
         mask_range: tuple[float, float] = (0.0, 1.0),
@@ -854,7 +848,7 @@ def _strain_tensor(
 
     # const = -1 is the reciprocal-space (nanobeam) shear/rotation convention. Both
     # modalities reduce strain_trans to F.T above, so the convention is shared.
-    const = -1
+    const = 1 if real_space else -1
     e_rr = strain_trans[:, :, 0, 0] - 1
     e_cc = strain_trans[:, :, 1, 1] - 1
     e_rc = strain_trans[:, :, 1, 0] * 0.5 * const + strain_trans[:, :, 0, 1] * 0.5 * const

@@ -903,8 +903,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 if isinstance(loss_fn, SqrtMSELoss):
                     gamma = float(loss_fn.gamma)
                     eps = 1.0
-                    pred_min = pred.amin(dim=(1, 2), keepdim=True).detach()
-                    tgt_min = targets.amin(dim=(1, 2), keepdim=True).detach()
+                    pred_min = pred.amin(dim=(1, 2), keepdim=True)
+                    tgt_min = targets.amin(dim=(1, 2), keepdim=True)
                     pred_mod = (pred - pred_min + eps) ** gamma
                     tgt_mod = (targets - tgt_min + eps) ** gamma
                     per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
@@ -1664,11 +1664,12 @@ class _BatchedPlan:
         disk_intensity_frozen = "disk.intensity_raw" in skip_keys
 
         # DiskTemplate composite hard constraints
-        if self.disk is not None and not disk_template_frozen:
+        if self.disk is not None:
             template = stacked.get("disk.template_raw")
             intensity = stacked.get("disk.intensity_raw")
             cfg = self.disk.constraint_config
-            if template is not None and intensity is not None:
+            force_positive = bool(self.disk.hard_constraints.get("force_positive", False))
+            if not disk_template_frozen and template is not None and intensity is not None:
                 if bool(self.disk.hard_constraints.get("force_center", False)):
                     self._batched_center_disk(template)
                 if bool(self.disk.hard_constraints.get("force_cutoff", False)):
@@ -1677,12 +1678,14 @@ class _BatchedPlan:
                     self._batched_enforce_circular_mask(template, cfg)
                 if bool(self.disk.hard_constraints.get("force_shrinkage", False)):
                     template.sub_(float(cfg.get("shrinkage_amount", 0.25)))
-                if bool(self.disk.hard_constraints.get("force_positive", False)):
+                if force_positive:
                     template.clamp_(min=0.0)
                     if not disk_intensity_frozen and intensity is not None:
                         intensity.clamp_(min=0.0)
                 if bool(self.disk.hard_constraints.get("force_norm", False)):
                     self._batched_enforce_norm(template)
+            if force_positive and not disk_intensity_frozen and intensity is not None:
+                intensity.clamp_(min=0.0)
 
         for lat_name, lat in zip(self.lat_names, self.lats):
             key = f"{lat_name}.i0_raw"

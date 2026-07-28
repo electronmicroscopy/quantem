@@ -802,8 +802,8 @@ class SqrtMSELoss(nn.Module):
     
     def forward(self, pred, target):
         eps = 1
-        pred_modified = (pred - pred.min().detach() + eps) ** self.gamma
-        target_modified = (target - target.min().detach() + eps) ** self.gamma
+        pred_modified = (pred - pred.min() + eps) ** self.gamma
+        target_modified = (target - target.min() + eps) ** self.gamma
         loss = self.mse_fn(pred_modified, target_modified)
         return loss
 
