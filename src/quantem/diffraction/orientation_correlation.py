@@ -604,6 +604,14 @@ def calculate_orientation_correlation(
 # for a stable slope. See plot_orientation_correlation(slope_weight_scale=...).
 SLOPE_WEIGHT_FRACTION = 0.10
 
+# Orientations are pi-periodic, so ``num_theta`` bins span 180 degrees and the
+# relative-angle lag spacing is ``180 / num_theta`` degrees. The correlation
+# keeps ``num_theta // 2 + 1`` lags, so the stored axis always runs from 0 to
+# ``(num_theta // 2) * 180 / num_theta`` = 90 degrees: parallel to
+# perpendicular. Labelling it 0-180 overstated every relative angle by a
+# factor of two.
+MAX_RELATIVE_ANGLE_DEGREES = 90.0
+
 
 def plot_orientation_correlation(
     orient_corr,
@@ -621,11 +629,28 @@ def plot_orientation_correlation(
 ):
     """Plot distance-orientation correlations using Matplotlib.
 
-    The 50% boundary is halfway between the correlation at zero separation
-    and the random-association baseline of one. Its intercepts give the
-    radial and annular 50% distances. The signed slope is fitted separately
-    to the primary correlation-equals-one boundary between positive
-    correlation and anticorrelation.
+    The 50% boundary is halfway between the correlation at the pair's
+    dominant lobe at zero separation and the random-association baseline of
+    one. Its intercepts give the radial and annular 50% distances: the
+    radial distance is measured along the lobe, and the annular distance is
+    an angular offset away from it. The lobe is at a relative orientation of
+    zero (parallel) for autocorrelations and aligned families, and at 90
+    degrees (perpendicular) for orthogonal families, whose parallel cut
+    carries no decay to measure. Only the two ends are lobe candidates: an
+    interior maximum of a weakly correlated pair is noise. The signed slope
+    is fitted separately to the primary correlation-equals-one boundary
+    between positive correlation and anticorrelation.
+
+    The relative-angle axis spans 0 to 90 degrees, not 0 to 180. Orientations
+    are pi-periodic, so ``num_theta`` bins cover 180 degrees and the retained
+    ``num_theta // 2 + 1`` lags are spaced ``180 / num_theta`` degrees apart.
+    Annular distances and slopes reported before this was corrected were a
+    factor of two too large; radial distances were unaffected.
+
+    An intercept the measured window does not contain is reported as NaN with
+    the matching ``*_censored`` flag set and a ``*_lower_bound`` giving the
+    edge of the window, so a correlation that outlasts the scan stays
+    distinguishable from one that could not be measured at all.
 
     Parameters
     ----------
@@ -731,7 +756,9 @@ def plot_orientation_correlation(
         )
     distance_max = (values.shape[2] - 1) * float(pixel_size)
     distances = np.arange(values.shape[2], dtype=float) * float(pixel_size)
-    angles = np.linspace(0.0, 180.0, values.shape[1])
+    angles = np.linspace(
+        0.0, MAX_RELATIVE_ANGLE_DEGREES, values.shape[1]
+    )
     image = None
     metrics = []
     for index, ax in enumerate(axes.flat):
@@ -742,7 +769,7 @@ def plot_orientation_correlation(
             values[index],
             origin="lower",
             aspect="auto",
-            extent=(0, distance_max, 0, 180),
+            extent=(0, distance_max, 0, MAX_RELATIVE_ANGLE_DEGREES),
             norm=LogNorm(vmin=lower, vmax=upper),
             cmap=cmap,
         )
@@ -762,7 +789,33 @@ def plot_orientation_correlation(
             ylabel="relative orientation (degrees)",
         )
         panel = np.asarray(values[index], dtype=float)
-        origin_probability = panel[0, 0]
+        # Reference the pair's dominant lobe at zero separation rather than a
+        # hard-coded relative orientation of zero. The axis is bimodal by
+        # construction -- parallel at 0 degrees, perpendicular at 90 -- so the
+        # lobe is whichever end correlates more strongly at zero separation.
+        # For autocorrelations and aligned families that is 0 and nothing
+        # changes. Orthogonal families peak at 90 degrees, where the zero cut
+        # is a shallow anticorrelated plateau that need never reach the half
+        # level: measuring there returned a bare NaN radial distance and an
+        # annular intercept referenced to the wrong end of the axis.
+        #
+        # Only the two ends are candidates. An interior maximum of a weakly
+        # correlated pair is noise, and selecting it produced arbitrary
+        # decay lengths that swung by an order of magnitude between pairs.
+        zero_separation = panel[:, 0]
+        first_probability = zero_separation[0]
+        last_probability = zero_separation[-1]
+        lobe_index = (
+            zero_separation.size - 1
+            if np.isfinite(last_probability)
+            and (
+                not np.isfinite(first_probability)
+                or last_probability > first_probability
+            )
+            else 0
+        )
+        lobe_angle = float(angles[lobe_index])
+        origin_probability = panel[lobe_index, 0]
         half_probability = (
             1.0 + 0.5 * (origin_probability - 1.0)
             if np.isfinite(origin_probability)
@@ -772,6 +825,9 @@ def plot_orientation_correlation(
         )
         radial_distance = np.nan
         annular_distance = np.nan
+        annular_angle = np.nan
+        radial_censored = False
+        annular_censored = False
         slope = np.nan
         slope_fit_r_squared = np.nan
         slope_fit_point_count = 0
@@ -782,15 +838,38 @@ def plot_orientation_correlation(
         fit_angles = np.array([])
         if np.isfinite(half_probability):
             radial_distance = crossing(
-                distances, panel[0, :], half_probability
+                distances, panel[lobe_index, :], half_probability
             )
-            annular_distance = crossing(
-                angles, panel[:, 0], half_probability
-            )
+            # Walk outwards from the lobe along the zero-separation column in
+            # both directions and keep the nearer crossing, so the annular
+            # distance is an angular offset from the lobe for every pair and
+            # stays comparable across correlated and anticorrelated pairs.
+            angular_step = float(angles[1] - angles[0])
+            annular_candidates = []
+            for direction, branch in (
+                (1.0, zero_separation[lobe_index:]),
+                (-1.0, zero_separation[: lobe_index + 1][::-1]),
+            ):
+                if branch.size < 2:
+                    continue
+                offsets = np.arange(branch.size, dtype=float) * angular_step
+                offset = crossing(offsets, branch, half_probability)
+                if np.isfinite(offset):
+                    annular_candidates.append(
+                        (offset, lobe_angle + direction * offset)
+                    )
+            if annular_candidates:
+                annular_distance, annular_angle = min(annular_candidates)
+            # An intercept that does not exist inside the measured window is
+            # censored, not missing: the correlation is still decaying at the
+            # edge of the scan. Record that so callers can report a bound
+            # rather than treat a real but unbounded length as a failure.
+            radial_censored = not np.isfinite(radial_distance)
+            annular_censored = not np.isfinite(annular_distance)
             if np.isfinite(radial_distance):
                 ax.scatter(
                     [radial_distance],
-                    [0],
+                    [lobe_angle],
                     marker="o",
                     s=45,
                     facecolor="white",
@@ -798,10 +877,10 @@ def plot_orientation_correlation(
                     linewidth=0.8,
                     zorder=5,
                 )
-            if np.isfinite(annular_distance):
+            if np.isfinite(annular_angle):
                 ax.scatter(
                     [0],
-                    [annular_distance],
+                    [annular_angle],
                     marker="D",
                     s=40,
                     facecolor="white",
@@ -944,7 +1023,11 @@ def plot_orientation_correlation(
                     drawn[: min(2, drawn.size)] = True
             else:
                 drawn = np.ones_like(fit_distances, dtype=bool)
-            visible_fit = drawn & (fit_angles >= 0) & (fit_angles <= 180)
+            visible_fit = (
+                drawn
+                & (fit_angles >= 0)
+                & (fit_angles <= MAX_RELATIVE_ANGLE_DEGREES)
+            )
             ax.plot(
                 fit_distances[visible_fit],
                 fit_angles[visible_fit],
@@ -990,8 +1073,20 @@ def plot_orientation_correlation(
             "pair": pair,
             "title": title,
             "half_probability": float(half_probability),
+            "lobe_angle_degrees": lobe_angle,
             "radial_distance": float(radial_distance),
+            "radial_distance_censored": bool(radial_censored),
+            "radial_distance_lower_bound": (
+                float(distance_max) if radial_censored else np.nan
+            ),
             "annular_distance_degrees": float(annular_distance),
+            "annular_distance_censored": bool(annular_censored),
+            "annular_distance_lower_bound_degrees": (
+                float(max(lobe_angle, MAX_RELATIVE_ANGLE_DEGREES - lobe_angle))
+                if annular_censored
+                else np.nan
+            ),
+            "max_relative_angle_degrees": MAX_RELATIVE_ANGLE_DEGREES,
             "slope_degrees_per_unit": float(slope),
             "slope_fit_r_squared": float(slope_fit_r_squared),
             "slope_fit_point_count": slope_fit_point_count,
@@ -1008,11 +1103,15 @@ def plot_orientation_correlation(
             radial_text = (
                 f"{radial_distance:.2f} {pixel_units}"
                 if np.isfinite(radial_distance)
+                else f"> {distance_max:.2f} {pixel_units}"
+                if radial_censored
                 else "not resolved"
             )
             annular_text = (
                 f"{annular_distance:.2f} degrees"
                 if np.isfinite(annular_distance)
+                else f"> {max(lobe_angle, MAX_RELATIVE_ANGLE_DEGREES - lobe_angle):.2f} degrees"
+                if annular_censored
                 else "not resolved"
             )
             slope_text = (
