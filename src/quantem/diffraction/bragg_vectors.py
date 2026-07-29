@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy as _copy
 from pathlib import Path
 from typing import Any, Literal, Sequence, Union
 
@@ -478,6 +479,78 @@ class BraggVectors(AutoSerialize):
         self.metadata["detect"] = detect_kwargs
         self.compute_bvm()
         return peaks
+
+    def correct_peak_origins(
+        self,
+        origins: NDArray,
+        origin_ref: NDArray | tuple[float, float] | None = None,
+        *,
+        inplace: bool = False,
+    ) -> "BraggVectors":
+        """Shift the detected peak coordinates so all positions share one origin.
+
+        Subtracts each scan position's measured diffraction origin (e.g. the
+        plane-fitted center-of-mass of the central beam -- the descan) from its
+        peaks and adds back a common reference ``origin_ref``, so the peak
+        coordinates from every position live in a single detector frame. The
+        diffraction data itself is untouched: this calibrates the measurements,
+        not the images. The Bragg vector map is recomputed from the corrected
+        peaks.
+
+        By default a corrected *copy* of the workflow is returned and ``self``
+        keeps the raw detections, so calling this repeatedly (e.g. re-running a
+        notebook cell) never double-applies the shift.
+
+        Parameters
+        ----------
+        origins : np.ndarray
+            ``(scan_row, scan_col, 2)`` per-position diffraction origins in
+            detector pixels (row, col).
+        origin_ref : array-like of float, optional
+            ``(row, col)`` common origin the corrected peaks are referred to.
+            Defaults to the scan-mean of ``origins``.
+        inplace : bool, default=False
+            If ``True``, correct ``self`` instead of returning a corrected copy.
+
+        Returns
+        -------
+        BraggVectors
+            The workflow holding the corrected peaks (a new instance unless
+            ``inplace=True``); its :attr:`bvm` is recomputed.
+        """
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before correct_peak_origins().")
+        scan_shape = tuple(int(v) for v in self.dataset.shape[:2])
+        origins = np.asarray(origins, dtype=float)
+        if origins.shape != scan_shape + (2,):
+            raise ValueError(f"origins must have shape {scan_shape + (2,)}, got {origins.shape}.")
+        if origin_ref is None:
+            origin_ref = origins.mean(axis=(0, 1))
+        origin_ref = np.asarray(origin_ref, dtype=float).reshape(2)
+
+        if inplace:
+            bv = self
+        else:
+            bv = type(self)(dataset=self.dataset, device=self.device, _token=type(self)._token)
+            bv._template = self._template
+            bv._template_ft = self._template_ft
+            bv.metadata = _copy.deepcopy(self.metadata)
+            bv.peaks = self.peaks.copy()
+
+        peaks = bv.peaks
+        # rowwise transform on the flat peak table: one shift per scan cell,
+        # repeated per detected peak (cells and shifts share raster order)
+        flat = peaks.flatten()
+        counts = np.asarray(peaks.row_counts(), dtype=int)
+        shifts = np.repeat(origin_ref[None, :] - origins.reshape(-1, 2), counts, axis=0)
+        flat[:, :2] += shifts
+        peaks.set_flattened(flat)
+
+        bv.metadata["origin_correction"] = {
+            "origin_ref": (float(origin_ref[0]), float(origin_ref[1])),
+        }
+        bv.compute_bvm()
+        return bv
 
     def compute_bvm(self, sampling: float = 1.0) -> Dataset2d:
         """Accumulate all detected peaks into a Bragg vector map (intensity histogram).
