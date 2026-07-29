@@ -237,9 +237,52 @@ def template_fourier(template: torch.Tensor) -> torch.Tensor:
     return torch.conj(torch.fft.fft2(template))
 
 
+def _background_highpass(
+    shape: tuple[int, int],
+    background_sigma: float,
+    device,
+    rfft: bool = False,
+) -> torch.Tensor:
+    """Fourier-domain high-pass ``1 - G`` removing correlation background.
+
+    ``G`` is the transform of a real-space Gaussian of standard deviation
+    ``background_sigma`` pixels, so multiplying the Fourier product by ``1 - G``
+    subtracts a Gaussian-smoothed copy of the correlation map -- the slowly
+    varying background (the zero-sum template's negative moat around the bright
+    central beam) that otherwise pushes weak disk peaks below zero, where the
+    ``relu`` clamp erases them before peak finding.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        ``(H, W)`` detector shape.
+    background_sigma : float
+        Real-space standard deviation of the subtracted background, in pixels.
+    device
+        Torch device for the filter tensor.
+    rfft : bool, default=False
+        If ``True``, return the ``(H, W // 2 + 1)`` half-plane filter for
+        ``rfft2`` products instead of the full ``(H, W)`` filter.
+
+    Returns
+    -------
+    torch.Tensor
+        The ``1 - G`` filter in the requested Fourier layout.
+    """
+    H, W = int(shape[0]), int(shape[1])
+    qr = torch.fft.fftfreq(H, device=device, dtype=torch.float)[:, None]
+    if rfft:
+        qc = torch.fft.rfftfreq(W, device=device, dtype=torch.float)[None, :]
+    else:
+        qc = torch.fft.fftfreq(W, device=device, dtype=torch.float)[None, :]
+    g = torch.exp(-2.0 * (torch.pi**2) * (float(background_sigma) ** 2) * (qr**2 + qc**2))
+    return 1.0 - g
+
+
 def cross_correlation(
     dp: torch.Tensor,
     template_ft: torch.Tensor,
+    background_sigma: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cross-correlate a diffraction pattern with a template.
 
@@ -261,6 +304,8 @@ def cross_correlation(
     """
     dp = torch.as_tensor(dp)
     m = torch.fft.fft2(dp) * template_ft
+    if background_sigma is not None and background_sigma > 0:
+        m = m * _background_highpass(m.shape[-2:], background_sigma, m.device)
     corr_map = torch.clamp(torch.fft.ifft2(m).real, min=0.0)
     return corr_map, m
 
@@ -268,6 +313,7 @@ def cross_correlation(
 def cross_correlation_batch(
     dps: torch.Tensor,
     template_ft: torch.Tensor,
+    background_sigma: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cross-correlate a stack of diffraction patterns with one template.
 
@@ -291,11 +337,17 @@ def cross_correlation_batch(
     """
     dps = torch.as_tensor(dps)
     m = torch.fft.fft2(dps) * template_ft
+    if background_sigma is not None and background_sigma > 0:
+        m = m * _background_highpass(m.shape[-2:], background_sigma, m.device)
     corr_map = torch.clamp(torch.fft.ifft2(m).real, min=0.0)
     return corr_map, m
 
 
-def _corr_map_rfft(dps: torch.Tensor, template_ft: torch.Tensor) -> torch.Tensor:
+def _corr_map_rfft(
+    dps: torch.Tensor,
+    template_ft: torch.Tensor,
+    background_sigma: float | None = None,
+) -> torch.Tensor:
     """Real-FFT correlation map(s), used when no Fourier product is needed downstream.
 
     For real ``dps`` and a real template the Fourier product is conjugate-symmetric,
@@ -318,6 +370,8 @@ def _corr_map_rfft(dps: torch.Tensor, template_ft: torch.Tensor) -> torch.Tensor
     dps = torch.as_tensor(dps)
     H, W = dps.shape[-2], dps.shape[-1]
     prod = torch.fft.rfft2(dps) * template_ft[..., : W // 2 + 1]
+    if background_sigma is not None and background_sigma > 0:
+        prod = prod * _background_highpass((H, W), background_sigma, prod.device, rfft=True)
     corr_map = torch.fft.irfft2(prod, s=(H, W))
     return torch.clamp(corr_map, min=0.0)
 
@@ -332,6 +386,7 @@ def detect_disks(
     subpixel: str = "upsample",
     upsample_factor: int = 16,
     max_num_peaks: int = 1000,
+    background_sigma: float | None = None,
 ) -> np.ndarray:
     """Detect Bragg disks in one diffraction pattern by template matching.
 
@@ -366,7 +421,7 @@ def detect_disks(
     if subpixel not in SUBPIXEL_MODES:
         raise ValueError(f"subpixel must be in {SUBPIXEL_MODES}, got {subpixel!r}")
 
-    corr_map, m = cross_correlation(dp, template_ft)
+    corr_map, m = cross_correlation(dp, template_ft, background_sigma)
 
     peaks = _local_maxima(corr_map, edge_boundary)
     peaks = _filter_maxima(peaks, min_abs_intensity, min_spacing, max_num_peaks)
@@ -393,6 +448,7 @@ def detect_disks_batch(
     subpixel: str = "upsample",
     upsample_factor: int = 16,
     max_num_peaks: int = 1000,
+    background_sigma: float | None = None,
 ) -> list[np.ndarray]:
     """Detect Bragg disks across a stack of diffraction patterns (batched).
 
@@ -437,9 +493,9 @@ def detect_disks_batch(
         raise ValueError(f"subpixel must be in {SUBPIXEL_MODES}, got {subpixel!r}")
 
     if subpixel == "upsample":
-        corr_map, m = cross_correlation_batch(dps, template_ft)
+        corr_map, m = cross_correlation_batch(dps, template_ft, background_sigma)
     else:
-        corr_map = _corr_map_rfft(dps, template_ft)
+        corr_map = _corr_map_rfft(dps, template_ft, background_sigma)
         m = None
 
     peaks_all, bidx, counts = _detect_peaks_batched(

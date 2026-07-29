@@ -353,7 +353,9 @@ class BraggVectors(AutoSerialize):
             return None
         return torch.fft.fftshift(self._template).detach().cpu().numpy()
 
-    def correlation_map(self, row: int, col: int) -> np.ndarray:
+    def correlation_map(
+        self, row: int, col: int, background_sigma: float | str | None = "auto"
+    ) -> np.ndarray:
         """Cross-correlation map of one diffraction pattern with the template (numpy).
 
         Peaks in the returned map sit at absolute disk positions (no fftshift
@@ -376,7 +378,9 @@ class BraggVectors(AutoSerialize):
         dp = torch.as_tensor(
             np.asarray(self.dataset.array[row, col]), dtype=torch.float, device=self.device
         )
-        corr, _ = cross_correlation(dp, self._template_ft)
+        corr, _ = cross_correlation(
+            dp, self._template_ft, self._resolve_background_sigma(background_sigma)
+        )
         return corr.detach().cpu().numpy()
 
     def detect_disks(
@@ -389,6 +393,7 @@ class BraggVectors(AutoSerialize):
         subpixel: str = "upsample",
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
+        background_sigma: float | str | None = "auto",
         batch_size: int | None = None,
         progressbar: bool = True,
     ) -> Vector:
@@ -444,6 +449,7 @@ class BraggVectors(AutoSerialize):
             subpixel=subpixel,
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
+            background_sigma=self._resolve_background_sigma(background_sigma),
         )
 
         if positions is not None:
@@ -1090,6 +1096,7 @@ class BraggVectors(AutoSerialize):
         subpixel: str = "upsample",
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
+        background_sigma: float | str | None = "auto",
         image: np.ndarray | None = None,
         peak_radius: float = 6.0,
         marker_radius: float | None = None,
@@ -1161,6 +1168,7 @@ class BraggVectors(AutoSerialize):
             subpixel=subpixel,
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
+            background_sigma=background_sigma,
             progressbar=False,
         )
         if image is None:
@@ -1218,6 +1226,31 @@ class BraggVectors(AutoSerialize):
             return fig, ax
 
     # ---- helpers ----
+
+    def _resolve_background_sigma(
+        self, background_sigma: float | str | None
+    ) -> float | None:
+        """Resolve the ``background_sigma`` argument to a value in pixels.
+
+        ``"auto"`` (the default everywhere) maps to twice the central-beam
+        radius: wide enough that the disk-scale correlation peaks pass
+        untouched, narrow enough to remove the zero-sum template's negative
+        moat around a bright unscattered beam -- which otherwise pushes weak
+        disk peaks below zero, where the correlation clamp erases them before
+        peak finding. Pass ``None`` to disable the background subtraction or a
+        float to set the scale explicitly.
+        """
+        if background_sigma is None:
+            return None
+        if isinstance(background_sigma, str):
+            if background_sigma != "auto":
+                raise ValueError("background_sigma must be a float, None, or 'auto'.")
+            radius = self.metadata.get("template", {}).get("radius")
+            if radius is None:
+                dp_mean = np.asarray(self.dataset.dp_mean.array)
+                _, radius = estimate_central_beam(dp_mean)
+            return 2.0 * float(radius)
+        return float(background_sigma)
 
     def _set_template(
         self,
