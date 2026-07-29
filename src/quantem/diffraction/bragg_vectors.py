@@ -211,7 +211,7 @@ class BraggVectors(AutoSerialize):
         radius: float | None = None,
         edge: float = 1.0,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
     ) -> "BraggVectors":
         """Build the template from a synthetic soft-edged disk.
 
@@ -227,9 +227,10 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` disk center; defaults to the detector center
             ``(H // 2, W // 2)``.
-        subtract_mean : bool, default=True
-            If ``True``, make the template zero-sum — a band-pass kernel that
-            suppresses uniform background in the correlation.
+        subtract_mean : bool, default=False
+            If ``True``, make the template zero-sum. The default keeps the
+            unit-sum positive template, so correlation values stay positive and
+            roughly measure the probe-weighted counts under each peak.
 
         Returns
         -------
@@ -257,7 +258,7 @@ class BraggVectors(AutoSerialize):
     def make_template_from_data(
         self,
         roi: NDArray | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
         center: tuple[float, float] | None = None,
     ) -> "BraggVectors":
         """Build the template by averaging diffraction patterns from the data.
@@ -269,9 +270,10 @@ class BraggVectors(AutoSerialize):
             ideally a vacuum / single-disk region so the unscattered probe is
             isolated. ``None`` (default) averages the whole scan (the mean
             diffraction pattern).
-        subtract_mean : bool, default=True
-            If ``True``, make the template zero-sum — a band-pass kernel that
-            suppresses uniform background in the correlation.
+        subtract_mean : bool, default=False
+            If ``True``, make the template zero-sum. The default keeps the
+            unit-sum positive template, so correlation values stay positive and
+            roughly measure the probe-weighted counts under each peak.
         center : tuple of float, optional
             ``(row, col)`` probe center rolled to the origin; defaults to the
             probe's intensity centroid.
@@ -305,7 +307,7 @@ class BraggVectors(AutoSerialize):
         self,
         probe: NDArray | torch.Tensor,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
     ) -> "BraggVectors":
         """Build the template from an explicit probe image (e.g. a measured vacuum probe).
 
@@ -316,9 +318,10 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` probe center rolled to the origin; defaults to the
             probe's intensity centroid.
-        subtract_mean : bool, default=True
-            If ``True``, make the template zero-sum — a band-pass kernel that
-            suppresses uniform background in the correlation.
+        subtract_mean : bool, default=False
+            If ``True``, make the template zero-sum. The default keeps the
+            unit-sum positive template, so correlation values stay positive and
+            roughly measure the probe-weighted counts under each peak.
 
         Returns
         -------
@@ -354,7 +357,7 @@ class BraggVectors(AutoSerialize):
         return torch.fft.fftshift(self._template).detach().cpu().numpy()
 
     def correlation_map(
-        self, row: int, col: int, background_sigma: float | str | None = "auto"
+        self, row: int, col: int, background_sigma: float | str | None = None
     ) -> np.ndarray:
         """Cross-correlation map of one diffraction pattern with the template (numpy).
 
@@ -393,7 +396,7 @@ class BraggVectors(AutoSerialize):
         subpixel: str = "upsample",
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
-        background_sigma: float | str | None = "auto",
+        background_sigma: float | str | None = None,
         batch_size: int | None = None,
         progressbar: bool = True,
     ) -> Vector:
@@ -1096,7 +1099,7 @@ class BraggVectors(AutoSerialize):
         subpixel: str = "upsample",
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
-        background_sigma: float | str | None = "auto",
+        background_sigma: float | str | None = None,
         image: np.ndarray | None = None,
         peak_radius: float = 6.0,
         marker_radius: float | None = None,
