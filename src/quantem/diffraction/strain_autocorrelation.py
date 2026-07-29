@@ -1275,6 +1275,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             mask=mask,
             ds_sampling=ds_sampling,
             ds_units=ds_units,
+            q_to_r_rotation_ccw_deg = self.metadata['q_to_r_rotation_ccw_deg '],
+            q_transpose = self.metadata['q_transpose'],
         )
 
     def plot_lattice_vectors(

@@ -1125,6 +1125,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         u_ref: np.ndarray | None = None,
         v_ref: np.ndarray | None = None,
         mask: np.ndarray | None = None,
+        q_to_r_rotation_ccw_deg: float | None = None,
+        q_transpose: bool | None = None,
     ) -> StrainMap:
         """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
 
@@ -1172,6 +1174,40 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 default_sampling = float(self.dataset.sampling[0])
             else:
                 default_sampling = float(self.dataset.sampling)
+        
+        parent_rot = self.dataset.metadata.get("q_to_r_rotation_ccw_deg", None)
+        parent_tr = self.dataset.metadata.get("q_transpose", None)
+        
+        used_parent = False
+        if q_to_r_rotation_ccw_deg is None and parent_rot is not None:
+            q_to_r_rotation_ccw_deg = parent_rot
+            used_parent = True
+        if q_transpose is None and parent_tr is not None:
+            q_transpose = parent_tr
+            used_parent = True
+
+        if used_parent:
+            import warnings
+
+            warnings.warn(
+                "StrainMapAutocorrelation.preprocess: using parent Dataset4dstem metadata "
+                f"(q_to_r_rotation_ccw_deg={q_to_r_rotation_ccw_deg or 0.0}, "
+                f"q_transpose={q_transpose or False}).",
+                UserWarning,
+            )
+
+        if q_to_r_rotation_ccw_deg is None or q_transpose is None:
+            import warnings
+
+            q_to_r_rotation_ccw_deg = 0.0 if q_to_r_rotation_ccw_deg is None else q_to_r_rotation_ccw_deg
+            q_transpose = False if q_transpose is None else q_transpose
+            warnings.warn(
+                "StrainMapAutocorrelation.preprocess: setting q_to_r_rotation_ccw_deg=0.0 and q_transpose=False.",
+                UserWarning,
+            )
+
+        self.metadata["q_to_r_rotation_ccw_deg"] = q_to_r_rotation_ccw_deg
+        self.metadata["q_transpose"] = q_transpose
 
         return StrainMap(
             u_array = self.u_array,
@@ -1183,6 +1219,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             mask = mask,
             ds_sampling=default_sampling,
             ds_units = default_units,
+            q_to_r_rotation_ccw_deg = q_to_r_rotation_ccw_deg,
+            q_transpose = q_transpose,
         )
 
     @property
