@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 from typing import Optional
-from quantem.core.ml.constraints import BaseContext
 
 import torch
+
+from quantem.core.ml.constraints import BaseContext
 
 
 @dataclass
@@ -28,3 +29,4 @@ class ReconstructionContext(BaseContext):
     pred: Optional[torch.Tensor] = None
     all_densities: Optional[torch.Tensor] = None
     obj: Optional[torch.Tensor] = None
+    tv_tap_densities: Optional[torch.Tensor] = None

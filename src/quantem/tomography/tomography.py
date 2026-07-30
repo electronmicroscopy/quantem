@@ -210,7 +210,14 @@ class Tomography(TomographyOpt, TomographyBase):
                 ):
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
-                    all_densities = self.obj_model.forward(all_coords)
+                    tap_coords = self.obj_model.sample_tv_tap_coords(all_coords)
+                    if tap_coords is not None:
+                        all_densities, tv_tap_raw = self.obj_model.forward_with_tv_taps(
+                            all_coords, tap_coords
+                        )
+                    else:
+                        all_densities = self.obj_model.forward(all_coords)
+                        tv_tap_raw = None
 
                     integrated_densities = self.dset.integrate_rays(
                         all_densities,
@@ -225,6 +232,7 @@ class Tomography(TomographyOpt, TomographyBase):
                         coords=all_coords,
                         pred=pred,
                         all_densities=all_densities,
+                        tv_tap_densities=tv_tap_raw,
                     )
                 )
 

@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from quantem.core import config
+
 # --- Projection Operator Utils ---
 
 
@@ -67,6 +69,42 @@ def differentiable_rotx_vectorized(mags, theta, mode="bilinear"):
 
     rotated_mags = torch.vmap(transform_slice)(mags)
     return rotated_mags.permute(1, 2, 3, 0)
+
+
+def tv_loss_vol_sq(obj: torch.Tensor) -> torch.Tensor:
+    """Squared-anisotropic volume TV: sum of squared forward differences.
+
+    Computes ``Σ (Δd)² + Σ (Δh)² + Σ (Δw)²`` over the three trailing
+    spatial dims, leaving any leading channel/batch axes intact (they are
+    included in the sum). This is the unnormalized ``tv_vol`` regularizer;
+    callers apply their own ``weight / numel`` scaling.
+
+    When the optional ``quantem-cuda`` package is installed
+    (``pip install quantem[cuda]``), the tensor is on a CUDA device, and the
+    ``use_cuda_kernels`` config option is true (default), this dispatches to
+    the fused CUDA forward/backward kernel — identical math, one kernel
+    launch instead of several large intermediates.
+
+    Args:
+        obj: Tensor of shape ``[..., D, H, W]`` (ndim >= 3).
+
+    Returns:
+        0-dim tensor on the same device as ``obj``; differentiable.
+    """
+    if (
+        obj.is_cuda
+        and obj.dtype == torch.float32
+        and config.get("has_quantem_cuda")
+        and config.get("use_cuda_kernels", default=True)
+    ):
+        from quantem.cuda.core import tv_loss_sq_3d
+
+        return tv_loss_sq_3d(obj)
+
+    tv_d = torch.pow(obj[..., 1:, :, :] - obj[..., :-1, :, :], 2).sum()
+    tv_h = torch.pow(obj[..., :, 1:, :] - obj[..., :, :-1, :], 2).sum()
+    tv_w = torch.pow(obj[..., :, :, 1:] - obj[..., :, :, :-1], 2).sum()
+    return tv_d + tv_h + tv_w
 
 
 def tv_loss_1d(x: torch.Tensor, reduction: str = "mean") -> torch.Tensor:

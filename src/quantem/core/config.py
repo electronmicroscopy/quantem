@@ -34,6 +34,15 @@ except Exception as e:
     if "cuda" in str(e):
         NUM_DEVICES = 0
     _defaults["has_cupy"] = False
+try:
+    import quantem.cuda  # type: ignore  # noqa: F401
+
+    _defaults["has_quantem_cuda"] = True
+except ModuleNotFoundError:
+    _defaults["has_quantem_cuda"] = False
+except Exception:
+    # installed but unloadable (e.g. libcudart missing at runtime)
+    _defaults["has_quantem_cuda"] = False
 
 
 defaults: list[Mapping] = [_defaults]
