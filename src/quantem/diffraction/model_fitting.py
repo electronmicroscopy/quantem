@@ -324,6 +324,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self,
         *,
         align: bool = False,
+        origins: Any = None,
         edge_blend: float = 8.0,
         upsample_factor: int = 32,
         max_shift: float | None = None,
@@ -333,6 +334,27 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         rows=None,
         cols = None,
     ) -> "ModelDiffraction":
+        """Build the mean-pattern fit target ``image_ref`` (optionally descan-free).
+
+        By default ``image_ref`` is the plain mean over the (optionally
+        subsetted) scan. With probe descan, that mean is smeared; two ways to
+        build a sharp mean CBED instead:
+
+        - ``origins``: pass the measured per-position diffraction origins
+          (``(scan_row, scan_col, 2)``, e.g. the plane-fitted CoM of the
+          central beam). Each pattern is shifted by ``mean(origins) -
+          origins[r, c]`` before averaging, so the mean CBED is centered on
+          the scan-mean beam position. Deterministic and robust -- preferred
+          when the descan has been measured.
+        - ``align=True``: self-align the patterns by cross-correlation to a
+          running mean. Works when the patterns are similar across the scan,
+          but can chase changing diffraction contrast; ignored when
+          ``origins`` is given.
+
+        Only ``image_ref`` is built from shifted copies -- ``dataset.array``
+        itself is never resampled. The applied shifts are stored in
+        :attr:`preprocess_shifts`.
+        """
         arr = np.asarray(self.dataset.array)
         self.mask = np.ones(arr.shape[:2])
 
@@ -392,6 +414,29 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         stack = arr.reshape((-1, h, w)).astype(np.float32, copy=False)
         n = stack.shape[0]
+
+        if origins is not None:
+            origins = np.asarray(origins, dtype=float)
+            scan_shape = tuple(int(v) for v in self.dataset.shape[:2])
+            if origins.shape != scan_shape + (2,):
+                raise ValueError(
+                    f"origins must have shape {scan_shape + (2,)}, got {origins.shape}."
+                )
+            origins_sub = origins[np.ix_(rows, cols)].reshape(-1, 2)
+            shifts = (origins_sub.mean(axis=0) - origins_sub).astype(np.float32)
+            aligned = np.empty_like(stack, dtype=np.float32)
+            for i in range(n):
+                aligned[i] = ndi_shift(
+                    stack[i],
+                    shift=(float(shifts[i, 0]), float(shifts[i, 1])),
+                    order=int(shift_order),
+                    mode="nearest",
+                    prefilter=False,
+                )
+            self.image_ref = np.mean(aligned, axis=0)
+            self.preprocess_shifts = shifts.reshape(self.index_shape + (2,))
+            return self
+
         if not align or n <= 1:
             self.image_ref = np.mean(stack, axis=0)
             self.preprocess_shifts = None
