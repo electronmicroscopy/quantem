@@ -127,6 +127,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.u_array: np.ndarray | None = None
         self.v_array: np.ndarray | None = None
         self.mask_weight: np.ndarray | None = None
+        self._gpu_cache: torch.Tensor | None = None
 
     @classmethod
     def from_dataset(cls, dataset: Dataset4dstem, *, name: str | None = None) -> "StrainMapAutocorrelation":
@@ -227,31 +228,9 @@ class StrainMapAutocorrelation(AutoSerialize):
         mask_init[:, -1] = True
         mask_init[-1, :] = True
 
-        # The feather cannot be wider than the kept region's inradius: otherwise no
-        # pixel reaches mask ~ 1 and the int_edge reduction below sees an empty
-        # selection (e.g. edge_blend=64 on a 128x128 detector).
-        edge_distance = distance_transform_edt(np.logical_not(mask_init))
-        max_distance = float(np.max(edge_distance))
-        if max_distance <= 0.0:
-            raise ValueError(
-                "No detector pixels survive the threshold; lower threshold or "
-                "threshold_percentile."
-            )
-        if edge_blend > max_distance:
-            import warnings
-
-            warnings.warn(
-                f"edge_blend={edge_blend:g} exceeds the kept region's largest distance "
-                f"from the masked region ({max_distance:g} pixels); clamping to "
-                f"{max_distance:g}. Pass a smaller edge_blend to silence this warning.",
-                UserWarning,
-                stacklevel=2,
-            )
-            edge_blend = max_distance
-
         self.mask_diffraction = np.sin(
             np.clip(
-                edge_distance / edge_blend,
+                distance_transform_edt(np.logical_not(mask_init)) / edge_blend,
                 0.0,
                 1.0,
             )
@@ -771,6 +750,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         gaussian_maxfev: int = 100,
         progressbar: bool = True,
         device: str = "cpu",
+        batch_size: int | None = None,
+        save_to_gpu: bool = True,
     ) -> "StrainMapAutocorrelation":
         """Fit the lattice vectors at every scan position (the heavy step).
 
@@ -866,6 +847,8 @@ class StrainMapAutocorrelation(AutoSerialize):
                 refine_all_peaks=refine_all_peaks,
                 peaks=self.mean_img_peaks if refine_all_peaks else None,
                 weights=self.mean_img_weights if refine_all_peaks else None,
+                batch_size = batch_size,
+                save_to_gpu = save_to_gpu
             )
         else:
             # Per-position fallback for DFT upsampling (refine_dft=True).
@@ -943,6 +926,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         refine_all_peaks: bool = False,
         peaks: NDArray | None = None,
         weights: NDArray | None = None,
+        batch_size: int | None = None,
+        save_to_gpu: bool = True,
     ) -> None:
         """Batched torch implementation of the non-DFT :meth:`fit_lattice_vectors` path.
 
@@ -981,12 +966,27 @@ class StrainMapAutocorrelation(AutoSerialize):
         gamma = float(self.metadata["gamma"]) if mode == "gamma" else None
 
         dev = torch.device(device)
-        # float32: supported on every backend (MPS has no float64, and float64 is
-        # ~30x slower on consumer CUDA cards); precision is ample for the ~0.01 px
-        # peak-fit noise floor.
-        mask = torch.as_tensor(self.mask_diffraction, dtype=torch.float32, device=dev)
-        mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=torch.float32, device=dev)
-
+        mask = torch.as_tensor(self.mask_diffraction, dtype=torch.float64, device=dev)
+        mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=torch.float64, device=dev)
+        use_cache = False
+        if save_to_gpu and str(dev) != "cpu":
+            if not hasattr(self, '_gpu_cache') or self._gpu_cache is None:
+                try:
+                    print(f"Loading dataset to {dev}", end = " ", flush = True)
+                    self._gpu_cache = torch.as_tensor(
+                        np.asarray(self.dataset.array),
+                        dtype = torch.float32,
+                        device=dev,
+                    )
+                    use_cache = True
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    print(f"Out of memory, will read per-batch")
+                    self._gpu_cache = None
+                    use_cache = False
+            else:
+                # self._gpu_cache = None
+                use_cache = True
+            
         if refine_all_peaks:
             # Precompute the fixed pieces of the per-position all-peaks fit (these do not
             # change across scan positions): the detected peak seeds, their normalized
@@ -1000,7 +1000,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             n_pk = peaks_arr.shape[0]
 
         # Match the correlation chunking heuristic (see BraggVectors._detect_positions).
-        batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
+        if batch_size is None:
+            batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
 
         starts = range(0, n_pos, batch_size)
         if progressbar:
@@ -1017,15 +1018,21 @@ class StrainMapAutocorrelation(AutoSerialize):
             stop = min(start + batch_size, n_pos)
             idxs = [(idx // scan_c, idx % scan_c) for idx in range(start, stop)]
 
-            dps = torch.stack(
-                [
-                    torch.as_tensor(
-                        np.asarray(self.dataset.array[r, c]), dtype=torch.float32, device=dev
-                    )
-                    for r, c in idxs
-                ],
-                dim=0,
-            )
+            if use_cache:
+                rows = [r for r, c in idxs]
+                cols = [c for r, c in idxs]
+                dps = self._gpu_cache[rows, cols]
+            else:
+                dps = torch.stack(
+                    [
+                        torch.as_tensor(
+                            np.asarray(self.dataset.array[r, c]), dtype=torch.float64, device=dev
+                        )
+                        for r, c in idxs
+                    ],
+                    dim=0,
+                )
+
             dpm = dps * mask + mask_inv
             if mode == "linear":
                 tr = dpm
@@ -1268,6 +1275,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             mask=mask,
             ds_sampling=ds_sampling,
             ds_units=ds_units,
+            q_to_r_rotation_ccw_deg = self.metadata['q_to_r_rotation_ccw_deg'],
+            q_transpose = self.metadata['q_transpose'],
         )
 
     def plot_lattice_vectors(
@@ -1689,8 +1698,13 @@ def _refine_peak_subpixel_dft(
     F = np.fft.fft2(np.fft.fftshift(im))
 
     up = upsample
-    du = int(np.fix(np.ceil(1.5 * up)))
-    patch = np.abs(dft_upsample(F, up=up, shift=(r0, c0)))
+    H, W = im.shape
+    du = int(np.floor(np.ceil(1.5 * up) / 2.0))
+    off_r = -(-H // 2)          # ceil(H/2)
+    off_c = -(-W // 2)          # ceil(W/2)
+
+    shift = (du + up * (r0 - off_r), du + up * (c0 - off_c))
+    patch = np.abs(dft_upsample(F, up=up, shift=shift))
     patch = np.asarray(patch, dtype=float)
 
     i0, j0 = np.unravel_index(np.argmax(patch), patch.shape)
@@ -1706,9 +1720,9 @@ def _refine_peak_subpixel_dft(
         dj = _parabolic_vertex_delta(row[0], row[1], row[2])
     else:
         dj = 0.0
-    M, N = im.shape
-    dr = ((float(i0) - du + di)) / up
-    dc = ((float(j0) - du + dj)) / up
+
+    dr = ((du - float(i0) - di)) / up
+    dc = ((du - float(j0) - dj)) / up
 
     return r0 + dr, c0 + dc
 
@@ -2129,4 +2143,3 @@ def _refine_peaks_batched(
     row = torch.where(ok, row, r_sub)
     col = torch.where(ok, col, c_sub)
     return torch.stack([row - rcent, col - ccent, amp, sig, bg], 1)
-

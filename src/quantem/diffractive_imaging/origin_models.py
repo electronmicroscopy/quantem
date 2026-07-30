@@ -309,9 +309,40 @@ class CenterOfMassOriginModel(AutoSerialize):
         return rotation_curl
 
     def estimate_detector_rotation(
-        self, rotation_angles_deg: torch.Tensor | NDArray | None = None
+        self,
+        rotation_angles_deg: torch.Tensor | NDArray | None = None,
+        print_result: bool = False,
+        plot_result: bool = False,
+        **plot_kwargs,
     ):
-        """ """
+        """Estimate the detector->scan rotation (and transpose) by curl minimization.
+
+        Sweeps ``rotation_angles_deg`` and, for both the un-transposed and transposed
+        center-of-mass field, computes the mean absolute curl of the rotated CoM. The
+        physical orientation makes the CoM field curl-free, so the global minimum over
+        both branches selects the rotation angle and whether the detector axes are
+        transposed. Results are stored in :attr:`detector_rotation_deg` and
+        :attr:`detector_transpose`.
+
+        Parameters
+        ----------
+        rotation_angles_deg : torch.Tensor or NDArray, optional
+            Angles (degrees) to search. Defaults to ``arange(-89, 90, 1)``.
+        print_result : bool, default=False
+            If ``True``, print the minimum curl and angle of each branch and the
+            chosen orientation.
+        plot_result : bool, default=False
+            If ``True``, plot the curl-vs-rotation curves for both branches, marking
+            each branch minimum. Useful for judging whether the transpose choice is
+            trustworthy (a clear, deep minimum on one branch) or ambiguous.
+        **plot_kwargs
+            Forwarded to :func:`matplotlib.pyplot.subplots` when ``plot_result``.
+
+        Returns
+        -------
+        CenterOfMassOriginModel
+            ``self``.
+        """
         if rotation_angles_deg is None:
             rotation_angles_deg = torch.arange(-89, 90, 1, device=self.device, dtype=torch.float)
 
@@ -342,6 +373,31 @@ class CenterOfMassOriginModel(AutoSerialize):
             ind_min = torch.argmin(curl_transpose)
 
         self._detector_rotation_deg = rotation_angles_deg[ind_min].item()
+
+        if print_result or plot_result:
+            a = rotation_angles_deg.detach().cpu().numpy()
+            cn = curl_no_transpose.detach().cpu().numpy()
+            ct = curl_transpose.detach().cpu().numpy()
+            i_no, i_tr = int(cn.argmin()), int(ct.argmin())
+
+            if print_result:
+                chosen = "TRANSPOSE" if self._detector_transpose else "NO transpose"
+                print(f"no-transpose : min curl {cn[i_no]:.4g} at {a[i_no]:+.2f} deg")
+                print(f"transpose    : min curl {ct[i_tr]:.4g} at {a[i_tr]:+.2f} deg")
+                print(f"=> chosen: {chosen} at {self._detector_rotation_deg:+.2f} deg")
+
+            if plot_result:
+                import matplotlib.pyplot as plt
+
+                _fig, ax = plt.subplots(**{"figsize": (6, 4), **plot_kwargs})
+                line_no = ax.plot(a, cn, label="no transpose")[0]
+                line_tr = ax.plot(a, ct, label="transpose")[0]
+                ax.plot(a[i_no], cn[i_no], "o", color=line_no.get_color())
+                ax.plot(a[i_tr], ct[i_tr], "o", color=line_tr.get_color())
+                ax.set_xlabel("rotation (deg)")
+                ax.set_ylabel("mean |curl| of CoM  (lower = better)")
+                ax.set_title("Detector-rotation search")
+                ax.legend()
 
         return self
 

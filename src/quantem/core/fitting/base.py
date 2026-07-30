@@ -802,12 +802,8 @@ class SqrtMSELoss(nn.Module):
     
     def forward(self, pred, target):
         eps = 1
-        pred_modified = (pred-torch.min(pred)+eps)**self.gamma
-        # pred_modified = pred_modified / torch.linalg.norm(pred_modified)
-
-        target_modified = (target-torch.min(target)+eps)**self.gamma
-        # target_modified = target_modified / torch.linalg.norm(target_modified)
-
+        pred_modified = (pred - pred.min() + eps) ** self.gamma
+        target_modified = (target - target.min() + eps) ** self.gamma
         loss = self.mse_fn(pred_modified, target_modified)
         return loss
 
@@ -1049,11 +1045,8 @@ class FitBase(OptimizerMixin):
         self, pred: torch.Tensor, target: torch.Tensor, **kwargs: Any
     ) -> torch.Tensor:
         if self.ctx is not None and self.ctx.mask is not None:
-            # TODO -- use loss modules (currently implemented in tomo branch)
-            # and update them to allow for masking at module level
-            diff = (pred - target) * self.ctx.mask
-            denom = torch.clamp(torch.sum(self.ctx.mask), min=1.0)
-            return torch.sum(diff * diff) / denom
+            valid = self.ctx.mask.bool()
+            return self.loss_fn(pred[valid], target[valid])
         return self.loss_fn(pred, target)
 
     def _constraint_loss(

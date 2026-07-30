@@ -48,143 +48,6 @@ def _splat_patch(
     put(r0i + 1, c0i + 1, w11)
 
 
-def _gaussian_tap_weights(
-    frac: torch.Tensor, taps: torch.Tensor, sigma: float
-) -> torch.Tensor:
-    """
-    Normalized 1D Gaussian weights from fractional positions to integer taps.
-
-    Parameters
-    ----------
-    frac : torch.Tensor
-        Fractional parts in ``[0, 1)``, any shape ``(...,)``.
-    taps : torch.Tensor
-        Integer tap offsets, shape ``(T,)``.
-    sigma : float
-        Gaussian width in pixels.
-
-    Returns
-    -------
-    torch.Tensor
-        Weights of shape ``(..., T)`` summing to 1 along the last axis, so the
-        splatted flux is conserved and (unlike bilinear) the effective blur is
-        independent of the subpixel phase — no integer-pixel "locking" minima.
-    """
-    d = taps.reshape((1,) * frac.ndim + (-1,)) - frac.unsqueeze(-1)
-    w = torch.exp(-(d * d) / (2.0 * sigma * sigma))
-    return w / w.sum(dim=-1, keepdim=True)
-
-
-def _smooth_tap_weights(
-    frac: torch.Tensor, taps: torch.Tensor, width: float
-) -> torch.Tensor:
-    """
-    Normalized finite-support smoothstep splat weights.
-
-    A compact alternative to the Gaussian tap weights with NO tails: the weight
-    is ``smoothstep(1 - |d|/width)`` (``smoothstep(x) = 3x^2 - 2x^3``), which is
-    exactly zero for ``|d| >= width`` and, for ``width > 1``, still nonzero at
-    the neighbouring integer taps when centred -- so the effective blur stays
-    phase-independent (no integer-pixel locking) while the kernel has finite
-    bandwidth. The disk edge itself is carried by the template, so this kernel
-    only interpolates sub-pixel position and provides anti-lock.
-    """
-    d = (taps.reshape((1,) * frac.ndim + (-1,)) - frac.unsqueeze(-1)).abs()
-    x = torch.clamp(1.0 - d / float(width), min=0.0)
-    w = x * x * (3.0 - 2.0 * x)
-    return w / w.sum(dim=-1, keepdim=True)
-
-
-def _kernel_taps_weights(frac, width, kernel, device, dtype):
-    """Return (taps, weights) for the requested finite render kernel."""
-    if kernel == "smoothstep":
-        K = max(2, int(np.ceil(float(width))))
-        taps = torch.arange(-K + 1, K + 1, device=device, dtype=dtype)
-        return taps, _smooth_tap_weights(frac, taps, width)
-    K = max(2, int(np.ceil(3.0 * float(width))))
-    taps = torch.arange(-K + 1, K + 1, device=device, dtype=dtype)
-    return taps, _gaussian_tap_weights(frac, taps, width)
-
-
-def _splat_patch_gaussian(
-    out: torch.Tensor,
-    *,
-    r0: torch.Tensor,
-    c0: torch.Tensor,
-    patch_vals: torch.Tensor,
-    dr: torch.Tensor,
-    dc: torch.Tensor,
-    scale: torch.Tensor,
-    sigma: float,
-    kernel: str = "gaussian",
-) -> None:
-    """Finite-kernel analogue of ``_splat_patch`` (phase-independent blur)."""
-    h, w = out.shape
-    r = r0 + dr
-    c = c0 + dc
-    r_base = torch.floor(r)
-    c_base = torch.floor(c)
-    fr = r - r_base
-    fc = c - c_base
-    r0i = r_base.to(torch.long)
-    c0i = c_base.to(torch.long)
-    v = patch_vals * scale
-
-    taps, wr = _kernel_taps_weights(fr, sigma, kernel, out.device, out.dtype)
-    _, wc = _kernel_taps_weights(fc, sigma, kernel, out.device, out.dtype)
-    taps_i = taps.to(torch.long)
-
-    for i in range(taps_i.numel()):
-        rr = r0i + taps_i[i]
-        r_ok = (rr >= 0) & (rr < h)
-        for j in range(taps_i.numel()):
-            cc = c0i + taps_i[j]
-            keep = r_ok & (cc >= 0) & (cc < w)
-            if torch.any(keep):
-                ww = wr[:, i] * wc[:, j]
-                out.index_put_(
-                    (rr[keep], cc[keep]), v[keep] * ww[keep], accumulate=True
-                )
-
-
-def _splat_patch_batched_gaussian(
-    shape: tuple[int, int],
-    *,
-    r0: torch.Tensor,
-    c0: torch.Tensor,
-    vals: torch.Tensor,
-    device: torch.device,
-    dtype: torch.dtype,
-    sigma: float,
-    kernel: str = "gaussian",
-) -> torch.Tensor:
-    """Finite-kernel analogue of ``_splat_patch_batched``."""
-    h, w = int(shape[0]), int(shape[1])
-    B, N = r0.shape
-    r_base = torch.floor(r0)
-    c_base = torch.floor(c0)
-    fr = r0 - r_base
-    fc = c0 - c_base
-    r0i = r_base.to(torch.long)
-    c0i = c_base.to(torch.long)
-
-    taps, wr = _kernel_taps_weights(fr, sigma, kernel, device, dtype)
-    _, wc = _kernel_taps_weights(fc, sigma, kernel, device, dtype)
-    taps_i = taps.to(torch.long)
-
-    out_flat = torch.zeros(B, h * w, device=device, dtype=dtype)
-    for i in range(taps_i.numel()):
-        rr = r0i + taps_i[i]
-        r_ok = (rr >= 0) & (rr < h)
-        rr_c = rr.clamp(0, h - 1)
-        for j in range(taps_i.numel()):
-            cc = c0i + taps_i[j]
-            keep = r_ok & (cc >= 0) & (cc < w)
-            weighted = wr[:, :, i] * wc[:, :, j] * vals * keep.to(dtype)
-            out_flat.scatter_add_(1, rr_c * w + cc.clamp(0, w - 1), weighted)
-    return out_flat.reshape(B, h, w)
-
-
 def _splat_patch_batched(
     shape: tuple[int, int],
     *,
@@ -446,11 +309,6 @@ class DiskTemplate(RenderComponent):
         r0 = origin_coords_b[:, 0:1] + dr.unsqueeze(0)
         c0 = origin_coords_b[:, 1:2] + dc.unsqueeze(0)
         vals = template_raw_b.reshape(B, N) * intensity_raw_b.view(B, 1)
-        if self.render_sigma is not None:
-            return _splat_patch_batched_gaussian(
-                ctx.shape, r0=r0, c0=c0, vals=vals, device=ctx.device,
-                dtype=ctx.dtype, sigma=self.render_sigma, kernel=self.render_kernel,
-            )
         return _splat_patch_batched(
             ctx.shape, r0=r0, c0=c0, vals=vals, device=ctx.device, dtype=ctx.dtype
         )
@@ -696,10 +554,7 @@ class SyntheticDiskLattice(RenderComponent):
         center_intensity_0: float | Sequence[float] | None = None,
         exclude_indices: Iterable[tuple[int, int]] | None = None,
         boundary_px: float = 0.0,
-        max_slope_ratio: float | None = None,
-        own_template: bool = False,
-        intensity_softplus_beta: float | None = None,
-        slope_l2_weight: float = 0.0,
+        min_frac_inside_mask: float | None = None,
         origin: OriginND | None = None,
         origin_key: str = "origin",
         constraint_params: dict[str, Any] | None = None,
@@ -763,23 +618,12 @@ class SyntheticDiskLattice(RenderComponent):
         self.u_max = int(u_max)
         self.v_max = int(v_max)
         self.boundary_px = float(boundary_px)
-        self.max_slope_ratio = None if max_slope_ratio is None else float(max_slope_ratio)
-        # When True, ``disk`` is the lattice's OWN template (a distinct
-        # DiskTemplate from the center-beam component), so its ``template_raw``
-        # is trained via this lattice and shaped by the disk's constraints. When
-        # False (default) the lattice shares the center disk's template.
-        self.own_template = bool(own_template)
-        # None -> hard clamp max(f, 0); float -> softplus(beta*f)/beta (smooth,
-        # gradient-alive positivity that approaches zero without crossing it).
-        self.intensity_softplus_beta = (
-            None if intensity_softplus_beta is None else float(intensity_softplus_beta)
+        # Drop a lattice disk from the render/fit when less than this fraction
+        # of its (circular) template patch falls inside ctx.mask -- i.e. the disk
+        # has too little illuminated data to constrain it. None disables it.
+        self.min_frac_inside_mask = (
+            None if min_frac_inside_mask is None else float(min_frac_inside_mask)
         )
-        # Soft L2 prior on the per-disk linear slopes (ir, ic). Unlike the hard
-        # max_slope_ratio cap this shrinks slopes toward zero proportionally to
-        # the data misfit, so it auto-adapts: slopes relax to ~0 where there is
-        # no real intensity asymmetry (e.g. precession-averaged data) and grow
-        # only where the data supports them.
-        self.slope_l2_weight = float(slope_l2_weight)
 
         if max_intensity_order is None:
             max_intensity_order = 1 if bool(per_disk_slopes) else 0
@@ -972,27 +816,35 @@ class SyntheticDiskLattice(RenderComponent):
         super().enforce_hard_constraints(ctx)
 
 
-    def _apply_positivity(self, inten: torch.Tensor) -> torch.Tensor:
-        """Map the per-pixel intensity polynomial to nonnegative values.
-
-        Hard ``max(f, 0)`` clips part of a tilted disk dark but leaves a dead
-        gradient in the clipped region; softplus (``intensity_softplus_beta``
-        set) is smooth and keeps the slope gradient alive everywhere while still
-        approaching zero without crossing it.
+    def _mask_keep(
+        self, ctx: RenderContext, centers_r: torch.Tensor, centers_c: torch.Tensor
+    ) -> torch.Tensor | None:
         """
-        if self.intensity_softplus_beta is not None:
-            beta = self.intensity_softplus_beta
-            return F.softplus(beta * inten) / beta
-        return torch.clamp(inten, min=0.0)
+        Per-disk keep mask from ``min_frac_inside_mask``.
 
-    def constraint_loss(
-        self, ctx: RenderContext, params: dict[str, object] | None = None
-    ) -> torch.Tensor:
-        if self.slope_l2_weight <= 0.0 or self.ir is None or self.ic is None:
-            return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
-        ir = self.ir.to(device=ctx.device, dtype=ctx.dtype)
-        ic = self.ic.to(device=ctx.device, dtype=ctx.dtype)
-        return self.slope_l2_weight * torch.mean(ir * ir + ic * ic)
+        Returns a boolean tensor shaped like ``centers_r`` that is True where at
+        least ``min_frac_inside_mask`` of the disk's circular template patch lands
+        on a True pixel of ``ctx.mask``; returns None when the filter is disabled
+        or no mask is set. Off-frame patch pixels count as outside the mask.
+        """
+        if self.min_frac_inside_mask is None or ctx.mask is None:
+            return None
+        mask = ctx.mask
+        h, w = int(mask.shape[0]), int(mask.shape[1])
+        dr = cast(torch.Tensor, self.disk.dr).to(device=ctx.device)
+        dc = cast(torch.Tensor, self.disk.dc).to(device=ctx.device)
+        tv = self.disk.patch_values().detach()
+        supp = tv > 0.5 * tv.max().clamp(min=1e-12)
+        drs = dr[supp]
+        dcs = dc[supp]
+        if drs.numel() == 0:
+            return None
+        rr = (centers_r.reshape(-1)[:, None] + drs[None, :]).round().to(torch.long)
+        cc = (centers_c.reshape(-1)[:, None] + dcs[None, :]).round().to(torch.long)
+        in_frame = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+        mval = mask[rr.clamp(0, h - 1), cc.clamp(0, w - 1)].to(torch.bool) & in_frame
+        frac = mval.to(torch.float32).mean(dim=1)
+        return (frac >= self.min_frac_inside_mask).reshape(centers_r.shape)
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
@@ -1013,6 +865,9 @@ class SyntheticDiskLattice(RenderComponent):
         b = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
         keep = (centers_r >= b) & (centers_r <= (ctx.shape[0] - 1) - b)
         keep = keep & (centers_c >= b) & (centers_c <= (ctx.shape[1] - 1) - b)
+        mk = self._mask_keep(ctx, centers_r, centers_c)
+        if mk is not None:
+            keep = keep & mk
         if not torch.any(keep):
             return out
         
@@ -1054,8 +909,6 @@ class SyntheticDiskLattice(RenderComponent):
             if active_order >= 2:
                 inten = inten + self.irr * centers_r**2 + self.icc * centers_c**2 + self.irc * centers_r * centers_c
         
-        # Positivity: hard clip, or smooth softplus if a beta is configured.
-        inten = self._apply_positivity(inten)
         inten = inten[:, None].expand(-1, num_pixels) if inten.ndim == 1 else inten.expand(num_disks, num_pixels)
         total_pixels = num_disks * num_pixels
         r0_all = centers_r[:, None].expand(-1, num_pixels).reshape(total_pixels)
@@ -1063,23 +916,15 @@ class SyntheticDiskLattice(RenderComponent):
         dr_all = dr[None, :].expand(num_disks, -1).reshape(total_pixels)
         dc_all = dc[None, :].expand(num_disks, -1).reshape(total_pixels)
         vals_all = (patch_vals[None, :] * inten).reshape(total_pixels)
-        if self.disk.render_sigma is not None:
-            _splat_patch_gaussian(
-                out, r0=r0_all, c0=c0_all, patch_vals=vals_all,
-                dr=dr_all, dc=dc_all, scale=torch.ones_like(vals_all),
-                sigma=self.disk.render_sigma,
-                kernel=self.disk.render_kernel,
-            )
-        else:
-            _splat_patch(
-                out,
-                r0=r0_all,
-                c0=c0_all,
-                patch_vals=vals_all,
-                dr=dr_all,
-                dc=dc_all,
-                scale=torch.ones_like(vals_all)
-            )
+        _splat_patch(
+            out,
+            r0=r0_all,
+            c0=c0_all,
+            patch_vals=vals_all,
+            dr=dr_all,
+            dc=dc_all,
+            scale=torch.ones_like(vals_all)
+        )
         return out
 
     def forward_batched(
@@ -1125,6 +970,9 @@ class SyntheticDiskLattice(RenderComponent):
         bb = torch.as_tensor(self.boundary_px, device=ctx.device, dtype=ctx.dtype)
         keep = (r0_kb >= bb) & (r0_kb <= (ctx.shape[0] - 1) - bb)
         keep = keep & (c0_kb >= bb) & (c0_kb <= (ctx.shape[1] - 1) - bb)
+        mk = self._mask_keep(ctx, r0_kb, c0_kb)
+        if mk is not None:
+            keep = keep & mk
         keep_f = keep.to(dtype=ctx.dtype)
 
         active_order = int(
@@ -1162,8 +1010,6 @@ class SyntheticDiskLattice(RenderComponent):
                     + irc_b.view(B, 1, 1) * (r0_kb * c0_kb).unsqueeze(2)
                 )
 
-        # Positivity: hard clip, or smooth softplus if a beta is configured.
-        inten = self._apply_positivity(inten)
         inten = inten * keep_f.unsqueeze(2)
         vals = patch_vals.unsqueeze(1) * inten
 
@@ -1171,11 +1017,6 @@ class SyntheticDiskLattice(RenderComponent):
         c0_full = (c0_kb.unsqueeze(2) + dc.view(1, 1, N_pix)).reshape(B, K * N_pix)
         vals_full = vals.reshape(B, K * N_pix)
 
-        if self.disk.render_sigma is not None:
-            return _splat_patch_batched_gaussian(
-                ctx.shape, r0=r0_full, c0=c0_full, vals=vals_full,
-                device=ctx.device, dtype=ctx.dtype, sigma=self.disk.render_sigma, kernel=self.disk.render_kernel,
-            )
         return _splat_patch_batched(
             ctx.shape, r0=r0_full, c0=c0_full, vals=vals_full,
             device=ctx.device, dtype=ctx.dtype,
@@ -1184,13 +1025,7 @@ class SyntheticDiskLattice(RenderComponent):
     def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
         params = []
         for name, param in self.named_parameters(recurse=True):
-            if name.startswith('disk.'):
-                # The lattice's own template is trained here; other disk params
-                # (intensity, its origin) are not owned by the lattice.
-                if self.own_template and name == 'disk.template_raw' and param.requires_grad:
-                    params.append(param)
-                continue
-            if param.requires_grad:
+            if not name.startswith('disk.') and param.requires_grad:
                 params.append(param)
         if not params:
             return {}
