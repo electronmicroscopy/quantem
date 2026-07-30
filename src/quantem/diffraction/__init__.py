@@ -2,3 +2,4 @@ from quantem.diffraction.bragg_vectors import BraggVectors as BraggVectors
 from quantem.diffraction.strain import StrainMap as StrainMap
 from quantem.diffraction.strain_autocorrelation import StrainMapAutocorrelation as StrainMapAutocorrelation
 from quantem.diffraction.model_fitting import ModelDiffraction as ModelDiffraction
+from quantem.diffraction.digital_dark_field import *

@@ -7,6 +7,8 @@ from typing import Any, Literal, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from tqdm import tqdm
+
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import (
     validate_fields,
@@ -977,6 +979,61 @@ class Vector(AutoSerialize):
             if rows > 0:
                 cell[:, field_indices] = op(chunk, lhs) if reverse else op(lhs, chunk)
             cursor += rows
+
+    # ------------------------------------------------------------------ #
+    # Digital Dark Field Enabling
+    # ------------------------------------------------------------------ #
+
+def make_FullPointsVector_centres(vecs,centers):
+    '''
+    This may be a bit wasteful but it builds a new vector object that contains everything you need for 
+    DDF imaging.  Maybe you could do this instead by augmenting the existing object
+    from disk detection, but I couldn't figure out how
+    azimuthal angle is measured anticlockwise from horizontal right
+
+    Parameters
+    ----------
+    vecs: Vector
+        Currently must contain fields for kx, ky and intensity
+    centers: np.ndarray
+        A (2,Rx,Ry) array of kx and ky centres
+
+    Returns
+    -------
+    pointsvector: Vector
+        Containing fields ["rx", "ry", "kx", "ky", "kr", "kphi", "intensity"]
+
+    '''
+    Rshape = centers.shape[1:]
+    if 'q_row' in vecs.fields:
+        fields = ["q_row","q_col"]
+    elif 'kx' in vecs.fields:
+        fields = ["kx","ky"]
+    pointsvector = Vector.from_shape(
+        shape=Rshape,
+        fields=("rx", "ry", "kx", "ky", "kr", "kphi", "intensity"),
+        units=("pixels", "pixels", "pixels", "pixels", "pixels", "degrees", "counts"),
+        name="diffraction_vectors",
+    )
+ 
+    for rx in tqdm(range(Rshape[0])):
+        for ry in range(Rshape[1]):
+            kx = vecs[rx,ry].select_fields(fields[0]).flatten()-centers[0,rx,ry]
+            ky = vecs[rx,ry].select_fields(fields[1]).flatten()-centers[1,rx,ry]
+            kr = (kx**2+ky**2)**.5
+            kphi = np.degrees(np.arctan2(-kx, ky))
+            I = vecs[rx,ry].select_fields("intensity").flatten()
+            
+            pointsvector[rx, ry] = np.column_stack((
+                rx * np.ones_like(kx), 
+                ry * np.ones_like(kx), 
+                kx, 
+                ky, 
+                kr,
+                kphi,
+                I
+            ))
+    return pointsvector
 
 
 def _resolve_fields(
