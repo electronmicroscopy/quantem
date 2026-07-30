@@ -169,6 +169,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         AutoSerialize.__init__(self)
@@ -178,7 +179,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
         if not (
-            tilt_stack.shape[0] < tilt_stack.shape[1] or tilt_stack.shape[0] < tilt_stack.shape[2]
+            tilt_stack.shape[0] == tilt_angles.shape[0]
         ):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
@@ -188,7 +189,10 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_stack = torch.from_numpy(tilt_stack)
         if type(tilt_angles) is not torch.Tensor:
             tilt_angles = torch.from_numpy(tilt_angles)
-        max_val = torch.quantile(tilt_stack, 0.95)
+        if norm_quantile:
+            max_val = torch.quantile(tilt_stack, 0.95)
+        else:
+            max_val = torch.max(tilt_stack)
 
         # Tilt stack normalization
         tilt_stack = tilt_stack / max_val
@@ -221,12 +225,14 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
     ):
         return cls(
             tilt_stack=tilt_stack,
             tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=cls._token,
         )
 
@@ -397,6 +403,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         _token: object | None = None,
     ):
         super().__init__(
@@ -404,6 +411,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
             tilt_angles=-tilt_angles,  # TODO: Flip the tilt angles to be negative to match the convention of INR.
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
             _token=_token,
         )
 
@@ -456,10 +464,18 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         tilt_angles: NDArray | torch.Tensor,
         learn_shift: bool = True,
         learn_tilt_axis: bool = True,
+        norm_quantile: bool = True,
         seed: int = 42,
         _token: object | None = None,
     ):
-        super().__init__(tilt_stack, tilt_angles, learn_shift, learn_tilt_axis, _token=_token)
+        super().__init__(
+            tilt_stack,
+            tilt_angles,
+            learn_shift,
+            learn_tilt_axis,
+            norm_quantile,
+            _token=_token,
+        )
 
     # --- Forward Pass w/ Params Method for OptimizerMixin ---
     def forward(self, dummy_input: Any = None):
@@ -520,7 +536,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         return all_coords
 
     @staticmethod
-    @torch.compile(mode="reduce-overhead")
     def create_batch_rays(
         pixel_i: torch.Tensor, pixel_j: torch.Tensor, N: int, num_samples_per_ray: int
     ) -> torch.Tensor:
@@ -583,7 +598,6 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         return transformed_rays
 
     @staticmethod
-    @torch.compile(mode="reduce-overhead")
     def integrate_rays(
         rays: torch.Tensor, num_samples_per_ray: int, target_values_len: int
     ) -> torch.Tensor:
