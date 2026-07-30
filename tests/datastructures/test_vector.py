@@ -297,6 +297,46 @@ class TestVector:
         )
         assert from_data.dtype == torch.float64
 
+    def test_out_of_place_arithmetic_uses_torch_dtype_promotion(self):
+        integer = Vector.from_shape(shape=(1,), fields=["a"], dtype=torch.int64)
+        integer[0] = [[3]]
+        divided = integer / 2
+        assert divided.dtype == torch.float32
+        assert_rows(divided.flatten(), [[1.5]])
+
+        real = Vector.from_shape(shape=(1,), fields=["a"])
+        real[0] = [[1.0]]
+
+        doubled = real + torch.tensor([[2.0]], dtype=torch.float64)
+        assert doubled.dtype == torch.float64
+        assert_rows(doubled.flatten(), [[3.0]])
+
+        complex_result = real + torch.tensor([[2.0j]], dtype=torch.complex64)
+        assert complex_result.dtype == torch.complex64
+        torch.testing.assert_close(
+            complex_result.flatten(), torch.tensor([[1.0 + 2.0j]], dtype=torch.complex64)
+        )
+
+    def test_unknown_shape_preserving_torch_function_returns_tensor(self):
+        v = make_line_vector()
+
+        flipped = torch.flip(v.select_fields("kx"), dims=(0,))
+
+        assert isinstance(flipped, torch.Tensor)
+        assert not isinstance(flipped, Vector)
+        torch.testing.assert_close(flipped, torch.flip(v.select_fields("kx").flatten(), dims=(0,)))
+
+    def test_numpy_detaches_tensor(self):
+        v = Vector.from_shape(shape=(1,), fields=["a"])
+        v._state["data"] = torch.tensor([[1.0]], requires_grad=True)
+        v._state["cell_starts"][0] = 0
+        v._state["cell_lengths"][0] = 1
+
+        array = v.numpy()
+
+        np.testing.assert_array_equal(array, np.array([[1.0]], dtype=np.float32))
+        assert not array.flags.writeable
+
     def test_device_property_and_to_cpu(self):
         v = make_line_vector()
         assert v.device == "cpu"
@@ -392,6 +432,27 @@ class TestVector:
 
         with pytest.raises(IndexError):
             _ = v[np.array([[True, False], [False, True]])]
+
+    def test_repeated_fancy_indices_are_readable_but_not_writable(self):
+        v = make_line_vector()
+        repeated = v[[0, 0]].select_fields("intensity")
+
+        assert repeated.shape == (2,)
+        assert_rows(repeated.flatten(), [[1.0], [2.0], [1.0], [2.0]])
+        assert_rows((repeated + 1).flatten(), [[2.0], [3.0], [2.0], [3.0]])
+
+        before = v.flatten()
+        with pytest.raises(ValueError, match="repeated cell indices"):
+            repeated += 1
+        torch.testing.assert_close(v.flatten(), before)
+
+        with pytest.raises(ValueError, match="repeated cell indices"):
+            repeated.set_flattened(torch.zeros((4, 1)))
+        torch.testing.assert_close(v.flatten(), before)
+
+        with pytest.raises(ValueError, match="repeated cell indices"):
+            v[[0, 0]] = torch.tensor([[9.0, 9.0, 9.0]])
+        torch.testing.assert_close(v.flatten(), before)
 
     def test_empty_selection_is_valid_and_no_op_for_scalar_math(self):
         v = make_grid_vector()

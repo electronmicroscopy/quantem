@@ -24,6 +24,21 @@ if TYPE_CHECKING:
 
 DEFAULT_DTYPE = torch.float32
 
+# Only functions whose output preserves the meaning of each individual row may
+# be rebuilt as a Vector. Other torch functions still receive flattened tensor
+# inputs, but their results stay as ordinary tensors.
+_SAFE_ELEMENTWISE_TORCH_FUNCTIONS = frozenset(
+    getattr(torch, name)
+    for name in """
+        abs absolute acos acosh add asin asinh atan atan2 atanh
+        ceil clamp clip cos cosh divide erf erfc exp floor frexp
+        log log10 log1p log2 maximum minimum multiply neg pow
+        remainder round rsqrt sigmoid sin sinh sqrt square subtract
+        tan tanh trunc
+    """.split()
+    if hasattr(torch, name)
+)
+
 
 class Vector(AutoSerialize):
     """Ragged cell data on a fixed grid, backed by torch.
@@ -353,7 +368,7 @@ class Vector(AutoSerialize):
         read-only so accidental in-place writes raise instead of silently going
         nowhere; use :meth:`set_flattened` to write values back.
         """
-        array = self.flatten().cpu().numpy()
+        array = self.flatten().detach().cpu().numpy()
         array.flags.writeable = False
         return array
 
@@ -525,6 +540,7 @@ class Vector(AutoSerialize):
         the rowwise companion to ``flatten()`` and is especially useful for
         tensor-based transforms that operate on all selected rows at once.
         """
+        self._require_unique_cell_targets("set_flattened")
         field_indices = self._field_indices()
         targets = self._selected_cell_indices().tolist()
         row_counts = self.row_counts()
@@ -667,6 +683,8 @@ class Vector(AutoSerialize):
         flat_kwargs = {key: _flatten_torch_input(value) for key, value in kwargs.items()}
         result = func(*flat_args, **flat_kwargs)
 
+        if func not in _SAFE_ELEMENTWISE_TORCH_FUNCTIONS:
+            return result
         if isinstance(result, tuple):
             return tuple(_maybe_wrap_result(template, item, row_counts) for item in result)
         return _maybe_wrap_result(template, result, row_counts)
@@ -1058,6 +1076,7 @@ class Vector(AutoSerialize):
 
     def _assign(self, value: Any) -> None:
         """Dispatch assignment based on whether all fields or a subset are selected."""
+        self._require_unique_cell_targets("Assignment")
         if self._selected_fields is None:
             self._assign_full_cells(value)
         else:
@@ -1140,12 +1159,34 @@ class Vector(AutoSerialize):
 
     def _binary_op(self, other: Any, op: Any, reverse: bool = False) -> "Vector":
         """Return a new Vector produced by elementwise arithmetic."""
-        result = self.copy()
-        result._inplace_op(other, op, reverse=reverse)
-        return result
+        row_counts = self.row_counts()
+        lhs = self.flatten()
+
+        if isinstance(other, Vector):
+            if other.num_cells != self.num_cells:
+                raise ValueError(f"Expected {self.num_cells} cells, got {other.num_cells}")
+            if other.num_fields != self.num_fields:
+                raise ValueError(f"Expected {self.num_fields} fields, got {other.num_fields}")
+            if other.row_counts() != row_counts:
+                raise ValueError("Per-cell row counts must match for Vector arithmetic.")
+            rhs: Any = other.flatten()
+        elif _is_scalar(other):
+            rhs = _scalar_value(other)
+        else:
+            rhs = _broadcast_field_values(
+                other,
+                sum(row_counts),
+                self.num_fields,
+                dtype=None,
+                device=lhs.device,
+            )
+
+        rows = op(rhs, lhs) if reverse else op(lhs, rhs)
+        return _vector_from_rows(self, rows, row_counts)
 
     def _inplace_unary(self, op: Any) -> None:
         """Apply a unary elementwise operation in-place to the selected fields."""
+        self._require_unique_cell_targets("In-place arithmetic")
         targets = self._selected_cell_indices().tolist()
         field_indices = self._field_indices()
         for target in targets:
@@ -1156,6 +1197,7 @@ class Vector(AutoSerialize):
 
     def _inplace_op(self, other: Any, op: Any, reverse: bool = False) -> None:
         """Apply elementwise arithmetic in-place to the selected fields."""
+        self._require_unique_cell_targets("In-place arithmetic")
         targets = self._selected_cell_indices().tolist()
         field_indices = self._field_indices()
         row_counts = self.row_counts()
@@ -1198,6 +1240,16 @@ class Vector(AutoSerialize):
             if rows > 0:
                 cell[:, field_indices] = op(chunk, lhs) if reverse else op(lhs, chunk)
             cursor += rows
+
+    def _require_unique_cell_targets(self, operation: str) -> None:
+        """Reject ambiguous write-through operations on repeated cell indices."""
+        indices = self._selection_indices
+        if indices is None:
+            return
+        if indices.numel() != torch.unique(indices).numel():
+            raise ValueError(
+                f"{operation} does not support repeated cell indices in a write selection."
+            )
 
 
 def _resolve_device(device: str | int | torch.device | None) -> torch.device:
@@ -1257,16 +1309,7 @@ def _flatten_torch_input(value: Any) -> Any:
 
 
 def _maybe_wrap_result(template: "Vector", value: Any, row_counts: list[int]) -> Any:
-    """Rebuild a Vector from a rowwise torch result, or pass the result through.
-
-    The test is purely on shape: a tensor shaped like the flattened rows is
-    rebuilt, anything else is returned untouched. That covers the intent --
-    pointwise ops get wrapped, reductions and predicates do not -- but it is a
-    heuristic, not a knowledge of which ops are pointwise. A shape-preserving
-    non-pointwise op (``torch.t`` on a Vector whose row and field counts happen
-    to be equal) would be wrapped with its rows permuted. Swap this for an
-    explicit pointwise-op set if that ever bites.
-    """
+    """Rebuild a Vector from a shape-compatible result of an approved rowwise operation."""
     if isinstance(value, torch.Tensor) and tuple(value.shape) == (
         sum(row_counts),
         template.num_fields,
@@ -1573,7 +1616,7 @@ def _broadcast_field_values(
     value: Any,
     total_rows: int,
     num_fields: int,
-    dtype: torch.dtype,
+    dtype: torch.dtype | None,
     device: torch.device,
 ) -> torch.Tensor:
     """Broadcast array-like input to flattened rowwise assignment shape."""
