@@ -60,6 +60,9 @@ dependencies = [
 widgets = [
     "quantem.widget",
 ]
+dataframe = [
+    "polars>=1.0",
+]
 
 [tool.hatch.build.targets.sdist]
 # hatchling always includes:

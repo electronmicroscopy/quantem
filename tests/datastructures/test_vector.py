@@ -415,6 +415,88 @@ class TestVector:
         with pytest.raises(ValueError, match="same number of fields"):
             Vector.from_data(data=[np.array([[1.0, 2.0]]), np.array([[1.0, 2.0, 3.0]])])
 
+    def test_to_polars_line_vector(self):
+        pytest.importorskip("polars")
+        v = make_line_vector()
+
+        df = v.to_polars()
+        assert df.columns == ["dim_0", "intensity", "kx", "ky"]
+        assert df.height == v.total_rows == 6
+        assert df["dim_0"].to_list() == [0, 0, 1, 2, 2, 3]
+        np.testing.assert_array_equal(
+            df.select(v.fields).to_numpy(),
+            v.flatten(),
+        )
+
+    def test_to_polars_grid_and_dim_names(self):
+        pytest.importorskip("polars")
+        v = make_grid_vector()
+
+        df = v.to_polars()
+        assert df.columns == ["dim_0", "dim_1", "intensity", "kx", "ky"]
+        assert df.height == 6
+        assert list(zip(df["dim_0"], df["dim_1"])) == [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+        ]
+
+        renamed = v.to_polars(dim_names=("rx", "ry"))
+        assert renamed.columns == ["rx", "ry", "intensity", "kx", "ky"]
+
+    def test_to_polars_respects_current_selection(self):
+        pytest.importorskip("polars")
+        v = make_grid_vector()
+
+        # Field selection narrows the value columns, grid columns are kept.
+        field_view = v.select_fields("kx").to_polars()
+        assert field_view.columns == ["dim_0", "dim_1", "kx"]
+
+        # Fixed-grid selection reports *root* grid coordinates, not local ones.
+        cell_view = v[2].to_polars()
+        assert cell_view.height == 2
+        assert cell_view["dim_0"].to_list() == [2, 2]
+        assert cell_view["dim_1"].to_list() == [0, 1]
+
+        scalar_view = v[1, 1].select_fields("ky").to_polars()
+        assert scalar_view.columns == ["dim_0", "dim_1", "ky"]
+        assert scalar_view.to_dicts() == [{"dim_0": 1, "dim_1": 1, "ky": 211.0}]
+
+    def test_to_polars_handles_empty_cells_and_zero_dim_grid(self):
+        pytest.importorskip("polars")
+
+        sparse = Vector.from_shape(shape=(3,), fields=["a"])
+        sparse[0] = np.array([[1.0], [2.0]])
+        sparse[2] = np.array([[9.0]])
+        df = sparse.to_polars()
+        assert df["dim_0"].to_list() == [0, 0, 2]
+        assert df["a"].to_list() == [1.0, 2.0, 9.0]
+
+        empty = Vector.from_shape(shape=(2,), fields=["a", "b"]).to_polars()
+        assert empty.height == 0
+        assert empty.columns == ["dim_0", "a", "b"]
+
+        # A 0D fixed grid has no grid axes, so no index columns are emitted.
+        scalar_grid = Vector.from_shape(shape=(), fields=["a", "b"])
+        scalar_grid[...] = np.array([[1.0, 2.0], [3.0, 4.0]])
+        assert scalar_grid.to_polars().columns == ["a", "b"]
+
+    def test_to_polars_rejects_colliding_and_mismatched_names(self):
+        pytest.importorskip("polars")
+
+        with pytest.raises(ValueError, match="collide with field name"):
+            Vector.from_shape(shape=(2,), fields=["dim_0", "b"]).to_polars()
+
+        v = make_grid_vector()
+        with pytest.raises(ValueError, match="Expected 2 dim_names, got 1"):
+            v.to_polars(dim_names=("only_one",))
+
+        with pytest.raises(ValueError, match="Duplicate dim_names"):
+            v.to_polars(dim_names=("same", "same"))
+
     def test_save_and_load_round_trip(self, tmp_path):
         v = make_grid_vector()
         v.add_fields("extra", v.select_fields("intensity") + 1.0)

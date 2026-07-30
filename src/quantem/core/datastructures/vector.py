@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,6 +14,9 @@ from quantem.core.utils.validators import (
     validate_shape,
     validate_vector_units,
 )
+
+if TYPE_CHECKING:
+    import polars as pl
 
 
 class Vector(AutoSerialize):
@@ -701,6 +704,73 @@ class Vector(AutoSerialize):
     # I/O
     # ------------------------------------------------------------------ #
 
+    def to_polars(self, dim_names: Sequence[str] | None = None) -> "pl.DataFrame":
+        """Export the current selection to a polars DataFrame.
+
+        Every ragged row becomes one DataFrame row. The fixed-grid location of
+        that row is carried in leading integer columns -- one per fixed-grid
+        dimension -- followed by one column per selected field.
+
+        Grid coordinates are always reported in the *root* grid, not the
+        selection's local coordinates, so a view such as ``v[1, :]`` still
+        reports ``dim_0 == 1``. Both fixed-grid indexing and ``select_fields``
+        are honored, so ``v[1].select_fields("kx").to_polars()`` returns only
+        the ``kx`` rows belonging to cell 1.
+
+        Requires polars, which is an optional dependency:
+        ``pip install "quantem[dataframe]"``.
+
+        Parameters
+        ----------
+        dim_names : sequence of str, optional
+            Names for the fixed-grid index columns. Defaults to
+            ``("dim_0", ..., "dim_{ndim-1}")``. Must have one entry per
+            fixed-grid dimension.
+
+        Returns
+        -------
+        polars.DataFrame
+            Shape ``(total_rows, grid_ndim + num_fields)``.
+
+        Examples
+        --------
+        >>> v = Vector.from_shape((3, 2), fields=("kx", "ky"))
+        >>> v.to_polars().columns
+        ['dim_0', 'dim_1', 'kx', 'ky']
+        """
+        try:
+            import polars as pl
+        except ImportError as exc:  # pragma: no cover - depends on environment
+            raise ImportError(
+                "Vector.to_polars() requires polars, which is an optional dependency. "
+                'Install it with: pip install polars   (or: pip install "quantem[dataframe]")'
+            ) from exc
+
+        root_shape = self._state["shape"]
+        index_names = _resolve_dim_names(dim_names, len(root_shape))
+
+        collisions = [name for name in index_names if name in self.fields]
+        if collisions:
+            raise ValueError(
+                f"Fixed-grid column name(s) {collisions} collide with field name(s). "
+                "Pass dim_names=... to to_polars() to rename the index columns."
+            )
+
+        columns: dict[str, Any] = {}
+        if index_names:
+            counts = np.asarray(self.row_counts(), dtype=np.int64)
+            coords = np.unravel_index(self._selected_cell_indices(), root_shape)
+            for name, axis_coords in zip(index_names, coords):
+                columns[name] = pl.Series(
+                    name, np.repeat(axis_coords, counts).astype(np.int64, copy=False)
+                )
+
+        values = self.flatten()
+        for column, field in enumerate(self.fields):
+            columns[field] = pl.Series(field, values[:, column])
+
+        return pl.DataFrame(columns)
+
     def save(
         self,
         path: str | Path,
@@ -1026,6 +1096,18 @@ def _normalize_field_names(field_names: str | Sequence[str]) -> tuple[str, ...]:
         raise ValueError("At least one field name is required.")
     validate_fields(list(normalized))
     return normalized
+
+
+def _resolve_dim_names(dim_names: Sequence[str] | None, ndim: int) -> list[str]:
+    """Resolve fixed-grid index column names for DataFrame export."""
+    if dim_names is None:
+        return [f"dim_{i}" for i in range(ndim)]
+    resolved = [str(name) for name in dim_names]
+    if len(resolved) != ndim:
+        raise ValueError(f"Expected {ndim} dim_names, got {len(resolved)}")
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("Duplicate dim_names are not allowed.")
+    return resolved
 
 
 def _normalize_units(units: str | Sequence[str] | None, count: int) -> list[str]:
