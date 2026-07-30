@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import copy
+import math
+import numbers
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 import numpy as np
+import torch
 from numpy.typing import NDArray
 
+from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import (
     validate_fields,
@@ -18,16 +22,18 @@ from quantem.core.utils.validators import (
 if TYPE_CHECKING:
     import polars as pl
 
+DEFAULT_DTYPE = torch.float32
+
 
 class Vector(AutoSerialize):
-    """Ragged cell data on a fixed grid.
+    """Ragged cell data on a fixed grid, backed by torch.
 
     A ``Vector`` has two independent axes of structure:
     - fixed-grid dimensions given by ``shape``
     - ragged rows stored inside each fixed-grid cell
 
     Each ragged row has one value per named field, so each cell behaves like a
-    small 2D array with shape ``(n_rows, num_fields)``, where ``n_rows`` may
+    small 2D tensor with shape ``(n_rows, num_fields)``, where ``n_rows`` may
     vary from cell to cell.
 
     Parameters
@@ -43,57 +49,74 @@ class Vector(AutoSerialize):
         Descriptive name for the Vector.
     metadata : dict, optional
         Additional user metadata.
+    dtype : torch.dtype, optional
+        Row-buffer dtype. Defaults to ``torch.float32``.
+    device : str or torch.device, optional
+        Device for the row buffer. Defaults to ``"cpu"``.
 
     Notes
     -----
+    This class is torch-native: ``tensor``, ``flatten()`` and every arithmetic
+    result are ``torch.Tensor`` values living on ``device``. NumPy arrays,
+    Python sequences and scalars are accepted as *input* anywhere a payload is
+    taken and converted at the boundary; call ``numpy()`` to get NumPy back.
+
     The public API keeps fixed-grid indexing and field selection separate:
     - use ``[]`` for fixed-grid indexing
     - use ``select_fields(...)`` for field selection
 
     Fixed-grid indexing always returns a ``Vector``. A 0D selection exposes its
-    underlying cell array through ``.array``. Multi-cell selections can be
+    underlying cell tensor through ``.tensor``. Multi-cell selections can be
     concatenated with ``flatten()``.
 
     The internal representation is compact:
-    - ``_state["data"]`` stores all ragged rows in one numeric 2D array
+    - ``_state["data"]`` stores all ragged rows in one numeric 2D tensor
     - ``_state["cell_starts"]`` stores the start offset for each cell
     - ``_state["cell_lengths"]`` stores the row count for each cell
 
+    The offset bookkeeping is deliberately kept on the CPU even when the row
+    buffer lives on a GPU: it is read one scalar at a time, so keeping it on
+    the device would force a synchronization on every cell access.
+
     A ``Vector`` selection is a write-through view over shared storage. Views
     track only the selected fixed-grid shape, selected cell indices, and selected
-    field names.
+    field names. Because ``_state`` is shared, ``to(device)`` moves every view
+    of the same Vector.
 
     Examples
     --------
     Create a Vector and assign one cell:
 
-    >>> import numpy as np
+    >>> import torch
     >>> v = Vector.from_shape((2, 2), fields=("kx", "ky", "intensity"))
-    >>> v[0, 0] = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    >>> v[0, 0].array.shape
-    (2, 3)
+    >>> v[0, 0] = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    >>> v[0, 0].tensor.shape
+    torch.Size([2, 3])
 
     Select fields and apply in-place arithmetic:
 
     >>> kx = v.select_fields("kx")
     >>> kx += 16
     >>> kx.flatten().shape
-    (2, 1)
+    torch.Size([2, 1])
 
     Apply a rowwise transform with ``flatten()`` and ``set_flattened()``:
 
     >>> kx = v.select_fields("kx")
     >>> ky = v.select_fields("ky")
     >>> kx.set_flattened(
-    ...     np.where(
+    ...     torch.where(
     ...         ((kx.flatten() - 16) ** 2 + (ky.flatten() - 16) ** 2) < 12,
-    ...         10,
+    ...         10.0,
     ...         kx.flatten(),
     ...     )
     ... )
     """
 
-    __array_priority__ = 1000
+    # Opt out of NumPy's ufunc machinery entirely. This makes ``np.sin(vector)``
+    # raise a clear TypeError instead of building an object array, and makes
+    # ``ndarray + vector`` defer to ``Vector.__radd__``.
+    __array_ufunc__ = None
     _token = object()
 
     # ------------------------------------------------------------------ #
@@ -107,6 +130,8 @@ class Vector(AutoSerialize):
         units: Sequence[str] | None = None,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        dtype: torch.dtype | None = None,
+        device: str | int | torch.device | None = None,
         _token: object | None = None,
     ) -> None:
         if _token is not self._token:
@@ -119,6 +144,8 @@ class Vector(AutoSerialize):
             list(units) if units is not None else None,
             len(root_fields),
         )
+        root_dtype = DEFAULT_DTYPE if dtype is None else dtype
+        root_device = _resolve_device(device)
 
         self._state = {
             "shape": root_shape,
@@ -126,12 +153,12 @@ class Vector(AutoSerialize):
             "units": list(root_units),
             "name": name or f"{len(root_shape)}d ragged array",
             "metadata": dict(metadata or {}),
-            "data": np.empty((0, len(root_fields)), dtype=float),
-            "cell_starts": np.zeros(_cell_count(root_shape), dtype=np.int64),
-            "cell_lengths": np.zeros(_cell_count(root_shape), dtype=np.int64),
+            "data": torch.empty((0, len(root_fields)), dtype=root_dtype, device=root_device),
+            "cell_starts": torch.zeros(_cell_count(root_shape), dtype=torch.int64),
+            "cell_lengths": torch.zeros(_cell_count(root_shape), dtype=torch.int64),
         }
         self._selection_shape = root_shape
-        self._selection_indices: NDArray[np.int64] | None = None
+        self._selection_indices: torch.Tensor | None = None
         self._selected_fields: tuple[str, ...] | None = None
 
     @classmethod
@@ -139,16 +166,16 @@ class Vector(AutoSerialize):
         cls,
         state: dict[str, Any],
         selection_shape: tuple[int, ...],
-        selection_indices: NDArray[np.int64] | None,
+        selection_indices: torch.Tensor | None,
         selected_fields: tuple[str, ...] | None,
     ) -> "Vector":
         """Build a view that shares backing storage with another Vector."""
         obj = cls.__new__(cls)
         obj._state = state
-        obj._selection_shape = selection_shape
         obj._selection_indices = (
-            None if selection_indices is None else selection_indices.astype(np.int64, copy=False)
+            None if selection_indices is None else selection_indices.to(torch.int64)
         )
+        obj._selection_shape = selection_shape
         obj._selected_fields = selected_fields
         return obj
 
@@ -161,6 +188,8 @@ class Vector(AutoSerialize):
         units: Sequence[str] | None = None,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        dtype: torch.dtype | None = None,
+        device: str | int | torch.device | None = None,
     ) -> "Vector":
         """Create an empty Vector with the given fixed-grid shape and fields."""
         fields = _resolve_fields(fields, num_fields, None)
@@ -170,6 +199,8 @@ class Vector(AutoSerialize):
             units=units,
             name=name,
             metadata=metadata,
+            dtype=dtype,
+            device=device,
             _token=cls._token,
         )
 
@@ -182,11 +213,16 @@ class Vector(AutoSerialize):
         units: Sequence[str] | None = None,
         name: str | None = None,
         metadata: dict[str, Any] | None = None,
+        dtype: torch.dtype | None = None,
+        device: str | int | torch.device | None = None,
     ) -> "Vector":
         """Create a Vector from nested fixed-grid data.
 
         The outer nesting defines the fixed-grid shape. Each leaf must coerce to a
-        2D cell array with consistent field count across all cells.
+        2D cell tensor with consistent field count across all cells. Leaves may be
+        tensors, NumPy arrays or nested sequences; they are cast to ``dtype``
+        (``torch.float32`` by default), so pass ``dtype=torch.float64`` to keep
+        double precision.
         """
         if not isinstance(data, (list, tuple)):
             raise TypeError(f"Data must be a list or tuple, got {type(data)}")
@@ -202,9 +238,11 @@ class Vector(AutoSerialize):
             units=units,
             name=name,
             metadata=metadata,
+            dtype=dtype,
+            device=device,
             _token=cls._token,
         )
-        vector._replace_cells(np.arange(len(cell_arrays), dtype=np.int64), cell_arrays)
+        vector._replace_cells(torch.arange(len(cell_arrays), dtype=torch.int64), cell_arrays)
         return vector
 
     # ------------------------------------------------------------------ #
@@ -255,64 +293,87 @@ class Vector(AutoSerialize):
     @property
     def num_cells(self) -> int:
         """Return the number of fixed-grid cells in the current selection."""
-        return int(self._selected_cell_indices().size)
+        if self._selection_indices is None:
+            return _cell_count(self._state["shape"])
+        return int(self._selection_indices.numel())
 
     @property
     def total_rows(self) -> int:
         """Return the total ragged-row count in the current selection."""
-        return int(self._state["cell_lengths"][self._selected_cell_indices()].sum())
+        return int(self._selected_cell_lengths().sum())
 
     @property
-    def dtype(self) -> np.dtype[Any]:
-        """Return the NumPy dtype of the backing row buffer."""
+    def dtype(self) -> torch.dtype:
+        """Return the dtype of the backing row buffer."""
         return self._state["data"].dtype
+
+    @property
+    def device(self) -> str:
+        """Return the device string of the backing row buffer."""
+        return str(self._state["data"].device)
 
     # ------------------------------------------------------------------ #
     # Data access
     # ------------------------------------------------------------------ #
 
     @property
-    def array(self) -> NDArray[Any]:
-        """Return the selected cell as a NumPy array.
+    def tensor(self) -> torch.Tensor:
+        """Return the selected cell as a torch tensor.
 
-        This is only valid for 0D selections. Single-field and contiguous
-        multi-field selections return writable views into the backing storage.
-        Non-contiguous multi-field selections return a copy because NumPy cannot
-        expose a writable column-subset view for that layout.
+        Unlike ``Dataset.tensor``, which is the whole payload, this is *one
+        cell*: it is only valid for 0D selections and raises otherwise. Use
+        :meth:`flatten` to get every row of a multi-cell selection.
+
+        Contiguous field selections return writable views into the backing
+        storage. Reordered or non-contiguous selections return a copy, because
+        torch cannot expose a writable column-subset view for that layout.
         """
         if self.shape != ():
-            raise ValueError(".array is only valid when the selection contains exactly one cell.")
-        cell = self._cell_matrix(self._selected_cell_indices()[0])
-        cols = self._field_indices()
-        if cols.size == self._full_num_fields:
-            return cell
-        if cols.size == 1:
-            col = int(cols[0])
-            return cell[:, col : col + 1]
-        if _is_contiguous(cols):
-            return cell[:, int(cols[0]) : int(cols[-1]) + 1]
-        return cell[:, cols].copy()
+            raise ValueError(".tensor is only valid when the selection contains exactly one cell.")
+        return self._selected_cell_matrix(int(self._selected_cell_indices()[0]))
 
-    def flatten(self) -> NDArray[Any]:
+    def flatten(self) -> torch.Tensor:
         """Concatenate selected cells in row-major order.
 
-        Returns a 2D array with shape ``(total_rows, num_fields)`` even for
+        Returns a 2D tensor with shape ``(total_rows, num_fields)`` even for
         single-field selections.
         """
-        arrays = [
-            self._selected_cell_matrix(index)
-            for index in self._selected_cell_indices()
-            if self._cell_row_count(index) > 0
-        ]
-        if arrays:
-            return np.vstack(arrays)
+        data = self._state["data"]
+        gather = self._row_gather_index(self._selected_cell_indices())
+        if gather.numel() == 0:
+            return torch.empty((0, self.num_fields), dtype=data.dtype, device=data.device)
+        return _select_columns(data.index_select(0, gather.to(data.device)), self._field_indices())
 
-        dtype = self._state["data"].dtype if self._state["data"].ndim == 2 else float
-        return np.empty((0, self.num_fields), dtype=dtype)
+    def numpy(self) -> NDArray[Any]:
+        """Return the flattened selection as a NumPy array.
+
+        This is the NumPy counterpart of :meth:`flatten`, **not** of
+        :attr:`tensor` -- it covers the whole selection, not one cell. The
+        result is a detached CPU copy, and like ``Dataset.numpy()`` it is marked
+        read-only so accidental in-place writes raise instead of silently going
+        nowhere; use :meth:`set_flattened` to write values back.
+        """
+        array = self.flatten().cpu().numpy()
+        array.flags.writeable = False
+        return array
 
     def row_counts(self) -> list[int]:
         """Return per-cell row counts in the current selection order."""
-        return [self._cell_row_count(int(index)) for index in self._selected_cell_indices()]
+        return self._selected_cell_lengths().tolist()
+
+    def to(self, device: str | int | torch.device) -> "Vector":
+        """Move the backing row buffer to ``device`` and return ``self``.
+
+        ``device`` is normalized via :func:`quantem.core.config.validate_device`
+        so ``"cuda"``, ``0``, ``"cuda:0"`` and ``torch.device("cuda:0")`` all
+        resolve to the same canonical device.
+
+        Because all views share one ``_state``, this moves every view of the same
+        Vector, not just this one. The offset bookkeeping stays on the CPU by
+        design.
+        """
+        self._state["data"] = self._state["data"].to(_resolve_device(device))
+        return self
 
     # ------------------------------------------------------------------ #
     # Field management
@@ -449,24 +510,23 @@ class Vector(AutoSerialize):
             raise ValueError("append_rows requires an index that selects exactly one cell.")
         target._require_full_field_view("append_rows")
 
-        new_rows = _coerce_cell_array(rows, target.num_fields)
+        new_rows = target._coerce_cell(rows, target.num_fields)
         if new_rows.shape[0] == 0:
             return
 
         cell_index = int(target._selected_cell_indices()[0])
-        existing = target._cell_matrix(cell_index)
-        combined = np.vstack((existing, new_rows)) if existing.shape[0] > 0 else new_rows.copy()
-        target._replace_cells(np.array([cell_index], dtype=np.int64), [combined])
+        combined = torch.cat((target._cell_matrix(cell_index), new_rows), dim=0)
+        target._replace_cells(torch.tensor([cell_index], dtype=torch.int64), [combined])
 
     def set_flattened(self, values: Any) -> None:
         """Write values back in flattened row-major order.
 
         This updates existing rows without changing per-cell row counts. It is
         the rowwise companion to ``flatten()`` and is especially useful for
-        NumPy-based transforms that operate on all selected rows at once.
+        tensor-based transforms that operate on all selected rows at once.
         """
         field_indices = self._field_indices()
-        targets = self._selected_cell_indices()
+        targets = self._selected_cell_indices().tolist()
         row_counts = self.row_counts()
         total_rows = sum(row_counts)
 
@@ -476,8 +536,9 @@ class Vector(AutoSerialize):
             flat_values = values.flatten()
             if flat_values.shape[0] != total_rows:
                 raise ValueError(f"Expected {total_rows} rows, got {flat_values.shape[0]}")
+            flat_values = self._to_buffer(flat_values)
         else:
-            flat_values = _broadcast_field_values(values, total_rows, self.num_fields)
+            flat_values = self._broadcast_values(values, total_rows, self.num_fields)
 
         cursor = 0
         for target, rows in zip(targets, row_counts):
@@ -494,24 +555,20 @@ class Vector(AutoSerialize):
         predictable at the cost of reallocating the backing buffer.
         """
         data = self._state["data"]
-        used_rows = int(self._state["cell_lengths"].sum())
-        if used_rows == 0:
-            self._state["data"] = np.empty((0, self._full_num_fields), dtype=data.dtype)
-            self._state["cell_starts"].fill(0)
-            return
+        lengths = self._state["cell_lengths"]
+        used_rows = int(lengths.sum())
+        if data.shape[0] == used_rows:
+            return  # already dense, nothing to reclaim
 
-        compacted = np.empty((used_rows, self._full_num_fields), dtype=data.dtype)
-        starts = np.zeros_like(self._state["cell_starts"])
-        cursor = 0
-        for linear_index in range(_cell_count(self._state["shape"])):
-            length = self._cell_row_count(linear_index)
-            starts[linear_index] = cursor
-            if length > 0:
-                cell = self._cell_matrix(linear_index)
-                compacted[cursor : cursor + length] = cell
-                cursor += length
-        self._state["data"] = compacted
-        self._state["cell_starts"] = starts
+        all_cells = torch.arange(_cell_count(self._state["shape"]), dtype=torch.int64)
+        gather = self._row_gather_index(all_cells)
+        if gather.numel() == 0:
+            self._state["data"] = torch.empty(
+                (0, self._full_num_fields), dtype=data.dtype, device=data.device
+            )
+        else:
+            self._state["data"] = data.index_select(0, gather.to(data.device))
+        self._state["cell_starts"] = torch.cumsum(lengths, 0) - lengths
 
     # ------------------------------------------------------------------ #
     # Python data model
@@ -529,6 +586,7 @@ class Vector(AutoSerialize):
                 f"quantem.Vector, shape={self.shape}, name={self.name}",
                 f"  fields = {self.fields}",
                 f"  units: {self.units}",
+                f"  dtype: {self.dtype}, device: {self.device}",
             ]
         )
 
@@ -536,20 +594,7 @@ class Vector(AutoSerialize):
 
     def copy(self) -> "Vector":
         """Return a deep copy of the current selection."""
-        copied = self.__class__(
-            shape=self.shape,
-            fields=self.fields,
-            units=self.units,
-            name=self.name,
-            metadata=copy.deepcopy(self.metadata),
-            _token=self.__class__._token,
-        )
-        target_cells = copied._selected_cell_indices()
-        source_arrays = [
-            self._selected_cell_matrix(index).copy() for index in self._selected_cell_indices()
-        ]
-        copied._replace_cells(target_cells, source_arrays)
-        return copied
+        return _vector_from_rows(self, self.flatten(), self.row_counts())
 
     def __getitem__(self, idx: Any) -> "Vector":
         """Return a fixed-grid selection as another Vector view."""
@@ -582,122 +627,129 @@ class Vector(AutoSerialize):
     # Arithmetic operators
     # ------------------------------------------------------------------ #
 
-    def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any) -> Any:
-        """Apply supported NumPy ufuncs elementwise.
+    @classmethod
+    def __torch_function__(
+        cls,
+        func: Any,
+        types: Any,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Apply torch functions elementwise over the ragged rows.
 
-        Supported operations are limited to elementwise ``__call__`` ufuncs. The
-        result preserves the current selection shape and fields.
+        Every ``Vector`` argument is replaced by its flattened rows, ``func`` is
+        applied, and any result shaped ``(total_rows, num_fields)`` is rebuilt
+        into a ``Vector`` preserving the selection shape and fields. Results of
+        any other shape -- reductions such as ``torch.sum`` and predicates such
+        as ``torch.allclose`` -- are returned as-is.
         """
-        if method != "__call__":
+        kwargs = {} if kwargs is None else kwargs
+        if kwargs.get("out") is not None:
             return NotImplemented
 
-        out = kwargs.get("out")
-        if out is not None:
-            return NotImplemented
-
-        vector_inputs = [value for value in inputs if isinstance(value, Vector)]
+        all_args = list(args) + list(kwargs.values())
+        vector_inputs = [value for value in all_args if isinstance(value, Vector)]
         if not vector_inputs:
             return NotImplemented
 
         template = vector_inputs[0]
         row_counts = template.row_counts()
-        total_rows = sum(row_counts)
 
         for other in vector_inputs[1:]:
             if other.shape != template.shape:
-                raise ValueError("Vector ufunc inputs must have matching fixed-grid shapes.")
+                raise ValueError("Vector inputs must have matching fixed-grid shapes.")
             if other.num_fields != template.num_fields:
-                raise ValueError("Vector ufunc inputs must have matching field counts.")
+                raise ValueError("Vector inputs must have matching field counts.")
             if other.row_counts() != row_counts:
-                raise ValueError("Vector ufunc inputs must have matching per-cell row counts.")
+                raise ValueError("Vector inputs must have matching per-cell row counts.")
 
-        flat_inputs = [
-            _normalize_ufunc_input(value, total_rows, template.num_fields) for value in inputs
-        ]
-        result = ufunc(*flat_inputs, **kwargs)
+        flat_args = tuple(_flatten_torch_input(value) for value in args)
+        flat_kwargs = {key: _flatten_torch_input(value) for key, value in kwargs.items()}
+        result = func(*flat_args, **flat_kwargs)
+
         if isinstance(result, tuple):
-            return tuple(_vector_from_flat_result(template, item, row_counts) for item in result)
-        return _vector_from_flat_result(template, result, row_counts)
+            return tuple(_maybe_wrap_result(template, item, row_counts) for item in result)
+        return _maybe_wrap_result(template, result, row_counts)
 
     def __add__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.add)
+        return self._binary_op(other, torch.add)
 
     def __sub__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.subtract)
+        return self._binary_op(other, torch.subtract)
 
     def __mul__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.multiply)
+        return self._binary_op(other, torch.multiply)
 
     def __truediv__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.divide)
+        return self._binary_op(other, torch.divide)
 
     def __floordiv__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.floor_divide)
+        return self._binary_op(other, torch.floor_divide)
 
     def __mod__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.mod)
+        return self._binary_op(other, torch.remainder)
 
     def __pow__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.power)
+        return self._binary_op(other, torch.pow)
 
     def __radd__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.add, reverse=True)
+        return self._binary_op(other, torch.add, reverse=True)
 
     def __rmul__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.multiply, reverse=True)
+        return self._binary_op(other, torch.multiply, reverse=True)
 
     def __rsub__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.subtract, reverse=True)
+        return self._binary_op(other, torch.subtract, reverse=True)
 
     def __rtruediv__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.divide, reverse=True)
+        return self._binary_op(other, torch.divide, reverse=True)
 
     def __rfloordiv__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.floor_divide, reverse=True)
+        return self._binary_op(other, torch.floor_divide, reverse=True)
 
     def __rmod__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.mod, reverse=True)
+        return self._binary_op(other, torch.remainder, reverse=True)
 
     def __rpow__(self, other: Any) -> "Vector":
-        return self._binary_op(other, np.power, reverse=True)
+        return self._binary_op(other, torch.pow, reverse=True)
 
     def __iadd__(self, other: Any) -> "Vector":
-        self._inplace_op(other, np.add)
+        self._inplace_op(other, torch.add)
         return self
 
     def __isub__(self, other: Any) -> "Vector":
-        self._inplace_op(other, np.subtract)
+        self._inplace_op(other, torch.subtract)
         return self
 
     def __imul__(self, other: Any) -> "Vector":
-        self._inplace_op(other, np.multiply)
+        self._inplace_op(other, torch.multiply)
         return self
 
     def __itruediv__(self, other: Any) -> "Vector":
-        self._inplace_op(other, np.divide)
+        self._inplace_op(other, torch.divide)
         return self
 
     def __ifloordiv__(self, other: Any) -> "Vector":
-        self._inplace_op(other, np.floor_divide)
+        self._inplace_op(other, torch.floor_divide)
         return self
 
     def __imod__(self, other: Any) -> "Vector":
-        self._inplace_op(other, np.mod)
+        self._inplace_op(other, torch.remainder)
         return self
 
     def __ipow__(self, other: Any) -> "Vector":
-        self._inplace_op(other, np.power)
+        self._inplace_op(other, torch.pow)
         return self
 
     def __neg__(self) -> "Vector":
-        return self._binary_op(-1, np.multiply)
+        return self._binary_op(-1, torch.multiply)
 
     def __pos__(self) -> "Vector":
         return self.copy()
 
     def __abs__(self) -> "Vector":
         result = self.copy()
-        result._inplace_unary(np.abs)
+        result._inplace_unary(torch.abs)
         return result
 
     # ------------------------------------------------------------------ #
@@ -759,13 +811,14 @@ class Vector(AutoSerialize):
         columns: dict[str, Any] = {}
         if index_names:
             counts = np.asarray(self.row_counts(), dtype=np.int64)
-            coords = np.unravel_index(self._selected_cell_indices(), root_shape)
+            cells = np.asarray(self._selected_cell_indices().tolist(), dtype=np.int64)
+            coords = np.unravel_index(cells, root_shape)
             for name, axis_coords in zip(index_names, coords):
                 columns[name] = pl.Series(
                     name, np.repeat(axis_coords, counts).astype(np.int64, copy=False)
                 )
 
-        values = self.flatten()
+        values = self.numpy()
         for column, field in enumerate(self.fields):
             columns[field] = pl.Series(field, values[:, column])
 
@@ -794,22 +847,77 @@ class Vector(AutoSerialize):
         skip : str, type, or list of (str or type)
             Attribute names/types to skip (by name or type) during serialization.
         compression_level : int or None
-            If set (0–9), applies Zstandard compression with Blosc backend at that level.
+            If set (0-9), applies Zstandard compression with Blosc backend at that level.
             Level 0 disables compression. Raises ValueError if > 9.
 
         Notes
         -----
         Skipped attribute names and types are also stored in the file metadata for correct
         round-trip skipping during load().
+
+        The row buffer and offset arrays are written as NumPy arrays rather than as
+        torch tensors, so they land in chunked, compressed Zarr arrays instead of
+        uncompressed ``torch.save`` blobs. :meth:`_post_load` converts them back to
+        CPU tensors on load, which also makes a GPU-saved Vector loadable without CUDA.
+
+        Note this only applies when the Vector is the *root* of the save.
+        ``AutoSerialize`` walks nested objects with ``_recursive_save`` rather than
+        calling their ``save()``, so a Vector held as an attribute of another
+        serializable object still round-trips correctly but writes its buffers as
+        uncompressed blobs. Fixing that properly means teaching
+        ``AutoSerialize._serialize_value`` to store plain non-grad tensors as Zarr
+        arrays, at which point this whole override collapses to ``compact()``.
         """
         self.compact()
-        super().save(
-            path,
-            mode=mode,
-            store=store,
-            skip=skip,
-            compression_level=compression_level,
-        )
+        buffer_keys = ("data", "cell_starts", "cell_lengths")
+        saved_state = {key: self._state[key] for key in buffer_keys}
+        saved_indices = self._selection_indices
+        try:
+            for key, tensor in saved_state.items():
+                self._state[key] = tensor.detach().cpu().numpy()
+            if saved_indices is not None:
+                self._selection_indices = saved_indices.detach().cpu().numpy()  # type: ignore[assignment]
+            super().save(
+                path,
+                mode=mode,
+                store=store,
+                skip=skip,
+                compression_level=compression_level,
+            )
+        finally:
+            for key, tensor in saved_state.items():
+                self._state[key] = tensor
+            self._selection_indices = saved_indices
+
+    def _post_load(self) -> None:
+        """Rehydrate NumPy-backed state into CPU tensors after deserialization.
+
+        Called by ``AutoSerialize._recursive_load``. This handles both files
+        written by :meth:`save` and older files written when Vector was
+        NumPy-backed; in both cases the stored dtype is preserved rather than
+        being coerced to the current default.
+        """
+        state = getattr(self, "_state", None)
+        if isinstance(state, dict):
+            if "data" in state:
+                state["data"] = _as_tensor(state["data"])
+            for key in ("cell_starts", "cell_lengths"):
+                if key in state:
+                    state[key] = _as_tensor(state[key], dtype=torch.int64)
+            if "shape" in state:
+                state["shape"] = tuple(int(dim) for dim in state["shape"])
+
+        selection_shape = getattr(self, "_selection_shape", None)
+        if selection_shape is not None:
+            self._selection_shape = tuple(int(dim) for dim in selection_shape)
+
+        indices = getattr(self, "_selection_indices", None)
+        if indices is not None:
+            self._selection_indices = _as_tensor(indices, dtype=torch.int64)
+
+        selected_fields = getattr(self, "_selected_fields", None)
+        if selected_fields is not None:
+            self._selected_fields = tuple(selected_fields)
 
     # ------------------------------------------------------------------ #
     # Private helpers — backing-store access
@@ -819,14 +927,18 @@ class Vector(AutoSerialize):
     def _full_num_fields(self) -> int:
         return len(self._state["fields"])
 
-    def _field_indices(self) -> NDArray[np.int64]:
-        """Map selected field names to column indices in the backing buffer."""
+    def _field_indices(self) -> list[int]:
+        """Map selected field names to column indices in the backing buffer.
+
+        Returned as a plain list so it can index a tensor on any device without
+        needing a matching index tensor there.
+        """
         if self._selected_fields is None:
-            return np.arange(self._full_num_fields, dtype=np.int64)
+            return list(range(self._full_num_fields))
 
         lookup = {field: i for i, field in enumerate(self._state["fields"])}
         try:
-            return np.array([lookup[field] for field in self._selected_fields], dtype=np.int64)
+            return [lookup[field] for field in self._selected_fields]
         except KeyError as exc:
             raise KeyError(f"Unknown field(s): {[str(exc.args[0])]}") from exc
 
@@ -835,36 +947,65 @@ class Vector(AutoSerialize):
         if self._selected_fields is not None:
             raise ValueError(f"{operation} is only allowed when all fields are selected.")
 
-    def _selected_cell_indices(self) -> NDArray[np.int64]:
+    def _selected_cell_indices(self) -> torch.Tensor:
         """Return linear cell indices for the current fixed-grid selection."""
         if self._selection_indices is None:
-            return np.arange(_cell_count(self._state["shape"]), dtype=np.int64)
+            return torch.arange(_cell_count(self._state["shape"]), dtype=torch.int64)
         return self._selection_indices
+
+    def _selected_cell_lengths(self) -> torch.Tensor:
+        """Return per-cell row counts for the current selection, in order."""
+        lengths = self._state["cell_lengths"]
+        if self._selection_indices is None:
+            return lengths
+        return lengths[self._selection_indices]
+
+    def _row_gather_index(self, cells: torch.Tensor) -> torch.Tensor:
+        """Buffer row indices for ``cells``, concatenated in row-major order.
+
+        This is the vectorized replacement for walking cells one at a time: the
+        result indexes ``_state["data"]`` directly, so gathering a whole
+        selection is a single ``index_select`` instead of one slice per cell.
+        """
+        lengths = self._state["cell_lengths"][cells]
+        total = int(lengths.sum())
+        if total == 0:
+            return torch.empty(0, dtype=torch.int64)
+        starts = self._state["cell_starts"][cells]
+        # Row r of output cell k comes from buffer row (start_k - out_start_k) + r.
+        offsets = starts - (torch.cumsum(lengths, 0) - lengths)
+        return torch.repeat_interleave(offsets, lengths) + torch.arange(total, dtype=torch.int64)
 
     def _cell_row_count(self, linear_index: int) -> int:
         """Return the row count for one cell in the backing buffer."""
         return int(self._state["cell_lengths"][linear_index])
 
-    def _cell_matrix(self, linear_index: int) -> NDArray[Any]:
+    def _cell_matrix(self, linear_index: int) -> torch.Tensor:
         """Return the full backing matrix for one cell."""
         start = int(self._state["cell_starts"][linear_index])
         length = int(self._state["cell_lengths"][linear_index])
         return self._state["data"][start : start + length]
 
-    def _selected_cell_matrix(self, linear_index: int) -> NDArray[Any]:
+    def _selected_cell_matrix(self, linear_index: int) -> torch.Tensor:
         """Return one cell with the current field selection applied."""
-        cell = self._cell_matrix(linear_index)
-        cols = self._field_indices()
-        if cols.size == self._full_num_fields:
-            return cell
-        if cols.size == 1:
-            col = int(cols[0])
-            return cell[:, col : col + 1]
-        if _is_contiguous(cols):
-            return cell[:, int(cols[0]) : int(cols[-1]) + 1]
-        return cell[:, cols].copy()
+        return _select_columns(self._cell_matrix(linear_index), self._field_indices())
 
-    def _replace_cells(self, targets: NDArray[np.int64], arrays: Sequence[NDArray[Any]]) -> None:
+    def _to_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Cast a tensor to the backing buffer's dtype and device."""
+        data = self._state["data"]
+        return tensor.to(dtype=data.dtype, device=data.device)
+
+    def _coerce_cell(self, value: Any, num_fields: int) -> torch.Tensor:
+        """Normalize a single-cell payload onto this Vector's dtype/device."""
+        data = self._state["data"]
+        return _coerce_cell_array(value, num_fields, data.dtype, data.device)
+
+    def _broadcast_values(self, value: Any, total_rows: int, num_fields: int) -> torch.Tensor:
+        """Broadcast array-like input onto this Vector's dtype/device."""
+        data = self._state["data"]
+        return _broadcast_field_values(value, total_rows, num_fields, data.dtype, data.device)
+
+    def _replace_cells(self, targets: torch.Tensor, arrays: Sequence[Any]) -> None:
         """Replace complete cells in the compact row buffer.
 
         Whole-cell replacement is implemented by appending the new payload rows to
@@ -878,30 +1019,30 @@ class Vector(AutoSerialize):
         if len(targets) == 0:
             return
 
-        normalized = [_coerce_cell_array(array, self._full_num_fields) for array in arrays]
+        normalized = [self._coerce_cell(array, self._full_num_fields) for array in arrays]
         payloads = [array for array in normalized if array.shape[0] > 0]
         if payloads:
-            appended = np.vstack(payloads)
-            self._state["data"] = np.concatenate((self._state["data"], appended), axis=0)
+            appended = torch.cat(payloads, dim=0)
+            self._state["data"] = torch.cat((self._state["data"], appended), dim=0)
 
-        cursor = self._state["data"].shape[0] - sum(array.shape[0] for array in normalized)
-        for target, array in zip(targets, normalized):
-            self._state["cell_starts"][target] = cursor
-            self._state["cell_lengths"][target] = array.shape[0]
-            cursor += array.shape[0]
+        lengths = torch.tensor([array.shape[0] for array in normalized], dtype=torch.int64)
+        cursor = self._state["data"].shape[0] - int(lengths.sum())
+        self._state["cell_starts"][targets] = cursor + torch.cumsum(lengths, 0) - lengths
+        self._state["cell_lengths"][targets] = lengths
 
         self._maybe_compact_storage()
 
     def _expand_storage(self, num_new_fields: int) -> None:
-        """Append new ``np.nan``-initialized columns for added fields."""
+        """Append new NaN-initialized columns for added fields."""
         data = self._state["data"]
-        dtype = np.result_type(data.dtype, float)
-        if data.shape[0] == 0:
-            self._state["data"] = np.empty((0, data.shape[1] + num_new_fields), dtype=dtype)
-            return
-
-        filler = np.full((data.shape[0], num_new_fields), np.nan, dtype=dtype)
-        self._state["data"] = np.concatenate((data.astype(dtype, copy=False), filler), axis=1)
+        # Promote to a float dtype first: torch.full(..., nan) rejects integer dtypes.
+        # This is a "smallest float that holds NaN" rule, independent of the
+        # new-Vector default in DEFAULT_DTYPE -- keep them separate.
+        dtype = torch.promote_types(data.dtype, torch.float32)
+        filler = torch.full(
+            (data.shape[0], num_new_fields), float("nan"), dtype=dtype, device=data.device
+        )
+        self._state["data"] = torch.cat((data.to(dtype), filler), dim=1)
 
     def _maybe_compact_storage(self) -> None:
         """Compact automatically once dead rows become materially larger than live rows."""
@@ -935,11 +1076,13 @@ class Vector(AutoSerialize):
                 raise ValueError(f"Expected {len(targets)} cells, got {len(source_cells)}")
             if value.num_fields != self.num_fields:
                 raise ValueError(f"Expected {self.num_fields} fields, got {value.num_fields}")
-            arrays = [value._selected_cell_matrix(index).copy() for index in source_cells]
+            arrays = [
+                value._selected_cell_matrix(index).clone() for index in source_cells.tolist()
+            ]
             self._replace_cells(targets, arrays)
             return
 
-        array = _coerce_cell_array(value, self.num_fields)
+        array = self._coerce_cell(value, self.num_fields)
         self._replace_cells(targets, [array] * len(targets))
 
     def _assign_selected_fields(self, value: Any) -> None:
@@ -950,35 +1093,39 @@ class Vector(AutoSerialize):
         preserved, so each target cell keeps its existing row count and only the
         selected columns are overwritten.
         """
-        targets = self._selected_cell_indices()
+        targets = self._selected_cell_indices().tolist()
         field_indices = self._field_indices()
-        row_counts = [self._cell_row_count(index) for index in targets]
+        row_counts = self.row_counts()
         total_rows = sum(row_counts)
 
         if isinstance(value, Vector):
-            source_cells = value._selected_cell_indices()
+            source_cells = value._selected_cell_indices().tolist()
             if len(targets) != len(source_cells):
                 raise ValueError(f"Expected {len(targets)} cells, got {len(source_cells)}")
             if value.num_fields != self.num_fields:
                 raise ValueError(f"Expected {self.num_fields} fields, got {value.num_fields}")
-            source_counts = [value._cell_row_count(index) for index in source_cells]
+            source_counts = value.row_counts()
             if row_counts != source_counts:
                 raise ValueError("Per-cell row counts must match for field-selected assignment.")
-            snapshots = [value._selected_cell_matrix(index).copy() for index in source_cells]
+            snapshots = [
+                self._to_buffer(value._selected_cell_matrix(index)).clone()
+                for index in source_cells
+            ]
             for target, array in zip(targets, snapshots):
                 cell = self._cell_matrix(int(target))
                 if array.shape[0] > 0:
                     cell[:, field_indices] = array
             return
 
-        if np.isscalar(value):
+        if _is_scalar(value):
+            scalar = _scalar_value(value)
             for target in targets:
                 cell = self._cell_matrix(int(target))
                 if cell.shape[0] > 0:
-                    cell[:, field_indices] = value
+                    cell[:, field_indices] = scalar
             return
 
-        broadcast = _broadcast_field_values(value, total_rows, self.num_fields)
+        broadcast = self._broadcast_values(value, total_rows, self.num_fields)
         cursor = 0
         for target, rows in zip(targets, row_counts):
             chunk = broadcast[cursor : cursor + rows]
@@ -999,7 +1146,7 @@ class Vector(AutoSerialize):
 
     def _inplace_unary(self, op: Any) -> None:
         """Apply a unary elementwise operation in-place to the selected fields."""
-        targets = self._selected_cell_indices()
+        targets = self._selected_cell_indices().tolist()
         field_indices = self._field_indices()
         for target in targets:
             cell = self._cell_matrix(int(target))
@@ -1009,36 +1156,40 @@ class Vector(AutoSerialize):
 
     def _inplace_op(self, other: Any, op: Any, reverse: bool = False) -> None:
         """Apply elementwise arithmetic in-place to the selected fields."""
-        targets = self._selected_cell_indices()
+        targets = self._selected_cell_indices().tolist()
         field_indices = self._field_indices()
-        row_counts = [self._cell_row_count(index) for index in targets]
+        row_counts = self.row_counts()
         total_rows = sum(row_counts)
 
         if isinstance(other, Vector):
-            source_cells = other._selected_cell_indices()
+            source_cells = other._selected_cell_indices().tolist()
             if len(targets) != len(source_cells):
                 raise ValueError(f"Expected {len(targets)} cells, got {len(source_cells)}")
             if other.num_fields != self.num_fields:
                 raise ValueError(f"Expected {self.num_fields} fields, got {other.num_fields}")
-            source_counts = [other._cell_row_count(index) for index in source_cells]
+            source_counts = other.row_counts()
             if row_counts != source_counts:
                 raise ValueError("Per-cell row counts must match for Vector arithmetic.")
-            snapshots = [other._selected_cell_matrix(index).copy() for index in source_cells]
+            snapshots = [
+                self._to_buffer(other._selected_cell_matrix(index)).clone()
+                for index in source_cells
+            ]
             for target, rhs in zip(targets, snapshots):
                 cell = self._cell_matrix(int(target))
                 lhs = cell[:, field_indices]
                 cell[:, field_indices] = op(rhs, lhs) if reverse else op(lhs, rhs)
             return
 
-        if np.isscalar(other):
+        if _is_scalar(other):
+            scalar = _scalar_value(other)
             for target in targets:
                 cell = self._cell_matrix(int(target))
                 lhs = cell[:, field_indices]
                 if lhs.shape[0] > 0:
-                    cell[:, field_indices] = op(other, lhs) if reverse else op(lhs, other)
+                    cell[:, field_indices] = op(scalar, lhs) if reverse else op(lhs, scalar)
             return
 
-        broadcast = _broadcast_field_values(other, total_rows, self.num_fields)
+        broadcast = self._broadcast_values(other, total_rows, self.num_fields)
         cursor = 0
         for target, rows in zip(targets, row_counts):
             chunk = broadcast[cursor : cursor + rows]
@@ -1047,6 +1198,81 @@ class Vector(AutoSerialize):
             if rows > 0:
                 cell[:, field_indices] = op(chunk, lhs) if reverse else op(lhs, chunk)
             cursor += rows
+
+
+def _resolve_device(device: str | int | torch.device | None) -> torch.device:
+    """Normalize a device specifier.
+
+    Note that ``None`` means CPU here, whereas ``config.validate_device(None)``
+    resolves to whatever accelerator is available. A data container that
+    silently lands on a GPU is surprising, so the default is explicit and
+    ``to()`` is how you move one.
+    """
+    if device is None:
+        return torch.device("cpu")
+    resolved, _ = config.validate_device(device)
+    return torch.device(resolved)
+
+
+def _as_tensor(
+    value: Any,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Coerce array-like input (tensor, ndarray, sequence, scalar) to a tensor.
+
+    Incoming tensors are detached: the row buffer is written in place, which is
+    not allowed on a tensor that requires grad.
+    """
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+    else:
+        if isinstance(value, np.ndarray) and any(stride < 0 for stride in value.strides):
+            # torch cannot wrap negatively-strided memory (e.g. arr[::-1]).
+            value = np.ascontiguousarray(value)
+        tensor = torch.as_tensor(value)
+    if dtype is not None and tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+    if device is not None and tensor.device != torch.device(device):
+        tensor = tensor.to(device)
+    return tensor
+
+
+def _is_scalar(value: Any) -> bool:
+    """Return True for values that broadcast as a single number."""
+    if isinstance(value, torch.Tensor):
+        return value.ndim == 0
+    return isinstance(value, (numbers.Number, np.generic))
+
+
+def _scalar_value(value: Any) -> Any:
+    """Unwrap a scalar-like value into something torch ops accept directly."""
+    # torch ops do not reliably accept numpy scalar types; python/tensor pass through.
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _flatten_torch_input(value: Any) -> Any:
+    """Replace a Vector argument with its flattened rows for torch dispatch."""
+    return value.flatten() if isinstance(value, Vector) else value
+
+
+def _maybe_wrap_result(template: "Vector", value: Any, row_counts: list[int]) -> Any:
+    """Rebuild a Vector from a rowwise torch result, or pass the result through.
+
+    The test is purely on shape: a tensor shaped like the flattened rows is
+    rebuilt, anything else is returned untouched. That covers the intent --
+    pointwise ops get wrapped, reductions and predicates do not -- but it is a
+    heuristic, not a knowledge of which ops are pointwise. A shape-preserving
+    non-pointwise op (``torch.t`` on a Vector whose row and field counts happen
+    to be equal) would be wrapped with its rows permuted. Swap this for an
+    explicit pointwise-op set if that ever bites.
+    """
+    if isinstance(value, torch.Tensor) and tuple(value.shape) == (
+        sum(row_counts),
+        template.num_fields,
+    ):
+        return _vector_from_rows(template, value, row_counts)
+    return value
 
 
 def _resolve_fields(
@@ -1083,7 +1309,7 @@ def _resolve_fields(
 
 def _cell_count(shape: tuple[int, ...]) -> int:
     """Return the number of fixed-grid cells in a shape."""
-    return int(np.prod(shape, dtype=np.int64)) if shape else 1
+    return math.prod(shape) if shape else 1
 
 
 def _normalize_field_names(field_names: str | Sequence[str]) -> tuple[str, ...]:
@@ -1135,20 +1361,25 @@ def _looks_like_field_selector(idx: Any) -> bool:
     return False
 
 
-def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[Any]:
+def _coerce_cell_array(
+    value: Any,
+    num_fields: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
     """Normalize a single-cell payload to shape ``(n_rows, num_fields)``."""
     if isinstance(value, Vector):
         if value.shape != ():
             raise ValueError("Expected a 0D Vector for single-cell assignment.")
-        array = value.array.copy()
+        array = value.tensor.clone()
     else:
-        array = np.asarray(value)
+        array = _as_tensor(value)
 
     if array.ndim == 0:
         raise ValueError("Cell assignment requires a 2D array.")
     if array.ndim == 1:
-        if array.size == 0:
-            array = np.empty((0, num_fields), dtype=float)
+        if array.numel() == 0:
+            array = torch.empty((0, num_fields), dtype=dtype, device=device)
         elif num_fields == 1:
             array = array.reshape(-1, 1)
         else:
@@ -1157,12 +1388,12 @@ def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[Any]:
         raise ValueError("Cell assignment requires a 2D array.")
     if array.shape[1] != num_fields:
         raise ValueError(f"Expected {num_fields} fields, got {array.shape[1]}")
-    return array
+    return array.to(dtype=dtype, device=device)
 
 
-def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[Any]]]:
+def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[torch.Tensor]]:
     """Recursively flatten nested fixed-grid input into row-major cell order."""
-    if isinstance(node, np.ndarray):
+    if isinstance(node, (np.ndarray, torch.Tensor)):
         return (), [_coerce_inferred_cell_array(node)]
     if not isinstance(node, (list, tuple)):
         raise TypeError("Data must be a nested list/tuple of cell arrays or row sequences.")
@@ -1172,7 +1403,7 @@ def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[Any]]]
         return (0,), []
 
     child_shape: tuple[int, ...] | None = None
-    cells: list[NDArray[Any]] = []
+    cells: list[torch.Tensor] = []
     for child in node:
         shape, child_cells = _flatten_fixed_grid(child)
         if child_shape is None:
@@ -1194,21 +1425,21 @@ def _looks_like_cell_rows(node: Sequence[Any]) -> bool:
 
 def _is_row_like(item: Any) -> bool:
     """Return True for a single row of scalar values."""
-    if isinstance(item, np.ndarray):
+    if isinstance(item, (np.ndarray, torch.Tensor)):
         return item.ndim == 1
     if not isinstance(item, (list, tuple)):
         return False
-    return all(np.isscalar(value) for value in item)
+    return all(_is_scalar(value) for value in item)
 
 
-def _coerce_inferred_cell_array(value: Any) -> NDArray[Any]:
-    """Infer a 2D cell array from row-like input during ``from_data``."""
-    array = np.asarray(value)
+def _coerce_inferred_cell_array(value: Any) -> torch.Tensor:
+    """Infer a 2D cell tensor from row-like input during ``from_data``."""
+    array = _as_tensor(value)
     if array.ndim == 0:
         raise ValueError("Cell data must be 1D or 2D.")
     if array.ndim == 1:
-        if array.size == 0:
-            return np.empty((0, 0), dtype=float)
+        if array.numel() == 0:
+            return torch.empty((0, 0), dtype=array.dtype)
         return array.reshape(1, -1)
     if array.ndim != 2:
         raise ValueError("Cell data must be 1D or 2D.")
@@ -1217,9 +1448,9 @@ def _coerce_inferred_cell_array(value: Any) -> NDArray[Any]:
 
 def _select_linear_indices(
     shape: tuple[int, ...],
-    current_indices: NDArray[np.int64],
+    current_indices: torch.Tensor,
     idx: Any,
-) -> tuple[tuple[int, ...], NDArray[np.int64]]:
+) -> tuple[tuple[int, ...], torch.Tensor]:
     """Apply fixed-grid indexing to a flattened cell-index view.
 
     ``current_indices`` stores the linear cell indices represented by the current
@@ -1230,13 +1461,13 @@ def _select_linear_indices(
     """
     if shape == ():
         if idx in ((), Ellipsis):
-            return (), np.array([int(current_indices[0])], dtype=np.int64)
+            return (), torch.tensor([int(current_indices[0])], dtype=torch.int64)
         raise IndexError("Too many indices for 0D Vector")
 
     index_tuple = _normalize_index_tuple(idx, len(shape))
     current_grid = current_indices.reshape(shape)
 
-    axis_positions: list[NDArray[np.int64]] = []
+    axis_positions: list[torch.Tensor] = []
     out_shape: list[int] = []
     scalar_axes: list[bool] = []
     for axis, axis_index in enumerate(index_tuple):
@@ -1249,14 +1480,14 @@ def _select_linear_indices(
     if all(scalar_axes):
         scalar_key = tuple(int(positions[0]) for positions in axis_positions)
         value = int(current_grid[scalar_key])
-        return (), np.array([value], dtype=np.int64)
+        return (), torch.tensor([value], dtype=torch.int64)
 
     mesh_inputs = [
         positions if not is_scalar else positions[:1]
         for positions, is_scalar in zip(axis_positions, scalar_axes)
     ]
-    grids = np.meshgrid(*mesh_inputs, indexing="ij")
-    selected = np.asarray(current_grid[tuple(grids)], dtype=np.int64).reshape(-1)
+    grids = torch.meshgrid(*mesh_inputs, indexing="ij")
+    selected = current_grid[tuple(grids)].reshape(-1).to(torch.int64)
     return tuple(out_shape), selected
 
 
@@ -1281,7 +1512,7 @@ def _normalize_index_tuple(idx: Any, ndim: int) -> tuple[Any, ...]:
     return idx
 
 
-def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], bool]:
+def _positions_for_axis(axis_index: Any, size: int) -> tuple[torch.Tensor, bool]:
     """Resolve one axis index into concrete positions and scalar-vs-vector shape behavior."""
     if isinstance(axis_index, (bool, np.bool_)):
         raise TypeError("Boolean scalars are not valid Vector indices.")
@@ -1292,45 +1523,63 @@ def _positions_for_axis(axis_index: Any, size: int) -> tuple[NDArray[np.int64], 
             index += size
         if index < 0 or index >= size:
             raise IndexError("Vector index out of range")
-        return np.array([index], dtype=np.int64), True
+        return torch.tensor([index], dtype=torch.int64), True
 
     if isinstance(axis_index, slice):
-        return np.arange(size, dtype=np.int64)[axis_index], False
+        return torch.arange(size, dtype=torch.int64)[axis_index], False
 
-    array = np.asarray(axis_index)
+    array = _as_index_tensor(axis_index)
     if array.ndim == 0:
-        if np.issubdtype(array.dtype, np.integer):
+        if _is_integer_dtype(array.dtype):
             return _positions_for_axis(int(array.item()), size)
         raise TypeError(f"Unsupported index type: {type(axis_index)!r}")
 
-    if array.dtype == bool or np.issubdtype(array.dtype, np.bool_):
+    if array.dtype == torch.bool:
         if array.ndim != 1:
             raise IndexError("Full-grid boolean masks are not supported.")
         if array.shape[0] != size:
             raise IndexError(
                 f"Boolean mask length {array.shape[0]} does not match axis length {size}"
             )
-        return np.flatnonzero(array).astype(np.int64, copy=False), False
+        return array.nonzero(as_tuple=False).reshape(-1).to(torch.int64), False
 
     if array.ndim != 1:
         raise IndexError("Fancy indexing arrays must be one-dimensional.")
-    if array.size == 0:
-        return np.array([], dtype=np.int64), False
-    if not np.issubdtype(array.dtype, np.integer):
+    if array.numel() == 0:
+        return torch.empty(0, dtype=torch.int64), False
+    if not _is_integer_dtype(array.dtype):
         raise TypeError("Fancy indices must be integers or booleans.")
 
-    positions = array.astype(np.int64, copy=True)
+    positions = array.to(torch.int64).clone()
     positions[positions < 0] += size
-    if np.any((positions < 0) | (positions >= size)):
+    if bool(((positions < 0) | (positions >= size)).any()):
         raise IndexError("Vector index out of range")
     return positions, False
 
 
-def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDArray[Any]:
+def _as_index_tensor(value: Any) -> torch.Tensor:
+    """Coerce an index-like value into a CPU tensor without forcing a dtype."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    return _as_tensor(np.asarray(value))
+
+
+def _is_integer_dtype(dtype: torch.dtype) -> bool:
+    """Return True for signed/unsigned integer dtypes (excluding bool)."""
+    return not dtype.is_floating_point and not dtype.is_complex and dtype != torch.bool
+
+
+def _broadcast_field_values(
+    value: Any,
+    total_rows: int,
+    num_fields: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
     """Broadcast array-like input to flattened rowwise assignment shape."""
-    array = np.asarray(value)
+    array = _as_tensor(value, dtype=dtype, device=device)
     if array.ndim == 0:
-        return np.broadcast_to(array.reshape(1, 1), (total_rows, num_fields))
+        return array.reshape(1, 1).expand(total_rows, num_fields)
     if num_fields == 1 and array.ndim == 1:
         if total_rows == 0 and array.shape[0] == 0:
             return array.reshape(0, 1)
@@ -1338,55 +1587,60 @@ def _broadcast_field_values(value: Any, total_rows: int, num_fields: int) -> NDA
             raise ValueError(f"Expected {total_rows} values, got {array.shape[0]}")
         return array.reshape(total_rows, 1)
     try:
-        return np.broadcast_to(array, (total_rows, num_fields))
-    except ValueError as exc:
+        return torch.broadcast_to(array, (total_rows, num_fields))
+    except RuntimeError as exc:
         raise ValueError(
-            f"Cannot broadcast value with shape {array.shape} to ({total_rows}, {num_fields})"
+            f"Cannot broadcast value with shape {tuple(array.shape)} "
+            f"to ({total_rows}, {num_fields})"
         ) from exc
 
 
-def _normalize_ufunc_input(value: Any, total_rows: int, num_fields: int) -> Any:
-    """Normalize one ufunc input to flattened Vector-compatible form."""
-    if isinstance(value, Vector):
-        return value.flatten()
-    if np.isscalar(value):
-        return value
-    return _broadcast_field_values(value, total_rows, num_fields)
-
-
-def _vector_from_flat_result(
+def _vector_from_rows(
     template: Vector,
-    values: Any,
+    rows: torch.Tensor,
     row_counts: list[int],
 ) -> Vector:
-    """Build a Vector from flattened rowwise result data."""
-    total_rows = sum(row_counts)
-    flat_values = _broadcast_field_values(values, total_rows, template.num_fields)
+    """Build a Vector from an already row-major block of rows.
 
+    ``rows`` is exactly the buffer the result needs, so it is adopted directly
+    and the offsets are derived from ``row_counts`` -- no per-cell split and
+    re-concatenation.
+    """
+    source = _as_tensor(rows)
     result = Vector.from_shape(
         shape=template.shape,
         fields=template.fields,
         units=template.units,
         name=template.name,
+        dtype=source.dtype,
+        device=source.device,
     )
     result._state["metadata"] = copy.deepcopy(template.metadata)
 
-    if total_rows == 0:
-        result._state["data"] = np.empty((0, template.num_fields), dtype=flat_values.dtype)
-        return result
-
-    cursor = 0
-    cells: list[NDArray[Any]] = []
-    for rows in row_counts:
-        cells.append(flat_values[cursor : cursor + rows].copy())
-        cursor += rows
-
-    result._replace_cells(result._selected_cell_indices(), cells)
+    lengths = torch.tensor(row_counts, dtype=torch.int64)
+    result._state["data"] = source.contiguous()
+    result._state["cell_lengths"] = lengths
+    result._state["cell_starts"] = torch.cumsum(lengths, 0) - lengths
     return result
 
 
-def _is_contiguous(indices: NDArray[np.int64]) -> bool:
-    """Return True when integer column indices form one contiguous slice."""
-    if indices.size <= 1:
+def _is_contiguous(indices: Sequence[int]) -> bool:
+    """Return True when integer column indices form one ascending contiguous slice."""
+    if len(indices) <= 1:
         return True
-    return bool(np.all(indices[1:] - indices[:-1] == 1))
+    return all(after - before == 1 for before, after in zip(indices, indices[1:]))
+
+
+def _select_columns(rows: torch.Tensor, cols: list[int]) -> torch.Tensor:
+    """Apply a field selection to a 2D row block.
+
+    A contiguous ascending column run is returned as a writable view; any other
+    selection goes through advanced indexing, which copies. Reordered selections
+    must take the copying path so the columns come back in the requested order
+    rather than storage order.
+    """
+    if _is_contiguous(cols):
+        if not cols:
+            return rows[:, :0]
+        return rows[:, cols[0] : cols[-1] + 1]
+    return rows[:, cols]

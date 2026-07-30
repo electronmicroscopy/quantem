@@ -740,6 +740,14 @@ class AutoSerialize:
         if hasattr(obj, "__attrs_post_init__"):
             obj.__attrs_post_init__()
 
+        # Give the class a chance to normalize its restored state. Loading
+        # bypasses __init__, so classes that store data in a form different from
+        # what they serialize (e.g. Vector, which writes NumPy but works in
+        # torch) use this hook to rehydrate.
+        post_load = getattr(obj, "_post_load", None)
+        if callable(post_load):
+            post_load()
+
         # Fix PyTorch module set attributes after all loading is complete
         if isinstance(obj, torch.nn.Module):
             cls._fix_torch_module_sets(obj)
