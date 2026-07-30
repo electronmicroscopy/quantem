@@ -984,8 +984,8 @@ class StrainMapAutocorrelation(AutoSerialize):
                     self._gpu_cache = None
                     use_cache = False
             else:
-                self._gpu_cache = None
-                use_cache = False
+                # self._gpu_cache = None
+                use_cache = True
             
         if refine_all_peaks:
             # Precompute the fixed pieces of the per-position all-peaks fit (these do not
@@ -1275,7 +1275,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             mask=mask,
             ds_sampling=ds_sampling,
             ds_units=ds_units,
-            q_to_r_rotation_ccw_deg = self.metadata['q_to_r_rotation_ccw_deg '],
+            q_to_r_rotation_ccw_deg = self.metadata['q_to_r_rotation_ccw_deg'],
             q_transpose = self.metadata['q_transpose'],
         )
 
@@ -1698,8 +1698,13 @@ def _refine_peak_subpixel_dft(
     F = np.fft.fft2(np.fft.fftshift(im))
 
     up = upsample
-    du = int(np.fix(np.ceil(1.5 * up)))
-    patch = np.abs(dft_upsample(F, up=up, shift=(r0, c0)))
+    H, W = im.shape
+    du = int(np.floor(np.ceil(1.5 * up) / 2.0))
+    off_r = -(-H // 2)          # ceil(H/2)
+    off_c = -(-W // 2)          # ceil(W/2)
+
+    shift = (du + up * (r0 - off_r), du + up * (c0 - off_c))
+    patch = np.abs(dft_upsample(F, up=up, shift=shift))
     patch = np.asarray(patch, dtype=float)
 
     i0, j0 = np.unravel_index(np.argmax(patch), patch.shape)
@@ -1715,9 +1720,9 @@ def _refine_peak_subpixel_dft(
         dj = _parabolic_vertex_delta(row[0], row[1], row[2])
     else:
         dj = 0.0
-    M, N = im.shape
-    dr = ((float(i0) - du + di)) / up
-    dc = ((float(j0) - du + dj)) / up
+
+    dr = ((du - float(i0) - di)) / up
+    dc = ((du - float(j0) - dj)) / up
 
     return r0 + dr, c0 + dc
 

@@ -154,7 +154,7 @@ def plot_strain_panels(
                 r"$\epsilon_{vv}$",
                 r"$\epsilon_{uv}$",
             )
-            title_arrow_angles = (90 + strain_rotation_angle, 0 + strain_rotation_angle, -45 + strain_rotation_angle)
+            title_arrow_angles = (0 + strain_rotation_angle, 90 + strain_rotation_angle, -45 + strain_rotation_angle)
     else:
             title_arrow_angles = (None, None, None)
 

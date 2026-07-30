@@ -20,6 +20,7 @@ from quantem.core.fitting.base import (
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.optimizer_mixin import OptimizerParams
 from quantem.core.utils.imaging_utils import cross_correlation_shift
 from quantem.diffraction.model_fitting_visualizations import ModelDiffractionVisualizations
 from quantem.diffraction.strain import StrainMap
@@ -830,6 +831,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         loss_fn = self.loss_fn
 
+        fidelity_mask: torch.Tensor | None = None
+        fidelity_valid_count: torch.Tensor | None = None
+        if ctx.mask is not None:
+            fidelity_mask = ctx.mask.bool().to(ctx.device)
+            fidelity_valid_count = fidelity_mask.sum().clamp(min=1).to(ctx.dtype)
+
         total_steps = len(positions) * n_steps
         pbar = tqdm(total=total_steps, desc="Fit individual (batched)", disable=not progress)
 
@@ -868,11 +875,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
             stacked = plan.build_stacked_params(B)
 
-            adam_state: dict[str, dict[str, torch.Tensor]] = {
-                name: {
-                    "m": torch.zeros_like(p.detach()),
-                    "v": torch.zeros_like(p.detach()),
-                }
+            opt_state: dict[str, dict[str, torch.Tensor]] = {
+                name: (
+                    {"m": torch.zeros_like(p.detach()), "v": torch.zeros_like(p.detach())}
+                    if plan.opt_type in ("adam", "adamw")
+                    else {"buf": torch.zeros_like(p.detach())}
+                )
                 for name, p in stacked.items()
             }
 
@@ -903,17 +911,37 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 if isinstance(loss_fn, SqrtMSELoss):
                     gamma = float(loss_fn.gamma)
                     eps = 1.0
-                    pred_min = pred.amin(dim=(1, 2), keepdim=True)
-                    tgt_min = targets.amin(dim=(1, 2), keepdim=True)
+                    if fidelity_mask is not None:
+                        pred_min = pred.masked_fill(~fidelity_mask, float("inf")).amin(dim=(1, 2), keepdim=True)
+                        tgt_min = targets.masked_fill(~fidelity_mask, float("inf")).amin(dim=(1, 2), keepdim=True)
+                    else:
+                        pred_min = pred.amin(dim=(1, 2), keepdim=True)
+                        tgt_min = targets.amin(dim=(1, 2), keepdim=True)
                     pred_mod = (pred - pred_min + eps) ** gamma
                     tgt_mod = (targets - tgt_min + eps) ** gamma
-                    per_sample_loss = ((pred_mod - tgt_mod) ** 2).mean(dim=(1, 2))
+                    sq = (pred_mod - tgt_mod) ** 2
+                    if fidelity_mask is not None:
+                        per_sample_loss = (sq * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
+                    else:
+                        per_sample_loss = sq.mean(dim=(1, 2))
                 elif isinstance(loss_fn, LogMSELoss):
-                    per_sample_loss = ((torch.log1p(pred) - torch.log1p(targets)) ** 2).mean(dim=(1, 2))
+                    sq = (torch.log1p(pred) - torch.log1p(targets)) ** 2
+                    if fidelity_mask is not None:
+                        per_sample_loss = (sq * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
+                    else:
+                        per_sample_loss = sq.mean(dim=(1, 2))
                 elif isinstance(loss_fn, torch.nn.L1Loss):
-                    per_sample_loss = diff2.abs().mean(dim=(1, 2))
+                    ad = diff2.abs()
+                    if fidelity_mask is not None:
+                        per_sample_loss = (ad * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
+                    else:
+                        per_sample_loss = ad.mean(dim=(1, 2))
                 else:
-                    per_sample_loss = (diff2 * diff2).mean(dim=(1, 2))
+                    sq = diff2 * diff2
+                    if fidelity_mask is not None:
+                        per_sample_loss = (sq * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
+                    else:
+                        per_sample_loss = sq.mean(dim=(1, 2))
 
                 # Add per-sample soft constraint loss.
                 if float(constraint_weight) != 0.0:
@@ -940,7 +968,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
                 t = step + 1
                 current_lrs = plan.lr_at_step(t, int(n_steps))
-                _adam_step_inplace(stacked, tuple(grads_list), adam_state, current_lrs, chunk_trainable, t)
+                _optimizer_step_inplace(
+                    plan.opt_type, stacked, tuple(grads_list), opt_state,
+                    current_lrs, plan.opt_hparams, chunk_trainable, t,
+                )
 
                 with torch.no_grad():
                     plan.apply_hard_constraints(stacked, skip_keys=hard_skip_keys)
@@ -983,6 +1014,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 if pos_state is None:
                     self.u_array[r,c,:] = None
                     self.v_array[r,c,:] = None
+                    continue
                 for key in pos_state.keys():
                     key_parts = key.split('.')
                     if(key_parts[-1] == 'u_row'):
@@ -1264,51 +1296,155 @@ def _lr_for_component(
         return float(optimizer_params[class_name].get("lr", component.DEFAULT_LR))
     return float(component.DEFAULT_LR)
 
+
+def _opt_spec_for_component(
+    component: RenderComponent,
+    component_idx: int,
+    optimizer_params: dict[str, Any],
+    model: AdditiveRenderModel,
+):
+    """Resolve the full optimizer spec (type + hyperparameters) for one component.
+
+    Mirrors ``_lr_for_component``'s name-then-class lookup, but returns the parsed
+    ``OptimizerParams`` spec instead of just the learning rate, so batched fitting can
+    honor a requested optimizer ``type`` (e.g. ``"sgd"``) instead of silently always
+    running Adam.
+    """
+    name = model._component_constraint_name(component, component_idx)
+    class_name = component.__class__.__name__
+    if name in optimizer_params:
+        d = dict(optimizer_params[name])
+    elif class_name in optimizer_params:
+        d = dict(optimizer_params[class_name])
+    else:
+        return OptimizerParams.Adam(lr=component.DEFAULT_LR)
+    d.setdefault("type", "adam")
+    d.setdefault("lr", component.DEFAULT_LR)
+    return OptimizerParams.parse_dict(d)
+
+
+def _masked(t: torch.Tensor, mask_expanded: torch.Tensor | None) -> torch.Tensor:
+    return t if mask_expanded is None else t * mask_expanded
+
+
 def _adam_step_inplace(
     stacked: dict[str, torch.Tensor],
     grads: tuple[torch.Tensor, ...],
     adam_state: dict[str, dict[str, torch.Tensor]],
     lrs: dict[str, float],
-    chunk_trainable: dict[str, torch.Tensor],  # NEW parameter
+    hparams: dict[str, dict[str, Any]],
+    chunk_trainable: dict[str, torch.Tensor],
     t: int,
-    beta1: float = 0.9,
-    beta2: float = 0.999,
-    eps: float = 1e-8,
+    decoupled_wd: bool = False,
 ) -> None:
     """
-    In-place Adam step with per-sample trainability support.
-    
+    In-place Adam/AdamW step with per-sample trainability support.
+
     Frozen samples (mask=False) will:
     1. Not accumulate gradient statistics in moments
-    2. Not receive parameter updates
+    2. Not receive parameter updates -- including from weight decay, which is
+       explicitly masked too (unlike a plain zeroed gradient, weight decay would
+       otherwise still pull frozen samples toward zero every step).
     """
-    bias1 = 1.0 - beta1 ** t
-    bias2 = 1.0 - beta2 ** t
-    
     with torch.no_grad():
         for (name, p), g in zip(stacked.items(), grads):
             if g is None:
                 continue
-            
+
+            hp = hparams.get(name, {})
+            beta1, beta2 = hp.get("betas", (0.9, 0.999))
+            eps = hp.get("eps", 1e-8)
+            wd = hp.get("weight_decay", 0.0)
+
             st = adam_state[name]
             mask_b = chunk_trainable.get(name)
-            
+            mask_expanded = None
             if mask_b is not None and not bool(mask_b.all()):
                 view_shape = (g.shape[0],) + (1,) * (g.ndim - 1)
                 mask_expanded = mask_b.view(view_shape).to(dtype=g.dtype)
-                g_masked = g * mask_expanded
-                
-                st["m"].mul_(beta1).add_(g_masked, alpha=1.0 - beta1)
-                st["v"].mul_(beta2).addcmul_(g_masked, g_masked, value=1.0 - beta2)
-            else:
-                st["m"].mul_(beta1).add_(g, alpha=1.0 - beta1)
-                st["v"].mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
-            
-            m_hat = st["m"] / bias1
-            v_hat = st["v"] / bias2
-            
+
+            g_eff = _masked(g, mask_expanded)
+            if wd != 0:
+                if decoupled_wd:
+                    lr_ = float(lrs.get(name, 1e-2))
+                    p.data.sub_(_masked(lr_ * wd * p.data, mask_expanded))
+                else:
+                    g_eff = g_eff + _masked(wd * p.data, mask_expanded)
+
+            st["m"].mul_(beta1).add_(g_eff, alpha=1.0 - beta1)
+            st["v"].mul_(beta2).addcmul_(g_eff, g_eff, value=1.0 - beta2)
+
+            m_hat = st["m"] / (1.0 - beta1 ** t)
+            v_hat = st["v"] / (1.0 - beta2 ** t)
+
             lr = float(lrs.get(name, 1e-2))
             p.data.addcdiv_(m_hat, v_hat.sqrt().add_(eps), value=-lr)
+
+
+def _sgd_step_inplace(
+    stacked: dict[str, torch.Tensor],
+    grads: tuple[torch.Tensor, ...],
+    sgd_state: dict[str, dict[str, torch.Tensor]],
+    lrs: dict[str, float],
+    hparams: dict[str, dict[str, Any]],
+    chunk_trainable: dict[str, torch.Tensor],
+    t: int,
+) -> None:
+    """In-place SGD step (with optional momentum/dampening/nesterov/weight_decay),
+    matching ``torch.optim.SGD`` exactly, with the same per-sample trainability
+    masking as :func:`_adam_step_inplace` (including for the weight-decay term)."""
+    with torch.no_grad():
+        for (name, p), g in zip(stacked.items(), grads):
+            if g is None:
+                continue
+
+            hp = hparams.get(name, {})
+            momentum = hp.get("momentum", 0.0)
+            dampening = hp.get("dampening", 0.0)
+            wd = hp.get("weight_decay", 0.0)
+            nesterov = hp.get("nesterov", False)
+
+            mask_b = chunk_trainable.get(name)
+            mask_expanded = None
+            if mask_b is not None and not bool(mask_b.all()):
+                view_shape = (g.shape[0],) + (1,) * (g.ndim - 1)
+                mask_expanded = mask_b.view(view_shape).to(dtype=g.dtype)
+
+            d_p = _masked(g, mask_expanded)
+            if wd != 0:
+                d_p = d_p + _masked(wd * p.data, mask_expanded)
+            if momentum != 0:
+                buf = sgd_state[name]["buf"]
+                if t == 1:
+                    buf.copy_(d_p)
+                else:
+                    buf.mul_(momentum).add_(d_p, alpha=1.0 - dampening)
+                d_p = d_p.add(buf, alpha=momentum) if nesterov else buf
+
+            lr = float(lrs.get(name, 1e-2))
+            p.data.add_(d_p, alpha=-lr)
+
+
+def _optimizer_step_inplace(
+    opt_type: str,
+    stacked: dict[str, torch.Tensor],
+    grads: tuple[torch.Tensor, ...],
+    opt_state: dict[str, dict[str, torch.Tensor]],
+    lrs: dict[str, float],
+    hparams: dict[str, dict[str, Any]],
+    chunk_trainable: dict[str, torch.Tensor],
+    t: int,
+) -> None:
+    """Dispatch a single in-place optimizer step for the batched fit loop."""
+    if opt_type in ("adam", "adamw"):
+        _adam_step_inplace(
+            stacked, grads, opt_state, lrs, hparams, chunk_trainable, t,
+            decoupled_wd=(opt_type == "adamw"),
+        )
+    elif opt_type == "sgd":
+        _sgd_step_inplace(stacked, grads, opt_state, lrs, hparams, chunk_trainable, t)
+    else:
+        raise NotImplementedError(f"Batched fit does not support optimizer type '{opt_type}'.")
 
 class _BatchedPlan:
     """Resolved layout for the batched per-pattern fit: component refs, lrs, and helpers."""
@@ -1320,6 +1456,8 @@ class _BatchedPlan:
         self.disk_idx: int | None = None
         self.dcbg_idx: int | None = None
         self.lrs: dict[str, float] = {}
+        self.opt_type: str = "adam"
+        self.opt_hparams: dict[str, dict[str, Any]] = {}
         self.scheduler_specs: dict[str, dict[str, Any]] = {}
         self.component_keys: dict[str, list[str]] = {}
         self.lats: list[SyntheticDiskLattice] = []
@@ -1483,6 +1621,28 @@ class _BatchedPlan:
 
         # Default schedulers: constant LR for every key
         self.scheduler_specs = {k: {"type": "none"} for k in self.lrs}
+
+        # Resolve optimizer type/hyperparameters. All components must agree on the
+        # optimizer class -- mirroring OptimizerMixin.set_optimizer's own constraint --
+        # since a single manual step function runs once per training step over every
+        # stacked parameter. Keys with no explicit spec fall back to that type's
+        # library defaults inside _adam_step_inplace/_sgd_step_inplace (e.g.
+        # "origin.coords", which never has its own optimizer_params entry).
+        spec_types: set[type] = set()
+        for idx, comp in enumerate(components_list):
+            spec = _opt_spec_for_component(comp, idx, optimizer_params, model)
+            spec_types.add(type(spec))
+            canonical_name = model._component_constraint_name(comp, idx)
+            for key in self.component_keys.get(canonical_name, []):
+                self.opt_hparams[key] = spec.params()
+        if len(spec_types) > 1:
+            raise ValueError(
+                "All components must use the same optimizer type for batched fitting; "
+                f"got {sorted(t.__name__ for t in spec_types)}."
+            )
+        if spec_types:
+            self.opt_type = next(iter(spec_types))._name
+
         return self
 
     # ... (keep set_scheduler_params, lr_at_step, batched_constraint_loss, resolve_component_keys as-is)
