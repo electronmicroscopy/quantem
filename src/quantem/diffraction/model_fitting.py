@@ -1897,10 +1897,32 @@ class _BatchedPlan:
 
         if self.lats is not None:
             for lat_name, lat in zip(self.lat_names, self.lats):
-                for pname, (lo, hi) in lat.parameter_bounds.items():
-                    key = f"{lat_name}.{pname}"
-                    if key in stacked and key not in skip_keys:
-                        self._clamp_bounds_inplace(stacked[key], lo, hi)
+                i0_key = f"{lat_name}.i0_raw"
+                if i0_key not in skip_keys and bool(lat.hard_constraints.get("force_positive_intensity", False)):
+                    i0 = stacked.get(i0_key)
+                    if i0 is not None:
+                        i0.clamp_(min=0.0)
+
+                ir_key, ic_key = f"{lat_name}.ir", f"{lat_name}.ic"
+                ir = stacked.get(ir_key)
+                ic = stacked.get(ic_key)
+                if (
+                    lat.max_slope_ratio is not None
+                    and ir is not None
+                    and ic is not None
+                    and ir_key not in skip_keys
+                    and ic_key not in skip_keys
+                ):
+                    i0_for_slope = stacked.get(i0_key)
+                    if i0_for_slope is None:
+                        i0_for_slope = lat.i0_raw.detach().to(ir.device, ir.dtype).expand_as(ir)
+                    radius = lat._slope_support_radius()
+                    if radius > 0.0:
+                        slope = torch.sqrt(ir * ir + ic * ic)
+                        limit = float(lat.max_slope_ratio) * i0_for_slope / radius
+                        scale = torch.clamp(limit / slope.clamp(min=1e-12), max=1.0)
+                        ir.mul_(scale)
+                        ic.mul_(scale)
 
         disk_template_frozen = "disk.template_raw" in skip_keys
         disk_intensity_frozen = "disk.intensity_raw" in skip_keys
@@ -2189,6 +2211,14 @@ class _BatchedPlan:
             template_b = stacked.get("disk.template_raw")
             if template_b is not None:
                 out = out + self.disk.constraint_loss_batched(ctx, template_raw_b=template_b)
+        for lat_name, lat in zip(self.lat_names, self.lats):
+            w = float(getattr(lat, "slope_l2_weight", 0.0))
+            if w <= 0.0:
+                continue
+            ir = stacked.get(f"{lat_name}.ir")
+            ic = stacked.get(f"{lat_name}.ic")
+            if ir is not None and ic is not None:
+                out = out + w * (ir * ir + ic * ic).mean(dim=1)
         return out
 
     def resolve_component_keys(self, components: Any) -> list[str]:

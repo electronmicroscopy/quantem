@@ -1020,7 +1020,7 @@ class SyntheticDiskLattice(RenderComponent):
         if self.intensity_softplus_beta is not None:
             beta = self.intensity_softplus_beta
             return F.softplus(beta * inten) / beta
-        return torch.clamp(inten, min=0.0)
+        return (inten)
 
     def constraint_loss(
         self, ctx: RenderContext, params: dict[str, object] | None = None
