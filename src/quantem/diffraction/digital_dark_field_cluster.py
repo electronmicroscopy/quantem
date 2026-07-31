@@ -11,7 +11,7 @@ from sklearn.cluster import DBSCAN
 from quantem.core.datastructures.vector import Vector
 
     # ------------------------------------------------------------------ #
-    # Digital Dark Field Basics
+    # Create suitable Vector object
     # ------------------------------------------------------------------ #
 
 def make_FullPointsVector_centres(vecs,centers):
@@ -64,6 +64,58 @@ def make_FullPointsVector_centres(vecs,centers):
                 I
             ))
     return pointsvector
+
+def make_FullPointsVector_from_pointsarray(pointsarray):
+    '''
+    For back compatibility, this reads in pointsarray objects made with py4DSTEM
+    digital dark field
+    
+    Parameters
+    ----------
+    pointsarray: np.ndarray
+        Nx7 array
+
+    Returns
+    -------
+    pointsvector: Vector
+        Containing fields ["rx", "ry", "kx", "ky", "kr", "kphi", "intensity"]
+
+    '''
+    Rshape = (int(pointsarray.T[3].max()+1),int(pointsarray.T[4].max()+1))
+    print(Rshape)
+    pointsvector = Vector.from_shape(
+        shape=Rshape,
+        fields=("rx", "ry", "kx", "ky", "kr", "kphi", "intensity"),
+        units=("pixels", "pixels", "pixels", "pixels", "pixels", "degrees", "counts"),
+        name="diffraction_vectors",
+    )
+ 
+    for rx in tqdm(range(Rshape[0])):
+        for ry in range(Rshape[1]):
+            mask = np.logical_and(
+                pointsarray.T[3]==rx,
+                pointsarray.T[4]==ry,
+            )
+            kx = pointsarray.T[0][mask]
+            ky = pointsarray.T[1][mask]
+            kr = pointsarray.T[5][mask]
+            kphi = pointsarray.T[6][mask]
+            I = pointsarray.T[2][mask]
+            
+            pointsvector[rx, ry] = np.column_stack((
+                rx * np.ones_like(kx), 
+                ry * np.ones_like(kx), 
+                kx, 
+                ky, 
+                kr,
+                kphi,
+                I
+            ))
+    return pointsvector
+
+    # ------------------------------------------------------------------ #
+    # Digital Dark Field Basics
+    # ------------------------------------------------------------------ #
 
 def generate_DDF_pointselect_array(
     Qshape, 
@@ -400,7 +452,7 @@ def show_L1_clusters_in_real_space(
 
         mask = L1labels == cluster_label
         im = DDFimage_from_maskstack(pointsvector,mask[None,:])
-        ax.imshow(im, norm=colors.PowerNorm(gamma=gamma), cmap=cmapname)
+        ax.imshow(im, norm=PowerNorm(gamma=gamma), cmap=cmapname)
         ax.text(
             5,
             5,
