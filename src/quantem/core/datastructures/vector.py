@@ -651,13 +651,25 @@ class Vector(AutoSerialize):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
-        """Apply torch functions elementwise over the ragged rows.
+        """Apply torch functions over the ragged rows.
 
-        Every ``Vector`` argument is replaced by its flattened rows, ``func`` is
-        applied, and any result shaped ``(total_rows, num_fields)`` is rebuilt
-        into a ``Vector`` preserving the selection shape and fields. Results of
-        any other shape -- reductions such as ``torch.sum`` and predicates such
-        as ``torch.allclose`` -- are returned as-is.
+        Every ``Vector`` argument is replaced by its flattened rows and ``func``
+        is applied to those tensors. The result is rebuilt into a ``Vector``
+        -- preserving the selection shape and fields -- only when both hold:
+
+        - ``func`` is in :data:`_SAFE_ELEMENTWISE_TORCH_FUNCTIONS`, i.e. it maps
+          each row to a row and so keeps the ragged structure meaningful
+        - the result is a tensor shaped ``(total_rows, num_fields)``
+
+        Anything else is returned exactly as torch produced it. That covers
+        reductions (``torch.sum``), predicates (``torch.allclose``), and
+        shape-changing ops (``torch.t``) -- all of which still *work*, they just
+        hand back plain tensors rather than Vectors.
+
+        The allowlist is what makes this safe: shape alone is not a reliable
+        test, since ``torch.t`` on a Vector whose row and field counts happen to
+        be equal returns a same-shaped tensor that would otherwise be rewrapped
+        with its rows silently permuted.
         """
         kwargs = {} if kwargs is None else kwargs
         if kwargs.get("out") is not None:
