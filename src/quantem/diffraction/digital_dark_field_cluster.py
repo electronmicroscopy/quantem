@@ -221,9 +221,6 @@ def DDFimage_from_maskstack(pointsvector,maskstack):
         im[rx,ry]+=I
     return im
 
-    import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, Normalize, PowerNorm
 
     # ------------------------------------------------------------------ #
     # Clustering Functions
