@@ -365,7 +365,7 @@ def plot_L1_clusters_kspace(L1labels, pointsvector, fields, max_kr, cmap=califor
         )
 
 def show_L1_clusters_in_real_space(
-    L1labels, pointsvector, col=5, gamma=0.25, cmapname='inferno'
+    L1labels, pointsvector, ncols=5, gamma=0.25, cmapname='inferno'
 ):
     """
     Function to show real space plots of L1 clustering outputs
@@ -376,7 +376,7 @@ def show_L1_clusters_in_real_space(
         The labels list from a clustering algorithm
     pointsvector: Vector
         A points array, as defined in py4DSTEM.process.diffraction.digital_dark_field
-    cols: int
+    ncols: int
         number of columns to be used
     gamma: float
         Image gamma.  <1 boosts lower intensities in display.
@@ -390,17 +390,15 @@ def show_L1_clusters_in_real_space(
     l = cluster_list.shape[0]
     ar = shape[1] / shape[0]
     w = 10
-    row = int(np.ceil(l / col))
-    fig = plt.figure(figsize=(w, w * row / col / ar))
-    gs = GridSpec.GridSpec(row, col)
+    row = int(np.ceil(l / ncols))
+    fig = plt.figure(figsize=(w, w * row / ncols / ar))
+    gs = GridSpec.GridSpec(row, ncols)
     for n, cluster_label in enumerate(cluster_list):
-        i, j = int(n / col), n % col
+        i, j = int(n / ncols), n % ncols
         ax = plt.subplot(gs[i, j])
         ax.set_axis_off()
 
         mask = L1labels == cluster_label
-        DDFimage_from_maskstack
-        selpoints = pointsarray[L1labels == cluster_label]
         im = DDFimage_from_maskstack(pointsvector,mask[None,:])
         ax.imshow(im, norm=colors.PowerNorm(gamma=gamma), cmap=cmapname)
         ax.text(
