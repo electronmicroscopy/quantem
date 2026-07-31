@@ -6,6 +6,8 @@ import matplotlib.gridspec as GridSpec
 
 from sklearn.cluster import DBSCAN
 
+from quantem.core.datastructures.vector import Vector
+
     # ------------------------------------------------------------------ #
     # Digital Dark Field Basics
     # ------------------------------------------------------------------ #
