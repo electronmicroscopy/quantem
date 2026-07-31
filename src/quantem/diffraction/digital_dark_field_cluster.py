@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, Normalize, PowerNorm
 import matplotlib.gridspec as GridSpec
 
+from tqdm import tqdm
+
 from sklearn.cluster import DBSCAN
 
 from quantem.core.datastructures.vector import Vector
