@@ -14,9 +14,11 @@ from quantem.core.fitting.background import DCBackground, GaussianBackground
 from quantem.core.fitting.base import (
     AdditiveRenderModel,
     FitBase,
+    LogMSELoss,
     OriginND,
     RenderComponent,
     RenderContext,
+    SqrtMSELoss,
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
@@ -325,6 +327,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self,
         *,
         align: bool = False,
+        origins: Any = None,
         edge_blend: float = 8.0,
         upsample_factor: int = 32,
         max_shift: float | None = None,
@@ -393,6 +396,29 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         stack = arr.reshape((-1, h, w)).astype(np.float32, copy=False)
         n = stack.shape[0]
+
+        if origins is not None:
+            origins = np.asarray(origins, dtype=float)
+            scan_shape = tuple(int(v) for v in self.dataset.shape[:2])
+            if origins.shape != scan_shape + (2,):
+                raise ValueError(
+                    f"origins must have shape {scan_shape + (2,)}, got {origins.shape}."
+                )
+            origins_sub = origins[np.ix_(rows, cols)].reshape(-1, 2)
+            shifts = (origins_sub.mean(axis=0) - origins_sub).astype(np.float32)
+            aligned = np.empty_like(stack, dtype=np.float32)
+            for i in range(n):
+                aligned[i] = ndi_shift(
+                    stack[i],
+                    shift=(float(shifts[i, 0]), float(shifts[i, 1])),
+                    order=int(shift_order),
+                    mode="nearest",
+                    prefilter=False,
+                )
+            self.image_ref = np.mean(aligned, axis=0)
+            self.preprocess_shifts = shifts.reshape(self.index_shape + (2,))
+            return self
+
         if not align or n <= 1:
             self.image_ref = np.mean(stack, axis=0)
             self.preprocess_shifts = None
@@ -606,6 +632,11 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             if (individual_row >= self.state_individual_refined.shape[0]) or (individual_col >= self.state_individual_refined.shape[1]):
                 raise ValueError("row and column values not in range")
             state = self.state_individual_refined[individual_row, individual_col]
+            if state is None:
+                raise RuntimeError(
+                    f"No refined state for position ({individual_row}, {individual_col}). "
+                    "Run fit_individual_diffraction_pattern(...) for that row and column first."
+                )
             if reset_history:
                 self._clear_fit_history_all()
         else:
@@ -626,6 +657,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         constraint_config_params: dict[str, Any] | None = None,
+        edge_weight: float = 0.0,
         progress: bool = True,
         batch_size: int | None = None,
         frozen_components: list[str] | str | None = None,
@@ -645,6 +677,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                 constraint_weight=float(constraint_weight),
                 constraint_params=constraint_params,
                 constraint_config_params=constraint_config_params,
+                edge_weight=float(edge_weight),
                 frozen_components=frozen_components,
                 sample_trainability=sample_trainability,
                 progress=progress,
@@ -727,6 +760,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         constraint_config_params: dict[str, Any] | None = None,
+        edge_weight: float = 0.0,
         frozen_components: list[str] | str | None = None,
         sample_trainability: dict[str, Any] | None = None,
         progress: bool = True,
@@ -901,47 +935,57 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                         mixed_trainable_keys.append(key)
                         init_snapshots[key] = stacked[key].detach().clone()
 
+            is_sqrt = isinstance(loss_fn, SqrtMSELoss)
+            is_log = isinstance(loss_fn, LogMSELoss)
+            is_l1 = isinstance(loss_fn, torch.nn.L1Loss)
+            ew = float(edge_weight)
+            if is_sqrt:
+                sqrt_gamma = float(loss_fn.gamma)
+                sqrt_eps = 1.0
+                if fidelity_mask is not None:
+                    tgt_min = targets.masked_fill(~fidelity_mask, float("inf")).amin(dim=(1, 2), keepdim=True)
+                else:
+                    tgt_min = targets.amin(dim=(1, 2), keepdim=True)
+                tgt_mod = (targets - tgt_min + sqrt_eps) ** sqrt_gamma
+            elif is_log:
+                tgt_mod = torch.log1p(targets)
+            else:
+                tgt_mod = targets
+            if ew > 0.0:
+                # Edge term compares spatial gradients of the (compressed) images.
+                # Disk-position information is concentrated at the aperture edges,
+                # while per-disk intensity tilts act on disk interiors, so this
+                # term anchors the lattice geometry against tilt-shift mimicry.
+                tgt_dr = tgt_mod[:, 1:, :] - tgt_mod[:, :-1, :]
+                tgt_dc = tgt_mod[:, :, 1:] - tgt_mod[:, :, :-1]
             for step in range(int(n_steps)):
                 pred = plan.batched_forward(ctx, stacked)
-                # Per-sample fidelity loss summed → scalar with per-sample grads
-                diff2 = (pred.float() - targets.float())
-                # Match SqrtMSELoss behavior approximately when loss_fn is SqrtMSELoss:
-                # gamma-power transform of (x - min(x) + 1), per-sample independently.
-                from quantem.core.fitting.base import SqrtMSELoss, LogMSELoss
-                if isinstance(loss_fn, SqrtMSELoss):
-                    gamma = float(loss_fn.gamma)
-                    eps = 1.0
+
+                if is_sqrt:
                     if fidelity_mask is not None:
                         pred_min = pred.masked_fill(~fidelity_mask, float("inf")).amin(dim=(1, 2), keepdim=True)
-                        tgt_min = targets.masked_fill(~fidelity_mask, float("inf")).amin(dim=(1, 2), keepdim=True)
                     else:
                         pred_min = pred.amin(dim=(1, 2), keepdim=True)
-                        tgt_min = targets.amin(dim=(1, 2), keepdim=True)
-                    pred_mod = (pred - pred_min + eps) ** gamma
-                    tgt_mod = (targets - tgt_min + eps) ** gamma
-                    sq = (pred_mod - tgt_mod) ** 2
-                    if fidelity_mask is not None:
-                        per_sample_loss = (sq * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
-                    else:
-                        per_sample_loss = sq.mean(dim=(1, 2))
-                elif isinstance(loss_fn, LogMSELoss):
-                    sq = (torch.log1p(pred) - torch.log1p(targets)) ** 2
-                    if fidelity_mask is not None:
-                        per_sample_loss = (sq * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
-                    else:
-                        per_sample_loss = sq.mean(dim=(1, 2))
-                elif isinstance(loss_fn, torch.nn.L1Loss):
-                    ad = diff2.abs()
-                    if fidelity_mask is not None:
-                        per_sample_loss = (ad * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
-                    else:
-                        per_sample_loss = ad.mean(dim=(1, 2))
+                    pred_mod = (pred - pred_min + sqrt_eps) ** sqrt_gamma
+                elif is_log:
+                    pred_mod = torch.log1p(pred)
                 else:
-                    sq = diff2 * diff2
-                    if fidelity_mask is not None:
-                        per_sample_loss = (sq * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
-                    else:
-                        per_sample_loss = sq.mean(dim=(1, 2))
+                    pred_mod = pred
+
+                diff_mod = pred_mod - tgt_mod
+                val = diff_mod.abs() if is_l1 else diff_mod * diff_mod
+                if fidelity_mask is not None:
+                    per_sample_loss = (val * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
+                else:
+                    per_sample_loss = val.mean(dim=(1, 2))
+
+                if ew > 0.0:
+                    pr_dr = pred_mod[:, 1:, :] - pred_mod[:, :-1, :]
+                    pr_dc = pred_mod[:, :, 1:] - pred_mod[:, :, :-1]
+                    per_sample_loss = per_sample_loss + ew * (
+                        ((pr_dr - tgt_dr) ** 2).mean(dim=(1, 2))
+                        + ((pr_dc - tgt_dc) ** 2).mean(dim=(1, 2))
+                    )
 
                 # Add per-sample soft constraint loss.
                 if float(constraint_weight) != 0.0:
