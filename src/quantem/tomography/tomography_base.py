@@ -11,6 +11,7 @@ from quantem.tomography.object_models import (
     ObjConstraintsType,
     ObjectINR,
     ObjectModelType,
+    ObjectTensorDecomp,
 )
 
 
@@ -51,7 +52,7 @@ class TomographyBase(AutoSerialize, RNGMixin, DDPMixin):
         self._val_losses: list[float] = []
         self._lrs: dict[str, list] = {}
         # DDP Initialization
-        if isinstance(obj_model, ObjectINR):
+        if isinstance(obj_model, ObjectINR) or isinstance(obj_model, ObjectTensorDecomp):
             self.setup_distributed(device=device)
             if self.global_rank == 0:
                 print("Setting up DDP for obj_model")

@@ -14,7 +14,11 @@ from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.loss_functions import get_loss_module
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerMixin,
+    OptimizerParamsType,
+    SchedulerParamsType,
+)
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.validators import (
     validate_arr_gt,
@@ -194,7 +198,7 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
     @property
     @abstractmethod
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         raise NotImplementedError()
 
     @abstractmethod
@@ -232,16 +236,12 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     def name(self) -> str:
         raise NotImplementedError()
 
-    def get_optimization_parameters(self):
-        """Get the parameters that should be optimized for this model."""
-        try:
-            params = self.params
-            if params is None:
-                return []
-            return params
-        except NotImplementedError:
-            # This happens when params is not implemented yet in abstract base
-            return []
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """Get the parameters that should be optimized for this model, keyed by group."""
+        params = self.params
+        if params is None:
+            return {}
+        return {self.DEFAULT_OPTIMIZER_KEY: list(params)}
 
     def _propagate_array(
         self, array: "torch.Tensor", propagator_array: "torch.Tensor"
@@ -633,9 +633,9 @@ class ObjectPixelated(ObjectConstraints):
         return self._obj.shape[0]
 
     @property
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
-        return self._obj
+        return [self._obj]
 
     @property
     def initial_obj(self):
@@ -1025,9 +1025,9 @@ class ObjectDIP(ObjectConstraints):
         return self
 
     @property
-    def params(self):
+    def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
-        return self.model.parameters()
+        return list(self.model.parameters())
 
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
@@ -1050,8 +1050,8 @@ class ObjectDIP(ObjectConstraints):
         pretrain_target: torch.Tensor | None = None,
         reset: bool = False,
         num_iters: int = 100,
-        optimizer_params: dict | None = None,
-        scheduler_params: dict | None = None,
+        optimizer_params: dict | OptimizerParamsType | None = None,
+        scheduler_params: dict | SchedulerParamsType | None = None,
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,

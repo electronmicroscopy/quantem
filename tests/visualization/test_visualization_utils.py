@@ -14,8 +14,8 @@ from quantem.core.visualization.visualization_utils import (
     add_scalebar_to_ax,
     array_to_rgba,
     bilinear_histogram_2d,
+    combine_arrays_to_rgba,
     estimate_scalebar_length,
-    list_of_arrays_to_rgba,
     turbo_black,
 )
 
@@ -85,14 +85,14 @@ class TestArrayToRGBA:
             array_to_rgba(sample_array, wrong_shape)
 
 
-class TestListOfArraysToRGBA:
-    def test_list_of_arrays_to_rgba(self, sample_arrays):
-        rgba = list_of_arrays_to_rgba(sample_arrays)
+class TestCombineArraysToRGBA:
+    def test_combine_arrays_to_rgba(self, sample_arrays):
+        rgba = combine_arrays_to_rgba(sample_arrays)
         assert rgba.shape == (*sample_arrays[0].shape, 4)
         assert np.all(rgba[..., 3] == 1)  # alpha channel should be 1
 
-    def test_list_of_arrays_to_rgba_with_chroma_boost(self, sample_arrays):
-        rgba = list_of_arrays_to_rgba(sample_arrays, chroma_boost=2.0)
+    def test_combine_arrays_to_rgba_with_chroma_boost(self, sample_arrays):
+        rgba = combine_arrays_to_rgba(sample_arrays, chroma_boost=2.0)
         assert rgba.shape == (*sample_arrays[0].shape, 4)
 
 

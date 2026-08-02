@@ -1,7 +1,7 @@
 import textwrap
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Iterator, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 
 from quantem.core import config
 
@@ -219,7 +219,7 @@ class OptimizerParams:
             raise ValueError(f"Unknown optimizer type: {name.lower()}")
 
 
-OptimizerType = (
+OptimizerParamsType = (
     OptimizerParams.Adam
     | OptimizerParams.AdamW
     | OptimizerParams.SGD
@@ -514,7 +514,7 @@ class SchedulerParams:
             raise ValueError(f"Unknown scheduler type: {name}")
 
 
-SchedulerType = (
+SchedulerParamsType = (
     SchedulerParams.Plateau
     | SchedulerParams.Exponential
     | SchedulerParams.Cyclic
@@ -531,13 +531,16 @@ class OptimizerMixin:
     """
 
     DEFAULT_OPTIMIZER_TYPE = "adamw"
+    DEFAULT_OPTIMIZER_KEY = "default"
 
     def __init__(self):
         """Initialize the optimizer mixin."""
         self._optimizer = None
         self._scheduler = None
-        self._optimizer_params: OptimizerType = OptimizerParams.NoneOptimizer()
-        self._scheduler_params: SchedulerType = SchedulerParams.NoneScheduler()
+        self._optimizer_params: dict[str, OptimizerParamsType] = {
+            self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()
+        }
+        self._scheduler_params: SchedulerParamsType = SchedulerParams.NoneScheduler()
         # Don't call super().__init__() in mixin classes to avoid MRO issues
 
     @property
@@ -551,83 +554,141 @@ class OptimizerMixin:
         return self._scheduler
 
     @property
-    def optimizer_params(self) -> OptimizerType:
+    def optimizer_params(self) -> dict[str, OptimizerParamsType]:
         """Get the optimizer parameters."""
         return self._optimizer_params
 
     @optimizer_params.setter
-    def optimizer_params(self, params: OptimizerType | dict):
-        """Set the optimizer parameters."""
-        if isinstance(params, dict):
-            params = OptimizerParams.parse_dict(d=params)
-        if not isinstance(params, OptimizerType):
-            raise TypeError(f"optimizer parameters must be a OptimizerType, got {type(params)}")
-        self._optimizer_params = params
+    def optimizer_params(
+        self, params: OptimizerParamsType | dict[str, OptimizerParamsType] | dict[str, Any]
+    ) -> None:
+        self._optimizer_params = self._normalize_optimizer_params(params)
+
+    def _normalize_optimizer_params(
+        self, params: OptimizerParamsType | dict[str, Any]
+    ) -> dict[str, OptimizerParamsType]:
+        """Normalize input to dict[str, OptimizerParamsType]. Subclasses can override to validate keys."""
+        # Single optimizer, already an OptimizerParamsType
+        if isinstance(params, OptimizerParamsType):
+            return {self.DEFAULT_OPTIMIZER_KEY: params}
+        if not isinstance(params, dict):
+            raise TypeError(f"optimizer_params must be OptimizerParamsType or dict, got {type(params)}")
+        # Single optimizer as dict shorthand, e.g. {"name": "adam", "lr": 1e-3}
+        if self._is_single_optimizer_dict(params):
+            return {self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.parse_dict(d=params)}
+        # dict-of-OptimizerParamsType form (PPLR)
+        return {
+            k: v if isinstance(v, OptimizerParamsType) else OptimizerParams.parse_dict(d=v)
+            for k, v in params.items()
+        }
+
+    @staticmethod
+    def _is_single_optimizer_dict(d: dict) -> bool:
+        return "type" in d or "name" in d
 
     @property
-    def scheduler_params(self) -> SchedulerType:
+    def scheduler_params(self) -> SchedulerParamsType:
         """Get the scheduler parameters."""
         return self._scheduler_params
 
     @scheduler_params.setter
-    def scheduler_params(self, params: SchedulerType | dict):
+    def scheduler_params(self, params: SchedulerParamsType | dict):
         """Set the scheduler parameters."""
         if isinstance(params, dict):
             params = SchedulerParams.parse_dict(d=params)
-        if not isinstance(params, SchedulerType):
-            raise TypeError(f"scheduler parameters must be a SchedulerType, got {type(params)}")
+        if not isinstance(params, SchedulerParamsType):
+            raise TypeError(f"scheduler parameters must be a SchedulerParamsType, got {type(params)}")
         self._scheduler_params = params
 
     @abstractmethod
     def get_optimization_parameters(
         self,
-    ) -> "torch.Tensor | Sequence[torch.Tensor] | Iterator[torch.Tensor]":
+    ) -> "dict[str, list[torch.Tensor]]":
         """
-        Get the parameters that should be optimized for this model.
-        This could be replaced with just module.parameters(), but this allows for flexibility
-        in the future to allow for per parameter LRs.
+        Get the parameters that should be optimized for this model, grouped by name.
+
+        Returns a mapping ``{group_key: [tensors]}``. The group keys MUST match the keys of
+        ``optimizer_params`` (the common single-group case uses ``DEFAULT_OPTIMIZER_KEY``).
+        ``set_optimizer`` joins each group to its optimizer spec by key and bakes the per-group
+        hyperparameters (``spec.params()``) into the torch param group — implementations return
+        only the tensors, NOT pre-baked hyperparameters. Return ``{}`` when there is nothing
+        to optimize.
         """
         raise NotImplementedError("Subclasses must implement get_optimization_parameters")
 
-    def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
+    def set_optimizer(self, opt_params: OptimizerParamsType | dict | None = None) -> None:
         """
-        Set the optimizer for this model.
-        Currently supports single LR for all parameters, TODO allow for per parameter LRs by
-        updating get_optimization_parameters to return a list of parameters and their LRs.
+        Set the optimizer for this model, supporting per-parameter-group learning rates (PPLR).
+
+        ``optimizer_params`` is a ``dict[str, OptimizerParamsType]`` keyed by parameter group. Each
+        group's spec is joined by key to the tensors returned by ``get_optimization_parameters()``
+        and its hyperparameters are baked into the corresponding torch param group here. All
+        groups must use the same optimizer class. If every group is a ``NoneOptimizer`` (or there
+        are no groups), the optimizer is removed.
         """
         if opt_params is not None:
             self.optimizer_params = opt_params
 
-        if not self._optimizer_params:
-            self._optimizer = None
-            return
-
-        if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
+        # Single canonical "disable" path: drop NoneOptimizer sentinels and, if nothing is left,
+        # remove the optimizer. Done BEFORE get_optimization_parameters() because some models
+        # (e.g. the dataset model) raise / return nothing when there is nothing to optimize.
+        specs = {
+            key: spec
+            for key, spec in self.optimizer_params.items()
+            if not isinstance(spec, OptimizerParams.NoneOptimizer)
+        }
+        if not specs:
             self.remove_optimizer()
             return
 
-        params = self.get_optimization_parameters()
-        if isinstance(params, torch.Tensor):
-            params = [params]
-        elif isinstance(params, Generator):
-            params = list(params)
+        # All groups must agree on the optimizer class.
+        spec_list = list(specs.values())
+        for spec in spec_list[1:]:
+            if type(spec) is not type(spec_list[0]):
+                raise ValueError(
+                    f"All parameter groups must use the same optimizer type, "
+                    f"got {type(spec_list[0]).__name__} and {type(spec).__name__}"
+                )
 
-        # Ensure parameters require gradients
-        for p in params:
-            p.requires_grad_(True)
+        # Join specs to param groups by key; bake each group's hyperparameters here.
+        groups = self.get_optimization_parameters()  # dict[str, list[tensor]]
+        if set(groups) != set(specs):
+            raise ValueError(
+                f"optimizer_params keys {set(specs)} do not match parameter group keys "
+                f"{set(groups)} from {type(self).__name__}.get_optimization_parameters()"
+            )
 
-        match self._optimizer_params:
+        param_groups = []
+        for key, tensors in groups.items():
+            for p in tensors:
+                p.requires_grad_(True)
+            param_groups.append({"params": tensors, **specs[key].params()})
+        self._optimizer = self._build_optimizer(spec_list[0], param_groups)
+
+    def _build_optimizer(self, opt_params, param_groups) -> "torch.optim.Optimizer":
+        """Construct the torch optimizer for ``opt_params`` over pre-baked ``param_groups``.
+
+        ``param_groups`` already carry their per-group hyperparameters (see ``set_optimizer``),
+        so each group's ``lr`` etc. overrides the optimizer-level default. ``NoneOptimizer`` must
+        have been filtered out by the caller.
+        """
+        match opt_params:
             case OptimizerParams.Adam():
-                self._optimizer = torch.optim.Adam(params, **self._optimizer_params.params())
+                return torch.optim.Adam(param_groups)
             case OptimizerParams.AdamW():
-                self._optimizer = torch.optim.AdamW(params, **self._optimizer_params.params())
+                return torch.optim.AdamW(param_groups)
             case OptimizerParams.SGD():
-                self._optimizer = torch.optim.SGD(params, **self._optimizer_params.params())
+                return torch.optim.SGD(param_groups)
+            case OptimizerParams.NoneOptimizer():
+                raise ValueError(
+                    "NoneOptimizer must be filtered out before _build_optimizer; "
+                    "set_optimizer should have short-circuited to remove_optimizer()."
+                )
             case _:
-                raise NotImplementedError(f"Unknown optimizer type: {self._optimizer_params}")
+                raise NotImplementedError(f"Unknown optimizer type: {opt_params}")
 
     def set_scheduler(
-        self, scheduler_params: SchedulerType | dict | None = None, num_iter: int | None = None
+        self, scheduler_params: SchedulerParamsType | dict | None = None, num_iter: int | None = None
     ) -> None:
         """Set the scheduler for this model."""
         if scheduler_params is not None:
@@ -638,7 +699,10 @@ class OptimizerMixin:
             return
 
         optimizer = self._optimizer
-        base_LR = optimizer.param_groups[0]["lr"]
+        # Schedulers scale every torch param group proportionally off its own initial_lr; this
+        # scalar only seeds scheduler config (e.g. min_lr, cyclic bounds). Use the max group LR
+        # as the representative (collapses to group 0 in the single-group case).
+        base_LR = max(pg["lr"] for pg in optimizer.param_groups)
         params = self._scheduler_params.params(base_LR, num_iter=num_iter)
         match self.scheduler_params:
             case SchedulerParams.NoneScheduler():
@@ -703,7 +767,7 @@ class OptimizerMixin:
     def remove_optimizer(self) -> None:
         """Remove the optimizer and scheduler."""
         self._optimizer = None
-        self._optimizer_params = OptimizerParams.NoneOptimizer()
+        self._optimizer_params = {self.DEFAULT_OPTIMIZER_KEY: OptimizerParams.NoneOptimizer()}
         self._scheduler = None
         self._scheduler_params = SchedulerParams.NoneScheduler()
 
@@ -721,56 +785,44 @@ class OptimizerMixin:
         if self._optimizer is None:
             return
 
-        current_params = self.get_optimization_parameters()
-        if isinstance(current_params, torch.Tensor):
-            current_params = [current_params]
-        elif isinstance(current_params, Generator):
-            current_params = list(current_params)
-
-        optimizable_params = [
-            p for p in current_params if isinstance(p, torch.Tensor) and p.is_leaf
-        ]
-
-        if not optimizable_params:
-            print(
-                f"souldn't be getting here! No optimizable parameters found for {self.__class__.__name__}, removing optimizer"
-            )
+        new_groups = self.get_optimization_parameters()
+        if not new_groups:
+            print(f"No optimizable parameters for {type(self).__name__}, removing optimizer")
             self.remove_optimizer()
             return
 
-        for p in optimizable_params:
-            p.requires_grad_(True)
+        # Ensure leaf params with grad
+        for tensors in new_groups.values():
+            for p in tensors:
+                if not p.is_leaf:
+                    raise ValueError("Non-leaf tensor in param group; build groups from leaves")
+                p.requires_grad_(True)
 
-        # Preserve optimizer state and param_group settings
-        old_state = self._optimizer.state.copy()
-        current_param_group = self._optimizer.param_groups[0].copy()
+        old_state = dict(self._optimizer.state)
+        old_hyperparams = [
+            {k: v for k, v in pg.items() if k != "params"} for pg in self._optimizer.param_groups
+        ]
 
-        # Reconnect to new parameters
         self._optimizer.param_groups.clear()
-        self._optimizer.add_param_group({"params": optimizable_params})
+        for tensors in new_groups.values():
+            self._optimizer.add_param_group({"params": tensors})
 
-        # Update state mapping and move tensors to correct device
+        # Restore per-group hyperparameters by index
+        for new_pg, old_pg in zip(self._optimizer.param_groups, old_hyperparams):
+            new_pg.update(old_pg)
+
+        # Remap state for tensors that survived
         new_state = {}
-        device = optimizable_params[0].device
-        for i, old_param in enumerate(old_state.keys()):
-            if i < len(optimizable_params):
-                new_param = optimizable_params[i]
-                new_state[new_param] = {}
-                for key, value in old_state[old_param].items():
-                    if isinstance(value, torch.Tensor):
-                        new_state[new_param][key] = value.to(device)
-                    else:
-                        new_state[new_param][key] = value
+        for new_pg in self._optimizer.param_groups:
+            for new_param in new_pg["params"]:
+                if new_param in old_state:
+                    new_state[new_param] = {
+                        k: (v.to(new_param.device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in old_state[new_param].items()
+                    }
 
         self._optimizer.state.clear()
         self._optimizer.state.update(new_state)
 
-        # Restore param_group settings (LR, betas, etc.) but keep new parameters
-        self._optimizer.param_groups[0].update(
-            {k: v for k, v in current_param_group.items() if k != "params"}
-        )
-
-        # Reconnect scheduler
-        if self._scheduler is not None and self._optimizer is not None:
+        if self._scheduler is not None:
             self._scheduler.optimizer = self._optimizer
-        return
