@@ -91,7 +91,8 @@ def iradon_torch(
         sinograms = sinograms.unsqueeze(0)
     B, A, N = sinograms.shape
     device = device or sinograms.device
-    theta = theta if theta is not None else torch.linspace(0, 180, steps=A, device=device)
+    # Match radon_torch / scikit-image: A angles evenly spanning [0, 180) (endpoint excluded).
+    theta = theta if theta is not None else torch.linspace(0, 180, steps=A + 1, device=device)[:-1]
 
     if output_size is None:
         output_size = N if circle else int((N**2 / 2) ** 0.5)

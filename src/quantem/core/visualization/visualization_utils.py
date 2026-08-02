@@ -1,7 +1,8 @@
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, cast
 
 import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as np
 from colorspacious import cspace_convert
 from matplotlib import cm, colors, legend, ticker
@@ -18,9 +19,9 @@ from quantem.core.visualization.custom_normalizations import CustomNormalization
 
 def array_to_rgba(
     scaled_amplitude: NDArray,
-    scaled_angle: Optional[NDArray] = None,
+    scaled_angle: NDArray | None = None,
     *,
-    cmap: Union[str, colors.Colormap] = "gray",
+    cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1,
 ) -> NDArray:
     """Convert amplitude and angle arrays to an RGBA color array.
@@ -72,8 +73,8 @@ def array_to_rgba(
     return rgba
 
 
-def list_of_arrays_to_rgba(
-    list_of_arrays: List[NDArray],
+def combine_arrays_to_rgba(
+    list_of_arrays: list[NDArray],
     *,
     norm: CustomNormalization = CustomNormalization(),
     chroma_boost: float = 1,
@@ -139,15 +140,21 @@ class ScalebarConfig:
     loc : str or int, default="lower right"
         Location of the scale bar on the plot. Can be a string like "lower right"
         or an integer location code.
+    fontsize : int, default=12
+        Font size of the scale bar label in points.
+    bold : bool, default=True
+        Whether to render the scale bar label in bold.
     """
 
     sampling: float = 1.0
     units: str = "pixels"
-    length: Optional[float] = None
+    length: float | None = None
     width_px: float = 1
     pad_px: float = 0.5
     color: str = "white"
-    loc: Union[str, int] = "lower right"
+    loc: str | int = "lower right"
+    fontsize: int = 12
+    bold: bool = False
 
 
 SCALEBAR_KWARGS = [
@@ -156,7 +163,7 @@ SCALEBAR_KWARGS = [
 ]
 
 
-def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
+def _resolve_scalebar(cfg: Any, **kwargs) -> ScalebarConfig | None:
     """Resolve various input types to a ScalebarConfig object.
 
     Parameters
@@ -190,11 +197,15 @@ def _resolve_scalebar(cfg: Any, **kwargs) -> Optional[ScalebarConfig]:
         return ScalebarConfig(**cfg)
     elif isinstance(cfg, ScalebarConfig):
         return cfg
+    elif hasattr(cfg, "to_config"):
+        return cfg.to_config()
     else:
-        raise TypeError("scalebar must be None, dict, bool, or ScalebarConfig")
+        raise TypeError(
+            "scalebar must be None, dict, bool, ScalebarConfig, or ShowParams.Scalebar"
+        )
 
 
-def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, float]:
+def estimate_scalebar_length(length: float, sampling: float) -> tuple[float, float]:
     """Estimate an appropriate scale bar length based on data dimensions.
 
     This function calculates a "nice" scale bar length that is a multiple of
@@ -236,43 +247,106 @@ def estimate_scalebar_length(length: float, sampling: float) -> Tuple[float, flo
 
 def _normalize_length_units(length_units: float, units: str) -> tuple[float, str]:
     """
-    pick intelligent units for the scalebar length
+    Pick intelligent units for the scalebar length. Handles both direct and inverse units.
     """
-    if units in ["A", "Å", "angstrom", "Angstrom"]:
-        length_A = length_units
-    elif units in ["nm", "nanometer", "nanometre"]:
-        length_A = length_units * 10
-    elif units in ["um", "μm", "micrometer", "micrometre"]:
-        length_A = length_units * 1e4
-    elif units in ["mm", "millimeter", "millimetre"]:
-        length_A = length_units * 1e7
-    elif units in ["cm", "centimeter", "centimetre"]:
-        length_A = length_units * 1e8
-    else:
-        return length_units, units
+    inverse_unit_map = {
+        "1/A": "$\\mathrm{Å}^{-1}$",
+        "1/Å": "$\\mathrm{Å}^{-1}$",
+        "A^-1": "$\\mathrm{Å}^{-1}$",
+        "1/angstrom": "$\\mathrm{Å}^{-1}$",
+        "1/Angstrom": "$\\mathrm{Å}^{-1}$",
+        "1/nm": "$\\mathrm{nm}^{-1}$",
+        "1/nanometer": "$\\mathrm{nm}^{-1}$",
+        "1/nanometre": "$\\mathrm{nm}^{-1}$",
+    }
+    direct_unit_map = {
+        "A": "Å",
+        "Å": "Å",
+        "angstrom": "Å",
+        "Angstrom": "Å",
+        "nm": "nm",
+        "nanometer": "nm",
+        "nanometre": "nm",
+        "um": "μm",
+        "μm": "μm",
+        "micrometer": "μm",
+        "micrometre": "μm",
+        "micron": "μm",
+        "mm": "mm",
+        "millimeter": "mm",
+        "millimetre": "mm",
+        "cm": "cm",
+        "centimeter": "cm",
+        "centimetre": "cm",
+        "m": "m",
+        "meter": "m",
+        "metre": "m",
+    }
 
-    if length_A < 0.1:
-        return length_A * 100, "pm"
-    elif length_A < 10:
-        return length_A, "Å"
-    elif length_A < 3e4:
-        return length_A / 10, "nm"
-    elif length_A < 1e7:
-        return length_A / 1e4, "μm"
-    else:
-        return length_A / 1e7, "mm"
+    # Handle inverse units first
+    if units in inverse_unit_map:
+        # Convert everything to 1/Å then scale
+        units = inverse_unit_map[units]
+        if units == "$\\mathrm{Å}^{-1}$":
+            length_invA = length_units
+        else:  # units == "$\\mathrm{nm}^{-1}$":
+            length_invA = length_units / 10
+
+        if length_invA < 0.1:
+            return length_invA * 10, "$\\mathrm{nm}^{-1}$"
+        elif length_invA < 100:
+            return length_invA, "$\\mathrm{Å}^{-1}$"
+        else:  # length_invA >= 10:
+            return length_invA / 100, "$\\mathrm{pm}^{-1}$"
+
+    # Handle direct metric units (distance)
+    if units in direct_unit_map:
+        # Everything to Å
+        if units in ["A", "Å", "angstrom", "Angstrom"]:
+            length_A = length_units
+        elif units in ["nm", "nanometer", "nanometre"]:
+            length_A = length_units * 10
+        elif units in ["um", "μm", "micrometer", "micrometre", "micron"]:
+            length_A = length_units * 1e4
+        elif units in ["mm", "millimeter", "millimetre"]:
+            length_A = length_units * 1e7
+        elif units in ["cm", "centimeter", "centimetre"]:
+            length_A = length_units * 1e8
+        elif units in ["m", "meter", "metre"]:
+            length_A = length_units * 1e10
+        else:
+            # fallback, should not happen due to keys in direct_unit_map
+            return length_units, units
+
+        if length_A <= 0.1:
+            return length_A * 100, "pm"
+        elif length_A < 10:
+            return length_A, "Å"
+        elif length_A < 1e4:
+            return length_A / 10, "nm"
+        elif length_A < 1e7:
+            return length_A / 1e4, "μm"
+        elif length_A < 1e10:
+            return length_A / 1e7, "mm"
+        else:
+            return length_A / 1e10, "m"
+
+    # fallback: unknown unit, return as is
+    return length_units, units
 
 
 def add_scalebar_to_ax(
     ax: Axes,
     array_size: float,
     sampling: float,
-    length_units: Optional[float],
+    length_units: float | None,
     units: str,
     width_px: float,
     pad_px: float,
     color: str,
-    loc: Union[str, int],
+    loc: str | int,
+    fontsize: int = 12,
+    bold: bool = True,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -297,7 +371,13 @@ def add_scalebar_to_ax(
         Color of the scale bar.
     loc : str or int
         Location of the scale bar on the plot.
+    fontsize : int
+        Font size of the scale bar label in points.
+    bold : bool
+        Whether to render the scale bar label in bold.
     """
+    from matplotlib.font_manager import FontProperties
+
     if length_units is None:
         length_units, length_px = estimate_scalebar_length(array_size, sampling)
     else:
@@ -315,6 +395,9 @@ def add_scalebar_to_ax(
         loc_strings = {v: k for k, v in loc_codes.items()}
         loc = loc_strings[loc]
 
+    fontprops = FontProperties(size=fontsize, weight="bold" if bold else "normal")
+
+    label_top = loc[:3] == "low"
     bar = AnchoredSizeBar(
         ax.transData,
         length_px,
@@ -323,8 +406,10 @@ def add_scalebar_to_ax(
         pad=pad_px,
         color=color,
         frameon=False,
-        label_top=loc[:3] == "low",
-        size_vertical=int(width_px),  # Convert to int as required by AnchoredSizeBar
+        label_top=label_top,
+        size_vertical=int(width_px),
+        fontproperties=fontprops,
+        sep=2 if label_top else int(round(0.3 * fontsize)),
     )
     ax.add_artist(bar)
 
@@ -414,7 +499,7 @@ def add_arg_cbar_to_ax(
     cb_angle = fig.colorbar(sm, cax=cax)
 
     cb_angle.set_label("arg", rotation=0, ha="center", va="bottom")
-    cb_angle.ax.yaxis.set_label_coords(0.5, -0.05)
+    cb_angle.ax.yaxis.set_label_coords(0.5, -0.07)
     cb_angle.set_ticks([-np.pi, -np.pi / 2, 0, np.pi / 2, np.pi])
     cb_angle.set_ticklabels(
         [r"$-\pi$", r"$-\dfrac{\pi}{2}$", "$0$", r"$\dfrac{\pi}{2}$", r"$\pi$"]
@@ -423,7 +508,7 @@ def add_arg_cbar_to_ax(
     return cb_angle
 
 
-def turbo_black(num_colors: int = 256, fade_len: Optional[int] = None) -> colors.ListedColormap:
+def turbo_black(num_colors: int = 256, fade_len: int | None = None) -> colors.ListedColormap:
     """Create a modified version of the 'turbo' colormap that fades to black.
 
     This function creates a colormap based on the 'turbo' colormap but with
@@ -462,12 +547,12 @@ except ValueError:
 
 
 def bilinear_histogram_2d(
-    shape: Tuple[int, int],
+    shape: tuple[int, int],
     x: NDArray,
     y: NDArray,
     weight: NDArray,
-    origin: Tuple[float, float] = (0.0, 0.0),
-    sampling: Tuple[float, float] = (1.0, 1.0),
+    origin: tuple[float, float] = (0.0, 0.0),
+    sampling: tuple[float, float] = (1.0, 1.0),
     statistic: str = "sum",
 ) -> NDArray:
     """Create a 2D histogram with bilinear binning.
@@ -512,7 +597,7 @@ def bilinear_histogram_2d(
         )
 
     # Convert shape tuple to list for binned_statistic_2d
-    bins: Sequence[int] = [Nx, Ny]
+    bins: list[int] = [Nx, Ny]
     hist, _, _, _ = binned_statistic_2d(
         x,
         y,
@@ -547,7 +632,7 @@ def axes_with_inset(
     - Fractional inset by default (relative to main axes size).
     - Only the inset axes background is set to black (main axes stays default).
     """
-    fig, ax_main = mpl.pyplot.subplots(1, 1, figsize=axsize)
+    fig, ax_main = plt.subplots(1, 1, figsize=axsize)
 
     # lazy import here (some environments need it this way)
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes

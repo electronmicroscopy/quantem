@@ -1,3 +1,4 @@
+import warnings
 from collections.abc import Sequence
 from typing import Self
 
@@ -5,7 +6,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.fft import fftfreq
-import warnings
 from numpy.typing import NDArray
 from scipy.interpolate import interp1d
 from scipy.ndimage import distance_transform_edt, gaussian_filter

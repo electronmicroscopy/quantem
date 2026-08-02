@@ -167,7 +167,7 @@ class Siren(nn.Module):
         Examples
         --------
         For a model with in_features=2:
-        >>> bounds = ((0, 1), (0, 1))
+        >>> bounds = ((-1, 1), (-1, 1))
         >>> sampling = (0.1, 0.1)
         >>> coords = siren.make_equispaced_grid(bounds, sampling)
         """

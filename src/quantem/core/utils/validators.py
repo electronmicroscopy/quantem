@@ -10,8 +10,9 @@ from quantem.core import config
 from quantem.core.utils import array_funcs as af
 
 if TYPE_CHECKING:
-    import cupy as cp
+    import cupy as cp  # type: ignore
     import torch
+
     TensorLike: TypeAlias = ArrayLike | torch.Tensor
 else:
     TensorLike: TypeAlias = ArrayLike
@@ -20,9 +21,10 @@ else:
     if config.get("has_cupy"):
         import cupy as cp
 
+
 # --- Dataset Validation Functions ---
 def ensure_valid_array(
-    array: "np.ndarray | cp.ndarray", dtype: DTypeLike = None, ndim: int | None = None
+    array: "np.ndarray | cp.ndarray", dtype: DTypeLike | None = None, ndim: int | None = None
 ) -> Union[np.ndarray, "cp.ndarray"]:
     """
     Ensure input is a numpy array or cupy array (if available), converting if necessary.
@@ -356,6 +358,17 @@ def validate_gt(
             raise ValueError(f"{name} must be greater than or equal to {cutoff}, got {value}")
     elif value <= cutoff:
         raise ValueError(f"{name} must be greater than {cutoff}, got {value}")
+    return value
+
+
+def validate_lt(
+    value: float | int, cutoff: float | int, name: str, leq: bool = False
+) -> float | int:
+    if leq:  # less than or equal to
+        if value > cutoff:
+            raise ValueError(f"{name} must be less than or equal to {cutoff}, got {value}")
+    elif value >= cutoff:
+        raise ValueError(f"{name} must be less than {cutoff}, got {value}")
     return value
 
 
