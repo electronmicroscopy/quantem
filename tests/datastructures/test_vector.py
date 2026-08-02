@@ -3,6 +3,7 @@ import zipfile
 import numpy as np
 import pytest
 
+from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import load
 
@@ -110,6 +111,102 @@ class TestVector:
         assert multi.dtype == np.dtype(float)
         assert multi.total_rows == 6
         assert multi.row_counts() == [2, 1, 2, 1]
+
+    def test_reductions_over_all_rows(self):
+        v = make_line_vector()
+
+        np.testing.assert_allclose(v.sum(), np.array([21.0, 210.0, 2100.0]))
+        np.testing.assert_allclose(v.mean(), np.array([3.5, 35.0, 350.0]))
+        np.testing.assert_allclose(v.min(), np.array([1.0, 10.0, 100.0]))
+        np.testing.assert_allclose(v.max(), np.array([6.0, 60.0, 600.0]))
+        np.testing.assert_allclose(v.std(), np.std(v.flatten(), axis=0))
+        assert v.count() == 6
+
+        # Field and fixed-grid selections narrow what is reduced
+        np.testing.assert_allclose(v.select_fields("kx").mean(), np.array([35.0]))
+        np.testing.assert_allclose(v[:2].sum(), np.array([6.0, 60.0, 600.0]))
+        assert v[:2].count() == 3
+
+    def test_reductions_per_cell(self):
+        v = make_line_vector()
+
+        np.testing.assert_allclose(
+            v.sum(per_cell=True),
+            np.array(
+                [[3.0, 30.0, 300.0], [3.0, 30.0, 300.0], [9.0, 90.0, 900.0], [6.0, 60.0, 600.0]]
+            ),
+        )
+        np.testing.assert_allclose(
+            v.mean(per_cell=True),
+            np.array(
+                [[1.5, 15.0, 150.0], [3.0, 30.0, 300.0], [4.5, 45.0, 450.0], [6.0, 60.0, 600.0]]
+            ),
+        )
+        np.testing.assert_allclose(v.min(per_cell=True)[0], np.array([1.0, 10.0, 100.0]))
+        np.testing.assert_allclose(v.max(per_cell=True)[0], np.array([2.0, 20.0, 200.0]))
+        np.testing.assert_allclose(
+            v.select_fields("intensity").std(per_cell=True)[:, 0],
+            np.array([0.5, 0.0, 0.5, 0.0]),
+        )
+        np.testing.assert_array_equal(v.count(per_cell=True), np.array([2, 1, 2, 1]))
+
+        # Per-cell results keep the fixed-grid shape plus a trailing field axis
+        grid = make_grid_vector()
+        assert grid.sum(per_cell=True).shape == (3, 2, 3)
+        assert grid.count(per_cell=True).shape == (3, 2)
+        np.testing.assert_allclose(grid.max(per_cell=True)[2, 1], np.array([21.0, 121.0, 221.0]))
+
+    def test_reductions_handle_empty_cells_and_selections(self):
+        v = Vector.from_shape(shape=(3,), fields=["intensity"])
+        v[0] = np.array([[2.0], [4.0]])
+        v[2] = np.array([[9.0]])
+
+        np.testing.assert_allclose(v.sum(per_cell=True)[:, 0], np.array([6.0, 0.0, 9.0]))
+        per_cell_mean = v.mean(per_cell=True)[:, 0]
+        np.testing.assert_allclose(per_cell_mean[[0, 2]], np.array([3.0, 9.0]))
+        assert np.isnan(per_cell_mean[1])
+        assert np.isnan(v.min(per_cell=True)[1, 0])
+        assert np.isnan(v.max(per_cell=True)[1, 0])
+        assert np.isnan(v.std(per_cell=True)[1, 0])
+        np.testing.assert_array_equal(v.count(per_cell=True), np.array([2, 0, 1]))
+
+        # A selection with no rows at all
+        empty = v[1]
+        np.testing.assert_allclose(empty.sum(), np.array([0.0]))
+        assert np.isnan(empty.mean()).all()
+        assert empty.count() == 0
+
+    def test_reductions_as_dataset(self):
+        v = make_grid_vector()
+
+        image = v.select_fields("intensity").max(per_cell=True, as_dataset=True)
+        assert isinstance(image, Dataset2d)
+        assert image.shape == (3, 2)
+        assert image.signal_units == "none"
+        assert "max" in image.name
+        np.testing.assert_allclose(image.array, np.array([[0.0, 1.0], [10.0, 11.0], [20.0, 21.0]]))
+
+        counts = v.count(per_cell=True, as_dataset=True)
+        assert isinstance(counts, Dataset2d)
+        assert counts.signal_units == "counts"
+        np.testing.assert_array_equal(counts.array, np.ones((3, 2)))
+
+        line = make_line_vector()
+        line_sum = line.select_fields("kx").sum(per_cell=True, as_dataset=True)
+        assert line_sum.shape == (4,)
+        assert line_sum.signal_units == "px"
+
+        with pytest.raises(ValueError, match="exactly one selected field"):
+            v.max(per_cell=True, as_dataset=True)
+
+        with pytest.raises(ValueError, match="requires per_cell=True"):
+            v.select_fields("intensity").max(as_dataset=True)
+
+        with pytest.raises(ValueError, match="requires per_cell=True"):
+            v.count(as_dataset=True)
+
+        with pytest.raises(ValueError, match="at least one fixed-grid axis"):
+            v[0, 0].select_fields("intensity").max(per_cell=True, as_dataset=True)
 
     def test_array_mutation_writes_through_for_single_field(self):
         v = make_line_vector()
@@ -311,6 +408,7 @@ class TestVector:
         empty = v[[], :]
         assert empty.shape == (0, 2)
         assert empty.flatten().shape == (0, 3)
+        assert empty.copy().shape == (0, 2)
 
         empty.select_fields("kx")[...] += 1
         np.testing.assert_array_equal(v.flatten(), before)
@@ -370,6 +468,131 @@ class TestVector:
             v[0].array,
             np.array([[1.0, 100.0], [2.0, 200.0]]),
         )
+
+    def test_mask_empties_deselected_cells(self):
+        v = make_grid_vector()
+
+        grid_mask = np.array([[True, False], [False, True], [True, True]])
+        masked = v.mask(grid_mask)
+
+        assert isinstance(masked, Vector)
+        assert masked.shape == v.shape
+        assert masked.fields == v.fields
+        assert masked.units == v.units
+        assert masked.name == v.name
+        assert masked.row_counts() == [1, 0, 0, 1, 1, 1]
+        np.testing.assert_array_equal(masked[0, 0].array, v[0, 0].array)
+        assert masked[0, 1].array.shape == (0, 3)
+        np.testing.assert_array_equal(masked[1, 1].array, v[1, 1].array)
+
+        # The source Vector is untouched
+        assert v.row_counts() == [1] * 6
+
+    def test_mask_accepts_flat_and_integer_masks(self):
+        v = make_grid_vector()
+        grid_mask = np.array([[True, False], [False, True], [True, True]])
+
+        # A flat mask in row-major cell order matches the grid-shaped mask
+        np.testing.assert_array_equal(
+            v.mask(grid_mask.reshape(-1)).flatten(),
+            v.mask(grid_mask).flatten(),
+        )
+
+        # Integer masks are read as nonzero-means-keep
+        np.testing.assert_array_equal(
+            v.mask(grid_mask.astype(int)).flatten(),
+            v.mask(grid_mask).flatten(),
+        )
+
+    def test_mask_over_fixed_grid_dimensions(self):
+        # 1D
+        line = make_line_vector()
+        line_masked = line.mask(np.array([False, True, False, True]))
+        assert line_masked.shape == (4,)
+        assert line_masked.row_counts() == [0, 1, 0, 1]
+        np.testing.assert_array_equal(
+            line_masked.flatten(),
+            np.array([[3.0, 30.0, 300.0], [6.0, 60.0, 600.0]]),
+        )
+
+        # 0D, where the mask is a single boolean
+        assert line[0].mask(np.True_).array.shape == (2, 3)
+        assert line[0].mask(np.False_).array.shape == (0, 3)
+
+        # 3D
+        cube = Vector.from_shape(shape=(2, 2, 2), fields=["kx", "ky"])
+        for i in range(2):
+            for j in range(2):
+                for k in range(2):
+                    cube[i, j, k] = np.array([[float(i), float(j + k)]])
+        cube_mask = np.zeros((2, 2, 2), dtype=bool)
+        cube_mask[1, 0, 1] = True
+        cube_masked = cube.mask(cube_mask)
+        assert cube_masked.shape == (2, 2, 2)
+        assert cube_masked.total_rows == 1
+        np.testing.assert_array_equal(cube_masked[1, 0, 1].array, np.array([[1.0, 1.0]]))
+
+    def test_mask_on_field_and_grid_selections(self):
+        v = make_grid_vector()
+
+        # Masking a field-selected view keeps only that field, like copy()
+        kx_masked = v.select_fields("kx").mask(np.array([[True, False]] * 3))
+        assert kx_masked.fields == ["kx"]
+        np.testing.assert_array_equal(kx_masked.flatten(), np.array([[100.0], [110.0], [120.0]]))
+
+        # Masking a fixed-grid selection is relative to that selection's shape
+        sub = v[:2]
+        sub_masked = sub.mask(np.array([[True, True], [False, False]]))
+        assert sub_masked.shape == (2, 2)
+        assert sub_masked.row_counts() == [1, 1, 0, 0]
+
+    def test_mask_in_place_empties_cells_across_all_fields(self):
+        v = make_grid_vector()
+
+        assert v.mask(np.array([[True, False], [True, False], [True, False]])) is not None
+        assert (
+            v.mask(np.array([[True, False], [True, False], [True, False]]), modify_in_place=True)
+            is None
+        )
+        assert v.shape == (3, 2)
+        assert v.row_counts() == [1, 0, 1, 0, 1, 0]
+        np.testing.assert_array_equal(
+            v.flatten(),
+            np.array([[0.0, 100.0, 200.0], [10.0, 110.0, 210.0], [20.0, 120.0, 220.0]]),
+        )
+
+        # Cells are emptied across every field, even through a field-selected view
+        v2 = make_grid_vector()
+        v2.select_fields("kx").mask(np.zeros((3, 2), dtype=bool), modify_in_place=True)
+        assert v2.fields == ["intensity", "kx", "ky"]
+        assert v2.row_counts() == [0] * 6
+
+        # In-place masking of a grid selection leaves unselected cells alone
+        v3 = make_grid_vector()
+        v3[0].mask(np.array([False, True]), modify_in_place=True)
+        assert v3.row_counts() == [0, 1, 1, 1, 1, 1]
+
+    def test_mask_edge_cases_and_validation(self):
+        v = make_grid_vector()
+
+        keep_all = v.mask(np.ones((3, 2), dtype=bool))
+        np.testing.assert_array_equal(keep_all.flatten(), v.flatten())
+
+        drop_all = v.mask(np.zeros((3, 2), dtype=bool))
+        assert drop_all.row_counts() == [0] * 6
+        assert drop_all.flatten().shape == (0, 3)
+
+        empty = v[[], :]
+        assert empty.mask(np.zeros((0, 2), dtype=bool)).flatten().shape == (0, 3)
+
+        with pytest.raises(ValueError, match=r"expected \(3, 2\)"):
+            v.mask(np.ones((2, 3), dtype=bool))
+
+        with pytest.raises(ValueError, match="flat mask with 6 entries"):
+            v.mask(np.ones(5, dtype=bool))
+
+        with pytest.raises(TypeError, match="boolean or integer"):
+            v.mask(np.ones((3, 2), dtype=float))
 
     def test_copy_is_deep(self):
         v = make_line_vector()
