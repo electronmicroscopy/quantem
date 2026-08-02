@@ -714,13 +714,13 @@ class Vector(AutoSerialize):
 
         See Also
         --------
+        filter_rows : Rowwise counterpart, dropping ragged rows instead of cells.
         select_fields : Field-wise counterpart, selecting fields instead of cells.
 
         Notes
         -----
         Masking selects whole cells, never individual ragged rows. To drop rows by
-        field value, e.g. peaks below an intensity threshold, work through
-        ``flatten()`` and ``set_flattened()``.
+        field value, e.g. peaks below an intensity threshold, use ``filter_rows``.
 
         Examples
         --------
@@ -752,6 +752,81 @@ class Vector(AutoSerialize):
         kept = [
             self._selected_cell_matrix(int(index)) if flag else empty
             for index, flag in zip(targets, keep)
+        ]
+        result = self._empty_like()
+        result._replace_cells(result._selected_cell_indices(), kept)
+        return result
+
+    def filter_rows(self, mask: Any, modify_in_place: bool = False) -> "Vector | None":
+        """Keep only the ragged rows selected by a rowwise boolean mask.
+
+        The mask holds one entry per ragged row, in the row-major order produced
+        by ``flatten()``, which is how a mask built from field values arrives:
+
+        >>> kr = v.select_fields("kr").flatten()[:, 0]
+        >>> annulus = v.filter_rows((kr > k_min) & (kr < k_max))
+
+        Rows are kept or dropped in full, across every field, so only per-cell row
+        counts change. The fixed-grid shape and the field schema are preserved, and
+        cells that lose all their rows simply become empty.
+
+        Parameters
+        ----------
+        mask : array-like or Vector
+            Rows to keep, as a 1D boolean array of ``total_rows`` entries or a 2D
+            array of shape ``(total_rows, 1)``, i.e. the direct result of comparing
+            a single-field ``flatten()`` against a value. A single-field ``Vector``
+            with matching per-cell row counts also works, with nonzero meaning
+            keep. Integer masks are read as nonzero-means-keep; masks with more
+            than one column must be reduced first, e.g. with ``.any(axis=1)``.
+        modify_in_place : bool, optional
+            If True, drop the rows from this Vector's backing storage and return
+            None. Rows are removed across *all* fields, even when the mask was
+            built from a field-selected view, and the change is visible to every
+            view sharing that storage. If False (default), return a new Vector
+            holding only the kept rows and leave this one untouched.
+
+        Returns
+        -------
+        Vector or None
+            Filtered copy of the current selection if ``modify_in_place`` is False,
+            otherwise None.
+
+        Raises
+        ------
+        ValueError
+            If the mask length does not match the number of selected rows.
+        TypeError
+            If the mask is neither boolean nor integer typed.
+
+        See Also
+        --------
+        mask : Cellwise counterpart, emptying fixed-grid cells instead of rows.
+
+        Examples
+        --------
+        Keep the peaks inside a reciprocal-space annulus:
+
+        >>> kr = v.select_fields("kr").flatten()[:, 0]
+        >>> annulus = v.filter_rows((kr > k_min) & (kr < k_max))
+        >>> annulus.shape == v.shape
+        True
+
+        Discard weak peaks from the Vector itself:
+
+        >>> intensity = v.select_fields("intensity").flatten()
+        >>> v.filter_rows(intensity > 0.1, modify_in_place=True)
+        """
+        row_masks = self._resolve_row_mask(mask)
+        targets = self._selected_cell_indices()
+
+        if modify_in_place:
+            kept = [self._cell_matrix(int(index))[keep] for index, keep in zip(targets, row_masks)]
+            self._replace_cells(targets, kept)
+            return None
+
+        kept = [
+            self._selected_cell_matrix(int(index))[keep] for index, keep in zip(targets, row_masks)
         ]
         result = self._empty_like()
         result._replace_cells(result._selected_cell_indices(), kept)
@@ -1118,6 +1193,38 @@ class Vector(AutoSerialize):
             name=f"{self.name} {label}({fields})",
             signal_units=signal_units,
         )
+
+    def _resolve_row_mask(self, mask: Any) -> list[NDArray[np.bool_]]:
+        """Validate a rowwise mask and split it into one boolean array per selected cell."""
+        row_counts = self.row_counts()
+        if isinstance(mask, Vector):
+            if mask.num_fields != 1:
+                raise ValueError(
+                    f"A Vector mask must have exactly one field, got {mask.num_fields}."
+                )
+            if mask.row_counts() != row_counts:
+                raise ValueError("A Vector mask must have matching per-cell row counts.")
+            mask = mask.flatten()[:, 0] != 0
+
+        array = np.asarray(mask)
+        if array.ndim == 2 and array.shape[1] == 1:
+            array = array[:, 0]
+        if array.ndim != 1:
+            raise ValueError(
+                f"Mask must be 1D or of shape (n_rows, 1), got shape {array.shape}. "
+                "Reduce multi-column masks first, e.g. with .any(axis=1)."
+            )
+        if array.size and array.dtype != bool and not np.issubdtype(array.dtype, np.integer):
+            raise TypeError(f"Mask must be boolean or integer typed, got dtype {array.dtype}.")
+        if array.shape[0] != sum(row_counts):
+            raise ValueError(
+                f"Mask has {array.shape[0]} entries, expected {sum(row_counts)} rows."
+            )
+
+        if not row_counts:
+            return []
+        bounds = np.cumsum(row_counts[:-1], dtype=np.int64)
+        return list(np.split(array.astype(bool, copy=False), bounds))
 
     def _resolve_cell_mask(self, mask: Any) -> NDArray[np.bool_]:
         """Validate a fixed-grid mask and flatten it to one boolean per selected cell."""

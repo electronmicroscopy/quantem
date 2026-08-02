@@ -572,6 +572,93 @@ class TestVector:
         v3[0].mask(np.array([False, True]), modify_in_place=True)
         assert v3.row_counts() == [0, 1, 1, 1, 1, 1]
 
+    def test_filter_rows_keeps_selected_rows(self):
+        v = make_line_vector()
+
+        intensity = v.select_fields("intensity").flatten()
+        filtered = v.filter_rows(intensity > 3.0)
+
+        assert isinstance(filtered, Vector)
+        assert filtered.shape == v.shape
+        assert filtered.fields == v.fields
+        assert filtered.units == v.units
+        assert filtered.row_counts() == [0, 0, 2, 1]
+        np.testing.assert_array_equal(
+            filtered.flatten(),
+            np.array([[4.0, 40.0, 400.0], [5.0, 50.0, 500.0], [6.0, 60.0, 600.0]]),
+        )
+        # The source Vector is untouched
+        assert v.row_counts() == [2, 1, 2, 1]
+
+        # (n_rows, 1) and 1D masks are equivalent, as are integer masks
+        np.testing.assert_array_equal(
+            v.filter_rows((intensity > 3.0)[:, 0]).flatten(), filtered.flatten()
+        )
+        np.testing.assert_array_equal(
+            v.filter_rows(np.array([0, 0, 0, 1, 1, 1])).flatten(), filtered.flatten()
+        )
+
+        # A single-field Vector mask works too
+        np.testing.assert_array_equal(
+            v.filter_rows(np.greater(v.select_fields("intensity"), 3.0)).flatten(),
+            filtered.flatten(),
+        )
+
+    def test_filter_rows_in_place_and_on_selections(self):
+        v = make_line_vector()
+
+        kr = v.select_fields("ky").flatten()[:, 0]
+        assert v.filter_rows((kr > 150.0) & (kr < 550.0), modify_in_place=True) is None
+        assert v.row_counts() == [1, 1, 2, 0]
+        np.testing.assert_array_equal(v[0].array, np.array([[2.0, 20.0, 200.0]]))
+
+        # Rows drop across all fields even when the mask came from a field view
+        v2 = make_line_vector()
+        kx = v2.select_fields("kx")
+        kx.filter_rows(kx.flatten() < 45.0, modify_in_place=True)
+        assert v2.fields == ["intensity", "kx", "ky"]
+        assert v2.row_counts() == [2, 1, 1, 0]
+        np.testing.assert_array_equal(v2[2].array, np.array([[4.0, 40.0, 400.0]]))
+
+        # Filtering a field-selected view returns only that field, like copy()
+        kx_only = make_line_vector().select_fields("kx")
+        kx_filtered = kx_only.filter_rows(kx_only.flatten() >= 40.0)
+        assert kx_filtered.fields == ["kx"]
+        np.testing.assert_array_equal(kx_filtered.flatten(), np.array([[40.0], [50.0], [60.0]]))
+
+        # A fixed-grid selection only sees its own rows, and leaves the rest alone
+        v3 = make_line_vector()
+        v3[:2].filter_rows(np.array([False, True, True]), modify_in_place=True)
+        assert v3.row_counts() == [1, 1, 2, 1]
+        np.testing.assert_array_equal(v3[0].array, np.array([[2.0, 20.0, 200.0]]))
+
+    def test_filter_rows_edge_cases_and_validation(self):
+        v = make_line_vector()
+
+        np.testing.assert_array_equal(v.filter_rows(np.ones(6, dtype=bool)).flatten(), v.flatten())
+
+        drop_all = v.filter_rows(np.zeros(6, dtype=bool))
+        assert drop_all.row_counts() == [0, 0, 0, 0]
+        assert drop_all.flatten().shape == (0, 3)
+
+        empty = v[[]]
+        assert empty.filter_rows(np.array([], dtype=bool)).flatten().shape == (0, 3)
+
+        with pytest.raises(ValueError, match="expected 6 rows"):
+            v.filter_rows(np.ones(5, dtype=bool))
+
+        with pytest.raises(TypeError, match="boolean or integer"):
+            v.filter_rows(np.ones(6, dtype=float))
+
+        with pytest.raises(ValueError, match="Reduce multi-column masks"):
+            v.filter_rows(np.ones((6, 3), dtype=bool))
+
+        with pytest.raises(ValueError, match="exactly one field"):
+            v.filter_rows(np.greater(v.select_fields("intensity", "kx"), 3.0))
+
+        with pytest.raises(ValueError, match="matching per-cell row counts"):
+            v.filter_rows(np.greater(v[:2].select_fields("intensity"), 3.0))
+
     def test_mask_edge_cases_and_validation(self):
         v = make_grid_vector()
 
