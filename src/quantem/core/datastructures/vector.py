@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
-
-from tqdm import tqdm
 
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import (
@@ -16,6 +14,9 @@ from quantem.core.utils.validators import (
     validate_shape,
     validate_vector_units,
 )
+
+if TYPE_CHECKING:
+    from quantem.core.datastructures.dataset import Dataset
 
 
 class Vector(AutoSerialize):
@@ -90,6 +91,18 @@ class Vector(AutoSerialize):
     ...         kx.flatten(),
     ...     )
     ... )
+
+    Empty the fixed-grid cells that a boolean grid mask deselects:
+
+    >>> kept = v.mask(np.array([[True, False], [False, True]]))
+    >>> kept.row_counts()
+    [2, 0, 0, 0]
+
+    Reduce the ragged rows of each cell down to a fixed-grid image:
+
+    >>> total = v.select_fields("intensity").sum(per_cell=True, as_dataset=True)
+    >>> total.shape
+    (2, 2)
     """
 
     __array_priority__ = 1000
@@ -314,6 +327,182 @@ class Vector(AutoSerialize):
         return [self._cell_row_count(int(index)) for index in self._selected_cell_indices()]
 
     # ------------------------------------------------------------------ #
+    # Reductions
+    # ------------------------------------------------------------------ #
+
+    def sum(self, per_cell: bool = False, as_dataset: bool = False) -> "NDArray[Any] | Dataset":
+        """Sum the ragged rows of the current selection, per field.
+
+        Parameters
+        ----------
+        per_cell : bool, optional
+            If False (default), reduce every selected row into one value per
+            field, giving shape ``(num_fields,)``. If True, reduce within each
+            fixed-grid cell instead, giving shape ``shape + (num_fields,)``.
+        as_dataset : bool, optional
+            If True, return the per-cell result as a fixed-grid ``Dataset``
+            instead of an array. Requires ``per_cell=True`` and exactly one
+            selected field.
+
+        Returns
+        -------
+        numpy.ndarray or Dataset
+            Summed values. Cells with no rows sum to ``0.0``.
+
+        See Also
+        --------
+        mean : Average instead of total.
+        count : Number of rows, rather than a reduction over field values.
+
+        Examples
+        --------
+        Total intensity recorded at each scan position, as an image:
+
+        >>> total = v.select_fields("intensity").sum(per_cell=True, as_dataset=True)
+        >>> total.shape
+        (128, 128)
+        """
+        return self._reduce("sum", per_cell, as_dataset)
+
+    def mean(self, per_cell: bool = False, as_dataset: bool = False) -> "NDArray[Any] | Dataset":
+        """Average the ragged rows of the current selection, per field.
+
+        Parameters
+        ----------
+        per_cell : bool, optional
+            If False (default), reduce every selected row into one value per
+            field, giving shape ``(num_fields,)``. If True, reduce within each
+            fixed-grid cell instead, giving shape ``shape + (num_fields,)``.
+        as_dataset : bool, optional
+            If True, return the per-cell result as a fixed-grid ``Dataset``
+            instead of an array. Requires ``per_cell=True`` and exactly one
+            selected field.
+
+        Returns
+        -------
+        numpy.ndarray or Dataset
+            Mean values. Cells with no rows are ``np.nan``.
+
+        Examples
+        --------
+        Mean peak position over the whole scan:
+
+        >>> v.select_fields("q_row", "q_col").mean()
+        array([63.8, 64.1])
+        """
+        return self._reduce("mean", per_cell, as_dataset)
+
+    def min(self, per_cell: bool = False, as_dataset: bool = False) -> "NDArray[Any] | Dataset":
+        """Reduce the ragged rows of the current selection to their minimum, per field.
+
+        Parameters
+        ----------
+        per_cell : bool, optional
+            If False (default), reduce every selected row into one value per
+            field, giving shape ``(num_fields,)``. If True, reduce within each
+            fixed-grid cell instead, giving shape ``shape + (num_fields,)``.
+        as_dataset : bool, optional
+            If True, return the per-cell result as a fixed-grid ``Dataset``
+            instead of an array. Requires ``per_cell=True`` and exactly one
+            selected field.
+
+        Returns
+        -------
+        numpy.ndarray or Dataset
+            Minimum values. Cells with no rows are ``np.nan``.
+        """
+        return self._reduce("min", per_cell, as_dataset)
+
+    def max(self, per_cell: bool = False, as_dataset: bool = False) -> "NDArray[Any] | Dataset":
+        """Reduce the ragged rows of the current selection to their maximum, per field.
+
+        Parameters
+        ----------
+        per_cell : bool, optional
+            If False (default), reduce every selected row into one value per
+            field, giving shape ``(num_fields,)``. If True, reduce within each
+            fixed-grid cell instead, giving shape ``shape + (num_fields,)``.
+        as_dataset : bool, optional
+            If True, return the per-cell result as a fixed-grid ``Dataset``
+            instead of an array. Requires ``per_cell=True`` and exactly one
+            selected field.
+
+        Returns
+        -------
+        numpy.ndarray or Dataset
+            Maximum values. Cells with no rows are ``np.nan``.
+
+        Examples
+        --------
+        Brightest peak found at each scan position:
+
+        >>> brightest = v.select_fields("intensity").max(per_cell=True, as_dataset=True)
+        """
+        return self._reduce("max", per_cell, as_dataset)
+
+    def std(self, per_cell: bool = False, as_dataset: bool = False) -> "NDArray[Any] | Dataset":
+        """Standard deviation of the ragged rows of the current selection, per field.
+
+        The population standard deviation is used, matching ``numpy.std``
+        defaults.
+
+        Parameters
+        ----------
+        per_cell : bool, optional
+            If False (default), reduce every selected row into one value per
+            field, giving shape ``(num_fields,)``. If True, reduce within each
+            fixed-grid cell instead, giving shape ``shape + (num_fields,)``.
+        as_dataset : bool, optional
+            If True, return the per-cell result as a fixed-grid ``Dataset``
+            instead of an array. Requires ``per_cell=True`` and exactly one
+            selected field.
+
+        Returns
+        -------
+        numpy.ndarray or Dataset
+            Standard deviations. Cells with no rows are ``np.nan``.
+        """
+        return self._reduce("std", per_cell, as_dataset)
+
+    def count(self, per_cell: bool = False, as_dataset: bool = False) -> "int | NDArray | Dataset":
+        """Count the ragged rows of the current selection.
+
+        Counts are a property of rows rather than of field values, so the result
+        carries no field axis.
+
+        Parameters
+        ----------
+        per_cell : bool, optional
+            If False (default), return the total row count as an int. If True,
+            return one count per fixed-grid cell, with shape ``shape``.
+        as_dataset : bool, optional
+            If True, return the per-cell result as a fixed-grid ``Dataset``
+            instead of an array. Requires ``per_cell=True``.
+
+        Returns
+        -------
+        int, numpy.ndarray or Dataset
+            Row counts, as ``np.int64`` when ``per_cell`` is True.
+
+        Examples
+        --------
+        Number of Bragg peaks detected at each scan position:
+
+        >>> num_peaks = v.count(per_cell=True, as_dataset=True)
+        >>> num_peaks.shape
+        (128, 128)
+        """
+        if not per_cell:
+            if as_dataset:
+                raise ValueError("as_dataset=True requires per_cell=True.")
+            return self.total_rows
+
+        counts = np.asarray(self.row_counts(), dtype=np.int64).reshape(self.shape)
+        if not as_dataset:
+            return counts
+        return self._as_dataset(counts, "count", signal_units="counts")
+
+    # ------------------------------------------------------------------ #
     # Field management
     # ------------------------------------------------------------------ #
 
@@ -485,6 +674,89 @@ class Vector(AutoSerialize):
                 cell[:, field_indices] = flat_values[cursor : cursor + rows]
             cursor += rows
 
+    def mask(self, mask: Any, modify_in_place: bool = False) -> "Vector | None":
+        """Keep only the fixed-grid cells selected by a boolean mask.
+
+        The mask is a boolean array with the same shape as this Vector, holding
+        one entry per fixed-grid cell, so a Vector of Bragg peaks over a
+        ``(N_row, N_col)`` scan takes a ``(N_row, N_col)`` mask. Any fixed-grid
+        dimensionality is supported, from 0D up.
+
+        Cells marked False are emptied: they keep their place in the fixed grid
+        and simply hold zero ragged rows. The fixed-grid shape and the field
+        schema are always preserved, so a masked ``(256, 256)`` scan is still
+        ``(256, 256)``.
+
+        Parameters
+        ----------
+        mask : array-like
+            Boolean array of shape ``self.shape``, or a flat boolean array with
+            one entry per cell in row-major order. Integer masks are accepted and
+            read as nonzero-means-keep.
+        modify_in_place : bool, optional
+            If True, empty the deselected cells in this Vector's backing storage
+            and return None. The change is visible to every view sharing that
+            storage. If False (default), return a new Vector holding only the
+            selected cells and leave this one untouched.
+
+        Returns
+        -------
+        Vector or None
+            Masked copy of the current selection if ``modify_in_place`` is False,
+            otherwise None.
+
+        Raises
+        ------
+        ValueError
+            If the mask shape does not match the selected fixed-grid cells.
+        TypeError
+            If the mask is neither boolean nor integer typed.
+
+        See Also
+        --------
+        select_fields : Field-wise counterpart, selecting fields instead of cells.
+
+        Notes
+        -----
+        Masking selects whole cells, never individual ragged rows. To drop rows by
+        field value, e.g. peaks below an intensity threshold, work through
+        ``flatten()`` and ``set_flattened()``.
+
+        Examples
+        --------
+        Keep the scan positions inside a region of interest:
+
+        >>> roi = (scan_row > 32) & (scan_row < 96)  # shape == v.shape == (128, 128)
+        >>> region = v.mask(roi)
+        >>> region.shape
+        (128, 128)
+
+        Empty a few cells of a 1D Vector, in place:
+
+        >>> v.mask(np.array([True, False, True, True]), modify_in_place=True)
+
+        Mask a single cell of a 0D selection:
+
+        >>> kept = v[3, 7].mask(np.True_)
+        """
+        keep = self._resolve_cell_mask(mask)
+        targets = self._selected_cell_indices()
+
+        if modify_in_place:
+            dropped = targets[~keep]
+            empty = np.empty((0, self._full_num_fields), dtype=self.dtype)
+            self._replace_cells(dropped, [empty] * dropped.size)
+            return None
+
+        empty = np.empty((0, self.num_fields), dtype=self.dtype)
+        kept = [
+            self._selected_cell_matrix(int(index)) if flag else empty
+            for index, flag in zip(targets, keep)
+        ]
+        result = self._empty_like()
+        result._replace_cells(result._selected_cell_indices(), kept)
+        return result
+
     def compact(self) -> None:
         """Repack the backing row buffer to remove dead rows.
 
@@ -535,14 +807,7 @@ class Vector(AutoSerialize):
 
     def copy(self) -> "Vector":
         """Return a deep copy of the current selection."""
-        copied = self.__class__(
-            shape=self.shape,
-            fields=self.fields,
-            units=self.units,
-            name=self.name,
-            metadata=copy.deepcopy(self.metadata),
-            _token=self.__class__._token,
-        )
+        copied = self._empty_like()
         target_cells = copied._selected_cell_indices()
         source_arrays = [
             self._selected_cell_matrix(index).copy() for index in self._selected_cell_indices()
@@ -751,6 +1016,28 @@ class Vector(AutoSerialize):
     def _full_num_fields(self) -> int:
         return len(self._state["fields"])
 
+    def _empty_like(self) -> "Vector":
+        """Return an empty root Vector matching this selection's shape and schema.
+
+        Unlike the public constructor this accepts zero-length fixed-grid axes, so
+        selections such as ``vector[[]]`` can still be copied or masked.
+        """
+        obj = self.__class__.__new__(self.__class__)
+        obj._state = {
+            "shape": self.shape,
+            "fields": list(self.fields),
+            "units": list(self.units),
+            "name": self.name,
+            "metadata": copy.deepcopy(self.metadata),
+            "data": np.empty((0, self.num_fields), dtype=self.dtype),
+            "cell_starts": np.zeros(_cell_count(self.shape), dtype=np.int64),
+            "cell_lengths": np.zeros(_cell_count(self.shape), dtype=np.int64),
+        }
+        obj._selection_shape = self.shape
+        obj._selection_indices = None
+        obj._selected_fields = None
+        return obj
+
     def _field_indices(self) -> NDArray[np.int64]:
         """Map selected field names to column indices in the backing buffer."""
         if self._selected_fields is None:
@@ -795,6 +1082,55 @@ class Vector(AutoSerialize):
         if _is_contiguous(cols):
             return cell[:, int(cols[0]) : int(cols[-1]) + 1]
         return cell[:, cols].copy()
+
+    def _reduce(self, op: str, per_cell: bool, as_dataset: bool) -> "NDArray[Any] | Dataset":
+        """Reduce the selected rows over one field column at a time."""
+        values = self.flatten()
+        if not per_cell:
+            if as_dataset:
+                raise ValueError("as_dataset=True requires per_cell=True.")
+            return _reduce_rows(values, op)
+
+        lengths = np.asarray(self.row_counts(), dtype=np.int64)
+        reduced = _reduce_segments(values, lengths, op)
+        reduced = reduced.reshape(self.shape + (self.num_fields,))
+        if not as_dataset:
+            return reduced
+        if self.num_fields != 1:
+            raise ValueError(
+                f"as_dataset=True requires exactly one selected field, got {self.num_fields}. "
+                "Narrow the selection with select_fields(...) first."
+            )
+        return self._as_dataset(reduced[..., 0], op, signal_units=self.units[0])
+
+    def _as_dataset(self, array: NDArray[Any], label: str, signal_units: str) -> "Dataset":
+        """Wrap a fixed-grid result array in the Dataset subclass for its dimensionality."""
+        from quantem.core.datastructures import Dataset
+
+        if self.shape == ():
+            raise ValueError(
+                "as_dataset=True requires a Vector with at least one fixed-grid axis."
+            )
+        cls = Dataset._registry.get(len(self.shape), Dataset)
+        fields = ", ".join(self.fields)
+        return cls.from_array(
+            array=array,
+            name=f"{self.name} {label}({fields})",
+            signal_units=signal_units,
+        )
+
+    def _resolve_cell_mask(self, mask: Any) -> NDArray[np.bool_]:
+        """Validate a fixed-grid mask and flatten it to one boolean per selected cell."""
+        array = np.asarray(mask)
+        num_cells = self.num_cells
+        if array.shape != self.shape and not (array.ndim == 1 and array.shape[0] == num_cells):
+            raise ValueError(
+                f"Mask has shape {array.shape}, expected {self.shape} or a flat mask "
+                f"with {num_cells} entries."
+            )
+        if array.size and array.dtype != bool and not np.issubdtype(array.dtype, np.integer):
+            raise TypeError(f"Mask must be boolean or integer typed, got dtype {array.dtype}.")
+        return array.astype(bool, copy=False).reshape(-1)
 
     def _replace_cells(self, targets: NDArray[np.int64], arrays: Sequence[NDArray[Any]]) -> None:
         """Replace complete cells in the compact row buffer.
@@ -1078,6 +1414,55 @@ def _coerce_cell_array(value: Any, num_fields: int) -> NDArray[Any]:
     if array.shape[1] != num_fields:
         raise ValueError(f"Expected {num_fields} fields, got {array.shape[1]}")
     return array
+
+
+def _reduce_rows(values: NDArray[Any], op: str) -> NDArray[Any]:
+    """Reduce a flattened ``(n_rows, num_fields)`` array down to one value per field."""
+    if values.shape[0] == 0:
+        fill = 0.0 if op == "sum" else np.nan
+        return np.full(values.shape[1], fill, dtype=float)
+    if op == "sum":
+        return values.sum(axis=0)
+    if op == "mean":
+        return values.mean(axis=0)
+    if op == "min":
+        return values.min(axis=0)
+    if op == "max":
+        return values.max(axis=0)
+    if op == "std":
+        return values.std(axis=0)
+    raise ValueError(f"Unknown reduction {op!r}.")
+
+
+def _reduce_segments(values: NDArray[Any], lengths: NDArray[np.int64], op: str) -> NDArray[Any]:
+    """Reduce contiguous row segments of ``values``, one segment per fixed-grid cell.
+
+    ``values`` holds the selected rows in cell order and ``lengths`` their per-cell
+    row counts, so each cell owns one contiguous slice. Empty cells have no rows to
+    reduce and are filled with ``0.0`` for sums and ``np.nan`` otherwise.
+    """
+    out = np.full((lengths.size, values.shape[1]), 0.0 if op == "sum" else np.nan, dtype=float)
+    nonempty = lengths > 0
+    if not nonempty.any():
+        return out
+
+    starts = (np.cumsum(lengths) - lengths)[nonempty]
+    counts = lengths[nonempty].astype(float)[:, None]
+    if op == "sum":
+        out[nonempty] = np.add.reduceat(values, starts, axis=0)
+    elif op == "mean":
+        out[nonempty] = np.add.reduceat(values, starts, axis=0) / counts
+    elif op == "min":
+        out[nonempty] = np.minimum.reduceat(values, starts, axis=0)
+    elif op == "max":
+        out[nonempty] = np.maximum.reduceat(values, starts, axis=0)
+    elif op == "std":
+        means = np.add.reduceat(values, starts, axis=0) / counts
+        deviations = (values - np.repeat(means, lengths[nonempty], axis=0)) ** 2
+        out[nonempty] = np.sqrt(np.add.reduceat(deviations, starts, axis=0) / counts)
+    else:
+        raise ValueError(f"Unknown reduction {op!r}.")
+    return out
 
 
 def _flatten_fixed_grid(node: Any) -> tuple[tuple[int, ...], list[NDArray[Any]]]:
