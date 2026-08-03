@@ -284,7 +284,7 @@ def DDFrphimask(pointsvector,r,rtol,phi=None,phitol=None):
         maskstack = radial_selection
     return maskstack.T
 
-def DDFimage_from_maskstack(pointsvector,maskstack):
+def DDFimage_from_mask(pointsvector,mask):
     '''
     This calculates a DDF image from a Boolean maskstack object, which is a set of Boolean mask layers.  
     Each mask layer may contribute to some of the same pixels, so calculating each separately is necessary.
@@ -306,14 +306,8 @@ def DDFimage_from_maskstack(pointsvector,maskstack):
     im: np.ndarray
         The Digital Dark Field Image
     '''
-    im = np.zeros(shape=pointsvector.shape)
-    if len(maskstack.shape) == 1:
-        maskstack = maskstack[None,:]
-    for mask in maskstack:
-        rx = pointsvector.select_fields("rx").flatten()[mask].astype(int)
-        ry = pointsvector.select_fields("ry").flatten()[mask].astype(int)
-        I = pointsvector.select_fields("intensity").flatten()[mask]
-        im[rx,ry]+=I
+    cut = pointsvector.filter_rows(mask)
+    im = cut.imgreduce()
     return im
 
 
@@ -321,71 +315,15 @@ def DDFimage_from_maskstack(pointsvector,maskstack):
     # Clustering Functions
     # ------------------------------------------------------------------ #
 
+
 def DBSCAN_pointsvector(
     pointsvector, 
     fields=['kx','ky'], 
     scaling = [1,1], 
     eps=0.5, 
     min_samples=20, 
-    plot=True
-):
-    '''
-    This is the working code that DBSCANs everything
-
-    Runs DBSCAN on selected fields in a pointsvector
-    See scikit-learn documentation for general comments on their implementation of the DBSCAN function
-    Experience suggests about eps should be about 0.3-0.5 for detecting diffraction spots in kx,ky 2D
-    clustering, and about 1 will connect arcs/rings of spots for nanocrystalline / amorphous materials.
-    Too small and you see no clusters at all.
-    For 4D rx,ry,kx,ky clustering, eps needs to be larger, perhaps 3-10, depending on your scaling parameters.
-    Alter the relative weighting of real and reciprocal space depending on your dataset and the size of your
-    crystals in real space compared to the spacing of diffraction peaks in reciprocal space.
-
-    Parameters
-    ----------
-    pointsvector: Vector
-        Should contain any fields you are selecting to cluster on
-    fields: list of str
-        Strings in ["rx", "ry", 'kx', "ky", "kr", "kphi"] to cluster on
-    scaling: list of int, float
-        Relative scaling factors for different dimensions
-    eps: float
-        As defined in scikit-learn
-    min_samples: int
-        As defined in scikit-learn
-    plot: bool
-        Turns plotting on or off
-    Returns
-    -------
-    pointsvector2: Vector
-        A copy of the original Vector, with an additional field for L1labels.  It may be shorter than 
-        pointsvector if radial filtering has been applied
-    
-    '''
-    for item in fields:
-        assert item in ["rx", "ry", 'kx', "ky", "kr", "kphi"], "field not found in [rx, ry, kx, ky, kr, kphi]"
-    assert len(scaling)==len(fields), "the scalings and fields must have the same number of entries"
-    pointsarray = (np.array(scaling)*pointsvector.select_fields(*fields).flatten())
-    db = DBSCAN(eps=eps, min_samples=min_samples)
-    db.fit(pointsarray)
-    if 'L1labels' in pointsvector.fields:
-        pointsvector.remove_fields('L1labels')
-    pointsvector.add_fields('L1labels',db.labels_)
-    if plot:
-        plot_L1_clusters_kspace( 
-            pointsvector, 
-            fields, 
-            max_kr_plot=int(pointsvector.select_fields('kx').flatten().max()*1.1)
-        )
-
-def incomplete_radial_filtering(
-    pointsvector, 
-    fields=['kx','ky'], 
-    scaling = [1,1], 
-    eps=0.5, 
-    min_samples=20, 
-    min_kr = 0,
-    max_kr = 1000,
+    kr_min = 0,
+    kr_max = 1000,
     plot=True
 ):
     '''
@@ -410,7 +348,7 @@ def incomplete_radial_filtering(
         As defined in scikit-learn
     min_samples: int
         As defined in scikit-learn
-    min_kr, max_kr: int, float
+    kr_min, kr_max: int, float
         minimum and maximum peak radii to use for clustering.  Setting min_kr>0 blocks the primary beam, which
         may be sensible.  Values will need adjusting for your data and detector, and whether you are working in
         calibrated units or raw pixels
@@ -431,26 +369,20 @@ def incomplete_radial_filtering(
     pointsvector2 = pointsvector.copy()
 
     # making the mask is obvious
-    kr = pointsvector2.select_fields("kr").flatten()
-    radialmask  = np.squeeze(np.logical_and(kr >= min_kr, kr <= max_kr))
-
-    # It's pretty easy to trim either the selected fields or a whole flattened array
-    pointsarray = (np.array(scaling)*pointsvector.select_fields(*fields).flatten())[radialmask]
-
+    kr = pointsvector.select_fields("kr").flatten()
+    pointsvector2 = pointsvector.filter_rows((kr > kr_min) & (kr < kr_max))
+    pointsarray = (np.array(scaling)*pointsvector2.select_fields(*fields).flatten())
 
     db = DBSCAN(eps=eps, min_samples=min_samples)
     db.fit(pointsarray)
-
-    # but how do we rebuild the vector easily from the filtered flattened version
-    if 'L1labels' in pointsvector.fields:
-        pointsvector.remove_fields('L1labels')
-    pointsvector.add_fields('L1labels',db.labels_)
+    pointsvector2.add_fields('L1labels',db.labels_)
     if plot:
         plot_L1_clusters_kspace( 
-            pointsvector, 
+            pointsvector2, 
             fields, 
-            max_kr_plot=int(pointsvector.select_fields('kx').flatten().max()*1.1)
+            kr_max_plot=int(pointsvector2.select_fields('kx').flatten().max()*1.05)
         )
+    return pointsvector2
 
 '''
 A custom colormap for the k-space plots
@@ -470,7 +402,7 @@ california = LinearSegmentedColormap.from_list(
 california.set_under('lightgrey')
 california.set_bad('red')
 
-def plot_L1_clusters_kspace(pointsvector, fields, max_kr_plot, cmap=california, figax=None):
+def plot_L1_clusters_kspace(pointsvector, fields, kr_max_plot, cmap=california, figax=None):
     """
     Takes a L1 cluster result of running some cluster algorithm in Scikit-Learn (e.g. DBSCAN)
     on 4D data in a points array and plots the results in reciprocal and real space.  Everything
@@ -488,7 +420,7 @@ def plot_L1_clusters_kspace(pointsvector, fields, max_kr_plot, cmap=california, 
     pointsvector: Vector
         A Vector object from this repo, preferably constructed with ["rx", "ry", 'kx', "ky", "kr", "kphi", "I]
         as the fields
-    max_kr: int, float
+    kr_max_plot: int, float
         maximum radius for the reciprocal space plot
     cmap: colormap
         Either use the default one or provide your own.  Note it needs to be a colormap (not
@@ -509,8 +441,8 @@ def plot_L1_clusters_kspace(pointsvector, fields, max_kr_plot, cmap=california, 
     ax.set_title("DBSCAN "+", ".join(fields))
     ax.set_xlabel("kx", fontsize=24)
     ax.set_ylabel("ky", fontsize=24)
-    ax.set_ylim(max_kr_plot, -max_kr_plot)
-    ax.set_xlim(-max_kr_plot, max_kr_plot)
+    ax.set_ylim(kr_max_plot, -kr_max_plot)
+    ax.set_xlim(-kr_max_plot, kr_max_plot)
 
     kx = pointsvector.select_fields("kx").flatten()
     ky = pointsvector.select_fields("ky").flatten()
@@ -529,10 +461,10 @@ def plot_L1_clusters_kspace(pointsvector, fields, max_kr_plot, cmap=california, 
         rasterized=True
     )
 
-    for label in uniquelabels:
+    for label in uniquelabels[1:]:
         clustermask = L1labels==label
         maxint = np.argmax(I[clustermask])
-        r = kr[clustermask][maxint] + 6
+        r = kr[clustermask][maxint] + 3
         ang = np.radians(kphi[clustermask][maxint])
         
         labx = np.sin(ang) * r
@@ -543,18 +475,19 @@ def plot_L1_clusters_kspace(pointsvector, fields, max_kr_plot, cmap=california, 
             (laby, -labx),
             horizontalalignment="center",
             verticalalignment="center",
-            size=7,
+            size=8,
         )
 
 def show_L1_clusters_in_real_space(
-    pointsvector, ncols=5, gamma=0.25, cmapname='inferno', ordering='sequential'
+    pointsvector, ncols=5, gamma=0.25, cmapname='inferno', ordering='sequential', save_ims=False
 ):
     """
     Function to show real space plots of all L1 clustering outputs.  This is designed purely
     for in-line sanity checking, and not for publication quality output so there is no 
     savefig option.  It is likely that in many cases, the output will be verbose and need 
     scrolling through.
-    There is an option to return the images themselves, 
+    There is an option to return the images themselves as a dict, which is especially useful
+    for image similarity based computation of L2 clusters.
 
     Parameters
     ----------
@@ -571,8 +504,12 @@ def show_L1_clusters_in_real_space(
     ordering: str
         Either "sequential" for the ordering from the cluster output or "size" for ordering
         by cluster size
+    save_ims: bool
+        Can turn on return of an image
     Returns
     -------
+    imdict: dict
+        dictionary with cluster indices as keys and images as np.ndarray
     """
     assert ordering in ["sequential", "size"], "ordering must be either sequential or size"
     L1labels = pointsvector.select_fields("L1labels").flatten().astype(int)
@@ -582,12 +519,20 @@ def show_L1_clusters_in_real_space(
         cluster_list = L1_unique_labels[1:]
     elif ordering == "size":
         cluster_list = L1_unique_labels[1:][np.argsort(L1_all_cluster_sizes[1:])[::-1]]
+    
+    # Set up aspect ration for plotting
     l = cluster_list.shape[0]
     ar = shape[1] / shape[0]
     w = 10
     row = int(np.ceil(l / ncols))
+    
+    # Set up plot
     fig = plt.figure(figsize=(w, w * row / ncols / ar))
     gs = GridSpec.GridSpec(row, ncols)
+    
+    # Do the plotting (and maybe save the images)
+    if save_ims:
+        ims = []
     for n, cluster_label in enumerate(cluster_list):
         i, j = int(n / ncols), n % ncols
         ax = plt.subplot(gs[i, j])
@@ -605,6 +550,10 @@ def show_L1_clusters_in_real_space(
             fontweight="bold",
             verticalalignment="top",
         )
+        if save_ims:
+            ims+=[im]
+    if save_ims:
+        return np.array(ims)
 
 def cluster_mask(cluster_labels, selected_cluster_labels):
     """
@@ -672,8 +621,7 @@ def Cluster_COMs_R(pointsvector, weighted=True):
     """
     assert "L1labels" in pointsvector.fields, "This Vector does not appear to have been clustered"
 
-    rxy = pointsvector.select_fields("rx").flatten()
-    ry = pointsvector.select_fields("ry").flatten()
+    rxy = pointsvector.select_fields("rx","ry").flatten()
     I = pointsvector.select_fields("intensity").flatten()
     L1labels = pointsvector.select_fields("L1labels").flatten().astype(int)
 
@@ -681,21 +629,99 @@ def Cluster_COMs_R(pointsvector, weighted=True):
 
     COMs = np.zeros_like(np.vstack((L1_unique_labels,L1_unique_labels)).T)
     for n, label in enumerate(L1_unique_labels):
-        mask = np.squeeze(L1labels==Label)
+        mask = np.squeeze(L1labels==label)
         if weighted:
             COMs[n] = (I * rxy)[mask].sum(axis=0) / I[mask].sum()
-         else:
+        else:
             COMs[n] = (rxy)[mask].sum(axis=0) / (rxy)[mask].shape[0]
     return COMs
 
-# def DBSCAN_L2_(pointsvector,
-#     method = "COM", 
-#     eps=3, 
-#     min_samples=2, 
-#     # plot=True
-# ):
+def DBSCAN_L2(
+    pointsvector,
+    eps=5, 
+    min_samples=2, 
+    plot=True,
+    method='COMs'
+):
+    assert method in ['COMs','Jaccard'], 'method currently restricted to COMs or Jaccard'
+    
+    db2 = DBSCAN(eps=eps, min_samples=min_samples)
 
-#     COMs = Cluster_COMs_R(pointsvector, weighted=True):
-#     db2 = DBSCAN(eps=eps, min_samples=ms)
-#     db2.fit(COMs)
+    if method == "COMs":
+        COMs = Cluster_COMs_R(pointsvector, weighted=True)
+        db2.fit(COMs)
 
+    elif method == "Jaccard":
+        L1labels = pointsvector.select_fields("L1labels").flatten().astype(int)
+        L1_unique_labels = np.unique(L1labels)
+        ims = []
+        for L1_label in L1_unique_labels[1:]:
+            mask = L1labels == L1_label
+
+        corrs = jaccard_image_similarity(imsarray, plot=False)
+
+    L2_unique_labels, L2_all_cluster_sizes = np.unique(db2.labels_, return_counts=True)
+    L2_unique_labels_proper = L2_unique_labels[1:]
+
+    L1labels = np.squeeze(pointsvector.select_fields("L1labels").flatten().astype(int))
+    L1_unique_labels_proper = np.unique(L1labels)[1:]
+
+    Rshape = pointsvector.shape
+
+    fig,ax = plt.subplots(1,1, figsize=(12,12*Rshape[0]/Rshape[1]))
+    ax.set_ylim(Rshape[0],0)
+    ax.set_xlim(0,Rshape[1])
+
+    L1toL2mapping = {-1:-2}
+    L2toL1mapping = {}
+    for L2cluster in L2_unique_labels:
+        L1labels_in_L2cluster = L1_unique_labels_proper[db2.labels_==L2cluster]
+        [L1toL2mapping.update({L1label: L2cluster}) for L1label in L1labels_in_L2cluster]
+        L2toL1mapping.update({L2cluster:L1labels_in_L2cluster})
+
+    L2labels = [L1toL2mapping[L1label] for L1label in L1labels]
+    if 'L2labels' in pointsvector.fields:
+        pointsvector.remove_fields('L2labels')
+    pointsvector.add_fields('L2labels',L2labels)
+        
+    if plotCOMs:
+        for L2cluster in L2_unique_labels:
+            L1labels_in_L2cluster = L2toL1mapping[L2cluster]
+            chosenCOMs = COMs[L1labels_in_L2cluster]
+            ax.scatter(
+                chosenCOMs.T[1],
+                chosenCOMs.T[0],
+                cmap = california, 
+                c=[L2cluster]*chosenCOMs.T[0].shape[0], 
+                norm=Normalize(vmin=0, vmax=L2_unique_labels_proper.max(), clip=False),
+                rasterized=True
+            )
+            if L2cluster!=-1:
+                ax.text(
+                    chosenCOMs.T[1].mean(),
+                    chosenCOMs.T[0].mean(),
+                    str(L2cluster),
+                    horizontalalignment='center',
+                    verticalalignment='center',
+                    fontsize=14,
+                    path_effects = [
+                        path_effects.Stroke(linewidth=3, foreground='w'),
+                        path_effects.Normal()
+                    ]
+                )
+
+def jaccard_image_similarity(imsarray, plot=False):
+
+    imsmask[imsarray>1] = 1
+    
+    corrs = np.zeros(shape=(imsarray.shape[0],imsarray.shape[0]))
+    masks = imsarray > 1
+    
+    for i, mask in enumerate(masks):
+        either = (np.logical_or(masks,mask[np.newaxis,:,:])).sum(axis=(1,2))
+        both = (masks*mask[np.newaxis,:,:]).sum(axis=(1,2))
+        corrs[i] = both/either
+    
+    if plot:
+        plt.imshow(corrs)
+    return corrs

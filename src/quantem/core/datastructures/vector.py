@@ -502,6 +502,25 @@ class Vector(AutoSerialize):
             return counts
         return self._as_dataset(counts, "count", signal_units="counts")
 
+    def imgreduce(self):
+        '''
+        This method reduces a Vector to an image by summing all the intensity
+        in each pixel
+
+        Return
+        ------
+        im: np.ndarray
+            the final image
+        '''
+        intensity = self.select_fields("intensity")
+
+        flat   = intensity.flatten()[:, 0]            # (total_rows,) — flatten() is always 2D
+        counts = np.asarray(intensity.row_counts())   # row-major over vec.shape
+        cells  = np.repeat(np.arange(counts.size), counts)
+
+        img = np.bincount(cells, weights=flat, minlength=counts.size).reshape(self.shape)
+        return img
+
     # ------------------------------------------------------------------ #
     # Field management
     # ------------------------------------------------------------------ #
