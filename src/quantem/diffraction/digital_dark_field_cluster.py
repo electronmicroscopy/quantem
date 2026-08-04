@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, Normalize, PowerNorm
 import matplotlib.gridspec as GridSpec
+import matplotlib.patheffects as path_effects
 
 from tqdm import tqdm
 
@@ -239,7 +240,9 @@ def DDFpointsmask(pointsvector,selectionpoints,tolerance):
             pointsvector.select_fields(*fields).flatten()[:,None,:]-selectionpoints,axis=2
         )<tolerance
     )
-    return maskstack
+    if len(maskstack.shape)>1:
+        mask = maskstack.sum(axis=0)
+    return mask
 
 def DDFrphimask(pointsvector,r,rtol,phi=None,phitol=None):
     '''
@@ -264,8 +267,8 @@ def DDFrphimask(pointsvector,r,rtol,phi=None,phitol=None):
 
     Returns
     -------
-    maskstack: np.ndarray
-        A set of Boolean masks for selecting points.  Each will have the same length as the flattened fields
+    mask: np.ndarray
+        A Boolean mask for selecting points with the same length as the flattened fields
         in the pointsvector it is to be used on.
     '''
     radial_selection = np.abs(pointsvector.select_fields('kr').flatten()-r)<rtol
@@ -279,10 +282,10 @@ def DDFrphimask(pointsvector,r,rtol,phi=None,phitol=None):
         elif phi-phitol < -180:
             additional_phi_selection = np.abs(pointsvector.select_fields('kphi').flatten()-phi-360)<phitol
         phi_selection = np.logical_or(phi_selection,additional_phi_selection)
-        maskstack = np.logical_and(radial_selection,phi_selection)
+        mask = np.squeeze(np.logical_and(radial_selection,phi_selection))
     else:
-        maskstack = radial_selection
-    return maskstack.T
+        mask = np.squeeze(radial_selection)
+    return mask
 
 def DDFimage_from_mask(pointsvector,mask):
     '''
@@ -478,8 +481,8 @@ def plot_L1_clusters_kspace(pointsvector, fields, kr_max_plot, cmap=california, 
             size=8,
         )
 
-def show_L1_clusters_in_real_space(
-    pointsvector, ncols=5, gamma=0.25, cmapname='inferno', ordering='sequential', save_ims=False
+def show_clusters_in_real_space(
+    pointsvector, ncols=5, gamma=0.25, cmapname='inferno', ordering='sequential', save_ims=False, level=1
 ):
     """
     Function to show real space plots of all L1 clustering outputs.  This is designed purely
@@ -506,17 +509,22 @@ def show_L1_clusters_in_real_space(
         by cluster size
     save_ims: bool
         Can turn on return of an image
+    level: int
+        Selects which level to pull from the pointsvector
     Returns
     -------
     imdict: dict
         dictionary with cluster indices as keys and images as np.ndarray
     """
     assert ordering in ["sequential", "size"], "ordering must be either sequential or size"
-    L1labels = pointsvector.select_fields("L1labels").flatten().astype(int)
-    L1_unique_labels, L1_all_cluster_sizes = np.unique(L1labels, return_counts=True)
+    assert level in [1,2], "level must be either 1 or 2"
+    level_label = f"L{level}labels"
+
+    labels = pointsvector.select_fields(level_label).flatten().astype(int)
+    unique_labels, all_cluster_sizes = np.unique(labels, return_counts=True)
     shape = pointsvector.shape
     if ordering == "sequential":
-        cluster_list = L1_unique_labels[1:]
+        cluster_list = unique_labels[1:]
     elif ordering == "size":
         cluster_list = L1_unique_labels[1:][np.argsort(L1_all_cluster_sizes[1:])[::-1]]
     
@@ -538,8 +546,8 @@ def show_L1_clusters_in_real_space(
         ax = plt.subplot(gs[i, j])
         ax.set_axis_off()
 
-        mask = L1labels == cluster_label
-        im = DDFimage_from_maskstack(pointsvector,mask[None,:])
+        mask = labels == cluster_label
+        im = DDFimage_from_mask(pointsvector,mask)
         ax.imshow(im, norm=PowerNorm(gamma=gamma), cmap=cmapname)
         ax.text(
             5,
@@ -555,11 +563,11 @@ def show_L1_clusters_in_real_space(
     if save_ims:
         return np.array(ims)
 
-def cluster_mask(cluster_labels, selected_cluster_labels):
+def cluster_mask(pointsvector, selected_cluster_labels, labelstitle):
     """
     Makes a mask that selects only the points in a particular cluster.  If applied on an output
     from clustering directly on a Vector object, then it can be used for Digital Dark Field imaging
-    with that Vector using "DDFimage_from_maskstack".
+    with that Vector using "DDFimage_from_mask".
 
     Parameters
     ----------
@@ -570,13 +578,19 @@ def cluster_mask(cluster_labels, selected_cluster_labels):
         more than one cluster
     Returns
     -------
-    maskstack: np.ndarray
-
+    mask: np.ndarray
+        A single mask that is True wherever any row matches one of the selected cluster labels
     """
+    maskstack = []
+    assert labelstitle in ['L1labels','L2labels'], "You need to choose either L1labels or L2labels"
+    assert labelstitle in pointsvector.fields, "This clustering has not yet been done on this Vector"
+    cluster_labels = pointsvector.select_fields(labelstitle).flatten().astype(int)
+
     for cluster_label in selected_cluster_labels:
-        assert cluster_label in cluster_labels, f"{cluster_label} not in the cluster labels"
-    maskstack = (cluster_labels in selected_cluster_labels)
-    return maskstack
+        assert cluster_label in cluster_labels, f"{cluster_label} not in the cluster labels" 
+        maskstack += [cluster_labels == cluster_label]
+    mask = np.squeeze(np.array(maskstack).sum(axis=0)).astype(bool)
+    return mask
 
 def apply_maskstack_to_Vector(pointsvector,maskstack):
     """
@@ -640,37 +654,62 @@ def DBSCAN_L2(
     pointsvector,
     eps=5, 
     min_samples=2, 
-    plot=True,
-    method='COMs'
+    plotCOMs=True,
+    method='COMs',
+    printclustersizes=False
 ):
+    '''
+    Groups L1 clusters into clusters via two different methods and then writes the Labels
+    into a new field ("L2labels") in the Vector, which can then be used to make images or 
+    diffraction patterns
+
+    The two methods are clustering real space centres of mass for L1 clusters, or clustering
+    image distances (1-image similarity) via the simple Jaccard metric.
+
+    Parameters
+    ----------
+    pointsvector: Vector
+        The raw Vector that was run through L1 clustering.  Must have a column giving the L1labels.
+    eps: int, float
+        As defined by scikit-learn
+    min_samples: int
+        As defined by scikit-learn, wants at least 2 L1 clusters to correlate
+    plotCOMs: bool
+        True makes a plot if method is "COMs"
+    method: str
+        Either COMs or Jaccard
+    printclustersizes: bool
+        If True, then you see the cluster labels and sizes, which may help in tuning eps
+    Returns
+    -------
+    '''
     assert method in ['COMs','Jaccard'], 'method currently restricted to COMs or Jaccard'
-    
-    db2 = DBSCAN(eps=eps, min_samples=min_samples)
 
     if method == "COMs":
+        db2 = DBSCAN(eps=eps, min_samples=min_samples)
         COMs = Cluster_COMs_R(pointsvector, weighted=True)
         db2.fit(COMs)
 
-    elif method == "Jaccard":
+    if method == "Jaccard":
         L1labels = pointsvector.select_fields("L1labels").flatten().astype(int)
-        L1_unique_labels = np.unique(L1labels)
         ims = []
-        for L1_label in L1_unique_labels[1:]:
-            mask = L1labels == L1_label
-
-        corrs = jaccard_image_similarity(imsarray, plot=False)
-
+        for cluster_label in np.unique(L1labels)[1:]:
+            mask = L1labels == cluster_label
+            ims += [DDFimage_from_mask(pointsvector,mask)]
+        imstack = np.array(ims)
+        corrs = jaccard_image_dist(imstack, plot=False)
+        db2 = DBSCAN(eps=eps, min_samples=min_samples,metric='precomputed')
+        db2.fit(corrs)
+    
     L2_unique_labels, L2_all_cluster_sizes = np.unique(db2.labels_, return_counts=True)
     L2_unique_labels_proper = L2_unique_labels[1:]
+    if printclustersizes:
+        print(L2_unique_labels, L2_all_cluster_sizes)
 
     L1labels = np.squeeze(pointsvector.select_fields("L1labels").flatten().astype(int))
     L1_unique_labels_proper = np.unique(L1labels)[1:]
 
     Rshape = pointsvector.shape
-
-    fig,ax = plt.subplots(1,1, figsize=(12,12*Rshape[0]/Rshape[1]))
-    ax.set_ylim(Rshape[0],0)
-    ax.set_xlim(0,Rshape[1])
 
     L1toL2mapping = {-1:-2}
     L2toL1mapping = {}
@@ -684,7 +723,10 @@ def DBSCAN_L2(
         pointsvector.remove_fields('L2labels')
     pointsvector.add_fields('L2labels',L2labels)
         
-    if plotCOMs:
+    if plotCOMs and method=='COMs':
+        fig,ax = plt.subplots(1,1, figsize=(12,12*Rshape[0]/Rshape[1]))
+        ax.set_ylim(Rshape[0],0)
+        ax.set_xlim(0,Rshape[1])
         for L2cluster in L2_unique_labels:
             L1labels_in_L2cluster = L2toL1mapping[L2cluster]
             chosenCOMs = COMs[L1labels_in_L2cluster]
@@ -710,18 +752,18 @@ def DBSCAN_L2(
                     ]
                 )
 
-def jaccard_image_similarity(imsarray, plot=False):
+def jaccard_image_dist(imsarray, plot=False):
 
-    imsmask[imsarray>1] = 1
+    imsmask = (imsarray>1).astype(int)
     
-    corrs = np.zeros(shape=(imsarray.shape[0],imsarray.shape[0]))
+    dists = np.zeros(shape=(imsarray.shape[0],imsarray.shape[0]))
     masks = imsarray > 1
     
     for i, mask in enumerate(masks):
         either = (np.logical_or(masks,mask[np.newaxis,:,:])).sum(axis=(1,2))
         both = (masks*mask[np.newaxis,:,:]).sum(axis=(1,2))
-        corrs[i] = both/either
+        dists[i] = 1-both/either
     
     if plot:
-        plt.imshow(corrs)
-    return corrs
+        plt.imshow(dists)
+    return dists
