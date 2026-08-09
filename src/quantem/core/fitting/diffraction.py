@@ -671,6 +671,10 @@ class SyntheticDiskLattice(RenderComponent):
     DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
         "force_positive_intensity": True,
     }
+    DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {
+            "consistency_weight": 0.0,
+            "consistency_window": 1,
+        }
 
     def __init__(
         self,
@@ -1022,15 +1026,6 @@ class SyntheticDiskLattice(RenderComponent):
             return F.softplus(beta * inten) / beta
         return (inten)
 
-    def constraint_loss(
-        self, ctx: RenderContext, params: dict[str, object] | None = None
-    ) -> torch.Tensor:
-        if self.slope_l2_weight <= 0.0 or self.ir is None or self.ic is None:
-            return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
-        ir = self.ir.to(device=ctx.device, dtype=ctx.dtype)
-        ic = self.ic.to(device=ctx.device, dtype=ctx.dtype)
-        return self.slope_l2_weight * torch.mean(ir * ir + ic * ic)
-
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
             raise RuntimeError("SyntheticDiskLattice requires an OriginND instance.")
@@ -1238,3 +1233,73 @@ class SyntheticDiskLattice(RenderComponent):
         if not params:
             return {}
         return {'default': params}
+
+    def constraint_loss(
+        self, 
+        ctx: RenderContext, 
+        params: dict[str, object] | None = None,
+        neighbor_target: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
+        tv_weight = float(cfg.get("consistency_weight", 0.0))
+
+        if self.slope_l2_weight <= 0.0 or self.ir is None or self.ic is None:
+            l2_loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        else:
+            ir = self.ir.to(device=ctx.device, dtype=ctx.dtype)
+            ic = self.ic.to(device=ctx.device, dtype=ctx.dtype)
+            l2_loss = self.slope_l2_weight * torch.mean(ir * ir + ic * ic)
+        
+        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
+        consistency_weight = max(float(cfg.get("consistency_weight", 0.0)), 0.0)
+        consistency_loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
+        if consistency_weight > 0.0 and neighbor_target is not None:
+            for attr, key in (("u_row", "u_row"), ("u_col", "u_col"), ("v_row", "v_row"), ("v_col", "v_col")):
+                tgt = neighbor_target.get(key)
+                if tgt is None or tgt != tgt:  # NaN check without importing math
+                    continue
+                val = getattr(self, attr).to(device=ctx.device, dtype=ctx.dtype)
+                consistency_loss = consistency_loss + consistency_weight * (val - tgt) ** 2
+
+        return consistency_loss + l2_loss
+
+    def constraint_loss_batched(
+        self,
+        ctx: RenderContext,
+        *,
+        u_row_b: torch.Tensor | None = None,
+        u_col_b: torch.Tensor | None = None,
+        v_row_b: torch.Tensor | None = None,
+        v_col_b: torch.Tensor | None = None,
+        ir_b: torch.Tensor | None = None,
+        ic_b: torch.Tensor | None = None,
+        neighbor_target: dict[str, torch.Tensor] | None = None,
+        params: dict[str, object] | None = None,
+    ) -> torch.Tensor:
+        """Per-sample analogue of ``constraint_loss`` for stacked (batched) lattices."""
+        ref = next((t for t in (u_row_b, ir_b) if t is not None), None)
+        B = ref.shape[0] if ref is not None else 1
+        out = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+
+        if self.slope_l2_weight > 0.0 and ir_b is not None and ic_b is not None:
+            out = out + self.slope_l2_weight * (ir_b * ir_b + ic_b * ic_b)
+
+        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
+        consistency_weight = max(float(cfg.get("consistency_weight", 0.0)), 0.0)
+
+        if consistency_weight > 0.0 and neighbor_target is not None:
+            def penalty(x, tgt):
+                if x is None or tgt is None:
+                    return torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
+                valid = ~torch.isnan(tgt)
+                safe_tgt = torch.where(valid, tgt, x.detach())
+                return torch.where(valid, (x - safe_tgt) ** 2, torch.zeros_like(x))
+            
+            out = out + consistency_weight * (
+                penalty(u_row_b, neighbor_target.get("u_row"))
+                + penalty(u_col_b, neighbor_target.get("u_col"))
+                + penalty(v_row_b, neighbor_target.get("v_row"))
+                + penalty(v_col_b, neighbor_target.get("v_col"))
+            )
+
+        return out

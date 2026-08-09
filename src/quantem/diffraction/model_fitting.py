@@ -725,6 +725,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             for c in cols:
                 # print(self.dataset.array[r,c].shape)
                 self.reset(reset_to=cast(Literal["initialized", "mean_refined"], reset), reset_history=False)
+                nt_single = _neighbor_uv_target_single(self.state_individual_refined, r, c)
                 self.fit_render(
                     target=torch.as_tensor(self.dataset.array[r,c],device=self.ctx.device,dtype=self.ctx.dtype),
                     n_steps=int(n_steps),
@@ -734,6 +735,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                     scheduler_params=scheduler_params,
                     progress=False,
                     run_key=f"individual_{r}_{c}",
+                    neighbor_target=nt_single,
                 )
 
                 s_fit = self._get_model_state_dict_copy()
@@ -909,6 +911,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
             stacked = plan.build_stacked_params(B)
 
+            neighbor_target = _neighbor_uv_target(
+                self.state_individual_refined, chunk, plan.lat_names[0], ctx.device, ctx.dtype,
+            )
+
             opt_state: dict[str, dict[str, torch.Tensor]] = {
                 name: (
                     {"m": torch.zeros_like(p.detach()), "v": torch.zeros_like(p.detach())}
@@ -989,7 +995,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
                 # Add per-sample soft constraint loss.
                 if float(constraint_weight) != 0.0:
-                    constraint_per_sample = plan.batched_constraint_loss(ctx, stacked)
+                    constraint_per_sample = plan.batched_constraint_loss(ctx, stacked, neighbor_target=neighbor_target)
                     per_sample_loss = per_sample_loss + float(constraint_weight) * constraint_per_sample
 
                 total_loss = per_sample_loss.sum()
@@ -1325,6 +1331,108 @@ def _resolve_rows_cols_for_batched(
         cols_arr = np.asarray(list(cols), dtype=int)
     return rows_arr, cols_arr
 
+def _neighbor_uv_target(state_individual_refined, positions, lat_prefix, device, dtype, radius=1):
+    scan_r, scan_c = state_individual_refined.shape
+    keys = [f"{lat_prefix}.u_row", f"{lat_prefix}.u_col", f"{lat_prefix}.v_row", f"{lat_prefix}.v_col"]
+    out = {k: [] for k in keys}
+    for (r, c) in positions:
+        vals = {k: [] for k in keys}
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr == 0 and dc == 0:
+                    continue
+                rr, cc = r + dr, c + dc
+                if not (0 <= rr < scan_r and 0 <= cc < scan_c):
+                    continue
+                neighbor_state = state_individual_refined[rr, cc]
+                if neighbor_state is None:
+                    continue
+                for k in keys:
+                    if k in neighbor_state:
+                        vals[k].append(float(neighbor_state[k]))
+        for k in keys:
+            out[k].append(float(np.mean(vals[k])) if vals[k] else float("nan"))
+    return {k: torch.tensor(v, device=device, dtype=dtype) for k, v in out.items()}
+
+def _neighbor_uv_target_single(state_individual_refined, r, c, radius=1):
+    """Non-batched analogue of _neighbor_uv_target: looks up neighbors by key
+    *suffix* rather than exact prefix, since state_individual_refined here
+    holds raw nn.Module.state_dict() entries (full module-path keys), not the
+    _BatchedPlan naming convention."""
+    scan_r, scan_c = state_individual_refined.shape
+    suffixes = ("u_row", "u_col", "v_row", "v_col")
+    vals = {s: [] for s in suffixes}
+    for dr in range(-radius, radius + 1):
+        for dc in range(-radius, radius + 1):
+            if dr == 0 and dc == 0:
+                continue
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < scan_r and 0 <= cc < scan_c):
+                continue
+            if not (0 <= rr < scan_r and 0 <= cc < scan_c):
+                continue
+            neighbor_state = state_individual_refined[rr, cc]
+            if neighbor_state is None:
+                continue
+            for s in suffixes:
+                key = next((k for k in neighbor_state if k.endswith(f".{s}")), None)
+                if key is not None:
+                    vals[s].append(float(neighbor_state[key]))
+    return {s: (float(np.mean(vals[s])) if vals[s] else float("nan")) for s in suffixes}
+
+def is_outlier(state_individual_refined, r, c, deviation_threshold, radius=1):
+    state = state_individual_refined[r, c]
+    if state is None:
+        return False, None
+    nt = _neighbor_uv_target_single(state_individual_refined, r, c, radius=radius)
+    cur = _extract_uv_single(state)
+    devs = [abs(cur[k] - nt[k]) for k in cur if nt[k] == nt[k]]
+    if not devs:
+        return False, None
+    return max(devs) > deviation_threshold, nt
+
+def redo_position(model_diff, r, c, neighbor_target, n_steps=500,
+                   optimizer_params=None, scheduler_params=None):
+    model_diff._load_model_state_dict_copy(model_diff.state_individual_refined[r, c])
+    model_diff.fit_render(
+        target=torch.as_tensor(model_diff.dataset.array[r, c], device=model_diff.ctx.device, dtype=model_diff.ctx.dtype),
+        n_steps=n_steps, optimizer_params=optimizer_params, scheduler_params=scheduler_params,
+        progress=False, run_key=f"refit_{r}_{c}",
+        neighbor_target=neighbor_target,
+    )
+    model_diff.state_individual_refined[r, c] = model_diff._get_model_state_dict_copy()
+
+def refit_outlier_positions(model_diff, deviation_threshold, radius=1, n_steps=500,
+                             optimizer_params=None, scheduler_params=None, consistency_weight=1.0):
+    scan_r, scan_c = model_diff.state_individual_refined.shape
+    lat = next(c for c in model_diff.model.components if type(c).__name__ == "SyntheticDiskLattice")
+    old_weight = lat.soft_constraints.get("consistency_weight", 0.0)
+    lat.apply_constraint_params({"consistency_weight": consistency_weight})
+
+    n_refit = 0
+    for r in range(scan_r):
+        for c in range(scan_c):
+            outlier, nt = is_outlier(model_diff.state_individual_refined, r, c, deviation_threshold, radius=radius)
+            if outlier:
+                redo_position(model_diff, r, c, nt, n_steps=n_steps,
+                               optimizer_params=optimizer_params, scheduler_params=scheduler_params)
+                n_refit += 1
+
+    lat.apply_constraint_params({"consistency_weight": old_weight})
+    model_diff.get_individual_uv_vectors()
+    print(f"refit {n_refit} / {scan_r*scan_c} outlier positions")
+    return model_diff
+
+def _extract_uv_single(state_dict):
+    """Pull a position's own (u_row, u_col, v_row, v_col) out of one state dict,
+    matching by key suffix so it works regardless of key-naming convention
+    (batched 'lat.u_row' or raw state_dict 'components.N.u_row')."""
+    suffixes = ("u_row", "u_col", "v_row", "v_col")
+    out = {}
+    for s in suffixes:
+        key = next((k for k in state_dict if k.endswith(f".{s}")), None)
+        out[s] = float(state_dict[key]) if key is not None else float("nan")
+    return out
 
 def _lr_for_component(
     component: RenderComponent,
@@ -2203,8 +2311,8 @@ class _BatchedPlan:
         self,
         ctx: RenderContext,
         stacked: dict[str, torch.Tensor],
+        neighbor_target=None
     ) -> torch.Tensor:
-        """Per-sample soft-constraint loss summed across components."""
         B = next(iter(stacked.values())).shape[0] if stacked else 1
         out = torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
         if self.disk is not None:
@@ -2212,13 +2320,19 @@ class _BatchedPlan:
             if template_b is not None:
                 out = out + self.disk.constraint_loss_batched(ctx, template_raw_b=template_b)
         for lat_name, lat in zip(self.lat_names, self.lats):
-            w = float(getattr(lat, "slope_l2_weight", 0.0))
-            if w <= 0.0:
-                continue
-            ir = stacked.get(f"{lat_name}.ir")
-            ic = stacked.get(f"{lat_name}.ic")
-            if ir is not None and ic is not None:
-                out = out + w * (ir * ir + ic * ic).mean(dim=1)
+            nt = None
+            if neighbor_target is not None:
+                nt = {s: neighbor_target.get(f"{lat_name}.{s}") for s in ("u_row", "u_col", "v_row", "v_col")}
+            out = out + lat.constraint_loss_batched(
+                ctx,
+                u_row_b=stacked.get(f"{lat_name}.u_row"),
+                u_col_b=stacked.get(f"{lat_name}.u_col"),
+                v_row_b=stacked.get(f"{lat_name}.v_row"),
+                v_col_b=stacked.get(f"{lat_name}.v_col"),
+                ir_b=stacked.get(f"{lat_name}.ir"),
+                ic_b=stacked.get(f"{lat_name}.ic"),
+                neighbor_target=nt,
+            )
         return out
 
     def resolve_component_keys(self, components: Any) -> list[str]:
