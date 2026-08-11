@@ -30,6 +30,7 @@ class CNN2d(nn.Module):
         activation: str | Callable = "relu",
         final_activation: str | Callable = nn.Identity(),
         use_batchnorm: bool = True,
+        conv_kernel_size: int = 3,
     ):
         """Initialize CNN2d.
 
@@ -57,11 +58,17 @@ class CNN2d(nn.Module):
             Activation function for output layer, by default nn.Identity()
         use_batchnorm : bool, optional
             Whether to use batch normalization, by default True
+        conv_kernel_size : int, optional
+            Size of the convolutional kernel used throughout the network, by default 3.
+            Must be a positive odd integer; padding is set to conv_kernel_size // 2 to
+            preserve spatial size.
 
         Raises
         ------
         ValueError
             If use_skip_connections is True and num_per_layer < 2.
+        ValueError
+            If conv_kernel_size is not a positive odd integer.
         """
         super().__init__()
         self.in_channels = int(in_channels)
@@ -79,6 +86,16 @@ class CNN2d(nn.Module):
         self.dropout = dropout
         self._use_batchnorm = use_batchnorm
 
+        if conv_kernel_size <= 0:
+            raise ValueError(
+                f"Convolutional kernel size must be greater than 0. Got value {conv_kernel_size}"
+            )
+        if conv_kernel_size % 2 == 0:
+            raise ValueError(
+                f"Convolutional kernel size must be an odd number. Got value {conv_kernel_size}"
+            )
+        self._conv_kernel_size = int(conv_kernel_size)
+
         if self.dtype.is_complex:
             self.pool = complex_pool
         else:
@@ -92,6 +109,10 @@ class CNN2d(nn.Module):
         self.final_activation = final_activation
 
         self._build()
+
+    @property
+    def conv_kernel_size(self) -> int:
+        return self._conv_kernel_size
 
     @property
     def activation(self) -> Callable:
@@ -129,6 +150,8 @@ class CNN2d(nn.Module):
                     dropout=self.dropout,
                     dtype=self.dtype,
                     activation=self._activation,  # Pass activation config, not instance
+                    kernel_size=self.conv_kernel_size,
+                    padding=self.conv_kernel_size // 2,
                 )
             )
             in_channels = out_channels
@@ -142,6 +165,8 @@ class CNN2d(nn.Module):
             dropout=self.dropout,
             dtype=self.dtype,
             activation=self._activation,
+            kernel_size=self.conv_kernel_size,
+            padding=self.conv_kernel_size // 2,
         )
         in_channels = out_channels
 
@@ -165,11 +190,17 @@ class CNN2d(nn.Module):
                     dropout=self.dropout,
                     dtype=self.dtype,
                     activation=self._activation,
+                    kernel_size=self.conv_kernel_size,
+                    padding=self.conv_kernel_size // 2,
                 )
             )
 
             in_channels = out_channels
 
+        # final_conv intentionally stays at Conv2dBlock's default kernel_size=3/padding=1
+        # regardless of conv_kernel_size -- this matches the historical cnn2d.py wiring and
+        # real trained checkpoints (e.g. the kernel=7 lamellar_pre_earmix_v2_v1arch_2026_06_28
+        # run has 7x7 weights everywhere except a 3x3 final_conv).
         self.final_conv = Conv2dBlock(
             nb_layers=1,
             input_channels=self.start_filters,
