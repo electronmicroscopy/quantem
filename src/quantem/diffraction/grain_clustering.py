@@ -53,6 +53,7 @@ __all__ = [
     "GrainInfo",
     "GrainResult",
     "extract_signals",
+    "consolidate_signals_per_probe",
     "cluster_signals_into_grains",
     "refine_grains_crf",
     "circular_distance_deg",
@@ -145,6 +146,154 @@ def circular_distance_deg(a, b, period: float = 180.0):
     """Circular distance between angles (degrees), default 180-deg period (2-fold)."""
     d = np.abs(np.asarray(a, float) - np.asarray(b, float)) % period
     return np.minimum(d, period - d)
+
+
+# --------------------------------------------------------------------------------------
+# same-probe consolidation
+# --------------------------------------------------------------------------------------
+def _complete_link_groups(distance: np.ndarray) -> list[np.ndarray]:
+    """Deterministic complete-link groups whose maximum internal distance is <= 1."""
+    groups = [[i] for i in range(distance.shape[0])]
+    while len(groups) > 1:
+        best = None
+        for i in range(len(groups) - 1):
+            for j in range(i + 1, len(groups)):
+                cost = float(np.max(distance[np.ix_(groups[i], groups[j])]))
+                candidate = (cost, groups[i][0], groups[j][0], i, j)
+                if best is None or candidate < best:
+                    best = candidate
+        if best[0] > 1.0:
+            break
+        i, j = best[-2:]
+        groups[i] = sorted(groups[i] + groups[j])
+        del groups[j]
+    return [np.asarray(group, dtype=np.int64) for group in groups]
+
+
+def consolidate_signals_per_probe(
+    signals: SignalTable,
+    *,
+    theta_tol_deg: float = 5.0,
+    r_tol_rel: float = 0.05,
+    intensity_reducer: str = "sum",
+    return_inverse: bool = False,
+):
+    """Consolidate compatible detections at the same probe and in the same window.
+
+    This adapter reconciles peak-level extraction with the grain clusterer's
+    ``enforce_one_per_probe`` invariant.  Within each ``(probe, window)`` cell,
+    complete-link clustering merges detections only when *every pair* in the merged
+    group is within both tolerances.  Complete linkage prevents a chain of individually
+    close peaks from joining two incompatible endpoints.
+
+    The consolidated orientation is an intensity-weighted circular mean with a
+    180-degree period, and radius is an intensity-weighted arithmetic mean.  Non-positive
+    intensities fall back to equal weights for these representative coordinates.
+
+    Parameters
+    ----------
+    signals : SignalTable
+        Peak-level signals to consolidate.
+    theta_tol_deg : float
+        Maximum pairwise circular orientation difference in degrees. ``inf`` disables
+        orientation separation.
+    r_tol_rel : float
+        Maximum pairwise relative radius difference ``|dr| / r_mean``. ``inf`` disables
+        radius separation.
+    intensity_reducer : {"sum", "mean", "max"}
+        How the intensities of a consolidated group are combined.
+    return_inverse : bool
+        If True, also return an integer array mapping every original signal index to its
+        consolidated signal index.
+
+    Returns
+    -------
+    SignalTable or (SignalTable, ndarray)
+        Consolidated signals, optionally followed by the original-to-consolidated map.
+    """
+    theta_tol = float(theta_tol_deg)
+    radius_tol = float(r_tol_rel)
+    if not (theta_tol > 0.0):
+        raise ValueError("theta_tol_deg must be positive")
+    if not (radius_tol > 0.0):
+        raise ValueError("r_tol_rel must be positive")
+    if intensity_reducer not in {"sum", "mean", "max"}:
+        raise ValueError("intensity_reducer must be 'sum', 'mean', or 'max'")
+
+    n = len(signals)
+    if n == 0:
+        inverse = np.empty(0, dtype=np.int64)
+        return (signals, inverse) if return_inverse else signals
+
+    cells: dict[tuple[int, int, int], list[int]] = {}
+    for i in range(n):
+        key = (
+            int(signals.window[i]),
+            int(signals.pos[i, 0]),
+            int(signals.pos[i, 1]),
+        )
+        cells.setdefault(key, []).append(i)
+
+    source_groups = []
+    inv_theta = 0.0 if np.isinf(theta_tol) else 1.0 / theta_tol
+    inv_radius = 0.0 if np.isinf(radius_tol) else 1.0 / radius_tol
+    for source_ids in cells.values():
+        ids = np.asarray(source_ids, dtype=np.int64)
+        if ids.size == 1:
+            source_groups.append(ids)
+            continue
+        theta = signals.theta[ids]
+        radius = signals.r[ids]
+        d_theta = circular_distance_deg(theta[:, None], theta[None, :]) * inv_theta
+        rbar = 0.5 * (radius[:, None] + radius[None, :])
+        d_radius = (
+            np.abs(radius[:, None] - radius[None, :])
+            / np.where(rbar > 0.0, rbar, 1.0)
+            * inv_radius
+        )
+        distance = np.maximum(d_theta, d_radius)
+        source_groups.extend(ids[group] for group in _complete_link_groups(distance))
+
+    # Preserve the original signal ordering as closely as possible.
+    source_groups.sort(key=lambda ids: int(ids[0]))
+    m = len(source_groups)
+    pos = np.empty((m, 2), dtype=np.int64)
+    theta = np.empty(m, dtype=float)
+    radius = np.empty(m, dtype=float)
+    intensity = np.empty(m, dtype=float)
+    window = np.empty(m, dtype=np.int64)
+    inverse = np.empty(n, dtype=np.int64)
+
+    for out_i, ids in enumerate(source_groups):
+        values = signals.intensity[ids]
+        weights = np.clip(values, 0.0, None)
+        if not np.any(weights > 0.0):
+            weights = np.ones(ids.size, dtype=float)
+        angles = np.deg2rad(2.0 * signals.theta[ids])
+        theta[out_i] = (
+            np.rad2deg(
+                np.arctan2(
+                    np.sum(weights * np.sin(angles)),
+                    np.sum(weights * np.cos(angles)),
+                )
+            )
+            / 2.0
+        ) % 180.0
+        radius[out_i] = float(np.average(signals.r[ids], weights=weights))
+        if intensity_reducer == "sum":
+            intensity[out_i] = float(np.sum(values))
+        elif intensity_reducer == "mean":
+            intensity[out_i] = float(np.mean(values))
+        else:
+            intensity[out_i] = float(np.max(values))
+        pos[out_i] = signals.pos[ids[0]]
+        window[out_i] = signals.window[ids[0]]
+        inverse[ids] = out_i
+
+    consolidated = SignalTable(
+        pos, theta, radius, intensity, window, signals.map_shape
+    )
+    return (consolidated, inverse) if return_inverse else consolidated
 
 
 # --------------------------------------------------------------------------------------
@@ -824,8 +973,12 @@ def _qualitative_palette(n: int, seed: int = 0):
 
 
 def _rasterize_window(signals: SignalTable, result: GrainResult, window: int):
-    """Per-window maps (highest-intensity signal wins each probe): label, theta, confidence,
-    and a 'filled' mask (a signal of this window present regardless of label)."""
+    """Per-window maps for the highest-intensity *assigned* signal at each probe.
+
+    Outliers do not overwrite an assigned signal, even when the outlier is more intense.
+    ``filled`` independently records every probe containing a signal in this window, so
+    probes containing only outliers can still be rendered with ``outlier_color``.
+    """
     Rx, Ry = signals.map_shape
     lab = np.full((Rx, Ry), -1, dtype=np.int64)
     th = np.zeros((Rx, Ry))
@@ -836,6 +989,8 @@ def _rasterize_window(signals: SignalTable, result: GrainResult, window: int):
     for i in order:
         rx, ry = signals.pos[i]
         filled[rx, ry] = True
+        if result.labels[i] < 0:
+            continue
         th[rx, ry] = signals.theta[i]
         lab[rx, ry] = result.labels[i]
         if conf is not None:

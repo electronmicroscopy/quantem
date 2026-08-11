@@ -298,7 +298,7 @@ def fit_ellipse_from_ring(
     #    validate on held-out angular blocks.
     coarse_ratios = np.linspace(ratio_range[0], ratio_range[1], n_ratio)
     coarse_thetas = np.linspace(0.0, 180.0, n_theta, endpoint=False)
-    diagnostics = []
+    candidates = []
     ratio_step = (
         (ratio_range[1] - ratio_range[0]) / max(n_ratio - 1, 1)
     )
@@ -341,7 +341,7 @@ def fit_ellipse_from_ring(
             and coverage >= min_angular_coverage
             and not boundary_limited
         )
-        diagnostics.append({
+        candidates.append({
             "band": (float(band[0]), float(band[1])),
             "r0": float(band[2]),
             "ratio_b_over_a": float(ratio),
@@ -354,7 +354,7 @@ def fit_ellipse_from_ring(
             "accepted": bool(accepted),
         })
 
-    accepted_candidates = [item for item in diagnostics if item["accepted"]]
+    accepted_candidates = [item for item in candidates if item["accepted"]]
     if accepted_candidates:
         selected = min(
             accepted_candidates,
@@ -366,7 +366,7 @@ def fit_ellipse_from_ring(
         fit_accepted = True
     else:
         selected = min(
-            diagnostics,
+            candidates,
             key=lambda item: (
                 item["boundary_limited"],
                 item["raw_score"],
@@ -395,7 +395,7 @@ def fit_ellipse_from_ring(
         "method": "angular_variance",
         "accepted": fit_accepted,
         "selected": selected,
-        "candidates": diagnostics,
+        "candidates": candidates,
         "explicit_band": explicit_band,
         "center_initial": tuple(float(v) for v in center),
         "center_refined": tuple(float(v) for v in center),
@@ -429,7 +429,7 @@ def fit_ellipse_from_ring(
         warnings.warn(message, RuntimeWarning, stacklevel=2)
     if verbose:
         bands_text = ", ".join(
-            f"{item['r0']:.1f}" for item in diagnostics
+            f"{item['r0']:.1f}" for item in candidates
         )
         print(
             f"  ellipse ring candidates: r0=[{bands_text}] px; "
