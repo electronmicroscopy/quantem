@@ -1,18 +1,20 @@
 import warnings
 from abc import abstractmethod
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.utils.data
 
 from quantem.core import config
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerParams
 from quantem.core.utils.utils import electron_wavelength_angstrom, tqdmnd
 from quantem.core.utils.validators import (
@@ -22,7 +24,6 @@ from quantem.core.utils.validators import (
     validate_tensor,
 )
 from quantem.core.visualization import show_2d
-from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import AffineTransform, fit_origin, shift_array
 
 """
@@ -30,7 +31,79 @@ Dataset models for ptychographic reconstruction.
 """
 
 
-class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
+class PtychoDatasetConstraintParams:
+    """
+    Namespace class for ptychography dataset constraint dataclasses.
+
+    Tab-complete on ``PtychoDatasetConstraintParams`` in a notebook to discover the
+    available variants. Tab-complete inside a variant's constructor to see every
+    constraint field with its default value.
+
+    Variants
+    --------
+    Raster
+        Constraints for ``PtychographyDatasetRaster`` (descan TV penalty, descan
+        zero-out, scan position clipping and centering).
+    """
+
+    @dataclass
+    class Raster(Constraints):
+        """Constraints for raster-scan ptychography datasets (``PtychographyDatasetRaster``).
+
+        Attributes
+        ----------
+        descan_shifts_zero : bool, default ``False``
+            Forces all descan shifts to zero after each update. Useful when you
+            want to keep the descan optimizer in the parameter group but freeze
+            its effect. (Distinct from ``learn_descan=False``, which holds descan
+            at its fitted value rather than zeroing it.)
+        center_scan_positions : bool, default ``False``
+            Shifts all scan positions uniformly so their mean sits at the object
+            center after each update. Prevents the reconstruction from
+            translating during long runs with ``lr_scan_positions > 0``.
+        clip_scan_positions : bool, default ``True``
+            Clamps scan positions to lie within ``[0, obj_shape - 1]`` after each
+            update. On by default to prevent positions from drifting off the
+            padded object during refinement.
+        descan_tv_weight : float, default ``0.0``
+            Soft penalty. Weight on the total-variation of the descan-shift
+            sequence (x and y averaged). Encourages smoothly varying descan, but
+            only contributes when ``learn_descan`` is on and the dataset has a
+            descan optimizer attached.
+        """
+
+        # hard constraints
+        descan_shifts_zero: bool = False
+        center_scan_positions: bool = False
+        clip_scan_positions: bool = True
+        # soft constraints
+        descan_tv_weight: float = 0.0
+        _name: str = "raster"
+
+        soft_constraint_keys = ["descan_tv_weight"]
+        hard_constraint_keys = [
+            "descan_shifts_zero",
+            "center_scan_positions",
+            "clip_scan_positions",
+        ]
+
+    @classmethod
+    def parse_dict(cls, d: dict) -> "PtychoDatasetConstraintsType":
+        """Instantiate the appropriate variant from a config dict.
+
+        The dict must contain a ``'name'`` or ``'type'`` key (case-insensitive),
+        with value ``'raster'``. All other keys are forwarded as keyword
+        arguments to the chosen dataclass.
+        """
+        return cast(PtychoDatasetConstraintsType, parse_constraint_dict(cls, d, kind="dataset"))
+
+
+PtychoDatasetConstraintsType = PtychoDatasetConstraintParams.Raster
+
+
+class PtychographyDatasetBase(
+    AutoSerialize, OptimizerMixin, torch.nn.Module, torch.utils.data.Dataset
+):
     _token = object()
     _patch_indices: torch.Tensor
 
@@ -64,10 +137,15 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
         self.dset = dset
         self.verbose = verbose
+        # target_residency controls where loss targets live:
+        #   "device" (default) — targets are kept resident on the compute device (current behavior)
+        #   "cpu"              — targets live in CPU RAM and are streamed to the device per-batch,
+        #                        enabling datasets larger than a single GPU's VRAM
+        self._target_residency: Literal["device", "cpu"] = "device"
         self._preprocessed = False
         self._preprocessing_params = {}  # for serialization and reloading
         self._com_rotation_rad = 0  # default
-        self._com_transpose = False  # default
+        self._transpose = False  # default
 
         # scan_positions_px: [num_positions, 2] in pixels
         self._scan_positions_px = nn.Parameter(
@@ -87,15 +165,32 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         self._initial_scan_positions_px = torch.zeros_like(self._scan_positions_px)
         self._initial_descan_shifts = torch.zeros_like(self._descan_shifts)
 
-        self.register_buffer("_targets", torch.zeros(self.num_gpts, *self.roi_shape))
-        self.register_buffer(
-            "_patch_indices", torch.zeros(self.num_gpts, *self.roi_shape, dtype=torch.int32)
-        )
+        # _targets is a plain attribute so that its device can be managed explicitly per
+        # target_residency. Initialized empty (rather than (num_gpts, *roi_shape) buffer) to avoid
+        # a redundant allocation during preprocessing
+        self._targets = torch.zeros(0, dtype=getattr(torch, config.get("dtype_real")))
+        self.register_buffer("_patch_indices", torch.zeros(0, dtype=torch.int32))
         self.register_buffer("_last_patch_positions_px", torch.zeros(self.num_gpts, 2))
         self.register_buffer("_detector_mask", torch.ones(*self.roi_shape))
+        self.positions_mask = torch.ones(self.num_gpts, dtype=torch.bool)
         self.detector_mask = detector_mask
         self._constraints = {}
         self._probe_energy = None
+        # Set by the ptychography wiring from obj_model.is_implicit. When True, forward()
+        # emits continuous per-patch coordinates instead of integer patch_indices (and zeroed
+        # fractional positions), so the probe is not subpixel-shifted.
+        self._implicit_object = False
+
+        # Measurement arrays. Only ``centered_amplitudes`` is materialized during normalization;
+        self._centered_amplitudes: torch.Tensor | None = None
+        self._amplitudes: torch.Tensor | None = None
+        self._intensities: torch.Tensor | None = None
+        self._centered_intensities: torch.Tensor | None = None
+        self._pattern_crop_mask: np.ndarray | None = None
+        self._pattern_crop_mask_shape: tuple[int, int] = (
+            int(self.roi_shape[0]),
+            int(self.roi_shape[1]),
+        )
 
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
         """Descan and scan-position parameters as separate PPLR groups.
@@ -143,6 +238,15 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         """Move all relevant tensors to a different device."""
         # Call parent's to() method to handle PyTorch's internal device management
         super().to(*args, **kwargs)
+        # _targets is a plain attribute, so nn.Module.to() does not move it; do so explicitly
+        # unless residency is "cpu" (in which case targets intentionally stay on CPU and are
+        # streamed to the device per-batch).
+        if (
+            getattr(self, "target_residency", "device") != "cpu"
+            and getattr(self, "_targets", None) is not None
+        ):
+            # After super().to(), self.device reflects the new device (it reads off a Parameter).
+            self._targets = self._targets.to(self.device)
         # Reconnect optimizer to parameters on the new device
         self.reconnect_optimizer_to_parameters()
         return self
@@ -158,7 +262,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             shifts,
             name="descan_shifts",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._descan_shifts.data = shifts.to(self.device)
 
@@ -180,7 +284,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             positions,
             name="scan_positions_px",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._scan_positions_px.data = positions.to(self.device)
 
@@ -228,7 +332,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             shifts,
             name="initial_descan_shifts",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._initial_descan_shifts = shifts
 
@@ -243,7 +347,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             positions,
             name="initial_scan_positions_px",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._initial_scan_positions_px = positions
 
@@ -253,30 +357,58 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             raise ValueError("dset must be preprocessed before targets can be accessed")
         return self._targets
 
-    def _set_targets(
-        self,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ],
-    ):
-        if "amplitude" in loss_type:
-            if self.learn_descan and self.has_optimizer():
-                self._targets = self.amplitudes.clone().to(self.device)
-            else:
-                self._targets = self.centered_amplitudes.clone().to(self.device)
-        elif "intensity" in loss_type or loss_type == "poisson":
-            if self.learn_descan and self.has_optimizer():
-                self._targets = self.intensities.clone().to(self.device)
-            else:
-                self._targets = self.centered_intensities.clone().to(self.device)
+    @property
+    def target_residency(self) -> Literal["device", "cpu"]:
+        """Where the loss targets live: ``"device"`` (resident, fastest) or
+        ``"cpu"`` (streamed per-batch, enables datasets larger than VRAM)."""
+        return self._target_residency
+
+    @target_residency.setter
+    def target_residency(self, value: str) -> None:
+        if value not in ("device", "cpu"):
+            raise ValueError(f"target_residency must be 'device' or 'cpu', got {value!r}")
+        self._target_residency = value
+
+    def _set_targets(self, target_space: Literal["amplitude", "intensity"]):
+        """Build the per-position targets in the given measurement space.
+
+        ``target_space`` is the space the data-fidelity criterion compares in (set from the
+        criterion's ``target_space``); the comparison itself lives in the criterion, not here.
+        """
+        # When residency is "cpu", build targets on CPU so they can be streamed per-batch
+        # (and read by DataLoader workers); otherwise keep them resident on the compute device.
+        target_device = "cpu" if self.target_residency == "cpu" else self.device
+        learn_descan = self.learn_descan and self.has_optimizer()
+        if target_space == "amplitude":
+            source = self.amplitudes if learn_descan else self.centered_amplitudes
+        elif target_space == "intensity":
+            source = self.intensities if learn_descan else self.centered_intensities
         else:
-            raise ValueError(f"Unknown loss type {loss_type}")
+            raise ValueError(
+                f"target_space must be 'amplitude' or 'intensity', got {target_space!r}"
+            )
+        self._targets = source.to(target_device)
 
     @property
     def patch_indices(self) -> torch.Tensor:
         return self._patch_indices
 
     # endregion --- buffers ---
+
+    # region --- torch.utils.data.Dataset interface ---
+    def __len__(self) -> int:
+        return self.num_positions
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        """Return one sample for the DataLoader.
+
+        The target is returned as-is on whatever device target_residency dictates (CPU when
+        residency is "cpu" so DataLoader workers can read it). The integer index is collated
+        into a LongTensor by the default collate_fn.
+        """
+        return {"index": idx, "target": self._targets[idx]}
+
+    # endregion --- torch.utils.data.Dataset interface ---
 
     # region --- explicit properties (have setters) ---
     @property
@@ -294,6 +426,8 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         """gives the amplitudes that have had descan corrected and which are centered in the fov
         shaped as (rr*rc, qx, qy)
         """
+        if self._centered_amplitudes is None:
+            raise ValueError("centered_amplitudes is unset; preprocess the dataset first")
         return self._centered_amplitudes
 
     @centered_amplitudes.setter
@@ -303,14 +437,38 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             name="centered_amplitudes",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._centered_amplitudes = arr
+
+    def _recompute_raw_measurement(self, amplitude: bool) -> torch.Tensor:
+        """
+        Recompute the raw (un-centered) masked ``amplitudes``/``intensities`` from
+        ``intensities_4d`` on demand. Values are identical to what
+        ``_normalize_diffraction_intensities`` used to store; kept lazy so the full-size arrays are
+        not held resident.
+
+        Typically will be called only when changing the targets (using ``set_targets``).
+        """
+        dtype = config.get("dtype_real")
+        mask = self.positions_mask.detach().cpu().numpy().ravel()
+        roi = tuple(int(x) for x in self.roi_shape)
+        arr = np.maximum(
+            np.asarray(self.intensities_4d).reshape(self.num_gpts, *roi).astype(dtype), 0
+        )
+        if amplitude:
+            arr = np.sqrt(arr)
+        arr = arr[mask]
+        if self._pattern_crop_mask is not None:
+            arr = arr[:, self._pattern_crop_mask].reshape((-1, *self._pattern_crop_mask_shape))
+        return torch.as_tensor(np.ascontiguousarray(arr), dtype=getattr(torch, dtype))
 
     @property
     def amplitudes(self) -> torch.Tensor:
         """raw intensities converted to amplitudes, as a torch tensor"""
-        return self._amplitudes
+        if self._amplitudes is not None:
+            return self._amplitudes
+        return self._recompute_raw_measurement(amplitude=True)
 
     @amplitudes.setter
     def amplitudes(self, arr: "np.ndarray | torch.Tensor") -> None:
@@ -319,7 +477,7 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             name="amplitudes",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._amplitudes = arr
 
@@ -328,7 +486,9 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         """intensities that have had descan corrected and which are centered in the fov
         shaped as (rr*rc, qx, qy)
         """
-        return self._centered_intensities
+        if self._centered_intensities is not None:
+            return self._centered_intensities
+        return self.centered_amplitudes**2
 
     @centered_intensities.setter
     def centered_intensities(self, arr: "np.ndarray | torch.Tensor") -> None:
@@ -337,14 +497,16 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             name="centered_intensities",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._centered_intensities = arr
 
     @property
     def intensities(self) -> torch.Tensor:
         """raw intensities as a torch tensor"""
-        return self._intensities
+        if self._intensities is not None:
+            return self._intensities
+        return self._recompute_raw_measurement(amplitude=False)
 
     @intensities.setter
     def intensities(self, arr: "np.ndarray | torch.Tensor") -> None:
@@ -353,9 +515,27 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             name="intensities",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._intensities = arr
+
+    @property
+    def positions_mask(self) -> torch.Tensor:
+        """1D boolean mask (length ``num_gpts``) of scan positions kept in the reconstruction.
+        Initialized to all-True. Masked-out (False) positions are dropped from the targets,
+        scan positions, descan shifts, and patch indices during preprocessing.
+        """
+        return self._positions_mask
+
+    @positions_mask.setter
+    def positions_mask(self, mask: torch.Tensor | np.ndarray) -> None:
+        # accept a 2D real-space mask (gpts) or any array-like; flatten to the raster order
+        mask = validate_tensor(mask, name="positions_mask", dtype=torch.bool).reshape(-1)
+        if mask.shape[0] != self.num_gpts:
+            raise ValueError(
+                f"positions_mask must have {self.num_gpts} elements, got {mask.shape[0]}"
+            )
+        self._positions_mask = mask
 
     @property
     def verbose(self) -> int:
@@ -425,6 +605,20 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         return self._preprocessed
 
     @property
+    def implicit_object(self) -> bool:
+        """Whether the paired object model is an implicit (coordinate-queried) representation.
+
+        Set by the ptychography wiring from ``obj_model.is_implicit``. When True, ``forward``
+        emits continuous per-patch coordinates (instead of integer ``patch_indices``) along with
+        zeroed fractional positions, so the probe is not subpixel-shifted.
+        """
+        return self._implicit_object
+
+    @implicit_object.setter
+    def implicit_object(self, val: bool) -> None:
+        self._implicit_object = bool(val)
+
+    @property
     def shape(self) -> np.ndarray:
         return np.array(self.dset.shape)
 
@@ -435,6 +629,16 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     @property
     def num_gpts(self) -> int:
         return int(self.dset.shape[0])
+
+    @property
+    def num_positions(self) -> int:
+        """Number of active scan positions, i.e. ``positions_mask.sum()``.
+
+        Equals ``num_gpts`` until a sparser ``positions_mask`` is applied. This is the length
+        of ``targets``/``scan_positions_px``/``descan_shifts`` and the index range the
+        reconstruction loops (DataLoader, train/val split) operate over.
+        """
+        return int(self.positions_mask.sum())
 
     @property
     def detector_sampling(self) -> np.ndarray:
@@ -480,10 +684,12 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
     @property
     def _obj_shape_crop_2d(self) -> np.ndarray:
-        """All object shapes are 2D"""
+        """Allocated/expected object crop shape, in the object array's own axis order."""
         shp = np.floor(self.fov / self.obj_sampling)
         shp += shp % 2
         shp = shp.astype("int")
+        if self.com_transpose:  # match the axis-flipped scan positions
+            shp = shp[::-1]
         return shp
 
     @property
@@ -553,7 +759,11 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
 
         # Process positions in chunks to reduce memory usage
         chunk_size = min(1000, len(r0))
-        patch_indices_list = []
+        patch_indices = torch.empty(
+            (len(r0), int(self.roi_shape[0]), int(self.roi_shape[1])),
+            dtype=torch.int32,
+            device=r0.device,
+        )
 
         for i in range(0, len(r0), chunk_size):
             end_idx = min(i + chunk_size, len(r0))
@@ -563,11 +773,10 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
             row_chunk = (r0_chunk[:, None, None] + x_ind[None, :, None]) % obj_shape[-2]
             col_chunk = (c0_chunk[:, None, None] + y_ind[None, None, :]) % obj_shape[-1]
 
-            patch_indices_chunk = (row_chunk * obj_shape[-1] + col_chunk).type(torch.int32)
-            patch_indices_list.append(patch_indices_chunk)
+            patch_indices[i:end_idx] = (row_chunk * obj_shape[-1] + col_chunk).type(torch.int32)
 
-        self._patch_indices = torch.cat(patch_indices_list, dim=0)
-        self._last_patch_positions_px = self.scan_positions_px.clone()
+        self._patch_indices = patch_indices
+        self._last_patch_positions_px = self.scan_positions_px.detach().clone()
 
     def patch_indices_need_update(self) -> bool:
         """
@@ -577,6 +786,38 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
         new_pos = torch.round(self.scan_positions_px)
         return not torch.equal(old_pos, new_pos)
 
+    def _scan_coords(
+        self, batch_indices: np.ndarray | torch.Tensor, obj_padding_px: np.ndarray | tuple
+    ) -> torch.Tensor:
+        """Continuous normalized ``(row, col)`` patch coordinates for implicit objects.
+
+        For each scan position (NOT rounded) we add the same integer ROI offsets used by
+        ``_set_patch_indices``, then normalize to ``[-1, 1]`` over the padded object extent
+        via ``idx / (N - 1) * 2 - 1`` (matching ``torch.linspace(-1, 1, N)``). Unlike
+        ``_set_patch_indices`` there is no modulo wrap: samples that fall outside the object
+        map outside ``[-1, 1]``, and the implicit object treats them as vacuum.
+
+        Because the un-rounded (fractional) position is baked into the coordinates here, the
+        probe is queried at zero fractional shift in this case.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(batch, Hroi, Wroi, 2)`` normalized ``(row, col)`` coordinates.
+        """
+        obj_shape = self._obj_shape_full_2d(obj_padding_px)
+        positions = self.scan_positions_px[batch_indices]  # (batch, 2), un-rounded
+        hroi, wroi = int(self.roi_shape[0]), int(self.roi_shape[1])
+        x_ind = torch.fft.fftfreq(hroi, d=1 / hroi).to(self.device)
+        y_ind = torch.fft.fftfreq(wroi, d=1 / wroi).to(self.device)
+        rows = positions[:, 0][:, None, None] + x_ind[None, :, None]  # (batch, Hroi, 1)
+        cols = positions[:, 1][:, None, None] + y_ind[None, None, :]  # (batch, 1, Wroi)
+        rows = rows.expand(-1, -1, wroi)
+        cols = cols.expand(-1, hroi, -1)
+        rows_n = rows / float(obj_shape[-2] - 1) * 2.0 - 1.0
+        cols_n = cols / float(obj_shape[-1] - 1) * 2.0 - 1.0
+        return torch.stack([rows_n, cols_n], dim=-1)  # (batch, Hroi, Wroi, 2)
+
     def reset(self) -> None:
         self.descan_shifts = self.initial_descan_shifts.clone().to(self.device)
         self.scan_positions_px = self.initial_scan_positions_px.clone().to(self.device)
@@ -584,24 +825,19 @@ class PtychographyDatasetBase(AutoSerialize, OptimizerMixin, torch.nn.Module):
     # endregion --- class methods ---
 
 
-class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
-    DEFAULT_CONSTRAINTS = {
-        "descan_tv_weight": 0.0,
-        "descan_shifts_constant": False,
-        "center_scan_positions": False,
-        "clip_scan_positions": True,
-    }
+class DatasetConstraints(
+    BaseConstraints[PtychoDatasetConstraintParams.Raster], PtychographyDatasetBase
+):
+    DEFAULT_CONSTRAINTS: PtychoDatasetConstraintParams.Raster = (
+        PtychoDatasetConstraintParams.Raster()
+    )
 
     def apply_soft_constraints(self, descan_shifts: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
 
-        if (
-            self.constraints.get("descan_tv_weight", 0) > 0
-            and self.learn_descan
-            and self.has_optimizer()
-        ):
-            tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints["descan_tv_weight"])
+        if self.constraints.descan_tv_weight > 0 and self.learn_descan and self.has_optimizer():
+            tv_loss = self.get_descan_tv_loss(descan_shifts, self.constraints.descan_tv_weight)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("descan_tv_weight", tv_loss)
 
@@ -621,23 +857,17 @@ class DatasetConstraints(BaseConstraints, PtychographyDatasetBase):
         self,
         descan: torch.Tensor,
     ) -> torch.Tensor:
-        if self.constraints["descan_shifts_constant"]:
+        if self.constraints.descan_shifts_zero:
             descan = torch.zeros_like(descan)
         return descan
 
     def apply_hard_constraints(self, obj_padding_px: np.ndarray | tuple) -> None:
-        # could clip positions here if needed
         positions = self.scan_positions_px
         obj_shape = torch.tensor(self._obj_shape_full_2d(obj_padding_px), device=positions.device)
-        if self.constraints.get(
-            "clip_scan_positions", self.DEFAULT_CONSTRAINTS["clip_scan_positions"]
-        ):
+        if self.constraints.clip_scan_positions:
             positions = torch.clamp(positions, min=torch.zeros_like(obj_shape), max=obj_shape - 1)
 
-        if self.constraints.get(
-            "center_scan_positions", self.DEFAULT_CONSTRAINTS["center_scan_positions"]
-        ):
-            # shift all positions uniformly so that the mean position is at the center of the object
+        if self.constraints.center_scan_positions:
             positions = positions - positions.mean(dim=0, keepdim=True)
             positions = positions + obj_shape / 2
 
@@ -667,12 +897,15 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self.scan_sampling = dset.sampling[:2]
         self.scan_units = dset.units[:2]
         self.gpts = dset.shape[:2]
-        self.intensities_4d = dset.array.copy()
+        # TODO remove after Dataset torch migration complete
+        dset_numpy = dset.array if dset.array is not None else dset.tensor.cpu().numpy()
+
+        self.intensities_4d = dset_numpy.copy()
 
         # convert to dataset3d
-        shp = dset.array.shape
+        shp = dset_numpy.shape
         dset3d = Dataset3d.from_array(
-            array=dset.array.reshape((shp[0] * shp[1], shp[2], shp[3])),
+            array=dset_numpy.reshape((shp[0] * shp[1], shp[2], shp[3])),
             name=dset.name,
             origin=[0, *dset.origin[2:]],
             sampling=[0, *dset.sampling[2:]],
@@ -824,8 +1057,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
     @intensities_4d.setter
     def intensities_4d(self, intensities: np.ndarray) -> None:
+        # Keep raw detector counts in their native dtype
+        dtype = validate_array(intensities, name="intensities_4d", ndim=4).dtype
         self._intensities_4d = validate_array(
-            intensities, name="intensities_4d", ndim=4, dtype=config.get("dtype_real")
+            intensities, name="intensities_4d", ndim=4, dtype=dtype
         )
 
     @property
@@ -907,7 +1142,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
     @property
     def upsample_factor(self) -> float:
-        return (self._obj_shape_crop_2d / self.gpts).mean()
+        # pair each crop axis with its own scan-grid axis so the factor stays
+        # transpose-invariant (_obj_shape_crop_2d is transposed when com_transpose)
+        gpts = self.gpts[::-1] if self.com_transpose else self.gpts
+        return (self._obj_shape_crop_2d / gpts).mean()
 
     # endregion --- properties ---
 
@@ -936,6 +1174,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
         if obj_padding_px is None:
             obj_padding_px = np.array([0, 0])
 
+        if positions_mask is not None:
+            self.positions_mask = positions_mask
+
         nr, nc = self.gpts
         Sr, Sc = self._scan_sampling
         r = np.arange(nr) * Sr
@@ -943,9 +1184,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
         r, c = np.meshgrid(r, c, indexing="ij")
 
-        if positions_mask is not None:
-            r = r[positions_mask]
-            c = c[positions_mask]
+        pos_mask_2d = self.positions_mask.reshape(nr, nc).cpu().numpy()
+        r = r[pos_mask_2d]
+        c = c[pos_mask_2d]
 
         positions = np.stack((r.ravel(), c.ravel()), axis=-1).astype(config.get("dtype_real"))
 
@@ -958,8 +1199,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
             positions = np.flip(positions, axis=1)
             sampling = sampling[::-1]
 
-        # ensure positive
-        m: np.ndarray = np.min(positions, axis=0).clip(-np.inf, 0)
+        # anchor the used positions to the object origin
+        m: np.ndarray = np.min(positions, axis=0)
         positions -= m
 
         # finally, switch to pixels
@@ -969,7 +1210,6 @@ class PtychographyDatasetRaster(DatasetConstraints):
         # top-left padding
         positions[:, 0] += obj_padding_px[0]
         positions[:, 1] += obj_padding_px[1]
-
         self.scan_positions_px = positions
         self.initial_scan_positions_px = self.scan_positions_px.data.clone()
         return
@@ -986,7 +1226,11 @@ class PtychographyDatasetRaster(DatasetConstraints):
         plot_com: str | bool = True,
         vectorized: bool = True,
         probe_energy: float | None = None,
+        positions_mask: np.ndarray | None = None,
     ):
+        if positions_mask is not None:
+            self.positions_mask = positions_mask
+
         # Store preprocessing parameters for serialization and reloading
         self._preprocessing_params = {
             "com_fit_function": com_fit_function,
@@ -998,6 +1242,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             "plot_rotation": False,
             "plot_com": False,
             "vectorized": vectorized,
+            "positions_mask": self.positions_mask.cpu().numpy(),
         }
 
         if probe_energy is not None:
@@ -1014,16 +1259,20 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 ),
                 modify_in_place=True,
             )
-            self.intensities_4d = self.dset.array.reshape(
+            # TODO remove after Dataset torch migration complete
+            dset_numpy = (
+                self.dset.array if self.dset.array is not None else self.dset.tensor.cpu().numpy()
+            )
+            self.intensities_4d = dset_numpy.reshape(
                 (*self.gpts, *padded_diffraction_intensities_shape)
             )
             self.detector_mask = torch.nn.functional.pad(
                 self.detector_mask,
                 (
-                    self.diffraction_padding[0],
-                    self.diffraction_padding[0],
                     self.diffraction_padding[1],
                     self.diffraction_padding[1],
+                    self.diffraction_padding[0],
+                    self.diffraction_padding[0],
                 ),
                 mode="constant",
                 value=0,
@@ -1050,7 +1299,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self._set_initial_scan_positions_px(obj_padding_px)
         self._set_patch_indices(obj_padding_px)
 
-        self._set_targets("l2_amplitude")
+        self._set_targets("amplitude")  # default space; criterion-driven space set in reconstruct
 
         self._preprocessed = True
         return
@@ -1101,8 +1350,12 @@ class PtychographyDatasetRaster(DatasetConstraints):
             com_measured_c = np.sum(intensities_mask * kcm[None, None], axis=(-2, -1))
 
             intensities_sum = np.sum(intensities_mask, axis=(-2, -1))
+            intensities_mask = intensities_sum == 0
+            intensities_sum[intensities_mask] = 1
             com_measured_r /= intensities_sum
             com_measured_c /= intensities_sum
+            com_measured_r[intensities_mask] = np.nan
+            com_measured_c[intensities_mask] = np.nan
 
         else:
             shape_r, shape_c = intensities.shape[:2]
@@ -1119,10 +1372,14 @@ class PtychographyDatasetRaster(DatasetConstraints):
             ):
                 masked_intensity = intensities[Rr, Rc]
                 if dp_mask is not None:
-                    masked_intensity *= dp_mask
+                    masked_intensity = masked_intensity * dp_mask
                 summed_intensity = masked_intensity.sum()
-                com_measured_r[Rr, Rc] = np.sum(masked_intensity * kcm) / summed_intensity
-                com_measured_c[Rr, Rc] = np.sum(masked_intensity * krm) / summed_intensity
+                if summed_intensity == 0:
+                    com_measured_r[Rr, Rc] = np.nan
+                    com_measured_c[Rr, Rc] = np.nan
+                else:
+                    com_measured_r[Rr, Rc] = np.sum(masked_intensity * krm) / summed_intensity
+                    com_measured_c[Rr, Rc] = np.sum(masked_intensity * kcm) / summed_intensity
 
         if fit_function == "none":
             com_fit_r, com_fit_c = com_measured_r, com_measured_c
@@ -1131,7 +1388,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
             com_fit_r = com_fit_r * self.roi_shape[0] / 2
             com_fit_c = com_fit_c * self.roi_shape[1] / 2
         else:
-            finite_mask = np.isfinite(com_measured_r)
+            pos_mask_2d = self.positions_mask.reshape(self.gpts[0], self.gpts[1]).cpu().numpy()
+            finite_mask = np.isfinite(com_measured_r) & pos_mask_2d
             com_fit_r, com_fit_c, _com_res_r, _com_res_c = fit_origin(
                 data=(com_measured_r, com_measured_c),
                 fit_function=fit_function,
@@ -1187,7 +1445,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             """Calculate curl of CoM gradient vector field"""
             grad_r_c = com_r[1:-1, 2:] - com_r[1:-1, :-2]  # dVh/dw
             grad_c_r = com_c[2:, 1:-1] - com_c[:-2, 1:-1]  # dVw/dh
-            return float(np.mean(np.abs(grad_c_r - grad_r_c)))
+            return float(np.nanmean(np.abs(grad_c_r - grad_r_c)))
 
         def calculate_curl_for_angles(
             angles_rad: np.ndarray,
@@ -1206,7 +1464,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
             grad_r_c = rot_r[:, 1:-1, 2:] - rot_r[:, 1:-1, :-2]
             grad_c_r = rot_c[:, 2:, 1:-1] - rot_c[:, :-2, 1:-1]
-            return np.mean(np.abs(grad_c_r - grad_r_c), axis=(-2, -1))
+            return np.nanmean(np.abs(grad_c_r - grad_r_c), axis=(-2, -1))
 
         def plot_curl_results(
             angles_deg: np.ndarray,
@@ -1271,6 +1529,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
         rotation_angles_deg = np.asarray(rotation_angles_deg)
         rotation_angles_rad = np.deg2rad(rotation_angles_deg)
 
+        pos_mask_2d = self.positions_mask.reshape(self.gpts[0], self.gpts[1]).cpu().numpy()
+        com_normalized_masked = self.com_normalized.copy()
+        com_normalized_masked[:, ~pos_mask_2d] = np.nan
+
         # Case 1: Known rotation
         if force_com_rotation is not None:
             _rotation_best_rad = np.deg2rad(force_com_rotation)
@@ -1285,12 +1547,12 @@ class PtychographyDatasetRaster(DatasetConstraints):
             else:
                 # Calculate curl for both transpose options
                 rot_r, rot_c = rotate_com_vectors(
-                    self.com_normalized, _rotation_best_rad, transpose=False
+                    com_normalized_masked, _rotation_best_rad, transpose=False
                 )
                 rotation_curl = calculate_curl(rot_r, rot_c)
 
                 rot_r, rot_c = rotate_com_vectors(
-                    self.com_normalized, _rotation_best_rad, transpose=True
+                    com_normalized_masked, _rotation_best_rad, transpose=True
                 )
                 rotation_curl_transpose = calculate_curl(rot_r, rot_c)
 
@@ -1310,7 +1572,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 # Calculate curl for all angles with known transpose
                 curl_values = calculate_curl_for_angles(
                     rotation_angles_rad,
-                    self.com_normalized,
+                    com_normalized_masked,
                     transpose=_rotation_best_transpose,
                 )
 
@@ -1334,13 +1596,13 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 # Calculate curl for both transpose options
                 rotation_curl = calculate_curl_for_angles(
                     rotation_angles_rad,
-                    self.com_normalized,
+                    com_normalized_masked,
                     transpose=False,
                 )
 
                 rotation_curl_transpose = calculate_curl_for_angles(
                     rotation_angles_rad,
-                    self.com_normalized,
+                    com_normalized_masked,
                     transpose=True,
                 )
 
@@ -1407,18 +1669,18 @@ class PtychographyDatasetRaster(DatasetConstraints):
         bilinear: bool = False,
     ):
         dtype = config.get("dtype_real")
-        diff_intensities = self.intensities_4d.copy().astype(dtype)
+        np_dtype = np.dtype(dtype)
+        raw = self._intensities_4d
         com_fit = self.com_fit
+        if positions_mask is not None:
+            self.positions_mask = positions_mask
+        positions_mask_2d = self.positions_mask.reshape(self.gpts[0], self.gpts[1]).cpu().numpy()
 
         # Aggressive cropping for when off-centered high scattering angle data was recorded
         if crop_patterns:
-            crop_r = int(
-                np.minimum(diff_intensities.shape[2] - com_fit[0].max(), com_fit[0].min())
-            )
-            crop_c = int(
-                np.minimum(diff_intensities.shape[3] - com_fit[1].max(), com_fit[1].min())
-            )
-            crop_m = np.minimum(crop_c, crop_r)
+            crop_r = int(np.minimum(raw.shape[2] - com_fit[0].max(), com_fit[0].min()))
+            crop_c = int(np.minimum(raw.shape[3] - com_fit[1].max(), com_fit[1].min()))
+            crop_m = int(np.minimum(crop_c, crop_r))
 
             pattern_crop_mask = np.zeros(self.roi_shape, dtype="bool")
             pattern_crop_mask[:crop_m, :crop_m] = True
@@ -1429,35 +1691,39 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
         else:
             pattern_crop_mask = None
-            pattern_crop_mask_shape = self.roi_shape
+            pattern_crop_mask_shape = (int(self.roi_shape[0]), int(self.roi_shape[1]))
+
+        # Accumulate into a numpy buffer and convert once at the end
+        n_out = int(positions_mask_2d.sum())
+        centered_amplitudes = np.zeros((n_out, *pattern_crop_mask_shape), dtype=np_dtype)
 
         mean_intensity = 0
         mean_amplitude = 0
-        centered_amplitudes = np.zeros(diff_intensities.shape, dtype=dtype)
-        amplitudes = np.zeros(diff_intensities.shape, dtype=dtype)
-        centered_intensities = np.zeros(diff_intensities.shape, dtype=dtype)
-        intensities = np.zeros(diff_intensities.shape, dtype=dtype)
-        ## there is some additional memory overhead in this loop due to numpy array assignment
-        ## but I don't think it's easy to avoid -- ARCM 251212
+        out_i = 0
+        current_Rr = -1
+        row = None
         for Rr, Rc in tqdmnd(
-            range(diff_intensities.shape[0]),
-            range(diff_intensities.shape[1]),
+            range(raw.shape[0]),
+            range(raw.shape[1]),
             desc="Normalizing intensities",
             unit="probe position",
             disable=not self._verbose,
         ):
-            if positions_mask is not None:
-                if not positions_mask[Rr, Rc]:
-                    continue
+            if not positions_mask_2d[Rr, Rc]:
+                continue
 
-            intensity = np.maximum(diff_intensities[Rr, Rc], 0)
-            intensities[Rr, Rc] = intensity
+            # Cast to float32 one scan-row at a time--avoids a full 4D float32 copy
+            if Rr != current_Rr:
+                current_Rr = Rr
+                row = raw[Rr]
+                if row.dtype != np_dtype:
+                    row = row.astype(dtype)
+            intensity = np.maximum(row[Rc], 0)
             mean_intensity += np.sum(intensity)
+
             ### shifting amplitude rather than intensity to minimize ringing artifacts
             amplitude = np.maximum(np.sqrt(intensity), 0)
             mean_amplitude += np.sum(amplitude)
-            amplitudes[Rr, Rc] = amplitude
-
             shift_amplitude = shift_array(  # shifting to 0,0 then fftshift
                 amplitude,
                 -(com_fit[0, Rr, Rc] + 0.0),
@@ -1466,42 +1732,27 @@ class PtychographyDatasetRaster(DatasetConstraints):
             )
             shift_amplitude = np.maximum(shift_amplitude, 0)
             shift_amplitude = np.fft.fftshift(shift_amplitude)
+            if pattern_crop_mask is not None:
+                shift_amplitude = shift_amplitude[pattern_crop_mask].reshape(
+                    pattern_crop_mask_shape
+                )
 
-            centered_amplitudes[Rr, Rc] = shift_amplitude
-            centered_intensities[Rr, Rc] = shift_amplitude**2
+            centered_amplitudes[out_i] = shift_amplitude
+            out_i += 1
 
-        if positions_mask is not None:
-            amplitudes = amplitudes[positions_mask]
-            centered_amplitudes = centered_amplitudes[positions_mask]
-            intensities = intensities[positions_mask]
-            centered_intensities = centered_intensities[positions_mask]
-        else:
-            amplitudes = amplitudes.reshape((-1, *self.roi_shape))
-            centered_amplitudes = centered_amplitudes.reshape((-1, *self.roi_shape))
-            intensities = intensities.reshape((-1, *self.roi_shape))
-            centered_intensities = centered_intensities.reshape((-1, *self.roi_shape))
+        mean_intensity /= n_out
+        mean_amplitude /= n_out
 
-        if crop_patterns:
-            amplitudes = amplitudes[:, pattern_crop_mask].reshape((-1, *pattern_crop_mask_shape))
-            centered_amplitudes = centered_amplitudes[:, pattern_crop_mask].reshape(
-                (-1, *pattern_crop_mask_shape)
-            )
-            intensities = intensities[:, pattern_crop_mask].reshape((-1, *pattern_crop_mask_shape))
-            centered_intensities = centered_intensities[:, pattern_crop_mask].reshape(
-                (-1, *pattern_crop_mask_shape)
-            )
-
-        mean_intensity /= amplitudes.shape[0]
-        mean_amplitude /= amplitudes.shape[0]
-
-        self.centered_amplitudes = centered_amplitudes
-        self.amplitudes = amplitudes
-        self.centered_intensities = centered_intensities
-        self.intensities = intensities
-        descan_shifts = -1 * np.stack((com_fit[0].flatten(), com_fit[1].flatten()))
+        # Wrap the numpy buffer zero-copy (``torch.from_numpy`` shares storage)
+        self._centered_amplitudes = torch.from_numpy(centered_amplitudes)
+        self._amplitudes = None
+        self._intensities = None
+        self._centered_intensities = None
         descan_shifts = -1 * com_fit.reshape((2, -1))  # (2, rr*rc)
         descan_shifts += self.roi_shape[:, None] / 2
-        self.descan_shifts = descan_shifts.T
+        descan_shifts = descan_shifts.T  # (rr*rc, 2)
+        descan_shifts = descan_shifts[positions_mask_2d.ravel()]
+        self.descan_shifts = descan_shifts
         self.initial_descan_shifts = self.descan_shifts.data.clone()
 
         self.mean_diffraction_intensity = mean_intensity
@@ -1515,19 +1766,31 @@ class PtychographyDatasetRaster(DatasetConstraints):
         batch_indices: np.ndarray | torch.Tensor,
         obj_padding_px: np.ndarray | tuple,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Forward pass to compute the diffraction intensities from the object and scan positions."""
+        """Forward pass to compute the diffraction intensities from the object and scan positions.
+
+        The first return value is the object-query payload: integer ``patch_indices`` for a
+        grid-based object, or continuous normalized coordinates for an implicit object
+        (``implicit_object=True``). In the implicit case the fractional position is baked into
+        the coordinates, so the returned fractional shift is zero (the probe is not shifted).
+        """
         self.apply_hard_constraints(obj_padding_px)
         positions_px = self.scan_positions_px[batch_indices]
-        positions_px_fractional = positions_px - torch.round(positions_px)
-        with torch.no_grad():
-            if self.patch_indices_need_update():
-                self._set_patch_indices(obj_padding_px)
-        patch_indices = self.patch_indices[batch_indices]
         if self.learn_descan and self.has_optimizer():
             descan_shifts = self.apply_descan_constraints(self.descan_shifts)[batch_indices]
         else:
             descan_shifts = None
-        return patch_indices, positions_px, positions_px_fractional, descan_shifts
+
+        if self._implicit_object:
+            patch_data = self._scan_coords(batch_indices, obj_padding_px)
+            positions_px_fractional = torch.zeros_like(positions_px)
+            return patch_data, positions_px, positions_px_fractional, descan_shifts
+
+        positions_px_fractional = positions_px - torch.round(positions_px)
+        with torch.no_grad():
+            if self.patch_indices_need_update():
+                self._set_patch_indices(obj_padding_px)
+        patch_data = self.patch_indices[batch_indices]
+        return patch_data, positions_px, positions_px_fractional, descan_shifts
 
 
 DatasetModelType = PtychographyDatasetRaster  # | PtychographyDatasetSpiral
