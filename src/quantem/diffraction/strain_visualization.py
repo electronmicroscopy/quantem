@@ -31,11 +31,13 @@ def plot_strain_panels(
     cmap_strain: str = "RdBu_r",
     cmap_rotation: str = "PiYG",
     layout: str = "horizontal",
-    rotate_strain: bool = False,
+    transpose_image: bool = False,
     rotate_title: bool = False,
     plot_dilation: bool = False,
     figsize: tuple[float, float] | None = None,
     panel_titles: tuple[str, str, str] | None = None,
+    strain_rotation_angle: float = 0.0,
+    arrow_style: str = "title",
     **kwargs,
 ):
     """Render strain (e_uu, e_vv, e_uv) and rotation panels.
@@ -113,7 +115,7 @@ def plot_strain_panels(
     evv_disp = _roi_compose(norm_strain(evv_pct), cm_strain)
     euv_disp = _roi_compose(norm_strain(euv_pct), cm_strain)
 
-    if rotate_strain:
+    if transpose_image:
         euu_disp = euu_disp.transpose(1,0,2)
         evv_disp = evv_disp.transpose(1,0,2)
         euv_disp = euv_disp.transpose(1,0,2)
@@ -122,14 +124,15 @@ def plot_strain_panels(
     if plot_dilation:
         etot_pct = (e_uu + e_vv) * 100
         etot_disp = _roi_compose(norm_strain(etot_pct), cm_strain)
-        if rotate_strain:
+        if transpose_image:
             etot_disp = etot_disp.transpose(1,0,2)
-        ax[0].imshow(euu_disp * mask[:, :, np.newaxis])
+        ax[0].imshow(etot_disp * mask[:, :, np.newaxis])
         ax[1].imshow(euv_disp * mask[:, :, np.newaxis])
     else:
         ax[0].imshow(euu_disp * mask[:, :, np.newaxis])
         ax[1].imshow(evv_disp * mask[:, :, np.newaxis])
         ax[2].imshow(euv_disp * mask[:, :, np.newaxis])
+
 
     ref_dim = figsize[1] if is_horizontal else figsize[0]
     fs_threshold = 3.0
@@ -137,36 +140,44 @@ def plot_strain_panels(
     title_fs = 16 * fs_scale
     tick_fs = 12 * fs_scale
     title_val = 'vertical' if rotate_title else 'horizontal'
-    if panel_titles is None and not plot_dilation:
-        panel_titles = (
-            r"$\epsilon_{uu}$ $\updownarrow$",
-            r"$\epsilon_{vv}$ $\leftrightarrow$",
-            r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\searrow$",
-        )
-        ax[0].set_title(panel_titles[0], fontsize=title_fs, rotation=title_val)
-        ax[1].set_title(panel_titles[1], fontsize=title_fs, rotation=title_val)
-        ax[2].set_title(panel_titles[2], fontsize=title_fs, rotation=title_val)
-    if plot_dilation and panel_titles is None:
-        panel_titles = (
-            r"$\epsilon_{uu} + \epsilon_{vv}$",
-            r"$\epsilon_{uv}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
-            ""
-        )
-        ax[0].set_title(panel_titles[0], fontsize=title_fs, rotation=title_val)
-        ax[1].set_title(panel_titles[1], fontsize=title_fs, rotation=title_val)
+    if panel_titles is None:
+        if plot_dilation:
+            panel_titles = (
+                r"$\epsilon_{uu} + \epsilon_{vv}$",
+                r"$\epsilon_{uv}$",
+                "",
+            )
+            title_arrow_angles = (None, -45 + strain_rotation_angle, None)
+        else:
+            panel_titles = (
+                r"$\epsilon_{uu}$",
+                r"$\epsilon_{vv}$",
+                r"$\epsilon_{uv}$",
+            )
+            title_arrow_angles = (90 + strain_rotation_angle, 0 + strain_rotation_angle, -45 + strain_rotation_angle)
+            if transpose_image: 
+                title_arrow_angles = (0 + strain_rotation_angle, 90 + strain_rotation_angle, 45 + strain_rotation_angle)
+    else:
+            title_arrow_angles = (None, None, None)
+
 
     if plot_rotation:
         norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
         rot_disp = _roi_compose(norm_rot(rot_deg), cm_rot)
-        if rotate_strain: rot_disp = rot_disp.transpose(1,0,2)
+        if transpose_image: rot_disp = rot_disp.transpose(1,0,2)
         ax[-1].imshow(rot_disp * mask[:, :, np.newaxis])
-        ax[-1].set_title(r"Rotation $\circlearrowleft$", fontsize=title_fs, rotation=title_val)
+        if arrow_style == "title":
+            ax[-1].set_title(r"$\phi$ $\circlearrowleft$", fontsize=title_fs, rotation=title_val)
+        else:
+            ax[-1].set_title(r"$\phi$", fontsize=title_fs, rotation=title_val)
+
 
     for a in ax:
         a.set_xticks([])
         a.set_yticks([])
         a.set_facecolor("black")
         a.set_aspect("equal")
+        a.set_anchor("W" if not is_horizontal else "C")
 
     if plot_scalebar:
         scalebar_kwargs = {}
@@ -216,12 +227,13 @@ def plot_strain_panels(
         except AttributeError:  # matplotlib < 3.5
             fig.canvas.draw()
 
+    need_side_panel = plot_gvecs or arrow_style == "legend"
     if is_horizontal:
         # Reserve a bottom band wide enough for the colorbar + its tick labels and
         # title (fontsize 16) and a right band for the rotation-panel gap; widen the
         # right band when the g-vector compass is drawn in it. These keep the figure
         # usable when saved "as is" (no bbox_inches='tight').
-        right = 0.78 if plot_gvecs else 0.93
+        right = 0.72 if need_side_panel else 0.93
         fig.subplots_adjust(left=0.04, right=right, top=0.88, bottom=0.24, wspace=0.05)
         if plot_rotation:
             # nudge the rotation panel right for a visual gap from the strain panels;
@@ -249,20 +261,23 @@ def plot_strain_panels(
 
     else:
         # Top band for the panel titles, right band for the vertical colorbars + labels.
-        fig.subplots_adjust(left=0.04, right=0.80, top=0.92, bottom=0.06, hspace=0.15)
+        right = 0.55 if need_side_panel else 0.80
+        fig.subplots_adjust(left=0.04, right=right, top=0.92, bottom=0.06, hspace=0.15)
         _finalize_layout()
 
         cb_orientation = "vertical"
         b0 = ax[0].get_position()
         b2 = ax[n_strain - 1].get_position()
-        strain_cb_pos = [b0.x1 + cb_pad, b2.y0, cb_size, b0.y1 - b2.y0]
+        title_gap = 0.15 if arrow_style == "title" else cb_pad
+        cb_x0 = b0.x1 + title_gap
+        strain_cb_pos = [cb_x0, b2.y0, cb_size, b0.y1 - b2.y0]
 
         if plot_rotation:
             b3 = ax[-1].get_position()
             rot_cb_h = max(b3.y1 - b3.y0, cb_min_len)
             rot_cb_cy = 0.5 * (b3.y0 + b3.y1)
             rot_cb_y0 = min(max(rot_cb_cy - 0.5 * rot_cb_h, 0.0), 0.99 - rot_cb_h)
-            rot_cb_pos = [b0.x1 + cb_pad, rot_cb_y0, cb_size, rot_cb_h]
+            rot_cb_pos = [cb_x0, rot_cb_y0, cb_size, rot_cb_h]
             last_pos = b3
         else:
             rot_cb_pos = None
@@ -286,51 +301,129 @@ def plot_strain_panels(
         cbar2.update_ticks()
         cbar2.ax.tick_params(labelsize=tick_fs)
 
-    if plot_gvecs:
-        if u_ref is None or v_ref is None:
-            print("Warning: u_ref and v_ref not found. Call fit_strain() first.")
-            return fig, ax
 
-        # The compass goes in the reserved margin beside the last panel; clamp its
-        # right edge to 0.99 so it never spills off the figure when saved "as is".
-        if is_horizontal:
-            ref_left = last_pos.x1 + 0.005
-            ref_width = min(last_pos.width, 0.99 - ref_left)
-            ref_ax = fig.add_axes([ref_left, last_pos.y0, ref_width, last_pos.height])
-        else:
-            ref_left = min(last_pos.x1 + 0.18, 0.74)
-            ref_width = min(last_pos.width, 0.99 - ref_left)
-            ref_ax = fig.add_axes([ref_left, last_pos.y0, ref_width, last_pos.height])
+    def _add_title_arrow(ax, angle_deg, gap_pt=4.0, color="black", fontsize=None):
+            fs = fontsize if fontsize is not None else title_fs
+            try:
+                ax.figure.draw_without_rendering()
+            except AttributeError:  # matplotlib < 3.5
+                ax.figure.canvas.draw()
+            renderer = ax.figure.canvas.get_renderer()
+            bbox_ax = ax.title.get_window_extent(renderer=renderer).transformed(ax.transAxes.inverted())
+            y = 0.5 * (bbox_ax.y0 + bbox_ax.y1)
+            ax.annotate(
+                "\u2194",
+                xy=(bbox_ax.x1, y), xycoords=ax.transAxes,
+                xytext=(gap_pt + fs / 2.0, 0), textcoords="offset points",
+                ha="center", va="center",
+                rotation=angle_deg, rotation_mode="anchor",
+                fontsize=fs, color=color,
+                annotation_clip=False,
+            )
+    
+    def _add_arrow_legend(fig, x0, y_top, entries, plot_rotation, fontsize, color="black"):
+        fig_w_in, fig_h_in = figsize
+        row_h_in = fontsize * 1.6 / 72.0
+        box_w_in = 1.6
+        n_rows = len(entries) + 1 + (2 if plot_rotation else 0)
+        row_h = row_h_in / fig_h_in
+        box_h = row_h * n_rows
+        box_w = min(box_w_in / fig_w_in, 0.99 - x0)
+        leg_ax = fig.add_axes([x0, y_top - box_h, box_w, box_h])
+        leg_ax.set_xlim(0, 1)
+        leg_ax.set_ylim(0, 1)
+        leg_ax.axis("off")
 
+        dy = 1.0 / n_rows
+        y = 1.0 - dy / 2
+        leg_ax.text(0.0, y, "Strain", fontsize=fontsize, fontweight="bold", ha="left", va="center")
+        for label, angle_deg in entries:
+            y -= dy
+            leg_ax.text(0.15, y, "\u2194", rotation=angle_deg, rotation_mode="anchor",
+                        ha="center", va="center", fontsize=fontsize, color=color)
+            leg_ax.text(0.32, y, label, fontsize=fontsize, ha="left", va="center")
+
+        if plot_rotation:
+            y -= dy
+            leg_ax.text(0.0, y, "Rotation", fontsize=fontsize, fontweight="bold", ha="left", va="center")
+            y -= dy
+            leg_ax.text(0.15, y, "\u21ba", fontsize=fontsize, ha="center", va="center")
+            leg_ax.text(0.32, y, r"$\phi$", fontsize=fontsize, ha="left", va="center")
+        return box_h
+
+    for i in range(n_strain):
+        ax[i].set_title(panel_titles[i], fontsize=title_fs, rotation=title_val)
+        angle = title_arrow_angles[i]
+        if arrow_style == "title" and angle is not None:
+            _add_title_arrow(ax[i], angle, color="black")
+
+    if is_horizontal:
+        _finalize_layout()
+        renderer = fig.canvas.get_renderer()
+        panel_edge = last_pos.x1
+        if plot_rotation:
+            title_edge = ax[-1].title.get_window_extent(renderer=renderer).transformed(fig.transFigure.inverted()).x1
+            panel_edge = max(panel_edge, title_edge)
+        margin_x0 = panel_edge + 0.03
+    else:
+        _finalize_layout()
+        renderer = fig.canvas.get_renderer()
+        margin_x0 = cax1.get_tightbbox(renderer).transformed(fig.transFigure.inverted()).x1 + 0.02
+        if plot_rotation and rot_cb_pos is not None:
+            rot_edge = cax2.get_tightbbox(renderer).transformed(fig.transFigure.inverted()).x1
+            margin_x0 = max(margin_x0, rot_edge + 0.02)
+    top_bound = 0.88 if is_horizontal else 0.92
+    bottom_bound = 0.24 if is_horizontal else 0.06
+    center_y = 0.5 * (top_bound + bottom_bound)
+
+    entries = []
+    leg_h = 0.0
+    if arrow_style == "legend":
+        entries = [(panel_titles[i], title_arrow_angles[i]) for i in range(n_strain)
+                   if title_arrow_angles[i] is not None]
+        n_rows = len(entries) + 1 + (2 if plot_rotation else 0)
+        leg_h = (title_fs * 1.6 / 72.0 / figsize[1]) * n_rows
+
+    show_gvecs = plot_gvecs and u_ref is not None and v_ref is not None
+    if plot_gvecs and not show_gvecs:
+        print("Warning: u_ref and v_ref not found. Call fit_strain() first.")
+    fig_aspect = figsize[0] / figsize[1]
+    gvec_w = min(0.99 - margin_x0, 0.15) if show_gvecs else 0.0
+    gvec_h = gvec_w * fig_aspect if show_gvecs else 0.0
+
+    gap = 0.03 if (leg_h > 0 and gvec_h > 0) else 0.0
+    total_needed = leg_h + gap + gvec_h
+    available_span = top_bound - bottom_bound
+    side_scale = min(1.0, available_span / total_needed) if total_needed > 0 else 1.0
+    leg_h *= side_scale
+    gvec_w *= side_scale
+    gvec_h *= side_scale
+    legend_fontsize = title_fs * side_scale
+
+    y_top = center_y + (leg_h + gap * side_scale + gvec_h) / 2.0
+
+    if leg_h > 0:
+        _add_arrow_legend(fig, margin_x0, y_top, entries, plot_rotation=plot_rotation,
+                           fontsize=legend_fontsize, color="black")
+        y_top -= leg_h + gap * side_scale
+
+    if show_gvecs:
+        ref_ax = fig.add_axes([margin_x0, y_top - gvec_h, gvec_w, gvec_h])
         ref_ax.set_xlim(-1.5, 1.5)
         ref_ax.set_ylim(-1.5, 1.5)
         ref_ax.set_aspect("equal")
         ref_ax.axis("off")
         u_norm = u_ref / np.linalg.norm(u_ref)
         v_norm = v_ref / np.linalg.norm(v_ref)
-
         u_row, u_col = u_norm
         v_row, v_col = v_norm
         arrow_props_ref = dict(arrowstyle="->", lw=3, mutation_scale=25)
-
-        u_arrow = FancyArrowPatch(
-            (0, 0), (u_col, -u_row),
-            color="darkred", **arrow_props_ref
-        )
-        ref_ax.add_patch(u_arrow)
-
-        v_arrow = FancyArrowPatch(
-            (0, 0), (v_col, -v_row),
-            color="darkblue", **arrow_props_ref
-        )
-        ref_ax.add_patch(v_arrow)
-        ref_ax.text(u_col * 1.3, -u_row * 1.3, r"$\mathbf{g}_{1}$",
-                    fontsize=14, fontweight="bold", color="darkred",
-                    ha="center", va="center")
-
-        ref_ax.text(v_col * 1.3, -v_row * 1.3, r"$\mathbf{g}_{2}$",
-                    fontsize=14, fontweight="bold", color="darkblue",
-                    ha="center", va="center")
+        ref_ax.add_patch(FancyArrowPatch((0, 0), (u_col, -u_row), color="darkred", **arrow_props_ref))
+        ref_ax.add_patch(FancyArrowPatch((0, 0), (v_col, -v_row), color="darkblue", **arrow_props_ref))
+        ref_ax.text(u_col * 1.3, -u_row * 1.3, r"$\mathbf{g}_{1}$", fontsize=14, fontweight="bold",
+                    color="darkred", ha="center", va="center")
+        ref_ax.text(v_col * 1.3, -v_row * 1.3, r"$\mathbf{g}_{2}$", fontsize=14, fontweight="bold",
+                    color="darkblue", ha="center", va="center")
 
     return fig, ax
 

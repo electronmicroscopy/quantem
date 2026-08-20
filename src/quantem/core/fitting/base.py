@@ -452,11 +452,15 @@ class AdditiveRenderModel(nn.Module): # step all otpimzers
             component = cast(RenderComponent, module)
             component.enforce_hard_constraints(ctx)
 
-    def total_constraint_loss(self, ctx: RenderContext) -> torch.Tensor:
+    def total_constraint_loss(self, ctx: RenderContext, **kwargs: Any) -> torch.Tensor:
+        from quantem.core.fitting.diffraction import SyntheticDiskLattice
         loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
         for module in self.components:
             component = cast(RenderComponent, module)
-            loss = loss + component.constraint_loss(ctx)
+            if isinstance(component, SyntheticDiskLattice):
+                loss = loss + component.constraint_loss(ctx, neighbor_target=kwargs.get("neighbor_target"))
+            else:
+                loss = loss + component.constraint_loss(ctx)
         return loss
 
     def initilize_independant_optimizers(self, 
@@ -802,8 +806,8 @@ class SqrtMSELoss(nn.Module):
     
     def forward(self, pred, target):
         eps = 1
-        pred_modified = (pred - pred.min().detach() + eps) ** self.gamma
-        target_modified = (target - target.min().detach() + eps) ** self.gamma
+        pred_modified = (pred - pred.min() + eps) ** self.gamma
+        target_modified = (target - target.min() + eps) ** self.gamma
         loss = self.mse_fn(pred_modified, target_modified)
         return loss
 
@@ -1057,7 +1061,7 @@ class FitBase(OptimizerMixin):
     ) -> torch.Tensor:
         if self.model is None or self.ctx is None:
             raise RuntimeError("Model and context are not defined for fitting.")
-        return self.model.total_constraint_loss(self.ctx)
+        return self.model.total_constraint_loss(self.ctx, **kwargs)
 
     def set_component_trainable(
         self, 

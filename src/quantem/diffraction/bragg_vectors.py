@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy as _copy
 from pathlib import Path
 from typing import Any, Literal, Sequence, Union
 
@@ -211,7 +212,7 @@ class BraggVectors(AutoSerialize):
         radius: float | None = None,
         edge: float = 1.0,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
     ) -> "BraggVectors":
         """Build the template from a synthetic soft-edged disk.
 
@@ -227,9 +228,10 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` disk center; defaults to the detector center
             ``(H // 2, W // 2)``.
-        subtract_mean : bool, default=True
-            If ``True``, make the template zero-sum — a band-pass kernel that
-            suppresses uniform background in the correlation.
+        subtract_mean : bool, default=False
+            If ``True``, make the template zero-sum. The default keeps the
+            unit-sum positive template, so correlation values stay positive and
+            roughly measure the probe-weighted counts under each peak.
 
         Returns
         -------
@@ -257,7 +259,7 @@ class BraggVectors(AutoSerialize):
     def make_template_from_data(
         self,
         roi: NDArray | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
         center: tuple[float, float] | None = None,
     ) -> "BraggVectors":
         """Build the template by averaging diffraction patterns from the data.
@@ -269,9 +271,10 @@ class BraggVectors(AutoSerialize):
             ideally a vacuum / single-disk region so the unscattered probe is
             isolated. ``None`` (default) averages the whole scan (the mean
             diffraction pattern).
-        subtract_mean : bool, default=True
-            If ``True``, make the template zero-sum — a band-pass kernel that
-            suppresses uniform background in the correlation.
+        subtract_mean : bool, default=False
+            If ``True``, make the template zero-sum. The default keeps the
+            unit-sum positive template, so correlation values stay positive and
+            roughly measure the probe-weighted counts under each peak.
         center : tuple of float, optional
             ``(row, col)`` probe center rolled to the origin; defaults to the
             probe's intensity centroid.
@@ -318,7 +321,7 @@ class BraggVectors(AutoSerialize):
         self,
         probe: NDArray | torch.Tensor,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
     ) -> "BraggVectors":
         """Build the template from an explicit probe image (e.g. a measured vacuum probe).
 
@@ -329,9 +332,10 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` probe center rolled to the origin; defaults to the
             probe's intensity centroid.
-        subtract_mean : bool, default=True
-            If ``True``, make the template zero-sum — a band-pass kernel that
-            suppresses uniform background in the correlation.
+        subtract_mean : bool, default=False
+            If ``True``, make the template zero-sum. The default keeps the
+            unit-sum positive template, so correlation values stay positive and
+            roughly measure the probe-weighted counts under each peak.
 
         Returns
         -------
@@ -366,7 +370,9 @@ class BraggVectors(AutoSerialize):
             return None
         return torch.fft.fftshift(self._template).detach().cpu().numpy()
 
-    def correlation_map(self, row: int, col: int) -> np.ndarray:
+    def correlation_map(
+        self, row: int, col: int, background_sigma: float | str | None = None
+    ) -> np.ndarray:
         """Cross-correlation map of one diffraction pattern with the template (numpy).
 
         Peaks in the returned map sit at absolute disk positions (no fftshift
@@ -389,7 +395,9 @@ class BraggVectors(AutoSerialize):
         dp = torch.as_tensor(
             np.asarray(self.dataset.array[row, col]), dtype=torch.float, device=self.device
         )
-        corr, _ = cross_correlation(dp, self._template_ft)
+        corr, _ = cross_correlation(
+            dp, self._template_ft, self._resolve_background_sigma(background_sigma)
+        )
         return corr.detach().cpu().numpy()
 
     def detect_disks(
@@ -402,6 +410,7 @@ class BraggVectors(AutoSerialize):
         subpixel: str = "upsample",
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
+        background_sigma: float | str | None = None,
         batch_size: int | None = None,
         progressbar: bool = True,
         save_to_gpu: bool = True,
@@ -441,7 +450,8 @@ class BraggVectors(AutoSerialize):
             detector dimensions.
         progressbar : bool, default=True
             If ``True``, show a tqdm progress bar over the full-scan detection.
-
+        save_to_gpu: bool, default = True,
+            Transfers dataset to gpu for faster calculation and less cpu load.
         Returns
         -------
         Vector
@@ -458,6 +468,7 @@ class BraggVectors(AutoSerialize):
             subpixel=subpixel,
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
+            background_sigma=self._resolve_background_sigma(background_sigma),
         )
 
         if save_to_gpu and self.device != "cpu":
@@ -496,6 +507,78 @@ class BraggVectors(AutoSerialize):
         self.metadata["detect"] = detect_kwargs
         self.compute_bvm()
         return peaks
+
+    def correct_peak_origins(
+        self,
+        origins: NDArray,
+        origin_ref: NDArray | tuple[float, float] | None = None,
+        *,
+        inplace: bool = False,
+    ) -> "BraggVectors":
+        """Shift the detected peak coordinates so all positions share one origin.
+
+        Subtracts each scan position's measured diffraction origin (e.g. the
+        plane-fitted center-of-mass of the central beam -- the descan) from its
+        peaks and adds back a common reference ``origin_ref``, so the peak
+        coordinates from every position live in a single detector frame. The
+        diffraction data itself is untouched: this calibrates the measurements,
+        not the images. The Bragg vector map is recomputed from the corrected
+        peaks.
+
+        By default a corrected *copy* of the workflow is returned and ``self``
+        keeps the raw detections, so calling this repeatedly (e.g. re-running a
+        notebook cell) never double-applies the shift.
+
+        Parameters
+        ----------
+        origins : np.ndarray
+            ``(scan_row, scan_col, 2)`` per-position diffraction origins in
+            detector pixels (row, col).
+        origin_ref : array-like of float, optional
+            ``(row, col)`` common origin the corrected peaks are referred to.
+            Defaults to the scan-mean of ``origins``.
+        inplace : bool, default=False
+            If ``True``, correct ``self`` instead of returning a corrected copy.
+
+        Returns
+        -------
+        BraggVectors
+            The workflow holding the corrected peaks (a new instance unless
+            ``inplace=True``); its :attr:`bvm` is recomputed.
+        """
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before correct_peak_origins().")
+        scan_shape = tuple(int(v) for v in self.dataset.shape[:2])
+        origins = np.asarray(origins, dtype=float)
+        if origins.shape != scan_shape + (2,):
+            raise ValueError(f"origins must have shape {scan_shape + (2,)}, got {origins.shape}.")
+        if origin_ref is None:
+            origin_ref = origins.mean(axis=(0, 1))
+        origin_ref = np.asarray(origin_ref, dtype=float).reshape(2)
+
+        if inplace:
+            bv = self
+        else:
+            bv = type(self)(dataset=self.dataset, device=self.device, _token=type(self)._token)
+            bv._template = self._template
+            bv._template_ft = self._template_ft
+            bv.metadata = _copy.deepcopy(self.metadata)
+            bv.peaks = self.peaks.copy()
+
+        peaks = bv.peaks
+        # rowwise transform on the flat peak table: one shift per scan cell,
+        # repeated per detected peak (cells and shifts share raster order)
+        flat = peaks.flatten()
+        counts = np.asarray(peaks.row_counts(), dtype=int)
+        shifts = np.repeat(origin_ref[None, :] - origins.reshape(-1, 2), counts, axis=0)
+        flat[:, :2] += shifts
+        peaks.set_flattened(flat)
+
+        bv.metadata["origin_correction"] = {
+            "origin_ref": (float(origin_ref[0]), float(origin_ref[1])),
+        }
+        bv.compute_bvm()
+        return bv
 
     def compute_bvm(self, sampling: float = 1.0) -> Dataset2d:
         """Accumulate all detected peaks into a Bragg vector map (intensity histogram).
@@ -924,6 +1007,8 @@ class BraggVectors(AutoSerialize):
         u_ref: np.ndarray | None = None,
         v_ref: np.ndarray | None = None,
         mask: np.ndarray | None = None,
+        q_to_r_rotation_ccw_deg: float | None = None,
+        q_transpose: bool | None = None,
     ) -> StrainMap:
         """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
 
@@ -954,8 +1039,52 @@ class BraggVectors(AutoSerialize):
         if mask is None:
             mask = self.mask_weight
 
-        ds_sampling = float(self.dataset.sampling[0])
-        ds_units = str(self.dataset.units[0])
+        ds_units = None
+        ds_sampling = None
+        if hasattr(self.dataset, 'units'):
+            if isinstance(self.dataset.units, (tuple, list)):
+                ds_units = str(self.dataset.units[0])
+            else:
+                ds_units = str(self.dataset.units)
+        if hasattr(self.dataset, 'sampling'):
+            if isinstance(self.dataset.sampling, (tuple, list, np.ndarray)):
+                ds_sampling = float(self.dataset.sampling[0])
+            else:
+                ds_sampling = float(self.dataset.sampling)
+
+        parent_rot = self.dataset.metadata.get("q_to_r_rotation_ccw_deg", None)
+        parent_tr = self.dataset.metadata.get("q_transpose", None)
+        
+        used_parent = False
+        if q_to_r_rotation_ccw_deg is None and parent_rot is not None:
+            q_to_r_rotation_ccw_deg = parent_rot
+            used_parent = True
+        if q_transpose is None and parent_tr is not None:
+            q_transpose = parent_tr
+            used_parent = True
+
+        if used_parent:
+            import warnings
+
+            warnings.warn(
+                "StrainMapAutocorrelation.preprocess: using parent Dataset4dstem metadata "
+                f"(q_to_r_rotation_ccw_deg={q_to_r_rotation_ccw_deg or 0.0}, "
+                f"q_transpose={q_transpose or False}).",
+                UserWarning,
+            )
+
+        if q_to_r_rotation_ccw_deg is None or q_transpose is None:
+            import warnings
+
+            q_to_r_rotation_ccw_deg = 0.0 if q_to_r_rotation_ccw_deg is None else q_to_r_rotation_ccw_deg
+            q_transpose = False if q_transpose is None else q_transpose
+            warnings.warn(
+                "StrainMapAutocorrelation.preprocess: setting q_to_r_rotation_ccw_deg=0.0 and q_transpose=False.",
+                UserWarning,
+            )
+
+        self.metadata["q_to_r_rotation_ccw_deg"] = q_to_r_rotation_ccw_deg
+        self.metadata["q_transpose"] = q_transpose
 
         return StrainMap(
             u_array=self.u_array,
@@ -967,6 +1096,8 @@ class BraggVectors(AutoSerialize):
             mask=mask,
             ds_sampling=ds_sampling,
             ds_units=ds_units,
+            q_to_r_rotation_ccw_deg = q_to_r_rotation_ccw_deg,
+            q_transpose = q_transpose,
         )
 
     # ---- visualization ----
@@ -1117,6 +1248,7 @@ class BraggVectors(AutoSerialize):
         subpixel: str = "upsample",
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
+        background_sigma: float | str | None = None,
         image: np.ndarray | None = None,
         peak_radius: float = 6.0,
         marker_radius: float | None = None,
@@ -1188,6 +1320,7 @@ class BraggVectors(AutoSerialize):
             subpixel=subpixel,
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
+            background_sigma=background_sigma,
             progressbar=False,
         )
         if image is None:
@@ -1245,6 +1378,31 @@ class BraggVectors(AutoSerialize):
             return fig, ax
 
     # ---- helpers ----
+
+    def _resolve_background_sigma(
+        self, background_sigma: float | str | None
+    ) -> float | None:
+        """Resolve the ``background_sigma`` argument to a value in pixels.
+
+        ``"auto"`` (the default everywhere) maps to twice the central-beam
+        radius: wide enough that the disk-scale correlation peaks pass
+        untouched, narrow enough to remove the zero-sum template's negative
+        moat around a bright unscattered beam -- which otherwise pushes weak
+        disk peaks below zero, where the correlation clamp erases them before
+        peak finding. Pass ``None`` to disable the background subtraction or a
+        float to set the scale explicitly.
+        """
+        if background_sigma is None:
+            return None
+        if isinstance(background_sigma, str):
+            if background_sigma != "auto":
+                raise ValueError("background_sigma must be a float, None, or 'auto'.")
+            radius = self.metadata.get("template", {}).get("radius")
+            if radius is None:
+                dp_mean = np.asarray(self.dataset.dp_mean.array)
+                _, radius = estimate_central_beam(dp_mean)
+            return 2.0 * float(radius)
+        return float(background_sigma)
 
     def _set_template(
         self,
