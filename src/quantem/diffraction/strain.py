@@ -909,13 +909,10 @@ def _strain_tensor(
                 # reciprocal-space vectors contract under tension: U_ref @ U^-1 == F.T
                 strain_trans[r, c, :, :] = Uref @ np.linalg.inv(U)
 
-    # const = -1 is the reciprocal-space (nanobeam) shear/rotation convention. Both
-    # modalities reduce strain_trans to F.T above, so the convention is shared.
-    const = 1 if real_space else -1
     e_rr = strain_trans[:, :, 0, 0] - 1
     e_cc = strain_trans[:, :, 1, 1] - 1
-    e_rc = strain_trans[:, :, 1, 0] * 0.5 * const + strain_trans[:, :, 0, 1] * 0.5 * const
-    phi = strain_trans[:, :, 1, 0] * -0.5 * const + strain_trans[:, :, 0, 1] * 0.5 * const
+    e_rc = strain_trans[:, :, 1, 0] * 0.5 + strain_trans[:, :, 0, 1] * 0.5
+    phi = strain_trans[:, :, 1, 0] * -0.5 + strain_trans[:, :, 0, 1] * 0.5
     return e_rr, e_cc, e_rc, phi
 
 
