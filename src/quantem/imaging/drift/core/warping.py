@@ -390,6 +390,130 @@ def warp_and_translate(
     return (warped_t, weights_t) if return_weights else warped_t
 
 
+def align_translation(
+    self,
+    *,
+    max_image_shift: float | None | str = "auto",
+    fixed_scans: list[int] | None = None,
+    show_combined: bool = True,
+    show_scans: bool = False,
+    show_knots: bool = True,
+    show_knot_plot: bool = False,
+    show_report: bool = False,
+    verbose: bool = True,
+):
+    """Align scans by a global translation without estimating drift.
+
+    Use this manual stage when the acquisitions differ by a rigid offset but
+    the scan geometry should remain unchanged. Translation is registration,
+    so it intentionally keeps the ``align_`` verb; affine, strip, and
+    non-rigid deformation stages use the ``correct_`` verb.
+
+    Parameters
+    ----------
+    max_image_shift : float, None, or "auto", default "auto"
+        Maximum allowed translation in pixels. ``"auto"`` derives a bound
+        from the scan dimensions. ``None`` allows any translation.
+    fixed_scans : list of int or None, default None
+        Scan indices that remain fixed. Reference-based corrections keep scan
+        0 fixed automatically.
+    show_combined : bool, default True
+        Display the combined registration view after alignment.
+    show_scans : bool, default False
+        Display the individually aligned scans.
+    show_knots : bool, default True
+        Show scan-line origins on requested views.
+    show_knot_plot : bool, default False
+        Show the standalone scan-line-origin displacement plot.
+    show_report : bool, default False
+        Print common-coverage registration measurements.
+    verbose : bool, default True
+        Print the recovered ``(row, col)`` translation for each scan.
+
+    Returns
+    -------
+    DriftCorrection
+        The same correction object for method chaining.
+
+    Examples
+    --------
+    >>> drift = DriftCorrection.from_emd(scan_0_path, scan_1_path)
+    >>> drift.align_translation(max_image_shift=32)
+    """
+    if not hasattr(self, "_initial_knots"):
+        self.preprocess(
+            verbose=False,
+            show_combined=False,
+            show_scans=False,
+            show_knots=False,
+        )
+    if self.shape[0] < 2:
+        raise ValueError(
+            "align_translation requires at least 2 images; "
+            f"got {self.shape[0]}."
+        )
+    if fixed_scans is None and self._reference_mode:
+        fixed_scans = [0]
+    fixed_set = frozenset(fixed_scans) if fixed_scans is not None else frozenset()
+    if max_image_shift == "auto":
+        reference_alignment = bool(fixed_set)
+        max_image_shift = max(
+            16.0,
+            min(self.imgs[0].shape[:2])
+            * (0.0625 if reference_alignment else 0.25),
+        )
+    elif isinstance(max_image_shift, str):
+        raise ValueError(
+            "max_image_shift must be 'auto', None, or a non-negative "
+            f"number; got {max_image_shift!r}."
+        )
+    elif max_image_shift is not None:
+        max_image_shift = float(max_image_shift)
+        if not np.isfinite(max_image_shift) or max_image_shift < 0:
+            raise ValueError(
+                "max_image_shift must be 'auto', None, or a non-negative "
+                f"number; got {max_image_shift!r}."
+            )
+
+    knots_before = [knots.detach().clone() for knots in self.knots]
+    warp_and_translate(
+        self,
+        max_image_shift=max_image_shift,
+        upsample_factor=8,
+        fixed_indices=fixed_set,
+    )
+    translations = np.asarray(
+        [
+            (after - before).mean(dim=(1, 2)).detach().cpu().numpy()
+            for before, after in zip(knots_before, self.knots, strict=True)
+        ],
+        dtype=np.float64,
+    )
+    self._images_warped_stale = False
+    self._warped_fingerprint = knot_fingerprint(self)
+    if verbose:
+        for index, (row_shift, column_shift) in enumerate(translations):
+            print(
+                f"align_translation: scan {index} shifted "
+                f"({row_shift:+.3f}, {column_shift:+.3f}) px (row, col)"
+            )
+
+    import quantem.imaging.drift.plot as drift_plot
+
+    drift_plot.show_after_step(
+        self,
+        "translation",
+        show_combined=show_combined,
+        show_scans=show_scans,
+        show_knots=show_knots,
+    )
+    if show_knot_plot:
+        self.plot_knots()
+    if show_report:
+        print(self.report().to_string())
+    return self
+
+
 def backward_warp(
     images: torch.Tensor,
     drift: tuple[float, float] | torch.Tensor,

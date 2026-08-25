@@ -1,6 +1,7 @@
 """Apply a solved drift field and return corrected scientific data."""
 
 from copy import deepcopy
+from typing import Literal
 
 import numpy as np
 import torch
@@ -141,7 +142,7 @@ def corrected(
     self,
     *,
     upsample_factor: int = 2,
-    output_original_shape: bool | None = None,
+    output_frame: Literal["auto", "input", "canvas"] = "auto",
     strip_padding: bool = False,
     smoothing_sigma: float | None = 0.5,
     stage: str | None = None,
@@ -158,10 +159,12 @@ def corrected(
     ----------
     upsample_factor : int, default 2
         Sampling multiplier for the corrected image.
-    output_original_shape : bool or None, default None
-        ``None`` keeps the natural frame: the padded solver canvas for paired
-        2-D scans and the native input frame for reference datasets. ``True``
-        returns the original image shape; ``False`` keeps the solver canvas.
+    output_frame : {"auto", "input", "canvas"}, default "auto"
+        ``"auto"`` returns the padded solver canvas for paired 2-D scans and
+        the native input frame for a channel-resolved reference dataset.
+        ``"input"`` always returns the original scan shape. ``"canvas"``
+        retains the padded solver canvas used for publication figures and
+        when chaining a solved correction as a structural reference.
     strip_padding : bool, default False
         Remove pixels that do not share measured coverage across scans.
     smoothing_sigma : float or None, default 0.5
@@ -183,17 +186,21 @@ def corrected(
     >>> corrected = drift.corrected()
     >>> scans = drift.corrected(merge=False)
     """
-    automatic_output_frame = output_original_shape is None
-    output_original_shape = (
-        self._reference_mode
-        if automatic_output_frame
-        else bool(output_original_shape)
-    )
+    if output_frame not in {"auto", "input", "canvas"}:
+        raise ValueError(
+            "output_frame must be 'auto', 'input', or 'canvas', "
+            f"got {output_frame!r}"
+        )
+    resolved_output_frame = (
+        "input" if self._reference_mode else "canvas"
+    ) if output_frame == "auto" else output_frame
+    if strip_padding and resolved_output_frame != "input":
+        raise ValueError("strip_padding=True requires output_frame='input'")
 
     if self._reference_mode:
         if (
             upsample_factor != 2
-            or not output_original_shape
+            or resolved_output_frame != "input"
             or strip_padding
             or smoothing_sigma != 0.5
             or not merge
@@ -229,7 +236,6 @@ def corrected(
     if not merge:
         if (
             upsample_factor != 2
-            or (not automatic_output_frame and not output_original_shape)
             or strip_padding
             or smoothing_sigma != 0.5
         ):
@@ -239,6 +245,18 @@ def corrected(
                 "controls apply only to the merged image."
             )
         panels = comparison_panels(self, stage)
+        corrected_scans = panels["corrected_scans"]
+        if resolved_output_frame == "input":
+            scan_shape = tuple(int(value) for value in self.imgs[0].shape[:2])
+            row, column = padding_offset(
+                corrected_scans[0].shape[:2],
+                scan_shape,
+                integer=True,
+            )
+            corrected_scans = [
+                array[row : row + scan_shape[0], column : column + scan_shape[1]]
+                for array in corrected_scans
+            ]
         return [
             Dataset2d.from_array(
                 np.asarray(array),
@@ -247,7 +265,7 @@ def corrected(
                 sampling=self.imgs[0].sampling,
                 units=self.imgs[0].units,
             )
-            for index, array in enumerate(panels["corrected_scans"])
+            for index, array in enumerate(corrected_scans)
         ]
 
     device = self._device
@@ -275,7 +293,7 @@ def corrected(
 
     output_shape = (
         tuple(int(value) for value in self.imgs[0].shape[:2])
-        if output_original_shape
+        if resolved_output_frame == "input"
         else tuple(int(value) for value in self.shape[-2:])
     )
     image_corr_fft = fourier_crop_torch(
@@ -283,7 +301,7 @@ def corrected(
         output_shape,
     ) / upsample_factor**2
     corrected_array = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
-    if strip_padding and output_original_shape:
+    if strip_padding:
         scan_h, scan_w = self.imgs[0].shape[:2]
         pad_h, pad_w = padding_offset(corrected_array.shape[:2], (scan_h, scan_w), integer=True)
         corrected_array = corrected_array[pad_h : pad_h + scan_h, pad_w : pad_w + scan_w]

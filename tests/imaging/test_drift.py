@@ -4,7 +4,7 @@ import inspect
 
 import numpy as np
 import pytest
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, shift
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging import DriftCorrection
@@ -37,10 +37,12 @@ def _orthogonal_pair(size: int = 64) -> tuple[Dataset2d, Dataset2d]:
 def test_primary_api_uses_scientist_facing_names():
     """The final PR exposes one concise chain without legacy solve names."""
     preprocess = inspect.signature(DriftCorrection.preprocess).parameters
+    translation = inspect.signature(DriftCorrection.align_translation).parameters
     affine = inspect.signature(DriftCorrection.correct_affine).parameters
     nonrigid = inspect.signature(DriftCorrection.correct_nonrigid).parameters
 
     assert {"padding_fraction", "smoothing_sigma", "num_knots"} <= set(preprocess)
+    assert {"max_image_shift", "fixed_scans"} <= set(translation)
     assert {"max_drift_rate", "num_rates", "region"} <= set(affine)
     assert {"num_knots", "num_refine_cycles", "knot_smoothing_sigma"} <= set(
         nonrigid
@@ -95,7 +97,7 @@ def test_metadata_driven_affine_workflow_returns_calibrated_dataset():
     )
     corrected = drift.corrected(
         upsample_factor=1,
-        output_original_shape=True,
+        output_frame="input",
         verbose=False,
     )
 
@@ -107,13 +109,68 @@ def test_metadata_driven_affine_workflow_returns_calibrated_dataset():
     assert corrected.units == scan_0.units
     assert len(drift.drift_rate) == 2
 
-    automatic = drift.corrected(verbose=False)
+    automatic = drift.corrected(upsample_factor=1, verbose=False)
     canvas = drift.corrected(
-        output_original_shape=False,
+        upsample_factor=1,
+        output_frame="canvas",
         verbose=False,
     )
     assert automatic.shape == tuple(drift.shape[-2:])
     assert canvas.shape == tuple(drift.shape[-2:])
+
+
+def test_manual_translation_alignment_reduces_global_offset():
+    """Manual translation alignment registers scans without fitting drift."""
+    rng = np.random.default_rng(7)
+    reference = gaussian_filter(
+        rng.normal(size=(64, 64)).astype(np.float32),
+        sigma=1.5,
+    )
+    moving = np.rot90(
+        shift(
+            reference,
+            shift=(3.0, -4.0),
+            order=1,
+            mode="constant",
+            cval=float(np.median(reference)),
+        ),
+        k=1,
+    ).astype(np.float32)
+    drift = DriftCorrection.from_images(
+        reference,
+        moving,
+        scan_direction_degrees=(0.0, 90.0),
+        device="cpu",
+    )
+
+    returned = drift.align_translation(
+        max_image_shift=8,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    initial = drift.corrected(
+        stage="initial",
+        merge=False,
+        output_frame="input",
+        verbose=False,
+    )
+    aligned = drift.corrected(
+        merge=False,
+        output_frame="input",
+        verbose=False,
+    )
+    interior = np.s_[8:-8, 8:-8]
+    initial_error = np.mean(
+        np.abs(initial[0].array[interior] - initial[1].array[interior])
+    )
+    aligned_error = np.mean(
+        np.abs(aligned[0].array[interior] - aligned[1].array[interior])
+    )
+
+    assert returned is drift
+    assert aligned_error < initial_error * 0.6
 
 
 def test_nonrigid_diagnostic_defines_fast_roughness():

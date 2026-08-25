@@ -440,6 +440,7 @@ def _stage_description(stage: str | None) -> str:
         None: "current correction",
         "initial": "raw",
         "raw": "raw",
+        "translation": "after translation alignment",
         "affine": "after affine correction",
         "strip": "after strip correction",
         "nonrigid": "after non-rigid correction",

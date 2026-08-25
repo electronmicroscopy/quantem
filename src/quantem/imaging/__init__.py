@@ -1,10 +1,12 @@
+"""Imaging tools for scientific image analysis."""
+
 from quantem.imaging.drift import (
     CorrectionResult as CorrectionResult,
     DriftCorrection as DriftCorrection,
     StripPass as StripPass,
-)
-from quantem.imaging.drift import (
     pair_spectrum_image_references as pair_spectrum_image_references,
+)
+from quantem.imaging.drift.io import (
     read_emd as read_emd,
     read_emd_eds as read_emd_eds,
     read_emd_metadata as read_emd_metadata,

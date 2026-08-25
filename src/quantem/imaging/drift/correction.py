@@ -5,6 +5,7 @@ This module owns the public workflow class. Numerical stages live in
 and 4D-STEM helpers in ``fourdstem``. Notebooks should import
 ``DriftCorrection`` from ``quantem.imaging`` or ``quantem.imaging.drift`` and
 use ``from_emd`` / ``correct_affine`` / ``plot_combined`` / ``show`` / ``save``.
+Manual rigid registration remains available through ``align_translation``.
 """
 
 from typing import Self
@@ -17,6 +18,7 @@ import quantem.imaging.drift.apply as drift_apply
 import quantem.imaging.drift.core.affine as affine
 import quantem.imaging.drift.core.nonrigid as nonrigid
 import quantem.imaging.drift.core.strip as strip
+import quantem.imaging.drift.core.warping as warping
 import quantem.imaging.drift.diagnostics as diagnostics
 import quantem.imaging.drift.fourdstem as fourdstem
 import quantem.imaging.drift.plot as drift_plot
@@ -34,8 +36,10 @@ class DriftCorrection(AutoSerialize):
     Aligns scans at different scan directions, recovers per-scanline drift,
     and forms a corrected product (HAADF pairs, reference EDS/EELS, 4D-STEM).
 
-    Typical chain: :meth:`from_emd` → :meth:`correct_affine` → :meth:`plot_combined`
-    / :meth:`show` / :meth:`save`. Residual polish: :meth:`correct_strip`,
+    Typical chain: :meth:`from_emd` → :meth:`correct_affine` →
+    :meth:`plot_combined` / :meth:`show` / :meth:`save`. Use
+    :meth:`align_translation` when a manual rigid-registration stage is
+    required. Residual polish: :meth:`correct_strip`,
     :meth:`correct_nonrigid` (use small ``max_image_shift`` on lattices).
     """
 
@@ -353,7 +357,7 @@ class DriftCorrection(AutoSerialize):
                     verbose=False,
                 )
             reference_image = preparation.match_reference_image(
-                reference_dc.corrected().array,
+                reference_dc.corrected(output_frame="canvas").array,
                 tuple(int(value) for value in reference_dc.imgs[0].shape[:2]),
                 tuple(int(value) for value in drifted_shape),
             )
@@ -384,6 +388,7 @@ class DriftCorrection(AutoSerialize):
     probe_positions = fourdstem.probe_positions
 
     preprocess = preparation.preprocess
+    align_translation = warping.align_translation
     correct_affine = affine.correct_affine
 
     correct_strip = strip.correct_strip
