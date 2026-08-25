@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from torch.fft import fftfreq
 
-from quantem.imaging.drift import diagnostics
+from quantem.imaging.drift import diagnostics, preparation
 from quantem.imaging.drift.core.knots import (
     bilinear_kde_batch,
     transform_coordinates_single_knot,
@@ -22,6 +22,7 @@ def align_affine(
     upsample_factor: int = 8,
     max_image_shift: float | None = 32,
     chunk_size: int | None = None,
+    downsample: int | str = 1,
     show_merged: bool = True,
     show_images: bool = False,
     show_knots: bool = True,
@@ -64,6 +65,10 @@ def align_affine(
     chunk_size : int or None
         Number of candidates per pass. If None, all candidates at once.
         Set to a smaller value if you run out of memory.
+    downsample : int or "auto", default 1
+        Exact average-pooling factor used only to find the broad affine
+        candidate. The accepted rate is transferred back to the native grid
+        and refined there; corrected output is never downsampled.
     show_merged : bool
         Display the merged (averaged) image after alignment.
     show_images : bool
@@ -99,6 +104,26 @@ def align_affine(
             f"num_tests must be odd (got {num_tests}). Try {num_tests + 1}."
         )
     fixed_reference = getattr(self, "_reference_mode", False)
+    pyramid_factor = preparation.resolve_downsample(
+        downsample,
+        tuple(self.images[0].shape),
+    )
+    if pyramid_factor > 1:
+        return _align_affine_pyramid(
+            self,
+            factor=pyramid_factor,
+            step=step,
+            num_tests=num_tests,
+            refine=refine,
+            upsample_factor=upsample_factor,
+            max_image_shift=max_image_shift,
+            chunk_size=chunk_size,
+            show_merged=show_merged,
+            show_images=show_images,
+            show_knots=show_knots,
+            verbose=verbose,
+            kwargs=kwargs,
+        )
 
     # Build candidate grid with circular mask (~21% fewer than square)
     grid_axis = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
@@ -188,6 +213,149 @@ def align_affine(
             **kwargs,
         )
 
+    return self
+
+
+def _affine_rate_from_knots(correction, image_index: int) -> np.ndarray:
+    """Measure one canvas drift-rate vector from a solved one-knot trajectory."""
+    delta = (
+        correction.knots[image_index]
+        - correction._initial_knots[image_index]
+    )
+    lines = delta.shape[1]
+    return (
+        delta[:, -1, 0] - delta[:, 0, 0]
+    ) / max(lines - 1, 1)
+
+
+def _apply_affine_rate(correction, rate: np.ndarray) -> None:
+    """Apply one canvas drift rate to every non-reference scan."""
+    fixed_reference = getattr(correction, "_reference_mode", False)
+    for image_index in range(correction.shape[0]):
+        if fixed_reference and image_index == 0:
+            continue
+        lines = correction.knots[image_index].shape[1]
+        offset = np.arange(lines) - (lines - 1) / 2
+        correction.knots[image_index][0] += rate[0] * offset[:, None]
+        correction.knots[image_index][1] += rate[1] * offset[:, None]
+
+
+def _align_affine_pyramid(
+    self,
+    *,
+    factor: int,
+    step: float,
+    num_tests: int,
+    refine: bool,
+    upsample_factor: int,
+    max_image_shift: float | None,
+    chunk_size: int | None,
+    show_merged: bool,
+    show_images: bool,
+    show_knots: bool,
+    verbose: bool,
+    kwargs: dict,
+):
+    """Search a pooled grid, transfer its rate, and verify it natively."""
+    pooled = [
+        preparation.average_downsample_2d(image.array, factor)
+        for image in self.images
+    ]
+    if getattr(self, "_reference_mode", False):
+        pyramid = type(self).from_reference(
+            pooled[0],
+            pooled[1],
+            scan_direction_degrees=float(self.scan_direction_degrees[1]),
+            device=self.device,
+        )
+    else:
+        pyramid = type(self).from_data(
+            pooled,
+            scan_direction_degrees=self.scan_direction_degrees,
+            device=self.device,
+        )
+    pyramid.preprocess(
+        pad_fraction=self.pad_fraction,
+        pad_value="median",
+        kde_sigma=self.kde_sigma,
+        number_knots=1,
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+    ).align_affine(
+        step=step,
+        num_tests=num_tests,
+        refine=refine,
+        upsample_factor=max(2, upsample_factor // 2),
+        max_image_shift=(
+            None
+            if max_image_shift is None
+            else max(2.0, float(max_image_shift) / factor)
+        ),
+        chunk_size=chunk_size,
+        downsample=1,
+        show_merged=False,
+        show_images=False,
+        show_knots=False,
+        verbose=False,
+    )
+    solved_index = 1 if getattr(self, "_reference_mode", False) else 0
+    coarse_rate = _affine_rate_from_knots(pyramid, solved_index)
+    _apply_affine_rate(self, coarse_rate)
+
+    native_rate = coarse_rate.copy()
+    native_evaluations = 0
+    if refine:
+        residual_step = step / max(num_tests - 1, 1)
+        axis = np.asarray((-residual_step, 0.0, residual_step))
+        row, column = np.meshgrid(axis, axis, indexing="ij")
+        candidates = np.column_stack((row.ravel(), column.ravel()))
+        best_index, _ = self._affine_grid_search_batch(
+            candidates,
+            upsample_factor,
+            max_image_shift,
+            chunk_size,
+            fixed_reference=getattr(self, "_reference_mode", False),
+        )
+        residual_rate = candidates[best_index]
+        _apply_affine_rate(self, residual_rate)
+        native_rate += residual_rate
+        native_evaluations = len(candidates)
+
+    warped_t = self._warp_and_translate_torch(
+        max_image_shift,
+        upsample_factor,
+        fixed_reference=getattr(self, "_reference_mode", False),
+    )
+    self.calculate_error(1, _warped_t=warped_t)
+    self.affine_search_info = {
+        "strategy": "average_pooled_pyramid",
+        "downsample_factor": factor,
+        "coarse_rate_px_per_line": coarse_rate.tolist(),
+        "native_rate_px_per_line": native_rate.tolist(),
+        "native_candidate_evaluations": native_evaluations,
+    }
+    diagnostics._record_stage(self, "affine")
+    if verbose:
+        print(
+            "align_affine: average-pooled pyramid "
+            f"{factor}x; native rate=({native_rate[0]:+.6f}, "
+            f"{native_rate[1]:+.6f}) px/line; "
+            f"{native_evaluations} native candidates"
+        )
+    kwargs.pop("title", None)
+    if show_merged:
+        self.plot_merged_images(
+            show_knots=show_knots,
+            title="Merged: affine",
+            **kwargs,
+        )
+    if show_images:
+        self.plot_transformed_images(
+            show_knots=show_knots,
+            title=[f"Image {index}: affine" for index in range(self.shape[0])],
+            **kwargs,
+        )
     return self
 
 

@@ -409,6 +409,15 @@ def generate_corrected(
         sampling=self.images[0].sampling,
         units=self.images[0].units,
     )
+    image_corr.metadata.update(
+        {
+            "downsample": int(getattr(self, "downsample", 1)),
+            "downsample_method": getattr(self, "downsample_method", "none"),
+            "downsample_metadata": copy.deepcopy(
+                getattr(self, "downsample_metadata", {})
+            ),
+        }
+    )
     if show_merged:
         show_2d(image_corr.array, **kwargs)
         plt.show()
@@ -577,6 +586,15 @@ def generate_corrected_image(
         origin=self.images[0].origin,
         sampling=self.images[0].sampling,
         units=self.images[0].units,
+    )
+    image_corr.metadata.update(
+        {
+            "downsample": int(getattr(self, "downsample", 1)),
+            "downsample_method": getattr(self, "downsample_method", "none"),
+            "downsample_metadata": copy.deepcopy(
+                getattr(self, "downsample_metadata", {})
+            ),
+        }
     )
 
     if show_image:

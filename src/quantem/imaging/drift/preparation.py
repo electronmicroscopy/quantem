@@ -1,7 +1,9 @@
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 
+from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.utils.compound_validators import (
     validate_pad_value,
@@ -17,12 +19,151 @@ from quantem.imaging.drift.core.knots import (
 )
 
 
+def validate_downsample(value: int) -> int:
+    """Validate one integer computational downsampling factor."""
+    factor = int(value)
+    if factor < 1 or factor != value:
+        raise ValueError(f"downsample must be a positive integer, got {value!r}.")
+    return factor
+
+
+def average_downsample_2d(array: NDArray, factor: int) -> NDArray:
+    """Average-pool a two-dimensional image by an exact integer factor."""
+    image = np.asarray(array)
+    factor = validate_downsample(factor)
+    if factor == 1:
+        return np.ascontiguousarray(image)
+    if image.ndim != 2:
+        raise ValueError(
+            f"downsample currently supports 2-D images, got ndim={image.ndim}."
+        )
+    rows, columns = image.shape
+    if rows % factor or columns % factor:
+        raise ValueError(
+            f"downsample={factor} requires image dimensions divisible by "
+            f"{factor}, got {image.shape}."
+        )
+    downsampled = image.reshape(
+        rows // factor,
+        factor,
+        columns // factor,
+        factor,
+    ).mean(axis=(1, 3))
+    dtype = image.dtype if np.issubdtype(image.dtype, np.floating) else np.float32
+    return np.ascontiguousarray(downsampled.astype(dtype, copy=False))
+
+
+def automatic_downsample_factor(shape: tuple[int, int]) -> int:
+    """Return the largest exact average-pooling factor, capped at eight."""
+    rows, columns = shape
+    for factor in (8, 4, 2):
+        if rows % factor == 0 and columns % factor == 0:
+            return factor
+    return 1
+
+
+def resolve_downsample(value: int | str, shape: tuple[int, int]) -> int:
+    """Resolve ``"auto"`` or validate one explicit exact divisor."""
+    if value == "auto":
+        return automatic_downsample_factor(shape)
+    if isinstance(value, str):
+        raise ValueError(
+            "downsample must be 'auto' or a positive integer, "
+            f"got {value!r}."
+        )
+    factor = validate_downsample(value)
+    if any(size % factor for size in shape):
+        raise ValueError(
+            f"downsample={factor} requires both image dimensions to be "
+            f"divisible by {factor}, got {shape}."
+        )
+    return factor
+
+
+def _scaled_coordinate_metadata(
+    values,
+    factor: int,
+    *,
+    offset: NDArray | None = None,
+) -> NDArray:
+    """Scale the first two coordinate entries while preserving their length."""
+    scaled = np.asarray(values, dtype=float).copy()
+    if scaled.size < 2:
+        scaled = np.resize(scaled, 2)
+    if offset is None:
+        scaled[:2] *= factor
+    else:
+        scaled[:2] += offset[:2]
+    return scaled
+
+
+def apply_downsample(correction, factor: int) -> None:
+    """Average-downsample alignment images and preserve physical coordinates."""
+    factor = resolve_downsample(factor, tuple(correction.images[0].shape))
+    original_records = []
+    downsampled_images = []
+    for image_index, image in enumerate(correction.images):
+        original_array = np.asarray(image.array)
+        original_sampling = np.asarray(image.sampling, dtype=float).copy()
+        original_origin = np.asarray(image.origin, dtype=float).copy()
+        original_shape = tuple(int(value) for value in original_array.shape)
+        downsampled = average_downsample_2d(original_array, factor)
+        sampling = _scaled_coordinate_metadata(original_sampling, factor)
+        origin_offset = (factor - 1) * original_sampling[:2] / 2.0
+        origin = _scaled_coordinate_metadata(
+            original_origin,
+            factor,
+            offset=origin_offset,
+        )
+        metadata = dict(getattr(image, "metadata", {}))
+        metadata.update(
+            {
+                "downsample": factor,
+                "downsample_method": "average",
+                "downsample_original_shape": list(original_shape),
+                "downsample_original_sampling": original_sampling.tolist(),
+                "downsample_original_origin": original_origin.tolist(),
+                "downsampled_shape": list(downsampled.shape),
+                "sampling_is_downsampled": True,
+            }
+        )
+        downsampled_image = Dataset2d.from_array(
+            downsampled,
+            name=f"{image.name} ({factor}x downsample)",
+            origin=origin,
+            sampling=sampling,
+            units=list(image.units),
+            signal_units=image.signal_units,
+        )
+        downsampled_image.metadata.update(metadata)
+        downsampled_images.append(downsampled_image)
+        original_records.append(
+            {
+                "image_index": image_index,
+                "shape": list(original_shape),
+                "sampling": original_sampling.tolist(),
+                "origin": original_origin.tolist(),
+                "units": list(image.units),
+            }
+        )
+    correction.images = downsampled_images
+    correction.downsample = factor
+    correction.downsample_method = "average"
+    correction.downsample_metadata = {
+        "factor": factor,
+        "method": "average",
+        "original_images": original_records,
+        "downsampled_shape": list(correction.images[0].shape),
+    }
+
+
 def preprocess(
     self,
     pad_fraction: float = 0.25,
     pad_value: float | str | list[float] = "median",
     kde_sigma: float = 0.5,
     number_knots: int = 1,
+    downsample: int | str = 1,
     show_merged: bool = False,
     show_images: bool = False,
     show_knots: bool = True,
@@ -55,6 +196,10 @@ def preprocess(
         Number of Bezier knots per scanline. Use ``1`` (recommended)
         for linear drift correction. Higher values allow per-scanline
         curvature but are slower and rarely needed.
+    downsample : int or "auto", default 1
+        Exact average-pooling factor for the 2-D alignment images. Sampling
+        and pixel-center origin are updated so physical coordinates remain
+        calibrated. This is computational downsampling, not detector binning.
     show_merged : bool
         Display the merged (averaged) warped images after preprocessing.
     show_images : bool
@@ -75,6 +220,38 @@ def preprocess(
     ...     images=[im0, im1], scan_direction_degrees=[0, 90])
     >>> drift.preprocess(pad_fraction=0.25, kde_sigma=0.5, number_knots=1)
     """
+    factor = resolve_downsample(downsample, tuple(self.images[0].shape))
+    if factor > 1:
+        if getattr(self, "_datasets", None) is not None:
+            raise ValueError(
+                "preprocess(downsample>1) is only for 2-D alignment images. "
+                "Keep multidimensional data native and use the affine search "
+                "pyramid instead."
+            )
+        if hasattr(self, "_initial_knots"):
+            raise RuntimeError(
+                "downsample changes the alignment grid. Create a new "
+                "DriftCorrection before choosing a different factor."
+            )
+        apply_downsample(self, factor)
+    else:
+        self.downsample = 1
+        self.downsample_method = "none"
+        self.downsample_metadata = {
+            "factor": 1,
+            "method": "none",
+            "original_images": [
+                {
+                    "image_index": index,
+                    "shape": list(image.shape),
+                    "sampling": np.asarray(image.sampling, dtype=float).tolist(),
+                    "origin": np.asarray(image.origin, dtype=float).tolist(),
+                    "units": list(image.units),
+                }
+                for index, image in enumerate(self.images)
+            ],
+            "downsampled_shape": list(self.images[0].shape),
+        }
     self.pad_fraction = float(pad_fraction)
     self.pad_value = validate_pad_value(pad_value, self.images)
     self.kde_sigma = float(kde_sigma)
