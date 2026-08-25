@@ -1,4 +1,4 @@
-"""Parity tests for drift_utils.py torch functions.
+"""Parity tests for Drift Torch numerical helpers.
 
 Tests the core building blocks against numpy/scipy equivalents.
 The full pipeline is covered by frozen baselines in test_drift.py.
@@ -10,18 +10,22 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 from quantem.core.utils.imaging_utils import bilinear_kde, fourier_cropping
-from quantem.imaging.drift import _bounded_sine_sigmoid_torch, _fourier_crop_torch
-from quantem.imaging.drift import bounded_sine_sigmoid
-from quantem.imaging.drift_utils import (
-    _parabolic_peak_2d,
-    _parabolic_sub_pixel,
+from quantem.imaging.drift import (
+    _bounded_sine_sigmoid_torch,
+    _fourier_crop_torch,
+    bounded_sine_sigmoid,
+)
+from quantem.imaging.drift.core.knots import (
     _symmetric_pad,
     bilinear_kde_batch,
-    cross_corr_batch,
     gaussian_smooth_1d,
     gaussian_smooth_batch,
 )
-
+from quantem.imaging.drift.core.warping import (
+    _parabolic_peak_2d,
+    _parabolic_sub_pixel,
+    cross_corr_batch,
+)
 
 # ---------------------------------------------------------------------------
 # High-level: cross-correlation and warping
