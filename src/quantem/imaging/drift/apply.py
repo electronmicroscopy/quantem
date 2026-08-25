@@ -1,4 +1,6 @@
 
+import warnings
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -9,12 +11,7 @@ from quantem.core.utils.imaging_utils import (
     fourier_cropping,
 )
 from quantem.core.visualization import show_2d
-from quantem.imaging.drift.core.warping import (
-    _bounded_sine_sigmoid_torch,
-    _fourier_crop_torch,
-    bounded_sine_sigmoid,
-)
-from quantem.imaging.drift_utils import (
+from quantem.imaging.drift.core.knots import (
     bilinear_kde_batch,
     transform_coordinates_single_knot,
 )
@@ -397,3 +394,81 @@ def calculate_error(
         self.error_track = error_current[None, :]  # initialize with first row
     else:
         self.error_track = np.vstack((self.error_track, error_current))
+
+
+def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
+    """
+    Piecewise bounded sigmoid: zero, raised sine squared, one.
+
+    Parameters
+    ----------
+    x : array-like, shape (...,)
+        Input values in [0, 1].
+    midpoint : float
+        Center of the sigmoid transition.
+    width : float
+        Width of the sigmoid (range over which it ramps from 0 to 1).
+    Returns
+    -------
+    y : array-like
+        Output in [0, 1], same shape as x.
+    """
+    x = np.asarray(x)
+    # Truncate width if midpoint too close to edge
+    left_max = midpoint - width / 2
+    right_min = midpoint + width / 2
+    if left_max < 0:
+        warnings.warn(
+            f"width={width} is too large for midpoint={midpoint}, "
+            f"clamping width to {2 * midpoint}.",
+            RuntimeWarning,
+        )
+        width = 2 * midpoint
+
+    if right_min > 1:
+        warnings.warn(
+            f"width={width} is too large for midpoint={midpoint}, "
+            f"clamping width to {2 * (1 - midpoint)}.",
+            RuntimeWarning,
+        )
+        width = 2 * (1 - midpoint)
+    # Recalculate edges
+    left = midpoint - width / 2
+    right = midpoint + width / 2
+
+    y = np.zeros_like(x, dtype=float)
+    in_band = (x >= left) & (x <= right)
+    # Map [left, right] to [0, pi/2]
+    t = (x[in_band] - left) / width  # goes from 0 to 1
+    y[in_band] = np.sin(t * np.pi / 2) ** 2
+    y[x > right] = 1.0
+    return y
+
+
+def _bounded_sine_sigmoid_torch(
+    x: torch.Tensor,
+    midpoint: float = 0.5,
+    width: float = 1.0,
+) -> torch.Tensor:
+    width = min(width, 2 * midpoint, 2 * (1 - midpoint))
+    left = midpoint - width / 2
+    right = midpoint + width / 2
+    t = ((x - left) / width).clamp(0.0, 1.0)
+    return torch.where(x > right, torch.ones_like(x), torch.sin(t * (np.pi / 2)) ** 2)
+
+
+def _fourier_crop_torch(
+    fft_array: torch.Tensor,
+    crop_shape: tuple[int, int],
+) -> torch.Tensor:
+    crop_h, crop_w = crop_shape
+    h1 = crop_h // 2
+    h2 = crop_h - h1
+    w1 = crop_w // 2
+    w2 = crop_w - w1
+    result = torch.zeros(crop_shape, dtype=fft_array.dtype, device=fft_array.device)
+    result[:h1, :w1] = fft_array[:h1, :w1]
+    result[:h1, -w2:] = fft_array[:h1, -w2:]
+    result[-h2:, :w1] = fft_array[-h2:, :w1]
+    result[-h2:, -w2:] = fft_array[-h2:, -w2:]
+    return result

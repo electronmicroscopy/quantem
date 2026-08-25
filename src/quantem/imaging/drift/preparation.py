@@ -9,8 +9,8 @@ from quantem.core.utils.compound_validators import (
 from quantem.core.utils.imaging_utils import (
     cross_correlation_shift,
 )
-from quantem.imaging.drift.core.warping import DriftInterpolator
-from quantem.imaging.drift_utils import (
+from quantem.imaging.drift.core.knots import (
+    DriftInterpolator,
     bilinear_kde_batch,
     transform_coordinates_single_knot,
 )

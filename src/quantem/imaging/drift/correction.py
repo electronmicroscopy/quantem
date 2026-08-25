@@ -95,9 +95,9 @@ class DriftCorrection(AutoSerialize):
 
         - **Batched grid search**: all ~97 candidate drift vectors are warped
           and scored in parallel, instead of one-at-a-time in a Python loop.
-        - **Batched bilinear KDE** (``drift_utils.bilinear_kde_batch``):
+        - **Batched bilinear KDE** (``core.knots.bilinear_kde_batch``):
           scatter-based image warping via ``scatter_add_`` with int32 indices.
-        - **Batched FFT cross-correlation** (``drift_utils.cross_corr_batch``):
+        - **Batched FFT cross-correlation** (``core.warping.cross_corr_batch``):
           sub-pixel alignment using DFT upsampling across all candidates at once.
         - **Zero CPU round-trips**: coordinate transforms, Gaussian smoothing,
           translation alignment, and error computation all stay on GPU until

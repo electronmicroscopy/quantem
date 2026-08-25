@@ -5,9 +5,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.optimize import minimize
 from tqdm import tqdm
 
-from quantem.imaging.drift_utils import (
-    gaussian_smooth_1d,
-)
+from quantem.imaging.drift.core.knots import gaussian_smooth_1d
 
 
 def align_nonrigid(

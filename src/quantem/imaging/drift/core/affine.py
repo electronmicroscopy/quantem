@@ -3,10 +3,12 @@ import numpy as np
 import torch
 from torch.fft import fftfreq
 
-from quantem.imaging.drift_utils import (
+from quantem.imaging.drift.core.knots import (
     bilinear_kde_batch,
-    cross_corr_batch,
     transform_coordinates_single_knot,
+)
+from quantem.imaging.drift.core.warping import (
+    cross_corr_batch,
     translate_align,
 )
 
