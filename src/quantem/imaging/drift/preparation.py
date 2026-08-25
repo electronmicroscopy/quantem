@@ -9,6 +9,7 @@ from quantem.core.utils.compound_validators import (
 from quantem.core.utils.imaging_utils import (
     cross_correlation_shift,
 )
+from quantem.imaging.drift import diagnostics
 from quantem.imaging.drift.core.knots import (
     DriftInterpolator,
     bilinear_kde_batch,
@@ -137,6 +138,7 @@ def preprocess(
         warped_t[img_idx] = warped[0]
         self.images_warped.array[img_idx] = warped[0].cpu().numpy()
         self.weights_warped.array[img_idx] = weights[0].cpu().numpy()
+    diagnostics._record_stage(self, "initial")
     self.calculate_error(0, _warped_t=warped_t)
     kwargs.pop("title", None)
     if show_merged:
@@ -191,6 +193,7 @@ def align_translation(
             self.images[ind].array,
             self.knots[ind],
         )
+    diagnostics._record_stage(self, "translation")
     kwargs.pop("title", None)
     if show_merged:
         self.plot_merged_images(show_knots=show_knots, title="Merged: translation", **kwargs)

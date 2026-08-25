@@ -5,6 +5,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.optimize import minimize
 from tqdm import tqdm
 
+from quantem.imaging.drift import diagnostics
 from quantem.imaging.drift.core.knots import gaussian_smooth_1d
 
 
@@ -300,6 +301,8 @@ def align_nonrigid(
                 self.knots[ind] = knots_updated
             warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor=8)
             self.calculate_error(2, _warped_t=warped_t)
+
+    diagnostics._record_stage(self, "nonrigid")
 
     if show_merged:
         self.plot_merged_images(

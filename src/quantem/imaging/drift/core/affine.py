@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch.fft import fftfreq
 
+from quantem.imaging.drift import diagnostics
 from quantem.imaging.drift.core.knots import (
     bilinear_kde_batch,
     transform_coordinates_single_knot,
@@ -155,6 +156,8 @@ def align_affine(
         err = self.error_track
         print(f"Error: {err[0, 1]:.2f} -> {err[-1, 1]:.2f} "
               f"({(err[0, 1] - err[-1, 1]) / err[0, 1] * 100:+.1f}%)")
+
+    diagnostics._record_stage(self, "affine")
 
     # Plots
     kwargs.pop("title", None)
