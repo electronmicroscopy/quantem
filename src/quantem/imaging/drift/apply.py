@@ -19,65 +19,24 @@ from quantem.imaging.drift.core.knots import (
 )
 
 
-@torch.inference_mode()
-def apply_correction(self, spectrum_image: Dataset3d) -> Dataset3d:
-    """Apply one learned spatial field to every spectrum-image channel.
-
-    Parameters
-    ----------
-    spectrum_image : Dataset3d
-        Spectrum image with axes ``(scan_row, scan_col, energy)``.
-
-    Returns
-    -------
-    Dataset3d
-        Corrected spectrum image with unchanged calibration, units, metadata,
-        and spectral-axis ordering.
-
-    Examples
-    --------
-    >>> corrected = drift.apply_correction(spectrum_image)
-    >>> corrected.shape == spectrum_image.shape
-    True
-    """
-    if not getattr(self, "_reference_mode", False):
-        raise RuntimeError(
-            "apply_correction requires DriftCorrection.from_reference(...)."
-        )
-    if not hasattr(self, "_initial_knots"):
-        raise RuntimeError(
-            "No drift field found. Call preprocess() and align_affine() first."
-        )
-    if "affine" not in getattr(self, "_diagnostic_knots", {}):
-        raise RuntimeError(
-            "No fitted reference field found. Call align_affine() before "
-            "applying the correction."
-        )
-    if not isinstance(spectrum_image, Dataset3d):
-        raise TypeError("spectrum_image must be a Dataset3d.")
-    dataset = spectrum_image
-    scan_rows, scan_cols, num_channels = dataset.shape
-    if (scan_rows, scan_cols) != tuple(self.images[1].shape):
+def _raw_frame_displacement(self, image_index: int) -> torch.Tensor:
+    """Return a one-knot trajectory displacement in raw scan coordinates."""
+    index = image_index % len(self.images)
+    if self.knots[index].shape[-1] != 1:
         raise ValueError(
-            "The spectrum-image scan axes must match the fitted alignment image; "
-            f"got {(scan_rows, scan_cols)} and {self.images[1].shape}."
+            "Multidimensional correction currently requires number_knots=1."
         )
-    if self.knots[1].shape[-1] != 1:
-        raise ValueError(
-            "Spectrum-image correction currently requires number_knots=1."
-        )
-
-    device = self._device
+    scan_rows, scan_cols = self.images[index].shape
     delta_canvas_t = torch.as_tensor(
-        self.knots[1] - self._initial_knots[1],
+        self.knots[index] - self._initial_knots[index],
         dtype=torch.float32,
-        device=device,
+        device=self._device,
     )[:, :, 0]
     scan_fast_t = torch.as_tensor(
-        self.scan_fast[1], dtype=torch.float32, device=device
+        self.scan_fast[index], dtype=torch.float32, device=self._device
     )
     scan_slow_t = torch.as_tensor(
-        self.scan_slow[1], dtype=torch.float32, device=device
+        self.scan_slow[index], dtype=torch.float32, device=self._device
     )
     aspect = float(scan_rows - 1) / float(scan_cols - 1) if scan_cols > 1 else 1.0
     determinant = (
@@ -92,11 +51,19 @@ def apply_correction(self, spectrum_image: Dataset3d) -> Dataset3d:
         -scan_slow_t[1] * delta_canvas_t[0]
         + scan_slow_t[0] * delta_canvas_t[1]
     ) / determinant
-    row_t = torch.arange(scan_rows, dtype=torch.float32, device=device)
-    col_t = torch.arange(scan_cols, dtype=torch.float32, device=device)
+    return torch.stack((drift_row_t, drift_col_t))
+
+
+def _scan_warp_grid(self, image_index: int) -> torch.Tensor:
+    """Return one raw-frame sampling grid for a solved scan trajectory."""
+    index = image_index % len(self.images)
+    scan_rows, scan_cols = self.images[index].shape
+    drift_row_t, drift_col_t = _raw_frame_displacement(self, index)
+    row_t = torch.arange(scan_rows, dtype=torch.float32, device=self._device)
+    col_t = torch.arange(scan_cols, dtype=torch.float32, device=self._device)
     sample_row_t = row_t[:, None] - drift_row_t[:, None]
     sample_col_t = col_t[None, :] - drift_col_t[:, None]
-    grid_t = torch.stack(
+    return torch.stack(
         (
             2.0 * sample_col_t.expand(scan_rows, scan_cols) / (scan_cols - 1) - 1.0,
             2.0 * sample_row_t.expand(scan_rows, scan_cols) / (scan_rows - 1) - 1.0,
@@ -104,26 +71,184 @@ def apply_correction(self, spectrum_image: Dataset3d) -> Dataset3d:
         dim=-1,
     )[None]
 
-    corrected_array = np.empty(dataset.shape, dtype=np.float32)
-    chunk_size = min(num_channels, 64)
+
+@torch.inference_mode()
+def _apply_scan_field(
+    self,
+    data: np.ndarray | torch.Tensor,
+    *,
+    image_index: int,
+    chunk_size: int | None,
+    output_dtype: np.dtype | torch.dtype | str | None,
+    mode: str = "bilinear",
+    output: np.ndarray | None = None,
+) -> np.ndarray | torch.Tensor:
+    """Warp only the two leading scan axes of an array."""
+    index = image_index % len(self.images)
+    scan_rows, scan_cols = self.images[index].shape
+    if data.ndim < 2 or tuple(data.shape[:2]) != (scan_rows, scan_cols):
+        raise ValueError(
+            "The leading scan axes must match the fitted alignment image; "
+            f"got {tuple(data.shape[:2])} and {(scan_rows, scan_cols)}."
+        )
+    trailing_shape = tuple(data.shape[2:])
+    num_channels = int(np.prod(trailing_shape, dtype=np.int64)) if trailing_shape else 1
+    source_is_torch = isinstance(data, torch.Tensor)
+    source_dtype = data.dtype
+    if output is not None:
+        if not isinstance(output, np.ndarray) or output.shape != tuple(data.shape):
+            raise ValueError("output must be a NumPy array matching the input shape.")
+        output_flat = output.reshape(scan_rows, scan_cols, num_channels)
+    else:
+        output_flat = None
+    flat = (
+        data.reshape(scan_rows, scan_cols, num_channels)
+        if source_is_torch
+        else torch.from_numpy(
+            np.ascontiguousarray(data).reshape(scan_rows, scan_cols, num_channels)
+        )
+    )
+    grid_t = _scan_warp_grid(self, index)
+    chunk_size = min(num_channels, 64 if chunk_size is None else int(chunk_size))
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+    corrected_t = None
+    if output_flat is None:
+        corrected_t = torch.empty(
+            (scan_rows, scan_cols, num_channels),
+            dtype=torch.float32,
+            device=self._device,
+        )
     for start in range(0, num_channels, chunk_size):
         stop = min(start + chunk_size, num_channels)
-        channels_t = torch.as_tensor(
-            np.ascontiguousarray(dataset.array[:, :, start:stop]),
+        channels_t = flat[:, :, start:stop].to(
+            device=self._device,
             dtype=torch.float32,
-            device=device,
         ).permute(2, 0, 1)[None]
-        corrected_t = torch.nn.functional.grid_sample(
+        corrected_block_t = torch.nn.functional.grid_sample(
             channels_t,
             grid_t,
-            mode="bilinear",
+            mode=mode,
             padding_mode="border",
             align_corners=True,
         )[0].permute(1, 2, 0)
-        corrected_array[:, :, start:stop] = corrected_t.cpu().numpy()
+        if output_flat is None:
+            corrected_t[:, :, start:stop] = corrected_block_t
+        else:
+            output_dtype_np = output_flat.dtype
+            if np.issubdtype(output_dtype_np, np.integer):
+                limits = np.iinfo(output_dtype_np)
+                corrected_block_t = corrected_block_t.round().clamp(
+                    limits.min,
+                    limits.max,
+                )
+            output_flat[:, :, start:stop] = corrected_block_t.cpu().numpy().astype(
+                output_dtype_np,
+                copy=False,
+            )
+    if output_flat is not None:
+        return output
+    assert corrected_t is not None
+    corrected_t = corrected_t.reshape((scan_rows, scan_cols, *trailing_shape))
+    preserve_dtype = output_dtype == "same"
+    requested_dtype = source_dtype if preserve_dtype else output_dtype
+    if requested_dtype is not None:
+        if source_is_torch or isinstance(requested_dtype, torch.dtype):
+            torch_dtype = source_dtype if preserve_dtype else requested_dtype
+            if not isinstance(torch_dtype, torch.dtype):
+                torch_dtype = torch.from_numpy(
+                    np.empty((), dtype=np.dtype(torch_dtype))
+                ).dtype
+            if not torch_dtype.is_floating_point:
+                limits = torch.iinfo(torch_dtype)
+                corrected_t = corrected_t.round().clamp(limits.min, limits.max)
+            corrected_t = corrected_t.to(torch_dtype)
+        else:
+            numpy_dtype = np.dtype(source_dtype if preserve_dtype else requested_dtype)
+            if np.issubdtype(numpy_dtype, np.integer):
+                limits = np.iinfo(numpy_dtype)
+                corrected_t = corrected_t.round().clamp(limits.min, limits.max)
+            return corrected_t.cpu().numpy().astype(numpy_dtype, copy=False)
+    if source_is_torch:
+        return corrected_t.to(data.device)
+    return corrected_t.cpu().numpy()
 
+
+@torch.inference_mode()
+def apply_correction(
+    self,
+    data: Dataset3d | np.ndarray | torch.Tensor | None = None,
+    image_index: int = -1,
+    *,
+    mode: str = "bilinear",
+    chunk_size: int | None = None,
+    output_dtype: np.dtype | torch.dtype | str | None = None,
+    output_device: str | torch.device | None = None,
+    output: np.ndarray | None = None,
+    verbose: bool = True,
+):
+    """Apply one learned spatial field without mixing trailing data axes.
+
+    Parameters
+    ----------
+    data : Dataset3d, numpy.ndarray, torch.Tensor, or None
+        Data with leading ``(scan_row, scan_col)`` axes. ``None`` uses a raw
+        dataset retained by :meth:`DriftCorrection.from_4dstem`.
+    image_index : int, default -1
+        Fitted scan trajectory to apply.
+    chunk_size : int or None, default None
+        Number of spectral or detector channels corrected per GPU batch.
+    output_dtype : numpy dtype, torch dtype, "same", or None
+        Output dtype. The default returns floating-point interpolation.
+    output_device : str, torch.device, or None
+        Device for a tensor result. NumPy inputs return NumPy by default.
+    output : numpy.ndarray or None
+        Optional preallocated NumPy destination.
+    verbose : bool, default True
+        Reserved for progress reporting in larger workflows.
+
+    Returns
+    -------
+    Dataset3d, numpy.ndarray, or torch.Tensor
+        Corrected data with unchanged shape and trailing-axis order.
+
+    Examples
+    --------
+    >>> corrected = drift.apply_correction(spectrum_image, image_index=1)
+    """
+    if not hasattr(self, "_initial_knots"):
+        raise RuntimeError(
+            "No drift field found. Call preprocess() and align_affine() first."
+        )
+    if "affine" not in getattr(self, "_diagnostic_knots", {}):
+        raise RuntimeError(
+            "No fitted reference field found. Call align_affine() before "
+            "applying the correction."
+        )
+    if mode not in {"bilinear", "bicubic"}:
+        raise ValueError(f"mode must be 'bilinear' or 'bicubic', got {mode!r}.")
+    if data is None:
+        datasets = getattr(self, "_datasets", None)
+        if datasets is None:
+            raise ValueError("No data supplied and no 4D-STEM dataset is retained.")
+        data = datasets[image_index % len(datasets)]
+    dataset = data if isinstance(data, Dataset3d) else None
+    array = dataset.array if dataset is not None else data
+    corrected_array = _apply_scan_field(
+        self,
+        array,
+        image_index=image_index,
+        chunk_size=chunk_size,
+        output_dtype=output_dtype,
+        mode=mode,
+        output=output,
+    )
+    if output is None and output_device is not None:
+        corrected_array = torch.as_tensor(corrected_array).to(output_device)
+    if dataset is None:
+        return corrected_array
     corrected = Dataset3d.from_array(
-        corrected_array,
+        np.asarray(corrected_array),
         name=f"drift-corrected {dataset.name}",
         origin=dataset.origin.copy(),
         sampling=dataset.sampling.copy(),

@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from typing import Self
 
+import numpy as np
 import torch
 from numpy.typing import NDArray
 
@@ -14,8 +15,8 @@ from quantem.core.utils.compound_validators import (
 from quantem.core.utils.validators import ensure_valid_array
 
 from . import apply as drift_apply
+from . import fourdstem, preparation
 from . import plot as drift_plot
-from . import preparation
 from .core import affine, nonrigid
 
 
@@ -124,6 +125,7 @@ class DriftCorrection(AutoSerialize):
         self,
         images: list[Dataset2d],
         scan_direction_degrees: NDArray,
+        device: str | None = None,
         _token: object | None = None,
     ):
         if _token is not self._token:
@@ -135,7 +137,7 @@ class DriftCorrection(AutoSerialize):
         self.scan_direction_degrees = ensure_valid_array(scan_direction_degrees, ndim=1)
         self._reference_mode = False
 
-        device, _ = validate_device(None)
+        device, _ = validate_device(device)
         self._device = device
         self._dtype = torch.float32
 
@@ -157,12 +159,14 @@ class DriftCorrection(AutoSerialize):
         cls,
         images: list[Dataset2d] | list[NDArray] | Dataset3d | NDArray,
         scan_direction_degrees: list[float] | NDArray,
+        device: str | None = None,
     ) -> Self:
         validated_images = validate_list_of_dataset2d(images)
 
         return cls(
             images=validated_images,
             scan_direction_degrees=scan_direction_degrees,
+            device=device,
             _token=cls._token,
         )
 
@@ -173,6 +177,7 @@ class DriftCorrection(AutoSerialize):
         alignment_image: Dataset2d | NDArray,
         *,
         scan_direction_degrees: float | None = None,
+        device: str | None = None,
     ) -> Self:
         """Fit a fixed-reference drift field from two-dimensional images.
 
@@ -240,9 +245,99 @@ class DriftCorrection(AutoSerialize):
         result = cls.from_data(
             images=[reference_image, alignment_image],
             scan_direction_degrees=[scan_direction_degrees, scan_direction_degrees],
+            device=device,
         )
         result._reference_mode = True
         return result
+
+    @classmethod
+    def from_4dstem(
+        cls,
+        *datasets,
+        scan_direction_degrees: Sequence[float] | NDArray | None = None,
+        scan_sampling: float | tuple[float, float] | None = None,
+        scan_units: str | tuple[str, str] = "pixels",
+        device: str | None = None,
+    ) -> Self:
+        """Fit one correction from virtual images of two 4D-STEM scans.
+
+        Only scan axes are transformed when the fitted fields are later
+        applied. Detector coordinates and native detector sampling are never
+        rotated, resampled, or binned by this constructor.
+        """
+        if len(datasets) != 2:
+            raise ValueError(
+                f"from_4dstem requires exactly two datasets, got {len(datasets)}."
+            )
+        raw_datasets = [fourdstem.data_array(dataset) for dataset in datasets]
+        if any(data.ndim != 4 for data in raw_datasets):
+            raise ValueError(
+                "from_4dstem expects scan-axis-leading 4-D inputs; got "
+                f"{[tuple(data.shape) for data in raw_datasets]}."
+            )
+        detector_shapes = [tuple(data.shape[2:]) for data in raw_datasets]
+        if detector_shapes[0] != detector_shapes[1]:
+            raise ValueError(
+                "4D-STEM inputs must share one detector shape; got "
+                f"{detector_shapes}."
+            )
+        if scan_direction_degrees is None:
+            angles = [
+                getattr(dataset, "metadata", {}).get("scan_rotation_deg")
+                for dataset in datasets
+            ]
+            if any(angle is None for angle in angles):
+                raise TypeError(
+                    "scan_direction_degrees is required when 4D-STEM inputs "
+                    "do not carry scan_rotation_deg metadata."
+                )
+            scan_direction_degrees = angles
+        virtual_images = []
+        for index, (dataset, raw_dataset) in enumerate(
+            zip(datasets, raw_datasets, strict=True)
+        ):
+            image = Dataset2d.from_array(
+                fourdstem.integrate_virtual_detector(raw_dataset),
+                name=f"4D-STEM virtual image {index}",
+            )
+            if scan_sampling is None and hasattr(dataset, "sampling"):
+                image.sampling = np.asarray(dataset.sampling[:2], dtype=float)
+            if isinstance(scan_units, str) and hasattr(dataset, "units"):
+                image.units = list(dataset.units[:2])
+            image.metadata.update(dict(getattr(dataset, "metadata", {})))
+            virtual_images.append(image)
+        if scan_sampling is not None:
+            sampling = (
+                (float(scan_sampling), float(scan_sampling))
+                if np.isscalar(scan_sampling)
+                else tuple(float(value) for value in scan_sampling)
+            )
+            units = (
+                (scan_units, scan_units)
+                if isinstance(scan_units, str)
+                else tuple(scan_units)
+            )
+            for image in virtual_images:
+                image.sampling = sampling
+                image.units = units
+        result = cls.from_data(
+            virtual_images,
+            scan_direction_degrees=scan_direction_degrees,
+            device=device,
+        )
+        result._datasets = raw_datasets
+        result._datasets_consumed = False
+        return result
+
+    @property
+    def imgs(self):
+        """Compatibility alias for the scan images used by the solver."""
+        return self.images
+
+    @property
+    def device(self) -> str:
+        """Compute device selected for drift fitting and data propagation."""
+        return str(self._device)
 
     preprocess = preparation.preprocess
     align_translation = preparation.align_translation
@@ -259,6 +354,24 @@ class DriftCorrection(AutoSerialize):
     generate_corrected = drift_apply.generate_corrected
     generate_corrected_image = drift_apply.generate_corrected_image
     apply_correction = drift_apply.apply_correction
+    drift_field = fourdstem.drift_field
+    probe_positions = fourdstem.probe_positions
+    corrected_virtual_images = fourdstem.corrected_virtual_images
+    regional_diffraction_patterns = fourdstem.regional_diffraction_patterns
+    corrected_4dstem = fourdstem.corrected_4dstem
+    integrate_virtual_detector = staticmethod(fourdstem.integrate_virtual_detector)
+
+    def save(self, path, mode="w", store="auto", skip=(), compression_level=4):
+        """Serialize fitted state without embedding raw multidimensional data."""
+        if isinstance(skip, (str, type)):
+            skip = [skip]
+        super().save(
+            path,
+            mode=mode,
+            store=store,
+            skip=[*skip, "_datasets"],
+            compression_level=compression_level,
+        )
     calculate_error = drift_apply.calculate_error
     plot_transformed_images = drift_plot.plot_transformed_images
     plot_convergence = drift_plot.plot_convergence

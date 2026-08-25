@@ -1,4 +1,7 @@
-from quantem.imaging.drift import DriftCorrection as DriftCorrection
+from quantem.imaging.drift import (
+    CorrectionResult as CorrectionResult,
+    DriftCorrection as DriftCorrection,
+)
 from quantem.imaging.drift import (
     pair_spectrum_image_references as pair_spectrum_image_references,
     read_emd as read_emd,
