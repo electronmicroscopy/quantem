@@ -102,6 +102,7 @@ def preprocess(
                      + u_fast[None, :] * self.scan_fast[img_idx, 1]
                      + v_slow[:, None] * self.scan_slow[img_idx, 1])
         self.knots.append(np.stack([row_knots, col_knots], axis=0))
+    self._initial_knots = [knots.copy() for knots in self.knots]
     self.interpolator = [
         DriftInterpolator(
             input_shape=self.images[i].shape,

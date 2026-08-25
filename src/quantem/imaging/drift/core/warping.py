@@ -93,6 +93,7 @@ def translate_align(
     warped_images: torch.Tensor,
     upsample_factor: int,
     max_image_shift: float | None,
+    anchor_first: bool = False,
 ) -> torch.Tensor:
     """Pairwise translation alignment of warped images via cross-correlation.
 
@@ -113,6 +114,9 @@ def translate_align(
         Sub-pixel precision (1/N pixel) for DFT refinement.
     max_image_shift : float or None
         Maximum allowed shift in pixels. Peaks beyond this radius are masked.
+    anchor_first : bool, default False
+        Keep image 0 fixed and apply the full relative translation to later
+        images. Used when a reference image defines the output coordinates.
 
     Returns
     -------
@@ -162,8 +166,9 @@ def translate_align(
             )
         )
         ref_fft = ref_fft * img_idx / (img_idx + 1) + mov_fft * phase / (img_idx + 1)
-    # Remove mean so shifts are relative (no absolute reference frame)
-    image_shifts -= image_shifts.mean(dim=0)
+    if not anchor_first:
+        # Mutual correction has no absolute reference frame.
+        image_shifts -= image_shifts.mean(dim=0)
     return image_shifts
 
 

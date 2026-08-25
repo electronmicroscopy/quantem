@@ -133,6 +133,7 @@ class DriftCorrection(AutoSerialize):
 
         self.images = images
         self.scan_direction_degrees = ensure_valid_array(scan_direction_degrees, ndim=1)
+        self._reference_mode = False
 
         device, _ = validate_device(None)
         self._device = device
@@ -165,6 +166,84 @@ class DriftCorrection(AutoSerialize):
             _token=cls._token,
         )
 
+    @classmethod
+    def from_reference(
+        cls,
+        reference_image: Dataset2d | NDArray | Self,
+        alignment_image: Dataset2d | NDArray,
+        *,
+        scan_direction_degrees: float | None = None,
+    ) -> Self:
+        """Fit a fixed-reference drift field from two-dimensional images.
+
+        The two-dimensional ``reference_image`` defines the output frame.
+        ``alignment_image`` is the HAADF image acquired with a spectrum image.
+        Pass the spectrum image to :meth:`apply_correction` after fitting.
+
+        Parameters
+        ----------
+        reference_image : Dataset2d, numpy.ndarray, or DriftCorrection
+            Fixed two-dimensional reference image. A solved correction is
+            converted to its corrected native-size image automatically.
+        alignment_image : Dataset2d or numpy.ndarray
+            HAADF image acquired with the spectrum image.
+        scan_direction_degrees : float or None, default None
+            Recorded scan rotation. Omit when ``alignment_image`` carries
+            ``metadata["scan_rotation_deg"]``.
+
+        Returns
+        -------
+        DriftCorrection
+            Correction ready for ``preprocess`` and ``align_affine``.
+
+        Examples
+        --------
+        >>> drift = DriftCorrection.from_reference(
+        ...     reference,
+        ...     haadf,
+        ...     scan_direction_degrees=0.0,
+        ... )
+        >>> drift.preprocess(show_merged=False, show_images=False)
+        >>> drift.align_affine(show_merged=False, show_images=False)
+        >>> corrected = drift.apply_correction(spectrum_image)
+        """
+        if isinstance(reference_image, cls):
+            reference_image = reference_image.generate_corrected(
+                upsample_factor=1,
+                strip_padding=True,
+                mask_output=False,
+                show_merged=False,
+            )
+        reference_array = (
+            reference_image.array
+            if isinstance(reference_image, Dataset2d)
+            else ensure_valid_array(reference_image, ndim=2)
+        )
+        alignment_array = (
+            alignment_image.array
+            if isinstance(alignment_image, Dataset2d)
+            else ensure_valid_array(alignment_image, ndim=2)
+        )
+        if reference_array.shape != alignment_array.shape:
+            raise ValueError(
+                "reference_image and alignment_image must have the same "
+                f"shape; got {reference_array.shape} and {alignment_array.shape}."
+            )
+        if scan_direction_degrees is None:
+            metadata = getattr(alignment_image, "metadata", {})
+            scan_direction_degrees = metadata.get("scan_rotation_deg")
+        if scan_direction_degrees is None:
+            raise TypeError(
+                "scan_direction_degrees is required when alignment_image "
+                "does not carry scan_rotation_deg metadata."
+            )
+        result = cls.from_data(
+            images=[reference_image, alignment_image],
+            scan_direction_degrees=[scan_direction_degrees, scan_direction_degrees],
+        )
+        result._reference_mode = True
+        return result
+
     preprocess = preparation.preprocess
     align_translation = preparation.align_translation
     align_affine = affine.align_affine
@@ -179,6 +258,7 @@ class DriftCorrection(AutoSerialize):
     _optimize_knots_scipy = nonrigid._optimize_knots_scipy
     generate_corrected = drift_apply.generate_corrected
     generate_corrected_image = drift_apply.generate_corrected_image
+    apply_correction = drift_apply.apply_correction
     calculate_error = drift_apply.calculate_error
     plot_transformed_images = drift_plot.plot_transformed_images
     plot_convergence = drift_plot.plot_convergence

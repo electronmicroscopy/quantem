@@ -1,4 +1,5 @@
 
+import copy
 import warnings
 
 import matplotlib.pyplot as plt
@@ -7,6 +8,7 @@ import torch
 from scipy.ndimage import distance_transform_edt
 
 from quantem.core.datastructures.dataset2d import Dataset2d
+from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.utils.imaging_utils import (
     fourier_cropping,
 )
@@ -15,6 +17,121 @@ from quantem.imaging.drift.core.knots import (
     bilinear_kde_batch,
     transform_coordinates_single_knot,
 )
+
+
+@torch.inference_mode()
+def apply_correction(self, spectrum_image: Dataset3d) -> Dataset3d:
+    """Apply one learned spatial field to every spectrum-image channel.
+
+    Parameters
+    ----------
+    spectrum_image : Dataset3d
+        Spectrum image with axes ``(scan_row, scan_col, energy)``.
+
+    Returns
+    -------
+    Dataset3d
+        Corrected spectrum image with unchanged calibration, units, metadata,
+        and spectral-axis ordering.
+
+    Examples
+    --------
+    >>> corrected = drift.apply_correction(spectrum_image)
+    >>> corrected.shape == spectrum_image.shape
+    True
+    """
+    if not getattr(self, "_reference_mode", False):
+        raise RuntimeError(
+            "apply_correction requires DriftCorrection.from_reference(...)."
+        )
+    if not hasattr(self, "_initial_knots"):
+        raise RuntimeError(
+            "No drift field found. Call preprocess() and align_affine() first."
+        )
+    if "affine" not in getattr(self, "_diagnostic_knots", {}):
+        raise RuntimeError(
+            "No fitted reference field found. Call align_affine() before "
+            "applying the correction."
+        )
+    if not isinstance(spectrum_image, Dataset3d):
+        raise TypeError("spectrum_image must be a Dataset3d.")
+    dataset = spectrum_image
+    scan_rows, scan_cols, num_channels = dataset.shape
+    if (scan_rows, scan_cols) != tuple(self.images[1].shape):
+        raise ValueError(
+            "The spectrum-image scan axes must match the fitted alignment image; "
+            f"got {(scan_rows, scan_cols)} and {self.images[1].shape}."
+        )
+    if self.knots[1].shape[-1] != 1:
+        raise ValueError(
+            "Spectrum-image correction currently requires number_knots=1."
+        )
+
+    device = self._device
+    delta_canvas_t = torch.as_tensor(
+        self.knots[1] - self._initial_knots[1],
+        dtype=torch.float32,
+        device=device,
+    )[:, :, 0]
+    scan_fast_t = torch.as_tensor(
+        self.scan_fast[1], dtype=torch.float32, device=device
+    )
+    scan_slow_t = torch.as_tensor(
+        self.scan_slow[1], dtype=torch.float32, device=device
+    )
+    aspect = float(scan_rows - 1) / float(scan_cols - 1) if scan_cols > 1 else 1.0
+    determinant = (
+        scan_slow_t[0] * scan_fast_t[1]
+        - scan_fast_t[0] * aspect * scan_slow_t[1]
+    )
+    drift_row_t = (
+        scan_fast_t[1] * delta_canvas_t[0]
+        - scan_fast_t[0] * aspect * delta_canvas_t[1]
+    ) / determinant
+    drift_col_t = (
+        -scan_slow_t[1] * delta_canvas_t[0]
+        + scan_slow_t[0] * delta_canvas_t[1]
+    ) / determinant
+    row_t = torch.arange(scan_rows, dtype=torch.float32, device=device)
+    col_t = torch.arange(scan_cols, dtype=torch.float32, device=device)
+    sample_row_t = row_t[:, None] - drift_row_t[:, None]
+    sample_col_t = col_t[None, :] - drift_col_t[:, None]
+    grid_t = torch.stack(
+        (
+            2.0 * sample_col_t.expand(scan_rows, scan_cols) / (scan_cols - 1) - 1.0,
+            2.0 * sample_row_t.expand(scan_rows, scan_cols) / (scan_rows - 1) - 1.0,
+        ),
+        dim=-1,
+    )[None]
+
+    corrected_array = np.empty(dataset.shape, dtype=np.float32)
+    chunk_size = min(num_channels, 64)
+    for start in range(0, num_channels, chunk_size):
+        stop = min(start + chunk_size, num_channels)
+        channels_t = torch.as_tensor(
+            np.ascontiguousarray(dataset.array[:, :, start:stop]),
+            dtype=torch.float32,
+            device=device,
+        ).permute(2, 0, 1)[None]
+        corrected_t = torch.nn.functional.grid_sample(
+            channels_t,
+            grid_t,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )[0].permute(1, 2, 0)
+        corrected_array[:, :, start:stop] = corrected_t.cpu().numpy()
+
+    corrected = Dataset3d.from_array(
+        corrected_array,
+        name=f"drift-corrected {dataset.name}",
+        origin=dataset.origin.copy(),
+        sampling=dataset.sampling.copy(),
+        units=list(dataset.units),
+        signal_units=dataset.signal_units,
+    )
+    corrected.metadata.update(copy.deepcopy(dataset.metadata))
+    return corrected
 
 
 @torch.inference_mode()

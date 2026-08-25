@@ -98,6 +98,8 @@ def align_affine(
         raise ValueError(
             f"num_tests must be odd (got {num_tests}). Try {num_tests + 1}."
         )
+    fixed_reference = getattr(self, "_reference_mode", False)
+
     # Build candidate grid with circular mask (~21% fewer than square)
     grid_axis = np.arange(-(num_tests - 1) / 2, (num_tests + 1) / 2)
     row_grid, col_grid = np.meshgrid(grid_axis, grid_axis, indexing="ij")
@@ -120,16 +122,28 @@ def align_affine(
 
     def _apply_drift(drift_vec):
         for img_idx in range(self.shape[0]):
+            if fixed_reference and img_idx == 0:
+                continue
             scanline_offset = np.arange(self.knots[img_idx].shape[1]) - (self.knots[img_idx].shape[1] - 1) / 2
             self.knots[img_idx][0] += drift_vec[0] * scanline_offset[:, None]
             self.knots[img_idx][1] += drift_vec[1] * scanline_offset[:, None]
 
     def _search_and_apply(candidates, label):
-        best_idx, costs = self._affine_grid_search_batch(candidates, upsample_factor, max_image_shift, chunk_size)
+        best_idx, costs = self._affine_grid_search_batch(
+            candidates,
+            upsample_factor,
+            max_image_shift,
+            chunk_size,
+            fixed_reference=fixed_reference,
+        )
         _apply_drift(candidates[best_idx])
         if verbose:
             _print_top_candidates(label, candidates, costs)
-        warped_t = self._warp_and_translate_torch(max_image_shift, upsample_factor)
+        warped_t = self._warp_and_translate_torch(
+            max_image_shift,
+            upsample_factor,
+            fixed_reference=fixed_reference,
+        )
         self.calculate_error(1, _warped_t=warped_t)
         return candidates[best_idx]
 
@@ -178,7 +192,14 @@ def align_affine(
 
 
 @torch.inference_mode()
-def _affine_grid_search_batch(self, drift_vectors, upsample_factor, max_image_shift, chunk_size=None):
+def _affine_grid_search_batch(
+    self,
+    drift_vectors,
+    upsample_factor,
+    max_image_shift,
+    chunk_size=None,
+    fixed_reference=False,
+):
     """Evaluate all candidate drift vectors in parallel.
 
     Warps both images for each candidate using ``bilinear_kde_batch``
@@ -245,8 +266,13 @@ def _affine_grid_search_batch(self, drift_vectors, upsample_factor, max_image_sh
         warped_pair = []
         for img_idx in range(2):
             image_t, row_base, col_base, scanline_offset = base_data[img_idx]
-            row_candidates = row_base[None] + drift_chunk[:, 0, None, None] * scanline_offset[None, :, None]
-            col_candidates = col_base[None] + drift_chunk[:, 1, None, None] * scanline_offset[None, :, None]
+            if fixed_reference and img_idx == 0:
+                batch_size = drift_chunk.shape[0]
+                row_candidates = row_base[None].expand(batch_size, -1, -1)
+                col_candidates = col_base[None].expand(batch_size, -1, -1)
+            else:
+                row_candidates = row_base[None] + drift_chunk[:, 0, None, None] * scanline_offset[None, :, None]
+                col_candidates = col_base[None] + drift_chunk[:, 1, None, None] * scanline_offset[None, :, None]
             warped, _ = bilinear_kde_batch(
                 row_candidates, col_candidates, image_t,
                 canvas_shape, self.kde_sigma,
@@ -307,6 +333,7 @@ def _warp_and_translate_torch(
     upsample_factor: int = 8,
     knots_batch: torch.Tensor | None = None,
     solve_translation: bool = True,
+    fixed_reference: bool = False,
 ) -> torch.Tensor:
     """Regenerate warped images and solve translation on GPU.
 
@@ -331,6 +358,8 @@ def _warp_and_translate_torch(
     solve_translation : bool
         If False, skip translation alignment (Phase 2+3). Only warp
         once using current knots and sync to CPU.
+    fixed_reference : bool, default False
+        Keep image 0 fixed while translating later images.
 
     Returns
     -------
@@ -366,7 +395,12 @@ def _warp_and_translate_torch(
         self.weights_warped.array[:] = weights_t.cpu().numpy()
         return warped_t
     # Solve translation shifts and apply to knots
-    shifts_t = translate_align(warped_t, upsample_factor, max_image_shift)
+    shifts_t = translate_align(
+        warped_t,
+        upsample_factor,
+        max_image_shift,
+        anchor_first=fixed_reference,
+    )
     if knots_batch is not None:
         knots_batch[:, 0] += shifts_t[:, 0:1]
         knots_batch[:, 1] += shifts_t[:, 1:2]
