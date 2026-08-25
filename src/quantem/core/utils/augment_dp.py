@@ -7,7 +7,7 @@ from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.utils import array_funcs as af
-from quantem.core.utils.utils import RNGMixin
+from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.validators import validate_tensor
 
 if TYPE_CHECKING:
