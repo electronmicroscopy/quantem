@@ -10,11 +10,7 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 from quantem.core.utils.imaging_utils import bilinear_kde, fourier_cropping
-from quantem.imaging.drift import (
-    _bounded_sine_sigmoid_torch,
-    _fourier_crop_torch,
-    bounded_sine_sigmoid,
-)
+from quantem.imaging.drift.apply import fourier_crop_torch
 from quantem.imaging.drift.core.knots import (
     _symmetric_pad,
     bilinear_kde_batch,
@@ -195,27 +191,8 @@ def test_parabolic_sub_pixel_exact():
 
 
 # ---------------------------------------------------------------------------
-# generate_corrected helpers: torch parity against numpy originals
+# Corrected-output Fourier helper parity against NumPy
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("midpoint,width", [(0.5, 1.0), (0.3, 0.4), (0.7, 0.5)])
-def test_bounded_sine_sigmoid_torch_matches_numpy(midpoint, width):
-    """Torch sigmoid helper must match the numpy original point-for-point.
-
-    bounded_sine_sigmoid is the Fourier low-pass weight ramp used in
-    generate_corrected(). A mismatch would apply different weighting
-    to the merged output than the numpy path.
-    """
-    rng = np.random.default_rng(0)
-    x = rng.random(256).astype(np.float32)
-    expected = bounded_sine_sigmoid(x, midpoint=midpoint, width=width).astype(np.float32)
-    result = _bounded_sine_sigmoid_torch(
-        torch.tensor(x), midpoint=midpoint, width=width
-    ).numpy()
-    np.testing.assert_allclose(result, expected, atol=1e-6,
-        err_msg=f"Sigmoid mismatch at midpoint={midpoint}, width={width}")
-
 
 @pytest.mark.parametrize("input_shape,crop_shape", [
     ((64, 64), (32, 32)),
@@ -232,7 +209,7 @@ def test_fourier_crop_torch_matches_numpy(input_shape, crop_shape):
     rng = np.random.default_rng(1)
     arr = (rng.random(input_shape) + 1j * rng.random(input_shape)).astype(np.complex64)
     expected = fourier_cropping(arr, crop_shape)
-    result = _fourier_crop_torch(
+    result = fourier_crop_torch(
         torch.tensor(arr), crop_shape
     ).numpy()
     np.testing.assert_allclose(result, expected, atol=1e-6,

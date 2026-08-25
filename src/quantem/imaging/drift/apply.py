@@ -1,726 +1,76 @@
+"""Apply a solved drift field and return corrected scientific data."""
 
-import copy
-import warnings
+from copy import deepcopy
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from scipy.ndimage import distance_transform_edt
+import torch.nn.functional as F
+from numpy.typing import NDArray
+from scipy.ndimage import binary_closing as ndi_binary_closing
+from tqdm.auto import tqdm
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset3d import Dataset3d
-from quantem.core.utils.imaging_utils import (
-    fourier_cropping,
+from quantem.imaging.drift.core import knots as drift_knots
+from quantem.imaging.drift.core.warping import (
+    backward_warp,
+    ensure_warped_images,
+    reference_scan_stack,
+    warp_and_translate,
 )
-from quantem.core.visualization import show_2d
-from quantem.imaging.drift.core.knots import (
-    bilinear_kde_batch,
-    transform_coordinates_single_knot,
-)
 
 
-def _raw_frame_displacement(self, image_index: int) -> torch.Tensor:
-    """Return a one-knot trajectory displacement in raw scan coordinates."""
-    index = image_index % len(self.images)
-    if self.knots[index].shape[-1] != 1:
-        raise ValueError(
-            "Multidimensional correction currently requires number_knots=1."
-        )
-    scan_rows, scan_cols = self.images[index].shape
-    delta_canvas_t = torch.as_tensor(
-        self.knots[index] - self._initial_knots[index],
-        dtype=torch.float32,
-        device=self._device,
-    )[:, :, 0]
-    scan_fast_t = torch.as_tensor(
-        self.scan_fast[index], dtype=torch.float32, device=self._device
-    )
-    scan_slow_t = torch.as_tensor(
-        self.scan_slow[index], dtype=torch.float32, device=self._device
-    )
-    aspect = float(scan_rows - 1) / float(scan_cols - 1) if scan_cols > 1 else 1.0
-    determinant = (
-        scan_slow_t[0] * scan_fast_t[1]
-        - scan_fast_t[0] * aspect * scan_slow_t[1]
-    )
-    drift_row_t = (
-        scan_fast_t[1] * delta_canvas_t[0]
-        - scan_fast_t[0] * aspect * delta_canvas_t[1]
-    ) / determinant
-    drift_col_t = (
-        -scan_slow_t[1] * delta_canvas_t[0]
-        + scan_slow_t[0] * delta_canvas_t[1]
-    ) / determinant
-    return torch.stack((drift_row_t, drift_col_t))
+def dataset_info(dataset) -> dict[str, object]:
+    """Copy the calibration and metadata needed for corrected output."""
+    if not hasattr(dataset, "array"):
+        return {}
+    info = {}
+    for name in ("name", "origin", "sampling", "units", "signal_units"):
+        if hasattr(dataset, name):
+            info[name] = deepcopy(getattr(dataset, name))
+    metadata = getattr(dataset, "metadata", None)
+    if isinstance(metadata, dict):
+        info["metadata"] = deepcopy(metadata)
+    return info
 
 
-def _scan_warp_grid(self, image_index: int) -> torch.Tensor:
-    """Return one raw-frame sampling grid for a solved scan trajectory."""
-    index = image_index % len(self.images)
-    scan_rows, scan_cols = self.images[index].shape
-    drift_row_t, drift_col_t = _raw_frame_displacement(self, index)
-    row_t = torch.arange(scan_rows, dtype=torch.float32, device=self._device)
-    col_t = torch.arange(scan_cols, dtype=torch.float32, device=self._device)
-    sample_row_t = row_t[:, None] - drift_row_t[:, None]
-    sample_col_t = col_t[None, :] - drift_col_t[:, None]
-    return torch.stack(
-        (
-            2.0 * sample_col_t.expand(scan_rows, scan_cols) / (scan_cols - 1) - 1.0,
-            2.0 * sample_row_t.expand(scan_rows, scan_cols) / (scan_rows - 1) - 1.0,
-        ),
-        dim=-1,
-    )[None]
+def _corrected_dataset(array: np.ndarray, info: dict[str, object]):
+    """Construct corrected data without discarding source calibration."""
+    dataset_class = Dataset2d if array.ndim == 2 else Dataset3d
+    if array.ndim == 4:
+        from quantem.core.datastructures.dataset4d import Dataset4d
+
+        dataset_class = Dataset4d
+    kwargs = {
+        name: deepcopy(info[name])
+        for name in ("name", "origin", "sampling", "units", "signal_units")
+        if name in info
+    }
+    result = dataset_class.from_array(array, **kwargs)
+    if metadata := info.get("metadata"):
+        result.metadata.update(deepcopy(metadata))
+    return result
 
 
-@torch.inference_mode()
-def _apply_scan_field(
-    self,
-    data: np.ndarray | torch.Tensor,
+def padding_offset(
+    canvas_shape: tuple[int, int],
+    scan_shape: tuple[int, int],
     *,
-    image_index: int,
-    chunk_size: int | None,
-    output_dtype: np.dtype | torch.dtype | str | None,
-    mode: str = "bilinear",
-    output: np.ndarray | None = None,
-) -> np.ndarray | torch.Tensor:
-    """Warp only the two leading scan axes of an array."""
-    index = image_index % len(self.images)
-    scan_rows, scan_cols = self.images[index].shape
-    if data.ndim < 2 or tuple(data.shape[:2]) != (scan_rows, scan_cols):
-        raise ValueError(
-            "The leading scan axes must match the fitted alignment image; "
-            f"got {tuple(data.shape[:2])} and {(scan_rows, scan_cols)}."
-        )
-    trailing_shape = tuple(data.shape[2:])
-    num_channels = int(np.prod(trailing_shape, dtype=np.int64)) if trailing_shape else 1
-    source_is_torch = isinstance(data, torch.Tensor)
-    source_dtype = data.dtype
-    if output is not None:
-        if not isinstance(output, np.ndarray) or output.shape != tuple(data.shape):
-            raise ValueError("output must be a NumPy array matching the input shape.")
-        output_flat = output.reshape(scan_rows, scan_cols, num_channels)
-    else:
-        output_flat = None
-    flat = (
-        data.reshape(scan_rows, scan_cols, num_channels)
-        if source_is_torch
-        else torch.from_numpy(
-            np.ascontiguousarray(data).reshape(scan_rows, scan_cols, num_channels)
-        )
-    )
-    grid_t = _scan_warp_grid(self, index)
-    chunk_size = min(num_channels, 64 if chunk_size is None else int(chunk_size))
-    if chunk_size < 1:
-        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-    corrected_t = None
-    if output_flat is None:
-        corrected_t = torch.empty(
-            (scan_rows, scan_cols, num_channels),
-            dtype=torch.float32,
-            device=self._device,
-        )
-    for start in range(0, num_channels, chunk_size):
-        stop = min(start + chunk_size, num_channels)
-        channels_t = flat[:, :, start:stop].to(
-            device=self._device,
-            dtype=torch.float32,
-        ).permute(2, 0, 1)[None]
-        corrected_block_t = torch.nn.functional.grid_sample(
-            channels_t,
-            grid_t,
-            mode=mode,
-            padding_mode="border",
-            align_corners=True,
-        )[0].permute(1, 2, 0)
-        if output_flat is None:
-            corrected_t[:, :, start:stop] = corrected_block_t
-        else:
-            output_dtype_np = output_flat.dtype
-            if np.issubdtype(output_dtype_np, np.integer):
-                limits = np.iinfo(output_dtype_np)
-                corrected_block_t = corrected_block_t.round().clamp(
-                    limits.min,
-                    limits.max,
-                )
-            output_flat[:, :, start:stop] = corrected_block_t.cpu().numpy().astype(
-                output_dtype_np,
-                copy=False,
-            )
-    if output_flat is not None:
-        return output
-    assert corrected_t is not None
-    corrected_t = corrected_t.reshape((scan_rows, scan_cols, *trailing_shape))
-    preserve_dtype = output_dtype == "same"
-    requested_dtype = source_dtype if preserve_dtype else output_dtype
-    if requested_dtype is not None:
-        if source_is_torch or isinstance(requested_dtype, torch.dtype):
-            torch_dtype = source_dtype if preserve_dtype else requested_dtype
-            if not isinstance(torch_dtype, torch.dtype):
-                torch_dtype = torch.from_numpy(
-                    np.empty((), dtype=np.dtype(torch_dtype))
-                ).dtype
-            if not torch_dtype.is_floating_point:
-                limits = torch.iinfo(torch_dtype)
-                corrected_t = corrected_t.round().clamp(limits.min, limits.max)
-            corrected_t = corrected_t.to(torch_dtype)
-        else:
-            numpy_dtype = np.dtype(source_dtype if preserve_dtype else requested_dtype)
-            if np.issubdtype(numpy_dtype, np.integer):
-                limits = np.iinfo(numpy_dtype)
-                corrected_t = corrected_t.round().clamp(limits.min, limits.max)
-            return corrected_t.cpu().numpy().astype(numpy_dtype, copy=False)
-    if source_is_torch:
-        return corrected_t.to(data.device)
-    return corrected_t.cpu().numpy()
+    integer: bool = False,
+) -> tuple[float, float] | tuple[int, int]:
+    """Return the ``(row, col)`` offset of a scan in its padded canvas."""
+    canvas_h, canvas_w = canvas_shape
+    scan_h, scan_w = scan_shape
+    if integer:
+        return (canvas_h - scan_h) // 2, (canvas_w - scan_w) // 2
+    return (canvas_h - scan_h) / 2.0, (canvas_w - scan_w) / 2.0
 
 
-@torch.inference_mode()
-def apply_correction(
-    self,
-    data: Dataset3d | np.ndarray | torch.Tensor | None = None,
-    image_index: int = -1,
-    *,
-    mode: str = "bilinear",
-    chunk_size: int | None = None,
-    output_dtype: np.dtype | torch.dtype | str | None = None,
-    output_device: str | torch.device | None = None,
-    output: np.ndarray | None = None,
-    verbose: bool = True,
-):
-    """Apply one learned spatial field without mixing trailing data axes.
-
-    Parameters
-    ----------
-    data : Dataset3d, numpy.ndarray, torch.Tensor, or None
-        Data with leading ``(scan_row, scan_col)`` axes. ``None`` uses a raw
-        dataset retained by :meth:`DriftCorrection.from_4dstem`.
-    image_index : int, default -1
-        Fitted scan trajectory to apply.
-    chunk_size : int or None, default None
-        Number of spectral or detector channels corrected per GPU batch.
-    output_dtype : numpy dtype, torch dtype, "same", or None
-        Output dtype. The default returns floating-point interpolation.
-    output_device : str, torch.device, or None
-        Device for a tensor result. NumPy inputs return NumPy by default.
-    output : numpy.ndarray or None
-        Optional preallocated NumPy destination.
-    verbose : bool, default True
-        Reserved for progress reporting in larger workflows.
-
-    Returns
-    -------
-    Dataset3d, numpy.ndarray, or torch.Tensor
-        Corrected data with unchanged shape and trailing-axis order.
-
-    Examples
-    --------
-    >>> corrected = drift.apply_correction(spectrum_image, image_index=1)
-    """
-    if not hasattr(self, "_initial_knots"):
-        raise RuntimeError(
-            "No drift field found. Call preprocess() and align_affine() first."
-        )
-    if "affine" not in getattr(self, "_diagnostic_knots", {}):
-        raise RuntimeError(
-            "No fitted reference field found. Call align_affine() before "
-            "applying the correction."
-        )
-    if mode not in {"bilinear", "bicubic"}:
-        raise ValueError(f"mode must be 'bilinear' or 'bicubic', got {mode!r}.")
-    if data is None:
-        datasets = getattr(self, "_datasets", None)
-        if datasets is None:
-            raise ValueError("No data supplied and no 4D-STEM dataset is retained.")
-        data = datasets[image_index % len(datasets)]
-    dataset = data if isinstance(data, Dataset3d) else None
-    array = dataset.array if dataset is not None else data
-    corrected_array = _apply_scan_field(
-        self,
-        array,
-        image_index=image_index,
-        chunk_size=chunk_size,
-        output_dtype=output_dtype,
-        mode=mode,
-        output=output,
-    )
-    if output is None and output_device is not None:
-        corrected_array = torch.as_tensor(corrected_array).to(output_device)
-    if dataset is None:
-        return corrected_array
-    corrected = Dataset3d.from_array(
-        np.asarray(corrected_array),
-        name=f"drift-corrected {dataset.name}",
-        origin=dataset.origin.copy(),
-        sampling=dataset.sampling.copy(),
-        units=list(dataset.units),
-        signal_units=dataset.signal_units,
-    )
-    corrected.metadata.update(copy.deepcopy(dataset.metadata))
-    return corrected
-
-
-@torch.inference_mode()
-def generate_corrected(
-    self,
-    upsample_factor: int = 2,
-    output_original_shape: bool = True,
-    strip_padding: bool = False,
-    mask_output: bool = True,
-    mask_edge_blend: float = 8.0,
-    fourier_filter: bool = True,
-    filter_midpoint: float = 0.5,
-    kde_sigma: float | None = 0.5,
-    weight_thresh: float = 0.1,
-    show_merged: bool = True,
-    **kwargs,
-):
-    """Generate the final drift-corrected image on GPU using torch.
-
-    Parameters
-    ----------
-    upsample_factor : int, default 2
-        Factor to upsample the output image for enhanced interpolation accuracy.
-    output_original_shape : bool, default True
-        If True, crop the output image back to the original input dimensions.
-    strip_padding : bool, default False
-        If True (and output_original_shape is True), also strip the scan padding
-        to return only the original scan-area pixels.
-    mask_output : bool, default True
-        If True, mask the output using the probe position weights.
-    mask_edge_blend : float, default 8.0
-        Pixels over which the mask edge is blended.
-    fourier_filter : bool, default True
-        Whether to apply Fourier-based directional filtering to merge corrected images.
-    filter_midpoint : float, default 0.5
-        Midpoint for the sigmoid-based Fourier weighting filter.
-    kde_sigma : float or None, default 0.5
-        Standard deviation for kernel density estimation. Uses object's kde_sigma if None.
-    weight_thresh : float, default 0.1
-        Threshold for masking outputs.
-    show_merged : bool, default True
-        Whether to display the final corrected image.
-    **kwargs
-        Additional keyword arguments passed to the plotting function.
-
-    Returns
-    -------
-    image_corr : Dataset2d
-        The final drift-corrected output image.
-    """
-    if not hasattr(self, "knots"):
-        raise RuntimeError(
-            "No knots found. Call .preprocess() before generating the corrected image."
-        )
-
-    device = self._device
-    dtype = self._dtype
-    up_h = round(self.shape[1] * upsample_factor)
-    up_w = round(self.shape[2] * upsample_factor)
-    canvas_shape = (up_h, up_w)
-
-    if kde_sigma is None:
-        kde_sigma = self.kde_sigma
-
-    stack_corr = torch.zeros(self.shape[0], up_h, up_w, dtype=dtype, device=device)
-    weight_corr = torch.zeros_like(stack_corr)
-    for img_idx in range(self.shape[0]):
-        knots_t = torch.as_tensor(self.knots[img_idx], dtype=dtype, device=device)
-        row_t, col_t = transform_coordinates_single_knot(
-            knots_t,
-            self.scan_fast_t[img_idx],
-            self.images[img_idx].shape,
-        )
-        warped, weights = bilinear_kde_batch(
-            row_t[None] * upsample_factor,
-            col_t[None] * upsample_factor,
-            self.images_t[img_idx],
-            canvas_shape,
-            kde_sigma * upsample_factor,
-            self.pad_value[img_idx],
-        )
-        stack_corr[img_idx] = warped[0]
-        weight_corr[img_idx] = weights[0]
-
-    if fourier_filter:
-        freq_row = torch.fft.fftfreq(up_h, dtype=dtype, device=device)[:, None]
-        freq_col = torch.fft.fftfreq(up_w, dtype=dtype, device=device)[None, :]
-        freq_angle = torch.atan2(freq_col, freq_row)
-        stack_fft = torch.fft.fft2(stack_corr)
-        weights = torch.zeros_like(stack_corr)
-        for img_idx in range(self.shape[0]):
-            weights[img_idx] = torch.abs(
-                torch.remainder(
-                    (freq_angle - self.scan_direction[img_idx]) / np.pi + 0.5,
-                    1.0,
-                ) - 0.5
-            ) / 0.5
-            weights[img_idx, 0, 0] = 1.0
-            weights[img_idx] = _bounded_sine_sigmoid_torch(
-                weights[img_idx],
-                midpoint=filter_midpoint,
-            )
-            stack_fft[img_idx] *= weights[img_idx]
-        weights_sum = weights.sum(0)
-        fft_sum = stack_fft.sum(0)
-        image_corr_fft = torch.where(
-            weights_sum > 0.0,
-            fft_sum / weights_sum.clamp(min=1e-8),
-            torch.zeros_like(fft_sum),
-        )
-    else:
-        image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
-
-    if mask_output:
-        weight_np = weight_corr.cpu().numpy()
-        mask_edge = np.prod(weight_np >= (weight_thresh / upsample_factor**2), axis=0)
-        mask_edge[:, 0] = False
-        mask_edge[:, -1] = False
-        mask_edge[0, :] = False
-        mask_edge[-1, :] = False
-        mask_inner = distance_transform_edt(mask_edge) <= mask_edge_blend
-        mask_np = (
-            np.cos(
-                (np.pi / 2)
-                * np.clip(distance_transform_edt(mask_inner) / mask_edge_blend, 0.0, 1.0)
-            )
-            ** 2
-        )
-        mask_t = torch.as_tensor(mask_np, dtype=dtype, device=device)
-        pad_value_mean = float(np.mean(self.pad_value))
-        image_corr_fft = torch.fft.fft2(
-            torch.fft.ifft2(image_corr_fft).real * mask_t + pad_value_mean * (1 - mask_t)
-        )
-
-    if output_original_shape:
-        image_corr_fft = _fourier_crop_torch(image_corr_fft, self.shape[-2:]) / upsample_factor**2
-
-    corr_np = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
-    if strip_padding and output_original_shape:
-        scan_h, scan_w = self.images[0].shape[:2]
-        canvas_h, canvas_w = corr_np.shape[:2]
-        pad_h = (canvas_h - scan_h) // 2
-        pad_w = (canvas_w - scan_w) // 2
-        corr_np = corr_np[pad_h:pad_h + scan_h, pad_w:pad_w + scan_w]
-
-    image_corr = Dataset2d.from_array(
-        corr_np,
-        name="drift corrected image",
-        origin=self.images[0].origin,
-        sampling=self.images[0].sampling,
-        units=self.images[0].units,
-    )
-    image_corr.metadata.update(
-        {
-            "downsample": int(getattr(self, "downsample", 1)),
-            "downsample_method": getattr(self, "downsample_method", "none"),
-            "downsample_metadata": copy.deepcopy(
-                getattr(self, "downsample_metadata", {})
-            ),
-        }
-    )
-    if show_merged:
-        show_2d(image_corr.array, **kwargs)
-        plt.show()
-    return image_corr
-
-
-def generate_corrected_image(
-    self,
-    upsample_factor: int = 2,
-    output_original_shape: bool = True,
-    mask_output: bool = True,
-    mask_edge_blend: float = 8.0,
-    fourier_filter: bool = True,
-    filter_midpoint: float = 0.5,
-    kde_sigma: float = 0.5,
-    weight_thresh=0.1,
-    show_image: bool = True,
-    **kwargs,
-):
-    """
-    Generate the final drift-corrected image after aligning a stack of input images.
-
-    Parameters
-    ----------
-    upsample_factor : int, default 2
-        Factor to upsample the output image for enhanced interpolation accuracy.
-    output_original_shape : bool, default True
-        If True, crop the output image back to the original input dimensions after processing.
-    mask_output : bool, default True
-        If true, mask the output using the probe position weights
-    mask_edge_blend : float, default 8.0
-        Value in pixels to blend from the edge of the mask (where we have data)
-    fourier_filter : bool, default True
-        Whether to apply Fourier-based directional filtering to merge corrected images.
-    filter_midpoint : float, default 0.5
-        Midpoint for the sigmoid-based Fourier weighting filter, determining transition smoothness.
-        Setting this to a low value close to 0 will include more signal but also more slow scan artifacts.
-        If using 2 images at 0 and 90 degrees scan angles, any value >0.75 will be unstable.
-        Only use larger values (close to 1.0) if multiple images covering many scan angles are used.
-    kde_sigma : float, default 0.5
-        Standard deviation for kernel density estimation used during image interpolation. Defaults
-        to the object's stored kde_sigma if set to None.
-    weight_thresh: float, default 0.1
-        This value sets the threshold for masking the outputs.
-        For very large jitter artifacts this value can be lowered.
-    show_image : bool, default True
-        Whether to display the final corrected image after processing.
-    **kwargs : dict
-        Additional keyword arguments passed to the plotting function when displaying the image.
-
-    Returns
-    -------
-    image_corr : Dataset2d
-        The final drift-corrected output image encapsulated in a Dataset2d object.
-
-    Notes
-    -----
-    - The function applies per-frame warping using knot-based interpolation and optionally
-      performs directional Fourier filtering to blend multiple warped images.
-    - The Fourier filter suppresses directional artifacts by weighting image contributions based
-      on their scan angles, utilizing a bounded sine sigmoid for smooth transition.
-    - Upsampling enhances interpolation precision but may increase computational cost.
-    """
-
-    # init
-    stack_corr = np.zeros(
-        (
-            self.shape[0],
-            np.round(self.shape[1] * upsample_factor).astype("int"),
-            np.round(self.shape[2] * upsample_factor).astype("int"),
-        )
-    )
-    weight_corr = np.zeros(
-        (
-            self.shape[0],
-            np.round(self.shape[1] * upsample_factor).astype("int"),
-            np.round(self.shape[2] * upsample_factor).astype("int"),
-        )
-    )
-
-    if kde_sigma is None:
-        kde_sigma = self.kde_sigma
-
-    # Update images
-    for ind in range(self.shape[0]):
-        stack_corr[ind], weight_corr[ind] = self.interpolator[ind].warp_image(
-            self.images[ind].array,
-            self.knots[ind],
-            kde_sigma=kde_sigma,
-            upsample_factor=upsample_factor,
-        )
-
-    if fourier_filter:
-        # Apply fourier filtering
-        kx = np.fft.fftfreq(stack_corr.shape[1])[:, None]
-        ky = np.fft.fftfreq(stack_corr.shape[2])[None, :]
-        kt = np.arctan2(ky, kx)
-
-        stack_fft = np.fft.fft2(stack_corr)
-        weights = np.zeros_like(stack_corr)
-
-        for ind in range(stack_corr.shape[0]):
-            # Calculate weights as a function of angle
-            weights[ind] = np.abs(
-                np.mod((kt - self.scan_direction[ind]) / np.pi + 0.5, 1.0) - 0.5
-            ) / (1 / 2)
-            weights[ind][0, 0] = 1.0
-
-            # Apply sigmoid to weighting function
-            weights[ind] = bounded_sine_sigmoid(
-                weights[ind],
-                midpoint=filter_midpoint,
-            )
-
-            # Weight the fourier transformed images
-            stack_fft[ind] *= weights[ind]
-
-        weights_sum = np.sum(weights, axis=0)
-        image_corr_fft = np.zeros_like(weights_sum, dtype=complex)
-        np.divide(
-            np.sum(stack_fft, axis=0),
-            weights_sum,
-            where=weights_sum > 0.0,
-            out=image_corr_fft,
-        )
-
-    else:
-        image_corr_fft = np.fft.fft2(np.mean(stack_corr, axis=0))
-
-    if mask_output:
-        # Note that we compute 2 boolean masks to round off the corners of image blending
-
-        # calculate mask from product of individual image masks
-        # scale weights by upsample factor to normalize to mean value of 1.0
-        mask_edge = np.prod(weight_corr >= (weight_thresh / upsample_factor**2), axis=0)
-        # Set outermost pixels to False to define the boundary for edge blending
-        mask_edge[:, 0] = False
-        mask_edge[:, -1] = False
-        mask_edge[0, :] = False
-        mask_edge[-1, :] = False
-        # Find inner boundary mask
-        mask_inner = distance_transform_edt(mask_edge) <= mask_edge_blend
-        # compute mask using edge blending value
-        mask = (
-            np.cos(
-                (np.pi / 2)
-                * np.clip(distance_transform_edt(mask_inner) / mask_edge_blend, 0.0, 1.0)
-            )
-            ** 2
-        )
-        # Mean pad value
-        pad_value_mean = np.mean([ind.pad_value for ind in self.interpolator])
-        # apply mask
-        image_corr_fft = np.fft.fft2(
-            np.fft.ifft2(image_corr_fft) * mask + pad_value_mean * (1 - mask)
-        )
-
-    if output_original_shape:
-        image_corr_fft = fourier_cropping(image_corr_fft, self.shape[-2:]) / upsample_factor**2
-
-    # TODO - adjust origin / sampling if output sampling is different from input
-    # i.e. if output_original_shape is False, and upsample_factor > 1
-    image_corr = Dataset2d.from_array(
-        np.real(np.fft.ifft2(image_corr_fft)),
-        name="drift corrected image",
-        origin=self.images[0].origin,
-        sampling=self.images[0].sampling,
-        units=self.images[0].units,
-    )
-    image_corr.metadata.update(
-        {
-            "downsample": int(getattr(self, "downsample", 1)),
-            "downsample_method": getattr(self, "downsample_method", "none"),
-            "downsample_metadata": copy.deepcopy(
-                getattr(self, "downsample_metadata", {})
-            ),
-        }
-    )
-
-    if show_image:
-        fig, ax = show_2d(image_corr.array, **kwargs)
-        # Force a render whether we're drawing into a provided Axes or a fresh Figure
-        ax_to_draw = kwargs.get("ax", ax)
-        try:
-            ax_to_draw.figure.canvas.draw_idle()
-            # If we're not drawing into a caller-provided Axes, also pop the window
-            if "ax" not in kwargs:
-                plt.show()
-        except Exception:
-            # Fallback: if backend is odd, try a blocking show
-            plt.show()
-    return image_corr
-
-
-def calculate_error(
-    self,
-    mode: int,
-    _warped_t: torch.Tensor | None = None,
-):
-    """Compute per-image MAE against the mean and append to error history.
-
-    Measures how well the warped images agree by computing the mean
-    absolute difference of each image from the stack mean. Without
-    error tracking, there is no way to verify that alignment steps
-    are actually improving the result.
-
-    Parameters
-    ----------
-    mode : int
-        Stage identifier (0=preprocess, 1=affine, 2=nonrigid).
-    _warped_t : torch.Tensor or None
-        If provided, compute error from this tensor directly,
-        avoiding a GPU-to-CPU round-trip.
-    """
-    if _warped_t is not None:
-        images_mean = _warped_t.mean(dim=0)
-        sig_diff = torch.mean(
-            torch.abs(_warped_t - images_mean[None]), dim=(1, 2)
-        ).cpu().numpy()
-    else:
-        # Lazy refresh: align_nonrigid defers the warped→numpy sync until
-        # someone reads it, so calculate_error must trigger the refresh.
-        self._ensure_warped_images()
-        images_mean = np.mean(self.images_warped.array, axis=0)
-        sig_diff = np.mean(
-            np.abs(self.images_warped.array - images_mean[None, :, :]), axis=(1, 2)
-        )
-
-    # Error vector
-    error_current = np.hstack((mode, np.mean(sig_diff), sig_diff))
-
-    # Initialize or append to error tracking array
-    if not hasattr(self, "error_track"):
-        self.error_track = error_current[None, :]  # initialize with first row
-    else:
-        self.error_track = np.vstack((self.error_track, error_current))
-
-
-def bounded_sine_sigmoid(x, midpoint=0.5, width=1.0):
-    """
-    Piecewise bounded sigmoid: zero, raised sine squared, one.
-
-    Parameters
-    ----------
-    x : array-like, shape (...,)
-        Input values in [0, 1].
-    midpoint : float
-        Center of the sigmoid transition.
-    width : float
-        Width of the sigmoid (range over which it ramps from 0 to 1).
-    Returns
-    -------
-    y : array-like
-        Output in [0, 1], same shape as x.
-    """
-    x = np.asarray(x)
-    # Truncate width if midpoint too close to edge
-    left_max = midpoint - width / 2
-    right_min = midpoint + width / 2
-    if left_max < 0:
-        warnings.warn(
-            f"width={width} is too large for midpoint={midpoint}, "
-            f"clamping width to {2 * midpoint}.",
-            RuntimeWarning,
-        )
-        width = 2 * midpoint
-
-    if right_min > 1:
-        warnings.warn(
-            f"width={width} is too large for midpoint={midpoint}, "
-            f"clamping width to {2 * (1 - midpoint)}.",
-            RuntimeWarning,
-        )
-        width = 2 * (1 - midpoint)
-    # Recalculate edges
-    left = midpoint - width / 2
-    right = midpoint + width / 2
-
-    y = np.zeros_like(x, dtype=float)
-    in_band = (x >= left) & (x <= right)
-    # Map [left, right] to [0, pi/2]
-    t = (x[in_band] - left) / width  # goes from 0 to 1
-    y[in_band] = np.sin(t * np.pi / 2) ** 2
-    y[x > right] = 1.0
-    return y
-
-
-def _bounded_sine_sigmoid_torch(
-    x: torch.Tensor,
-    midpoint: float = 0.5,
-    width: float = 1.0,
-) -> torch.Tensor:
-    width = min(width, 2 * midpoint, 2 * (1 - midpoint))
-    left = midpoint - width / 2
-    right = midpoint + width / 2
-    t = ((x - left) / width).clamp(0.0, 1.0)
-    return torch.where(x > right, torch.ones_like(x), torch.sin(t * (np.pi / 2)) ** 2)
-
-
-def _fourier_crop_torch(
+def fourier_crop_torch(
     fft_array: torch.Tensor,
     crop_shape: tuple[int, int],
 ) -> torch.Tensor:
+    """Crop a corner-centered FFT tensor to its lowest frequencies."""
     crop_h, crop_w = crop_shape
     h1 = crop_h // 2
     h2 = crop_h - h1
@@ -732,3 +82,845 @@ def _fourier_crop_torch(
     result[-h2:, :w1] = fft_array[-h2:, :w1]
     result[-h2:, -w2:] = fft_array[-h2:, -w2:]
     return result
+
+
+def largest_rectangle(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Return the largest axis-aligned all-true rectangle in ``mask``."""
+    bin_factor = max(1, int(np.ceil(max(mask.shape) / 512)))
+    if bin_factor > 1:
+        height = mask.shape[0] // bin_factor
+        width = mask.shape[1] // bin_factor
+        small = (
+            mask[: height * bin_factor, : width * bin_factor]
+            .reshape(height, bin_factor, width, bin_factor)
+            .all(axis=(1, 3))
+        )
+    else:
+        small = mask
+    heights = np.zeros(small.shape[1], dtype=int)
+    best = (0, 0, 0, 0, 0)
+    for row in range(small.shape[0]):
+        heights = np.where(small[row], heights + 1, 0)
+        stack: list[tuple[int, int]] = []
+        extended = np.append(heights, 0)
+        for col in range(len(extended)):
+            start = col
+            while stack and stack[-1][1] >= extended[col]:
+                stack_start, height = stack.pop()
+                if height * (col - stack_start) > best[0]:
+                    best = (
+                        height * (col - stack_start),
+                        row - height + 1,
+                        row + 1,
+                        stack_start,
+                        col,
+                    )
+                start = stack_start
+            stack.append((start, extended[col]))
+    _, row_0, row_1, col_0, col_1 = best
+    row_0, row_1, col_0, col_1 = (
+        row_0 * bin_factor,
+        row_1 * bin_factor,
+        col_0 * bin_factor,
+        col_1 * bin_factor,
+    )
+    row_1 = min(row_1, mask.shape[0])
+    col_1 = min(col_1, mask.shape[1])
+    while row_0 < row_1 and not mask[row_0, col_0:col_1].all():
+        row_0 += 1
+    while row_1 > row_0 and not mask[row_1 - 1, col_0:col_1].all():
+        row_1 -= 1
+    while col_0 < col_1 and not mask[row_0:row_1, col_0].all():
+        col_0 += 1
+    while col_1 > col_0 and not mask[row_0:row_1, col_1 - 1].all():
+        col_1 -= 1
+    return row_0, row_1, col_0, col_1
+
+
+def corrected(
+    self,
+    *,
+    upsample_factor: int = 2,
+    output_original_shape: bool | None = None,
+    strip_padding: bool = False,
+    smoothing_sigma: float | None = 0.5,
+    stage: str | None = None,
+    merge: bool = True,
+    verbose: bool = True,
+):
+    """Return corrected scientific data in the natural type for the acquisition.
+
+    A single endpoint keeps HAADF, spectrum-image, and 4D-STEM workflows from
+    requiring separate output APIs while preserving each dataset's calibration
+    and axis order.
+
+    Parameters
+    ----------
+    upsample_factor : int, default 2
+        Sampling multiplier for the corrected image.
+    output_original_shape : bool or None, default None
+        ``None`` keeps the natural frame: the padded solver canvas for paired
+        2-D scans and the native input frame for reference datasets. ``True``
+        returns the original image shape; ``False`` keeps the solver canvas.
+    strip_padding : bool, default False
+        Remove pixels that do not share measured coverage across scans.
+    smoothing_sigma : float or None, default 0.5
+        Gaussian smoothing applied during scanline interpolation.
+    stage : {"initial", "affine", "strip", None}, optional
+        Saved correction stage to apply. ``None`` uses the current solution.
+    merge : bool, default True
+        Average corrected image pairs. ``False`` returns each scan separately.
+    verbose : bool, default True
+        Show progress for a multi-channel reference dataset.
+
+    Returns
+    -------
+    Dataset2d, Dataset3d, or list of Dataset2d
+        Corrected data with the source calibration and metadata.
+
+    Examples
+    --------
+    >>> corrected = drift.corrected()
+    >>> scans = drift.corrected(merge=False)
+    """
+    automatic_output_frame = output_original_shape is None
+    output_original_shape = (
+        self._reference_mode
+        if automatic_output_frame
+        else bool(output_original_shape)
+    )
+
+    if self._reference_mode:
+        if (
+            upsample_factor != 2
+            or not output_original_shape
+            or strip_padding
+            or smoothing_sigma != 0.5
+            or not merge
+        ):
+            raise ValueError(
+                "Reference-mode corrected() returns the corrected source dataset "
+                "at its native shape. Use apply_correction() for interpolation "
+                "controls and crop() to remove unsupported borders."
+            )
+        drifted = self._datasets[1]
+        corrected = apply_correction(
+            self,
+            drifted,
+            image_index=1,
+            stage=stage,
+            verbose=verbose,
+        )
+        if isinstance(corrected, torch.Tensor):
+            corrected = corrected.cpu().numpy()
+        corrected = corrected.astype(np.float32, copy=False)
+        return _corrected_dataset(
+            corrected,
+            getattr(self, "_reference_dataset_info", {}),
+        )
+    if getattr(self, "_datasets", None) is not None:
+        raise RuntimeError(
+            "4D-STEM collection correction uses the explicit "
+            "corrected_4dstem() API. Use "
+            "DriftCorrection.from_4dstem(data_0, data_1, ...)"
+            ".preprocess().correct_affine().corrected_4dstem()."
+        )
+
+    if not merge:
+        if (
+            upsample_factor != 2
+            or (not automatic_output_frame and not output_original_shape)
+            or strip_padding
+            or smoothing_sigma != 0.5
+        ):
+            raise ValueError(
+                "corrected(merge=False) returns the individual scans on the "
+                "solver canvas. Resampling, output-shape, smoothing, and crop "
+                "controls apply only to the merged image."
+            )
+        panels = comparison_panels(self, stage)
+        return [
+            Dataset2d.from_array(
+                np.asarray(array),
+                name=f"drift corrected scan {index}",
+                origin=self.imgs[0].origin,
+                sampling=self.imgs[0].sampling,
+                units=self.imgs[0].units,
+            )
+            for index, array in enumerate(panels["corrected_scans"])
+        ]
+
+    device = self._device
+    dtype = self._dtype
+    up_h = round(self.shape[1] * upsample_factor)
+    up_w = round(self.shape[2] * upsample_factor)
+    canvas_up = (up_h, up_w)
+    if smoothing_sigma is None:
+        smoothing_sigma = self.kde_sigma
+
+    stack_corr = torch.zeros(self.shape[0], up_h, up_w, dtype=dtype, device=device)
+    knots = drift_knots.stage_knots(self, stage)
+    for image_index in range(self.shape[0]):
+        warped, _ = drift_knots.interpolator(
+            self, image_index, knots[image_index]
+        ).warp_to_canvas(
+            self.imgs_t[image_index],
+            canvas_up,
+            smoothing_sigma * upsample_factor,
+            self.pad_value[image_index],
+            upsample_factor=upsample_factor,
+        )
+        stack_corr[image_index] = warped
+    image_corr_fft = torch.fft.fft2(stack_corr.mean(0))
+
+    output_shape = (
+        tuple(int(value) for value in self.imgs[0].shape[:2])
+        if output_original_shape
+        else tuple(int(value) for value in self.shape[-2:])
+    )
+    image_corr_fft = fourier_crop_torch(
+        image_corr_fft,
+        output_shape,
+    ) / upsample_factor**2
+    corrected_array = torch.fft.ifft2(image_corr_fft).real.cpu().numpy()
+    if strip_padding and output_original_shape:
+        scan_h, scan_w = self.imgs[0].shape[:2]
+        pad_h, pad_w = padding_offset(corrected_array.shape[:2], (scan_h, scan_w), integer=True)
+        corrected_array = corrected_array[pad_h : pad_h + scan_h, pad_w : pad_w + scan_w]
+
+    image_corr = Dataset2d.from_array(
+        corrected_array,
+        name="drift corrected image",
+        origin=self.imgs[0].origin,
+        sampling=self.imgs[0].sampling,
+        units=self.imgs[0].units,
+    )
+    image_corr.metadata.update(
+        {
+            "downsample": int(getattr(self, "downsample", 1)),
+            "downsample_method": getattr(self, "downsample_method", "none"),
+            "downsample_metadata": getattr(
+                self,
+                "downsample_metadata",
+                {"factor": 1, "method": "none"},
+            ),
+            "downsample_sampling": np.asarray(self.imgs[0].sampling, dtype=float).tolist(),
+            "downsample_units": list(self.imgs[0].units),
+        }
+    )
+    return image_corr
+
+
+def apply_correction_to_dataset(
+    correction,
+    ds_4d: torch.Tensor | np.ndarray | None = None,
+    *,
+    image_index: int = -1,
+    mode: str = "bilinear",
+    chunk_size: int | None = None,
+    output_dtype: torch.dtype | np.dtype | str | None = None,
+    output_device: str | torch.device | None = None,
+    output: np.ndarray | None = None,
+    verbose: bool = False,
+    progress_desc: str = "Applying drift correction",
+    stage: str | None = None,
+) -> torch.Tensor | np.ndarray:
+    """Apply drift correction to a ≥3-D dataset with scan axes leading.
+
+    Internal worker for the 4D-STEM / spectral path of
+    :meth:`DriftCorrection.apply_correction`. It selects single-shot or chunked
+    processing from available device memory and supports preallocated
+    ``output=`` for zero-copy memmap workflows.
+    """
+    # Resolve dataset from stored data when not provided explicitly
+    if ds_4d is None:
+        datasets = correction._datasets
+        if datasets is None:
+            raise ValueError(
+                "No dataset provided and none stored. Pass ds_4d "
+                "explicitly, or build this instance with "
+                "DriftCorrection(ds_a, ds_b, ...)."
+            )
+        if image_index < 0:
+            image_index = len(datasets) + image_index
+        if image_index < 0 or image_index >= len(datasets):
+            raise IndexError(
+                f"image_index={image_index} out of range for "
+                f"{len(datasets)} stored datasets"
+            )
+        ds_4d = datasets[image_index]
+
+    is_numpy = isinstance(ds_4d, np.ndarray)
+    original_shape = ds_4d.shape if is_numpy else tuple(ds_4d.shape)
+    input_np_dtype = ds_4d.dtype if is_numpy else None
+    use_external_output = output is not None
+
+    if use_external_output:
+        if not isinstance(output, np.ndarray):
+            raise TypeError(
+                "output must be a numpy ndarray (or np.memmap), "
+                f"got {type(output).__name__}"
+            )
+        if tuple(output.shape) != tuple(original_shape):
+            raise ValueError(
+                f"output shape {output.shape} does not match "
+                f"ds_4d shape {original_shape}"
+            )
+
+    ndim = len(original_shape)
+    if ndim < 3:
+        raise ValueError(
+            f"ds_4d must be at least 3D, got shape {original_shape}"
+        )
+
+    scan_h, scan_w = original_shape[0], original_shape[1]
+    n_channels = 1
+    for d in range(2, ndim):
+        n_channels *= original_shape[d]
+
+    device = torch.device(correction._device)
+
+    # ── Drift from knots (canvas → raw frame) ──
+    idx = image_index % len(correction.knots)
+    # Validates preprocess+align ran.
+    knots = drift_knots.stage_knots(correction, stage)[idx]
+    knot_h = knots.shape[1]
+    if knot_h != scan_h:
+        raise ValueError(
+            f"Drift grid has {knot_h} rows but ds_4d has "
+            f"{scan_h} scan rows. Ensure reference image and ds_4d "
+            f"have matching scan dimensions (check padding / resize).")
+
+    drift = drift_knots.interpolator(correction, idx, knots).drift_raw(
+        correction._initial_knots[idx]
+    ).to(
+        device=device, dtype=torch.float32
+    )
+    # K=1 → drift is (2, H), broadcast across columns.
+    # K>=2 → drift is (2, H, W), varies along fast axis.
+    if drift.ndim == 2:
+        drift_row = drift[0][:, None]
+        drift_col = drift[1][:, None]
+    else:
+        drift_row = drift[0]
+        drift_col = drift[1]
+    row_coords = torch.arange(scan_h, device=device, dtype=torch.float32)
+    col_coords = torch.arange(scan_w, device=device, dtype=torch.float32)
+    sample_row = row_coords[:, None].expand(scan_h, scan_w) - drift_row
+    sample_col = col_coords[None, :].expand(scan_h, scan_w) - drift_col
+    # ── Pre-compute warp grid ONCE (tiny: 1×H×W×2 f32) ──
+    warp_grid = torch.stack([
+        2.0 * sample_col / (scan_w - 1) - 1.0,
+        2.0 * sample_row / (scan_h - 1) - 1.0,
+    ], dim=-1)[None]                                       # (1, H, W, 2)
+
+    # ── Flatten input to (H, W, C) view ──
+    flat = (
+        torch.from_numpy(ds_4d.reshape(scan_h, scan_w, n_channels))
+        if is_numpy
+        else ds_4d.reshape(scan_h, scan_w, n_channels)
+    )
+
+    # Output dtype for device intermediates.
+    out_dt = torch.float32
+    if output_dtype == "same":
+        if is_numpy and input_np_dtype is not None:
+            out_dt = torch.from_numpy(
+                np.empty(0, dtype=input_np_dtype)
+            ).dtype
+        elif not is_numpy:
+            out_dt = ds_4d.dtype
+    elif isinstance(output_dtype, torch.dtype):
+        out_dt = output_dtype
+
+    # ── Target device ──
+    # Default the output to the input's device so the pipeline stays
+    # in place; explicit ``output_device`` overrides.
+    if use_external_output:
+        target = torch.device("cpu")
+    elif output_device is not None:
+        target = torch.device(output_device)
+        if target.type == "cuda":
+            target = device
+    elif (
+        isinstance(ds_4d, torch.Tensor)
+        and (ds_4d.is_cuda or ds_4d.device.type == "mps")
+    ):
+        target = device
+    else:
+        target = torch.device("cpu")
+    return_numpy = (
+        use_external_output
+        or (is_numpy and output_device is None)
+    )
+
+    # Choose a chunk size from available device memory.
+    if chunk_size is None:
+        bytes_per_ch = scan_h * scan_w * 4
+        if device.type == "cuda":
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(device)
+            except RuntimeError:
+                free_bytes = 0
+        else:
+            free_bytes = 0
+        if target.type == "cuda" and not use_external_output:
+            out_elem = torch.tensor([], dtype=out_dt).element_size()
+            free_bytes = max(
+                0,
+                free_bytes - n_channels * scan_h * scan_w * out_elem,
+            )
+        if device.type == "mps":
+            chunk_size = min(n_channels, 64)
+        elif device.type == "cuda":
+            chunk_size = min(
+                n_channels,
+                max(1, int(free_bytes * 0.7 / (bytes_per_ch * 2))),
+            )
+        else:
+            chunk_size = min(n_channels, 64)
+
+    # ── Allocate output ──
+    if use_external_output:
+        out_flat = output.reshape(scan_h, scan_w, n_channels)
+    else:
+        internal_output = torch.empty(
+            scan_h, scan_w, n_channels, dtype=out_dt, device=target,
+        )
+
+    # ── Numpy dtype for external output conversion ──
+    if use_external_output:
+        _out_np_dtype = output.dtype
+
+    # ── Vectorized grid_sample with pre-computed grid ──
+    chunks = range(0, n_channels, chunk_size)
+    num_chunks = len(chunks)
+    correction_progress = tqdm(
+        total=n_channels,
+        desc=progress_desc,
+        unit="channel",
+        disable=not verbose or num_chunks <= 1,
+    )
+    for start in chunks:
+        end = min(start + chunk_size, n_channels)
+        warped = F.grid_sample(
+            flat[:, :, start:end].permute(2, 0, 1).contiguous()
+            .to(device=device, dtype=torch.float32)[None],
+            warp_grid,
+            mode=mode, align_corners=True, padding_mode="border",
+        )[0].permute(1, 2, 0)
+
+        # Integer casts truncate. Round first or low-count detector pixels
+        # collapse to zero after interpolation.
+        is_int = isinstance(out_dt, torch.dtype) and not out_dt.is_floating_point
+        if is_int:
+            warped_cast = warped.round().clamp_(
+                torch.iinfo(out_dt).min, torch.iinfo(out_dt).max)
+        else:
+            warped_cast = warped
+        if use_external_output:
+            out_flat[:, :, start:end] = (
+                warped_cast.cpu().numpy().astype(_out_np_dtype)
+            )
+        else:
+            internal_output[:, :, start:end] = warped_cast.to(
+                device=target, dtype=out_dt,
+            )
+        correction_progress.update(end - start)
+    correction_progress.close()
+
+    if use_external_output:
+        return output
+
+    result = internal_output.reshape(original_shape)
+    if return_numpy:
+        return result.detach().cpu().numpy()
+    return result
+
+
+def apply_correction(
+    self,
+    data: Dataset2d | Dataset3d | torch.Tensor | np.ndarray | None = None,
+    image_index: int = -1,
+    *,
+    stage: str | None = None,
+    mode: str = "bilinear",
+    chunk_size: int | None = None,
+    output_dtype: torch.dtype | np.dtype | str | None = None,
+    output_device: str | torch.device | None = None,
+    output: np.ndarray | None = None,
+    verbose: bool = True,
+) -> torch.Tensor | np.ndarray:
+    """Apply the learned drift correction to an image or dataset.
+
+    Image collections use the last two axes as scan coordinates. Reference
+    and 4D-STEM datasets use the first two axes, so spectra and diffraction
+    patterns remain attached to their corrected probe positions. Large
+    datasets are processed in chunks and may be written directly into a
+    preallocated array.
+
+    Parameters
+    ----------
+    data : Dataset2d, Dataset3d, ndarray, or torch.Tensor, optional
+        Data to correct. If omitted, use the stored alignment image or
+        4D-STEM dataset.
+    image_index : int, optional
+        Scan trajectory to apply. Default is the last scan.
+    stage : {"initial", "affine", "strip", None}, optional
+        Saved correction stage to apply. ``None`` uses the current solution.
+    mode : str, optional
+        Interpolation kernel, either ``"bilinear"`` or ``"bicubic"``.
+        Default is ``"bilinear"``.
+    chunk_size : int, optional
+        Number of detector or spectral channels corrected together. The
+        default selects a size that fits the available device memory.
+    output_dtype : torch.dtype, numpy dtype, or str, optional
+        Output precision for dataset correction. By default, preserve the
+        input precision.
+    output_device : str or torch.device, optional
+        Device for the returned tensor. NumPy inputs return NumPy arrays by
+        default.
+    output : ndarray, optional
+        Preallocated destination, such as a memory-mapped array.
+    verbose : bool, optional
+        Show progress for multi-chunk datasets. Default is ``True``.
+
+    Returns
+    -------
+    Dataset2d, Dataset3d, torch.Tensor, or ndarray
+        Corrected data with the same shape and axis order as the input.
+        QuantEM datasets retain calibration, units, and metadata.
+
+    Examples
+    --------
+    >>> dc = DriftCorrection(reference, moving, scan_direction_degrees=(0, 90))
+    >>> dc.correct_affine(show_combined=False)
+    >>> corrected = dc.apply_correction(image_index=1)
+
+    """
+    if isinstance(data, (Dataset2d, Dataset3d)):
+        source = data
+        corrected = apply_correction(
+            self,
+            source.array,
+            image_index=image_index,
+            stage=stage,
+            mode=mode,
+            chunk_size=chunk_size,
+            output_dtype=output_dtype,
+            output_device=output_device,
+            output=output,
+            verbose=verbose,
+        )
+        if isinstance(corrected, torch.Tensor):
+            corrected = corrected.detach().cpu().numpy()
+        return _corrected_dataset(
+            np.asarray(corrected),
+            dataset_info(source),
+        )
+
+    if not hasattr(self, "knots") or not hasattr(self, "_initial_knots"):
+        raise RuntimeError(
+            "apply_correction() requires preprocess() and correct_affine() "
+            "first. Run dc.preprocess().correct_affine() (and optionally "
+            ".correct_nonrigid()) before apply_correction()."
+        )
+    valid_modes = {"bilinear", "bicubic"}
+    if mode not in valid_modes:
+        raise ValueError(f"mode must be one of {valid_modes}, got {mode!r}")
+    index = image_index % len(self.knots)
+    drift_knots.knot_delta_canvas(self, index)
+    is_4dstem_mode = getattr(self, "_datasets", None) is not None and not self._reference_mode
+    scan_h = self.imgs[index].shape[0]
+    scan_w = self.imgs[index].shape[1]
+    dataset_layout = data is None and is_4dstem_mode
+    if data is None:
+        if (
+            getattr(self, "_built_from_datasets", False)
+            and getattr(self, "_datasets", None) is None
+        ):
+            raise ValueError(
+                "apply_correction() has no data: this instance was built "
+                "from a 4D-STEM / reference dataset, but save() dropped the "
+                "dataset (too large to serialize) and it was not re-attached "
+                "after load. Pass the dataset explicitly, e.g. "
+                "dc.apply_correction(data=my_4dstem_array), or re-attach it "
+                "before calling apply_correction()."
+            )
+        if self._reference_mode:
+            data = self._datasets[1]
+    if data is not None:
+        ndim = data.ndim
+        shape = tuple(data.shape)
+        dataset_layout = ndim >= 4
+        if ndim == 3:
+            cube_layout = shape[0] == scan_h and shape[1] == scan_w
+            batch_layout = shape[-2] == scan_h and shape[-1] == scan_w and not cube_layout
+            dataset_layout = cube_layout and (not batch_layout or is_4dstem_mode)
+
+    if dataset_layout:
+        return apply_correction_to_dataset(
+            self,
+            data,
+            image_index=image_index,
+            stage=stage,
+            mode=mode,
+            chunk_size=chunk_size,
+            output_dtype=output_dtype,
+            output_device=output_device,
+            output=output,
+            verbose=verbose,
+        )
+
+    if data is None:
+        data_t = self.imgs_t[index]
+    elif isinstance(data, np.ndarray):
+        data_t = torch.tensor(data, dtype=self._dtype, device=self._device)
+    else:
+        data_t = data.to(device=self._device, dtype=self._dtype)
+    image_height = data_t.shape[-2]
+    knots = drift_knots.stage_knots(self, stage)[index]
+    knot_height = knots.shape[1]
+    if image_height != knot_height:
+        raise ValueError(
+            f"Input scan-row axis ({image_height}) does not match knot grid "
+            f"height ({knot_height}). For 4D-STEM mode the leading axis is "
+            "the scan row; for image collection mode the trailing-2 axes "
+            "are scan."
+        )
+    drift = drift_knots.interpolator(self, index, knots).drift_raw(
+        self._initial_knots[index]
+    )
+    return backward_warp(data_t, drift=drift, mode=mode)
+
+
+def crop(self, image: NDArray, *, shape: str = "square") -> NDArray:
+    """Crop an image to the field measured by every corrected scan.
+
+    Parameters
+    ----------
+    image : numpy.ndarray
+        Corrected image or scan-axis-leading dataset.
+    shape : {"square", "rectangle"}, default "square"
+        Keep the largest centered square or the full common rectangle.
+
+    Returns
+    -------
+    numpy.ndarray
+        Cropped data with trailing channel or detector axes unchanged.
+
+    Examples
+    --------
+    >>> cropped = drift.crop(corrected.array, shape="rectangle")
+    """
+    rows, cols = crop_slices(self)
+    if shape == "square":
+        height = rows.stop - rows.start
+        width = cols.stop - cols.start
+        side = min(height, width)
+        row_start = rows.start + (height - side) // 2
+        col_start = cols.start + (width - side) // 2
+        rows = slice(row_start, row_start + side)
+        cols = slice(col_start, col_start + side)
+    elif shape != "rectangle":
+        raise ValueError(f'shape must be "rectangle" or "square", got {shape!r}')
+    # Scan axes are the LEADING two: an EDS cube is (row, col, channel), so
+    # trailing-axis indexing would slice width and channels instead of the
+    # scan field. 4D-STEM mode shares the same (row, col, ...) layout.
+    return np.asarray(image)[rows, cols, ...]
+
+
+def crop_slices(self) -> tuple[slice, slice]:
+    """Return row and column slices for the common measured field of view.
+
+    Use these slices when several related arrays must receive exactly the same
+    crop as the corrected image.
+
+    Returns
+    -------
+    tuple of slice
+        Row and column slices in ``(row, col)`` order.
+
+    Examples
+    --------
+    >>> rows, cols = drift.crop_slices()
+    >>> cropped_spectrum = spectrum[rows, cols, :]
+    """
+    if getattr(self, "_reference_mode", False) and hasattr(self, "_initial_knots"):
+        scan_h, scan_w = np.asarray(self.imgs[0].array).shape[:2]
+        pad = 4
+        field = self.drift_field(1).detach().cpu().numpy()
+        row_drift = field[0].ravel()
+        col_drift = field[1].ravel()
+        top = max(0.0, float(row_drift.max()))
+        bottom = max(0.0, float(-row_drift.min()))
+        left = max(0.0, float(col_drift.max()))
+        right = max(0.0, float(-col_drift.min()))
+        row = slice(
+            int(np.ceil(top)) + pad,
+            scan_h - int(np.ceil(bottom)) - pad,
+        )
+        col = slice(
+            int(np.ceil(left)) + pad,
+            scan_w - int(np.ceil(right)) - pad,
+        )
+        return row, col
+    mask = coverage_mask(self)
+    scan_h, scan_w = mask.shape
+    pad = 4
+    row_0, row_1, col_0, col_1 = largest_rectangle(mask)
+    row = slice(min(row_0 + pad, scan_h), max(row_1 - pad, 0))
+    col = slice(min(col_0 + pad, scan_w), max(col_1 - pad, 0))
+    return row, col
+
+
+def coverage_mask(self) -> np.ndarray:
+    """Identify pixels supported by every corrected scan.
+
+    The mask separates measured overlap from padded canvas pixels, making NCC
+    and other comparisons use the same physical field of view.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean mask in the original scan frame.
+
+    Examples
+    --------
+    >>> common_pixels = drift.coverage_mask()
+    >>> ncc = compare(first[common_pixels], second[common_pixels])
+    """
+    canvas_h, canvas_w = self.imgs_warped.array.shape[-2:]
+    knot_counts = {int(knots.shape[2]) for knots in self.knots}
+    if knot_counts != {1}:
+        knots = torch.stack(
+            [value.detach() for value in self.knots]
+        ).to(device=self._device, dtype=self._dtype)
+        _, weights = warp_and_translate(
+            self,
+            max_image_shift=None,
+            knots_batch=knots,
+            solve_translation=False,
+            return_weights=True,
+        )
+        common = (weights >= 1e-3).all(dim=0).cpu().numpy()
+        scan_h, scan_w = self.imgs[0].shape[:2]
+        offset_row = (canvas_h - scan_h) // 2
+        offset_col = (canvas_w - scan_w) // 2
+        return common[
+            offset_row : offset_row + scan_h,
+            offset_col : offset_col + scan_w,
+        ]
+
+    common = np.ones((canvas_h, canvas_w), dtype=bool)
+    for index in range(len(self.knots)):
+        knots_full = self.knots[index].detach().cpu().numpy()
+        knots = knots_full[:, :, 0]
+        fast = np.asarray(self.scan_fast[index], dtype=float)
+        width = int(self.imgs[index].shape[1])
+        position = np.arange(width, dtype=float)
+        rows = np.round(knots[0][:, None] + fast[0] * position[None, :]).astype(int)
+        cols = np.round(knots[1][:, None] + fast[1] * position[None, :]).astype(int)
+        footprint = np.zeros((canvas_h, canvas_w), dtype=bool)
+        inside = (rows >= 0) & (rows < canvas_h) & (cols >= 0) & (cols < canvas_w)
+        footprint[rows[inside], cols[inside]] = True
+        footprint = ndi_binary_closing(footprint, structure=np.ones((3, 3), dtype=bool))
+        common &= footprint
+    scan_h = int(self.imgs[0].shape[0])
+    scan_w = int(self.imgs[0].shape[1])
+    offset_row = (canvas_h - scan_h) // 2
+    offset_col = (canvas_w - scan_w) // 2
+    return common[
+        offset_row : offset_row + scan_h,
+        offset_col : offset_col + scan_w,
+    ]
+
+
+def warped_stack(correction, stage: str | None = None) -> np.ndarray:
+    """Return aligned scans at one checkpoint without changing the solved object.
+
+    This is the shared data path behind stage-aware figures, reports, and
+    ``corrected(merge=False)``. Historical checkpoints are rendered directly
+    from their saved knots, so asking for an affine result after non-rigid
+    refinement cannot alter the final correction or its cache.
+    """
+    if stage in (None, "nonrigid", "non-rigid"):
+        ensure_warped_images(correction)
+        return np.asarray(correction.imgs_warped.array, dtype=np.float32)
+
+    knots = drift_knots.stage_knots(correction, stage)
+    if not correction._reference_mode:
+        warped = warp_and_translate(
+            correction,
+            max_image_shift=None,
+            upsample_factor=8,
+            knots_batch=torch.stack([k.detach() for k in knots]),
+            solve_translation=False,
+        )
+        return warped.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    stack = np.stack(reference_scan_stack(correction, knots)).astype(
+        np.float32, copy=False
+    )
+    canvas = np.empty((2, *correction.shape[1:]), dtype=np.float32)
+    row = (correction.shape[1] - stack.shape[1]) // 2
+    col = (correction.shape[2] - stack.shape[2]) // 2
+    for index in range(2):
+        canvas[index].fill(float(correction.pad_value[index]))
+        canvas[
+            index,
+            row : row + stack.shape[1],
+            col : col + stack.shape[2],
+        ] = stack[index]
+    return canvas
+
+
+def comparison_panels(correction, stage: str | None = None) -> dict:
+    """Compare raw and corrected scans in the first acquisition's frame."""
+    num_scans = correction.shape[0]
+    angles = np.asarray(correction.scan_direction_degrees, dtype=float)
+    quarter = [int(round(-angle / 90.0)) % 4 for angle in angles]
+    reference = quarter[0]
+    raw = [
+        np.rot90(
+            np.asarray(correction.imgs[index].array),
+            (quarter[index] - reference) % 4,
+        )
+        for index in range(num_scans)
+    ]
+    corrected = np.rot90(
+        warped_stack(correction, stage),
+        (-reference) % 4,
+        axes=(1, 2),
+    )
+    raw_combined = sum(image.astype(np.float32) for image in raw) / num_scans
+    relative_angles = [
+        ((float(angle) - float(angles[0]) + 180.0) % 360.0) - 180.0
+        for angle in angles
+    ]
+    names = ["0deg"] + [
+        f"{int(round(relative_angles[index]))}deg" for index in range(1, num_scans)
+    ]
+    raw_labels = [f"{names[0]} scan"] + [
+        f"{names[index]} scan -> 0deg frame" for index in range(1, num_scans)
+    ]
+    images = raw + [raw_combined] + list(corrected) + [corrected.mean(0)]
+    labels = (
+        raw_labels
+        + ["combined scan"]
+        + [f"corrected {name}" for name in names]
+        + ["corrected combined scan"]
+    )
+    sampling = np.asarray(correction.imgs[0].sampling, dtype=float)
+    unit = correction.imgs[0].units[0] if getattr(correction.imgs[0], "units", None) else "pixels"
+    return {
+        "images": images,
+        "labels": labels,
+        "ncols": num_scans + 1,
+        "raw_scans": raw,
+        "raw_combined": raw_combined,
+        "corrected_scans": list(corrected),
+        "corrected_combined": corrected.mean(0),
+        "pixel_size": float(sampling[0]),
+        "pixel_unit": unit,
+    }

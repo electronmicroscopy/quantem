@@ -1,122 +1,211 @@
-"""Knot interpolation and batched scan-coordinate projection."""
+"""Scanline-knot geometry and forward warping.
 
+:class:`DriftKnot` keeps the single- and multi-knot coordinate models consistent.
+It provides per-pixel canvas coordinates (:meth:`to_canvas`), raw-frame drift
+(:meth:`drift_raw`), in-place affine slope (:meth:`apply_affine_shift`),
+and forward scatter onto the canvas (:meth:`warp_to_canvas`).
+
+The forward-warp kernels live here too because forward scatter is what
+the knot *does* to a source image:
+
+* :func:`bilinear_kde_batch` — batched bilinear forward scatter.
+* :func:`gaussian_smooth_batch` / :func:`gaussian_smooth_1d` — separable
+  Gaussian smoothing reused by KDE normalization and (1-D) by the
+  knot regularizer in :mod:`nonrigid`.
+* :func:`initialize_scanline_knots` — initial knot grid for ``preprocess``.
+* Private :func:`_transform_coordinates_single_knot` /
+  :func:`_transform_coordinates_multi_knot` — the K-specific coordinate
+  formulas the class dispatches between.
+
+Backward warping, cross-correlation, and translation alignment are a
+separate concerns and live in :mod:`warping`.
+"""
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from scipy.interpolate import interp1d
-
-from quantem.core.utils.imaging_utils import bilinear_kde
 
 
-class DriftInterpolator:
-    def __init__(
-        self,
-        input_shape,
-        output_shape,
-        scan_fast,
-        scan_slow,
-        pad_value,
-        kde_sigma,
-    ):
-        self.input_shape = input_shape
-        self.output_shape = output_shape
-        self.scan_fast = scan_fast
-        self.scan_slow = scan_slow
-        self.pad_value = pad_value
-        self.kde_sigma = kde_sigma
+def interpolator(correction, image_index: int, knots: torch.Tensor | None = None):
+    """Map one scan's knot positions into its padded correction canvas.
 
-        self.rows_input = np.arange(input_shape[0])
-        self.cols_input = np.arange(input_shape[1])
-        self.u = np.linspace(0, 1, input_shape[1])
+    The knot geometry is shared by affine fitting, non-rigid warping, corrected
+    products, and probe-position recovery. Keeping that geometry here gives
+    every stage the same row/column coordinate transformation.
+    """
+    if knots is None:
+        knots = correction.knots[image_index]
+    return DriftKnot(
+        knots,
+        correction.scan_fast_t[image_index],
+        correction.scan_slow_t[image_index],
+        correction.imgs[image_index].shape,
+    )
 
-    def transform_rows(
-        self,
-        knots_row: NDArray,
-    ):
-        num_knots = knots_row.shape[-1]
-        basis = np.linspace(0, 1, num_knots)
 
-        if num_knots == 1:
-            xa = knots_row[0] + self.u[None, :] * self.scan_fast[0] * (self.input_shape[0] - 1)
-            ya = knots_row[1] + self.u[None, :] * self.scan_fast[1] * (self.input_shape[1] - 1)
-        elif num_knots == 2:
-            xa = interp1d(basis, knots_row[0], kind="linear", assume_sorted=True)(self.u)
-            ya = interp1d(basis, knots_row[1], kind="linear", assume_sorted=True)(self.u)
-        else:
-            kind = "quadratic" if num_knots == 3 else "cubic"
-            xa = interp1d(
-                basis,
-                knots_row[0],
-                kind=kind,
-                fill_value="extrapolate",
-                assume_sorted=True,
-            )(self.u)
-            ya = interp1d(
-                basis,
-                knots_row[1],
-                kind=kind,
-                fill_value="extrapolate",
-                assume_sorted=True,
-            )(self.u)
+def knot_delta_canvas(correction, image_index: int) -> torch.Tensor:
+    """Return one scan's fitted knot displacement on the correction canvas."""
+    if not hasattr(correction, "_initial_knots"):
+        raise RuntimeError(
+            "apply_correction() requires preprocess() and correct_affine() "
+            "first. Run dc.preprocess().correct_affine() (and optionally "
+            ".correct_nonrigid()) before apply_correction()."
+        )
+    return correction.knots[image_index] - correction._initial_knots[image_index]
 
-        return xa, ya
 
-    def transform_coordinates(
-        self,
-        knots: NDArray,
-    ):
-        num_knots = knots.shape[-1]
+def stage_knots(correction, stage: str | None) -> list[torch.Tensor]:
+    """Select the saved knot field for a correction stage comparison."""
+    if stage in (None, "nonrigid", "non-rigid"):
+        return correction.knots
+    attribute = {
+        "initial": "_initial_knots",
+        "raw": "_initial_knots",
+        "affine": "_knots_after_affine",
+        "strip": "_knots_after_strip",
+    }.get(stage)
+    if attribute is None:
+        raise ValueError(
+            f"Unknown correction stage {stage!r}. Choose initial, affine, "
+            "strip, nonrigid, or None for the current result."
+        )
+    knots = getattr(correction, attribute, None)
+    if knots is None:
+        required = "preprocess" if stage in ("initial", "raw") else f"correct_{stage}"
+        raise ValueError(f"stage={stage!r} needs a prior {required} call.")
+    return knots
 
-        if num_knots == 1:
-            # vectorized version for speed
-            xa, ya = self.transform_rows(knots)
-        else:
-            xa = np.zeros(self.input_shape)
-            ya = np.zeros(self.input_shape)
-            for i in range(self.input_shape[0]):
-                xa[i], ya[i] = self.transform_rows(knots[:, i])
 
-        return xa, ya
+def initialize_scanline_knots(
+    input_shape: tuple[int, int],
+    output_shape: tuple[int, int],
+    scan_fast: NDArray,
+    scan_slow: NDArray,
+    number_knots: int,
+) -> NDArray:
+    """Build the initial knot grid used by ``DriftCorrection.preprocess``.
 
-    def warp_image(
-        self,
-        image: NDArray,
-        knots: NDArray,  # shape: (2, rows, num_knots)
-        kde_sigma=None,
-        output_shape=None,
-        pad_value=None,
-        upsample_factor=None,
-    ) -> NDArray:
-        xa, ya = self.transform_coordinates(
-            knots,
+    The knot anchors define where each scanline starts on the padded canvas
+    before any affine or non-rigid optimization. For ``number_knots == 1``,
+    this is a vertical line of anchors at the fast-scan start edge of the
+    centered footprint. The full scanline width is then added later by
+    ``_transform_coordinates_single_knot``.
+
+    Parameters
+    ----------
+    input_shape : tuple[int, int]
+        Raw image shape ``(num_rows, num_cols)``.
+    output_shape : tuple[int, int]
+        Padded canvas shape ``(num_rows, num_cols)``.
+    scan_fast : NDArray
+        Unit vector of the fast scan direction in ``(row, col)`` order.
+    scan_slow : NDArray
+        Unit vector of the slow scan direction in ``(row, col)`` order.
+    number_knots : int
+        Number of control knots per scanline.
+
+    Returns
+    -------
+    NDArray
+        Initial knot array with shape ``(2, input_rows, number_knots)``.
+    """
+    v_slow = np.linspace(-(input_shape[0] - 1) / 2, (input_shape[0] - 1) / 2, input_shape[0])
+    u_fast = np.linspace(-(input_shape[1] - 1) / 2, (input_shape[1] - 1) / 2, number_knots)
+    row_knots = ((output_shape[0] - 1) / 2
+                 + u_fast[None, :] * scan_fast[0]
+                 + v_slow[:, None] * scan_slow[0])
+    col_knots = ((output_shape[1] - 1) / 2
+                 + u_fast[None, :] * scan_fast[1]
+                 + v_slow[:, None] * scan_slow[1])
+    return np.stack([row_knots, col_knots], axis=0)
+
+
+def resize_scanline_knots(correction, num_knots: int):
+    """Change fast-scan knot density without changing the fitted drift field
+
+    Affine and strip correction establish a displacement field before a
+    scientist decides how much fast-scan flexibility the non-rigid stage
+    needs. Resampling the displacement at a new knot density lets
+    ``correct_nonrigid(num_knots=...)`` retain that corrected geometry instead
+    of repeating affine correction or discarding its result.
+
+    Parameters
+    ----------
+    correction : DriftCorrection
+        Prepared correction containing the current and initial knot fields.
+    num_knots : int
+        New number of knots along every fast-scan line.
+
+    Returns
+    -------
+    DriftCorrection
+        The same correction with every saved checkpoint represented at the
+        requested knot density.
+    """
+    count = int(num_knots)
+    if count < 1:
+        raise ValueError(f"num_knots must be >= 1, got {num_knots!r}.")
+    current = {int(value.shape[2]) for value in correction.knots}
+    if current == {count}:
+        return correction
+    if len(current) != 1:
+        raise ValueError(
+            "All scans must use the same knot count before resizing; "
+            f"got {sorted(current)}."
         )
 
-        if kde_sigma is None:
-            kde_sigma = self.kde_sigma
-
-        if output_shape is None:
-            output_shape = self.output_shape
-
-        if pad_value is None:
-            pad_value = self.pad_value
-
-        if upsample_factor is None:
-            upsample_factor = 1.0
-
-        image_interp, weight_interp = bilinear_kde(
-            xa=xa * upsample_factor,  # rows
-            ya=ya * upsample_factor,  # cols
-            values=image,
-            output_shape=np.round(np.array(output_shape) * upsample_factor).astype("int"),
-            kde_sigma=kde_sigma * upsample_factor,
-            pad_value=pad_value,
-            return_pix_count=True,
+    old_initial = correction._initial_knots
+    new_initial = [
+        torch.as_tensor(
+            initialize_scanline_knots(
+                input_shape=correction.imgs[index].shape,
+                output_shape=correction.shape[1:],
+                scan_fast=correction.scan_fast[index],
+                scan_slow=correction.scan_slow[index],
+                number_knots=count,
+            ),
+            dtype=correction._dtype,
+            device=correction._device,
         )
+        for index in range(correction.shape[0])
+    ]
 
-        return image_interp, weight_interp
+    def resize_checkpoint(checkpoint):
+        resized = []
+        for value, initial, target in zip(
+            checkpoint,
+            old_initial,
+            new_initial,
+            strict=True,
+        ):
+            displacement = value - initial
+            if displacement.shape[2] == 1:
+                displacement = displacement.expand(-1, -1, count)
+            else:
+                rows = displacement.shape[1]
+                displacement = torch.nn.functional.interpolate(
+                    displacement.reshape(1, 2 * rows, -1),
+                    size=count,
+                    mode="linear",
+                    align_corners=True,
+                ).reshape(2, rows, count)
+            resized.append(target + displacement)
+        return resized
+
+    checkpoints = {
+        name: resize_checkpoint(getattr(correction, name))
+        for name in ("knots", "_knots_after_affine", "_knots_after_strip")
+        if hasattr(correction, name)
+    }
+    correction._initial_knots = new_initial
+    for name, values in checkpoints.items():
+        setattr(correction, name, values)
+    correction.number_knots = count
+    correction.preprocess_info["num_knots"] = count
+    correction._images_warped_stale = True
+    return correction
 
 
-def transform_coordinates_single_knot(
+def _transform_coordinates_single_knot(
     knots: torch.Tensor,
     scan_fast: torch.Tensor,
     input_shape: tuple[int, int],
@@ -125,14 +214,9 @@ def transform_coordinates_single_knot(
 
     **Single-knot only.** Each scanline has exactly one (row, col) anchor;
     the fast-scan-direction position is filled in by linear interpolation
-    along the scanline. Multi-knot Bezier interpolation is intentionally
-    not supported here - that's the scipy backend's job. The pytorch path
-    optimizes for the common single-knot case (≥95% of real STEM workflows).
-
-    Called by ``preprocess``, ``_affine_grid_search_batch``, and
-    ``_warp_and_translate_torch`` to map source image pixels onto the
-    padded output canvas. Without this, the warped images would have
-    no spatial mapping and the grid search couldn't score test drifts.
+    along the scanline.  Multi-knot input is handled by
+    :func:`_transform_coordinates_multi_knot`; :class:`DriftKnot` dispatches
+    on ``knots.shape[2]``.
 
     Each input row maps to a line on the canvas:
     ``row = knot_row + fraction * scan_fast[0] * (num_rows - 1)``
@@ -143,8 +227,6 @@ def transform_coordinates_single_knot(
     ----------
     knots : torch.Tensor
         Knot positions, shape ``(2, num_rows, 1)``. First dim is (row, col).
-        The trailing 1 is the single-knot dimension; multi-knot inputs are
-        rejected by the caller before reaching this function.
     scan_fast : torch.Tensor
         Fast scan direction vector, shape ``(2,)``.
     input_shape : tuple[int, int]
@@ -156,20 +238,220 @@ def transform_coordinates_single_knot(
         Row coordinates on canvas, shape ``(num_rows, num_cols)``.
     col_coords : torch.Tensor
         Column coordinates on canvas, shape ``(num_rows, num_cols)``.
-
-    Examples
-    --------
-    >>> knots = torch.zeros(2, 64, 1)
-    >>> scan_fast = torch.tensor([0.0, 1.0])
-    >>> r, c = transform_coordinates_single_knot(knots, scan_fast, (64, 64))
-    >>> r.shape
-    torch.Size([64, 64])
     """
     num_rows, num_cols = input_shape
     fast_fraction = torch.linspace(0, 1, num_cols, dtype=knots.dtype, device=knots.device)
     row_coords = knots[0, :, 0:1] + fast_fraction[None, :] * scan_fast[0] * (num_rows - 1)
     col_coords = knots[1, :, 0:1] + fast_fraction[None, :] * scan_fast[1] * (num_cols - 1)
     return row_coords, col_coords
+
+
+def _transform_coordinates_multi_knot(
+    knots: torch.Tensor,
+    input_shape: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Multi-knot path: linearly interpolate K knot anchors per scanline.
+
+    For ``K`` knots per scanline (``K >= 2``), knot ``k`` sits at fast-axis
+    fraction ``k / (K - 1)`` of the scanline.  Per-pixel canvas coordinates
+    are obtained by piecewise-linear interpolation between the two adjacent
+    knots.  The K=1 case is intentionally not handled here — it has no
+    end-knot to interpolate toward, so the caller dispatches to
+    :func:`_transform_coordinates_single_knot` (which walks along
+    ``scan_fast`` instead).
+
+    With ``K = 2`` and the initial knot grid (knots at the start and end
+    of each scanline along ``scan_fast``), this reduces to the same
+    per-pixel canvas positions as the K=1 path — verified in tests.
+
+    Parameters
+    ----------
+    knots : torch.Tensor
+        Knot positions, shape ``(2, num_rows, K)`` with ``K >= 2``.
+        First axis is ``(row, col)``.
+    input_shape : tuple[int, int]
+        Original image shape ``(num_rows, num_cols)``.  Only ``num_cols``
+        is consulted (``num_rows`` is implicit in ``knots.shape[1]``).
+
+    Returns
+    -------
+    row_coords : torch.Tensor
+        Row coordinates on canvas, shape ``(num_rows, num_cols)``.
+    col_coords : torch.Tensor
+        Column coordinates on canvas, shape ``(num_rows, num_cols)``.
+    """
+    _, num_cols = input_shape
+    K = knots.shape[2]
+    t = torch.linspace(0, 1, num_cols, dtype=knots.dtype, device=knots.device) * (K - 1)
+    seg = torch.clamp(t.long(), max=K - 2)
+    frac = (t - seg.to(knots.dtype))[None, :]
+    row_lo = knots[0, :, seg]
+    row_hi = knots[0, :, seg + 1]
+    col_lo = knots[1, :, seg]
+    col_hi = knots[1, :, seg + 1]
+    row_coords = row_lo + (row_hi - row_lo) * frac
+    col_coords = col_lo + (col_hi - col_lo) * frac
+    return row_coords, col_coords
+
+
+class DriftKnot:
+    """Maps K knot anchors per scanline to canvas geometry, drift, and warps.
+
+    This is the single dispatch point for K=1 versus K>=2 geometry.
+    K=1 walks along ``scan_fast`` (one anchor per row, scanline geometry
+    implicit); K>=2 piecewise-linearly interpolates the K anchors along
+    the fast axis. :func:`interpolator` builds the geometry for each scan.
+
+    Attributes
+    ----------
+    knots : torch.Tensor
+        Knot anchors, shape ``(2, H, K)`` (row/col × scanline × knot).
+    scan_fast, scan_slow : torch.Tensor
+        Fast / slow scan unit vectors ``(2,)``.  ``scan_fast`` is only
+        consulted when ``K == 1`` (walk); ``scan_slow`` enters
+        :meth:`drift_raw` to invert the canvas Jacobian.
+    input_shape : tuple[int, int]
+        Source image shape ``(H, W)``.
+    K : int
+        Number of knots per scanline (cached from ``knots.shape[2]``).
+    """
+
+    def __init__(
+        self,
+        knots: torch.Tensor,
+        scan_fast: torch.Tensor,
+        scan_slow: torch.Tensor,
+        input_shape: tuple[int, int],
+    ):
+        self.knots = knots
+        self.scan_fast = scan_fast
+        self.scan_slow = scan_slow
+        self.input_shape = input_shape
+        self.K = knots.shape[2]
+
+    def to_canvas(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-pixel canvas (row, col) coordinates for warping.
+
+        Returns ``(row_coords, col_coords)`` each ``(H, W)``.  K=1 uses the
+        ``scan_fast`` walk fast path; K>=2 uses the multi-knot lerp.
+        """
+        if self.K == 1:
+            return _transform_coordinates_single_knot(
+                self.knots, self.scan_fast, self.input_shape)
+        return _transform_coordinates_multi_knot(self.knots, self.input_shape)
+
+    def _drift_canvas(self, initial_knots: torch.Tensor) -> torch.Tensor:
+        """Drift in canvas coordinates relative to ``initial_knots``.
+
+        Internal step used by :meth:`drift_raw`.  Returns ``(2, H)`` for
+        K=1 (per-row shift) or ``(2, H, W)`` for K>=2 (per-pixel via lerp).
+        Callers want raw-frame drift, not canvas-frame, so this method
+        stays private.
+        """
+        delta = self.knots - initial_knots
+        if self.K == 1:
+            return delta[:, :, 0]
+        _, num_cols = self.input_shape
+        t = torch.linspace(0, 1, num_cols, dtype=delta.dtype, device=delta.device) * (self.K - 1)
+        seg = torch.clamp(t.long(), max=self.K - 2)
+        frac = (t - seg.to(delta.dtype))[None, :]
+        delta_row = delta[0, :, seg] + (delta[0, :, seg + 1] - delta[0, :, seg]) * frac
+        delta_col = delta[1, :, seg] + (delta[1, :, seg + 1] - delta[1, :, seg]) * frac
+        return torch.stack([delta_row, delta_col])
+
+    def drift_raw(self, initial_knots: torch.Tensor) -> torch.Tensor:
+        """Drift relative to ``initial_knots`` in raw-frame coordinates.
+
+        Returns ``(2, H)`` for K=1 (per-row shift) or ``(2, H, W)`` for K>=2
+        (per-pixel).  Inverts the canvas Jacobian so callers feed the
+        result straight into ``backward_warp``.  For square images this
+        reduces to a rotation by the scan angle; the ``alpha`` factor
+        handles non-square scans.
+        """
+        delta_canvas = self._drift_canvas(initial_knots)
+        scan_h, scan_w = self.input_shape
+        alpha = float(scan_h - 1) / float(scan_w - 1) if scan_w > 1 else 1.0
+        det = (self.scan_slow[0] * self.scan_fast[1]
+               - self.scan_fast[0] * alpha * self.scan_slow[1])
+        drift_row = (
+            self.scan_fast[1] * delta_canvas[0]
+            - self.scan_fast[0] * alpha * delta_canvas[1]
+        ) / det
+        drift_col = (
+            -self.scan_slow[1] * delta_canvas[0]
+            + self.scan_slow[0] * delta_canvas[1]
+        ) / det
+        return torch.stack([drift_row, drift_col])
+
+    def affine_candidate_base(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-pixel canvas coords plus the scanline-centered offset axis.
+
+        Returns ``(row_base, col_base, scanline_offset)``.  The first two
+        are :meth:`to_canvas`'s output; the third is
+        ``arange(H) - (H-1)/2`` shaped ``(H,)`` so callers can broadcast a
+        candidate ``drift_vec`` over scanlines as
+        ``row_base + drift_vec[0] * scanline_offset[:, None]``.
+
+        Used by ``affine.grid_search_batch`` so candidate-broadcast geometry
+        construction lives on the geometry class instead of the orchestrator.
+        """
+        row_base, col_base = self.to_canvas()
+        H = self.knots.shape[1]
+        scanline_offset = (
+            torch.arange(H, dtype=self.knots.dtype, device=self.knots.device)
+            - (H - 1) / 2
+        )
+        return row_base, col_base, scanline_offset
+
+    def apply_affine_shift(self, drift_vec: torch.Tensor) -> None:
+        """Add an affine drift slope to every knot, in place.
+
+        For each scanline ``i``, shifts the knots by
+        ``drift_vec * (i - (H - 1) / 2)`` so the slow-axis-centered slope
+        accumulates linearly across the image.  Used by ``correct_affine``
+        to bake a per-row drift candidate into the knot grid.
+        """
+        H = self.knots.shape[1]
+        scanline_offset = (
+            torch.arange(H, dtype=self.knots.dtype, device=self.knots.device)
+            - (H - 1) / 2
+        )[:, None]
+        self.knots[0] += drift_vec[0] * scanline_offset
+        self.knots[1] += drift_vec[1] * scanline_offset
+
+    def warp_to_canvas(
+        self,
+        source_image: torch.Tensor,
+        canvas_shape: tuple[int, int],
+        kde_sigma: float,
+        pad_value,
+        upsample_factor: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward-scatter ``source_image`` onto the canvas using the knot grid.
+
+        Wraps :meth:`to_canvas` + :func:`bilinear_kde_batch` so callers
+        don't repeat the (knots → coords → scatter) idiom.  Returns
+        ``(warped, weights)``, each ``canvas_shape``.
+
+        ``upsample_factor`` scales the canvas coordinates and KDE sigma in
+        lockstep, so ``corrected`` can scatter at a finer grid
+        without recomputing the interpolation.
+        """
+        row_t, col_t = self.to_canvas()
+        if upsample_factor != 1:
+            row_t = row_t * upsample_factor
+            col_t = col_t * upsample_factor
+        warped, weights = bilinear_kde_batch(
+            row_t[None], col_t[None], source_image, canvas_shape,
+            kde_sigma, pad_value)
+        return warped[0], weights[0]
+
+
+# ---------------------------------------------------------------------------
+# Forward-warp kernels: scatter source pixels onto the canvas, smooth, normalize.
+# Used by :meth:`DriftKnot.warp_to_canvas` (and ``affine.grid_search_batch``'s
+# candidate broadcast which calls bilinear_kde_batch directly).
+# ---------------------------------------------------------------------------
 
 
 def bilinear_kde_batch(
@@ -276,8 +558,6 @@ def bilinear_kde_batch(
         sum_values / torch.clamp(sum_weights, min=1e-8)
     )
     return warped_images, sum_weights
-
-
 def gaussian_smooth_batch(
     field_stack: torch.Tensor,
     sigma: float,
@@ -336,14 +616,16 @@ def gaussian_smooth_1d(
     kernel, radius = _gaussian_kernel_1d(sigma, signal.dtype, signal.device)
     signal_padded = _symmetric_pad_1d(signal[:, None], radius)
     return torch.nn.functional.conv1d(signal_padded, kernel[None, None, :])[:, 0]
-
-
 def _symmetric_pad_1d(signal: torch.Tensor, pad: int) -> torch.Tensor:
     """Symmetric 1D padding matching scipy's reflect mode.
 
     Same edge-repeat semantics as ``_symmetric_pad`` but for 1D signals.
     Used by ``gaussian_smooth_1d`` for regularization of knot vectors.
     """
+    if pad <= 0:
+        # signal[:, :, -0:] is the whole signal, not an empty slice, so a naive
+        # tail slice would double the length. No padding needed when pad == 0.
+        return signal
     left = signal[:, :, :pad].flip(-1)
     right = signal[:, :, -pad:].flip(-1)
     return torch.cat([left, signal, right], dim=-1)
@@ -394,7 +676,7 @@ def _symmetric_pad(
     return field_stack
 
 
-def _gaussian_kernel_1d(sigma, dtype, device, _cache={}):
+def _gaussian_kernel_1d(sigma: float, dtype: torch.dtype, device: torch.device, _cache: dict = {}) -> torch.Tensor:
     """Normalized 1D Gaussian ``exp(-0.5*(x/sigma)^2)``, radius ``4*sigma``.
 
     Cached via mutable default arg - the grid search calls this ~800 times

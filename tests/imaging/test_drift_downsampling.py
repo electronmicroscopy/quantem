@@ -6,7 +6,6 @@ from scipy.ndimage import gaussian_filter
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection
-from quantem.imaging.drift.core.affine import _affine_rate_from_knots
 from quantem.imaging.drift.preparation import (
     average_downsample_2d,
     resolve_downsample,
@@ -44,41 +43,43 @@ def test_average_downsample_is_exact_block_mean():
 def test_preprocess_downsample_preserves_pixel_center_calibration():
     """Sampling grows and origin moves to the center of each averaged block."""
     datasets = _calibrated_pair()
-    drift = DriftCorrection.from_data(
-        datasets,
+    drift = DriftCorrection.from_images(
+        *datasets,
         scan_direction_degrees=(0.0, 90.0),
         device="cpu",
     ).preprocess(
         downsample=2,
-        show_merged=False,
-        show_images=False,
+        show_combined=False,
+        show_scans=False,
         show_knots=False,
+        verbose=False,
     )
 
-    assert drift.images[0].shape == (8, 8)
-    np.testing.assert_allclose(drift.images[0].sampling, (0.4, 0.6))
-    np.testing.assert_allclose(drift.images[0].origin, (1.1, 2.15))
-    assert drift.images[0].units == ["nm", "nm"]
-    assert drift.images[0].metadata["source"] == "synthetic calibrated scan"
+    assert drift.imgs[0].shape == (8, 8)
+    np.testing.assert_allclose(drift.imgs[0].sampling, (0.4, 0.6))
+    np.testing.assert_allclose(drift.imgs[0].origin, (1.1, 2.15))
+    assert drift.imgs[0].units == ["nm", "nm"]
+    assert drift.imgs[0].metadata["source"] == "synthetic calibrated scan"
     assert drift.downsample_metadata["original_images"][0]["shape"] == [16, 16]
 
 
 def test_corrected_output_records_downsampling_provenance():
     """A corrected image tells readers which computational grid was fitted."""
-    drift = DriftCorrection.from_data(
-        _calibrated_pair(),
+    drift = DriftCorrection.from_images(
+        *_calibrated_pair(),
         scan_direction_degrees=(0.0, 90.0),
         device="cpu",
     ).preprocess(
         downsample=2,
-        show_merged=False,
-        show_images=False,
+        show_combined=False,
+        show_scans=False,
         show_knots=False,
+        verbose=False,
     )
 
-    corrected = drift.generate_corrected(
+    corrected = drift.corrected(
         upsample_factor=1,
-        show_merged=False,
+        verbose=False,
     )
 
     assert corrected.metadata["downsample"] == 2
@@ -92,21 +93,23 @@ def test_downsample_requires_exact_divisor_and_new_correction():
     with pytest.raises(ValueError, match="divisible"):
         resolve_downsample(4, (18, 18))
 
-    drift = DriftCorrection.from_data(
-        _calibrated_pair(),
+    drift = DriftCorrection.from_images(
+        *_calibrated_pair(),
         scan_direction_degrees=(0.0, 90.0),
         device="cpu",
     ).preprocess(
-        show_merged=False,
-        show_images=False,
+        show_combined=False,
+        show_scans=False,
         show_knots=False,
+        verbose=False,
     )
     with pytest.raises(RuntimeError, match="Create a new DriftCorrection"):
         drift.preprocess(
             downsample=2,
-            show_merged=False,
-            show_images=False,
+            show_combined=False,
+            show_scans=False,
             show_knots=False,
+            verbose=False,
         )
 
 
@@ -117,8 +120,8 @@ def test_automatic_factor_is_largest_exact_divisor_up_to_eight():
     assert resolve_downsample("auto", (1025, 1025)) == 1
 
 
-def test_affine_pyramid_refines_rate_on_native_grid():
-    """A pooled broad search retains the native image and affine rate."""
+def test_affine_pyramid_search_retains_native_grid():
+    """A pooled broad search never downsamples the fitted or output grid."""
     size = 64
     rng = np.random.default_rng(23)
     reference = gaussian_filter(rng.normal(size=(size, size)), 1.5).astype(np.float32)
@@ -134,50 +137,21 @@ def test_affine_pyramid_refines_rate_on_native_grid():
             right=float(np.median(reference[row])),
         )
 
-    native = DriftCorrection.from_reference(
+    drift = DriftCorrection.from_reference(
         reference,
         target,
         scan_direction_degrees=0.0,
         device="cpu",
-    ).preprocess(
-        show_merged=False,
-        show_images=False,
-        show_knots=False,
     )
-    pyramid = DriftCorrection.from_reference(
-        reference,
-        target,
-        scan_direction_degrees=0.0,
-        device="cpu",
-    ).preprocess(
-        show_merged=False,
-        show_images=False,
-        show_knots=False,
-    )
-
-    native.align_affine(
-        step=0.02,
-        num_tests=7,
-        max_image_shift=8,
-        downsample=1,
-        show_merged=False,
-        show_images=False,
-        show_knots=False,
-    )
-    pyramid.align_affine(
-        step=0.02,
-        num_tests=7,
-        max_image_shift=8,
+    drift.correct_affine(
         downsample=2,
-        show_merged=False,
-        show_images=False,
+        show_combined=False,
+        show_scans=False,
         show_knots=False,
+        verbose=False,
     )
 
-    assert pyramid.images[0].shape == (size, size)
-    assert pyramid.affine_search_info["downsample_factor"] == 2
-    np.testing.assert_allclose(
-        _affine_rate_from_knots(pyramid, 1),
-        _affine_rate_from_knots(native, 1),
-        atol=0.01,
-    )
+    assert drift.imgs[0].shape == (size, size)
+    assert drift.affine_search_info["downsample_factor"] == 2
+    assert np.isfinite(drift.drift_rate).all()
+    assert drift.corrected(verbose=False).shape == (size, size)

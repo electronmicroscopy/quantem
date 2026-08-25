@@ -1,6 +1,7 @@
 from quantem.imaging.drift import (
     CorrectionResult as CorrectionResult,
     DriftCorrection as DriftCorrection,
+    StripPass as StripPass,
 )
 from quantem.imaging.drift import (
     pair_spectrum_image_references as pair_spectrum_image_references,

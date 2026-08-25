@@ -7,36 +7,11 @@ import torch
 from tqdm.auto import tqdm
 
 from quantem.imaging.drift.apply import (
-    _apply_scan_field,
-    _raw_frame_displacement,
+    apply_correction_to_dataset,
+    crop_slices,
+    padding_offset,
 )
-
-
-def data_array(dataset):
-    """Return the resident array or tensor from a QuantEM dataset wrapper."""
-    if isinstance(dataset, (np.ndarray, torch.Tensor)):
-        return dataset
-    array = getattr(dataset, "array", None)
-    if array is not None:
-        return array
-    tensor = getattr(dataset, "_tensor", None)
-    if tensor is not None:
-        return tensor
-    raise TypeError(
-        "4D-STEM input must be an array, tensor, or QuantEM dataset with "
-        "resident .array/.tensor data."
-    )
-
-
-def padding_offset(
-    canvas_shape: tuple[int, int],
-    scan_shape: tuple[int, int],
-) -> tuple[float, float]:
-    """Return the centered scan offset in the padded solver canvas."""
-    return (
-        (canvas_shape[0] - scan_shape[0]) / 2.0,
-        (canvas_shape[1] - scan_shape[1]) / 2.0,
-    )
+from quantem.imaging.drift.core import knots as drift_knots
 
 
 @dataclass
@@ -119,7 +94,13 @@ def integrate_virtual_detector(
     --------
     >>> adf = integrate_virtual_detector(data, detector_mask=annulus)
     """
-    dataset = data_array(dataset)
+    try:
+        from quantem.gpu.detector import masked_sum
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"quantem.gpu", "quantem.gpu.detector"}:
+            raise
+        masked_sum = None
+
     if reduce not in {"mean", "sum"}:
         raise ValueError(f"reduce must be 'mean' or 'sum', got {reduce!r}")
     scan_shape = tuple(int(value) for value in dataset.shape[:2])
@@ -140,17 +121,25 @@ def integrate_virtual_detector(
     num_selected = int(mask.sum())
     if num_selected == 0:
         raise ValueError("detector_mask selects zero detector pixels")
-    if isinstance(dataset, torch.Tensor):
+    if isinstance(dataset, np.ndarray) and np.issubdtype(
+        dataset.dtype,
+        np.floating,
+    ):
+        flat = dataset.reshape(*scan_shape, -1)
+        image = flat[..., mask.reshape(-1)].sum(axis=-1, dtype=np.float32)
+    elif masked_sum is not None:
+        image = masked_sum(dataset, mask).reshape(scan_shape)
+    elif isinstance(dataset, torch.Tensor):
         mask_t = torch.as_tensor(mask, device=dataset.device)
-        flattened = dataset.reshape(*scan_shape, -1).to(torch.float32)
-        image = flattened[..., mask_t.reshape(-1)].sum(-1)
-        image = image.detach().cpu().numpy()
+        flat = dataset.reshape(*scan_shape, -1).to(torch.float32)
+        image = flat[..., mask_t.reshape(-1)].sum(-1).detach().cpu().numpy()
     else:
         array = dataset.get() if hasattr(dataset, "get") else np.asarray(dataset)
-        image = array.reshape(*scan_shape, -1)[..., mask.reshape(-1)].sum(
-            -1,
-            dtype=np.float64,
-        ).astype(np.float32)
+        flat = array.reshape(*scan_shape, -1)
+        image = flat[..., mask.reshape(-1)].sum(
+            axis=-1,
+            dtype=np.float32,
+        )
     return image / num_selected if reduce == "mean" else image
 
 
@@ -181,7 +170,9 @@ def drift_field(self, idx: int) -> torch.Tensor:
             "Run dc.preprocess().correct_affine() (and optionally "
             ".correct_nonrigid()) before drift_field()."
         )
-    return _raw_frame_displacement(self, idx)
+    return drift_knots.interpolator(self, idx).drift_raw(
+        self._initial_knots[idx]
+    )
 
 
 def probe_positions(
@@ -229,47 +220,31 @@ def probe_positions(
             "dc.preprocess() before exporting nominal or corrected "
             "probe positions."
         )
-    index = image_index % len(self.images)
+    index = image_index % len(self.imgs)
     knots = (
         self.knots[index]
         if corrected
         else self._initial_knots[index]
     )
-    row, column = self.interpolator[index].transform_coordinates(knots)
-    positions = np.stack([row, column], axis=-1).astype(np.float32)
+    row, column = drift_knots.interpolator(self, index, knots).to_canvas()
+    positions = torch.stack([row, column], dim=-1)
     if strip_padding:
         pad_row, pad_column = padding_offset(
             (self.shape[1], self.shape[2]),
-            self.images[0].shape[:2],
+            self.imgs[0].shape[:2],
         )
-        positions -= np.asarray([pad_row, pad_column], dtype=np.float32)
-    result = positions
+        positions -= torch.tensor(
+            [pad_row, pad_column],
+            device=positions.device,
+            dtype=positions.dtype,
+        )
+    result = to_numpy(positions, dtype=np.float32)
     if plot:
-        import matplotlib.pyplot as plt
-
-        nominal = self.probe_positions(
-            index,
-            corrected=False,
+        self.plot_probe_positions(
+            image_index=index,
             strip_padding=strip_padding,
-            plot=False,
+            stride=stride,
         )
-        plt.plot(
-            nominal[::stride, ::stride, 1],
-            nominal[::stride, ::stride, 0],
-            ".",
-            alpha=0.4,
-            label="nominal",
-        )
-        plt.plot(
-            result[::stride, ::stride, 1],
-            result[::stride, ::stride, 0],
-            ".",
-            alpha=0.6,
-            label="corrected",
-        )
-        plt.gca().invert_yaxis()
-        plt.gca().set_aspect("equal")
-        plt.legend()
     return result
 
 
@@ -327,7 +302,7 @@ def corrected_virtual_images(
             "corrected_virtual_images() requires preprocess() and "
             "correct_affine() first."
         )
-    if len(self.images) != 2:
+    if len(self.imgs) != 2:
         raise ValueError(
             "corrected_virtual_images() expects exactly two scan images"
         )
@@ -340,14 +315,11 @@ def corrected_virtual_images(
         np.asarray(image_0, dtype=np.float32),
         np.asarray(image_1, dtype=np.float32),
     ]
-    if (
-        images[0].shape != self.images[0].shape
-        or images[1].shape != self.images[1].shape
-    ):
+    if images[0].shape != self.imgs[0].shape or images[1].shape != self.imgs[1].shape:
         raise ValueError(
             "virtual image shapes must match the raw scan images used for drift "
             f"alignment: got {images[0].shape}, {images[1].shape}; expected "
-            f"{self.images[0].shape}, {self.images[1].shape}"
+            f"{self.imgs[0].shape}, {self.imgs[1].shape}"
         )
 
     if output_frame == "canvas":
@@ -355,32 +327,42 @@ def corrected_virtual_images(
         components = []
         coverages = []
         for image_index, image in enumerate(images):
-            corrected, coverage = self.interpolator[image_index].warp_image(
+            image_t = torch.as_tensor(
                 image,
-                self.knots[image_index],
-                output_shape=canvas_shape,
-                kde_sigma=self.kde_sigma,
-                pad_value=0.0,
+                device=self._device,
+                dtype=torch.float32,
+            )
+            corrected, coverage = drift_knots.interpolator(
+                self,
+                image_index,
+            ).warp_to_canvas(
+                image_t,
+                canvas_shape,
+                self.kde_sigma,
+                0.0,
             )
             components.append(corrected)
             coverages.append(coverage)
 
         valid = [coverage >= 1e-3 for coverage in coverages]
-        contribution_count = valid[0].astype(np.float32) + valid[1].astype(
-            np.float32
+        contribution_count = valid[0].to(torch.float32) + valid[1].to(
+            torch.float32
         )
-        merged = np.divide(
-            components[0] * valid[0] + components[1] * valid[1],
-            contribution_count,
-            out=np.zeros(canvas_shape, dtype=np.float32),
-            where=contribution_count > 0,
+        merged = torch.where(
+            contribution_count > 0,
+            (
+                components[0] * valid[0]
+                + components[1] * valid[1]
+            )
+            / contribution_count.clamp_min(1),
+            0.0,
         )
         return {
             "corrected_image": to_numpy(merged, dtype=np.float32),
             "corrected_image_0": to_numpy(components[0], dtype=np.float32),
             "corrected_image_1": to_numpy(components[1], dtype=np.float32),
             "coverage_image": to_numpy(
-                np.maximum(coverages[0], coverages[1]),
+                torch.maximum(coverages[0], coverages[1]),
                 dtype=np.float32,
             ),
             "coverage_image_0": to_numpy(coverages[0], dtype=np.float32),
@@ -389,17 +371,24 @@ def corrected_virtual_images(
 
     components = []
     for image_index, image in enumerate(images):
-        corrected = _apply_scan_field(
-            self,
+        image_t = torch.as_tensor(
             image[..., None],
+            device=self._device,
+            dtype=torch.float32,
+        )
+        corrected = apply_correction_to_dataset(
+            self,
+            image_t,
             image_index=image_index,
+            mode="bilinear",
             chunk_size=1,
-            output_dtype=np.float32,
+            output_dtype=torch.float32,
+            output_device=self._device,
         )[..., 0]
         if image_index == 1:
             rot_k = _rot90_to_image0_frame(self, image_index=1)
             if rot_k:
-                corrected = np.rot90(corrected, k=rot_k, axes=(0, 1)).copy()
+                corrected = torch.rot90(corrected, k=rot_k, dims=(0, 1))
         components.append(corrected)
 
     merged = (components[0] + components[1]) * 0.5
@@ -491,16 +480,14 @@ def regional_diffraction_patterns(
             "regional_diffraction_patterns() needs the two raw 4D-STEM datasets. "
             "Pass datasets=(scan_0, scan_90) when using a saved correction."
         )
-    source_datasets = tuple(data_array(dataset) for dataset in source_datasets)
+    source_datasets = tuple(source_datasets)
     if len(source_datasets) != 2 or any(dataset is None for dataset in source_datasets):
         raise ValueError(
             "regional_diffraction_patterns() expects exactly two raw 4D-STEM "
             f"datasets, got {len(source_datasets)}"
         )
     scan_shapes = [tuple(int(value) for value in data.shape[:2]) for data in source_datasets]
-    expected_shapes = [
-        tuple(int(value) for value in image.shape) for image in self.images
-    ]
+    expected_shapes = [tuple(int(value) for value in image.shape) for image in self.imgs]
     detector_shapes = [tuple(int(value) for value in data.shape[2:]) for data in source_datasets]
     if scan_shapes != expected_shapes:
         raise ValueError(
@@ -592,6 +579,75 @@ def regional_diffraction_patterns(
     }
 
 
+def corrected_4dstem_views(correction, *, det_bin: int = 1) -> list[np.ndarray]:
+    """Prepare a compact raw-to-corrected 4D-STEM comparison.
+
+    Detector binning before correction preserves the correction field while
+    avoiding work on detector detail that the interactive viewer will discard.
+    The returned stages share image 0's scan frame and the solved crop.
+    """
+    def detector_bin(cube):
+        if det_bin == 1:
+            return cube
+        detector_rows, detector_columns = cube.shape[-2:]
+        shape = cube.shape
+        reshaped = cube.reshape(
+            shape[0],
+            shape[1],
+            detector_rows // det_bin,
+            det_bin,
+            detector_columns // det_bin,
+            det_bin,
+        )
+        if isinstance(reshaped, torch.Tensor):
+            dtype = reshaped.dtype if reshaped.is_floating_point() else torch.int32
+        else:
+            dtype = (
+                reshaped.dtype
+                if np.issubdtype(reshaped.dtype, np.floating)
+                else np.int32
+            )
+        return reshaped.sum((3, 5), dtype=dtype)
+
+    raw_0, raw_1 = (detector_bin(dataset) for dataset in correction._datasets)
+    corrected_0 = correction.apply_correction(
+        raw_0,
+        image_index=0,
+        output_dtype="same",
+        output_device=correction.device,
+        verbose=False,
+    )
+    corrected_1 = correction.apply_correction(
+        raw_1,
+        image_index=1,
+        output_dtype="same",
+        output_device=correction.device,
+        verbose=False,
+    )
+    quarter_turns = _rot90_to_image0_frame(correction)
+    if quarter_turns:
+        corrected_1 = (
+            torch.rot90(corrected_1, quarter_turns, dims=(0, 1))
+            if isinstance(corrected_1, torch.Tensor)
+            else np.rot90(corrected_1, quarter_turns, axes=(0, 1)).copy()
+        )
+    if isinstance(corrected_0, torch.Tensor):
+        if corrected_0.is_floating_point():
+            merged = (corrected_0 + corrected_1) * 0.5
+        else:
+            merged = (
+                (corrected_0.to(torch.int64) + corrected_1.to(torch.int64)) >> 1
+            ).to(corrected_0.dtype)
+    elif np.issubdtype(corrected_0.dtype, np.floating):
+        merged = (corrected_0 + corrected_1) * 0.5
+    else:
+        merged = (
+            (corrected_0.astype(np.int64) + corrected_1.astype(np.int64)) >> 1
+        ).astype(corrected_0.dtype)
+    rows, columns = crop_slices(correction)
+    return [to_numpy(cube[rows, columns]) for cube in (raw_0, corrected_0, merged)]
+
+
 def corrected_4dstem(
     self,
     *,
@@ -663,31 +719,21 @@ def corrected_4dstem(
         and isinstance(datasets[1], torch.Tensor) and datasets[1].is_cuda
     )
 
-    corrected_4dstem_0 = _apply_scan_field(
-        self,
-        datasets[0],
-        image_index=0,
-        mode=mode,
-        chunk_size=chunk_size,
-        output_dtype=output_dtype,
-        output=output_0,
+    corrected_4dstem_0 = apply_correction_to_dataset(
+        self, None, image_index=0, mode=mode, chunk_size=chunk_size,
+        output_dtype=output_dtype, output_device=output_device,
+        output=output_0, verbose=verbose,
+        progress_desc="Correcting scan 1/2",
     )
-    if output_device is not None and output_0 is None:
-        corrected_4dstem_0 = torch.as_tensor(corrected_4dstem_0).to(output_device)
     if inputs_on_device:
         self._datasets[0] = None
         torch.cuda.empty_cache()
-    corrected_4dstem_1 = _apply_scan_field(
-        self,
-        datasets[1],
-        image_index=1,
-        mode=mode,
-        chunk_size=chunk_size,
-        output_dtype=output_dtype,
-        output=output_1,
+    corrected_4dstem_1 = apply_correction_to_dataset(
+        self, None, image_index=1, mode=mode, chunk_size=chunk_size,
+        output_dtype=output_dtype, output_device=output_device,
+        output=output_1, verbose=verbose,
+        progress_desc="Correcting scan 2/2",
     )
-    if output_device is not None and output_1 is None:
-        corrected_4dstem_1 = torch.as_tensor(corrected_4dstem_1).to(output_device)
     if inputs_on_device:
         self._datasets[1] = None
         self._datasets_consumed = True
@@ -702,7 +748,7 @@ def corrected_4dstem(
         else:
             corrected_4dstem_1 = np.rot90(
                 corrected_4dstem_1, k=rot_k, axes=(0, 1),
-            )
+            ).copy()
 
     corrected_4dstem = None
     if merge:
@@ -723,15 +769,21 @@ def corrected_4dstem(
             disable=not verbose or len(row_starts) <= 1,
         )
         if isinstance(corrected_4dstem_0, torch.Tensor):
-            corrected_4dstem = torch.empty_like(
-                corrected_4dstem_0,
-                dtype=torch.float32,
+            merge_dtype = (
+                corrected_4dstem_0.dtype
+                if corrected_4dstem_0.is_floating_point()
+                else torch.float32
+            )
+            corrected_4dstem = torch.empty(
+                corrected_4dstem_0.shape,
+                dtype=merge_dtype,
+                device=corrected_4dstem_0.device,
             )
             for r0 in row_starts:
                 r1 = min(r0 + row_block, Hm)
                 corrected_4dstem[r0:r1] = (
-                    corrected_4dstem_0[r0:r1].to(torch.float32)
-                    + corrected_4dstem_1[r0:r1].to(torch.float32)
+                    corrected_4dstem_0[r0:r1].to(merge_dtype)
+                    + corrected_4dstem_1[r0:r1].to(merge_dtype)
                 ) * 0.5
                 merge_progress.update(r1 - r0)
         else:
@@ -751,8 +803,8 @@ def corrected_4dstem(
     # Extract raw VDFs from the stored alignment images. The scan collection
     # reference is the scalar channel correction implied by the learned scan
     # drift fields, not an external ground truth.
-    alignment_vdf_0 = np.asarray(self.images[0].array)
-    alignment_vdf_1 = np.asarray(self.images[1].array)
+    alignment_vdf_0 = np.asarray(self.imgs[0].array)
+    alignment_vdf_1 = np.asarray(self.imgs[1].array)
     scalar_corrected_vdf = corrected_virtual_images(
         self,
         alignment_vdf_0,

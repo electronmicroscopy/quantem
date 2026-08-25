@@ -75,19 +75,28 @@ def test_reference_correction_preserves_spectra_and_calibration():
 
     drift = DriftCorrection.from_reference(
         reference,
-        alignment_image,
+        spectrum_image,
+        alignment_image=alignment_image,
         scan_direction_degrees=0.0,
-    ).preprocess(show_merged=False, show_images=False)
-    initial_reference_knots = drift.knots[0].copy()
-    drift.align_affine(
-        step=0.04,
-        num_tests=11,
+        device="cpu",
+    ).preprocess(
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+    initial_reference_knots = drift.knots[0].clone()
+    drift.correct_affine(
+        max_drift_rate=0.2,
+        num_rates=11,
         refine=True,
         max_image_shift=16,
-        show_merged=False,
-        show_images=False,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
     )
-    corrected = drift.apply_correction(spectrum_image)
+    corrected = drift.corrected(verbose=False)
 
     interior = np.s_[12:-12, 12:-12]
     raw_ncc = np.corrcoef(
@@ -100,7 +109,11 @@ def test_reference_correction_preserves_spectra_and_calibration():
     )[0, 1]
     assert corrected_ncc > raw_ncc + 0.02
     assert corrected_ncc > 0.99
-    np.testing.assert_allclose(drift.knots[0], initial_reference_knots, atol=0.0)
+    np.testing.assert_allclose(
+        drift.knots[0].cpu(),
+        initial_reference_knots.cpu(),
+        atol=0.0,
+    )
     np.testing.assert_allclose(
         corrected.array[..., 1],
         2.0 * corrected.array[..., 0] + 3.0,
