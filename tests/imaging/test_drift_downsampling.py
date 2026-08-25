@@ -6,7 +6,7 @@ from scipy.ndimage import gaussian_filter
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.imaging.drift import DriftCorrection
-from quantem.imaging.drift.preparation import (
+from quantem.imaging.drift.preprocess import (
     average_downsample_2d,
     resolve_downsample,
 )

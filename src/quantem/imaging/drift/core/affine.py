@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 import quantem.imaging.drift.apply as drift_apply
 import quantem.imaging.drift.plot as drift_plot
-import quantem.imaging.drift.preparation as preparation
+import quantem.imaging.drift.preprocess as preprocessing
 import quantem.imaging.drift.report as report
 from quantem.imaging.drift.core import knots as drift_knots
 from quantem.imaging.drift.core.warping import (
@@ -94,7 +94,7 @@ def _scan_disagreement(warped: torch.Tensor, scan_axis: int) -> torch.Tensor:
 def _downsampled_correction(correction, factor):
     """Build the same correction problem on average-pooled scan images."""
     images = [
-        preparation.average_downsample_2d(np.asarray(image.array), factor)
+        preprocessing.average_downsample_2d(np.asarray(image.array), factor)
         for image in correction.imgs
     ]
     if correction._reference_mode:
@@ -460,10 +460,10 @@ def correct_affine(
             normalize = False
             normalization_reason = "4dstem_collection"
         else:
-            normalize, normalization_reason = preparation.automatic_alignment_normalization(
+            normalize, normalization_reason = preprocessing.automatic_alignment_normalization(
                 self.imgs
             )
-        padding = preparation.minimum_affine_padding_fraction(
+        padding = preprocessing.minimum_affine_padding_fraction(
             tuple(int(value) for value in self.imgs[0].shape[:2]),
             self.scan_direction_degrees,
             planned_rate,
@@ -820,7 +820,7 @@ def automatic_affine_search(
     starting_knots = [knot.clone() for knot in self.knots]
     initial_error_row = np.asarray(self.error_track[-1], dtype=np.float64).copy()
     image_shape = tuple(int(value) for value in self.imgs[0].shape[:2])
-    factor = preparation.resolve_downsample(
+    factor = preprocessing.resolve_downsample(
         pyramid_downsample,
         image_shape,
     )

@@ -1,4 +1,4 @@
-"""Image and canvas preparation for drift alignment."""
+"""Preprocess scientific inputs for drift alignment."""
 
 from collections.abc import Sequence
 

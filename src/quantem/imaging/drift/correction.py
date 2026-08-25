@@ -22,7 +22,7 @@ import quantem.imaging.drift.core.warping as warping
 import quantem.imaging.drift.diagnostics as diagnostics
 import quantem.imaging.drift.fourdstem as fourdstem
 import quantem.imaging.drift.plot as drift_plot
-import quantem.imaging.drift.preparation as preparation
+import quantem.imaging.drift.preprocess as preprocessing
 import quantem.imaging.drift.report as drift_report
 from quantem.core.config import validate_device
 from quantem.core.datastructures.dataset2d import Dataset2d
@@ -81,7 +81,7 @@ class DriftCorrection(AutoSerialize):
 
         if not datasets and alignment_image is None:
             return
-        preparation.prepare_inputs(
+        preprocessing.prepare_inputs(
             self, datasets, scan_direction_degrees, alignment_image
         )
 
@@ -186,7 +186,7 @@ class DriftCorrection(AutoSerialize):
 
         data = [read_emd(p) for p in paths]
         if len(data) == 2:
-            data[0], data[1] = preparation.match_scan_shapes(
+            data[0], data[1] = preprocessing.match_scan_shapes(
                 data[0], data[1], verbose=verbose
             )
         if verbose:
@@ -324,8 +324,8 @@ class DriftCorrection(AutoSerialize):
             reference_dc = reference_image
             if device is None:
                 device = reference_dc.device
-            drifted_shape = preparation.input_array(drifted_dataset).shape[:2]
-            reference_downsample = preparation.reference_downsample(
+            drifted_shape = preprocessing.input_array(drifted_dataset).shape[:2]
+            reference_downsample = preprocessing.reference_downsample(
                 tuple(int(value) for value in reference_dc.imgs[0].shape[:2]),
                 tuple(int(value) for value in drifted_shape),
                 reference_sampling=getattr(reference_dc.imgs[0], "sampling", None),
@@ -339,7 +339,7 @@ class DriftCorrection(AutoSerialize):
                 # images avoids that alias while keeping the operation fully
                 # automatic and costs well under a second on the microscope GPU.
                 scaled_reference_images = [
-                    preparation.average_downsample_2d(
+                    preprocessing.average_downsample_2d(
                         np.asarray(image.array),
                         reference_downsample,
                     )
@@ -356,7 +356,7 @@ class DriftCorrection(AutoSerialize):
                     show_knots=False,
                     verbose=False,
                 )
-            reference_image = preparation.match_reference_image(
+            reference_image = preprocessing.match_reference_image(
                 reference_dc.corrected(output_frame="canvas").array,
                 tuple(int(value) for value in reference_dc.imgs[0].shape[:2]),
                 tuple(int(value) for value in drifted_shape),
@@ -387,7 +387,7 @@ class DriftCorrection(AutoSerialize):
     drift_field = fourdstem.drift_field
     probe_positions = fourdstem.probe_positions
 
-    preprocess = preparation.preprocess
+    preprocess = preprocessing.preprocess
     align_translation = warping.align_translation
     correct_affine = affine.correct_affine
 
