@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, Literal, Self, Sequence
+from typing import Any, Callable, Literal, Self, Sequence
 
 import numpy as np
 import torch
@@ -14,6 +14,15 @@ from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectDIP, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeDIP, ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
+
+
+def _scheduler_spec(scheduler_type: str, scheduler_factor: float) -> dict[str, Any]:
+    scheduler_dict: dict[str, Any] = {
+        "name": "exponential" if scheduler_type == "exp" else scheduler_type
+    }
+    if scheduler_type in ("exp", "plateau"):
+        scheduler_dict["factor"] = scheduler_factor
+    return scheduler_dict
 
 
 class PtychoLite(Ptychography):
@@ -31,25 +40,25 @@ class PtychoLite(Ptychography):
         *,
         # object settings
         num_slices: int = 1,
-        slice_thicknesses: float | Sequence | None = None,
+        slice_thicknesses: float | Sequence[float] | None = None,
         obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
         # probe settings
         num_probes: int = 1,
         energy: float | None = None,
         defocus: float | None = None,
         semiangle_cutoff: float | None = None,
-        polar_parameters: dict | None = None,
+        polar_parameters: dict[str, Any] | None = None,
         middle_focus: bool = False,
         vacuum_probe_intensity: np.ndarray | Dataset4dstem | None = None,
         initial_probe_weights: list[float] | np.ndarray | None = None,
         # preprocessing
         obj_padding_px: tuple[int, int] = (0, 0),
         # logging/device
-        log_dir: os.PathLike | str | None = None,
+        log_dir: os.PathLike[str] | str | None = None,
         log_prefix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = False,
-        device: Literal["cpu", "gpu"] = "cpu",
+        device: str | int = "cpu",
         verbose: int | bool = True,
         rng: np.random.Generator | int | None = None,
     ) -> Self:
@@ -70,13 +79,13 @@ class PtychoLite(Ptychography):
             Object parameterization.
         num_probes : int
             Number of probe components (mixed state when >1).
-        energy, defocus, semiangle_cutoff, rolloff, polar_parameters
+        energy, defocus, semiangle_cutoff, polar_parameters
             Probe settings passed to ProbePixelated.
         vacuum_probe_intensity : np.ndarray | Dataset4dstem | None
             Optional corner-centered vacuum probe intensity for scaling/centering.
         initial_probe_weights : list[float] | np.ndarray | None
             Optional initial component weights (length=num_probes).
-        log_dir, log_prefix, log_suffix, log_images_every, log_probe_images, device, verbose, rng
+        log_dir, log_prefix, log_images_every, log_probe_images, device, verbose, rng
             Standard Ptychography configuration.
         """
 
@@ -89,6 +98,12 @@ class PtychoLite(Ptychography):
             raise TypeError(
                 f"dset must be Dataset4dstem or PtychographyDatasetRaster, got {type(dset)}"
             )
+
+        dset_model.learn_scan_positions = False
+        dset_model.learn_descan = False
+        dset_model.scan_positions_px.requires_grad_(False)
+        dset_model.descan_shifts.requires_grad_(False)
+        dset_model.remove_optimizer()
 
         if not dset_model.preprocessed:
             dset_model.preprocess(com_fit_function="constant")
@@ -113,7 +128,7 @@ class PtychoLite(Ptychography):
             probe_params.update(polar_parameters)
 
         if middle_focus:
-            if num_slices > 1:
+            if num_slices > 1 and obj_model.slice_thicknesses is not None:
                 half_thickness = obj_model.slice_thicknesses.sum() / 2
                 if "C10" in probe_params and probe_params["C10"] is not None:
                     probe_params["C10"] -= half_thickness
@@ -159,25 +174,46 @@ class PtychoLite(Ptychography):
         )
         return ptycho
 
-    def reconstruct(  # type:ignore could do overloads but this is simpler...
+    def reconstruct(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         num_iters: int = 0,
         reset: bool = False,
         lr_obj: float = 5e-3,
         learn_probe: bool = True,
         lr_probe: float = 1e-3,
+        lr_scan_positions: float = 0.0,
         batch_size: int | None = None,
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
-        constraints: dict = {},  # TODO add constraints flags
+        constraints: dict[str, Any] | None = None,
         store_iterations_every: int | None = None,
-        device: Literal["cpu", "gpu"] | None = None,
+        device: "str | int | list[int] | None" = None,
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
+        lr_scan_positions = float(lr_scan_positions)
+        if lr_scan_positions < 0:
+            raise ValueError(f"lr_scan_positions must be non-negative, got {lr_scan_positions}")
 
-        if new_optimizers or reset or self.num_iters == 0:
+        setup_new_optimizers = new_optimizers or reset or self.num_iters == 0
+        has_dataset_optimizer = "dataset" in self.optimizers
+        learn_scan_positions = lr_scan_positions > 0 or (
+            not setup_new_optimizers and has_dataset_optimizer
+        )
+        self.dset.learn_scan_positions = learn_scan_positions
+        self.dset.learn_descan = False
+        self.dset.scan_positions_px.requires_grad_(learn_scan_positions)
+        self.dset.descan_shifts.requires_grad_(False)
+
+        needs_dataset_optimizer = learn_scan_positions
+        if not needs_dataset_optimizer and "dataset" in self.optimizers:
+            self.remove_optimizer("dataset")
+
+        opt_params: dict[str, Any] | None
+        scheduler_params: dict[str, Any] | None
+        if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
+            scheduler_dict = _scheduler_spec(scheduler_type, scheduler_factor)
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -185,25 +221,23 @@ class PtychoLite(Ptychography):
                 },
             }
             scheduler_params = {
-                "object": {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                "object": dict(scheduler_dict),
             }
             if learn_probe:
                 opt_params["probe"] = {
                     "name": "adamw",
                     "lr": lr_probe,
                 }
-                scheduler_params["probe"] = {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
+                scheduler_params["probe"] = dict(scheduler_dict)
+            if needs_dataset_optimizer:
+                opt_params["dataset"] = {
+                    "name": "adamw",
+                    "lr": lr_scan_positions,
                 }
+                scheduler_params["dataset"] = dict(scheduler_dict)
         else:
             opt_params = None
             scheduler_params = None
-
-        constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
             num_iters=num_iters,
@@ -249,15 +283,15 @@ class PtychoLite(Ptychography):
                 upgraded = cls._recursive_load_from_path(path)
                 return upgraded  # type: ignore[return-value]
 
-        return base  # type: ignore[return-value]
+        return base  # pyright: ignore[reportReturnType]
 
 
 class PtychoLiteDIP(Ptychography):
     """
     High-level convenience wrapper around Ptychography.
 
-    Provides a from_dataset() constructor that builds pixelated object and probe
-    models from simple flags, then initializes a full Ptychography instance.
+    Provides a from_ptycholite() constructor that builds DIP object and probe
+    models from an existing PtychoLite, then initializes a full Ptychography instance.
     """
 
     @classmethod
@@ -265,27 +299,36 @@ class PtychoLiteDIP(Ptychography):
         cls,
         ptycholite: PtychoLite,
         pretrain_iters: int | None = None,
-        pretrain_lr: float = 1e-3,
+        pretrain_object_lr: float | None = None,
+        pretrain_probe_lr: float = 1e-3,
+        pretrain_lr: float | None = None,
         pretrain_probe: bool = True,
         pretrain_object: bool = True,
+        normalize_object_plotting: bool = True,
         # model settings
         cnn_num_layers: int = 3,
+        final_activation: "str | Callable[..., Any]" = "identity",
         # logging/device
-        log_dir: os.PathLike | str | None = None,
+        log_dir: os.PathLike[str] | str | None = None,
         log_prefix: str = "",
         log_images_every: int = 10,
         log_probe_images: bool = False,
-        device: Literal["cpu", "gpu", "cuda"] = "cpu",
+        device: str | int | torch.device = "cpu",
         verbose: int | bool = True,
     ) -> Self:
-        if device == "gpu":
-            device = "cuda"
+        if pretrain_object_lr is None:
+            pretrain_object_lr = 1e-3 if pretrain_lr is None else pretrain_lr
+        elif pretrain_lr is not None and pretrain_lr != pretrain_object_lr:
+            raise ValueError("Got conflicting values for pretrain_lr and pretrain_object_lr.")
+
+        device, _ = config.validate_device(device)
         # Object model
         obj_dip = CNN2d(
             in_channels=ptycholite.obj_model.num_slices,
             out_channels=ptycholite.obj_model.num_slices,
             num_layers=cnn_num_layers,
             dtype=torch.complex64 if ptycholite.obj_model.obj_type == "complex" else torch.float32,
+            final_activation=final_activation,
         )
 
         obj_model = ObjectDIP.from_pixelated(
@@ -315,14 +358,15 @@ class PtychoLiteDIP(Ptychography):
                     num_iters=pretrain_iters,
                     optimizer_params={
                         "name": "adamw",
-                        "lr": pretrain_lr,
+                        "lr": pretrain_object_lr,
                     },
                     scheduler_params={
                         "name": "plateau",
                         "factor": 0.5,
                     },
                     apply_constraints=False,
-                    device=config.get("device"),
+                    device=device,
+                    normalize_object_plotting=normalize_object_plotting,
                 )
             if pretrain_probe:
                 probe_model.pretrain(
@@ -330,7 +374,7 @@ class PtychoLiteDIP(Ptychography):
                     num_iters=pretrain_iters,
                     optimizer_params={
                         "name": "adamw",
-                        "lr": 1e-3,
+                        "lr": pretrain_probe_lr,
                     },
                     scheduler_params={
                         "name": "plateau",
@@ -343,7 +387,7 @@ class PtychoLiteDIP(Ptychography):
             logger = LoggerPtychography(
                 log_dir=log_dir,
                 run_prefix=log_prefix,
-                run_suffix="pix",
+                run_suffix="dip",
                 log_images_every=log_images_every,
                 log_probe_images=log_probe_images,
             )
@@ -360,7 +404,7 @@ class PtychoLiteDIP(Ptychography):
             detector_model=ptycholite.detector_model,
             logger=logger if logger is not None else ptycholite.logger,
             device=device,
-            verbose=ptycholite.verbose,
+            verbose=verbose,
             rng=ptycholite.rng,
         )
 
@@ -369,25 +413,46 @@ class PtychoLiteDIP(Ptychography):
         )
         return ptycho
 
-    def reconstruct(  # type:ignore could do overloads but this is simpler...
+    def reconstruct(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         num_iters: int = 0,
         reset: bool = False,
         lr_obj: float = 1e-3,
         learn_probe: bool = True,
         lr_probe: float = 1e-3,
+        lr_scan_positions: float = 0.0,
         batch_size: int | None = None,
         scheduler_type: Literal["exp", "cyclic", "plateau", "none"] = "none",
         scheduler_factor: float = 0.5,
         new_optimizers: bool = False,  # not sure what the default should be
-        constraints: dict = {},  # TODO add constraints flags
+        constraints: dict[str, Any] | None = None,
         store_iterations_every: int | None = None,
-        device: Literal["cpu", "gpu"] | None = None,
+        device: str | int | list[int] | None = None,
         verbose: int | bool = True,
     ) -> Self:
         self.verbose = verbose
+        lr_scan_positions = float(lr_scan_positions)
+        if lr_scan_positions < 0:
+            raise ValueError(f"lr_scan_positions must be non-negative, got {lr_scan_positions}")
 
-        if new_optimizers or reset or self.num_iters == 0:
+        setup_new_optimizers = new_optimizers or reset or self.num_iters == 0
+        has_dataset_optimizer = "dataset" in self.optimizers
+        learn_scan_positions = lr_scan_positions > 0 or (
+            not setup_new_optimizers and has_dataset_optimizer
+        )
+        self.dset.learn_scan_positions = learn_scan_positions
+        self.dset.learn_descan = False
+        self.dset.scan_positions_px.requires_grad_(learn_scan_positions)
+        self.dset.descan_shifts.requires_grad_(False)
+
+        needs_dataset_optimizer = learn_scan_positions
+        if not needs_dataset_optimizer and "dataset" in self.optimizers:
+            self.remove_optimizer("dataset")
+
+        opt_params: dict[str, Any] | None
+        scheduler_params: dict[str, Any] | None
+        if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
+            scheduler_dict = _scheduler_spec(scheduler_type, scheduler_factor)
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -395,25 +460,23 @@ class PtychoLiteDIP(Ptychography):
                 },
             }
             scheduler_params = {
-                "object": {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                "object": dict(scheduler_dict),
             }
             if learn_probe:
                 opt_params["probe"] = {
                     "name": "adamw",
                     "lr": lr_probe,
                 }
-                scheduler_params["probe"] = {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
+                scheduler_params["probe"] = dict(scheduler_dict)
+            if needs_dataset_optimizer:
+                opt_params["dataset"] = {
+                    "name": "adamw",
+                    "lr": lr_scan_positions,
                 }
+                scheduler_params["dataset"] = dict(scheduler_dict)
         else:
             opt_params = None
             scheduler_params = None
-
-        constraints = constraints  # placeholder for constraints flags
 
         return super().reconstruct(
             num_iters=num_iters,

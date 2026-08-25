@@ -19,6 +19,7 @@ from quantem.core.utils.validators import (
     validate_int,
     validate_tensor,
 )
+from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging.complex_probe import (
     aberration_surface,
     aberration_surface_cartesian_basis,
@@ -44,6 +45,7 @@ from itertools import product
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     ABERRATION_PRESETS,
     _crop_corner_centered_mask,
+    _rotation_degrees_to_radians,
     align_vbf_stack_multiscale,
     create_edge_window,
     fit_aberrations_from_shifts,
@@ -156,13 +158,13 @@ class HyperparameterState:
             if self.initial_aberrations:
                 add("initial_aberrations", self.initial_aberrations)
             if self.initial_rotation_angle is not None:
-                add("initial_rotation_angle", self.initial_rotation_angle)
+                add("initial_rotation_angle_deg", self.initial_rotation_angle)
 
         elif which == "optimized":
             if self.optimized_aberrations:
                 add("optimized_aberrations", self.optimized_aberrations)
             if self.optimized_rotation_angle is not None:
-                add("optimized_rotation_angle", self.optimized_rotation_angle)
+                add("optimized_rotation_angle_deg", self.optimized_rotation_angle)
 
         elif which == "current":
             current_abers = self.current_aberrations(override_aberration_coefs)
@@ -171,17 +173,17 @@ class HyperparameterState:
             if current_abers:
                 add("current_aberrations", current_abers)
             if current_rot is not None:
-                add("current_rotation_angle", current_rot)
+                add("current_rotation_angle_deg", current_rot)
 
         elif which == "all":
             if self.initial_aberrations:
                 add("initial_aberrations", self.initial_aberrations)
             if self.initial_rotation_angle is not None:
-                add("initial_rotation_angle", self.initial_rotation_angle)
+                add("initial_rotation_angle_deg", self.initial_rotation_angle)
             if self.optimized_aberrations:
                 add("optimized_aberrations", self.optimized_aberrations)
             if self.optimized_rotation_angle is not None:
-                add("optimized_rotation_angle", self.optimized_rotation_angle)
+                add("optimized_rotation_angle_deg", self.optimized_rotation_angle)
 
         else:
             raise ValueError(
@@ -335,7 +337,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         if rotation_angle is None:
             origin.estimate_detector_rotation()
-            rotation_angle = origin.detector_rotation_deg / 180 * math.pi
+            rotation_angle = origin.detector_rotation_deg
 
         # shift to origin
         origin.shift_origin_to(
@@ -494,6 +496,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
     @property
     def rotation_angle(self) -> float:
+        """Current detector rotation angle in degrees."""
         return self.hyperparameter_state.current_rotation_angle()
 
     @property
@@ -679,7 +682,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         upsampling_factor : int, optional
             Factor by which to upsample the reconstruction
         override_rotation_angle : float, optional
-            Rotation angle for coordinate system
+            Rotation angle for coordinate system, in degrees
         max_batch_size : int, optional
             Maximum batch size for processing
         deconvolution_kernel : str, one of ['ssb', 'obf', 'mf','prlx','icom']
@@ -742,7 +745,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         # Get k-space grid
         kxa, kya = spatial_frequencies(
-            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+            self.gpts,
+            self.sampling,
+            rotation_angle=_rotation_degrees_to_radians(rotation_angle),
+            device=self.device,
         )
         k, phi = polar_coordinates(kxa, kya)
 
@@ -900,6 +906,62 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         obj = to_numpy(self.corrected_bf)
         return obj
 
+    def visualize(
+        self,
+        return_fig: bool = False,
+        show_obj_fft: bool = True,
+        apply_hanning_window: bool = False,
+        **kwargs,
+    ):
+        """
+        Show the reconstructed object and its Hann-windowed Fourier transform.
+
+        Parameters
+        ----------
+        cbar : bool, optional
+            Whether to show colorbars, by default True.
+        return_fig : bool, optional
+            If True, return ``(fig, axs)``.
+        fft_norm : str | dict, optional
+            Normalization passed to ``show_2d`` for the object FFT.
+        **kwargs
+            Additional arguments passed to ``show_2d``.
+        """
+        if self.corrected_bf is None:
+            raise RuntimeError("Run reconstruct() before visualize().")
+
+        obj = self.obj
+        obj_scalebar = {"sampling": self.scan_sampling[1], "units": "Å"}
+
+        if show_obj_fft:
+            if apply_hanning_window:
+                window = np.hanning(obj.shape[-2])[:, None] * np.hanning(obj.shape[-1])[None, :]
+                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj * window)))
+            else:
+                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj)))
+
+            fft_sampling = 1 / (self.scan_sampling[1] * obj.shape[-1])
+            fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
+
+            fig, axs = show_2d(
+                [obj, obj_fft],
+                title=["Object phase", "Object phase FFT"],
+                scalebar=[obj_scalebar, fft_scalebar],
+                **kwargs,
+            )
+            axs[1].set_aspect(obj.shape[-1] / obj.shape[-2])
+        else:
+            fig, axs = show_2d(
+                obj,
+                title="Object phase",
+                scalebar=obj_scalebar,
+                **kwargs,
+            )
+
+        if return_fig:
+            return fig, axs
+        return None
+
     def optimize_hyperparameters(
         self,
         aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
@@ -917,7 +979,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         aberration_coefs : dict[str, float|OptimizationParameter]
             Dict of aberration names to either fixed values or optimization ranges.
         rotation_angle : float|OptimizationParameter
-            Fixed rotation or optimization range.
+            Fixed rotation or optimization range, in degrees.
         n_trials : int
             Number of Optuna trials.
         sampler : optuna.samplers.BaseSampler, optional
@@ -1107,7 +1169,10 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         # Get initial shifts
         kxa, kya = spatial_frequencies(
-            self.gpts, self.sampling, rotation_angle=rotation_angle, device=self.device
+            self.gpts,
+            self.sampling,
+            rotation_angle=_rotation_degrees_to_radians(rotation_angle),
+            device=self.device,
         )
         k, phi = polar_coordinates(kxa, kya)
 
@@ -1335,7 +1400,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         kxa, kya = spatial_frequencies(
             self.gpts,
             self.sampling,
-            rotation_angle=rotation_angle,
+            rotation_angle=_rotation_degrees_to_radians(rotation_angle),
             device=device,
         )
 
@@ -1511,7 +1576,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
 
         Args:
             aberration_coefs: Initial aberration coefficients to deconvolve
-            rotation_angle: Rotation angle for basis functions
+            rotation_angle: Rotation angle for basis functions, in degrees
             cartesian_basis: Aberration basis to fit. Can be:
                 - str: preset name like "low_order"
                 - list[str]: explicit list like ["C10", "C12_a", "C12_b", ...]

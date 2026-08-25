@@ -1,4 +1,4 @@
-from math import ceil, floor
+from math import ceil
 from typing import Literal, Union, overload
 
 import numpy as np
@@ -25,7 +25,6 @@ class SimpleBatcher:
         train_indices: np.ndarray | None = None,
         val_indices: np.ndarray | None = None,
     ):
-        self.indices = np.arange(num)
         self.batch_size = batch_size if batch_size is not None else num
         self.shuffle = shuffle
         self.rng = rng
@@ -37,42 +36,9 @@ class SimpleBatcher:
             self.train_indices = np.asarray(train_indices, dtype=int)
             self.val_indices = np.asarray(val_indices, dtype=int)
         else:
-            # Validate ratio and split deterministically given rng
-            if val_ratio < 0 or val_ratio >= 1:
-                val_ratio = 0.0
-            n_val = int(round(len(self.indices) * val_ratio))
-            if n_val > 0:
-                if val_mode == "random":
-                    # Random unique selection for validation
-                    perm = self.rng.permutation(self.indices)
-                    self.val_indices = perm[:n_val]
-                    self.train_indices = np.setdiff1d(
-                        self.indices, self.val_indices, assume_unique=False
-                    )
-                else:  # grid/regular selection: every k-th index
-                    if val_ratio <= 0.5:
-                        k = max(1, int(round(1.0 / val_ratio)))
-                        invert = False
-                    else:
-                        k = max(1, int(round(1.0 / (1.0 - val_ratio))))
-                        invert = True
-
-                    grid_sel = self.indices[::k]
-                    if len(grid_sel) > n_val:
-                        grid_sel = grid_sel[:n_val]
-                    if invert:
-                        self.train_indices = grid_sel
-                        self.val_indices = np.setdiff1d(
-                            self.indices, grid_sel, assume_unique=False
-                        )
-                    else:
-                        self.val_indices = grid_sel
-                        self.train_indices = np.setdiff1d(
-                            self.indices, self.val_indices, assume_unique=False
-                        )
-            else:
-                self.val_indices = np.asarray([], dtype=int)
-                self.train_indices = self.indices
+            self.train_indices, self.val_indices = compute_train_val_split(
+                num, val_ratio, val_mode, self.rng
+            )
 
     @property
     def rng(self) -> np.random.Generator:
@@ -117,6 +83,73 @@ class SimpleBatcher:
         return int(ceil(len(self.val_indices) / self.batch_size)) if self.has_validation else 0
 
 
+def compute_train_val_split(
+    num: int,
+    val_ratio: float,
+    val_mode: Literal["grid", "random"],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the train/validation index split.
+
+    Returns ``(train_indices, val_indices)`` as int numpy arrays. ``val_mode="grid"``
+    selects every k-th index (with ``k = round(1/val_ratio)``, inverted when
+    ``val_ratio > 0.5``); ``"random"`` selects a seeded ``rng.permutation`` slice.
+    """
+    indices = np.arange(num)
+    if val_ratio < 0 or val_ratio >= 1:
+        val_ratio = 0.0
+    n_val = int(round(len(indices) * val_ratio))
+    if n_val <= 0:
+        return indices, np.asarray([], dtype=int)
+
+    if val_mode == "random":
+        # Random unique selection for validation
+        perm = rng.permutation(indices)
+        val_indices = perm[:n_val]
+        train_indices = np.setdiff1d(indices, val_indices, assume_unique=False)
+    else:  # grid/regular selection: every k-th index
+        if val_ratio <= 0.5:
+            k = max(1, int(round(1.0 / val_ratio)))
+            invert = False
+        else:
+            k = max(1, int(round(1.0 / (1.0 - val_ratio))))
+            invert = True
+
+        grid_sel = indices[::k]
+        if len(grid_sel) > n_val:
+            grid_sel = grid_sel[:n_val]
+        if invert:
+            train_indices = grid_sel
+            val_indices = np.setdiff1d(indices, grid_sel, assume_unique=False)
+        else:
+            val_indices = grid_sel
+            train_indices = np.setdiff1d(indices, val_indices, assume_unique=False)
+
+    return np.asarray(train_indices, dtype=int), np.asarray(val_indices, dtype=int)
+
+
+def add_input_noise(
+    model_input: torch.Tensor,
+    noise_std: float,
+    dtype: torch.dtype,
+    device: "torch.device | str | int",
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Add gaussian noise to a DIP model input when noise_std > 0."""
+    if noise_std > 0.0:
+        noise = (
+            torch.randn(
+                model_input.shape,
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+            * noise_std
+        )
+        return model_input + noise
+    return model_input
+
+
 @overload
 def fourier_shift_expand(
     array: np.ndarray, positions: np.ndarray, expand_dim: bool = True
@@ -129,14 +162,15 @@ def fourier_shift_expand(
     array: ArrayLike, positions: ArrayLike, expand_dim: bool = True
 ) -> ArrayLike:
     """Fourier-shift array by flat array of positions."""
-    phase = fourier_translation_operator(positions, array.shape, expand_dim, dtype=array.dtype)
+    dtype = array.dtype if af.is_complex(array) else None
+    phase = fourier_translation_operator(positions, array.shape, expand_dim, dtype=dtype)
     fourier_array = af.fft2(array)
     shifted_fourier_array = fourier_array * phase
     shifted_array = af.ifft2(shifted_fourier_array)
     if af.is_complex(array):
         return shifted_array
     else:
-        return shifted_array.real
+        return shifted_array.real  # type:ignore ## will be numeric so this should be safe
 
 
 @overload
@@ -144,20 +178,20 @@ def fourier_translation_operator(
     positions: np.ndarray,
     shape: tuple,
     expand_dim: bool = True,
-    dtype: "str|torch.dtype|None" = None,
+    dtype: "str|torch.dtype|np.dtype|None" = None,
 ) -> np.ndarray: ...
 @overload
 def fourier_translation_operator(
     positions: "torch.Tensor",
     shape: tuple,
     expand_dim: bool = True,
-    dtype: "str|torch.dtype|None" = None,
+    dtype: "str|torch.dtype|np.dtype|None" = None,
 ) -> "torch.Tensor": ...
 def fourier_translation_operator(
     positions: ArrayLike,
     shape: tuple,
     expand_dim: bool = True,
-    dtype: "str|torch.dtype|None" = None,
+    dtype: "str|torch.dtype|np.dtype|None" = None,
 ) -> ArrayLike:
     """Returns phase ramp for fourier-shifting array of shape `shape`."""
     nr, nc = shape[-2:]
@@ -174,42 +208,6 @@ def fourier_translation_operator(
     if dtype is not None:
         ramp = af.as_type(ramp, dtype)
     return ramp
-
-
-@overload
-def get_com_2d(ar: np.ndarray, corner_centered: bool = False) -> np.ndarray: ...
-@overload
-def get_com_2d(ar: "torch.Tensor", corner_centered: bool = False) -> "torch.Tensor": ...
-def get_com_2d(ar: ArrayLike, corner_centered: bool = False) -> ArrayLike:
-    """
-    Finds and returns the center of mass along last two dimensions.
-    If corner_centered is True, uses fftfreq for indices.
-    """
-    nr, nc = ar.shape[-2:]
-
-    if corner_centered:
-        c, r = np.meshgrid(np.fft.fftfreq(nc, 1 / nc), np.fft.fftfreq(nr, 1 / nr))
-    else:
-        c, r = np.meshgrid(np.arange(nc), np.arange(nr))
-
-    rc = af.match_device(np.stack([r, c]), ar)
-    com = (
-        af.sum(
-            rc * ar[..., None, :, :],
-            axis=(
-                -1,
-                -2,
-            ),
-        )
-        / af.sum(
-            ar,
-            axis=(
-                -1,
-                -2,
-            ),
-        )[:, None]
-    )
-    return com
 
 
 def sum_patches_base(
@@ -368,8 +366,12 @@ def fit_origin(
     elif fit_function == "bezier_two":
         f = _bezier_two
     elif fit_function == "constant":
-        qr0_fit = np.mean(qr0_meas) * np.ones_like(qr0_meas)
-        qc0_fit = np.mean(qc0_meas) * np.ones_like(qc0_meas)
+        # only average over the masked-in (and finite) positions; otherwise NaN/masked-out
+        # positions (e.g. zeroed diffraction patterns) would poison the mean
+        qr0_sel = qr0_meas[mask] if mask is not None else qr0_meas
+        qc0_sel = qc0_meas[mask] if mask is not None else qc0_meas
+        qr0_fit = np.nanmean(qr0_sel) * np.ones_like(qr0_meas)
+        qc0_fit = np.nanmean(qc0_sel) * np.ones_like(qc0_meas)
         qr0_residuals = qr0_meas - qr0_fit
         qc0_residuals = qc0_meas - qc0_fit
         return qr0_fit, qc0_fit, qr0_residuals, qc0_residuals
@@ -387,7 +389,9 @@ def fit_origin(
         qr0_meas_masked = qr0_meas[mask]
         qc0_meas_masked = qc0_meas[mask]
         mask1D = mask.reshape(1, np.prod(shape))
-        rc_masked = np.vstack((r1D * mask1D, c1D * mask1D))
+        rc_masked = np.vstack((r1D[mask1D], c1D[mask1D]))
+        # old failed for zero-valued DPs
+        # rc_masked = np.vstack((r1D * mask1D, c1D * mask1D))
 
         popt_r, _ = curve_fit(f, rc_masked, qr0_meas_masked)
         popt_c, _ = curve_fit(f, rc_masked, qc0_meas_masked)
@@ -490,7 +494,7 @@ class AffineTransform:
             return cls()
         R[1] /= scale1
         shear1 /= scale1
-        angle = np.arccos(R[0, 0])
+        angle = np.arctan2(-R[0, 1], R[0, 0])
 
         if T.shape[0] > 2:
             t0, t1 = T[2]
@@ -612,9 +616,9 @@ def center_crop_arr(
                 raise ValueError(
                     f"Dimension {i} of shape ({s}) is larger than dimension {i} of arr ({a})."
                 )
-            pad[i] = [int(floor(s - a) / 2), int(ceil(s - a) / 2)]
+            pad[i] = [(s - a) // 2, ceil((s - a) / 2)]
 
-    if any(pad):
+    if any(p != [0, 0] for p in pad):
         arr = np.pad(arr, pad_width=pad, mode="constant")
 
     slices = []

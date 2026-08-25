@@ -52,7 +52,7 @@ class LoggerPtychography(LoggerBase):
             elif obj_type == "pure_phase":
                 self.log_image(
                     tag="object/phase_zsum",
-                    image=np.angle(obj_sum),
+                    image=obj_sum,
                     step=iter,
                     cmap=self._phase_cmap,
                 )
@@ -74,7 +74,7 @@ class LoggerPtychography(LoggerBase):
             print(f"Warning: Failed to log object images at iteration {iter}: {e}")
 
     def probe_image(self, probe_model: ProbeModelType, iter: int, logger_cmap: str = "turbo"):
-        """Log probe images showing both real-space and fourier-space representations (optimized)."""
+        """Log real-space probe images (optimized)."""
         try:
             probe = probe_model.probe
 
@@ -160,7 +160,7 @@ class LoggerPtychography(LoggerBase):
                     self.log_scalar(f"learning_rate/{param_name}", float(lr_value), iter)
 
             # Images (only when needed)
-            if iter % self.log_images_every == 0 and self.log_images_every > 0:
+            if self.log_images_every > 0 and iter % self.log_images_every == 0:
                 self.object_image(object_model, iter, logger_cmap)
                 if self._log_probe_images:
                     self.probe_image(probe_model, iter, logger_cmap)

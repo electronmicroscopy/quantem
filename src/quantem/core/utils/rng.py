@@ -3,6 +3,8 @@ from typing import Union
 import numpy as np
 import torch
 
+from quantem.core import config
+
 DeviceType = Union[str, "torch.device", int]
 
 
@@ -26,7 +28,7 @@ class RNGMixin:
         *args,
         **kwargs,
     ):
-        self._device = device
+        self._device = config.validate_device(device)[0]
         self.rng = rng
 
     @property

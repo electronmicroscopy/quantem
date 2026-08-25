@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
-from typing import Any, Callable, Self, Union
+from dataclasses import dataclass
+from typing import Any, Callable, Self, Union, cast
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -14,6 +15,7 @@ from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
+from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.optimizer_mixin import (
     OptimizerMixin,
@@ -36,13 +38,94 @@ from quantem.diffractive_imaging.complex_probe import (
     POLAR_SYMBOLS,
     real_space_probe,
 )
-from quantem.diffractive_imaging.constraints import BaseConstraints
 from quantem.diffractive_imaging.ptycho_utils import (
+    add_input_noise,
     fourier_shift_expand,
     shift_array,
 )
 
 DeviceType = Union[str, torch.device, int]
+
+
+class PtychoProbeConstraintParams:
+    """
+    Namespace class for ptychography probe constraint dataclasses.
+
+    Tab-complete on ``PtychoProbeConstraintParams`` in a notebook to discover the
+    available variants. Tab-complete inside a variant's constructor to see every
+    constraint field with its default value.
+
+    Variants
+    --------
+    Raster
+        Constraints for grid-based probe representations (``ProbePixelated`` and
+        ``ProbeDIP`` share this set today).
+    Parametric
+        Placeholder for parametric probe models, where Gram-Schmidt orthogonalization
+        and pixel-domain TV are moot.
+    """
+
+    @dataclass
+    class Raster(Constraints):
+        """Constraints for grid-based ptychography probe models (``ProbePixelated``,
+        ``ProbeDIP``).
+
+        Attributes
+        ----------
+        orthogonalize_probe : bool, default ``True``
+            Mixed-state probe (``num_probes > 1``) only. After each update applies
+            Gram-Schmidt orthogonalization across the probe stack and then sorts
+            the resulting probes by total intensity (descending). For
+            ``num_probes == 1`` this is effectively a renormalization no-op.
+        center_probe : bool, default ``False``
+            Shifts the probe's intensity center-of-mass back to the array center
+            via a Fourier shift after each update. Useful when probe drift
+            competes with scan-position refinement; if both move freely the
+            reconstruction can wander while still fitting the diffraction data.
+        tv_weight : float, default ``0.0``
+            Soft penalty. Weight on the in-plane total-variation of the (complex)
+            probe; encourages smooth probe magnitude / phase.
+        """
+
+        # hard constraints
+        orthogonalize_probe: bool = True
+        center_probe: bool = False
+        # soft constraints
+        tv_weight: float = 0.0
+        _name: str = "raster"
+
+        soft_constraint_keys = ["tv_weight"]
+        hard_constraint_keys = ["orthogonalize_probe", "center_probe"]
+
+    @dataclass
+    class Parametric(Constraints):
+        """Placeholder for parametric probe constraints (``ProbeParametric``).
+
+        Parametric probes are pure functions of aberration / aperture coefficients,
+        so pixel-domain projections like ``orthogonalize_probe`` and ``tv_weight``
+        don't apply. Parametric-specific fields (e.g. bounds on individual
+        aberration coefficients) will land here when needed.
+        """
+
+        _name: str = "parametric"
+
+        soft_constraint_keys = []
+        hard_constraint_keys = []
+
+    @classmethod
+    def parse_dict(cls, d: dict) -> "PtychoProbeConstraintsType":
+        """Instantiate the appropriate variant from a config dict.
+
+        The dict must contain a ``'name'`` or ``'type'`` key (case-insensitive),
+        with value ``'raster'`` or ``'parametric'``. All other keys are forwarded
+        as keyword arguments to the chosen dataclass.
+        """
+        return cast(PtychoProbeConstraintsType, parse_constraint_dict(cls, d, kind="probe"))
+
+
+PtychoProbeConstraintsType = (
+    PtychoProbeConstraintParams.Raster | PtychoProbeConstraintParams.Parametric
+)
 
 
 class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
@@ -74,14 +157,13 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     ):
         if _token is not self._token:
             raise RuntimeError("Use a factory method to instantiate this class.")
-
         # Initialize nn.Module first
         nn.Module.__init__(self)
         RNGMixin.__init__(self, rng=rng, device=device)
         OptimizerMixin.__init__(self)
 
         self.num_probes = num_probes
-        self._device = device
+        self.device = device
         self._probe_params = self.DEFAULT_PROBE_PARAMS
         self._max_aberrations_order = max_aberrations_order
         self.probe_params = probe_params
@@ -154,7 +236,7 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return self._probe_params
 
     @probe_params.setter
-    def probe_params(self, params: dict[str, Any] = {}):
+    def probe_params(self, params: dict[str, Any]):
         validate_dict_keys(
             params,
             [*self.DEFAULT_PROBE_PARAMS.keys(), *POLAR_SYMBOLS, *POLAR_ALIASES.keys()],
@@ -409,9 +491,6 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         if probe_energy is None:
             raise ValueError("probe_model energy must be set to compute propagators.")
         wavelength = electron_wavelength_angstrom(probe_energy)
-        propagators = torch.empty(
-            (num_slices - 1, kr.shape[0], kc.shape[0]), dtype=torch.complex64, device=self.device
-        )
 
         theta_r, theta_c = self.probe_tilt
         dz = torch.tensor(slice_thicknesses, device=self.device, dtype=k2.dtype)  # (T,)
@@ -427,22 +506,14 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         return propagators
 
 
-class ProbeConstraints(BaseConstraints, ProbeBase):
-    DEFAULT_CONSTRAINTS = {
-        # "fix_probe": False,
-        "orthogonalize_probe": True,
-        "center_probe": False,
-        "tv_weight": 0.0,
-    }
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], ProbeBase):
+    DEFAULT_CONSTRAINTS: PtychoProbeConstraintParams.Raster = PtychoProbeConstraintParams.Raster()
 
     def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
-        if self.constraints["tv_weight"]:
-            loss_tv = self._probe_tv_constraint(probe, self.constraints["tv_weight"])
+        if self.constraints.tv_weight:
+            loss_tv = self._probe_tv_constraint(probe, self.constraints.tv_weight)
             self.add_soft_constraint_loss("tv_loss", loss_tv)
             loss = loss + loss_tv
 
@@ -450,11 +521,9 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         return loss
 
     def apply_hard_constraints(self, probe: torch.Tensor) -> torch.Tensor:
-        # if self.constraints["fix_probe"]:
-        #     return self.initial_probe
-        if self.constraints["orthogonalize_probe"]:
+        if self.constraints.orthogonalize_probe:
             probe = self._probe_orthogonalization_constraint(probe)
-        if self.constraints["center_probe"]:
+        if self.constraints.center_probe:
             probe = self._probe_center_of_mass_constraint(probe)
         return probe
 
@@ -525,28 +594,6 @@ class ProbeConstraints(BaseConstraints, ProbeBase):
         return orthogonal_probes_sorted
 
 
-#    def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
-#        """
-#        """
-#        n_probes = start_probe.shape[0]
-#
-#        # Gram matrix, G = P @ P.H
-#        P = start_probe.view(n_probes,-1)
-#        G = P @ P.conj().T
-#
-#        # eigen-decomposition of G
-#        _, eigenvecs = torch.linalg.eigh(G)
-#
-#        # rotate probes into orthogonal basis
-#        orthogonal_probes = torch.tensordot(eigenvecs.T, start_probe, dims=1)
-#
-#        # sort by intensity
-#        intensities = torch.sum(torch.abs(orthogonal_probes) ** 2, dim=(-2,-1))
-#        order = torch.argsort(intensities, descending=True)
-#
-#        return orthogonal_probes[order]
-
-
 class ProbePixelated(ProbeConstraints):
     def __init__(
         self,
@@ -594,6 +641,8 @@ class ProbePixelated(ProbeConstraints):
     ):
         if isinstance(probe_array, np.ndarray):
             probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
+        else:
+            probe_array = probe_array.to(dtype=dtype, device=device)
         if probe_array.ndim == 3:
             if num_probes is None:
                 num_probes = probe_array.shape[0]
@@ -603,9 +652,7 @@ class ProbePixelated(ProbeConstraints):
                 )
         else:
             num_probes = 1 if num_probes is None else num_probes
-            probe_array = torch.tensor(probe_array, dtype=dtype, device=device)
-            # probe_array = torch.tile(probe_array, (num_probes, 1, 1))
-            probe_array = torch.cat([probe_array] * num_probes, dim=0)
+            probe_array = torch.stack([probe_array] * num_probes, dim=0)
 
         probe_model = cls(
             num_probes=num_probes,
@@ -761,11 +808,6 @@ class ProbePixelated(ProbeConstraints):
     def reset(self):
         super().reset()
         self.probe = self._initial_probe.clone()
-        self._probe = nn.Parameter(self._initial_probe.clone().to(self.device), requires_grad=True)
-
-    def to(self, *args, **kwargs) -> Self:
-        super().to(*args, **kwargs)
-        return self
 
     @property
     def name(self) -> str:
@@ -798,7 +840,7 @@ class ProbePixelated(ProbeConstraints):
         elif isinstance(vp, np.ndarray):
             vp2 = vp.astype(config.get("dtype_real"))
         elif isinstance(vp, (Dataset4dstem, Dataset2d)):
-            vp2 = vp.array
+            vp2 = cast(np.ndarray, vp.array)  # TODO when finished Dataset->torch fix here
         elif isinstance(vp, torch.Tensor):
             vp2 = vp.cpu().detach().numpy()
         else:
@@ -979,7 +1021,7 @@ class ProbeParametric(ProbeConstraints):
         )
 
     @property
-    def vacuum_probe_intensity(self) -> np.ndarray | None:
+    def vacuum_probe_intensity(self) -> torch.Tensor | None:
         if self._vacuum_probe_intensity is None:
             return None
         return self._vacuum_probe_intensity
@@ -992,7 +1034,7 @@ class ProbeParametric(ProbeConstraints):
         elif isinstance(vp, np.ndarray):
             vp2 = vp.astype(config.get("dtype_real"))
         elif isinstance(vp, (Dataset4dstem, Dataset2d)):
-            vp2 = vp.array
+            vp2 = cast(np.ndarray, vp.array)  # TODO when finished Dataset->torch fix here
         else:
             raise NotImplementedError(f"Unknown vacuum probe type: {type(vp)}")
 
@@ -1001,7 +1043,7 @@ class ProbeParametric(ProbeConstraints):
         elif vp2.ndim != 2:
             raise ValueError(f"Unexpected shape for vacuum probe: {vp2.shape}")
 
-        self._vacuum_probe_intensity = vp2
+        self._vacuum_probe_intensity = torch.tensor(vp2, dtype=torch.float32, device=self.device)
 
     @property
     def params(self) -> list[nn.Parameter]:
@@ -1095,7 +1137,8 @@ class ProbeDIP(ProbeConstraints):
         self.register_buffer("_pretrain_target", torch.tensor([]))
 
         self._model = model.to(self._device)
-        self._check_roi_shape()
+        if roi_shape is not None:
+            self._check_roi_shape()
         self.set_pretrained_weights(self._model)
 
         self._optimizer = None
@@ -1191,22 +1234,6 @@ class ProbeDIP(ProbeConstraints):
         """get the DIP model"""
         return self._model
 
-    @model.setter
-    def model(self, dip: "torch.nn.Module"):
-        """
-        This actually doesn't work -- can't have setters for torch sub modules
-        https://github.com/pytorch/pytorch/issues/52664
-        """
-        print("probe model setter hi")
-        if not isinstance(dip, torch.nn.Module):
-            raise TypeError(f"DIP must be a torch.nn.Module, got {type(dip)}")
-        if hasattr(dip, "dtype"):
-            dt = getattr(dip, "dtype")
-            if not dt.is_complex:
-                raise ValueError("DIP model must be a complex-valued model for probe objects")
-        self._model = dip.to(self.device)
-        self.set_pretrained_weights(self._model)
-
     @property
     def pretrained_weights(self) -> dict[str, torch.Tensor]:
         """get the pretrained weights of the DIP model"""
@@ -1286,23 +1313,15 @@ class ProbeDIP(ProbeConstraints):
     def _probe(self) -> torch.Tensor:
         return self.forward(None)  # type: ignore
 
+    def _noisy_model_input(self) -> torch.Tensor:
+        """model input with gaussian noise added when _input_noise_std > 0"""
+        return add_input_noise(
+            self.model_input, self._input_noise_std, self.dtype, self.device, self._rng_torch
+        )
+
     def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
         """Get shifted probes at fractional positions"""
-        if self._input_noise_std > 0.0:
-            noise = (
-                torch.randn(
-                    self.model_input.shape,
-                    dtype=self.dtype,
-                    device=self.device,
-                    generator=self._rng_torch,
-                )
-                * self._input_noise_std
-            )
-            model_input = self.model_input + noise
-        else:
-            model_input = self.model_input
-
-        probe = self.model(model_input)[0]
+        probe = self.model(self._noisy_model_input())[0]
         shifted_probes = fourier_shift_expand(probe, fract_positions).swapaxes(0, 1)
         return shifted_probes
 
@@ -1318,6 +1337,7 @@ class ProbeDIP(ProbeConstraints):
         super().set_initial_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
+        self._check_roi_shape()
 
         # could check if num_probes corresponds to out_channels of model
 
@@ -1364,10 +1384,11 @@ class ProbeDIP(ProbeConstraints):
         loss_fn: Callable | str = "l2",
         apply_constraints: bool = False,
         show: bool = True,
-        device: str | None = None,  # allow overwriting of device
+        device: str | int | None = None,
     ):
         if device is not None:
-            self.to(device)
+            dev, _ = config.validate_device(device)
+            self.to(dev)
 
         if optimizer_params is not None:
             self.set_optimizer(optimizer_params)
@@ -1388,7 +1409,7 @@ class ProbeDIP(ProbeConstraints):
                     f"Model target shape {pretrain_target.shape} does not match model input shape {self.model_input.shape}"
                 )
             self.pretrain_target = pretrain_target.clone().detach().to(self.device)
-        elif self.pretrain_target is None:
+        elif self._pretrain_target.numel() == 0:
             self.pretrain_target = self._initial_probe.clone().detach()
 
         loss_fn = get_loss_module(loss_fn, self.dtype)
@@ -1408,7 +1429,7 @@ class ProbeDIP(ProbeConstraints):
         show: bool = False,
     ):
         """Pretrain the DIP model."""
-        if not hasattr(self, "pretrain_target"):
+        if self._pretrain_target.numel() == 0:
             raise ValueError("Pretrain target is not set. Use pretrain_target to set it.")
 
         self.model.train()
@@ -1421,19 +1442,7 @@ class ProbeDIP(ProbeConstraints):
         output = self.probe
 
         for a0 in pbar:
-            if self._input_noise_std > 0.0:
-                noise = (
-                    torch.randn(
-                        self.model_input.shape,
-                        dtype=self.dtype,
-                        device=self.device,
-                        generator=self._rng_torch,
-                    )
-                    * self._input_noise_std
-                )
-                model_input = self.model_input + noise
-            else:
-                model_input = self.model_input
+            model_input = self._noisy_model_input()
 
             if apply_constraints:
                 output = self.apply_hard_constraints(self.model(model_input)[0])
