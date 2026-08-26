@@ -878,15 +878,21 @@ def static_comparison(correction, zoom: float, size: int, **kwargs):
     elif vmin is not None or vmax is not None:
         norm = {"vmin": vmin, "vmax": vmax}
 
-    figure, axes = show_2d(
-        image_grid,
-        title=label_grid,
-        cmap=cmap,
-        norm=norm,
-        scalebar={"sampling": panels["pixel_size"], "units": panels["pixel_unit"]},
-        axsize=(max(float(size), 200.0) / 100.0,) * 2,
-        **kwargs,
-    )
+    # Build without registering an inline-backend draw. Otherwise Jupyter
+    # flushes the open figure after also rendering the returned Figure value.
+    with plt.ioff():
+        figure, axes = show_2d(
+            image_grid,
+            title=label_grid,
+            cmap=cmap,
+            norm=norm,
+            scalebar={
+                "sampling": panels["pixel_size"],
+                "units": panels["pixel_unit"],
+            },
+            axsize=(max(float(size), 200.0) / 100.0,) * 2,
+            **kwargs,
+        )
     axes_array = np.asarray(axes, dtype=object).reshape(len(image_grid), ncols)
     interpolation = "bilinear" if smooth else "nearest"
     for axis, image in zip(axes_array.flat, images, strict=True):
@@ -912,6 +918,9 @@ def static_comparison(correction, zoom: float, size: int, **kwargs):
             center_row + visible_height / 2,
             center_row - visible_height / 2,
         )
+    # Remove the manager while preserving the returned Figure for rich display
+    # and savefig. A bare ``drift.show(mode="static")`` then renders once.
+    plt.close(figure)
     return figure
 
 

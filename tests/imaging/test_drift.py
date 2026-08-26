@@ -2,8 +2,10 @@
 
 import inspect
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pytest
+from matplotlib.figure import Figure
 from scipy.ndimage import gaussian_filter, shift
 
 from quantem.core.datastructures.dataset2d import Dataset2d
@@ -72,6 +74,25 @@ def test_from_images_requires_angles_for_bare_arrays():
     image = np.zeros((16, 16), dtype=np.float32)
     with pytest.raises(TypeError, match="scan_direction_degrees is required"):
         DriftCorrection.from_images(image, image.copy(), device="cpu")
+
+
+def test_static_show_returns_one_closed_matplotlib_figure():
+    """A bare static show call does not also queue an inline duplicate."""
+    scan_0, scan_90 = _orthogonal_pair()
+    drift = DriftCorrection.from_images(scan_0, scan_90, device="cpu")
+    drift.preprocess(
+        padding_fraction=0.25,
+        show_combined=False,
+        show_scans=False,
+        show_knots=False,
+        verbose=False,
+    )
+
+    figure = drift.show(mode="static", cmap="gray")
+
+    assert isinstance(figure, Figure)
+    assert len(figure.axes) == 6
+    assert figure.number not in plt.get_fignums()
 
 
 def test_metadata_driven_affine_workflow_returns_calibrated_dataset():

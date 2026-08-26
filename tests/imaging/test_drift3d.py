@@ -292,3 +292,80 @@ def test_read_emd_eds_preserves_native_energy_axis(tmp_path, monkeypatch):
     np.testing.assert_array_equal(spectrum.origin, [1.0, 2.0, 0.35])
     np.testing.assert_array_equal(spectrum.sampling, [0.2, 0.2, 0.01])
     assert spectrum.units == ["nm", "nm", "keV"]
+
+
+def test_read_emd_eds_extracts_requested_windows_without_dense_cube(
+    tmp_path, monkeypatch
+):
+    """Requested EDS windows are counted directly from each sparse stream."""
+    path = tmp_path / "spectrum_windows.emd"
+    _write_metadata_emd(
+        path,
+        rotation_degrees=0.0,
+        stage_position=(0.0, 0.0),
+        spectrum_image=True,
+        timestamp=1,
+        scan_shape=(2, 3),
+    )
+    detector_metadata = {
+        "BinaryResult": {"Detector": "SuperX-1"},
+        "Detectors": {
+            "Detector-0": {
+                "DetectorName": "SuperX-1",
+                "Dispersion": "100",
+                "OffsetEnergy": "0",
+            }
+        },
+    }
+    acquisition_settings = {
+        "bincount": "8",
+        "StreamEncoding": "uint16",
+        "RasterScanDefinition": {"Width": "3", "Height": "2"},
+    }
+    # Six pixels. Values other than 65535 are one X-ray count in that
+    # energy-channel index; 65535 advances to the next scan pixel.
+    stream = np.array(
+        [1, 2, 65535, 2, 65535, 4, 65535, 1, 3, 65535, 2, 2, 65535, 65535],
+        dtype=np.uint16,
+    )
+    with h5py.File(path, "a") as handle:
+        group = handle.create_group("Data/SpectrumStream/stream-0")
+        group.create_dataset(
+            "AcquisitionSettings",
+            data=np.array([json.dumps(acquisition_settings).encode()]),
+        )
+        encoded = np.frombuffer(json.dumps(detector_metadata).encode(), dtype=np.uint8)
+        group.create_dataset("Metadata", data=encoded)
+        group.create_dataset("Data", data=stream[:, None])
+
+    streams = [
+        {
+            "data": np.ones((2, 3), dtype=np.float32),
+            "metadata": {"General": {"title": "HAADF"}},
+            "axes": [
+                {"index_in_array": 0, "scale": 1.0, "offset": 0.0},
+                {"index_in_array": 1, "scale": 1.0, "offset": 0.0},
+            ],
+        }
+    ]
+    monkeypatch.setattr("rsciio.emd.file_reader", lambda *args, **kwargs: streams)
+
+    acquisition = read_emd_eds(
+        path,
+        energy_windows={"low": (0.1, 0.2), "high": (0.3, 0.4)},
+        verbose=False,
+    )
+
+    np.testing.assert_array_equal(
+        acquisition["window_maps"]["low"],
+        [[2, 1, 0], [1, 2, 0]],
+    )
+    np.testing.assert_array_equal(
+        acquisition["window_maps"]["high"],
+        [[0, 0, 1], [1, 0, 0]],
+    )
+    np.testing.assert_allclose(
+        acquisition["energy_axis_keV"],
+        np.arange(8, dtype=np.float32) * np.float32(0.1),
+    )
+    assert acquisition["spectrum"] is None

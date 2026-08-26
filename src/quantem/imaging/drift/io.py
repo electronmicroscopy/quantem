@@ -8,6 +8,107 @@ import h5py
 import numpy as np
 
 
+def _decode_velox_json(dataset: h5py.Dataset) -> dict:
+    """Decode one JSON record stored as bytes or a padded uint8 array."""
+    value = dataset[0] if dataset.dtype.kind in {"O", "S", "U"} else dataset[:]
+    if isinstance(value, str):
+        raw = value.encode()
+    elif isinstance(value, bytes):
+        raw = value
+    else:
+        raw = bytes(np.asarray(value, dtype=np.uint8).reshape(-1))
+    raw = raw.replace(b"\x00", b"")
+    for candidate in (raw, _deinterleave_velox_metadata(raw)):
+        try:
+            return json.loads(candidate.decode("utf-8", errors="ignore"))
+        except json.JSONDecodeError:
+            continue
+    raise ValueError(f"Could not decode Velox JSON dataset {dataset.name}")
+
+
+def _read_emd_energy_windows(
+    path: str | Path,
+    energy_windows: dict[str, tuple[float, float]],
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Count selected energy windows directly from compressed EDS streams."""
+    windows: dict[str, tuple[float, float]] = {}
+    for name, limits in energy_windows.items():
+        if len(limits) != 2:
+            raise ValueError(f"Energy window {name!r} must contain (low, high)")
+        low, high = (float(limits[0]), float(limits[1]))
+        if not np.isfinite(low) or not np.isfinite(high) or low > high:
+            raise ValueError(f"Invalid energy window {name!r}: {limits!r}")
+        windows[str(name)] = (low, high)
+    if not windows:
+        return {}, np.empty(0, dtype=np.float32)
+
+    maps: dict[str, np.ndarray] | None = None
+    reference_shape: tuple[int, int] | None = None
+    reference_axis: np.ndarray | None = None
+    with h5py.File(path, "r") as handle:
+        stream_group = handle.get("Data/SpectrumStream")
+        if stream_group is None or not stream_group:
+            raise ValueError(f"{path} contains no Velox SpectrumStream data")
+        for stream in stream_group.values():
+            settings = _decode_velox_json(stream["AcquisitionSettings"])
+            raster = settings["RasterScanDefinition"]
+            shape = (int(raster["Height"]), int(raster["Width"]))
+            channels = int(settings["bincount"])
+            if reference_shape is None:
+                reference_shape = shape
+                maps = {
+                    name: np.zeros(shape[0] * shape[1], dtype=np.uint32)
+                    for name in windows
+                }
+            elif shape != reference_shape:
+                raise ValueError("EDS detector streams have inconsistent scan shapes")
+
+            metadata = _decode_velox_json(stream["Metadata"])
+            detector_name = metadata["BinaryResult"]["Detector"]
+            detector = next(
+                (
+                    item
+                    for item in metadata["Detectors"].values()
+                    if item.get("DetectorName") == detector_name
+                ),
+                None,
+            )
+            if detector is None:
+                raise ValueError(f"Missing calibration for EDS detector {detector_name}")
+            scale = np.float32(float(detector["Dispersion"]) / 1000.0)
+            offset = np.float32(float(detector["OffsetEnergy"]) / 1000.0)
+            axis = np.arange(channels, dtype=np.float32) * scale + offset
+            if reference_axis is None:
+                reference_axis = axis
+            elif not np.array_equal(axis, reference_axis):
+                raise ValueError("EDS detector streams have inconsistent energy axes")
+
+            encoded = np.asarray(stream["Data"][:, 0], dtype=np.uint16)
+            gates = encoded == np.uint16(65535)
+            pixel_index = np.cumsum(gates, dtype=np.int32)
+            pixel_count = shape[0] * shape[1]
+            assert maps is not None
+            for name, (low, high) in windows.items():
+                selected_channels = (axis >= low) & (axis <= high)
+                lookup = np.zeros(65536, dtype=bool)
+                lookup[:channels] = selected_channels
+                selected_events = (~gates) & lookup[encoded]
+                counts = np.bincount(
+                    pixel_index[selected_events] % pixel_count,
+                    minlength=pixel_count,
+                )
+                maps[name] += counts[:pixel_count].astype(np.uint32, copy=False)
+
+    assert maps is not None and reference_shape is not None and reference_axis is not None
+    return (
+        {
+            name: values.reshape(reference_shape).astype(np.float32)
+            for name, values in maps.items()
+        },
+        reference_axis,
+    )
+
+
 def _axis_calibration(
     axes: list[dict],
     ndim: int,
@@ -243,6 +344,7 @@ def read_emd_eds(
     path: str | Path,
     *,
     load_spectrum: bool = False,
+    energy_windows: dict[str, tuple[float, float]] | None = None,
     verbose: bool = True,
 ) -> dict[str, object]:
     """Read images from a Velox EDS/EELS spectrum-image EMD.
@@ -261,6 +363,10 @@ def read_emd_eds(
     load_spectrum : bool, optional
         Load the full ``(row, col, energy)`` spectrum. The default ``False``
         loads only the HAADF and stored 2-D elemental maps.
+    energy_windows : dict, optional
+        Named ``(low_keV, high_keV)`` intervals to count directly from the
+        compressed Velox SpectrumStream. This avoids expanding the full
+        spectrum cube. Window endpoints are inclusive.
     verbose : bool, optional
         Print a compact summary of the loaded images.
 
@@ -328,8 +434,13 @@ def read_emd_eds(
         if spectrum_stream is None
         else _spectrum_dataset(spectrum_stream, path, metadata)
     )
+    window_maps: dict[str, np.ndarray] = {}
+    if energy_windows is not None:
+        window_maps, window_axis = _read_emd_energy_windows(path, energy_windows)
+    else:
+        window_axis = None
     if spectrum is None:
-        energy_axis = None
+        energy_axis = window_axis
     else:
         scale = float(spectrum.sampling[-1])
         offset = float(spectrum.origin[-1])
@@ -354,6 +465,7 @@ def read_emd_eds(
         "cube": None if spectrum is None else spectrum.array,
         "energy_axis_keV": energy_axis,
         "element_maps": element_maps,
+        "window_maps": window_maps,
         "scan_rotation_deg": scan_rot,
         "pixel_size_nm": px_nm,
         "shape": shape,
