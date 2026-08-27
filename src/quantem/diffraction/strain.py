@@ -469,6 +469,7 @@ class StrainMap(AutoSerialize):
         window: int = 5,
         mask_threshold: float = 0.5,
         min_neighbors: int = 3,
+        require_full_neighborhood: bool = True,
         component: str = "combined",
         bins: int = 50,
         bounds: tuple[float, float] | None = None,
@@ -571,6 +572,8 @@ class StrainMap(AutoSerialize):
         p = window // 2
         oy, ox = np.ogrid[-p : p + 1, -p : p + 1]
         n_neighbors = int(np.sum((oy ** 2 + ox ** 2) <= (window / 2.0) ** 2) - 1)
+        if require_full_neighborhood:
+            min_neighbors = n_neighbors
 
         # per-component fields in the (optionally rotated) display frame; phi is
         # rotation-invariant and is carried through unchanged
@@ -669,6 +672,8 @@ class StrainMap(AutoSerialize):
             "mask_threshold": float(mask_threshold),
             "mask_range": (low, high),
             "rotation_angle": float(rotation_angle),
+            "min_neighbors": int(min_neighbors),
+            "require_full_neighborhood": bool(require_full_neighborhood),
         }
 
         print("Strain precision  (median local deviation, mask-weighted)")
