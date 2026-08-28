@@ -518,6 +518,29 @@ class TestVector:
         assert v.fields == ["intensity", "ky"]
         assert_rows(v[0].tensor, [[1.0, 100.0], [2.0, 200.0]])
 
+    def test_empty_selection_can_be_copied(self):
+        v = make_grid_vector()
+        empty = v[[], :]
+
+        copied = empty.copy()
+        assert copied.shape == (0, 2)
+        assert copied.fields == v.fields
+        assert copied.units == v.units
+        assert tuple(copied.flatten().shape) == (0, 3)
+        assert copied.total_rows == 0
+
+        with pytest.raises(ValueError, match="must be non-negative"):
+            Vector.from_shape(shape=(-1,), fields=["a"])
+
+    def test_torch_sequence_functions_report_a_clear_error(self):
+        v = make_line_vector()
+
+        with pytest.raises(TypeError, match="sequence of tensors"):
+            torch.cat([v, v])
+
+        # The suggested workaround does work
+        assert tuple(torch.cat([v.flatten(), v.flatten()]).shape) == (12, 3)
+
     def test_copy_is_deep(self):
         v = make_line_vector()
         v_copy = v.select_fields(["intensity", "kx"]).copy()

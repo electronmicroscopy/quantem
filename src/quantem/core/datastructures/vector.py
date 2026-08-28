@@ -678,6 +678,20 @@ class Vector(AutoSerialize):
         all_args = list(args) + list(kwargs.values())
         vector_inputs = [value for value in all_args if isinstance(value, Vector)]
         if not vector_inputs:
+            # Functions like torch.cat/torch.stack take a *sequence* of tensors,
+            # so the Vectors never appear as arguments in their own right. Say so,
+            # rather than letting torch report an opaque dispatch failure.
+            if any(
+                isinstance(item, Vector)
+                for value in all_args
+                if isinstance(value, (list, tuple))
+                for item in value
+            ):
+                raise TypeError(
+                    f"{func.__name__} takes a sequence of tensors, which cannot hold Vectors: "
+                    "ragged rows have no single shape to combine along. Pass flatten() "
+                    "results instead, e.g. torch.cat([a.flatten(), b.flatten()])."
+                )
             return NotImplemented
 
         template = vector_inputs[0]
