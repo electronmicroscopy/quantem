@@ -341,6 +341,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             mode_norm = "linear"
         elif mode_in in {"log", "cepstrum", "cepstral"}:
             mode_norm = "log"
+        elif mode_in in {"log_min", "log-min", "padgett", "log_min_shift", "log-min-shift", "pcepstrum"}:
+            mode_norm = "log-min"
         elif mode_in in {"gamma", "power", "sqrt"}:
             mode_norm = "gamma"
         else:
@@ -422,6 +424,9 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         arr = self.dataset.array if skip is None else self.dataset.array[::skip, ::skip]
         dp = arr * self.mask_diffraction[None, None, :, :] + self.mask_diffraction_inv[None, None, :, :]
+        dp_min = float(np.min(self.dataset.array))
+        if mode_norm == "log2":
+            self.metadata["dp_min"] = dp_min
 
         if mode_norm == "linear":
             dp_proc = dp
@@ -429,6 +434,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             dp_proc = np.log1p(dp)
         elif mode_norm == "gamma":
             dp_proc = np.power(np.clip(dp, 0.0, None), self.metadata["gamma"])
+        elif mode_norm == "log-min":
+            dp_proc = np.log(dp - dp_min + 0.1)
         else:
             raise RuntimeError("Unreachable: normalized mode mapping failed.")
 
@@ -611,10 +618,13 @@ class StrainMapAutocorrelation(AutoSerialize):
             im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
         elif mode == "log":
             im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
+        elif mode == "log-min":
+            dp_min = self.dataset.metadata.get("dp_min", 0.0)
+            im = np.fft.fftshift(np.abs(np.fft.fft2(np.log(dp - dp_min + 0.1))))
         elif mode == "gamma":
             im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g))))
         else:
-            raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
+            raise ValueError("metadata['mode'] must be 'linear', 'log', 'log-min', or 'gamma'")
 
     
         fig, ax = show_2d(im, **defaults)
@@ -894,10 +904,13 @@ class StrainMapAutocorrelation(AutoSerialize):
                     im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
                 elif mode == "log":
                     im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
+                elif mode == "log-min":
+                    dp_min = self.dataset.metadata.get("dp_min", 0.0)
+                    im = np.fft.fftshift(np.abs(np.fft.fft2(np.log(dp - dp_min + 0.1))))
                 elif mode == "gamma":
                     im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g))))
                 else:
-                    raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
+                    raise ValueError("metadata['mode'] must be 'linear', 'log', 'log-min', or 'gamma'")
 
                 u_fit_abs, v_fit_abs, _, _ = _refine_lattice_vectors(
                     im,
@@ -983,8 +996,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         rcent, ccent = H // 2, W // 2
 
         mode = self.metadata.get("mode", "linear").lower()
-        if mode not in ("linear", "log", "gamma"):
-            raise ValueError("metadata['mode'] must be 'linear', 'log', or 'gamma'")
+        if mode not in ("linear", "log", 'log-min', "gamma"):
+            raise ValueError("metadata['mode'] must be 'linear', 'log', 'log-min', or 'gamma'")
         gamma = float(self.metadata["gamma"]) if mode == "gamma" else None
 
         dev = torch.device(device)
@@ -1060,6 +1073,9 @@ class StrainMapAutocorrelation(AutoSerialize):
                 tr = dpm
             elif mode == "log":
                 tr = torch.log1p(dpm)
+            elif mode == "log-min":
+                dp_min = self.dataset.metadata.get("dp_min", 0.0)
+                tr = torch.log(dpm - dp_min + 0.1)
             else:  # gamma
                 tr = dpm.clamp(min=0.0).pow(gamma)
             ims = torch.fft.fftshift(torch.fft.fft2(tr).abs(), dim=(-2, -1))
