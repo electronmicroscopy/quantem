@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
@@ -11,6 +12,11 @@ import torch
 from tqdm.auto import tqdm
 
 from quantem.core.visualization import show_2d
+from quantem.diffractive_imaging.dataset_models import (
+    PtychographyDatasetBase,
+    PtychographyDatasetRaster,
+)
+from quantem.diffractive_imaging.ptychography_lite import PtychoLite, PtychoLiteDIP
 
 
 @dataclass
@@ -85,7 +91,13 @@ def _replace_opt_params_with_best(config, best_params):
             return type(obj)(replace_recursive(v, (*path, i)) for i, v in enumerate(obj))
         return obj
 
-    return replace_recursive(config)
+    # trial params are named relative to each sub-config, not to the whole config
+    updated = dict(config)
+    for key in ("base_kwargs", "dataset_kwargs", "dataset_preprocess_kwargs"):
+        sub_config = updated.get(key)
+        if sub_config is not None:
+            updated[key] = replace_recursive(sub_config)
+    return updated
 
 
 def _is_dataset_param(param_path):
@@ -134,6 +146,7 @@ def _build_ptychography_instance(constructors, resolved_kwargs):
 
     init_kwargs = resolved_kwargs.get("init", {}).copy()
     init_kwargs["verbose"] = False
+    _isolate_trial_dataset(init_kwargs)
 
     return constructors["ptychography_class"](
         obj_model=obj_model,
@@ -147,11 +160,92 @@ def _build_ptycholite_instance(constructors, resolved_kwargs):
     """Build PtychoLite instance."""
     init_kwargs = resolved_kwargs.get("init", {}).copy()
     init_kwargs["verbose"] = False
+    _isolate_trial_dataset(init_kwargs)
 
     return constructors["ptychography_class"](**init_kwargs)
 
 
-def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
+def _isolate_trial_dataset(init_kwargs: dict[str, Any]) -> None:
+    """Give each optimization trial a private mutable dataset model."""
+    dset = init_kwargs.get("dset")
+    if not isinstance(dset, PtychographyDatasetBase):
+        return
+
+    dset = _clone_ptychography_dataset(dset)
+    dset.reset()
+    dset.zero_grad(set_to_none=True)
+    dset.reset_optimizer()
+    init_kwargs["dset"] = dset
+
+
+def _clone_ptychography_dataset(dset: PtychographyDatasetBase) -> PtychographyDatasetBase:
+    """Clone a ptychography dataset without using torch Module deepcopy."""
+    if not isinstance(dset, PtychographyDatasetRaster):
+        raise RuntimeError(
+            "Could not copy the ptychography dataset for an optimization trial. "
+            "Pass a dataset_constructor instead so each trial can build a fresh dataset."
+        )
+
+    detector_mask = dset.detector_mask.detach().cpu().clone()
+    origin = np.array([0, 0, *dset.dset.origin[-2:]])
+    sampling = np.array([*dset.scan_sampling, *dset.detector_sampling])
+    units = [*dset.scan_units, *dset.detector_units]
+    cloned = PtychographyDatasetRaster.from_array(
+        array=dset.intensities_4d.copy(),
+        name=dset.dset.name,
+        origin=origin,
+        sampling=sampling,
+        units=units,
+        signal_units=dset.dset.signal_units,
+        detector_mask=detector_mask,
+        verbose=dset.verbose,
+        learn_descan=dset.learn_descan,
+        learn_scan_positions=dset.learn_scan_positions,
+    )
+    cloned.constraints = copy.deepcopy(dset.constraints)
+    cloned._preprocessing_params = copy.deepcopy(dset._preprocessing_params)
+    cloned.com_rotation_rad = dset.com_rotation_rad
+    if hasattr(dset, "_transpose"):
+        cloned.com_transpose = dset.com_transpose
+    if dset.probe_energy is not None:
+        cloned.probe_energy = dset.probe_energy
+
+    if not dset.preprocessed:
+        return cloned
+
+    cloned.diffraction_padding = dset.diffraction_padding.copy()
+    cloned.com_measured = dset.com_measured.copy()
+    cloned.com_fit = dset.com_fit.copy()
+    cloned.centered_amplitudes = dset.centered_amplitudes.detach().cpu().clone()
+    # amplitudes / intensities / centered_intensities are derived on demand from
+    # intensities_4d; only carry them over if the source has them materialized
+    for attr in ("_amplitudes", "_intensities", "_centered_intensities"):
+        source = getattr(dset, attr, None)
+        if source is not None:
+            setattr(cloned, attr[1:], source.detach().cpu().clone())
+    cloned.detector_mask = detector_mask
+    cloned.mean_diffraction_intensity = dset.mean_diffraction_intensity
+    if hasattr(dset, "mean_diffraction_amplitude"):
+        cloned.mean_diffraction_amplitude = dset.mean_diffraction_amplitude
+    cloned._pattern_crop_mask = copy.deepcopy(getattr(dset, "_pattern_crop_mask", None))
+    mask_shape = getattr(dset, "_pattern_crop_mask_shape", None)
+    cloned._pattern_crop_mask_shape = (
+        copy.deepcopy(mask_shape)
+        if mask_shape is not None
+        else (int(dset.roi_shape[0]), int(dset.roi_shape[1]))
+    )
+    cloned.initial_descan_shifts = dset.initial_descan_shifts.detach().cpu().clone()
+    cloned.initial_scan_positions_px = dset.initial_scan_positions_px.detach().cpu().clone()
+    cloned.descan_shifts = cloned.initial_descan_shifts.clone()
+    cloned.scan_positions_px = cloned.initial_scan_positions_px.clone()
+    cloned._patch_indices = dset.patch_indices.detach().cpu().clone()
+    cloned._last_patch_positions_px = cloned.scan_positions_px.detach().clone()
+    cloned._targets = dset.targets.detach().cpu().clone()
+    cloned._preprocessed = True
+    return cloned
+
+
+def _run_reconstruction_pipeline(recon_obj, resolved_kwargs):
     """Run the reconstruction pipeline for either class."""
     # Preprocess step
     preprocess_kwargs = resolved_kwargs.get("preprocess")
@@ -159,9 +253,13 @@ def _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type):
         recon_obj.preprocess(**preprocess_kwargs)
 
     # Reconstruct step
-    reconstruct_kwargs = resolved_kwargs.get("reconstruct", {})
-    reconstruct_kwargs["verbose"] = False
+    recon_obj.verbose = False
+    reconstruct_kwargs = resolved_kwargs.get("reconstruct")
     if reconstruct_kwargs:
+        reconstruct_kwargs = dict(reconstruct_kwargs)
+        # only PtychoLite/PtychoLiteDIP.reconstruct take verbose, and they reset recon_obj.verbose
+        if isinstance(recon_obj, (PtychoLite, PtychoLiteDIP)):
+            reconstruct_kwargs.setdefault("verbose", False)
         recon_obj.reconstruct(**reconstruct_kwargs)
 
 
@@ -233,7 +331,7 @@ def _OptimizePtychographyObjective(
             recon_obj = _build_ptychography_instance(constructors, resolved_kwargs)
 
         # 5) Run the reconstruction pipeline
-        _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type)
+        _run_reconstruction_pipeline(recon_obj, resolved_kwargs)
 
         # 6) Extract loss
         if loss_getter is not None:
@@ -266,7 +364,7 @@ class OptimizePtychography:
         self.study_kwargs = study_kwargs or {}
         self.unit = unit
         self.verbose = verbose
-        self._config = None
+        self._config: Dict[str, Any] | None = None
         self.study = optuna.create_study(direction=direction, **self.study_kwargs)
 
     @classmethod
@@ -357,32 +455,34 @@ class OptimizePtychography:
         if hasattr(self, "_config") and self._config:
             self.study.set_user_attr("config", self._config)
 
-        if not self.verbose:
-            optuna.logging.set_verbosity(optuna.logging.WARNING)
-        else:
-            optuna.logging.set_verbosity(optuna.logging.INFO)
+        prev_verbosity = optuna.logging.get_verbosity()
+        optuna.logging.set_verbosity(
+            optuna.logging.INFO if self.verbose else optuna.logging.WARNING
+        )
 
-        with tqdm(total=self.n_trials, desc="optimizing", unit=self.unit) as pbar:
+        try:
+            with tqdm(total=self.n_trials, desc="optimizing", unit=self.unit) as pbar:
 
-            def _on_trial_end(study_: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
-                pbar.update(1)
+                def _on_trial_end(
+                    study_: optuna.study.Study, trial: optuna.trial.FrozenTrial
+                ) -> None:
+                    pbar.update(1)
 
-                torch.cuda.empty_cache()
-                gc.collect()
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
-            self.study.optimize(
-                self.objective_func,
-                n_trials=self.n_trials,
-                callbacks=[_on_trial_end],
-                show_progress_bar=self.verbose,
-            )
-
-        if not self.verbose:
-            optuna.logging.set_verbosity(optuna.logging.INFO)
+                self.study.optimize(
+                    self.objective_func,
+                    n_trials=self.n_trials,
+                    callbacks=[_on_trial_end],
+                    show_progress_bar=False,
+                )
+        finally:
+            optuna.logging.set_verbosity(prev_verbosity)
 
         return self
 
-    def visualize(self, figsize=(10, 6)):
+    def visualize(self, figsize=None):
         """Visualize optimization results showing parameter values vs loss."""
         if not self.study.trials:
             raise RuntimeError("No trials to plot. Run optimize() first.")
@@ -392,20 +492,22 @@ class OptimizePtychography:
         if not trials:
             raise RuntimeError("No completed trials to plot.")
 
-        param_names = list(trials[0].params.keys())
+        # trials may not all sample the same parameters, so take the union
+        param_names = list(dict.fromkeys(name for trial in trials for name in trial.params))
         best_trial = self.study.best_trial
         best_value = best_trial.value
 
         # Special case: 2 parameters - add 2D scatter plot
         if len(param_names) == 2:
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            fig, axes = plt.subplots(1, 3, figsize=figsize or (15, 5))
 
             ax_2d = axes[0]
             param1, param2 = param_names
 
-            param1_values = np.array([trial.params[param1] for trial in trials])
-            param2_values = np.array([trial.params[param2] for trial in trials])
-            losses = np.array([trial.value for trial in trials])
+            pair_trials = [t for t in trials if param1 in t.params and param2 in t.params]
+            param1_values = np.array([trial.params[param1] for trial in pair_trials])
+            param2_values = np.array([trial.params[param2] for trial in pair_trials])
+            losses = np.array([trial.value for trial in pair_trials])
 
             scatter = ax_2d.scatter(
                 param1_values,
@@ -419,18 +521,19 @@ class OptimizePtychography:
             )
 
             # Highlight best trial
-            best_param1 = best_trial.params[param1]
-            best_param2 = best_trial.params[param2]
-            ax_2d.scatter(
-                [best_param1],
-                [best_param2],
-                color="red",
-                s=300,
-                marker="*",
-                edgecolors="black",
-                linewidth=2,
-                zorder=5,
-            )
+            best_param1 = best_trial.params.get(param1)
+            best_param2 = best_trial.params.get(param2)
+            if best_param1 is not None and best_param2 is not None:
+                ax_2d.scatter(
+                    [best_param1],
+                    [best_param2],
+                    color="red",
+                    s=300,
+                    marker="*",
+                    edgecolors="black",
+                    linewidth=2,
+                    zorder=5,
+                )
 
             # Colorbar
             cbar = plt.colorbar(scatter, ax=ax_2d)
@@ -446,41 +549,7 @@ class OptimizePtychography:
 
             # Second and third subplots: individual parameter plots
             for idx, param_name in enumerate(param_names):
-                ax = axes[idx + 1]
-
-                # Extract data
-                param_values = np.array([trial.params[param_name] for trial in trials])
-                losses = np.array([trial.value for trial in trials])
-
-                # Scatter plot
-                ax.scatter(
-                    param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5
-                )
-
-                # Highlight best trial
-                best_param_value = best_trial.params[param_name]
-                ax.scatter(
-                    [best_param_value],
-                    [best_value],
-                    color="red",
-                    s=200,
-                    marker="*",
-                    edgecolors="black",
-                    linewidth=1.5,
-                    zorder=5,
-                )
-
-                # Vertical line at optimal parameter value
-                ax.axvline(best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7)
-
-                # Clean up parameter name for label
-                clean_name = param_name.split(".")[-1]
-
-                # Labels
-                ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
-                ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
-                ax.set_title(f"{param_name}", fontsize=10)
-                ax.grid(True, alpha=0.3)
+                self._plot_param_panel(axes[idx + 1], trials, param_name, best_trial, best_value)
 
             plt.tight_layout()
             return fig, axes
@@ -490,22 +559,30 @@ class OptimizePtychography:
         n_cols = min(3, n_params)  # Max 3 columns
         n_rows = (n_params + n_cols - 1) // n_cols  # Ceiling division
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize or (10, 6), squeeze=False)
         axes = axes.flatten()
 
         # Plot each parameter
         for idx, param_name in enumerate(param_names):
-            ax = axes[idx]
+            self._plot_param_panel(axes[idx], trials, param_name, best_trial, best_value)
 
-            # Extract data
-            param_values = np.array([trial.params[param_name] for trial in trials])
-            losses = np.array([trial.value for trial in trials])
+        # Hide unused subplots
+        for idx in range(n_params, len(axes)):
+            axes[idx].set_visible(False)
 
-            # Scatter plot
-            ax.scatter(param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5)
+        plt.tight_layout()
+        return fig, axes
 
-            # Highlight best trial
-            best_param_value = best_trial.params[param_name]
+    def _plot_param_panel(self, ax, trials, param_name, best_trial, best_value):
+        """Scatter one parameter's values vs loss, highlighting the best trial."""
+        param_trials = [t for t in trials if param_name in t.params]
+        param_values = np.array([trial.params[param_name] for trial in param_trials])
+        losses = np.array([trial.value for trial in param_trials])
+
+        ax.scatter(param_values, losses, alpha=0.6, s=50, edgecolors="black", linewidth=0.5)
+
+        best_param_value = best_trial.params.get(param_name)
+        if best_param_value is not None:
             ax.scatter(
                 [best_param_value],
                 [best_value],
@@ -516,25 +593,14 @@ class OptimizePtychography:
                 linewidth=1.5,
                 zorder=5,
             )
-
             # Vertical line at optimal parameter value
             ax.axvline(best_param_value, color="red", linestyle="--", linewidth=1.5, alpha=0.7)
 
-            # Clean up parameter name for label
-            clean_name = param_name.split(".")[-1]
-
-            # Labels
-            ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
-            ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
-            ax.set_title(f"{param_name}", fontsize=10)
-            ax.grid(True, alpha=0.3)
-
-        # Hide unused subplots
-        for idx in range(n_params, len(axes)):
-            axes[idx].set_visible(False)
-
-        plt.tight_layout()
-        return fig, axes
+        clean_name = param_name.split(".")[-1]
+        ax.set_xlabel(clean_name, fontsize=11, fontweight="bold")
+        ax.set_ylabel("Loss", fontsize=11, fontweight="bold")
+        ax.set_title(f"{param_name}", fontsize=10)
+        ax.grid(True, alpha=0.3)
 
     def _extract_optimization_params(self):
         """Extract OptimizationParameter specs from stored config."""
@@ -576,8 +642,6 @@ class OptimizePtychography:
         """
         from itertools import product
 
-        import numpy as np
-
         if self.objective_func is None:
             raise RuntimeError("No objective function set. Use from_constructors() first.")
 
@@ -603,20 +667,8 @@ class OptimizePtychography:
             else:
                 raise ValueError(f"Invalid parameter spec for {param_name}")
 
-            param_names = list(param_grids.keys())
-            all_combinations = list(product(*param_grids.values()))
-
-        def objective_with_capture(trial):
-            """Modified objective that captures the reconstruction object."""
-            # Call the original objective
-            loss = self.objective_func(trial)
-
-            return loss
-
-        # Enqueue all grid points
-        for combo in all_combinations:
-            params = dict(zip(param_names, combo))
-            self.study.enqueue_trial(params)
+        param_names = list(param_grids.keys())
+        all_combinations = list(product(*param_grids.values()))
 
         # Run trials and capture reconstructions
         print("\nRunning reconstructions...")
@@ -643,7 +695,7 @@ class OptimizePtychography:
                 gc.collect()
 
         # Find best
-        best_idx = np.argmin([r["loss"] for r in results])
+        best_idx = self._best_index([r["loss"] for r in results])
         best_result = results[best_idx]
 
         # Plot objects
@@ -657,6 +709,11 @@ class OptimizePtychography:
                 "param_grids": param_grids,
             }
 
+    def _best_index(self, losses) -> int:
+        """Index of the best loss given the study direction."""
+        argfn = np.argmax if self.direction == "maximize" else np.argmin
+        return int(argfn(losses))
+
     def _run_reconstruction_with_params(self, params):
         """Run a single reconstruction with given parameters and return the object.
 
@@ -668,44 +725,33 @@ class OptimizePtychography:
         """
         from quantem.diffractive_imaging.optimize_hyperparameters import _resolve_params_with_trial
 
-        # Create a mock trial that returns our fixed parameters
-        class FixedTrial:
-            def __init__(self, fixed_params):
-                self.params = fixed_params
-                self.number = 0
+        trial = optuna.trial.FixedTrial(params)
 
-            def suggest_float(self, name, low, high, **kwargs):
-                return self.params.get(name, (low + high) / 2)
-
-            def suggest_int(self, name, low, high, **kwargs):
-                return int(self.params.get(name, (low + high) // 2))
-
-            def suggest_categorical(self, name, choices):
-                return self.params.get(name, choices[0])
-
-        trial = FixedTrial(params)
+        config = self._config
+        if config is None:
+            raise RuntimeError("Optimizer is not configured; use a factory method first.")
 
         # Resolve parameters
-        resolved_kwargs = _resolve_params_with_trial(trial, self._config["base_kwargs"])
+        resolved_kwargs = _resolve_params_with_trial(trial, config["base_kwargs"])
 
         # Handle dataset construction if needed
-        if self._config.get("dataset_constructor") is not None:
+        if config.get("dataset_constructor") is not None:
             resolved_dataset_kwargs = _resolve_params_with_trial(
-                trial, self._config.get("dataset_kwargs", {})
+                trial, config.get("dataset_kwargs", {})
             )
-            pdset = self._config["dataset_constructor"](**resolved_dataset_kwargs)
+            pdset = config["dataset_constructor"](**resolved_dataset_kwargs)
 
-            if self._config.get("dataset_preprocess_kwargs") is not None:
+            if config.get("dataset_preprocess_kwargs") is not None:
                 resolved_preprocess_kwargs = _resolve_params_with_trial(
-                    trial, self._config["dataset_preprocess_kwargs"]
+                    trial, config["dataset_preprocess_kwargs"]
                 )
                 pdset.preprocess(**resolved_preprocess_kwargs)
 
             resolved_kwargs.setdefault("init", {})["dset"] = pdset
 
         # Determine reconstruction class
-        reconstruction_class = self._config.get("reconstruction_class", "auto")
-        constructors = self._config["constructors"]
+        reconstruction_class = config.get("reconstruction_class", "auto")
+        constructors = config["constructors"]
 
         if reconstruction_class == "auto":
             main_constructor = constructors.get("ptychography_class")
@@ -743,10 +789,10 @@ class OptimizePtychography:
             _run_reconstruction_pipeline,
         )
 
-        _run_reconstruction_pipeline(recon_obj, resolved_kwargs, class_type)
+        _run_reconstruction_pipeline(recon_obj, resolved_kwargs)
 
         # Extract loss
-        loss_getter = self._config.get("loss_getter")
+        loss_getter = config.get("loss_getter")
         if loss_getter is not None:
             loss = float(loss_getter(recon_obj))
         else:
@@ -774,35 +820,23 @@ class OptimizePtychography:
         axes = axes.flatten()
 
         # Find best result
-        losses = [r["loss"] for r in results]
-        best_idx = np.argmin(losses)
+        best_idx = self._best_index([r["loss"] for r in results])
 
         for idx, result in enumerate(results):
             ax = axes[idx]
 
             recon_obj = result["reconstruction"]
 
-            obj = recon_obj._to_numpy(recon_obj.obj_cropped)
+            obj = recon_obj.obj_cropped
             if recon_obj.obj_type == "potential":
                 obj = np.abs(obj).sum(0)
             elif recon_obj.obj_type == "pure_phase":
-                obj = np.angle(obj).sum(0)
+                # pure_phase obj_cropped is a real phase array — plot directly
+                obj = obj.sum(0)
             else:
                 obj = np.angle(obj).sum(0)
 
-            if obj is not None:
-                show_2d(obj, cmap="magma", figax=(fig, ax))
-            else:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No object\navailable",
-                    ha="center",
-                    va="center",
-                    transform=ax.transAxes,
-                    fontsize=10,
-                )
-                ax.set_facecolor("#f0f0f0")
+            show_2d(obj, cmap="magma", figax=(fig, ax))
 
             # Title with parameters and loss
             param_str = ", ".join(

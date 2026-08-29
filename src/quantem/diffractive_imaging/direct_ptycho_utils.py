@@ -37,6 +37,12 @@ ABERRATION_PRESETS = {
 # fmt: on
 
 
+def _rotation_degrees_to_radians(rotation_angle: float | None) -> float | None:
+    if rotation_angle is None:
+        return None
+    return math.radians(float(rotation_angle))
+
+
 def create_edge_window(shape, edge_blend_pixels, device="cpu"):
     """
     Create a smooth edge window that transitions from 0 at edges to 1 in center.
@@ -495,7 +501,10 @@ def fit_aberrations_from_shifts(
     gpts: tuple[int, int],
     sampling: tuple[float, float],
 ) -> dict[str, float]:
-    """ """
+    """Fit low-order aberrations from lateral shifts.
+
+    Returns ``rotation_angle`` in degrees.
+    """
     device = shifts_ang.device
 
     # Get spatial frequencies at BF positions
@@ -534,7 +543,7 @@ def fit_aberrations_from_shifts(
         "C10": C10.item(),
         "C12": C12.item(),
         "phi12": phi12.item(),
-        "rotation_angle": rotation_rad.item(),
+        "rotation_angle": torch.rad2deg(rotation_rad).item(),
     }
 
 

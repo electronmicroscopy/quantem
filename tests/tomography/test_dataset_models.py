@@ -43,10 +43,11 @@ def _stack(nang=5, n=12, seed=0):
 
 class TestTomographyPixDataset:
     def test_wrong_projection_axis_raises(self):
-        # projections must live on axis 0 (i.e. fewer than the image dims).
-        bad = np.zeros((20, 5, 5), dtype=np.float32)
+        # projections must live on axis 0, matching the number of tilt angles.
+        # here the projections are on the last axis, so axis 0 (12) != n_angles (5).
+        bad = np.zeros((12, 12, 5), dtype=np.float32)
         with pytest.raises(ValueError):
-            TomographyPixDataset.from_data(bad, np.linspace(-60, 60, 20).astype(np.float32))
+            TomographyPixDataset.from_data(bad, np.linspace(-60, 60, 5).astype(np.float32))
 
     def test_tilt_angles_are_negated(self):
         angles = np.linspace(-40, 60, 5).astype(np.float32)
