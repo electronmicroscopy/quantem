@@ -9,6 +9,20 @@ from quantem.core.datastructures import Dataset as Dataset
 from quantem.core.datastructures import Dataset2d as Dataset2d
 from quantem.core.datastructures import Dataset3d as Dataset3d
 from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
+from quantem.spectroscopy import (
+    Dataset3deels as Dataset3deels,
+)
+from quantem.spectroscopy import Dataset3dspectroscopy as Dataset3dspectroscopy
+from quantem.spectroscopy import (
+    Dataset3dxeds as Dataset3dxeds,
+)
+
+
+def _print_available_datasets(data_list):
+    print("Available datasets:")
+    for index, entry in enumerate(data_list):
+        array = entry["data"]
+        print(f"  Dataset {index}: shape {array.shape}, ndim={array.ndim}")
 
 
 def read_4dstem(
@@ -98,19 +112,17 @@ def read_4dstem(
     else:
         # Automatically find first 4D dataset
         four_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 4]
+        _print_available_datasets(data_list)
 
         if len(four_d_datasets) == 0:
-            print(f"No 4D datasets found in {file_path}. Available datasets:")
-            for i, d in enumerate(data_list):
-                print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+            print(f"No 4D datasets found in {file_path}.")
             raise ValueError("No 4D dataset found in file")
 
         dataset_index, imported_data = four_d_datasets[0]
 
-        if len(data_list) > 1:
-            print(
-                f"File contains {len(data_list)} dataset(s). Using dataset {dataset_index} with shape {imported_data['data'].shape}"
-            )
+        print(
+            f"Using first 4D dataset at index {dataset_index} with shape {imported_data['data'].shape}"
+        )
 
     imported_axes = imported_data["axes"]
 
@@ -142,6 +154,94 @@ def read_4dstem(
         origin=origin,
         units=units,
         name=name_override,
+    )
+
+    return dataset
+
+
+def read_3d_spectroscopy(
+    file_path: str, file_type: str, data_type: str, dataset_index: int | None = None
+) -> Dataset3dspectroscopy:
+    """
+    File reader for 3D spectroscopy data
+
+    Parameters
+    ----------
+    file_path: str
+        Path to data
+    file_type: str
+        The type of file reader needed. See rosettasciio for supported formats
+        https://hyperspy.org/rosettasciio/supported_formats/index.html
+    data_type: str
+        type of spectroscopy data 'EELS' or 'XEDS'
+    Returns
+    --------
+    Dataset3dspectroscopy
+    """
+    data_type_normalized = str(data_type).upper()
+
+    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
+    data_list = file_reader(file_path)
+
+    # If specific index provided, use it
+    if dataset_index is not None:
+        imported_data = data_list[dataset_index]
+        if imported_data["data"].ndim != 3:
+            raise ValueError(
+                f"Dataset at index {dataset_index} has {imported_data['data'].ndim} dimensions, "
+                f"expected 3D. Shape: {imported_data['data'].shape}"
+            )
+    else:
+        # Automatically find first 3D dataset
+        three_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 3]
+        _print_available_datasets(data_list)
+
+        if len(three_d_datasets) == 0:
+            print(f"No 3D datasets found in {file_path}.")
+            raise ValueError("No 3D dataset found in file")
+
+        dataset_index, imported_data = three_d_datasets[0]
+
+        dataset_indices = [entry[0] for entry in three_d_datasets]
+        print(
+            f"Using first 3D dataset at index {dataset_index} with shape {imported_data['data'].shape}. "
+            f"3D dataset indices: {', '.join(map(str, dataset_indices))}"
+        )
+
+    imported_axes = imported_data["axes"]
+    # axis_order = (0, 1, 2) if file_type == "digitalmicrograph" else (2, 0, 1)
+    axis_order = (1, 2, 0) if file_type == "digitalmicrograph" else (0, 1, 2)
+    array = (
+        imported_data["data"].transpose(axis_order)
+        if file_type == "digitalmicrograph"
+        else imported_data["data"]
+    )
+    ordered_axes = [imported_axes[idx] for idx in axis_order]
+    sampling = [ax.get("scale", 1) for ax in ordered_axes]
+    origin = [ax.get("offset", 0) for ax in ordered_axes]
+    units = [
+        "pixels" if ax.get("units", "1") == "1" else ax.get("units", "pixels")
+        for ax in ordered_axes
+    ]
+
+    for i, unit in enumerate(units):
+        if unit == "eV" and data_type_normalized == "XEDS":
+            sampling[i] = sampling[i] / 1000
+            origin[i] = origin[i] / 1000
+            units[i] = "keV"
+
+    if data_type_normalized == "EELS":
+        dataset_cls = Dataset3deels
+    elif data_type_normalized == "XEDS":
+        dataset_cls = Dataset3dxeds
+    else:
+        raise ValueError(f"`data_type` must be `XEDS` or `EELS` not `{data_type}`")
+
+    dataset = dataset_cls.from_array(
+        array=array,
+        sampling=sampling,
+        origin=origin,
+        units=units,
     )
 
     return dataset
