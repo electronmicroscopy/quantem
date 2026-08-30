@@ -1,3 +1,4 @@
+from os import PathLike
 from typing import Any, Self
 
 import matplotlib.pyplot as plt
@@ -8,6 +9,7 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -77,7 +79,7 @@ class Dataset4dstem(Dataset4d):
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
-        mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
+        mdata_keys_4dstem = ["q_to_r_rotation_ccw_deg", "q_transpose", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
                 metadata[k] = None
@@ -97,15 +99,15 @@ class Dataset4dstem(Dataset4d):
         self._virtual_detectors = {}  # Store detector information for regeneration
 
     @classmethod
-    def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
+    def from_file(cls, file_path: str | PathLike, file_type: str | None = None) -> "Dataset4dstem":
         """
         Create a new Dataset4dstem from a file.
 
         Parameters
         ----------
-        file_path : str
+        file_path : str | PathLike
             Path to the data file
-        file_type : str
+        file_type : str | None
             The type of file reader needed. See rosettasciio for supported formats
             https://hyperspy.org/rosettasciio/supported_formats/index.html
 
@@ -798,3 +800,5 @@ class Dataset4dstem(Dataset4d):
             self.array[:, :, index_x, index_y] = np.median(
                 self.array[:, :, x_min:x_max, y_min:y_max], axis=(2, 3)
             )
+
+    polar_transform = dataset4dstem_polar_transform

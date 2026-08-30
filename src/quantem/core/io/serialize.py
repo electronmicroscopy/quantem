@@ -1494,3 +1494,28 @@ def print_file(
                         )
 
     _recurse(root)
+
+
+class Bundle(AutoSerialize):
+    """A named collection of serializable objects, saved as one file.
+
+    Groups any AutoSerialize objects (Datasets, Vectors, ...) plus plain
+    metadata values under attribute names::
+
+        bundle = Bundle(adf=dataset2d, peaks=vector, note="IM689")
+        bundle.save("data.zip")
+        b = load("data.zip"); b.adf, b.peaks
+
+    """
+
+    def __init__(self, **objects):
+        for name, obj in objects.items():
+            setattr(self, name, obj)
+
+    def __repr__(self) -> str:
+        items = ", ".join(
+            f"{k}: {type(v).__name__}"
+            for k, v in vars(self).items()
+            if not k.startswith("_")
+        )
+        return f"Bundle({items})"

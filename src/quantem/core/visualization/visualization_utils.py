@@ -347,6 +347,9 @@ def add_scalebar_to_ax(
     loc: str | int,
     fontsize: int = 12,
     bold: bool = True,
+    box: bool = False,
+    box_color: str = "black",
+    box_alpha: float = 0.5,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -375,6 +378,14 @@ def add_scalebar_to_ax(
         Font size of the scale bar label in points.
     bold : bool
         Whether to render the scale bar label in bold.
+    box : bool, default=False
+        Draw a translucent box behind the bar and label so it stays
+        readable on any image (e.g. white bar on a black box, or black bar
+        on a white box).
+    box_color : str, default="black"
+        Fill color of the box.
+    box_alpha : float, default=0.5
+        Opacity of the box.
     """
     from matplotlib.font_manager import FontProperties
 
@@ -403,14 +414,16 @@ def add_scalebar_to_ax(
         length_px,
         label,
         loc,
-        pad=pad_px,
+        pad=pad_px if not box else max(pad_px, 0.35),
         color=color,
-        frameon=False,
+        frameon=box,
         label_top=label_top,
         size_vertical=int(width_px),
         fontproperties=fontprops,
         sep=2 if label_top else int(round(0.3 * fontsize)),
     )
+    if box:
+        bar.patch.set(facecolor=box_color, edgecolor="none", alpha=box_alpha)
     ax.add_artist(bar)
 
 
