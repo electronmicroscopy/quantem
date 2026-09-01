@@ -2,14 +2,17 @@
 
 No external clustering dependency: neighbors are found with blockwise
 distance computations pruned by a sliding sorted window along the widest
-dimension, and cluster connectivity is resolved by min-label propagation
-with path compression. Runs on CPU or any torch device.
+dimension. Cluster connectivity among core points is resolved in a single
+pass with scipy's sparse connected-components graph routine, rather than
+iterative label propagation. Runs on CPU or any torch device.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import scipy.sparse as sp
 import torch
+from scipy.sparse.csgraph import connected_components
 
 
 def dbscan(
@@ -19,7 +22,6 @@ def dbscan(
     device: str | torch.device = "cpu",
     block: int = 2048,
     sort_by_size: bool = True,
-    max_rounds: int = 200,
 ) -> np.ndarray:
     """DBSCAN cluster labels for a point set.
 
@@ -79,35 +81,34 @@ def dbscan(
         counts[i0:i1] = (d <= eps).sum(dim=1)
     core = counts >= min_samples
 
-    # pass 2: min-label propagation among core points
-    labels = torch.arange(N, dtype=torch.long, device=device)
-    labels[~core] = -1
-    for _ in range(max_rounds):
-        changed = False
-        for i0 in range(0, N, block):
-            i1 = min(i0 + block, N)
-            if not bool(core[i0:i1].any()):
-                continue
-            j0, j1 = block_candidates(i0, i1)
-            d = torch.cdist(ps[i0:i1], ps[j0:j1])
-            adj = (d <= eps) & core[i0:i1, None] & core[None, j0:j1]
-            lab_nb = torch.where(
-                adj, labels[j0:j1][None, :], torch.full_like(d, N, dtype=torch.long)
-            )
-            new = lab_nb.min(dim=1).values
-            cur = labels[i0:i1]
-            upd = core[i0:i1] & (new < cur)
-            if bool(upd.any()):
-                labels[i0:i1] = torch.where(upd, new, cur)
-                changed = True
-        # path compression: labels point at representative indices
-        for _ in range(32):
-            comp = torch.where(core, labels[labels.clamp_min(0)], labels)
-            if bool(torch.equal(comp, labels)):
-                break
-            labels = comp
-        if not changed:
-            break
+    # pass 2: connect core points within eps of each other, once, then
+    # resolve clusters as connected components (single pass, no iterative
+    # relabeling rounds)
+    edge_rows: list[torch.Tensor] = []
+    edge_cols: list[torch.Tensor] = []
+    for i0 in range(0, N, block):
+        i1 = min(i0 + block, N)
+        if not bool(core[i0:i1].any()):
+            continue
+        j0, j1 = block_candidates(i0, i1)
+        d = torch.cdist(ps[i0:i1], ps[j0:j1])
+        adj = (d <= eps) & core[i0:i1, None] & core[None, j0:j1]
+        ii, jj = torch.nonzero(adj, as_tuple=True)
+        edge_rows.append(ii + i0)
+        edge_cols.append(jj + j0)
+
+    labels = torch.full((N,), -1, dtype=torch.long, device=device)
+    if edge_rows:
+        rows = torch.cat(edge_rows).cpu().numpy()
+        cols = torch.cat(edge_cols).cpu().numpy()
+        graph = sp.coo_matrix(
+            (np.ones(rows.shape[0], dtype=np.int8), (rows, cols)), shape=(N, N)
+        )
+        _, comp = connected_components(graph, directed=False)
+        core_np = core.cpu().numpy()
+        labels = torch.as_tensor(
+            np.where(core_np, comp, -1), dtype=torch.long, device=device
+        )
 
     # pass 3: border points join the nearest core cluster within eps
     for i0 in range(0, N, block):

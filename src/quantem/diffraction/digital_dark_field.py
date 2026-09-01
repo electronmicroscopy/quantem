@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import numpy as np
 
+import matplotlib.pyplot as plt
+from matplotlib.colors import hsv_to_rgb   
+
+from quantem.core.datastructures.vector import Vector
 from quantem.core.utils.clustering import cluster_vector, dbscan  # noqa: F401
 
 
@@ -124,7 +128,6 @@ def composite_ddf(
     np.ndarray
         (R, C, 3) RGB image in [0, 1].
     """
-    from matplotlib.colors import hsv_to_rgb
 
     K = images.shape[0]
     if colors is None:
@@ -144,8 +147,21 @@ def composite_ddf(
 
 
 def color_wheel(n: int = 256, saturation: float = 1.0) -> np.ndarray:
-    """(n, n, 4) RGBA hue wheel for labeling composite images."""
-    from matplotlib.colors import hsv_to_rgb
+    """
+    (n, n, 4) RGBA hue wheel for labeling composite images.
+
+    Parameters
+    n: int
+        Size of the output image.
+    saturation: float
+        Saturation of the hue wheel (0=gray, 1=full color).
+
+    Returns
+    -------
+    np.ndarray
+        (n, n, 4) RGBA image in [0, 1].
+    """
+     
 
     y, x = np.mgrid[-1 : 1 : n * 1j, -1 : 1 : n * 1j]
     r = np.hypot(x, y)
@@ -163,13 +179,45 @@ def plot_cluster_scatter(
     labeled,
     q_fields=("qx", "qy"),
     label_field: str = "cluster",
+    specific_cluster: int | None = None,
     max_clusters: int | None = None,
-    show_noise: bool = True,
+    show_unclustered: bool = True,
     point_size: float = 2.0,
+    alpha: float = 0.2,
     figax=None,
 ):
-    """All peaks in diffraction space, colored by cluster (noise in gray)."""
-    import matplotlib.pyplot as plt
+    """
+    All peaks in diffraction space, colored by cluster (unclustered in gray).
+
+    Parameters
+    ----------
+    labeled : Vector
+        Labeled diffraction data.
+    q_fields: tuple of str
+        Field names for the diffraction-space coordinates to plot.
+    label_field: str
+        Field name for the cluster label.
+    specific_cluster: int | None
+        If given, plot only this cluster (unclustered points are not shown).
+    max_clusters: int | None
+        Maximum number of clusters to plot (for large datasets).
+    show_unclustered: bool
+        Whether to show unclustered points (label < 0) in gray.
+    point_size: float
+        Size of the scatter points.
+    alpha: float
+        Transparency of the scatter points.  Recommended to be << 1.0 for large datasets so only dense
+        regions are visible.
+    figax: tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes) | None
+        If provided, plot into this figure and axes instead of creating a new one.
+
+    Returns
+    -------
+    fig: matplotlib.figure.Figure
+        The figure containing the scatter plot.
+    ax: matplotlib.axes.Axes
+        The axes containing the scatter plot.
+    """
 
     fields = labeled.fields
     flat = labeled.flatten()
@@ -181,7 +229,20 @@ def plot_cluster_scatter(
         fig, ax = plt.subplots(figsize=(6.5, 6.5))
     else:
         fig, ax = figax
-    if show_noise:
+    q_max = np.max(np.abs([qx, qy]))*1.05
+    ax.set_xlim(-q_max, q_max)
+    ax.set_ylim(-q_max, q_max)
+    ax.set_aspect("equal")
+    ax.invert_yaxis()
+    ax.set_xlabel("$q_y$")
+    ax.set_ylabel("$q_x$")
+
+    if specific_cluster is not None:
+        m = labels == specific_cluster
+        ax.scatter(qy[m], qx[m], s=point_size, color="C0", lw=0, alpha=alpha)
+        return fig, ax
+    
+    if show_unclustered:
         m = labels < 0
         ax.scatter(qy[m], qx[m], s=point_size, color="0.85", lw=0)
     n = labels.max() + 1
@@ -191,9 +252,37 @@ def plot_cluster_scatter(
     hues = rng.permutation(np.linspace(0, 1, len(list(ids)), endpoint=False))
     for k in ids:
         m = labels == k
-        ax.scatter(qy[m], qx[m], s=point_size, color=cmap(hues[k]), lw=0)
-    ax.set_aspect("equal")
-    ax.invert_yaxis()
-    ax.set_xlabel("$q_c$")
-    ax.set_ylabel("$q_r$")
+        ax.scatter(qy[m], qx[m], s=point_size, color=cmap(hues[k]), lw=0, alpha=alpha)
     return fig, ax
+
+def assign_grain_labels(L1, L2_labels,label_field: str = "cluster"):
+    """Assign L2 grain labels to L1 clusters based on their centers of mass.
+
+    Parameters
+    ----------
+    L1 : Vector
+        Labeled diffraction data with L1 cluster labels.
+    L2_labels : np.ndarray
+        (K,) array of L2 grain labels corresponding to each L1 cluster.
+
+    Returns
+    -------
+    L2 : Vector
+        Labeled diffraction data with L2 grain labels assigned.
+    L2_labels : np.ndarray
+        Updated array of L2 grain labels.
+    """
+    fields = L1.fields
+    flat = L1.flatten()
+    L1_labels = flat[:, fields.index(label_field)].astype(int)
+    L1_unique = np.unique(L1_labels)
+
+    L1_to_L2 = np.insert(L2_labels,0,-2)
+    mapper = dict(zip(L1_unique, L1_to_L2))
+    L2_labels_full = np.array([mapper[label] for label in L1_labels])
+    
+    L2 = L1.copy()
+    L2.add_fields("grain_label", values = L2_labels_full)
+    
+    # Return the new Vector with L2 labels
+    return L2
