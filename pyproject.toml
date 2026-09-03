@@ -50,6 +50,11 @@ dependencies = [
   "torchinfo>=1.8.0",
 ]
 
+[project.optional-dependencies]
+dataframe = [
+    "polars>=1.0",
+]
+
 [tool.hatch.build.targets.sdist]
 # hatchling always includes:
 # pyproject.toml, .gitignore, any README, any LICENSE, AUTHORS
