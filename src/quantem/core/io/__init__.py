@@ -3,6 +3,10 @@ from quantem.core.io.file_readers import read_4dstem as read_4dstem
 from quantem.core.io.file_readers import (
     read_3d_spectroscopy as read_3d_spectroscopy,
 )
+from quantem.core.io.file_readers import (
+    read_stem_eels_folder as read_stem_eels_folder,
+)
+from quantem.core.io.file_readers import StemEelsRaw as StemEelsRaw
 from quantem.core.io.serialize import AutoSerialize as AutoSerialize
 from quantem.core.io.serialize import load as load
 from quantem.core.io.serialize import print_file as print_file
