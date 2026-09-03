@@ -7,6 +7,8 @@ from quantem.core.io.file_readers import (
     read_stem_eels_folder as read_stem_eels_folder,
 )
 from quantem.core.io.file_readers import StemEelsRaw as StemEelsRaw
+from quantem.core.io.file_readers import describe_folder as describe_folder
+from quantem.core.io.file_readers import inspect_dm4_tags as inspect_dm4_tags
 from quantem.core.io.serialize import AutoSerialize as AutoSerialize
 from quantem.core.io.serialize import load as load
 from quantem.core.io.serialize import print_file as print_file
