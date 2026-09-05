@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import gc
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
 
 import matplotlib.pyplot as plt
@@ -16,26 +15,10 @@ from quantem.diffractive_imaging.dataset_models import (
     PtychographyDatasetBase,
     PtychographyDatasetRaster,
 )
+from quantem.diffractive_imaging.ptycho_utils import (
+    OptimizationParameter as OptimizationParameter,  # re-export: the documented path
+)
 from quantem.diffractive_imaging.ptychography_lite import PtychoLite, PtychoLiteDIP
-
-
-@dataclass
-class OptimizationParameter:
-    """Specification for a parameter to optimize."""
-
-    low: float
-    high: float
-    log: bool = False
-    n_points: int | None = None
-
-    def grid_values(self):
-        """Return an array of grid values for this parameter."""
-        if self.n_points is None:
-            raise ValueError("n_points must be specified for grid search parameters.")
-        if self.log:
-            return np.geomspace(self.low, self.high, self.n_points)
-        else:
-            return np.linspace(self.low, self.high, self.n_points)
 
 
 def _suggest_from_spec(trial: optuna.trial.Trial, spec: OptimizationParameter, name: str) -> float:

@@ -309,6 +309,13 @@ class KPlanes(PPLR, TensorDecompositionModel):
 # ---------------------------------------------------------------------------
 
 
+def _rotate_tilted_points_fp32(
+    pts: torch.Tensor, rotation_matrices: torch.Tensor
+) -> torch.Tensor:
+    with torch.autocast(device_type=pts.device.type, enabled=False):
+        return torch.einsum("tij,bj->tbi", rotation_matrices.float(), pts.float())
+
+
 def interpolate_ms_features_tilted(
     pts: torch.Tensor,  # (B, 3)
     ms_grids: nn.ParameterList,  # each grid: (3*T, C, H, W)
@@ -322,7 +329,7 @@ def interpolate_ms_features_tilted(
     B = pts.shape[0]
 
     # (T, B, 3)  — rotate all points by all rotations at once
-    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+    rotated = _rotate_tilted_points_fp32(pts, rotation_matrices)
 
     # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
     # index_select is faster and cleaner than advanced indexing with python lists.
@@ -610,7 +617,7 @@ def interpolate_ms_features_cp_tilted(
     B = pts.shape[0]
 
     # Rotate all points by all rotations: (T, B, 3)
-    rotated = torch.einsum("tij,bj->tbi", rotation_matrices, pts)
+    rotated = _rotate_tilted_points_fp32(pts, rotation_matrices)
 
     per_scale_features = []
     for line_coef in ms_grids:

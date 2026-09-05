@@ -27,6 +27,7 @@ from quantem.tomography.object_models import (
     ObjectINR,
     ObjectPixelated,
     ObjectTensorDecomp,
+    _tomography_autocast,
 )
 from quantem.tomography.radon.radon import iradon_torch, radon_torch
 from quantem.tomography.tomography_base import TomographyBase
@@ -84,6 +85,7 @@ class Tomography(TomographyOpt, TomographyBase):
         loss_func_kwargs: dict = {},
         reset_dset: DatasetModelType | None = None,
         show_metrics: bool = False,
+        use_bfloat16: bool = True,
     ):
         """
         This function should be able to handle both AD and INR-based tomography reconstruction methods.
@@ -203,11 +205,7 @@ class Tomography(TomographyOpt, TomographyBase):
 
             for batch_idx, batch in enumerate(self.dataloader):
                 self.zero_grad_all()
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=torch.bfloat16,
-                    enabled=False,
-                ):
+                with _tomography_autocast(self.device, use_bfloat16):
                     all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
                     all_densities = self.obj_model.forward(all_coords)
@@ -285,11 +283,7 @@ class Tomography(TomographyOpt, TomographyBase):
                     val_loss = torch.tensor(0.0, device=self.device)
 
                     for batch in self.val_dataloader:
-                        with torch.autocast(
-                            device_type=self.device.type,
-                            dtype=torch.bfloat16,
-                            enabled=True,
-                        ):
+                        with _tomography_autocast(self.device, use_bfloat16):
                             all_coords = self.dset.get_coords(batch, N, curr_num_samples_per_ray)
 
                             all_densities = self.obj_model.forward(all_coords)

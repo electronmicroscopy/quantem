@@ -29,56 +29,34 @@ def dft_upsample(
     Manuel Guizar-Sicairos, Samuel T. Thurman, and James R. Fienup, "Efficient subpixel
     image registration algorithms," Opt. Lett. 33, 156-158 (2008).
     http://www.sciencedirect.com/science/article/pii/S0045790612000778
+
+    Evaluates the inverse transform of ``F`` on a ``(2*du+1)`` square grid of spacing
+    ``1/up``, centered on ``shift``, where ``du = ceil(1.5 * up)``. The center tap is
+    therefore index ``du``, not ``up``.
+
+    Parameters
+    ----------
+    F : ndarray
+        Fourier-domain array, in FFT (unshifted) order.
+    up : int
+        Upsampling factor. The output samples ``shift + arange(-du, du+1) / up``.
+    shift : tuple of float
+        Position, in pixels of the *real-space* image, to center the fine grid on.
     """
     M, N = F.shape
-    pixel_radius = 1.5
-    num_row = int(math.ceil(pixel_radius * up))
-    num_col = num_row
+    du = np.ceil(1.5 * up).astype(int)
+    span = np.arange(-du, du + 1)
 
-    col_freq = np.fft.ifftshift(np.arange(N)) - math.floor(N / 2)
-    row_freq = np.fft.ifftshift(np.arange(M)) - math.floor(M / 2)
+    # frequency of FFT bin m, i.e. `ifftshift` of the centered ramp
+    freq_row = xp.fft.ifftshift(xp.arange(M)) - M // 2
+    freq_col = xp.fft.ifftshift(xp.arange(N)) - N // 2
 
-    row_coords = np.arange(num_row, dtype=float) - float(shift[0])
-    col_coords = np.arange(num_col, dtype=float) - float(shift[1])
-
-    factor_row = -2j * math.pi / (M * float(up))
-    factor_col = -2j * math.pi / (N * float(up))
-
-    row_kern = np.exp(factor_row * (row_coords[:, None] * row_freq[None, :])).astype(F.dtype)
-    col_kern = np.exp(factor_col * (col_freq[:, None] * col_coords[None, :])).astype(F.dtype)
-
-    return (row_kern @ F @ col_kern).real
-
-
-def _upsampled_correlation_numpy(
-    imageCorr: NDArray,
-    upsampleFactor: int,
-    xyShift: NDArray,
-) -> NDArray:
-    xyShift = np.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
-    globalShift = math.floor(math.ceil(upsampleFactor * 1.5) / 2.0)
-    upsampleCenter = float(globalShift) - (float(upsampleFactor) * xyShift)
-
-    im_up = dft_upsample(
-        np.conj(imageCorr), upsampleFactor, (float(upsampleCenter[0]), float(upsampleCenter[1]))
-    )
-    imageCorrUpsample = np.conj(im_up)
-
-    flat_idx = int(np.argmax(imageCorrUpsample.real))
-    r = flat_idx // imageCorrUpsample.shape[1]
-    c = flat_idx % imageCorrUpsample.shape[1]
-
-    dx = 0.0
-    dy = 0.0
-    patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
-    if patch.shape == (3, 3):
-        dx = _parabolic_peak(patch[:, 1])
-        dy = _parabolic_peak(patch[1, :])
-
-    xySubShift = np.array([float(r), float(c)], dtype=float) - float(globalShift)
-    xyShift = xyShift + (xySubShift + np.array([dx, dy], dtype=float)) / float(upsampleFactor)
-
-    return xyShift
+    # The offset re-centers the *output* sampling positions -- `shift + span/up` -- rather
+    # than translating the input frequencies, and the sign is the inverse transform's, so
+    # that this agrees with `ifft2` where the two grids coincide.
+    kern_row = xp.exp(2j * np.pi / (M * up) * np.outer(span + up * shift[0], freq_row))
+    kern_col = xp.exp(2j * np.pi / (N * up) * np.outer(freq_col, span + up * shift[1]))
+    return xp.real(kern_row @ F @ kern_col)
 
 
 def cross_correlation_shift(
@@ -155,10 +133,26 @@ def cross_correlation_shift(
     if upsample_factor > 2:
         xy_shift = _upsampled_correlation_numpy(cc, int(upsample_factor), xy_shift)
 
-    shifts = np.empty(2, dtype=float)
-    shifts[0] = ((xy_shift[0] + M / 2) % M) - M / 2
-    shifts[1] = ((xy_shift[1] + N / 2) % N) - N / 2
-    shifts = (float(shifts[0]), float(shifts[1]))
+        local = dft_upsample(cc, upsample_factor, (x0, y0), device=device)
+        peak = np.unravel_index(xp.argmax(local), local.shape)
+
+        try:
+            lx, ly = peak
+            icc = local[lx - 1 : lx + 2, ly - 1 : ly + 2]
+            if icc.shape == (3, 3):
+                dxf = parabolic_peak(icc[:, 1])
+                dyf = parabolic_peak(icc[1, :])
+            else:
+                raise ValueError("Subarray too close to edge")
+        except (IndexError, ValueError):
+            dxf = dyf = 0.0
+
+        # the fine grid is centered on its middle tap, `ceil(1.5 * upsample_factor)`
+        center = np.ceil(1.5 * upsample_factor).astype(int)
+        shifts = np.array([x0, y0]) + (np.array(peak) - center) / upsample_factor
+        shifts += np.array([dxf, dyf]) / upsample_factor
+
+    shifts = (shifts + 0.5 * np.array(cc.shape)) % cc.shape - 0.5 * np.array(cc.shape)
 
     if not return_shifted_image:
         return shifts
