@@ -1180,3 +1180,207 @@ def radially_project_fourier_tensor(
         array_1d = array_1d[0]
 
     return q_bins_out, array_1d
+
+def _parabolic_peak(v) -> float:
+    denom = 4.0 * v[1] - 2.0 * v[2] - 2.0 * v[0]
+    if denom == 0:
+        return 0.0
+    return float((v[2] - v[0]) / denom)
+
+
+def _upsampled_correlation_numpy(
+    imageCorr: NDArray,
+    upsampleFactor: int,
+    xyShift: NDArray,
+) -> NDArray:
+    xyShift = np.round(xyShift * float(upsampleFactor)) / float(upsampleFactor)
+    globalShift = math.floor(math.ceil(upsampleFactor * 1.5) / 2.0)
+    upsampleCenter = float(globalShift) - (float(upsampleFactor) * xyShift)
+
+    im_up = dft_upsample(
+        np.conj(imageCorr), upsampleFactor, (float(upsampleCenter[0]), float(upsampleCenter[1]))
+    )
+    imageCorrUpsample = np.conj(im_up)
+
+    flat_idx = int(np.argmax(imageCorrUpsample.real))
+    r = flat_idx // imageCorrUpsample.shape[1]
+    c = flat_idx % imageCorrUpsample.shape[1]
+
+    dx = 0.0
+    dy = 0.0
+    patch = imageCorrUpsample.real[r - 1 : r + 2, c - 1 : c + 2]
+    if patch.shape == (3, 3):
+        dx = _parabolic_peak(patch[:, 1])
+        dy = _parabolic_peak(patch[1, :])
+
+    xySubShift = np.array([float(r), float(c)], dtype=float) - float(globalShift)
+    xyShift = xyShift + (xySubShift + np.array([dx, dy], dtype=float)) / float(upsampleFactor)
+
+    return xyShift
+
+
+def weighted_cross_correlation_shift(
+    im_ref=None,
+    im=None,
+    *,
+    cc=None,
+    weight_real=None,
+    upsample_factor: int = 1,
+    max_shift=None,
+    fft_input: bool = False,
+    fft_output: bool = False,
+    return_shifted_image: bool = False,
+):
+    """
+    Weighted peak selection + DFT subpixel refinement for Fourier cross-correlation.
+
+    Provide either:
+      - im_ref and im (real-space images, or Fourier-domain if fft_input=True), OR
+      - cc (the Fourier-domain cross-spectrum), where cc = F_ref * conj(F_im)
+
+    The weight is applied ONLY in real-space correlation to choose the peak location,
+    but the subpixel refinement uses the true (unweighted) cross-spectrum `cc`.
+
+    Returns
+    -------
+    shift_rc : tuple[float, float]
+        (d_row, d_col) shift to apply to `im` to align it to `im_ref`.
+    shifted : ndarray (optional)
+        If return_shifted=True: shifted image. If fft_output=True returns FFT (corner-centered),
+        else returns real-space image.
+    """
+    if cc is None:
+        if im_ref is None or im is None:
+            raise ValueError("Provide either `cc` or both `im_ref` and `im`.")
+        F_ref = np.asarray(im_ref) if fft_input else np.fft.fft2(np.asarray(im_ref))
+        F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
+        cc = F_ref * np.conj(F_im)
+    else:
+        cc = np.asarray(cc)
+        F_im = None
+
+    cc_real = np.fft.ifft2(cc).real
+    M, N = cc_real.shape
+
+    if weight_real is not None:
+        w = np.asarray(weight_real)
+        if w.shape != cc_real.shape:
+            raise ValueError(
+                f"weight_real.shape={w.shape} must match correlation shape {cc_real.shape}."
+            )
+        cc_pick = cc_real * w
+    else:
+        cc_pick = cc_real
+
+    if max_shift is not None:
+        fr = np.fft.fftfreq(M) * M
+        fc = np.fft.fftfreq(N) * N
+        mask = fr[:, None] ** 2 + fc[None, :] ** 2 > float(max_shift) ** 2
+        cc_pick = cc_pick.copy()
+        cc_pick[mask] = -np.inf
+
+    flat_idx = int(np.argmax(cc_pick))
+    x0 = flat_idx // N
+    y0 = flat_idx % N
+
+    x_inds = [((x0 + dx) % M) for dx in (-1, 0, 1)]
+    y_inds = [((y0 + dy) % N) for dy in (-1, 0, 1)]
+    vx = cc_pick[x_inds, y0]
+    vy = cc_pick[x0, y_inds]
+
+    dx = _parabolic_peak(vx)
+    dy = _parabolic_peak(vy)
+
+    x0 = np.round((float(x0) + float(dx)) * 2.0) / 2.0
+    y0 = np.round((float(y0) + float(dy)) * 2.0) / 2.0
+    xy_shift = np.array([x0, y0], dtype=float)
+
+    if upsample_factor > 2:
+        xy_shift = _upsampled_correlation_numpy(cc, int(upsample_factor), xy_shift)
+
+    dr = ((xy_shift[0] + M / 2) % M) - M / 2
+    dc = ((xy_shift[1] + N / 2) % N) - N / 2
+    shift_rc = (float(dr), float(dc))
+
+    if not return_shifted_image:
+        return shift_rc
+
+    if im is None:
+        raise ValueError(
+            "return_shifted_image=True requires `im` (or its FFT via fft_input=True)."
+        )
+
+    if F_im is None:
+        F_im = np.asarray(im) if fft_input else np.fft.fft2(np.asarray(im))
+
+    kr = np.fft.fftfreq(M)[:, None]
+    kc = np.fft.fftfreq(N)[None, :]
+    phase_ramp = np.exp(-2j * np.pi * (kr * shift_rc[0] + kc * shift_rc[1]))
+    F_im_shifted = F_im * phase_ramp
+
+    if fft_output:
+        return shift_rc, F_im_shifted
+    return shift_rc, np.fft.ifft2(F_im_shifted).real
+
+def rotate_image(
+    im,
+    rotation_deg: float,
+    origin: tuple[float, float] | None = None,
+    clockwise: bool = True,
+    interpolation: str = "bilinear",
+    mode: str = "constant",
+    cval: float = 0.0,
+):
+    """Rotate an array about a pixel origin using bilinear/bicubic interpolation."""
+    im = np.asarray(im)
+    if im.ndim < 2:
+        raise ValueError("im must have at least 2 dimensions")
+
+    H, W = im.shape[-2], im.shape[-1]
+    if origin is None:
+        r0 = float(H // 2)
+        c0 = float(W // 2)
+    else:
+        r0 = float(origin[0])
+        c0 = float(origin[1])
+
+    interp = str(interpolation).lower()
+    if interp in {"bilinear", "linear"}:
+        order = 1
+    elif interp in {"bicubic", "cubic"}:
+        order = 3
+    else:
+        raise ValueError("interpolation must be 'bilinear' or 'bicubic'")
+
+    theta = float(np.deg2rad(rotation_deg))
+    if not clockwise:
+        theta = -theta
+
+    ct = float(np.cos(theta))
+    st = float(np.sin(theta))
+
+    r_out, c_out = np.meshgrid(
+        np.arange(H, dtype=np.float64),
+        np.arange(W, dtype=np.float64),
+        indexing="ij",
+    )
+
+    c_rel = c_out - c0
+    r_rel = r_out - r0
+
+    c_in = ct * c_rel + st * r_rel + c0
+    r_in = -st * c_rel + ct * r_rel + r0
+
+    coords = np.vstack((r_in.ravel(), c_in.ravel()))
+
+    if im.ndim == 2:
+        out = map_coordinates(im, coords, order=order, mode=mode, cval=cval)
+        return out.reshape(H, W)
+
+    prefix = im.shape[:-2]
+    n = int(np.prod(prefix)) if prefix else 1
+    im_flat = im.reshape(n, H, W)
+    out_flat = np.empty((n, H * W), dtype=np.result_type(im_flat.dtype, np.float64))
+    for i in range(n):
+        out_flat[i] = map_coordinates(im_flat[i], coords, order=order, mode=mode, cval=cval)
+    return out_flat.reshape(*prefix, H, W)
