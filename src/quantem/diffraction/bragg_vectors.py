@@ -1114,7 +1114,7 @@ class BraggVectors(AutoSerialize):
 
         Parameters
         ----------
-        position : tuple of int, default=(0, 0)
+        position : tuple of int, default=(0, 0) in pixels
             ``(row, col)`` scan position whose correlation map is shown.
         crop_factor : float, optional
             If given, zoom to a square window of half-width ``crop_factor * radius``
