@@ -30,6 +30,7 @@ Contributions are broken down by module:
 
 ## Spectroscopy
 - [Stephanie Ribet](https://github.com/smribet)
+- [Niko Vlahakis](https://github.com/nwvlahakis)
 
 ## Tomography 
 - [Cedric Lim](https://github.com/cedriclim1)
