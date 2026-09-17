@@ -66,10 +66,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         # Misc metadata
         self.metadata: dict[str, Any] = {}
 
-        self.u_ref: np.ndarray | None = None
-        self.v_ref: np.ndarray | None = None
-        self.u_array: np.ndarray | None = None
-        self.v_array: np.ndarray | None = None
+        self.g1_ref: np.ndarray | None = None
+        self.g2_ref: np.ndarray | None = None
+        self.g1_array: np.ndarray | None = None
+        self.g2_array: np.ndarray | None = None
 
         self.real_space = False
 
@@ -1054,27 +1054,27 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
         
-        self.u_array = np.empty(shape=(scan_r, scan_c, 2))
-        self.v_array = np.empty(shape=(scan_r, scan_c, 2))
+        self.g1_array = np.empty(shape=(scan_r, scan_c, 2))
+        self.g2_array = np.empty(shape=(scan_r, scan_c, 2))
         if self.state_individual_refined is None:
             raise RuntimeError("Call .fit_individual_diffraction_pattern(...) on all patterns first.")
         for r in range(scan_r):
             for c in range(scan_c):
                 pos_state = self.state_individual_refined[r,c]
                 if pos_state is None:
-                    self.u_array[r,c,:] = None
-                    self.v_array[r,c,:] = None
+                    self.g1_array[r,c,:] = None
+                    self.g2_array[r,c,:] = None
                     continue
                 for key in pos_state.keys():
                     key_parts = key.split('.')
                     if(key_parts[-1] == 'u_row'):
-                        self.u_array[r,c,0] = pos_state[key]
+                        self.g1_array[r,c,0] = pos_state[key]
                     if(key_parts[-1] == 'u_col'):
-                        self.u_array[r,c,1] = pos_state[key]
+                        self.g1_array[r,c,1] = pos_state[key]
                     if(key_parts[-1] == 'v_row'):
-                        self.v_array[r,c,0] = pos_state[key]
+                        self.g2_array[r,c,0] = pos_state[key]
                     if(key_parts[-1] == 'v_col'):
-                        self.v_array[r,c,1] = pos_state[key]
+                        self.g2_array[r,c,1] = pos_state[key]
 
         return self
     
@@ -1204,8 +1204,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
     def calculate_strain_map(
         self,
-        u_ref: np.ndarray | None = None,
-        v_ref: np.ndarray | None = None,
+        g1_ref: np.ndarray | None = None,
+        g2_ref: np.ndarray | None = None,
         mask: np.ndarray | None = None,
         q_to_r_rotation_ccw_deg: float | None = None,
         q_transpose: bool | None = None,
@@ -1219,10 +1219,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         Parameters
         ----------
-        u_ref : np.ndarray, optional
+        g1_ref : np.ndarray, optional
             ``(2,)`` reference for the first lattice vector. Defaults to the median over
             the scan inside :class:`StrainMap`.
-        v_ref : np.ndarray, optional
+        g2_ref : np.ndarray, optional
             ``(2,)`` reference for the second lattice vector. Defaults to the median over
             the scan inside :class:`StrainMap`.
         mask : np.ndarray, optional
@@ -1236,7 +1236,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         StrainMap
             A strain map initialized from the fitted lattice vectors.
         """
-        if self.u_array is None or self.v_array is None:
+        if self.g1_array is None or self.g2_array is None:
             self.get_individual_uv_vectors()
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
@@ -1292,12 +1292,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self.metadata["q_transpose"] = q_transpose
 
         return StrainMap(
-            u_array = self.u_array,
-            v_array = self.v_array,
+            g1_array = self.g1_array,
+            g2_array = self.g2_array,
             ds_shape = self.dataset.shape,
             real_space = self.real_space,
-            u_ref = u_ref,
-            v_ref = v_ref,
+            g1_ref = g1_ref,
+            g2_ref = g2_ref,
             mask = mask,
             ds_sampling=default_sampling,
             ds_units = default_units,

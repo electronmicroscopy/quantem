@@ -16,8 +16,8 @@ def plot_strain_panels(
     e_uv: np.ndarray,
     rotation: np.ndarray,
     mask: np.ndarray | None,
-    u_ref: np.ndarray | None,
-    v_ref: np.ndarray | None,
+    g1_ref: np.ndarray | None,
+    g2_ref: np.ndarray | None,
     ds_shape: tuple[int, ...],
     ds_sampling: float = 1.0,
     ds_units: str = "pixels",
@@ -384,9 +384,9 @@ def plot_strain_panels(
         n_rows = len(entries) + 1 + (2 if plot_rotation else 0)
         leg_h = (title_fs * 1.6 / 72.0 / figsize[1]) * n_rows
 
-    show_gvecs = plot_gvecs and u_ref is not None and v_ref is not None
+    show_gvecs = plot_gvecs and g1_ref is not None and g2_ref is not None
     if plot_gvecs and not show_gvecs:
-        print("Warning: u_ref and v_ref not found. Call fit_strain() first.")
+        print("Warning: g1_ref and g2_ref not found. Call fit_strain() first.")
     fig_aspect = figsize[0] / figsize[1]
     gvec_w = min(0.99 - margin_x0, 0.15) if show_gvecs else 0.0
     gvec_h = gvec_w * fig_aspect if show_gvecs else 0.0
@@ -413,16 +413,16 @@ def plot_strain_panels(
         ref_ax.set_ylim(-1.5, 1.5)
         ref_ax.set_aspect("equal")
         ref_ax.axis("off")
-        u_norm = u_ref / np.linalg.norm(u_ref)
-        v_norm = v_ref / np.linalg.norm(v_ref)
-        u_row, u_col = u_norm
-        v_row, v_col = v_norm
+        g1_norm = g1_ref / np.linalg.norm(g1_ref)
+        g2_norm = g2_ref / np.linalg.norm(g2_ref)
+        g1_row, g1_col = g1_norm
+        g2_row, g2_col = g2_norm
         arrow_props_ref = dict(arrowstyle="->", lw=3, mutation_scale=25)
-        ref_ax.add_patch(FancyArrowPatch((0, 0), (u_col, -u_row), color="darkred", **arrow_props_ref))
-        ref_ax.add_patch(FancyArrowPatch((0, 0), (v_col, -v_row), color="darkblue", **arrow_props_ref))
-        ref_ax.text(u_col * 1.3, -u_row * 1.3, r"$\mathbf{g}_{1}$", fontsize=14, fontweight="bold",
+        ref_ax.add_patch(FancyArrowPatch((0, 0), (g1_col, -g1_row), color="darkred", **arrow_props_ref))
+        ref_ax.add_patch(FancyArrowPatch((0, 0), (g2_col, -g2_row), color="darkblue", **arrow_props_ref))
+        ref_ax.text(g1_col * 1.3, -g1_row * 1.3, r"$\mathbf{g}_{1}$", fontsize=14, fontweight="bold",
                     color="darkred", ha="center", va="center")
-        ref_ax.text(v_col * 1.3, -v_row * 1.3, r"$\mathbf{g}_{2}$", fontsize=14, fontweight="bold",
+        ref_ax.text(g2_col * 1.3, -g2_row * 1.3, r"$\mathbf{g}_{2}$", fontsize=14, fontweight="bold",
                     color="darkblue", ha="center", va="center")
 
     return fig, ax

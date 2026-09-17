@@ -55,7 +55,7 @@ class BraggVectors(AutoSerialize):
        peaks into a reference lattice (``reference_ab``/``reference_qpos``).
     5. :meth:`fit_lattice` – the heavy step: at every scan position, match the
        detections to the reference within ``max_peak_shift``, intensity-weighted
-       least-squares fit the lattice vectors into ``u_array``/``v_array`` of shape
+       least-squares fit the lattice vectors into ``g1_array``/``g2_array`` of shape
        ``(scan_row, scan_col, 2)``, and compute the per-position ``mask_weight``.
     6. :meth:`calculate_strain_map` – hand the lattice vectors (and
        ``mask_weight``) to a :class:`~quantem.diffraction.strain.StrainMap`.
@@ -107,8 +107,8 @@ class BraggVectors(AutoSerialize):
         self.reference_qpos: np.ndarray | None = None
         self.reference_intensity: np.ndarray | None = None
 
-        self.u_array: np.ndarray | None = None
-        self.v_array: np.ndarray | None = None
+        self.g1_array: np.ndarray | None = None
+        self.g2_array: np.ndarray | None = None
         # per-position diagnostics from fit_lattice()
         self.mask_weight: np.ndarray | None = None
         self.fit_error: np.ndarray | None = None
@@ -158,7 +158,7 @@ class BraggVectors(AutoSerialize):
         Overrides :meth:`~quantem.core.io.serialize.AutoSerialize.save` to drop
         :attr:`dataset` — the raw 4D-STEM cube, which dominates the file size — from
         serialization by default. The detected :attr:`peaks`, lattice fit
-        (:attr:`u_array`/:attr:`v_array`), Bragg vector map and all diagnostics are
+        (:attr:`g1_array`/:attr:`g2_array`), Bragg vector map and all diagnostics are
         kept, so the file holds the *results* of the workflow (orders of magnitude
         smaller than the data) rather than the data itself.
 
@@ -848,8 +848,8 @@ class BraggVectors(AutoSerialize):
         ``origin + a*g1 + b*g2`` for each reference ``(a, b)`` — keeping a peak only
         when it lands within ``max_peak_shift`` of its nearest ideal site (not the
         measured candidate position), then ``q = x0 + a*g1 + b*g2`` is fit by
-        intensity-weighted least squares over the matched peaks. The fitted ``g1``/``g2`` go into :attr:`u_array`/
-        :attr:`v_array` (shape ``(scan_row, scan_col, 2)``, row/col components);
+        intensity-weighted least squares over the matched peaks. The fitted ``g1``/``g2`` go into :attr:`g1_array`/
+        :attr:`g2_array` (shape ``(scan_row, scan_col, 2)``, row/col components);
         positions with fewer than ``min_num_peaks`` matched peaks are left ``nan``.
 
         Two diagnostics are stored per position. :attr:`fit_error` is the RMS fit
@@ -919,8 +919,8 @@ class BraggVectors(AutoSerialize):
         rms_rand = float(np.sqrt(cell_area / (2.0 * np.pi))) if cell_area > 0 else 1.0
 
         scan_r, scan_c = int(self.dataset.shape[0]), int(self.dataset.shape[1])
-        u_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
-        v_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
+        g1_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
+        g2_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
         mask_weight = np.zeros((scan_r, scan_c), dtype=float)
         fit_error = np.full((scan_r, scan_c), np.nan, dtype=float)
 
@@ -961,8 +961,8 @@ class BraggVectors(AutoSerialize):
             )
             if beta is None:
                 continue
-            u_array[r, c] = beta[1]
-            v_array[r, c] = beta[2]
+            g1_array[r, c] = beta[1]
+            g2_array[r, c] = beta[2]
             fit_error[r, c] = rms
 
             # mask weight = lattice "order parameter": snap EVERY detected peak to the
@@ -985,8 +985,8 @@ class BraggVectors(AutoSerialize):
                 rms_all = float(np.sqrt(np.sum(w * disp[nonzero] ** 2) / wsum))
                 mask_weight[r, c] = float(np.clip(1.0 - rms_all / rms_rand, 0.0, 1.0))
 
-        self.u_array = u_array
-        self.v_array = v_array
+        self.g1_array = g1_array
+        self.g2_array = g2_array
         self.mask_weight = mask_weight
         self.fit_error = fit_error
         self.metadata["fit"] = {
@@ -1004,8 +1004,8 @@ class BraggVectors(AutoSerialize):
 
     def calculate_strain_map(
         self,
-        u_ref: np.ndarray | None = None,
-        v_ref: np.ndarray | None = None,
+        g1_ref: np.ndarray | None = None,
+        g2_ref: np.ndarray | None = None,
         mask: np.ndarray | None = None,
         q_to_r_rotation_ccw_deg: float | None = None,
         q_transpose: bool | None = None,
@@ -1014,10 +1014,10 @@ class BraggVectors(AutoSerialize):
 
         Parameters
         ----------
-        u_ref : np.ndarray, optional
+        g1_ref : np.ndarray, optional
             ``(2,)`` reference for the first lattice vector. Defaults to the median
             over the scan inside :class:`StrainMap`.
-        v_ref : np.ndarray, optional
+        g2_ref : np.ndarray, optional
             ``(2,)`` reference for the second lattice vector. Defaults to the median
             over the scan inside :class:`StrainMap`.
         mask : np.ndarray, optional
@@ -1033,7 +1033,7 @@ class BraggVectors(AutoSerialize):
         StrainMap
             A strain map initialized from the fitted lattice vectors.
         """
-        if self.u_array is None or self.v_array is None:
+        if self.g1_array is None or self.g2_array is None:
             raise ValueError("Run fit_lattice() before calculate_strain_map().")
 
         if mask is None:
@@ -1087,12 +1087,12 @@ class BraggVectors(AutoSerialize):
         self.metadata["q_transpose"] = q_transpose
 
         return StrainMap(
-            u_array=self.u_array,
-            v_array=self.v_array,
+            g1_array=self.g1_array,
+            g2_array=self.g2_array,
             ds_shape=tuple(self.dataset.shape),
             real_space=self.real_space,
-            u_ref=u_ref,
-            v_ref=v_ref,
+            g1_ref=g1_ref,
+            g2_ref=g2_ref,
             mask=mask,
             ds_sampling=ds_sampling,
             ds_units=ds_units,

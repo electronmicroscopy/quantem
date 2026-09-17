@@ -29,9 +29,9 @@ class StrainMap(AutoSerialize):
 
     Parameters
     ----------
-    u_array : np.ndarray
+    g1_array : np.ndarray
         Per-position first lattice vector, shape ``(scan_row, scan_col, 2)``.
-    v_array : np.ndarray
+    g2_array : np.ndarray
         Per-position second lattice vector, shape ``(scan_row, scan_col, 2)``.
     ds_shape : tuple of int
         Shape of the parent scan grid, used to size the strain maps.
@@ -39,10 +39,10 @@ class StrainMap(AutoSerialize):
         ``False`` for reciprocal-space (Bragg/correlation) lattice vectors; ``True``
         for real-space (cepstral autocorrelation / DPC) vectors. Both modalities are
         arranged to yield matching strain (see :func:`_strain_tensor`).
-    u_ref : np.ndarray, optional
+    g1_ref : np.ndarray, optional
         Fixed reference for ``u``; if omitted the median over the mask/ROI is used.
         A value supplied here persists across re-fits.
-    v_ref : np.ndarray, optional
+    g2_ref : np.ndarray, optional
         Fixed reference for ``v``; if omitted the median over the mask/ROI is used.
         A value supplied here persists across re-fits.
     mask : np.ndarray, optional
@@ -62,10 +62,10 @@ class StrainMap(AutoSerialize):
     e_rc: Dataset2d
     phi: Dataset2d
 
-    u_ref: np.ndarray | None = None
-    v_ref: np.ndarray | None = None
-    u_array: np.ndarray
-    v_array: np.ndarray
+    g1_ref: np.ndarray | None = None
+    g2_ref: np.ndarray | None = None
+    g1_array: np.ndarray
+    g2_array: np.ndarray
 
     ds_sampling: float = 1.0
     ds_units: str = "pixels"
@@ -73,12 +73,12 @@ class StrainMap(AutoSerialize):
 
     def __init__(
         self,
-        u_array: np.ndarray,
-        v_array: np.ndarray,
+        g1_array: np.ndarray,
+        g2_array: np.ndarray,
         ds_shape: tuple[int, ...],
         real_space: bool,
-        u_ref: np.ndarray | None = None,
-        v_ref: np.ndarray | None = None,
+        g1_ref: np.ndarray | None = None,
+        g2_ref: np.ndarray | None = None,
         mask: np.ndarray | None = None,
         ds_sampling: float | None = None,
         ds_units: str | None = None,
@@ -86,14 +86,14 @@ class StrainMap(AutoSerialize):
         q_transpose: bool = False,
     ):
         super().__init__()
-        self.u_array = u_array
-        self.v_array = v_array
+        self.g1_array = g1_array
+        self.g2_array = g2_array
         
         self.q_to_r_rotation_ccw_deg = q_to_r_rotation_ccw_deg
         self.q_transpose = q_transpose
 
-        self.u_array = _raw_vec_to_display(self.u_array, rotation_ccw_deg = q_to_r_rotation_ccw_deg, transpose=q_transpose)
-        self.v_array = _raw_vec_to_display(self.v_array, rotation_ccw_deg = q_to_r_rotation_ccw_deg, transpose=q_transpose)
+        self.g1_array = _raw_vec_to_display(self.g1_array, rotation_ccw_deg = q_to_r_rotation_ccw_deg, transpose=q_transpose)
+        self.g2_array = _raw_vec_to_display(self.g2_array, rotation_ccw_deg = q_to_r_rotation_ccw_deg, transpose=q_transpose)
 
         self.ds_shape = ds_shape
         self.real_space = real_space
@@ -111,14 +111,14 @@ class StrainMap(AutoSerialize):
         self.mask = m
 
         # user-supplied reference vectors persist across re-fits (None = use median)
-        self._u_ref_fixed = None if u_ref is None else _raw_vec_to_display(np.asarray(u_ref, dtype=float), 
+        self.g1_ref_fixed = None if g1_ref is None else _raw_vec_to_display(np.asarray(g1_ref, dtype=float), 
                                                                                                                         rotation_ccw_deg=q_to_r_rotation_ccw_deg, 
                                                                                                                         transpose=q_transpose)
-        self._v_ref_fixed = None if v_ref is None else _raw_vec_to_display(np.asarray(v_ref, dtype=float), 
+        self.g2_ref_fixed = None if g2_ref is None else _raw_vec_to_display(np.asarray(g2_ref, dtype=float), 
                                                                                                                         rotation_ccw_deg=q_to_r_rotation_ccw_deg, 
                                                                                                                         transpose=q_transpose)
-        self.u_ref = None
-        self.v_ref = None
+        self.g1_ref = None
+        self.g2_ref = None
 
         self.update_reference()
 
@@ -127,15 +127,15 @@ class StrainMap(AutoSerialize):
     def update_reference(
         self,
         strain_mask: np.ndarray | None = None,
-        u_ref: np.ndarray | None = None,
-        v_ref: np.ndarray | None = None,
+        g1_ref: np.ndarray | None = None,
+        g2_ref: np.ndarray | None = None,
         plot_strain_roi: bool = False,
         define_in_rotated_frame: bool = False,
         **plot_kwargs,
     ) -> "StrainMap":
         """(Re)compute the reference lattice and strain tensor maps.
 
-        Reference precedence: explicit ``u_ref``/``v_ref`` argument > vectors fixed at
+        Reference precedence: explicit ``g1_ref``/``g2_ref`` argument > vectors fixed at
         construction > median over ``strain_mask`` (if given) else over ``self.mask``
         else the global median.
 
@@ -145,18 +145,19 @@ class StrainMap(AutoSerialize):
             ``(scan_row, scan_col)`` ROI selecting the positions used to compute the
             median reference lattice. If omitted, ``self.mask`` (else the global
             median) is used.
-        u_ref : np.ndarray, optional
-            Explicit reference for ``u``; overrides both the construction-time fixed
+        g1_ref : np.ndarray, optional
+            Explicit reference for ``g1``; overrides both the construction-time fixed
             value and the median.
-        v_ref : np.ndarray, optional
-            Explicit reference for ``v``; overrides both the construction-time fixed
+        g2_ref : np.ndarray, optional
+            Explicit reference for ``g2``; overrides both the construction-time fixed
             value and the median.
         plot_strain_roi : bool, default=False
             If ``True``, show the recomputed strain via :meth:`plot_strain_roi`
             (color-scaled to the ROI) so the chosen reference region can be checked
             for flatness.
         define_in_rotated_frame: bool, default = False
-            If ''True'' means the u_ref and v_ref passed into the function is defined in the rotated detector frame
+            If ``True``, the ``g1_ref`` and ``g2_ref`` passed into the function are
+            defined in the rotated detector frame.
         **plot_kwargs
             Forwarded to :meth:`plot_strain_roi` when ``plot_strain_roi=True``.
 
@@ -165,36 +166,36 @@ class StrainMap(AutoSerialize):
         StrainMap
             ``self``, with the reference lattice and strain maps recomputed.
         """
-        u_med, v_med = _reference_lattice(self.u_array, self.v_array, self.mask, strain_mask)
+        g1_med, g2_med = _reference_lattice(self.g1_array, self.g2_array, self.mask, strain_mask)
 
-        if u_ref is not None:
+        if g1_ref is not None:
             if define_in_rotated_frame:
-                self.u_ref = np.asarray(u_ref, dtype=float)
+                self.g1_ref = np.asarray(g1_ref, dtype=float)
             else:
-                self.u_ref = _raw_vec_to_display(
-                                        np.asarray(u_ref, dtype=float),
+                self.g1_ref = _raw_vec_to_display(
+                                        np.asarray(g1_ref, dtype=float),
                                         rotation_ccw_deg=self.q_to_r_rotation_ccw_deg, 
                                         transpose=self.q_transpose)
-        elif self._u_ref_fixed is not None:
-            self.u_ref = self._u_ref_fixed
+        elif self.g1_ref_fixed is not None:
+            self.g1_ref = self.g1_ref_fixed
         else:
-            self.u_ref = u_med
+            self.g1_ref = g1_med
 
-        if v_ref is not None:
+        if g2_ref is not None:
             if define_in_rotated_frame:
-                self.v_ref = np.asarray(v_ref, dtype=float)
+                self.g2_ref = np.asarray(g2_ref, dtype=float)
             else:
-                self.v_ref = _raw_vec_to_display(
-                                                    np.asarray(v_ref, dtype=float),
+                self.g2_ref = _raw_vec_to_display(
+                                                    np.asarray(g2_ref, dtype=float),
                                                     rotation_ccw_deg=self.q_to_r_rotation_ccw_deg, 
                                                     transpose=self.q_transpose)
-        elif self._v_ref_fixed is not None:
-            self.v_ref = self._v_ref_fixed
+        elif self.g2_ref_fixed is not None:
+            self.g2_ref = self.g2_ref_fixed
         else:
-            self.v_ref = v_med
+            self.g2_ref = g2_med
 
         e_rr, e_cc, e_rc, phi = _strain_tensor(
-            self.u_array, self.v_array, self.u_ref, self.v_ref, self.real_space
+            self.g1_array, self.g2_array, self.g1_ref, self.g2_ref, self.real_space
         )
         self.e_rr = Dataset2d.from_array(e_rr, name="strain e_rr", signal_units="fractional")
         self.e_cc = Dataset2d.from_array(e_cc, name="strain e_cc", signal_units="fractional")
@@ -319,8 +320,8 @@ class StrainMap(AutoSerialize):
             e_rc,
             phi,
             self.mask,
-            self.u_ref,
-            self.v_ref,
+            self.g1_ref,
+            self.g2_ref,
             self.ds_shape,
             ds_sampling=self.ds_sampling,
             ds_units=self.ds_units,
@@ -439,8 +440,8 @@ class StrainMap(AutoSerialize):
             e_uv,
             phi,
             self.mask,
-            self.u_ref,
-            self.v_ref,
+            self.g1_ref,
+            self.g2_ref,
             self.ds_shape,
             ds_sampling=self.ds_sampling,
             ds_units=self.ds_units,
@@ -777,8 +778,8 @@ def _local_masked_median(
 
 
 def _reference_lattice(
-    u_array: np.ndarray,
-    v_array: np.ndarray,
+    g1_array: np.ndarray,
+    g2_array: np.ndarray,
     mask: np.ndarray | None = None,
     strain_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -797,9 +798,9 @@ def _reference_lattice(
 
     Parameters
     ----------
-    u_array : np.ndarray
+    g1_array : np.ndarray
         Per-position first lattice vector, shape ``(scan_row, scan_col, 2)``.
-    v_array : np.ndarray
+    g2_array : np.ndarray
         Per-position second lattice vector, shape ``(scan_row, scan_col, 2)``.
     mask : np.ndarray, optional
         ``(scan_row, scan_col)`` per-position weight in ``[0, 1]``. Used as the median
@@ -810,7 +811,7 @@ def _reference_lattice(
     Returns
     -------
     tuple of np.ndarray
-        ``(u_ref, v_ref)``, each a length-2 reference vector.
+        ``(g1_ref, g2_ref)``, each a length-2 reference vector.
     """
     if strain_mask is not None:
         w = np.asarray(strain_mask, dtype=float).reshape(-1)
@@ -819,8 +820,8 @@ def _reference_lattice(
     else:
         w = None
 
-    u_flat = u_array.reshape(-1, 2)
-    v_flat = v_array.reshape(-1, 2)
+    g1_flat = g1_array.reshape(-1, 2)
+    g2_flat = g2_array.reshape(-1, 2)
 
     def _wmed(vals: np.ndarray) -> float:
         # weighted median over finite, positively-weighted positions; positions
@@ -834,16 +835,16 @@ def _reference_lattice(
             return float(np.nanmedian(vals)) if finite.any() else float("nan")
         return _weighted_quantile(vals[use], ww[use], 0.5)
 
-    u_ref = np.array((_wmed(u_flat[:, 0]), _wmed(u_flat[:, 1])), dtype=float)
-    v_ref = np.array((_wmed(v_flat[:, 0]), _wmed(v_flat[:, 1])), dtype=float)
-    return u_ref, v_ref
+    g1_ref = np.array((_wmed(g1_flat[:, 0]), _wmed(g1_flat[:, 1])), dtype=float)
+    g2_ref = np.array((_wmed(g2_flat[:, 0]), _wmed(g2_flat[:, 1])), dtype=float)
+    return g1_ref, g2_ref
 
 
 def _strain_tensor(
-    u_array: np.ndarray,
-    v_array: np.ndarray,
-    u_ref: np.ndarray,
-    v_ref: np.ndarray,
+    g1_array: np.ndarray,
+    g2_array: np.ndarray,
+    g1_ref: np.ndarray,
+    g2_ref: np.ndarray,
     real_space: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Per-position strain tensor from lattice vectors relative to a reference.
@@ -866,13 +867,13 @@ def _strain_tensor(
 
     Parameters
     ----------
-    u_array : np.ndarray
+    g1_array : np.ndarray
         Per-position first lattice vector, shape ``(scan_row, scan_col, 2)``.
-    v_array : np.ndarray
+    g2_array : np.ndarray
         Per-position second lattice vector, shape ``(scan_row, scan_col, 2)``.
-    u_ref : np.ndarray
+    g1_ref : np.ndarray
         Reference first lattice vector (length 2).
-    v_ref : np.ndarray
+    g2_ref : np.ndarray
         Reference second lattice vector (length 2).
     real_space : bool
         ``False`` for reciprocal-space (Bragg/correlation) vectors; ``True`` for
@@ -884,8 +885,8 @@ def _strain_tensor(
     tuple of np.ndarray
         ``(e_rr, e_cc, e_rc, phi)``, each of shape ``(scan_row, scan_col)``.
     """
-    scan_r, scan_c = u_array.shape[0], u_array.shape[1]
-    Uref = np.stack((u_ref, v_ref), axis=1).astype(float)
+    scan_r, scan_c = g1_array.shape[0], g1_array.shape[1]
+    Uref = np.stack((g1_ref, g2_ref), axis=1).astype(float)
     strain_trans = np.zeros((scan_r, scan_c, 2, 2))
 
     # For real-space vectors the reference is inverted once (it is shared by every
@@ -896,7 +897,7 @@ def _strain_tensor(
 
     for r in range(scan_r):
         for c in range(scan_c):
-            U = np.stack((u_array[r, c, :], v_array[r, c, :]), axis=1)
+            U = np.stack((g1_array[r, c, :], g2_array[r, c, :]), axis=1)
             # Positions fit_lattice could not fit are NaN; a degenerate (collinear)
             # fit is singular. Either way there is no meaningful inverse -- leave the
             # strain NaN (masked out downstream) rather than feeding NaN into pinv,
