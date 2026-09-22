@@ -1,12 +1,31 @@
+from typing import Any, Dict, List, Tuple
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
+from scipy.signal import find_peaks, savgol_filter
 from scipy.stats import norm
 
 from quantem.core.visualization import show_2d
 
 
-def plot_attached_spectrum(self, spectrum_index=0):
+def plot_attached_spectrum(
+    self,
+    spectrum_index=0,
+    display_energy_range=None,
+    display_intensity_range=None,
+):
+    """
+    Parameters
+    ----------
+    display_energy_range : (float, float), optional
+        (lo, hi) to zoom the x-axis into. Display-only -- the full spectrum
+        is still plotted; this only changes what's visible. Defaults to the
+        full energy range (no zoom).
+    display_intensity_range : (float, float), optional
+        (lo, hi) to zoom the y-axis into. Display-only, same caveat as
+        ``display_energy_range``.
+    """
     fig, (ax_spec) = plt.subplots(1, 1, figsize=(12, 4))
 
     ds = self.attached_spectra[spectrum_index]
@@ -21,6 +40,22 @@ def plot_attached_spectrum(self, spectrum_index=0):
     ax_spec.set_title(f"Spectrum in index {spectrum_index}")
     ax_spec.grid(True, alpha=0.1)
 
+    if display_energy_range is not None:
+        e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        ax_spec.set_xlim(e_lo, e_hi)
+
+    if display_intensity_range is not None:
+        i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+        if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+            raise ValueError(
+                f"display_intensity_range must be (lo, hi) with lo < hi, got {display_intensity_range!r}"
+            )
+        ax_spec.set_ylim(i_lo, i_hi)
+
     fig.tight_layout()
     plt.show()
 
@@ -31,6 +66,7 @@ def _plot_pca_results(
     loadings,
     explained_variance_ratio,
     n_show: int = 4,
+    title: str = "",
 ):
     """
     Plot PCA results including scree plot, components, and loadings.
@@ -45,6 +81,8 @@ def _plot_pca_results(
         Explained variance ratios
     n_show : int
         Number of components to show
+    title : str, optional
+        Extra line(s) written under the figure titles (e.g. which data / background subtraction the PCA is of).
     """
     fig, (ax_scree, ax_components) = plt.subplots(1, 2, figsize=(12, 4))
     cumsum_var = np.cumsum(explained_variance_ratio)
@@ -79,7 +117,7 @@ def _plot_pca_results(
     ax_components.legend()
     ax_components.grid(True, alpha=0.3)
 
-    fig.suptitle("PCA Analysis")
+    fig.suptitle("PCA Analysis" + (f"\n{title}" if title else ""), fontsize=10)
     fig.tight_layout()
     plt.show()
 
@@ -95,6 +133,8 @@ def _plot_pca_results(
             "units": str(self.units[1]),
         },
     )
+    if title:
+        plt.gcf().suptitle(title, fontsize=8)
     plt.show()
 
 
@@ -211,6 +251,66 @@ def show_mean_spectrum(
     return fig, (ax_img, ax_spec)
 
 
+_MAP_NORMALIZATIONS = ("percentile", "minmax", "zscore", "robust_z", "relative")
+
+
+def _normalize_energy_map(energy_map, mode, percentiles=(1.0, 99.0)):
+    """Rescale one 2D energy-window map so maps from different windows are comparable.
+
+    Every mode is computed from this map alone, so a bright window (e.g.
+    near the ZLP tail) and a dim one (e.g. a weak feature at 2 eV) end up on
+    the same footing and their *spatial contrast* can be compared directly.
+    NaN/inf pixels are ignored when computing the statistics.
+
+    ``"percentile"`` : clip to the (``percentiles``) range, then map to [0, 1].
+        Robust to hot pixels/spikes; the default.
+    ``"minmax"``     : (m - min) / (max - min) -> [0, 1].
+    ``"zscore"``     : (m - mean) / std, i.e. units of standard deviations.
+    ``"robust_z"``   : (m - median) / (1.4826 * MAD). Same units as ``"zscore"``
+        (a Gaussian-noise pixel is ~N(0, 1)) but the median/MAD are not
+        inflated by a few hot pixels or spikes, so genuine outliers stand out
+        instead of inflating their own yardstick. Falls back to the std when
+        the MAD is 0 (a map that is mostly identical values).
+    ``"relative"``   : m / mean(m), i.e. fold-change vs. the map's own mean
+        (1.0 = average pixel). Only meaningful when the mean is not ~0.
+    """
+    m = np.asarray(energy_map, dtype=float)
+    finite = m[np.isfinite(m)]
+    if finite.size == 0:
+        raise ValueError("energy map has no finite pixels to normalize")
+
+    if mode in ("percentile", "minmax"):
+        if mode == "percentile":
+            p_lo, p_hi = float(percentiles[0]), float(percentiles[1])
+            if not (0.0 <= p_lo < p_hi <= 100.0):
+                raise ValueError(
+                    f"percentiles must satisfy 0 <= lo < hi <= 100, got {percentiles!r}"
+                )
+            lo, hi = np.percentile(finite, [p_lo, p_hi])
+        else:
+            lo, hi = finite.min(), finite.max()
+        if hi <= lo:  # flat map: no contrast to show
+            return np.zeros_like(m)
+        return np.clip((m - lo) / (hi - lo), 0.0, 1.0)
+    if mode == "zscore":
+        std = finite.std()
+        return (m - finite.mean()) / std if std > 0 else np.zeros_like(m)
+    if mode == "robust_z":
+        med = np.median(finite)
+        scale = 1.4826 * np.median(np.abs(finite - med))
+        if scale == 0:  # sparse map: >half the pixels identical -> use std instead
+            scale = finite.std()
+        return (m - med) / scale if scale > 0 else np.zeros_like(m)
+    if mode == "relative":
+        mean = finite.mean()
+        if mean == 0 or not np.isfinite(mean):
+            raise ValueError("map_normalization='relative' needs a non-zero map mean")
+        return m / mean
+    raise ValueError(
+        f"map_normalization must be None or one of {_MAP_NORMALIZATIONS}, got {mode!r}"
+    )
+
+
 def show_energy_window_map(
     self,
     energy_window=None,
@@ -219,6 +319,12 @@ def show_energy_window_map(
     mask=None,
     cmap="viridis",
     show=True,
+    display_energy_range=None,
+    normalize=True,
+    vmin=None,
+    vmax=None,
+    map_normalization="percentile",
+    normalization_percentiles=(1.0, 99.0),
 ):
     """Show a spatial map integrated over a selected energy window.
 
@@ -241,14 +347,68 @@ def show_energy_window_map(
         Matplotlib colormap for the map.
     show : bool, optional
         If True, call ``plt.show()``.
+    display_energy_range : list[float] | tuple[float, float] | None, optional
+        (lo, hi) energy range to zoom the spectrum subplot's x-axis into.
+        Purely a display crop -- does not affect ``energy_window`` (what's
+        integrated into the map) or the map itself. Defaults to the full
+        (masked) energy axis, i.e. no zoom.
+    normalize : bool, optional
+        If True (default), divide the summed window intensity by the
+        number of integrated channels, giving a mean intensity/channel
+        instead of a raw sum. Without this, a wider ``energy_window``
+        trivially sums more channels and produces larger values purely
+        from its width, making maps from differently sized windows not
+        comparable on the same color scale. Set False to get the raw
+        per-pixel sum instead.
+    vmin, vmax : float | None, optional
+        Explicit color-scale limits for the map, forwarded to ``show_2d``.
+        Pass the same ``vmin``/``vmax`` across multiple calls (e.g. one
+        shared max computed up front) to put several energy-window maps
+        on an identical color scale for direct visual comparison. If
+        None (default), each call auto-scales to its own map's min/max.
+        These apply to the map *after* ``map_normalization``, so with the
+        default they are in normalized units (e.g. 0-1).
+    map_normalization : {"percentile", "minmax", "zscore", "robust_z", "relative"} | None, optional
+        Rescales each window's map on its own, so windows with very
+        different intensity ranges (bright near the ZLP tail, dim at a
+        weak feature) can be compared by their spatial contrast. Unlike
+        ``normalize`` (which only divides out the window *width*), this
+        removes the window's overall intensity *scale*:
+
+        - ``"percentile"`` (default): clip to ``normalization_percentiles``
+          then map to [0, 1]; robust to hot pixels and spikes.
+        - ``"minmax"``: map the map's min..max to [0, 1].
+        - ``"zscore"``: (map - mean) / std.
+        - ``"robust_z"``: (map - median) / (1.4826 * MAD). Like ``"zscore"``
+          but not inflated by hot pixels/spikes, so real outliers keep their
+          full significance instead of inflating their own std. Best choice
+          for sparse, spike-dominated maps.
+        - ``"relative"``: map / mean, i.e. fold-change vs. the average pixel.
+        - ``None``: keep the raw mean-intensity/channel (or summed) values.
+
+        A shared ``vmin``/``vmax`` computed from several normalized maps
+        (the pattern used in the notebooks) stays consistent, since every
+        call normalizes the same way.
+    normalization_percentiles : (float, float), optional
+        Lower/upper percentile used by ``map_normalization="percentile"``.
+        Default (1, 99).
 
     Returns
     -------
     tuple
-        ``(fig, (ax_map, ax_spec), energy_map)`` where ``energy_map`` is the integrated 2D array.
+        ``(fig, (ax_map, ax_spec), energy_map)`` where ``energy_map`` is the 2D
+        array that is displayed, i.e. **after** ``map_normalization``. Pass
+        ``map_normalization=None`` to get the raw integrated intensities.
     """
     y, x, dy, dx = self._resolve_roi(roi=roi, roi_cal=roi_cal)
     has_roi_overlay = any(val is not None for val in (roi, roi_cal))
+    if map_normalization is False:
+        map_normalization = None
+    if map_normalization is not None and map_normalization not in _MAP_NORMALIZATIONS:
+        raise ValueError(
+            f"map_normalization must be None or one of {_MAP_NORMALIZATIONS}, "
+            f"got {map_normalization!r}"
+        )
 
     dE = float(self.sampling[2])
     E0 = float(self.origin[2]) if hasattr(self, "origin") else 0.0
@@ -282,6 +442,12 @@ def show_energy_window_map(
 
     arr = np.asarray(self.array, dtype=float)
     energy_map = arr[:, :, window_mask].sum(axis=-1)
+    if normalize:
+        energy_map = energy_map / float(np.count_nonzero(window_mask))
+    if map_normalization is not None:
+        energy_map = _normalize_energy_map(
+            energy_map, map_normalization, percentiles=normalization_percentiles
+        )
 
     spec = self.calculate_mean_spectrum(
         roi=roi,
@@ -295,11 +461,26 @@ def show_energy_window_map(
         E_spec = E
 
     unit_label = "keV" if str(self.dataset_type).lower() == "xeds" else "eV"
+    map_kind = "mean intensity/channel" if normalize else "summed intensity"
+    if map_normalization is not None:
+        p_lo, p_hi = normalization_percentiles
+        map_kind = {
+            "percentile": f"normalized 0-1, clipped {p_lo:g}-{p_hi:g} pct",
+            "minmax": "normalized 0-1 (min-max)",
+            "zscore": "z-score",
+            "robust_z": "robust z-score (median/MAD)",
+            "relative": "relative to map mean",
+        }[map_normalization]
     fig, (ax_map, ax_spec) = plt.subplots(1, 2, figsize=(12, 4))
+    show_2d_kwargs = {}
+    if vmin is not None:
+        show_2d_kwargs["vmin"] = vmin
+    if vmax is not None:
+        show_2d_kwargs["vmax"] = vmax
     show_2d(
         energy_map,
         figax=(fig, ax_map),
-        title=f"Energy-Window Map [{emin:.3f}, {emax:.3f}] {unit_label}",
+        title=f"Energy-Window Map [{emin:.3f}, {emax:.3f}] {unit_label} ({map_kind})",
         cmap=cmap,
         cbar=True,
         show_ticks=True,
@@ -307,6 +488,7 @@ def show_energy_window_map(
             "sampling": float(self.sampling[1]),
             "units": str(self.units[1]),
         },
+        **show_2d_kwargs,
     )
 
     if has_roi_overlay:
@@ -329,6 +511,21 @@ def show_energy_window_map(
     ax_spec.grid(True, alpha=0.1)
     ax_spec.legend(loc="best")
 
+    if display_energy_range is not None:
+        d_lo, d_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(d_lo) and np.isfinite(d_hi) and d_lo < d_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        ax_spec.set_xlim(d_lo, d_hi)
+        # rescale y to what is visible: a steep edge of the (background-subtracted) spectrum just outside the
+        # zoomed x-range would otherwise set the y-scale and flatten everything inside it
+        visible = (E_spec >= d_lo) & (E_spec <= d_hi) & np.isfinite(spec)
+        if np.any(visible):
+            y_lo, y_hi = float(np.min(spec[visible])), float(np.max(spec[visible]))
+            pad = 0.06 * (y_hi - y_lo) if y_hi > y_lo else max(abs(y_hi), 1.0) * 0.06
+            ax_spec.set_ylim(y_lo - pad, y_hi + pad)
+
     fig.tight_layout()
 
     if show:
@@ -345,7 +542,20 @@ def _plot_background_subtraction(
     subtracted_spectrum,
     fit_mode,
     show_subtracted,
+    display_energy_range=None,
+    display_intensity_range=None,
 ):
+    """
+    Parameters
+    ----------
+    display_energy_range : (float, float), optional
+        (lo, hi) to zoom the x-axis into. Display-only -- the full
+        input/background/subtracted spectra are still plotted; this only
+        changes what's visible. Defaults to the full energy range (no zoom).
+    display_intensity_range : (float, float), optional
+        (lo, hi) to zoom the y-axis into. Display-only, same caveat as
+        ``display_energy_range``.
+    """
     fig, (ax_specbacksub) = plt.subplots(1, 1, figsize=(12, 4))
 
     ax_specbacksub.plot(energy_axis, input_spectrum, linewidth=1.2, label="Input")
@@ -365,6 +575,22 @@ def _plot_background_subtraction(
     ax_specbacksub.set_title(f"Background-subtracted spectrum from ROI ({fit_mode})")
     ax_specbacksub.grid(True, alpha=0.1)
     ax_specbacksub.legend()
+
+    if display_energy_range is not None:
+        e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        ax_specbacksub.set_xlim(e_lo, e_hi)
+
+    if display_intensity_range is not None:
+        i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+        if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+            raise ValueError(
+                f"display_intensity_range must be (lo, hi) with lo < hi, got {display_intensity_range!r}"
+            )
+        ax_specbacksub.set_ylim(i_lo, i_hi)
 
     fig.tight_layout()
     plt.show()
@@ -646,13 +872,46 @@ def plot_absolute_thickness(t_lambda_map, mfp_nm, dataset=None):
     return thickness_nm
 
 
-def plot_dual_eels_picker(ll, hl, coords=None, title="QuantEM: Dual-EELS Analysis"):
+def plot_dual_eels_picker(
+    ll,
+    hl,
+    coords=None,
+    title="QuantEM: Dual-EELS Analysis",
+    display_energy_range=None,
+    display_intensity_range=None,
+):
     """
     Dual-EELS Picker with starting coordinates.
 
     coords, when provided, is interpreted as (scan_row, scan_col).
+
+    Parameters
+    ----------
+    display_energy_range : (float, float), optional
+        (lo, hi) to zoom both spectrum panels' x-axis into. Display-only --
+        the full LL/HL spectra are still plotted; this only changes what's
+        visible, and stays fixed as you click around the maps. Defaults to
+        the full energy range (no zoom).
+    display_intensity_range : (float, float), optional
+        (lo, hi) to fix both spectrum panels' y-axis to. Display-only, same
+        caveat as ``display_energy_range``. If not given, each panel
+        auto-rescales its y-axis to the clicked spectrum's max, as before.
     """
     # 1. Setup Data
+    if display_energy_range is not None:
+        e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+    if display_intensity_range is not None:
+        i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+        if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+            raise ValueError(
+                f"display_intensity_range must be (lo, hi) with lo < hi, "
+                f"got {display_intensity_range!r}"
+            )
+
     sum_ll = np.sum(ll.array, axis=2)
     sum_hl = np.sum(hl.array, axis=2)
     energy_ll = np.asarray(ll.energy_axis, dtype=float)
@@ -681,6 +940,13 @@ def plot_dual_eels_picker(ll, hl, coords=None, title="QuantEM: Dual-EELS Analysi
     (line_ll,) = ax_spec_ll.plot(energy_ll, ll.array[i_row, i_col, :], color="tab:blue")
     (line_hl,) = ax_spec_hl.plot(energy_hl, hl.array[i_row, i_col, :], color="tab:red")
 
+    if display_energy_range is not None:
+        ax_spec_ll.set_xlim(e_lo, e_hi)
+        ax_spec_hl.set_xlim(e_lo, e_hi)
+    if display_intensity_range is not None:
+        ax_spec_ll.set_ylim(i_lo, i_hi)
+        ax_spec_hl.set_ylim(i_lo, i_hi)
+
     def update_plots(i_row, i_col):
         marker_ll.set_data([i_col], [i_row])
         marker_hl.set_data([i_col], [i_row])
@@ -690,9 +956,10 @@ def plot_dual_eels_picker(ll, hl, coords=None, title="QuantEM: Dual-EELS Analysi
         line_ll.set_ydata(new_ll)
         line_hl.set_ydata(new_hl)
 
-        # Rescale
-        ax_spec_ll.set_ylim(0, np.max(new_ll) * 1.1)
-        ax_spec_hl.set_ylim(0, np.max(new_hl) * 1.1)
+        # Rescale (unless a fixed display_intensity_range was requested)
+        if display_intensity_range is None:
+            ax_spec_ll.set_ylim(0, np.max(new_ll) * 1.1)
+            ax_spec_hl.set_ylim(0, np.max(new_hl) * 1.1)
 
         ax_spec_ll.set_title(f"LL Spectrum at ({i_row}, {i_col})")
         ax_spec_hl.set_title(f"HL Spectrum at ({i_row}, {i_col})")
@@ -831,3 +1098,734 @@ def plot_zlp_drift_diagnostics(dataset, title="ZLP Drift Analysis"):
     plt.close(fig)
 
     return fig
+
+
+def plot_near_zlp_transitions_fit(
+    fit_result,
+    dataset=None,
+    title=None,
+    display_energy_range=None,
+    display_intensity_range=None,
+    display_residual_range=None,
+):
+    """
+    Plot diagnostics for ``Dataset3deels.fit_near_zlp_transitions()``.
+
+    Call directly (not as a bound dataset method -- ``fit_result``'s
+    position as the first argument, not ``dataset``, would conflict with
+    the module's usual self-binding convention)::
+
+        fit_result = eels_hl_despiked.fit_near_zlp_transitions(peaks, ...)
+        fig = plot_near_zlp_transitions_fit(fit_result, dataset=eels_hl_despiked)
+
+    Top panel overlays the raw spectrum, the total fit, the ZLP-tail
+    component alone, and each peak component alone. Bottom panel is the
+    residual (raw - total fit) -- the important diagnostic: if a region is
+    genuinely explained by the ZLP tail plus the fitted peaks, the residual
+    there should be small and unstructured; a real unexplained feature will
+    show up there instead of being silently absorbed into a peak.
+
+    Parameters
+    ----------
+    fit_result : dict
+        The dict returned by ``fit_near_zlp_transitions()``.
+    dataset : Dataset3deels, optional
+        Only used for the title (``dataset.name``) if ``title`` isn't given.
+    title : str, optional
+        Plot title. Defaults to ``f"Near-ZLP transition fit: {dataset.name}"``
+        if ``dataset`` is given, else a generic title.
+    display_energy_range : (float, float), optional
+        (lo, hi) eV to zoom the top panel's x-axis into (the residual panel
+        shares this x-axis, so it zooms too). Purely a display crop -- the
+        full spectrum/fit/residual are still plotted and returned; this
+        only changes what's visible. Useful for peeking at the low-amplitude
+        peak components against the ZLP tail's much larger dynamic range.
+        Defaults to the full fitted energy range (no zoom).
+    display_intensity_range : (float, float), optional
+        (lo, hi) to zoom the top panel's y-axis into (does not affect the
+        residual panel, which has its own, unrelated scale). Same
+        display-only caveat as ``display_energy_range``.
+    display_residual_range : (float, float), optional
+        (lo, hi) to zoom the bottom (residual) panel's y-axis into. Separate
+        from ``display_intensity_range`` since the residual is typically a
+        much smaller scale than the raw intensity. Same display-only
+        caveat as ``display_energy_range``.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    energy = fit_result["energy"]
+    spectrum = fit_result["spectrum"]
+    total_fit = fit_result["total_fit"]
+    residual = fit_result["residual"]
+    components = fit_result["components"]
+
+    if title is None:
+        title = (
+            f"Near-ZLP transition fit: {dataset.name}"
+            if dataset is not None
+            else "Near-ZLP transition fit"
+        )
+
+    fig, (ax_fit, ax_resid) = plt.subplots(
+        2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1]}
+    )
+
+    ax_fit.plot(energy, spectrum, color="black", lw=1.3, label="Raw spectrum")
+    ax_fit.plot(energy, total_fit, color="crimson", lw=1.8, label="Total fit")
+    for name, comp in components.items():
+        style = "--" if name == "zlp_tail" else "-."
+        ax_fit.plot(
+            energy,
+            comp["curve"],
+            style,
+            lw=1.2,
+            label=f"{name} (c={comp['center']:.3f} eV, fwhm={comp['fwhm']:.3f} eV)",
+        )
+    ax_fit.set_ylabel("Intensity")
+    ax_fit.set_title(title)
+    ax_fit.legend(fontsize=8)
+    ax_fit.grid(True, alpha=0.15)
+
+    ax_resid.axhline(0, color="gray", lw=0.8)
+    ax_resid.plot(energy, residual, color="steelblue", lw=1.0)
+    ax_resid.set_xlabel("Energy (eV)")
+    ax_resid.set_ylabel("Residual")
+    ax_resid.grid(True, alpha=0.15)
+
+    if display_energy_range is not None:
+        e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        ax_fit.set_xlim(e_lo, e_hi)  # ax_resid shares this x-axis (sharex=True)
+
+    if display_intensity_range is not None:
+        i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+        if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+            raise ValueError(
+                f"display_intensity_range must be (lo, hi) with lo < hi, got {display_intensity_range!r}"
+            )
+        ax_fit.set_ylim(i_lo, i_hi)
+
+    if display_residual_range is not None:
+        r_lo, r_hi = float(display_residual_range[0]), float(display_residual_range[1])
+        if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_lo < r_hi):
+            raise ValueError(
+                f"display_residual_range must be (lo, hi) with lo < hi, got {display_residual_range!r}"
+            )
+        ax_resid.set_ylim(r_lo, r_hi)
+
+    fig.tight_layout()
+    plt.close(fig)
+
+    return fig
+
+
+def _odd_clipped(value, lo, hi):
+    """Round to the nearest odd int, then clip into [lo, hi] (lo/hi assumed odd)."""
+    v = int(round(value))
+    if v % 2 == 0:
+        v += 1
+    return max(lo, min(hi, v))
+
+
+def find_maximum_and_shoulder(
+    x,
+    y,
+    x_min: float,
+    x_max: float,
+    min_x_separation: float,
+    *,
+    prominence_fraction: float = 0.075,
+    edge_margin_fraction: float = 0.05,
+    stability_fraction: float = 0.05,
+    smoothing_change_fraction: float = 0.20,
+    polyorder: int = 3,
+    show: bool = True,
+    hover_annotations: bool = True,
+) -> Dict[str, Any]:
+    """
+    Identify the main maximum and (optionally) one shoulder in noisy 1D data
+    (x, y), restricted to [x_min, x_max]. General-purpose -- x/y need not be
+    an EELS spectrum; call directly, it doesn't take a dataset.
+
+    Procedure:
+    1. Restrict to [x_min, x_max].
+    2. Smooth with a Savitzky-Golay filter (preserves broad peak shapes
+       better than a Gaussian). If x is unevenly spaced, interpolate onto a
+       uniform grid first.
+    3. Search increasing SavGol window lengths (from a small fraction of
+       the point count up to ~75%) and pick the *smallest* one whose
+       smoothed curve has exactly one locally-maximal peak with prominence
+       >= `prominence_fraction` (default 7.5%, i.e. within the requested
+       5-10%) of the smoothed curve's total range in [x_min, x_max] --
+       "small noise-induced local maxima" get smoothed away before that
+       point; larger windows aren't used once one dominant peak remains.
+    4. Re-analyze at window lengths +/- `smoothing_change_fraction`
+       (default 20%) around the selected one. A feature (main maximum or
+       shoulder) only counts as valid if its x-position is stable (within
+       `stability_fraction` of the [x_min, x_max] span) across all three.
+    5. Main maximum = the highest accepted local maximum of the selected
+       smoothed curve.
+    6-8. Shoulder = a 2nd-derivative sign change that is >= `min_x_separation`
+       from the main maximum, outside `edge_margin_fraction` of either
+       boundary, sits on a real (non-negligible) slope (not a flat region),
+       and is position-stable under the +/-20% smoothing check. If nothing
+       satisfies all of that, no shoulder is reported (never forced).
+
+    Parameters
+    ----------
+    x, y : ndarray
+        1D data (need not be sorted or evenly spaced -- both are handled).
+    x_min, x_max : float
+        Restrict analysis to this range of x.
+    min_x_separation : float
+        Minimum x-distance a shoulder candidate must keep from the main
+        maximum to be considered a distinct feature.
+    prominence_fraction : float, optional
+        Minimum peak prominence, as a fraction of the smoothed curve's own
+        range in [x_min, x_max], for a local maximum to be accepted.
+        Default 0.075.
+    edge_margin_fraction : float, optional
+        Reject any maximum/shoulder within this fraction of the
+        [x_min, x_max] span from either boundary. Default 0.05.
+    stability_fraction : float, optional
+        A feature's x-position must stay within this fraction of the
+        [x_min, x_max] span across the +/-`smoothing_change_fraction`
+        smoothing check to count as stable. Default 0.05.
+    smoothing_change_fraction : float, optional
+        Relative change in SavGol window length used for the stability
+        check. Default 0.20 (+/-20%).
+    polyorder : int, optional
+        Savitzky-Golay polynomial order. Default 3.
+    show : bool, optional
+        Display the 5-panel diagnostic figure. Default True.
+    hover_annotations : bool, optional
+        Adds a mouse-hover tooltip to plot 2 (the main max / shoulder
+        markers) showing that point's (x, y) as you move the cursor near
+        it, instead of only reading it off the legend text. This needs an
+        interactive matplotlib backend to actually fire mouse-move events
+        -- with the default static/Agg backend the plot renders exactly as
+        before and the tooltip just never appears. In a notebook, run
+        `%matplotlib widget` (ipympl) once before this cell to enable it.
+        Pass False to skip this and always get the plain static plot.
+        Default True.
+
+    Returns
+    -------
+    dict with keys:
+        smoothing_method, smoothing_params,
+        main_maximum ({"x", "y"} or None),
+        main_maximum_prominence,
+        shoulder ({"x", "y"} or None),
+        shoulder_stability_statement,
+        main_maximum_stable (bool),
+        notes (list of str -- caveats, e.g. if the ideal single-peak
+        smoothing level was never reached).
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.shape != y.shape:
+        raise ValueError(f"x and y must have the same shape; got {x.shape} and {y.shape}")
+    if not (x_min < x_max):
+        raise ValueError(f"x_min must be < x_max; got x_min={x_min}, x_max={x_max}")
+
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    mask = (x >= x_min) & (x <= x_max) & ~np.isnan(y)
+    x_r, y_r = x[mask], y[mask]
+
+    notes: List[str] = []
+
+    if len(x_r) < polyorder + 3:
+        print(
+            f"  -> not enough data points in [{x_min}, {x_max}] "
+            f"({len(x_r)} found) to smooth/analyze."
+        )
+        return {
+            "smoothing_method": "savgol",
+            "smoothing_params": None,
+            "main_maximum": None,
+            "main_maximum_prominence": None,
+            "shoulder": None,
+            "shoulder_stability_statement": "No resolvable shoulder (insufficient data).",
+            "main_maximum_stable": False,
+            "notes": ["insufficient data points in range"],
+        }
+
+    # ---- 1/2. restrict + interpolate onto a uniform grid if needed ----
+    diffs = np.diff(x_r)
+    uniform = bool(np.allclose(diffs, diffs[0], rtol=1e-3, atol=1e-12)) if len(diffs) else True
+    if not uniform:
+        x_grid = np.linspace(x_r[0], x_r[-1], len(x_r))
+        y_grid = np.interp(x_grid, x_r, y_r)
+        notes.append("x was unevenly spaced -- interpolated onto a uniform grid before smoothing")
+    else:
+        x_grid, y_grid = x_r, y_r
+
+    n = len(x_grid)
+    span = x_max - x_min
+    edge_margin = edge_margin_fraction * span
+    stability_tol = stability_fraction * span
+
+    min_window = _odd_clipped(
+        max(polyorder + 2, 0.01 * n),
+        polyorder + 2 if (polyorder + 2) % 2 else polyorder + 3,
+        n if n % 2 else n - 1,
+    )
+    max_window = _odd_clipped(0.75 * n, min_window, n if n % 2 else n - 1)
+    if max_window < min_window:
+        max_window = min_window
+
+    def _prominent_maxima(smoothed):
+        y_range = float(smoothed.max() - smoothed.min())
+        min_prom = prominence_fraction * y_range if y_range > 0 else 0.0
+        idx, props = find_peaks(smoothed, prominence=min_prom)
+        return idx, props.get("prominences", np.array([]))
+
+    # ---- 3. search increasing window lengths for the lowest one giving
+    # exactly one dominant, prominent local maximum ----
+    fractions = [0.01, 0.015, 0.02, 0.03, 0.045, 0.07, 0.1, 0.15, 0.22, 0.33, 0.5, 0.75]
+    candidate_windows = sorted(
+        {min_window, max_window} | {_odd_clipped(f * n, min_window, max_window) for f in fractions}
+    )
+
+    results = []  # (window_length, smoothed, idx, prominences)
+    for w in candidate_windows:
+        smoothed_w = savgol_filter(y_grid, window_length=w, polyorder=polyorder)
+        idx_w, prom_w = _prominent_maxima(smoothed_w)
+        results.append((w, smoothed_w, idx_w, prom_w))
+
+    selected = next((r for r in results if len(r[2]) == 1), None)
+    if selected is None:
+        multi = [r for r in results if len(r[2]) >= 1]
+        if multi:
+            selected = multi[0]
+            notes.append(
+                f"never reached exactly one dominant maximum (best: {len(selected[2])} at "
+                f"window_length={selected[0]}); using its highest peak as the main maximum"
+            )
+        else:
+            selected = results[-1]
+            notes.append(
+                "no local maximum cleared the prominence threshold at any smoothing level; "
+                "falling back to the global maximum of the most-smoothed curve"
+            )
+
+    w_sel, smoothed_sel, idx_sel, prom_sel = selected
+    if len(idx_sel) == 0:
+        main_idx = int(np.argmax(smoothed_sel))
+        main_prom = None
+    else:
+        best = int(np.argmax(smoothed_sel[idx_sel]))
+        main_idx = int(idx_sel[best])
+        main_prom = float(prom_sel[best])
+
+    main_max_x = float(x_grid[main_idx])
+    main_max_y = float(smoothed_sel[main_idx])
+
+    # ---- 4. +/-20% smoothing-strength neighbors, for stability checks and
+    # for the "nearby smoothing strengths" plot ----
+    w_minus = _odd_clipped(w_sel * (1 - smoothing_change_fraction), min_window, max_window)
+    w_plus = _odd_clipped(w_sel * (1 + smoothing_change_fraction), min_window, max_window)
+    smoothed_minus = savgol_filter(y_grid, window_length=w_minus, polyorder=polyorder)
+    smoothed_plus = savgol_filter(y_grid, window_length=w_plus, polyorder=polyorder)
+
+    def _main_max_x(smoothed):
+        idx, _ = _prominent_maxima(smoothed)
+        if len(idx) == 0:
+            return float(x_grid[int(np.argmax(smoothed))])
+        best = idx[int(np.argmax(smoothed[idx]))]
+        return float(x_grid[best])
+
+    main_x_minus = _main_max_x(smoothed_minus)
+    main_x_plus = _main_max_x(smoothed_plus)
+    main_maximum_stable = (
+        abs(main_x_minus - main_max_x) <= stability_tol
+        and abs(main_x_plus - main_max_x) <= stability_tol
+    )
+    if not main_maximum_stable:
+        notes.append(
+            f"main maximum position shifts beyond {stability_tol:.3g} "
+            f"({stability_fraction:.0%} of range) under +/-{smoothing_change_fraction:.0%} "
+            f"smoothing changes -- treat its exact position with caution"
+        )
+
+    # ---- 6/7. shoulder candidates ----
+    #
+    # A 2nd derivative amplifies noise far more than the signal itself, so
+    # the window_length that already gives "one dominant maximum" in Y
+    # (a low-frequency criterion) is typically nowhere near clean enough
+    # for derivative work -- so the shoulder search re-runs its own
+    # increasing-smoothing search starting from w_sel, independent of it.
+    #
+    # SavGol's own polynomial-fit derivatives (deriv=1/2) are used instead
+    # of np.gradient on the smoothed curve -- a finite difference of an
+    # already-smoothed curve still amplifies noise far more than SavGol's
+    # own local least-squares derivative at the same window length.
+    #
+    # Candidates are gated and ranked by absolute SLOPE-DROP magnitude
+    # (|dy/dx|'s local maximum minus its value at the candidate), not by
+    # the raw Y change nearby -- that alternative is dominated by however
+    # large the *main* peak happens to be anywhere near its own flank,
+    # which buries a real but weaker, more separated shoulder every time.
+    # The noise floor for that comparison is estimated by running the
+    # exact same SavGol derivative filter over the (raw - smoothed)
+    # residuals -- linearity means that shows directly how much spurious
+    # slope pure noise contributes at this window length.
+    dx = float(np.median(np.diff(x_grid))) if n > 1 else 1.0
+    n_local = max(4, int(round(0.5 * min_x_separation / dx))) if dx > 0 else 4
+    min_shoulder_snr = 4.0
+
+    def _shoulder_derivs(w):
+        smoothed_w = savgol_filter(y_grid, window_length=w, polyorder=polyorder)
+        dy_w = savgol_filter(y_grid, window_length=w, polyorder=polyorder, deriv=1, delta=dx)
+        d2y_w = savgol_filter(y_grid, window_length=w, polyorder=polyorder, deriv=2, delta=dx)
+        return smoothed_w, dy_w, d2y_w
+
+    # Every 2nd-derivative zero crossing is a stationary point of the 1st
+    # derivative, and there are two kinds: a LOCAL MAXIMUM of |dy/dx| (the
+    # steepest point of an otherwise plain monotonic flank -- e.g. every
+    # single Gaussian has exactly two of these, at mu +/- sigma, with no
+    # second feature involved at all), or a LOCAL MINIMUM of |dy/dx| (the
+    # slope genuinely slows down / flattens there before continuing --
+    # exactly the "flattening, slope change, or weak secondary feature"
+    # signature the spec asks for). Only the second kind is a real shoulder.
+    def _shoulder_candidates(w, smoothed_w, dy_w, d2y_w):
+        residuals_w = y_grid - smoothed_w
+        dy_noise = savgol_filter(
+            residuals_w, window_length=w, polyorder=polyorder, deriv=1, delta=dx
+        )
+        dy_noise_sigma = 1.4826 * float(np.median(np.abs(dy_noise - np.median(dy_noise))))
+        slope_drop_threshold = min_shoulder_snr * dy_noise_sigma if dy_noise_sigma > 0 else 0.0
+
+        raw = []
+        for i in range(1, len(d2y_w)):
+            s0, s1 = d2y_w[i - 1], d2y_w[i]
+            if s0 * s1 >= 0:
+                continue
+            frac = abs(s0) / (abs(s0) + abs(s1)) if (abs(s0) + abs(s1)) > 0 else 0.5
+            xc = float(x_grid[i - 1] + frac * (x_grid[i] - x_grid[i - 1]))
+            if abs(xc - main_max_x) < min_x_separation:
+                continue
+            if (xc - x_min) < edge_margin or (x_max - xc) < edge_margin:
+                continue
+
+            lo_i, hi_i = max(0, i - n_local), min(len(dy_w) - 1, i + n_local)
+            local_abs_dy = np.abs(dy_w[lo_i : hi_i + 1])
+            slope_here = abs(dy_w[i])
+            if local_abs_dy.max() <= 0 or slope_here > 0.85 * local_abs_dy.max():
+                continue  # a slope-magnitude LOCAL MAX -> the peak's own flank inflection
+
+            slope_drop = local_abs_dy.max() - slope_here
+            if slope_drop < slope_drop_threshold:
+                continue  # doesn't clear the noise floor for this window length
+            raw.append((xc, slope_drop))
+
+        # merge crossings within min_x_separation of each other (one real
+        # shoulder can produce more than one raw crossing), keeping the
+        # strongest of each cluster
+        raw.sort(key=lambda c: c[0])
+        merged: List[Tuple[float, float]] = []
+        for xc, drop in raw:
+            if merged and (xc - merged[-1][0]) < min_x_separation:
+                if drop > merged[-1][1]:
+                    merged[-1] = (xc, drop)
+            else:
+                merged.append((xc, drop))
+        merged.sort(key=lambda c: -c[1])
+        return merged
+
+    # Search increasing window lengths, starting at w_sel, for one where the
+    # (merged) shoulder-candidate list has settled to exactly 1 or 2. This
+    # needs a much finer step than the Y-level search above -- the window
+    # range where a real shoulder is cleanly resolved (neither buried in
+    # derivative noise nor smoothed away entirely) can be narrow, and the
+    # coarse geometric `candidate_windows` list can jump straight over it
+    # (e.g. straight from "several candidates" to "zero candidates").  So
+    # this steps by ~8% at a time, and if it *does* jump from >2 straight to
+    # 0, it bisects between those two window lengths to land inside the gap.
+    def _try(w):
+        smoothed_w, dy_w, d2y_w = _shoulder_derivs(w)
+        return w, smoothed_w, dy_w, d2y_w, _shoulder_candidates(w, smoothed_w, dy_w, d2y_w)
+
+    w_shoulder, smoothed_w, dy_w, d2y_w, shoulder_merged = _try(w_sel)
+    prev = None
+    if not (1 <= len(shoulder_merged) <= 2):
+        w = w_sel
+        found = False
+        for _ in range(40):
+            prev = (w, smoothed_w, dy_w, d2y_w, shoulder_merged)
+            w_next = _odd_clipped(w * 1.08, min_window, max_window)
+            if w_next <= w:
+                break
+            w, smoothed_w, dy_w, d2y_w, shoulder_merged = _try(w_next)
+            if 1 <= len(shoulder_merged) <= 2:
+                w_shoulder = w
+                found = True
+                break
+            if len(shoulder_merged) == 0 and len(prev[4]) > 2:
+                # jumped from several candidates straight to none -- bisect
+                lo_w = prev[0]
+                hi_w = w
+                for _ in range(12):
+                    mid = _odd_clipped((lo_w + hi_w) / 2, min_window, max_window)
+                    if mid <= lo_w or mid >= hi_w:
+                        break
+                    mid_state = _try(mid)
+                    if 1 <= len(mid_state[4]) <= 2:
+                        w_shoulder, smoothed_w, dy_w, d2y_w, shoulder_merged = mid_state
+                        found = True
+                        break
+                    if len(mid_state[4]) > 2:
+                        lo_w = mid
+                    else:
+                        hi_w = mid
+                break
+            if w >= max_window:
+                break
+        if not found:
+            w_shoulder = w
+            notes.append(
+                f"shoulder candidates never settled to 1-2 at any smoothing level tried "
+                f"(ended at window_length={w_shoulder} with {len(shoulder_merged)} candidates); "
+                f"reporting its best candidate only"
+            )
+
+    dy_sel, d2y_sel = dy_w, d2y_w  # for the derivative plots below
+
+    shoulder = None
+    shoulder_stability_statement = "No resolvable shoulder."
+    if shoulder_merged:
+        shoulder_x_candidate = shoulder_merged[0][0]
+
+        w_shoulder_minus = _odd_clipped(
+            w_shoulder * (1 - smoothing_change_fraction), min_window, max_window
+        )
+        w_shoulder_plus = _odd_clipped(
+            w_shoulder * (1 + smoothing_change_fraction), min_window, max_window
+        )
+
+        def _best_shoulder_x(w):
+            sm, dyw, d2yw = _shoulder_derivs(w)
+            merged = _shoulder_candidates(w, sm, dyw, d2yw)
+            return merged[0][0] if merged else None
+
+        def _best_shoulder_x_near(target_w):
+            # The window range where a given shoulder resolves cleanly can
+            # be narrow; requiring a hit at exactly the +/-20% window can
+            # miss it by a handful of points even though the feature is
+            # genuinely present just next door. Try the target first, then
+            # a small neighborhood around it, before giving up.
+            x = _best_shoulder_x(target_w)
+            if x is not None:
+                return x, target_w
+            for frac in (0.95, 1.05, 0.90, 1.10, 0.85, 1.15):
+                w_try = _odd_clipped(target_w * frac, min_window, max_window)
+                if w_try == target_w:
+                    continue
+                x = _best_shoulder_x(w_try)
+                if x is not None:
+                    return x, w_try
+            return None, target_w
+
+        sx_minus, w_minus_used = _best_shoulder_x_near(w_shoulder_minus)
+        sx_plus, w_plus_used = _best_shoulder_x_near(w_shoulder_plus)
+        stable = (
+            sx_minus is not None
+            and sx_plus is not None
+            and abs(sx_minus - shoulder_x_candidate) <= stability_tol
+            and abs(sx_plus - shoulder_x_candidate) <= stability_tol
+        )
+        if stable:
+            shoulder_y = float(np.interp(shoulder_x_candidate, x_grid, smoothed_sel))
+            shoulder = {"x": shoulder_x_candidate, "y": shoulder_y}
+            shoulder_stability_statement = (
+                f"Shoulder at x={shoulder_x_candidate:.4g} is stable: present within "
+                f"{stability_tol:.3g} of this position at both window_length={w_minus_used} "
+                f"({sx_minus:.4g}) and window_length={w_plus_used} ({sx_plus:.4g})."
+            )
+        else:
+            shoulder_stability_statement = (
+                "A candidate shoulder was found at the selected smoothing level but its "
+                "position was not stable within +/-20% smoothing changes, so it is not "
+                "reported. No resolvable shoulder."
+            )
+
+    print(f"Smoothing: Savitzky-Golay, window_length={w_sel}, polyorder={polyorder}")
+    print(
+        f"Main maximum: x={main_max_x:.4g}, y={main_max_y:.4g}"
+        + (
+            f", prominence={main_prom:.4g}"
+            if main_prom is not None
+            else " (prominence threshold not met)"
+        )
+    )
+    print(
+        f"Shoulder: x={shoulder['x']:.4g}, y={shoulder['y']:.4g}" if shoulder else "Shoulder: none"
+    )
+    print(shoulder_stability_statement)
+    for note in notes:
+        print(f"  note: {note}")
+
+    if show:
+        fig, axes = plt.subplots(5, 1, figsize=(9, 22), sharex=True)
+
+        # 1. raw data + smoothed curve
+        axes[0].plot(x_r, y_r, "k.", ms=3, alpha=0.4, label="raw data")
+        axes[0].plot(x_grid, smoothed_sel, "b-", lw=1.8, label=f"smoothed (window_length={w_sel})")
+        axes[0].set_ylabel("y")
+        axes[0].set_title("1. Raw data and smoothed curve")
+        axes[0].legend(loc="best", fontsize=8)
+        axes[0].grid(True, alpha=0.3)
+
+        # 2. detected main maximum + shoulder
+        axes[1].plot(x_grid, smoothed_sel, "b-", lw=1.5)
+        axes[1].plot(
+            [main_max_x],
+            [main_max_y],
+            "r^",
+            ms=10,
+            label=f"main max ({main_max_x:.3g}, {main_max_y:.3g})",
+        )
+        if shoulder:
+            axes[1].plot(
+                [shoulder["x"]],
+                [shoulder["y"]],
+                "gD",
+                ms=9,
+                label=f"shoulder ({shoulder['x']:.3g}, {shoulder['y']:.3g})",
+            )
+
+        if hover_annotations:
+            # Plain matplotlib event handling -- no extra dependency (e.g.
+            # mplcursors isn't installed here). Only fires with an
+            # interactive backend (e.g. `%matplotlib widget` via ipympl);
+            # with the static/Agg backend this sets up harmlessly and the
+            # tooltip just never appears since no mouse-move events occur.
+            hover_points = [
+                (main_max_x, main_max_y, f"main max\n({main_max_x:.4g}, {main_max_y:.4g})")
+            ]
+            if shoulder:
+                hover_points.append(
+                    (
+                        shoulder["x"],
+                        shoulder["y"],
+                        f"shoulder\n({shoulder['x']:.4g}, {shoulder['y']:.4g})",
+                    )
+                )
+            tooltip = axes[1].annotate(
+                "",
+                xy=(0, 0),
+                xytext=(15, 15),
+                textcoords="offset points",
+                bbox=dict(boxstyle="round", fc="lightyellow", ec="gray", alpha=0.95),
+                arrowprops=dict(arrowstyle="->"),
+                fontsize=9,
+                visible=False,
+                zorder=10,
+            )
+            hover_pixel_radius = 20
+
+            def _on_hover(event, _ax=axes[1], _pts=hover_points, _tip=tooltip):
+                if event.inaxes is not _ax or event.x is None:
+                    if _tip.get_visible():
+                        _tip.set_visible(False)
+                        fig.canvas.draw_idle()
+                    return
+                best, best_dist = None, None
+                for px, py, label in _pts:
+                    sx, sy = _ax.transData.transform((px, py))
+                    d = ((sx - event.x) ** 2 + (sy - event.y) ** 2) ** 0.5
+                    if best_dist is None or d < best_dist:
+                        best_dist, best = d, (px, py, label)
+                if best is not None and best_dist <= hover_pixel_radius:
+                    px, py, label = best
+                    _tip.xy = (px, py)
+                    _tip.set_text(label)
+                    if not _tip.get_visible():
+                        _tip.set_visible(True)
+                    fig.canvas.draw_idle()
+                elif _tip.get_visible():
+                    _tip.set_visible(False)
+                    fig.canvas.draw_idle()
+
+            fig.canvas.mpl_connect("motion_notify_event", _on_hover)
+
+        axes[1].set_ylabel("y")
+        axes[1].set_title("2. Detected main maximum and shoulder")
+        axes[1].legend(loc="best", fontsize=8)
+        axes[1].grid(True, alpha=0.3)
+
+        # 3. first derivative (from the shoulder-analysis smoothing level,
+        # which is typically higher than w_sel -- see note above)
+        axes[2].plot(x_grid, dy_sel, "m-", lw=1.2)
+        axes[2].axhline(0, color="gray", ls="--", lw=1)
+        axes[2].set_ylabel("dy/dx")
+        axes[2].set_title(f"3. First derivative (window_length={w_shoulder})")
+        axes[2].grid(True, alpha=0.3)
+
+        # 4. second derivative
+        axes[3].plot(x_grid, d2y_sel, "c-", lw=1.2)
+        axes[3].axhline(0, color="gray", ls="--", lw=1)
+        if shoulder:
+            axes[3].axvline(shoulder["x"], color="g", ls=":", lw=1.5)
+        axes[3].set_ylabel("d2y/dx2")
+        axes[3].set_title(f"4. Second derivative (window_length={w_shoulder})")
+        axes[3].grid(True, alpha=0.3)
+
+        # 5. nearby smoothing strengths
+        axes[4].plot(
+            x_grid,
+            smoothed_minus,
+            "--",
+            color="tab:orange",
+            lw=1.2,
+            label=f"window_length={w_minus} (-{smoothing_change_fraction:.0%})",
+        )
+        axes[4].plot(
+            x_grid,
+            smoothed_sel,
+            "-",
+            color="tab:blue",
+            lw=1.8,
+            label=f"window_length={w_sel} (selected)",
+        )
+        axes[4].plot(
+            x_grid,
+            smoothed_plus,
+            "--",
+            color="tab:green",
+            lw=1.2,
+            label=f"window_length={w_plus} (+{smoothing_change_fraction:.0%})",
+        )
+        axes[4].axvline(main_x_minus, color="tab:orange", ls=":", lw=1, alpha=0.7)
+        axes[4].axvline(main_max_x, color="tab:blue", ls=":", lw=1, alpha=0.7)
+        axes[4].axvline(main_x_plus, color="tab:green", ls=":", lw=1, alpha=0.7)
+        axes[4].set_xlabel("x")
+        axes[4].set_ylabel("y")
+        axes[4].set_title("5. Results at nearby smoothing strengths")
+        axes[4].legend(loc="best", fontsize=8)
+        axes[4].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "smoothing_method": "savgol",
+        "smoothing_params": {
+            "window_length": w_sel,
+            "polyorder": polyorder,
+            "window_length_minus": w_minus,
+            "window_length_plus": w_plus,
+            "shoulder_window_length": w_shoulder,
+        },
+        "main_maximum": {"x": main_max_x, "y": main_max_y},
+        "main_maximum_prominence": main_prom,
+        "shoulder": shoulder,
+        "shoulder_stability_statement": shoulder_stability_statement,
+        "notes": notes,
+    }

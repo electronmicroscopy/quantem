@@ -29,6 +29,12 @@ from quantem.spectroscopy.utils import (
     load_eels_edges_database,
     load_xray_lines_database,
 )
+from quantem.spectroscopy.utils import (
+    crop_energy_range as _crop_energy_range,
+)
+from quantem.spectroscopy.utils import (
+    fit_windows_inside_axis as _fit_windows_inside_axis,
+)
 
 
 class _ModelElementsDict(dict):
@@ -67,6 +73,8 @@ class Dataset3dspectroscopy(Dataset3d):
     show_mean_spectrum = _visualize_mean_spectrum
     show_energy_window_map = _visualize_energy_window_map
     _plot_background_subtraction = _visualize_background_subtraction
+    crop_energy_range = _crop_energy_range
+    fit_windows_inside_axis = _fit_windows_inside_axis
 
     def __init__(
         self,
@@ -384,6 +392,7 @@ class Dataset3dspectroscopy(Dataset3d):
         mask: Optional[NDArray] = None,
         plot_results: bool = True,
         return_results=False,
+        title: str = "",
     ) -> dict:
         """
         Perform Principal Component Analysis (PCA) on the spectroscopy dataset.
@@ -399,6 +408,9 @@ class Dataset3dspectroscopy(Dataset3d):
             (scan_row, scan_col) or a flattened spatial mask.
         plot_results : bool
             If True, plot the explained variance and first few components
+        title : str
+            Extra text written under the titles of the PCA figures (e.g. what data / background
+            subtraction the PCA is of).
 
         Returns
         -------
@@ -468,6 +480,7 @@ class Dataset3dspectroscopy(Dataset3d):
                 loadings_spatial,
                 explained_variance_ratio,
                 n_show=min(4, n_components),
+                title=title,
             )
 
         reconstructed_spectra = spectra.copy()
@@ -765,6 +778,8 @@ class Dataset3dspectroscopy(Dataset3d):
         show=True,
         show_subtracted=True,
         return_background=False,
+        display_energy_range=None,
+        display_intensity_range=None,
     ):
         """
         Subtract fitted background from a 3D spectroscopy dataset.
@@ -788,6 +803,14 @@ class Dataset3dspectroscopy(Dataset3d):
         show : bool, optional
             If True, plot the mean raw spectrum, fitted background, and
             background-subtracted spectrum.
+        display_energy_range : (float, float), optional
+            (lo, hi) eV to zoom the plot's x-axis into. Display-only -- the
+            fit itself still uses the full (or ``energy_range``-cropped)
+            axis; this only changes what's visible. Defaults to the full
+            plotted range (no zoom).
+        display_intensity_range : (float, float), optional
+            (lo, hi) to zoom the plot's y-axis into. Display-only, same
+            caveat as ``display_energy_range``.
         polynomial_degree : int, optional
             Degree of the polynomial power-series background used for XEDS data.
             Ignored for EELS data.
@@ -850,6 +873,8 @@ class Dataset3dspectroscopy(Dataset3d):
                 subtracted_mean_spectrum,
                 fit_mode=fit_mode,
                 show_subtracted=show_subtracted,
+                display_energy_range=display_energy_range,
+                display_intensity_range=display_intensity_range,
             )
 
         dataset_type = str(self.dataset_type).lower()
