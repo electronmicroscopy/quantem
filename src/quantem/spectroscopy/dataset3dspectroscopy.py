@@ -940,10 +940,8 @@ class Dataset3dspectroscopy(Dataset3d):
             raise ValueError(f"Unsupported spectroscopy dataset_type {self.dataset_type!r}")
 
         method = str(method).lower()
-        if method == "iterative":
-            return np.full_like(spectrum, self.calculate_background_iterative(spectrum))
         if method != "powerlaw":
-            raise ValueError("EELS background method must be 'powerlaw' or 'iterative'")
+            raise ValueError("EELS background method must be 'powerlaw'")
         if target_edge is None:
             raise ValueError("target_edge is required for EELS powerlaw background fitting")
 
