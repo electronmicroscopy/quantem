@@ -5,7 +5,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter1d, median_filter
 from scipy.optimize import curve_fit
 
 from quantem.core.visualization import show_2d
@@ -30,6 +30,18 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     visualize_thickness_windows as _visualize_thickness_windows,
+)
+from quantem.spectroscopy.utils import (
+    auto_hl_config as _auto_hl_config,
+)
+from quantem.spectroscopy.utils import (
+    auto_ll_pre_edge_range as _auto_ll_pre_edge_range,
+)
+from quantem.spectroscopy.utils import (
+    robustness_check_near_zlp as _robustness_check_near_zlp,
+)
+from quantem.spectroscopy.utils import (
+    suggest_spike_ranges as _suggest_spike_ranges,
 )
 
 
@@ -240,6 +252,10 @@ class Dataset3deels(Dataset3dspectroscopy):
     plot_dual_eels_picker = _visualize_dual_eels_picker
     plot_quantem_diagnostic = _visualize_quantem_diagnostic
     plot_zlp_drift_diagnostics = _visualize_zlp_drift_diagnostics
+    suggest_spike_ranges = _suggest_spike_ranges
+    auto_hl_config = _auto_hl_config
+    auto_ll_pre_edge_range = _auto_ll_pre_edge_range
+    robustness_check_near_zlp = _robustness_check_near_zlp
 
     def __init__(
         self,
@@ -958,7 +974,48 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         return background_fit
 
-    def smooth_eels_rolling_average(self, roi=None, energy_range=None, mask=None, kernel_size=10):
+    def smooth_eels_rolling_average(
+        self,
+        roi=None,
+        energy_range=None,
+        mask=None,
+        kernel_size=10,
+        method="rolling_average",
+        sigma_eV=1.0,
+        show=True,
+    ):
+        """
+        Smooth every spectrum along the energy axis and return a new dataset.
+
+        This is denoising, not artifact correction: every channel is averaged with
+        its neighbours. ``self`` is not modified.
+
+        Parameters
+        ----------
+        roi, mask : optional
+            Passed to :meth:`calculate_mean_spectrum` for the preview plot only.
+        energy_range : (float, float), optional
+            Restrict smoothing (and the returned dataset) to this energy range.
+        kernel_size : int, optional
+            Box width in channels (``method="rolling_average"``). Default 10.
+        method : {"rolling_average", "gaussian"}, optional
+            ``"rolling_average"`` (default): box kernel, zero-padded at the ends.
+            ``"gaussian"``: Gaussian of standard deviation ``sigma_eV``, with
+            reflected ends so edge channels are not pulled toward zero.
+        sigma_eV : float, optional
+            Gaussian standard deviation in eV (``method="gaussian"``). Default 1.0.
+        show : bool, optional
+            Plot the raw and smoothed mean spectra. Default True.
+
+        Returns
+        -------
+        Dataset3deels
+            Smoothed dataset.
+        """
+        if method not in ("rolling_average", "gaussian"):
+            raise ValueError(f"Unknown method {method!r}; choose 'rolling_average' or 'gaussian'.")
+        if method == "gaussian" and not (np.isfinite(sigma_eV) and sigma_eV > 0):
+            raise ValueError(f"sigma_eV must be a finite number > 0; got {sigma_eV!r}")
         energy_axis = self.energy_axis
 
         if energy_range is not None:
@@ -974,18 +1031,26 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         array3d_subrange = self.array[:, :, indices]
 
-        kernel = np.ones(kernel_size) / kernel_size
+        if method == "gaussian":
+            array3d_smoothed = gaussian_filter1d(
+                np.asarray(array3d_subrange, dtype=float),
+                sigma=sigma_eV / float(self.sampling[2]),
+                axis=-1,
+                mode="reflect",
+            )
+        else:
+            kernel = np.ones(kernel_size) / kernel_size
 
-        # For each probe position, convolve spectral data with smoothing kernel
+            # For each probe position, convolve spectral data with smoothing kernel
 
-        array3d_smoothed = np.zeros(array3d_subrange.shape)
+            array3d_smoothed = np.zeros(array3d_subrange.shape)
 
-        scan_row, scan_col, _n_energy = array3d_subrange.shape
-        for i_row in range(scan_row):
-            for i_col in range(scan_col):
-                probe_spectrum = array3d_subrange[i_row, i_col, :]
-                spectrum_smoothed = np.convolve(probe_spectrum, kernel, mode="same")
-                array3d_smoothed[i_row, i_col, :] = spectrum_smoothed
+            scan_row, scan_col, _n_energy = array3d_subrange.shape
+            for i_row in range(scan_row):
+                for i_col in range(scan_col):
+                    probe_spectrum = array3d_subrange[i_row, i_col, :]
+                    spectrum_smoothed = np.convolve(probe_spectrum, kernel, mode="same")
+                    array3d_smoothed[i_row, i_col, :] = spectrum_smoothed
 
         output_origin = np.array(self.origin, dtype=float, copy=True)
         output_origin[2] = energy_axis[0]
@@ -995,6 +1060,9 @@ class Dataset3deels(Dataset3dspectroscopy):
             origin=output_origin,
             units=self.units,
         )
+
+        if not show:
+            return smoothed_data3d
 
         # Plot raw and smoothed mean spectra on the same set of axes
 
@@ -1011,7 +1079,14 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         fig, ax = plt.subplots()
         ax.plot(energy_axis, mean_spectrum_raw, label="raw spectrum", color="b")
-        ax.plot(energy_axis, mean_spectrum_smoothed, label="kernel-smoothed spectrum", color="r")
+        ax.plot(
+            energy_axis,
+            mean_spectrum_smoothed,
+            label="kernel-smoothed spectrum"
+            if method == "rolling_average"
+            else "gaussian-smoothed spectrum",
+            color="r",
+        )
         ax.legend()
 
         return smoothed_data3d

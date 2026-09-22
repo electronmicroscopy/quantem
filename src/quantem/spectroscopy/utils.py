@@ -1,9 +1,12 @@
+import contextlib
 import csv
+import io
+import warnings
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, median_filter
 from scipy.signal import find_peaks
 from scipy.stats import pearsonr
 
@@ -552,3 +555,452 @@ def fit_windows_inside_axis(
         if hi2 - lo2 >= min_width_eV:
             out.append((round(lo2, 3), round(hi2, 3)))
     return sorted(out)
+
+
+def suggest_spike_ranges(
+    dataset,
+    *,
+    threshold_sigma: float = 12.0,
+    min_sigma: float = 4.0,
+    medfilt_channels: int = 11,
+    sigma_window_channels: Optional[int] = None,
+    merge_gap_channels: int = 4,
+    pad_channels: int = 2,
+    max_width_eV: float = 1.0,
+    exclude_zlp_eV: float = 1.0,
+    edge_guard_channels: int = 15,
+    max_ranges: int = 8,
+) -> List[Tuple[float, float]]:
+    """
+    Suggest narrow detector-spike intervals from a dataset's mean spectrum.
+
+    The mean spectrum minus its own running median (``medfilt_channels`` wide)
+    leaves only structure narrower than that window. Its noise level sigma is the
+    robust global 1.4826 x MAD of that residual (or, with ``sigma_window_channels``,
+    a running median of |residual|, floored at 30 % of the global value -- this
+    tracks noise that varies along the spectrum but also makes real structure in
+    smooth, low-noise stretches look like spikes, so it is off by default).
+    Channels with |residual| > ``min_sigma`` * sigma are grouped (gaps up to
+    ``merge_gap_channels`` merge -- a spike usually comes with an undershoot), and
+    a group is reported only if
+
+    * its strongest channel exceeds ``threshold_sigma`` * sigma (high enough to
+      leave real but weaker narrow features alone, e.g. a ~9 sigma, 0.1-0.2 eV
+      wide peak),
+    * it is narrower than ``max_width_eV`` (a broad peak is not a spike),
+    * it does not overlap the zero-loss peak (|E| <= ``exclude_zlp_eV``), and
+    * it is not within ``edge_guard_channels`` of either end of the axis, where
+      the running median is unreliable.
+
+    Groups are padded by ``pad_channels`` and overlapping ranges merged. If more
+    than ``max_ranges`` survive, the spectrum is almost certainly noise or real
+    structure rather than a few spikes, so a warning is issued and nothing is
+    returned.
+
+    This is a *suggestion*: the mean spectrum only shows artifacts that sit at the
+    same channel in most pixels, and interpolating across a spike also removes any
+    real signal under it -- check the ranges on the spectrum before using them.
+
+    Returns
+    -------
+    list of (float, float)
+        (lo_eV, hi_eV) spike intervals, ascending.
+    """
+    energy = np.asarray(dataset.energy_axis, dtype=float)
+    mean_spec = np.asarray(dataset.calculate_mean_spectrum(), dtype=float)
+    resid = mean_spec - median_filter(mean_spec, size=int(medfilt_channels) | 1, mode="nearest")
+    dev = np.abs(resid - np.median(resid))
+    sigma_global = 1.4826 * float(np.median(dev))
+    if not np.isfinite(sigma_global) or sigma_global <= 0:
+        return []
+    if sigma_window_channels is None:
+        sigma = np.full_like(resid, sigma_global)
+    else:
+        sigma = np.maximum(
+            1.4826 * median_filter(dev, size=int(sigma_window_channels) | 1, mode="nearest"),
+            0.3 * sigma_global,
+        )
+
+    flagged = np.where(np.abs(resid) > min_sigma * sigma)[0]
+    groups: List[List[int]] = []
+    for i in flagged:
+        if groups and i - groups[-1][-1] <= merge_gap_channels:
+            groups[-1].append(int(i))
+        else:
+            groups.append([int(i)])
+
+    n = len(energy)
+    ranges: List[Tuple[float, float]] = []
+    for g in groups:
+        if np.max(np.abs(resid[g]) / sigma[g]) < threshold_sigma:
+            continue
+        lo_i, hi_i = g[0], g[-1]
+        if lo_i < edge_guard_channels or hi_i > n - 1 - edge_guard_channels:
+            continue
+        if energy[hi_i] - energy[lo_i] > max_width_eV:
+            continue
+        if energy[hi_i] >= -exclude_zlp_eV and energy[lo_i] <= exclude_zlp_eV:
+            continue
+        lo_i, hi_i = max(lo_i - pad_channels, 1), min(hi_i + pad_channels, n - 2)
+        lo, hi = float(energy[lo_i]), float(energy[hi_i])
+        if ranges and lo <= ranges[-1][1]:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], hi))
+        else:
+            ranges.append((lo, hi))
+    if len(ranges) > max_ranges:
+        warnings.warn(
+            f"suggest_spike_ranges: {len(ranges)} candidate ranges (> max_ranges={max_ranges}) -- "
+            "this looks like noisy or structured data rather than a few detector spikes; "
+            "returning no suggestions."
+        )
+        return []
+    return [(round(lo, 3), round(hi, 3)) for lo, hi in ranges]
+
+
+# Elements whose edges auto_hl_config() scores by default, with the shell label used
+# for reporting. Onsets come from the EELS edge database (eels_edges.csv).
+HL_CANDIDATE_EDGES = {
+    "Si": "L2,3",
+    "P": "L2,3",
+    "S": "L2,3",
+    "Cl": "L2,3",
+    "K": "L2,3",
+    "Ca": "L2,3",
+    "C": "K",
+    "N": "K",
+    "O": "K",
+    "F": "K",
+}
+
+
+def _candidate_edge_onsets(
+    element_info: dict, candidate_edges: dict, min_onset_eV: float
+) -> dict[str, float]:
+    """{"<symbol> <shell>": onset_eV} -- lowest "major" database edge >= min_onset_eV per element."""
+    onsets = {}
+    for symbol, shell in candidate_edges.items():
+        majors = [
+            float(info["onset_energy (eV)"])
+            for info in element_info.get(symbol, {}).values()
+            if info.get("edge_label") == "major"
+            and float(info["onset_energy (eV)"]) >= min_onset_eV
+        ]
+        if not majors:
+            continue
+        onset = min(majors)
+        name = f"{symbol} {shell}" if shell else f"{symbol} {onset:g} eV"
+        onsets[name] = onset
+    return onsets
+
+
+def auto_hl_config(
+    dataset,
+    *,
+    low_loss_windows: Sequence[Tuple[float, float]] = ((0.8, 1.4), (1.4, 1.8), (1.8, 2.2)),
+    candidate_edges: Optional[dict] = None,
+    report_only: Sequence[str] = ("K L2,3",),
+) -> dict[str, Any]:
+    """
+    Pick background / energy-window settings for a high-loss cube whose energy
+    range is not known in advance (carbon K, oxygen K, S/P/Cl L2,3, or even a
+    low-loss-range window).
+
+    * If the usable axis starts below 50 eV the "HL" cube is really a low-loss
+      range spectrum: pre-edge just above the axis start, windows =
+      ``low_loss_windows`` that fit inside the axis (else generic ones).
+    * Otherwise each candidate edge whose onset sits at least 12 eV inside the
+      axis is scored by its jump ratio in the mean spectrum: median post-edge
+      signal (onset + 3 to + 15 eV) over a power law extrapolated from the
+      pre-edge (onset - 32 to - 8 eV). The highest eligible score wins. Pre-edge
+      = (onset - 32, onset - 8) clipped to the axis, windows = (onset, onset +
+      3.5) and (onset + 5, onset + 16).
+
+    Parameters
+    ----------
+    low_loss_windows : sequence of (float, float), optional
+        Energy windows to use when the cube turns out to be a low-loss range.
+    candidate_edges : dict, optional
+        ``{element_symbol: shell_label}`` to score. Each onset is the element's
+        lowest "major" edge >= 50 eV in the dataset's edge database
+        (:meth:`load_element_info`). A ``None`` shell label names the edge
+        ``"<symbol> <onset> eV"``. Default :data:`HL_CANDIDATE_EDGES`.
+    report_only : sequence of str, optional
+        Edge names that are scored and reported in ``scores`` but never picked.
+        Default ``("K L2,3",)``: its pre-edge window reaches into carbon K's rise
+        whenever both are in the axis, which flipped the winner on a noise-level
+        margin on real data (1.086 vs 1.083) with no evidence of potassium.
+
+    Returns
+    -------
+    dict
+        ``kind`` ("core-loss" or "low-loss-range"), ``edge`` (name or None),
+        ``target_edge`` (eV), ``pre_edge_range``, ``windows``, ``scores``
+        ({edge: jump ratio} for every scored candidate), ``valid_start_eV``
+        (start of the usable axis after skipping dead leading channels) and
+        ``confident`` (False when the picked edge's jump ratio is < 1.04 -- the
+        pick is then just the least-bad candidate).
+    """
+    e = np.asarray(dataset.energy_axis, dtype=float)
+    m = np.asarray(dataset.calculate_mean_spectrum(), dtype=float)
+    hi_ax = float(e[-1])
+    # Dead leading channels (mean ~0 for the first few eV) ruin a pre-edge fit, so
+    # the usable axis starts at the first channel from which the next 10 all carry
+    # at least 30 % of the typical level.
+    typical = float(np.median(m[: min(len(m), 300)]))
+    if typical > 0:
+        ok = np.array([bool(np.all(m[i : i + 10] > 0.3 * typical)) for i in range(len(m) - 9)])
+    else:
+        ok = np.array([True])
+    lead = int(np.argmax(ok)) if ok.any() else 0
+    lo_ax = float(e[lead])
+
+    if lo_ax < 50.0:
+        s0 = max(lo_ax, 0.0)
+        pre = (round(max(0.15, s0 + 0.05), 3), round(max(0.60, s0 + 0.50), 3))
+        wins = [w for w in low_loss_windows if w[0] >= pre[1] and w[1] <= hi_ax]
+        if not wins:
+            wins = [
+                (round(pre[1] + 0.4, 3), round(pre[1] + 2.4, 3)),
+                (round(pre[1] + 2.4, 3), round(pre[1] + 6.4, 3)),
+            ]
+        return dict(
+            kind="low-loss-range",
+            edge=None,
+            target_edge=round(pre[1] + 0.5, 3),
+            pre_edge_range=pre,
+            windows=tuple(wins),
+            scores={},
+            confident=True,
+            valid_start_eV=lo_ax,
+        )
+
+    def _jump(onset):
+        pre = (e >= max(lo_ax + 0.05, onset - 32.0)) & (e <= onset - 8.0) & (e > 0) & (m > 0)
+        post = (e >= onset + 3.0) & (e <= onset + 15.0) & (m > 0)
+        if pre.sum() < 20 or post.sum() < 10:
+            return np.nan
+        slope, intercept = np.polyfit(np.log(e[pre]), np.log(m[pre]), 1)
+        pred = np.exp(intercept + slope * np.log(e[post]))
+        return float(np.median(m[post] / pred))
+
+    onsets = _candidate_edge_onsets(
+        dataset.load_element_info() or {},
+        HL_CANDIDATE_EDGES if candidate_edges is None else candidate_edges,
+        min_onset_eV=50.0,
+    )
+    scores = {name: _jump(on) for name, on in onsets.items() if lo_ax + 12 <= on <= hi_ax - 12}
+    scores = {k: v for k, v in scores.items() if np.isfinite(v)}
+    eligible = {k: v for k, v in scores.items() if k not in report_only}
+    if eligible:
+        edge = max(eligible, key=eligible.get)
+        onset = onsets[edge]
+    else:  # no candidate edge inside the window: treat the middle of the axis as the "edge"
+        edge, onset = None, 0.5 * (lo_ax + hi_ax)
+    pre = (round(max(lo_ax + 0.05, onset - 32.0), 3), round(onset - 8.0, 3))
+    wins = (
+        (round(onset, 3), round(onset + 3.5, 3)),
+        (round(onset + 5.0, 3), round(onset + 16.0, 3)),
+    )
+    return dict(
+        kind="core-loss",
+        edge=edge,
+        target_edge=float(onset),
+        pre_edge_range=pre,
+        windows=wins,
+        scores={k: round(v, 3) for k, v in scores.items()},
+        confident=bool(eligible) and max(eligible.values()) >= 1.04,
+        valid_start_eV=lo_ax,
+    )
+
+
+def auto_ll_pre_edge_range(
+    dataset,
+    *,
+    target_edge: float,
+    windows: Sequence[Tuple[float, float]],
+    method: str = "powerlaw",
+    fallback_methods: Sequence[str] = ("polynomial",),
+    candidates: Optional[Sequence[Tuple[float, float]]] = None,
+    max_zero_frac: float = 0.05,
+):
+    """
+    Choose a low-loss background pre-edge window (and, if needed, method) that
+    does not over-subtract.
+
+    A power law fitted to the steep ZLP tail can overshoot the real spectrum; the
+    subtraction then clips to exactly 0 and the maps come out flat and empty. This
+    tries each candidate window (clipped to the energy axis and kept below
+    ``target_edge`` and ``windows``; default candidates start close to the ZLP
+    tail and move away from it) with ``method``, then with each of
+    ``fallback_methods``, running :meth:`subtract_background_limited_preedge`, and
+    scores every attempt by the largest fraction of pixels that are exactly 0 in
+    any of ``windows`` after subtraction. The first attempt at or below
+    ``max_zero_frac`` wins; otherwise the one with the lowest score.
+
+    Parameters
+    ----------
+    target_edge : float
+        Edge onset (eV) passed to the background subtraction.
+    windows : sequence of (float, float)
+        Energy windows (eV) the maps will be integrated over.
+    method : str, optional
+        First background method to try. Default "powerlaw".
+    fallback_methods : sequence of str, optional
+        Methods tried, in order, if no window passes with ``method``.
+    candidates : sequence of (float, float), optional
+        Pre-edge windows to try. Default: a few windows just above the ZLP tail.
+    max_zero_frac : float, optional
+        Largest acceptable fraction of exactly-zero pixels in any window.
+
+    Returns
+    -------
+    ((float, float), str, list)
+        The chosen pre-edge window, the method used, and a table of
+        ``(method, window, worst_zero_fraction)`` for every attempt (a failed or
+        all-NaN fit scores 1.0).
+    """
+    energy = np.asarray(dataset.energy_axis, dtype=float)
+    lo_ax, hi_ax = float(energy[0]), float(energy[-1])
+    win_lo = max(
+        min(w[0] for w in windows), lo_ax + 0.5
+    )  # windows below the axis start are clipped anyway
+    hi_limit = min(float(target_edge) - 0.05, win_lo - 0.02, hi_ax)
+    if candidates is None:
+        candidates = [(0.15, 0.60), (0.20, 0.70), (0.30, 0.70), (0.40, 0.75), (0.45, 0.78)]
+        if lo_ax > 0.1:  # the axis itself starts above the ZLP-tail region
+            candidates = [
+                (lo_ax + 0.05, lo_ax + 0.45),
+                (lo_ax + 0.1, lo_ax + 0.6),
+                (lo_ax + 0.2, lo_ax + 0.8),
+            ]
+    valid = [(max(lo, lo_ax + 0.02), min(hi, hi_limit)) for lo, hi in candidates]
+    valid = [(round(lo, 3), round(hi, 3)) for lo, hi in valid if hi - lo >= 0.15]
+    if not valid:
+        valid = [(round(lo_ax + 0.05, 3), round(lo_ax + 0.5, 3))]
+
+    table = []
+    for meth in (method, *fallback_methods):
+        for win in valid:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    arr = np.asarray(
+                        dataset.subtract_background_limited_preedge(
+                            target_edge=target_edge,
+                            pre_edge_range=win,
+                            method=meth,
+                            show=False,
+                            return_dataset=False,
+                        )
+                    )
+            except Exception:
+                table.append((meth, win, 1.0))
+                continue
+            if not np.isfinite(arr).any():
+                table.append((meth, win, 1.0))
+                continue
+            worst = 0.0
+            for lo, hi in windows:
+                k = (energy >= lo) & (energy <= hi)
+                if k.any():
+                    worst = max(worst, float(np.mean(arr[:, :, k].sum(axis=-1) == 0)))
+            table.append((meth, win, round(worst, 3)))
+            if worst <= max_zero_frac:
+                return win, meth, table
+    best = min(table, key=lambda t: t[2])
+    return best[1], best[0], table
+
+
+def robustness_check_near_zlp(
+    dataset,
+    peaks: List[dict],
+    energy_range: Tuple[float, float] = (-1.9, 0.85),
+    n_refits: int = 4,
+    seed: int = 42,
+    max_spread_eV: float = 0.02,
+) -> dict:
+    """
+    Fit :meth:`fit_near_zlp_transitions` once, then refit ``n_refits`` more times
+    from perturbed initial guesses (same bounds) and report the spread of each
+    component's fitted center.
+
+    Any center that pins at a bound, or whose spread across refits exceeds
+    ``max_spread_eV``, is flagged -- only a center that lands in the same place
+    regardless of the starting guess is a confident detection.
+
+    Parameters
+    ----------
+    peaks : list of dict
+        Peak specs as accepted by :meth:`fit_near_zlp_transitions` (each with
+        ``name``, ``center_guess``, ``center_bounds``, ``width_guess``,
+        ``width_bounds``).
+    energy_range : (float, float), optional
+        Energy window passed to :meth:`fit_near_zlp_transitions`.
+    n_refits : int, optional
+        Number of additional perturbed-initial-guess refits.
+    seed : int, optional
+        RNG seed for the perturbations.
+    max_spread_eV : float, optional
+        Center spread above which a component is flagged. Default 0.02.
+
+    Returns
+    -------
+    dict
+        The base (unperturbed) fit result, plus a ``"robustness"`` entry:
+        ``{name: {"centers": [...], "spread": float, "flags": [...]}}``.
+    """
+    rng = np.random.default_rng(seed)
+    base = dataset.fit_near_zlp_transitions(peaks, energy_range=energy_range)
+    centers_by_name = {name: [comp["center"]] for name, comp in base["components"].items()}
+
+    for _ in range(n_refits):
+        trial_peaks = []
+        for peak in peaks:
+            lo, hi = peak["center_bounds"]
+            wlo, whi = peak["width_bounds"]
+            p = dict(peak)
+            p["center_guess"] = float(lo + rng.uniform(0.2, 0.8) * (hi - lo))
+            p["width_guess"] = float(wlo + rng.uniform(0.2, 0.8) * (whi - wlo))
+            trial_peaks.append(p)
+        try:
+            trial = dataset.fit_near_zlp_transitions(
+                trial_peaks,
+                energy_range=energy_range,
+                zlp_center_guess=float(rng.uniform(-0.08, 0.08)),
+                zlp_width_guess=float(rng.uniform(0.02, 0.9)),
+            )
+        except RuntimeError as exc:
+            print(f"  refit failed to converge: {exc}")
+            continue
+        for name, comp in trial["components"].items():
+            centers_by_name[name].append(comp["center"])
+
+    print("=== Fitted components (main fit) ===")
+    for name, comp in base["components"].items():
+        print(
+            f"{name:12s} shape={comp['shape']:12s} "
+            f"center={comp['center']:.4f}+/-{comp['center_stderr']:.4f} eV  "
+            f"fwhm={comp['fwhm']:.4f}+/-{comp['fwhm_stderr']:.4f} eV  "
+            f"amp={comp['amplitude']:.4g}  area={comp['area']:.4g}"
+        )
+    print(f"residual std: {np.std(base['residual']):.4f}")
+
+    print(f"\n--- Robustness: center spread across {n_refits} perturbed refits ---")
+    bounds_by_name = {p["name"]: p["center_bounds"] for p in peaks}
+    robustness = {}
+    for name, centers in centers_by_name.items():
+        centers = np.array(centers)
+        spread = float(centers.max() - centers.min())
+        flags = []
+        bounds = bounds_by_name.get(name)
+        if bounds is not None:
+            tol = 1e-3
+            if abs(centers.min() - bounds[0]) < tol or abs(centers.max() - bounds[1]) < tol:
+                flags.append("PINNED AT BOUND")
+        if spread > max_spread_eV:
+            flags.append(f"SPREAD {spread:.4f} eV > {max_spread_eV} eV")
+        flag_str = f"  <-- {'; '.join(flags)} -- NOT a confident detection" if flags else "  OK"
+        print(f"{name:12s} centers={np.round(centers, 4).tolist()}{flag_str}")
+        robustness[name] = {"centers": centers.tolist(), "spread": spread, "flags": flags}
+
+    base["robustness"] = robustness
+    return base
