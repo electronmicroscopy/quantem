@@ -1,10 +1,12 @@
-from typing import Any, Dict, List, Tuple
+import textwrap
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
-from scipy.signal import find_peaks, savgol_filter
-from scipy.stats import norm
+from scipy.ndimage import median_filter
+from scipy.signal import find_peaks, peak_widths, savgol_coeffs, savgol_filter
+from scipy.stats import norm, pearsonr
 
 from quantem.core.visualization import show_2d
 
@@ -1829,3 +1831,808 @@ def find_maximum_and_shoulder(
         "shoulder_stability_statement": shoulder_stability_statement,
         "notes": notes,
     }
+
+
+def _wrap_title(text, width=80):
+    """Wrap a long plot-title line at `width` characters."""
+    return textwrap.fill(str(text), width=width)
+
+
+def detect_broad_bump_via_slope_change(
+    dataset,
+    energy_range: Tuple[float, float],
+    smoothing_window_eV: float = 0.4,
+    polyorder: int = 3,
+    min_prominence: Optional[float] = None,
+    plot: bool = True,
+) -> Dict[str, Any]:
+    """
+    Find a very broad, low-amplitude bump riding on a monotonically
+    decaying spectrum (e.g. sitting on the ZLP tail's own decay) that never
+    produces an actual local maximum in the raw data -- so it's invisible
+    to `detect_peaks_in_range()`, including its "shoulder" fallback, which
+    both ultimately require a real extremum of intensity or of the 1st
+    derivative. This instead looks at where the *2nd derivative* (the
+    curvature) itself dips: a genuine bend where the decay's slope stops
+    steepening and briefly flattens/reverses because of the underlying
+    bump, before resuming its plain decay. A plain monotonic decay with no
+    hidden bump has a 2nd derivative with no such dip.
+
+    This is a qualitative, not quantitative, bump *locator* -- use its
+    `candidates[i]["center_eV"]` to seed where to center a real physical
+    model (e.g. a Gaussian on top of a fitted background), not as the
+    bump's actual amplitude or width.
+
+    Never modifies `dataset`.
+
+    Parameters
+    ----------
+    dataset : Dataset3deels-like
+        Any dataset with `.energy_axis`, `.calculate_mean_spectrum()`, and
+        `.sampling` (its eV/channel spacing is `sampling[2]`).
+    energy_range : (float, float)
+        (lo, hi) eV window to restrict analysis to.
+    smoothing_window_eV : float, default 0.4
+        Savitzky-Golay window width in eV, converted to an odd number of
+        samples using this dataset's own eV/channel spacing
+        (`dataset.sampling[2]`).
+    polyorder : int, default 3
+        Savitzky-Golay polynomial order, shared by all three passes
+        (spectrum, 1st derivative, 2nd derivative) so they stay directly
+        comparable.
+    min_prominence : float, optional
+        Minimum prominence (in the smoothed 2nd derivative's own units) a
+        curvature dip must clear to be reported. If None (default), every
+        local minimum of the 2nd derivative in the (edge-trimmed) range is
+        returned unfiltered (scipy.signal.find_peaks's own default
+        handling) -- pass an explicit threshold to keep only dips whose
+        prominence clears it.
+    plot : bool, default True
+        Show the 3-panel diagnostic figure (raw+smoothed spectrum; slope;
+        curvature with candidate dips marked).
+
+    Returns
+    -------
+    dict with keys:
+        "energy", "spectrum_smoothed", "first_derivative",
+        "second_derivative" : the windowed (not edge-trimmed) arrays.
+        "candidates" : list of
+            {"center_eV", "dip_prominence", "slope_change_amplitude"},
+            sorted by center_eV ascending (energy position, not
+            prominence) -- every candidate found is a real local minimum
+            of the curvature, not ranked as "more/less real" by strength.
+            `slope_change_amplitude` is the difference between the
+            smoothed 1st derivative's local extrema immediately
+            bracketing the dip -- an honestly qualitative indicator of how
+            much the slope visibly bent, not a rigorous amplitude fit.
+    """
+    lo, hi = float(energy_range[0]), float(energy_range[1])
+    if not (lo < hi):
+        raise ValueError(f"energy_range must be (lo, hi) with lo < hi, got {energy_range!r}")
+
+    energy_axis = np.asarray(dataset.energy_axis, dtype=float)
+    mean_spec = np.asarray(dataset.calculate_mean_spectrum(), dtype=float)
+    mask = (energy_axis >= lo) & (energy_axis <= hi)
+    E = energy_axis[mask]
+    I_win = mean_spec[mask]
+    if len(E) < 5:
+        raise ValueError(
+            f"energy_range={energy_range!r} contains only {len(E)} sample(s); need at least "
+            "a handful of channels to smooth and differentiate."
+        )
+
+    spacing = float(dataset.sampling[2])
+    if not (np.isfinite(spacing) and spacing > 0):
+        raise ValueError(f"dataset eV/channel spacing (sampling[2]={spacing!r}) must be positive.")
+
+    # ---- 2. smoothing_window_eV -> odd sample count at this dataset's own
+    # spacing, validated against both polyorder and energy_range itself
+    # (rather than silently clipped -- a silently-shrunk window would
+    # quietly change what "0.4 eV" means without the caller noticing).
+    window_samples = int(round(smoothing_window_eV / spacing))
+    if window_samples % 2 == 0:
+        window_samples += 1
+    if window_samples <= polyorder + 1:
+        raise ValueError(
+            f"smoothing_window_eV={smoothing_window_eV} eV converts to {window_samples} "
+            f"samples at this dataset's spacing ({spacing:.4g} eV/channel), which is not "
+            f"> polyorder+1={polyorder + 1}; widen smoothing_window_eV or lower polyorder."
+        )
+    if window_samples > len(E):
+        raise ValueError(
+            f"smoothing_window_eV={smoothing_window_eV} eV converts to {window_samples} "
+            f"samples at this dataset's spacing ({spacing:.4g} eV/channel), which does not "
+            f"fit inside energy_range={energy_range!r} ({len(E)} samples available)."
+        )
+
+    # ---- 3. three SavGol passes over the same windowed spectrum: the
+    # smoothed spectrum itself (deriv=0), the smoothed slope (deriv=1),
+    # and the smoothed curvature (deriv=2) -- same window/polyorder for
+    # all three so they're directly comparable, `delta` set to the actual
+    # eV spacing so the derivatives are in real dI/dE, d2I/dE2 units.
+    smoothed = savgol_filter(
+        I_win, window_length=window_samples, polyorder=polyorder, delta=spacing
+    )
+    first_derivative = savgol_filter(
+        I_win, window_length=window_samples, polyorder=polyorder, deriv=1, delta=spacing
+    )
+    second_derivative = savgol_filter(
+        I_win, window_length=window_samples, polyorder=polyorder, deriv=2, delta=spacing
+    )
+
+    # ---- 4. trim a half-window margin off each edge before searching for
+    # candidates -- a SavGol derivative near a boundary is fit from a
+    # lopsided/incomplete window and is not trustworthy there.
+    half_window = window_samples // 2
+    n = len(E)
+    trim_lo, trim_hi = half_window, n - half_window
+    if trim_hi - trim_lo < 3:
+        raise ValueError(
+            f"energy_range={energy_range!r} is too narrow relative to "
+            f"smoothing_window_eV={smoothing_window_eV} eV -- after trimming a half-window "
+            f"margin off each edge only {max(0, trim_hi - trim_lo)} sample(s) remain to "
+            "search for candidates."
+        )
+
+    # ---- 5. candidates = local MINIMA of the 2nd derivative (find_peaks on
+    # its negation) -- a genuine dip/bend in curvature, not a zero
+    # crossing (which marks an inflection with no actual curvature
+    # extremum, and fires on every plain monotonic decay too).
+    #
+    # prominence=0.0 here is not a real filter (every local extremum has
+    # prominence >= 0) -- it's only how find_peaks is told to actually
+    # compute and report prominences for every peak it finds under its own
+    # default handling, rather than silently collapsing to one "best"
+    # candidate. An explicit min_prominence is what does the real
+    # filtering.
+    prominence_threshold = min_prominence if min_prominence is not None else 0.0
+    neg_curvature = -second_derivative[trim_lo:trim_hi]
+    peak_idx, props = find_peaks(neg_curvature, prominence=prominence_threshold)
+    dip_prominences = props["prominences"]
+    full_idx = peak_idx + trim_lo
+
+    # 1st derivative's own local extrema (both signs) -- used to bracket
+    # each candidate and report how much the slope visibly bent.
+    extrema_idx = np.sort(
+        np.concatenate([find_peaks(first_derivative)[0], find_peaks(-first_derivative)[0]])
+    )
+
+    raw_candidates = []  # (index, dip_prominence, slope_change_amplitude)
+    for i, prom in zip(full_idx, dip_prominences):
+        left = extrema_idx[extrema_idx < i]
+        right = extrema_idx[extrema_idx > i]
+        left_i = int(left[-1]) if len(left) else 0
+        right_i = int(right[0]) if len(right) else n - 1
+        slope_change_amplitude = abs(float(first_derivative[right_i] - first_derivative[left_i]))
+        raw_candidates.append((int(i), float(prom), slope_change_amplitude))
+    raw_candidates.sort(key=lambda t: t[0])  # by energy position, not prominence
+
+    candidates = [
+        {"center_eV": float(E[i]), "dip_prominence": prom, "slope_change_amplitude": amp}
+        for i, prom, amp in raw_candidates
+    ]
+
+    print(
+        f"detect_broad_bump_via_slope_change: window_samples={window_samples} "
+        f"({smoothing_window_eV} eV at {spacing:.4g} eV/channel spacing), polyorder={polyorder}, "
+        f"energy_range={energy_range!r}"
+    )
+    if candidates:
+        for c in candidates:
+            print(
+                f"  -> candidate at {c['center_eV']:.4g} eV: dip_prominence="
+                f"{c['dip_prominence']:.4g}, slope_change_amplitude={c['slope_change_amplitude']:.4g}"
+            )
+    else:
+        print("  -> no candidates found.")
+
+    if plot:
+        fig, axes = plt.subplots(3, 1, figsize=(9, 10), sharex=True)
+
+        axes[0].plot(E, I_win, "k.", ms=3, alpha=0.4, label="raw mean spectrum")
+        axes[0].plot(
+            E, smoothed, "b-", lw=1.6, label=f"SavGol smoothed (window_length={window_samples})"
+        )
+        axes[0].set_ylabel("Intensity")
+        axes[0].set_title("1. Raw spectrum and smoothed spectrum")
+        axes[0].legend(loc="best", fontsize=8)
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(E, first_derivative, "m-", lw=1.2, label="smoothed 1st derivative (slope)")
+        axes[1].axhline(0, color="gray", ls="--", lw=1)
+        for (i, prom, _amp), c in zip(raw_candidates, candidates):
+            axes[1].axvline(c["center_eV"], color="tab:red", ls=":", lw=1.5)
+            axes[1].annotate(
+                f"{c['center_eV']:.3g} eV\nprominence={prom:.3g}",
+                xy=(c["center_eV"], float(first_derivative[i])),
+                xytext=(6, 6),
+                textcoords="offset points",
+                fontsize=8,
+                color="tab:red",
+            )
+        axes[1].set_ylabel("dI/dE")
+        axes[1].set_title("2. Slope (1st derivative) -- candidate positions marked")
+        axes[1].legend(loc="best", fontsize=8)
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(
+            E, second_derivative, "c-", lw=1.2, label="smoothed 2nd derivative (curvature)"
+        )
+        axes[2].axhline(0, color="gray", ls="--", lw=1)
+        for (i, prom, _amp), c in zip(raw_candidates, candidates):
+            y_bottom = float(second_derivative[i])
+            y_top = y_bottom + prom
+            axes[2].plot([c["center_eV"]], [y_bottom], "rv", ms=9, zorder=5)
+            axes[2].annotate(
+                "",
+                xy=(c["center_eV"], y_top),
+                xytext=(c["center_eV"], y_bottom),
+                arrowprops=dict(arrowstyle="<->", color="tab:red", lw=1.3),
+            )
+            axes[2].annotate(
+                f"{c['center_eV']:.3g} eV\nprominence={prom:.3g}",
+                xy=(c["center_eV"], y_top),
+                xytext=(6, 6),
+                textcoords="offset points",
+                fontsize=8,
+                color="tab:red",
+            )
+        axes[2].set_xlabel("Energy loss (eV)")
+        axes[2].set_ylabel("d2I/dE2")
+        axes[2].set_title("3. Curvature (2nd derivative) -- candidate dip + prominence bracket")
+        axes[2].legend(loc="best", fontsize=8)
+        axes[2].grid(True, alpha=0.3)
+
+        fig.suptitle(
+            "Broad bump detection via 2nd-derivative slope change "
+            "-- NOT a peak/shoulder fit (see detect_peaks_in_range for that)",
+            fontsize=10,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        plt.show()
+
+    return {
+        "energy": E,
+        "spectrum_smoothed": smoothed,
+        "first_derivative": first_derivative,
+        "second_derivative": second_derivative,
+        "candidates": candidates,
+    }
+
+
+def build_hidden_bump_spatial_maps(
+    eels_hl_despiked,
+    eels_ll,
+    thickness_map,
+    adf,
+    candidate_energies_eV: Sequence[float],
+    window_samples: int = 45,
+    polyorder: int = 3,
+    zlp_search_half_width_eV: float = 0.2,
+    median_filter_pixels: int = 3,
+    show: bool = True,
+) -> Dict[str, Any]:
+    """
+    Per-pixel spatial maps of fixed broad-bump candidate energies (e.g. the
+    ones `detect_broad_bump_via_slope_change()` found on the mean
+    spectrum), built directly from the 2nd-derivative/slope-change
+    signature at the pixel level -- no ZLP model is fitted.
+
+    Why the ZLP peak height comes from `eels_ll`, not `eels_hl_despiked`
+    itself: `eels_hl_despiked`'s own energy axis starts a bit above 0 eV
+    (dual-EELS acquisition -- LL carries the ZLP/thickness signal, HL is
+    read out starting just past it) -- there is no "window around E=0"
+    inside `eels_hl_despiked` to measure a ZLP peak height from. Only
+    `eels_ll`'s energy axis actually spans E=0, so each pixel's ZLP peak
+    height is measured from that SAME pixel's `eels_ll` spectrum, then
+    used to normalize that pixel's `eels_hl_despiked` spectrum, before any
+    derivative is taken -- controlling for per-pixel thickness/intensity
+    differences up front.
+
+    The ZLP peak height itself reuses the crude-ZLP convention already
+    used (twice) in `Dataset3deels` -- `measure_zlp_offset()` and
+    `calculate_thickness_log_ratio()` both median-filter each pixel's
+    spectrum first ("to discount hot pixels that might spuriously produce
+    the maximum intensity") before taking its max as the crude per-pixel
+    ZLP estimate. Reused verbatim here (same `median_filter_pixels=3`
+    default), just reporting the max VALUE (the peak height) within a
+    narrow +/-`zlp_search_half_width_eV` window around E=0, rather than
+    the position a Gaussian fit would refine it to, or the integrated
+    intensity `calculate_thickness_log_ratio` sums.
+
+    Per pixel:
+      1. `height` = max of the median-filtered `eels_ll` spectrum within
+         `|E| <= zlp_search_half_width_eV`.
+      2. `normalized` = that pixel's `eels_hl_despiked` spectrum / `height`.
+      3. 2nd derivative of `normalized` via the same Savitzky-Golay
+         `window_samples`/`polyorder` `detect_broad_bump_via_slope_change`
+         uses (`delta` = this dataset's own eV/channel spacing), over the
+         full spectrum.
+      4. At each fixed candidate energy, a dip "prominence" = the max of
+         the 2nd derivative in a small local window (+/- `window_samples
+         // 2` samples -- the same edge-trim half-window
+         `detect_broad_bump_via_slope_change` uses) around that energy,
+         minus the 2nd derivative's own value there. Left signed, not
+         clipped at 0 -- a negative value means the curvature is locally
+         convex (no dip at all) at that pixel, which is real information
+         about how much weaker/absent the feature is there, not noise to
+         discard.
+
+    A pixel is NaN-masked (never silently filled) if: its `eels_ll` ZLP
+    peak height is non-finite, or so close to zero (<= 1e-6 * the median
+    finite height across the scan) that normalizing by it is meaningless;
+    its raw `eels_hl_despiked` spectrum contains a non-finite value; the
+    normalized spectrum contains a non-finite value; or the
+    Savitzky-Golay filter itself raises.
+
+    Parameters
+    ----------
+    eels_hl_despiked, eels_ll : Dataset3deels
+        ZLP-corrected high-loss (despiked) and low-loss datasets from the
+        SAME scan -- must share `(scan_row, scan_col)`.
+    thickness_map : ndarray, shape (scan_row, scan_col)
+        For the visual comparison panel and the thickness correlation
+        cross-check.
+    adf : ndarray, shape (scan_row, scan_col), or None
+        For the visual comparison panel and the ADF correlation
+        cross-check. Pass None to skip both (e.g. `raw.adf is None`).
+    candidate_energies_eV : sequence of float
+        The fixed energies (eV) to sample the per-pixel 2nd derivative at,
+        typically ``candidates[i]["center_eV"]`` from
+        ``detect_broad_bump_via_slope_change()``.
+    window_samples, polyorder : int, default 45, 3
+        Savitzky-Golay parameters -- must match
+        `detect_broad_bump_via_slope_change`'s own choice for these to
+        mean the same thing spatially that they meant on the mean
+        spectrum.
+    zlp_search_half_width_eV : float, default 0.2
+        Half-width (eV) of the window around E=0 in `eels_ll` the ZLP peak
+        height is searched in.
+    median_filter_pixels : int, default 3
+        Same hot-pixel-discounting median filter size
+        `measure_zlp_offset` / `calculate_thickness_log_ratio` use.
+    show : bool, default True
+        Render the multi-panel figure (thickness, ADF if available, and
+        the candidate maps).
+
+    Returns
+    -------
+    dict with keys:
+        "map_<E>eV" -- one ndarray (scan_row, scan_col) per candidate
+            energy, with "." replaced by "p" in the key
+            (e.g. 1.649 -> "map_1p649eV").
+        "failed_pixel_counts" -- dict of the same map-name keys, each
+            mapping to the SAME shared failure count (a failure is a
+            per-pixel property of the whole normalized-spectrum/2nd-
+            derivative computation, not per candidate energy).
+        "correlation_with_thickness", "correlation_with_adf" -- dict of
+            map-name -> Pearson r (NaN-pair-dropped). "correlation_with_adf"
+            is empty if `adf` is None.
+    """
+    energy_axis = np.asarray(eels_hl_despiked.energy_axis, dtype=float)
+    spacing = float(eels_hl_despiked.sampling[2])
+    if not (np.isfinite(spacing) and spacing > 0):
+        raise ValueError(
+            f"eels_hl_despiked eV/channel spacing (sampling[2]={spacing!r}) must be positive."
+        )
+    if window_samples % 2 == 0 or window_samples <= polyorder + 1:
+        raise ValueError(
+            f"window_samples={window_samples} must be odd and > polyorder+1={polyorder + 1}."
+        )
+    half_window = window_samples // 2
+    n_energy = len(energy_axis)
+
+    candidate_idx = []
+    for e in candidate_energies_eV:
+        idx = int(np.argmin(np.abs(energy_axis - e)))
+        if idx < half_window or idx >= n_energy - half_window:
+            raise ValueError(
+                f"candidate energy {e} eV (index {idx}) is within the half-window "
+                f"({half_window} samples) edge margin of eels_hl_despiked's own energy "
+                "range -- the 2nd derivative there is unreliable near the boundary."
+            )
+        candidate_idx.append(idx)
+
+    hl_array = np.asarray(eels_hl_despiked.array, dtype=float)
+    ll_array = np.asarray(eels_ll.array, dtype=float)
+    if hl_array.shape[:2] != ll_array.shape[:2]:
+        raise ValueError(
+            f"eels_hl_despiked scan shape {hl_array.shape[:2]} does not match eels_ll "
+            f"scan shape {ll_array.shape[:2]} -- must be the same scan."
+        )
+    scan_row, scan_col, _ = hl_array.shape
+
+    ll_energy_axis = np.asarray(eels_ll.energy_axis, dtype=float)
+    zlp_window_mask = np.abs(ll_energy_axis) <= zlp_search_half_width_eV
+    if not np.any(zlp_window_mask):
+        raise ValueError(
+            f"No eels_ll energy channels fall within +/-{zlp_search_half_width_eV} eV of "
+            "E=0 -- widen zlp_search_half_width_eV."
+        )
+
+    # ---- 1. per-pixel ZLP peak height from eels_ll (max of a median-
+    # filtered spectrum within a narrow window around E=0) -- see the
+    # docstring for why eels_ll and not eels_hl_despiked itself.
+    zlp_height = np.full((scan_row, scan_col), np.nan)
+    for i in range(scan_row):
+        for j in range(scan_col):
+            spec = ll_array[i, j, :]
+            if median_filter_pixels > 0:
+                spec = median_filter(spec, median_filter_pixels)
+            window_vals = spec[zlp_window_mask]
+            if np.any(np.isfinite(window_vals)):
+                zlp_height[i, j] = float(np.nanmax(window_vals))
+
+    finite_heights = zlp_height[np.isfinite(zlp_height)]
+    zlp_epsilon = 1e-6 * float(np.nanmedian(finite_heights)) if finite_heights.size else 0.0
+
+    maps = [np.full((scan_row, scan_col), np.nan) for _ in candidate_idx]
+    n_failed = 0
+    failure_reasons: Dict[str, int] = {}
+
+    def _fail(reason):
+        nonlocal n_failed
+        n_failed += 1
+        failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+
+    # ---- 2/3. per-pixel: normalize by that pixel's own ZLP height, SavGol
+    # 2nd derivative, sample it at each fixed candidate energy.
+    for i in range(scan_row):
+        for j in range(scan_col):
+            height = zlp_height[i, j]
+            if not np.isfinite(height) or height <= zlp_epsilon:
+                _fail("zlp_height_near_zero_or_nan")
+                continue
+
+            spectrum = hl_array[i, j, :]
+            if not np.all(np.isfinite(spectrum)):
+                _fail("non_finite_raw_spectrum")
+                continue
+
+            normalized = spectrum / height
+            if not np.all(np.isfinite(normalized)):
+                _fail("non_finite_normalized_spectrum")
+                continue
+
+            try:
+                second_derivative = savgol_filter(
+                    normalized,
+                    window_length=window_samples,
+                    polyorder=polyorder,
+                    deriv=2,
+                    delta=spacing,
+                )
+            except ValueError:
+                _fail("savgol_failed")
+                continue
+
+            for k, idx in enumerate(candidate_idx):
+                lo_i, hi_i = idx - half_window, idx + half_window + 1
+                baseline = float(np.max(second_derivative[lo_i:hi_i]))
+                maps[k][i, j] = baseline - float(second_derivative[idx])
+
+    def _key(e):
+        return f"map_{f'{e:.3f}'.replace('.', 'p')}eV"
+
+    map_names = [_key(e) for e in candidate_energies_eV]
+    result_maps = dict(zip(map_names, maps))
+    failed_pixel_counts = {name: n_failed for name in map_names}
+
+    n_total = scan_row * scan_col
+    print(
+        f"build_hidden_bump_spatial_maps: {n_total - n_failed}/{n_total} pixels usable "
+        f"(window_samples={window_samples}, polyorder={polyorder}, "
+        f"zlp_search_half_width_eV={zlp_search_half_width_eV})"
+    )
+    if n_failed:
+        print(f"  -> {n_failed} pixel(s) NaN-masked: {failure_reasons}")
+    for name in map_names:
+        print(f"  -> {name}: {failed_pixel_counts[name]} failed pixel(s)")
+
+    # ---- correlation cross-check against thickness and ADF -- even after
+    # normalizing by ZLP peak height, multiple-scattering broadening in
+    # thicker regions could still leave a residual thickness correlation
+    # in the curvature SHAPE itself, not just its amplitude.
+    thickness_map = np.asarray(thickness_map, dtype=float)
+    adf_map = np.asarray(adf, dtype=float) if adf is not None else None
+
+    correlation_with_thickness: Dict[str, float] = {}
+    correlation_with_adf: Dict[str, float] = {}
+    for name, m in zip(map_names, maps):
+        valid = np.isfinite(m) & np.isfinite(thickness_map)
+        correlation_with_thickness[name] = (
+            float(pearsonr(m[valid], thickness_map[valid])[0])
+            if valid.sum() >= 2
+            else float("nan")
+        )
+        if adf_map is not None:
+            valid = np.isfinite(m) & np.isfinite(adf_map)
+            correlation_with_adf[name] = (
+                float(pearsonr(m[valid], adf_map[valid])[0]) if valid.sum() >= 2 else float("nan")
+            )
+
+    print("Pearson correlation vs. thickness_map:")
+    for name in map_names:
+        print(f"  -> {name}: r={correlation_with_thickness[name]:.3f}")
+    if adf_map is not None:
+        print("Pearson correlation vs. ADF:")
+        for name in map_names:
+            print(f"  -> {name}: r={correlation_with_adf[name]:.3f}")
+    else:
+        print("ADF not available (adf=None) -- skipped correlation_with_adf.")
+
+    if show:
+        panels: List[Any] = []
+        titles: List[str] = []
+        cmaps: List[str] = []
+
+        panels.append(thickness_map)
+        titles.append("Thickness (t/λ)")
+        cmaps.append("viridis")
+
+        if adf_map is not None:
+            panels.append(adf_map)
+            titles.append("ADF")
+            cmaps.append("gray")
+
+        for name, e, m in zip(map_names, candidate_energies_eV, maps):
+            panels.append(m)
+            titles.append(f"{e:.3f} eV dip prominence")
+            cmaps.append("magma")
+
+        # NaN pixels render fully transparent under matplotlib's default
+        # "bad" color, and show_2d's default norm (2nd-98th percentile,
+        # per panel) already filters NaN/inf before computing its limits
+        # -- no extra handling needed here.
+        fig, axs = show_2d(panels, title=titles, cmap=cmaps, cbar=True)
+        fig.suptitle(
+            "Per-pixel spatial maps of validated bump candidates (2nd-derivative/slope-change)",
+            fontsize=10,
+        )
+        plt.show()
+
+    return {
+        **result_maps,
+        "failed_pixel_counts": failed_pixel_counts,
+        "correlation_with_thickness": correlation_with_thickness,
+        "correlation_with_adf": correlation_with_adf,
+    }
+
+
+def detect_peaks_whole_range(
+    dataset,
+    *,
+    exclude_windows=(),
+    energy_range=None,
+    smoothing_window_eV: float = 2.0,
+    polyorder: int = 3,
+    prominence_sigma: float = 5.0,
+    min_prominence_fraction: float = 0.15,
+    min_prominence: Optional[float] = None,
+    min_distance_eV: float = 1.0,
+    edge_guard_eV: float = 0.5,
+    check_reproducibility: bool = True,
+    reproducibility_tol_eV: float = 0.15,
+    title: str = "",
+    display_energy_range=None,
+    show: bool = True,
+):
+    """
+    General peak detection on the mean spectrum over a WHOLE range (e.g. the entire high-loss axis), skipping
+    `exclude_windows` (typically the background-fit area, where the background-subtracted spectrum is zero by
+    construction). Unlike `detect_broad_bump_via_slope_change()` -- which looks for a faint bend riding on a
+    smooth decaying tail and needs a very smooth curve -- this finds ordinary local maxima of a
+    Savitzky-Golay-smoothed mean spectrum, so it works on a whole noisy core-loss spectrum.
+
+    `check_reproducibility=True` (default) also runs the same detection independently on two interleaved
+    pixel subsets (a checkerboard split -- not a left/right split, so a real spatial gradient across the scan
+    doesn't bias one half) and flags each peak `reproducible: True/False`: found in both halves within
+    `reproducibility_tol_eV`. This is how a genuine, sharp, very-high-SNR "peak" was previously traced to a
+    fixed detector pattern rather than a real spectral feature -- its per-pixel amplitude didn't track the
+    local signal, but a plain significance/prominence test alone could not tell it apart from a real edge
+    feature. A real edge or resonance is present in (most of) the pixels and survives the split; a fixed
+    detector artifact, present identically in every pixel, also survives it (this check does NOT catch that
+    case -- cross-check a suspiciously narrow, very high `snr` peak's per-pixel amplitude against local
+    signal/counts by hand, as was done here). What it DOES catch is a peak driven by a handful of outlier
+    pixels (e.g. one spike-affected region), which typically appears strongly in only one of the two halves.
+
+    Noise: sigma_y = 1.4826 * MAD of (mean spectrum - its smoothed curve); the noise left in the smoothed curve
+    is sigma_y times the norm of the smoothing filter's coefficients. That statistical noise is tiny for a mean over
+    hundreds of pixels, while a real spectrum carries a systematic ripple (detector pattern, correlated noise) many
+    times larger, so a peak must ALSO have a prominence of at least `min_prominence_fraction` of the smoothed curve's
+    dynamic range in the searched region. The threshold is max(`prominence_sigma` x noise,
+    `min_prominence_fraction` x range), or the absolute `min_prominence` if given. A peak must further be `min_distance_eV` from a stronger peak, and
+    lie at least `edge_guard_eV` away from an excluded window / the ends of the range (the smoother is unreliable
+    there). Each contiguous allowed stretch is searched separately so a peak cannot straddle an excluded window.
+
+    A wider `smoothing_window_eV` gives a smoother curve (fewer, broader peaks): correlated noise in core-loss data
+    needs 2-4 eV; broad features may need more.
+
+    Returns ``(peaks, figure_or_None)``; `peaks` is a list of dicts sorted by energy with ``energy_eV``,
+    ``height`` (of the smoothed curve), ``prominence``, ``fwhm_eV`` (width at half prominence), ``snr``
+    (prominence / smoothed-curve noise) and ``reproducible`` (True/False if `check_reproducibility`, else
+    None). The figure shows the raw mean, the smoothed curve, the peaks (labelled, hollow marker = not
+    reproducible) and the excluded windows (red).
+    """
+    e = np.asarray(dataset.energy_axis, dtype=float)
+    dE = float(np.median(np.diff(e)))
+    n = int(round(smoothing_window_eV / dE))
+    n += n % 2 == 0
+    n = max(n, polyorder + 2 + ((polyorder + 2) % 2 == 0))
+    if n > len(e):
+        raise ValueError(
+            f"smoothing_window_eV={smoothing_window_eV} eV needs {n} channels, the axis has only {len(e)}"
+        )
+    lo_r, hi_r = (
+        (float(e[0]), float(e[-1]))
+        if energy_range is None
+        else (float(energy_range[0]), float(energy_range[1]))
+    )
+    allowed = (e >= lo_r) & (e <= hi_r)
+    for lo, hi in exclude_windows:
+        allowed &= ~((e >= lo - edge_guard_eV) & (e <= hi + edge_guard_eV))
+    guard = int(round(edge_guard_eV / dE))
+    allowed[: n // 2 + guard] = False
+    allowed[len(e) - n // 2 - guard :] = False
+    dist = max(int(round(min_distance_eV / dE)), 1)
+
+    def _find(mean_spec):
+        """Same detection logic, parameterized on the mean spectrum -- reused for the full mean and each
+        checkerboard half. Returns (peaks_without_reproducibility_field, sigma_s, dyn_range, smooth)."""
+        smooth = savgol_filter(mean_spec, n, polyorder)
+        resid = (mean_spec - smooth)[allowed]
+        sigma_y = (
+            1.4826 * float(np.median(np.abs(resid - np.median(resid))))
+            if resid.size
+            else float("nan")
+        )
+        gain = float(np.linalg.norm(savgol_coeffs(n, polyorder)))
+        sigma_s = sigma_y * gain
+        searched = smooth[allowed]
+        dyn_range = float(searched.max() - searched.min()) if searched.size else 0.0
+        prom = (
+            float(min_prominence)
+            if min_prominence is not None
+            else max(prominence_sigma * sigma_s, min_prominence_fraction * dyn_range)
+        )
+        found = []
+        idx = np.flatnonzero(allowed)
+        if idx.size:
+            splits = np.flatnonzero(np.diff(idx) > 1) + 1
+            for seg in np.split(idx, splits):
+                if len(seg) < 5:
+                    continue
+                y = smooth[seg]
+                pk, props = find_peaks(y, prominence=prom, distance=dist)
+                if len(pk):
+                    widths = peak_widths(y, pk, rel_height=0.5)[0] * dE
+                    for j, k in enumerate(pk):
+                        found.append(
+                            dict(
+                                energy_eV=float(e[seg][k]),
+                                height=float(y[k]),
+                                prominence=float(props["prominences"][j]),
+                                fwhm_eV=float(widths[j]),
+                                snr=float(props["prominences"][j] / sigma_s)
+                                if sigma_s > 0
+                                else float("inf"),
+                            )
+                        )
+        return found, sigma_s, dyn_range, smooth
+
+    m = np.asarray(dataset.calculate_mean_spectrum(), dtype=float)
+    peaks, sigma_s, dyn_range, smooth = _find(m)
+    peaks.sort(key=lambda d: d["energy_eV"])
+
+    if check_reproducibility and peaks:
+        arr = np.asarray(dataset.array, dtype=float)
+        ny, nx = arr.shape[:2]
+        checker = np.add.outer(np.arange(ny), np.arange(nx)) % 2 == 0
+        half_peaks = []
+        for mask in (checker, ~checker):
+            if mask.sum() < 2:  # e.g. a 1x1 dataset: nothing to split
+                half_peaks.append([])
+                continue
+            hp, *_ = _find(arr[mask].mean(axis=0))
+            half_peaks.append(hp)
+        for d in peaks:
+            d["reproducible"] = all(
+                any(abs(d["energy_eV"] - h["energy_eV"]) <= reproducibility_tol_eV for h in hp)
+                for hp in half_peaks
+            )
+    elif peaks:
+        for d in peaks:
+            d["reproducible"] = None  # not checked
+
+    print(
+        f"peak detection over {lo_r:g}-{hi_r:g} eV excluding {[tuple(w) for w in exclude_windows]}: smoothing {smoothing_window_eV} eV "
+        f"({n} channels, order {polyorder}), noise of smoothed curve {sigma_s:.3g}, range {dyn_range:.3g}, min prominence "
+        f"{max(prominence_sigma * sigma_s, min_prominence_fraction * dyn_range) if min_prominence is None else min_prominence:.3g}"
+    )
+    if peaks:
+        print(
+            f"{'energy (eV)':>12s} {'height':>9s} {'prominence':>11s} {'FWHM (eV)':>10s} {'prom/noise':>11s}  reproducible (both pixel halves)"
+        )
+        for d in peaks:
+            rep = "-" if d["reproducible"] is None else ("yes" if d["reproducible"] else "NO")
+            print(
+                f"{d['energy_eV']:12.2f} {d['height']:9.3g} {d['prominence']:11.3g} {d['fwhm_eV']:10.2f} {d['snr']:11.1f}  {rep}"
+            )
+        if check_reproducibility and not all(d["reproducible"] for d in peaks):
+            print(
+                "  -> peaks flagged NOT reproducible are driven by a subset of pixels (e.g. one hot/spike-affected "
+                "region), not a signal present across the scan -- treat with more suspicion than the others."
+            )
+    else:
+        print("  -> no peaks found.")
+
+    fig = None
+    if show:
+        fig, ax = plt.subplots(figsize=(11, 4.6))
+        ax.plot(e, m, color="0.65", lw=0.8, label="mean spectrum")
+        ax.plot(
+            e,
+            np.where(allowed, smooth, np.nan),
+            "b-",
+            lw=1.6,
+            label=f"smoothed ({smoothing_window_eV:g} eV, order {polyorder})",
+        )
+        ax.plot(
+            e,
+            np.where(allowed, np.nan, smooth),
+            color="0.5",
+            lw=1.0,
+            ls=":",
+            label="smoothed (not searched)",
+        )
+        for lo, hi in exclude_windows:
+            ax.axvspan(lo, hi, color="red", alpha=0.12)
+        rep = [d for d in peaks if d["reproducible"] is not False]
+        not_rep = [d for d in peaks if d["reproducible"] is False]
+        ax.plot(
+            [d["energy_eV"] for d in rep],
+            [d["height"] for d in rep],
+            "rv",
+            ms=8,
+            label="detected peaks",
+        )
+        if not_rep:
+            ax.plot(
+                [d["energy_eV"] for d in not_rep],
+                [d["height"] for d in not_rep],
+                "v",
+                ms=9,
+                mfc="none",
+                mec="darkred",
+                mew=1.6,
+                label="NOT reproducible (both pixel halves)",
+            )
+        for d in peaks:
+            ax.annotate(
+                f"{d['energy_eV']:.1f}",
+                (d["energy_eV"], d["height"]),
+                textcoords="offset points",
+                xytext=(0, 8),
+                ha="center",
+                fontsize=8,
+                color="darkred",
+            )
+        ax.set_xlim(*(display_energy_range or (lo_r, hi_r)))
+        vis = (e >= ax.get_xlim()[0]) & (e <= ax.get_xlim()[1])
+        if vis.any():
+            y0, y1 = float(np.nanmin(m[vis])), float(np.nanmax(m[vis]))
+            ax.set_ylim(y0 - 0.05 * (y1 - y0), y1 + 0.12 * (y1 - y0))
+        ax.set_xlabel("Energy loss (eV)")
+        ax.set_ylabel("Mean intensity")
+        ax.set_title(
+            _wrap_title(
+                f"{title}: general peak detection (red = excluded from the search)".strip(" :"),
+                110,
+            ),
+            fontsize=10,
+        )
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        plt.show()
+    return peaks, fig

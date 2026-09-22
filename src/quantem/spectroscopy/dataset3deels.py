@@ -11,6 +11,12 @@ from scipy.optimize import curve_fit
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy
 from quantem.spectroscopy.spectroscopy_visualzitions import (
+    detect_broad_bump_via_slope_change as _detect_broad_bump_via_slope_change,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    detect_peaks_whole_range as _detect_peaks_whole_range,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
     interpret_thickness_quality as _visualize_thickness_quality,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
@@ -39,6 +45,9 @@ from quantem.spectroscopy.utils import (
 )
 from quantem.spectroscopy.utils import (
     robustness_check_near_zlp as _robustness_check_near_zlp,
+)
+from quantem.spectroscopy.utils import (
+    subtract_background_two_sided as _subtract_background_two_sided,
 )
 from quantem.spectroscopy.utils import (
     suggest_spike_ranges as _suggest_spike_ranges,
@@ -256,6 +265,9 @@ class Dataset3deels(Dataset3dspectroscopy):
     auto_hl_config = _auto_hl_config
     auto_ll_pre_edge_range = _auto_ll_pre_edge_range
     robustness_check_near_zlp = _robustness_check_near_zlp
+    subtract_background_two_sided = _subtract_background_two_sided
+    detect_peaks_whole_range = _detect_peaks_whole_range
+    detect_broad_bump_via_slope_change = _detect_broad_bump_via_slope_change
 
     def __init__(
         self,

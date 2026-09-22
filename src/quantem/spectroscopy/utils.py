@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 from scipy.stats import pearsonr
 
@@ -1004,3 +1005,196 @@ def robustness_check_near_zlp(
 
     base["robustness"] = robustness
     return base
+
+
+def _block_mean(arr, factor):
+    """Average `factor` x `factor` real-space blocks of a (ny, nx, n_energy) cube. Edge blocks that are not
+    full are averaged over the pixels they contain. Returns (binned, iy, ix) where iy / ix map every original
+    row / column to its block index."""
+    arr = np.asarray(arr, dtype=float)
+    ny, nx = arr.shape[:2]
+    starts_y, starts_x = np.arange(0, ny, factor), np.arange(0, nx, factor)
+    summed = np.add.reduceat(np.add.reduceat(arr, starts_y, axis=0), starts_x, axis=1)
+    counts = np.outer(np.diff(np.append(starts_y, ny)), np.diff(np.append(starts_x, nx)))
+    return summed / counts[..., None], np.arange(ny) // factor, np.arange(nx) // factor
+
+
+def subtract_background_two_sided(
+    dataset,
+    fit_windows: Sequence[Tuple[float, float]],
+    *,
+    form: str = "powerlaw_const",
+    polynomial_degree: int = 2,
+    bin_factor: int = 1,
+    free_offset: bool = True,
+    clip_negative: bool = False,
+    exclude_windows: Sequence[Tuple[float, float]] = (),
+    return_details: bool = False,
+):
+    """
+    Background subtraction with fit windows on BOTH sides of the features of interest (interpolation across
+    them instead of extrapolation from one side), for any 3D spectroscopy dataset (LL, HL, ...).
+
+    The functional shape is fixed on the *mean* spectrum, and only the few linear coefficients are fitted per
+    pixel -- far more stable at low counts than an independent nonlinear fit in every pixel:
+
+    * ``form="powerlaw_const"`` : A*E^-r + c. r (and c) are fitted on the mean spectrum in `fit_windows`; each
+      pixel then gets its own A and (if `free_offset`) its own c by linear least squares. With
+      ``free_offset=False`` the per-pixel model is A*(E^-r + c_mean/A_mean): the mean's shape, scaled.
+    * ``form="powerlaw_curved"``: A*E^-r*exp(s*ln(E)^2) + c -- a power law whose exponent changes slowly with
+      energy (a parabola in log-log). A ZLP tail is not a pure power law over an eV or more (its wings bend), so
+      this often leaves a flatter baseline than ``powerlaw_const`` when the windows are far apart; r, s, c come
+      from the mean, A (and c if `free_offset`) per pixel. More flexible => check that it does not absorb real
+      broad features (it needs windows on both sides of them).
+    * ``form="powerlaw"``       : A*E^-r with r from the mean, A per pixel.
+    * ``form="polynomial"``     : per-pixel polynomial of `polynomial_degree` (fitted directly per pixel).
+
+    ``bin_factor > 1`` averages `bin_factor` x `bin_factor` pixels **before the fitting**: the coefficients are
+    fitted on the binned spectra (less noise) and each original pixel takes the coefficients of its block; the
+    background is then subtracted from the original, full-resolution spectra. So the output keeps the input's
+    spatial shape (use ``dataset.bin(bin_factor, axes=(0, 1), reducer="mean")`` if you want a binned cube
+    instead -- note that it drops incomplete edge blocks, which this function keeps).
+
+    ``exclude_windows`` -- (lo, hi) eV ranges that are NEVER used for the fit, even where they overlap
+    `fit_windows` (e.g. a real peak, a plasmon, a reaction feature): they are removed from the fit mask. They
+    are still subtracted from like everything else, only the fit ignores them.
+
+    Power-law forms need E > 0 in the fit windows. Channels at E <= 0 (pre-ZLP) get no subtraction (the model
+    is undefined there); near E ~ 0+ the power law is huge, so crop the ZLP region afterwards (the notebooks
+    do: LL is trimmed to >= 0.3 eV). Negative results are kept by default (`clip_negative=False`) -- clipping
+    to 0 is what turns an over-subtraction into flat, empty maps.
+
+    Returns the background-subtracted dataset (a new object, input untouched); with ``return_details=True``
+    also a dict with the fitted shape (``r``, ``c``), the windows, the binned block count and the per-pixel
+    background cube ``background`` (same shape as the input).
+    """
+    energy = np.asarray(dataset.energy_axis, dtype=float)
+    data = np.asarray(dataset.array, dtype=float)
+    wins = [(float(lo), float(hi)) for lo, hi in fit_windows]
+    if not wins:
+        raise ValueError("fit_windows must contain at least one (lo, hi) window")
+    for lo, hi in wins:
+        if not lo < hi:
+            raise ValueError(f"fit window must have lo < hi, got ({lo}, {hi})")
+        if lo < energy[0] or hi > energy[-1]:
+            raise ValueError(
+                f"fit window ({lo}, {hi}) eV is outside the energy axis [{energy[0]:.3f}, {energy[-1]:.3f}] eV "
+                "(fit_windows_inside_axis() can adapt it)"
+            )
+    fit = np.zeros(energy.shape, dtype=bool)
+    for lo, hi in wins:
+        fit |= (energy >= lo) & (energy <= hi)
+    excl = [(float(lo), float(hi)) for lo, hi in exclude_windows]
+    for lo, hi in excl:
+        fit &= ~((energy >= lo) & (energy <= hi))
+    n_params = {
+        "powerlaw": 1,
+        "powerlaw_const": 2 if free_offset else 1,
+        "powerlaw_curved": 2 if free_offset else 1,
+        "polynomial": int(polynomial_degree) + 1,
+    }
+    if form not in n_params:
+        raise ValueError(f"form must be one of {sorted(n_params)}, got {form!r}")
+    if fit.sum() < n_params[form] + (5 if form == "powerlaw_curved" else 3):
+        raise ValueError(
+            f"only {int(fit.sum())} channels left in the fit windows after exclude_windows -- too few for form={form!r}"
+        )
+    if form != "polynomial" and np.any(energy[fit] <= 0):
+        raise ValueError("power-law forms need fit windows entirely above 0 eV")
+
+    bin_factor = int(bin_factor)
+    if bin_factor > 1:
+        fit_cube, iy, ix = _block_mean(data, bin_factor)
+    else:
+        fit_cube, iy, ix = data, np.arange(data.shape[0]), np.arange(data.shape[1])
+    ny_b, nx_b = fit_cube.shape[:2]
+    Y = fit_cube[:, :, fit].reshape(ny_b * nx_b, -1)  # (n_binned_pixels, n_fit_channels)
+
+    mean_spec = data.reshape(-1, data.shape[2]).mean(axis=0)
+    details = dict(
+        windows=wins,
+        exclude_windows=excl,
+        fit_mask=fit,
+        form=form,
+        bin_factor=bin_factor,
+        r=None,
+        c=None,
+        s=None,
+    )
+    if form == "polynomial":
+        basis_fit = np.vander(energy[fit], int(polynomial_degree) + 1, increasing=True)
+        basis_all = np.vander(energy, int(polynomial_degree) + 1, increasing=True)
+    else:
+        s_curv = 0.0
+        y_fit = mean_spec[fit]
+        a0 = float(np.max(y_fit))
+        chain = {
+            "powerlaw_curved": ("powerlaw_curved", "powerlaw_const", "powerlaw"),
+            "powerlaw_const": ("powerlaw_const", "powerlaw"),
+            "powerlaw": ("powerlaw",),
+        }[form]
+        for (
+            form_try
+        ) in chain:  # a nonlinear fit that does not converge falls back to the next simpler shape
+            try:
+                if form_try == "powerlaw":
+                    slope, _ = np.polyfit(
+                        np.log(energy[fit]), np.log(np.clip(y_fit, 1e-12, None)), 1
+                    )
+                    r, c_mean, a_mean = -float(slope), 0.0, 1.0
+                elif form_try == "powerlaw_const":
+                    f = lambda x, a, r_, c_: a * x ** (-r_) + c_  # noqa: E731
+                    popt, _ = curve_fit(f, energy[fit], y_fit, p0=(a0, 2.0, 0.0), maxfev=20000)
+                    a_mean, r, c_mean = (float(v) for v in popt)
+                else:
+                    f = lambda x, a, r_, s_, c_: a * x ** (-r_) * np.exp(s_ * np.log(x) ** 2) + c_  # noqa: E731
+                    popt, _ = curve_fit(
+                        f, energy[fit], y_fit, p0=(a0, 2.0, 0.0, 0.0), maxfev=50000
+                    )
+                    a_mean, r, s_curv, c_mean = (float(v) for v in popt)
+                break
+            except (RuntimeError, ValueError):
+                continue
+        else:
+            raise RuntimeError(
+                "none of the tail shapes could be fitted to the mean spectrum in the fit windows"
+            )
+        if form_try != form:
+            warnings.warn(
+                f"subtract_background_two_sided: form {form!r} did not converge on the mean spectrum; used {form_try!r}"
+            )
+        form = form_try
+        details.update(r=r, c=c_mean, s=s_curv, form=form)
+
+        def shape(x):
+            # x<=0 (pre-ZLP) channels are masked out by the outer np.where anyway, but numpy still evaluates
+            # both branches eagerly -- clip to a tiny positive value first so that branch never sees 0/negative
+            # input (log(0), 0**-r) and warns.
+            xs = np.where(x > 0, x, 1e-6)
+            return np.where(x > 0, xs ** (-r) * np.exp(s_curv * np.log(xs) ** 2), 0.0)
+
+        g_fit, g_all = shape(energy[fit]), shape(energy)
+        with_offset = form in ("powerlaw_const", "powerlaw_curved")
+        if with_offset and free_offset:
+            basis_fit = np.stack([g_fit, np.ones_like(g_fit)], axis=1)
+            basis_all = np.stack([g_all, np.where(energy > 0, 1.0, 0.0)], axis=1)
+        else:  # single shape scaled per pixel (offset, if any, is part of the mean's shape)
+            off = c_mean / a_mean if with_offset else 0.0
+            basis_fit = (g_fit + off)[:, None]
+            basis_all = np.where(energy > 0, g_all + off, 0.0)[:, None]
+
+    coef = Y @ np.linalg.pinv(basis_fit).T  # (n_binned_pixels, n_params)
+    bg_binned = (coef @ basis_all.T).reshape(ny_b, nx_b, -1)
+    background = bg_binned[iy][:, ix]  # nearest-neighbour back to the original pixel grid
+    result = data - background
+    if clip_negative:
+        result = np.clip(result, 0.0, None)
+
+    out = dataset.copy()
+    out.array = result
+    out.name = f"{dataset.name} (two-sided {form} background subtracted)"
+    if return_details:
+        details["background"] = background
+        details["n_blocks"] = ny_b * nx_b
+        return out, details
+    return out
