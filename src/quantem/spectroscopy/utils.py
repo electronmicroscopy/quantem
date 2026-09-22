@@ -1198,3 +1198,117 @@ def subtract_background_two_sided(
         details["n_blocks"] = ny_b * nx_b
         return out, details
     return out
+
+
+def summarize_energy_windows(dataset, windows):
+    """
+    Per energy window, what does the (background-subtracted) data actually contain? For every window the
+    per-pixel window mean (mean over the window's channels, as in the energy-window maps) is taken and summarised:
+
+    * ``mean`` / ``sem`` -- mean over pixels and its standard error (spatial std / sqrt(n_pixels));
+    * ``t`` -- mean / sem, how many standard errors the window's signal sits from 0 (>~3 = clearly there);
+    * ``frac_positive`` -- fraction of pixels with a positive window mean (~0.5 = nothing but noise);
+    * ``spatial_cv`` -- spatial std / |mean|: >> 1 means the window is dominated by pixel-to-pixel noise, so its
+      map will look like noise even if the mean is significant;
+    * ``peak_eV`` / ``peak_value`` -- position and height of the maximum of the mean spectrum inside the window.
+
+    Returns a list of dicts (one per window, in order).
+    """
+    e = np.asarray(dataset.energy_axis, dtype=float)
+    arr = np.asarray(dataset.array, dtype=float)
+    mean_spec = arr.reshape(-1, arr.shape[2]).mean(axis=0)
+    rows = []
+    for lo, hi in windows:
+        k = (e >= lo) & (e <= hi)
+        if not k.any():
+            rows.append(dict(window=(lo, hi), n_channels=0))
+            continue
+        m = arr[:, :, k].mean(axis=-1).ravel()
+        sd = float(m.std(ddof=1)) if m.size > 1 else float("nan")
+        sem = sd / np.sqrt(m.size)
+        mean = float(m.mean())
+        j = int(np.argmax(mean_spec[k]))
+        rows.append(
+            dict(
+                window=(float(lo), float(hi)),
+                n_channels=int(k.sum()),
+                mean=mean,
+                sem=sem,
+                t=mean / sem if sem > 0 else float("nan"),
+                frac_positive=float(np.mean(m > 0)),
+                spatial_cv=sd / abs(mean) if mean != 0 else float("inf"),
+                peak_eV=float(e[k][j]),
+                peak_value=float(mean_spec[k][j]),
+            )
+        )
+    return rows
+
+
+def summarize_map_diagnostics(
+    maps: dict,
+    *,
+    adf: Optional[np.ndarray] = None,
+    thickness_map: Optional[np.ndarray] = None,
+    n_perm: int = 200,
+    seed: int = 0,
+) -> List[dict]:
+    """
+    For every ``{(lo, hi): 2D map}`` in ``maps``: is the map showing real spatial
+    structure, or does it just look interesting?
+
+    Combines :func:`spatial_coherence` (more structure than the same pixel values
+    shuffled at random -- Moran's I, permutation z/p) with
+    :func:`correlate_with_reference` against the ADF and/or thickness map, if given
+    (is the pattern just following material contrast or thickness).
+
+    This asks a different question than the window t-value of
+    :func:`summarize_energy_windows`: t asks whether the window's average signal is
+    above zero; this asks whether the signal varies coherently in space. A real,
+    uniform feature can have high t and low Moran's I; a weak, zero-mean feature
+    can still be spatially structured.
+
+    Returns
+    -------
+    list of dict
+        One per window, in ``maps`` order: ``window``, ``moran_i``, ``z``, ``p``,
+        ``n_valid``, and ``corr_adf`` / ``corr_thickness`` ({r, p, n}) when the
+        corresponding reference was given. :func:`plot_map_diagnostics` prints and
+        plots the same rows.
+    """
+    rows = []
+    for w in maps:
+        emap = maps[w]
+        sc = spatial_coherence(emap, n_perm=n_perm, seed=seed)
+        row = dict(window=w, **sc)
+        if adf is not None:
+            row["corr_adf"] = correlate_with_reference(emap, adf)
+        if thickness_map is not None:
+            row["corr_thickness"] = correlate_with_reference(emap, thickness_map)
+        rows.append(row)
+    return rows
+
+
+def _validate_pre_edge_window(lo, hi, energy_axis, target_edge=None) -> Tuple[float, float]:
+    """(lo, hi) must be finite, lo < hi, fully inside ``energy_axis``, and hi < ``target_edge``."""
+    energy_axis = np.asarray(energy_axis, dtype=float)
+    lo, hi = float(lo), float(hi)
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        raise ValueError(f"Background window bounds must be finite; got lo={lo} eV, hi={hi} eV")
+    if not lo < hi:
+        raise ValueError(f"Lower bound must be < upper bound; got lo={lo:.3f} eV, hi={hi:.3f} eV")
+    axis_lo, axis_hi = float(energy_axis[0]), float(energy_axis[-1])
+    if lo < axis_lo or hi > axis_hi:
+        raise ValueError(
+            f"Window [{lo:.3f}, {hi:.3f}] eV is not fully within the energy axis "
+            f"[{axis_lo:.3f}, {axis_hi:.3f}] eV"
+        )
+    if target_edge is not None:
+        target_edge = float(target_edge)
+        if not np.isfinite(target_edge):
+            raise ValueError(f"target_edge must be finite; got {target_edge}")
+        if not hi < target_edge:
+            raise ValueError(
+                f"Upper bound {hi:.3f} eV must be below target_edge={target_edge:.3f} eV "
+                "(the pre-edge fitting window must not reach the edge onset)."
+            )
+    return lo, hi

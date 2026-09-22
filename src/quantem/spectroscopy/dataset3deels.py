@@ -11,6 +11,9 @@ from scipy.optimize import curve_fit
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy
 from quantem.spectroscopy.spectroscopy_visualzitions import (
+    compare_background_methods as _compare_background_methods,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
     detect_broad_bump_via_slope_change as _detect_broad_bump_via_slope_change,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
@@ -26,6 +29,9 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
     plot_absolute_zlp_shift as _visualize_absolute_zlp_shift,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_background_fit_ranges as _plot_background_fit_ranges,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
     plot_dual_eels_picker as _visualize_dual_eels_picker,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
@@ -33,6 +39,9 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     plot_zlp_drift_diagnostics as _visualize_zlp_drift_diagnostics,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    show_energy_windows_with_peaks as _show_energy_windows_with_peaks,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     visualize_thickness_windows as _visualize_thickness_windows,
@@ -268,6 +277,9 @@ class Dataset3deels(Dataset3dspectroscopy):
     subtract_background_two_sided = _subtract_background_two_sided
     detect_peaks_whole_range = _detect_peaks_whole_range
     detect_broad_bump_via_slope_change = _detect_broad_bump_via_slope_change
+    show_energy_windows_with_peaks = _show_energy_windows_with_peaks
+    compare_background_methods = _compare_background_methods
+    plot_background_fit_ranges = _plot_background_fit_ranges
 
     def __init__(
         self,

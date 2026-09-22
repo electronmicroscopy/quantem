@@ -1,14 +1,23 @@
+import contextlib
+import io
 import textwrap
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
-from scipy.ndimage import median_filter
+from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.optimize import curve_fit
 from scipy.signal import find_peaks, peak_widths, savgol_coeffs, savgol_filter
 from scipy.stats import norm, pearsonr
 
 from quantem.core.visualization import show_2d
+from quantem.spectroscopy.utils import (
+    _validate_pre_edge_window,
+    detect_peaks_in_range,
+    summarize_energy_windows,
+    summarize_map_diagnostics,
+)
 
 
 def plot_attached_spectrum(
@@ -2636,3 +2645,1061 @@ def detect_peaks_whole_range(
         fig.tight_layout()
         plt.show()
     return peaks, fig
+
+
+def plot_energy_windows_summary(
+    dataset, windows, *, title="", display_energy_range=None, show=True
+):
+    """
+    Two panels: the mean spectrum with the energy windows shaded and numbered (dotted line = position of the
+    window's maximum), and the per-window signal (mean over pixels +/- standard error) as bars with the
+    t-value (signal / standard error) written on them. Prints the table from `summarize_energy_windows()`.
+    Returns ``(rows, figure_or_None)``.
+    """
+    rows = summarize_energy_windows(dataset, windows)
+    e = np.asarray(dataset.energy_axis, dtype=float)
+    mean_spec = np.asarray(dataset.calculate_mean_spectrum(), dtype=float)
+    print(
+        f"{'window (eV)':>16s} {'mean':>9s} {'sem':>8s} {'t':>7s} {'pixels>0':>9s} {'spatial CV':>11s}  peak of the mean spectrum"
+    )
+    for r in rows:
+        if r["n_channels"]:
+            print(
+                f"{r['window'][0]:7.2f}-{r['window'][1]:<8.2f} {r['mean']:9.4g} {r['sem']:8.3g} {r['t']:7.1f} "
+                f"{r['frac_positive']:9.2f} {r['spatial_cv']:11.1f}  {r['peak_value']:.3g} at {r['peak_eV']:.2f} eV"
+            )
+    fig = None
+    if show:
+        lo_all = min(w[0] for w in windows)
+        hi_all = max(w[1] for w in windows)
+        pad = 0.35 * (hi_all - lo_all)
+        xlim = display_energy_range or (
+            max(float(e[0]), lo_all - pad),
+            min(float(e[-1]), hi_all + pad),
+        )
+        fig, (ax1, ax2) = plt.subplots(
+            1, 2, figsize=(12, 4.2), gridspec_kw=dict(width_ratios=[2.2, 1])
+        )
+        ax1.plot(e, mean_spec, "k-", lw=1.3)
+        colors = plt.cm.tab10(np.arange(len(windows)))
+        for i, (r, (lo, hi)) in enumerate(zip(rows, windows)):
+            ax1.axvspan(lo, hi, color=colors[i], alpha=0.18)
+            ax1.text(
+                0.5 * (lo + hi),
+                0.97,
+                str(i + 1),
+                transform=ax1.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=11,
+                weight="bold",
+                color=colors[i],
+            )
+            if r["n_channels"]:
+                ax1.axvline(r["peak_eV"], color=colors[i], ls=":", lw=1.2)
+        ax1.set_xlim(*xlim)
+        vis = (e >= xlim[0]) & (e <= xlim[1])
+        if vis.any():
+            y0, y1 = float(mean_spec[vis].min()), float(mean_spec[vis].max())
+            ax1.set_ylim(y0 - 0.06 * (y1 - y0), y1 + 0.12 * (y1 - y0))
+        ax1.axhline(0, color="gray", ls="--", lw=0.8)
+        ax1.set_xlabel("Energy loss (eV)")
+        ax1.set_ylabel("Mean intensity")
+        ax1.set_title("mean spectrum and the energy windows")
+        ax1.grid(True, alpha=0.3)
+        vals = [r.get("mean", np.nan) for r in rows]
+        errs = [r.get("sem", np.nan) for r in rows]
+        ax2.bar(
+            range(1, len(rows) + 1),
+            vals,
+            yerr=errs,
+            color=colors[: len(rows)],
+            alpha=0.8,
+            capsize=4,
+        )
+        for i, r in enumerate(rows):
+            if r["n_channels"]:
+                ax2.text(
+                    i + 1,
+                    r["mean"] + (r["sem"] if r["mean"] >= 0 else -r["sem"]),
+                    f"t={r['t']:.1f}",
+                    ha="center",
+                    va="bottom" if r["mean"] >= 0 else "top",
+                    fontsize=8,
+                )
+        ax2.axhline(0, color="gray", lw=0.8)
+        ax2.set_xticks(range(1, len(rows) + 1))
+        ax2.set_xticklabels([f"{w[0]:g}-{w[1]:g}" for w in windows], fontsize=8, rotation=20)
+        ax2.set_ylabel("window mean +/- s.e.m. over pixels")
+        ax2.set_title("signal in each window")
+        ax2.grid(True, axis="y", alpha=0.3)
+        if title:
+            fig.suptitle(_wrap_title(title, 130), fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, 0.9 if title else 1))
+        plt.show()
+    return rows, fig
+
+
+def show_energy_windows_with_peaks(
+    eels_hl_bgsub,
+    energy_windows: Sequence[Tuple[float, float]],
+    *,
+    target_edge: Optional[float] = None,
+    display_energy_range: Optional[Tuple[float, float]] = None,
+    detect_peaks: bool = True,
+    peak_detection_method: str = "auto",
+    peak_kwargs: Optional[dict] = None,
+    show_peak_markers: bool = False,
+    show_peak_labels: bool = False,
+    show_second_derivative: bool = False,
+    show_peak_table: bool = True,
+    hover_annotations: bool = True,
+    enable_click_labels: bool = True,
+    click_label_snap_to_spectrum: bool = True,
+    click_label_precision: int = 2,
+    title_suffix: str = "",
+) -> Dict[Tuple[float, float], List[float]]:
+    """
+    NON-interactive preview (no prompts): plot the mean background-subtracted
+    HL spectrum with `energy_windows` shaded and a smoothed-curve overlay per
+    window, run peak detection (via detect_peaks_in_range()) and print a
+    summary regardless of what's drawn, and return the detected-peaks dict
+    -- a visual/printed aid for hand-editing the `energy_windows` tuple used
+    by the static show_energy_window_map() loop. Does not change or replace
+    that loop.
+
+    Default display is deliberately minimal: spectrum + smoothed overlay +
+    shaded windows + a peak-coordinate table underneath -- no vertical peak
+    lines, no in-plot text labels, no derivative subplot. Detection always
+    runs and is always printed/returned the same way regardless of these
+    display toggles; only what gets *drawn* changes.
+
+    Parameters
+    ----------
+    eels_hl_bgsub : Dataset3deels
+        Background-subtracted HL dataset.
+    energy_windows : sequence of (lo_eV, hi_eV)
+        The windows to shade (and, if detect_peaks, search for peaks in) --
+        e.g. pass the notebook's `energy_windows` tuple directly.
+    target_edge : float, optional
+        Reference vertical line only.
+    display_energy_range : (float, float), optional
+        (lo, hi) eV to zoom the plotted x-axis into. Purely a display crop
+        -- the full mean spectrum is still plotted and windows outside this
+        range are still shaded if they happen to be visible; peak detection
+        always runs over the full `energy_windows` regardless of this
+        range. Defaults to the dataset's full energy axis (no zoom).
+    detect_peaks : bool, default True
+        If False, just shades the windows -- no detection, no peak summary,
+        no peak table regardless of `show_peak_table`.
+    peak_detection_method : "max" | "local_maxima" | "shoulder" | "auto"
+        Passed to detect_peaks_in_range() for every window.
+    peak_kwargs : dict, optional
+        Method-specific kwargs (prominence/height/distance for local_maxima;
+        smooth_window/zero_crossing_threshold for shoulder), passed to
+        detect_peaks_in_range() for every window.
+    show_peak_markers : bool, default False
+        Draw a dashed vertical line at each detected peak.
+    show_peak_labels : bool, default False
+        Draw a boxed, rotated "X.XX eV" label at each detected peak
+        (staggered to increasing heights when peaks are close together in
+        energy, so labels don't overlap, with the y-axis expanded to keep
+        them fully inside the axes). Implies `show_peak_markers=True`
+        regardless of that argument's own value -- a label with no line
+        pointing at it isn't useful.
+    show_second_derivative : bool, default False
+        If True and peak_detection_method is "shoulder" or "auto", adds a
+        subplot showing the (smoothed) 2nd derivative used by the shoulder
+        method, for debugging/validation.
+    show_peak_table : bool, default True
+        Adds a compact table beneath the plot(s) listing every window and
+        its detected peak energies in plain text. Each row's border is
+        color-matched to that window's shading color. No-ops if
+        `detect_peaks=False` or there are no windows.
+    hover_annotations : bool, default True
+        Adds a mouse-hover tooltip to the main spectrum axes showing the
+        nearest (energy, intensity) point on the mean spectrum as you move
+        the cursor anywhere over it -- not just near a marker -- plus which
+        energy window (if any) and nearest detected peak (if close enough).
+        Plain matplotlib event handling only (no extra dependency); needs an
+        interactive backend to actually fire mouse-move events -- with the
+        default static/Agg backend the plot renders exactly the same and
+        the tooltip just never appears. In a notebook, run
+        `%matplotlib widget` (ipympl) once before this cell to enable it.
+    enable_click_labels : bool, default True
+        On the main spectrum axes only (same interactive-backend caveat as
+        `hover_annotations` -- a no-op under the static Agg backend):
+        left-click anywhere on the axes to permanently pin a coordinate
+        label there; right-click an existing pinned label to delete just
+        that one; press 'c' (with the plot focused) to clear all of them.
+        New labels are staggered away from existing ones that are close in
+        energy, same idea as the peak labels, to avoid overlap. Purely a
+        display feature -- never touches peak detection or the returned
+        dict.
+    click_label_snap_to_spectrum : bool, default True
+        If True, a click's label position snaps to the nearest actual
+        (energy, intensity) sample on the mean spectrum (found via
+        np.searchsorted), so the pinned coordinate is always a real data
+        point. If False, the label uses the raw clicked position instead.
+    click_label_precision : int, default 2
+        Decimal places shown in pinned-label text, e.g. `(539.37, 12.51)`.
+
+    The smoothed curve overlaid per window uses the exact same
+    (window-width-adaptive, unless overridden) sigma detect_peaks_in_range()
+    uses internally -- what you see is what was detected on.
+
+    Returns
+    -------
+    dict {(lo, hi): [peak_eV, ...]} -- empty list per window if
+    detect_peaks=False or none were found.
+    """
+    peak_kwargs = dict(peak_kwargs or {})
+    energy_axis = np.asarray(eels_hl_bgsub.energy_axis, dtype=float)
+    mean_spec = eels_hl_bgsub.calculate_mean_spectrum()
+
+    # Shared label-placement scale, reused by both the (optional) peak
+    # labels and the click-pinned labels below, so both use the same
+    # "how close counts as overlapping" / "how far apart to stagger" sense
+    # of scale.
+    x_span = float(energy_axis[-1] - energy_axis[0]) or 1.0
+    close_threshold = 0.035 * x_span
+    data_range = float(mean_spec.max() - mean_spec.min()) or 1.0
+    label_step = 0.10 * data_range
+
+    # A label with no marker pointing at it isn't useful.
+    show_peak_markers = show_peak_markers or show_peak_labels
+
+    want_second_deriv_plot = show_second_derivative and peak_detection_method in (
+        "shoulder",
+        "auto",
+    )
+    want_table = show_peak_table and detect_peaks and len(energy_windows) > 0
+
+    n_plot_axes = 2 if want_second_deriv_plot else 1
+    n_total = n_plot_axes + (1 if want_table else 0)
+    height_ratios = [3] * n_plot_axes + (
+        [max(1.0, 0.42 * len(energy_windows) + 0.6)] if want_table else []
+    )
+    fig, all_axes = plt.subplots(
+        n_total,
+        1,
+        figsize=(9, 5 * n_plot_axes + (height_ratios[-1] if want_table else 0)),
+        gridspec_kw={"height_ratios": height_ratios},
+    )
+    all_axes = np.atleast_1d(all_axes)
+    plot_axes = list(all_axes[:n_plot_axes])
+    table_ax = all_axes[n_plot_axes] if want_table else None
+    for a in plot_axes[1:]:
+        a.sharex(plot_axes[0])
+
+    ax = plot_axes[0]
+    ax.plot(energy_axis, mean_spec, "k-", lw=1.2, label="Mean HL spectrum (bg-subtracted)")
+
+    colors = plt.cm.tab10.colors
+    detected: Dict[Tuple[float, float], List[float]] = {}
+    smoothed_by_window: Dict[Tuple[float, float], Tuple[np.ndarray, np.ndarray]] = {}
+    all_peak_points: List[Tuple[float, float, str]] = []  # (x, y, color) across every window
+
+    print(
+        "Detected peaks in energy windows:"
+        if detect_peaks
+        else "Energy windows (peak detection disabled):"
+    )
+    for i, (lo, hi) in enumerate(energy_windows):
+        color = colors[i % len(colors)]
+        ax.axvspan(lo, hi, alpha=0.25, color=color, label=f"[{lo:.2f}, {hi:.2f}] eV")
+
+        # Same adaptive-sigma formula detect_peaks_in_range() uses
+        # internally (window-width-scaled unless smooth_window is
+        # explicitly overridden in peak_kwargs), so the overlaid curve is
+        # exactly what detection saw for this window, not an approximation.
+        win_mask = (energy_axis >= lo) & (energy_axis <= hi)
+        n_window_points = int(np.sum(win_mask))
+        smooth_window_fraction = peak_kwargs.get("smooth_window_fraction", 0.04)
+        default_sigma = (
+            max(2, round(smooth_window_fraction * n_window_points)) if n_window_points else 2
+        )
+        win_sigma = peak_kwargs.get("smooth_window", default_sigma)
+        win_smoothed = gaussian_filter1d(mean_spec, sigma=win_sigma) if win_sigma else mean_spec
+        smoothed_by_window[(lo, hi)] = (win_smoothed, win_mask)
+
+        ax.plot(
+            energy_axis[win_mask],
+            win_smoothed[win_mask],
+            color=color,
+            lw=2.0,
+            alpha=0.9,
+            label="smoothed (per window)" if i == 0 else None,
+        )
+
+        if not detect_peaks:
+            detected[(lo, hi)] = []
+            print(f"  Window ({lo}, {hi}) eV")
+            continue
+
+        # Detection (and its console printout) always runs, unaffected by
+        # what's drawn -- only the code below this point decides what to
+        # plot from the results.
+        peaks = detect_peaks_in_range(
+            mean_spec, energy_axis, (lo, hi), method=peak_detection_method, **peak_kwargs
+        )
+        detected[(lo, hi)] = peaks
+        print(
+            f"  Window ({lo}, {hi}) eV: {[round(p, 2) for p in peaks]} eV"
+            if peaks
+            else f"  Window ({lo}, {hi}) eV: [no peaks detected]"
+        )
+
+        if show_peak_markers:
+            for p in peaks:
+                ax.axvline(p, color=color, linestyle="--", linewidth=1, alpha=0.85)
+                if show_peak_labels:
+                    y = float(np.interp(p, energy_axis, mean_spec))
+                    all_peak_points.append((p, y, color))
+
+    # Place every peak's label in one pass across ALL windows together (not
+    # per-window) so labels that are close in energy but belong to
+    # different windows still get staggered relative to each other, not
+    # just within their own window.
+    if show_peak_labels and all_peak_points:
+        all_peak_points.sort(key=lambda t: t[0])
+        max_stagger_levels = 5
+
+        levels = []
+        last_x = None
+        level = 0
+        for x_p, _, _ in all_peak_points:
+            if last_x is not None and (x_p - last_x) < close_threshold:
+                level = (level + 1) % max_stagger_levels
+            else:
+                level = 0
+            levels.append(level)
+            last_x = x_p
+
+        for (x_p, y_p, color), level in zip(all_peak_points, levels):
+            label_y = y_p + (level + 1) * label_step
+            ax.annotate(
+                f"{x_p:.2f} eV",
+                xy=(x_p, y_p),
+                xytext=(x_p, label_y),
+                textcoords="data",
+                rotation=90,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=color,
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor="white",
+                    edgecolor=color,
+                    alpha=0.85,
+                    linewidth=1.3,
+                ),
+                arrowprops=dict(arrowstyle="-", color=color, lw=0.8, alpha=0.7),
+                zorder=6,
+            )
+
+        # Reserve enough headroom (based on the tallest stack of labels
+        # actually used) so labels sit fully inside the axes -- not cut off
+        # at the top -- instead of relying on autoscale to guess.
+        max_level_used = max(levels)
+        ax.set_ylim(
+            mean_spec.min() - 0.05 * data_range,
+            mean_spec.max() + (max_level_used + 2) * label_step,
+        )
+
+    if target_edge is not None:
+        ax.axvline(
+            target_edge,
+            color="tab:orange",
+            ls=":",
+            lw=2,
+            label=f"target_edge = {float(target_edge):.2f} eV",
+        )
+
+    ax.set_xlabel("Energy loss (eV)")
+    ax.set_ylabel("Intensity")
+    ax.set_title(
+        "Energy windows for chemical maps"
+        + (" + detected peaks" if detect_peaks else "")
+        + (f"\n{_wrap_title(title_suffix, 85)}" if title_suffix else ""),
+        fontsize=10,
+    )
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    if display_energy_range is not None:
+        d_lo, d_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(d_lo) and np.isfinite(d_hi) and d_lo < d_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        # ax2 (if present) shares its x-axis with ax, so this zooms both.
+        ax.set_xlim(d_lo, d_hi)
+
+    if hover_annotations:
+        # Plain matplotlib event handling -- no extra dependency (e.g.
+        # mplcursors isn't installed here). Only fires with an interactive
+        # backend (e.g. `%matplotlib widget` via ipympl); with the static
+        # Agg backend this sets up harmlessly and the tooltip just never
+        # appears since no mouse-move events occur.
+        hover_annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(15, 15),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="lightyellow", ec="gray", alpha=0.95),
+            arrowprops=dict(arrowstyle="->"),
+            fontsize=9,
+            visible=False,
+            zorder=10,
+        )
+        hover_windows = list(energy_windows)
+        hover_peak_tolerance = 0.02 * (float(energy_axis[-1] - energy_axis[0]) or 1.0)
+
+        def _on_hover(event):
+            if event.inaxes is not ax or event.xdata is None:
+                if hover_annot.get_visible():
+                    hover_annot.set_visible(False)
+                    fig.canvas.draw_idle()
+                return
+
+            idx = int(np.searchsorted(energy_axis, event.xdata))
+            idx = min(max(idx, 0), len(energy_axis) - 1)
+            if idx > 0 and abs(energy_axis[idx - 1] - event.xdata) < abs(
+                energy_axis[idx] - event.xdata
+            ):
+                idx -= 1
+            e_val = float(energy_axis[idx])
+            i_val = float(mean_spec[idx])
+
+            lines = [f"Energy: {e_val:.2f} eV", f"Intensity: {i_val:.2f}"]
+
+            for lo, hi in hover_windows:
+                if lo <= e_val <= hi:
+                    lines.append(f"Window: [{lo:.2f}, {hi:.2f}] eV")
+                    break
+
+            all_peaks_flat = [p for peaks in detected.values() for p in peaks]
+            if all_peaks_flat:
+                nearest_peak = min(all_peaks_flat, key=lambda p: abs(p - e_val))
+                if abs(nearest_peak - e_val) <= hover_peak_tolerance:
+                    lines.append(f"Nearest detected peak: {nearest_peak:.2f} eV")
+
+            hover_annot.xy = (e_val, i_val)
+            hover_annot.set_text("\n".join(lines))
+            if not hover_annot.get_visible():
+                hover_annot.set_visible(True)
+            fig.canvas.draw_idle()
+
+        hover_callback_id = fig.canvas.mpl_connect("motion_notify_event", _on_hover)
+        # Keep strong references so the callback and annotation aren't
+        # garbage-collected once this function returns.
+        fig._eels_hover_callback = hover_callback_id
+        fig._eels_hover_annotation = hover_annot
+
+    if enable_click_labels:
+        # Manual click-to-pin coordinate labels on the main spectrum axes
+        # only. Plain matplotlib event handling, same reasoning as the
+        # hover tooltip above: harmless under a static/Agg backend (the
+        # callbacks just never fire), needs an interactive backend (e.g.
+        # `%matplotlib widget`) to actually respond to clicks/key presses.
+        # Purely a display feature -- never touches detection or `detected`.
+        pinned_labels: List[dict] = []
+        click_hit_radius_px = 25
+
+        def _pin_label_at(x_click, y_click):
+            if click_label_snap_to_spectrum:
+                idx = int(np.searchsorted(energy_axis, x_click))
+                idx = min(max(idx, 0), len(energy_axis) - 1)
+                if idx > 0 and abs(energy_axis[idx - 1] - x_click) < abs(
+                    energy_axis[idx] - x_click
+                ):
+                    idx -= 1
+                x_val = float(energy_axis[idx])
+                y_val = float(mean_spec[idx])
+            else:
+                x_val = float(x_click)
+                y_val = (
+                    float(y_click)
+                    if y_click is not None
+                    else float(np.interp(x_click, energy_axis, mean_spec))
+                )
+
+            # Avoid overlap: pick the lowest stagger level not already used
+            # by an existing pinned label close to this one in energy.
+            used_levels = {
+                e["level"] for e in pinned_labels if abs(e["x"] - x_val) < close_threshold
+            }
+            level = 0
+            while level in used_levels:
+                level += 1
+            label_y = y_val + (level + 1) * label_step
+
+            artist = ax.annotate(
+                f"({x_val:.{click_label_precision}f}, {y_val:.{click_label_precision}f})",
+                xy=(x_val, y_val),
+                xytext=(x_val, label_y),
+                textcoords="data",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="black",
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor="white",
+                    edgecolor="black",
+                    alpha=0.9,
+                    linewidth=1.1,
+                ),
+                arrowprops=dict(arrowstyle="-", color="black", lw=0.8, alpha=0.7),
+                zorder=8,
+            )
+            pinned_labels.append(
+                {"x": x_val, "y": y_val, "level": level, "label_y": label_y, "artist": artist}
+            )
+
+            cur_bottom, cur_top = ax.get_ylim()
+            needed_top = label_y + 0.05 * data_range
+            if needed_top > cur_top:
+                ax.set_ylim(cur_bottom, needed_top)
+
+        def _delete_nearest_pinned_label(event):
+            if not pinned_labels:
+                return
+            best_i, best_dist = None, None
+            for i, entry in enumerate(pinned_labels):
+                px, py = ax.transData.transform((entry["x"], entry["label_y"]))
+                d = ((px - event.x) ** 2 + (py - event.y) ** 2) ** 0.5
+                if best_dist is None or d < best_dist:
+                    best_dist, best_i = d, i
+            if best_i is not None and best_dist <= click_hit_radius_px:
+                pinned_labels[best_i]["artist"].remove()
+                del pinned_labels[best_i]
+
+        def _on_click(event):
+            if event.inaxes is not ax or event.xdata is None:
+                return
+            if event.button == 1:  # left click -> pin a new label
+                _pin_label_at(event.xdata, event.ydata)
+                fig.canvas.draw_idle()
+            elif event.button == 3:  # right click -> delete nearest pinned label
+                _delete_nearest_pinned_label(event)
+                fig.canvas.draw_idle()
+
+        def _on_key(event):
+            if event.key == "c" and pinned_labels:
+                for entry in pinned_labels:
+                    entry["artist"].remove()
+                pinned_labels.clear()
+                fig.canvas.draw_idle()
+
+        click_callback_id = fig.canvas.mpl_connect("button_press_event", _on_click)
+        key_callback_id = fig.canvas.mpl_connect("key_press_event", _on_key)
+        # Keep strong references so callbacks/state aren't garbage-collected
+        # once this function returns.
+        fig._eels_click_label_callbacks = [click_callback_id, key_callback_id]
+        fig._eels_pinned_labels = pinned_labels
+
+    if want_second_deriv_plot:
+        ax2 = plot_axes[1]
+        # Per-window, using each window's own smoothed curve (same one
+        # plotted above and used by detect_peaks_in_range()) rather than one
+        # fixed-sigma curve for the whole spectrum -- otherwise this
+        # wouldn't match what detection actually saw for narrow vs. wide
+        # windows.
+        for i, (lo, hi) in enumerate(energy_windows):
+            win_smoothed, win_mask = smoothed_by_window[(lo, hi)]
+            second = np.gradient(np.gradient(win_smoothed, energy_axis), energy_axis)
+            ax2.plot(energy_axis[win_mask], second[win_mask], color=colors[i % len(colors)], lw=1)
+            ax2.axvspan(lo, hi, alpha=0.15, color=colors[i % len(colors)])
+        ax2.axhline(0, color="gray", ls="--", lw=1)
+        ax2.set_xlabel("Energy loss (eV)")
+        ax2.set_ylabel("2nd derivative")
+        ax2.set_title("2nd derivative (shoulder-method debugging)")
+        ax2.grid(True, alpha=0.3)
+
+    if want_table:
+        table_ax.axis("off")
+        col_labels = ["Energy window (eV)", "Detected peak(s) (eV)"]
+        cell_text = []
+        for i, (lo, hi) in enumerate(energy_windows):
+            peaks = detected.get((lo, hi), [])
+            peak_str = ", ".join(f"{p:.2f}" for p in peaks) if peaks else "no peaks detected"
+            cell_text.append([f"[{lo:.2f}, {hi:.2f}]", peak_str])
+
+        tbl = table_ax.table(
+            cellText=cell_text, colLabels=col_labels, loc="center", cellLoc="center"
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1, 1.5)
+        for i in range(len(energy_windows)):
+            color = colors[i % len(colors)]
+            for col in (0, 1):
+                cell = tbl[(i + 1, col)]  # +1: row 0 is the header
+                cell.set_edgecolor(color)
+                cell.set_linewidth(2)
+        table_ax.set_title("Peak coordinate summary", fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
+
+    return detected
+
+
+def plot_background_fit_ranges(
+    before,
+    after,
+    background,
+    *,
+    fit_windows,
+    ranges=((None,),),
+    n_pixels: int = 3,
+    exclude_windows=(),
+    title: str = "",
+    show: bool = True,
+):
+    """
+    Look at a background fit and its subtraction over SEVERAL energy ranges, to spot artifacts (over- or
+    under-subtraction, ringing at a fit-window edge, a step where the model stops being valid, binning
+    blocks, ...).
+
+    Figure 1 -- one column per energy range in `ranges` (each a (lo, hi) eV tuple, or None = full axis):
+        top    mean spectrum before subtraction (black) and the mean fitted background (red), y-scaled to
+               what is visible in that range;
+        bottom mean spectrum after subtraction, with the zero line, again y-scaled to the visible range.
+        The fit windows are shaded green in every panel. For a one-sided subtraction (`background=None`) the
+        bottom panel also shows the mean *without* the per-pixel clip at 0 (dashed): where the two differ, the
+        clip is inflating the mean of the saved result (the mean of max(noise, 0) is > 0).
+    Figure 2 -- the same three curves (before / background / after) for `n_pixels` individual pixels picked by
+        quantile of the intensity inside the fit windows (dim / typical / bright), over the first range, so a
+        problem that averages out in the mean but hits single pixels is visible.
+
+    Parameters
+    ----------
+    before, after : Dataset3deels-like
+        Spectra before and after the subtraction (same shape and energy axis).
+    background : ndarray (row, col, energy) or None
+        The fitted background cube (`subtract_background_two_sided(..., return_details=True)["background"]`).
+        If None (one-sided subtraction: a single curve subtracted from every pixel, result clipped at 0) the
+        curve is recovered from `before - after` as the per-channel maximum over pixels.
+    fit_windows : sequence of (lo, hi)
+        Windows the fit was made on (shaded green).
+    exclude_windows : sequence of (lo, hi)
+        Ranges kept out of the fit (shaded red).
+    """
+    energy = np.asarray(before.energy_axis, dtype=float)
+    e_after = np.asarray(after.energy_axis, dtype=float)
+    data = np.asarray(before.array, dtype=float)
+    res = np.asarray(after.array, dtype=float)
+    idx = np.abs(energy[None, :] - e_after[:, None]).argmin(
+        axis=1
+    )  # nearest channel (axes differ by rounding)
+    clipped_curve = None
+    if background is None:
+        # No per-pixel background given (one-sided subtraction: ONE fitted curve for the whole cube, and the result is
+        # clipped at 0 per pixel). before - after equals the curve only where a pixel was not clipped, and a clipped
+        # pixel gives before - 0 = before < curve -- so the per-channel MAXIMUM over pixels recovers the curve.
+        curve = np.full(energy.shape, np.nan)
+        curve[idx] = (data[:, :, idx] - res).reshape(-1, len(idx)).max(axis=0)
+        bg_full = np.broadcast_to(curve, data.shape).copy()
+        clipped_curve = curve
+    else:
+        bg_full = np.asarray(background, dtype=float)
+    res_full = np.full_like(data, np.nan)
+    res_full[:, :, idx] = res
+
+    mean_before = np.nanmean(data.reshape(-1, data.shape[2]), axis=0)
+    mean_bg = np.nanmean(bg_full.reshape(-1, data.shape[2]), axis=0)
+    mean_after = np.nanmean(res_full.reshape(-1, data.shape[2]), axis=0)
+
+    def _rng(r):
+        return (
+            (float(energy[0]), float(energy[-1]))
+            if r is None or r[0] is None
+            else (float(r[0]), float(r[1]))
+        )
+
+    def _scale(ax, x, *ys, lo_zero=False):
+        vis = (x >= ax.get_xlim()[0]) & (x <= ax.get_xlim()[1])
+        vals = np.concatenate([np.asarray(y)[vis][np.isfinite(np.asarray(y)[vis])] for y in ys])
+        if vals.size:
+            lo, hi = float(vals.min()), float(vals.max())
+            if lo_zero:
+                lo, hi = min(lo, 0.0), max(hi, 0.0)
+            pad = 0.06 * (hi - lo) if hi > lo else 1.0
+            ax.set_ylim(lo - pad, hi + pad)
+
+    figs = []
+    if show:
+        rr = [_rng(r if not isinstance(r, tuple) or len(r) == 2 else None) for r in ranges]
+        fig, axes = plt.subplots(2, len(rr), figsize=(4.6 * len(rr) + 1.5, 7.5), squeeze=False)
+        for j, (lo, hi) in enumerate(rr):
+            for i in (0, 1):
+                ax = axes[i, j]
+                for wl, wh in fit_windows:
+                    ax.axvspan(wl, wh, color="green", alpha=0.15)
+                for wl, wh in exclude_windows:
+                    ax.axvspan(wl, wh, color="red", alpha=0.10)
+                ax.set_xlim(lo, hi)
+                ax.grid(True, alpha=0.3)
+            axes[0, j].plot(energy, mean_before, "k-", lw=1.2, label="before (mean)")
+            axes[0, j].plot(energy, mean_bg, "r-", lw=1.2, label="fitted background (mean)")
+            _scale(axes[0, j], energy, mean_before, mean_bg)
+            axes[0, j].set_title(f"{lo:g} - {hi:g} eV")
+            axes[1, j].plot(
+                energy, mean_after, "b-", lw=1.2, label="after (mean of the saved result)"
+            )
+            ys = [mean_after]
+            if (
+                clipped_curve is not None
+            ):  # show what the mean would be without the per-pixel clip at 0
+                mean_unclipped = mean_before - clipped_curve
+                axes[1, j].plot(
+                    energy,
+                    mean_unclipped,
+                    "g--",
+                    lw=1.0,
+                    label="mean before - fitted curve (no clip)",
+                )
+                ys.append(mean_unclipped)
+            axes[1, j].axhline(0, color="gray", ls="--", lw=1)
+            _scale(axes[1, j], energy, *ys, lo_zero=True)
+            axes[1, j].set_xlabel("Energy loss (eV)")
+        axes[0, 0].set_ylabel("Intensity")
+        axes[1, 0].set_ylabel("after subtraction")
+        axes[0, 0].legend(fontsize=7, loc="best")
+        axes[1, 0].legend(fontsize=7, loc="best")
+        fig.suptitle(
+            _wrap_title(
+                f"{title}: background fit and subtraction, several ranges (green = fit windows, red = excluded from the fit)".strip(
+                    " :"
+                ),
+                150,
+            ),
+            fontsize=10,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+        plt.show()
+        figs.append(fig)
+
+        if n_pixels > 0:
+            in_fit = np.zeros(energy.shape, dtype=bool)
+            for wl, wh in fit_windows:
+                in_fit |= (energy >= wl) & (energy <= wh)
+            level = np.nanmean(data[:, :, in_fit], axis=-1).ravel()
+            order = np.argsort(level)
+            picks = [order[int(q * (len(order) - 1))] for q in np.linspace(0.1, 0.9, n_pixels)]
+            lo, hi = rr[0]
+            fig2, axs = plt.subplots(n_pixels, 2, figsize=(11, 3.0 * n_pixels), squeeze=False)
+            for k, flat in enumerate(picks):
+                r_, c_ = np.unravel_index(flat, data.shape[:2])
+                for ax in axs[k]:
+                    for wl, wh in fit_windows:
+                        ax.axvspan(wl, wh, color="green", alpha=0.15)
+                    for wl, wh in exclude_windows:
+                        ax.axvspan(wl, wh, color="red", alpha=0.10)
+                    ax.set_xlim(lo, hi)
+                    ax.grid(True, alpha=0.3)
+                axs[k, 0].plot(energy, data[r_, c_], "k-", lw=1, label="before")
+                axs[k, 0].plot(energy, bg_full[r_, c_], "r-", lw=1, label="background")
+                _scale(axs[k, 0], energy, data[r_, c_], bg_full[r_, c_])
+                axs[k, 1].plot(energy, res_full[r_, c_], "b-", lw=1, label="after")
+                axs[k, 1].axhline(0, color="gray", ls="--", lw=1)
+                _scale(axs[k, 1], energy, res_full[r_, c_], lo_zero=True)
+                axs[k, 0].set_ylabel(f"pixel ({r_}, {c_})")
+                if k == 0:
+                    axs[k, 0].legend(fontsize=7)
+                    axs[k, 1].legend(fontsize=7)
+            axs[-1, 0].set_xlabel("Energy loss (eV)")
+            axs[-1, 1].set_xlabel("Energy loss (eV)")
+            fig2.suptitle(
+                _wrap_title(
+                    f"{title}: single pixels (dim / typical / bright in the fit windows), {lo:g}-{hi:g} eV".strip(
+                        " :"
+                    ),
+                    110,
+                ),
+                fontsize=10,
+            )
+            fig2.tight_layout(rect=(0, 0, 1, 0.93))
+            plt.show()
+            figs.append(fig2)
+    return figs
+
+
+def compare_background_methods(
+    dataset,
+    *,
+    target_edge: float,
+    pre_edge_range: Tuple[float, float],
+    methods: Sequence[Tuple[str, str, int]] = (
+        ("powerlaw", "powerlaw", 0),
+        ("linear", "linear", 1),
+        ("polynomial deg 2", "polynomial", 2),
+        ("polynomial deg 3", "polynomial", 3),
+    ),
+    windows: Sequence[Tuple[float, float]] = (),
+    markers: Sequence[float] = (),
+    two_sided_windows: Optional[Sequence[Tuple[float, float]]] = None,
+    display_energy_range: Optional[Tuple[float, float]] = None,
+    display_intensity_range: Optional[Tuple[float, float]] = None,
+    display_subtracted_range: Optional[Tuple[float, float]] = None,
+    title: str = "",
+    show: bool = True,
+) -> Dict[str, Any]:
+    """
+    Side-by-side look at the pre-edge background fits available in
+    `subtract_background_limited_preedge()` -- power law, linear and polynomial
+    (degree 2, 3) -- on the same fit window, for one dataset.
+
+    Top panel: the mean spectrum with each method's fitted background over the
+    display range (the fit window is shaded). Bottom panel: mean spectrum minus
+    each fitted background (unclipped, so an over-subtraction shows as negative
+    values instead of being hidden by the clip to 0 that the real per-pixel
+    subtraction applies), with the map `windows` shaded and any `markers` (eV)
+    drawn as dotted lines. The fits are done on the mean spectrum with the same
+    functional forms (`A*E^-r`, `polyfit`), so they show what every pixel's fit
+    looks like on average.
+
+    The returned table also reports, from the *real* per-pixel subtraction
+    (`subtract_background_limited_preedge`), the largest fraction of pixels
+    that end up exactly 0 in any of `windows` -- a flat-map check -- and the RMS
+    of the fit residual inside the fit window.
+
+    `two_sided_windows` (e.g. ``((0.5, 0.8), (2.4, 3.2))``) adds two more curves
+    for comparison: ``A*E^-r + c`` and the curved ``A*E^-r*exp(s ln(E)^2) + c``
+    fitted to the mean spectrum in windows on BOTH sides of the features, so the
+    background is interpolated across them instead of extrapolated from one side
+    (see `subtract_background_two_sided()` for the real per-pixel subtraction).
+
+    Returns ``{"table": [...], "background": {label: array}, "figure": fig}``.
+    """
+    energy = np.asarray(dataset.energy_axis, dtype=float)
+    mean_spec = np.asarray(dataset.calculate_mean_spectrum(), dtype=float)
+    lo, hi = float(pre_edge_range[0]), float(pre_edge_range[1])
+    fit = (energy >= lo) & (energy <= hi)
+    if fit.sum() < 4:
+        raise ValueError(
+            f"pre_edge_range {pre_edge_range} contains only {int(fit.sum())} channels"
+        )
+
+    backgrounds, table = {}, []
+    for label, method, degree in methods:
+        row = dict(method=label, note="")
+        try:
+            if method == "powerlaw":
+                ok = fit & (energy > 0) & (mean_spec > 0)
+                slope, intercept = np.polyfit(np.log(energy[ok]), np.log(mean_spec[ok]), 1)
+                bgc = np.where(energy > 0, np.exp(intercept) * np.abs(energy) ** slope, np.nan)
+                row["note"] = f"A={np.exp(intercept):.3g}, r={-slope:.2f}"
+            else:
+                coef = np.polyfit(energy[fit], mean_spec[fit], int(degree))
+                bgc = np.polyval(coef, energy)
+            backgrounds[label] = bgc
+            row["fit_rms"] = float(np.sqrt(np.nanmean((mean_spec[fit] - bgc[fit]) ** 2)))
+        except Exception as exc:  # a failed fit must not stop the comparison
+            row["note"] = f"fit failed: {type(exc).__name__}"
+            row["fit_rms"] = float("nan")
+        # real per-pixel subtraction -> flat-map check
+        zero = float("nan")
+        if windows:
+            try:
+                _validate_pre_edge_window(lo, hi, energy, target_edge)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    sub = dataset.subtract_background_limited_preedge(
+                        target_edge=target_edge,
+                        pre_edge_range=(lo, hi),
+                        method=method,
+                        polynomial_degree=int(degree) if method == "polynomial" else 2,
+                        show=False,
+                    )
+                e2, a2 = np.asarray(sub.energy_axis), np.asarray(sub.array)
+                if a2.size == 0 or not np.isfinite(a2).any():
+                    raise ValueError("background subtraction produced an empty / all-NaN result")
+                zero = 0.0
+                for wl, wh in windows:
+                    k = (e2 >= wl) & (e2 <= wh)
+                    if k.any():
+                        zero = max(zero, float(np.mean(a2[:, :, k].sum(axis=-1) == 0)))
+            except Exception as exc:
+                row["note"] += f" subtraction failed: {type(exc).__name__}"
+        row["worst_zero_pixel_fraction"] = zero
+        table.append(row)
+
+    if two_sided_windows:
+        sel = np.zeros_like(energy, dtype=bool)
+        for wl, wh in two_sided_windows:
+            sel |= (energy >= wl) & (energy <= wh)
+        sel &= energy > 0
+        forms = (
+            (
+                "two-sided power law + const",
+                lambda x, a, r, c: a * x ** (-r) + c,
+                (float(np.max(mean_spec[sel])), 2.0, 0.0),
+                1,
+            ),
+            (
+                "two-sided curved power law + const",
+                lambda x, a, r, s_, c: a * x ** (-r) * np.exp(s_ * np.log(x) ** 2) + c,
+                (float(np.max(mean_spec[sel])), 2.0, 0.0, 0.0),
+                2,
+            ),
+        )
+        for label, f, p0, _ in forms:
+            try:
+                popt, _ = curve_fit(f, energy[sel], mean_spec[sel], p0=p0, maxfev=50000)
+                backgrounds[label] = np.where(
+                    energy > 0, f(np.abs(energy) + (energy <= 0), *popt), np.nan
+                )
+                table.append(
+                    dict(
+                        method=label,
+                        note=f"windows {tuple(tuple(w) for w in two_sided_windows)}, params={np.round(popt, 3).tolist()} (mean spectrum only)",
+                        fit_rms=float(
+                            np.sqrt(np.nanmean((mean_spec[sel] - backgrounds[label][sel]) ** 2))
+                        ),
+                        worst_zero_pixel_fraction=float("nan"),
+                    )
+                )
+            except Exception as exc:
+                table.append(
+                    dict(
+                        method=label,
+                        note=f"fit failed: {type(exc).__name__}",
+                        fit_rms=float("nan"),
+                        worst_zero_pixel_fraction=float("nan"),
+                    )
+                )
+
+    fig = None
+    if show:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8.5), sharex=True)
+        xlim = display_energy_range or (float(energy[0]), float(energy[-1]))
+        ax1.plot(energy, mean_spec, "k-", lw=1.4, label="mean spectrum")
+        ax1.axvspan(lo, hi, color="green", alpha=0.15, label=f"fit window {lo:g}-{hi:g} eV")
+        for label, bgc in backgrounds.items():
+            ax1.plot(energy, bgc, lw=1.3, label=f"{label} fit")
+        ax1.set_xlim(*xlim)
+        if display_intensity_range is not None:
+            ax1.set_ylim(*display_intensity_range)
+        ax1.set_ylabel("Intensity")
+        ax1.set_title(f"{title} background fits on the mean spectrum".strip())
+        ax1.legend(fontsize=8, loc="best")
+        ax1.grid(True, alpha=0.3)
+
+        for label, bgc in backgrounds.items():
+            ax2.plot(energy, mean_spec - bgc, lw=1.3, label=label)
+        ax2.axhline(0, color="gray", lw=1, ls="--")
+        for wl, wh in windows:
+            ax2.axvspan(wl, wh, color="orange", alpha=0.12)
+        for m in markers:
+            ax2.axvline(m, color="k", ls=":", lw=0.9)
+        ax2.axvspan(lo, hi, color="green", alpha=0.10)
+        for wl, wh in two_sided_windows or ():
+            ax1.axvspan(wl, wh, color="purple", alpha=0.08)
+            ax2.axvspan(wl, wh, color="purple", alpha=0.08)
+        if display_subtracted_range is not None:
+            ax2.set_ylim(*display_subtracted_range)
+        ax2.set_xlabel("Energy loss (eV)")
+        ax2.set_ylabel("mean - fitted background")
+        ax2.set_title("Subtracted mean spectrum per method (unclipped; orange = map windows)")
+        ax2.legend(fontsize=8, loc="best")
+        ax2.grid(True, alpha=0.3)
+        fig.tight_layout()
+        plt.show()
+
+    print(f"{'method':18s} {'fit RMS':>9s} {'worst zero-pixel frac in windows':>34s}  note")
+    for r in table:
+        print(
+            f"{r['method']:18s} {r['fit_rms']:9.4g} {r['worst_zero_pixel_fraction']:34.2f}  {r['note']}"
+        )
+    return {"table": table, "background": backgrounds, "figure": fig}
+
+
+def plot_map_diagnostics(
+    maps,
+    *,
+    adf=None,
+    thickness_map=None,
+    n_perm: int = 200,
+    seed: int = 0,
+    title: str = "",
+    show: bool = True,
+):
+    """
+    Print and plot :func:`summarize_map_diagnostics` for a ``{(lo, hi): 2D map}`` dict:
+    a table, plus (if ``show``) a bar chart of each window's Moran's I z-score (dashed
+    line at the one-sided p = 0.05 threshold, z = 1.645) and, where given, its
+    correlation with the ADF / thickness map.
+
+    Returns ``(rows, figure_or_None)`` with the rows of
+    :func:`summarize_map_diagnostics`. Call directly, not as a bound method.
+    """
+    windows = list(maps.keys())
+    rows = summarize_map_diagnostics(
+        maps, adf=adf, thickness_map=thickness_map, n_perm=n_perm, seed=seed
+    )
+
+    print(
+        f"{'window (eV)':>14s} {'moran I':>9s} {'z':>7s} {'p':>8s}"
+        + ("  corr(ADF) r [p]" if adf is not None else "")
+        + ("  corr(thickness) r [p]" if thickness_map is not None else "")
+    )
+    for r in rows:
+        line = f"{r['window'][0]:6.2f}-{r['window'][1]:<6.2f} {r['moran_i']:9.3f} {r['z']:7.2f} {r['p']:8.3g}"
+        if "corr_adf" in r:
+            line += f"   {r['corr_adf']['r']:+.2f} [{r['corr_adf']['p']:.2g}]"
+        if "corr_thickness" in r:
+            line += f"       {r['corr_thickness']['r']:+.2f} [{r['corr_thickness']['p']:.2g}]"
+        print(line)
+    sig = [r for r in rows if np.isfinite(r["z"]) and r["z"] >= 1.645]
+    if sig:
+        print(
+            "  -> spatially coherent (z >= 1.645, one-sided p <= 0.05): "
+            + ", ".join(f"[{r['window'][0]:g}, {r['window'][1]:g}] eV" for r in sig)
+        )
+    else:
+        print(
+            "  -> no window shows spatial structure clearly above what shuffling the same pixels would give."
+        )
+
+    fig = None
+    if show:
+        n_extra = int(adf is not None) + int(thickness_map is not None)
+        fig, axes = plt.subplots(1, 1 + n_extra, figsize=(4.5 * (1 + n_extra), 4), squeeze=False)
+        axes = axes[0]
+        labels = [f"{w[0]:g}-{w[1]:g}" for w in windows]
+        colors = [
+            "tab:green" if (np.isfinite(r["z"]) and r["z"] >= 1.645) else "0.6" for r in rows
+        ]
+        axes[0].bar(range(len(rows)), [r["z"] for r in rows], color=colors)
+        axes[0].axhline(1.645, color="red", ls="--", lw=1, label="p=0.05 (one-sided)")
+        axes[0].set_xticks(range(len(rows)))
+        axes[0].set_xticklabels(labels, fontsize=8, rotation=20)
+        axes[0].set_ylabel("Moran's I z-score")
+        axes[0].set_title("Spatial coherence per window")
+        axes[0].legend(fontsize=8)
+        axes[0].grid(True, axis="y", alpha=0.3)
+        j = 1
+        for key, ylabel in (
+            ("corr_adf", "r with ADF"),
+            ("corr_thickness", "r with thickness map"),
+        ):
+            if any(key in r for r in rows):
+                vals = [r[key]["r"] for r in rows]
+                sigc = ["tab:red" if r[key]["p"] < 0.05 else "0.6" for r in rows]
+                axes[j].bar(range(len(rows)), vals, color=sigc)
+                axes[j].axhline(0, color="gray", lw=0.8)
+                axes[j].set_xticks(range(len(rows)))
+                axes[j].set_xticklabels(labels, fontsize=8, rotation=20)
+                axes[j].set_ylabel(ylabel)
+                axes[j].set_title(f"{ylabel} (red = p<0.05)")
+                axes[j].grid(True, axis="y", alpha=0.3)
+                j += 1
+        if title:
+            fig.suptitle(_wrap_title(title, 130), fontsize=9)
+        fig.tight_layout(rect=(0, 0, 1, 0.92 if title else 1))
+        plt.show()
+    return rows, fig

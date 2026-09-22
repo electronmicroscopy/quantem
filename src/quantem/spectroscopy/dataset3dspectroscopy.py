@@ -19,6 +19,9 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
     plot_attached_spectrum as _visualize_attached_spectrum,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_energy_windows_summary as _plot_energy_windows_summary,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
     show_energy_window_map as _visualize_energy_window_map,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
@@ -34,6 +37,9 @@ from quantem.spectroscopy.utils import (
 )
 from quantem.spectroscopy.utils import (
     fit_windows_inside_axis as _fit_windows_inside_axis,
+)
+from quantem.spectroscopy.utils import (
+    summarize_energy_windows as _summarize_energy_windows,
 )
 
 
@@ -75,6 +81,8 @@ class Dataset3dspectroscopy(Dataset3d):
     _plot_background_subtraction = _visualize_background_subtraction
     crop_energy_range = _crop_energy_range
     fit_windows_inside_axis = _fit_windows_inside_axis
+    summarize_energy_windows = _summarize_energy_windows
+    plot_energy_windows_summary = _plot_energy_windows_summary
 
     def __init__(
         self,
