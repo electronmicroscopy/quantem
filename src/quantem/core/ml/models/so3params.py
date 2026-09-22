@@ -14,12 +14,12 @@ import torch.nn.functional as F
 
 class SO3ParamQuat(nn.Module):
     """
-    Stores T unit quaternions as learnable parameters in R^4 and normalises
+    Stores T unit quaternions as learnable parameters in R^4 and normalizes
     them on every call to `as_matrix()`.
 
     Quaternion convention: [x, y, z, w]  (scalar-last, same as scipy).
 
-    Initialisation
+    Initialization
     --------------
     "random"  – uniform sampling over SO(3) via Shoemake's method.
     "identity" – all rotations start as the identity (good for fine-tuning).
@@ -105,7 +105,7 @@ class SO3ParamQuat(nn.Module):
         return f"T={self.quats.shape[0]}"
 
     # ------------------------------------------------------------------
-    # Initialisers
+    # Initializers
     # ------------------------------------------------------------------
 
     @staticmethod

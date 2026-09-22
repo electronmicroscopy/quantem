@@ -52,7 +52,7 @@ class OptimizerParams:
         eps : float
             Term added to the denominator for numerical stability. Default: 1e-8.
         weight_decay : float
-            L2 regularisation penalty. Default: 0.
+            L2 regularization penalty. Default: 0.
         """
 
         lr: float = 1e-3
@@ -97,7 +97,7 @@ class OptimizerParams:
         eps : float
             Term added to the denominator for numerical stability. Default: 1e-8.
         weight_decay : float
-            Decoupled L2 regularisation penalty. Default: 0.
+            Decoupled L2 regularization penalty. Default: 0.
         """
 
         lr: float = 1e-3
@@ -138,7 +138,7 @@ class OptimizerParams:
         dampening : float
             Dampening for momentum. Default: 0.
         weight_decay : float
-            L2 regularisation penalty. Default: 0.
+            L2 regularization penalty. Default: 0.
         nesterov : bool
             Enables Nesterov momentum. Default: False.
         """
@@ -266,7 +266,7 @@ class SchedulerParams:
         Parameters
         ----------
         mode : {'min', 'max'}
-            Whether the monitored metric should be minimised or maximised. Default: 'min'.
+            Whether the monitored metric should be minimized or maximized. Default: 'min'.
         min_lr_factor : float
             Sets ``min_lr = min_lr_factor * base_lr`` when ``min_lr`` is not provided.
             Default: 1/20.

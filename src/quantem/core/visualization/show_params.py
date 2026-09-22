@@ -54,7 +54,7 @@ class ShowParams:
         vmax : float or None
             Explicit maximum for ``"manual"`` interval.
         vcenter : float
-            Centre value for ``"centered"`` interval. Default 0.0.
+            Center value for ``"centered"`` interval. Default 0.0.
         half_range : float or None
             Symmetric half-range for ``"centered"`` interval.
         power : float
@@ -241,7 +241,7 @@ class ShowParams:
         pad_px : float
             Padding between bar and plot edge in image pixels. Default 0.5.
         color : str
-            Bar and label colour. Default ``"white"``.
+            Bar and label color. Default ``"white"``.
         loc : ``"lower right"`` | ``"lower left"`` | ``"upper right"`` | ``"upper left"``
             Anchor location. Default ``"lower right"``.
         fontsize : int
