@@ -11,6 +11,9 @@ from scipy.optimize import curve_fit
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy
 from quantem.spectroscopy.spectroscopy_visualzitions import (
+    attach_hover_to_axes as _attach_hover_to_axes,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
     compare_background_methods as _compare_background_methods,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
@@ -44,7 +47,13 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
     plot_zlp_drift_diagnostics as _visualize_zlp_drift_diagnostics,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
+    show_eels_spectrum_with_hover as _show_eels_spectrum_with_hover,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
     show_energy_windows_with_peaks as _show_energy_windows_with_peaks,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
+    show_low_loss_zlp_cutoff_inspection as _show_low_loss_zlp_cutoff_inspection,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     visualize_thickness_windows as _visualize_thickness_windows,
@@ -286,6 +295,8 @@ class Dataset3deels(Dataset3dspectroscopy):
     show_energy_windows_with_peaks = _show_energy_windows_with_peaks
     compare_background_methods = _compare_background_methods
     plot_background_fit_ranges = _plot_background_fit_ranges
+    show_eels_spectrum_with_hover = _show_eels_spectrum_with_hover
+    show_low_loss_zlp_cutoff_inspection = _show_low_loss_zlp_cutoff_inspection
 
     def __init__(
         self,
@@ -1128,6 +1139,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         display_energy_range=None,
         display_intensity_range=None,
         display_residual_range=None,
+        hover_annotations=True,
     ):
         """
         Remove narrow detector spikes by linear interpolation across each range.
@@ -1147,6 +1159,10 @@ class Dataset3deels(Dataset3dspectroscopy):
             Default True.
         display_energy_range, display_intensity_range, display_residual_range : (float, float), optional
             Display-only zoom for the preview plot.
+        hover_annotations : bool, optional
+            Hover coordinates and click-to-pin labels on the preview panels
+            (needs an interactive backend such as ``%matplotlib widget``).
+            Default True.
 
         Returns
         -------
@@ -1190,7 +1206,7 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         if show:
             mean_spec = np.asarray(self.calculate_mean_spectrum(), dtype=float)
-            _plot_despike_preview(
+            fig = _plot_despike_preview(
                 energy_axis,
                 mean_spec,
                 _despike_apply(mean_spec, energy_axis, ranges),
@@ -1199,6 +1215,9 @@ class Dataset3deels(Dataset3dspectroscopy):
                 display_intensity_range=display_intensity_range,
                 display_residual_range=display_residual_range,
             )
+            if hover_annotations:
+                for ax in fig.axes:
+                    _attach_hover_to_axes(fig, ax)
         return despiked
 
     def measure_zlp_offset(

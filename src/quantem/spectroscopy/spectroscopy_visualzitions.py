@@ -1,7 +1,8 @@
 import contextlib
 import io
 import textwrap
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -3786,3 +3787,1021 @@ def plot_despike_preview(
     plt.tight_layout()
     plt.show()
     return fig
+
+
+def _attach_interactive_labels(
+    fig,
+    ax,
+    lines: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    *,
+    x_unit: str = "eV",
+    hover_annotations: bool = True,
+    enable_click_labels: bool = True,
+    click_label_snap_to_spectrum: bool = True,
+    click_label_precision: int = 2,
+):
+    """
+    Attach the hover-tooltip / click-to-pin coordinate-label interaction
+    shared by `show_eels_spectrum_with_hover` and
+    `compare_eels_spectra_with_hover` to `ax`, reading off one or more
+    already-plotted lines.
+
+    Parameters
+    ----------
+    lines : dict[str, (x_array, y_array)]
+        One entry per plotted line, keyed by its legend label. Lines need
+        not share the same x array.
+
+    Interaction (same conventions as :func:`attach_hover_to_axes`):
+      - Hover anywhere in the axes: tooltip follows the cursor, snapped to
+        the nearest real measured sample (via np.searchsorted, never a
+        freely interpolated position) of whichever line is visually
+        closest to the cursor -- "Energy: ... eV" / "Intensity: ...",
+        prefixed with the line's label when more than one line is present.
+      - Left-click: pins a permanent coordinate label using that same
+        nearest-line/nearest-sample logic (or the raw click position if
+        `click_label_snap_to_spectrum=False`). Labels close in x to an
+        existing one are staggered to a free vertical level so they don't
+        overlap.
+      - Right-click near a pinned label: deletes just that one.
+      - 'c' key (plot must have focus): clears all pinned labels.
+
+    State (callback ids, annotation artist, pinned labels) is stashed on
+    `fig._eels_interactive_state[id(ax)]` so multiple axes on one figure
+    (e.g. an image + spectrum layout) each carry independent interactivity
+    without clobbering each other, and so nothing is garbage-collected once
+    this function returns.
+    """
+    if not lines:
+        raise ValueError("lines must be a non-empty dict of {label: (x, y)}")
+
+    lines = {
+        name: (np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+        for name, (x, y) in lines.items()
+    }
+    multi = len(lines) > 1
+
+    all_x = np.concatenate([x for x, _ in lines.values()])
+    all_y = np.concatenate([y for _, y in lines.values()])
+    x_span = float(all_x.max() - all_x.min()) or 1.0
+    close_threshold = 0.035 * x_span
+    data_range = float(all_y.max() - all_y.min()) or 1.0
+    label_step = 0.10 * data_range
+
+    def _nearest_on_line(x_arr, xdata):
+        idx = int(np.searchsorted(x_arr, xdata))
+        idx = min(max(idx, 0), len(x_arr) - 1)
+        if idx > 0 and abs(x_arr[idx - 1] - xdata) < abs(x_arr[idx] - xdata):
+            idx -= 1
+        return idx
+
+    def _nearest_point(xdata, ydata):
+        """Nearest (name, x_val, y_val) across every line: each line's
+        nearest-in-x sample is a candidate, and among candidates we pick
+        whichever is closest in *pixel* distance to the cursor -- this is
+        what disambiguates overlapping/crossing lines when more than one
+        is plotted (e.g. ZLP-corrected vs. uncorrected)."""
+        cursor_px = ax.transData.transform((xdata, ydata if ydata is not None else 0.0))
+        best = None
+        for name, (x_arr, y_arr) in lines.items():
+            idx = _nearest_on_line(x_arr, xdata)
+            x_val, y_val = float(x_arr[idx]), float(y_arr[idx])
+            px = ax.transData.transform((x_val, y_val))
+            d = float(np.hypot(px[0] - cursor_px[0], px[1] - cursor_px[1]))
+            if best is None or d < best[0]:
+                best = (d, name, x_val, y_val)
+        return best[1], best[2], best[3]
+
+    if hover_annotations:
+        # Plain matplotlib event handling -- no extra dependency. Only fires
+        # with an interactive backend (e.g. `%matplotlib widget`); under the
+        # static/Agg backend this sets up harmlessly and the tooltip just
+        # never appears since no mouse-move events occur.
+        hover_annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(15, 15),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="lightyellow", ec="gray", alpha=0.95),
+            arrowprops=dict(arrowstyle="->"),
+            fontsize=9,
+            visible=False,
+            zorder=10,
+        )
+
+        def _on_hover(event):
+            if event.inaxes is not ax or event.xdata is None:
+                if hover_annot.get_visible():
+                    hover_annot.set_visible(False)
+                    fig.canvas.draw_idle()
+                return
+            name, x_val, y_val = _nearest_point(event.xdata, event.ydata)
+            hover_annot.xy = (x_val, y_val)
+            prefix = f"{name}\n" if multi else ""
+            hover_annot.set_text(f"{prefix}Energy: {x_val:.2f} {x_unit}\nIntensity: {y_val:.2f}")
+            if not hover_annot.get_visible():
+                hover_annot.set_visible(True)
+            fig.canvas.draw_idle()
+
+        hover_callback_id = fig.canvas.mpl_connect("motion_notify_event", _on_hover)
+    else:
+        hover_callback_id, hover_annot = None, None
+
+    if enable_click_labels:
+        # Manual click-to-pin coordinate labels -- same reasoning as the
+        # hover tooltip above (harmless under Agg, needs an interactive
+        # backend to actually respond). Purely a display feature -- never
+        # touches the underlying dataset(s).
+        pinned_labels: List[dict] = []
+        click_hit_radius_px = 25
+
+        def _pin_label_at(x_click, y_click):
+            if click_label_snap_to_spectrum:
+                name, x_val, y_val = _nearest_point(
+                    x_click, y_click if y_click is not None else 0.0
+                )
+            else:
+                name = None
+                x_val = float(x_click)
+                first_x, first_y = next(iter(lines.values()))
+                y_val = (
+                    float(y_click)
+                    if y_click is not None
+                    else float(np.interp(x_click, first_x, first_y))
+                )
+
+            used_levels = {
+                e["level"] for e in pinned_labels if abs(e["x"] - x_val) < close_threshold
+            }
+            level = 0
+            while level in used_levels:
+                level += 1
+            label_y = y_val + (level + 1) * label_step
+
+            text = f"({x_val:.{click_label_precision}f}, {y_val:.{click_label_precision}f})"
+            if multi and name is not None:
+                text = f"{name}\n{text}"
+
+            artist = ax.annotate(
+                text,
+                xy=(x_val, y_val),
+                xytext=(x_val, label_y),
+                textcoords="data",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="black",
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor="white",
+                    edgecolor="black",
+                    alpha=0.9,
+                    linewidth=1.1,
+                ),
+                arrowprops=dict(arrowstyle="-", color="black", lw=0.8, alpha=0.7),
+                zorder=8,
+            )
+            pinned_labels.append(
+                {"x": x_val, "y": y_val, "level": level, "label_y": label_y, "artist": artist}
+            )
+
+            cur_bottom, cur_top = ax.get_ylim()
+            needed_top = label_y + 0.05 * data_range
+            if needed_top > cur_top:
+                ax.set_ylim(cur_bottom, needed_top)
+
+        def _delete_nearest_pinned_label(event):
+            if not pinned_labels:
+                return
+            best_i, best_dist = None, None
+            for i, entry in enumerate(pinned_labels):
+                px, py = ax.transData.transform((entry["x"], entry["label_y"]))
+                d = ((px - event.x) ** 2 + (py - event.y) ** 2) ** 0.5
+                if best_dist is None or d < best_dist:
+                    best_dist, best_i = d, i
+            if best_i is not None and best_dist <= click_hit_radius_px:
+                pinned_labels[best_i]["artist"].remove()
+                del pinned_labels[best_i]
+
+        def _on_click(event):
+            if event.inaxes is not ax or event.xdata is None:
+                return
+            if event.button == 1:  # left click -> pin a new label
+                _pin_label_at(event.xdata, event.ydata)
+                fig.canvas.draw_idle()
+            elif event.button == 3:  # right click -> delete nearest pinned label
+                _delete_nearest_pinned_label(event)
+                fig.canvas.draw_idle()
+
+        def _on_key(event):
+            if event.key == "c" and pinned_labels:
+                for entry in pinned_labels:
+                    entry["artist"].remove()
+                pinned_labels.clear()
+                fig.canvas.draw_idle()
+
+        click_callback_id = fig.canvas.mpl_connect("button_press_event", _on_click)
+        key_callback_id = fig.canvas.mpl_connect("key_press_event", _on_key)
+    else:
+        pinned_labels = []
+        click_callback_id = key_callback_id = None
+
+    # Keep strong references so callbacks/annotations/pinned-label state
+    # aren't garbage-collected once this function returns.
+    state = getattr(fig, "_eels_interactive_state", None)
+    if state is None:
+        state = {}
+        fig._eels_interactive_state = state
+    state[id(ax)] = {
+        "hover_callback": hover_callback_id,
+        "hover_annotation": hover_annot,
+        "click_label_callbacks": [click_callback_id, key_callback_id],
+        "pinned_labels": pinned_labels,
+    }
+
+
+def _draw_highlight_ranges(ax, highlight_range, color, label):
+    """Shade one (lo, hi) span or several ((lo, hi), (lo, hi), ...) spans; only the first gets the legend label."""
+    if highlight_range is None:
+        return
+    ranges = np.asarray(highlight_range, dtype=float)
+    ranges = ranges.reshape(1, 2) if ranges.ndim == 1 else ranges
+    for k, (lo, hi) in enumerate(ranges):
+        ax.axvspan(float(lo), float(hi), alpha=0.2, color=color, label=label if k == 0 else None)
+
+
+def attach_hover_to_axes(
+    fig,
+    ax=None,
+    *,
+    x_unit: str = "eV",
+    hover_annotations: bool = True,
+    enable_click_labels: bool = True,
+    click_label_snap_to_spectrum: bool = True,
+    click_label_precision: int = 2,
+):
+    """
+    Add hover coordinates and click-to-pin labels to an axes that was
+    plotted by *something else* -- `Dataset3deels.show_mean_spectrum()`,
+    `show_energy_window_map()`'s spectrum panel, `plot_near_zlp_transitions_fit()`,
+    a one-off `ax.plot(...)` cell, etc. -- without recomputing or re-plotting
+    anything: it reads the (x, y) data straight off every already-drawn
+    Line2D on `ax`.
+
+    This is the general-purpose way to get hover/click labeling on *any*
+    spectrum plot, including those drawn by other ``quantem.spectroscopy``
+    methods. Call it right after any plotting call that returns (or
+    otherwise exposes) a `fig`/`ax`, e.g.::
+
+        fig, (ax_map, ax_spec), _ = eels_hl_bgsub.show_energy_window_map(...)
+        attach_hover_to_axes(fig, ax_spec)
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+    ax : matplotlib.axes.Axes, optional
+        The axes holding the spectrum line(s) to attach to. Defaults to
+        `fig.axes[-1]` -- the rightmost/last axes, which is the spectrum
+        panel in image+spectrum layouts
+        (`show_mean_spectrum`, `show_energy_window_map`). Pass explicitly
+        for a figure with more than one spectrum-bearing axes (e.g.
+        `plot_near_zlp_transitions_fit`'s residual panel).
+    x_unit, hover_annotations, enable_click_labels,
+    click_label_snap_to_spectrum, click_label_precision :
+        Same as `show_eels_spectrum_with_hover`.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        The axes interactivity was attached to (`ax`, resolved).
+
+    Raises
+    ------
+    ValueError
+        If `ax` (or the resolved default) has no plotted Line2D to read
+        data from.
+    """
+    if ax is None:
+        if not fig.axes:
+            raise ValueError("attach_hover_to_axes: figure has no axes")
+        ax = fig.axes[-1]
+
+    plotted = ax.get_lines()
+    if not plotted:
+        raise ValueError(
+            "attach_hover_to_axes: this axes has no plotted Line2D to read data "
+            "from -- pass the axes that actually holds the spectrum line(s)."
+        )
+
+    lines: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    single = len(plotted) == 1
+    for i, line in enumerate(plotted):
+        label = line.get_label()
+        if not label or label.startswith("_"):
+            # matplotlib's default auto-label for a `plot()` call with no
+            # explicit `label=` -- fall back to a readable placeholder
+            # rather than dropping the line.
+            label = "Spectrum" if single else f"Line {i + 1}"
+        key = label
+        n = 1
+        while key in lines:  # de-dupe an accidental repeated label
+            n += 1
+            key = f"{label} ({n})"
+        lines[key] = (np.asarray(line.get_xdata()), np.asarray(line.get_ydata()))
+
+    _attach_interactive_labels(
+        fig,
+        ax,
+        lines,
+        x_unit=x_unit,
+        hover_annotations=hover_annotations,
+        enable_click_labels=enable_click_labels,
+        click_label_snap_to_spectrum=click_label_snap_to_spectrum,
+        click_label_precision=click_label_precision,
+    )
+    return ax
+
+
+def show_eels_spectrum_with_hover(
+    eels_data,
+    *,
+    roi=None,
+    roi_cal=None,
+    mask=None,
+    title: str = "Mean high-loss EELS spectrum",
+    hover_annotations: bool = True,
+    enable_click_labels: bool = True,
+    click_label_snap_to_spectrum: bool = True,
+    click_label_precision: int = 2,
+    display_energy_range: Optional[Tuple[float, float]] = None,
+    display_intensity_range: Optional[Tuple[float, float]] = None,
+    highlight_range: Optional[Tuple[float, float]] = None,
+    highlight_label: str = "Fit region",
+    highlight_color: str = "green",
+):
+    """
+    NON-blocking spectrum inspection: plot `eels_data`'s mean spectrum with
+    mouse-hover and click-to-pin coordinate reading, and return immediately
+    (no `input()`, no confirmation prompt) so the notebook cell finishes
+    normally and the widget stays live for you to hover/click at your own
+    pace -- e.g. to read off exact spike energies before choosing ranges
+    for :meth:`Dataset3deels.despike`.
+
+    Works on any dataset with `.energy_axis` and `.calculate_mean_spectrum()`
+    -- HL or LL, ZLP-corrected or raw, a full-frame mean or an ROI-restricted
+    one via `roi`/`roi_cal`/`mask`. Never modifies `eels_data`. To compare
+    two spectra (e.g. ZLP-corrected vs. uncorrected) on one axes instead, see
+    `compare_eels_spectra_with_hover`.
+
+    Interaction (same conventions as :func:`attach_hover_to_axes`):
+      - Hover anywhere in the axes: tooltip follows the cursor, snapped to
+        the nearest real measured channel (via np.searchsorted, never a
+        freely interpolated position) -- "Energy: ... eV" / "Intensity: ...".
+      - Left-click: pins a permanent coordinate label at that same
+        nearest-channel logic (or the raw click position if
+        `click_label_snap_to_spectrum=False`). Labels close in energy to an
+        existing one are staggered to a free vertical level so they don't
+        overlap.
+      - Right-click near a pinned label: deletes just that one.
+      - 'c' key (plot must have focus): clears all pinned labels.
+
+    Parameters
+    ----------
+    eels_data : Dataset3deels
+        Any dataset with `.energy_axis` and `.calculate_mean_spectrum()`
+        (e.g. `eels_hl` right after ZLP correction, before despiking).
+    roi : list or tuple, optional
+        Region of interest as `[y, x, dy, dx]` (or `[y, x]` for a single
+        pixel), forwarded to `eels_data.calculate_mean_spectrum()`. If
+        None (default), the mean spectrum is over the full frame. See
+        `Dataset3dspectroscopy.calculate_mean_spectrum` for the exact
+        semantics.
+    roi_cal : list or tuple, optional
+        Same as `roi` but in calibrated (physical) units instead of pixel
+        indices. Use only one of `roi` / `roi_cal`.
+    mask : array-like, optional
+        Boolean mask over energy channels, forwarded to
+        `calculate_mean_spectrum()`.
+    title : str
+        Plot title.
+    hover_annotations : bool, default True
+        Enable the hover tooltip. Same interactive-backend caveat as the
+        other hover-enabled plots here: a no-op under the static/Agg backend (the plot
+        still renders, callbacks just never fire).
+    enable_click_labels : bool, default True
+        Enable left-click-to-pin / right-click-to-delete / 'c'-to-clear.
+    click_label_snap_to_spectrum : bool, default True
+        Snap pinned labels to the nearest real spectrum sample rather than
+        the raw clicked position.
+    click_label_precision : int, default 2
+        Decimal places in pinned-label text, e.g. `(285.42, 1234.56)`.
+    display_energy_range : (float, float), optional
+        (lo, hi) eV to zoom the x-axis into. Display-only -- the full
+        spectrum is still plotted (and hover/click still read off the full
+        underlying data, not just the zoomed view); this only changes
+        what's visible. Defaults to the full energy range (no zoom).
+    display_intensity_range : (float, float), optional
+        (lo, hi) to zoom the y-axis into. Display-only, same caveat as
+        ``display_energy_range``. If None (default), the y-axis is
+        auto-scaled (with 5% padding) to the intensity actually visible
+        within ``display_energy_range`` -- not matplotlib's default
+        full-spectrum autoscale, which would stay dominated by features
+        (e.g. the ZLP) outside a zoomed-in energy window.
+    highlight_range : (float, float), optional
+        (lo, hi) eV span to shade on the spectrum, e.g. the pre-edge
+        window used for background fitting. Purely cosmetic -- an
+        `ax.axvspan`, same green/alpha=0.2 convention as the static
+        preview in `Dataset3deels.subtract_background_limited_preedge`.
+        None (default) draws no shading.
+    highlight_label : str, default "Fit region"
+        Legend label for the shaded `highlight_range` span. Ignored if
+        `highlight_range` is None.
+    highlight_color : str, default "green"
+        Color for the shaded `highlight_range` span. Ignored if
+        `highlight_range` is None.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure, with strong references to its callbacks/annotations/
+        pinned-label state stashed on it (`fig._eels_hover_callback`,
+        `fig._eels_hover_annotation`, `fig._eels_click_label_callbacks`,
+        `fig._eels_pinned_labels`) so they survive after this function
+        returns.
+    """
+    energy_axis = np.asarray(eels_data.energy_axis, dtype=float)
+    mean_spec = np.asarray(
+        eels_data.calculate_mean_spectrum(roi=roi, roi_cal=roi_cal, mask=mask), dtype=float
+    )
+    if mask is not None:
+        energy_axis = energy_axis[np.asarray(mask, dtype=bool)]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(energy_axis, mean_spec, "k-", lw=1.2, label="Mean spectrum")
+    _draw_highlight_ranges(ax, highlight_range, highlight_color, highlight_label)
+    ax.set_xlabel("Energy loss (eV)")
+    ax.set_ylabel("Intensity")
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    if display_energy_range is not None:
+        e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        ax.set_xlim(e_lo, e_hi)
+
+    if display_intensity_range is not None:
+        i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+        if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+            raise ValueError(
+                f"display_intensity_range must be (lo, hi) with lo < hi, "
+                f"got {display_intensity_range!r}"
+            )
+        ax.set_ylim(i_lo, i_hi)
+    else:
+        # Autoscale to the intensity actually visible in the displayed
+        # energy window, not matplotlib's default full-data autoscale --
+        # otherwise a zoomed-in display_energy_range leaves the y-axis
+        # dominated by, e.g., the ZLP peak outside the visible window.
+        lo, hi = ax.get_xlim()
+        visible = (energy_axis >= lo) & (energy_axis <= hi)
+        visible_spec = mean_spec[visible] if visible.any() else mean_spec
+        y_lo, y_hi = float(visible_spec.min()), float(visible_spec.max())
+        y_pad = 0.05 * (y_hi - y_lo) if y_hi > y_lo else max(abs(y_hi), 1.0) * 0.05
+        ax.set_ylim(y_lo - y_pad, y_hi + y_pad)
+
+    _attach_interactive_labels(
+        fig,
+        ax,
+        {"Mean spectrum": (energy_axis, mean_spec)},
+        hover_annotations=hover_annotations,
+        enable_click_labels=enable_click_labels,
+        click_label_snap_to_spectrum=click_label_snap_to_spectrum,
+        click_label_precision=click_label_precision,
+    )
+    # Mirror the per-axes state under the flat attribute names this
+    # function has always documented/returned.
+    state = fig._eels_interactive_state[id(ax)]
+    fig._eels_hover_callback = state["hover_callback"]
+    fig._eels_hover_annotation = state["hover_annotation"]
+    fig._eels_click_label_callbacks = state["click_label_callbacks"]
+    fig._eels_pinned_labels = state["pinned_labels"]
+
+    plt.show()
+    return fig
+
+
+def compare_eels_spectra_with_hover(
+    spectra: Dict[str, Any],
+    *,
+    roi=None,
+    roi_cal=None,
+    mask=None,
+    title: str = "EELS spectrum comparison",
+    colors: Optional[Dict[str, str]] = None,
+    hover_annotations: bool = True,
+    enable_click_labels: bool = True,
+    click_label_snap_to_spectrum: bool = True,
+    click_label_precision: int = 2,
+    display_energy_range: Optional[Tuple[float, float]] = None,
+    display_intensity_range: Optional[Tuple[float, float]] = None,
+    highlight_range: Optional[Tuple[float, float]] = None,
+    highlight_label: str = "Fit region",
+    highlight_color: str = "green",
+):
+    """
+    Same non-blocking hover/click-to-pin inspection as
+    `show_eels_spectrum_with_hover`, but for two or more spectra plotted
+    together on one axes -- e.g. ZLP-corrected vs. uncorrected, or HL vs.
+    LL from the same ROI. The hover tooltip and pinned labels report which
+    line they came from, disambiguated by pixel distance to the cursor so
+    crossing/overlapping lines behave sensibly.
+
+    Never modifies any dataset in `spectra` -- only reads `.energy_axis` and
+    calls `.calculate_mean_spectrum()`.
+
+    Parameters
+    ----------
+    spectra : dict[str, Dataset3deels]
+        One entry per line, keyed by the legend label to use for it, e.g.
+        ``{"Uncorrected": raw.eels_hl, "ZLP-corrected": eels_hl}``. Must be
+        non-empty.
+    roi, roi_cal, mask : optional
+        Forwarded to every dataset's `calculate_mean_spectrum()` -- the same
+        ROI/mask is applied to all spectra being compared. See
+        `Dataset3dspectroscopy.calculate_mean_spectrum` for their meaning.
+    title : str
+        Plot title.
+    colors : dict[str, str], optional
+        Explicit `{label: matplotlib color}` per line. Defaults to
+        matplotlib's usual color cycle.
+    hover_annotations, enable_click_labels, click_label_snap_to_spectrum,
+    click_label_precision, display_energy_range, display_intensity_range,
+    highlight_range, highlight_label, highlight_color :
+        Same as `show_eels_spectrum_with_hover`.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure, with interactivity state stashed on
+        `fig._eels_interactive_state[id(ax)]` (`ax` being the single axes
+        this function creates) so it survives after this function returns.
+    """
+    if not spectra:
+        raise ValueError("spectra must be a non-empty dict of {label: Dataset3deels}")
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    lines: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for name, ds in spectra.items():
+        energy_axis = np.asarray(ds.energy_axis, dtype=float)
+        spec = np.asarray(
+            ds.calculate_mean_spectrum(roi=roi, roi_cal=roi_cal, mask=mask), dtype=float
+        )
+        if mask is not None:
+            energy_axis = energy_axis[np.asarray(mask, dtype=bool)]
+        color = colors.get(name) if colors else None
+        ax.plot(energy_axis, spec, lw=1.2, label=name, color=color)
+        lines[name] = (energy_axis, spec)
+
+    _draw_highlight_ranges(ax, highlight_range, highlight_color, highlight_label)
+
+    ax.set_xlabel("Energy loss (eV)")
+    ax.set_ylabel("Intensity")
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    if display_energy_range is not None:
+        e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        ax.set_xlim(e_lo, e_hi)
+
+    if display_intensity_range is not None:
+        i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+        if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+            raise ValueError(
+                f"display_intensity_range must be (lo, hi) with lo < hi, "
+                f"got {display_intensity_range!r}"
+            )
+        ax.set_ylim(i_lo, i_hi)
+
+    _attach_interactive_labels(
+        fig,
+        ax,
+        lines,
+        hover_annotations=hover_annotations,
+        enable_click_labels=enable_click_labels,
+        click_label_snap_to_spectrum=click_label_snap_to_spectrum,
+        click_label_precision=click_label_precision,
+    )
+
+    plt.show()
+    return fig
+
+
+def show_low_loss_zlp_cutoff_inspection(
+    eels_ll,
+    *,
+    title: str = "Mean low-loss EELS spectrum — inspect ZLP cutoff",
+    hover_annotations: bool = True,
+    enable_click_labels: bool = True,
+    click_label_snap_to_spectrum: bool = True,
+    click_label_precision: int = 2,
+    current_cutoff_eV: Optional[float] = None,
+):
+    """
+    NON-blocking LOW-LOSS (LL) inspection plot: plot `eels_ll`'s mean
+    spectrum with mouse-hover and click-to-pin coordinate reading, and
+    return immediately (no `input()`, no confirmation prompt) so the
+    notebook cell finishes normally and the widget stays live for you to
+    hover/click at your own pace before deciding on a manual ZLP cutoff.
+
+    This applies only to `eels_ll`. It never modifies `eels_ll`, and it has
+    no effect on `eels_hl`, HL despiking, background subtraction, peak
+    preview, maps, or PCA.
+
+    Interaction (same conventions as show_eels_spectrum_with_hover()):
+      - Hover anywhere in the axes: tooltip follows the cursor, snapped to
+        the nearest real measured channel -- "Energy: ... eV" /
+        "Intensity: ...".
+      - Left-click: pins a permanent coordinate label (or the raw click
+        position if `click_label_snap_to_spectrum=False`).
+      - Right-click near a pinned label: deletes just that one.
+      - 'c' key (plot must have focus): clears all pinned labels.
+
+    Parameters
+    ----------
+    eels_ll : Dataset3deels
+        The ZLP-corrected low-loss dataset (e.g. `eels_ll` right after
+        `apply_zlp_correction`). Only `.energy_axis` and
+        `.calculate_mean_spectrum()` are read; never modified.
+    title : str
+        Plot title.
+    hover_annotations : bool, default True
+        Enable the hover tooltip. A no-op under the static/Agg backend (the
+        plot still renders, callbacks just never fire).
+    enable_click_labels : bool, default True
+        Enable left-click-to-pin / right-click-to-delete / 'c'-to-clear.
+    click_label_snap_to_spectrum : bool, default True
+        Snap pinned labels to the nearest real spectrum sample rather than
+        the raw clicked position.
+    click_label_precision : int, default 2
+        Decimal places in pinned-label text.
+    current_cutoff_eV : float, optional
+        If given, draws a labeled vertical cutoff guide at this energy and
+        lightly shades the region below it ("ZLP region to discard"). Purely
+        a display aid -- it does not validate or apply anything.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure, with strong references to its callbacks/annotations/
+        pinned-label state stashed on it so they survive after this
+        function returns.
+    """
+    energy_axis = np.asarray(eels_ll.energy_axis, dtype=float)
+    mean_spec = np.asarray(eels_ll.calculate_mean_spectrum(), dtype=float)
+
+    x_span = float(energy_axis[-1] - energy_axis[0]) or 1.0
+    close_threshold = 0.035 * x_span
+    data_range = float(mean_spec.max() - mean_spec.min()) or 1.0
+    label_step = 0.10 * data_range
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(energy_axis, mean_spec, "k-", lw=1.2, label="Mean LL spectrum")
+    if current_cutoff_eV is not None:
+        cutoff_eV = float(current_cutoff_eV)
+        ax.axvspan(
+            energy_axis[0], cutoff_eV, color="gray", alpha=0.3, label="ZLP region to discard"
+        )
+        ax.axvline(cutoff_eV, color="red", ls="--", lw=1.5, label=f"cutoff: {cutoff_eV:.2f} eV")
+    ax.set_xlabel("Energy loss (eV)")
+    ax.set_ylabel("Intensity")
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    def _nearest_idx(xdata):
+        idx = int(np.searchsorted(energy_axis, xdata))
+        idx = min(max(idx, 0), len(energy_axis) - 1)
+        if idx > 0 and abs(energy_axis[idx - 1] - xdata) < abs(energy_axis[idx] - xdata):
+            idx -= 1
+        return idx
+
+    if hover_annotations:
+        hover_annot = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(15, 15),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="lightyellow", ec="gray", alpha=0.95),
+            arrowprops=dict(arrowstyle="->"),
+            fontsize=9,
+            visible=False,
+            zorder=10,
+        )
+
+        def _on_hover(event):
+            if event.inaxes is not ax or event.xdata is None:
+                if hover_annot.get_visible():
+                    hover_annot.set_visible(False)
+                    fig.canvas.draw_idle()
+                return
+            idx = _nearest_idx(event.xdata)
+            e_val, i_val = float(energy_axis[idx]), float(mean_spec[idx])
+            hover_annot.xy = (e_val, i_val)
+            hover_annot.set_text(f"Energy: {e_val:.2f} eV\nIntensity: {i_val:.2f}")
+            if not hover_annot.get_visible():
+                hover_annot.set_visible(True)
+            fig.canvas.draw_idle()
+
+        hover_callback_id = fig.canvas.mpl_connect("motion_notify_event", _on_hover)
+        fig._eels_ll_hover_callback = hover_callback_id
+        fig._eels_ll_hover_annotation = hover_annot
+
+    if enable_click_labels:
+        pinned_labels: List[dict] = []
+        click_hit_radius_px = 25
+
+        def _pin_label_at(x_click, y_click):
+            if click_label_snap_to_spectrum:
+                idx = _nearest_idx(x_click)
+                x_val, y_val = float(energy_axis[idx]), float(mean_spec[idx])
+            else:
+                x_val = float(x_click)
+                y_val = (
+                    float(y_click)
+                    if y_click is not None
+                    else float(np.interp(x_click, energy_axis, mean_spec))
+                )
+
+            used_levels = {
+                e["level"] for e in pinned_labels if abs(e["x"] - x_val) < close_threshold
+            }
+            level = 0
+            while level in used_levels:
+                level += 1
+            label_y = y_val + (level + 1) * label_step
+
+            artist = ax.annotate(
+                f"({x_val:.{click_label_precision}f}, {y_val:.{click_label_precision}f})",
+                xy=(x_val, y_val),
+                xytext=(x_val, label_y),
+                textcoords="data",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="black",
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor="white",
+                    edgecolor="black",
+                    alpha=0.9,
+                    linewidth=1.1,
+                ),
+                arrowprops=dict(arrowstyle="-", color="black", lw=0.8, alpha=0.7),
+                zorder=8,
+            )
+            pinned_labels.append(
+                {"x": x_val, "y": y_val, "level": level, "label_y": label_y, "artist": artist}
+            )
+
+            cur_bottom, cur_top = ax.get_ylim()
+            needed_top = label_y + 0.05 * data_range
+            if needed_top > cur_top:
+                ax.set_ylim(cur_bottom, needed_top)
+
+        def _delete_nearest_pinned_label(event):
+            if not pinned_labels:
+                return
+            best_i, best_dist = None, None
+            for i, entry in enumerate(pinned_labels):
+                px, py = ax.transData.transform((entry["x"], entry["label_y"]))
+                d = ((px - event.x) ** 2 + (py - event.y) ** 2) ** 0.5
+                if best_dist is None or d < best_dist:
+                    best_dist, best_i = d, i
+            if best_i is not None and best_dist <= click_hit_radius_px:
+                pinned_labels[best_i]["artist"].remove()
+                del pinned_labels[best_i]
+
+        def _on_click(event):
+            if event.inaxes is not ax or event.xdata is None:
+                return
+            if event.button == 1:
+                _pin_label_at(event.xdata, event.ydata)
+                fig.canvas.draw_idle()
+            elif event.button == 3:
+                _delete_nearest_pinned_label(event)
+                fig.canvas.draw_idle()
+
+        def _on_key(event):
+            if event.key == "c" and pinned_labels:
+                for entry in pinned_labels:
+                    entry["artist"].remove()
+                pinned_labels.clear()
+                fig.canvas.draw_idle()
+
+        click_callback_id = fig.canvas.mpl_connect("button_press_event", _on_click)
+        key_callback_id = fig.canvas.mpl_connect("key_press_event", _on_key)
+        fig._eels_ll_click_label_callbacks = [click_callback_id, key_callback_id]
+        fig._eels_ll_pinned_labels = pinned_labels
+
+    plt.show()
+    return fig
+
+
+def inspect_single_pass(
+    folder: Union[str, Path],
+    pass_number: Optional[int] = None,
+    good_passes: Union[str, Sequence[int]] = "all",
+    show: bool = True,
+    display_energy_range: Optional[Tuple[float, float]] = None,
+    display_intensity_range: Optional[Tuple[float, float]] = None,
+    hover_annotations: bool = True,
+) -> Dict[str, Any]:
+    """
+    Inspect one specific pass (1-indexed, matching ``passes_used`` in
+    ``quantem.core.io.read_stem_eels_folder``) from a multi-pass in-situ acquisition on its own -- without
+    summing it into the rest of the scan -- against two references: pass 1
+    (the first/reference pass) and the aggregate over `good_passes`.
+
+    Builds on load_multipass_raw_stacks(), the same per-pass access path
+    _load_multi_pass() uses (and available to any other per-pass function,
+    e.g. damage detection), so the raw sidecars only get parsed once however
+    many pass-level functions you call, not once per function.
+
+    Parameters
+    ----------
+    folder : str or Path
+        Acquisition folder, e.g. 'InSitu (9)'.
+    pass_number : int or None, default None
+        1-indexed pass number to inspect. If None (the default), resolves to
+        `n_passes` -- the true last pass in the sequence (1-indexed, so for a
+        37-pass acquisition this is pass 37, not 36) -- so calling this with
+        no pass_number gives a quick look at the most likely-damaged pass
+        (the raw last scan) against the reference pass 1, with no need to
+        already know which passes are damaged.
+    good_passes : str or sequence of int, default "all"
+        Which passes make up the "overall mean" comparison spectra -- same
+        spec format as ``quantem.core.io`` ``select_passes()`` / ``passes=``
+        ('all', '1-15', '1,3,5', '1-10,20,25-30', or a list of 1-indexed
+        pass numbers).
+    show : bool, default True
+        Plot the ADF image (pass 1 vs. inspected pass, side by side) and the
+        LL/HL spectrum comparisons (pass 1, inspected pass, and the overall
+        mean, all on the same axes).
+    display_energy_range : (float, float), optional
+        (lo, hi) eV to zoom both spectrum subplots' x-axis into. Purely a
+        display crop -- the full spectra are still plotted and returned;
+        this only changes what's visible. Defaults to each dataset's full
+        energy axis (no zoom).
+    display_intensity_range : (float, float), optional
+        (lo, hi) to zoom both spectrum subplots' y-axis into. Same
+        display-only caveat as `display_energy_range`.
+    hover_annotations : bool, default True
+        Mouse-hover coordinates and click-to-pin labels on both spectrum
+        subplots (:func:`attach_hover_to_axes`; needs an interactive backend
+        such as ``%matplotlib widget``).
+
+    Returns
+    -------
+    dict with keys:
+        adf_image_i : (ny, nx) ndarray, or None if no ADF raw sidecar was
+            found -- the real-space ADF image for the inspected pass alone.
+        adf_image_1 : same, for pass 1 (the reference pass); None under the
+            same condition as adf_image_i.
+        ll_spectrum_i, hl_spectrum_i : (n_energy,) ndarray -- the inspected
+            pass's spatially-averaged LL/HL spectra.
+        ll_spectrum_1, hl_spectrum_1 : (n_energy,) ndarray -- pass 1's
+            spatially-averaged LL/HL spectra.
+        ll_mean_overall, hl_mean_overall : (n_energy,) ndarray -- LL/HL
+            spectra averaged over `good_passes` (spatially and across those
+            passes).
+        ll_energy_axis, hl_energy_axis : (n_energy,) ndarray.
+        pass_number : the (1-indexed) pass inspected.
+        good_passes_used : 1-indexed pass numbers that went into the
+            "overall mean" comparison.
+    """
+    # Imported here, not at module level: quantem.core.io.file_readers imports
+    # quantem.spectroscopy, so a top-level import would be circular.
+    from quantem.core.io.file_readers import load_multipass_raw_stacks, select_passes
+
+    raw = load_multipass_raw_stacks(folder)
+
+    if pass_number is None:
+        pass_number = raw.n_passes
+    if pass_number < 1 or pass_number > raw.n_passes:
+        raise ValueError(f"pass_number={pass_number} out of range 1..{raw.n_passes}")
+    i = pass_number - 1
+    good_indices = select_passes(raw.n_passes, mode="manual", passes=good_passes)
+
+    # ll_stack/hl_stack are (n_frames, n_energy, ny, nx) -- see
+    # MultipassRawStacks for why energy is axis 1, not last.
+    ll_spectrum_i = raw.ll_stack[i].mean(axis=(1, 2))
+    hl_spectrum_i = raw.hl_stack[i].mean(axis=(1, 2))
+    ll_spectrum_1 = raw.ll_stack[0].mean(axis=(1, 2))
+    hl_spectrum_1 = raw.hl_stack[0].mean(axis=(1, 2))
+    ll_mean_overall = raw.ll_stack[good_indices].mean(axis=(0, 2, 3))
+    hl_mean_overall = raw.hl_stack[good_indices].mean(axis=(0, 2, 3))
+    if raw.adf_stack is not None:
+        adf_image_i = raw.adf_stack[i]
+        adf_image_1 = raw.adf_stack[0]
+    else:
+        adf_image_i = None
+        adf_image_1 = None
+
+    if show:
+        if adf_image_i is not None:
+            fig, (ax1, axi) = plt.subplots(1, 2, figsize=(8, 4))
+            im1 = ax1.imshow(adf_image_1, cmap="gray")
+            ax1.set_title("ADF -- pass 1 (reference)")
+            plt.colorbar(im1, ax=ax1)
+            imi = axi.imshow(adf_image_i, cmap="gray")
+            axi.set_title(f"ADF -- pass {pass_number}")
+            plt.colorbar(imi, ax=axi)
+            plt.tight_layout()
+            plt.show()
+        else:
+            print(f"No ADF raw stack found for {folder} -- skipping ADF image.")
+
+        fig, (ax_ll, ax_hl) = plt.subplots(1, 2, figsize=(12, 4))
+        ax_ll.plot(
+            raw.ll_energy_axis, ll_spectrum_1, label="pass 1 (reference)", color="tab:green"
+        )
+        ax_ll.plot(
+            raw.ll_energy_axis, ll_spectrum_i, label=f"pass {pass_number}", color="tab:blue"
+        )
+        ax_ll.plot(
+            raw.ll_energy_axis,
+            ll_mean_overall,
+            label=f"mean ({good_passes})",
+            color="tab:orange",
+            ls="--",
+        )
+        ax_ll.set_xlabel("Energy (eV)")
+        ax_ll.set_ylabel("Intensity")
+        ax_ll.set_title("LL spectrum")
+        ax_ll.legend()
+
+        ax_hl.plot(
+            raw.hl_energy_axis, hl_spectrum_1, label="pass 1 (reference)", color="tab:green"
+        )
+        ax_hl.plot(
+            raw.hl_energy_axis, hl_spectrum_i, label=f"pass {pass_number}", color="tab:blue"
+        )
+        ax_hl.plot(
+            raw.hl_energy_axis,
+            hl_mean_overall,
+            label=f"mean ({good_passes})",
+            color="tab:orange",
+            ls="--",
+        )
+        ax_hl.set_xlabel("Energy (eV)")
+        ax_hl.set_ylabel("Intensity")
+        ax_hl.set_title("HL spectrum")
+        ax_hl.legend()
+
+        if display_energy_range is not None:
+            e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+            if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+                raise ValueError(
+                    f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+                )
+            ax_ll.set_xlim(e_lo, e_hi)
+            ax_hl.set_xlim(e_lo, e_hi)
+
+        if display_intensity_range is not None:
+            i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+            if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+                raise ValueError(
+                    f"display_intensity_range must be (lo, hi) with lo < hi, got {display_intensity_range!r}"
+                )
+            ax_ll.set_ylim(i_lo, i_hi)
+            ax_hl.set_ylim(i_lo, i_hi)
+
+        if hover_annotations:
+            attach_hover_to_axes(fig, ax_ll)
+            attach_hover_to_axes(fig, ax_hl)
+        plt.tight_layout()
+        plt.show()
+
+    return {
+        "adf_image_i": adf_image_i,
+        "adf_image_1": adf_image_1,
+        "ll_spectrum_i": ll_spectrum_i,
+        "hl_spectrum_i": hl_spectrum_i,
+        "ll_spectrum_1": ll_spectrum_1,
+        "hl_spectrum_1": hl_spectrum_1,
+        "ll_mean_overall": ll_mean_overall,
+        "hl_mean_overall": hl_mean_overall,
+        "ll_energy_axis": raw.ll_energy_axis,
+        "hl_energy_axis": raw.hl_energy_axis,
+        "pass_number": pass_number,
+        "good_passes_used": [p + 1 for p in good_indices],
+    }
