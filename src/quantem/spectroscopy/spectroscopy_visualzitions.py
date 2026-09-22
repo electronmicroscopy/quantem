@@ -3703,3 +3703,86 @@ def plot_map_diagnostics(
         fig.tight_layout(rect=(0, 0, 1, 0.92 if title else 1))
         plt.show()
     return rows, fig
+
+
+def plot_despike_preview(
+    energy_axis,
+    mean_spec,
+    mean_spec_corrected,
+    ranges,
+    display_energy_range=None,
+    display_intensity_range=None,
+    display_residual_range=None,
+):
+    """Three panels: the mean spectrum with the spike ranges shaded, original vs.
+    despiked, and the correction residual (zero outside the ranges). Used by
+    :meth:`Dataset3deels.despike`; returns the figure."""
+    fig, axes = plt.subplots(3, 1, figsize=(9, 12), sharex=True)
+    colors = ("red", "orange")
+
+    # 1. original spectrum with chosen spike ranges shaded
+    axes[0].plot(energy_axis, mean_spec, "k-", lw=1.2, label="Mean HL spectrum (original)")
+    for i, (lo, hi) in enumerate(ranges):
+        axes[0].axvspan(
+            lo,
+            hi,
+            color=colors[i % len(colors)],
+            alpha=0.3,
+            label=f"spike {i + 1}: [{lo:.2f}, {hi:.2f}] eV",
+        )
+    axes[0].set_ylabel("Intensity")
+    axes[0].set_title("1. Original spectrum with chosen spike ranges")
+    axes[0].legend(loc="best", fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    # 2. original vs. despiked mean spectrum overlaid
+    axes[1].plot(energy_axis, mean_spec, "k-", lw=1.2, alpha=0.55, label="original")
+    axes[1].plot(energy_axis, mean_spec_corrected, "b-", lw=1.4, label="despiked")
+    for lo, hi in ranges:
+        axes[1].axvspan(lo, hi, color="red", alpha=0.12)
+    axes[1].set_ylabel("Intensity")
+    axes[1].set_title("2. Original vs. despiked mean spectrum")
+    axes[1].legend(loc="best", fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    # 3. correction residual -- should be exactly zero outside the chosen
+    # ranges, which is the direct visual proof that nothing else changed
+    axes[2].plot(energy_axis, mean_spec_corrected - mean_spec, "m-", lw=1.0)
+    axes[2].axhline(0, color="gray", ls="--", lw=1)
+    for lo, hi in ranges:
+        axes[2].axvspan(lo, hi, color="red", alpha=0.12)
+    axes[2].set_xlabel("Energy loss (eV)")
+    axes[2].set_ylabel("corrected - original")
+    axes[2].set_title("3. Correction residual (should be zero outside the shaded ranges)")
+    axes[2].grid(True, alpha=0.3)
+
+    if display_energy_range is not None:
+        e_lo, e_hi = float(display_energy_range[0]), float(display_energy_range[1])
+        if not (np.isfinite(e_lo) and np.isfinite(e_hi) and e_lo < e_hi):
+            raise ValueError(
+                f"display_energy_range must be (lo, hi) with lo < hi, got {display_energy_range!r}"
+            )
+        axes[0].set_xlim(e_lo, e_hi)  # axes[1], axes[2] share this x-axis (sharex=True)
+
+    if display_intensity_range is not None:
+        i_lo, i_hi = float(display_intensity_range[0]), float(display_intensity_range[1])
+        if not (np.isfinite(i_lo) and np.isfinite(i_hi) and i_lo < i_hi):
+            raise ValueError(
+                f"display_intensity_range must be (lo, hi) with lo < hi, "
+                f"got {display_intensity_range!r}"
+            )
+        axes[0].set_ylim(i_lo, i_hi)
+        axes[1].set_ylim(i_lo, i_hi)
+
+    if display_residual_range is not None:
+        r_lo, r_hi = float(display_residual_range[0]), float(display_residual_range[1])
+        if not (np.isfinite(r_lo) and np.isfinite(r_hi) and r_lo < r_hi):
+            raise ValueError(
+                f"display_residual_range must be (lo, hi) with lo < hi, "
+                f"got {display_residual_range!r}"
+            )
+        axes[2].set_ylim(r_lo, r_hi)
+
+    plt.tight_layout()
+    plt.show()
+    return fig

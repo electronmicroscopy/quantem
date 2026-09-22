@@ -32,6 +32,9 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
     plot_background_fit_ranges as _plot_background_fit_ranges,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
+    plot_despike_preview as _plot_despike_preview,
+)
+from quantem.spectroscopy.spectroscopy_visualzitions import (
     plot_dual_eels_picker as _visualize_dual_eels_picker,
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
@@ -45,6 +48,9 @@ from quantem.spectroscopy.spectroscopy_visualzitions import (
 )
 from quantem.spectroscopy.spectroscopy_visualzitions import (
     visualize_thickness_windows as _visualize_thickness_windows,
+)
+from quantem.spectroscopy.utils import (
+    _despike_apply as _despike_apply,
 )
 from quantem.spectroscopy.utils import (
     auto_hl_config as _auto_hl_config,
@@ -1114,6 +1120,86 @@ class Dataset3deels(Dataset3dspectroscopy):
         ax.legend()
 
         return smoothed_data3d
+
+    def despike(
+        self,
+        spike_ranges,
+        show=True,
+        display_energy_range=None,
+        display_intensity_range=None,
+        display_residual_range=None,
+    ):
+        """
+        Remove narrow detector spikes by linear interpolation across each range.
+
+        Every channel inside each ``(lo, hi)`` range is replaced, independently
+        in every pixel, by a straight line between the clean channel just below
+        and just above the range. Channels outside the ranges are unchanged, and
+        ``self`` is not modified. :meth:`suggest_spike_ranges` proposes ranges.
+
+        Parameters
+        ----------
+        spike_ranges : sequence of (float, float)
+            Energy ranges (eV) to interpolate across. Each must lie inside the
+            energy axis and leave at least one channel on both sides.
+        show : bool, optional
+            Plot the mean spectrum before/after and the correction residual.
+            Default True.
+        display_energy_range, display_intensity_range, display_residual_range : (float, float), optional
+            Display-only zoom for the preview plot.
+
+        Returns
+        -------
+        Dataset3deels
+            Despiked copy. An empty ``spike_ranges`` returns an unchanged copy.
+
+        Raises
+        ------
+        ValueError
+            A range with lo >= hi, outside the axis, containing no channel, or
+            touching the first/last channel.
+        """
+        energy_axis = np.asarray(self.energy_axis, dtype=float)
+        edge_lo, edge_hi = float(energy_axis[0]), float(energy_axis[-1])
+        n_energy = len(energy_axis)
+        ranges = []
+        for lo, hi in spike_ranges:
+            lo, hi = float(lo), float(hi)
+            if not (lo < hi):
+                raise ValueError(
+                    f"lower bound must be < upper bound; got lo={lo:.4f}, hi={hi:.4f}"
+                )
+            if lo < edge_lo or hi > edge_hi:
+                raise ValueError(
+                    f"range [{lo:.4f}, {hi:.4f}] eV is outside the energy axis "
+                    f"[{edge_lo:.4f}, {edge_hi:.4f}] eV"
+                )
+            idx = np.where((energy_axis >= lo) & (energy_axis <= hi))[0]
+            if idx.size == 0:
+                raise ValueError(f"range [{lo:.4f}, {hi:.4f}] eV contains no energy channels")
+            if idx[0] <= 0 or idx[-1] >= n_energy - 1:
+                raise ValueError(
+                    f"range [{lo:.4f}, {hi:.4f}] eV touches the first/last energy channel -- "
+                    "a despiking interval needs a clean channel on both sides"
+                )
+            ranges.append((lo, hi))
+
+        despiked = self.copy()
+        despiked.array = _despike_apply(self.array, energy_axis, ranges)
+        despiked.name = f"{self.name} (despiked)"
+
+        if show:
+            mean_spec = np.asarray(self.calculate_mean_spectrum(), dtype=float)
+            _plot_despike_preview(
+                energy_axis,
+                mean_spec,
+                _despike_apply(mean_spec, energy_axis, ranges),
+                ranges,
+                display_energy_range=display_energy_range,
+                display_intensity_range=display_intensity_range,
+                display_residual_range=display_residual_range,
+            )
+        return despiked
 
     def measure_zlp_offset(
         self,

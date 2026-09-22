@@ -1312,3 +1312,52 @@ def _validate_pre_edge_window(lo, hi, energy_axis, target_edge=None) -> Tuple[fl
                 "(the pre-edge fitting window must not reach the edge onset)."
             )
     return lo, hi
+
+
+def _despike_apply(array, energy_axis, ranges):
+    """
+    Replace the channels inside each (lo, hi) range with a linear
+    interpolation between the clean channel immediately before and
+    immediately after the range, independently for every spectrum in
+    `array` (whatever its leading dims are -- works for a 1D mean spectrum
+    or the full (row, col, energy) cube, since energy is always the last
+    axis and everything else broadcasts).
+    """
+    out = np.array(array, copy=True)
+    for lo, hi in ranges:
+        idx = np.where((energy_axis >= lo) & (energy_axis <= hi))[0]
+        i0, i1 = int(idx[0]), int(idx[-1])
+        left, right = i0 - 1, i1 + 1
+        x_left, x_right = energy_axis[left], energy_axis[right]
+        y_left = out[..., left]
+        y_right = out[..., right]
+        seg_x = energy_axis[i0 : i1 + 1]
+        frac = (seg_x - x_left) / (x_right - x_left)
+        out[..., i0 : i1 + 1] = y_left[..., None] + frac * (y_right - y_left)[..., None]
+    return out
+
+
+def bin_spatial(dataset, factor: int = 2):
+    """
+    Average ``factor`` x ``factor`` real-space pixels into one, to raise the
+    signal-to-noise of each spectrum at the cost of spatial resolution.
+
+    Returns a new dataset (the input is untouched) with the spatial sampling
+    multiplied by ``factor``. Incomplete edge blocks are averaged over the pixels
+    they contain, so no row or column is lost -- unlike ``Dataset.bin()``, which
+    drops the remainder when the scan size is not a multiple of ``factor``.
+    ``factor=1`` returns a copy.
+    """
+    factor = int(factor)
+    if factor < 1:
+        raise ValueError(f"factor must be >= 1, got {factor}")
+    out = dataset.copy()
+    if factor == 1:
+        return out
+    binned, _, _ = _block_mean(dataset.array, factor)
+    out.array = binned
+    sampling = np.array(dataset.sampling, dtype=float)
+    sampling[:2] *= factor
+    out.sampling = sampling
+    out.name = f"{dataset.name} (binned {factor}x{factor})"
+    return out

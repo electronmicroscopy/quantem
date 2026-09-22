@@ -33,6 +33,9 @@ from quantem.spectroscopy.utils import (
     load_xray_lines_database,
 )
 from quantem.spectroscopy.utils import (
+    bin_spatial as _bin_spatial,
+)
+from quantem.spectroscopy.utils import (
     crop_energy_range as _crop_energy_range,
 )
 from quantem.spectroscopy.utils import (
@@ -79,6 +82,7 @@ class Dataset3dspectroscopy(Dataset3d):
     show_mean_spectrum = _visualize_mean_spectrum
     show_energy_window_map = _visualize_energy_window_map
     _plot_background_subtraction = _visualize_background_subtraction
+    bin_spatial = _bin_spatial
     crop_energy_range = _crop_energy_range
     fit_windows_inside_axis = _fit_windows_inside_axis
     summarize_energy_windows = _summarize_energy_windows
