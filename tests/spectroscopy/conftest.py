@@ -1,7 +1,100 @@
+"""Shared fixtures for the spectroscopy test suite.
+
+Covers both:
+- EELS: the ``Dataset3deels`` ZLP-offset robustness fix (``measure_zlp_offset`` /
+  ``calculate_thickness_log_ratio``) -- synthetic scans with a known, exactly-linear
+  ZLP-center plane so recovered surface-fit coefficients can be checked against ground truth.
+- XEDS: synthetic spectra built from the real X-ray line database (``xeds_factory``,
+  ``line_spectrum_factory``) for line-lookup/peak-fitting/background tests.
+"""
+
 import numpy as np
 import pytest
 
 from quantem.spectroscopy import Dataset3dxeds
+from quantem.spectroscopy.dataset3deels import Dataset3deels
+
+# ---------------------------------------------------------------------------
+# EELS: tilted zero-loss-peak plane
+# ---------------------------------------------------------------------------
+
+SCAN_ROW = 12
+SCAN_COL = 12
+N_ENERGY = 400
+ENERGY_LO = -2.0
+ENERGY_HI = 2.0
+
+# Ground-truth plane: mu(row, col) = A_TRUE * row + B_TRUE * col + C_TRUE
+A_TRUE = 0.01
+B_TRUE = -0.005
+C_TRUE = 0.02
+SIGMA_TRUE = 0.1
+AMP_TRUE = 1000.0
+NOISE_STD = 0.5
+
+
+def energy_axis() -> np.ndarray:
+    return np.linspace(ENERGY_LO, ENERGY_HI, N_ENERGY)
+
+
+def make_tilted_zlp_scan(
+    a: float = A_TRUE,
+    b: float = B_TRUE,
+    c: float = C_TRUE,
+    sigma: float = SIGMA_TRUE,
+    amp: float = AMP_TRUE,
+    noise: float = NOISE_STD,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a (scan_row, scan_col, n_energy) array of Gaussian ZLPs whose
+    centers lie exactly on the plane ``mu(row, col) = a*row + b*col + c``.
+
+    Returns ``(array, plane)``, where ``plane`` is the (scan_row, scan_col)
+    ground-truth ZLP center (eV) at every pixel.
+    """
+    rng = np.random.default_rng(seed)
+    energy = energy_axis()
+    array = np.empty((SCAN_ROW, SCAN_COL, N_ENERGY))
+    plane = np.empty((SCAN_ROW, SCAN_COL))
+    for i in range(SCAN_ROW):
+        for j in range(SCAN_COL):
+            mu = a * i + b * j + c
+            plane[i, j] = mu
+            array[i, j, :] = amp * np.exp(-0.5 * ((energy - mu) / sigma) ** 2)
+            array[i, j, :] += rng.normal(0, noise, N_ENERGY)
+    return array, plane
+
+
+def dataset_from_array(array: np.ndarray) -> Dataset3deels:
+    energy = energy_axis()
+    return Dataset3deels.from_array(
+        array=array,
+        sampling=[1, 1, (energy[-1] - energy[0]) / (N_ENERGY - 1)],
+        origin=[0, 0, energy[0]],
+        units=["px", "px", "eV"],
+    )
+
+
+@pytest.fixture(scope="module")
+def tilted_zlp_scan() -> tuple[np.ndarray, np.ndarray]:
+    """Clean synthetic (array, ground_truth_plane) with a known tilted ZLP plane."""
+    return make_tilted_zlp_scan()
+
+
+@pytest.fixture
+def tilted_zlp_dataset(tilted_zlp_scan) -> tuple[Dataset3deels, np.ndarray]:
+    """``Dataset3deels`` built from ``tilted_zlp_scan``, plus its ground-truth plane.
+
+    Function-scoped (fresh dataset per test) even though the underlying
+    array is module-scoped and reused read-only.
+    """
+    array, plane = tilted_zlp_scan
+    return dataset_from_array(array.copy()), plane
+
+
+# ---------------------------------------------------------------------------
+# XEDS: synthetic spectra from the real X-ray line database
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
