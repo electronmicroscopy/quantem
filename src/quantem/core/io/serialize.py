@@ -789,7 +789,9 @@ class AutoSerialize:
 
         # Handle list/tuple containers
         if isinstance(value, (list, tuple)):
-            group.attrs["_container_type"] = type(value).__name__
+            # normalize subclasses (torch.Size, namedtuples, ...) to their base container,
+            # since _deserialize_container only knows how to rebuild list/tuple
+            group.attrs["_container_type"] = "tuple" if isinstance(value, tuple) else "list"
             # Fast-path: homogeneous numeric scalars → single ndarray
             try:
                 is_all_numeric = len(value) > 0 and all(

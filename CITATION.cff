@@ -1,0 +1,148 @@
+# This file describes how to cite the quantem software (schema: https://citation-file-format.github.io).
+# It is maintained by hand. Unlike Zenodo's auto-generated author list, this file will not
+# pick up new contributors on its own: update `authors`, `version`, and `date-released`
+# with each release.
+message: >-
+  If you use quantem in your research, please cite this software using the metadata below,
+  along with any relevant method papers listed in the README.
+title: "quantem: quantitative electron microscopy analysis toolkit"
+abstract: >-
+  quantem is a quantitative electron microscopy data analysis toolkit built on PyTorch, 
+  providing tools for analyzing many kinds of transmission electron microscopy data.
+type: software
+authors:
+  - given-names: "Arthur R. C."
+    family-names: McCray
+    orcid: "0000-0001-6077-4698"
+    affiliation: "Stanford University"  
+  - given-names: Colin
+    family-names: Ophus
+    orcid: "0000-0003-2348-8558"  
+    affiliation: "Stanford University"  
+  - given-names: "Stephanie M."
+    family-names: Ribet
+    orcid: "0000-0002-7117-066X"  
+    affiliation: "Lawrence Berkeley National Laboratory"  
+  - given-names: Georgios
+    family-names: Varnavides
+    orcid: "0000-0001-8338-3323"  
+    affiliation: "Delft University of Technology"  
+  - given-names: Cedric
+    family-names: Lim
+    orcid: "0009-0000-1319-5175"  
+    affiliation: "Stanford University"  
+  - given-names: Karen
+    family-names: Ehrhardt
+    # orcid: ""  
+    # affiliation: ""  
+  - given-names: Matthew
+    family-names: Feickert
+    # orcid: ""  
+    # affiliation: ""  
+  - given-names: Carter
+    family-names: Francis
+    # orcid: ""  
+    # affiliation: ""  
+  - given-names: "Sangjoon Bob"
+    family-names: Lee
+    # orcid: ""  
+    # affiliation: ""  
+  - given-names: Darshan
+    family-names: Mali
+    # orcid: ""  
+    # affiliation: ""  
+  - given-names: Nicholas
+    family-names: Marchese
+    # orcid: ""  
+    # affiliation: ""  
+  - given-names: Will
+    family-names: Millsaps
+    # orcid: ""  
+    # affiliation: ""  
+doi: 10.5281/zenodo.18642593  # concept DOI (always resolves to the latest release)
+license: MIT
+repository-code: "https://github.com/electronmicroscopy/quantem"
+url: "https://github.com/electronmicroscopy/quantem"
+keywords:
+  - electron microscopy
+  - 4D-STEM
+  - ptychography
+  - tomography
+  - TEM
+  - STEM
+  - PyTorch
+references:
+  - type: article
+    title: "Deep generative priors for robust and efficient electron ptychography"
+    authors:
+      - given-names: "Arthur R. C."
+        family-names: McCray
+      - given-names: "Stephanie M."
+        family-names: Ribet
+      - given-names: Georgios
+        family-names: Varnavides
+      - given-names: Colin
+        family-names: Ophus
+    year: 2025
+    url: "https://arxiv.org/abs/2511.07795"
+    notes: "arXiv:2511.07795"
+  - type: article
+    title: "Relaxing Direct Ptychography Sampling Requirements via Parallax Imaging Insights"
+    authors:
+      - given-names: Georgios
+        family-names: Varnavides
+      - given-names: "Julie Marie"
+        family-names: Bekkevold
+      - given-names: "Stephanie M."
+        family-names: Ribet
+      - given-names: "Mary C."
+        family-names: Scott
+      - given-names: Lewys
+        family-names: Jones
+      - given-names: Colin
+        family-names: Ophus
+    journal: "Microscopy and Microanalysis"
+    volume: 32
+    issue: 2
+    year: 2026
+    doi: 10.1093/mam/ozaf139
+  - type: article
+    title: >-
+      Missing Wedge Inpainting and Joint Alignment in Electron Tomography through
+      Implicit Neural Representations
+    authors:
+      - given-names: Cedric
+        family-names: Lim
+      - given-names: Corneel
+        family-names: Casert
+      - given-names: "Arthur R. C."
+        family-names: McCray
+      - given-names: Serin
+        family-names: Lee
+      - given-names: Andrew
+        family-names: Barnum
+      - given-names: Jennifer
+        family-names: Dionne
+      - given-names: Colin
+        family-names: Ophus
+    year: 2025
+    url: "https://arxiv.org/abs/2512.08113"
+    notes: "arXiv:2512.08113"
+  - type: article
+    title: >-
+      Multi-angle Precession Electron Diffraction (MAPED): A Versatile Approach to
+      4D-STEM Precession
+    authors:
+      - given-names: "Stephanie M."
+        family-names: Ribet
+      - given-names: Rohan
+        family-names: Dhall
+      - given-names: Colin
+        family-names: Ophus
+      - given-names: "Karen C."
+        family-names: Bustillo
+    journal: "Microscopy and Microanalysis"
+    volume: 31
+    issue: 6
+    year: 2025
+    doi: 10.1093/mam/ozaf103

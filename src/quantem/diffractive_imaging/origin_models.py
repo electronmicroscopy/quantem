@@ -160,9 +160,13 @@ class CenterOfMassOriginModel(AutoSerialize):
             xa, ya = torch.meshgrid(x, y, indexing="ij")
             probe_positions = torch.stack([xa, ya], -1).view((-1, 2))
         else:
-            probe_positions = validate_tensor(
-                probe_positions, "probe positions", dtype=torch.float
-            ).view((-1, 2))
+            # `.to(self.device)` matters: positions usually arrive as a numpy array, and a
+            # CPU tensor meeting `origin_measured` on MPS raises rather than promoting
+            probe_positions = (
+                validate_tensor(probe_positions, "probe positions", dtype=torch.float)
+                .to(self.device)
+                .view((-1, 2))
+            )
             if probe_positions.shape != self.origin_measured.shape:
                 raise ValueError("probe positions shape must match the measured origins.")
 

@@ -4,9 +4,13 @@ from warnings import warn
 import numpy as np
 import scipy.ndimage as ndi
 import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 
 from quantem.core import config
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.ml.constraints import Constraints
+from quantem.core.ml.dist_utils import all_reduce_params, worker_init_fn
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.utils import (
     electron_wavelength_angstrom,
@@ -28,8 +32,8 @@ from quantem.diffractive_imaging.detector_models import DetectorBase, DetectorMo
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelType
 from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
+from quantem.diffractive_imaging.ptycho_losses import DataCriterion, get_data_criterion
 from quantem.diffractive_imaging.ptycho_utils import (
-    AffineTransform,
     center_crop_arr,
     fourier_translation_operator,
     sum_patches,
@@ -93,12 +97,24 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise RuntimeError("the quantEM Ptychography module requires torch to be installed.")
 
         super().__init__()
+
+        # Pre-initialize private attributes so type checker sees them in __init__
+        self._verbose: int = 0
+        self._logger: LoggerPtychography | None = None
+        self._batch_size: int = 1
+        self._dset: DatasetModelType = dset
+        self._obj_model: ObjectModelType = obj_model
+        self._probe_model: ProbeModelType = probe_model
+        self._detector_model: DetectorModelType = detector_model
+        self._criterion: DataCriterion = get_data_criterion("l2_amplitude")
+
         self.verbose = verbose
         self.dset = dset
         self.device = device
         self.rng = rng
 
         # initializing default attributes
+        self._multi_gpu_devices: list[int] | None = None
         self._preprocessed: bool = False
         self._obj_padding_force_power2_level: int = 3
         self._store_snapshots: bool = False
@@ -106,10 +122,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._iter_losses: list[float] = []
         self._iter_val_losses: list[float] = []
         self._iter_recon_types: list[str] = []
-        self._iter_lrs: dict[str, list] = {}  # LRs/step_sizes across iterations
+        self._iter_lrs: dict[str, list[float]] = {}  # LRs/step_sizes across iterations
         self._snapshots: list[Snapshot] = []
         self._obj_padding_px = np.array([0, 0])
-        self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
+        self.obj_fov_mask = torch.ones(tuple(self.dset._obj_shape_full_2d(self.obj_padding_px)))
         self.batch_size = self.dset.num_gpts
         self._val_ratio = 0.0
         self._val_mode: Literal["grid", "random"] = "grid"
@@ -117,9 +133,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if (
             isinstance(probe_model, ProbePixelated)
             and (probe_model.vacuum_probe_intensity is not None)
-            and (dset.amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
+            # ``centered_amplitudes`` shares amplitudes' shape but is always resident (amplitudes is
+            # recomputed lazily), so use it here to avoid materializing the full raw array.
+            and (dset.centered_amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
         ):
-            probe_model.rescale_vacuum_probe((dset.amplitudes.shape[1], dset.amplitudes.shape[2]))
+            probe_model.rescale_vacuum_probe(
+                (dset.centered_amplitudes.shape[1], dset.centered_amplitudes.shape[2])
+            )
 
         # Remove centralized optimizer storage - now managed by individual models
         self.probe_model = probe_model
@@ -127,10 +147,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.detector_model = detector_model
         self.compute_propagator_arrays()
         self.logger = logger
-        self.to(self.device)
+        self.to(self._single_device)
 
     # region --- preprocessing ---
-    ## hopefully will be able to remove some of thes preprocessing flags,
+    ## hopefully will be able to remove some of these preprocessing flags,
     ## convert plotting and vectorized to kwargs
     def preprocess(
         self,
@@ -170,13 +190,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.roi_shape,
                 self.reciprocal_sampling,
                 self.dset.mean_diffraction_intensity,
-                device=self.device,
+                device=self._single_device,
             )
 
         # change obj_padding_px and whatever else needs to be changed
         self.obj_padding_px = obj_padding_px  # also initializes the object model
-        self.dset._set_initial_scan_positions_px(self.obj_padding_px)
-        self.dset._set_patch_indices(self.obj_padding_px)
 
         self.compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
@@ -192,7 +210,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         overlap = self._get_probe_overlap(batch_size)
         ov = overlap > overlap.max() * 0.3
         ov = ndi.binary_closing(ov, iterations=5)
-        ov = ndi.binary_dilation(ov, iterations=min(32, np.min(self.obj_padding_px) // 4))
+        dilation_iters = min(32, np.min(self.obj_padding_px) // 4)
+        if dilation_iters > 0:
+            ov = ndi.binary_dilation(ov, iterations=dilation_iters)
         ov = ndi.gaussian_filter(ov.astype(config.get("dtype_real")), sigma=gaussian_sigma)
         self.obj_fov_mask = ov
         self.obj_model.mask = ov
@@ -200,12 +220,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     def _get_probe_overlap(self, max_batch_size: int | None = None) -> np.ndarray:
         prb = self.probe_model.probe[0]
-        num_dps = int(np.prod(self.gpts))
+        num_dps = self.dset.num_positions
         shifted_probes = prb.expand(num_dps, *self.roi_shape)
 
-        batch_size = num_dps if max_batch_size is None else int(max_batch_size)
+        batch_size = min(num_dps, 4096) if max_batch_size is None else int(max_batch_size)
         probe_overlap = torch.zeros(
-            tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self.device
+            tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self._single_device
         )
         for start, end in generate_batches(num_dps, max_batch=batch_size):
             probe_overlap += sum_patches(
@@ -229,6 +249,21 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         ):
             raise TypeError(f"dset should be a PtychographyDataset, got {type(new_dset)}")
         self._dset = new_dset
+
+    @property
+    def criterion(self) -> DataCriterion:
+        """Active data-fidelity criterion. Assign a registered name or a ``DataCriterion``.
+
+        Transient config (re-set from ``loss_type`` each ``reconstruct``); not serialized, so it
+        lazily re-defaults to L2 on a loaded object (where ``__init__`` did not run).
+        """
+        if getattr(self, "_criterion", None) is None:
+            self._criterion = get_data_criterion("l2_amplitude")
+        return self._criterion
+
+    @criterion.setter
+    def criterion(self, value: "str | DataCriterion") -> None:
+        self._criterion = get_data_criterion(value)
 
     @property
     def detector_model(self) -> DetectorModelType:
@@ -296,7 +331,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return self._to_numpy(slice_thick)
 
     @slice_thicknesses.setter
-    def slice_thicknesses(self, val: float | Sequence | None) -> None:
+    def slice_thicknesses(self, val: float | Sequence[float] | None) -> None:
         self._obj_model.slice_thicknesses = val
         if hasattr(self, "_propagators"):  # propagators already set, update with new slices
             self.compute_propagator_arrays()
@@ -311,8 +346,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj(self) -> np.ndarray:
+        """Object array in its native representation per ``obj_type``:
+
+        - ``"complex"`` → complex ndarray (amp * exp(1j*phase)); phase recentered.
+        - ``"pure_phase"`` → real ndarray of phase values.
+        - ``"potential"`` → real ndarray of potential values.
+        """
         obj = self._to_numpy(self.obj_model.obj)
-        if self.obj_type in ["pure_phase", "complex"]:
+        if self.obj_type == "complex":
             ph = np.angle(obj)
             obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
         return obj
@@ -416,7 +457,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def probe(self) -> np.ndarray:
-        """Complex valued probe(s). Shape [num_probes, roi_reight, roi_width]"""
+        """Complex valued probe(s). Shape [num_probes, roi_height, roi_width]"""
         return self._to_numpy(self.probe_model.probe)
 
     @property
@@ -482,11 +523,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if cropped:
             snp2 = snp.copy()
             cropped_obj = self._crop_rotate_obj_fov(snp2["obj"])
-            # same logic as self.obj_cropped
-            if self.obj_type == "pure_phase":
-                ph = np.angle(cropped_obj)
-                cropped_obj = np.exp(1j * (ph - ph.mean()))
-            if self.obj_type in ["pure_phase", "complex"]:
+            # same logic as self.obj_cropped: only re-center for complex (which
+            # carries phase inside a complex tensor); pure_phase and potential
+            # are already real and recentered upstream.
+            if self.obj_type == "complex":
                 ph = np.angle(cropped_obj)
                 cropped_obj = np.abs(cropped_obj) * np.exp(1j * (ph - ph.mean()))
             snp2["obj"] = cropped_obj
@@ -506,8 +546,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise TypeError(f"obj_model must be a ObjectModelType, got {type(model)}")
 
         # Set object shape
-        model.to(self.device)
+        model.to(self._single_device)
         self._obj_model = cast(ObjectModelType, model)
+        # Keep the dataset's forward path (coordinates vs. integer patch_indices) in sync with
+        # the object representation. Implicit objects are queried at continuous coordinates.
+        if hasattr(self, "_dset"):
+            self.dset.implicit_object = model.is_implicit
 
     @property
     def probe_model(self) -> ProbeModelType:
@@ -527,12 +571,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.roi_shape,
                 self.reciprocal_sampling,
                 self.dset.mean_diffraction_intensity,
-                device=self.device,
+                device=self._single_device,
             )
         else:
             # will be set in ptycho.preprocess after dset is preprocessed
             pass
-        self._probe_model.to(self.device)
+        self._probe_model.to(self._single_device)
 
     @property
     def constraints(self) -> dict[str, Any]:
@@ -548,7 +592,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @constraints.setter
     def constraints(self, c: dict[str, Any]):
-        """Set constraints by forwarding to individual models."""
+        """Set constraints by forwarding to individual models.
+
+        Each leaf value may be either a plain ``dict`` (validated per-key against
+        the model's constraint dataclass) or a ``Constraints`` dataclass instance
+        (assigned wholesale to the model).
+        """
         constraint_handlers = {
             "object": self.obj_model,
             "probe": self.probe_model,
@@ -556,9 +605,16 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         }
 
         for key, value in c.items():
-            if key in constraint_handlers and isinstance(value, dict):
-                for subkey, subvalue in value.items():
-                    constraint_handlers[key].add_constraint(subkey, subvalue)
+            if key in constraint_handlers:
+                if isinstance(value, Constraints):
+                    constraint_handlers[key].constraints = value
+                elif isinstance(value, dict):
+                    constraint_handlers[key].constraints = value
+                else:
+                    raise TypeError(
+                        f"Constraints for '{key}' must be a dict or Constraints dataclass, "
+                        f"got {type(value).__name__}"
+                    )
             elif key == "detector" and isinstance(value, dict):
                 warn("Detector constraints not implemented, skipping")
             else:
@@ -595,12 +651,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     # region --- implicit class properties ---
 
     @property
-    def device(self) -> str:
-        """This should be of form 'cuda:X' or 'cpu', as defined by quantem.config"""
+    def device(self) -> str | list[int]:
+        """Returns the active device: 'cuda:X'/'cpu' for single-GPU, or [gpu_ids] for multi-GPU."""
+        if self._multi_gpu_devices is not None:
+            return self._multi_gpu_devices
         if hasattr(self, "_device"):
             return self._device
-        else:
-            return config.get("device")
+        return config.get("device")
 
     @device.setter
     def device(self, device: str | int | None):
@@ -612,6 +669,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 self.to(dev)
             except AttributeError:
                 pass
+
+    @property
+    def _single_device(self) -> str:
+        """Single-device string for internal tensor operations. Always str, never a list."""
+        return self._device if hasattr(self, "_device") else str(config.get("device"))
 
     @property
     def _obj_dtype(self) -> "torch.dtype":
@@ -628,8 +690,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def obj_cropped(self) -> np.ndarray:
+        """Cropped + FOV-rotated object, in its native representation.
+
+        - ``obj_type="complex"`` → complex array (amp * exp(1j*phase)); phase is
+          recentered to zero mean here as a defensive duplicate of
+          ``ObjectConstraints._apply_hard_complex``.
+        - ``obj_type="pure_phase"`` → real array of phase values (already
+          recentered upstream by ``_apply_hard_pure_phase``).
+        - ``obj_type="potential"`` → real array of potential values.
+        """
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
-        if self.obj_type in ["pure_phase", "complex"]:
+        if self.obj_type == "complex":
             ph = np.angle(cropped)
             cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
         return cropped
@@ -733,11 +804,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 "Preprocessing has not been completed. Please run Ptycho.preprocess()"
             )
 
-    def _check_rm_preprocessed(self, new_val: Any, name: str) -> None:
-        if hasattr(self, name):
-            if getattr(self, name) != new_val:
-                self._preprocessed = False
-
     def _to_numpy(self, array: "np.ndarray | torch.Tensor") -> np.ndarray:
         return to_numpy(array)
 
@@ -770,13 +836,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise TypeError(f"dtype should be string or torch.dtype, got {type(dtype)} {dtype}")
 
         if isinstance(array, np.ndarray):
-            t = torch.tensor(array.copy(), device=self.device, dtype=dt)
+            t = torch.tensor(array.copy(), device=self._single_device, dtype=dt)
         elif isinstance(array, torch.Tensor):
-            t = array.to(self.device)
+            t = array.to(self._single_device)
             if dt is not None:
                 t = t.type(dt)
         elif isinstance(array, (list, tuple)):
-            t = torch.tensor(array, device=self.device, dtype=dt)
+            t = torch.tensor(array, device=self._single_device, dtype=dt)
         else:
             raise TypeError(f"arr should be ndarray or Tensor, got {type(array)}")
         return t
@@ -789,57 +855,23 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         transpose: bool | None = None,
         padding: np.ndarray | tuple[int, int] | None = None,
     ) -> np.ndarray:
-        """
-        Crops and rotated object to FOV bounded by current pixel positions.
-        """
+        """Un-rotates and un-transposes the object and crops it to the reconstruction FOV."""
         array = self._to_numpy(array).copy()
         com_rotation_rad = (
             self.dset.com_rotation_rad if com_rotation_rad is None else com_rotation_rad
         )
         transpose = self.dset.com_transpose if transpose is None else transpose
-        padding = np.array(padding) if padding is not None else self.obj_padding_px
 
         angle = com_rotation_rad if transpose else -1 * com_rotation_rad
 
-        if positions_px is None:
-            positions = self.dset.initial_scan_positions_px.cpu().detach().numpy()
-            # if using learned positions potentially need to pad the object in center_crop_arr
-            # positions = self.dset.scan_positions_px.cpu().detach().numpy()
-        else:
-            positions = positions_px
-
-        tf = AffineTransform(angle=angle)
-        rotated_points = tf(positions, origin=positions.mean(0))
-        rotated_points += 1e-9  # avoid pixel perfect errors
-
-        min_r, min_c = np.floor(np.min(rotated_points, axis=0)).astype("int")
-        min_r = max(min_r, 0)
-        min_c = max(min_c, 0)
-        max_r, max_c = np.ceil(np.max(rotated_points, axis=0)).astype("int")
-        max_r = min(max_r, array.shape[-2])
-        max_c = min(max_c, array.shape[-1])
-        # print(f"{min_r = }, {min_c = }, {max_r = }, {max_c = }")
-
-        rotated_array = ndi.rotate(
-            array, np.rad2deg(-angle), order=1, reshape=False, axes=(-2, -1)
-        )[..., min_r:max_r, min_c:max_c]
+        rotated_array = ndi.rotate(array, np.rad2deg(-angle), order=1, reshape=True, axes=(-2, -1))
 
         if transpose:
             rotated_array = rotated_array.swapaxes(-2, -1)
 
-        # fixing that is sometimes 1 pixel off
         cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop), pad_if_needed=False)
 
         return cropped
-
-    def _repeat_arr(
-        self, arr: "np.ndarray|torch.Tensor", repeats: int, axis: int
-    ) -> "np.ndarray|torch.Tensor":
-        """repeat the input array along the desired axis."""
-        if config.get("has_torch"):
-            if isinstance(arr, torch.Tensor):
-                return torch.repeat_interleave(arr, repeats, dim=axis)
-        return np.repeat(arr, repeats, axis=axis)
 
     def reset_recon(self) -> None:
         self._reset_rng()
@@ -847,7 +879,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.probe_model.reset()
         self.dset.reset()
         self.compute_propagator_arrays()
-        self.obj_model.constraints = self.obj_model.DEFAULT_CONSTRAINTS
+        # obj_model and its DEFAULT_CONSTRAINTS are correlated at runtime (each object type pairs
+        # with its own constraint dataclass), which the union type can't express.
+        self.obj_model.constraints = self.obj_model.DEFAULT_CONSTRAINTS  # pyright: ignore[reportAttributeAccessIssue]
         # detector reset if necessary
         self._iter_losses = []
         self._iter_val_losses = []
@@ -876,10 +910,57 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             intensities = np.abs(probe) ** 2
             return intensities.sum(axis=(-2, -1)) / intensities.sum()
 
+    def _broadcast_parameters(self, src: int = 0) -> None:
+        """Broadcast obj, probe, and dataset parameters from rank src to all other ranks.
+
+        Uses .parameters() so it works for both pixelated and DIP/INR models. The dataset's
+        learnable params (scan positions / descan shifts) must also be broadcast: with the
+        DistributedSampler partitioning scan positions, the full position params are replicated
+        on every rank, so they must start identical and stay synchronized.
+        """
+        for p in self.obj_model.parameters():
+            dist.broadcast(p.data, src=src)
+        for p in self.probe_model.parameters():
+            dist.broadcast(p.data, src=src)
+        for group in self.dset.get_optimization_parameters().values():
+            for p in group:
+                buf = p.data.contiguous()
+                dist.broadcast(buf, src=src)
+                p.data.copy_(buf)
+
+    def _all_reduce_gradients(self) -> None:
+        """Average obj, probe, and dataset gradients across all ranks (call after backward,
+        before step).
+
+        Uses .parameters() so it works for both pixelated and DIP/INR models. The dataset's
+        learnable params are included because each scan position's gradient is nonzero on
+        exactly one rank, so they must be reduced (AVG) to stay consistent across ranks.
+        """
+        dset_params = [
+            p for group in self.dset.get_optimization_parameters().values() for p in group
+        ]
+        params = [
+            p
+            for p in (
+                list(self.obj_model.parameters())
+                + list(self.probe_model.parameters())
+                + dset_params
+            )
+            if p.grad is not None
+        ]
+        if params:
+            for p in params:
+                if p.grad is not None and not p.grad.is_contiguous():
+                    p.grad = p.grad.contiguous()
+            all_reduce_params(*params)
+
     def to(self, device: str | int | torch.device):
         dev, _id = config.validate_device(device)
-        if dev != self.device:
-            self._device = dev
+        self._device = dev
+        self._multi_gpu_devices = None
+        # Sync each sub-model's own device tracker so their reset() uses the correct device
+        self.obj_model.device = dev
+        self.probe_model.device = dev
         self.obj_model.to(dev)
         self.probe_model.to(dev)
         self.dset.to(dev)
@@ -887,9 +968,99 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._propagators = self._to_torch(self._propagators)
         self._rng_to_device(dev)
 
+    def _build_dataloaders(
+        self,
+        train_indices: np.ndarray,
+        val_indices: np.ndarray,
+        world_size: int,
+        rank: int,
+        num_workers: int,
+    ) -> "tuple[DataLoader, DistributedSampler | None, DataLoader | None]":
+        """Build train + (optional) val DataLoaders for both single- and multi-GPU paths.
+
+        Mirrors the shape of ``DDPMixin.setup_dataloader`` but adapted to ptycho's device
+        contract (``str | list[int]``) and ptycho's precomputed ``val_mode`` index split.
+        ``world_size > 1`` uses ``DistributedSampler`` over a ``Subset``; ``world_size == 1``
+        uses ``shuffle=True`` with a seeded ``torch.Generator`` for run-to-run determinism.
+        ``__getitem__`` returns ``{"index": idx, ...}`` for the original dataset index, and
+        ``Subset[i]`` calls ``dataset[indices[i]]``, so ``batch["index"]`` is the original
+        dataset index under either branch.
+
+        ``self.batch_size`` is the GLOBAL batch: the number of samples contributing to one
+        optimizer step across all ranks. Each rank's DataLoader draws ``batch_size //
+        world_size``, so the same ``batch_size`` gives the same optimization trajectory (and
+        loss curve) on any GPU count.
+        """
+        pin_memory = self.dset.target_residency == "cpu" and str(self._single_device).startswith(
+            "cuda"
+        )
+        per_rank_batch = self.batch_size
+        if world_size > 1:
+            per_rank_batch = max(1, self.batch_size // world_size)
+            if self.batch_size % world_size != 0:
+                warn(
+                    f"batch_size={self.batch_size} is not divisible by world_size={world_size}; "
+                    f"each rank uses {per_rank_batch}, so the effective global batch is "
+                    f"{per_rank_batch * world_size}."
+                )
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": per_rank_batch,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "drop_last": False,
+        }
+        if num_workers > 0:
+            loader_kwargs.update(
+                multiprocessing_context="spawn",
+                persistent_workers=True,
+                worker_init_fn=worker_init_fn,
+            )
+
+        train_subset = torch.utils.data.Subset(self.dset, train_indices.tolist())
+        val_subset = (
+            torch.utils.data.Subset(self.dset, val_indices.tolist())
+            if len(val_indices) > 0
+            else None
+        )
+
+        if world_size > 1:
+            train_sampler = DistributedSampler(
+                train_subset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=int(self.rng.integers(0, 2**31 - 1)),
+                drop_last=False,
+            )
+            train_loader = DataLoader(train_subset, sampler=train_sampler, **loader_kwargs)
+            if val_subset is not None:
+                val_sampler = DistributedSampler(
+                    val_subset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
+                val_loader = DataLoader(val_subset, sampler=val_sampler, **loader_kwargs)
+            else:
+                val_loader = None
+        else:
+            train_sampler = None
+            shuffle_gen = torch.Generator().manual_seed(int(self.rng.integers(0, 2**31 - 1)))
+            train_loader = DataLoader(
+                train_subset, shuffle=True, generator=shuffle_gen, **loader_kwargs
+            )
+            val_loader = (
+                DataLoader(val_subset, shuffle=False, **loader_kwargs)
+                if val_subset is not None
+                else None
+            )
+
+        return train_loader, train_sampler, val_loader
+
     # endregion
 
-    # region --- ptychography foRcard model ---
+    # region --- ptychography forward model ---
 
     def forward_operator(
         self,
@@ -910,28 +1081,27 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def error_estimate(
         self,
         pred_intensities: torch.Tensor,
-        batch_indices: np.ndarray,
-        loss_type: Literal[
-            "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
-        ] = "l2_amplitude",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        targets = self.dset.targets[batch_indices]
-        if "amplitude" in loss_type:
-            preds = torch.sqrt(pred_intensities + 1e-9)  # add eps to avoid diverging gradients
+        targets: torch.Tensor,
+        global_n: int | None = None,
+    ) -> torch.Tensor:
+        """Data-fidelity loss for one batch via the active criterion (``self.criterion``).
+
+        Maps predictions into the criterion's measurement space (amplitude or intensity),
+        applies the detector mask, evaluates the criterion, and normalizes by the mean
+        diffraction intensity. Which comparison is used (L2/L1/smooth-L1/Poisson/S3IM/...) is
+        entirely the criterion's concern; see ``ptycho_losses``.
+        """
+        criterion = self.criterion
+        if criterion.target_space == "amplitude":
+            preds = torch.sqrt(pred_intensities + 1e-9)  # eps avoids diverging gradients at 0
         else:
             preds = pred_intensities
 
-        diff = preds * self.dset.detector_mask - targets * self.dset.detector_mask
-        if "l1" in loss_type:
-            error = torch.sum(torch.abs(diff)) / (diff.shape[0] / self.dset.num_gpts)
-        elif "l2" in loss_type:
-            error = torch.sum(torch.abs(diff) ** 2) / (diff.shape[0] / self.dset.num_gpts)
-        elif loss_type == "poisson":
-            error = torch.sum(preds - targets * torch.log(preds + 1e-6))
-        else:
-            raise ValueError(f"Unknown loss type {loss_type}, should be 'l1' or 'l2'")
+        mask = self.dset.detector_mask
+        n = global_n if global_n is not None else self.dset.num_positions
+        error = criterion(preds * mask, targets * mask, n)
         loss = error / self.dset.mean_diffraction_intensity
-        return loss, targets
+        return loss
 
     def overlap_projection(self, obj_patches, input_probe):
         """Multiplies `input_probes` with roi-shaped patches from `obj_array`.
@@ -956,14 +1126,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # incoherent sum of all probe components
         eps = 1e-9  # this is to avoid diverging gradients at sqrt(0)
         overlap_fft = torch.fft.fft2(overlap_array, norm="ortho")
-        amps = torch.sqrt(torch.sum(torch.abs(overlap_fft + eps) ** 2, dim=0))
+        amps = torch.sqrt(torch.sum(torch.abs(overlap_fft) ** 2, dim=0) + eps)
         if not corner_centered:  # default is shifted amplitudes matching exp data
             return torch.fft.fftshift(amps, dim=(-2, -1))
         else:
             return amps
 
     def estimate_intensities(self, overlap_array: "torch.Tensor") -> "torch.Tensor":
-        """Returns the estimated fourier amplitudes from real-valued `overlap_array`."""
+        """Returns the estimated fourier intensities from real-valued `overlap_array`."""
         # overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         # incoherent sum of all probe components
         overlap_fft = torch.fft.fft2(overlap_array, norm="ortho")

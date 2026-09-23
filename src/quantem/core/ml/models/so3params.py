@@ -174,11 +174,13 @@ class SO3ParamR9SVD(nn.Module):
     @staticmethod
     def r9_to_rotmat(M: torch.Tensor) -> torch.Tensor:
         """R9 (..., 3, 3) -> nearest SO(3) matrix via SVD+."""
-        U, _, Vh = torch.linalg.svd(M)
-        d = torch.det(U @ Vh)
-        diag = torch.ones(*M.shape[:-2], 3, device=M.device, dtype=M.dtype)
-        diag[..., 2] = d
-        return U @ (diag.unsqueeze(-1) * Vh)
+        with torch.autocast(device_type=M.device.type, enabled=False):
+            M_work = M if M.dtype in (torch.float32, torch.float64) else M.float()
+            U, _, Vh = torch.linalg.svd(M_work)
+            d = torch.det(U @ Vh)
+            diag = torch.ones(*M.shape[:-2], 3, device=M.device, dtype=M_work.dtype)
+            diag[..., 2] = d
+            return U @ (diag.unsqueeze(-1) * Vh)
 
     def as_matrix(self) -> torch.Tensor:
         return self.r9_to_rotmat(self.M)

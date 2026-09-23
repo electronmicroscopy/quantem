@@ -1,13 +1,10 @@
-# Defualt configuration file for quantem
-# TODO: control for threads, torch
+# Default configuration file for quantem
 
 # The device can be either 'cpu', "gpu", or "cuda:<x>". "gpu" defaults to "cuda:0"
 device: cpu
 
 # The float precision to use. Options are 'float32' or 'float64'
-# ?? will this control both real and complex?
 precision: float32
-# global verbosity, ?? unecessary
 
 dtype_real: float32
 dtype_complex: complex64
@@ -21,7 +18,7 @@ cupy:
 mkl:
   # The number of threads to use for mkl
   threads: 2
-warnings: ### not sure how handling warnings yet
+warnings:
 
   # Show a warning when the grid is overspecified
 
@@ -34,20 +31,13 @@ viz:
   # The default units to use in real space
   real_space_units: "A"
   # The default units to use in reciprocal space
-
-  reciprocal_space_units: "Angstrom"
-  # The default colormap to use for plotting
-  cmap: "viridis"
-  # The default colormap to use for plotting the phase
-  phase_cmap: "hsluv"
-
-  default_colors: ""
-
   reciprocal_space_units: "A^-1"
   # The default colormap to use for showing images
   cmap: "gray"
   # The default colormap to use for showing the phase
   phase_cmap: "magma"
+
+  default_colors: ""
   # plotting default colors: 
   colors: 
     # categorical color lists for plotting
