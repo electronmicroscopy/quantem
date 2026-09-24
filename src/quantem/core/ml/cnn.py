@@ -182,6 +182,14 @@ class CNN2d(nn.Module):
         return
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # pad (H, W) up to a multiple of 2**num_layers so the skip connections line up
+        in_shape = x.shape[-2:]
+        div = 2**self.num_layers
+        pad = []
+        for n in reversed(in_shape):
+            pad.extend([0, -n % div])
+        if any(pad):
+            x = nn.functional.pad(x, pad)
         skips = []
         for down_block in self.down_conv_blocks:
             x = down_block(x)
@@ -198,7 +206,7 @@ class CNN2d(nn.Module):
             x = up_conv_block(x)
 
         y = self.final_conv(x)
-
+        y = y[..., : in_shape[0], : in_shape[1]]
         return y
 
     def reset_weights(self):
@@ -394,6 +402,14 @@ class CNN3d(nn.Module):
                 raise ValueError(
                     f"Input tensor must have 4 or 5 dimensions, got {x.dim()} dimensions."
                 )
+        # pad (D, H, W) up to a multiple of 2**num_layers so the skip connections line up
+        in_shape = x.shape[-3:]
+        div = 2**self.num_layers
+        pad = []
+        for n in reversed(in_shape):
+            pad.extend([0, -n % div])
+        if any(pad):
+            x = nn.functional.pad(x, pad)
         skips = []
         for down_block in self.down_conv_blocks:
             x = down_block(x)
@@ -409,6 +425,7 @@ class CNN3d(nn.Module):
             x = up_conv_block(x)
 
         y = self.final_conv(x)
+        y = y[..., : in_shape[0], : in_shape[1], : in_shape[2]]
         if squeeze_0:
             y = y.squeeze(0)
         return y
