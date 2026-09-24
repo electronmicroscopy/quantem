@@ -241,6 +241,43 @@ class TestPurePhaseRealValued:
 # --- FOV-mask single application ---------------------------------------------
 
 
+class TestTvLossFovMask:
+    def _make_obj(self) -> ObjectPixelated:
+        obj = ObjectPixelated.from_uniform(obj_type="potential", num_slices=2, slice_thicknesses=1)
+        obj._initialize_obj((2, 16, 16), sampling=(0.1, 0.1))
+        obj.constraints.tv_weight_xy = 1.0
+        obj.constraints.tv_weight_z = 1.0
+        return obj
+
+    def test_masked_region_excluded(self):
+        obj = self._make_obj()
+        mask = torch.zeros(16, 16)
+        mask[4:12, 4:12] = 1.0
+        obj.mask = mask
+        arr = torch.full((2, 16, 16), 5.0)
+        arr[:, 4:12, 4:12] = 1.0
+        # flat inside the FOV, so the step to the padded region must not count
+        assert obj.get_tv_loss(arr, mask=obj.mask).item() == pytest.approx(0.0)
+        assert obj.get_tv_loss(arr).item() > 0
+
+    def test_masked_tv_does_not_pull_fov_to_zero(self):
+        obj = self._make_obj()
+        mask = torch.zeros(16, 16)
+        mask[4:12, 4:12] = 1.0
+        obj.mask = mask
+        arr = torch.ones(2, 16, 16, requires_grad=True)
+        obj.apply_soft_constraints(arr * obj.mask, mask=obj.mask).backward()
+        assert arr.grad is not None
+        assert torch.all(arr.grad == 0)
+
+    def test_empty_mask_matches_unmasked(self):
+        obj = self._make_obj()
+        arr = torch.rand(2, 16, 16, generator=torch.Generator().manual_seed(0))
+        assert obj.get_tv_loss(arr, mask=obj.mask).item() == pytest.approx(
+            obj.get_tv_loss(arr).item()
+        )
+
+
 class TestFovMaskSingleApplication:
     def _make_obj(self, obj_type) -> ObjectPixelated:
         obj = ObjectPixelated.from_uniform(obj_type=obj_type, num_slices=1)

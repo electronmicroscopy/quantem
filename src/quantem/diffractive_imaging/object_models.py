@@ -589,7 +589,7 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         # reset recorded losses each call
         self.reset_soft_constraint_losses()
 
-        tv_loss = self.get_tv_loss(obj)
+        tv_loss = self.get_tv_loss(obj, mask=mask)
         self.add_soft_constraint_loss("tv_loss", tv_loss)
 
         surface_zero_loss = self.get_surface_zero_loss(
@@ -601,7 +601,10 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         return tv_loss + surface_zero_loss
 
     def get_tv_loss(
-        self, array: torch.Tensor, weights: None | tuple[float, float] = None
+        self,
+        array: torch.Tensor,
+        weights: None | tuple[float, float] = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Total-variation soft penalty on the object.
 
@@ -609,16 +612,25 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         to ``(self.constraints.tv_weight_z, self.constraints.tv_weight_xy)``. A single
         scalar is broadcast to both axes. The z weight is zeroed for
         ``num_slices == 1``.
+
+        If a FOV ``mask`` is given, each finite difference is weighted by the mask at both of
+        its pixels and the result is a mask-weighted mean. The padded region outside the scan is
+        unconstrained by the data, so it is excluded rather than pulling the FOV toward it.
         """
         loss = self._get_zero_loss_tensor()
         w = self._resolve_tv_weights(weights)
         if not any(w):
             return loss
 
+        if mask is not None and mask.numel() > 0:
+            mask = (mask.real if mask.is_complex() else mask).expand_as(array)
+        else:
+            mask = None
+
         if self.obj_type == "complex":
-            return self._tv_complex(array, w)
+            return self._tv_complex(array, w, mask)
         # pure_phase and potential are both real tensors; phase wrapping is gone.
-        return self._calc_tv_loss(array, w)
+        return self._calc_tv_loss(array, w, mask)
 
     def _resolve_tv_weights(
         self, weights: None | tuple[float, float] | float | int
@@ -638,7 +650,9 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             w = (0.0, w[1])
         return w
 
-    def _tv_complex(self, array: torch.Tensor, w: tuple[float, float]) -> torch.Tensor:
+    def _tv_complex(
+        self, array: torch.Tensor, w: tuple[float, float], mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # complex objects carry information in both amplitude and phase. We
         # still extract phase via angle() here, so the wrap warning stays —
         # but only for obj_type == "complex".
@@ -651,17 +665,20 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         # TODO: amp and phase share `w` here. Consider splitting `tv_weight_xy`
         # into separate amp/phase weights on PtychoObjConstraintParams.Raster
         # so users can tune them independently for obj_type="complex".
-        loss = loss + self._calc_tv_loss(ph, w)
+        loss = loss + self._calc_tv_loss(ph, w, mask)
         amp = array.abs()
-        loss = loss + self._calc_tv_loss(amp, w)
+        loss = loss + self._calc_tv_loss(amp, w, mask)
         return loss
 
-    def _calc_tv_loss(self, array: torch.Tensor, weight: tuple[float, float]) -> torch.Tensor:
+    def _calc_tv_loss(
+        self, array: torch.Tensor, weight: tuple[float, float], mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Mean-|diff| TV on a real array. ``weight = (w_z, w_xy)``.
 
         For a 3D ``(slices, H, W)`` array, dim 0 uses ``w_z`` and dims 1+2 use
         ``w_xy``. The result is averaged over the number of axes that actually
-        contributed (i.e. had a non-zero weight).
+        contributed (i.e. had a non-zero weight). ``mask`` (same shape as ``array``) turns each
+        per-axis mean into a mean weighted by ``mask`` at both pixels of the difference.
         """
         loss = self._get_zero_loss_tensor()
         calc_dim = 0
@@ -672,7 +689,13 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
                 w = weight[1]
             if w > 0:
                 calc_dim += 1
-                loss = loss + w * torch.mean(torch.abs(array.diff(dim=dim)))
+                diff = torch.abs(array.diff(dim=dim))
+                if mask is None:
+                    loss = loss + w * torch.mean(diff)
+                else:
+                    n = array.shape[dim] - 1
+                    m = mask.narrow(dim, 0, n) * mask.narrow(dim, 1, n)
+                    loss = loss + w * (diff * m).sum() / m.sum().clamp_min(1e-12)
         if calc_dim > 0:
             loss = loss / calc_dim
         return loss
