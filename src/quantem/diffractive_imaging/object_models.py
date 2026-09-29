@@ -487,14 +487,22 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
     DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.Raster = PtychoObjConstraintParams.Raster()
 
     def apply_hard_constraints(
-        self, raw: torch.Tensor, mask: torch.Tensor | None = None
+        self,
+        raw: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        straight_through: bool = True,
     ) -> torch.Tensor:
         """
-        Apply hard constraints: range clamping and filtering. All hard constaints are applied in
-        place with torch.no_grad().
+        Apply hard constraints: range clamping and filtering.
+
+        With ``straight_through=True`` the constraints are computed under ``torch.no_grad()`` and
+        the result is passed through with an identity gradient. With ``False`` they are applied
+        with autograd, so e.g. clamped pixels get zero gradient. DIP models need the latter: the
+        network shares weights across pixels, so an identity gradient through a clamp destabilizes
+        training.
         """
         c = self.constraints
-        with torch.no_grad():
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not straight_through):
             if self.obj_type == "complex":
                 constrained = self._apply_hard_complex(raw, c)
             elif self.obj_type == "pure_phase":
@@ -502,6 +510,8 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             else:  # potential
                 constrained = self._apply_hard_potential(raw, c, mask)
             constrained = self._apply_shared_hard(constrained, c, mask)
+        if not straight_through:
+            return constrained
         return raw + (constrained - raw).detach()
 
     def _apply_hard_complex(
@@ -572,9 +582,12 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             obj = self.butterworth_constraint(obj, sampling=self.sampling)
 
         if self.num_slices > 1 and c.identical_slices:
-            # In-place mutation is safe because apply_hard_constraints is
-            # always called under outer torch.no_grad (see its docstring).
-            obj[:] = torch.mean(obj, dim=0, keepdim=True)
+            if torch.is_grad_enabled():
+                obj = torch.mean(obj, dim=0, keepdim=True).expand_as(obj)
+            else:
+                # in place under no_grad (straight-through path); for "shrink" this also
+                # projects the ObjectPixelated parameter, which aliases obj here
+                obj[:] = torch.mean(obj, dim=0, keepdim=True)
         return obj
 
     def apply_soft_constraints(
@@ -1139,8 +1152,10 @@ class ObjectDIP(ObjectConstraints):
         """Create ObjectDIP from a CNN and model input.
 
         ``forward_hard_constraints`` applies the hard constraints (positivity, filtering,
-        identical slices, ...) to the network output in the forward model, as ``ObjectPixelated``
-        does. When False they only affect ``obj`` (display and soft-constraint input).
+        identical slices, ...) to the network output in the forward model, with real gradients
+        (not straight-through). When False the forward model uses the raw network output and the
+        constraints only affect ``obj``, so ``obj`` can differ from what the data was fit with
+        (e.g. a per-slice positivity clamp of an output that has negative voxels).
         """
         obj_model = cls(
             num_slices=num_slices,
@@ -1324,7 +1339,9 @@ class ObjectDIP(ObjectConstraints):
         """get the full object"""
         raw = self.model(self._model_input)[0]
         # TODO -- single channel 2D with identical slices, view as 3D num_slices
-        return self.apply_hard_constraints(raw, mask=self.mask)
+        return self.apply_hard_constraints(
+            raw, mask=self.mask, straight_through=not self.forward_hard_constraints
+        )
 
     @property
     def _obj(self):
@@ -1337,7 +1354,9 @@ class ObjectDIP(ObjectConstraints):
         )
         obj_array = self.model(model_input)[0]
         if self.forward_hard_constraints:
-            obj_array = self.apply_hard_constraints(obj_array, mask=self.mask)
+            obj_array = self.apply_hard_constraints(
+                obj_array, mask=self.mask, straight_through=False
+            )
         if self.mask.numel() > 0:
             obj_array = obj_array * self._mask
         return self._get_obj_patches(obj_array, patch_indices)

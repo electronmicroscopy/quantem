@@ -280,7 +280,7 @@ class TestTvLossFovMask:
         )
 
 
-class _Negate(torch.nn.Module):
+class _Scale(torch.nn.Module):
     dtype = torch.float32
 
     def __init__(self):
@@ -288,34 +288,67 @@ class _Negate(torch.nn.Module):
         self.scale = torch.nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x):
-        return -self.scale * x
+        return self.scale * x
 
 
 class TestDIPForwardHardConstraints:
-    def _make_dip(self, forward_hard_constraints: bool) -> ObjectDIP:
-        pix = ObjectPixelated.from_uniform(obj_type="potential", num_slices=1)
-        pix._initialize_obj((1, 8, 8), sampling=(0.1, 0.1))
-        pix._obj = torch.nn.Parameter(torch.ones(1, 8, 8))
+    def _make_dip(self, forward_hard_constraints: bool, num_slices: int = 1) -> ObjectDIP:
+        pix = ObjectPixelated.from_uniform(
+            obj_type="potential", num_slices=num_slices, slice_thicknesses=1
+        )
+        pix._initialize_obj((num_slices, 8, 8), sampling=(0.1, 0.1))
+        pix._obj = torch.nn.Parameter(torch.ones(num_slices, 8, 8))
         dip = ObjectDIP.from_pixelated(
-            model=_Negate(),
+            model=_Scale(),
             pixelated=pix,
             input_noise_std=0.0,
             forward_hard_constraints=forward_hard_constraints,
         )
         return dip
 
+    @staticmethod
+    def _set_input(dip, arr):
+        dip._model_input = arr[None].to(dip.model_input)
+
     @pytest.mark.parametrize("on", [True, False])
     def test_positivity_in_forward(self, on):
         dip = self._make_dip(on)
+        self._set_input(dip, -torch.ones(1, 8, 8))
         patches = dip.forward(torch.arange(64).reshape(1, 8, 8))
         # potential -> exp(1j * obj): clamped to 0 gives phase 0, raw -1 gives phase -1
         expected = 0.0 if on else -1.0
         assert torch.allclose(patches.angle(), torch.full_like(patches.real, expected))
 
-    def test_gradient_reaches_model(self):
+    def test_clamp_gradient_is_not_straight_through(self):
         dip = self._make_dip(True)
+        self._set_input(dip, -torch.ones(1, 8, 8))
+        dip.forward(torch.arange(64).reshape(1, 8, 8)).imag.sum().backward()
+        # every output is clamped, so the network gets no gradient through them
+        assert dip.model.scale.grad is not None
+        assert dip.model.scale.grad.item() == 0.0
+
+    def test_unclamped_pixels_get_gradient(self):
+        dip = self._make_dip(True)
+        self._set_input(dip, torch.full((1, 8, 8), 0.5))
         dip.forward(torch.arange(64).reshape(1, 8, 8)).imag.sum().backward()
         assert dip.model.scale.grad is not None
+        assert dip.model.scale.grad.item() != 0.0
+
+    def test_obj_matches_forward_model(self):
+        dip = self._make_dip(True)
+        self._set_input(dip, -torch.ones(1, 8, 8))
+        assert torch.all(dip.obj == 0)
+
+    def test_identical_slices_differentiable(self):
+        dip = self._make_dip(True, num_slices=3)
+        dip.constraints.identical_slices = True
+        arr = torch.stack([torch.full((8, 8), v) for v in (0.2, 0.4, 0.9)])
+        self._set_input(dip, arr)
+        obj = dip.obj
+        assert torch.allclose(obj, torch.full_like(obj, 0.5))
+        obj.sum().backward()
+        assert dip.model.scale.grad is not None
+        assert dip.model.scale.grad.item() == pytest.approx(arr.sum().item())
 
     def test_flag_survives_save_load(self, tmp_path):
         dip = self._make_dip(False)
