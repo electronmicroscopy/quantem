@@ -7,8 +7,10 @@ import pytest
 import torch
 
 from quantem.core.datastructures import Dataset4dstem
+from quantem.core.io.serialize import load
 from quantem.diffractive_imaging import (
     DetectorPixelated,
+    ObjectDIP,
     ObjectPixelated,
     ProbePixelated,
     PtychoDatasetConstraintParams,
@@ -276,6 +278,49 @@ class TestTvLossFovMask:
         assert obj.get_tv_loss(arr, mask=obj.mask).item() == pytest.approx(
             obj.get_tv_loss(arr).item()
         )
+
+
+class _Negate(torch.nn.Module):
+    dtype = torch.float32
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x):
+        return -self.scale * x
+
+
+class TestDIPForwardHardConstraints:
+    def _make_dip(self, forward_hard_constraints: bool) -> ObjectDIP:
+        pix = ObjectPixelated.from_uniform(obj_type="potential", num_slices=1)
+        pix._initialize_obj((1, 8, 8), sampling=(0.1, 0.1))
+        pix._obj = torch.nn.Parameter(torch.ones(1, 8, 8))
+        dip = ObjectDIP.from_pixelated(
+            model=_Negate(),
+            pixelated=pix,
+            input_noise_std=0.0,
+            forward_hard_constraints=forward_hard_constraints,
+        )
+        return dip
+
+    @pytest.mark.parametrize("on", [True, False])
+    def test_positivity_in_forward(self, on):
+        dip = self._make_dip(on)
+        patches = dip.forward(torch.arange(64).reshape(1, 8, 8))
+        # potential -> exp(1j * obj): clamped to 0 gives phase 0, raw -1 gives phase -1
+        expected = 0.0 if on else -1.0
+        assert torch.allclose(patches.angle(), torch.full_like(patches.real, expected))
+
+    def test_gradient_reaches_model(self):
+        dip = self._make_dip(True)
+        dip.forward(torch.arange(64).reshape(1, 8, 8)).imag.sum().backward()
+        assert dip.model.scale.grad is not None
+
+    def test_flag_survives_save_load(self, tmp_path):
+        dip = self._make_dip(False)
+        dip.save(tmp_path / "dip.zip")
+        assert load(tmp_path / "dip.zip").forward_hard_constraints is False
 
 
 class TestFovMaskSingleApplication:

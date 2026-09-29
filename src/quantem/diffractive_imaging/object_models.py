@@ -1090,11 +1090,15 @@ class ObjectDIP(ObjectConstraints):
         - then allow for 3D models, single channel output
     """
 
+    # class-level default so DIP models saved before this attribute existed still load
+    forward_hard_constraints: bool = True
+
     def __init__(
         self,
         num_slices: int = 1,
         slice_thicknesses: float | Sequence | torch.Tensor | None = None,
         input_noise_std: float = 0.025,
+        forward_hard_constraints: bool = True,
         device: str = "cpu",
         obj_type: object_type = "complex",
         rng: np.random.Generator | int | None = None,
@@ -1106,6 +1110,7 @@ class ObjectDIP(ObjectConstraints):
             rng=rng,
             _token=_token,
         )
+        self.forward_hard_constraints = forward_hard_constraints
         self.register_buffer("_model_input", torch.tensor([]))
         self.register_buffer("_pretrain_target", torch.tensor([]))
 
@@ -1126,15 +1131,22 @@ class ObjectDIP(ObjectConstraints):
         num_slices: int = 1,
         slice_thicknesses: float | Sequence | torch.Tensor | None = None,
         input_noise_std: float = 0.025,
+        forward_hard_constraints: bool = True,
         device: str = "cpu",
         obj_type: object_type = "complex",
         rng: np.random.Generator | int | None = None,
     ):
-        """Create ObjectDIP from a CNN and model input."""
+        """Create ObjectDIP from a CNN and model input.
+
+        ``forward_hard_constraints`` applies the hard constraints (positivity, filtering,
+        identical slices, ...) to the network output in the forward model, as ``ObjectPixelated``
+        does. When False they only affect ``obj`` (display and soft-constraint input).
+        """
         obj_model = cls(
             num_slices=num_slices,
             slice_thicknesses=slice_thicknesses,
             input_noise_std=input_noise_std,
+            forward_hard_constraints=forward_hard_constraints,
             device=device,
             obj_type=obj_type,
             rng=rng,
@@ -1152,10 +1164,12 @@ class ObjectDIP(ObjectConstraints):
         model: "torch.nn.Module",
         pixelated: "ObjectModelType",  # ObjectPixelated upsets linter when ptycho.obj_model is used
         input_noise_std: float = 0.025,
+        forward_hard_constraints: bool = True,
         device: str = "cpu",
     ) -> "ObjectDIP":
         """
-        Create ObjectDIP from a pixelated object model.
+        Create ObjectDIP from a pixelated object model. See ``from_model`` for
+        ``forward_hard_constraints``.
         """
         if not (
             isinstance(pixelated, ObjectPixelated) or "ObjectPixelated" in str(type(pixelated))
@@ -1180,6 +1194,7 @@ class ObjectDIP(ObjectConstraints):
             num_slices=pixelated.num_slices,
             slice_thicknesses=pixelated.slice_thicknesses,
             input_noise_std=input_noise_std,
+            forward_hard_constraints=forward_hard_constraints,
             device=device,
             obj_type=pixelated.obj_type,
             rng=pixelated._rng_seed,
@@ -1321,6 +1336,8 @@ class ObjectDIP(ObjectConstraints):
             self.model_input, self._input_noise_std, self.dtype, self.device, self._rng_torch
         )
         obj_array = self.model(model_input)[0]
+        if self.forward_hard_constraints:
+            obj_array = self.apply_hard_constraints(obj_array, mask=self.mask)
         if self.mask.numel() > 0:
             obj_array = obj_array * self._mask
         return self._get_obj_patches(obj_array, patch_indices)
