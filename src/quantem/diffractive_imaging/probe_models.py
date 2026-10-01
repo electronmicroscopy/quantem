@@ -496,10 +496,10 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         dz = torch.tensor(slice_thicknesses, device=self.device, dtype=k2.dtype)  # (T,)
         phase_factor = -1.0j * torch.pi * wavelength * dz[:, None, None]  # (T,1,1)
         propagators = torch.exp(phase_factor * k2)  # (T, Sr, Sc)
-        if theta_r != 0:
+        if self.learn_probe_tilt or theta_r != 0:
             kr_term = 1.0j * (-2 * torch.pi * dz[:, None, None] * torch.tan(theta_r / 1e3))
             propagators = propagators * torch.exp(kr_term * kr[None, :, None])
-        if theta_c != 0:
+        if self.learn_probe_tilt or theta_c != 0:
             kc_term = 1.0j * (-2 * torch.pi * dz[:, None, None] * torch.tan(theta_c / 1e3))
             propagators = propagators * torch.exp(kc_term * kc[None, None, :])
 
