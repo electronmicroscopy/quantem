@@ -1716,6 +1716,7 @@ class Dataset3deels(Dataset3dspectroscopy):
         plot=True,
         mask=None,
         fit_window_fwhm_multiplier=3.5,
+        min_total_window_eV=50.0,
     ):
         """
         Calculates the relative thickness map (t/lambda) using the Log-Ratio method.
@@ -1731,6 +1732,23 @@ class Dataset3deels(Dataset3dspectroscopy):
         mask : ndarray of bool, shape (scan_row, scan_col), optional
             ``True`` marks a pixel to exclude from fitting (e.g. known
             vacuum/dead-detector regions).
+        min_total_window_eV : float, optional
+            ``I_total`` below is summed over whatever energy range this
+            dataset's own ``energy_axis`` happens to span -- it is NOT
+            extrapolated beyond what was actually recorded. A spectrum
+            acquired at a finer dispersion (more eV-resolution, less total
+            range) for the same channel count will therefore integrate less
+            of the plasmon/high-loss tail and report a systematically LOWER
+            t/lambda than a wider-span acquisition of the identical physical
+            thickness -- this is a real, confirmed effect (truncating a
+            83.6 eV reference spectrum down to 29.3 eV dropped its computed
+            t/lambda by ~25% with zero change in thickness). If the
+            recorded span is below this threshold (default 50 eV -- chosen
+            to sit well above the ~25-31 eV narrow-dispersion acquisitions
+            observed in this project's own data and well below the normal
+            ~84-104 eV span), a ``UserWarning`` is raised flagging the
+            result as not directly comparable to t/lambda computed from a
+            wider-span acquisition. Pass ``0`` to silence this check.
 
         Notes
         -----
@@ -1912,6 +1930,22 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         # Integrate intensity of ZLP and entire spectrum separately, and calculate t/lambda
         I_total = np.sum(self.array, axis=2)
+
+        total_span_eV = float(energy_axis.max() - energy_axis.min())
+        if min_total_window_eV and total_span_eV < min_total_window_eV:
+            warnings.warn(
+                f"calculate_thickness_log_ratio: recorded energy axis for {self.name!r} "
+                f"spans only {total_span_eV:.1f} eV (< min_total_window_eV="
+                f"{min_total_window_eV:.0f} eV). I_total is summed only over this recorded "
+                f"window -- a narrower acquisition window (e.g. finer dispersion for the "
+                f"same channel count) systematically UNDERESTIMATES t/lambda relative to a "
+                f"wider-window acquisition of the same physical thickness, because it misses "
+                f"the plasmon/high-loss tail. This t/lambda is NOT directly comparable to one "
+                f"computed from a wider-span spectrum (e.g. a companion HL dataset's LL "
+                f"channel); exclude it from any cross-acquisition thickness-trend comparison, "
+                f"or pass min_total_window_eV=0 to silence this check.",
+                UserWarning,
+            )
 
         t_over_lambda = np.log1p((I_total) / (I_zlp))
 

@@ -8,7 +8,7 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from scipy.ndimage import gaussian_filter1d, median_filter
 from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter
 from scipy.stats import pearsonr
 
 
@@ -1200,6 +1200,671 @@ def subtract_background_two_sided(
     return out
 
 
+def pre_edge_white_line_ratio(
+    dataset,
+    pre_edge_window: Tuple[float, float],
+    white_line_window: Tuple[float, float],
+    *,
+    reducer: str = "mean_spectrum",
+) -> dict:
+    """
+    Pre-edge / white-line intensity ratio -- a standard EELS/XANES chemistry
+    fingerprint. **This is a window-mean ratio, not a peak-position or
+    line-shape measurement** -- read the CAVEAT below before quoting a
+    difference in this number as "chemistry."
+
+    WHAT
+    ----
+    Ratio of the mean background-subtracted intensity in a low-energy
+    "pre-edge" window (empty states just below/at the edge onset -- only
+    populated when the absorbing atom sits in an oxidized/bonded
+    environment) to the mean intensity in a "white-line" window (the
+    always-present main edge maximum, used here purely as an internal
+    normalization for count rate / dose / thickness, not as chemistry
+    itself).
+
+    WHY / WHAT WE LEARN
+    --------------------
+    In transition-metal L2,3 edges and the O K edge in oxides, the relative
+    weight of empty states just below the main line tracks oxidation
+    state / covalent bonding character -- more low-energy empty states
+    (more oxidized / more hybridized with the metal) => a higher ratio.
+    This is why it was picked as a candidate "doping fingerprint" for the
+    OMIEC O K edge: a higher ratio on one day than another is *consistent
+    with* that day's sample being more oxidized.
+
+    HOW (theory / references)
+    --------------------------
+    No fitting, no line-shape model -- a window-mean ratio computed on an
+    already background-subtracted spectrum (see
+    :func:`subtract_background_two_sided`). The chemistry it is meant to
+    report follows the standard XANES/EELS oxidation-state literature:
+    - transition-metal L-edge white-line-ratio methods, e.g. Van Aken &
+      Liebscher (2002), *Phys. Chem. Minerals* 29, 188.
+    - O K pre-edge in oxide cathodes tracking metal-oxygen hybridization /
+      oxidation state, e.g. Yoon et al. (2002), *Electrochem. Solid-State
+      Lett.* 5, A263.
+
+    CAVEAT -- what this ratio cannot rule out on its own
+    ------------------------------------------------------
+    It is still a ratio of two ENERGY WINDOWS, not a peak position. The
+    number can move because of real chemistry (the intended signal), or
+    because of:
+    - ice/water contamination changing the pre-edge region without any
+      real doping change (see the Ghodsi-scale ice-fingerprint check),
+    - thickness-driven multiple scattering distorting the whole edge
+      shape (see the thickness-matched re-pick check),
+    - beam damage / radiolysis changing bonding with dose, not day
+      (see the dose-series "Radiolysis (ionization) damage" check),
+    - differing background-fit windows/forms between datasets.
+    Always report this alongside the confounds it was checked against --
+    never as a standalone number. A genuine chemistry claim also wants
+    :func:`fit_edge_peaks`'s peak table (center/width/area): a ratio can
+    move because a peak's *height* changed under a fixed window, or
+    because the peak *shifted* out from under that window entirely --
+    window integration alone cannot tell those two apart.
+
+    Parameters
+    ----------
+    dataset : Dataset3deels / Dataset3dspectroscopy
+        Background-subtracted.
+    pre_edge_window, white_line_window : (lo_eV, hi_eV)
+        The two integration windows.
+    reducer : {"mean_spectrum", "per_pixel"}, optional
+        "mean_spectrum" (default): one ratio from the dataset's mean
+        spectrum -- what to quote in a report. "per_pixel": a full
+        `(ny, nx)` map of the ratio (returned under `"map"` instead of
+        `"ratio"`) -- noisier, but shows whether the signal is spatially
+        uniform or localized to part of the scan.
+
+    Returns
+    -------
+    dict
+        `"ratio"` (or `"map"` if `reducer="per_pixel"`), plus
+        `"pre_edge_mean"`, `"white_line_mean"`, `"pre_edge_window"`,
+        `"white_line_window"` for provenance.
+    """
+    e = np.asarray(dataset.energy_axis, dtype=float)
+    arr = np.asarray(dataset.array, dtype=float)
+    pre_mask = (e >= pre_edge_window[0]) & (e <= pre_edge_window[1])
+    wl_mask = (e >= white_line_window[0]) & (e <= white_line_window[1])
+    if not pre_mask.any():
+        raise ValueError(f"pre_edge_window {pre_edge_window} has no channels on this axis")
+    if not wl_mask.any():
+        raise ValueError(f"white_line_window {white_line_window} has no channels on this axis")
+
+    if reducer == "mean_spectrum":
+        mean_spec = arr.reshape(-1, arr.shape[2]).mean(axis=0)
+        pre = float(mean_spec[pre_mask].mean())
+        wl = float(mean_spec[wl_mask].mean())
+        return dict(
+            ratio=pre / wl,
+            pre_edge_mean=pre,
+            white_line_mean=wl,
+            pre_edge_window=tuple(pre_edge_window),
+            white_line_window=tuple(white_line_window),
+        )
+    elif reducer == "per_pixel":
+        pre_map = arr[:, :, pre_mask].mean(axis=-1)
+        wl_map = arr[:, :, wl_mask].mean(axis=-1)
+        return dict(
+            map=pre_map / wl_map,
+            pre_edge_mean=pre_map,
+            white_line_mean=wl_map,
+            pre_edge_window=tuple(pre_edge_window),
+            white_line_window=tuple(white_line_window),
+        )
+    raise ValueError(f"reducer must be 'mean_spectrum' or 'per_pixel', got {reducer!r}")
+
+
+def normalize_edge_intensity(
+    dataset,
+    *,
+    method: str = "total_area",
+    reference_window: Optional[Tuple[float, float]] = None,
+    energy_range: Optional[Tuple[float, float]] = None,
+    return_details: bool = False,
+):
+    """
+    Normalize a background-subtracted spectrum so datasets/passes/pixels
+    recorded at different dose or counts become comparable in SHAPE, not
+    magnitude.
+
+    WHAT
+    ----
+    Divides every channel by a single scalar (per pixel, if the input is
+    per-pixel): either the total integrated intensity over `energy_range`
+    (`method="total_area"`) or the integrated intensity of one stable
+    reference feature, typically the white line (`method="reference_window"`).
+
+    WHY / WHAT WE LEARN
+    --------------------
+    Two spectra recorded at different dose (different summed pass counts)
+    or from pixels with different local thickness/counts differ in raw
+    intensity for reasons that have nothing to do with chemistry. Any
+    comparison of PEAK HEIGHT OR AREA (not a within-spectrum ratio) across
+    datasets, passes, or pixels -- including :func:`fit_edge_peaks`'s
+    per-peak area/height output -- is meaningless unless both sides are
+    normalized this way first. Window-RATIO metrics
+    (:func:`pre_edge_white_line_ratio`, the edge "jump" score) are already
+    self-normalizing (both windows scale together with dose), so this step
+    matters most before a peak-fitting comparison, not before those ratios.
+
+    HOW
+    ---
+    `method="total_area"`: normalization constant = trapezoidal integral
+    (`numpy.trapz`) of the spectrum over `energy_range` (defaults to the
+    dataset's full analysis range).
+    `method="reference_window"`: normalization constant = trapezoidal
+    integral over `reference_window` only -- pick this when part of the
+    analysis range is itself the thing you're comparing (e.g. don't
+    normalize a pre-edge feature by a total area that includes the
+    pre-edge itself; normalize by the white line instead).
+
+    Parameters
+    ----------
+    dataset : Dataset3deels / Dataset3dspectroscopy
+        Background-subtracted (normalizing a spectrum that still has a
+        decaying background in it is not meaningful).
+    method : {"total_area", "reference_window"}, optional
+    reference_window : (lo_eV, hi_eV), required if `method="reference_window"`.
+    energy_range : (lo_eV, hi_eV), optional
+        Only used by `method="total_area"`; defaults to the full axis.
+    return_details : bool, optional
+        If True, also return the normalization constant used.
+
+    Returns
+    -------
+    Dataset3deels / Dataset3dspectroscopy
+        A copy of `dataset` (unmodified) with every channel divided by its
+        normalization constant. If `return_details=True`:
+        `(normalized_dataset, norm_constant)`, where `norm_constant` is a
+        float for a single mean-spectrum-shaped input or a `(ny, nx)` array
+        for a per-pixel cube.
+    """
+    e = np.asarray(dataset.energy_axis, dtype=float)
+    arr = np.asarray(dataset.array, dtype=float)
+
+    if method == "total_area":
+        lo, hi = energy_range if energy_range is not None else (float(e[0]), float(e[-1]))
+        mask = (e >= lo) & (e <= hi)
+    elif method == "reference_window":
+        if reference_window is None:
+            raise ValueError("method='reference_window' requires reference_window=(lo, hi)")
+        mask = (e >= reference_window[0]) & (e <= reference_window[1])
+    else:
+        raise ValueError(f"method must be 'total_area' or 'reference_window', got {method!r}")
+    if not mask.any():
+        raise ValueError("normalize_edge_intensity: the requested window has no channels")
+
+    e_masked = e[mask]
+    _trapz = getattr(np, "trapezoid", None) or np.trapz  # numpy >=2.0 renamed trapz
+    norm = _trapz(arr[:, :, mask], e_masked, axis=-1)  # (ny, nx)
+    norm_safe = np.where(norm == 0, np.nan, norm)
+
+    out = dataset.copy()
+    out.array = arr / norm_safe[:, :, None]
+    out.name = f"{dataset.name} (normalized: {method})"
+
+    if return_details:
+        # collapse to a scalar when every pixel's constant is (numerically) the
+        # same, e.g. a mean-spectrum-shaped (1, 1, n_energy) input
+        if norm.size == 1:
+            return out, float(norm.ravel()[0])
+        return out, norm
+    return out
+
+
+_LINE_SHAPES = ("gaussian", "lorentzian", "pseudo_voigt", "step")
+
+
+def _gaussian_component(E, center, fwhm, height):
+    sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    return height * np.exp(-0.5 * ((E - center) / sigma) ** 2)
+
+
+def _lorentzian_component(E, center, fwhm, height):
+    return height / (1.0 + (2.0 * (E - center) / fwhm) ** 2)
+
+
+def _pseudo_voigt_component(E, center, fwhm, height, eta):
+    return eta * _lorentzian_component(E, center, fwhm, height) + (
+        1.0 - eta
+    ) * _gaussian_component(E, center, fwhm, height)
+
+
+def _step_component(E, center, width, height):
+    return height * (0.5 + (1.0 / np.pi) * np.arctan((E - center) / width))
+
+
+def fit_edge_peaks(
+    dataset,
+    peaks: List[dict],
+    energy_range: Tuple[float, float],
+    *,
+    reducer: str = "mean_spectrum",
+    return_fit: bool = False,
+) -> dict:
+    """
+    Fit named peaks (and, optionally, one buried edge-onset step) in a
+    background-subtracted core-loss near-edge spectrum. **This is the
+    missing piece window-integration ratios cannot provide**: neither the
+    edge "jump" score nor :func:`pre_edge_white_line_ratio` can tell you
+    whether a difference is a real energy SHIFT, a WIDTH change, or two
+    peaks swapping relative AREA under a window that never moved.
+
+    WHAT
+    ----
+    Simultaneous nonlinear least-squares fit (`scipy.optimize.curve_fit`)
+    of a sum of named components over `energy_range`:
+
+    - `"gaussian"`     : `A * exp(-(E-E0)^2 / (2*sigma^2))`, sigma from FWHM.
+    - `"lorentzian"`   : `A / (1 + (2(E-E0)/FWHM)^2)`.
+    - `"pseudo_voigt"` : `eta*lorentzian + (1-eta)*gaussian`, shared E0/FWHM,
+      extra fitted mixing parameter `eta` in [0, 1].
+    - `"step"`         : `H * (0.5 + (1/pi) atan((E-E0)/W))` -- a real
+      ionization-edge onset buried among sharper ELNES peaks. Not a peak:
+      reports `onset_eV` / `width_eV` / `step_height`, no `area`.
+
+    WHY / WHAT WE LEARN
+    --------------------
+    ELNES (energy-loss near-edge structure) features are transitions into
+    specific unoccupied final states (pi*/sigma* resonances, crystal-field
+    -split d states, ...) -- their CENTER is set by the local bonding
+    environment, their WIDTH by lifetime broadening / instrument
+    resolution / disorder, and their AREA by the number of available final
+    states. A real chemical change (doping, oxidation state, bond order)
+    most often shows up as one or more of: a peak shifting a few tenths of
+    an eV, a peak's relative area growing or shrinking against its
+    neighbors, or two close peaks merging/resolving -- none of which a
+    window ratio can see unless the window happens to move with the peak
+    (it never does automatically). Comparing this function's output
+    (center/FWHM/area per peak, per dataset) is what actually answers "did
+    anything shift."
+
+    HOW (theory / references)
+    --------------------------
+    Gaussian/Lorentzian/pseudo-Voigt line shapes for discrete excitations
+    and an arctan step for an edge onset: standard EELS/XAS ELNES-fitting
+    practice -- see Egerton, *Electron Energy-Loss Spectroscopy in the
+    Electron Microscope* (3rd ed., 2011), Ch. 3-4. This is descriptive
+    fitting (extracting center/width/area from the data), not an ab-initio
+    ELNES calculation -- it does not explain *why* a peak sits where it
+    does, only measures where it sits.
+
+    Parameters
+    ----------
+    dataset : Dataset3deels / Dataset3dspectroscopy
+        Background-subtracted (and normalized -- see
+        :func:`normalize_edge_intensity` -- if comparing peak AREA across
+        datasets/passes; comparing only center/FWHM doesn't need it).
+    peaks : list of dict
+        One entry per component, in the same convention as
+        `Dataset3deels.fit_near_zlp_transitions`'s `peaks` argument, plus a
+        required `"shape"` key:
+        `{"name": str, "shape": "gaussian"|"lorentzian"|"pseudo_voigt"|"step",
+        "center_guess": float, "center_bounds": (lo, hi),
+        "width_guess": float, "width_bounds": (lo, hi),
+        "height_guess": float (optional; default: the local data max within
+        `center_bounds`)}`.
+    energy_range : (lo_eV, hi_eV)
+        Fit window -- keep it as tight as the features you're fitting
+        justify; too wide invites the fit to trade unrelated broad
+        curvature against a peak's width.
+    reducer : {"mean_spectrum", "per_pixel"}, optional
+        `"mean_spectrum"` (default): fit once on the dataset's mean
+        spectrum -- what to report in a peak table. `"per_pixel"`: fit
+        every pixel independently (slow; only sensible at high enough
+        per-pixel counts -- check `summarize_energy_windows`'s
+        `spatial_cv` first).
+    return_fit : bool, optional
+        If True, also return the fitted total curve and each component's
+        own curve over `energy_range`, for plotting.
+
+    Returns
+    -------
+    dict
+        `{"components": {name: {"center_eV", "fwhm_eV", "area", "height",
+        "boundary_pinned", ...}}, "r_squared": float}` for
+        `reducer="mean_spectrum"` (an edge-onset `"step"` component has no
+        `"area"`: reports `"onset_eV"`/`"width_eV"`/`"step_height"`
+        instead). `"boundary_pinned"` is `True` when the fitted center or
+        width landed within 2% of its `_bounds` -- the fit ran out of room
+        to move, so treat that component's numbers as unreliable rather
+        than a real result (a `UserWarning` is also raised naming which
+        component(s)). `{"components": {name: {...per-pixel (ny, nx)
+        arrays...}}}` for `reducer="per_pixel"`.
+        If `return_fit=True`, also `"energy"`, `"data"`, `"total_fit"`, and
+        `"component_curves"` (dict of per-component curves).
+
+    Raises
+    ------
+    RuntimeError
+        If `curve_fit` fails to converge -- not silently returned as a bad
+        fit (same "fail loudly" convention as the rest of this module).
+    """
+    for p in peaks:
+        if p.get("shape") not in _LINE_SHAPES:
+            raise ValueError(
+                f"peaks[...]['shape'] must be one of {_LINE_SHAPES}, got {p.get('shape')!r}"
+            )
+
+    e = np.asarray(dataset.energy_axis, dtype=float)
+    arr = np.asarray(dataset.array, dtype=float)
+    mask = (e >= energy_range[0]) & (e <= energy_range[1])
+    if not mask.any():
+        raise ValueError(f"energy_range {energy_range} has no channels on this axis")
+    E = e[mask]
+
+    def _build_model(E, params):
+        total = np.zeros_like(E)
+        curves = {}
+        i = 0
+        for p in peaks:
+            shape = p["shape"]
+            if shape == "pseudo_voigt":
+                center, width, height, eta = params[i : i + 4]
+                i += 4
+                comp = _pseudo_voigt_component(E, center, width, height, eta)
+            else:
+                center, width, height = params[i : i + 3]
+                i += 3
+                comp = {
+                    "gaussian": _gaussian_component,
+                    "lorentzian": _lorentzian_component,
+                    "step": _step_component,
+                }[shape](E, center, width, height)
+            curves[p["name"]] = comp
+            total = total + comp
+        return total, curves
+
+    def _pack_bounds():
+        lo_all, hi_all, p0_all = [], [], []
+        for p in peaks:
+            lo_all += [p["center_bounds"][0], p["width_bounds"][0], 0.0]
+            hi_all += [p["center_bounds"][1], p["width_bounds"][1], np.inf]
+            p0_all += [p["center_guess"], p["width_guess"], p.get("height_guess", 1.0)]
+            if p["shape"] == "pseudo_voigt":
+                lo_all += [0.0]
+                hi_all += [1.0]
+                p0_all += [p.get("eta_guess", 0.5)]
+        return np.array(lo_all), np.array(hi_all), np.array(p0_all)
+
+    def _pinned(value, bounds, rel_tol=0.02):
+        lo, hi = bounds
+        span = hi - lo
+        if span <= 0:
+            return False
+        return (value - lo) <= rel_tol * span or (hi - value) <= rel_tol * span
+
+    def _extract(name_shape_list, popt):
+        out = {}
+        i = 0
+        for p in peaks:
+            shape = p["shape"]
+            if shape == "pseudo_voigt":
+                center, width, height, eta = popt[i : i + 4]
+                i += 4
+                area = (
+                    height
+                    * width
+                    * (eta * (np.pi / 2.0) + (1.0 - eta) * np.sqrt(np.pi / (4.0 * np.log(2.0))))
+                )
+                pinned = _pinned(center, p["center_bounds"]) or _pinned(width, p["width_bounds"])
+                out[p["name"]] = dict(
+                    center_eV=float(center),
+                    fwhm_eV=float(width),
+                    height=float(height),
+                    area=float(area),
+                    eta=float(eta),
+                    shape=shape,
+                    boundary_pinned=pinned,
+                )
+            elif shape == "gaussian":
+                center, width, height = popt[i : i + 3]
+                i += 3
+                area = height * width * np.sqrt(np.pi / (4.0 * np.log(2.0)))
+                pinned = _pinned(center, p["center_bounds"]) or _pinned(width, p["width_bounds"])
+                out[p["name"]] = dict(
+                    center_eV=float(center),
+                    fwhm_eV=float(width),
+                    height=float(height),
+                    area=float(area),
+                    shape=shape,
+                    boundary_pinned=pinned,
+                )
+            elif shape == "lorentzian":
+                center, width, height = popt[i : i + 3]
+                i += 3
+                area = height * width * (np.pi / 2.0)
+                pinned = _pinned(center, p["center_bounds"]) or _pinned(width, p["width_bounds"])
+                out[p["name"]] = dict(
+                    center_eV=float(center),
+                    fwhm_eV=float(width),
+                    height=float(height),
+                    area=float(area),
+                    shape=shape,
+                    boundary_pinned=pinned,
+                )
+            else:  # step
+                center, width, height = popt[i : i + 3]
+                i += 3
+                pinned = _pinned(center, p["center_bounds"]) or _pinned(width, p["width_bounds"])
+                out[p["name"]] = dict(
+                    onset_eV=float(center),
+                    width_eV=float(width),
+                    step_height=float(height),
+                    shape=shape,
+                    boundary_pinned=pinned,
+                )
+        return out
+
+    lo, hi, p0 = _pack_bounds()
+
+    def _model_flat(E, *params):
+        total, _ = _build_model(E, np.array(params))
+        return total
+
+    if reducer == "mean_spectrum":
+        y = arr.reshape(-1, arr.shape[2]).mean(axis=0)[mask]
+        try:
+            popt, _pcov = curve_fit(_model_flat, E, y, p0=p0, bounds=(lo, hi), maxfev=20000)
+        except RuntimeError as exc:
+            raise RuntimeError(f"fit_edge_peaks: curve_fit failed to converge: {exc}") from exc
+        total_fit, comp_curves = _build_model(E, popt)
+        ss_res = float(np.sum((y - total_fit) ** 2))
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        components = _extract(peaks, popt)
+        pinned_names = [name for name, c in components.items() if c["boundary_pinned"]]
+        if pinned_names:
+            warnings.warn(
+                f"fit_edge_peaks: {pinned_names} landed within 2% of a fit bound -- treat "
+                "their center/width/area as unreliable (the fit ran out of bound room, not "
+                "necessarily out of real signal; widen center_bounds/width_bounds or drop "
+                "the component and re-check).",
+                UserWarning,
+            )
+        result = dict(
+            components=components,
+            r_squared=1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"),
+        )
+        if return_fit:
+            result.update(energy=E, data=y, total_fit=total_fit, component_curves=comp_curves)
+        return result
+
+    elif reducer == "per_pixel":
+        ny, nx, _ = arr.shape
+        out_components: dict = {p["name"]: {} for p in peaks}
+        n_fail = 0
+        for iy in range(ny):
+            for ix in range(nx):
+                y = arr[iy, ix, mask]
+                try:
+                    popt, _pcov = curve_fit(_model_flat, E, y, p0=p0, bounds=(lo, hi), maxfev=5000)
+                    comp = _extract(peaks, popt)
+                except RuntimeError:
+                    n_fail += 1
+                    comp = None
+                for p in peaks:
+                    d = out_components[p["name"]]
+                    for key in (
+                        ["center_eV", "fwhm_eV", "height", "area"]
+                        if p["shape"] != "step"
+                        else ["onset_eV", "width_eV", "step_height"]
+                    ):
+                        d.setdefault(key, np.full((ny, nx), np.nan))
+                        d[key][iy, ix] = comp[p["name"]][key] if comp is not None else np.nan
+        if n_fail:
+            warnings.warn(
+                f"fit_edge_peaks: {n_fail}/{ny * nx} pixels failed to converge (left as NaN).",
+                UserWarning,
+            )
+        return dict(components=out_components, n_failed=n_fail, n_pixels=ny * nx)
+
+    raise ValueError(f"reducer must be 'mean_spectrum' or 'per_pixel', got {reducer!r}")
+
+
+def measure_peak_width_fwhm(
+    x: np.ndarray,
+    y: np.ndarray,
+    peak_x: float,
+    *,
+    search_half_width_eV: float = 5.0,
+    smoothing_window_eV: float = 1.0,
+    polyorder: int = 3,
+    baseline: str = "zero",
+) -> dict:
+    """
+    Model-free FWHM (full width at half maximum) at a KNOWN peak location --
+    no line-shape assumed, no fit to converge or pin against. Meant to pair
+    with :func:`find_maximum_and_shoulder`
+    (`quantem.spectroscopy.spectroscopy_visualzitions`), which locates a
+    peak/shoulder's `(x, y)` but does not report a width -- feed its
+    `main_maximum["x"]` / `shoulder["x"]` straight in here.
+
+    WHAT
+    ----
+    Lightly smooths `y` (Savitzky-Golay), then walks outward from `peak_x`
+    in both directions until the smoothed curve crosses half of the peak's
+    own height above `baseline`, linearly interpolating the exact crossing
+    energy between the two straddling samples. FWHM = right crossing minus
+    left crossing.
+
+    WHY / WHAT WE LEARN
+    --------------------
+    `fit_edge_peaks()`'s parametric fit (Gaussian/Lorentzian/pseudo-Voigt)
+    gives a width too, but it can fail to converge cleanly or pin at a
+    bound when the assumed line shape doesn't actually match the data (see
+    this module's own `boundary_pinned` flag) -- which is exactly what
+    happened fitting `2_HL_InSitu5`'s O K pre-edge. This function has no
+    such failure mode: it only ever asks "where does the curve cross half
+    its own height," which is well-defined for any peak shape, including
+    ones with a poorly-resolved or asymmetric flank. The cost is that it
+    needs `peak_x` handed to it (from `find_maximum_and_shoulder()` or
+    elsewhere) rather than discovering peaks on its own, and it will return
+    `NaN` for a side that never actually reaches half-max within
+    `search_half_width_eV` (e.g. two overlapping features close together)
+    rather than guessing.
+
+    HOW
+    ---
+    `baseline="zero"`: half-max is measured relative to `y=0` -- appropriate
+    for an already background-subtracted spectrum, where 0 is the physical
+    "no signal" level. `baseline="local_min"`: half-max is measured
+    relative to the lower of the two smoothed values at
+    `peak_x +/- search_half_width_eV` -- use this when the spectrum does
+    not return to zero within the search window (e.g. a peak sitting on a
+    slope from a neighboring broad feature) and `baseline="zero"` would
+    therefore never find one side's crossing.
+
+    Parameters
+    ----------
+    x, y : ndarray
+        1D data (need not be sorted or evenly spaced).
+    peak_x : float
+        The peak (or shoulder) energy to measure the width of -- from
+        `find_maximum_and_shoulder()`'s `main_maximum["x"]`/`shoulder["x"]`,
+        a fitted center, or by eye.
+    search_half_width_eV : float, optional
+        How far to search on each side of `peak_x` before giving up and
+        returning NaN for that side. Default 5.0 eV -- widen it for a
+        genuinely broad feature (e.g. the O K white line, ~6-9 eV FWHM
+        here) or the search will hit its own boundary before crossing
+        half-max.
+    smoothing_window_eV, polyorder : optional
+        Savitzky-Golay smoothing applied before the crossing search (same
+        idea as `detect_peaks_whole_range`'s smoothing, just local to this
+        window instead of the whole axis). Default 1.0 eV, order 3.
+    baseline : {"zero", "local_min"}, optional
+        See HOW above.
+
+    Returns
+    -------
+    dict
+        `"fwhm_eV"` (NaN if either side failed to cross), `"left_eV"`,
+        `"right_eV"` (the two crossing energies, NaN individually if that
+        side failed), `"peak_height"` (height above the resolved
+        baseline), `"baseline_value"`.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+
+    lo, hi = peak_x - search_half_width_eV, peak_x + search_half_width_eV
+    mask = (x >= lo) & (x <= hi) & ~np.isnan(y)
+    x_r, y_r = x[mask], y[mask]
+    if len(x_r) < polyorder + 3:
+        return dict(
+            fwhm_eV=float("nan"),
+            left_eV=float("nan"),
+            right_eV=float("nan"),
+            peak_height=float("nan"),
+            baseline_value=float("nan"),
+        )
+
+    disp = float(np.median(np.diff(x_r))) if len(x_r) > 1 else 1.0
+    win = max(polyorder + 2, int(round(smoothing_window_eV / disp)) | 1)
+    win = min(win, len(x_r) - (1 - len(x_r) % 2))
+    if win <= polyorder:
+        win = polyorder + 1 + (polyorder + 1) % 2
+    y_s = savgol_filter(y_r, win, polyorder) if win < len(x_r) else y_r
+
+    peak_idx = int(np.argmin(np.abs(x_r - peak_x)))
+    peak_val = float(y_s[peak_idx])
+
+    if baseline == "zero":
+        base = 0.0
+    elif baseline == "local_min":
+        base = float(min(y_s[0], y_s[-1]))
+    else:
+        raise ValueError(f"baseline must be 'zero' or 'local_min', got {baseline!r}")
+
+    half = base + 0.5 * (peak_val - base)
+
+    def _cross(idx_range):
+        for i in idx_range:
+            j = i + (1 if idx_range.step > 0 else -1)
+            if not (0 <= j < len(y_s)):
+                break
+            if (y_s[i] - half) * (y_s[j] - half) <= 0 and y_s[i] != y_s[j]:
+                frac = (half - y_s[i]) / (y_s[j] - y_s[i])
+                return float(x_r[i] + frac * (x_r[j] - x_r[i]))
+        return float("nan")
+
+    left = _cross(range(peak_idx, -1, -1))
+    right = _cross(range(peak_idx, len(y_s)))
+    fwhm = (right - left) if (np.isfinite(left) and np.isfinite(right)) else float("nan")
+
+    return dict(
+        fwhm_eV=fwhm,
+        left_eV=left,
+        right_eV=right,
+        peak_height=peak_val - base,
+        baseline_value=base,
+    )
+
+
 def summarize_energy_windows(dataset, windows):
     """
     Per energy window, what does the (background-subtracted) data actually contain? For every window the
@@ -1361,3 +2026,97 @@ def bin_spatial(dataset, factor: int = 2):
     out.sampling = sampling
     out.name = f"{dataset.name} (binned {factor}x{factor})"
     return out
+
+
+def cherenkov_feasibility_check(
+    voltage_V: float,
+    n_lo: float = 1.30,
+    n_hi: float = 1.335,
+) -> dict:
+    """
+    Cherenkov-radiation feasibility check for a near-ZLP / low-loss EELS
+    feature -- a real, quantifiable confound distinct from the
+    thickness/dose confound.
+
+    WHY THIS MATTERS
+    -----------------
+    Even a perfectly clean ZLP-tail removal (e.g. via
+    :func:`build_reflected_zlp_model`) doesn't guarantee residual 1-3 eV
+    intensity is real electronic-structure signal (polaron/bipolaron/
+    interband transition/etc.) -- the low-loss EELS literature lists
+    Cherenkov radiation, surface/guided-light plasmon modes, amorphous-
+    surface effects, and defect-state transitions as alternative sources of
+    near-gap intensity. Cherenkov emission specifically requires the beam
+    electron's velocity to exceed the local phase velocity of light in the
+    medium: ``beta > 1/n(h-omega)``.
+
+    **This is a factual physics calculation, not a verdict on whether any
+    particular near-gap bump IS Cherenkov radiation.** ``beta`` is computed
+    from the microscope's accelerating voltage (read this dataset's own DM4
+    ``Microscope Info.Voltage`` tag, e.g. via ``inspect_dm4_tags`` -- do not
+    assume/hardcode it) and compared against a literature refractive-index
+    range for the material of interest.
+
+    Default ``n_lo``/``n_hi`` are water/ice's refractive index over the
+    visible/near-IR band that spans 1-3 eV photon energy (~413-1240 nm):
+    water, n ~ 1.33 down to ~1.32 (Hale & Querry, *Appl. Opt.* 12, 555
+    (1973)); ice, n ~ 1.31, ordinary ray (Warren & Brandt, *J. Geophys.
+    Res.* 113, D14220 (2008)). Pass a different range for another material.
+
+    Parameters
+    ----------
+    voltage_V : float
+        Accelerating voltage in volts (e.g. 300000 for 300 kV).
+    n_lo, n_hi : float, optional
+        Literature refractive-index range to check against. Defaults are
+        water/ice over 1-3 eV (see above).
+
+    Returns
+    -------
+    dict
+        ``gamma``, ``beta`` (v/c), ``n_threshold`` (``1/beta`` -- Cherenkov
+        is allowed wherever the medium's refractive index exceeds this),
+        ``allowed_lo``/``allowed_hi`` (bool, whether ``n_lo``/``n_hi`` each
+        exceed ``n_threshold``), and ``verdict`` (str): "allowed" if both
+        bounds clear the threshold, "not allowed" if neither does, or
+        "borderline" if only the high end does.
+    """
+    m_e_c2_eV = 510998.95  # electron rest mass energy (CODATA), eV
+    T_eV = float(voltage_V)  # kinetic energy in eV (electron charge x volts)
+    gamma = 1 + T_eV / m_e_c2_eV
+    beta = np.sqrt(1 - 1 / gamma**2)
+    n_threshold = 1 / beta
+
+    allowed_lo = n_lo > n_threshold
+    allowed_hi = n_hi > n_threshold
+
+    if allowed_lo and allowed_hi:
+        verdict = (
+            "Cherenkov emission IS energetically allowed for this sample at this voltage, "
+            "across the full literature refractive-index range given. This is a real, "
+            "additional caveat on any near-gap feature interpretation here -- separate from "
+            "and in addition to any thickness/dose confound."
+        )
+    elif not allowed_lo and not allowed_hi:
+        verdict = (
+            "Cherenkov emission is NOT energetically allowed for this sample at this voltage "
+            "-- beta is too low / n is too low across the full literature refractive-index "
+            "range given. This specific confound is ruled out for this sample."
+        )
+    else:
+        verdict = (
+            "Borderline: allowed at the high end of the literature refractive-index range but "
+            "not the low end -- depends on the exact refractive index at the specific photon "
+            "energy in question."
+        )
+
+    return {
+        "gamma": float(gamma),
+        "beta": float(beta),
+        "n_threshold": float(n_threshold),
+        "n_lo": float(n_lo),
+        "n_hi": float(n_hi),
+        "allowed_lo": bool(allowed_lo),
+        "allowed_hi": bool(allowed_hi),
+        "verdict": verdict,
+    }

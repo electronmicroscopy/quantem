@@ -239,7 +239,13 @@ class TestCalculateThicknessLogRatio:
     def test_returns_finite_map_on_clean_data(self, tilted_zlp_dataset):
         ds, _ = tilted_zlp_dataset
         with _no_warnings():
-            t_map = ds.calculate_thickness_log_ratio(zlp_window=1.0, plot=False)
+            # min_total_window_eV=0: this fixture's synthetic energy axis is a few
+            # eV wide by construction, which would otherwise trip the (real-data-
+            # oriented) narrow-acquisition-window warning unrelated to what this
+            # test checks.
+            t_map = ds.calculate_thickness_log_ratio(
+                zlp_window=1.0, plot=False, min_total_window_eV=0
+            )
         assert np.isfinite(t_map).all()
         assert t_map.shape == (SCAN_ROW, SCAN_COL)
 
@@ -271,5 +277,7 @@ class TestCalculateThicknessLogRatio:
     def test_zlp_window_auto(self, tilted_zlp_dataset):
         ds, _ = tilted_zlp_dataset
         with _no_warnings():
-            t_map = ds.calculate_thickness_log_ratio(zlp_window="auto", plot=False)
+            t_map = ds.calculate_thickness_log_ratio(
+                zlp_window="auto", plot=False, min_total_window_eV=0
+            )
         assert np.isfinite(t_map).all()

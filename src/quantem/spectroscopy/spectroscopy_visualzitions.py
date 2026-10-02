@@ -1843,6 +1843,275 @@ def find_maximum_and_shoulder(
     }
 
 
+def build_reflected_zlp_model(
+    E: np.ndarray,
+    spectrum: np.ndarray,
+    zlp_center: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Mirrored/reflected-tail zero-loss-peak (ZLP) model for the near-ZLP
+    background -- an assumption-free alternative to fitting a functional
+    form (power law, Lorentzian, ...) right next to the ZLP.
+
+    Energy loss cannot physically be negative, so whatever a properly
+    ZLP-centered spectrum records on the negative-energy-loss side is pure
+    instrument response (beam energy spread + detector point-spread
+    function) with no real spectral signal in it. Mirroring that
+    negative-side shape onto the positive side gives a per-spectrum model
+    of "what the ZLP alone looks like here" without fitting anything.
+    Literature on near-ZLP EELS background removal (Rafferty & Brown-style
+    ZLP deconvolution work; see also Stoeger-Pollach's "pitfalls and
+    solutions" review of low-loss EELS) recommends exactly this over a
+    fitted/extrapolated background for the region immediately next to the
+    ZLP: a fitted form's anchor windows have to sit close to the region of
+    interest and the shape doesn't adapt per-spectrum, while the mirrored
+    real data does by construction.
+
+    Does NOT redo ZLP alignment -- reuse the already-established center
+    (e.g. `apply_zlp_correction()`'s output already centers the ZLP at
+    0 eV on its own energy axis, so `zlp_center=0.0`, the default, is
+    correct for that case; pass the actual measured offset only if working
+    from an uncorrected axis).
+
+    Deliberately mean-spectrum-oriented (call it on a mean spectrum, one
+    dose-block mean, etc., not per-pixel): the literature is explicit that
+    deconvolution/subtraction methods are unreliable on noisy data, and a
+    per-pixel spectrum-image spectrum is much noisier than a bulk-averaged
+    one -- same reasoning the LL near-gap analysis elsewhere applies.
+
+    Parameters
+    ----------
+    E : ndarray
+        1D energy axis (eV), same length as `spectrum`. Need not be
+        pre-sorted.
+    spectrum : ndarray
+        1D intensity (a mean spectrum -- see above).
+    zlp_center : float, optional
+        Energy (eV, same axis as `E`) of the already-established ZLP
+        center. Default 0.0.
+
+    Returns
+    -------
+    dict
+        `E_shifted` (`E - zlp_center`, sorted ascending), `spectrum_shifted`
+        (`spectrum` reordered to match), `reflected_zlp_model` (same shape;
+        `NaN` wherever `E_shifted <= 0` or beyond the available negative-
+        side coverage), `reflected_subtracted` (`spectrum_shifted -
+        reflected_zlp_model`, `NaN` in the same places),
+        `negative_coverage_eV` (float -- the most negative `E_shifted`
+        value actually available, i.e. how far out on the positive side
+        this model can be trusted; check this against whatever window you
+        actually need -- e.g. the near-gap band -- before trusting
+        `reflected_subtracted` there, and say so plainly if it falls
+        short rather than silently trusting a truncated range).
+
+    Raises
+    ------
+    ValueError
+        If `E`/`spectrum` shapes mismatch, or there are no negative-
+        energy-loss channels at all after the `zlp_center` shift (nothing
+        to mirror).
+    """
+    E = np.asarray(E, dtype=float)
+    spectrum = np.asarray(spectrum, dtype=float)
+    if E.shape != spectrum.shape:
+        raise ValueError(
+            f"E and spectrum must have the same shape; got {E.shape} and {spectrum.shape}"
+        )
+
+    order = np.argsort(E)
+    E_shifted = E[order] - float(zlp_center)
+    spectrum_shifted = spectrum[order]
+
+    neg_mask = E_shifted < 0
+    if not np.any(neg_mask):
+        raise ValueError(
+            f"no negative-energy-loss channels available on this axis (after zlp_center="
+            f"{zlp_center} shift) -- nothing to mirror. Axis range after shift: "
+            f"[{E_shifted[0]:.3f}, {E_shifted[-1]:.3f}] eV"
+        )
+    neg_E = E_shifted[neg_mask]
+    neg_I = spectrum_shifted[neg_mask]
+    # neg_E is ascending (E_shifted is sorted); mirror it into an ascending
+    # positive-equivalent lookup table: positive-equivalent energy = -neg_E,
+    # reversed so it runs ascending from just-above-zero out to the most
+    # negative channel's positive mirror.
+    pos_equiv_E = -neg_E[::-1]
+    pos_equiv_I = neg_I[::-1]
+    negative_coverage_eV = float(pos_equiv_E[-1])
+
+    reflected_zlp_model = np.full_like(E_shifted, np.nan)
+    pos_mask = E_shifted > 0
+    within_coverage = pos_mask & (E_shifted <= negative_coverage_eV)
+    reflected_zlp_model[within_coverage] = np.interp(
+        E_shifted[within_coverage], pos_equiv_E, pos_equiv_I
+    )
+
+    reflected_subtracted = spectrum_shifted - reflected_zlp_model
+
+    return {
+        "E_shifted": E_shifted,
+        "spectrum_shifted": spectrum_shifted,
+        "reflected_zlp_model": reflected_zlp_model,
+        "reflected_subtracted": reflected_subtracted,
+        "negative_coverage_eV": negative_coverage_eV,
+    }
+
+
+def plot_reflected_zlp_steps(
+    E: np.ndarray,
+    spectrum: np.ndarray,
+    zlp_center: float = 0.0,
+    near_gap_window: Tuple[float, float] = (0.5, 3.0),
+    context_window: Tuple[float, float] = (-3.0, 3.0),
+    title: str = "",
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+):
+    """
+    4-panel step-by-step teaching figure for `build_reflected_zlp_model()`'s
+    method -- built for a first-time user to actually see how the
+    reflected/mirrored-tail approach works (and to explain it to someone
+    else), not just consume its numeric result.
+
+    Calls `build_reflected_zlp_model()` internally (does not duplicate its
+    logic) and visualizes its four conceptual steps:
+
+    1. **The raw spectrum around the ZLP**, negative- and positive-energy-
+       loss sides shaded differently -- the negative side is pure
+       instrument response (energy loss can't physically be negative), the
+       positive side may contain real signal.
+    2. **The negative side mirrored onto the positive axis**, overlaid on
+       the ACTUAL recorded positive-side data over the same range: near
+       E=0 the two nearly coincide (still just ZLP tail there); further
+       out they diverge -- that divergence is where real signal starts.
+    3. **A zoom on `near_gap_window`**, with the gap between the two curves
+       shaded -- this shaded gap IS the residual the method extracts.
+    4. **That residual, standalone.**
+
+    Parameters
+    ----------
+    E, spectrum : ndarray
+        Same as `build_reflected_zlp_model()`.
+    zlp_center : float, optional
+        Default 0.0 (same convention as `build_reflected_zlp_model()`).
+    near_gap_window : (float, float), optional
+        Window for steps 3-4. Default (0.5, 3.0). Automatically clipped to
+        `build_reflected_zlp_model()`'s own `negative_coverage_eV` if the
+        available negative-side coverage falls short -- never silently
+        plots past what the model actually covers.
+    context_window : (float, float), optional
+        Range for steps 1-2 (full ZLP context, both signs). Default
+        (-3.0, 3.0).
+    title, save_path, show :
+        Same convention as this module's other `plot_*` functions.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    result : dict
+        `build_reflected_zlp_model()`'s own returned dict (so the caller
+        can reuse it, e.g. feeding `result["reflected_subtracted"]` into
+        `find_maximum_and_shoulder()`, without recomputing it).
+    """
+    result = build_reflected_zlp_model(E, spectrum, zlp_center=zlp_center)
+    E_s = result["E_shifted"]
+    I_s = result["spectrum_shifted"]
+    model = result["reflected_zlp_model"]
+    residual = result["reflected_subtracted"]
+    coverage = result["negative_coverage_eV"]
+
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(20, 4.6))
+
+    # Step 1: raw spectrum, negative vs. positive side shaded
+    ctx_mask = (E_s >= context_window[0]) & (E_s <= context_window[1])
+    ax1.plot(E_s[ctx_mask], I_s[ctx_mask], color="#374151", lw=1.3)
+    ax1.axvspan(
+        context_window[0],
+        0,
+        color="#93c5fd",
+        alpha=0.3,
+        label="negative side\n(instrument response only)",
+    )
+    ax1.axvspan(
+        0,
+        context_window[1],
+        color="#fca5a5",
+        alpha=0.3,
+        label="positive side\n(may contain real signal)",
+    )
+    ax1.axvline(0, color="black", lw=1, ls=":")
+    ax1.set_title("Step 1: raw spectrum\naround the ZLP")
+    ax1.set_xlabel("Energy loss (eV)")
+    ax1.set_ylabel("intensity")
+    ax1.legend(frameon=False, fontsize=7, loc="upper right")
+
+    # Step 2: mirrored negative side vs. actual positive-side data
+    pos_ctx_mask = (E_s > 0) & (E_s <= context_window[1])
+    ax2.plot(
+        E_s[pos_ctx_mask], I_s[pos_ctx_mask], color="#374151", lw=1.4, label="actual recorded data"
+    )
+    model_ctx_mask = pos_ctx_mask & ~np.isnan(model)
+    ax2.plot(
+        E_s[model_ctx_mask],
+        model[model_ctx_mask],
+        color="#2563eb",
+        lw=1.6,
+        ls="--",
+        label="mirrored negative side",
+    )
+    ax2.set_title("Step 2: mirror negative side\nonto positive axis")
+    ax2.set_xlabel("Energy loss (eV)")
+    ax2.set_ylabel("intensity")
+    ax2.legend(frameon=False, fontsize=7.5)
+
+    # Step 3: near-gap zoom, gap between the two curves shaded
+    ng_lo, ng_hi = near_gap_window
+    ng_hi_eff = min(ng_hi, coverage)
+    ng_mask = (E_s >= ng_lo) & (E_s <= ng_hi_eff) & ~np.isnan(model)
+    ax3.plot(E_s[ng_mask], I_s[ng_mask], color="#374151", lw=1.4, label="actual data")
+    ax3.plot(
+        E_s[ng_mask], model[ng_mask], color="#2563eb", lw=1.6, ls="--", label="mirrored model"
+    )
+    ax3.fill_between(
+        E_s[ng_mask],
+        model[ng_mask],
+        I_s[ng_mask],
+        color="#fbbf24",
+        alpha=0.4,
+        label="gap = extracted residual",
+    )
+    ax3.set_title(f"Step 3: near-gap zoom\n[{ng_lo}, {ng_hi_eff:.2f}] eV")
+    ax3.set_xlabel("Energy loss (eV)")
+    ax3.set_ylabel("intensity")
+    ax3.legend(frameon=False, fontsize=7.5)
+    if ng_hi_eff < ng_hi:
+        ax3.text(
+            0.02,
+            0.02,
+            f"coverage clipped to {ng_hi_eff:.2f} eV",
+            transform=ax3.transAxes,
+            fontsize=7,
+            color="#b45309",
+        )
+
+    # Step 4: the extracted residual, standalone
+    ax4.plot(E_s[ng_mask], residual[ng_mask], color="#b45309", lw=1.6)
+    ax4.axhline(0, color="#e5e7eb", lw=0.8)
+    ax4.set_title("Step 4: extracted residual")
+    ax4.set_xlabel("Energy loss (eV)")
+    ax4.set_ylabel("intensity\n(reflected-tail subtracted)")
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig, result
+
+
 def _wrap_title(text, width=80):
     """Wrap a long plot-title line at `width` characters."""
     return textwrap.fill(str(text), width=width)

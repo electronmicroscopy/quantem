@@ -549,6 +549,262 @@ def combine_passes(
     raise ValueError("method must be 'sum' or 'mean'")
 
 
+def estimate_pass_shifts(
+    images: np.ndarray,
+    passes: Sequence[int] | None = None,
+    *,
+    reference: str = "mean",
+    upsample_factor: int = 10,
+    max_shift_px: float | None = None,
+    normalization: str | None = None,
+) -> np.ndarray:
+    """
+    Estimate per-pass (dy, dx) rigid shifts, in pixels, via FFT-based
+    subpixel cross-correlation (`skimage.registration.phase_cross_correlation`)
+    against a single fixed reference image built from `images`.
+
+    Meant to correct the drift-during-summation artifact multi-pass
+    acquisitions are prone to: sample/stage drift between passes shifts
+    each pass's raster a little relative to the last, and summing
+    unregistered passes (as `combine_passes()` does on its own) smears any
+    sharp feature into a diagonal streak. Estimating (and then applying,
+    via `apply_pass_shifts()`) a per-pass shift before summing corrects
+    for that. `read_stem_eels_folder(..., align_passes=True)` runs this
+    automatically; call it directly only for a custom alignment workflow.
+
+    Parameters
+    ----------
+    images : (n_frames, ny, nx) ndarray
+        One 2D image per pass to register on -- pass the ADF stack
+        (`MultipassRawStacks.adf_stack`) when available, since its much
+        higher per-pass SNR than a single EELS pass makes the
+        cross-correlation far more reliable; fall back to an
+        energy-summed EELS stack (`stack.sum(axis=1)`, from either
+        `.ll_stack` or `.hl_stack`) only if no ADF sidecar was recorded.
+    passes : sequence of int, optional
+        0-indexed subset of `images`' frame axis to estimate shifts for
+        (e.g. the same `chosen` list `select_passes()` returned) and to
+        build the reference from. Defaults to every frame in `images`.
+    reference : {"mean", "first"}, optional
+        "mean" (default): register every selected pass against the
+        (unregistered) mean of all selected passes -- a smoother,
+        higher-SNR reference, though itself already blurred by drift if
+        the drift is large relative to the field of view.
+        "first": register every pass against the first selected pass --
+        avoids a blurred reference, but feeds that one frame's own noise
+        directly into every shift estimate.
+    upsample_factor : int, optional
+        Subpixel precision passed to `phase_cross_correlation` -- shifts
+        are resolved to `1/upsample_factor` of a pixel. Default 10 (0.1 px).
+    max_shift_px : float, optional
+        If given, any estimated shift with magnitude
+        `sqrt(dy**2 + dx**2)` greater than this is treated as a failed
+        registration (clamped to zero, i.e. that pass is left unshifted)
+        and reported in one `UserWarning` -- phase correlation can return
+        a wild spurious shift on a low-contrast or near-featureless pass;
+        this guards against actually applying one. `None` (default)
+        disables the check.
+    normalization : {"phase", None}, optional
+        Forwarded to `phase_cross_correlation`. Default `None` here
+        (skimage's own default is `"phase"`) -- phase-only normalization
+        whitens the cross-power spectrum, which amplifies noise and can
+        fail badly (near-zero correlation, a near-random shift estimate)
+        on images that are smooth/low-contrast relative to their noise --
+        common for STEM ADF/EELS frames (e.g. a lamella with a broad
+        thickness gradient and comparatively little fine texture).
+        Verified empirically on synthetic drifted ADF-like frames: default
+        `"phase"` normalization returned shift estimates uncorrelated with
+        the injected drift and a near-1.0 (fully decorrelated) match
+        error, while `normalization=None` recovered the injected drift
+        accurately. Pass `"phase"` explicitly if your data has enough
+        broadband texture (e.g. clear atomic-column contrast) for it to
+        help instead of hurt.
+
+    Returns
+    -------
+    ndarray, shape (len(passes), 2)
+        `[dy, dx]` per selected pass, in the same order as `passes`, in
+        pixels -- already the correction to *apply* to that pass (i.e.
+        `scipy.ndimage.shift(pass_image, shifts[i])` registers it onto the
+        reference; this is `phase_cross_correlation`'s own convention, the
+        negative of the pass's raw displacement from the reference).
+        `apply_pass_shifts()` consumes this directly, unchanged.
+    """
+    from skimage.registration import phase_cross_correlation
+
+    images = np.asarray(images)
+    if images.ndim != 3:
+        raise ValueError(f"images must be (n_frames, ny, nx), got shape {images.shape}")
+
+    idx = list(range(images.shape[0])) if passes is None else list(passes)
+    if not idx:
+        raise ValueError("passes must be non-empty")
+
+    selected = images[idx].astype(float)
+
+    if reference == "mean":
+        ref_image = selected.mean(axis=0)
+    elif reference == "first":
+        ref_image = selected[0]
+    else:
+        raise ValueError(f"reference must be 'mean' or 'first', got {reference!r}")
+
+    shifts = np.zeros((len(idx), 2), dtype=float)
+    clamped = []
+    for i, frame in enumerate(selected):
+        shift, _error, _diffphase = phase_cross_correlation(
+            ref_image, frame, upsample_factor=upsample_factor, normalization=normalization
+        )
+        if max_shift_px is not None and float(np.hypot(*shift)) > max_shift_px:
+            clamped.append((idx[i], float(np.hypot(*shift))))
+            shift = np.zeros(2)
+        shifts[i] = shift
+
+    if clamped:
+        details = ", ".join(f"pass {p + 1}: {d:.1f}px" for p, d in clamped)
+        warnings.warn(
+            f"estimate_pass_shifts: {len(clamped)} pass(es) exceeded "
+            f"max_shift_px={max_shift_px} and were left unshifted (likely a "
+            f"failed/spurious registration, e.g. a low-contrast pass): {details}",
+            UserWarning,
+        )
+
+    return shifts
+
+
+def apply_pass_shifts(
+    stack: np.ndarray,
+    shifts: np.ndarray,
+    passes: Sequence[int] | None = None,
+    *,
+    order: int = 1,
+    mode: str = "constant",
+    cval: float = 0.0,
+) -> np.ndarray:
+    """
+    Apply per-pass rigid shifts (from `estimate_pass_shifts()`) to the
+    trailing two (spatial) axes of `stack`, one frame at a time, leaving
+    any axes in between (e.g. an EELS stack's energy axis) untouched.
+
+    Parameters
+    ----------
+    stack : ndarray
+        `(n_frames, ny, nx)` (e.g. an ADF stack) or `(n_frames, n_energy,
+        ny, nx)` (e.g. `MultipassRawStacks.ll_stack` / `.hl_stack`) --
+        anything whose first axis is the pass/frame axis and last two axes
+        are spatial.
+    shifts : (len(passes), 2) ndarray
+        `[dy, dx]` per pass, in the same order as `passes`, as returned by
+        `estimate_pass_shifts()`.
+    passes : sequence of int, optional
+        0-indexed frame indices `shifts` corresponds to. Defaults to
+        `range(stack.shape[0])`, which requires `len(shifts) ==
+        stack.shape[0]`. Frames of `stack` not listed in `passes` are
+        copied through unshifted.
+    order : int, optional
+        Spline interpolation order for `scipy.ndimage.shift`. Default 1
+        (bilinear) -- a reasonable default for STEM images; use 0
+        (nearest) to avoid introducing any new interpolated values (e.g.
+        before an analysis sensitive to exact per-pixel counts).
+    mode, cval : optional
+        Forwarded to `scipy.ndimage.shift` for the newly-exposed border
+        region after shifting. Default `mode="constant", cval=0.0`, i.e.
+        the shifted-in border reads as zero, matching a raw EELS/ADF
+        stack's natural "no signal" value.
+
+    Returns
+    -------
+    ndarray
+        A new array, same shape as `stack`, with each pass in `passes`
+        shifted by `shifts[i]` (as returned by `estimate_pass_shifts()`,
+        unchanged -- that function already returns the correction to
+        apply, not the raw displacement). Cast through float for the
+        interpolation; cast back to `stack`'s original dtype (rounding) if
+        it was integer.
+    """
+    from scipy.ndimage import shift as ndi_shift
+
+    stack = np.asarray(stack)
+    idx = list(range(stack.shape[0])) if passes is None else list(passes)
+    shifts = np.asarray(shifts, dtype=float)
+    if shifts.shape != (len(idx), 2):
+        raise ValueError(
+            f"shifts must have shape ({len(idx)}, 2) to match passes, got {shifts.shape}"
+        )
+
+    out = stack.astype(float, copy=True)
+    for i, p in enumerate(idx):
+        dy, dx = shifts[i]
+        frame_shift = [0.0] * (stack.ndim - 1)
+        frame_shift[-2] = dy
+        frame_shift[-1] = dx
+        out[p] = ndi_shift(out[p], shift=frame_shift, order=order, mode=mode, cval=cval)
+
+    if np.issubdtype(stack.dtype, np.integer):
+        out = np.round(out).astype(stack.dtype)
+
+    return out
+
+
+def plot_pass_shifts(
+    pass_shifts_px: np.ndarray,
+    passes_used: Sequence[int] | None = None,
+    title: str = "Estimated per-pass drift",
+):
+    """
+    Quick diagnostic: plot the per-pass `[dy, dx]` shifts from
+    `estimate_pass_shifts()` (or `StemEelsRaw.pass_shifts_px`) against pass
+    number. A roughly linear/monotonic trend across passes is the classic
+    signature of steady thermal/stage drift during acquisition, as opposed
+    to a single outlier pass (drift-unrelated damage, a dropped frame,
+    etc.) -- useful both to confirm drift is the cause of a streaky summed
+    map before turning on `align_passes=True`, and to sanity-check the
+    fitted shifts afterward.
+
+    Parameters
+    ----------
+    pass_shifts_px : (n, 2) ndarray
+        `[dy, dx]` per pass, in pixels.
+    passes_used : sequence of int, optional
+        0-indexed pass numbers `pass_shifts_px` corresponds to (e.g.
+        `StemEelsRaw.passes_used`, 1-indexed there -- subtract 1, or just
+        omit this and let the x-axis default to `1..n`). Only used to
+        label the x-axis; defaults to `1, 2, ..., n`.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.pyplot as plt
+
+    pass_shifts_px = np.asarray(pass_shifts_px, dtype=float)
+    x = (
+        np.asarray(passes_used, dtype=float) + 1
+        if passes_used is not None
+        else np.arange(1, len(pass_shifts_px) + 1)
+    )
+
+    fig, (ax_xy, ax_mag) = plt.subplots(1, 2, figsize=(11, 4))
+    ax_xy.plot(x, pass_shifts_px[:, 1], "o-", label="dx (col)")
+    ax_xy.plot(x, pass_shifts_px[:, 0], "o-", label="dy (row)")
+    ax_xy.set_xlabel("Pass number")
+    ax_xy.set_ylabel("Shift (px)")
+    ax_xy.set_title("Shift components vs. pass")
+    ax_xy.legend()
+    ax_xy.grid(True, alpha=0.3)
+
+    magnitude = np.hypot(pass_shifts_px[:, 0], pass_shifts_px[:, 1])
+    ax_mag.plot(x, magnitude, "o-", color="k")
+    ax_mag.set_xlabel("Pass number")
+    ax_mag.set_ylabel("|shift| (px)")
+    ax_mag.set_title("Shift magnitude vs. pass")
+    ax_mag.grid(True, alpha=0.3)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
 def _get_dm4_calibration(
     dm4_path: str | PathLike, obj_idx: int, n_dims: int, energy_rank: int | None = None
 ) -> tuple[list[float], list[float], list[str]]:
@@ -727,6 +983,23 @@ class StemEelsRaw(AutoSerialize):
         1-indexed pass numbers combined into the result (multipass only).
     combine_method : str | None
         How `passes_used` were combined ("sum" or "mean"; multipass only).
+    pass_shifts_px : NDArray | None
+        `[dy, dx]` per entry of `passes_used`, in pixels, if
+        `read_stem_eels_folder(..., align_passes=True)` was used to
+        register passes against drift before combining them (multipass
+        only). `None` if alignment wasn't requested (the default) or this
+        is a single-pass acquisition. See `estimate_pass_shifts()` /
+        `plot_pass_shifts()`. When this came from `remove_drift_frames()`,
+        covers only the *kept* passes, in the same order as `passes_used` --
+        pass directly to `crop_alignment_border()`.
+    dropped_passes : list[int] | None
+        1-indexed passes `remove_drift_frames()` dropped before combining
+        (same numbering convention as `passes_used`). `None` unless this
+        came from `remove_drift_frames()`.
+    drop_reason : str | None
+        Human-readable reason for `dropped_passes`, from
+        `suggest_drift_frames_to_drop()` (or `"manual drop_list"`). `None`
+        unless this came from `remove_drift_frames()`.
     """
 
     def __init__(
@@ -743,6 +1016,9 @@ class StemEelsRaw(AutoSerialize):
         pixel_size_nm: float | None,
         passes_used: list[int] | None,
         combine_method: str | None,
+        pass_shifts_px: np.ndarray | None = None,
+        dropped_passes: list[int] | None = None,
+        drop_reason: str | None = None,
     ):
         self.folder = folder
         self.dm4_path = dm4_path
@@ -756,6 +1032,9 @@ class StemEelsRaw(AutoSerialize):
         self.pixel_size_nm = pixel_size_nm
         self.passes_used = passes_used
         self.combine_method = combine_method
+        self.dropped_passes = dropped_passes
+        self.drop_reason = drop_reason
+        self.pass_shifts_px = pass_shifts_px
 
 
 def _load_single_pass(
@@ -929,17 +1208,59 @@ def _load_multi_pass(
     pass_mode: str,
     passes: str | Sequence[int] | None,
     combine_method: str,
+    align_passes: bool = False,
+    alignment_stack: str = "adf",
+    alignment_reference: str = "mean",
+    alignment_upsample_factor: int = 10,
+    alignment_max_shift_px: float | None = None,
+    alignment_normalization: str | None = None,
 ) -> StemEelsRaw:
     raw = load_multipass_raw_stacks(folder)
     chosen = select_passes(raw.n_passes, mode=pass_mode, passes=passes)
 
+    ll_stack, hl_stack, adf_stack = raw.ll_stack, raw.hl_stack, raw.adf_stack
+    pass_shifts_px = None
+    if align_passes:
+        if alignment_stack == "adf" and raw.adf_stack is None:
+            warnings.warn(
+                "_load_multi_pass: align_passes=True with alignment_stack='adf' but "
+                "no ADF stack was found for this acquisition -- falling back to "
+                "alignment_stack='hl' (energy-summed high-loss image per pass).",
+                UserWarning,
+            )
+            alignment_stack = "hl"
+
+        if alignment_stack == "adf":
+            registration_images = raw.adf_stack
+        elif alignment_stack == "ll":
+            registration_images = raw.ll_stack.sum(axis=1)
+        elif alignment_stack == "hl":
+            registration_images = raw.hl_stack.sum(axis=1)
+        else:
+            raise ValueError(
+                f"alignment_stack must be 'adf', 'll', or 'hl', got {alignment_stack!r}"
+            )
+
+        pass_shifts_px = estimate_pass_shifts(
+            registration_images,
+            chosen,
+            reference=alignment_reference,
+            upsample_factor=alignment_upsample_factor,
+            max_shift_px=alignment_max_shift_px,
+            normalization=alignment_normalization,
+        )
+        ll_stack = apply_pass_shifts(raw.ll_stack, pass_shifts_px, chosen)
+        hl_stack = apply_pass_shifts(raw.hl_stack, pass_shifts_px, chosen)
+        if raw.adf_stack is not None:
+            adf_stack = apply_pass_shifts(raw.adf_stack, pass_shifts_px, chosen)
+
     # combine_passes() sums over the frame axis (axis 0), leaving energy at
     # axis 0 of the result -- move it to the end to match the (ny, nx,
     # n_energy) layout array_to_spectroscopy3d() requires.
-    ll_combined = np.moveaxis(combine_passes(raw.ll_stack, chosen, method=combine_method), 0, -1)
-    hl_combined = np.moveaxis(combine_passes(raw.hl_stack, chosen, method=combine_method), 0, -1)
+    ll_combined = np.moveaxis(combine_passes(ll_stack, chosen, method=combine_method), 0, -1)
+    hl_combined = np.moveaxis(combine_passes(hl_stack, chosen, method=combine_method), 0, -1)
     adf_combined = (
-        combine_passes(raw.adf_stack, chosen, method="mean") if raw.adf_stack is not None else None
+        combine_passes(adf_stack, chosen, method="mean") if adf_stack is not None else None
     )
     # ADF is averaged (not summed) by default since it's an image you want to
     # look at, not a counting signal -- pass combine_method="sum" if you'd
@@ -965,6 +1286,7 @@ def _load_multi_pass(
         pixel_size_nm=raw.pixel_size_nm,
         passes_used=[p + 1 for p in chosen],
         combine_method=combine_method,
+        pass_shifts_px=pass_shifts_px,
     )
 
 
@@ -973,6 +1295,12 @@ def read_stem_eels_folder(
     pass_mode: str = "manual",
     passes: str | Sequence[int] | None = None,
     combine_method: str = "sum",
+    align_passes: bool = False,
+    alignment_stack: str = "adf",
+    alignment_reference: str = "mean",
+    alignment_upsample_factor: int = 10,
+    alignment_max_shift_px: float | None = None,
+    alignment_normalization: str | None = None,
 ) -> StemEelsRaw:
     """
     Read a STEM-EELS acquisition folder (DM4 header + raw sidecars),
@@ -982,8 +1310,9 @@ def read_stem_eels_folder(
        spectrum image -- read directly via `read_3d_spectroscopy()`.
     2. Multi-pass (DigitalMicrograph in-situ/multi-pass scanning): every
        individual pass is its own frame in the raw sidecar file. This loads
-       the full frame stack, selects passes (`select_passes()`), combines
-       them (`combine_passes()`), and wraps the result the same way as (1).
+       the full frame stack, selects passes (`select_passes()`), optionally
+       registers them against drift (`align_passes`), combines them
+       (`combine_passes()`), and wraps the result the same way as (1).
 
     Parameters
     ----------
@@ -994,6 +1323,37 @@ def read_stem_eels_folder(
         dataset turns out multi-pass. Default `pass_mode="manual"` requires
         `passes=...` (or use `pass_mode="all"`) and never prompts; pass
         `pass_mode="ask"` for an interactive `input()` prompt instead.
+    align_passes : bool, optional
+        If True (multi-pass only), estimate a per-pass rigid (dy, dx)
+        shift via cross-correlation (`estimate_pass_shifts()`) and apply it
+        (`apply_pass_shifts()`) to LL/HL/ADF before combining passes --
+        corrects the diagonal-streak artifact that summing unregistered
+        passes produces when the sample/stage drifts during acquisition
+        (e.g. in-situ heating series). Default False, matching prior
+        behavior (passes summed/meaned as recorded, no registration). The
+        resulting shifts are returned as `StemEelsRaw.pass_shifts_px` --
+        pass it to `plot_pass_shifts()` to sanity-check them (a roughly
+        linear trend across passes is the expected drift signature).
+    alignment_stack : {"adf", "ll", "hl"}, optional
+        Which per-pass image stack to estimate shifts from when
+        `align_passes=True`. Default `"adf"` -- much higher per-pass SNR
+        than a single EELS pass, so the registration is far more reliable;
+        falls back to `"hl"` (with a warning) if no ADF sidecar was found.
+        `"ll"`/`"hl"` register on that stack's own per-pass energy-summed
+        image instead.
+    alignment_reference : {"mean", "first"}, optional
+        Forwarded to `estimate_pass_shifts()`. Default `"mean"`.
+    alignment_upsample_factor : int, optional
+        Forwarded to `estimate_pass_shifts()` (subpixel precision, as
+        `1/upsample_factor` px). Default 10.
+    alignment_max_shift_px : float, optional
+        Forwarded to `estimate_pass_shifts()` -- shifts larger than this
+        are treated as a failed registration and left unshifted (with a
+        warning) instead of applied. Default `None` (no check).
+    alignment_normalization : {"phase", None}, optional
+        Forwarded to `estimate_pass_shifts()`. Default `None` -- more
+        robust than skimage's own `"phase"` default for typical STEM
+        ADF/EELS frames; see `estimate_pass_shifts()`'s docstring for why.
 
     Returns
     -------
@@ -1019,7 +1379,1102 @@ def read_stem_eels_folder(
         return _load_single_pass(dm4_path, eels_infos)
 
     return _load_multi_pass(
-        folder, pass_mode=pass_mode, passes=passes, combine_method=combine_method
+        folder,
+        pass_mode=pass_mode,
+        passes=passes,
+        combine_method=combine_method,
+        align_passes=align_passes,
+        alignment_stack=alignment_stack,
+        alignment_reference=alignment_reference,
+        alignment_upsample_factor=alignment_upsample_factor,
+        alignment_max_shift_px=alignment_max_shift_px,
+        alignment_normalization=alignment_normalization,
+    )
+
+
+def _load_alignment_stack(
+    folder: str | PathLike, alignment_stack: str = "adf"
+) -> tuple[np.ndarray, int]:
+    """
+    Load just the ONE per-pass image stack needed to estimate drift
+    (default: ADF), without loading the much larger LL/HL EELS raw stacks --
+    the DM4-tag-only object lookup (`detect_multipass()`) is cheap; only the
+    single requested raw sidecar is actually read from disk. Falls back to
+    an energy-summed EELS stack (with a warning) if `alignment_stack="adf"`
+    has no recorded ADF sidecar.
+
+    Returns
+    -------
+    stack : (n_frames, ny, nx) ndarray
+    n_passes : int
+        Total recorded passes (from the EELS objects' frame counts), even
+        when the returned stack itself is the (possibly smaller) ADF one.
+    """
+    folder = Path(folder)
+    files = find_stem_si_files(folder)
+    obj_info = detect_multipass(files["dm4"])
+    ll_info = next(
+        o
+        for n, o in obj_info.items()
+        if "eels" in n.lower() and ("ll" in n.lower() or "low" in n.lower())
+    )
+    hl_info = next(
+        o
+        for n, o in obj_info.items()
+        if "eels" in n.lower() and ("hl" in n.lower() or "high" in n.lower())
+    )
+    n_passes = max(ll_info.n_frames, hl_info.n_frames)
+    if n_passes <= 1:
+        # Genuinely single-pass acquisitions don't have the per-pass raw
+        # sidecars (STEM SI_*.raw) this function reads at all -- fail here,
+        # before touching any of them, rather than a confusing
+        # FileNotFoundError from inside the alignment_stack fallback below.
+        raise ValueError(
+            f"_load_alignment_stack: {folder} is single-pass (n_passes={n_passes}) -- "
+            "nothing to estimate drift over."
+        )
+
+    if alignment_stack == "adf":
+        adf_info = next(
+            (
+                o
+                for n, o in obj_info.items()
+                if "adf" in n.lower() and "postacq" not in n.lower() and o.n_frames == n_passes
+            ),
+            None,
+        )
+        if adf_info is None or files["adf_raw"] is None:
+            warnings.warn(
+                f"_load_alignment_stack: no ADF raw sidecar found for {folder} -- "
+                "falling back to alignment_stack='hl' (energy-summed high-loss image "
+                "per pass; more expensive to load).",
+                UserWarning,
+            )
+            alignment_stack = "hl"
+        else:
+            return (
+                load_raw_stack(files["adf_raw"], adf_info.n_frames, adf_info.dims, adf_info.dtype),
+                n_passes,
+            )
+
+    if alignment_stack == "hl":
+        stack = load_raw_stack(files["eels_hl_raw"], hl_info.n_frames, hl_info.dims, hl_info.dtype)
+    elif alignment_stack == "ll":
+        stack = load_raw_stack(files["eels_ll_raw"], ll_info.n_frames, ll_info.dims, ll_info.dtype)
+    else:
+        raise ValueError(f"alignment_stack must be 'adf', 'll', or 'hl', got {alignment_stack!r}")
+    # load_raw_stack() returns (n_frames, n_energy, ny, nx) for EELS sidecars --
+    # energy-sum to a single 2D image per pass, same as _load_multi_pass() does
+    # for alignment_stack="ll"/"hl".
+    return stack.sum(axis=1), n_passes
+
+
+def plot_pass_drift(
+    folder: str | PathLike,
+    *,
+    alignment_stack: str = "adf",
+    reference: str = "mean",
+    upsample_factor: int = 10,
+    max_shift_px: float | None = None,
+    normalization: str | None = None,
+    title: str | None = None,
+    show: bool = True,
+):
+    """
+    Cheap per-pass drift screening for a multi-pass acquisition folder --
+    estimates and plots per-pass `(dy, dx)` shifts WITHOUT loading, aligning,
+    or combining the (much larger) LL/HL EELS stacks: only the requested
+    `alignment_stack` (`"adf"` by default, a single 2D image per pass) is
+    read from disk. Meant to run across many acquisitions as a fast triage
+    step -- decide which datasets have real drift worth correcting (see
+    `suggest_drift_frames_to_drop()`) before paying for a full
+    `align_passes=True` / `remove_drift_frames()` reload of any of them.
+
+    Uses the same estimator `align_passes=True` uses internally
+    (`estimate_pass_shifts()`); see its docstring for what each keyword
+    parameter here does.
+
+    Parameters
+    ----------
+    folder : str | PathLike
+        Acquisition folder. Raises `ValueError` if it turns out single-pass
+        (nothing to estimate drift over).
+    title : str, optional
+        Plot title. Defaults to `"{folder.name} -- estimated per-pass drift
+        ({alignment_stack})"`.
+    show : bool, optional
+        If True (default), also build and return the `plot_pass_shifts()`
+        figure (dx and dy as two separate lines vs. pass number, plus
+        magnitude). Set False to only compute `shifts`.
+
+    Returns
+    -------
+    shifts : (n_passes, 2) ndarray
+        `[dy, dx]` per pass, in pixels, 0-indexed pass order (pass 1 is
+        `shifts[0]`).
+    fig : matplotlib.figure.Figure | None
+        `None` if `show=False`.
+    """
+    folder = Path(folder)
+    stack, n_passes = _load_alignment_stack(folder, alignment_stack)
+    if n_passes <= 1:
+        raise ValueError(
+            f"plot_pass_drift: {folder} is single-pass (n_passes={n_passes}) -- "
+            "nothing to estimate drift over."
+        )
+    shifts = estimate_pass_shifts(
+        stack,
+        reference=reference,
+        upsample_factor=upsample_factor,
+        max_shift_px=max_shift_px,
+        normalization=normalization,
+    )
+    fig = None
+    if show:
+        fig = plot_pass_shifts(
+            shifts,
+            title=title or f"{folder.name} -- estimated per-pass drift ({alignment_stack})",
+        )
+    return shifts, fig
+
+
+@dataclass
+class DriftFrameSuggestion:
+    """Result of `suggest_drift_frames_to_drop()`. All pass indices are
+    0-indexed into the `shifts` array passed in (pass 1 is index 0)."""
+
+    drop: list[int]
+    keep: list[int]
+    leading_run: tuple[int, int] | None
+    trailing_run: tuple[int, int] | None
+    mid_outliers: list[int]
+    mid_outliers_dropped: list[int]
+    plateau_magnitude_px: float
+    threshold_px: float
+    reason: str
+
+
+def _plot_drift_drop_suggestion(
+    shifts: np.ndarray, suggestion: "DriftFrameSuggestion", labels: np.ndarray, title: str
+):
+    import matplotlib.pyplot as plt
+
+    x = labels.astype(float)
+    magnitude = np.hypot(shifts[:, 0], shifts[:, 1])
+
+    fig, (ax_xy, ax_mag) = plt.subplots(1, 2, figsize=(12, 4.5))
+    for ax in (ax_xy, ax_mag):
+        if suggestion.leading_run is not None:
+            a, b = suggestion.leading_run
+            ax.axvspan(
+                x[a] - 0.5,
+                x[b] + 0.5,
+                color="#C0392B",
+                alpha=0.15,
+                label="suggested drop (leading)" if ax is ax_xy else None,
+            )
+        if suggestion.trailing_run is not None:
+            a, b = suggestion.trailing_run
+            ax.axvspan(
+                x[a] - 0.5,
+                x[b] + 0.5,
+                color="#8E44AD",
+                alpha=0.15,
+                label="suggested drop (trailing)" if ax is ax_xy else None,
+            )
+
+    ax_xy.plot(x, shifts[:, 1], "o-", ms=3, color="#1F4E79", label="dx (col)")
+    ax_xy.plot(x, shifts[:, 0], "o-", ms=3, color="#C0392B", label="dy (row)")
+    ax_xy.set_xlabel("Pass number")
+    ax_xy.set_ylabel("Shift (px)")
+    ax_xy.set_title("Shift components vs. pass")
+    ax_xy.legend(fontsize=8)
+    ax_xy.grid(True, alpha=0.3)
+
+    ax_mag.plot(x, magnitude, "o-", ms=3, color="k", label="|shift|")
+    ax_mag.axhline(
+        suggestion.threshold_px,
+        color="#E67E22",
+        ls="--",
+        lw=1.2,
+        label=f"threshold {suggestion.threshold_px:.2f} px",
+    )
+    ax_mag.axhline(
+        suggestion.plateau_magnitude_px,
+        color="0.5",
+        ls=":",
+        lw=1.2,
+        label=f"plateau {suggestion.plateau_magnitude_px:.2f} px",
+    )
+    mo_kept = [i for i in suggestion.mid_outliers if i not in set(suggestion.mid_outliers_dropped)]
+    if mo_kept:
+        ax_mag.plot(
+            x[mo_kept],
+            magnitude[mo_kept],
+            "x",
+            ms=9,
+            mew=2,
+            color="#E74C3C",
+            label="mid-sequence outlier (NOT dropped)",
+        )
+    if suggestion.mid_outliers_dropped:
+        mo_d = suggestion.mid_outliers_dropped
+        ax_mag.plot(
+            x[mo_d],
+            magnitude[mo_d],
+            "x",
+            ms=9,
+            mew=2,
+            color="#8E44AD",
+            label="mid-sequence outlier (dropped, also_drop_mid_outliers=True)",
+        )
+    ax_mag.set_xlabel("Pass number")
+    ax_mag.set_ylabel("|shift| (px)")
+    ax_mag.set_title("Shift magnitude vs. pass")
+    ax_mag.legend(fontsize=8)
+    ax_mag.grid(True, alpha=0.3)
+
+    fig.suptitle(f"{title}\n{suggestion.reason}", fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
+def suggest_drift_frames_to_drop(
+    shifts: np.ndarray,
+    *,
+    threshold_multiplier: float = 3.0,
+    min_threshold_px: float = 0.5,
+    plateau_fraction: float = 1.0 / 3.0,
+    min_keep: int = 2,
+    also_drop_mid_outliers: bool = False,
+    guard_passes: int = 0,
+    passes_used: Sequence[int] | None = None,
+    title: str = "Suggested drift-frame drop",
+    show: bool = True,
+) -> tuple["DriftFrameSuggestion", Any]:
+    """
+    Flag which passes of a multi-pass acquisition to drop before combining,
+    from their per-pass `(dy, dx)` drift alone -- matches the settling-
+    in / late-series-creep pattern (large drift concentrated in a
+    CONTIGUOUS run at the start and/or end of the sequence), not scattered
+    mid-sequence outliers, which are reported separately (`.mid_outliers`)
+    and, by default, never silently folded into `.drop`.
+
+    Why mid-sequence outliers are treated differently by default: an
+    isolated single-pass spike can be a genuine transient (real, brief
+    specimen jump) as easily as it can be the same physical settling event
+    glitching a second time -- distinguishing those needs a human look at
+    the plot, not a threshold. `2_HL_InSitu5` is a concrete example of the
+    latter: pass 23 there sits at 13.0 px, sandwiched between passes 22 and
+    24 at ~0.2-0.3 px, in the same (dy>0, dx<0) direction as the leading
+    run's passes -- almost certainly one more settling glitch, not
+    chemistry. Once you've looked and agree, pass
+    `also_drop_mid_outliers=True` to fold it into `.drop` too; the default
+    stays `False` so nothing is dropped without that look.
+
+    Method
+    ------
+    1. `plateau_magnitude_px` = median `|shift|` over the middle
+       `plateau_fraction` of the sequence (default: the middle third).
+       Using the middle of the sequence, not all of it, keeps this estimate
+       of the acquisition's ordinary/stable drift robust even when a
+       leading or trailing run is itself contaminated with large shifts.
+    2. `threshold_px` = `max(threshold_multiplier * plateau_magnitude_px,
+       min_threshold_px)`. A pass is "flagged" if `|shift| > threshold_px`.
+       `min_threshold_px` guards against a near-zero plateau making the
+       multiplier alone hypersensitive to ordinary registration noise.
+    3. `leading_run` = the longest prefix of flagged passes starting at
+       pass 0 (or `None`); `trailing_run` = the longest suffix of flagged
+       passes ending at the last pass (or `None`). `.drop` is their union.
+       Any other flagged pass is a mid-sequence outlier: listed in
+       `.mid_outliers`, excluded from `.drop`.
+    4. If the suggested drop would leave fewer than `min_keep` passes,
+       nothing is dropped automatically -- `.drop` is empty and `.reason`
+       says why (fail loudly rather than silently dropping nearly
+       everything).
+
+    Parameters
+    ----------
+    shifts : (n, 2) ndarray
+        `[dy, dx]` per pass, 0-indexed order (as returned by
+        `estimate_pass_shifts()` / `plot_pass_drift()`, or
+        `StemEelsRaw.pass_shifts_px`).
+    threshold_multiplier, min_threshold_px, plateau_fraction, min_keep
+        Tunable; see Method above. Defaults were chosen to be conservative
+        against the pattern already confirmed on `2_HL_InSitu5` (peak
+        15.5 px vs. a ~0.3-0.4 px plateau, i.e. ~40-50x the plateau) --
+        `3x` won't over-flag a much milder settling run on other datasets,
+        but check the plot either way.
+    also_drop_mid_outliers : bool, optional
+        Default `False`: mid-sequence outliers are reported
+        (`.mid_outliers`) but never dropped automatically. `True`: fold
+        them into `.drop`/`.keep` too (recorded separately in
+        `.mid_outliers_dropped` so the plot/reason can still show which
+        passes were leading/trailing-run drops vs. opted-in mid-sequence
+        drops). Look at the plot before turning this on.
+    guard_passes : int, optional
+        Default `0` (no change from the plain threshold boundary): extend
+        each detected `leading_run`/`trailing_run` by this many additional
+        passes past where the magnitude first drops below `threshold_px`.
+        The pass immediately after a violent settling run can register a
+        small rigid shift (this function only fits one shift per whole
+        pass) while the specimen was still relaxing *during* that pass --
+        a plain threshold cut can accept it as "stable" too early. Set to
+        1-2 if the plot shows the pass right at a run's boundary still
+        looks like part of the same event even though its own magnitude
+        fell under threshold (e.g. `2_HL_InSitu5`'s pass 22, immediately
+        after its 21-pass leading run). Extended passes are recorded the
+        same as any other leading/trailing drop (not as
+        `.mid_outliers`/`.mid_outliers_dropped`, since they were never
+        flagged by the threshold in the first place -- `.reason` notes the
+        extension explicitly either way).
+    passes_used : sequence of int, optional
+        1-indexed pass numbers `shifts` corresponds to (e.g.
+        `StemEelsRaw.passes_used`), for readable `.reason` text and plot
+        labels only. Defaults to `1..n`.
+    show : bool, optional
+        If True (default), also build a figure: dx/dy and `|shift|` vs.
+        pass, with the suggested drop region(s) shaded and mid-sequence
+        outliers marked with an `x` -- meant to be visually checked, not
+        trusted blindly.
+
+    Returns
+    -------
+    suggestion : DriftFrameSuggestion
+    fig : matplotlib.figure.Figure | None
+        `None` if `show=False`.
+    """
+    shifts = np.asarray(shifts, dtype=float)
+    n = len(shifts)
+    if n == 0:
+        raise ValueError("suggest_drift_frames_to_drop: shifts is empty")
+    labels = np.asarray(passes_used, dtype=int) if passes_used is not None else np.arange(1, n + 1)
+
+    magnitude = np.hypot(shifts[:, 0], shifts[:, 1])
+
+    half_window = max(1, int(round(n * plateau_fraction / 2)))
+    mid = n // 2
+    lo, hi = max(0, mid - half_window), min(n, mid + half_window)
+    if hi <= lo:
+        lo, hi = 0, n
+    plateau_magnitude = float(np.median(magnitude[lo:hi]))
+    threshold = max(threshold_multiplier * plateau_magnitude, min_threshold_px)
+    flagged = magnitude > threshold
+
+    leading_run = None
+    i = 0
+    while i < n and flagged[i]:
+        i += 1
+    if i > 0:
+        leading_run = (0, i - 1)
+
+    trailing_run = None
+    j = n - 1
+    while j >= 0 and flagged[j]:
+        j -= 1
+    if j < n - 1:
+        trailing_run = (j + 1, n - 1)
+
+    guard_extended = False
+    if guard_passes > 0:
+        if leading_run is not None:
+            new_end = min(leading_run[1] + guard_passes, n - 1)
+            if trailing_run is not None:
+                new_end = min(new_end, trailing_run[0] - 1)
+            if new_end > leading_run[1]:
+                leading_run = (leading_run[0], new_end)
+                guard_extended = True
+        if trailing_run is not None:
+            new_start = max(trailing_run[0] - guard_passes, 0)
+            if leading_run is not None:
+                new_start = max(new_start, leading_run[1] + 1)
+            if new_start < trailing_run[0]:
+                trailing_run = (new_start, trailing_run[1])
+                guard_extended = True
+
+    drop_set: set[int] = set()
+    if leading_run is not None:
+        drop_set.update(range(leading_run[0], leading_run[1] + 1))
+    if trailing_run is not None:
+        drop_set.update(range(trailing_run[0], trailing_run[1] + 1))
+    keep_idx = sorted(set(range(n)) - drop_set)
+
+    if len(keep_idx) < min_keep:
+        reason = (
+            f"the leading/trailing high-drift run(s) would leave only {len(keep_idx)} "
+            f"pass(es) (< min_keep={min_keep}) -- refusing to auto-drop; threshold was "
+            f"{threshold:.2f} px ({threshold_multiplier:g}x the {plateau_magnitude:.2f} px "
+            "plateau estimate). Check the plot and pick a drop_list by hand, or loosen "
+            "threshold_multiplier/plateau_fraction/min_keep."
+        )
+        leading_run = trailing_run = None
+        drop_idx: list[int] = []
+        mid_outliers = sorted(int(k) for k in np.flatnonzero(flagged))
+        mid_outliers_dropped: list[int] = []
+        keep_idx = list(range(n))
+    else:
+        mid_outliers = sorted(i for i in range(n) if flagged[i] and i not in drop_set)
+        mid_outliers_dropped = list(mid_outliers) if also_drop_mid_outliers else []
+        drop_set = drop_set | set(mid_outliers_dropped)
+        drop_idx = sorted(drop_set)
+        keep_idx = sorted(set(range(n)) - drop_set)
+        parts = []
+        if leading_run is not None:
+            a, b = leading_run
+            parts.append(
+                f"leading: passes {int(labels[a])}-{int(labels[b])} "
+                f"({b - a + 1} passes, peak {magnitude[a : b + 1].max():.1f} px)"
+            )
+        if trailing_run is not None:
+            a, b = trailing_run
+            parts.append(
+                f"trailing: passes {int(labels[a])}-{int(labels[b])} "
+                f"({b - a + 1} passes, peak {magnitude[a : b + 1].max():.1f} px)"
+            )
+        if not parts:
+            reason = (
+                f"no leading/trailing high-drift run found (threshold {threshold:.2f} px, "
+                f"{threshold_multiplier:g}x the {plateau_magnitude:.2f} px plateau estimate); "
+                "nothing suggested to drop."
+            )
+        else:
+            reason = (
+                f"{' and '.join(parts)} vs. {plateau_magnitude:.2f} px plateau "
+                f"(threshold {threshold:.2f} px)"
+            )
+        if guard_extended:
+            reason += f"; extended by guard_passes={guard_passes}"
+        if mid_outliers_dropped:
+            reason += (
+                f"; also dropped {len(mid_outliers_dropped)} mid-sequence outlier(s) "
+                f"(also_drop_mid_outliers=True): passes "
+                f"{[int(labels[i]) for i in mid_outliers_dropped]}"
+            )
+        elif mid_outliers:
+            reason += (
+                f"; {len(mid_outliers)} mid-sequence outlier(s) NOT dropped (pass "
+                f"also_drop_mid_outliers=True to include them): passes "
+                f"{[int(labels[i]) for i in mid_outliers]}"
+            )
+
+    suggestion = DriftFrameSuggestion(
+        drop=drop_idx,
+        keep=keep_idx,
+        leading_run=leading_run,
+        trailing_run=trailing_run,
+        mid_outliers=mid_outliers,
+        mid_outliers_dropped=mid_outliers_dropped,
+        plateau_magnitude_px=plateau_magnitude,
+        threshold_px=threshold,
+        reason=reason,
+    )
+
+    fig = None
+    if show:
+        fig = _plot_drift_drop_suggestion(shifts, suggestion, labels, title=title)
+    return suggestion, fig
+
+
+def remove_drift_frames(
+    folder_or_raw: "str | PathLike | MultipassRawStacks",
+    drop_list: Sequence[int] | None = None,
+    *,
+    pass_mode: str = "manual",
+    passes: str | Sequence[int] | None = "all",
+    combine_method: str = "sum",
+    alignment_stack: str = "adf",
+    alignment_reference: str = "mean",
+    alignment_upsample_factor: int = 10,
+    alignment_max_shift_px: float | None = None,
+    alignment_normalization: str | None = None,
+    drop_threshold_multiplier: float = 3.0,
+    drop_min_threshold_px: float = 0.5,
+    drop_plateau_fraction: float = 1.0 / 3.0,
+    drop_min_keep: int = 2,
+    drop_also_mid_outliers: bool = False,
+    drop_guard_passes: int = 0,
+) -> "StemEelsRaw":
+    """
+    Multi-pass combine step that fixes the coverage-dilution problem of the
+    plain `align_passes=True` path: **align -> DROP the leading/trailing
+    high-drift passes -> THEN sum**, instead of summing every aligned pass
+    including the ones that mostly contribute zero-padded border (see
+    `crop_alignment_border()`'s docstring for why that border matters even
+    after dropping).
+
+    Parameters
+    ----------
+    folder_or_raw : str | PathLike | MultipassRawStacks
+        An acquisition folder (loaded internally via
+        `load_multipass_raw_stacks()`), or an already-loaded
+        `MultipassRawStacks` (e.g. to reuse one load across several
+        `drop_list` trials without re-reading the raw sidecars each time).
+    drop_list : sequence of int, optional
+        1-indexed passes to drop, overriding automatic detection entirely.
+        `None` (default): `suggest_drift_frames_to_drop()` decides, using
+        the `drop_*` parameters below. Its mid-sequence outliers (if any)
+        are reported via a `UserWarning` but NOT dropped automatically --
+        pass them in `drop_list` yourself if you want them out too.
+    pass_mode, passes, combine_method
+        Forwarded to `select_passes()`/`combine_passes()`, same meaning as
+        in `read_stem_eels_folder()`. `passes="all"` (default) considers
+        every recorded pass as a drop/keep candidate.
+    alignment_stack, alignment_reference, alignment_upsample_factor,
+    alignment_max_shift_px, alignment_normalization
+        Forwarded to `estimate_pass_shifts()`, same meaning as in
+        `read_stem_eels_folder(..., align_passes=True)`.
+    drop_threshold_multiplier, drop_min_threshold_px, drop_plateau_fraction,
+    drop_min_keep, drop_also_mid_outliers, drop_guard_passes
+        Forwarded to `suggest_drift_frames_to_drop()`'s equivalents (see
+        its docstring) when `drop_list` is `None`; ignored otherwise.
+
+    Returns
+    -------
+    StemEelsRaw
+        Same shape of result as `read_stem_eels_folder()`, with two extra
+        attributes: `.dropped_passes` (1-indexed, matching `.passes_used`'s
+        convention) and `.drop_reason`. `.pass_shifts_px` covers only the
+        KEPT passes, in the same order as `.passes_used` -- feed both
+        straight to `crop_alignment_border()`.
+    """
+    if isinstance(folder_or_raw, MultipassRawStacks):
+        raw = folder_or_raw
+        folder = raw.folder
+    else:
+        folder = Path(folder_or_raw)
+        raw = load_multipass_raw_stacks(folder)
+
+    chosen = select_passes(raw.n_passes, mode=pass_mode, passes=passes)
+    if len(chosen) <= 1:
+        raise ValueError(
+            f"remove_drift_frames: {folder} has only {len(chosen)} selected pass(es) -- "
+            "nothing to align or drop."
+        )
+
+    # --- 1. align (same estimator align_passes=True uses) ---
+    stack_kind = alignment_stack
+    if stack_kind == "adf" and raw.adf_stack is None:
+        warnings.warn(
+            "remove_drift_frames: alignment_stack='adf' but no ADF stack was found for "
+            f"{folder} -- falling back to alignment_stack='hl'.",
+            UserWarning,
+        )
+        stack_kind = "hl"
+    if stack_kind == "adf":
+        registration_images = raw.adf_stack
+    elif stack_kind == "ll":
+        registration_images = raw.ll_stack.sum(axis=1)
+    elif stack_kind == "hl":
+        registration_images = raw.hl_stack.sum(axis=1)
+    else:
+        raise ValueError(f"alignment_stack must be 'adf', 'll', or 'hl', got {alignment_stack!r}")
+
+    shifts = estimate_pass_shifts(
+        registration_images,
+        chosen,
+        reference=alignment_reference,
+        upsample_factor=alignment_upsample_factor,
+        max_shift_px=alignment_max_shift_px,
+        normalization=alignment_normalization,
+    )
+
+    # --- 2. drop the flagged high-drift passes, BEFORE summing ---
+    if drop_list is None:
+        suggestion, _ = suggest_drift_frames_to_drop(
+            shifts,
+            threshold_multiplier=drop_threshold_multiplier,
+            min_threshold_px=drop_min_threshold_px,
+            plateau_fraction=drop_plateau_fraction,
+            min_keep=drop_min_keep,
+            also_drop_mid_outliers=drop_also_mid_outliers,
+            guard_passes=drop_guard_passes,
+            passes_used=[p + 1 for p in chosen],
+            show=False,
+        )
+        drop_local = suggestion.drop  # indices into `chosen`/`shifts`
+        reason = suggestion.reason
+        still_kept_outliers = [
+            i for i in suggestion.mid_outliers if i not in set(suggestion.mid_outliers_dropped)
+        ]
+        if still_kept_outliers:
+            warnings.warn(
+                f"remove_drift_frames: {len(still_kept_outliers)} mid-sequence outlier "
+                "pass(es) exceeded the drift threshold but are not part of the leading/"
+                "trailing run and were NOT dropped automatically: "
+                f"{[chosen[i] + 1 for i in still_kept_outliers]} (1-indexed). Pass "
+                "them in drop_list explicitly, or set drop_also_mid_outliers=True, "
+                "if you want them removed too.",
+                UserWarning,
+            )
+    else:
+        drop_set_1idx = {int(d) for d in drop_list}
+        drop_local = [i for i, p in enumerate(chosen) if (p + 1) in drop_set_1idx]
+        reason = "manual drop_list"
+
+    keep_local = [i for i in range(len(chosen)) if i not in set(drop_local)]
+    if len(keep_local) < 2:
+        raise ValueError(
+            f"remove_drift_frames: only {len(keep_local)} pass(es) would remain after "
+            f"dropping {len(drop_local)} -- refusing to combine. reason: {reason}"
+        )
+    kept_chosen = [chosen[i] for i in keep_local]  # 0-indexed frame numbers
+    kept_shifts = shifts[keep_local]
+    dropped_chosen = [chosen[i] for i in drop_local]
+
+    # --- align + combine the KEPT passes only (load/shift only their data,
+    # not the dropped passes') ---
+    ll_stack = apply_pass_shifts(raw.ll_stack[kept_chosen], kept_shifts)
+    hl_stack = apply_pass_shifts(raw.hl_stack[kept_chosen], kept_shifts)
+    adf_stack = (
+        apply_pass_shifts(raw.adf_stack[kept_chosen], kept_shifts)
+        if raw.adf_stack is not None
+        else None
+    )
+
+    idx_all = list(range(len(kept_chosen)))
+    ll_combined = np.moveaxis(combine_passes(ll_stack, idx_all, method=combine_method), 0, -1)
+    hl_combined = np.moveaxis(combine_passes(hl_stack, idx_all, method=combine_method), 0, -1)
+    adf_combined = (
+        combine_passes(adf_stack, idx_all, method="mean") if adf_stack is not None else None
+    )
+
+    eels_ll = array_to_spectroscopy3d(
+        ll_combined, raw.ll_energy_axis, raw.pixel_size_nm, name="EELS_LL"
+    )
+    eels_hl = array_to_spectroscopy3d(
+        hl_combined, raw.hl_energy_axis, raw.pixel_size_nm, name="EELS_HL"
+    )
+
+    print(
+        f"remove_drift_frames: dropped {len(dropped_chosen)}/{len(chosen)} passes "
+        f"({reason}); kept {len(kept_chosen)} for combining."
+    )
+
+    return StemEelsRaw(
+        folder=Path(folder),
+        dm4_path=raw.dm4_path,
+        is_multipass=True,
+        n_passes=raw.n_passes,
+        eels_ll=eels_ll,
+        eels_hl=eels_hl,
+        adf=adf_combined,
+        energy_axis_ll=raw.ll_energy_axis,
+        energy_axis_hl=raw.hl_energy_axis,
+        pixel_size_nm=raw.pixel_size_nm,
+        passes_used=[p + 1 for p in kept_chosen],
+        combine_method=combine_method,
+        pass_shifts_px=kept_shifts,
+        dropped_passes=[p + 1 for p in dropped_chosen],
+        drop_reason=reason,
+    )
+
+
+def _compute_crop_margins(
+    shifts: np.ndarray,
+    ny: int,
+    nx: int,
+    extra_margin_px: int = 0,
+) -> tuple[int, int, int, int]:
+    """
+    Pure computation behind `crop_alignment_border`: given the non-empty
+    per-pass `[dy, dx]` shifts actually applied (same sign convention as
+    `apply_pass_shifts`) and the field-of-view size `(ny, nx)`, compute the
+    `(top, bottom, left, right)` pixel margins to crop so every surviving
+    pass's zero-filled/under-sampled border is excluded.
+
+    A pass shifted by `+dy` exposes a zero border at the TOP
+    (low-row-index) side, `-dy` at the bottom, and likewise `+dx` left /
+    `-dx` right (matches `scipy.ndimage.shift`'s convention, as used by
+    `apply_pass_shifts`).
+
+    Takes/returns only plain arrays and numbers -- no `StemEelsRaw`
+    dependency -- so it can be unit-tested directly against synthetic
+    shift arrays; see `tests/core/io/test_pass_drift.py`.
+
+    Parameters
+    ----------
+    shifts : (n, 2) ndarray
+        Non-empty `[dy, dx]` per pass. The "no shifts at all" precondition
+        is `crop_alignment_border`'s concern (it depends on where `shifts`
+        came from -- `combined_data.pass_shifts_px` vs. an explicit
+        `shifts_used` -- which this function doesn't know about), not
+        re-checked here.
+    ny, nx : int
+        Field-of-view size, in pixels, of the array being cropped.
+    extra_margin_px : int, optional
+        Additional pixels to add on every side beyond the computed
+        coverage-safe margin. Default 0.
+
+    Returns
+    -------
+    (top, bottom, left, right) : tuple of int
+
+    Raises
+    ------
+    ValueError
+        If the computed margins would consume the entire `(ny, nx)` field
+        (no pixels would survive the crop).
+    """
+    shifts = np.asarray(shifts, dtype=float)
+    dy, dx = shifts[:, 0], shifts[:, 1]
+    top = int(np.ceil(max(0.0, float(dy.max())))) + extra_margin_px
+    bottom = int(np.ceil(max(0.0, float(-dy.min())))) + extra_margin_px
+    left = int(np.ceil(max(0.0, float(dx.max())))) + extra_margin_px
+    right = int(np.ceil(max(0.0, float(-dx.min())))) + extra_margin_px
+
+    if top + bottom >= ny or left + right >= nx:
+        raise ValueError(
+            f"crop_alignment_border: computed margins (top={top}, bottom={bottom}, "
+            f"left={left}, right={right}) would leave no pixels on a {ny}x{nx} field -- "
+            "the shifts are too large relative to the field of view for a safe crop."
+        )
+    return top, bottom, left, right
+
+
+def crop_alignment_border(
+    combined_data: "StemEelsRaw",
+    shifts_used: np.ndarray | None = None,
+    *,
+    extra_margin_px: int = 0,
+    modify_in_place: bool = False,
+) -> "StemEelsRaw":
+    """
+    Crop away the zero-filled/under-sampled field-of-view border left by
+    aligning + summing shifted passes, and **update the cropped datasets'
+    spatial metadata** (`origin`) to match.
+
+    Why this matters: after `apply_pass_shifts()` shifts each pass by its
+    own `(dy, dx)`, the newly-exposed border of that pass reads as 0
+    (`mode="constant", cval=0.0`) -- summing shifted passes together means
+    that border region is under-sampled (fewer, or zero, real passes
+    contribute there) relative to the interior, which every downstream
+    per-pixel/map/mean-spectrum computation would otherwise silently
+    include. A **naive fix that only slices the array**
+    (`array[top:-bottom, left:-right]`) leaves the OLD `origin` in place --
+    every per-pixel coordinate downstream code derives from
+    `origin + pixel_index * sampling` (e.g. `Dataset3dspectroscopy`'s own
+    axis properties, spatial-coherence/ADF-correlation checks, anything
+    that overlays a map on the ADF image) would then be silently offset by
+    exactly the cropped margin. This function crops via `Dataset.crop()`,
+    which updates `origin` by `crop_start * sampling` on the cropped axes
+    (`sampling`, the per-pixel physical size, is unchanged by cropping) --
+    see the verification in this module's tests / the alignment-check
+    notebook for a before/after comparison confirming this.
+
+    Crops to exactly the region every SURVIVING, shifted pass actually
+    covers -- computed per-side from the signed shifts (not a fixed or
+    symmetric margin): a pass shifted by `+dy` exposes a zero border at the
+    TOP (low-row-index) side, `-dy` at the bottom, and likewise `+dx`
+    left / `-dx` right (verified empirically against
+    `scipy.ndimage.shift`'s convention).
+
+    Parameters
+    ----------
+    combined_data : StemEelsRaw
+        The result of `remove_drift_frames()` (or
+        `read_stem_eels_folder(..., align_passes=True)`) -- must carry real
+        per-pass shifts.
+    shifts_used : (n, 2) ndarray, optional
+        `[dy, dx]` per pass actually summed, 0-indexed order. Defaults to
+        `combined_data.pass_shifts_px`.
+    extra_margin_px : int, optional
+        Additional pixels to crop on every side beyond the computed
+        coverage-safe margin (e.g. to also clear residual interpolation
+        softening right at the coverage boundary, from `apply_pass_shifts`'
+        default bilinear `order=1`). Default 0.
+    modify_in_place : bool, optional
+        Forwarded to `Dataset.crop()` for `eels_ll`/`eels_hl`. Default
+        `False`: returns a new `StemEelsRaw`, `combined_data` untouched.
+
+    Returns
+    -------
+    StemEelsRaw
+        New object (or `combined_data` itself, mutated, if
+        `modify_in_place=True`) with `eels_ll`/`eels_hl` cropped and their
+        `.origin` updated to match, and `.adf` cropped identically (a plain
+        array -- no metadata of its own to update).
+    """
+    shifts = (
+        np.asarray(shifts_used, dtype=float)
+        if shifts_used is not None
+        else combined_data.pass_shifts_px
+    )
+    if shifts is None or len(shifts) == 0:
+        raise ValueError(
+            "crop_alignment_border: no pass_shifts_px on this StemEelsRaw and no "
+            "shifts_used given -- was this combined with align_passes=True / "
+            "remove_drift_frames()?"
+        )
+    shifts = np.asarray(shifts, dtype=float)
+
+    ny, nx = combined_data.eels_hl.shape[0], combined_data.eels_hl.shape[1]
+    top, bottom, left, right = _compute_crop_margins(shifts, ny, nx, extra_margin_px)
+
+    dy, dx = shifts[:, 0], shifts[:, 1]
+    crop_widths = ((top, ny - bottom), (left, nx - right))
+    if modify_in_place:
+        combined_data.eels_ll.crop(crop_widths, axes=(0, 1), modify_in_place=True)
+        combined_data.eels_hl.crop(crop_widths, axes=(0, 1), modify_in_place=True)
+        eels_ll, eels_hl = combined_data.eels_ll, combined_data.eels_hl
+    else:
+        eels_ll = combined_data.eels_ll.crop(crop_widths, axes=(0, 1))
+        eels_hl = combined_data.eels_hl.crop(crop_widths, axes=(0, 1))
+
+    adf = combined_data.adf
+    if adf is not None:
+        adf = adf[top : ny - bottom, left : nx - right]
+
+    print(
+        f"crop_alignment_border: cropped to rows [{top}:{ny - bottom}] (of {ny}), "
+        f"cols [{left}:{nx - right}] (of {nx}) -- margins top={top} bottom={bottom} "
+        f"left={left} right={right} px, from shifts dy in "
+        f"[{dy.min():.2f}, {dy.max():.2f}], dx in [{dx.min():.2f}, {dx.max():.2f}]"
+    )
+
+    if modify_in_place:
+        combined_data.adf = adf
+        return combined_data
+
+    return StemEelsRaw(
+        folder=combined_data.folder,
+        dm4_path=combined_data.dm4_path,
+        is_multipass=combined_data.is_multipass,
+        n_passes=combined_data.n_passes,
+        eels_ll=eels_ll,
+        eels_hl=eels_hl,
+        adf=adf,
+        energy_axis_ll=combined_data.energy_axis_ll,
+        energy_axis_hl=combined_data.energy_axis_hl,
+        pixel_size_nm=combined_data.pixel_size_nm,
+        passes_used=combined_data.passes_used,
+        combine_method=combined_data.combine_method,
+        pass_shifts_px=combined_data.pass_shifts_px,
+        dropped_passes=getattr(combined_data, "dropped_passes", None),
+        drop_reason=getattr(combined_data, "drop_reason", None),
+    )
+
+
+def suggest_pass_range_for_analysis(
+    drift_suggestion: "DriftFrameSuggestion",
+    dose_block_results: Sequence[dict],
+    *,
+    metric_key: str = "ratio",
+    trend_corr_threshold: float = 0.6,
+    trend_p_threshold: float = 0.05,
+    trend_relative_range_threshold: float = 0.05,
+) -> dict:
+    """
+    Combine the drift screen (position/settling) and a dose series
+    (chemistry-or-thickness vs. dose) into ONE recommendation: which passes
+    to actually sum for the most reliable signal.
+
+    WHAT
+    ----
+    Starts from `drift_suggestion.keep` (passes surviving the settling-
+    in / late-series-creep filter, see `suggest_drift_frames_to_drop()`).
+    Then tests `dose_block_results` (one dict per dose block, in
+    acquisition order, each carrying at least `metric_key`) for a genuine
+    monotonic trend with dose, via a Spearman rank correlation between
+    block order and the metric.
+
+    WHY / WHAT WE LEARN
+    --------------------
+    Two independent reasons a multi-pass acquisition's later passes can be
+    unusable: (1) drift/settling smears real space early on -- a POSITION
+    problem, fixed by dropping/aligning (`remove_drift_frames()`); (2)
+    radiolysis (ionization damage: bonding/chemistry changes with dose,
+    thickness can stay flat) or knock-on damage (displacement damage: mass
+    is actually removed, thickness drops) change the MATERIAL itself as
+    dose accumulates -- no amount of alignment fixes that; the only fix is
+    not summing the damaged passes. This function's job is to say, in one
+    place, given both checks: which pass range is actually safe to sum.
+    Run it twice -- once with `metric_key` set to a chemistry/shape ratio
+    (e.g. `pre_edge_white_line_ratio`'s `"ratio"`, the "Radiolysis
+    (ionization) damage" signal) and once with `metric_key="t_mean"` (the
+    "Knock-on/mass-loss damage" signal) -- they can show different, or no,
+    trends independently; do not average them into one verdict.
+
+    CAVEAT on `metric_key="t_mean"` -- direction matters, read `"direction"`
+    before calling it "knock-on damage". Knock-on/displacement damage
+    removes mass, so its signature is thickness DECREASING with dose. A
+    thickness INCREASE with dose is a different, common artifact instead:
+    beam-induced contamination buildup -- residual hydrocarbons or water
+    vapor in the vacuum system, cracked and deposited by the beam onto the
+    irradiated area (ice or amorphous carbon). This function reports which
+    direction it saw (`result["direction"]`) precisely so "damage_detected"
+    is never read as "knock-on" without checking that it's actually the
+    thinning direction; a real, significant, but SMALL rising trend (see
+    the `2_HL_InSitu5` case in this module's own tests: Spearman rho=0.94,
+    p=0.005, but only 2.3% of the median, correctly not flagged by the
+    `trend_relative_range_threshold` gate) is more consistent with mild
+    contamination than with knock-on -- and either way, "not flagged as
+    damage" is not the same claim as "no contamination is present," only
+    that it isn't large enough here to warrant cutting passes over.
+
+    HOW
+    ---
+    A trend is flagged "real" only if ALL of:
+    - Spearman `|rho| >= trend_corr_threshold` (default 0.6: a fairly
+      consistent monotonic direction, not scatter) -- rank correlation is
+      used (not Pearson) so the test doesn't assume the trend is linear,
+      only monotonic;
+    - `p-value <= trend_p_threshold` (default 0.05);
+    - the metric's total peak-to-peak range is
+      `>= trend_relative_range_threshold` (default 5%) of its own median --
+      guards against a statistically "significant" but physically
+      negligible wobble in a metric with very low block-to-block noise.
+    If flagged, the recommended cutoff is the first block whose metric
+    value leaves the range spanned by the first two blocks (assumed
+    representative of the undamaged/early state) -- i.e. where the series
+    visibly leaves its early plateau -- and every pass in later blocks is
+    dropped from the recommendation. If not flagged, every
+    `drift_suggestion.keep` pass is kept.
+
+    THIS IS A SCREENING HEURISTIC, NOT A PROOF.
+    Its thresholds are defaults, not physical constants -- tune them and
+    always look at the plotted dose series yourself before trusting the
+    recommendation blindly, the same way `suggest_drift_frames_to_drop()`'s
+    suggestion is meant to be checked against its shaded-region plot, not
+    applied automatically. With only a handful of dose blocks (typical: 4-8)
+    the Spearman test has limited power -- a real but small trend can fail
+    to reach `trend_p_threshold` simply from too few points, not because it
+    isn't there.
+
+    Parameters
+    ----------
+    drift_suggestion : DriftFrameSuggestion
+        From `suggest_drift_frames_to_drop()`.
+    dose_block_results : sequence of dict
+        One dict per dose block, in acquisition order, each with at least
+        `metric_key` (float). Block order is taken from list order, not
+        from any pass-number field.
+    metric_key : str, optional
+        Which key in each `dose_block_results` dict to test for a trend.
+        Default `"ratio"`.
+    trend_corr_threshold, trend_p_threshold, trend_relative_range_threshold
+        Tunable; see HOW above.
+
+    Returns
+    -------
+    dict
+        `"recommended_passes"`: the subset of `drift_suggestion.keep`
+        (0-indexed, same convention) surviving both checks.
+        `"damage_detected"`: bool. `"cutoff_block"`: int index into
+        `dose_block_results`, or `None`. `"direction"`: `"increasing"` /
+        `"decreasing"` / `"flat"` (sign of the metric's first-to-last
+        change; see the CAVEAT above -- for `metric_key="t_mean"`,
+        `"decreasing"` is the knock-on/mass-loss signature,
+        `"increasing"` is more consistent with contamination buildup,
+        reported regardless of `damage_detected` so the direction is never
+        silently lost even when the trend wasn't large enough to flag).
+        `"spearman_rho"`, `"spearman_p"`: the test statistics.
+        `"reason"`: human-readable summary.
+    """
+    from scipy.stats import spearmanr
+
+    values = np.array([float(b[metric_key]) for b in dose_block_results], dtype=float)
+    n_blocks = len(values)
+    if n_blocks < 3:
+        return dict(
+            recommended_passes=list(drift_suggestion.keep),
+            damage_detected=False,
+            cutoff_block=None,
+            direction="flat",
+            spearman_rho=float("nan"),
+            spearman_p=float("nan"),
+            reason=f"only {n_blocks} dose block(s) -- too few to test a trend; "
+            "keeping every drift-surviving pass.",
+        )
+
+    order = np.arange(n_blocks)
+    rho, p = spearmanr(order, values)
+    rel_range = (
+        (values.max() - values.min()) / abs(np.median(values)) if np.median(values) else 0.0
+    )
+    direction = (
+        "increasing"
+        if values[-1] > values[0]
+        else ("decreasing" if values[-1] < values[0] else "flat")
+    )
+
+    damage_detected = (
+        abs(rho) >= trend_corr_threshold
+        and p <= trend_p_threshold
+        and rel_range >= trend_relative_range_threshold
+    )
+
+    if not damage_detected:
+        # Distinguish WHY it wasn't flagged: the Spearman test itself can fail to reach
+        # significance (rho/p gate), or it can pass that gate but still not clear the
+        # magnitude gate (rel_range) -- these are different claims, and collapsing both
+        # into "no significant trend" is wrong for the second case: rho/p there ARE
+        # significant, the trend is just too small to act on (see the docstring's
+        # 2_HL_InSitu5 example: rho=0.94, p=0.005, range=2.3% -- a real but tiny trend).
+        corr_significant = abs(rho) >= trend_corr_threshold and p <= trend_p_threshold
+        if corr_significant:
+            reason = (
+                f"a statistically real monotonic trend in '{metric_key}' was detected across "
+                f"{n_blocks} dose blocks (Spearman rho={rho:.2f}, p={p:.3f}, direction="
+                f"{direction}), but its magnitude (range={rel_range * 100:.1f}% of median) is "
+                f"below trend_relative_range_threshold ({trend_relative_range_threshold * 100:.0f}%) "
+                "-- too small to warrant cutting passes over, not statistically absent. Keeping "
+                "every drift-surviving pass."
+            )
+        else:
+            reason = (
+                f"no significant monotonic trend detected in '{metric_key}' across {n_blocks} "
+                f"dose blocks (Spearman rho={rho:.2f}, p={p:.3f}, range={rel_range * 100:.1f}% "
+                f"of median, direction={direction}) -- keeping every drift-surviving pass."
+            )
+        return dict(
+            recommended_passes=list(drift_suggestion.keep),
+            damage_detected=False,
+            cutoff_block=None,
+            direction=direction,
+            spearman_rho=float(rho),
+            spearman_p=float(p),
+            reason=reason,
+        )
+
+    # early-plateau reference = the range spanned by the first two blocks
+    early = values[: min(2, n_blocks)]
+    lo, hi = early.min(), early.max()
+    pad = max(hi - lo, 1e-9)
+    cutoff_block = None
+    for i in range(2, n_blocks):
+        if values[i] < lo - pad or values[i] > hi + pad:
+            cutoff_block = i
+            break
+
+    reason = (
+        f"significant monotonic trend in '{metric_key}' (Spearman rho={rho:.2f}, "
+        f"p={p:.3f}, range={rel_range * 100:.1f}% of median, direction={direction}) "
+        f"across {n_blocks} dose blocks -- consistent with progressive damage. "
+    )
+    if metric_key == "t_mean":
+        reason += (
+            "decreasing -> knock-on/mass-loss signature. "
+            if direction == "decreasing"
+            else "increasing -> more consistent with contamination buildup (ice/carbon) "
+            "than knock-on damage, which removes mass rather than adding it. "
+        )
+    if cutoff_block is None:
+        reason += "trend detected but never clearly leaves the early plateau -- flagged, not cut."
+        recommended_passes = list(drift_suggestion.keep)
+    else:
+        reason += f"recommend cutting at dose block {cutoff_block} (0-indexed)."
+        n_drift_blocks_worth = len(drift_suggestion.keep)
+        cut_at = int(round(n_drift_blocks_worth * cutoff_block / n_blocks))
+        recommended_passes = list(drift_suggestion.keep[:cut_at])
+
+    return dict(
+        recommended_passes=recommended_passes,
+        damage_detected=True,
+        cutoff_block=cutoff_block,
+        direction=direction,
+        spearman_rho=float(rho),
+        spearman_p=float(p),
+        reason=reason,
     )
 
 
