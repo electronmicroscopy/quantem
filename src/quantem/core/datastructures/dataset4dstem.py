@@ -1,3 +1,4 @@
+from os import PathLike
 from typing import Any, Self
 
 import matplotlib.pyplot as plt
@@ -97,15 +98,15 @@ class Dataset4dstem(Dataset4d):
         self._virtual_detectors = {}  # Store detector information for regeneration
 
     @classmethod
-    def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
+    def from_file(cls, file_path: str | PathLike, file_type: str | None = None) -> "Dataset4dstem":
         """
         Create a new Dataset4dstem from a file.
 
         Parameters
         ----------
-        file_path : str
+        file_path : str | PathLike
             Path to the data file
-        file_type : str
+        file_type : str | None
             The type of file reader needed. See rosettasciio for supported formats
             https://hyperspy.org/rosettasciio/supported_formats/index.html
 
