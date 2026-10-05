@@ -212,7 +212,7 @@ class BraggVectors(AutoSerialize):
         radius: float | None = None,
         edge: float = 1.0,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = False,
+        subtract_mean: bool = True,
     ) -> "BraggVectors":
         """Build the template from a synthetic soft-edged disk.
 
@@ -228,7 +228,7 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` disk center; defaults to the detector center
             ``(H // 2, W // 2)``.
-        subtract_mean : bool, default=False
+        subtract_mean : bool, default=True
             If ``True``, make the template zero-sum. The default keeps the
             unit-sum positive template, so correlation values stay positive and
             roughly measure the probe-weighted counts under each peak.
@@ -259,7 +259,7 @@ class BraggVectors(AutoSerialize):
     def make_template_from_data(
         self,
         roi: NDArray | None = None,
-        subtract_mean: bool = False,
+        subtract_mean: bool = True,
         center: tuple[float, float] | None = None,
     ) -> "BraggVectors":
         """Build the template by averaging diffraction patterns from the data.
@@ -271,7 +271,7 @@ class BraggVectors(AutoSerialize):
             ideally a vacuum / single-disk region so the unscattered probe is
             isolated. ``None`` (default) averages the whole scan (the mean
             diffraction pattern).
-        subtract_mean : bool, default=False
+        subtract_mean : bool, default=True
             If ``True``, make the template zero-sum. The default keeps the
             unit-sum positive template, so correlation values stay positive and
             roughly measure the probe-weighted counts under each peak.
@@ -321,7 +321,7 @@ class BraggVectors(AutoSerialize):
         self,
         probe: NDArray | torch.Tensor,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = False,
+        subtract_mean: bool = True,
     ) -> "BraggVectors":
         """Build the template from an explicit probe image (e.g. a measured vacuum probe).
 
@@ -332,7 +332,7 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` probe center rolled to the origin; defaults to the
             probe's intensity centroid.
-        subtract_mean : bool, default=False
+        subtract_mean : bool, default=True
             If ``True``, make the template zero-sum. The default keeps the
             unit-sum positive template, so correlation values stay positive and
             roughly measure the probe-weighted counts under each peak.
@@ -1009,6 +1009,7 @@ class BraggVectors(AutoSerialize):
         mask: np.ndarray | None = None,
         q_to_r_rotation_ccw_deg: float | None = None,
         q_transpose: bool | None = None,
+        calculation_metric: str = "median",
     ) -> StrainMap:
         """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
 
@@ -1098,6 +1099,7 @@ class BraggVectors(AutoSerialize):
             ds_units=ds_units,
             q_to_r_rotation_ccw_deg = q_to_r_rotation_ccw_deg,
             q_transpose = q_transpose,
+            calculation_metric = calculation_metric,
         )
 
     # ---- visualization ----

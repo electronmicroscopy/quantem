@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -13,7 +14,7 @@ from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.utils.imaging_utils import dft_upsample, rotate_image
+from quantem.core.utils.imaging_utils import rotate_image
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import ScalebarConfig, show_2d
@@ -35,12 +36,15 @@ class StrainMapAutocorrelation(AutoSerialize):
 
     Workflow (each step writes state consumed by the next):
 
-    1. :meth:`diffraction_mask` -- build a soft mask over the detector that suppresses
-       the bright central beam / vacuum so the transform is dominated by the lattice.
+    1. :meth:`diffraction_mask` -- build a soft mask over the detector that masks pixels
+       below a threshold so the transform is dominated by the lattice.
     2. :meth:`preprocess` -- transform every pattern and average the magnitudes into a
-       mean transform image. Three ``mode`` choices set the intensity scaling applied
+       mean transform image. Four ``mode`` choices set the intensity scaling applied
        before the FFT: ``"linear"`` (Patterson / autocorrelation), ``"log"``
-       (cepstrum), or ``"gamma"`` (power law). The detector->scan rotation
+       (``log1p``), ``"log-min"`` (PC-STEM exit-wave power cepstrum,
+       ``log(I - min + log_offset)``), or ``"gamma"`` (power law). With
+       ``hann_window=True`` the scaled pattern is multiplied by a 2D Hann window before
+       the FFT, as in PC-STEM; this is required for ``method="cft"`` and ``refine_dft``.The detector->scan rotation
        (``q_to_r_rotation_ccw_deg`` + ``q_transpose``) is read from the parent dataset
        metadata, the single source of truth shared with the DPC/CoM and Bragg
        workflows.
@@ -48,7 +52,9 @@ class StrainMapAutocorrelation(AutoSerialize):
        against the mean transform, optionally auto-detecting and re-fitting all peaks.
     4. :meth:`fit_lattice_vectors` -- the heavy step: transform and fit the lattice
        vectors at every scan position into ``g1_array``/``g2_array`` of shape
-       ``(scan_row, scan_col, 2)``.
+       ``(scan_row, scan_col, 2)``. The sub-pixel peak refinement is chosen with ``method``: ``"gaussian"``
+       (isotropic Gaussian fit, optionally followed by DFT upsampling) or ``"cft"``
+       (exact continuous-Fourier-transform maximum, PC-STEM style).
     5. :meth:`create_mask` -- compute the per-position weight :attr:`mask_weight`
        (lattice signal strength) used to weight the reference lattice.
     6. :meth:`calculate_strain_map` -- hand the lattice vectors (and
@@ -112,6 +118,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         self.mean_img_peaks: NDArray | None = None
         self.mean_img_weights: NDArray | None = None
+        self.fft_window: NDArray | None = None
 
         self.mask_diffraction = np.ones(self.dataset.array.shape[2:])
         self.mask_diffraction_inv = np.zeros(self.dataset.array.shape[2:])
@@ -183,7 +190,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         plot_mask=True,
         figsize=(8, 4),
     ):
-        """Build a soft detector mask suppressing the central beam and vacuum.
+        """Build a soft detector mask that removes dim detector regions.
 
         Pixels of the mean diffraction pattern below ``threshold`` (plus the detector
         border) are treated as "outside" the useful signal. The kept region is feathered
@@ -191,8 +198,11 @@ class StrainMapAutocorrelation(AutoSerialize):
         transform) into :attr:`mask_diffraction` (multiplicative, in ``[0, 1]``), and a
         complementary fill :attr:`mask_diffraction_inv` replaces the masked region with a
         flat edge intensity. Both are applied to every pattern in :meth:`preprocess` and
-        :meth:`fit_lattice_vectors` so the transform is dominated by the crystalline
-        signal rather than the bright unscattered beam.
+        :meth:`fit_lattice_vectors` so the transform is not dominated by the dim, noisy parts of the detector. The
+        central beam is bright and is therefore *kept*. Because the mask is thresholded on
+        the raw mean pattern, it can follow the disk lattice (disks kept, gaps masked);
+        check it with ``plot_mask=True``, since a lattice-shaped mask imprints the mean
+        lattice on every pattern's transform.
 
         Parameters
         ----------
@@ -239,7 +249,6 @@ class StrainMapAutocorrelation(AutoSerialize):
                 "threshold_percentile."
             )
         if edge_blend > max_distance:
-            import warnings
 
             warnings.warn(
                 f"edge_blend={edge_blend:g} exceeds the kept region's largest distance "
@@ -286,6 +295,9 @@ class StrainMapAutocorrelation(AutoSerialize):
         plot_transform: bool = True,
         cropping_factor: float = 0.25,
         gamma: float = 0.5,
+        hann_window: bool = False,
+        log_offset: float = 0.1,
+        log_offset_relative: bool = False,
         **plot_kwargs: Any,
     ) -> "StrainMapAutocorrelation":
         """Transform every pattern into the autocorrelation domain and average it.
@@ -304,11 +316,14 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         Parameters
         ----------
-        mode : {"linear", "log", "gamma"}, default="linear"
+        mode : {"linear", "log", "log-min", "gamma"}, default="linear"
             Intensity scaling applied before the FFT. ``"linear"`` is the Patterson /
             autocorrelation (aliases ``"patterson"``, ``"acf"``, ``"autocorrelation"``);
-            ``"log"`` is the cepstrum, ``log1p(I)`` (aliases ``"cepstrum"``,
-            ``"cepstral"``); ``"gamma"`` raises intensity to the power ``gamma``
+            ``"log"`` is ``log1p(I)`` (aliases ``"cepstrum"``, ``"cepstral"``), i.e. an
+            absolute offset of 1, so it also depends on the data's intensity units;
+            ``"log-min"`` is the PC-STEM exit-wave power cepstrum
+            ``log(I - min(I) + log_offset)`` (aliases ``"padgett"``, ``"log_min"``,
+            ``"pcepstrum"``); ``"gamma"`` raises intensity to the power ``gamma``
             (aliases ``"power"``, ``"sqrt"``).
         q_to_r_rotation_ccw_deg : float, optional
             Counter-clockwise detector->scan rotation in degrees for the rotated display
@@ -328,6 +343,21 @@ class StrainMapAutocorrelation(AutoSerialize):
             ``True`` (the lattice peaks sit near the center).
         gamma : float, default=0.5
             Exponent for ``mode="gamma"`` (ignored otherwise).
+        hann_window : bool, default=False
+            If ``True``, multiply the intensity-scaled pattern by a 2D Hann window before
+            the FFT (after the scaling, as in PC-STEM). The window is stored in
+            :attr:`fft_window` and used by every later step. Required for
+            ``method="cft"`` and ``refine_dft=True``, which are otherwise pulled by
+            central-peak leakage.
+        log_offset : float, default=0.1
+            Offset inside the log for ``mode="log-min"``: ``log(I - min(I) + offset)``. The
+            PC-STEM default 0.1 assumes intensities in counts; for normalized data it swamps
+            the signal, the log becomes nearly linear (a Patterson), and results change with
+            the data's intensity units.
+        log_offset_relative : bool, default=False
+            If ``True``, ``log_offset`` is in units of the dataset's mean min-shifted
+            intensity, so the transform does not depend on intensity scaling. For the SiGe
+            simulations, ``log_offset=4, log_offset_relative=True`` matches 0.1 on x1e3 data.
         **plot_kwargs
             Forwarded to :meth:`plot_transform`.
 
@@ -349,6 +379,14 @@ class StrainMapAutocorrelation(AutoSerialize):
             raise ValueError(
                 "mode must be 'linear', 'log', or 'gamma' (aliases: 'patterson'->'linear', 'cepstrum'/'cepstral'->'log')."
             )
+
+        H, W = self.dataset.shape[2:]
+        if hann_window:
+            self.metadata["hann_window"] = True
+            self.fft_window = np.outer(np.hanning(H), np.hanning(W))
+        else:
+            self.fft_window = np.ones((H,W))
+            self.metadata["hann_window"] = False
 
         self.metadata["mode"] = mode_norm
         if mode_norm == "gamma":
@@ -400,7 +438,6 @@ class StrainMapAutocorrelation(AutoSerialize):
             used_parent = True
 
         if used_parent:
-            import warnings
 
             warnings.warn(
                 "StrainMapAutocorrelation.preprocess: using parent Dataset4dstem metadata "
@@ -410,7 +447,6 @@ class StrainMapAutocorrelation(AutoSerialize):
             )
 
         if q_to_r_rotation_ccw_deg is None or q_transpose is None:
-            import warnings
 
             q_to_r_rotation_ccw_deg = 0.0 if q_to_r_rotation_ccw_deg is None else q_to_r_rotation_ccw_deg
             q_transpose = False if q_transpose is None else q_transpose
@@ -425,8 +461,16 @@ class StrainMapAutocorrelation(AutoSerialize):
         arr = self.dataset.array if skip is None else self.dataset.array[::skip, ::skip]
         dp = arr * self.mask_diffraction[None, None, :, :] + self.mask_diffraction_inv[None, None, :, :]
         dp_min = float(np.min(self.dataset.array))
-        if mode_norm == "log2":
+        if mode_norm == "log-min":
+            if log_offset_relative:
+                offset = float(log_offset * (np.mean(arr) - dp_min))
+            else:
+                offset = float(log_offset)
+            if not np.isfinite(offset) or offset <= 0:
+                raise ValueError(f"log offset must be finite and > 0 (got {offset}).")
             self.metadata["dp_min"] = dp_min
+            self.metadata["log_offset"] = offset
+            self.metadata["log_offset_relative"] = log_offset_relative
 
         if mode_norm == "linear":
             dp_proc = dp
@@ -435,11 +479,11 @@ class StrainMapAutocorrelation(AutoSerialize):
         elif mode_norm == "gamma":
             dp_proc = np.power(np.clip(dp, 0.0, None), self.metadata["gamma"])
         elif mode_norm == "log-min":
-            dp_proc = np.log(dp - dp_min + 0.1)
+            dp_proc = np.log(dp - dp_min + self.metadata["log_offset"])
         else:
             raise RuntimeError("Unreachable: normalized mode mapping failed.")
 
-        im = np.mean(np.abs(np.fft.fft2(dp_proc)), axis=(0, 1))
+        im = np.mean(np.abs(np.fft.fft2(dp_proc * self.fft_window)), axis=(0, 1))
         im = np.fft.fftshift(im)
 
         self.transform = Dataset2d.from_array(
@@ -615,14 +659,15 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         
         if mode == "linear":
-            im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
+            im = np.fft.fftshift(np.abs(np.fft.fft2(dp * self.fft_window)))
         elif mode == "log":
-            im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
+            im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp) * self.fft_window)))
         elif mode == "log-min":
-            dp_min = self.dataset.metadata.get("dp_min", 0.0)
-            im = np.fft.fftshift(np.abs(np.fft.fft2(np.log(dp - dp_min + 0.1))))
+            dp_min = self.metadata.get("dp_min", 0.0)
+            offset = self.metadata.get("log_offset", 0.1)
+            im = np.fft.fftshift(np.abs(np.fft.fft2(np.log(dp - dp_min + offset) * self.fft_window)))
         elif mode == "gamma":
-            im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g))))
+            im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g) * self.fft_window)))
         else:
             raise ValueError("metadata['mode'] must be 'linear', 'log', 'log-min', or 'gamma'")
 
@@ -651,11 +696,9 @@ class StrainMapAutocorrelation(AutoSerialize):
         g2: tuple[float, float] | NDArray,
         define_in_rotated: bool = False,
         refine_gaussian: bool = True,
-        refine_dft: bool = False,
         refine_all_peaks: bool = False,
         refine_radius_px: float = 2.0,
-        upsample: int = 16,
-        gaussian_maxfev: int = 100,
+        gaussian_maxfev: int = 1000,
         threshold_percentile: float = 0.9975,
         min_peak_spacing: float = 0,
         plot: bool = True,
@@ -682,17 +725,13 @@ class StrainMapAutocorrelation(AutoSerialize):
         refine_gaussian : bool, default=True
             If ``True``, refine each peak by a 2D isotropic Gaussian fit; otherwise use
             the parabolic sub-pixel estimate only.
-        refine_dft : bool, default=False
-            If ``True``, additionally refine by DFT upsampling (uses ``upsample``).
         refine_all_peaks : bool, default=False
             If ``True``, auto-detect all peaks above ``threshold_percentile`` and fit
             the basis to the full set by weighted least squares (storing the detected
             peaks/weights for reuse), rather than refining only ``g1`` and ``g2``.
         refine_radius_px : float, default=2.0
             Half-width in pixels of the window used for sub-pixel/Gaussian refinement.
-        upsample : int, default=16
-            DFT upsampling factor used when ``refine_dft=True``.
-        gaussian_maxfev : int, default=100
+        gaussian_maxfev : int, default=1000
             Maximum function evaluations for the Gaussian fit.
         threshold_percentile : float, default=0.9975
             Intensity percentile (0--1) above which local maxima are kept as peaks when
@@ -732,28 +771,27 @@ class StrainMapAutocorrelation(AutoSerialize):
             g2_rc=g2_rc,
             radius_px=refine_radius_px,
             refine_gaussian=refine_gaussian,
-            refine_dft=refine_dft,
+            refine_dft=False,
             refine_all_peaks=refine_all_peaks,
             peaks=None,
             weights=None,
-            upsample=upsample,
             maxfev=gaussian_maxfev,
             threshold_percentile=threshold_percentile,
             min_peak_spacing = min_peak_spacing,
+            warn_on_bound = True,
         )
 
         self.g1 = g1_fit_abs[:2]
         self.g2 = g2_fit_abs[:2]
+
         if refine_all_peaks:
             self.mean_img_peaks = peaks
             self.mean_img_weights = weights
 
         self.metadata["choose_define_in_rotated"] = define_in_rotated
         self.metadata["choose_refine_gaussian"] = refine_gaussian
-        self.metadata["choose_refine_dft"] = refine_dft
         self.metadata["choose_refine_all_peaks"] = refine_all_peaks
         self.metadata["choose_refine_radius_px"] = refine_radius_px
-        self.metadata["choose_upsample"] = upsample
         self.metadata["choose_gaussian_maxfev"] = gaussian_maxfev
         self.metadata["choose_threshold_percentile"] = threshold_percentile
 
@@ -779,11 +817,13 @@ class StrainMapAutocorrelation(AutoSerialize):
         refine_all_peaks: bool = False,
         refine_radius_px: float = 2.0,
         upsample: int = 16,
-        gaussian_maxfev: int = 100,
+        gaussian_maxfev: int = 1000,
         progressbar: bool = True,
         device: str = "cpu",
         batch_size: int | None = None,
+        batch_fit: bool = True,
         save_to_gpu: bool = True,
+        method: str = "gaussian",
     ) -> "StrainMapAutocorrelation":
         """Fit the lattice vectors at every scan position (the heavy step).
 
@@ -795,41 +835,47 @@ class StrainMapAutocorrelation(AutoSerialize):
         (position, amplitude, width, background) are kept in :attr:`g1_peak_fit`/
         :attr:`g2_peak_fit` (shape ``(scan_row, scan_col, 5)``).
 
-        Whenever ``refine_dft=False`` (including ``refine_all_peaks=True``) the transforms
-        and the isotropic-Gaussian peak fits are batched across scan positions on
-        ``device`` (the analogue of the correlation pipeline's
-        :func:`~quantem.diffraction.disk_detection.detect_disks_batch`): the Gaussian fit
-        is a vectorized Levenberg-Marquardt solve rather than a per-position
-        ``scipy.optimize.curve_fit``. For ``refine_all_peaks=True`` every detected peak is
-        batch-refined across the stack and the basis is solved per position by weighted
-        least squares -- avoiding the ``n_positions x n_peaks`` ``curve_fit`` calls of the
-        old loop. This removes the dominant per-call overhead and runs far faster (and
-        faster still on a GPU). The batched Levenberg-Marquardt fit reproduces the
-        per-position ``scipy.optimize.curve_fit`` to ~1e-6 px on clean, well-isolated
-        peaks; on noisy, non-Gaussian cepstral peaks the bounded-trf and LM optima can
-        land a few hundredths of a pixel apart (amplitude-preserving and well below
-        strain-relevant precision). Only ``refine_dft=True`` falls back to the
-        per-position path.
+        With ``batch_fit=True`` the transforms and peak refinements are batched across
+        scan positions on ``device`` (the analogue of the correlation pipeline's
+        :func:`~quantem.diffraction.disk_detection.detect_disks_batch`); with
+        ``batch_fit=False`` each position is processed in turn with numpy/scipy. Every
+        ``method`` / ``refine_gaussian`` / ``refine_dft`` / ``refine_all_peaks``
+        combination runs on both paths. ``cft``, the parabolic estimate and DFT
+        upsampling agree between the paths to rounding error. For ``method="gaussian"``
+        the batched path uses a vectorized Levenberg-Marquardt solve (run on the CPU in
+        float64, where it is faster than on a GPU) in place of ``scipy.optimize.curve_fit``;
+        the two agree to ~1e-4 px on well-defined peaks, but can land in different local
+        minima on weak or non-Gaussian peaks, or with ``refine_radius_px`` > ~2.5.
 
         Parameters
         ----------
-        refine_gaussian : bool, default=True
-            If ``True``, refine each peak with a 2D isotropic Gaussian fit; otherwise
-            use the parabolic sub-pixel estimate only.
         refine_dft : bool, default=False
-            If ``True``, additionally refine by DFT upsampling (uses ``upsample``).
-        refine_all_peaks : bool, default=False
-            If ``True``, fit the basis to all peaks detected in
-            :meth:`choose_lattice_vector` (which must have been called with
-            ``refine_all_peaks=True``) rather than just ``g1`` and ``g2``.
+            If ``True``, after the Gaussian (or parabolic) estimate, refine the position
+            by DFT upsampling: |FT| of the windowed, scaled pattern is evaluated on a grid
+            of spacing ``1/upsample`` around the estimate. Ignored when ``method="cft"``.
+            Requires ``preprocess(hann_window=True)``.
         refine_radius_px : float, default=2.0
-            Half-width in pixels of the window used for sub-pixel/Gaussian refinement.
-        upsample : int, default=16
-            DFT upsampling factor used when ``refine_dft=True``.
-        gaussian_maxfev : int, default=100
-            Maximum function evaluations for each Gaussian fit.
-        progressbar : bool, default=True
-            If ``True``, show a tqdm progress bar over the scan positions.
+            For ``method="gaussian"``: half-width of the Gaussian fit window (use ~1.5;
+            larger windows bias the fit). For ``method="cft"``: maximum distance the peak
+            may move from its starting pixel.
+        device : str, default="cpu"
+            Torch device for the batched path (e.g. ``"cuda:0"``). Ignored when
+            ``batch_fit=False``.
+        batch_size : int, optional
+            Number of scan positions per batch when ``batch_fit=True``. If ``None``, it is
+            chosen from the detector size.
+        batch_fit : bool, default=True
+            If ``True``, use the batched torch path on ``device``; if ``False``, process
+            positions one at a time with numpy/scipy (slow; mainly for checking).
+        save_to_gpu : bool, default=True
+            If ``True`` and ``device`` is a GPU, copy the whole dataset to the GPU once
+            (cached for later calls). Falls back to per-batch transfer if it does not fit.
+        method : {"gaussian", "cft"}, default="gaussian"
+            Sub-pixel peak refinement. ``"gaussian"`` fits an isotropic Gaussian to the
+            |FFT| pixels (optionally followed by ``refine_dft``); ``"cft"`` maximises the
+            exact continuous Fourier transform of the windowed pattern, as in PC-STEM,
+            and ignores ``refine_gaussian`` and ``refine_dft``. Use ``"cft"`` or
+            ``refine_dft`` with ``preprocess(hann_window=True)``.
 
         Returns
         -------
@@ -842,6 +888,19 @@ class StrainMapAutocorrelation(AutoSerialize):
         if refine_all_peaks:
             if self.mean_img_peaks is None or self.mean_img_weights is None:
                 raise ValueError("Run choose_lattice_vector() with refine_all_peaks=True to determine which peaks to fit")
+        if method not in ("gaussian", "cft"):
+            raise ValueError("method must be 'gaussian' or 'cft'.")
+        hann = bool(self.metadata.get("hann_window", False))
+        if method == "gaussian" and refine_gaussian and refine_radius_px > 2.5:
+            warnings.warn("method='gaussian' with refine_radius_px > 2.5 is biased (0.8-1.5 px on the SiGe "
+                          "sims) and, without a window, has multiple local minima; use ~1.5, or method='cft'.",
+                          UserWarning, stacklevel=2)
+        if (method == "cft" or refine_dft) and not hann:
+            warnings.warn("method='cft' / refine_dft without preprocess(hann_window=True) is pulled by "
+                          "central-peak leakage; enable the Hann window.", UserWarning, stacklevel=2)
+        if method == "gaussian" and refine_gaussian and not refine_dft and hann:
+            warnings.warn("hann_window=True with a plain Gaussian fit biases positions (up to ~0.5 px); "
+                          "use method='cft' or refine_dft=True.", UserWarning, stacklevel=2)
     
         scan_r = self.dataset.shape[0]
         scan_c = self.dataset.shape[1]
@@ -863,27 +922,25 @@ class StrainMapAutocorrelation(AutoSerialize):
         g1_0 = np.asarray(self.g1, dtype=float).reshape(2)
         g2_0 = np.asarray(self.g2, dtype=float).reshape(2)
 
-        if not refine_dft:
-            # Fast path: batch the transforms and isotropic-Gaussian fits across scan
-            # positions on `device` (per-position scipy.optimize.curve_fit -> vectorized
-            # LM). Covers both the 2-vector fit and the all-peaks basis fit; matches the
-            # per-position result to ~1e-6 px on clean peaks (a few 0.01 px on noisy,
-            # non-Gaussian peaks -- optimizer variance). Only DFT upsampling still falls back.
+        if batch_fit:
+            # Fast path: batch the transforms
             self._fit_lattice_vectors_batched(
                 g1_0=g1_0,
                 g2_0=g2_0,
                 refine_gaussian=refine_gaussian,
                 refine_radius_px=refine_radius_px,
+                refine_dft=refine_dft,
+                upsample=upsample,
                 device=device,
                 progressbar=progressbar,
                 refine_all_peaks=refine_all_peaks,
                 peaks=self.mean_img_peaks if refine_all_peaks else None,
                 weights=self.mean_img_weights if refine_all_peaks else None,
                 batch_size = batch_size,
-                save_to_gpu = save_to_gpu
+                save_to_gpu = save_to_gpu,
+                method = method,
             )
         else:
-            # Per-position fallback for DFT upsampling (refine_dft=True).
             mode = self.metadata.get("mode", "linear").lower()
             if mode == "gamma":
                 g = self.metadata["gamma"]
@@ -901,16 +958,18 @@ class StrainMapAutocorrelation(AutoSerialize):
                 dp = self.dataset.array[r, c] * self.mask_diffraction + self.mask_diffraction_inv
 
                 if mode == "linear":
-                    im = np.fft.fftshift(np.abs(np.fft.fft2(dp)))
+                    dp_proc = (dp)
                 elif mode == "log":
-                    im = np.fft.fftshift(np.abs(np.fft.fft2(np.log1p(dp))))
+                    dp_proc = (np.log1p(dp))
                 elif mode == "log-min":
-                    dp_min = self.dataset.metadata.get("dp_min", 0.0)
-                    im = np.fft.fftshift(np.abs(np.fft.fft2(np.log(dp - dp_min + 0.1))))
+                    dp_min = self.metadata.get("dp_min", 0.0)
+                    dp_proc = (np.log(dp - dp_min + self.metadata.get("log_offset", 0.1)))
                 elif mode == "gamma":
-                    im = np.fft.fftshift(np.abs(np.fft.fft2(np.power(np.clip(dp, 0.0, None), g))))
+                    dp_proc = (np.power(np.clip(dp, 0.0, None), g))
                 else:
                     raise ValueError("metadata['mode'] must be 'linear', 'log', 'log-min', or 'gamma'")
+                im = np.fft.fftshift(np.abs(np.fft.fft2(dp_proc * self.fft_window)))
+                tr_np = dp_proc * self.fft_window
 
                 g1_fit_abs, g2_fit_abs, _, _ = _refine_lattice_vectors(
                     im,
@@ -924,6 +983,8 @@ class StrainMapAutocorrelation(AutoSerialize):
                     weights=self.mean_img_weights,
                     upsample=upsample,
                     maxfev=gaussian_maxfev,
+                    tr=tr_np,
+                    method=method,
                 )
 
                 self.g1_peak_fit.array[r, c, :] = g1_fit_abs
@@ -940,6 +1001,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.metadata["fit_refine_radius_px"] = refine_radius_px
         self.metadata["fit_upsample"] = upsample
         self.metadata["fit_gaussian_maxfev"] = gaussian_maxfev
+        self.metadata["fit_method"] = method
 
         # Populate the per-position weight directly from the fitted peak amplitudes,
         # mirroring the correlation pipeline where BraggVectors.fit_lattice emits
@@ -956,26 +1018,28 @@ class StrainMapAutocorrelation(AutoSerialize):
         g2_0: NDArray,
         refine_gaussian: bool,
         refine_radius_px: float,
+        refine_dft: bool = False,
+        upsample: int = 16,
         device: str,
         progressbar: bool,
         refine_all_peaks: bool = False,
         peaks: NDArray | None = None,
         weights: NDArray | None = None,
         batch_size: int | None = None,
+        method: str = "gaussian",
         save_to_gpu: bool = True,
     ) -> None:
-        """Batched torch implementation of the non-DFT :meth:`fit_lattice_vectors` path.
+        """Batched torch implementation of :meth:`fit_lattice_vectors` (``batch_fit=True``).
 
-        The transform (mask/fill -> ``mode`` -> ``|FFT|`` -> fftshift) and the
-        parabolic/isotropic-Gaussian peak refinement are evaluated for a stack of scan
-        positions at once on ``device``, the analogue of the correlation pipeline's
-        :func:`~quantem.diffraction.disk_detection.detect_disks_batch`. This reproduces
-        :func:`_refine_lattice_vectors` (with ``refine_dft=False``) -- to ~1e-6 px on
-        clean peaks, within a few 0.01 px on noisy non-Gaussian peaks (bounded-trf vs LM
-        optimizer variance) -- while removing the per-position
-        ``scipy.optimize.curve_fit`` overhead. Results are
-        written into :attr:`g1_array`/:attr:`g2_array` and :attr:`g1_peak_fit`/
-        :attr:`g2_peak_fit`.
+        The transform (mask/fill -> ``mode`` -> window -> ``|FFT|`` -> fftshift) and the
+        peak refinement are evaluated for a stack of scan positions at once on
+        ``device``. Refinement follows ``method``: ``"cft"`` uses
+        :func:`_refine_peaks_cft_batched`; ``"gaussian"`` uses
+        :func:`_refine_peaks_batched` (parabolic, then an isotropic-Gaussian
+        Levenberg-Marquardt fit when ``refine_gaussian``), optionally followed by
+        :func:`_refine_peaks_dft_batched` when ``refine_dft``. Results are written into
+        :attr:`g1_array`/:attr:`g2_array` and :attr:`g1_peak_fit`/:attr:`g2_peak_fit`,
+        and match the per-position path (see :meth:`fit_lattice_vectors`).
 
         With ``refine_all_peaks=False`` only the two seed vectors ``g1_0``/``g2_0`` are
         refined per position. With ``refine_all_peaks=True`` every peak in ``peaks`` (the
@@ -1049,6 +1113,21 @@ class StrainMapAutocorrelation(AutoSerialize):
         else:
             bar = None
 
+        if method not in ("gaussian", "cft"):
+            raise ValueError("method must be 'gaussian' or 'cft'.")
+
+        def refine(tr: torch.Tensor, ims: torch.Tensor, vec: NDArray) -> torch.Tensor:
+            if method == "cft":
+                return _refine_peaks_cft_batched(tr, ims, vec, radius_px=refine_radius_px)
+            out = _refine_peaks_batched(
+                ims, vec, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
+            )
+            if refine_dft and upsample > 1:
+                out[:, :2] = _refine_peaks_dft_batched(tr, out[:, :2], upsample=upsample)
+            return out
+
+        win_t = torch.as_tensor(self.fft_window, dtype=mask.dtype, device=dev)
+        
         for start in starts:
             stop = min(start + batch_size, n_pos)
             idxs = [(idx // scan_c, idx % scan_c) for idx in range(start, stop)]
@@ -1074,10 +1153,13 @@ class StrainMapAutocorrelation(AutoSerialize):
             elif mode == "log":
                 tr = torch.log1p(dpm)
             elif mode == "log-min":
-                dp_min = self.dataset.metadata.get("dp_min", 0.0)
-                tr = torch.log(dpm - dp_min + 0.1)
+                dp_min = self.metadata.get("dp_min", 0.0)
+                log_offset = float(self.metadata.get("log_offset", 0.1))
+                tr = torch.log(dpm - dp_min + log_offset)
             else:  # gamma
                 tr = dpm.clamp(min=0.0).pow(gamma)
+                
+            tr = tr * win_t
             ims = torch.fft.fftshift(torch.fft.fft2(tr).abs(), dim=(-2, -1))
 
             if refine_all_peaks:
@@ -1086,10 +1168,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 # weighted least squares as _refine_lattice_vectors' all-peaks branch.
                 pts_all = np.empty((len(idxs), n_pk, 2), dtype=float)
                 for j in range(n_pk):
-                    rj = _refine_peaks_batched(
-                        ims, peaks_arr[j], radius_px=refine_radius_px,
-                        refine_gaussian=refine_gaussian,
-                    ).cpu().numpy()
+                    rj = refine(tr, ims, peaks_arr[j]).cpu().numpy()
                     pts_all[:, j, :] = rj[:, :2]
                 # Amplitude/width/background for the mask weight come from the SAME
                 # single-peak refinement at the g1/g2 seeds as the single-peak branch
@@ -1097,44 +1176,31 @@ class StrainMapAutocorrelation(AutoSerialize):
                 # lstsq only improves the g1/g2 *positions*; the raw cepstral value at those
                 # positions rides the central-autocorrelation pedestal and would invert
                 # the mask in vacuum.)
-                g1_fit = _refine_peaks_batched(
-                    ims, g1_0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
-                ).cpu().numpy()
-                g2_fit = _refine_peaks_batched(
-                    ims, g2_0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
-                ).cpu().numpy()
-                for k, (r, c) in enumerate(idxs):
-                    pts = pts_all[k]  # (n_pk, 2) row/col offsets from center
-                    ab = np.round(np.linalg.lstsq(A_seed, pts.T, rcond=None)[0]).T
-                    M = np.ones((n_pk, 3))
-                    M[:, :2] = ab  # integer (h, k) indices + constant (center) column
-                    uvc = np.linalg.lstsq(M * sqrt_w, pts * sqrt_w, rcond=None)[0]  # (3, 2)
-                    # least-squares basis for THIS position -- not the reference basis
-                    g1_basis, g2_basis = uvc[0], uvc[1]
-                    self.g1_peak_fit.array[r, c, :] = (
-                        g1_basis[0], g1_basis[1], g1_fit[k, 2], g1_fit[k, 3], g1_fit[k, 4]
-                    )
-                    self.g2_peak_fit.array[r, c, :] = (
-                        g2_basis[0], g2_basis[1], g2_fit[k, 2], g2_fit[k, 3], g2_fit[k, 4]
-                    )
-                    self.g1_array[r, c, 0] = g1_basis[0]
-                    self.g1_array[r, c, 1] = g1_basis[1]
-                    self.g2_array[r, c, 0] = g2_basis[0]
-                    self.g2_array[r, c, 1] = g2_basis[1]
+                g1_fit = refine(tr, ims, g1_0).cpu().numpy()
+                g2_fit = refine(tr, ims, g2_0).cpu().numpy()
+
+                rows_a = np.fromiter((r for r, _ in idxs), int, len(idxs))
+                cols_a = np.fromiter((c for _, c in idxs), int, len(idxs))
+                # integer (h, k) indices per position/peak: A_seed is 2x2, so lstsq == solve
+                ab = np.round(np.einsum("ij,kpj->kpi", np.linalg.inv(A_seed), pts_all))  # (B, n_pk, 2)
+                M = np.concatenate([ab, np.ones(ab.shape[:2] + (1,))], axis=2)          # (B, n_pk, 3)
+                Mw = M * sqrt_w[None]                                                    # sqrt_w: (n_pk, 1)
+                Pw = pts_all * sqrt_w[None]
+                uvc = np.linalg.pinv(Mw) @ Pw                                            # (B, 3, 2), batched SVD
+                g1_b, g2_b = uvc[:, 0], uvc[:, 1]                                        # (B, 2) each
+                self.g1_peak_fit.array[rows_a, cols_a] = np.concatenate([g1_b, g1_fit[:, 2:]], 1)
+                self.g2_peak_fit.array[rows_a, cols_a] = np.concatenate([g2_b, g2_fit[:, 2:]], 1)
+                self.g1_array[rows_a, cols_a] = g1_b
+                self.g2_array[rows_a, cols_a] = g2_b
             else:
-                g1_np = _refine_peaks_batched(
-                    ims, g1_0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
-                ).cpu().numpy()
-                g2_np = _refine_peaks_batched(
-                    ims, g2_0, radius_px=refine_radius_px, refine_gaussian=refine_gaussian
-                ).cpu().numpy()
-                for k, (r, c) in enumerate(idxs):
-                    self.g1_peak_fit.array[r, c, :] = g1_np[k]
-                    self.g2_peak_fit.array[r, c, :] = g2_np[k]
-                    self.g1_array[r, c, 0] = g1_np[k, 0]
-                    self.g1_array[r, c, 1] = g1_np[k, 1]
-                    self.g2_array[r, c, 0] = g2_np[k, 0]
-                    self.g2_array[r, c, 1] = g2_np[k, 1]
+                g1_np = refine(tr, ims, g1_0).cpu().numpy()
+                g2_np = refine(tr, ims, g2_0).cpu().numpy()
+                rows_a = np.fromiter((r for r, _ in idxs), int, len(idxs))
+                cols_a = np.fromiter((c for _, c in idxs), int, len(idxs))
+                self.g1_peak_fit.array[rows_a, cols_a] = g1_np
+                self.g2_peak_fit.array[rows_a, cols_a] = g2_np
+                self.g1_array[rows_a, cols_a] = g1_np[:, :2]
+                self.g2_array[rows_a, cols_a] = g2_np[:, :2]
 
             if bar is not None:
                 bar.update(len(idxs))
@@ -1264,6 +1330,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         g1_ref: np.ndarray | None = None,
         g2_ref: np.ndarray | None = None,
         mask: np.ndarray | None = None,
+        calculation_metric: str = "median",
     ) -> StrainMap:
         """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
 
@@ -1316,6 +1383,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             ds_units=ds_units,
             q_to_r_rotation_ccw_deg = self.metadata['q_to_r_rotation_ccw_deg'],
             q_transpose = self.metadata['q_transpose'],
+            calculation_metric = calculation_metric,
         )
 
     def plot_lattice_vectors(
@@ -1694,76 +1762,94 @@ def _refine_peak_subpixel(
     return r_peak + dr, c_peak + dc
 
 
-def _refine_peak_subpixel_dft(
-    im: NDArray,
-    *,
-    r0: float,
-    c0: float,
-    upsample: int,
-) -> tuple[float, float]:
-    """Refine a peak location to subpixel precision via local DFT upsampling.
+def _refine_peak_cft(tr, im, vec, *, radius_px, n_grid=11, n_zoom=4) -> NDArray:
+    """Single-image version of :func:`_refine_peaks_cft_batched` (numpy).
 
-    Uses a matrix-multiply DFT (the Guizar-Sicairos upsampled cross-correlation
-    trick) to evaluate the image's Fourier interpolant on a fine grid in a small
-    neighborhood around the initial estimate, then locates the maximum of that
-    upsampled patch with a 3-point parabolic vertex refinement. This avoids
-    interpolating the whole image and is accurate to roughly ``1 / upsample`` of a
-    pixel.
+    Starting from the brightest pixel in the 3x3 window around ``center + vec`` in
+    ``im``, maximises |FT(tr)| at continuous frequencies on a zooming grid
+    (``n_grid`` points per axis, ``n_zoom`` levels: step 0.2 -> 0.04 -> 0.008 ->
+    0.0016 px for the defaults), constrained to ``+-radius_px`` of the starting pixel.
 
     Parameters
     ----------
+    tr : NDArray
+        Windowed, intensity-scaled pattern ``(H, W)`` whose FFT magnitude is ``im``.
     im : NDArray
-        2D real image (a transform panel) whose peak is being refined.
-    r0, c0 : float
-        Initial peak estimate in pixel coordinates (row, column). If ``r0`` or
-        ``c0`` is a torch tensor it is converted to a Python float.
-    upsample : int
-        DFT upsampling factor. Values ``<= 1`` skip refinement and return the
-        input estimate unchanged; larger values give finer subpixel resolution.
+        fftshifted ``|FFT(tr)|``, used for the starting pixel and the background.
+    vec : NDArray
+        ``(row, col)`` offset of the peak from the panel center.
+    radius_px : float
+        Maximum distance the refined peak may move from the starting pixel.
+    n_grid, n_zoom : int
+        Grid points per axis and number of zoom levels.
 
     Returns
     -------
-    tuple[float, float]
-        The refined ``(row, column)`` peak location in pixel coordinates.
+    NDArray
+        ``(row_off, col_off, amp, 0, bg)``. ``bg`` is the median of the border of the
+        ``(2*ceil(radius_px)+1)^2`` pixel window in ``im``, and ``amp = |FT| - bg``.
     """
-    if upsample <= 1:
-        return r0, c0
+    H, W = tr.shape
+    rc, cc = H // 2, W // 2
+    r0 = int(np.clip(round(rc + float(vec[0])), 1, H - 2))
+    c0 = int(np.clip(round(cc + float(vec[1])), 1, W - 2))
+    ir, ic = np.unravel_index(np.argmax(im[r0 - 1 : r0 + 2, c0 - 1 : c0 + 2]), (3, 3))
+    q_r0, q_c0 = r0 - 1 + ir - rc, c0 - 1 + ic - cc
+    q_r, q_c = float(q_r0), float(q_c0)
+    nr, nc = np.arange(H), np.arange(W)
+    t = np.linspace(-1.0, 1.0, n_grid)
+    half = 1.0
+    for _ in range(n_zoom):
+        kr, kc = q_r + half * t, q_c + half * t
+        P = np.abs(np.exp((-2j * np.pi / H) * np.outer(kr, nr)) @ tr
+                   @ np.exp((-2j * np.pi / W) * np.outer(nc, kc)))
+        i, j = np.unravel_index(np.argmax(P), P.shape)
+        q_r = float(np.clip(kr[i], q_r0 - radius_px, q_r0 + radius_px))
+        q_c = float(np.clip(kc[j], q_c0 - radius_px, q_c0 + radius_px))
+        half *= 2.0 / (n_grid - 1)
+    peak = float(P.max())
+    rad = int(max(1, np.ceil(radius_px)))
+    rr = np.clip(np.arange(q_r0 + rc - rad, q_r0 + rc + rad + 1), 0, H - 1)
+    cw = np.clip(np.arange(q_c0 + cc - rad, q_c0 + cc + rad + 1), 0, W - 1)
+    win = im[rr[:, None], cw[None, :]]
+    bg = float(np.median(np.concatenate([win[0], win[-1], win[1:-1, 0], win[1:-1, -1]])))
+    return np.array((q_r, q_c, peak - bg, 0.0, bg), dtype=float)
 
-    im = np.asarray(im, dtype=float)
-    if torch.is_tensor(r0):
-        r0 = float(r0.item())
-    if torch.is_tensor(c0):
-        c0 = float(c0.item())
-    F = np.fft.fft2(np.fft.fftshift(im))
 
-    up = upsample
-    H, W = im.shape
-    du = int(np.floor(np.ceil(1.5 * up) / 2.0))
-    off_r = -(-H // 2)          # ceil(H/2)
-    off_c = -(-W // 2)          # ceil(W/2)
+def _refine_peak_dft(tr, rc0, *, upsample) -> tuple[float, float]:
+    """Single-image version of :func:`_refine_peaks_dft_batched` (numpy).
 
-    shift = (du + up * (r0 - off_r), du + up * (c0 - off_c))
-    patch = np.abs(dft_upsample(F, up=up, shift=shift))
-    patch = np.asarray(patch, dtype=float)
+    Evaluates |FT(tr)| on a ``(2*du+1)^2`` grid of spacing ``1/upsample``
+    (``du = ceil(1.5*upsample)``, i.e. +-1.5 px) centred on ``rc0``, and refines the
+    maximum with a 3-point parabola.
 
-    i0, j0 = np.unravel_index(np.argmax(patch), patch.shape)
+    Parameters
+    ----------
+    tr : NDArray
+        Windowed, intensity-scaled pattern ``(H, W)``.
+    rc0 : tuple of float
+        Starting ``(row, col)`` offset from the panel center (e.g. the Gaussian fit).
+    upsample : int
+        Upsampling factor; the grid spacing is ``1/upsample`` px.
 
-    if 0 < i0 < patch.shape[0] - 1:
-        col = patch[i0 - 1 : i0 + 2, j0]
-        di = _parabolic_vertex_delta(col[0], col[1], col[2])
-    else:
-        di = 0.0
-
-    if 0 < j0 < patch.shape[1] - 1:
-        row = patch[i0, j0 - 1 : j0 + 2]
-        dj = _parabolic_vertex_delta(row[0], row[1], row[2])
-    else:
-        dj = 0.0
-
-    dr = ((du - float(i0) - di)) / up
-    dc = ((du - float(j0) - dj)) / up
-
-    return r0 + dr, c0 + dc
+    Returns
+    -------
+    tuple of float
+        Refined ``(row, col)`` offset from the panel center.
+    """
+    H, W = tr.shape
+    up = int(upsample)
+    du = int(np.ceil(1.5 * up))
+    t = np.arange(-du, du + 1) / up
+    kr, kc = rc0[0] + t, rc0[1] + t
+    P = np.abs(np.exp((-2j * np.pi / H) * np.outer(kr, np.arange(H))) @ tr
+               @ np.exp((-2j * np.pi / W) * np.outer(np.arange(W), kc)))
+    G = P.shape[0]
+    i, j = np.unravel_index(np.argmax(P), P.shape)
+    i, j = int(np.clip(i, 1, G - 2)), int(np.clip(j, 1, G - 2))
+    di = _parabolic_vertex_delta(P[i - 1, j], P[i, j], P[i + 1, j])
+    dj = _parabolic_vertex_delta(P[i, j - 1], P[i, j], P[i, j + 1])
+    return float(kr[i] + di / up), float(kc[j] + dj / up)
 
 
 def _refine_lattice_vectors(
@@ -1778,9 +1864,12 @@ def _refine_lattice_vectors(
     peaks: NDArray | None = None,
     weights: NDArray | None = None,
     upsample: int = 16,
-    maxfev: int = 100,
+    maxfev: int = 1000,
     threshold_percentile: float = 0.9975,
     min_peak_spacing: float = 0,
+    tr: NDArray | None = None,
+    method: str = "gaussian",
+    warn_on_bound: bool = False,
 ) -> tuple[NDArray, NDArray, NDArray, NDArray]:
     """Refine the two lattice vectors of a transform panel to subpixel precision.
 
@@ -1828,6 +1917,8 @@ def _refine_lattice_vectors(
     min_peak_spacing : float, optional
         Minimum allowed spacing (in pixels) between detected peaks; ``0`` (default)
         disables the spacing filter.
+    warn_on_bound : bool, default=False. 
+        Warn if a Gaussian peak fit ends on its window bound (the peak is likely outside the window).
 
     Returns
     -------
@@ -1920,12 +2011,24 @@ def _refine_lattice_vectors(
             row, col, amp, sig, bg = popt
             if not (np.isfinite(row) and np.isfinite(col) and np.isfinite(amp) and np.isfinite(sig) and np.isfinite(bg)):
                 return r0, c0, p0[2], 0.0, 0.0
+            if warn_on_bound and min(row - rlo, rhi - row, col - clo, chi - col) < 1e-3:
+                warnings.warn(
+                    f"Gaussian peak fit near offset ({r0 - r_center:.2f}, {c0 - c_center:.2f}) "
+                    "stopped at its window bound, so the peak is likely outside the window. "
+                    "Check the g1/g2 guess or increase refine_radius_px.",
+                    UserWarning, stacklevel=4)
             return row, col, amp, sig, bg
         except Exception:
             return r0, c0, p0[2], 0.0, 0.0
 
     def _refine_one(vec: NDArray) -> NDArray:
         vec = np.asarray(vec, dtype=float).reshape(2)
+
+        if method == "cft":
+            if tr is None:
+                raise ValueError("method='cft' needs the windowed pattern `tr`.")
+            return _refine_peak_cft(tr, im, vec, radius_px=radius_px)
+
         r_guess = r_center + vec[0]
         c_guess = c_center + vec[1]
 
@@ -1942,13 +2045,12 @@ def _refine_lattice_vectors(
             r_fit, c_fit, amp, sig, bg = r_par, c_par, amp_par, 0.0, 0.0
 
         if refine_dft and upsample > 1:
-            r_dft, c_dft = _refine_peak_subpixel_dft(
-                im,
-                r0=r_fit,
-                c0=c_fit,
-                upsample=upsample,
+            if tr is None:
+                raise ValueError("refine_dft needs the windowed pattern `tr`.")
+            r_fit, c_fit = _refine_peak_dft(
+                tr, (r_fit - r_center, c_fit - c_center), upsample=upsample
             )
-            r_fit, c_fit = r_dft, c_dft
+            r_fit, c_fit = r_fit + r_center, c_fit + c_center
 
         return np.array((r_fit - r_center, c_fit - c_center, amp, sig, bg), dtype=float)
 
@@ -2006,11 +2108,11 @@ def _refine_lattice_vectors(
         ab0_float = np.linalg.lstsq(A, pts.T, rcond=None)[0]
         ab0 = (np.round(ab0_float)).T
 
-        weights /= weights.sum()
+        weights_norm = weights/weights.sum()
         A = np.ones((pts.shape[0], 3))
         A[:,:2] = ab0
-        pts_weighted = pts * np.sqrt(weights)
-        A_weighted = A * np.sqrt(weights)
+        pts_weighted = pts * np.sqrt(weights_norm)
+        A_weighted = A * np.sqrt(weights_norm)
         uvr0 = np.linalg.lstsq(A_weighted, pts_weighted, rcond=None)[0]
         g1_refined = uvr0[0,:]
         g2_refined = uvr0[1,:]
@@ -2146,8 +2248,8 @@ def _refine_peaks_batched(
         sig = sig.clamp(min=1e-9)
         E = torch.exp(-((RR - row) ** 2 + (CC - col) ** 2) / (2.0 * sig * sig))
         return ((bg + amp * E - y) ** 2).sum(1)
-
-    for _ in range(lm_iters):
+    p_check = p[:, :2].clone()
+    for it in range(lm_iters):
         row, col, amp, sig, bg = [p[:, i : i + 1] for i in range(5)]
         sig = sig.clamp(min=1e-9)
         d_row = RR - row
@@ -2176,9 +2278,120 @@ def _refine_peaks_batched(
         better = s_new < s_old
         p = torch.where(better[:, None], pn, p)
         lam = torch.where(better, (lam * 0.5).clamp(min=1e-9), (lam * 3.0).clamp(max=1e6))
+        if it % 5 == 4:
+            # stop once no position has moved by more than 1e-6 px over the last 5 iterations
+            if (p[:, :2] - p_check).abs().amax() < 1e-6:
+                break
+            p_check = p[:, :2].clone()
 
     row, col, amp, sig, bg = [p[:, i] for i in range(5)]
     ok = torch.isfinite(p).all(1)
     row = torch.where(ok, row, r_sub)
     col = torch.where(ok, col, c_sub)
     return torch.stack([row - rcent, col - ccent, amp, sig, bg], 1)
+
+def _refine_peaks_cft_batched(
+    tr: torch.Tensor,
+    ims: torch.Tensor,
+    vec: NDArray,
+    *,
+    radius_px: float,
+    n_grid: int = 11,
+    n_zoom: int = 4,
+) -> torch.Tensor:
+    """PC-STEM-style peak refinement: maximise the exact continuous FT magnitude.
+
+    ``tr`` is the windowed, intensity-scaled pattern stack (B, H, W) that was FFT'd to
+    make ``ims`` (fftshifted |FFT|). Starting from the brightest pixel in the 3x3 around
+    ``center + vec``, |sum tr * exp(-2 pi i q.r / N)| is evaluated on a zooming grid
+    (step 0.2 -> 0.04 -> 0.008 -> 0.0016 px for the defaults), constrained to
+    +-radius_px of the starting pixel. Returns (row_off, col_off, amp, 0, bg) like
+    _refine_peaks_batched, where amp is background-subtracted.
+    """
+    Bn, H, W = tr.shape
+    dev, dt = tr.device, tr.dtype
+    rc, cc = H // 2, W // 2
+    bidx = torch.arange(Bn, device=dev)
+
+    r0 = int(np.clip(round(rc + float(vec[0])), 1, H - 2))
+    c0 = int(np.clip(round(cc + float(vec[1])), 1, W - 2))
+    am = ims[:, r0 - 1 : r0 + 2, c0 - 1 : c0 + 2].reshape(Bn, 9).argmax(1)
+    q_r0 = (r0 - 1 + torch.div(am, 3, rounding_mode="floor") - rc).to(dt)
+    q_c0 = (c0 - 1 + am % 3 - cc).to(dt)
+    q_r, q_c = q_r0.clone(), q_c0.clone()
+
+    nr = torch.arange(H, device=dev, dtype=dt)
+    nc = torch.arange(W, device=dev, dtype=dt)
+    trc = tr.to(torch.complex128 if dt == torch.float64 else torch.complex64)
+    t = torch.linspace(-1.0, 1.0, n_grid, device=dev, dtype=dt)
+    half = 1.0
+    for _ in range(n_zoom):
+        kr = q_r[:, None] + half * t[None, :]                                    # (B, G)
+        kc = q_c[:, None] + half * t[None, :]
+        Er = torch.exp((-2j * np.pi / H) * kr[:, :, None] * nr[None, None, :])   # (B, G, H)
+        Ec = torch.exp((-2j * np.pi / W) * nc[None, :, None] * kc[:, None, :])   # (B, W, G)
+        P = (Er @ trc @ Ec).abs()                                                # (B, G, G)
+        idx = P.reshape(Bn, -1).argmax(1)
+        q_r = torch.maximum(torch.minimum(kr[bidx, idx // n_grid], q_r0 + radius_px), q_r0 - radius_px)
+        q_c = torch.maximum(torch.minimum(kc[bidx, idx % n_grid], q_c0 + radius_px), q_c0 - radius_px)
+        half = half * 2.0 / (n_grid - 1)
+    peak = P.reshape(Bn, -1).max(1).values
+
+    # local background = median of the border of the (2*rad+1)^2 pixel window,
+    # so mask_weight keeps using a background-subtracted height (see the
+    # pedestal comment in _fit_lattice_vectors_batched)
+    rad = int(max(1, np.ceil(radius_px)))
+    off = torch.arange(-rad, rad + 1, device=dev)
+    ri = (q_r0 + rc).long()[:, None, None] + off[None, :, None]
+    ci = (q_c0 + cc).long()[:, None, None] + off[None, None, :]
+    win = ims[bidx[:, None, None], ri.clamp(0, H - 1), ci.clamp(0, W - 1)]
+    border = torch.cat([win[:, 0, :], win[:, -1, :], win[:, 1:-1, 0], win[:, 1:-1, -1]], 1)
+    bg = border.quantile(0.5, dim=1)
+
+    zeros = torch.zeros(Bn, device=dev, dtype=dt)
+    return torch.stack([q_r, q_c, peak - bg, zeros, bg], 1)
+
+def _refine_peaks_dft_batched(
+    tr: torch.Tensor,
+    rc0: torch.Tensor,
+    *,
+    upsample: int,
+) -> torch.Tensor:
+    """Batched DFT-upsampled refinement of a peak position (Guizar-Sicairos style).
+
+    ``tr`` is the windowed, intensity-scaled pattern stack (B, H, W); ``rc0`` (B, 2) is a
+    starting (row, col) offset from the panel center (e.g. the Gaussian fit). |FT(tr)| is
+    evaluated on a (2*du+1)^2 grid of spacing 1/upsample centred on ``rc0``
+    (du = ceil(1.5*upsample)), i.e. +-1.5 px, and the maximum is refined with a 3-point
+    parabola. Returns refined (B, 2) offsets from the center.
+    """
+    Bn, H, W = tr.shape
+    dev, dt = tr.device, tr.dtype
+    up = int(upsample)
+    du = int(np.ceil(1.5 * up))
+    t = torch.arange(-du, du + 1, device=dev, dtype=dt) / up                  # (G,)
+    kr = rc0[:, 0:1].to(dt) + t[None, :]                                        # (B, G)
+    kc = rc0[:, 1:2].to(dt) + t[None, :]
+    nr = torch.arange(H, device=dev, dtype=dt)
+    nc = torch.arange(W, device=dev, dtype=dt)
+    trc = tr.to(torch.complex128 if dt == torch.float64 else torch.complex64)
+    Er = torch.exp((-2j * np.pi / H) * kr[:, :, None] * nr[None, None, :])     # (B, G, H)
+    Ec = torch.exp((-2j * np.pi / W) * nc[None, :, None] * kc[:, None, :])     # (B, W, G)
+    P = (Er @ trc @ Ec).abs()                                                   # (B, G, G)
+
+    G = P.shape[1]
+    bidx = torch.arange(Bn, device=dev)
+    idx = P.reshape(Bn, -1).argmax(1)
+    i = (idx // G).clamp(1, G - 2)
+    j = (idx % G).clamp(1, G - 2)
+
+    def _parab(vm1, v0, vp1):
+        denom = vm1 - 2.0 * v0 + vp1
+        d = 0.5 * (vm1 - vp1) / denom
+        return torch.where(torch.isfinite(d) & (denom != 0), d, torch.zeros_like(d)).clamp(-1.0, 1.0)
+
+    di = _parab(P[bidx, i - 1, j], P[bidx, i, j], P[bidx, i + 1, j])
+    dj = _parab(P[bidx, i, j - 1], P[bidx, i, j], P[bidx, i, j + 1])
+    row = kr[bidx, i] + di / up
+    col = kc[bidx, j] + dj / up
+    return torch.stack([row, col], 1)

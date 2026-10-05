@@ -52,6 +52,9 @@ class StrainMap(AutoSerialize):
         Real-space scan sampling (step size); defaults to ``1.0``.
     ds_units : str, optional
         Units for ``ds_sampling``; defaults to ``"pixels"``.
+    calculation_metric : {"median", "mean"}, default="median"
+        Statistic used for the automatic reference lattice. Stored and reused by
+        :meth:`update_reference` unless overridden there.
     """
 
     mask: np.ndarray | None = None
@@ -71,6 +74,8 @@ class StrainMap(AutoSerialize):
     ds_units: str = "pixels"
     ds_shape: tuple[int, ...]
 
+    calculation_metric: str = "median"
+
     def __init__(
         self,
         g1_array: np.ndarray,
@@ -84,6 +89,7 @@ class StrainMap(AutoSerialize):
         ds_units: str | None = None,
         q_to_r_rotation_ccw_deg: float = 0.0,
         q_transpose: bool = False,
+        calculation_metric: str = "median",
     ):
         super().__init__()
         self.g1_array = g1_array
@@ -119,8 +125,8 @@ class StrainMap(AutoSerialize):
                                                                                                                         transpose=q_transpose)
         self.g1_ref = None
         self.g2_ref = None
-
-        self.update_reference()
+        self.calculation_metric = calculation_metric
+        self.update_reference(calculation_metric = calculation_metric)
 
     # ---- main methods ----
 
@@ -131,13 +137,14 @@ class StrainMap(AutoSerialize):
         g2_ref: np.ndarray | None = None,
         plot_strain_roi: bool = False,
         define_in_rotated_frame: bool = False,
+        calculation_metric: str | None = None,
         **plot_kwargs,
     ) -> "StrainMap":
         """(Re)compute the reference lattice and strain tensor maps.
 
         Reference precedence: explicit ``g1_ref``/``g2_ref`` argument > vectors fixed at
-        construction > median over ``strain_mask`` (if given) else over ``self.mask``
-        else the global median.
+        construction > ``calculation_metric`` (weighted median or mean) over
+        ``strain_mask`` (if given) else weighted by ``self.mask``.
 
         Parameters
         ----------
@@ -158,6 +165,10 @@ class StrainMap(AutoSerialize):
         define_in_rotated_frame: bool, default = False
             If ``True``, the ``g1_ref`` and ``g2_ref`` passed into the function are
             defined in the rotated detector frame.
+        calculation_metric : {"median", "mean"}, optional
+            Statistic for the automatic reference lattice. If given, it is stored on the
+            object and used by later calls; if ``None`` (default), the stored value is
+            used.
         **plot_kwargs
             Forwarded to :meth:`plot_strain_roi` when ``plot_strain_roi=True``.
 
@@ -166,7 +177,9 @@ class StrainMap(AutoSerialize):
         StrainMap
             ``self``, with the reference lattice and strain maps recomputed.
         """
-        g1_med, g2_med = _reference_lattice(self.g1_array, self.g2_array, self.mask, strain_mask)
+        if calculation_metric is not None:
+            self.calculation_metric = calculation_metric
+        g1_med, g2_med = _reference_lattice(self.g1_array, self.g2_array, self.mask, strain_mask, calculation_metric = self.calculation_metric)
 
         if g1_ref is not None:
             if define_in_rotated_frame:
@@ -782,19 +795,19 @@ def _reference_lattice(
     g2_array: np.ndarray,
     mask: np.ndarray | None = None,
     strain_mask: np.ndarray | None = None,
+    calculation_metric: str = "median",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Weighted-median reference lattice vectors, else the global median.
+    """Reference lattice vectors: weighted median or mean over a mask/ROI.
 
-    The reference is the per-component **weighted median** of the lattice vectors.
-    Weights come from ``strain_mask`` if given, else the continuous ``mask``
-    (the ``[0, 1]`` per-position weight from :meth:`create_mask` / ``fit_lattice``):
-    strong, well-indexed positions dominate the reference and weak / vacuum / bad-fit
-    positions are down-weighted. A boolean ROI (weights in ``{0, 1}``) reduces to the
-    plain median over the selected positions, so an explicit ``strain_mask`` behaves
-    as before. The weighted median (not ``mask == 1``) is used because a continuous
-    weight rarely hits *exactly* 1 -- the old exact-equality test collapsed a min-max
-    normalized mask to its single global-max position and made the reference one
-    arbitrary pixel.
+    Each component of the reference is the weighted median
+    (``calculation_metric="median"``) or weighted mean (``"mean"``) of the lattice
+    vectors over finite positions with positive weight. Weights come from
+    ``strain_mask`` if given, else from the continuous ``mask`` (the ``[0, 1]``
+    per-position weight from :meth:`create_mask` / ``fit_lattice``). A boolean ROI
+    (weights in ``{0, 1}``) reduces to the plain median/mean over the selected
+    positions. If no position has positive weight, the unweighted statistic over all
+    finite positions is used. A continuous weight (rather than ``mask == 1``) is used
+    because a min-max normalized mask rarely hits exactly 1.
 
     Parameters
     ----------
@@ -803,16 +816,26 @@ def _reference_lattice(
     g2_array : np.ndarray
         Per-position second lattice vector, shape ``(scan_row, scan_col, 2)``.
     mask : np.ndarray, optional
-        ``(scan_row, scan_col)`` per-position weight in ``[0, 1]``. Used as the median
+        ``(scan_row, scan_col)`` per-position weight in ``[0, 1]``. Used as the
         weights when ``strain_mask`` is not given.
     strain_mask : np.ndarray, optional
         ``(scan_row, scan_col)`` ROI / weight taking precedence over ``mask``.
+    calculation_metric : {"median", "mean"}, default="median"
+        Statistic used for the reference: weighted median or weighted mean.
 
     Returns
     -------
     tuple of np.ndarray
         ``(g1_ref, g2_ref)``, each a length-2 reference vector.
     """
+    if calculation_metric not in ("mean", "median"):
+        raise ValueError("calculation metric must be mean or median")
+
+    if calculation_metric == "mean":
+        reduce = lambda v, ww: float(np.average(v, weights=ww))
+    else:
+        reduce = lambda v, ww: _weighted_quantile(v, ww, 0.5)
+
     if strain_mask is not None:
         w = np.asarray(strain_mask, dtype=float).reshape(-1)
     elif mask is not None:
@@ -832,8 +855,8 @@ def _reference_lattice(
         ww = np.ones_like(vals) if w is None else w
         use = finite & (ww > 0)
         if not use.any():
-            return float(np.nanmedian(vals)) if finite.any() else float("nan")
-        return _weighted_quantile(vals[use], ww[use], 0.5)
+            return reduce(vals[finite], np.ones(finite.sum())) if finite.any() else float("nan")
+        return reduce(vals[use], ww[use])
 
     g1_ref = np.array((_wmed(g1_flat[:, 0]), _wmed(g1_flat[:, 1])), dtype=float)
     g2_ref = np.array((_wmed(g2_flat[:, 0]), _wmed(g2_flat[:, 1])), dtype=float)

@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from quantem.core.utils.utils import generate_batches
 

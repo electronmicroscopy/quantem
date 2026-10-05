@@ -1209,6 +1209,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         mask: np.ndarray | None = None,
         q_to_r_rotation_ccw_deg: float | None = None,
         q_transpose: bool | None = None,
+        calculation_metric: str = "median",
     ) -> StrainMap:
         """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
 
@@ -1230,6 +1231,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             reference lattice. Defaults to :attr:`mask` from :meth:`create_mask` (the
             lattice signal strength), so strong, well-fit positions dominate the
             reference.
+        calculation_metric : {"median", "mean"}, default="median"
+            Statistic used for the reference lattice (weighted by ``mask``). Stored on
+            the returned :class:`StrainMap` and reused by later
+            :meth:`~StrainMap.update_reference` calls.
 
         Returns
         -------
@@ -1303,6 +1308,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             ds_units = default_units,
             q_to_r_rotation_ccw_deg = q_to_r_rotation_ccw_deg,
             q_transpose = q_transpose,
+            calculation_metric = calculation_metric,
         )
 
     @property
