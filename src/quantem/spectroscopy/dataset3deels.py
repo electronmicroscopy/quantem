@@ -10,52 +10,52 @@ from scipy.optimize import curve_fit
 
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     attach_hover_to_axes as _attach_hover_to_axes,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     compare_background_methods as _compare_background_methods,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     detect_broad_bump_via_slope_change as _detect_broad_bump_via_slope_change,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     detect_peaks_whole_range as _detect_peaks_whole_range,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     interpret_thickness_quality as _visualize_thickness_quality,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_absolute_thickness as _visualize_absolute_thickness,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_absolute_zlp_shift as _visualize_absolute_zlp_shift,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_background_fit_ranges as _plot_background_fit_ranges,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_despike_preview as _plot_despike_preview,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_dual_eels_picker as _visualize_dual_eels_picker,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_quantem_diagnostic as _visualize_quantem_diagnostic,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_zlp_drift_diagnostics as _visualize_zlp_drift_diagnostics,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     show_eels_spectrum_with_hover as _show_eels_spectrum_with_hover,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     show_energy_windows_with_peaks as _show_energy_windows_with_peaks,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     show_low_loss_zlp_cutoff_inspection as _show_low_loss_zlp_cutoff_inspection,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     visualize_thickness_windows as _visualize_thickness_windows,
 )
 from quantem.spectroscopy.utils import (

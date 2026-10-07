@@ -9,22 +9,22 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.utils.filter import median_filter
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     _plot_background_subtraction as _visualize_background_subtraction,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     _plot_pca_results as _visualize_pca_results,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_attached_spectrum as _visualize_attached_spectrum,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_energy_windows_summary as _plot_energy_windows_summary,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     show_energy_window_map as _visualize_energy_window_map,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     show_mean_spectrum as _visualize_mean_spectrum,
 )
 from quantem.spectroscopy.utils import (

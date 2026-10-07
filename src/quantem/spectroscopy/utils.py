@@ -1738,7 +1738,7 @@ def measure_peak_width_fwhm(
     Model-free FWHM (full width at half maximum) at a KNOWN peak location --
     no line-shape assumed, no fit to converge or pin against. Meant to pair
     with :func:`find_maximum_and_shoulder`
-    (`quantem.spectroscopy.spectroscopy_visualzitions`), which locates a
+    (`quantem.spectroscopy.spectroscopy_visualizations`), which locates a
     peak/shoulder's `(x, y)` but does not report a width -- feed its
     `main_maximum["x"]` / `shoulder["x"]` straight in here.
 
