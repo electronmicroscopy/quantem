@@ -1,37 +1,29 @@
 import gc
 import math
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Literal, Tuple
+import warnings
+from typing import TYPE_CHECKING, Literal, Tuple
 
 import numpy as np
-import optuna
 from numpy.typing import NDArray
 from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d
-from quantem.core.io.serialize import AutoSerialize
-from quantem.core.utils.rng import RNGMixin
-from quantem.core.utils.utils import electron_wavelength_angstrom, to_numpy
 from quantem.core.utils.validators import (
     validate_aberration_coefficients,
-    validate_gt,
-    validate_int,
     validate_tensor,
 )
-from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging.complex_probe import (
+    FourierProbe,
     aberration_surface,
     aberration_surface_cartesian_basis,
     aberration_surface_cartesian_gradients,
     aperture,
-    evaluate_probe,
     gamma_factor,
     merge_aberration_coefficients,
     polar_coordinates,
     spatial_frequencies,
 )
-from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
 from quantem.diffractive_imaging.ptycho_utils import SimpleBatcher
 
 if TYPE_CHECKING:
@@ -40,175 +32,53 @@ else:
     if config.get("has_torch"):
         import torch
 
-from itertools import product
-
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     ABERRATION_PRESETS,
     _crop_corner_centered_mask,
     _rotation_degrees_to_radians,
     align_vbf_stack_multiscale,
-    create_edge_window,
+    build_vbf_stack_from_dataset3d,
+    build_vbf_stack_from_dataset4d,
     fit_aberrations_from_shifts,
     group_basis_by_method,
+    regrid_vbf_stack,
     unwrap_bf_overlap_phase_torch,
 )
+from quantem.diffractive_imaging.direct_ptychography_base import (
+    DirectPtychographyBase,
+    HyperparameterState,
+)
 
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-
-@dataclass
-class OptimizationParameter:
-    low: float
-    high: float
-    log: bool = False
-    n_points: int | None = None
-
-    def grid_values(self):
-        """Return an array of grid values for this parameter."""
-        if self.n_points is None:
-            raise ValueError("n_points must be specified for grid search parameters.")
-        if self.log:
-            return np.geomspace(self.low, self.high, self.n_points)
-        else:
-            return np.linspace(self.low, self.high, self.n_points)
+# re-exported because this was `OptimizationParameter`'s public path in v0.1.9, and
+# published notebooks still import it from this module
+from quantem.diffractive_imaging.direct_ptychography_base import (
+    OptimizationParameter as OptimizationParameter,
+)
 
 
-@dataclass
-class HyperparameterState:
-    initial_aberrations: dict[str, float] = field(default_factory=dict)
-    initial_rotation_angle: float | None = None
-    optimized_aberrations: dict[str, float] = field(default_factory=dict)
-    optimized_rotation_angle: float | None = None
-    optimized_keys: set[str] = field(default_factory=set)
-    study: optuna.Study | None = None
+class DirectPtychography(DirectPtychographyBase):
+    """
+    Direct ptychography in the scan-space Fourier domain.
 
-    def __post_init__(self):
-        self.initial_aberrations = validate_aberration_coefficients(dict(self.initial_aberrations))
-        self.optimized_aberrations = validate_aberration_coefficients(self.optimized_aberrations)
+    Every kernel here -- SSB, OBF, matched-filter, iCoM and parallax -- is a multiplier on
+    ``G(k, q)``, the virtual bright-field stack Fourier transformed over the scan. The
+    object is recovered by summing those multipliers over bright-field pixels and
+    transforming back once.
 
-        if self.optimized_keys:
-            canonical = validate_aberration_coefficients(
-                {k: 0.0 for k in self.optimized_keys if k != "rotation_angle"}
-            )
-            self.optimized_keys = set(canonical.keys()) | {
-                k for k in self.optimized_keys if k == "rotation_angle"
-            }
+    Because the multiplication happens in ``q``, the scan has to lie on a regular grid.
+    :meth:`from_dataset4d` and :meth:`from_virtual_bfs` are given one; :meth:`from_dataset3d`
+    resamples ungridded positions onto one, which is where its caveats come from.
 
-    def __repr__(self) -> str:
-        return self.summarize(which="all")
+    The alternative is
+    :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
+    which accumulates the scan onto a real-space canvas and needs no grid. See its class
+    docstring for the full comparison; in short, this class is exact and cheapest on a
+    gridded scan, but a bright-field mask beyond a few tens of thousands of pixels will not
+    fit in memory here.
 
-    def current_aberrations(
-        self, override_fixed: dict[str, float] | None = None
-    ) -> Dict[str, float]:
-        """Return full aberration dictionary (fixed ⊕ optimized)."""
-        out = dict(self.initial_aberrations)
-        out.update(self.optimized_aberrations)
-        if override_fixed is not None:
-            out.update(validate_aberration_coefficients(override_fixed))
-        return out
-
-    def current_rotation_angle(self, override_fixed: float | None = None) -> float:
-        """Return rotation angle (optimized takes precedence)."""
-        if override_fixed is not None:
-            return override_fixed
-        if self.optimized_rotation_angle is not None:
-            return self.optimized_rotation_angle
-        if self.initial_rotation_angle is not None:
-            return self.initial_rotation_angle
-        return 0.0
-
-    def clear_optimized(self):
-        """Clear all optimized aberrations and rotation angle."""
-        self.optimized_aberrations.clear()
-        self.optimized_rotation_angle = None
-        self.optimized_keys.clear()
-        self.study = None
-
-    def clear_all(self):
-        """Clear everything: initial and optimized hyperparameters."""
-        self.initial_aberrations.clear()
-        self.initial_rotation_angle = None
-        self.clear_optimized()
-
-    def copy(self):
-        """ """
-        return HyperparameterState(
-            initial_aberrations=self.initial_aberrations,
-            optimized_aberrations=self.optimized_aberrations,
-            initial_rotation_angle=self.initial_rotation_angle,
-            optimized_rotation_angle=self.optimized_rotation_angle,
-            optimized_keys=self.optimized_keys,
-            study=self.study,
-        )
-
-    def summarize(
-        self,
-        *,
-        which: str = "current",
-        override_aberration_coefs: dict[str, float] | None = None,
-        override_rotation_angle: float | None = None,
-    ) -> str:
-        cls = self.__class__.__name__
-        lines: list[str] = []
-
-        def add(name: str, value):
-            lines.append(f"  {name}={value!r},")
-
-        if which == "initial":
-            if self.initial_aberrations:
-                add("initial_aberrations", self.initial_aberrations)
-            if self.initial_rotation_angle is not None:
-                add("initial_rotation_angle_deg", self.initial_rotation_angle)
-
-        elif which == "optimized":
-            if self.optimized_aberrations:
-                add("optimized_aberrations", self.optimized_aberrations)
-            if self.optimized_rotation_angle is not None:
-                add("optimized_rotation_angle_deg", self.optimized_rotation_angle)
-
-        elif which == "current":
-            current_abers = self.current_aberrations(override_aberration_coefs)
-            current_rot = self.current_rotation_angle(override_rotation_angle)
-
-            if current_abers:
-                add("current_aberrations", current_abers)
-            if current_rot is not None:
-                add("current_rotation_angle_deg", current_rot)
-
-        elif which == "all":
-            if self.initial_aberrations:
-                add("initial_aberrations", self.initial_aberrations)
-            if self.initial_rotation_angle is not None:
-                add("initial_rotation_angle_deg", self.initial_rotation_angle)
-            if self.optimized_aberrations:
-                add("optimized_aberrations", self.optimized_aberrations)
-            if self.optimized_rotation_angle is not None:
-                add("optimized_rotation_angle_deg", self.optimized_rotation_angle)
-
-        else:
-            raise ValueError(
-                f"`which` must be one of "
-                f'{{"initial", "optimized", "current", "all"}}, got {which!r}'
-            )
-
-        if not lines:
-            return f"{cls}()"
-
-        body = "\n".join(lines)
-        return f"{cls}(\n{body}\n)"
-
-
-@dataclass(frozen=True)
-class BrightFieldContext:
-    bf_mask: torch.Tensor
-    bf_inds_i: torch.Tensor
-    bf_inds_j: torch.Tensor
-    num_bf: int
-    vbf_index_mapping: torch.Tensor
-
-
-class DirectPtychography(RNGMixin, AutoSerialize):
-    """ """
+    Instantiate with :meth:`from_dataset4d`, :meth:`from_virtual_bfs` or
+    :meth:`from_dataset3d`.
+    """
 
     _token = object()
 
@@ -216,16 +86,18 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self,
         vbf_dataset: Dataset3d,
         bf_mask_dataset: Dataset2d,
-        energy: float,
+        energy: float | None,
         rotation_angle: float,
         aberration_coefs: dict,
-        semiangle_cutoff: float | None,
+        semiangle_cutoff: float,
         soft_edges: bool,
         crop_bf_mask: bool,
         bf_mask_padding_px: int,
         rng: np.random.Generator | int | None,
         device: str | int,
         verbose: int | bool,
+        wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         _token: object | None = None,
     ):
         """ """
@@ -241,19 +113,20 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if crop_bf_mask:
             self.bf_mask = _crop_corner_centered_mask(self.bf_mask, bf_mask_padding_px)
 
-        self.wavelength = electron_wavelength_angstrom(energy)
+        self.wavelength = self._resolve_wavelength(energy, wavelength)
         self.scan_units = vbf_dataset.units[-2:]
         self.detector_units = bf_mask_dataset.units
 
-        self.scan_gpts = vbf_dataset.shape[-2:]
+        self.scan_gpts = tuple(int(n) for n in vbf_dataset.shape[-2:])
         self.scan_sampling = vbf_dataset.sampling[-2:]
         self.reciprocal_sampling = bf_mask_dataset.sampling
         self.angular_sampling = tuple(d * 1e3 * self.wavelength for d in self.reciprocal_sampling)
 
         self.num_bf = vbf_dataset.shape[0]
-        self.gpts = self.bf_mask.shape[:2]
+        self.gpts = tuple(int(n) for n in self.bf_mask.shape[:2])
         self.sampling = tuple(1 / s / n for n, s in zip(self.reciprocal_sampling, self.gpts))
 
+        self.fourier_probe = fourier_probe
         self.semiangle_cutoff = semiangle_cutoff  # ty:ignore[invalid-assignment]
         self.soft_edges = soft_edges
         self.rng = rng
@@ -269,10 +142,12 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         cls,
         vbf_dataset: Dataset3d,
         bf_mask_dataset: Dataset2d,
-        energy: float,
-        rotation_angle: float,
-        aberration_coefs: dict = {},
+        energy: float | None = None,
+        rotation_angle: float | None = None,
         semiangle_cutoff: float | None = None,
+        aberration_coefs: dict = {},
+        wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         soft_edges: bool = True,
         crop_bf_mask: bool = True,
         bf_mask_padding_px: int = 1,
@@ -286,9 +161,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
+            fourier_probe=fourier_probe,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -302,9 +179,11 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     def from_dataset4d(
         cls,
         dataset: Dataset4d,
-        energy: float,
-        semiangle_cutoff: float,
+        energy: float | None = None,
+        semiangle_cutoff: float | None = None,
         aberration_coefs: dict = {},
+        wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
         rotation_angle: float | None = None,
         max_batch_size: int | None = None,
         fit_method: str = "plane",
@@ -323,92 +202,29 @@ class DirectPtychography(RNGMixin, AutoSerialize):
     ):
         """ """
 
-        origin = CenterOfMassOriginModel.from_dataset(dataset, device=device)
-
-        # measure and fit origin
-        if force_fitted_origin is None:
-            if force_measured_origin is None:
-                origin.calculate_origin(max_batch_size)
-            else:
-                origin.origin_measured = force_measured_origin  # ty:ignore[invalid-assignment]
-            origin.fit_origin_background(fit_method=fit_method)
-        else:
-            origin.origin_fitted = force_fitted_origin  # ty:ignore[invalid-assignment]
-
-        if rotation_angle is None:
-            origin.estimate_detector_rotation()
-            rotation_angle = origin.detector_rotation_deg
-
-        # shift to origin
-        origin.shift_origin_to(
+        vbf_dataset, bf_mask_dataset, rotation_angle = build_vbf_stack_from_dataset4d(
+            dataset,
+            device=device,
             max_batch_size=max_batch_size,
+            fit_method=fit_method,
             mode=mode,
-        )
-        shifted_tensor = origin.shifted_tensor
-
-        # bf_mask
-        mean_dp = shifted_tensor.mean(dim=(0, 1))
-        bf_mask = mean_dp > mean_dp.max() * intensity_threshold
-
-        bf_mask_dataset = Dataset2d.from_array(
-            bf_mask.cpu().numpy(),
-            name="BF mask",
-            units=dataset.units[-2:],
-            sampling=dataset.sampling[-2:],
-        )
-
-        # vbf_stack
-        vbf_stack = shifted_tensor[..., bf_mask].cpu()
-        gpts = vbf_stack.shape[:2]
-
-        if normalization_order == 0:
-            vbf_stack = vbf_stack / vbf_stack.mean((0, 1))  # unity mean, important
-
-        elif normalization_order == 1:
-            # Fit linear background to each BF image
-            x = torch.linspace(-0.5, 0.5, gpts[0])
-            y = torch.linspace(-0.5, 0.5, gpts[1])
-            ya, xa = torch.meshgrid(y, x, indexing="ij")
-
-            # Basis for linear fit: [1, x, y]
-            basis = torch.stack(
-                [torch.ones_like(xa.ravel()), xa.ravel(), ya.ravel()], dim=1
-            )  # shape: [N_pixels, 3]
-
-            # Fit each BF image
-            for k in range(vbf_stack.shape[-1]):
-                intensities = vbf_stack[..., k].ravel()
-
-                # Least squares
-                coefs = torch.linalg.lstsq(basis, intensities).solution
-
-                # Normalize
-                background = (basis @ coefs).reshape(gpts)
-                vbf_stack[..., k] /= background
-        else:
-            raise ValueError()
-
-        # smooth window
-        window_edge = create_edge_window(
-            shape=gpts, edge_blend_pixels=edge_blend_pixels, device="cpu"
-        )
-        vbf_stack = (1 - window_edge[..., None]) + window_edge[..., None] * vbf_stack
-
-        vbf_stack = torch.moveaxis(vbf_stack, (0, 1, 2), (1, 2, 0))
-        vbf_dataset = Dataset3d.from_array(
-            vbf_stack.numpy(),
-            name="vBF stack",
-            units=("index",) + tuple(dataset.units[:2]),
-            sampling=(1,) + tuple(dataset.sampling[:2]),
+            force_measured_origin=force_measured_origin,
+            force_fitted_origin=force_fitted_origin,
+            rotation_angle=rotation_angle,
+            intensity_threshold=intensity_threshold,
+            normalization_order=normalization_order,
+            edge_blend_pixels=edge_blend_pixels,
         )
 
         return cls(
             vbf_dataset=vbf_dataset,
             bf_mask_dataset=bf_mask_dataset,
             energy=energy,
+            wavelength=wavelength,
             rotation_angle=rotation_angle,
             aberration_coefs=aberration_coefs,
             semiangle_cutoff=semiangle_cutoff,
+            fourier_probe=fourier_probe,
             soft_edges=soft_edges,
             crop_bf_mask=crop_bf_mask,
             bf_mask_padding_px=bf_mask_padding_px,
@@ -416,6 +232,241 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             device=device,
             verbose=verbose,
             _token=cls._token,
+        )
+
+    @classmethod
+    def from_dataset3d(
+        cls,
+        dataset: Dataset3d,
+        positions: Dataset2d | torch.Tensor | NDArray,
+        energy: float | None = None,
+        semiangle_cutoff: float | None = None,
+        rotation_angle: float | None = None,
+        scan_sampling: Tuple[float, float] | Literal["auto"] = "auto",
+        aberration_coefs: dict = {},
+        wavelength: float | None = None,
+        fourier_probe: "FourierProbe | None" = None,
+        bf_mask: torch.Tensor | NDArray | None = None,
+        scan_gpts: Tuple[int, int] | None = None,
+        interpolation: Literal["nearest", "bilinear"] = "nearest",
+        hole_fill: Literal["mean", "zero"] = "mean",
+        max_batch_size: int | None = None,
+        fit_method: str = "plane",
+        mode: str = "bilinear",
+        force_measured_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
+        force_fitted_origin: Tuple[float, float] | torch.Tensor | NDArray | None = None,
+        intensity_threshold: float = 0.5,
+        soft_edges: bool = True,
+        crop_bf_mask: bool = True,
+        bf_mask_padding_px: int = 1,
+        rng: np.random.Generator | int | None = None,
+        device: str | int = "cpu",
+        verbose: int | bool = True,
+        normalization_order: int = 0,
+    ):
+        """
+        Build from an ungridded stack of diffraction patterns and their probe positions.
+
+        Every kernel here is a multiplier on the scan-space Fourier transform, which needs a
+        regular grid. So the bright-field images are resampled onto one first, by splatting
+        them at their probe positions with no aberration shift and dividing by the
+        accumulated weight. Once gridded, SSB, OBF, matched-filter and iCoM all run exactly
+        as they do for a raster scan.
+
+        Parameters
+        ----------
+        dataset : Dataset3d
+            ``(N, Qx, Qy)`` diffraction patterns, reciprocal units ``"A^-1"`` or ``"mrad"``.
+        positions : Dataset2d, torch.Tensor or ndarray
+            ``(N, 2)`` probe positions in Angstrom, ordered ``(row, col)`` to match the
+            diffraction axes. A ``Dataset2d`` must carry units ``"A"``.
+        rotation_angle : float
+            Detector rotation in degrees. Required: rotation is otherwise estimated from the
+            curl of the center of mass over a 2D scan grid, which an ungridded scan lacks.
+        scan_sampling : tuple of float or "auto"
+            Grid pixel size in Angstrom. ``"auto"`` uses the median nearest-neighbour
+            position spacing and warns with the inferred value.
+
+            This, rather than ``reconstruct(upsampling_factor=...)``, is how to sample more
+            finely than the scan. Pass a fraction of the position spacing and the empty
+            pixels in between become the sparse comb the deconvolution unfolds, with its
+            teeth on the real probe positions. Measured against the analytical parallax CTF
+            on a scan scattered by a full pixel, correlation over the band above the scan
+            Nyquist: 0.720 for binning then ``upsampling_factor=2``, against 0.997 for
+            halving ``scan_sampling`` instead, and 0.982 for the montage.
+        scan_gpts : tuple of int, optional
+            Grid size. Defaults to whatever just covers the positions at ``scan_sampling``,
+            and may only be larger than that -- ``scan_sampling`` stays authoritative, so
+            this pads the canvas rather than rescaling the positions into it.
+        interpolation : {"nearest", "bilinear"}
+            Deposition scheme, matching ``DirectPtychographyMontage.reconstruct``.
+            ``"nearest"`` by default; see :func:`regrid_vbf_stack`.
+        hole_fill : {"mean", "zero"}
+            What to put in grid pixels no probe position reached. Defaults to each
+            bright-field image's mean over the visited pixels, which matters on a masked or
+            irregular scan and is also what centers a comb's gaps -- see
+            :func:`regrid_vbf_stack`.
+
+        Notes
+        -----
+        Regridding has two failure modes, both of which raise a warning.
+
+        Avoid combining this with ``reconstruct(upsampling_factor > 1)`` on an irregular
+        scan; pass a finer ``scan_sampling`` instead. Upsampling at reconstruct time recovers
+        detail above the scan Nyquist from where each probe sat, which binning onto a grid
+        discards, so the extra band returns as a replica of the contrast-transfer function
+        rather than an extension of it. With no holes, correlation over the extension band
+        falls 0.997 -> 0.822 -> 0.711 as the sub-pixel scatter grows from 0 to 0.5 to 1.0
+        grid pixels.
+
+        The second is holes: a grid pixel no probe reached has to be invented. ``hole_fill``
+        keeps that from becoming a hard-edged step, but a large filled region still biases
+        the result, and a coarser ``scan_gpts`` is the usual fix. Contiguous holes are worse
+        than scattered ones at equal fraction -- scattered holes behave like noise, while an
+        excluded region is a low-frequency mask the deconvolution spreads everywhere. Note
+        that a masked scan and an upsampled one want opposite treatments, filled holes versus
+        deliberate gaps, and ``hole_fill`` cannot do both at once.
+
+        Both are properties of the regridding rather than the deconvolution, so neither
+        applies to
+        :class:`~quantem.diffractive_imaging.direct_ptychography_montage.DirectPtychographyMontage`,
+        which uses the positions as measured. Prefer it for a scan that is sparse, strongly
+        irregular, or both masked and upsampled; see its class docstring for the comparison.
+        """
+        (
+            vbf_stack,
+            positions_px,
+            bf_mask_dataset,
+            fitted_gpts,
+            scan_sampling,
+            rotation_angle,
+            scan_origin,
+        ) = build_vbf_stack_from_dataset3d(
+            dataset,
+            positions,
+            scan_sampling,
+            device=device,
+            max_batch_size=max_batch_size,
+            fit_method=fit_method,
+            mode=mode,
+            force_measured_origin=force_measured_origin,
+            force_fitted_origin=force_fitted_origin,
+            rotation_angle=rotation_angle,
+            intensity_threshold=intensity_threshold,
+            normalization_order=normalization_order,
+            bf_mask=bf_mask,
+        )
+
+        if scan_gpts is None:
+            scan_gpts = fitted_gpts
+        else:
+            # `scan_sampling` stays authoritative, so the grid is padded, never rescaled:
+            # resizing the pixel to fill a requested shape would contradict the caller
+            scan_gpts = tuple(int(n) for n in scan_gpts)
+            if any(n < f for n, f in zip(scan_gpts, fitted_gpts)):
+                raise ValueError(
+                    f"`scan_gpts={scan_gpts}` is smaller than the {fitted_gpts} needed to "
+                    f"cover the positions at scan_sampling={scan_sampling}; positions would "
+                    "be dropped. Pass a coarser `scan_sampling` instead."
+                )
+
+        gridded, hole_fraction, occupied = regrid_vbf_stack(
+            vbf_stack,
+            positions_px,
+            scan_gpts,
+            interpolation=interpolation,
+            hole_fill=hole_fill,
+        )
+        if verbose:
+            occupancy = vbf_stack.shape[1] / (scan_gpts[0] * scan_gpts[1])
+            detail = (
+                f"grid is finer than the scan ({occupancy:.2f} positions per pixel), so "
+                f"{hole_fraction:.1%} of it is comb gaps for the deconvolution to unfold"
+                if occupancy < 1
+                else f"{hole_fraction:.1%} of grid pixels unvisited"
+            )
+            print(
+                f"Regridded {vbf_stack.shape[1]} positions onto "
+                f"{scan_gpts[0]}x{scan_gpts[1]}; {detail}."
+            )
+
+        vbf_dataset = Dataset3d.from_array(
+            gridded.cpu().numpy(),
+            name="regridded virtual BF stack",
+            sampling=(1.0, *scan_sampling),
+            units=("index", "A", "A"),
+        )
+
+        reconstruction = cls.from_virtual_bfs(
+            vbf_dataset=vbf_dataset,
+            bf_mask_dataset=bf_mask_dataset,
+            energy=energy,
+            wavelength=wavelength,
+            rotation_angle=rotation_angle,
+            semiangle_cutoff=semiangle_cutoff,
+            aberration_coefs=aberration_coefs,
+            fourier_probe=fourier_probe,
+            soft_edges=soft_edges,
+            crop_bf_mask=crop_bf_mask,
+            bf_mask_padding_px=bf_mask_padding_px,
+            rng=rng,
+            device=device,
+            verbose=verbose,
+        )
+        # the grid was anchored at the position bounding box, so record where that was --
+        # this is what lets `obj_origin` be read in the caller's own coordinates
+        reconstruction.scan_origin = scan_origin
+
+        # how far the positions sit from the grid they were binned onto. Upsampling unfolds
+        # aliased detail from where each probe actually was, which regridding discards, so
+        # this predicts whether `upsampling_factor` can work at all
+        subpixel = positions_px - np.round(positions_px)
+        lattice_rms_px = float(np.sqrt((subpixel**2).sum(axis=1).mean()))
+
+        reconstruction._regrid_info = {
+            "hole_fraction": hole_fraction,
+            "occupied": occupied,
+            "positions_px": positions_px,
+            "scan_gpts": scan_gpts,
+            "scan_sampling": scan_sampling,
+            "lattice_rms_px": lattice_rms_px,
+        }
+        return reconstruction
+
+    #: sub-pixel scatter, in grid pixels, above which regridding has destroyed enough of the
+    #: probe positions that upsampling replicates the band instead of extending it
+    _UNFOLDING_RMS_LIMIT = 0.1
+
+    def _warn_if_upsampling_cannot_unfold(self, upsampling_factor):
+        """Warn when upsampling an irregular regridded scan, which cannot unfold.
+
+        ``upsampling_factor`` recovers detail above the scan Nyquist from the aliased content
+        of the bright-field images, which depends on where each probe actually sat. Binning
+        those measurements onto a grid throws that away, so on an irregular scan the extra
+        band comes back as a replica of the CTF rather than an extension of it.
+
+        Measured on a white-noise object against the analytical parallax CTF, with no holes
+        at all: correlation over the band above the scan Nyquist falls 0.997 -> 0.965 ->
+        0.822 -> 0.711 as the sub-pixel scatter grows 0 -> 0.25 -> 0.5 -> 1.0 grid pixels,
+        while the montage holds 0.995 -> 0.983 on the same data.
+        """
+        info = getattr(self, "_regrid_info", None)
+        if upsampling_factor <= 1 or info is None:
+            return
+        if info["lattice_rms_px"] <= self._UNFOLDING_RMS_LIMIT:
+            return
+
+        warnings.warn(
+            f"This reconstruction was regridded from ungridded positions that sit "
+            f"{info['lattice_rms_px']:.2f} grid pixels from the grid on average, and "
+            f"`upsampling_factor={upsampling_factor}` cannot unfold that. Upsampling recovers "
+            "detail above the scan Nyquist from where each probe actually was, which the "
+            "regridding has already discarded, so the extra band will come back as a replica "
+            "of the contrast-transfer function rather than an extension of it. Rebuild with "
+            f"a `scan_sampling` {upsampling_factor}x finer instead, which keeps the probe "
+            "positions on the grid rather than binning them away first, or use "
+            "DirectPtychographyMontage, which needs no grid at all.",
+            stacklevel=2,
         )
 
     def _preprocess(
@@ -430,24 +481,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._q_signal_power = self._vbf_fourier.abs().square().sum(dim=0)  # (N_qx, N_qy)
 
         return self
-
-    def _return_bf_context(self, bf_mask):
-        """
-        Given a BF mask, compute all BF-dependent geometry and indexing.
-        """
-        bf_mask = torch.as_tensor(bf_mask, dtype=torch.bool, device=self.device)
-
-        bf_inds_i, bf_inds_j = torch.nonzero(bf_mask, as_tuple=True)
-        vbf_index_mapping = torch.where(bf_mask[self.bf_mask])[0]
-        num_bf = bf_inds_i.numel()
-
-        return BrightFieldContext(
-            bf_mask=bf_mask,
-            bf_inds_i=bf_inds_i,
-            bf_inds_j=bf_inds_j,
-            num_bf=num_bf,
-            vbf_index_mapping=vbf_index_mapping,
-        )
 
     def _return_upsampled_qgrid(
         self,
@@ -469,14 +502,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         return qxa, qya
 
     @property
-    def verbose(self) -> int:
-        return self._verbose
-
-    @verbose.setter
-    def verbose(self, v: bool | int | float) -> None:
-        self._verbose = validate_int(validate_gt(v, -1, "verbose"), "verbose")
-
-    @property
     def vbf_stack(self) -> torch.Tensor:
         return self._vbf_stack
 
@@ -485,78 +510,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         self._vbf_stack = validate_tensor(value, "vbf_stack", dtype=torch.float).to(
             device=self.device
         )
-
-    @property
-    def bf_mask(self) -> torch.Tensor:
-        return self._bf_mask
-
-    @bf_mask.setter
-    def bf_mask(self, value: torch.Tensor):
-        self._bf_mask = validate_tensor(value, "bf_mask", dtype=torch.bool).to(device=self.device)
-
-    @property
-    def rotation_angle(self) -> float:
-        """Current detector rotation angle in degrees."""
-        return self.hyperparameter_state.current_rotation_angle()
-
-    @property
-    def aberration_coefs(self) -> dict:
-        return self.hyperparameter_state.current_aberrations()
-
-    @property
-    def semiangle_cutoff(self) -> float:
-        return self._semiangle_cutoff
-
-    @semiangle_cutoff.setter
-    def semiangle_cutoff(self, value: float):
-        validate_gt(value, 0.0, "semiangle_cutoff")
-        self._semiangle_cutoff = value
-
-    @property
-    def device(self) -> str | torch.device:
-        """This should be of form 'cuda:X' or 'cpu', as defined by quantem.config"""
-        if hasattr(self, "_device"):
-            return self._device  # ty:ignore[invalid-return-type]
-        else:
-            return config.get("device")
-
-    @device.setter
-    def device(self, device: str | int | None):
-        if device is not None:
-            dev, _id = config.validate_device(device)
-            self._device = dev
-
-    @property
-    def scan_sampling(self) -> NDArray:
-        return self._scan_sampling  # ty:ignore[invalid-return-type]
-
-    @scan_sampling.setter
-    def scan_sampling(self, value: NDArray | tuple | list) -> None:
-        """
-        Units A or raises error
-        """
-        units = self.scan_units
-        if units[0] == "A":
-            self._scan_sampling = value
-        else:
-            raise ValueError("real-space needs to be given in 'A'")
-
-    @property
-    def reciprocal_sampling(self) -> NDArray:
-        return self._reciprocal_sampling  # ty:ignore[invalid-return-type]
-
-    @reciprocal_sampling.setter
-    def reciprocal_sampling(self, value: NDArray | tuple | list) -> None:
-        """
-        Units A or raises error
-        """
-        units = self.detector_units
-        if units[0] == "A^-1":
-            self._reciprocal_sampling = value
-        elif units[0] == "mrad":
-            self._reciprocal_sampling = tuple(val / self.wavelength / 1e3 for val in value)
-        else:
-            raise ValueError("reciprocal-space needs to be given in 'A^-1' or 'mrad'")
 
     def _return_kernel_contributions(
         self,
@@ -594,11 +547,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 (qmkxa, qmkya),
                 (qpkxa, qpkya),
                 cmplx_probe_at_k,
-                self.wavelength,
-                self.semiangle_cutoff,
-                self.soft_edges,
-                angular_sampling=self.angular_sampling,
-                aberration_coefs=aberration_coefs,
+                self._return_probe(aberration_coefs),
                 normalize=False,
             )
 
@@ -627,31 +576,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             fourier_factor = vbf_fourier * operator
 
         return fourier_factor, power
-
-    def _normalize_kernel_name(self, kernel):
-        kernel = kernel.lower()
-
-        aliases = {
-            "ssb": "ssb",
-            "single-sideband": "ssb",
-            "acbf": "ssb",
-            "aberration-corrected-bright-field": "ssb",
-            "obf": "obf",
-            "optimum-bright-field": "obf",
-            "mf": "mf",
-            "matched-filter": "mf",
-            "prlx": "prlx",
-            "parallax": "prlx",
-            "tcbf": "prlx",
-            "tilt-corrected-bright-field": "prlx",
-            "icom": "icom",
-            "center-of-mass": "icom",
-        }
-
-        if kernel not in aliases:
-            raise ValueError(f"Unknown deconvolution kernel '{kernel}'")
-
-        return aliases[kernel]
 
     def reconstruct(
         self,
@@ -725,6 +649,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         if upsampling_factor is None:
             upsampling_factor = 1
         upsampling_factor = math.ceil(upsampling_factor)
+        self._warn_if_upsampling_cannot_unfold(upsampling_factor)
 
         if bf_mask is None:
             bf_mask = self.bf_mask
@@ -738,6 +663,9 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             max_batch_size = num_bf
 
         deconvolution_kernel = self._normalize_kernel_name(deconvolution_kernel)
+        if deconvolution_kernel == "prlx":
+            # iCoM is exempt: `k . q / |q|**2` never reads the probe
+            self._require_analytic_probe("The prlx kernel")
 
         # Get upsampled q-space grid
         qxa, qya = self._return_upsampled_qgrid(upsampling_factor)
@@ -776,14 +704,7 @@ class DirectPtychography(RNGMixin, AutoSerialize):
             sign_sin_chi_q = None
 
         # compute global / cheap functions for all
-        cmplx_probe_k = evaluate_probe(
-            k * self.wavelength,
-            phi,
-            self.semiangle_cutoff,
-            self.angular_sampling,
-            self.wavelength,
-            aberration_coefs=aberration_coefs,
-        )
+        cmplx_probe_k = self._return_probe_on_grid(k, phi, aberration_coefs)
         BF_weights = cmplx_probe_k[bf_mask].abs().square().sum()
 
         butterworth_env = torch.ones_like(q)
@@ -900,290 +821,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
                 torch.inf, dtype=self.corrected_stack.dtype, device=self.device
             )
         return variance_loss
-
-    @property
-    def obj(self) -> np.ndarray:
-        obj = to_numpy(self.corrected_bf)
-        return obj
-
-    def visualize(
-        self,
-        return_fig: bool = False,
-        show_obj_fft: bool = True,
-        apply_hanning_window: bool = False,
-        **kwargs,
-    ):
-        """
-        Show the reconstructed object and its Hann-windowed Fourier transform.
-
-        Parameters
-        ----------
-        cbar : bool, optional
-            Whether to show colorbars, by default True.
-        return_fig : bool, optional
-            If True, return ``(fig, axs)``.
-        fft_norm : str | dict, optional
-            Normalization passed to ``show_2d`` for the object FFT.
-        **kwargs
-            Additional arguments passed to ``show_2d``.
-        """
-        if self.corrected_bf is None:
-            raise RuntimeError("Run reconstruct() before visualize().")
-
-        obj = self.obj
-        obj_scalebar = {"sampling": self.scan_sampling[1], "units": "Å"}
-
-        if show_obj_fft:
-            if apply_hanning_window:
-                window = np.hanning(obj.shape[-2])[:, None] * np.hanning(obj.shape[-1])[None, :]
-                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj * window)))
-            else:
-                obj_fft = np.fft.fftshift(np.abs(np.fft.fft2(obj)))
-
-            fft_sampling = 1 / (self.scan_sampling[1] * obj.shape[-1])
-            fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
-
-            fig, axs = show_2d(
-                [obj, obj_fft],
-                title=["Object phase", "Object phase FFT"],
-                scalebar=[obj_scalebar, fft_scalebar],
-                **kwargs,
-            )
-            axs[1].set_aspect(obj.shape[-1] / obj.shape[-2])
-        else:
-            fig, axs = show_2d(
-                obj,
-                title="Object phase",
-                scalebar=obj_scalebar,
-                **kwargs,
-            )
-
-        if return_fig:
-            return fig, axs
-        return None
-
-    def optimize_hyperparameters(
-        self,
-        aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
-        rotation_angle: float | OptimizationParameter | None = None,
-        n_trials=50,
-        sampler=None,
-        verbose=None,
-        **reconstruct_kwargs,
-    ):
-        """
-        Optimize hyperparameters (aberrations and/or rotation) using Optuna.
-
-        Parameters
-        ----------
-        aberration_coefs : dict[str, float|OptimizationParameter]
-            Dict of aberration names to either fixed values or optimization ranges.
-        rotation_angle : float|OptimizationParameter
-            Fixed rotation or optimization range, in degrees.
-        n_trials : int
-            Number of Optuna trials.
-        sampler : optuna.samplers.BaseSampler, optional
-            Custom Optuna sampler.
-        direction : str
-            "minimize" or "maximize" (default: "minimize").
-        show_progress_bar : bool
-            Show progress bar during optimization.
-        add_fixed_to_hyperparameter_state: bool
-            fixed aberrations included will be passed on to hyperparameter state
-        **reconstruct_kwargs :
-            Extra arguments passed to reconstruct().
-        """
-
-        if verbose is None:
-            verbose = self.verbose
-
-        sampler = sampler or optuna.samplers.TPESampler()
-
-        state = self.hyperparameter_state
-        aberration_coefs = aberration_coefs or {}
-
-        # Reset optimized bookkeeping
-        state.clear_optimized()
-
-        # Partition inputs
-        fixed_override_aberrations = {}
-        optimizable_aberrations = {}
-
-        for name, val in aberration_coefs.items():
-            if isinstance(val, OptimizationParameter):
-                optimizable_aberrations[name] = val
-                state.optimized_keys.add(name)
-            else:
-                fixed_override_aberrations[name] = val
-
-        if isinstance(rotation_angle, OptimizationParameter):
-            state.optimized_keys.add("rotation_angle")
-
-        def objective(trial):
-            trial_aberrations = {}
-            for name, val in optimizable_aberrations.items():
-                trial_aberrations[name] = trial.suggest_float(name, val.low, val.high, log=val.log)
-
-            trial_aberrations |= fixed_override_aberrations
-
-            if isinstance(rotation_angle, OptimizationParameter):
-                rot = trial.suggest_float(
-                    "rotation_angle",
-                    rotation_angle.low,
-                    rotation_angle.high,
-                    log=rotation_angle.log,
-                )
-            else:
-                rot = rotation_angle
-
-            self.reconstruct(
-                override_aberration_coefs=trial_aberrations,
-                override_rotation_angle=rot,
-                verbose=False,
-                **reconstruct_kwargs,
-            )
-            return float(self.variance_loss())
-
-        study = optuna.create_study(direction="minimize", sampler=sampler)
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=verbose)
-
-        # Write back optimized results
-        best = study.best_params.copy()
-        state.optimized_rotation_angle = best.pop("rotation_angle", None)
-
-        if state.optimized_rotation_angle is None and rotation_angle is not None:
-            state.optimized_rotation_angle = rotation_angle  # ty:ignore[invalid-assignment]
-
-        state.optimized_aberrations = best
-        state.optimized_aberrations = state.current_aberrations(fixed_override_aberrations)
-        state.study = study
-
-        if verbose:
-            print("Optimized state:\n\n", self.hyperparameter_state)
-
-        self.reconstruct(verbose=False, **reconstruct_kwargs)
-        return self
-
-    def grid_search_hyperparameters(
-        self,
-        aberration_coefs: dict[str, float | OptimizationParameter] | None = None,
-        rotation_angle: float | OptimizationParameter | None = None,
-        verbose=None,
-        **reconstruct_kwargs,
-    ):
-        if verbose is None:
-            verbose = self.verbose
-
-        aberration_coefs = aberration_coefs or {}
-        state = self.hyperparameter_state
-
-        # Reset optimized bookkeeping
-        state.clear_optimized()
-
-        # Partition inputs
-        fixed_override_aberrations: dict[str, float] = {}
-        optimizable_aberrations: dict[str, OptimizationParameter] = {}
-
-        for name, val in aberration_coefs.items():
-            if isinstance(val, OptimizationParameter):
-                optimizable_aberrations[name] = val
-                state.optimized_keys.add(name)
-            else:
-                fixed_override_aberrations[name] = val
-
-        optimize_rotation = isinstance(rotation_angle, OptimizationParameter)
-        if optimize_rotation:
-            state.optimized_keys.add("rotation_angle")
-
-        # Build parameter grid (only over optimizable parameters)
-        param_grid: dict[str, list[float]] = {}
-
-        for name, param in optimizable_aberrations.items():
-            param_grid[name] = param.grid_values()
-
-        if optimize_rotation:
-            param_grid["rotation_angle"] = (
-                rotation_angle.grid_values()  # ty:ignore[possibly-missing-attribute]
-            )
-
-        # Cartesian product
-        keys = list(param_grid.keys())
-        grid = list(product(*(param_grid[k] for k in keys)))
-
-        best_loss = float("inf")
-        best_params: dict[str, float] | None = None
-        results = []
-
-        for combo in tqdm(grid, disable=not verbose):
-            trial_params = dict(zip(keys, combo))
-
-            trial_aberrations = dict(fixed_override_aberrations)
-            trial_aberrations.update(
-                {k: v for k, v in trial_params.items() if k != "rotation_angle"}
-            )
-
-            if optimize_rotation:
-                rot = trial_params["rotation_angle"]
-            else:
-                rot = rotation_angle
-
-            self.reconstruct(
-                override_aberration_coefs=trial_aberrations,
-                override_rotation_angle=rot,
-                verbose=False,
-                **reconstruct_kwargs,
-            )
-
-            loss = float(self.variance_loss())
-            results.append((trial_params, loss))
-
-            if loss < best_loss:
-                best_loss = loss
-                best_params = trial_params
-
-        self._grid_search_results = results
-
-        # Write back best optimized values
-        if best_params is not None:
-            best_params = best_params.copy()
-            state.optimized_rotation_angle = best_params.pop("rotation_angle", None)
-            state.optimized_aberrations = best_params
-
-        if state.optimized_rotation_angle is None and rotation_angle is not None:
-            state.optimized_rotation_angle = rotation_angle  # ty:ignore[invalid-assignment]
-
-        state.optimized_aberrations = state.current_aberrations(fixed_override_aberrations)
-
-        if verbose:
-            print("Optimized state:\n\n", self.hyperparameter_state)
-
-        # Final reconstruction using merged state
-        self.reconstruct(verbose=False, **reconstruct_kwargs)
-        return self
-
-    def _return_lateral_shifts(
-        self,
-        rotation_angle,
-        aberration_coefs,
-        bf_mask,
-    ):
-        # Get initial shifts
-        kxa, kya = spatial_frequencies(
-            self.gpts,
-            self.sampling,
-            rotation_angle=_rotation_degrees_to_radians(rotation_angle),
-            device=self.device,
-        )
-        k, phi = polar_coordinates(kxa, kya)
-
-        dx, dy = aberration_surface_cartesian_gradients(
-            k * self.wavelength,
-            phi,
-            aberration_coefs=aberration_coefs,
-        )
-        grad_k = torch.stack((dx[bf_mask], dy[bf_mask]), -1)
-        lateral_shifts = grad_k / 2 / np.pi
-        return lateral_shifts
 
     def fit_hyperparameters_cross_correlation(
         self,
@@ -1550,7 +1187,8 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         # ---------------------------------------------------------
         # Solve LS
         # ---------------------------------------------------------
-        sol = torch.linalg.lstsq(A, b).solution
+        # Fall back to CPU (to support MPS), as fit_linear_plane does for eigh
+        sol = torch.linalg.lstsq(A.cpu(), b.cpu()).solution.to(A.device)
 
         delta_cartesian = {name: sol[i] for i, name in enumerate(cartesian_basis)}
 
@@ -1680,18 +1318,6 @@ class DirectPtychography(RNGMixin, AutoSerialize):
         ]
 
         return recons
-
-    def _make_checkerboard_bf_masks(self, gpts, bf_mask):
-        """ """
-        i_coords = torch.arange(gpts[0], device=self.device)
-        j_coords = torch.arange(gpts[1], device=self.device)
-        i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing="ij")
-        checkerboard = torch.fft.ifftshift(((i_grid + j_grid) % 2).bool())
-
-        bf1 = bf_mask & checkerboard
-        bf2 = bf_mask & (~checkerboard)
-
-        return [bf1, bf2]
 
     def _reconstruct_with_halfsets(self, verbose=None, **reconstruct_kwargs):
         """

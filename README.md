@@ -14,7 +14,7 @@
 - **Tomography**: fast and accurate HAADF tomography using implicit representations ([Lim et al., 2025](https://arxiv.org/abs/2512.08113)).
 - **Imaging**: drift correction and lattice analysis for (S)TEM images.
 - **Data structures & I/O**: a unified `Dataset` hierarchy that reads common electron-microscopy formats and serializes to [Zarr](https://zarr.dev/).
-- **Visualization**: publication-quality figures with perceptually-uniform colormaps.
+- **Visualization**: publication-quality figures with perceptually-uniform colormaps; for interactive, GPU-accelerated visualization, see the companion [quantem.widget](https://github.com/electronmicroscopy/quantem.widget) repository.
 - **GPU-accelerated & ML-ready**: a PyTorch backend with neural object representations and multi-GPU / multi-node reconstruction.
 - **Spectroscopy**: GPU-accelerated spectra fitting for EDS and EELS, under development.
 - **Diffraction**: multi-angle precession electron diffraction (MAPED), under development ([Ribet et al., 2025](https://doi.org/10.1093/mam/ozaf103)).
@@ -39,6 +39,8 @@ For custom CUDA kernels that accelerate tomography, ptychography, and io behind 
 
 The [quantem-tutorials](https://github.com/electronmicroscopy/quantem-tutorials) repository contains Jupyter notebooks that walk through the main workflows for each module.
 
+For interactive visualization in notebooks, command-line workflows, standalone HTML exports, and browser WebGPU, see [quantem.widget](https://github.com/electronmicroscopy/quantem.widget). Its [documentation](https://electronmicroscopy.github.io/quantem.widget/) covers installation, tutorials, supported backends, and complete visualization workflows.
+
 ## Citing
 
 If you use quantem in your research, please cite this repository as well as the relevant paper(s) for any module(s) that you used:
@@ -49,6 +51,7 @@ If you use quantem in your research, please cite this repository as well as the 
 - **Direct ptychography**: Varnavides, G., Bekkevold, J. M., Ribet, S. M., Scott, M. C., Jones, L., & Ophus, C. (2026). *Relaxing Direct Ptychography Sampling Requirements via Parallax Imaging Insights.* Microscopy and Microanalysis, 32(2), ozaf139. https://doi.org/10.1093/mam/ozaf139
 - **Electron tomography (implicit neural representations)**: Lim, C., Casert, C., McCray, A. R. C., Lee, S., Barnum, A., Dionne, J., & Ophus, C. (2025). *Missing Wedge Inpainting and Joint Alignment in Electron Tomography through Implicit Neural Representations.* arXiv:2512.08113. https://arxiv.org/abs/2512.08113
 - **Multi-angle precession electron diffraction (MAPED)**: Ribet, S. M., Dhall, R., Ophus, C., & Bustillo, K. C. (2025). *Multi-angle Precession Electron Diffraction (MAPED): A Versatile Approach to 4D-STEM Precession.* Microscopy and Microanalysis, 31(6), ozaf103. https://doi.org/10.1093/mam/ozaf103
+- **quantEM interactive visualization framework**: Lee, S., et al. (2026). *Interactive Framework for Real-Time 4DSTEM Analysis and Reconstruction.* Microscopy and Microanalysis, 32(Supplement 1), ozag053.941. https://doi.org/10.1093/mam/ozag053.941
 
 
 ## Contributing

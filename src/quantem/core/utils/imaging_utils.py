@@ -23,6 +23,19 @@ def dft_upsample(
     Manuel Guizar-Sicairos, Samuel T. Thurman, and James R. Fienup, "Efficient subpixel
     image registration algorithms," Opt. Lett. 33, 156-158 (2008).
     http://www.sciencedirect.com/science/article/pii/S0045790612000778
+
+    Evaluates the inverse transform of ``F`` on a ``(2*du+1)`` square grid of spacing
+    ``1/up``, centered on ``shift``, where ``du = ceil(1.5 * up)``. The center tap is
+    therefore index ``du``, not ``up``.
+
+    Parameters
+    ----------
+    F : ndarray
+        Fourier-domain array, in FFT (unshifted) order.
+    up : int
+        Upsampling factor. The output samples ``shift + arange(-du, du+1) / up``.
+    shift : tuple of float
+        Position, in pixels of the *real-space* image, to center the fine grid on.
     """
     if device == "gpu":
         import cupy as cp  # type: ignore
@@ -33,17 +46,17 @@ def dft_upsample(
 
     M, N = F.shape
     du = np.ceil(1.5 * up).astype(int)
-    row = np.arange(-du, du + 1)
-    col = np.arange(-du, du + 1)
-    r_shift = shift[0] - M // 2
-    c_shift = shift[1] - N // 2
+    span = np.arange(-du, du + 1)
 
-    kern_row = np.exp(
-        -2j * np.pi / (M * up) * np.outer(row, xp.fft.ifftshift(xp.arange(M)) - M // 2 + r_shift)
-    )
-    kern_col = np.exp(
-        -2j * np.pi / (N * up) * np.outer(xp.fft.ifftshift(xp.arange(N)) - N // 2 + c_shift, col)
-    )
+    # frequency of FFT bin m, i.e. `ifftshift` of the centered ramp
+    freq_row = xp.fft.ifftshift(xp.arange(M)) - M // 2
+    freq_col = xp.fft.ifftshift(xp.arange(N)) - N // 2
+
+    # The offset re-centers the *output* sampling positions -- `shift + span/up` -- rather
+    # than translating the input frequencies, and the sign is the inverse transform's, so
+    # that this agrees with `ifft2` where the two grids coincide.
+    kern_row = xp.exp(2j * np.pi / (M * up) * np.outer(span + up * shift[0], freq_row))
+    kern_col = xp.exp(2j * np.pi / (N * up) * np.outer(freq_col, span + up * shift[1]))
     return xp.real(kern_row @ F @ kern_col)
 
 
@@ -142,7 +155,9 @@ def cross_correlation_shift(
         except (IndexError, ValueError):
             dxf = dyf = 0.0
 
-        shifts = np.array([x0, y0]) + (np.array(peak) - upsample_factor) / upsample_factor
+        # the fine grid is centered on its middle tap, `ceil(1.5 * upsample_factor)`
+        center = np.ceil(1.5 * upsample_factor).astype(int)
+        shifts = np.array([x0, y0]) + (np.array(peak) - center) / upsample_factor
         shifts += np.array([dxf, dyf]) / upsample_factor
 
     shifts = (shifts + 0.5 * np.array(cc.shape)) % cc.shape - 0.5 * np.array(cc.shape)

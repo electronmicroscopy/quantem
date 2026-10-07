@@ -18,13 +18,10 @@ Getting started:
 - [install uv](https://docs.astral.sh/uv/getting-started/installation/)
 - `git clone` the repo and `cd` into the directory
 - run `uv sync` to install all the dependencies in an editable environment
-- run `uv sync --all-packages` to also install `quantem.widget` (optional)
 
-For widget developers (requires [Node.js](https://nodejs.org/)):
+### Interactive visualization and widget development
 
-- `cd widget && npm install` to install JS dependencies
-- `npm run build` to build the widget
-- `npm run dev` to watch for changes during development
+The interactive visualization package is maintained separately in the [quantem.widget](https://github.com/electronmicroscopy/quantem.widget) repository. To run the widgets, follow its [installation guide](https://electronmicroscopy.github.io/quantem.widget/install.html). To contribute to the Python, TypeScript, or WebGPU widget code, clone that repository and follow its [contributing guide](https://github.com/electronmicroscopy/quantem.widget/blob/main/CONTRIBUTING.md) for the development setup and checks.
 
 The following will set up the pre-commit and [ruff](https://github.com/astral-sh/ruff) for linting and formatting. These commands only need to be run once when first setting up your dev environment: 
 

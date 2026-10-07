@@ -417,7 +417,7 @@ class TestObjectTensorDecompUnit:
         assert isinstance(obj.model.density_activation, nn.Identity)  # identity, not softplus
         # force the whole potential negative via the (zero-weight) decoder bias
         with torch.no_grad():
-            obj.model.sigma_net.bias.fill_(-0.5) # type:ignore 
+            obj.model.sigma_net.bias.fill_(-0.5)  # type:ignore
         assert float(obj._materialize_obj().min()) == pytest.approx(-0.5, abs=1e-3)
         obj.constraints = {"positivity_weight": 1.0}
         assert float(obj._sampled_positivity_loss(1.0)) == pytest.approx(0.5, abs=0.05)

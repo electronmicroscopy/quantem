@@ -184,6 +184,10 @@ def validate_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     """
     Validate and convert shape to a tuple of integers.
 
+    Zero-length axes are allowed: an empty fixed-grid selection such as
+    ``vector[[], :]`` has shape ``(0, n)``, and copying or rebuilding it has to
+    round-trip that shape back through this validator.
+
     Parameters
     ----------
     shape : tuple[int, ...]
@@ -197,7 +201,7 @@ def validate_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     Raises
     ------
     ValueError
-        If shape contains non-positive integers
+        If shape contains negative integers
     TypeError
         If shape is not a tuple or contains non-integer values
     """
@@ -208,8 +212,8 @@ def validate_shape(shape: tuple[int, ...]) -> tuple[int, ...]:
     for dim in shape:
         if not isinstance(dim, int):
             raise TypeError(f"Shape dimensions must be integers, got {type(dim)}")
-        if dim <= 0:
-            raise ValueError(f"Shape dimensions must be positive, got {dim}")
+        if dim < 0:
+            raise ValueError(f"Shape dimensions must be non-negative, got {dim}")
         validated.append(dim)
 
     return tuple(validated)

@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from math import ceil
 from typing import Literal, Union, overload
 
@@ -8,6 +9,32 @@ from scipy.optimize import curve_fit
 from quantem.core.utils import array_funcs as af
 
 ArrayLike = Union[np.ndarray, "torch.Tensor"]
+
+
+@dataclass
+class OptimizationParameter:
+    """Specification for a parameter to optimize.
+
+    Shared by the iterative and direct hyperparameter searches, which both test candidate
+    specifications with ``isinstance``. It lives here, rather than in either of them, so
+    that there is only ever one class and a value built for one search is accepted by the
+    other. It is re-exported from ``direct_ptychography`` and ``optimize_hyperparameters``,
+    which are the paths callers already use.
+    """
+
+    low: float
+    high: float
+    log: bool = False
+    n_points: int | None = None
+
+    def grid_values(self):
+        """Return an array of grid values for this parameter."""
+        if self.n_points is None:
+            raise ValueError("n_points must be specified for grid search parameters.")
+        if self.log:
+            return np.geomspace(self.low, self.high, self.n_points)
+        else:
+            return np.linspace(self.low, self.high, self.n_points)
 
 
 # TODO: figure out what here should be put into ptycho base vs kept in a utilities file
