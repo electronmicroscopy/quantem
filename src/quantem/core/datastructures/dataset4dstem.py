@@ -1,3 +1,4 @@
+from os import PathLike
 from typing import Any, Self
 
 import matplotlib.pyplot as plt
@@ -8,6 +9,10 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
+from quantem.core.utils.diffractive_imaging_utils import (
+    fit_probe_circle as _fit_probe_circle,
+)
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -72,12 +77,22 @@ class Dataset4dstem(Dataset4d):
         signal_units : str, optional
             Units for the array values, by default "arb. units"
         metadata : dict
-            "r_to_q_rotation_cw_deg":  rotation r to q clockwise in degrees
-            "ellipticity": 3 parameters (a, b, theta (degrees))
+            Missing keys below are set to None.
+
+            "q_to_r_rotation_ccw_deg" : float
+                Rotation in degrees that maps detector (q) vectors onto the
+                scan (r) frame. A detector vector (dr, dc) is first swapped to
+                (dc, dr) if "q_transpose" is True, then rotated as
+                dr' = cos(t) dr - sin(t) dc, dc' = sin(t) dr + cos(t) dc.
+            "q_transpose" : bool
+                If True, swap the detector row and column axes before the
+                rotation.
+            "ellipticity" : tuple
+                3 parameters (a, b, theta in degrees).
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
-        mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
+        mdata_keys_4dstem = ["q_to_r_rotation_ccw_deg", "q_transpose", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
                 metadata[k] = None
@@ -97,15 +112,15 @@ class Dataset4dstem(Dataset4d):
         self._virtual_detectors = {}  # Store detector information for regeneration
 
     @classmethod
-    def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
+    def from_file(cls, file_path: str | PathLike, file_type: str | None = None) -> "Dataset4dstem":
         """
         Create a new Dataset4dstem from a file.
 
         Parameters
         ----------
-        file_path : str
+        file_path : str | PathLike
             Path to the data file
-        file_type : str
+        file_type : str | None
             The type of file reader needed. See rosettasciio for supported formats
             https://hyperspy.org/rosettasciio/supported_formats/index.html
 
@@ -273,6 +288,39 @@ class Dataset4dstem(Dataset4d):
             self._dp_mean = dp_mean_dataset
 
         return dp_mean_dataset
+
+    def fit_probe_circle(
+        self,
+        array: NDArray | Dataset2d | None = None,
+        threshold: float | None = None,
+        show: bool = True,
+    ) -> tuple[float, float, float]:
+        """Fit a circle to the probe in a diffraction pattern.
+
+        Parameters
+        ----------
+        array : NDArray | Dataset2d | None, optional
+            2D diffraction pattern to fit, either as an array or a Dataset2d. If
+            None, uses this dataset's mean diffraction pattern, computing it if needed.
+        threshold : float | None, optional
+            Threshold for binarizing the diffraction pattern. If None, Otsu's method
+            is used.
+        show : bool, optional
+            Whether to display the fitted circle, by default True.
+
+        Returns
+        -------
+        tuple[float, float, float]
+            Probe center in diffraction-pattern row and column coordinates
+            (probe_qy0, probe_qx0), followed by the fitted radius.
+        """
+        if array is None:
+            dp_mean = (
+                self._dp_mean if hasattr(self, "_dp_mean") else self.get_dp_mean(attach=False)
+            )
+            array = dp_mean.array
+
+        return _fit_probe_circle(array, threshold=threshold, show=show)
 
     @property
     def dp_max(self) -> Dataset2d:
@@ -566,7 +614,15 @@ class Dataset4dstem(Dataset4d):
 
         return (distance >= r_inner) & (distance <= r_outer)
 
-    def show_virtual_images(self, figsize: tuple[int, int] | None = None, **kwargs) -> tuple:
+    def show_virtual_images(
+        self,
+        figsize: tuple[int, int] | None = None,
+        *,
+        positions: list[tuple[int, int]] | None = None,
+        position_color: str = "red",
+        position_size: float = 60.0,
+        **kwargs,
+    ) -> tuple:
         """
         Display all virtual images stored in the dataset using show_2d.
 
@@ -574,6 +630,13 @@ class Dataset4dstem(Dataset4d):
         ----------
         figsize : tuple[int, int] | None, optional
             Figure size in inches. If None, automatically calculated based on number of images
+        positions : list of tuple of int, optional
+            ``(row, col)`` scan positions to mark on every image, e.g. the
+            positions used to tune Bragg disk detection.
+        position_color : str, default="red"
+            Color of the position markers.
+        position_size : float, default=60.0
+            Area of the position markers in points squared.
         **kwargs
             Additional keyword arguments passed to show_2d (e.g., cmap, norm, cbar, etc.)
 
@@ -623,7 +686,119 @@ class Dataset4dstem(Dataset4d):
             kwargs.setdefault("scalebar", [scalebar] + [False] * (len(arrays) - 1))
         fig, axs = show_2d(arrays_organized, title=titles_organized, figsize=figsize, **kwargs)
 
+        if positions is not None and len(positions) > 0:
+            pos = np.asarray(positions, dtype=float).reshape(-1, 2)
+            for ax in np.atleast_1d(np.asarray(axs, dtype=object)).ravel():
+                ax.scatter(
+                    pos[:, 1],
+                    pos[:, 0],
+                    s=position_size,
+                    facecolors="none",
+                    edgecolors=position_color,
+                    linewidths=1.5,
+                )
+
         return fig, axs
+
+    def show_virtual_detectors(
+        self,
+        names: str | list[str] | None = None,
+        *,
+        colors: list[str] | None = None,
+        alpha: float = 0.2,
+        linewidth: float = 1.5,
+        legend: bool = True,
+        **kwargs,
+    ) -> tuple:
+        """Show the mean diffraction pattern with the virtual detectors drawn on it.
+
+        Every detector attached by :meth:`get_virtual_image` is drawn on a single
+        mean pattern, so their placement relative to the direct beam and the
+        diffracted rings can be checked at a glance.
+
+        Parameters
+        ----------
+        names : str or list of str, optional
+            Detector(s) to draw. ``None`` (default) draws all attached detectors.
+        colors : list of str, optional
+            One color per detector; defaults to the matplotlib color cycle.
+        alpha : float, default=0.2
+            Opacity of the filled detector area. Set to 0 for outlines only.
+        linewidth : float, default=1.5
+            Width of the detector outline.
+        legend : bool, default=True
+            If ``True``, label the detectors in a legend.
+        **kwargs
+            Passed to :func:`~quantem.core.visualization.show_2d`; ``norm``,
+            ``scalebar`` and ``title`` have diffraction-pattern defaults.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)`` from :func:`~quantem.core.visualization.show_2d`.
+        """
+        if not self._virtual_detectors:
+            raise ValueError("No virtual detectors attached. Create one with get_virtual_image().")
+        if names is None:
+            names = list(self._virtual_detectors)
+        elif isinstance(names, str):
+            names = [names]
+        missing = [n for n in names if n not in self._virtual_detectors]
+        if missing:
+            raise ValueError(
+                f"Virtual detector(s) {missing} not found. "
+                f"Available detectors: {list(self._virtual_detectors)}"
+            )
+
+        if colors is None:
+            cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["red"])
+            colors = [cycle[i % len(cycle)] for i in range(len(names))]
+
+        dp_mean = self.dp_mean
+        kwargs.setdefault("norm", {"power": 0.4, "upper_quantile": 0.999})
+        kwargs.setdefault("title", "mean DP with virtual detectors")
+        kwargs.setdefault(
+            "scalebar", ScalebarConfig(sampling=self.sampling[2], units=self.units[2])
+        )
+        fig, ax = show_2d(dp_mean.array, **kwargs)
+
+        for name, color in zip(names, colors):
+            det = self._virtual_detectors[name]
+            mode, geometry, mask = det["mode"], det["geometry"], det["mask"]
+            if mask is not None:
+                ax.contour(mask, levels=[0.5], colors=[color], linewidths=linewidth)
+                ax.plot([], [], color=color, linewidth=linewidth, label=name)
+                continue
+            (cy, cx) = geometry[0]
+            if mode == "circle":
+                radius = geometry[1]
+                ax.add_patch(
+                    Circle((cx, cy), radius, color=color, fill=True, alpha=alpha, label=name)
+                )
+                ax.add_patch(
+                    Circle((cx, cy), radius, color=color, fill=False, linewidth=linewidth)
+                )
+            elif mode == "annular":
+                r_inner, r_outer = geometry[1]
+                ax.add_patch(
+                    Wedge(
+                        (cx, cy),
+                        r_outer,
+                        0,
+                        360,
+                        width=r_outer - r_inner,
+                        color=color,
+                        fill=True,
+                        alpha=alpha,
+                        label=name,
+                    )
+                )
+                for r in (r_inner, r_outer):
+                    ax.add_patch(Circle((cx, cy), r, color=color, fill=False, linewidth=linewidth))
+
+        if legend:
+            ax.legend(loc="upper right", framealpha=0.8)
+        return fig, ax
 
     def regenerate_virtual_images(self) -> None:
         """
@@ -798,3 +973,5 @@ class Dataset4dstem(Dataset4d):
             self.array[:, :, index_x, index_y] = np.median(
                 self.array[:, :, x_min:x_max, y_min:y_max], axis=(2, 3)
             )
+
+    polar_transform = dataset4dstem_polar_transform

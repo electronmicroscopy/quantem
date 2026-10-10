@@ -48,6 +48,8 @@ dependencies = [
   "optuna>=4.5.0",
   "hdf5plugin>=6.0.0",
   "torchinfo>=1.8.0",
+  "ase>=3.23",
+  "spglib>=2.5",
   "em-database>=0.5",
 ]
 

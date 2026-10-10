@@ -335,6 +335,11 @@ def _normalize_length_units(length_units: float, units: str) -> tuple[float, str
     return length_units, units
 
 
+# Minimum AnchoredSizeBar padding (fraction of the font size) when a box is
+# drawn behind the scale bar, so the box does not clip the label.
+_SCALEBAR_BOX_MIN_PAD = 0.35
+
+
 def add_scalebar_to_ax(
     ax: Axes,
     array_size: float,
@@ -347,6 +352,9 @@ def add_scalebar_to_ax(
     loc: str | int,
     fontsize: int = 12,
     bold: bool = True,
+    box: bool = False,
+    box_color: str = "black",
+    box_alpha: float = 0.5,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -375,6 +383,18 @@ def add_scalebar_to_ax(
         Font size of the scale bar label in points.
     bold : bool
         Whether to render the scale bar label in bold.
+    box : bool, default=False
+        Draw a translucent box behind the bar and label so it stays
+        readable on any image (e.g. white bar on a black box, or black bar
+        on a white box). The padding is raised to at least
+        ``_SCALEBAR_BOX_MIN_PAD`` (fraction of the font size) so the box clears the
+        label. ``box``, ``box_color`` and ``box_alpha`` are only available when
+        calling this function directly; ScalebarConfig and show_2d do not
+        pass them.
+    box_color : str, default="black"
+        Fill color of the box.
+    box_alpha : float, default=0.5
+        Opacity of the box.
     """
     from matplotlib.font_manager import FontProperties
 
@@ -403,14 +423,16 @@ def add_scalebar_to_ax(
         length_px,
         label,
         loc,
-        pad=pad_px,
+        pad=pad_px if not box else max(pad_px, _SCALEBAR_BOX_MIN_PAD),
         color=color,
-        frameon=False,
+        frameon=box,
         label_top=label_top,
         size_vertical=int(width_px),
         fontproperties=fontprops,
         sep=2 if label_top else int(round(0.3 * fontsize)),
     )
+    if box:
+        bar.patch.set(facecolor=box_color, edgecolor="none", alpha=box_alpha)
     ax.add_artist(bar)
 
 
@@ -452,7 +474,9 @@ def add_cbar_to_ax(
 
     formatter = ticker.ScalarFormatter(useMathText=True)
     formatter.set_scientific(True)
-    formatter.set_powerlimits((-1, 1))
+    # only fall back to a shared exponent for genuinely extreme ranges: a
+    # correlation running 0 to 0.8 should read 0.0, 0.2, ... not 0, 2 x 10^-1
+    formatter.set_powerlimits((-3, 4))
 
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     cb = fig.colorbar(sm, cax=cax, ticks=ticks, format=formatter)
