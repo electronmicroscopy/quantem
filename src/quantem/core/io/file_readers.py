@@ -375,6 +375,36 @@ def detect_multipass(
     return results
 
 
+def _find_split_eels_files(folder: Path) -> dict[str, Path | None] | None:
+    """Detect the split-file dual-EELS layout (see `find_stem_si_files()`).
+    Returns None unless both an `EELS LL SI.dm4` and an `EELS HL SI.dm4` exist."""
+
+    def _channel(tag: str) -> Path | None:
+        # "(12) Spectrum of EELS LL SI.dm4" etc. are extracted 1D spectra / pickers
+        # that also end in "EELS LL SI.dm4" -- not the spectrum image itself.
+        cands = [
+            p
+            for p in sorted(folder.glob(f"*EELS {tag} SI.dm4"))
+            if not any(k in p.name.lower() for k in ("spectrum of", "picker", "postacq"))
+        ]
+        exact = [p for p in cands if p.name == f"EELS {tag} SI.dm4"]
+        return (exact or cands or [None])[0]
+
+    ll_path, hl_path = _channel("LL"), _channel("HL")
+    if ll_path is None or hl_path is None:
+        return None
+    adf_path = folder / "ADF Image.dm4"
+    return {
+        "dm4": hl_path,
+        "adf_raw": None,
+        "eels_hl_raw": None,
+        "eels_ll_raw": None,
+        "dm4_ll": ll_path,
+        "dm4_hl": hl_path,
+        "dm4_adf": adf_path if adf_path.exists() else None,
+    }
+
+
 def find_stem_si_files(folder: str | PathLike) -> dict[str, Path | None]:
     """
     Locate the DM4 header + raw sidecars for a STEM SI acquisition folder,
@@ -384,8 +414,21 @@ def find_stem_si_files(folder: str | PathLike) -> dict[str, Path | None]:
         STEM SI_ADF Image.raw
         STEM SI_EELS HL SI.raw
         STEM SI_EELS LL SI.raw
+
+    Also recognizes the "split-file" layout, where DigitalMicrograph saved
+    each channel of a (single-pass) dual-EELS acquisition as its own DM4:
+
+        EELS LL SI.dm4
+        EELS HL SI.dm4
+        ADF Image.dm4        (optional, co-registered with the scan)
+
+    In that case the returned dict additionally carries `"dm4_ll"`,
+    `"dm4_hl"` and `"dm4_adf"`, and `"dm4"` points at the HL file.
     """
     folder = Path(folder)
+    split = _find_split_eels_files(folder)
+    if split is not None:
+        return split
     dm4_candidates = sorted(folder.glob("*SI.dm4")) or sorted(folder.glob("*.dm4"))
     # "Picker of ..." and "... PostAcq ..." files are auxiliary DM4s (drift
     # reference / post-acquisition survey images) that also match "*SI.dm4"
@@ -422,6 +465,8 @@ def describe_folder(folder: str | PathLike) -> dict[str, DM4ObjectInfo]:
     for k, v in files.items():
         print(f"  {k}: {v.name if v else '(not found)'}")
     info = detect_multipass(files["dm4"])
+    if files.get("dm4_ll") is not None:
+        info = {**detect_multipass(files["dm4_ll"]), **info}
     for name, o in info.items():
         tag = "MULTI-PASS" if o.is_multipass else "single-pass"
         print(f"  [{tag}] {name}: frames={o.n_frames}, dims={o.dims}, dtype={o.dtype}")
@@ -1037,8 +1082,54 @@ class StemEelsRaw(AutoSerialize):
         self.pass_shifts_px = pass_shifts_px
 
 
+def _load_split_files(files: dict[str, Path | None]) -> StemEelsRaw:
+    """Load the split-file dual-EELS layout (`EELS LL SI.dm4` + `EELS HL SI.dm4`,
+    optional `ADF Image.dm4`) -- see `find_stem_si_files()`. Single-pass only."""
+    from rsciio.digitalmicrograph import file_reader
+
+    ll_path, hl_path, adf_path = files["dm4_ll"], files["dm4_hl"], files.get("dm4_adf")
+    assert ll_path is not None and hl_path is not None
+    eels_ll = read_3d_spectroscopy(str(ll_path), file_type="digitalmicrograph", data_type="EELS")
+    eels_hl = read_3d_spectroscopy(str(hl_path), file_type="digitalmicrograph", data_type="EELS")
+    if tuple(eels_ll.shape[:2]) != tuple(eels_hl.shape[:2]):
+        raise ValueError(
+            f"LL and HL scan shapes differ in {ll_path.parent}: "
+            f"{tuple(eels_ll.shape[:2])} vs {tuple(eels_hl.shape[:2])}"
+        )
+
+    adf = None
+    if adf_path is not None:
+        adf_2d = [d["data"] for d in file_reader(str(adf_path)) if np.ndim(d["data"]) == 2]
+        if adf_2d:
+            adf = np.asarray(adf_2d[0])
+
+    pixel_size_nm = None
+    unit = str(eels_ll.units[0] or "").lower()
+    if unit == "nm":
+        pixel_size_nm = float(eels_ll.sampling[0])
+    elif unit in ("um", "µm", "micron", "microns"):
+        pixel_size_nm = float(eels_ll.sampling[0]) * 1000.0
+
+    return StemEelsRaw(
+        folder=hl_path.parent,
+        dm4_path=hl_path,
+        is_multipass=False,
+        n_passes=1,
+        eels_ll=eels_ll,
+        eels_hl=eels_hl,
+        adf=adf,
+        energy_axis_ll=getattr(eels_ll, "energy_axis", None),
+        energy_axis_hl=getattr(eels_hl, "energy_axis", None),
+        pixel_size_nm=pixel_size_nm,
+        passes_used=None,
+        combine_method=None,
+    )
+
+
 def _load_single_pass(
-    dm4_path: Path, eels_infos: dict[str, DM4ObjectInfo] | None = None
+    dm4_path: Path,
+    eels_infos: dict[str, DM4ObjectInfo] | None = None,
+    obj_info: dict[str, DM4ObjectInfo] | None = None,
 ) -> StemEelsRaw:
     from rsciio.digitalmicrograph import file_reader
 
@@ -1049,7 +1140,13 @@ def _load_single_pass(
     # only returns a subset of ImageList objects (e.g. it drops non-image
     # entries), renumbered from 0. rsciio does carry the original DM4 object
     # name in each entry's metadata.General.title, so datasets are matched
-    # by that name instead of reusing the ncempy index directly.
+    # by that name instead of reusing the ncempy index directly. Confirmed
+    # on real data (05-15-2026_STEM_ELLS_Mono_pg3T2, 90 meV dispersion
+    # acquisitions): rsciio's data_list can also DROP an object entirely
+    # (there the ADF survey image wasn't retrievable via its own ncempy
+    # getDataset() index either), which is exactly why ADF below falls back
+    # to the previous fixed-index behavior rather than erroring when its
+    # name isn't found in `all_data`.
     def _rsciio_index_by_title(name: str) -> int | None:
         for i, d in enumerate(all_data):
             if d.get("metadata", {}).get("General", {}).get("title") == name:
@@ -1081,7 +1178,43 @@ def _load_single_pass(
         dataset_index=hl_dataset_index,
     )
 
-    adf = all_data[1]["data"] if len(all_data) > 1 else None
+    # Match the ADF object by name too (same "adf", exclude "postacq"
+    # convention `load_multipass_raw_stacks()` uses below), instead of
+    # assuming it always sits at rsciio data_list position 1 -- that
+    # assumption silently mis-assigned an EELS cube's own data as `.adf`
+    # whenever a file's object ordering didn't happen to match (confirmed
+    # on 05-15-2026_STEM_ELLS_Mono_pg3T2's 90 meV dispersion acquisitions:
+    # `.adf` came out as a (3232, 59, 62) EELS-shaped array instead of a 2D
+    # image). Falls back to the old `all_data[1]` behavior only if no
+    # ADF-named object is found in the tags or it can't be matched by
+    # title in `all_data`, so files that happened to work under the old
+    # assumption keep working.
+    #
+    # Some single-pass DM4 files carry TWO distinct "adf"-named objects:
+    # a separate, lower-magnification "ADF Image (SI Survey)" context image
+    # (own field of view, NOT co-registered with the LL/HL scan -- same
+    # pixel count as the scan purely by coincidence, if at all) and a
+    # "STEM SI_ADF Image" acquired as part of the same SI raster as the
+    # LL/HL channels (same "STEM SI_" prefix as "STEM SI_EELS LL/HL SI"),
+    # i.e. the genuinely co-registered one -- confirmed on real data
+    # (05-15-2026_STEM_ELLS_Mono_pg3T2 / the original InSitu session alike):
+    # "STEM SI_ADF Image" matches the scan's own (ny, nx), "ADF Image (SI
+    # Survey)" does not. Prefer the "STEM SI_"-prefixed one when both exist;
+    # the plain "adf" match remains the fallback for files (e.g. most of
+    # the pg3T2 set) that only ever have the survey-style name.
+    _adf_candidates = [
+        o for n, o in (obj_info or {}).items() if "adf" in n.lower() and "postacq" not in n.lower()
+    ]
+    adf_info = next((o for o in _adf_candidates if "stem si" in o.name.lower()), None)
+    if adf_info is None:
+        adf_info = next(iter(_adf_candidates), None)
+    adf = None
+    if adf_info is not None:
+        adf_dataset_index = _rsciio_index_by_title(adf_info.name)
+        if adf_dataset_index is not None:
+            adf = all_data[adf_dataset_index]["data"]
+    if adf is None and len(all_data) > 1:
+        adf = all_data[1]["data"]
 
     return StemEelsRaw(
         folder=dm4_path.parent,
@@ -1362,6 +1495,8 @@ def read_stem_eels_folder(
     """
     folder = Path(folder)
     files = find_stem_si_files(folder)
+    if files.get("dm4_ll") is not None:
+        return _load_split_files(files)
     dm4_path = files["dm4"]
     assert dm4_path is not None
 
@@ -1376,7 +1511,7 @@ def read_stem_eels_folder(
     is_multipass = any(o.is_multipass for o in eels_infos.values())
 
     if not is_multipass:
-        return _load_single_pass(dm4_path, eels_infos)
+        return _load_single_pass(dm4_path, eels_infos, obj_info)
 
     return _load_multi_pass(
         folder,
@@ -1412,6 +1547,12 @@ def _load_alignment_stack(
     """
     folder = Path(folder)
     files = find_stem_si_files(folder)
+    if files.get("dm4_ll") is not None:
+        # split-file layout (EELS LL SI.dm4 + EELS HL SI.dm4) is always single-pass
+        raise ValueError(
+            f"_load_alignment_stack: {folder} is single-pass (n_passes=1) -- "
+            "nothing to estimate drift over."
+        )
     obj_info = detect_multipass(files["dm4"])
     ll_info = next(
         o
@@ -2251,6 +2392,49 @@ def crop_alignment_border(
         pass_shifts_px=combined_data.pass_shifts_px,
         dropped_passes=getattr(combined_data, "dropped_passes", None),
         drop_reason=getattr(combined_data, "drop_reason", None),
+    )
+
+
+def crop_unacquired_rows(raw: StemEelsRaw) -> StemEelsRaw:
+    """
+    Crop away the scan rows a spectrum-image acquisition never reached.
+
+    When an acquisition is stopped part way through, DigitalMicrograph saves the
+    full requested raster with the unvisited pixels left at exactly zero (whole
+    trailing rows, plus the tail of the row it stopped in). Those all-zero spectra
+    have no ZLP and derail per-pixel ZLP alignment / thickness mapping, so keep
+    only the leading block of rows in which every pixel has LL signal. Returns
+    `raw` itself, untouched, when every row is complete (or none is).
+    """
+    total = np.asarray(raw.eels_ll.array).sum(axis=-1)
+    ny = total.shape[0]
+    complete = (total > 0).all(axis=1)
+    if complete.all() or not complete.any():
+        return raw
+    start = int(np.argmax(complete))
+    incomplete_after = np.flatnonzero(~complete[start:])
+    stop = start + int(incomplete_after[0]) if len(incomplete_after) else ny
+    crop_widths = ((start, stop), (0, total.shape[1]))
+    print(
+        f"crop_unacquired_rows: kept rows [{start}:{stop}] of {ny} -- the rest were "
+        f"never (fully) acquired ({int((total <= 0).sum())} all-zero pixels)"
+    )
+    return StemEelsRaw(
+        folder=raw.folder,
+        dm4_path=raw.dm4_path,
+        is_multipass=raw.is_multipass,
+        n_passes=raw.n_passes,
+        eels_ll=raw.eels_ll.crop(crop_widths, axes=(0, 1)),
+        eels_hl=raw.eels_hl.crop(crop_widths, axes=(0, 1)),
+        adf=raw.adf[start:stop] if raw.adf is not None else None,
+        energy_axis_ll=raw.energy_axis_ll,
+        energy_axis_hl=raw.energy_axis_hl,
+        pixel_size_nm=raw.pixel_size_nm,
+        passes_used=raw.passes_used,
+        combine_method=raw.combine_method,
+        pass_shifts_px=raw.pass_shifts_px,
+        dropped_passes=getattr(raw, "dropped_passes", None),
+        drop_reason=getattr(raw, "drop_reason", None),
     )
 
 

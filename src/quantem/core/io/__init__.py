@@ -32,6 +32,7 @@ from quantem.core.io.file_readers import (
 )
 from quantem.core.io.file_readers import (
     crop_alignment_border as crop_alignment_border,
+    crop_unacquired_rows as crop_unacquired_rows,
 )
 from quantem.core.io.file_readers import (
     suggest_pass_range_for_analysis as suggest_pass_range_for_analysis,
