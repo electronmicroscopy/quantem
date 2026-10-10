@@ -8,7 +8,7 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from quantem.spectroscopy.dataset3deels import Dataset3deels  # noqa: E402
-from quantem.spectroscopy.spectroscopy_visualzitions import (  # noqa: E402
+from quantem.spectroscopy.spectroscopy_visualizations import (  # noqa: E402
     build_hidden_bump_spatial_maps,
 )
 

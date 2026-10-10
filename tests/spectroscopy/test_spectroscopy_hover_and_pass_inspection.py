@@ -1,5 +1,5 @@
 """Tests for the hover / coordinate-reading plots and ``inspect_single_pass``
-(quantem.spectroscopy.spectroscopy_visualzitions)."""
+(quantem.spectroscopy.spectroscopy_visualizations)."""
 
 from types import SimpleNamespace
 
@@ -15,7 +15,7 @@ from matplotlib.text import Annotation  # noqa: E402
 
 import quantem.core.io.file_readers as file_readers  # noqa: E402
 from quantem.spectroscopy.dataset3deels import Dataset3deels  # noqa: E402
-from quantem.spectroscopy.spectroscopy_visualzitions import (  # noqa: E402
+from quantem.spectroscopy.spectroscopy_visualizations import (  # noqa: E402
     attach_hover_to_axes,
     compare_eels_spectra_with_hover,
     inspect_single_pass,

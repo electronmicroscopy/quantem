@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from quantem.spectroscopy.spectroscopy_visualzitions import plot_map_diagnostics
+from quantem.spectroscopy.spectroscopy_visualizations import plot_map_diagnostics
 from quantem.spectroscopy.utils import (
     correlate_with_reference,
     spatial_coherence,

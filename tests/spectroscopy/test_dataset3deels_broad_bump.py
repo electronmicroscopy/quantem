@@ -15,7 +15,7 @@ import pytest
 from scipy.signal import find_peaks
 
 from quantem.spectroscopy.dataset3deels import Dataset3deels
-from quantem.spectroscopy.spectroscopy_visualzitions import detect_broad_bump_via_slope_change
+from quantem.spectroscopy.spectroscopy_visualizations import detect_broad_bump_via_slope_change
 
 ZLP_AMPLITUDE = 1000.0
 ZLP_GAMMA = 0.4  # Lorentzian HWHM-like scale

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from quantem.spectroscopy.dataset3deels import Dataset3deels
-from quantem.spectroscopy.spectroscopy_visualzitions import detect_peaks_whole_range
+from quantem.spectroscopy.spectroscopy_visualizations import detect_peaks_whole_range
 from quantem.spectroscopy.utils import crop_energy_range
 
 E = 250.0 + 0.03 * np.arange(2400)

@@ -1,7 +1,7 @@
 """Tests for the reflected/mirrored-tail ZLP model and the Cherenkov
 radiation feasibility check -- promoted from the sandbox's
 ``pipeline/stem_eels_pipeline.py`` / ``pipeline/build_dataset_notebooks.py``
-into the library proper (``quantem.spectroscopy.spectroscopy_visualzitions``
+into the library proper (``quantem.spectroscopy.spectroscopy_visualizations``
 and ``quantem.spectroscopy.utils`` respectively).
 
 ``build_reflected_zlp_model`` mirrors a spectrum's negative-energy-loss side
@@ -24,7 +24,7 @@ matplotlib.use("Agg")
 import numpy as np
 import pytest
 
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     build_reflected_zlp_model,
     plot_reflected_zlp_steps,
 )
