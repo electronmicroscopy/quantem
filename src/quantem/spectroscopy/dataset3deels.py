@@ -1717,18 +1717,30 @@ class Dataset3deels(Dataset3dspectroscopy):
         mask=None,
         fit_window_fwhm_multiplier=3.5,
         min_total_window_eV=50.0,
+        elastic_cut_eV=None,
     ):
         """
-        Calculates the relative thickness map (t/lambda) using the Log-Ratio method.
+        Calculates the relative thickness map (t/lambda) using the Log-Ratio method,
+        ``t/lambda = ln(I_total / I_0)``: ``I_total`` is the whole recorded spectrum
+        (elastic + inelastic) and ``I_0`` the zero-loss intensity. A spectrum with no
+        inelastic scattering (vacuum) therefore gives 0.
 
         Parameters
         ----------
         zlp_window : float or "auto"
             Half-width (eV) of the window the per-pixel ZLP Gaussian fit is
-            evaluated over (also the half-width of the ZLP integration
-            window). Default ``10`` (unchanged). Pass ``"auto"`` to size it
+            evaluated over. Unless ``elastic_cut_eV`` is given, ``I_0`` is
+            the sum over ``+/- zlp_window / 2`` around the fitted ZLP centre.
+            Default ``10`` (unchanged). Pass ``"auto"`` to size it
             as ``fit_window_fwhm_multiplier * FWHM`` estimated from the
             dataset's mean spectrum -- see ``measure_zlp_offset``.
+        elastic_cut_eV : float, optional
+            If given, ``I_0`` is instead every count up to this many eV above
+            the fitted ZLP centre, the whole negative-loss side included.
+            Use it (about 3 eV) when the ZLP has long tails, e.g. a
+            monochromated beam, where a narrow symmetric window leaves tail
+            counts in the inelastic part and biases t/lambda high. Default
+            ``None`` keeps the symmetric ``zlp_window`` integration.
         mask : ndarray of bool, shape (scan_row, scan_col), optional
             ``True`` marks a pixel to exclude from fitting (e.g. known
             vacuum/dead-detector regions).
@@ -1914,6 +1926,15 @@ class Dataset3deels(Dataset3dspectroscopy):
 
         for i_row in range(scan_row):
             for i_col in range(scan_col):
+                if elastic_cut_eV is not None:
+                    I_zlp[i_row, i_col] = np.sum(
+                        self.array[
+                            i_row,
+                            i_col,
+                            energy_axis <= zlp_measured[i_row, i_col] + elastic_cut_eV,
+                        ]
+                    )
+                    continue
                 I_zlp[i_row, i_col] = np.sum(
                     self.array[
                         i_row,
@@ -1947,7 +1968,10 @@ class Dataset3deels(Dataset3dspectroscopy):
                 UserWarning,
             )
 
-        t_over_lambda = np.log1p((I_total) / (I_zlp))
+        # Log-ratio: ln(I_total / I_0). I_total already contains the elastic counts, so
+        # this is NOT log1p(I_total / I_0) -- that would read ln(2) on a vacuum spectrum.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_over_lambda = np.log(I_total / I_zlp)
 
         # Remove NaN matrix elements
         t_over_lambda = np.nan_to_num(t_over_lambda, nan=0.0, posinf=0.0, neginf=0.0)

@@ -281,3 +281,37 @@ class TestCalculateThicknessLogRatio:
                 zlp_window="auto", plot=False, min_total_window_eV=0
             )
         assert np.isfinite(t_map).all()
+
+    def test_no_inelastic_scattering_gives_zero_not_ln2(self, tilted_zlp_dataset):
+        """Regression: t/lambda = ln(I_total / I_0), not ln(1 + I_total / I_0).
+
+        The fixture is a bare ZLP (vacuum: I_total == I_0), so the thickness must be 0.
+        The old formula returned ln(2) = 0.693 here and was biased high everywhere.
+        """
+        ds, _ = tilted_zlp_dataset
+        t_map = ds.calculate_thickness_log_ratio(zlp_window=2.0, plot=False, min_total_window_eV=0)
+        assert np.abs(t_map).max() < 0.02
+        t_cut = ds.calculate_thickness_log_ratio(
+            zlp_window=1.0, plot=False, min_total_window_eV=0, elastic_cut_eV=1.0
+        )
+        assert np.abs(t_cut).max() < 0.02
+
+    @pytest.mark.parametrize("elastic_cut_eV", [None, 3.0])
+    def test_recovers_known_thickness(self, elastic_cut_eV):
+        """A ZLP of area I_0 plus a loss peak of area (e^t - 1) * I_0 has t/lambda = t."""
+        t_true = 0.7
+        energy = np.linspace(-5.0, 45.0, 1001)
+        zlp = np.exp(-0.5 * (energy / 0.2) ** 2)
+        loss = np.exp(-0.5 * ((energy - 22.0) / 4.0) ** 2)
+        loss *= (np.exp(t_true) - 1.0) * zlp.sum() / loss.sum()
+        array = np.tile(1000.0 * (zlp + loss), (4, 4, 1))
+        ds = Dataset3deels.from_array(
+            array=array,
+            sampling=[1, 1, energy[1] - energy[0]],
+            origin=[0, 0, energy[0]],
+            units=["px", "px", "eV"],
+        )
+        t_map = ds.calculate_thickness_log_ratio(
+            zlp_window=4.0, plot=False, min_total_window_eV=0, elastic_cut_eV=elastic_cut_eV
+        )
+        np.testing.assert_allclose(t_map, t_true, atol=0.01)
