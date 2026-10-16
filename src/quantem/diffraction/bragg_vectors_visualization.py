@@ -564,7 +564,6 @@ def plot_bvm(
         ``(fig, ax)`` with ``ax`` a length-2 array of axes.
     """
     from quantem.core.visualization import show_2d
-
     fig, ax = plt.subplots(1, 2, figsize=figsize)
 
     show_2d(
