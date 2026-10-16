@@ -1,4 +1,6 @@
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,21 +10,29 @@ from scipy.optimize import least_squares
 
 from quantem.core.utils.filter import otsu_threshold
 
+if TYPE_CHECKING:
+    from quantem.core.datastructures.dataset2d import Dataset2d
+
 
 def fit_probe_circle(
-    img: np.ndarray, threshold: Optional[float] = None, show: bool = True
+    img: np.ndarray | Dataset2d, threshold: Optional[float] = None, show: bool = True
 ) -> Tuple[float, float, float]:
     """
     Fit a circle to the probe shape in an image.
 
     Args:
-        img (np.ndarray): Input image containing the probe.
+        img (np.ndarray | Dataset2d): Input diffraction pattern containing the probe.
         threshold (Optional[float]): Threshold for binarization. If None, Otsu's method is used.
         show (bool): Whether to display the fitted circle. Default is True.
 
     Returns:
         Tuple[float, float, float]: Center coordinates (xc, yc) and radius R of the fitted circle.
     """
+    if not isinstance(img, np.ndarray) and hasattr(img, "array"):
+        img = img.array
+    if img.ndim != 2:
+        raise ValueError(f"Expected a 2D diffraction pattern, got shape {img.shape}.")
+
     if threshold is None:
         threshold = otsu_threshold(img)
     binary = ndi.binary_closing(img > threshold, iterations=2)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy as _copy
+import warnings
 from pathlib import Path
 from typing import Any, Literal, Sequence, Union
 
@@ -46,7 +47,7 @@ class BraggVectors(AutoSerialize):
        image (:meth:`make_template_from_probe`).
     2. :meth:`detect_disks` – template-match every scan position; detected peaks
        are stored in :attr:`peaks` (a :class:`Vector` of ``[q_row, q_col,
-       intensity]``, numpy-backed) and accumulated into the Bragg vector map
+       intensity]`` in detector pixels) and accumulated into the Bragg vector map
        :attr:`bvm`.
     3. :meth:`choose_basis_vectors` – pick the lattice basis ``(origin, g1, g2)``
        from the BVM, automatically or by hand; also stores the numbered candidate
@@ -60,10 +61,11 @@ class BraggVectors(AutoSerialize):
     6. :meth:`calculate_strain_map` – hand the lattice vectors (and
        ``mask_weight``) to a :class:`~quantem.diffraction.strain.StrainMap`.
 
-    Detection runs in torch (CPU now, CUDA later); the ragged peak table is held
-    in a numpy-backed :class:`Vector`. The detector→scan rotation is read from
-    the parent dataset metadata (``q_to_r_rotation_ccw_deg`` + ``q_transpose``),
-    the single source of truth shared with the DPC/CoM workflow.
+    Detection runs in torch on :attr:`device` (CPU or GPU); the ragged peak table
+    is held in a torch-backed :class:`Vector`. The detector-to-scan rotation is
+    read from the parent dataset metadata (``q_to_r_rotation_ccw_deg`` and
+    ``q_transpose``), the same keys used by the DPC/CoM workflow, and applied in
+    :meth:`calculate_strain_map`.
 
     Use :meth:`from_dataset` to construct an instance.
 
@@ -93,6 +95,7 @@ class BraggVectors(AutoSerialize):
         self.device = device
 
         self.peaks: Vector | None = None
+        self.calibration = None
         self.bvm: Dataset2d | None = None
 
         self.origin: np.ndarray | None = None
@@ -115,6 +118,8 @@ class BraggVectors(AutoSerialize):
 
         self._template: torch.Tensor | None = None
         self._template_ft: torch.Tensor | None = None
+        # full dataset resident on self.device, set by detect_disks(save_to_gpu=True)
+        self._gpu_cache: torch.Tensor | None = None
         self.metadata: dict[str, Any] = {}
 
     @classmethod
@@ -160,7 +165,8 @@ class BraggVectors(AutoSerialize):
         serialization by default. The detected :attr:`peaks`, lattice fit
         (:attr:`g1_array`/:attr:`g2_array`), Bragg vector map and all diagnostics are
         kept, so the file holds the *results* of the workflow (orders of magnitude
-        smaller than the data) rather than the data itself.
+        smaller than the data) rather than the data itself. The device copy of the
+        dataset made by ``detect_disks(save_to_gpu=True)`` is never saved.
 
         ``"dataset"`` is recorded in the file's skip metadata, so a reloaded workflow
         simply has no ``dataset`` attribute. Re-attach one (``bv.dataset = ds``) before
@@ -193,6 +199,8 @@ class BraggVectors(AutoSerialize):
             skip = list(skip)
         if not include_dataset and "dataset" not in skip:
             skip.append("dataset")
+        if "_gpu_cache" not in skip:
+            skip.append("_gpu_cache")
         # Explicit (two-arg) super() rather than the bare super(): the zero-arg form
         # needs a compiler-created __class__ closure cell that is absent when this
         # method's source is re-exec'd from a string (Jupyter autoreload), which
@@ -212,7 +220,7 @@ class BraggVectors(AutoSerialize):
         radius: float | None = None,
         edge: float = 1.0,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
     ) -> "BraggVectors":
         """Build the template from a synthetic soft-edged disk.
 
@@ -228,7 +236,7 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` disk center; defaults to the detector center
             ``(H // 2, W // 2)``.
-        subtract_mean : bool, default=True
+        subtract_mean : bool, default=False
             If ``True``, make the template zero-sum. The default keeps the
             unit-sum positive template, so correlation values stay positive and
             roughly measure the probe-weighted counts under each peak.
@@ -259,7 +267,7 @@ class BraggVectors(AutoSerialize):
     def make_template_from_data(
         self,
         roi: NDArray | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
         center: tuple[float, float] | None = None,
     ) -> "BraggVectors":
         """Build the template by averaging diffraction patterns from the data.
@@ -271,7 +279,7 @@ class BraggVectors(AutoSerialize):
             ideally a vacuum / single-disk region so the unscattered probe is
             isolated. ``None`` (default) averages the whole scan (the mean
             diffraction pattern).
-        subtract_mean : bool, default=True
+        subtract_mean : bool, default=False
             If ``True``, make the template zero-sum. The default keeps the
             unit-sum positive template, so correlation values stay positive and
             roughly measure the probe-weighted counts under each peak.
@@ -321,7 +329,7 @@ class BraggVectors(AutoSerialize):
         self,
         probe: NDArray | torch.Tensor,
         center: tuple[float, float] | None = None,
-        subtract_mean: bool = True,
+        subtract_mean: bool = False,
     ) -> "BraggVectors":
         """Build the template from an explicit probe image (e.g. a measured vacuum probe).
 
@@ -332,7 +340,7 @@ class BraggVectors(AutoSerialize):
         center : tuple of float, optional
             ``(row, col)`` probe center rolled to the origin; defaults to the
             probe's intensity centroid.
-        subtract_mean : bool, default=True
+        subtract_mean : bool, default=False
             If ``True``, make the template zero-sum. The default keeps the
             unit-sum positive template, so correlation values stay positive and
             roughly measure the probe-weighted counts under each peak.
@@ -371,7 +379,12 @@ class BraggVectors(AutoSerialize):
         return torch.fft.fftshift(self._template).detach().cpu().numpy()
 
     def correlation_map(
-        self, row: int, col: int, background_sigma: float | str | None = None
+        self,
+        row: int,
+        col: int,
+        background_sigma: float | str | None = None,
+        corr_power: float = 1.0,
+        sigma_cc: float | None = None,
     ) -> np.ndarray:
         """Cross-correlation map of one diffraction pattern with the template (numpy).
 
@@ -384,6 +397,9 @@ class BraggVectors(AutoSerialize):
             Scan row of the diffraction pattern to correlate.
         col : int
             Scan column of the diffraction pattern to correlate.
+        background_sigma, corr_power, sigma_cc
+            Correlation options, as for :meth:`detect_disks`; pass the same
+            values to see the map the detection actually searches.
 
         Returns
         -------
@@ -396,7 +412,11 @@ class BraggVectors(AutoSerialize):
             np.asarray(self.dataset.array[row, col]), dtype=torch.float, device=self.device
         )
         corr, _ = cross_correlation(
-            dp, self._template_ft, self._resolve_background_sigma(background_sigma)
+            dp,
+            self._template_ft,
+            self._resolve_background_sigma(background_sigma),
+            corr_power,
+            sigma_cc,
         )
         return corr.detach().cpu().numpy()
 
@@ -411,6 +431,8 @@ class BraggVectors(AutoSerialize):
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
         background_sigma: float | str | None = None,
+        corr_power: float = 1.0,
+        sigma_cc: float | None = None,
         batch_size: int | None = None,
         progressbar: bool = True,
         save_to_gpu: bool = True,
@@ -445,13 +467,38 @@ class BraggVectors(AutoSerialize):
             Upsampling factor for the ``"upsample"`` subpixel refinement.
         max_num_peaks : int, default=1000
             Maximum number of peaks to keep per pattern.
+        background_sigma : float | "auto" | None, default=None
+            Width in pixels of a Fourier high-pass applied to the
+            cross-correlation before peak finding: a copy of the correlation
+            map smoothed by a Gaussian of this width is subtracted from it.
+            The filter is isotropic in the Fourier domain and needs no origin,
+            so it is not a radial background fit. Its purpose is the negative
+            moat a zero-sum template leaves around the bright unscattered
+            beam, which pushes weak disk peaks below zero where the
+            correlation clamp erases them. Set it a little wider than a disk
+            so the disk-scale peaks pass untouched; "auto" uses twice the
+            central beam radius.
+        corr_power : float, default=1.0
+            Correlation type: 1 is the plain cross-correlation, 0 the phase
+            correlation, and values in between the hybrid correlation. Lowering
+            it equalizes weak and strong disks, which finds many more weak
+            reflections on a bright background; the reported intensities are
+            then compressed, so check the effect before using them as weights.
+        sigma_cc : float | None
+            Gaussian smoothing of the correlation map (pixels) before peak
+            finding; merges the speckle of a noisy disk into one maximum.
         batch_size : int, optional
             Number of patterns per batch. ``None`` (default) picks a size from the
             detector dimensions.
         progressbar : bool, default=True
             If ``True``, show a tqdm progress bar over the full-scan detection.
-        save_to_gpu: bool, default = True,
-            Transfers dataset to gpu for faster calculation and less cpu load.
+        save_to_gpu : bool, default=True
+            If ``True`` and :attr:`device` is not the CPU, copy the whole dataset
+            to the device once and read the batches from that copy, which is
+            faster and lowers CPU load. If the copy does not fit in device memory,
+            batches are read from the dataset instead. The copy is kept for later
+            calls (including :meth:`make_template_from_data`) and is not saved.
+
         Returns
         -------
         Vector
@@ -469,19 +516,21 @@ class BraggVectors(AutoSerialize):
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
             background_sigma=self._resolve_background_sigma(background_sigma),
+            corr_power=corr_power,
+            sigma_cc=sigma_cc,
         )
 
-        if save_to_gpu and self.device != "cpu":
-            if not hasattr(self, '_gpu_cache') or self._gpu_cache is None:
+        if save_to_gpu and str(self.device) != "cpu":
+            if getattr(self, "_gpu_cache", None) is None:
                 try:
                     print(f"Loading dataset to {self.device}...", end=" ", flush=True)
                     self._gpu_cache = torch.as_tensor(
                         np.asarray(self.dataset.array),
                         dtype=torch.float32,
-                        device=self.device
+                        device=self.device,
                     )
-                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                    print(f"Out of memory, will read per-batch")
+                except (RuntimeError, torch.cuda.OutOfMemoryError):
+                    print("out of memory, reading per batch instead.")
                     self._gpu_cache = None
 
         if positions is not None:
@@ -496,12 +545,12 @@ class BraggVectors(AutoSerialize):
         results = self._detect_positions(
             coords, detect_kwargs, batch_size, progressbar=progressbar
         )
-        # Store every cell in a single bulk pass. Per-cell assignment
-        # (peaks[r, c] = arr) re-concatenates the entire backing buffer on every
-        # write -- O(N^2) over the scan, which is the stall at the end of
-        # detection. from_data stacks all cells with one _replace_cells call.
+        # Store every cell in one pass. Per-cell assignment (peaks[r, c] = arr)
+        # appends to the backing buffer on every write, while from_data joins all
+        # cells with a single concatenation.
         nested = [results[r * scan_c : (r + 1) * scan_c] for r in range(scan_r)]
         peaks = Vector.from_data(nested, fields=PEAK_FIELDS, name="bragg_peaks")
+        peaks.metadata.update(self._scan_calibration())
 
         self.peaks = peaks
         self.metadata["detect"] = detect_kwargs
@@ -568,7 +617,7 @@ class BraggVectors(AutoSerialize):
         peaks = bv.peaks
         # rowwise transform on the flat peak table: one shift per scan cell,
         # repeated per detected peak (cells and shifts share raster order)
-        flat = peaks.flatten()
+        flat = peaks.numpy().astype(np.float64)
         counts = np.asarray(peaks.row_counts(), dtype=int)
         shifts = np.repeat(origin_ref[None, :] - origins.reshape(-1, 2), counts, axis=0)
         flat[:, :2] += shifts
@@ -577,8 +626,49 @@ class BraggVectors(AutoSerialize):
         bv.metadata["origin_correction"] = {
             "origin_ref": (float(origin_ref[0]), float(origin_ref[1])),
         }
+        # the fitted origins travel with the peaks: plots that put a pattern
+        # behind the peaks need them to line the two up
+        peaks.metadata["origins"] = origins
+        peaks.metadata["origin_ref"] = (float(origin_ref[0]), float(origin_ref[1]))
         bv.compute_bvm()
         return bv
+
+    def select(self, positions) -> "BraggVectors":
+        """The same BraggVectors restricted to some scan positions.
+
+        The scan grid is unchanged: the other positions keep no peaks, their
+        per-position lattice fits are NaN and their fit weights zero. The dataset, template
+        and calibration are shared with this object, and the Bragg vector map
+        is recomputed if there was one. Use it to run any later step on a
+        sub-area, e.g. a region whose crystallography is known.
+
+        Parameters
+        ----------
+        positions : list of (row, col) | np.ndarray
+            A list, tuple or array of (row, col), or an (R, C) boolean mask.
+
+        Returns
+        -------
+        BraggVectors
+            New object; ``metadata["positions_mask"]`` holds the selection.
+        """
+        from quantem.diffraction.calibration import select_positions
+
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before select().")
+        out = _copy.copy(self)
+        out.metadata = _copy.deepcopy(self.metadata)
+        out.peaks, mask = select_positions(self.peaks, positions)
+        for name in ("g1_array", "g2_array", "mask_weight", "fit_error"):
+            arr = getattr(self, name, None)
+            if isinstance(arr, np.ndarray) and arr.shape[:2] == mask.shape:
+                arr = arr.astype(float, copy=True)
+                arr[~mask] = 0.0 if name == "mask_weight" else np.nan
+                setattr(out, name, arr)
+        if self.bvm is not None:
+            out.compute_bvm(sampling=float(np.atleast_1d(self.bvm.sampling)[0]))
+        out.metadata["positions_mask"] = mask
+        return out
 
     def compute_bvm(self, sampling: float = 1.0) -> Dataset2d:
         """Accumulate all detected peaks into a Bragg vector map (intensity histogram).
@@ -596,7 +686,7 @@ class BraggVectors(AutoSerialize):
         if self.peaks is None:
             raise ValueError("Run detect_disks() before compute_bvm().")
         H, W = (int(self.dataset.shape[-2]), int(self.dataset.shape[-1]))
-        flat = self.peaks.select_fields("q_row", "q_col", "intensity").flatten()
+        flat = self.peaks.select_fields("q_row", "q_col", "intensity").numpy().astype(np.float64)
 
         bvm = np.zeros((H, W), dtype=float)
         if flat.shape[0] > 0:
@@ -938,7 +1028,7 @@ class BraggVectors(AutoSerialize):
                 pass
 
         for r, c in coords:
-            cell = self.peaks[r, c].array
+            cell = self.peaks[r, c].numpy().astype(np.float64)
             if cell.shape[0] == 0:
                 continue
             qpos = cell[:, [i_qr, i_qc]]
@@ -1016,23 +1106,36 @@ class BraggVectors(AutoSerialize):
         Parameters
         ----------
         g1_ref : np.ndarray, optional
-            ``(2,)`` reference for the first lattice vector. Defaults to the median
-            over the scan inside :class:`StrainMap`.
+            ``(2,)`` reference for the first lattice vector, in detector
+            ``(row, col)`` pixels (the frame of :attr:`g1_array`). Defaults to the
+            ``calculation_metric`` over the scan inside :class:`StrainMap`.
         g2_ref : np.ndarray, optional
-            ``(2,)`` reference for the second lattice vector. Defaults to the median
-            over the scan inside :class:`StrainMap`.
+            ``(2,)`` reference for the second lattice vector, as ``g1_ref``.
         mask : np.ndarray, optional
             ``(scan_row, scan_col)`` per-position weighting used when computing the
             reference lattice. Defaults to :attr:`mask_weight` from
-            :meth:`fit_lattice` (the lattice order parameter — how well all detected
+            :meth:`fit_lattice` (the lattice order parameter: how well all detected
             intensity snaps to the fitted lattice), so clean single-crystal positions
             dominate the reference and positions with off-lattice intensity are
             down-weighted.
+        q_to_r_rotation_ccw_deg : float, optional
+            Counter-clockwise rotation in degrees from the detector frame to the
+            scan frame, applied to the lattice vectors before the strain is
+            computed, so ``e_rr``/``e_cc`` refer to the scan rows and columns.
+            ``None`` (default) reads ``q_to_r_rotation_ccw_deg`` from the dataset
+            metadata, else uses 0.
+        q_transpose : bool, optional
+            If ``True``, swap the detector row/col axes before the rotation.
+            ``None`` (default) reads ``q_transpose`` from the dataset metadata,
+            else uses ``False``.
+        calculation_metric : {"median", "mean"}, default="median"
+            Statistic for the automatic reference lattice (weighted by ``mask``).
 
         Returns
         -------
         StrainMap
-            A strain map initialized from the fitted lattice vectors.
+            A strain map initialized from the fitted lattice vectors. The rotation
+            and transpose used are also stored in :attr:`metadata`.
         """
         if self.g1_array is None or self.g2_array is None:
             raise ValueError("Run fit_lattice() before calculate_strain_map().")
@@ -1042,20 +1145,23 @@ class BraggVectors(AutoSerialize):
 
         ds_units = None
         ds_sampling = None
-        if hasattr(self.dataset, 'units'):
+        if hasattr(self.dataset, "units"):
             if isinstance(self.dataset.units, (tuple, list)):
                 ds_units = str(self.dataset.units[0])
             else:
                 ds_units = str(self.dataset.units)
-        if hasattr(self.dataset, 'sampling'):
+        if hasattr(self.dataset, "sampling"):
             if isinstance(self.dataset.sampling, (tuple, list, np.ndarray)):
                 ds_sampling = float(self.dataset.sampling[0])
             else:
                 ds_sampling = float(self.dataset.sampling)
 
-        parent_rot = self.dataset.metadata.get("q_to_r_rotation_ccw_deg", None)
-        parent_tr = self.dataset.metadata.get("q_transpose", None)
-        
+        metadata = getattr(self.dataset, "metadata", None) or {}
+        parent_rot = metadata.get("q_to_r_rotation_ccw_deg", None)
+        if parent_rot is None:
+            parent_rot = metadata.get("r_to_q_rotation_cw_deg", None)
+        parent_tr = metadata.get("q_transpose", None)
+
         used_parent = False
         if q_to_r_rotation_ccw_deg is None and parent_rot is not None:
             q_to_r_rotation_ccw_deg = parent_rot
@@ -1065,27 +1171,27 @@ class BraggVectors(AutoSerialize):
             used_parent = True
 
         if used_parent:
-            import warnings
-
             warnings.warn(
-                "StrainMapAutocorrelation.preprocess: using parent Dataset4dstem metadata "
+                "BraggVectors.calculate_strain_map: using Dataset4dstem metadata "
                 f"(q_to_r_rotation_ccw_deg={q_to_r_rotation_ccw_deg or 0.0}, "
                 f"q_transpose={q_transpose or False}).",
                 UserWarning,
             )
 
         if q_to_r_rotation_ccw_deg is None or q_transpose is None:
-            import warnings
-
-            q_to_r_rotation_ccw_deg = 0.0 if q_to_r_rotation_ccw_deg is None else q_to_r_rotation_ccw_deg
+            q_to_r_rotation_ccw_deg = (
+                0.0 if q_to_r_rotation_ccw_deg is None else q_to_r_rotation_ccw_deg
+            )
             q_transpose = False if q_transpose is None else q_transpose
             warnings.warn(
-                "StrainMapAutocorrelation.preprocess: setting q_to_r_rotation_ccw_deg=0.0 and q_transpose=False.",
+                "BraggVectors.calculate_strain_map: no detector rotation given or in "
+                f"the dataset metadata; using q_to_r_rotation_ccw_deg="
+                f"{q_to_r_rotation_ccw_deg} and q_transpose={q_transpose}.",
                 UserWarning,
             )
 
-        self.metadata["q_to_r_rotation_ccw_deg"] = q_to_r_rotation_ccw_deg
-        self.metadata["q_transpose"] = q_transpose
+        self.metadata["q_to_r_rotation_ccw_deg"] = float(q_to_r_rotation_ccw_deg)
+        self.metadata["q_transpose"] = bool(q_transpose)
 
         return StrainMap(
             g1_array=self.g1_array,
@@ -1097,9 +1203,9 @@ class BraggVectors(AutoSerialize):
             mask=mask,
             ds_sampling=ds_sampling,
             ds_units=ds_units,
-            q_to_r_rotation_ccw_deg = q_to_r_rotation_ccw_deg,
-            q_transpose = q_transpose,
-            calculation_metric = calculation_metric,
+            q_to_r_rotation_ccw_deg=float(q_to_r_rotation_ccw_deg),
+            q_transpose=bool(q_transpose),
+            calculation_metric=calculation_metric,
         )
 
     # ---- visualization ----
@@ -1116,8 +1222,9 @@ class BraggVectors(AutoSerialize):
 
         Parameters
         ----------
-        position : tuple of int, default=(0, 0) in pixels
-            ``(row, col)`` scan position whose correlation map is shown.
+        position : tuple of int, default=(0, 0)
+            ``(row, col)`` scan position (scan pixels) whose correlation map is
+            shown.
         crop_factor : float, optional
             If given, zoom to a square window of half-width ``crop_factor * radius``
             about the central-beam center, where ``radius`` is the central-beam
@@ -1251,6 +1358,8 @@ class BraggVectors(AutoSerialize):
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
         background_sigma: float | str | None = None,
+        corr_power: float = 1.0,
+        sigma_cc: float | None = None,
         image: np.ndarray | None = None,
         peak_radius: float = 6.0,
         marker_radius: float | None = None,
@@ -1284,6 +1393,26 @@ class BraggVectors(AutoSerialize):
             Upsampling factor for the ``"upsample"`` subpixel refinement.
         max_num_peaks : int, default=1000
             Maximum number of peaks to keep per pattern.
+        background_sigma : float | "auto" | None, default=None
+            Width in pixels of a Fourier high-pass applied to the
+            cross-correlation before peak finding: a copy of the correlation
+            map smoothed by a Gaussian of this width is subtracted from it.
+            The filter is isotropic in the Fourier domain and needs no origin,
+            so it is not a radial background fit. Its purpose is the negative
+            moat a zero-sum template leaves around the bright unscattered
+            beam, which pushes weak disk peaks below zero where the
+            correlation clamp erases them. Set it a little wider than a disk
+            so the disk-scale peaks pass untouched; "auto" uses twice the
+            central beam radius.
+        corr_power : float, default=1.0
+            Correlation type: 1 is the plain cross-correlation, 0 the phase
+            correlation, and values in between the hybrid correlation. Lowering
+            it equalizes weak and strong disks, which finds many more weak
+            reflections on a bright background; the reported intensities are
+            then compressed, so check the effect before using them as weights.
+        sigma_cc : float | None
+            Gaussian smoothing of the correlation map (pixels) before peak
+            finding; merges the speckle of a noisy disk into one maximum.
         image : np.ndarray or Dataset2d, optional
             Real-space navigation image (e.g. a virtual dark-field image) shown on
             the left with the chosen positions marked. ``None`` (default) shows only
@@ -1323,6 +1452,8 @@ class BraggVectors(AutoSerialize):
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
             background_sigma=background_sigma,
+            corr_power=corr_power,
+            sigma_cc=sigma_cc,
             progressbar=False,
         )
         if image is None:
@@ -1332,7 +1463,7 @@ class BraggVectors(AutoSerialize):
             image_title = getattr(image, "name", None) or "virtual image"
             image_arr = np.asarray(image.array if hasattr(image, "array") else image)
         dps = [np.asarray(self.dataset.array[r, c], dtype=float) for r, c in positions]
-        peaks = [sub[i].array for i in range(len(positions))]
+        peaks = [sub[i].numpy().astype(np.float64) for i in range(len(positions))]
         fig, ax = plot_detection(
             image_arr,
             dps,
@@ -1381,18 +1512,435 @@ class BraggVectors(AutoSerialize):
 
     # ---- helpers ----
 
-    def _resolve_background_sigma(
-        self, background_sigma: float | str | None
-    ) -> float | None:
+    # ------------------------------------------------------------------
+    # detector calibration
+    # ------------------------------------------------------------------
+
+    def measure_origins(
+        self,
+        search_radius: float = 6.0,
+        robust: bool = True,
+        plot: bool = False,
+        center=None,
+    ):
+        """Fit the diffraction origin at every probe position.
+
+        The direct beam wanders with the probe (descan). The brightest peak
+        within `search_radius` of `center` gives the origin at each
+        position, and a plane fit over the scan smooths the result.
+
+        Parameters
+        ----------
+        search_radius : float, default=6.0
+            Radius in detector pixels searched around `center`.
+        center : tuple of float, optional
+            ``(row, col)`` to search around; defaults to the detector
+            centre. Pass the beam position from
+            :func:`~quantem.diffraction.disk_detection.estimate_central_beam`
+            when the beam is not centred on the detector.
+        robust : bool, default=True
+            Reject outliers before the plane fit.
+        plot : bool, default=False
+            Show the measured and fitted origins.
+
+        Returns
+        -------
+        np.ndarray
+            ``(scan_row, scan_col, 2)`` origins in detector pixels.
+        """
+        from quantem.diffraction import calibration
+
+        return calibration.measure_origins(
+            self, search_radius=search_radius, robust=robust, plot=plot, center=center
+        )
+
+    def plot_origin_fit(self, origins, search_radius: float = 6.0, center=None):
+        """Measured origins, the plane fit, and their residual.
+
+        Parameters
+        ----------
+        origins : np.ndarray
+            ``(scan_row, scan_col, 2)`` origins from :meth:`measure_origins`.
+        search_radius : float, default=6.0
+            The radius used to measure them.
+        center : tuple of float, optional
+            The centre used to measure them.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)``.
+        """
+        from quantem.diffraction import calibration
+
+        return calibration.plot_origin_fit(
+            self, origins, search_radius=search_radius, center=center
+        )
+
+    def measure_scan_rotation(
+        self,
+        origins=None,
+        mask_radius: float | str | None = "auto",
+        transpose: bool | None = None,
+        plot: bool = False,
+    ) -> float:
+        """Rotation between the detector and the scan, from the direct beam.
+
+        The center of mass of the direct beam traces the projected potential
+        gradient over the scan, which is a curl-free field in the scan frame.
+        Rotating the detector axes until the curl vanishes recovers the angle.
+        It sets the in-plane orientations and nothing else: zone axes, phases
+        and the out-of-plane maps do not depend on it.
+
+        The curl is unchanged by a 180 degree rotation, so the answer is this
+        angle or this angle plus 180. A detector with its rows and columns
+        swapped is tested as well, as in ptychography.
+
+        The result is written to the dataset metadata as
+        ``q_to_r_rotation_ccw_deg`` and ``q_transpose``, the convention shared
+        with strain mapping and ptychography (see
+        :func:`~quantem.diffraction.calibration.q_to_r_matrix`), and read from
+        there by :meth:`calibrate`, :meth:`calibrate_2d` and
+        :meth:`calculate_strain_map`.
+
+        Parameters
+        ----------
+        origins : np.ndarray, optional
+            ``(scan_row, scan_col, 2)`` origins from :meth:`measure_origins`;
+            defaults to the detector centre.
+        mask_radius : float or "auto" or None, default="auto"
+            Radius in detector pixels around the origin used for the center
+            of mass, which keeps the Bragg disks out of it (needed for
+            nanobeam data). "auto" is 1.5 times the direct-beam radius
+            measured on the mean pattern, about the beam found there when no
+            `origins` are given; None uses the whole pattern.
+        transpose : bool, optional
+            Whether the detector axes are swapped; None (default) tests both.
+        plot : bool, default=False
+            Show the curl and divergence against the trial angle.
+
+        Returns
+        -------
+        float
+            Counter-clockwise rotation in degrees, in [-90, 90). The transpose
+            is in ``dataset.metadata["q_transpose"]``.
+        """
+        from quantem.diffraction import calibration
+
+        if isinstance(mask_radius, str):
+            if mask_radius != "auto":
+                raise ValueError(f"mask_radius must be a number, 'auto' or None: {mask_radius}")
+            from quantem.diffraction.disk_detection import estimate_central_beam
+
+            dp = np.asarray(self.dataset.array, dtype=float).mean(axis=(0, 1))
+            (cy, cx), r_beam = estimate_central_beam(dp)
+            mask_radius = 1.5 * float(r_beam)
+            if origins is None:
+                origins = np.broadcast_to(
+                    np.array([cy, cx], dtype=float), (*self.dataset.array.shape[:2], 2)
+                )
+        angle, transpose = calibration.measure_scan_rotation(
+            self.dataset,
+            origins=origins,
+            mask_radius=mask_radius,
+            transpose=transpose,
+            plot=plot,
+            return_transpose=True,
+        )
+        self._record_scan_rotation(angle, transpose)
+        if transpose:
+            print("the detector rows and columns are transposed (q_transpose=True)")
+        return angle
+
+    def _scan_rotation(self, rotation_ccw_deg, transpose) -> tuple[float, bool, bool]:
+        """The rotation and transpose to use: the values given, else the ones in
+        the dataset metadata, else none. Also says whether either was known."""
+        from quantem.diffraction.calibration import scan_rotation_from_metadata
+
+        md_rot, md_tr = scan_rotation_from_metadata(getattr(self.dataset, "metadata", None))
+        known = rotation_ccw_deg is not None or md_rot is not None
+        rot = rotation_ccw_deg if rotation_ccw_deg is not None else md_rot
+        tr = transpose if transpose is not None else md_tr
+        return float(rot or 0.0), bool(tr or False), known
+
+    def _record_scan_rotation(self, rotation_ccw_deg: float, transpose: bool) -> None:
+        """Write the rotation onto the dataset, where strain mapping and
+        ptychography read it."""
+        md = getattr(self.dataset, "metadata", None)
+        if isinstance(md, dict):
+            md["q_to_r_rotation_ccw_deg"] = float(rotation_ccw_deg)
+            md["q_transpose"] = bool(transpose)
+
+    def calibrate(
+        self,
+        crystal,
+        pixel_size_guess: float,
+        rotation_ccw_deg: float | None = None,
+        transpose: bool | None = None,
+        power_intensity: float = 0.5,
+        scale_search: tuple[float, float] = (0.9, 1.1),
+        positions=None,
+        plot: bool = False,
+        **kwargs,
+    ):
+        """Measure the reciprocal pixel size and the elliptic distortion.
+
+        Matches the radii of the detected peaks to the rings the reference
+        crystal can show, by position only: every allowed ring counts alike
+        and a ring missing from the data costs nothing, so texture, a single
+        zone axis or dynamical intensities do not pull the scale. The scale
+        is scanned around the guess, then the ellipse and the scale are
+        refined in turn, and every ring is checked separately. The result carries the evidence behind it and can
+        be saved and applied to another dataset, which is the route for a
+        strained sample: measure on a standard such as nanocrystalline gold,
+        save, and apply there.
+
+        Call this on origin-corrected peaks -- the rings must be concentric
+        before their radii mean anything.
+
+        Parameters
+        ----------
+        crystal : Crystal or list of Crystal
+            Reference structure(s) with structure factors calculated.
+        pixel_size_guess : float
+            Starting reciprocal pixel size, 1/Angstroms per detector pixel.
+            The scan covers `scale_search` around it.
+        rotation_ccw_deg : float, optional
+            Counter-clockwise diffraction-to-scan rotation in degrees, recorded
+            on the calibration. None (default) takes the dataset's
+            ``q_to_r_rotation_ccw_deg`` (from :meth:`measure_scan_rotation`,
+            ptychography or set by hand), else 0. A value given here is
+            written to the dataset metadata, so strain mapping and
+            ptychography use the same frame.
+        transpose : bool, optional
+            Detector axes swapped before the rotation; None (default) takes
+            the dataset's ``q_transpose``, else False.
+        power_intensity : float, default=0.5
+            Peaks are weighted by ``intensity ** power_intensity``; 0 counts
+            every peak alike.
+        scale_search : tuple, default=(0.9, 1.1)
+            Range of the scale scan as a multiple of the guess. Ring radii of
+            one lattice repeat at fixed ratios, so widen it only for a guess
+            that is far out, and check the result.
+        positions : list of (row, col) | np.ndarray | None
+            Scan positions to calibrate from: a list, tuple or array of
+            (row, col), or an (R, C) boolean mask. None (default) uses every
+            position. Calibrate on a region whose crystallography is known,
+            then apply the result to the whole scan with
+            :meth:`apply_calibration`.
+        plot : bool, default=False
+            Show the ring comparison before and after, for the first
+            reference crystal. :meth:`CrystalMap.plot_calibration` checks
+            every candidate phase afterwards.
+        **kwargs
+            Further arguments of
+            :func:`~quantem.diffraction.calibration.calibrate`, e.g.
+            `zone_axis` to fit only the rings of one zone, `fit_ellipse`,
+            `k_min`, `k_max`, `k_broadening`, `min_ring_intensity`,
+            `marker_size`, `figsize` and `shell_step` for ring grouping in
+            diagnostic plots.
+
+        Returns
+        -------
+        DiffractionCalibration
+            The measured calibration, also stored on :attr:`calibration`.
+            Save it with ``cal.save(path)`` and reload it with
+            :func:`~quantem.core.io.serialize.load`.
+
+        Raises
+        ------
+        ValueError
+            If no peaks have been detected.
+        """
+        from quantem.diffraction import calibration as _cal
+
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before calibrate().")
+        rotation_ccw_deg, transpose, known = self._scan_rotation(rotation_ccw_deg, transpose)
+        cal = _cal.calibrate(
+            self.peaks,
+            crystal,
+            pixel_size_guess,
+            rotation_ccw_deg=rotation_ccw_deg,
+            transpose=transpose,
+            power_intensity=power_intensity,
+            scale_search=scale_search,
+            positions=positions,
+            plot=plot,
+            **kwargs,
+        )
+        if known:
+            self._record_scan_rotation(rotation_ccw_deg, transpose)
+        self.calibration = cal
+        return cal
+
+    def calibrate_2d(
+        self,
+        crystal,
+        pixel_size_guess: float,
+        energy_ev: float,
+        rotation_ccw_deg: float | None = None,
+        transpose: bool | None = None,
+        precession_deg: float = 0.0,
+        power_intensity: float = 0.5,
+        positions=None,
+        plot: bool = False,
+        **kwargs,
+    ):
+        """Pixel size and elliptic distortion from the dominant orientation, in 2D.
+
+        For a scan dominated by one orientation (a single crystal, a matrix
+        grain), the peaks of every position summed into a 2D histogram form
+        one sharp spot pattern. It is indexed once against the candidate
+        crystal(s), and the detector distortion is fit to the paired spots
+        as a 2x2 map, with no radial histogram. Use :meth:`calibrate` for
+        polycrystalline or strongly textured data with many orientations.
+
+        Call this on origin-corrected peaks.
+
+        Parameters
+        ----------
+        crystal : Crystal or list of Crystal
+            Candidate phase(s), structure factors calculated; the best match
+            of the summed pattern picks the phase.
+        pixel_size_guess : float
+            Starting reciprocal pixel size, 1/Angstroms per detector pixel,
+            within a few percent.
+        energy_ev : float
+            Beam energy in eV.
+        rotation_ccw_deg : float, optional
+            Counter-clockwise diffraction-to-scan rotation in degrees, recorded
+            on the calibration. None (default) takes the dataset's
+            ``q_to_r_rotation_ccw_deg`` (from :meth:`measure_scan_rotation`,
+            ptychography or set by hand), else 0. A value given here is
+            written to the dataset metadata, so strain mapping and
+            ptychography use the same frame.
+        transpose : bool, optional
+            Detector axes swapped before the rotation; None (default) takes
+            the dataset's ``q_transpose``, else False.
+        precession_deg : float, default=0.0
+            Precession semi-angle of the simulated pattern.
+        power_intensity : float, default=0.5
+            Peaks are weighted by ``intensity ** power_intensity`` in the
+            histogram.
+        positions : list of (row, col) | np.ndarray | None
+            Scan positions to calibrate from, e.g. inside one grain: a list, tuple or array of
+            (row, col), or an (R, C) boolean mask. None (default) uses every
+            position. Calibrate on a region whose crystallography is known,
+            then apply the result to the whole scan with
+            :meth:`apply_calibration`.
+        plot : bool, default=False
+            Show the ring comparison and the 2D histogram of the peaks under
+            the simulated spots, before and after.
+        **kwargs
+            Further arguments of
+            :func:`~quantem.diffraction.calibration.calibrate_2d`, e.g.
+            `k_max`, `pair_tol`, `plan_params` and `figsize`.
+
+        Returns
+        -------
+        DiffractionCalibration
+            The measured calibration, also stored on :attr:`calibration`.
+        """
+        from quantem.diffraction import calibration as _cal
+
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before calibrate_2d().")
+        rotation_ccw_deg, transpose, known = self._scan_rotation(rotation_ccw_deg, transpose)
+        cal = _cal.calibrate_2d(
+            self.peaks,
+            crystal,
+            pixel_size_guess,
+            energy_ev=energy_ev,
+            rotation_ccw_deg=rotation_ccw_deg,
+            transpose=transpose,
+            precession_deg=precession_deg,
+            power_intensity=power_intensity,
+            positions=positions,
+            plot=plot,
+            **kwargs,
+        )
+        if known:
+            self._record_scan_rotation(rotation_ccw_deg, transpose)
+        self.calibration = cal
+        return cal
+
+    def apply_calibration(self, calibration=None, name: str = "bragg_peaks_calibrated"):
+        """Calibrated peaks in 1/Angstroms from the detected pixel peaks.
+
+        Parameters
+        ----------
+        calibration : DiffractionCalibration, optional
+            The calibration to apply. None (default) uses the one measured by
+            :meth:`calibrate`, so a calibration loaded from a standard is
+            passed here instead.
+        name : str, default="bragg_peaks_calibrated"
+            Name of the returned Vector.
+
+        Returns
+        -------
+        Vector
+            Peaks in 1/Angstroms, carrying the pixel size, the fitted origins
+            and the scan calibration, so plots downstream need none of them
+            passed.
+
+        Raises
+        ------
+        ValueError
+            If no peaks have been detected, or no calibration is available.
+        """
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before apply_calibration().")
+        cal = calibration if calibration is not None else getattr(self, "calibration", None)
+        if cal is None:
+            raise ValueError(
+                "No calibration available: run calibrate() first, or pass one loaded from a standard."
+            )
+        return cal.apply(self.peaks, name=name)
+
+    def _scan_calibration(self) -> dict:
+        """Calibration of the dataset, to travel with the peaks.
+
+        The scan step and the detector pixel size are properties of the
+        measurement, so they are set once on the dataset and carried by the
+        peaks rather than passed to every plot. Axes still in pixels record
+        nothing for that half.
+        """
+        out: dict = {}
+        sampling = np.atleast_1d(np.asarray(self.dataset.sampling, dtype=float))
+        units = [str(u).strip("b'\"") for u in self.dataset.units]
+
+        scan_unit = units[0] if units else ""
+        if scan_unit.lower() not in ("pixels", "px", "pixel", ""):
+            out["scan_sampling"] = tuple(float(v) for v in sampling[:2])
+            out["scan_units"] = scan_unit
+
+        if sampling.size >= 4 and len(units) >= 4:
+            dp_unit = units[2]
+            if dp_unit.lower() not in ("pixels", "px", "pixel", ""):
+                out["pixel_size"] = float(sampling[2])
+                out["pixel_size_units"] = dp_unit
+        return out
+
+    def _resolve_background_sigma(self, background_sigma: float | str | None) -> float | None:
         """Resolve the ``background_sigma`` argument to a value in pixels.
 
-        ``"auto"`` (the default everywhere) maps to twice the central-beam
-        radius: wide enough that the disk-scale correlation peaks pass
+        ``None`` (the default everywhere) disables the background subtraction.
+        ``"auto"`` maps to twice the central-beam radius: wide enough that the disk-scale correlation peaks pass
         untouched, narrow enough to remove the zero-sum template's negative
         moat around a bright unscattered beam -- which otherwise pushes weak
         disk peaks below zero, where the correlation clamp erases them before
-        peak finding. Pass ``None`` to disable the background subtraction or a
-        float to set the scale explicitly.
+        peak finding. A float sets the width explicitly.
+
+        Parameters
+        ----------
+        background_sigma : float, "auto" or None
+            The value passed by the caller.
+
+        Returns
+        -------
+        float or None
+            Width in pixels, or ``None`` for no background subtraction.
         """
         if background_sigma is None:
             return None
@@ -1482,8 +2030,8 @@ class BraggVectors(AutoSerialize):
         H, W = int(self.dataset.shape[-2]), int(self.dataset.shape[-1])
         if batch_size is None:
             batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
-        
-        use_cache = hasattr(self, '_gpu_cache') and self._gpu_cache is not None
+
+        use_cache = getattr(self, "_gpu_cache", None) is not None
 
         it = range(0, len(coords), batch_size)
         if progressbar:
@@ -1499,16 +2047,13 @@ class BraggVectors(AutoSerialize):
         results: list[NDArray] = []
         for start in it:
             chunk = coords[start : start + batch_size]
-        
+            rows = [r for r, c in chunk]
+            cols = [c for r, c in chunk]
             if use_cache:
-                rows = [r for r, c in chunk]
-                cols = [c for r, c in chunk]
                 dps = self._gpu_cache[rows, cols]
             else:
-                # SLOW PATH: Load from HDF5 (at least do it efficiently)
-                rows = np.array([r for r, c in chunk])
-                cols = np.array([c for r, c in chunk])
-                dps_np = self.dataset.array[rows, cols]
+                # one fancy-indexed read per batch rather than one per pattern
+                dps_np = np.asarray(self.dataset.array[np.asarray(rows), np.asarray(cols)])
                 dps = torch.as_tensor(dps_np, dtype=torch.float32, device=self.device)
 
             out = detect_disks_batch(dps, self._template_ft, **detect_kwargs)
@@ -1614,7 +2159,7 @@ def _fit_lattice_vectors(
     a: NDArray,
     b: NDArray,
     intensity: NDArray,
-) -> tuple[NDArray | None, NDArray | None]:
+) -> tuple[NDArray | None, float]:
     """Intensity-weighted lattice fit ``q = x0 + a*g1 + b*g2`` for one pattern.
 
     Parameters

@@ -29,7 +29,7 @@ SCAN_SAMPLING = SAMPLING * SCAN_STEP_SIZE  # Angstroms
 #: fixing the fitted origin keeps the center-of-mass step exact and deterministic
 ORIGIN = (N // 2, N // 2)
 
-DECONVOLUTION_KERNELS = ("ssb", "obf", "mf", "prlx", "icom")
+DECONVOLUTION_KERNELS = ("ssb", "obf", "prlx", "icom")
 
 
 def integer_shift_defocus(pixel_shift_per_k_step: int, upsampling_factor: int = 1) -> float:
@@ -592,3 +592,231 @@ ACCELERATORS = [
     )
     if present
 ]
+
+
+# ---------------------------------------------------------------------------
+# complex-valued and multislice objects
+#
+# A thin-layer multislice simulator on a 0.25 A grid with a 64 x 64 detector window and a
+# step-1 scan, so the scan samples the full 2 k_alpha band and nothing aliases. The diffraction
+# origin is pinned: fitting it resamples every pattern bilinearly, which mixes neighbouring
+# detector pixels at the aperture edge, where the low-frequency amplitude/phase separation
+# lives (4.7% amplitude-to-phase leakage fitted against 0.3% pinned).
+# ---------------------------------------------------------------------------
+
+ML_SAMPLING = 0.25  # Angstrom
+ML_N_DET = 64  # detector window, pixels: the 16 A object period, which makes the simulation exact
+ML_RECIPROCAL_SAMPLING = 1 / (ML_N_DET * ML_SAMPLING)
+ML_K_PROBE = 1.0  # inverse Angstrom
+ML_SEMIANGLE = ML_K_PROBE * electron_wavelength_angstrom(PROBE_ENERGY) * 1e3
+ML_ABERRATIONS = {"C10": 50.0, "C12": 20.0, "phi12": np.deg2rad(11)}
+
+
+def ml_probe_fourier(aberrations: dict) -> np.ndarray:
+    """``psi(k)`` on the detector window, soft aperture, unit total intensity."""
+    wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+    k = np.fft.fftfreq(ML_N_DET, ML_SAMPLING)
+    kx, ky = np.meshgrid(k, k, indexing="ij")
+    return analytic_psi(kx, ky, aberrations, wavelength)
+
+
+def library_probe_fourier(aberrations: dict) -> np.ndarray:
+    """``psi(k)`` on the detector window from the library's own aberration surface.
+
+    Unlike :func:`ml_probe_fourier`, which writes out only ``C10`` and ``C12``, this takes any
+    coefficient, which the tests of odd aberrations need.
+    """
+    from quantem.diffractive_imaging.complex_probe import FourierProbe
+
+    wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+    angular = ML_RECIPROCAL_SAMPLING * wavelength * 1e3
+    probe = FourierProbe.from_aberrations(
+        wavelength, ML_SEMIANGLE, (angular, angular), aberrations
+    )
+    k = torch.fft.fftfreq(ML_N_DET, ML_SAMPLING, dtype=torch.float64)
+    kx, ky = torch.meshgrid(k, k, indexing="ij")
+    return probe.at(kx, ky).numpy()
+
+
+def analytic_psi(kx, ky, aberrations: dict, wavelength: float) -> np.ndarray:
+    """Soft-aperture probe ``A(k) exp(-i chi(k))`` at arbitrary ``k``, matching the library."""
+    k2 = kx**2 + ky**2
+    phi = np.arctan2(ky, kx)
+    aperture = np.clip((ML_K_PROBE - np.sqrt(k2)) / ML_RECIPROCAL_SAMPLING + 0.5, 0, 1)
+    chi = (
+        np.pi
+        * wavelength
+        * k2
+        * (
+            aberrations.get("C10", 0.0)
+            + aberrations.get("C12", 0.0) * np.cos(2 * (phi - aberrations.get("phi12", 0.0)))
+        )
+    )
+    return aperture * np.exp(-1j * chi)
+
+
+def thin_layer_4dstem(
+    log_transmissions,
+    depths,
+    aberrations: dict = ML_ABERRATIONS,
+    dose=None,
+    seed=0,
+    probe_modes=None,
+) -> Dataset4d:
+    """4D-STEM through thin layers ``t = exp(a + i phi)`` at ``depths``, exact multislice.
+
+    ``log_transmissions`` are ``a + i phi`` arrays on the ``ML_SAMPLING`` grid, periodic.
+    Depths are downstream positive and relative to the plane the aberrations describe, so a
+    layer at ``z`` sees the probe at ``C10 + z``.
+
+    ``probe_modes``, ``(M, ML_N_DET, ML_N_DET)`` corner-centred ``psi_m(k)``, replaces the
+    analytic probe: the patterns are then the incoherent sum over the modes.
+    """
+    wavelength = electron_wavelength_angstrom(PROBE_ENERGY)
+    shape = np.asarray(log_transmissions[0]).shape
+    k = torch.fft.fftfreq(ML_N_DET, ML_SAMPLING, dtype=torch.float64)
+    k2 = k[:, None] ** 2 + k[None, :] ** 2
+    if probe_modes is None:
+        probe_modes = ml_probe_fourier(aberrations)[None]
+    psi = torch.as_tensor(np.asarray(probe_modes), dtype=torch.complex128)
+    psi = psi / psi.abs().square().sum().sqrt()
+
+    order = np.argsort(depths)
+    depths = np.asarray(depths, dtype=float)[order]
+    layers = [
+        torch.exp(torch.as_tensor(np.asarray(log_transmissions[i]), dtype=torch.complex128))
+        for i in order
+    ]
+    probe = torch.fft.ifft2(psi * torch.exp(-1j * np.pi * wavelength * depths[0] * k2)) * ML_N_DET
+
+    idx = torch.fft.fftfreq(ML_N_DET, d=1 / ML_N_DET).long()
+    cols = torch.arange(shape[1])
+    out = np.empty((shape[0], shape[1], ML_N_DET, ML_N_DET), dtype=np.float32)
+    for row in range(shape[0]):
+        rr = ((row + idx)[None, :, None] % shape[0]).expand(shape[1], -1, ML_N_DET)
+        cc = ((cols[:, None] + idx[None, :])[:, None, :] % shape[1]).expand(-1, ML_N_DET, -1)
+        wave = probe[None] * layers[0][rr, cc][:, None]
+        for j in range(1, len(depths)):
+            propagator = torch.exp(-1j * np.pi * wavelength * (depths[j] - depths[j - 1]) * k2)
+            wave = torch.fft.ifft2(torch.fft.fft2(wave) * propagator) * layers[j][rr, cc][:, None]
+        out[row] = torch.fft.fft2(wave).abs().square().sum(1).numpy()
+
+    if dose is not None:
+        rng = np.random.default_rng(seed)
+        out = rng.poisson(out * dose * ML_SAMPLING**2).astype(np.float32)
+    return Dataset4d.from_array(
+        np.fft.fftshift(out, axes=(-2, -1)),
+        name="thin-layer multislice",
+        sampling=(ML_SAMPLING, ML_SAMPLING, ML_RECIPROCAL_SAMPLING, ML_RECIPROCAL_SAMPLING),
+        units=("A", "A", "A^-1", "A^-1"),
+    )
+
+
+def ml_kwargs(aberrations: dict = ML_ABERRATIONS) -> dict:
+    return dict(
+        energy=PROBE_ENERGY,
+        semiangle_cutoff=ML_SEMIANGLE,
+        rotation_angle=0.0,
+        aberration_coefs=aberrations,
+        force_fitted_origin=(ML_N_DET // 2, ML_N_DET // 2),
+        edge_blend_pixels=0,
+        verbose=False,
+    )
+
+
+def band_limit_ml(image: np.ndarray, cutoff: float = 2 * ML_K_PROBE) -> np.ndarray:
+    """Low-pass to what the bright-field disk transfers, DC removed."""
+    qx = np.fft.fftfreq(image.shape[0], ML_SAMPLING)
+    qy = np.fft.fftfreq(image.shape[1], ML_SAMPLING)
+    q = np.hypot(qx[:, None], qy[None, :])
+    return np.fft.ifft2(np.fft.fft2(image) * ((q <= cutoff) & (q > 0))).real
+
+
+def periodic_gaussians(positions, shape, sampling=ML_SAMPLING, sigma=0.35, weights=None):
+    """Sum of periodic Gaussians at ``(row, col)`` positions in Angstrom."""
+    rows = np.arange(shape[0]) * sampling
+    cols = np.arange(shape[1]) * sampling
+    extent = np.asarray(shape) * sampling
+    weights = np.ones(len(positions)) if weights is None else weights
+    out = np.zeros(shape)
+    for (r, c), w in zip(positions, weights):
+        dr = (rows[:, None] - r + extent[0] / 2) % extent[0] - extent[0] / 2
+        dc = (cols[None, :] - c + extent[1] / 2) % extent[1] - extent[1] / 2
+        out += w * np.exp(-(dr**2 + dc**2) / (2 * sigma**2))
+    return out
+
+
+def _lattice_in_box(basis_vectors, motif, rotation, box):
+    """Lattice sites with a weighted motif, rotated and folded into a periodic box."""
+    c, s = np.cos(rotation), np.sin(rotation)
+    rot = np.array([[c, -s], [s, c]])
+    a1, a2 = (rot @ v for v in basis_vectors)
+    reach = int(np.ceil(2 * max(box) / min(np.linalg.norm(a1), np.linalg.norm(a2)))) + 2
+    sites = []
+    for i in range(-reach, reach + 1):
+        for j in range(-reach, reach + 1):
+            for offset, weight in motif:
+                fractional = (i * a1 + j * a2 + rot @ offset) / np.asarray(box)
+                fractional = fractional - np.floor(fractional + 1e-9)
+                if np.all(fractional < 1 - 1e-9):
+                    sites.append((*(fractional * box), weight))
+    sites = np.unique(np.round(np.asarray(sites), 6), axis=0)
+    return sites[:, :2], sites[:, 2]
+
+
+def twisted_square_cell():
+    """Two square lattices twisted by 36.87 degrees (Sigma 5), ``(shape, layers, twist)``.
+
+    ``a = 3.2`` A puts five cells across a 16 A box, which holds both lattices exactly:
+    ``(5a, 0)`` is ``4 a1' - 3 a2'`` of the rotated one. The motif is a strong corner site and
+    a half-strength centre site, a perovskite-like column pattern. Each layer's (10)
+    reflection then lands on the integer frequency pixels ``(5, 0)`` and ``(4, 3)``.
+    """
+    a, box = 3.2, (16.0, 16.0)
+    basis = (np.array([a, 0.0]), np.array([0.0, a]))
+    motif = [(np.zeros(2), 1.0), (np.array([a / 2, a / 2]), 0.5)]
+    twist = 2 * np.arctan(1 / 3)
+    shape = tuple(int(round(b / ML_SAMPLING)) for b in box)
+    layers = []
+    for angle in (0.0, twist):
+        sites, weights = _lattice_in_box(basis, motif, angle, box)
+        layers.append(periodic_gaussians(sites, shape, weights=weights))
+    return shape, layers, float(np.degrees(twist))
+
+
+def twisted_honeycomb_cell(a: float = 2.46):
+    """Two honeycombs twisted by 21.79 degrees, the (1, 2) commensurate cell.
+
+    Both layers are periodic in the orthogonal cell of their ``sqrt(7) a`` coincidence lattice,
+    ``sqrt(21) a x sqrt(7) a``, snapped to whole pixels (a 0.1-0.2% strain).
+    """
+    a1, a2 = np.array([a, 0.0]), np.array([a / 2, a * np.sqrt(3) / 2])
+    t, t_image = a1 + 2 * a2, 2 * a1 + a2
+    first = -np.arctan2(t[1], t[0])
+    second = first + np.arctan2(t[1], t[0]) - np.arctan2(t_image[1], t_image[0])
+    side = np.sqrt(7) * a
+    box_true = (side, np.sqrt(3) * side)  # built as (col, row), transposed below
+    shape = (int(round(box_true[1] / ML_SAMPLING)), int(round(box_true[0] / ML_SAMPLING)))
+    strain = np.asarray(shape[::-1]) * ML_SAMPLING / np.asarray(box_true)
+    motif = [(np.zeros(2), 1.0), ((a1 + a2) / 3, 1.0)]
+    layers = []
+    for angle in (first, second):
+        sites, weights = _lattice_in_box((a1, a2), motif, angle, box_true)
+        layers.append(periodic_gaussians((sites * strain)[:, ::-1], shape, weights=weights))
+    return shape, layers, float(np.degrees(np.arccos(13 / 14)))
+
+
+def layer_purity(slices, truths) -> tuple[float, float]:
+    """``(purity, correlation)`` averaged over layers, each true layer scored at its own slice.
+
+    ``purity = c_own^2 / sum_m c_m^2`` with ``c_m`` the correlation of that slice with layer
+    ``m``: 1 when a slice holds only its own layer, ``1 / n_layers`` when it holds all equally.
+    """
+    truths = [band_limit_ml(t) for t in truths]
+    purities, owns = [], []
+    for layer, image in enumerate(slices):
+        image = band_limit_ml(np.asarray(image))
+        c = np.array([correlation(image, t) for t in truths])
+        purities.append(c[layer] ** 2 / (c**2).sum())
+        owns.append(c[layer])
+    return float(np.mean(purities)), float(np.mean(owns))

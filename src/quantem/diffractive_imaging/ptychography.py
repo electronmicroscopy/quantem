@@ -23,10 +23,13 @@ from quantem.core.ml.dist_utils import (
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType, ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbeParametric
-from quantem.diffractive_imaging.ptycho_losses import DataCriterion
-from quantem.diffractive_imaging.ptycho_utils import compute_train_val_split
+from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType
+from quantem.diffractive_imaging.probe_models import ProbeModelType
+from quantem.diffractive_imaging.ptycho_losses import L2, DataCriterion
+from quantem.diffractive_imaging.ptycho_utils import (
+    compute_train_val_split,
+    fourier_translation_operator,
+)
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
 from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
@@ -276,6 +279,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         autograd: bool = True,
         loss_type: "str | DataCriterion" = "l2_amplitude",
         num_workers: int = 0,
+        analytic_step_normalization: bool = True,
     ) -> Self:
         """Run iterative ptychography reconstruction.
 
@@ -307,6 +311,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         ``"poisson"``, ``"smooth_l1_amplitude"``, ``"s3im_amplitude"``) or a ``DataCriterion``
         instance for custom parameters (e.g. ``AmplitudeS3IM(lambda_s3im=0.5)``). See
         ``ptycho_losses``.
+
+        ``autograd=False`` computes the gradient of the ``l2_amplitude`` loss analytically; it is
+        the same gradient autograd returns. With ``analytic_step_normalization`` (the default)
+        that gradient is then rescaled to the ePIE step: the object by the maximum summed probe
+        intensity over the batch (per slice), the probe by the maximum summed object intensity.
+        This is a step-size rule, not part of the gradient, and it is never applied under
+        autograd. For a full batch on a scan whose step is one object pixel the two coincide,
+        so ``SGD(lr)`` takes the same step on either path.
 
         """
         self._check_preprocessed()
@@ -374,6 +386,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             autograd=autograd,
             loss_type=loss_type,
             num_workers=num_workers,
+            analytic_step_normalization=analytic_step_normalization,
             _dist_rank=rank,
             _dist_world_size=world_size,
         )
@@ -391,6 +404,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         autograd: bool = True,
         loss_type: "str | DataCriterion" = "l2_amplitude",
         num_workers: int = 0,
+        analytic_step_normalization: bool = True,
         _dist_rank: int = 0,
         _dist_world_size: int = 1,
     ) -> Self:
@@ -422,11 +436,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self.set_schedulers(self.scheduler_params, num_iter=num_iters)
 
         self.criterion = loss_type  # resolve name/instance -> DataCriterion
-        if not autograd and self._criterion.target_space != "amplitude":
+        if not autograd and not (
+            isinstance(self._criterion, L2) and self._criterion.target_space == "amplitude"
+        ):
             raise ValueError(
-                "autograd=False uses the amplitude-projection update, which requires an "
-                f"amplitude-space loss; got loss_type with target_space="
-                f"{self._criterion.target_space!r}."
+                "autograd=False computes the gradient of the l2_amplitude loss analytically; "
+                f"got {type(self._criterion).__name__} with target_space="
+                f"{self._criterion.target_space!r}. Use autograd=True for other losses."
             )
         self.dset._set_targets(self._criterion.target_space)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
@@ -488,6 +504,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     overlap,
                     patch_data,
                     targets,
+                    positions_px_fractional=positions_px_fractional,
+                    descan_shifts=descan_shifts,
+                    global_n=global_n,
+                    step_normalization=analytic_step_normalization,
                 )
                 if _dist_world_size > 1:
                     self._all_reduce_gradients()
@@ -721,55 +741,69 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         overlap: torch.Tensor,
         patch_indices: torch.Tensor,
         amplitudes: torch.Tensor,
+        positions_px_fractional: torch.Tensor | None = None,
+        descan_shifts: torch.Tensor | None = None,
+        global_n: int | None = None,
+        step_normalization: bool = True,
     ):
+        """Populate the parameter gradients for one batch.
+
+        With ``autograd`` the loss is back-propagated as it is. Otherwise the same gradient is
+        computed analytically (``l2_amplitude`` only): ``gradient_step`` gives it with respect
+        to the exit waves, the object model carries it back through the slices, and the probe
+        model through the sub-pixel shifts. ``step_normalization`` then rescales both to the
+        ePIE step (see ``reconstruct``).
+        """
         if autograd:
             loss.backward()
-            # scaling pixelated ad gradients to closer match analytic
-            if isinstance(self.obj_model, ObjectPixelated):
-                obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
-                if self.obj_model._obj.grad is not None:
-                    self.obj_model._obj.grad.mul_(obj_grad_scale)
+            return
 
-            if isinstance(self.probe_model, ProbeParametric):
-                probe_grad_scale = np.sqrt(self.probe_model._mean_diffraction_intensity)
-                for par in self.probe_model.params:
-                    if par.grad is not None:
-                        par.grad.mul_(probe_grad_scale)
-
-        else:
-            gradient = self.gradient_step(amplitudes, overlap)
-            prop_gradient = self.obj_model.backward(
-                gradient,
+        with torch.no_grad():
+            exit_gradient = self.gradient_step(amplitudes, overlap, descan_shifts, global_n)
+            step_scale = None
+            if step_normalization:
+                # undo the loss normalization, leaving the plain residual sum that ePIE divides
+                n = self.dset.num_positions if global_n is None else global_n
+                step_scale = self.dset.mean_diffraction_intensity * overlap.shape[1] / n
+            probe_gradient = self.obj_model.backward(
+                exit_gradient,
                 obj_patches,
                 propagated_probes,
                 self._propagators,
                 patch_indices,
+                step_scale=step_scale,
             )
-            self.probe_model.backward(prop_gradient, obj_patches)
-
-    def gradient_step(self, amplitudes, overlap):
-        """Computes analytical gradient using the Fourier projection modified overlap"""
-        modified_overlap = self.fourier_projection(amplitudes, overlap)
-        ## mod_overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
-        ## grad shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
-        return modified_overlap - overlap
-
-    def fourier_projection(self, measured_amplitudes, overlap_array):
-        """Replaces the Fourier amplitude of overlap with the measured data."""
-        # corner centering measured amplitudes
-        measured_amplitudes = torch.fft.fftshift(measured_amplitudes, dim=(-2, -1))
-        fourier_overlap = torch.fft.fft2(overlap_array, norm="ortho")
-        if self.num_probes == 1:  # faster
-            fourier_modified_overlap = measured_amplitudes * torch.exp(
-                1.0j * torch.angle(fourier_overlap)
+            self.probe_model.backward(
+                probe_gradient, obj_patches, positions_px_fractional, step_scale=step_scale
             )
-        else:  # necessary for mixed state # TODO check this with normalization
-            farfield_amplitudes = self.estimate_amplitudes(overlap_array, corner_centered=True)
-            farfield_amplitudes[farfield_amplitudes == 0] = torch.inf
-            amplitude_modification = measured_amplitudes / farfield_amplitudes
-            fourier_modified_overlap = amplitude_modification[None] * fourier_overlap
 
-        return torch.fft.ifft2(fourier_modified_overlap, norm="ortho")
+    def gradient_step(
+        self,
+        amplitudes: torch.Tensor,
+        overlap: torch.Tensor,
+        descan_shifts: torch.Tensor | None = None,
+        global_n: int | None = None,
+    ) -> torch.Tensor:
+        """Gradient of the ``l2_amplitude`` loss with respect to the exit waves ``overlap``.
+
+        In torch's convention (what autograd returns for a complex tensor) this is
+        ``(n / B) / mean_I * mask**2 * (psi - psi')``, where ``psi'`` keeps the modelled phase
+        and takes the measured amplitude, the probe modes adding incoherently. The ``1e-9`` in
+        the modelled amplitude and the detector mask match ``error_estimate``, and the descan
+        ramp that ``forward_operator`` applies is undone by its conjugate.
+        """
+        n = self.dset.num_positions if global_n is None else global_n
+        scale = (n / overlap.shape[1]) / self.dset.mean_diffraction_intensity
+        measured = torch.fft.ifftshift(amplitudes, dim=(-2, -1))
+        mask = torch.fft.ifftshift(self.dset.detector_mask, dim=(-2, -1))
+        fourier_overlap = torch.fft.fft2(overlap, norm="ortho")
+        modelled = torch.sqrt(torch.sum(torch.abs(fourier_overlap) ** 2, dim=0) + 1e-9)
+        residual = scale * mask**2 * (1 - measured / modelled)
+        gradient = torch.fft.ifft2(residual[None] * fourier_overlap, norm="ortho")
+        if descan_shifts is not None:
+            ramp = fourier_translation_operator(descan_shifts, tuple(self.roi_shape))
+            gradient = gradient * ramp.conj()[None]
+        return gradient
 
     # endregion --- reconstruction ---
 

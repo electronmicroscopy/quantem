@@ -41,6 +41,7 @@ from quantem.diffractive_imaging.complex_probe import (
 from quantem.diffractive_imaging.ptycho_utils import (
     add_input_noise,
     fourier_shift_expand,
+    fourier_translation_operator,
     shift_array,
 )
 
@@ -813,16 +814,36 @@ class ProbePixelated(ProbeConstraints):
     def name(self) -> str:
         return "ProbePixelated"
 
-    def backward(self, propagated_gradient, obj_patches):
-        obj_normalization = torch.sum(torch.abs(obj_patches).square(), dim=(-2, -1)).max()
-        if self.num_probes == 1:
-            # this is wrong--but it fixes the issue with multiple probes sgd + analytical--TODO fix
-            # basically it screws up the amplitude grad but fixes the phase grad
-            ortho_norm: float = 2 * np.prod(self.roi_shape) ** 0.5  # from ortho fft2 # type:ignore
-        else:
-            ortho_norm: float = 1 / (2 * np.prod(self.roi_shape) ** 0.5)  # type:ignore
-        probe_grad = torch.sum(propagated_gradient, dim=1) / obj_normalization / ortho_norm
-        self._probe.grad = -1 * probe_grad.clone().detach()
+    def backward(
+        self,
+        propagated_gradient: torch.Tensor,
+        obj_patches: torch.Tensor,
+        positions_px_fractional: torch.Tensor | None = None,
+        step_scale: float | None = None,
+    ) -> None:
+        """Analytic gradient of the loss with respect to ``_probe``, stored in ``_probe.grad``.
+
+        ``propagated_gradient`` is the loss gradient with respect to the probe incident on the
+        first slice at each position, ``(num_probes, batch, *roi_shape)``. Each is shifted back
+        by its sub-pixel offset (the adjoint of ``forward``) and the positions are summed, giving
+        what autograd returns when the probe hard constraints are inactive (they are
+        differentiated through under autograd, and treated as the identity here). With a
+        ``step_scale`` the result is rescaled by ``step_scale / D``, where ``D`` is the largest
+        summed object intensity over the batch: the ePIE probe step.
+        """
+        if positions_px_fractional is not None:
+            ramp = fourier_translation_operator(
+                -positions_px_fractional,
+                tuple(propagated_gradient.shape[-2:]),
+                expand_dim=False,
+                dtype=propagated_gradient.dtype,
+            )  # (batch, *roi_shape), broadcast over the probe modes
+            propagated_gradient = torch.fft.ifft2(torch.fft.fft2(propagated_gradient) * ramp)
+        probe_grad = torch.sum(propagated_gradient, dim=1)
+        if step_scale is not None:
+            normalization = torch.sum(torch.abs(obj_patches[0]) ** 2, dim=0).max()
+            probe_grad = probe_grad * (step_scale / normalization)
+        self._probe.grad = probe_grad.detach().clone()
 
     @property
     def vacuum_probe_intensity(self) -> torch.Tensor | None:
@@ -1520,7 +1541,7 @@ class ProbeDIP(ProbeConstraints):
         )
         plt.show()
 
-    def backward(self, propagated_gradient, obj_patches):
+    def backward(self, *args, **kwargs):
         """Backward pass for analytical gradients (not implemented for DIP)"""
         raise NotImplementedError(
             f"Analytical gradients are not implemented for {self.name}, use autograd=True"

@@ -18,9 +18,15 @@ class StrainMap(AutoSerialize):
     """Strain tensor maps fit from per-position lattice vectors.
 
     Stores the reference-frame strain components ``e_rr`` (row), ``e_cc`` (col),
-    ``e_rc`` (shear), and ``phi`` (infinitesimal rotation). The reference lattice
-    is the median of the fitted ``g_u``/``g_v`` over a mask/ROI; the strain tensor
-    is recomputed by :meth:`update_reference`.
+    ``e_rc`` (shear), and ``phi`` (infinitesimal rotation, radians). The reference
+    lattice is the weighted median (or mean) of the fitted ``g1``/``g2`` over a
+    mask/ROI; the strain tensor is recomputed by :meth:`update_reference`.
+
+    The lattice vectors are first mapped from the detector frame into the scan
+    frame (optional row/col transpose, then a counter-clockwise rotation by
+    ``q_to_r_rotation_ccw_deg``), so ``e_rr``/``e_cc`` refer to the scan rows and
+    columns. :attr:`g1_array`, :attr:`g2_array`, :attr:`g1_ref` and :attr:`g2_ref`
+    are stored in that rotated frame.
 
     Two measurement modalities are supported and give identical strain for the same
     deformation, so correlation and cepstral maps can be compared directly:
@@ -40,11 +46,11 @@ class StrainMap(AutoSerialize):
         for real-space (cepstral autocorrelation / DPC) vectors. Both modalities are
         arranged to yield matching strain (see :func:`_strain_tensor`).
     g1_ref : np.ndarray, optional
-        Fixed reference for ``u``; if omitted the median over the mask/ROI is used.
-        A value supplied here persists across re-fits.
+        Fixed reference for ``g1``, in the same (unrotated) frame as ``g1_array``;
+        if omitted the ``calculation_metric`` over the mask/ROI is used. A value
+        supplied here persists across re-fits.
     g2_ref : np.ndarray, optional
-        Fixed reference for ``v``; if omitted the median over the mask/ROI is used.
-        A value supplied here persists across re-fits.
+        Fixed reference for ``g2``, as ``g1_ref``.
     mask : np.ndarray, optional
         ``(scan_row, scan_col)`` weighting/ROI mask; defaults to all ones (the full
         scan). Normalized to ``[0, 1]`` on assignment.
@@ -52,6 +58,12 @@ class StrainMap(AutoSerialize):
         Real-space scan sampling (step size); defaults to ``1.0``.
     ds_units : str, optional
         Units for ``ds_sampling``; defaults to ``"pixels"``.
+    q_to_r_rotation_ccw_deg : float, default=0.0
+        Counter-clockwise rotation in degrees from the detector (``q``) frame to
+        the scan (``r``) frame, applied to the lattice vectors and to ``g1_ref`` /
+        ``g2_ref``.
+    q_transpose : bool, default=False
+        If ``True``, swap the detector row/col axes before the rotation.
     calculation_metric : {"median", "mean"}, default="median"
         Statistic used for the automatic reference lattice. Stored and reused by
         :meth:`update_reference` unless overridden there.
@@ -94,12 +106,16 @@ class StrainMap(AutoSerialize):
         super().__init__()
         self.g1_array = g1_array
         self.g2_array = g2_array
-        
+
         self.q_to_r_rotation_ccw_deg = q_to_r_rotation_ccw_deg
         self.q_transpose = q_transpose
 
-        self.g1_array = _raw_vec_to_display(self.g1_array, rotation_ccw_deg = q_to_r_rotation_ccw_deg, transpose=q_transpose)
-        self.g2_array = _raw_vec_to_display(self.g2_array, rotation_ccw_deg = q_to_r_rotation_ccw_deg, transpose=q_transpose)
+        self.g1_array = _raw_vec_to_display(
+            self.g1_array, rotation_ccw_deg=q_to_r_rotation_ccw_deg, transpose=q_transpose
+        )
+        self.g2_array = _raw_vec_to_display(
+            self.g2_array, rotation_ccw_deg=q_to_r_rotation_ccw_deg, transpose=q_transpose
+        )
 
         self.ds_shape = ds_shape
         self.real_space = real_space
@@ -116,17 +132,29 @@ class StrainMap(AutoSerialize):
             m = (m - m_lo) / (m_hi - m_lo)
         self.mask = m
 
-        # user-supplied reference vectors persist across re-fits (None = use median)
-        self.g1_ref_fixed = None if g1_ref is None else _raw_vec_to_display(np.asarray(g1_ref, dtype=float), 
-                                                                                                                        rotation_ccw_deg=q_to_r_rotation_ccw_deg, 
-                                                                                                                        transpose=q_transpose)
-        self.g2_ref_fixed = None if g2_ref is None else _raw_vec_to_display(np.asarray(g2_ref, dtype=float), 
-                                                                                                                        rotation_ccw_deg=q_to_r_rotation_ccw_deg, 
-                                                                                                                        transpose=q_transpose)
+        # user-supplied reference vectors persist across re-fits (None = automatic)
+        self.g1_ref_fixed = (
+            None
+            if g1_ref is None
+            else _raw_vec_to_display(
+                np.asarray(g1_ref, dtype=float),
+                rotation_ccw_deg=q_to_r_rotation_ccw_deg,
+                transpose=q_transpose,
+            )
+        )
+        self.g2_ref_fixed = (
+            None
+            if g2_ref is None
+            else _raw_vec_to_display(
+                np.asarray(g2_ref, dtype=float),
+                rotation_ccw_deg=q_to_r_rotation_ccw_deg,
+                transpose=q_transpose,
+            )
+        )
         self.g1_ref = None
         self.g2_ref = None
         self.calculation_metric = calculation_metric
-        self.update_reference(calculation_metric = calculation_metric)
+        self.update_reference(calculation_metric=calculation_metric)
 
     # ---- main methods ----
 
@@ -149,9 +177,9 @@ class StrainMap(AutoSerialize):
         Parameters
         ----------
         strain_mask : np.ndarray, optional
-            ``(scan_row, scan_col)`` ROI selecting the positions used to compute the
-            median reference lattice. If omitted, ``self.mask`` (else the global
-            median) is used.
+            ``(scan_row, scan_col)`` ROI or weights selecting the positions used to
+            compute the automatic reference lattice. If omitted, ``self.mask`` is
+            used.
         g1_ref : np.ndarray, optional
             Explicit reference for ``g1``; overrides both the construction-time fixed
             value and the median.
@@ -162,9 +190,10 @@ class StrainMap(AutoSerialize):
             If ``True``, show the recomputed strain via :meth:`plot_strain_roi`
             (color-scaled to the ROI) so the chosen reference region can be checked
             for flatness.
-        define_in_rotated_frame: bool, default = False
-            If ``True``, the ``g1_ref`` and ``g2_ref`` passed into the function are
-            defined in the rotated detector frame.
+        define_in_rotated_frame : bool, default=False
+            If ``True``, the ``g1_ref`` and ``g2_ref`` passed here are already in
+            the rotated (scan) frame; otherwise they are in the detector frame and
+            are rotated like the lattice vectors.
         calculation_metric : {"median", "mean"}, optional
             Statistic for the automatic reference lattice. If given, it is stored on the
             object and used by later calls; if ``None`` (default), the stored value is
@@ -179,16 +208,23 @@ class StrainMap(AutoSerialize):
         """
         if calculation_metric is not None:
             self.calculation_metric = calculation_metric
-        g1_med, g2_med = _reference_lattice(self.g1_array, self.g2_array, self.mask, strain_mask, calculation_metric = self.calculation_metric)
+        g1_med, g2_med = _reference_lattice(
+            self.g1_array,
+            self.g2_array,
+            self.mask,
+            strain_mask,
+            calculation_metric=self.calculation_metric,
+        )
 
         if g1_ref is not None:
             if define_in_rotated_frame:
                 self.g1_ref = np.asarray(g1_ref, dtype=float)
             else:
                 self.g1_ref = _raw_vec_to_display(
-                                        np.asarray(g1_ref, dtype=float),
-                                        rotation_ccw_deg=self.q_to_r_rotation_ccw_deg, 
-                                        transpose=self.q_transpose)
+                    np.asarray(g1_ref, dtype=float),
+                    rotation_ccw_deg=self.q_to_r_rotation_ccw_deg,
+                    transpose=self.q_transpose,
+                )
         elif self.g1_ref_fixed is not None:
             self.g1_ref = self.g1_ref_fixed
         else:
@@ -199,9 +235,10 @@ class StrainMap(AutoSerialize):
                 self.g2_ref = np.asarray(g2_ref, dtype=float)
             else:
                 self.g2_ref = _raw_vec_to_display(
-                                                    np.asarray(g2_ref, dtype=float),
-                                                    rotation_ccw_deg=self.q_to_r_rotation_ccw_deg, 
-                                                    transpose=self.q_transpose)
+                    np.asarray(g2_ref, dtype=float),
+                    rotation_ccw_deg=self.q_to_r_rotation_ccw_deg,
+                    transpose=self.q_transpose,
+                )
         elif self.g2_ref_fixed is not None:
             self.g2_ref = self.g2_ref_fixed
         else:
@@ -279,21 +316,24 @@ class StrainMap(AutoSerialize):
             Colormap for the strain panels.
         cmap_rotation : str, default="PiYG"
             Colormap for the rotation panel.
-        strain_range_percent : tuple of float, default=(-3.0, 3.0)
-            Symmetric color range for the strain panels, in percent.
-        rotation_range_degrees : tuple of float, default=(-2.0, 2.0)
-            Symmetric color range for the rotation panel, in degrees.
-        transpose_image: bool, default = False
-            If ''True'' transpose the real space image before plotting strain
-        rotate_title: bool, default = False
-            If ''True'', rotates panel titles by 90 degrees.
-        plot_dilation: bool, default = False
-            If ''True'' plots euu + evv, and euv instead of euu, evv, euv
+        strain_range_percent : tuple of float, optional
+            Color range for the strain panels, in percent. ``None`` (default) uses
+            a symmetric range set by the largest absolute strain inside the ROI.
+        rotation_range_degrees : tuple of float, optional
+            Color range for the rotation panel, in degrees. ``None`` (default) uses
+            a symmetric range set by the largest absolute rotation inside the ROI.
+        transpose_image : bool, default=False
+            If ``True``, transpose the real-space images before plotting.
+        rotate_title : bool, default=False
+            If ``True``, rotate the panel titles by 90 degrees.
+        plot_dilation : bool, default=False
+            If ``True``, plot ``e_rr + e_cc`` and ``e_rc`` instead of ``e_rr``,
+            ``e_cc`` and ``e_rc``.
         layout : {"horizontal", "vertical"}, default="horizontal"
             Panel arrangement.
-        arrow_style: str, default="title"
-            Plots the directional arrows along with the strain titles. 
-            Alternatively can be "legend" where it plots it on the side
+        arrow_style : {"title", "legend"}, default="title"
+            Accepted for symmetry with :meth:`plot_strain`; the row/col titles
+            carry their own arrows, so no extra arrows are drawn here.
         figsize : tuple of float, optional
             Figure size in inches; if omitted it is derived from the layout.
         **kwargs
@@ -308,6 +348,18 @@ class StrainMap(AutoSerialize):
 
         if arrow_style not in ("title", "legend"):
             raise ValueError("arrow_style must be 'title' or 'legend'")
+
+        if plot_dilation:
+            panel_titles = (
+                r"$\epsilon_{rr} + \epsilon_{cc}$",
+                r"$\epsilon_{rc}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
+            )
+        else:
+            panel_titles = (
+                r"$\epsilon_{rr}$ $\updownarrow$",
+                r"$\epsilon_{cc}$ $\leftrightarrow$",
+                r"$\epsilon_{rc}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
+            )
 
         roi_src = self.mask if strain_mask is None else strain_mask
         e_rr, e_cc, e_rc, phi = (
@@ -338,23 +390,23 @@ class StrainMap(AutoSerialize):
             self.ds_shape,
             ds_sampling=self.ds_sampling,
             ds_units=self.ds_units,
-            strain_range_percent=(-smax, smax) if strain_range_percent is None else strain_range_percent,
-            rotation_range_degrees=(-rmax, rmax) if rotation_range_degrees is None else rotation_range_degrees,
+            strain_range_percent=(-smax, smax)
+            if strain_range_percent is None
+            else strain_range_percent,
+            rotation_range_degrees=(-rmax, rmax)
+            if rotation_range_degrees is None
+            else rotation_range_degrees,
             roi=inside,
             plot_rotation=plot_rotation,
             cmap_strain=cmap_strain,
             cmap_rotation=cmap_rotation,
             layout=layout,
-            transpose_image = transpose_image,
-            rotate_title = rotate_title,
-            plot_dilation = plot_dilation,
+            transpose_image=transpose_image,
+            rotate_title=rotate_title,
+            plot_dilation=plot_dilation,
             figsize=figsize,
-            panel_titles=(
-                r"$\epsilon_{rr}$ $\updownarrow$",
-                r"$\epsilon_{cc}$ $\leftrightarrow$",
-                r"$\epsilon_{rc}$ $\nwarrow\!\!\!\!\!\!\!\!\!\:\searrow$",
-            ),
-            arrow_style = arrow_style,
+            panel_titles=panel_titles,
+            arrow_style=arrow_style,
             **kwargs,
         )
 
@@ -404,25 +456,26 @@ class StrainMap(AutoSerialize):
             Colormap for the strain panels.
         cmap_rotation : str, default="PiYG"
             Colormap for the rotation panel.
-        transpose_image: bool, default = False
-            If ''True'' transpose the real space image before plotting strain
+        transpose_image : bool, default=False
+            If ``True``, transpose the real-space images before plotting.
         transpose_strain : bool, default=False
-            If ``True``, transpose the detector (row/col) axes before rotating,
-            matching the DPC convention (see
-            :func:`~quantem.diffraction.strain_autocorrelation._raw_vec_to_display`):
-            transpose first, then rotate. This swaps the normal strain components,
-            leaves the shear unchanged, and reverses the sign of the rotation field.
-        rotate_title: bool, default = False
-            If ''True'', rotates panel titles by 90 degrees.
-        plot_dilation: bool, default = False
-            If ''True'' plots euu + evv, and euv instead of euu, evv, euv
+            If ``True``, transpose the (row/col) axes of the strain tensor before
+            rotating, matching the DPC convention of :func:`_raw_vec_to_display`
+            (transpose first, then rotate). This swaps the normal strain
+            components, leaves the shear unchanged, and reverses the sign of the
+            rotation field.
+        rotate_title : bool, default=False
+            If ``True``, rotate the panel titles by 90 degrees.
+        plot_dilation : bool, default=False
+            If ``True``, plot ``e_uu + e_vv`` and ``e_uv`` instead of ``e_uu``,
+            ``e_vv`` and ``e_uv``.
         layout : {"horizontal", "vertical"}, default="horizontal"
             Panel arrangement.
+        arrow_style : {"title", "legend"}, default="title"
+            Draw the strain direction arrows next to the panel titles, or in a
+            legend at the side of the figure.
         figsize : tuple of float, optional
             Figure size in inches; if omitted it is derived from the layout.
-        arrow_style: str, default="title"
-            Plots the directional arrows along with the strain titles. 
-            Alternatively can be "legend" where it plots it on the side
         **kwargs
             Forwarded to
             :func:`~quantem.diffraction.strain_visualization.plot_strain_panels`.
@@ -434,7 +487,6 @@ class StrainMap(AutoSerialize):
         """
         if arrow_style not in ("title", "legend"):
             raise ValueError("arrow_style must be 'title' or 'legend'")
-        
         e_rr = self.e_rr.array
         e_cc = self.e_cc.array
         e_rc = self.e_rc.array
@@ -467,12 +519,12 @@ class StrainMap(AutoSerialize):
             cmap_strain=cmap_strain,
             cmap_rotation=cmap_rotation,
             layout=layout,
-            transpose_image = transpose_image,
-            rotate_title = rotate_title,
-            plot_dilation = plot_dilation,
+            transpose_image=transpose_image,
+            rotate_title=rotate_title,
+            plot_dilation=plot_dilation,
             figsize=figsize,
             strain_rotation_angle=rotation_angle,
-            arrow_style = arrow_style,
+            arrow_style=arrow_style,
             **kwargs,
         )
 
@@ -489,6 +541,7 @@ class StrainMap(AutoSerialize):
         bounds: tuple[float, float] | None = None,
         plot: bool = True,
         returnfig: bool = False,
+        verbose: bool = False,
     ):
         """Estimate strain *precision* (random scatter) from local median deviations.
 
@@ -545,7 +598,12 @@ class StrainMap(AutoSerialize):
             pixel cannot leak its scatter into the precision.
         min_neighbors : int, default=3
             Minimum number of valid neighbors required; positions with fewer get no
-            precision estimate (``nan``, dropped from the statistics).
+            precision estimate (``nan``, dropped from the statistics). Ignored when
+            ``require_full_neighborhood=True``.
+        require_full_neighborhood : bool, default=True
+            If ``True``, require every neighbor in the footprint to be valid (sets
+            ``min_neighbors`` to the footprint size), so positions next to masked
+            or missing data get no estimate.
         component : {"combined","e_uu","e_vv","e_uv","rotation"}, default="combined"
             Which error distribution to histogram.
         bins : int, default=50
@@ -564,6 +622,8 @@ class StrainMap(AutoSerialize):
             If ``True``, draw the weighted precision histogram.
         returnfig : bool, default=False
             If ``True``, return ``(fig, ax)`` instead of the results dict.
+        verbose : bool, default=False
+            If ``True``, print a summary of the precision per component.
 
         Returns
         -------
@@ -585,7 +645,7 @@ class StrainMap(AutoSerialize):
         # number of neighbors in the circular footprint (matches _local_masked_median)
         p = window // 2
         oy, ox = np.ogrid[-p : p + 1, -p : p + 1]
-        n_neighbors = int(np.sum((oy ** 2 + ox ** 2) <= (window / 2.0) ** 2) - 1)
+        n_neighbors = int(np.sum((oy**2 + ox**2) <= (window / 2.0) ** 2) - 1)
         if require_full_neighborhood:
             min_neighbors = n_neighbors
 
@@ -614,9 +674,7 @@ class StrainMap(AutoSerialize):
         # deviations). Rotation is reported separately, not folded in: in nanobeam
         # data it is partly a systematic (tilt/descan) and would mix radians into a
         # percent figure.
-        dev["combined"] = np.sqrt(
-            dev["e_uu"] ** 2 + dev["e_vv"] ** 2 + 2.0 * dev["e_uv"] ** 2
-        )
+        dev["combined"] = np.sqrt(dev["e_uu"] ** 2 + dev["e_vv"] ** 2 + 2.0 * dev["e_uv"] ** 2)
 
         # display-unit scaling: strain -> percent, rotation -> degrees
         scale = {
@@ -690,19 +748,20 @@ class StrainMap(AutoSerialize):
             "require_full_neighborhood": bool(require_full_neighborhood),
         }
 
-        print("Strain precision  (median local deviation, mask-weighted)")
-        print(
-            f"  reference={n_neighbors} neighbors (disk, window={window})  "
-            f"mask>{mask_threshold:g}  min_neighbors={min_neighbors}  "
-            f"rotation_angle={rotation_angle:g} deg"
-        )
-        for name in ("e_uu", "e_vv", "e_uv"):
-            print(f"    {name:<9}: {precision[name]:7.4f} %")
-        print(f"    {'rotation':<9}: {precision['rotation']:7.4f} deg")
-        print(
-            f"    {'combined':<9}: {precision['combined']:7.4f} %   "
-            "(strain-only Frobenius norm; rotation excluded)"
-        )
+        if verbose:
+            print("Strain precision  (median local deviation, mask-weighted)")
+            print(
+                f"  reference={n_neighbors} neighbors (disk, window={window})  "
+                f"mask>{mask_threshold:g}  min_neighbors={min_neighbors}  "
+                f"rotation_angle={rotation_angle:g} deg"
+            )
+            for name in ("e_uu", "e_vv", "e_uv"):
+                print(f"    {name:<9}: {precision[name]:7.4f} %")
+            print(f"    {'rotation':<9}: {precision['rotation']:7.4f} deg")
+            print(
+                f"    {'combined':<9}: {precision['combined']:7.4f} %   "
+                "(strain-only Frobenius norm; rotation excluded)"
+            )
 
         if not (plot or returnfig):
             return result
@@ -778,7 +837,7 @@ def _local_masked_median(
     fw[:, :, p, p] = np.nan  # exclude the center position from its own median
     # restrict the square box to a circular footprint of radius window/2
     oy, ox = np.ogrid[-p : p + 1, -p : p + 1]
-    outside = (oy ** 2 + ox ** 2) > (window / 2.0) ** 2
+    outside = (oy**2 + ox**2) > (window / 2.0) ** 2
     fw[:, :, outside] = np.nan
 
     flat = fw.reshape(fw.shape[0], fw.shape[1], -1)
@@ -803,7 +862,8 @@ def _reference_lattice(
     (``calculation_metric="median"``) or weighted mean (``"mean"``) of the lattice
     vectors over finite positions with positive weight. Weights come from
     ``strain_mask`` if given, else from the continuous ``mask`` (the ``[0, 1]``
-    per-position weight from :meth:`create_mask` / ``fit_lattice``). A boolean ROI
+    per-position weight, e.g. ``BraggVectors.mask_weight`` from
+    ``BraggVectors.fit_lattice``). A boolean ROI
     (weights in ``{0, 1}``) reduces to the plain median/mean over the selected
     positions. If no position has positive weight, the unweighted statistic over all
     finite positions is used. A continuous weight (rather than ``mask == 1``) is used
@@ -831,10 +891,10 @@ def _reference_lattice(
     if calculation_metric not in ("mean", "median"):
         raise ValueError("calculation metric must be mean or median")
 
-    if calculation_metric == "mean":
-        reduce = lambda v, ww: float(np.average(v, weights=ww))
-    else:
-        reduce = lambda v, ww: _weighted_quantile(v, ww, 0.5)
+    def reduce(v: np.ndarray, ww: np.ndarray) -> float:
+        if calculation_metric == "mean":
+            return float(np.average(v, weights=ww))
+        return _weighted_quantile(v, ww, 0.5)
 
     if strain_mask is not None:
         w = np.asarray(strain_mask, dtype=float).reshape(-1)
@@ -847,10 +907,10 @@ def _reference_lattice(
     g2_flat = g2_array.reshape(-1, 2)
 
     def _wmed(vals: np.ndarray) -> float:
-        # weighted median over finite, positively-weighted positions; positions
+        # weighted statistic over finite, positively-weighted positions; positions
         # fit_lattice could not fit are NaN and must be dropped, else the reference
         # (and the whole strain map) collapses to NaN. Falls back to the unweighted
-        # nan-median when no weight is given or none survives.
+        # statistic over finite positions when no weight survives.
         finite = np.isfinite(vals)
         ww = np.ones_like(vals) if w is None else w
         use = finite & (ww > 0)
@@ -884,9 +944,11 @@ def _strain_tensor(
       ``strain_trans = (U @ inv(U_ref)).T``.
 
     Both expressions evaluate to ``F.T`` (the transpose of the real-space deformation
-    gradient), so the normal strains, shear, and rotation come out the same
-    regardless of modality, and the reciprocal-space sign convention (``const = -1``,
-    which sets the shear/rotation handedness) is shared.
+    gradient ``F``), so the normal strains, shear, and rotation come out the same
+    regardless of modality: ``e_rr = F[0, 0] - 1``, ``e_cc = F[1, 1] - 1``,
+    ``e_rc = (F[0, 1] + F[1, 0]) / 2`` and ``phi = (F[1, 0] - F[0, 1]) / 2``, so a
+    lattice rotated counter-clockwise in the (row, col) frame by a small angle
+    ``theta`` gives ``phi = theta``.
 
     Parameters
     ----------
@@ -950,7 +1012,6 @@ def _rotate_strain_tensor(
     e_cc: np.ndarray,
     e_rc: np.ndarray,
     rotation_angle: float,
-    real_space=False
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Rotate a 2D strain tensor by ``rotation_angle`` (degrees).
 
@@ -964,8 +1025,6 @@ def _rotate_strain_tensor(
         Row-column (shear) strain component.
     rotation_angle : float
         Frame rotation angle, in degrees.
-    real_space: bool
-        Tells whether vector is defined in real or reciprocal space
     Returns
     -------
     tuple of np.ndarray
@@ -974,17 +1033,31 @@ def _rotate_strain_tensor(
     angle = np.deg2rad(rotation_angle)
     c = np.cos(angle)
     s = np.sin(angle)
-    sign = -1.0 if real_space else 1.0
-    e_uu = e_rr * (c * c) + sign * 2.0 * e_rc * (c * s) + e_cc * (s * s)
-    e_vv = e_rr * (s * s) - sign * 2.0 * e_rc * (c * s) + e_cc * (c * c)
-    e_uv = sign * (e_cc - e_rr) * (c * s) + e_rc * (c * c - s * s)
+    e_uu = e_rr * (c * c) + 2.0 * e_rc * (c * s) + e_cc * (s * s)
+    e_vv = e_rr * (s * s) - 2.0 * e_rc * (c * s) + e_cc * (c * c)
+    e_uv = (e_cc - e_rr) * (c * s) + e_rc * (c * c - s * s)
     return e_uu, e_vv, e_uv
+
 
 def _raw_vec_to_display(vec_rc: NDArray, *, rotation_ccw_deg: float, transpose: bool) -> NDArray:
     """Map a raw-detector ``(row, col)`` vector into the rotated display frame.
 
     Applies the optional axis transpose, then a counter-clockwise rotation of
-    ``rotation_ccw_deg``. Inverse of :func:`_display_vec_to_raw`.
+    ``rotation_ccw_deg``.
+
+    Parameters
+    ----------
+    vec_rc : np.ndarray
+        Vector(s) with ``(row, col)`` in the last axis, shape ``(..., 2)``.
+    rotation_ccw_deg : float
+        Counter-clockwise rotation in degrees.
+    transpose : bool
+        If ``True``, swap row and col before rotating.
+
+    Returns
+    -------
+    np.ndarray
+        Rotated vector(s), same shape as ``vec_rc``.
     """
     v = np.asarray(vec_rc, dtype=float)
     dr, dc = v[..., 0], v[..., 1]

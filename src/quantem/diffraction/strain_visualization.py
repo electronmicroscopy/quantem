@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.cm import ScalarMappable
@@ -54,6 +56,73 @@ def plot_strain_panels(
     When ``roi`` (a boolean ``(scan_row, scan_col)`` array) is given, positions
     inside it are drawn in color and positions outside it in greyscale (the same
     field, desaturated), so a chosen reference region stands out from its context.
+
+    Parameters
+    ----------
+    e_uu, e_vv, e_uv : np.ndarray
+        ``(scan_row, scan_col)`` fractional strain components in the display frame.
+    rotation : np.ndarray
+        ``(scan_row, scan_col)`` infinitesimal rotation in radians.
+    mask : np.ndarray or None
+        ``(scan_row, scan_col)`` brightness weights in ``[0, 1]``; ``None`` shows
+        every position at full brightness.
+    g1_ref, g2_ref : np.ndarray or None
+        Reference lattice vectors ``(row, col)``; only their directions are drawn,
+        and only when ``plot_gvecs=True``.
+    ds_shape : tuple of int
+        Scan shape; the first two entries size the default mask and the scale bar.
+    ds_sampling : float, default=1.0
+        Scan step size used by the scale bar, in ``ds_units``.
+    ds_units : str, default="pixels"
+        Units of ``ds_sampling``.
+    strain_range_percent : tuple of float, default=(-3.0, 3.0)
+        Color range of the strain panels, in percent.
+    rotation_range_degrees : tuple of float, default=(-2.0, 2.0)
+        Color range of the rotation panel, in degrees.
+    mask_range : tuple of float, default=(0.0, 1.0)
+        ``(low, high)`` window remapping ``mask`` before display (see above).
+    roi : np.ndarray, optional
+        Boolean ``(scan_row, scan_col)`` region drawn in color; the rest is grey.
+    plot_rotation : bool, default=True
+        Whether to add the rotation panel.
+    plot_gvecs : bool, default=False
+        Whether to draw the directions of ``g1_ref`` and ``g2_ref`` beside the panels.
+    plot_scalebar : bool, default=False
+        Whether to draw a scale bar on the first panel.
+    cmap_strain : str, default="RdBu_r"
+        Colormap of the strain panels.
+    cmap_rotation : str, default="PiYG"
+        Colormap of the rotation panel; ``None`` uses ``cmap_strain``.
+    layout : {"horizontal", "vertical"}, default="horizontal"
+        Panel arrangement.
+    transpose_image : bool, default=False
+        If ``True``, transpose every panel (swap scan rows and columns) for display.
+    rotate_title : bool, default=False
+        If ``True``, draw the panel titles vertically.
+    plot_dilation : bool, default=False
+        If ``True``, show ``e_uu + e_vv`` and ``e_uv`` (plus rotation) instead of
+        the three strain components. Forces the rotation panel on.
+    figsize : tuple of float, optional
+        Figure size in inches; derived from ``layout`` if omitted.
+    panel_titles : tuple of str, optional
+        Titles of the strain panels (three, or two with ``plot_dilation``). When
+        given, no direction arrows are drawn.
+    strain_rotation_angle : float, default=0.0
+        Angle in degrees by which the default direction arrows are rotated, to
+        match a strain tensor rotated by this angle.
+    arrow_style : {"title", "legend"}, default="title"
+        Draw the direction arrows next to the panel titles, or in a legend at the
+        side of the figure.
+    **kwargs
+        Keys starting with ``scalebar_`` are passed to the scale bar with the prefix
+        removed (for example ``scalebar_length``, ``scalebar_color``,
+        ``scalebar_box``, ``scalebar_box_color``, ``scalebar_box_alpha``). Other
+        keys are ignored.
+
+    Returns
+    -------
+    tuple
+        ``(fig, ax)`` with ``ax`` the array of panel axes.
     """
     if mask is None:
         mask = np.ones(ds_shape[:2])
@@ -75,7 +144,7 @@ def plot_strain_panels(
     ncols = 4 if plot_rotation else 3
     is_horizontal = layout == "horizontal"
     if plot_dilation:
-        ncols=3
+        ncols = 3
         plot_rotation = True
 
     n_strain = 2 if plot_dilation else 3
@@ -116,16 +185,16 @@ def plot_strain_panels(
     euv_disp = _roi_compose(norm_strain(euv_pct), cm_strain)
 
     if transpose_image:
-        euu_disp = euu_disp.transpose(1,0,2)
-        evv_disp = evv_disp.transpose(1,0,2)
-        euv_disp = euv_disp.transpose(1,0,2)
+        euu_disp = euu_disp.transpose(1, 0, 2)
+        evv_disp = evv_disp.transpose(1, 0, 2)
+        euv_disp = euv_disp.transpose(1, 0, 2)
         mask = mask.T
-    
+
     if plot_dilation:
         etot_pct = (e_uu + e_vv) * 100
         etot_disp = _roi_compose(norm_strain(etot_pct), cm_strain)
         if transpose_image:
-            etot_disp = etot_disp.transpose(1,0,2)
+            etot_disp = etot_disp.transpose(1, 0, 2)
         ax[0].imshow(etot_disp * mask[:, :, np.newaxis])
         ax[1].imshow(euv_disp * mask[:, :, np.newaxis])
     else:
@@ -133,13 +202,12 @@ def plot_strain_panels(
         ax[1].imshow(evv_disp * mask[:, :, np.newaxis])
         ax[2].imshow(euv_disp * mask[:, :, np.newaxis])
 
-
     ref_dim = figsize[1] if is_horizontal else figsize[0]
     fs_threshold = 3.0
     fs_scale = min(1.0, max(0.5, ref_dim / fs_threshold))
     title_fs = 16 * fs_scale
     tick_fs = 12 * fs_scale
-    title_val = 'vertical' if rotate_title else 'horizontal'
+    title_val = "vertical" if rotate_title else "horizontal"
     if panel_titles is None:
         if plot_dilation:
             panel_titles = (
@@ -154,23 +222,30 @@ def plot_strain_panels(
                 r"$\epsilon_{vv}$",
                 r"$\epsilon_{uv}$",
             )
-            title_arrow_angles = (90 + strain_rotation_angle, 0 + strain_rotation_angle, -45 + strain_rotation_angle)
-            if transpose_image: 
-                title_arrow_angles = (0 + strain_rotation_angle, 90 + strain_rotation_angle, 45 + strain_rotation_angle)
+            title_arrow_angles = (
+                90 + strain_rotation_angle,
+                0 + strain_rotation_angle,
+                -45 + strain_rotation_angle,
+            )
+            if transpose_image:
+                title_arrow_angles = (
+                    0 + strain_rotation_angle,
+                    90 + strain_rotation_angle,
+                    45 + strain_rotation_angle,
+                )
     else:
-            title_arrow_angles = (None, None, None)
-
+        title_arrow_angles = (None, None, None)
 
     if plot_rotation:
         norm_rot = Normalize(vmin=rotation_range_degrees[0], vmax=rotation_range_degrees[1])
         rot_disp = _roi_compose(norm_rot(rot_deg), cm_rot)
-        if transpose_image: rot_disp = rot_disp.transpose(1,0,2)
+        if transpose_image:
+            rot_disp = rot_disp.transpose(1, 0, 2)
         ax[-1].imshow(rot_disp * mask[:, :, np.newaxis])
         if arrow_style == "title":
             ax[-1].set_title(r"$\phi$ $\circlearrowleft$", fontsize=title_fs, rotation=title_val)
         else:
             ax[-1].set_title(r"$\phi$", fontsize=title_fs, rotation=title_val)
-
 
     for a in ax:
         a.set_xticks([])
@@ -183,16 +258,22 @@ def plot_strain_panels(
         scalebar_kwargs = {}
         for key, value in kwargs.items():
             if key.startswith("scalebar_"):
-                scalebar_key = key[len("scalebar_"):]
+                scalebar_key = key[len("scalebar_") :]
                 scalebar_kwargs[scalebar_key] = value
 
+        # default: white bar on a translucent black box, readable on the
+        # diverging strain colormaps; override with scalebar_color /
+        # scalebar_box / scalebar_box_color / scalebar_box_alpha
+        box = scalebar_kwargs.pop("box", True)
+        box_color = scalebar_kwargs.pop("box_color", "black")
+        box_alpha = scalebar_kwargs.pop("box_alpha", 0.45)
         scalebar_defaults = {
             "sampling": ds_sampling,
             "units": ds_units,
             "length": None,
             "width_px": 1,
             "pad_px": 0.5,
-            "color": "black",
+            "color": "white" if box and box_color == "black" else "black",
             "loc": "lower left",
             "fontsize": 12,
             "bold": True,
@@ -211,6 +292,9 @@ def plot_strain_panels(
             loc=scalebar_config.loc,
             fontsize=scalebar_config.fontsize,
             bold=scalebar_config.bold,
+            box=box,
+            box_color=box_color,
+            box_alpha=box_alpha,
         )
 
     cb_size = 0.02
@@ -301,26 +385,32 @@ def plot_strain_panels(
         cbar2.update_ticks()
         cbar2.ax.tick_params(labelsize=tick_fs)
 
-
     def _add_title_arrow(ax, angle_deg, gap_pt=4.0, color="black", fontsize=None):
-            fs = fontsize if fontsize is not None else title_fs
-            try:
-                ax.figure.draw_without_rendering()
-            except AttributeError:  # matplotlib < 3.5
-                ax.figure.canvas.draw()
-            renderer = ax.figure.canvas.get_renderer()
-            bbox_ax = ax.title.get_window_extent(renderer=renderer).transformed(ax.transAxes.inverted())
-            y = 0.5 * (bbox_ax.y0 + bbox_ax.y1)
-            ax.annotate(
-                "\u2194",
-                xy=(bbox_ax.x1, y), xycoords=ax.transAxes,
-                xytext=(gap_pt + fs / 2.0, 0), textcoords="offset points",
-                ha="center", va="center",
-                rotation=angle_deg, rotation_mode="anchor",
-                fontsize=fs, color=color,
-                annotation_clip=False,
-            )
-    
+        fs = fontsize if fontsize is not None else title_fs
+        try:
+            ax.figure.draw_without_rendering()
+        except AttributeError:  # matplotlib < 3.5
+            ax.figure.canvas.draw()
+        renderer = ax.figure.canvas.get_renderer()
+        bbox_ax = ax.title.get_window_extent(renderer=renderer).transformed(
+            ax.transAxes.inverted()
+        )
+        y = 0.5 * (bbox_ax.y0 + bbox_ax.y1)
+        ax.annotate(
+            "\u2194",
+            xy=(bbox_ax.x1, y),
+            xycoords=ax.transAxes,
+            xytext=(gap_pt + fs / 2.0, 0),
+            textcoords="offset points",
+            ha="center",
+            va="center",
+            rotation=angle_deg,
+            rotation_mode="anchor",
+            fontsize=fs,
+            color=color,
+            annotation_clip=False,
+        )
+
     def _add_arrow_legend(fig, x0, y_top, entries, plot_rotation, fontsize, color="black"):
         fig_w_in, fig_h_in = figsize
         row_h_in = fontsize * 1.6 / 72.0
@@ -339,13 +429,24 @@ def plot_strain_panels(
         leg_ax.text(0.0, y, "Strain", fontsize=fontsize, fontweight="bold", ha="left", va="center")
         for label, angle_deg in entries:
             y -= dy
-            leg_ax.text(0.15, y, "\u2194", rotation=angle_deg, rotation_mode="anchor",
-                        ha="center", va="center", fontsize=fontsize, color=color)
+            leg_ax.text(
+                0.15,
+                y,
+                "\u2194",
+                rotation=angle_deg,
+                rotation_mode="anchor",
+                ha="center",
+                va="center",
+                fontsize=fontsize,
+                color=color,
+            )
             leg_ax.text(0.32, y, label, fontsize=fontsize, ha="left", va="center")
 
         if plot_rotation:
             y -= dy
-            leg_ax.text(0.0, y, "Rotation", fontsize=fontsize, fontweight="bold", ha="left", va="center")
+            leg_ax.text(
+                0.0, y, "Rotation", fontsize=fontsize, fontweight="bold", ha="left", va="center"
+            )
             y -= dy
             leg_ax.text(0.15, y, "\u21ba", fontsize=fontsize, ha="center", va="center")
             leg_ax.text(0.32, y, r"$\phi$", fontsize=fontsize, ha="left", va="center")
@@ -362,7 +463,12 @@ def plot_strain_panels(
         renderer = fig.canvas.get_renderer()
         panel_edge = last_pos.x1
         if plot_rotation:
-            title_edge = ax[-1].title.get_window_extent(renderer=renderer).transformed(fig.transFigure.inverted()).x1
+            title_edge = (
+                ax[-1]
+                .title.get_window_extent(renderer=renderer)
+                .transformed(fig.transFigure.inverted())
+                .x1
+            )
             panel_edge = max(panel_edge, title_edge)
         margin_x0 = panel_edge + 0.03
     else:
@@ -379,14 +485,21 @@ def plot_strain_panels(
     entries = []
     leg_h = 0.0
     if arrow_style == "legend":
-        entries = [(panel_titles[i], title_arrow_angles[i]) for i in range(n_strain)
-                   if title_arrow_angles[i] is not None]
+        entries = [
+            (panel_titles[i], title_arrow_angles[i])
+            for i in range(n_strain)
+            if title_arrow_angles[i] is not None
+        ]
         n_rows = len(entries) + 1 + (2 if plot_rotation else 0)
         leg_h = (title_fs * 1.6 / 72.0 / figsize[1]) * n_rows
 
     show_gvecs = plot_gvecs and g1_ref is not None and g2_ref is not None
     if plot_gvecs and not show_gvecs:
-        print("Warning: g1_ref and g2_ref not found. Call fit_strain() first.")
+        warnings.warn(
+            "plot_gvecs=True but g1_ref and g2_ref are not set; run "
+            "StrainMap.update_reference() first.",
+            UserWarning,
+        )
     fig_aspect = figsize[0] / figsize[1]
     gvec_w = min(0.99 - margin_x0, 0.15) if show_gvecs else 0.0
     gvec_h = gvec_w * fig_aspect if show_gvecs else 0.0
@@ -403,8 +516,15 @@ def plot_strain_panels(
     y_top = center_y + (leg_h + gap * side_scale + gvec_h) / 2.0
 
     if leg_h > 0:
-        _add_arrow_legend(fig, margin_x0, y_top, entries, plot_rotation=plot_rotation,
-                           fontsize=legend_fontsize, color="black")
+        _add_arrow_legend(
+            fig,
+            margin_x0,
+            y_top,
+            entries,
+            plot_rotation=plot_rotation,
+            fontsize=legend_fontsize,
+            color="black",
+        )
         y_top -= leg_h + gap * side_scale
 
     if show_gvecs:
@@ -418,12 +538,32 @@ def plot_strain_panels(
         g1_row, g1_col = g1_norm
         g2_row, g2_col = g2_norm
         arrow_props_ref = dict(arrowstyle="->", lw=3, mutation_scale=25)
-        ref_ax.add_patch(FancyArrowPatch((0, 0), (g1_col, -g1_row), color="darkred", **arrow_props_ref))
-        ref_ax.add_patch(FancyArrowPatch((0, 0), (g2_col, -g2_row), color="darkblue", **arrow_props_ref))
-        ref_ax.text(g1_col * 1.3, -g1_row * 1.3, r"$\mathbf{g}_{1}$", fontsize=14, fontweight="bold",
-                    color="darkred", ha="center", va="center")
-        ref_ax.text(g2_col * 1.3, -g2_row * 1.3, r"$\mathbf{g}_{2}$", fontsize=14, fontweight="bold",
-                    color="darkblue", ha="center", va="center")
+        ref_ax.add_patch(
+            FancyArrowPatch((0, 0), (g1_col, -g1_row), color="darkred", **arrow_props_ref)
+        )
+        ref_ax.add_patch(
+            FancyArrowPatch((0, 0), (g2_col, -g2_row), color="darkblue", **arrow_props_ref)
+        )
+        ref_ax.text(
+            g1_col * 1.3,
+            -g1_row * 1.3,
+            r"$\mathbf{g}_{1}$",
+            fontsize=14,
+            fontweight="bold",
+            color="darkred",
+            ha="center",
+            va="center",
+        )
+        ref_ax.text(
+            g2_col * 1.3,
+            -g2_row * 1.3,
+            r"$\mathbf{g}_{2}$",
+            fontsize=14,
+            fontweight="bold",
+            color="darkblue",
+            ha="center",
+            va="center",
+        )
 
     return fig, ax
 
@@ -443,6 +583,27 @@ def plot_strain_precision_histogram(
     chosen ``component`` deviation in display units (``unit``). ``precision`` is the
     weighted-median local deviation per component (used for the annotation box); the
     plotted component's median is marked with a solid line.
+
+    Parameters
+    ----------
+    edges : np.ndarray
+        ``(bins + 1,)`` histogram bin edges, in ``unit``.
+    counts : np.ndarray
+        ``(bins,)`` weighted fraction of positions in each bin.
+    precision : dict of str to float
+        Median local deviation per component; must contain ``"e_uu"``, ``"e_vv"``,
+        ``"e_uv"`` (percent), ``"rotation"`` (degrees) and ``"combined"`` (percent).
+    component : str
+        Key of ``precision`` that was histogrammed; its median is marked.
+    unit : str
+        Display unit of ``component`` (``"%"`` or ``"°"``).
+    figsize : tuple of float, default=(6.0, 4.0)
+        Figure size in inches.
+
+    Returns
+    -------
+    tuple
+        ``(fig, ax)``.
     """
     fig, ax = plt.subplots(figsize=figsize)
     edges = np.asarray(edges, dtype=float)
@@ -450,8 +611,15 @@ def plot_strain_precision_histogram(
     centers = 0.5 * (edges[:-1] + edges[1:])
     widths = np.diff(edges)
 
-    ax.bar(centers, counts, width=widths, align="center",
-           color="#4C72B0", edgecolor="white", linewidth=0.3)
+    ax.bar(
+        centers,
+        counts,
+        width=widths,
+        align="center",
+        color="#4C72B0",
+        edgecolor="white",
+        linewidth=0.3,
+    )
 
     median_value = precision[component]
     if np.isfinite(median_value):
@@ -462,10 +630,14 @@ def plot_strain_precision_histogram(
         on_right = span > 0 and (median_value - edges[0]) / span > 0.5
         ax.annotate(
             f"median = {median_value:.3g} {unit}",
-            xy=(median_value, 0.96), xycoords=("data", "axes fraction"),
-            xytext=(-6 if on_right else 6, 0), textcoords="offset points",
-            ha="right" if on_right else "left", va="top",
-            color="crimson", fontsize=9,
+            xy=(median_value, 0.96),
+            xycoords=("data", "axes fraction"),
+            xytext=(-6 if on_right else 6, 0),
+            textcoords="offset points",
+            ha="right" if on_right else "left",
+            va="top",
+            color="crimson",
+            fontsize=9,
         )
 
     label = "combined" if component == "combined" else component
@@ -484,9 +656,17 @@ def plot_strain_precision_histogram(
             rf"  combined: {precision['combined']:.3g} %",
         ]
     )
-    ax.text(0.97, 0.97, annotation, transform=ax.transAxes, ha="right", va="top",
-            fontsize=9, family="monospace",
-            bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9))
+    ax.text(
+        0.97,
+        0.97,
+        annotation,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        family="monospace",
+        bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9),
+    )
 
     fig.tight_layout()
     return fig, ax

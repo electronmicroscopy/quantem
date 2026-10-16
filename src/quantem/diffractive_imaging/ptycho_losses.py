@@ -42,13 +42,18 @@ class DataCriterion:
 
 
 class L2(DataCriterion):
-    """Sum of squared residuals in ``target_space`` (amplitude or intensity)."""
+    """Half the sum of squared residuals in ``target_space`` (amplitude or intensity).
+
+    The half makes the amplitude-space gradient with respect to an exit wave the plain residual
+    ``psi - psi'`` (``psi'`` carrying the measured amplitude and the modelled phase), which is
+    the quantity the analytic path in ``Ptychography.gradient_step`` computes.
+    """
 
     def __init__(self, target_space: TargetSpace = "amplitude"):
         self.target_space = target_space
 
     def __call__(self, preds: torch.Tensor, targets: torch.Tensor, n: int) -> torch.Tensor:
-        return torch.sum((preds - targets) ** 2) / _global_scale(preds, n)
+        return 0.5 * torch.sum((preds - targets) ** 2) / _global_scale(preds, n)
 
 
 class L1(DataCriterion):

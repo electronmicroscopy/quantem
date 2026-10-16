@@ -11,7 +11,6 @@ Contributions are broken down by module:
 - [Colin Ophus](https://github.com/cophus)
 - [Stephanie Ribet](https://github.com/smribet)
 - [Cedric Lim](https://github.com/cedriclim1)
-- [Matthew Feickert](https://github.com/matthewfeickert)
 
 ## Diffraction
 - [Karen Ehrhardt](https://github.com/ehrhardtkm)
@@ -30,8 +29,8 @@ Contributions are broken down by module:
 - [Darshan Mali](https://github.com/darshan-mali)
 
 ## Spectroscopy
-- [Colin Ophus](https://github.com/cophus)
 - [Stephanie Ribet](https://github.com/smribet)
+- [Niko Vlahakis](https://github.com/nwvlahakis)
 
 ## Tomography 
 - [Cedric Lim](https://github.com/cedriclim1)

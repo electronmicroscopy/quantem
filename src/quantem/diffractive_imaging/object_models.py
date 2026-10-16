@@ -492,8 +492,15 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         """
         Apply hard constraints: range clamping and filtering. All hard constaints are applied in
         place with torch.no_grad().
+
+        A complex object is first rotated by its detached gauge phasor (see ``gauge_phasor``).
+        That rotation stays in the graph, so the gradient reaching ``raw`` is rotated back into
+        ``raw``'s own frame; a straight-through recentering would hand ``raw`` the gradient of
+        the rotated object and turn every update by the gauge angle.
         """
         c = self.constraints
+        if self.obj_type == "complex":
+            raw = raw * self.gauge_phasor(raw).conj()
         with torch.no_grad():
             if self.obj_type == "complex":
                 constrained = self._apply_hard_complex(raw, c)
@@ -504,12 +511,25 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             constrained = self._apply_shared_hard(constrained, c, mask)
         return raw + (constrained - raw).detach()
 
+    @staticmethod
+    def gauge_phasor(obj: torch.Tensor) -> torch.Tensor:
+        """Detached unit phasor of ``obj.mean()``, i.e. the circular mean of its phase.
+
+        The data cannot see a global phase, so it is fixed by rotating this phasor to 1. Unlike
+        the mean of the wrapped angles it varies continuously with ``obj``: it does not jump when
+        a pixel crosses the branch cut. Falls back to 1 when the mean vanishes.
+        """
+        with torch.no_grad():
+            m = obj.mean()
+            magnitude = m.abs()
+            return torch.where(magnitude > 0, m / magnitude.clamp_min(1e-30), torch.ones_like(m))
+
     def _apply_hard_complex(
         self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
     ) -> torch.Tensor:
+        # the global phase is fixed upstream, by the rotation in apply_hard_constraints
         amp = torch.clamp(torch.abs(obj), 0.0, 1.0)
-        phase = obj.angle() - obj.angle().mean()
-        return amp * torch.exp(1.0j * phase)
+        return amp * torch.exp(1.0j * obj.angle())
 
     def _apply_hard_pure_phase(
         self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
@@ -1023,38 +1043,49 @@ class ObjectPixelated(ObjectConstraints):
         shifted_probes: torch.Tensor,
         propagators: torch.Tensor,
         patch_indices: torch.Tensor,
-    ):
-        obj_shape = self._obj.shape[-2:]
+        step_scale: float | None = None,
+    ) -> torch.Tensor:
+        """Analytic gradient of the loss with respect to ``_obj``, stored in ``_obj.grad``.
+
+        ``gradient`` is the loss gradient with respect to the exit waves, in torch's convention
+        (from ``Ptychography.gradient_step``), and ``shifted_probes`` holds the wave incident on
+        each slice. The gradient is carried back through the transmissions and propagators, so
+        the stored result is the one autograd gives. With a ``step_scale`` each slice is instead
+        rescaled by ``step_scale / D_s``, where ``D_s`` is the largest summed probe intensity
+        over the batch on that slice: the ePIE step.
+
+        Returns the gradient with respect to the wave incident on the first slice.
+        """
+        obj_shape = tuple(self._obj.shape[-2:])
         obj_gradient = torch.zeros_like(self._obj)
         for s in reversed(range(self.num_slices)):
             probe_slice = shifted_probes[s]
             obj_slice = obj_patches[s]
-            probe_normalization = torch.zeros_like(self._obj[s])
-            obj_update = torch.zeros_like(self._obj[s])
-            for a0 in range(shifted_probes.shape[1]):
-                probe = probe_slice[a0]
-                grad = gradient[a0]
-                probe_normalization += sum_patches(
-                    torch.abs(probe) ** 2, patch_indices, obj_shape
-                ).max()
+            weighted = [torch.conj(probe_slice[m]) * gradient[m] for m in range(len(probe_slice))]
+            if self.obj_type == "complex":
+                patch_gradient = sum(weighted)
+            else:
+                # real phase or potential: d exp(i phi) / d phi brings down i exp(i phi)
+                patch_gradient = sum(torch.real(-1j * torch.conj(obj_slice) * w) for w in weighted)
+            slice_gradient = sum_patches(patch_gradient, patch_indices, obj_shape)
 
-                if self.obj_type == "potential":
-                    obj_update += sum_patches(
-                        torch.real(-1j * torch.conj(obj_slice) * torch.conj(probe) * grad),
-                        patch_indices,
-                        obj_shape,
-                    )
-                else:
-                    obj_update += sum_patches(torch.conj(probe) * grad, patch_indices, obj_shape)
-
-            obj_gradient[s] = obj_update / probe_normalization
+            if step_scale is not None:
+                normalization = sum(
+                    sum_patches(torch.abs(probe_slice[m]) ** 2, patch_indices, obj_shape).max()
+                    for m in range(len(probe_slice))
+                )
+                slice_gradient = slice_gradient * (step_scale / normalization)
+            obj_gradient[s] = slice_gradient
 
             # back-transmit and back-propagate
-            gradient *= torch.conj(obj_slice)
+            gradient = gradient * torch.conj(obj_slice)
             if s > 0:
                 gradient = self._propagate_array(gradient, torch.conj(propagators[s - 1]))
 
-        self._obj.grad = -1 * obj_gradient.clone().detach()
+        if self.obj_type == "complex":
+            # the forward rotated _obj by conj(phasor), so its gradient rotates back by phasor
+            obj_gradient = obj_gradient * self.gauge_phasor(self._obj)
+        self._obj.grad = obj_gradient.detach().clone()
         return gradient
 
 

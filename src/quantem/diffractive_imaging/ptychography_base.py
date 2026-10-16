@@ -354,8 +354,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         """
         obj = self._to_numpy(self.obj_model.obj)
         if self.obj_type == "complex":
-            ph = np.angle(obj)
-            obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
+            obj = remove_global_phase(obj)
         return obj
 
     @property
@@ -527,8 +526,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             # carries phase inside a complex tensor); pure_phase and potential
             # are already real and recentered upstream.
             if self.obj_type == "complex":
-                ph = np.angle(cropped_obj)
-                cropped_obj = np.abs(cropped_obj) * np.exp(1j * (ph - ph.mean()))
+                cropped_obj = remove_global_phase(cropped_obj)
             snp2["obj"] = cropped_obj
             return snp2
         else:
@@ -692,17 +690,16 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def obj_cropped(self) -> np.ndarray:
         """Cropped + FOV-rotated object, in its native representation.
 
-        - ``obj_type="complex"`` → complex array (amp * exp(1j*phase)); phase is
-          recentered to zero mean here as a defensive duplicate of
-          ``ObjectConstraints._apply_hard_complex``.
+        - ``obj_type="complex"`` → complex array (amp * exp(1j*phase)), rotated so that the
+          mean over the cropped field of view is real (``remove_global_phase``); the object
+          model fixes the same gauge over the full, padded object.
         - ``obj_type="pure_phase"`` → real array of phase values (already
           recentered upstream by ``_apply_hard_pure_phase``).
         - ``obj_type="potential"`` → real array of potential values.
         """
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "complex":
-            ph = np.angle(cropped)
-            cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
+            cropped = remove_global_phase(cropped)
         return cropped
 
     @property  # FIXME depend on ptychodataset
@@ -1169,6 +1166,19 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
 
 # misc helpers to maybe move elsewhere
+
+
+def remove_global_phase(obj: np.ndarray) -> np.ndarray:
+    """Rotate a complex object so that its mean is real and positive.
+
+    This is the display counterpart of ``ObjectConstraints.gauge_phasor``: the circular mean of
+    the phase, which unlike the mean of the wrapped angles does not jump when a pixel crosses
+    the branch cut.
+    """
+    m = obj.mean()
+    if np.abs(m) == 0:
+        return obj
+    return obj * (np.conj(m) / np.abs(m))
 
 
 def adjust_padding_power2(pad, shape, power2_level):

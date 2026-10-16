@@ -5,6 +5,8 @@ The headline check is equivalence with the Fourier-space parallax kernel of
 so on a raster scan with periodic wraparound they must agree.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -21,6 +23,7 @@ from quantem.diffractive_imaging.complex_probe import FourierProbe, spatial_freq
 from quantem.diffractive_imaging.direct_ptycho_utils import (
     allocate_splat_buffers,
     estimate_frame_drift,
+    fit_aberrations_from_probe,
     scatter_add_convolve,
     scatter_add_splat,
     splat_and_convolve,
@@ -326,17 +329,26 @@ class TestFourierEquivalence:
         rescaled = normalized * montage.num_bf / bf_weights
         assert _relative_error(rescaled, unnormalized) < 1e-4
 
-    def test_variance_loss_tracks_the_fourier_one(self, dataset4d):
+    def test_residual_loss_tracks_the_fourier_one(self, dataset4d):
+        """Both measure the spread of the parallax-corrected images about their mean.
+
+        At the integer-shift defocus the montage's nearest-pixel deposit is the exact shift,
+        so the two agree up to the frequencies past the band limit that only the montage
+        counts. ``band_limit=False`` because the two classes filter at different stages.
+        """
         defocus = integer_shift_defocus(1)
         fourier, montage = _build_pair(dataset4d, defocus)
 
-        recon_kwargs = dict(deconvolution_kernel="prlx", parallax_flip_phase=False, verbose=False)
+        recon_kwargs = dict(
+            deconvolution_kernel="prlx",
+            parallax_flip_phase=False,
+            band_limit=False,
+            verbose=False,
+        )
         fourier.reconstruct(**recon_kwargs)
         montage.reconstruct(weight_normalize=False, **recon_kwargs)
 
-        bf_weights = float(montage._bf_weights)
-        expected = float(fourier.variance_loss()) * bf_weights**2
-        assert float(montage.variance_loss()) == pytest.approx(expected, rel=1e-3)
+        assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), rel=5e-3)
 
     def test_bf_mask_subsets_are_additive(self, dataset4d):
         """Checkerboard half-sets, rescaled by their BF weights, sum to the whole."""
@@ -359,7 +371,7 @@ class TestFourierEquivalence:
 
         assert _relative_error(halves[0] + halves[1], full) < 1e-4
 
-    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
     def test_accepts_the_deconvolution_kernels(self, dataset4d, kernel):
         """Available as truncated real-space convolutions; see `TestRealSpaceKernels`."""
         _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
@@ -471,10 +483,14 @@ class TestPadBoundary:
         defocus = integer_shift_defocus(1)
         _, montage = _build_pair(dataset4d, defocus)
 
+        # the filter is an FFT over the whole canvas, and "pad" makes that canvas larger, so
+        # filtering then cropping is not the same operation as filtering the wrapped canvas.
+        # band_limit=False keeps this on the deposit and its boundary handling.
         recon_kwargs = dict(
             deconvolution_kernel="prlx",
             parallax_flip_phase=False,
             weight_normalize=False,
+            band_limit=False,
             verbose=False,
         )
         montage.reconstruct(boundary="wrap", **recon_kwargs)
@@ -704,7 +720,7 @@ class TestHyperparameterSearch:
         step = (1.6 - 0.4) * true_defocus / 6
         assert abs(best - true_defocus) <= step
 
-    def test_variance_loss_is_minimized_at_the_true_defocus(self, dataset4d):
+    def test_residual_loss_is_minimized_at_the_true_defocus(self, dataset4d):
         true_defocus = integer_shift_defocus(1)
         _, montage = _build_pair(dataset4d, true_defocus)
 
@@ -715,23 +731,23 @@ class TestHyperparameterSearch:
                 parallax_flip_phase=False,
                 verbose=False,
             )
-            losses[scale] = float(montage.variance_loss())
+            losses[scale] = montage.residual_loss()
 
         assert all(value > 0 for value in losses.values())
         assert min(losses, key=losses.get) == pytest.approx(1.0)
 
     def test_rms_gradient_drives_a_search_over_a_convolution_kernel(self, dataset4d):
-        """`variance_loss` is undefined for `ssb` here; the sharpness objective is not.
+        """`residual_loss` is undefined for the `ssb` stencil here; the sharpness objective is not.
 
         That is the reason it exists on this class: without it there is no way to tune
-        aberrations for the real-space SSB/OBF/MF kernels at all.
+        aberrations for the real-space SSB/OBF kernels at all.
         """
         true_defocus = integer_shift_defocus(1)
         _, montage = _build_pair(dataset4d, true_defocus)
 
         montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=6, verbose=False)
         with pytest.raises(NotImplementedError):
-            montage.variance_loss()
+            montage.residual_loss()
 
         montage.grid_search_hyperparameters(
             aberration_coefs={
@@ -750,14 +766,397 @@ class TestHyperparameterSearch:
         assert abs(best - true_defocus) <= step
 
 
+class TestSparseEvents:
+    """`from_vector` must reproduce `from_dataset3d` on the counts it was expanded from.
+
+    The comparison is exact rather than approximate: the event list is built by expanding an
+    integer-count stack, so the two constructors see identical data and every difference is a
+    difference of algorithm.
+    """
+
+    @staticmethod
+    def _counts(dataset4d, scale=40.0):
+        """Integer counts, in the ``(N_pos, N, N)`` layout `from_dataset3d` takes."""
+        frames = to_numpy(dataset4d.array).reshape(-1, N, N)
+        frames = frames - frames.min()
+        return np.rint(frames * (scale / frames.mean())).astype(np.int64)
+
+    @staticmethod
+    def _vector(counts, intensity_field=False):
+        from quantem.core.datastructures import Vector
+
+        cells = []
+        for frame in counts:
+            kx, ky = np.nonzero(frame)
+            weights = frame[kx, ky]
+            pixels = np.stack((kx, ky), axis=-1).astype(np.float64)
+            if intensity_field:
+                cells.append(np.concatenate((pixels, weights[:, None]), axis=-1))
+            else:
+                cells.append(np.repeat(pixels, weights, axis=0))
+        fields = ["kx", "ky", "intensity"] if intensity_field else ["kx", "ky"]
+        return Vector.from_data(cells, fields=fields, name="events")
+
+    @classmethod
+    def _pair(cls, dataset4d, defocus, *, intensity_field=False, boundary="wrap", **kwargs):
+        counts = cls._counts(dataset4d)
+        positions = scan_positions_px()[: counts.shape[0]] * SCAN_SAMPLING
+        common = dict(
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            boundary=boundary,
+            **_common_kwargs(defocus),
+            **kwargs,
+        )
+
+        dataset3d = Dataset3d.from_array(
+            counts.astype(np.float64),
+            name="counts",
+            units=("index", "A^-1", "A^-1"),
+            sampling=(1, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+        )
+        dense = DirectPtychographyMontage.from_dataset3d(dataset3d, positions, **common)
+        sparse = DirectPtychographyMontage.from_vector(
+            cls._vector(counts, intensity_field),
+            positions,
+            (N, N),
+            (RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+            weight_field="intensity" if intensity_field else None,
+            **common,
+        )
+        return dense, sparse
+
+    @pytest.fixture(scope="class")
+    def pair(self, dataset4d):
+        """The default dense and sparse models, built once for the class; the tests only
+        reconstruct from them."""
+        return self._pair(dataset4d, integer_shift_defocus(1))
+
+    @staticmethod
+    def _both(dense, sparse, **kwargs):
+        return (
+            dense.reconstruct(verbose=False, **kwargs).obj,
+            sparse.reconstruct(verbose=False, **kwargs).obj,
+        )
+
+    def test_prlx_matches_dense(self, pair):
+        dense, sparse = pair
+        a, b = self._both(dense, sparse, deconvolution_kernel="prlx", parallax_flip_phase=False)
+        assert _relative_error(b, a) < 1e-5
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_deconvolution_stencils_match_dense(self, pair, kernel):
+        dense, sparse = pair
+        a, b = self._both(
+            dense,
+            sparse,
+            deconvolution_kernel=kernel,
+            convolution_mode="stencil",
+            stencil_radius=4,
+        )
+        assert _relative_error(b, a) < 1e-4
+
+    @pytest.mark.parametrize("convolution_mode", ["fft", "stencil"])
+    def test_icom_matches_dense(self, pair, convolution_mode):
+        """The riCOM collapse reads only the center of mass, which is linear in the counts."""
+        dense, sparse = pair
+        extra = {"stencil_radius": 4} if convolution_mode == "stencil" else {}
+        a, b = self._both(
+            dense,
+            sparse,
+            deconvolution_kernel="icom",
+            convolution_mode=convolution_mode,
+            **extra,
+        )
+        assert _relative_error(b, a) < 1e-4
+
+    @pytest.mark.parametrize("boundary, interpolation", [("wrap", "nearest"), ("pad", "bilinear")])
+    def test_boundaries_and_interpolation_match_dense(
+        self, dataset4d, pair, boundary, interpolation
+    ):
+        if boundary == "wrap":
+            dense, sparse = pair
+        else:
+            dense, sparse = self._pair(dataset4d, integer_shift_defocus(1), boundary=boundary)
+        a, b = self._both(
+            dense,
+            sparse,
+            deconvolution_kernel="ssb",
+            convolution_mode="stencil",
+            stencil_radius=4,
+            interpolation=interpolation,
+        )
+        assert _relative_error(b, a) < 1e-4
+
+    def test_scattered_positions_match_dense(self, dataset4d):
+        """An ungridded scan, where the coverage the scan mean rides on is not constant."""
+        counts = self._counts(dataset4d)
+        rng = np.random.default_rng(0)
+        positions = scan_positions_px()[: counts.shape[0]] * SCAN_SAMPLING
+        positions = positions + rng.normal(0.0, 0.3 * SCAN_SAMPLING, positions.shape)
+
+        defocus = integer_shift_defocus(1)
+        common = dict(
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            boundary="pad",
+            **_common_kwargs(defocus),
+        )
+        dataset3d = Dataset3d.from_array(
+            counts.astype(np.float64),
+            name="counts",
+            units=("index", "A^-1", "A^-1"),
+            sampling=(1, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+        )
+        dense = DirectPtychographyMontage.from_dataset3d(dataset3d, positions, **common)
+        sparse = DirectPtychographyMontage.from_vector(
+            self._vector(counts),
+            positions,
+            (N, N),
+            (RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+            **common,
+        )
+        a, b = self._both(
+            dense,
+            sparse,
+            deconvolution_kernel="prlx",
+            parallax_flip_phase=False,
+            weight_normalize=True,
+        )
+        assert _relative_error(b, a) < 1e-5
+
+    def test_subtract_frame_mean_matches_dense(self, dataset4d):
+        dense, sparse = self._pair(dataset4d, integer_shift_defocus(1), subtract_frame_mean=True)
+        a, b = self._both(dense, sparse, deconvolution_kernel="prlx", parallax_flip_phase=False)
+        assert _relative_error(b, a) < 1e-5
+
+    def test_residual_loss_matches_dense(self, pair):
+        """The sum of squares is quadratic, so it takes the three-term expansion."""
+        dense, sparse = pair
+        self._both(dense, sparse, deconvolution_kernel="prlx", parallax_flip_phase=False)
+        assert sparse.residual_loss() == pytest.approx(dense.residual_loss(), rel=1e-5)
+
+    def test_bright_field_subset_matches_dense(self, pair):
+        """`reconstruct(bf_mask=...)` re-indexes the event table onto the subset."""
+        dense, sparse = pair
+        subset = to_numpy(dense.bf_mask).copy()
+        subset[:, ::2] = False
+
+        a, b = self._both(
+            dense,
+            sparse,
+            bf_mask=subset,
+            deconvolution_kernel="ssb",
+            convolution_mode="stencil",
+            stencil_radius=4,
+        )
+        assert _relative_error(b, a) < 1e-4
+
+    def test_intensity_field_weights_rows(self, dataset4d, pair):
+        """One row carrying a count must equal that many repeated unit rows."""
+        _, expanded = pair
+        _, weighted = self._pair(dataset4d, integer_shift_defocus(1), intensity_field=True)
+
+        kwargs = dict(deconvolution_kernel="prlx", parallax_flip_phase=False, verbose=False)
+        assert (
+            _relative_error(weighted.reconstruct(**kwargs).obj, expanded.reconstruct(**kwargs).obj)
+            < 1e-6
+        )
+
+    def test_measured_origin_matches_the_dense_center_of_mass(self, dataset4d):
+        """The per-frame event center of mass is the moment the dense model computes."""
+        from quantem.diffractive_imaging.direct_ptycho_utils import (
+            _event_table_from_vector,
+            _measure_event_origins,
+        )
+        from quantem.diffractive_imaging.origin_models import CenterOfMassOriginModel
+
+        counts = self._counts(dataset4d)
+        dataset3d = Dataset3d.from_array(
+            counts.astype(np.float64),
+            name="counts",
+            units=("index", "A^-1", "A^-1"),
+            sampling=(1, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+        )
+        expected = CenterOfMassOriginModel.from_dataset(dataset3d).calculate_origin()
+
+        position_index, coords, weights = _event_table_from_vector(self._vector(counts), None)
+        measured = _measure_event_origins(position_index, coords, weights, counts.shape[0], "cpu")
+        assert torch.allclose(measured, expected.origin_measured, atol=1e-4)
+
+    def test_fourier_route_is_refused(self, pair):
+        """...but only for the kernels that would need a canvas per bright-field pixel."""
+        _, sparse = pair
+
+        with pytest.raises(ValueError, match="unavailable for the 'ssb' kernel on sparse"):
+            sparse.reconstruct(deconvolution_kernel="ssb", convolution_mode="fft", verbose=False)
+
+        for kernel in ("prlx", "icom"):
+            sparse.reconstruct(deconvolution_kernel=kernel, convolution_mode="fft", verbose=False)
+            assert sparse.obj is not None
+
+    def test_defocus_gradient_is_refused(self, pair):
+        """A per-position defocus breaks the factorization the scan mean relies on."""
+        _, sparse = pair
+
+        with pytest.raises(NotImplementedError, match="not supported for sparse frames"):
+            sparse.reconstruct(
+                deconvolution_kernel="ssb",
+                convolution_mode="stencil",
+                stencil_radius=4,
+                defocus_gradient=(1e-3, 0.0),
+                verbose=False,
+            )
+
+    def test_defocus_map_is_refused(self, pair):
+        """`_patch_variance_loss` reads the dense stack, so it must say so rather than fail."""
+        _, sparse = pair
+
+        with pytest.raises(NotImplementedError, match="not supported for sparse frames"):
+            sparse.fit_defocus_gradient(
+                c10_values=np.linspace(0.0, 2.0, 3), patch_grid=(2, 2), verbose=False
+            )
+
+    def test_raster_vectors_match_the_flat_one(self, dataset4d):
+        """A raster acquisition may keep its scan grid, flattened row-major to the positions, and
+        take its detector calibration from `dataset.dp_mean`, which states shape, sampling and
+        units together so they cannot drift."""
+        from quantem.core.datastructures import Dataset4dstem
+        from quantem.diffractive_imaging.direct_ptycho_utils import vector_from_frames
+
+        counts = self._counts(dataset4d)
+        side = int(round(np.sqrt(counts.shape[0])))
+        dataset = Dataset4dstem.from_array(
+            counts.reshape(side, side, N, N).astype(np.float64),
+            name="counts",
+            sampling=(SCAN_SAMPLING, SCAN_SAMPLING, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+            units=["A", "A", "A^-1", "A^-1"],
+        )
+        common = dict(
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            boundary="wrap",
+            **_common_kwargs(integer_shift_defocus(1)),
+        )
+        detector = ((N, N), (RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING))
+        vector = vector_from_frames(np.asarray(dataset.array))
+
+        from_dataset = DirectPtychographyMontage.from_vector(
+            vector, dataset.probe_positions(), dataset.dp_mean, **common
+        )
+        raster = DirectPtychographyMontage.from_vector(
+            vector, dataset.probe_positions(), *detector, detector_units=("A^-1", "A^-1"), **common
+        )
+        flat = DirectPtychographyMontage.from_vector(
+            vector_from_frames(counts),
+            scan_positions_px()[: counts.shape[0]] * SCAN_SAMPLING,
+            *detector,
+            **common,
+        )
+        assert np.allclose(from_dataset.reciprocal_sampling, raster.reciprocal_sampling)
+
+        kwargs = dict(deconvolution_kernel="prlx", parallax_flip_phase=False, verbose=False)
+        expected = flat.reconstruct(**kwargs).obj
+        assert np.array_equal(raster.reconstruct(**kwargs).obj, expected)
+        assert np.array_equal(from_dataset.reconstruct(**kwargs).obj, expected)
+
+    def test_an_intensity_column_round_trips_like_repeated_rows(self, dataset4d):
+        """`vector_from_frames` may carry the count rather than repeat the row."""
+        from quantem.diffractive_imaging.direct_ptycho_utils import (
+            _event_table_from_vector,
+            vector_from_frames,
+        )
+
+        counts = self._counts(dataset4d)[:8]
+        expanded = vector_from_frames(counts)
+        weighted = vector_from_frames(counts, fields=("kx", "ky", "intensity"))
+
+        assert expanded.total_rows == int(counts.sum())
+        assert weighted.total_rows == int((counts > 0).sum())
+
+        for vector, field in ((expanded, None), (weighted, "intensity")):
+            index, coords, weights = _event_table_from_vector(vector, field)
+            frames = np.zeros_like(counts, dtype=np.float64)
+            np.add.at(
+                frames,
+                (index, coords[:, 0].astype(int), coords[:, 1].astype(int)),
+                weights,
+            )
+            assert np.allclose(frames, counts)
+
+    def test_detector_calibration_must_not_be_given_twice(self, dataset4d):
+        from quantem.core.datastructures import Dataset4dstem
+        from quantem.diffractive_imaging.direct_ptycho_utils import vector_from_frames
+
+        counts = self._counts(dataset4d)
+        side = int(round(np.sqrt(counts.shape[0])))
+        dataset = Dataset4dstem.from_array(
+            counts.reshape(side, side, N, N).astype(np.float64),
+            name="counts",
+            sampling=(SCAN_SAMPLING, SCAN_SAMPLING, RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+            units=["A", "A", "A^-1", "A^-1"],
+        )
+        with pytest.raises(ValueError, match="come from `detector`"):
+            DirectPtychographyMontage.from_vector(
+                vector_from_frames(np.asarray(dataset.array)),
+                dataset.probe_positions(),
+                dataset.dp_mean,
+                (RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+                **_common_kwargs(0.0),
+            )
+
+        with pytest.raises(ValueError, match="`reciprocal_sampling` is required"):
+            DirectPtychographyMontage.from_vector(
+                vector_from_frames(np.asarray(dataset.array)),
+                dataset.probe_positions(),
+                (N, N),
+                **_common_kwargs(0.0),
+            )
+
+    def test_rejects_a_position_count_mismatch(self):
+        from quantem.core.datastructures import Vector
+
+        gridded = Vector.from_shape((2, 2), fields=["kx", "ky"])
+        with pytest.raises(ValueError, match="diffraction patterns"):
+            DirectPtychographyMontage.from_vector(
+                gridded,
+                np.zeros((3, 2)),
+                (N, N),
+                (RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+                **_common_kwargs(0.0),
+            )
+
+    def test_rejects_a_vector_without_detector_fields(self):
+        from quantem.core.datastructures import Vector
+
+        vector = Vector.from_shape((4,), fields=["qx", "qy"])
+        with pytest.raises(ValueError, match="must carry 'kx' and 'ky'"):
+            DirectPtychographyMontage.from_vector(
+                vector,
+                np.zeros((4, 2)),
+                (N, N),
+                (RECIPROCAL_SAMPLING, RECIPROCAL_SAMPLING),
+                **_common_kwargs(0.0),
+            )
+
+    def test_dense_and_sparse_are_mutually_exclusive(self, pair):
+        dense, sparse = pair
+        assert sparse.sparse_frames
+        assert sparse.vbf_stack is None
+        assert sparse.events.num_positions == sparse.num_positions
+
+        assert not dense.sparse_frames
+        assert dense.events is None
+
+
 class TestSerialization:
     """Both classes must survive a save/load round-trip and stay usable afterwards."""
 
-    @pytest.mark.parametrize("cls_name", ["fourier", "montage"])
+    @pytest.mark.parametrize("cls_name", ["fourier", "montage", "sparse"])
     def test_round_trip(self, dataset4d, tmp_path, cls_name):
         defocus = integer_shift_defocus(1)
-        fourier, montage = _build_pair(dataset4d, defocus)
-        recon = fourier if cls_name == "fourier" else montage
+        if cls_name == "sparse":
+            recon = TestSparseEvents._pair(dataset4d, defocus)[1]
+        else:
+            fourier, montage = _build_pair(dataset4d, defocus)
+            recon = fourier if cls_name == "fourier" else montage
 
         recon.hyperparameter_state.optimized_aberrations = {"C10": 123.0}
         recon.hyperparameter_state.optimized_rotation_angle = 7.5
@@ -773,7 +1172,7 @@ class TestSerialization:
         assert restored.hyperparameter_state.optimized_aberrations == {"C10": 123.0}
         assert restored.hyperparameter_state.optimized_rotation_angle == 7.5
         assert restored.gpts == recon.gpts
-        assert float(restored.variance_loss()) == pytest.approx(float(recon.variance_loss()))
+        assert restored.residual_loss() == pytest.approx(recon.residual_loss())
 
         # and it must still be able to reconstruct
         restored.reconstruct(deconvolution_kernel="prlx", verbose=False)
@@ -875,7 +1274,7 @@ class TestFourierProbe:
         return analytic, empirical
 
     @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    @pytest.mark.parametrize("kernel", ["ssb", "obf", "mf"])
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
     def test_empirical_probe_reproduces_the_analytic_one(self, dataset4d, cls, kernel):
         """The headline: the same probe, described two ways, must reconstruct the same.
 
@@ -1009,7 +1408,11 @@ class TestFourierProbe:
         property of the data, not of the method.
         """
         defocus = integer_shift_defocus(1)
-        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        # the mean-pattern mask, so that both reconstructions crop the detector alike: a model
+        # aperture read off the lattice is bilinearly widened by a pixel
+        kwargs = dict(
+            _common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap", intensity_threshold=0.5
+        )
         kwargs["rotation_angle"] = rotation_angle
 
         analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
@@ -1032,7 +1435,9 @@ class TestFourierProbe:
 
     def test_low_oversampling_warns(self, dataset4d):
         defocus = integer_shift_defocus(1)
-        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        kwargs = dict(
+            _common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap", intensity_threshold=0.5
+        )
         kwargs["rotation_angle"] = 15.0
         analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
         empirical = DirectPtychographyMontage.from_dataset4d(
@@ -1059,8 +1464,11 @@ class TestFourierProbe:
         probe = empirical.fourier_probe
         half_pixel = torch.tensor([0.5 * probe.reciprocal_sampling[0]])
 
-        with pytest.raises(ValueError, match="own reciprocal grid"):
+        with pytest.raises(ValueError, match="own reciprocal grid") as error:
             probe.at(half_pixel, torch.zeros(1))
+        # the probe's field of view is 1 / dq, which the message quotes
+        field_of_view = 1 / probe.reciprocal_sampling[0]
+        assert f"{field_of_view:.2f} x" in str(error.value)
 
     def test_bilinear_accepts_off_grid_sampling(self, dataset4d):
         _, empirical = self._pair(dataset4d, DirectPtychographyMontage, interpolation="bilinear")
@@ -1087,11 +1495,33 @@ class TestFourierProbe:
         ],
     )
     def test_aberration_only_features_raise(self, dataset4d, kwargs, match):
-        """Everything that reads chi(k) has no meaning without aberration coefficients."""
+        """Everything that reads chi(k) has no meaning without aberration coefficients.
+
+        Zeroing them is the case the guard exists for: a measured probe carries a phase but
+        no surface to differentiate, so the shifts would come out zero and quietly sum the
+        bright-field stack into a plain incoherent image.
+        """
         _, empirical = self._pair(dataset4d, DirectPtychographyMontage)
 
         with pytest.raises(NotImplementedError, match=match):
-            empirical.reconstruct(verbose=False, **kwargs)
+            empirical.reconstruct(verbose=False, override_aberration_coefs={"C10": 0.0}, **kwargs)
+
+    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
+    def test_prlx_runs_on_a_modelled_empirical_probe(self, dataset4d, cls):
+        """Coefficients modelling a measured probe's phase are enough to run parallax.
+
+        The probe here *is* the analytic one materialized as an array, so the model is exact
+        and the two paths must agree. Whether a real measured probe is this well modelled is
+        what ``fit_aberrations_from_probe`` is for.
+        """
+        analytic, empirical = self._pair(dataset4d, cls, normalize=False)
+        extra = {} if cls is DirectPtychography else {"boundary": "wrap"}
+
+        analytic.reconstruct(deconvolution_kernel="prlx", verbose=False, **extra)
+        expected = analytic.obj.copy()
+        empirical.reconstruct(deconvolution_kernel="prlx", verbose=False, **extra)
+
+        assert correlation(to_numpy(empirical.obj), to_numpy(expected)) > 0.999
 
     def test_semiangle_cutoff_becomes_optional(self, dataset4d):
         """The empirical probe carries its own aperture, whatever shape it is."""
@@ -1122,7 +1552,7 @@ class TestFourierProbe:
         "array, match",
         [
             (np.ones((8, 8)), "must be a complex probe"),
-            (np.ones((8, 8, 2), dtype=complex), "must be 2D"),
+            (np.ones((2, 8, 8, 2), dtype=complex), "must be 2D"),
         ],
     )
     def test_array_validation(self, array, match):
@@ -1594,7 +2024,7 @@ class TestDefocusGradient:
 
 
 class TestRealSpaceKernels:
-    """SSB / OBF / MF as truncated real-space convolutions.
+    """SSB / OBF as truncated real-space convolutions.
 
     `obj = sum_m ifft2(G_m * K_m) = sum_m (v_m conv kappa_m)` is an identity, so truncating
     `kappa_m` to a box stencil is the *only* approximation: with a large enough stencil these
@@ -1605,13 +2035,13 @@ class TestRealSpaceKernels:
     being in focus does not help, since there is no chirp to concentrate the kernel.
     """
 
-    KERNELS = ("ssb", "obf", "mf")
+    KERNELS = ("ssb", "obf")
     MAX_RADIUS = 15  # canvas half-width for the 32x32 fixture
 
     @staticmethod
-    def _pair(dataset4d):
+    def _pair(dataset4d, **overrides):
         defocus = integer_shift_defocus(1)
-        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, **overrides)
         return (
             DirectPtychography.from_dataset4d(dataset4d, **kwargs),
             DirectPtychographyMontage.from_dataset4d(dataset4d, boundary="wrap", **kwargs),
@@ -1619,7 +2049,9 @@ class TestRealSpaceKernels:
 
     @pytest.mark.parametrize("kernel", KERNELS)
     def test_converges_to_the_fourier_kernel(self, dataset4d, kernel):
-        fourier, montage = self._pair(dataset4d)
+        # the half-intensity mask: the soft edge's pixels, which the model aperture keeps, have
+        # longer-ranged OBF kernels than this 32-pixel canvas can hold (3.9% at radius 15)
+        fourier, montage = self._pair(dataset4d, intensity_threshold=0.5)
         reference = fourier.reconstruct(deconvolution_kernel=kernel, verbose=False).obj
 
         errors = []
@@ -1681,7 +2113,6 @@ class TestRealSpaceKernels:
             stencil_radius=radius,
             truncation_tolerance=1.0,
             max_stencil_radius=radius,
-            matched_filter_norm_epsilon=1e-1,
             kernel_batch_size=16,
             verbose=False,
         )
@@ -1736,19 +2167,19 @@ class TestRealSpaceKernels:
         assert 0.0 <= info["mean_error"] <= info["max_error"]
 
     @pytest.mark.parametrize("kernel", KERNELS)
-    def test_variance_loss_is_undefined(self, dataset4d, kernel):
+    def test_residual_loss_is_undefined(self, dataset4d, kernel):
         _, montage = self._pair(dataset4d)
         montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=4, verbose=False)
 
         with pytest.raises(NotImplementedError, match="only defined for the parallax"):
-            montage.variance_loss()
+            montage.residual_loss()
 
-    def test_variance_loss_returns_after_a_parallax_reconstruction(self, dataset4d):
+    def test_residual_loss_returns_after_a_parallax_reconstruction(self, dataset4d):
         _, montage = self._pair(dataset4d)
         montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=4, verbose=False)
         montage.reconstruct(verbose=False)
 
-        assert float(montage.variance_loss()) > 0
+        assert montage.residual_loss() > 0
 
     def test_icom_runs_in_either_mode(self, dataset4d):
         _, montage = self._pair(dataset4d)
@@ -1921,14 +2352,14 @@ class TestRealSpaceKernels:
 
 
 class TestConvolutionModes:
-    """`convolution_mode` picks how the SSB / OBF / MF convolutions are evaluated.
+    """`convolution_mode` picks how the SSB / OBF convolutions are evaluated.
 
     `"fft"` multiplies in `q`, which is exact; `"stencil"` truncates to a box, which is not.
     Both are the same operator, so the only differences that may appear are the truncation
     and the circular-versus-linear boundary.
     """
 
-    KERNELS = ("ssb", "obf", "mf")
+    KERNELS = ("ssb", "obf")
 
     @staticmethod
     def _pair(dataset4d, boundary="wrap"):
@@ -2483,13 +2914,13 @@ class TestAccelerators:
 
         assert np.isfinite(obj).all()
 
-    def test_variance_loss_and_search_run(self, dataset4d, device):
+    def test_residual_loss_and_search_run(self, dataset4d, device):
         montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d, device=device, **self._kwargs(dataset4d)
         )
         montage.reconstruct(verbose=False)
 
-        assert np.isfinite(float(montage.variance_loss()))
+        assert np.isfinite(montage.residual_loss())
 
     @pytest.mark.parametrize(
         "cls", [DirectPtychography, DirectPtychographyMontage], ids=["fourier", "montage"]
@@ -2528,3 +2959,501 @@ def test_padded_canvas_shape_is_device_independent(dataset4d, device):
         return montage.reconstruct(verbose=False).obj.shape
 
     assert shape(device) == shape("cpu")
+
+
+class TestAberrationFitFromProbe:
+    """Fitting ``chi(k)`` to a measured ``psi(k)``, and knowing when not to trust it.
+
+    The parallax kernel needs the probe's phase to be an aberration surface. Whether it is
+    one is a property of the optic, so the fit has to report its own quality rather than
+    hand back coefficients unconditionally.
+    """
+
+    GPTS = (128, 128)
+    SAMPLING = (0.4, 0.4)
+    WAVELENGTH = 0.0251
+    CUTOFF = 25.0
+    TRUTH = {
+        "C10": -150.0,
+        "C12": 40.0,
+        "phi12": 0.3,
+        "C21": 2000.0,
+        "phi21": -0.7,
+        "C30": 1.0e5,
+    }
+
+    def _probe(self, aberration_coefs):
+        from quantem.diffractive_imaging.complex_probe import (
+            evaluate_probe,
+            polar_coordinates,
+        )
+
+        kxa, kya = spatial_frequencies(self.GPTS, self.SAMPLING)
+        k, phi = polar_coordinates(kxa, kya)
+        angular = tuple(self.WAVELENGTH * 1e3 / (n * s) for n, s in zip(self.GPTS, self.SAMPLING))
+        psi = evaluate_probe(
+            k * self.WAVELENGTH,
+            phi,
+            self.CUTOFF,
+            angular,
+            self.WAVELENGTH,
+            aberration_coefs=aberration_coefs,
+        )
+        return psi, (k * self.WAVELENGTH * 1e3) <= self.CUTOFF
+
+    def _fit(self, psi, bf_mask, **kwargs):
+        return fit_aberrations_from_probe(psi, bf_mask, self.WAVELENGTH, self.SAMPLING, **kwargs)
+
+    def test_round_trip_recovers_known_aberrations(self):
+        """An analytic probe must give its own coefficients back."""
+        psi, bf_mask = self._probe(self.TRUTH)
+        coefs, diagnostics = self._fit(psi, bf_mask, cartesian_basis="low_order")
+
+        assert diagnostics["variance_explained"] == pytest.approx(1.0, abs=1e-6)
+        assert diagnostics["shift_error_ang"] == pytest.approx(0.0, abs=1e-3)
+        for key, value in self.TRUTH.items():
+            assert coefs[key] == pytest.approx(value, rel=1e-3)
+
+    def test_defocus_only_probe_needs_only_the_defocus_basis(self):
+        psi, bf_mask = self._probe({"C10": -150.0})
+        coefs, diagnostics = self._fit(psi, bf_mask, cartesian_basis="defocus")
+
+        assert diagnostics["variance_explained"] == pytest.approx(1.0, abs=1e-6)
+        assert coefs["C10"] == pytest.approx(-150.0, rel=1e-3)
+
+    def test_a_truncated_basis_reports_what_it_missed(self):
+        """Fitting defocus alone to an aberrated probe must not claim a perfect fit."""
+        psi, bf_mask = self._probe(self.TRUTH)
+        _, diagnostics = self._fit(psi, bf_mask, cartesian_basis="defocus")
+
+        assert 0.5 < diagnostics["variance_explained"] < 0.99
+        assert diagnostics["shift_error_ang"] > 0.1
+
+    def test_random_phase_is_not_fittable(self):
+        """The failure case: no aberration surface exists, and the fit has to say so."""
+        psi, bf_mask = self._probe(self.TRUTH)
+        generator = torch.Generator().manual_seed(0)
+        scrambled = psi.abs() * torch.exp(2j * np.pi * torch.rand(self.GPTS, generator=generator))
+
+        _, diagnostics = self._fit(scrambled, bf_mask, cartesian_basis="all")
+
+        assert diagnostics["variance_explained"] < 0.05
+        # a uniform phase step has RMS pi/sqrt(3)
+        assert diagnostics["residual_rms_rad_px"] == pytest.approx(np.pi / np.sqrt(3), rel=0.1)
+
+    def test_unknown_preset_raises(self):
+        psi, bf_mask = self._probe(self.TRUTH)
+        with pytest.raises(ValueError, match="Unknown basis preset"):
+            self._fit(psi, bf_mask, cartesian_basis="not-a-preset")
+
+    def test_fitted_coefficients_drive_parallax(self, dataset4d):
+        """The whole point: fit a measured probe, then reconstruct with the fit.
+
+        A probe fitted from its own analytic form must reproduce the analytic parallax
+        reconstruction, which is what makes the relaxed guard safe to rely on.
+        """
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
+
+        psi = analytic_probe_array(analytic, {"C10": defocus})
+        coefs, diagnostics = fit_aberrations_from_probe(
+            psi,
+            analytic.bf_mask,
+            analytic.wavelength,
+            analytic.sampling,
+            cartesian_basis="defocus",
+        )
+        assert diagnostics["variance_explained"] > 0.99
+        assert coefs["C10"] == pytest.approx(defocus, rel=1e-2)
+
+        probe = FourierProbe.from_array(
+            psi, analytic.reciprocal_sampling, analytic.wavelength, normalize=False
+        )
+        empirical = DirectPtychographyMontage.from_dataset4d(
+            dataset4d, fourier_probe=probe, **kwargs
+        )
+
+        analytic.reconstruct(deconvolution_kernel="prlx", verbose=False)
+        expected = analytic.obj.copy()
+        empirical.reconstruct(
+            deconvolution_kernel="prlx", override_aberration_coefs=coefs, verbose=False
+        )
+
+        assert correlation(to_numpy(empirical.obj), to_numpy(expected)) > 0.999
+
+
+class TestBandLimit:
+    """Kernels without a ``gamma`` factor are cut at ``2 alpha / lambda``.
+
+    Upsampling tiles the bright-field spectrum. ``ssb``, ``obf`` and ``mf`` use ``k`` to tell
+    a real high frequency from its alias, which is where resolution past the scan Nyquist
+    comes from. A pure shift cannot, so for ``prlx`` the replicas are only alias.
+    """
+
+    @staticmethod
+    def _recon(dataset4d):
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        return DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
+
+    def test_band_limit_is_twice_the_cutoff(self, dataset4d):
+        montage = self._recon(dataset4d)
+        expected = 2 * montage.semiangle_cutoff * 1e-3 / montage.wavelength
+        assert montage._return_band_limit() == pytest.approx(expected)
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_deconvolution_kernels_are_untouched(self, dataset4d, kernel):
+        """``gamma`` already vanishes past the band limit, so the clamp must be a no-op."""
+        montage = self._recon(dataset4d)
+        montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=5, verbose=False)
+        limited = to_numpy(montage.obj).copy()
+        montage.reconstruct(
+            deconvolution_kernel=kernel, stencil_radius=5, band_limit=False, verbose=False
+        )
+        assert np.allclose(limited, to_numpy(montage.obj))
+
+    def test_parallax_amplitude_now_scales_like_ssb(self, dataset4d):
+        """Unfiltered ``prlx`` fell off as 1/U where every other kernel goes as 1/U**2,
+        and that gap was the retained replicas."""
+        montage = self._recon(dataset4d)
+
+        def spread(kernel, factor, **kwargs):
+            montage.reconstruct(
+                deconvolution_kernel=kernel, upsampling_factor=factor, verbose=False, **kwargs
+            )
+            return float(to_numpy(montage.obj).std())
+
+        # the exact SSB, not a truncated stencil, whose 50% truncation error would swamp the
+        # amplitude being compared
+        fft = {"convolution_mode": "fft"}
+        ssb_ratio = spread("ssb", 1, **fft) / spread("ssb", 2, **fft)
+        limited = spread("prlx", 1) / spread("prlx", 2)
+        unlimited = spread("prlx", 1, band_limit=False) / spread("prlx", 2, band_limit=False)
+
+        assert ssb_ratio == pytest.approx(4.0, rel=0.05)
+        assert limited == pytest.approx(4.0, rel=0.05)
+        assert unlimited == pytest.approx(2.0, rel=0.05)
+
+    def test_an_explicit_cutoff_below_the_band_limit_still_wins(self, dataset4d):
+        montage = self._recon(dataset4d)
+        band = montage._return_band_limit()
+
+        assert montage._resolve_q_lowpass(band / 4, "prlx") == pytest.approx(band / 4)
+        assert montage._resolve_q_lowpass(band * 4, "prlx") == pytest.approx(band)
+        assert montage._resolve_q_lowpass(None, "prlx") == pytest.approx(band)
+        assert montage._resolve_q_lowpass(band * 4, "ssb") == pytest.approx(band * 4)
+        assert montage._resolve_q_lowpass(band * 4, "prlx", band_limit=False) == pytest.approx(
+            band * 4
+        )
+
+    def test_an_empirical_probe_reads_its_extent_off_the_bf_mask(self, dataset4d):
+        """No ``semiangle_cutoff`` to read, so the mask supplies the probe's extent."""
+        defocus = integer_shift_defocus(1)
+        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
+        analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
+        psi = analytic_probe_array(analytic, {"C10": defocus})
+        probe = FourierProbe.from_array(
+            psi, analytic.reciprocal_sampling, analytic.wavelength, normalize=False
+        )
+        kwargs.pop("semiangle_cutoff")
+        empirical = DirectPtychographyMontage.from_dataset4d(
+            dataset4d, fourier_probe=probe, semiangle_cutoff=None, **kwargs
+        )
+
+        assert empirical.semiangle_cutoff is None
+        # the mask is the aperture rounded onto the detector grid, so this lands near but
+        # not exactly on the analytic 2 * alpha / lambda
+        assert empirical._return_band_limit() == pytest.approx(
+            analytic._return_band_limit(), rel=0.25
+        )
+
+
+# ---------------------------------------------------------------------------
+# complex-valued and multislice reconstructions
+# ---------------------------------------------------------------------------
+
+
+def _correlation(a, b):
+    a = np.asarray(a, dtype=np.float64) - np.mean(a)
+    b = np.asarray(b, dtype=np.float64) - np.mean(b)
+    return float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum()))
+
+
+@pytest.fixture(scope="module")
+def complex_pair():
+    """Both classes over one weak object with independent amplitude and phase."""
+    from .conftest import ml_kwargs, thin_layer_4dstem, white_noise_object_2D
+
+    noise = 0.02 * white_noise_object_2D(n=64, phi0=1.0)
+    dataset = thin_layer_4dstem([noise + 0.5j * noise[::-1]], [0.0])
+    fourier = DirectPtychography.from_dataset4d(dataset, **ml_kwargs())
+    montage = DirectPtychographyMontage.from_dataset4d(dataset, boundary="wrap", **ml_kwargs())
+    return fourier, montage
+
+
+@pytest.fixture(scope="module")
+def mixed_pair():
+    """Both classes over a weak object imaged with a two-mode probe, and that probe."""
+    from quantem.core.utils.utils import electron_wavelength_angstrom
+
+    from .conftest import (
+        ML_ABERRATIONS,
+        ML_RECIPROCAL_SAMPLING,
+        library_probe_fourier,
+        ml_kwargs,
+        thin_layer_4dstem,
+        white_noise_object_2D,
+    )
+
+    modes = np.stack(
+        [
+            np.sqrt(0.5) * library_probe_fourier(dict(ML_ABERRATIONS, C10=20.0)),
+            np.sqrt(0.5) * library_probe_fourier(dict(ML_ABERRATIONS, C10=80.0)),
+        ]
+    )
+    noise = 0.02 * white_noise_object_2D(n=64, phi0=1.0)
+    dataset = thin_layer_4dstem([noise + 0.5j * noise[::-1]], [0.0], probe_modes=modes)
+    probe = FourierProbe.from_array(
+        torch.as_tensor(modes, dtype=torch.complex64),
+        (ML_RECIPROCAL_SAMPLING, ML_RECIPROCAL_SAMPLING),
+        electron_wavelength_angstrom(PROBE_ENERGY),
+    )
+    kwargs = dict(ml_kwargs(), crop_bf_mask=False, fourier_probe=probe)
+    fourier = DirectPtychography.from_dataset4d(dataset, **kwargs)
+    montage = DirectPtychographyMontage.from_dataset4d(dataset, boundary="wrap", **kwargs)
+    return fourier, montage
+
+
+class TestMixedStateMontage:
+    """The montage sums the overlap function over probe modes exactly as the Fourier class."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"obj_type": "complex"},
+            {
+                "obj_type": "complex",
+                "num_slices": 2,
+                "slice_mode": "joint",
+                "slice_thicknesses": 10.0,
+            },
+        ],
+    )
+    def test_the_fft_route_matches_the_fourier_class(self, mixed_pair, kwargs):
+        fourier, montage = mixed_pair
+        kwargs = dict(deconvolution_kernel="obf", verbose=False, **kwargs)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        expected = to_numpy(fourier.corrected_bf)
+        assert _relative_error(to_numpy(montage.corrected_bf), expected) < 1e-3
+        assert fourier.residual_loss() < 1e-4
+        assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), abs=1e-5)
+
+    def test_the_stencil_route_reads_the_modes(self, mixed_pair):
+        """Every stencil kernel reads the modes through the same overlap terms."""
+        kernel = "obf"
+        fourier, montage = mixed_pair
+        fourier.reconstruct(deconvolution_kernel=kernel, verbose=False)
+        montage.reconstruct(deconvolution_kernel=kernel, convolution_mode="stencil", verbose=False)
+
+        expected = to_numpy(fourier.corrected_bf)
+        assert correlation(to_numpy(montage.corrected_bf), expected) > 0.99
+
+
+class TestComplexAndMultislice:
+    """The montage reaches the same solves, by FFT exactly and by stencil approximately."""
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_the_fft_route_matches_the_fourier_class(self, complex_pair, kernel):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel=kernel, obj_type="complex", verbose=False)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        # float32 precision over 777 bright-field pixels and 4096 positions; the pure-phase
+        # reconstructions of this fixture already differ by 2e-5
+        for attribute in ("corrected_bf", "corrected_amplitude"):
+            expected = to_numpy(getattr(fourier, attribute))
+            assert _relative_error(to_numpy(getattr(montage, attribute)), expected) < 1e-4
+        # the data are noiseless and weak, so the residual is about 1e-5 and the float32
+        # energies, which agree to 3e-7, set how well it can match
+        assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), abs=1e-6)
+
+    @pytest.mark.parametrize("kernel", ["obf"])
+    def test_the_fft_route_takes_the_ard_prior(self, complex_pair, kernel):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel=kernel, obj_type="complex", prior="ard", verbose=False)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        # the data are noiseless, so the estimate is float32 round-off, which the two routes
+        # accumulate in different orders
+        assert montage.noise_variance == pytest.approx(fourier.noise_variance, rel=0.05)
+        for attribute in ("corrected_bf", "corrected_amplitude"):
+            expected = to_numpy(getattr(fourier, attribute))
+            assert _relative_error(to_numpy(getattr(montage, attribute)), expected) < 1e-3
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    def test_the_fft_route_takes_the_wiener_kernel(self, complex_pair, obj_type):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel="wiener", obj_type=obj_type, verbose=False)
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        # the data are noiseless, so the noise variance is float32 round-off, which the two
+        # routes accumulate in different orders, and the Wiener's shrinkage follows it
+        assert montage.noise_variance == pytest.approx(fourier.noise_variance, rel=0.05)
+        attributes = ["corrected_bf"] + (["corrected_amplitude"] if obj_type == "complex" else [])
+        for attribute in attributes:
+            expected = to_numpy(getattr(fourier, attribute))
+            assert _relative_error(to_numpy(getattr(montage, attribute)), expected) < 5e-3
+
+    def test_the_stencil_route_refuses_the_wiener_kernel(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(ValueError, match="convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="wiener", convolution_mode="stencil", verbose=False
+            )
+
+    def test_wdd_is_refused(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(NotImplementedError, match="DirectPtychography only"):
+            montage.reconstruct(deconvolution_kernel="wdd", verbose=False)
+
+    def test_the_focal_spread_reaches_the_fft_route(self, complex_pair):
+        fourier, montage = complex_pair
+        kwargs = dict(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+        coherent = to_numpy(fourier.reconstruct(**kwargs).corrected_bf).copy()
+        for recon in (fourier, montage):
+            recon.focal_spread = 30.0
+        try:
+            fourier.reconstruct(**kwargs)
+            montage.reconstruct(convolution_mode="fft", **kwargs)
+            expected = to_numpy(fourier.corrected_bf)
+            assert _relative_error(to_numpy(montage.corrected_bf), expected) < 1e-3
+            assert _relative_error(expected, coherent) > 1e-2
+        finally:
+            for recon in (fourier, montage):
+                recon.focal_spread = 0.0
+
+    def test_the_stencil_route_refuses_the_ard_prior(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(ValueError, match="convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="obf", convolution_mode="stencil", prior="ard", verbose=False
+            )
+
+    def test_sections_are_single_plane_reconstructions(self, complex_pair):
+        """Sectioning is dispatched before the convolution route is chosen, so one route covers
+        both."""
+        _, montage = complex_pair
+        kwargs = dict(deconvolution_kernel="obf", convolution_mode="fft", verbose=False)
+        montage.reconstruct(num_slices=2, slice_thicknesses=20.0, slice_mode="sectioned", **kwargs)
+        stack = to_numpy(montage.corrected_bf).copy()
+        c10 = montage.hyperparameter_state.current_aberrations()["C10"]
+
+        for section, depth in zip(stack, montage.slice_depths):
+            montage.reconstruct(override_aberration_coefs={"C10": c10 + depth}, **kwargs)
+            assert np.array_equal(section, to_numpy(montage.corrected_bf))
+
+    @pytest.mark.parametrize("obj_type", ["pure_phase", "complex"])
+    def test_the_fft_route_solves_several_slices(self, complex_pair, obj_type):
+        fourier, montage = complex_pair
+        kwargs = dict(
+            deconvolution_kernel="obf",
+            obj_type=obj_type,
+            num_slices=2,
+            slice_mode="joint",
+            slice_thicknesses=8.0,
+            verbose=False,
+        )
+        fourier.reconstruct(**kwargs)
+        montage.reconstruct(convolution_mode="fft", **kwargs)
+
+        assert montage.corrected_bf.shape == (2, 64, 64)
+        # near-parallel slice columns amplify float32 differences up to the eigenvalue floor
+        assert (
+            _relative_error(to_numpy(montage.corrected_bf), to_numpy(fourier.corrected_bf)) < 1e-3
+        )
+
+    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
+    def test_complex_stencils_converge_to_the_fft_route(self, complex_pair, kernel):
+        """Phase and log-amplitude are packed as ``Re + i Re`` into one stencil per pixel."""
+        fourier, montage = complex_pair
+        fourier.reconstruct(deconvolution_kernel=kernel, obj_type="complex", verbose=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            montage.reconstruct(
+                deconvolution_kernel=kernel,
+                obj_type="complex",
+                convolution_mode="stencil",
+                stencil_radius=20,
+                verbose=False,
+            )
+
+        for attribute in ("corrected_bf", "corrected_amplitude"):
+            measured = to_numpy(getattr(montage, attribute))
+            assert _correlation(measured, to_numpy(getattr(fourier, attribute))) > 0.999
+        assert "amplitude_mean_error" in montage._stencil_info
+
+    @pytest.mark.parametrize("convolution_mode", ["fft", "stencil"])
+    def test_ricom_amplitude_is_the_zeroth_moment(self, complex_pair, convolution_mode):
+        fourier, montage = complex_pair
+        fourier.reconstruct(deconvolution_kernel="icom", obj_type="complex", verbose=False)
+        extra = {"stencil_radius": 8} if convolution_mode == "stencil" else {}
+        montage.reconstruct(
+            deconvolution_kernel="icom",
+            obj_type="complex",
+            convolution_mode=convolution_mode,
+            verbose=False,
+            **extra,
+        )
+
+        expected = to_numpy(fourier.corrected_amplitude)
+        assert _relative_error(to_numpy(montage.corrected_amplitude), expected) < 1e-4
+
+    def test_several_slices_need_the_fft_route(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(NotImplementedError, match="convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="obf",
+                num_slices=2,
+                slice_mode="joint",
+                slice_thicknesses=5.0,
+                convolution_mode="stencil",
+                stencil_radius=4,
+                verbose=False,
+            )
+
+    def test_parallax_rejects_complex(self, complex_pair):
+        _, montage = complex_pair
+        with pytest.raises(ValueError, match="cannot separate amplitude from phase"):
+            montage.reconstruct(deconvolution_kernel="prlx", obj_type="complex", verbose=False)
+
+    def test_frame_mean_subtraction_rejects_complex(self, dataset4d):
+        montage = DirectPtychographyMontage.from_dataset4d(
+            dataset4d,
+            boundary="wrap",
+            subtract_frame_mean=True,
+            edge_blend_pixels=0,
+            **_common_kwargs(integer_shift_defocus(1)),
+        )
+        with pytest.raises(ValueError, match="zeroth moment"):
+            montage.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
+
+    @pytest.mark.parametrize("kernel", ["obf", "icom"])
+    def test_sparse_frames_match_dense(self, dataset4d, kernel):
+        dense, sparse = TestSparseEvents._pair(dataset4d, integer_shift_defocus(1))
+        kwargs = dict(
+            deconvolution_kernel=kernel,
+            obj_type="complex",
+            convolution_mode="stencil",
+            stencil_radius=4,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            a, b = TestSparseEvents._both(dense, sparse, **kwargs)
+
+        assert _relative_error(b, a) < 1e-4

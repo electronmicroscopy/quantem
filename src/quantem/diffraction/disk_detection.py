@@ -1,3 +1,17 @@
+"""Template-matching Bragg disk detection for 4D-STEM, in torch.
+
+Each diffraction pattern is cross-correlated with a probe template in Fourier
+space (optionally as a hybrid or phase correlation, with a Fourier high-pass
+background removal and low-pass smoothing), local maxima of the correlation map
+are kept as candidate disks, and each one is refined to subpixel precision by a
+parabolic fit and then by DFT upsampling of the Fourier product. The approach
+follows the multicorr / ``find_Bragg_disks`` routines of py4DSTEM, which use the
+single-step DFT upsampling of Guizar-Sicairos, Thurman and Fienup, "Efficient
+subpixel image registration algorithms", Optics Letters 33, 156 (2008).
+Functions here are used by :class:`~quantem.diffraction.bragg_vectors.BraggVectors`.
+Peak coordinates are ``(row, col)`` in detector pixels.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -278,10 +292,69 @@ def _background_highpass(
     g = torch.exp(-2.0 * (torch.pi**2) * (float(background_sigma) ** 2) * (qr**2 + qc**2))
     return 1.0 - g
 
+
+def _smoothing_lowpass(
+    shape: tuple[int, int],
+    sigma: float,
+    device,
+    rfft: bool = False,
+) -> torch.Tensor:
+    """Fourier-domain Gaussian low-pass of width ``sigma`` pixels.
+
+    Smoothing the correlation map before peak finding merges the speckle of a
+    noisy disk into one maximum, which is what stops a weak disk from being
+    split into several sub-threshold peaks.
+    """
+    H, W = int(shape[0]), int(shape[1])
+    qr = torch.fft.fftfreq(H, device=device, dtype=torch.float)[:, None]
+    qc = (
+        torch.fft.rfftfreq(W, device=device, dtype=torch.float)[None, :]
+        if rfft
+        else torch.fft.fftfreq(W, device=device, dtype=torch.float)[None, :]
+    )
+    return torch.exp(-2.0 * (torch.pi**2) * (float(sigma) ** 2) * (qr**2 + qc**2))
+
+
+def _apply_corr_power(m: torch.Tensor, corr_power: float) -> torch.Tensor:
+    """Hybrid correlation: keep the phase, raise the magnitude to ``corr_power``.
+
+    ``corr_power=1`` is the plain cross-correlation, ``0`` the phase
+    correlation, and values in between the hybrid correlation. Dividing out
+    part of the magnitude equalizes the weak and strong reflections, so a
+    faint disk on a bright background produces a peak of the same height as a
+    strong one; this is what makes the phase and hybrid correlations find far
+    more weak disks than the plain product. The cost is that the peak height
+    is no longer proportional to the disk intensity -- with ``corr_power``
+    below 1 the reported intensities are compressed, which matters when they
+    are used downstream as weights (orientation matching, strain).
+    """
+    if corr_power == 1.0:
+        return m
+    mag = torch.abs(m)
+    return m * mag.clamp_min(1e-12) ** (float(corr_power) - 1.0)
+
+
+def _fourier_filter(
+    m: torch.Tensor,
+    shape: tuple[int, int],
+    background_sigma: float | None,
+    sigma_cc: float | None,
+    rfft: bool = False,
+) -> torch.Tensor:
+    """Apply the background high-pass and the smoothing low-pass to a product."""
+    if background_sigma is not None and background_sigma > 0:
+        m = m * _background_highpass(shape, background_sigma, m.device, rfft=rfft)
+    if sigma_cc is not None and sigma_cc > 0:
+        m = m * _smoothing_lowpass(shape, sigma_cc, m.device, rfft=rfft)
+    return m
+
+
 def cross_correlation(
     dp: torch.Tensor,
     template_ft: torch.Tensor,
     background_sigma: float | None = None,
+    corr_power: float = 1.0,
+    sigma_cc: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cross-correlate a diffraction pattern with a template.
 
@@ -291,6 +364,16 @@ def cross_correlation(
         ``(H, W)`` diffraction pattern.
     template_ft : torch.Tensor
         ``(H, W)`` pre-computed template FT from :func:`template_fourier`.
+    background_sigma : float, optional
+        Width in pixels of the Gaussian whose smoothed copy of the correlation is
+        subtracted (a Fourier high-pass). ``None`` or ``0`` disables it.
+    corr_power : float, default=1.0
+        Exponent applied to the magnitude of the Fourier product: 1 is the plain
+        cross-correlation, 0 the phase correlation, and values in between the
+        hybrid correlation.
+    sigma_cc : float, optional
+        Width in pixels of a Gaussian smoothing of the correlation map (a Fourier
+        low-pass). ``None`` or ``0`` disables it.
 
     Returns
     -------
@@ -298,13 +381,12 @@ def cross_correlation(
         ``(H, W)`` real-space correlation map ``relu(real(ifft2(m)))`` (used for
         peak finding).
     m : torch.Tensor
-        ``(H, W)`` Fourier-domain product ``fft2(dp) * template_ft`` (used for DFT
-        subpixel refinement).
+        ``(H, W)`` Fourier-domain product ``fft2(dp) * template_ft`` after the
+        ``corr_power`` and the filters (used for DFT subpixel refinement).
     """
     dp = torch.as_tensor(dp)
-    m = torch.fft.fft2(dp) * template_ft
-    if background_sigma is not None and background_sigma > 0:
-        m = m * _background_highpass(m.shape[-2:], background_sigma, m.device)
+    m = _apply_corr_power(torch.fft.fft2(dp) * template_ft, corr_power)
+    m = _fourier_filter(m, m.shape[-2:], background_sigma, sigma_cc)
     corr_map = torch.clamp(torch.fft.ifft2(m).real, min=0.0)
     return corr_map, m
 
@@ -313,6 +395,8 @@ def cross_correlation_batch(
     dps: torch.Tensor,
     template_ft: torch.Tensor,
     background_sigma: float | None = None,
+    corr_power: float = 1.0,
+    sigma_cc: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cross-correlate a stack of diffraction patterns with one template.
 
@@ -326,6 +410,16 @@ def cross_correlation_batch(
         ``(B, H, W)`` stack of diffraction patterns.
     template_ft : torch.Tensor
         ``(H, W)`` pre-computed template FT from :func:`template_fourier`.
+    background_sigma : float, optional
+        Width in pixels of the Gaussian whose smoothed copy of the correlation is
+        subtracted (a Fourier high-pass). ``None`` or ``0`` disables it.
+    corr_power : float, default=1.0
+        Exponent applied to the magnitude of the Fourier product: 1 is the plain
+        cross-correlation, 0 the phase correlation, and values in between the
+        hybrid correlation.
+    sigma_cc : float, optional
+        Width in pixels of a Gaussian smoothing of the correlation map (a Fourier
+        low-pass). ``None`` or ``0`` disables it.
 
     Returns
     -------
@@ -335,9 +429,8 @@ def cross_correlation_batch(
         ``(B, H, W)`` Fourier-domain products.
     """
     dps = torch.as_tensor(dps)
-    m = torch.fft.fft2(dps) * template_ft
-    if background_sigma is not None and background_sigma > 0:
-        m = m * _background_highpass(m.shape[-2:], background_sigma, m.device)
+    m = _apply_corr_power(torch.fft.fft2(dps) * template_ft, corr_power)
+    m = _fourier_filter(m, m.shape[-2:], background_sigma, sigma_cc)
     corr_map = torch.clamp(torch.fft.ifft2(m).real, min=0.0)
     return corr_map, m
 
@@ -346,6 +439,8 @@ def _corr_map_rfft(
     dps: torch.Tensor,
     template_ft: torch.Tensor,
     background_sigma: float | None = None,
+    corr_power: float = 1.0,
+    sigma_cc: float | None = None,
 ) -> torch.Tensor:
     """Real-FFT correlation map(s), used when no Fourier product is needed downstream.
 
@@ -360,6 +455,16 @@ def _corr_map_rfft(
         ``(H, W)`` or ``(B, H, W)`` diffraction pattern(s).
     template_ft : torch.Tensor
         ``(H, W)`` pre-computed template FT from :func:`template_fourier`.
+    background_sigma : float, optional
+        Width in pixels of the Gaussian whose smoothed copy of the correlation is
+        subtracted (a Fourier high-pass). ``None`` or ``0`` disables it.
+    corr_power : float, default=1.0
+        Exponent applied to the magnitude of the Fourier product: 1 is the plain
+        cross-correlation, 0 the phase correlation, and values in between the
+        hybrid correlation.
+    sigma_cc : float, optional
+        Width in pixels of a Gaussian smoothing of the correlation map (a Fourier
+        low-pass). ``None`` or ``0`` disables it.
 
     Returns
     -------
@@ -368,9 +473,8 @@ def _corr_map_rfft(
     """
     dps = torch.as_tensor(dps)
     H, W = dps.shape[-2], dps.shape[-1]
-    prod = torch.fft.rfft2(dps) * template_ft[..., : W // 2 + 1]
-    if background_sigma is not None and background_sigma > 0:
-        prod = prod * _background_highpass((H, W), background_sigma, prod.device, rfft=True)
+    prod = _apply_corr_power(torch.fft.rfft2(dps) * template_ft[..., : W // 2 + 1], corr_power)
+    prod = _fourier_filter(prod, (H, W), background_sigma, sigma_cc, rfft=True)
     corr_map = torch.fft.irfft2(prod, s=(H, W))
     return torch.clamp(corr_map, min=0.0)
 
@@ -386,6 +490,8 @@ def detect_disks(
     upsample_factor: int = 16,
     max_num_peaks: int = 1000,
     background_sigma: float | None = None,
+    corr_power: float = 1.0,
+    sigma_cc: float | None = None,
 ) -> np.ndarray:
     """Detect Bragg disks in one diffraction pattern by template matching.
 
@@ -410,6 +516,18 @@ def detect_disks(
         Upsampling factor for the ``"upsample"`` subpixel refinement.
     max_num_peaks : int, default=1000
         Maximum number of peaks to keep (after intensity sorting).
+    background_sigma : float, optional
+        Width in pixels of the smoothed correlation background subtracted
+        before peak finding. ``None`` (default) disables it.
+    corr_power : float, default=1.0
+        Correlation type: 1 the plain cross-correlation, 0 the phase
+        correlation, in between the hybrid correlation. Below 1 the weak disks
+        are amplified relative to the strong ones, which finds many more of
+        them on a bright background, at the cost of compressing the reported
+        intensities.
+    sigma_cc : float | None
+        Width in pixels of a Gaussian smoothing of the correlation map before
+        peak finding; merges the speckle of a noisy disk into one maximum.
 
     Returns
     -------
@@ -420,7 +538,7 @@ def detect_disks(
     if subpixel not in SUBPIXEL_MODES:
         raise ValueError(f"subpixel must be in {SUBPIXEL_MODES}, got {subpixel!r}")
 
-    corr_map, m = cross_correlation(dp, template_ft, background_sigma)
+    corr_map, m = cross_correlation(dp, template_ft, background_sigma, corr_power, sigma_cc)
 
     peaks = _local_maxima(corr_map, edge_boundary)
     peaks = _filter_maxima(peaks, min_abs_intensity, min_spacing, max_num_peaks)
@@ -448,6 +566,8 @@ def detect_disks_batch(
     upsample_factor: int = 16,
     max_num_peaks: int = 1000,
     background_sigma: float | None = None,
+    corr_power: float = 1.0,
+    sigma_cc: float | None = None,
 ) -> list[np.ndarray]:
     """Detect Bragg disks across a stack of diffraction patterns (batched).
 
@@ -481,6 +601,14 @@ def detect_disks_batch(
         Upsampling factor for the ``"upsample"`` subpixel refinement.
     max_num_peaks : int, default=1000
         Maximum number of peaks to keep per pattern (after intensity sorting).
+    background_sigma : float, optional
+        Width in pixels of the smoothed correlation background subtracted
+        before peak finding. ``None`` (default) disables it.
+    corr_power : float, default=1.0
+        Correlation type: 1 cross-correlation, 0 phase correlation, in between
+        hybrid (see :func:`detect_disks`).
+    sigma_cc : float | None
+        Width in pixels of a Gaussian smoothing of the correlation map.
 
     Returns
     -------
@@ -492,9 +620,11 @@ def detect_disks_batch(
         raise ValueError(f"subpixel must be in {SUBPIXEL_MODES}, got {subpixel!r}")
 
     if subpixel == "upsample":
-        corr_map, m = cross_correlation_batch(dps, template_ft, background_sigma)
+        corr_map, m = cross_correlation_batch(
+            dps, template_ft, background_sigma, corr_power, sigma_cc
+        )
     else:
-        corr_map = _corr_map_rfft(dps, template_ft, background_sigma)
+        corr_map = _corr_map_rfft(dps, template_ft, background_sigma, corr_power, sigma_cc)
         m = None
 
     peaks_all, bidx, counts = _detect_peaks_batched(

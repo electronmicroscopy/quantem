@@ -534,21 +534,29 @@ def plot_bvm(
     norm: str | dict = "log_auto",
     cmap: str = "inferno",
     counts_kwargs: dict | None = None,
-    **plotting_kwargs
+    **plotting_kwargs,
 ):
-    """The Bragg vector map (log-scaled) beside the per-position peak count.
+    """The Bragg vector map beside the per-position peak count.
 
     Parameters
     ----------
     bvm : np.ndarray
-        Bragg vector map; displayed log-scaled (``log1p``).
+        ``(H, W)`` Bragg vector map in detector pixels.
     counts : np.ndarray
         Per-position peak count, shape ``(scan_row, scan_col)``.
     figsize : tuple of float, default=(10, 4)
         Figure size in inches.
-    norm: normalization of data for easier visualization, default = log_auto
-    cmap: plotting colormap, default = inferno
-    counts_kwargs: plotting arguments for counts plot
+    norm : str or dict, default="log_auto"
+        Intensity normalization of the Bragg vector map, passed to
+        :func:`~quantem.core.visualization.show_2d`.
+    cmap : str, default="inferno"
+        Colormap of the Bragg vector map.
+    counts_kwargs : dict, optional
+        Keyword arguments for :func:`~quantem.core.visualization.show_2d` on the
+        peak-count panel (defaults: ``cmap="viridis"``, ``cbar=True``).
+    **plotting_kwargs
+        Further keyword arguments for :func:`~quantem.core.visualization.show_2d`
+        on the Bragg vector map panel.
 
     Returns
     -------
@@ -560,11 +568,11 @@ def plot_bvm(
 
     show_2d(
         np.asarray(bvm),
-        figax = (fig, ax[0]),
-        cmap = cmap,
-        norm = norm,
-        title = "Bragg vector map",
-        **plotting_kwargs
+        figax=(fig, ax[0]),
+        cmap=cmap,
+        norm=norm,
+        title="Bragg vector map",
+        **plotting_kwargs,
     )
     counts_plot_kwargs = {
         "cmap": "viridis",

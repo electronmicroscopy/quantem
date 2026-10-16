@@ -12,7 +12,10 @@ import torch.utils.data
 
 from quantem.core import config
 from quantem.core.datastructures.dataset3d import Dataset3d
-from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.datastructures.dataset4dstem import (
+    Dataset4dstem,
+    scan_rotation_from_metadata,
+)
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints, parse_constraint_dict
 from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerParams
@@ -743,6 +746,12 @@ class PtychographyDatasetBase(
     # endregion --- abstract class methods ---
 
     # region --- class methods ---
+    def _rotation_metadata(self) -> dict | None:
+        """The metadata holding the detector rotation: the source 4D dataset's
+        when there is one, else this dataset's."""
+        md = getattr(self, "source_metadata", None)
+        return md if isinstance(md, dict) else getattr(self.dset, "metadata", None)
+
     def vprint(self, m: Any, level: int = 1, *args, **kwargs) -> None:
         """Print messages if verbose is enabled."""
         if self.verbose >= level:
@@ -922,6 +931,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
             learn_scan_positions=learn_scan_positions,
             _token=_token,
         )
+        # the 4D dataset's own metadata (the same dict), where the detector
+        # rotation shared with the other workflows on that dataset lives
+        self.source_metadata = dset.metadata
 
     # region --- classmethods ---
     @classmethod
@@ -1231,6 +1243,20 @@ class PtychographyDatasetRaster(DatasetConstraints):
         if positions_mask is not None:
             self.positions_mask = positions_mask
 
+        # one detector-to-scan rotation per dataset: unless one is forced here,
+        # use the one recorded on the dataset (by the Bragg workflow, an earlier
+        # fit, or by hand), so ptychography and ACOM/strain share a frame
+        if force_com_rotation is None:
+            md_rot, md_tr = scan_rotation_from_metadata(self._rotation_metadata())
+            if md_rot is not None:
+                force_com_rotation = md_rot
+                if force_com_transpose is None:
+                    force_com_transpose = md_tr
+                self.vprint(
+                    f"Using the dataset's detector rotation, q_to_r_rotation_ccw_deg = "
+                    f"{md_rot:.2f} deg, q_transpose = {force_com_transpose}."
+                )
+
         # Store preprocessing parameters for serialization and reloading
         self._preprocessing_params = {
             "com_fit_function": com_fit_function,
@@ -1415,9 +1441,14 @@ class PtychographyDatasetRaster(DatasetConstraints):
         CoM gradient vector field or, alternatively, maximizing the divergence.
 
         force_com_rotation: float (degrees), optional
-            Force relative rotation angle between real and reciprocal space
+            Force relative rotation angle between real and reciprocal space.
+            ``preprocess`` passes the dataset's ``q_to_r_rotation_ccw_deg`` here
+            when one is recorded and none is forced; the fitted or forced
+            rotation is written back there (see
+            :func:`quantem.core.datastructures.dataset4dstem.q_to_r_matrix`).
         force_com_transpose: bool, optional
-            Force whether diffraction intensities need to be transposed.
+            Force whether diffraction intensities need to be transposed
+            (the dataset's ``q_transpose``).
         plot_rotation: bool, optional
             If True, the CoM curl minimization search result will be displayed
         plot_com: str, optional
@@ -1659,6 +1690,11 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
         self.com_rotation_rad = _rotation_best_rad
         self.com_transpose = _rotation_best_transpose
+        # the dataset carries the rotation for every other workflow on it
+        md = self._rotation_metadata()
+        if isinstance(md, dict):
+            md["q_to_r_rotation_ccw_deg"] = float(np.rad2deg(_rotation_best_rad))
+            md["q_transpose"] = bool(_rotation_best_transpose)
         self._com = _com_r, _com_c  # com_normalized rotated by com_rotation_rad
         return
 
