@@ -6,7 +6,8 @@ Lattice state — functions only read from the instance they receive.
 
 Registered plot names (callable via ``lattice.plot(kind=...)``)
 ---------------------------------------------------------------
-  "lattice_vectors"         - image + lattice vectors/grid (after define_lattice_vectors)
+  "lattice_vectors"   - image + lattice vectors/grid (after define_lattice_vectors)
+  "atoms"             - image + detected/refined atom overlays (after add_atoms / refine_atoms)
 """
 
 import numpy as np
@@ -43,12 +44,10 @@ def plot_lattice_vectors(
         None clips lines to image edges.
     **kwargs forwarded to show_2d (e.g. cmap, title).
     """
-    # Check if lattice vectors have been defined
     if not hasattr(lattice, "_lat"):
         raise ValueError(
             "Must define lattice vectors first. Call `Lattice.define_lattice_vectors()`"
         )
-    # Adding a defualt figsize
     if "figsize" not in kwargs:
         kwargs["figsize"] = (10, 10)
     fig, ax = show_2d(lattice._image.array, returnfig=True, **kwargs)
@@ -149,3 +148,85 @@ def plot_lattice_vectors(
         return fig, ax
     else:
         return None
+
+
+@_register("atoms")
+def plot_atoms(lattice, *, returnfig: bool = False, **kwargs) -> None | tuple:
+    """
+    Overlay detected (and optionally refined) atom positions on the image.
+    Call after add_atoms() or refine_atoms().
+
+    Parameters
+    ----------
+    returnfig : bool, default False
+        If True, return (fig, ax) instead of displaying.
+    **kwargs forwarded to show_2d (e.g. cmap, title, figsize).
+    """
+    if not hasattr(lattice, "atoms"):
+        raise ValueError("No atoms to plot. Call `Lattice.add_atoms()` first.")
+    if "figsize" not in kwargs:
+        kwargs["figsize"] = (10, 10)
+
+    fig, ax = show_2d(lattice._image.array, returnfig=True, **kwargs)
+    if ax.images:
+        ax.images[-1].set_zorder(0)
+
+    H, W = lattice._image.shape
+
+    for s in range(lattice._num_sites):
+        cell = lattice.atoms[s].array
+        if isinstance(cell, list) or cell is None or cell.size == 0:
+            continue
+        x = lattice.atoms[s].select_fields("x").array[:, 0]
+        y = lattice.atoms[s].select_fields("y").array[:, 0]
+        rgb = site_colors(int(lattice._numbers[s]))
+        ax.scatter(
+            y,
+            x,
+            s=18,
+            facecolor=(rgb[0], rgb[1], rgb[2], 0.25),
+            edgecolor=(rgb[0], rgb[1], rgb[2], 0.9),
+            linewidths=0.75,
+            marker="o",
+            zorder=18,
+        )
+
+    ax.set_xlim(0, W)
+    ax.set_ylim(H, 0)
+
+    if returnfig:
+        return fig, ax
+    else:
+        return None
+
+
+# --- Plotting Helper Functions ---
+def site_colors(number):
+    """
+    Map an integer 'number' to an RGB triple in [0,1].
+    If 'number' is a list, array, or tuple, returns an array of RGB triples.
+    Starts with the requested seed palette and cycles thereafter.
+    """
+    palette = [
+        (1.00, 0.00, 0.00),  # 0: red
+        (0.00, 0.70, 1.00),  # 1: lighter blue
+        (0.00, 0.70, 0.00),  # 2: green with lower perceptual brightness
+        (1.00, 0.00, 1.00),  # 3: magenta
+        (1.00, 0.70, 0.00),  # 4: orange
+        (0.00, 0.00, 1.00),  # 5: full blue
+        (0.60, 0.20, 0.80),
+        (0.30, 0.75, 0.75),
+        (0.80, 0.40, 0.00),
+        (0.20, 0.60, 0.20),
+        (0.70, 0.70, 0.00),
+        (1.00, 1.00, 1.00),  # -2: white
+        (0.00, 0.00, 0.00),  # -1: black
+    ]
+
+    if isinstance(number, int):
+        idx = int(number) % len(palette)
+        return palette[idx]
+    else:
+        numbers = np.asarray(number, dtype=int)
+        indices = numbers % len(palette)
+        return np.array([palette[idx] for idx in indices.flat]).reshape(numbers.shape + (3,))
