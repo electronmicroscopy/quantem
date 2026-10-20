@@ -118,6 +118,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         self.mean_img_peaks: NDArray | None = None
         self.mean_img_weights: NDArray | None = None
+        self.mean_img_ab: NDArray | None = None
         self.fft_window: NDArray | None = None
 
         self.mask_diffraction = np.ones(self.dataset.array.shape[2:])
@@ -129,8 +130,6 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.g2: np.ndarray | None = None
         self.g1_peak_fit: Dataset3d | None = None
         self.g2_peak_fit: Dataset3d | None = None
-        self.g1_ref: np.ndarray | None = None
-        self.g2_ref: np.ndarray | None = None
         self.g1_array: np.ndarray | None = None
         self.g2_array: np.ndarray | None = None
         self.mask_weight: np.ndarray | None = None
@@ -765,7 +764,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             g1_rc = _display_vec_to_raw(g1_rc, rotation_ccw_deg=rot_ccw, transpose=q_transpose)
             g2_rc = _display_vec_to_raw(g2_rc, rotation_ccw_deg=rot_ccw, transpose=q_transpose)
 
-        g1_fit_abs, g2_fit_abs, peaks, weights = _refine_lattice_vectors(
+        g1_fit_abs, g2_fit_abs, peaks, weights, peaks_ab = _refine_lattice_vectors(
             self.transform.array,
             g1_rc=g1_rc,
             g2_rc=g2_rc,
@@ -787,6 +786,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         if refine_all_peaks:
             self.mean_img_peaks = peaks
             self.mean_img_weights = weights
+            self.mean_img_ab = peaks_ab
 
         self.metadata["choose_define_in_rotated"] = define_in_rotated
         self.metadata["choose_refine_gaussian"] = refine_gaussian
@@ -1057,7 +1057,6 @@ class StrainMapAutocorrelation(AutoSerialize):
         """
         scan_r, scan_c, H, W = self.dataset.array.shape
         n_pos = scan_r * scan_c
-        rcent, ccent = H // 2, W // 2
 
         mode = self.metadata.get("mode", "linear").lower()
         if mode not in ("linear", "log", 'log-min', "gamma"):
@@ -1065,8 +1064,9 @@ class StrainMapAutocorrelation(AutoSerialize):
         gamma = float(self.metadata["gamma"]) if mode == "gamma" else None
 
         dev = torch.device(device)
-        mask = torch.as_tensor(self.mask_diffraction, dtype=torch.float64, device=dev)
-        mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=torch.float64, device=dev)
+        dt = torch.float32 if (method == "cft" and dev.type != "cpu") else torch.float64
+        mask = torch.as_tensor(self.mask_diffraction, dtype=dt, device=dev)
+        mask_inv = torch.as_tensor(self.mask_diffraction_inv, dtype=dt, device=dev)
         use_cache = False
         if save_to_gpu and str(dev) != "cpu":
             if not hasattr(self, '_gpu_cache') or self._gpu_cache is None:
@@ -1140,7 +1140,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 dps = torch.stack(
                     [
                         torch.as_tensor(
-                            np.asarray(self.dataset.array[r, c]), dtype=torch.float64, device=dev
+                            np.asarray(self.dataset.array[r, c]), dtype=dt, device=dev
                         )
                         for r, c in idxs
                     ],
@@ -1507,6 +1507,21 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         return fig, ax
 
+    @property
+    def reference_qpos(self) -> NDArray | None:
+        """Detected mean-transform peak positions, center-relative (alias of :attr:`mean_img_peaks`)."""
+        return self.mean_img_peaks
+
+    @property
+    def reference_intensity(self) -> NDArray | None:
+        """Normalized weight of each detected peak (alias of :attr:`mean_img_weights`)."""
+        return self.mean_img_weights
+
+    @property
+    def reference_ab(self) -> NDArray | None:
+        """Integer ``[a, b]`` index of each detected peak (alias of :attr:`mean_img_ab`)."""
+        return self.mean_img_ab
+
 
 def _nice_length_units(target: float) -> float:
     """Round ``target`` to the nearest "nice" scale-bar length (1/2/5 x 10^n)."""
@@ -1870,7 +1885,7 @@ def _refine_lattice_vectors(
     tr: NDArray | None = None,
     method: str = "gaussian",
     warn_on_bound: bool = False,
-) -> tuple[NDArray, NDArray, NDArray, NDArray]:
+) -> tuple[NDArray, NDArray, NDArray, NDArray, NDArray]:
     """Refine the two lattice vectors of a transform panel to subpixel precision.
 
     Starting from integer-pixel guesses for the ``g1`` and ``g2`` lattice vectors
@@ -2106,7 +2121,7 @@ def _refine_lattice_vectors(
         
         A = np.column_stack((g1_rc, g2_rc))
         ab0_float = np.linalg.lstsq(A, pts.T, rcond=None)[0]
-        ab0 = (np.round(ab0_float)).T
+        ab0 = (np.round(ab0_float)).T.astype(int)
 
         weights_norm = weights/weights.sum()
         A = np.ones((pts.shape[0], 3))
@@ -2124,9 +2139,9 @@ def _refine_lattice_vectors(
         g1_amp_fit = _refine_one(g1_rc)
         g2_amp_fit = _refine_one(g2_rc)
 
-        return np.array((g1_refined[0], g1_refined[1], g1_amp_fit[2], g1_amp_fit[3], g1_amp_fit[4]), dtype=float), np.array((g2_refined[0], g2_refined[1], g2_amp_fit[2], g2_amp_fit[3], g2_amp_fit[4]), dtype=float), pts, weights
+        return np.array((g1_refined[0], g1_refined[1], g1_amp_fit[2], g1_amp_fit[3], g1_amp_fit[4]), dtype=float), np.array((g2_refined[0], g2_refined[1], g2_amp_fit[2], g2_amp_fit[3], g2_amp_fit[4]), dtype=float), pts, weights, ab0
 
-    return _refine_one(g1_rc), _refine_one(g2_rc), None, None
+    return _refine_one(g1_rc), _refine_one(g2_rc), None, None, None
 
 
 def _refine_peaks_batched(

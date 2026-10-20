@@ -1240,9 +1240,6 @@ class SyntheticDiskLattice(RenderComponent):
         params: dict[str, object] | None = None,
         neighbor_target: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
-        tv_weight = float(cfg.get("consistency_weight", 0.0))
-
         if self.slope_l2_weight <= 0.0 or self.ir is None or self.ic is None:
             l2_loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
         else:

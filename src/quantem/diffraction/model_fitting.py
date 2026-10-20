@@ -66,8 +66,6 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         # Misc metadata
         self.metadata: dict[str, Any] = {}
 
-        self.g1_ref: np.ndarray | None = None
-        self.g2_ref: np.ndarray | None = None
         self.g1_array: np.ndarray | None = None
         self.g2_array: np.ndarray | None = None
 

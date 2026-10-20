@@ -770,6 +770,11 @@ class StrainMap(AutoSerialize):
         if returnfig:
             return fig, ax
         return result
+    
+    @property
+    def mask_weight(self) -> np.ndarray | None:
+        """Per-position fit weight (alias of :attr:`mask`, matching BraggVectors/StrainMapAutocorrelation)."""
+        return self.mask
 
 
 # ---- module-level fitting functions ----
