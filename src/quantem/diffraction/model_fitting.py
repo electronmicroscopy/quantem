@@ -888,7 +888,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                     device=dev,
                     dtype=ctx.dtype
                 )
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            except (RuntimeError, torch.cuda.OutOfMemoryError):
                 dataset_gpu = None
 
 

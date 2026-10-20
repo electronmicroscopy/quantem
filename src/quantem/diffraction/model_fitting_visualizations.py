@@ -11,7 +11,6 @@ from quantem.core.visualization.custom_normalizations import (
     _resolve_normalization,
 )
 
-
 if TYPE_CHECKING:
     from quantem.diffraction.model_fitting import ModelDiffraction
 

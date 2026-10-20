@@ -395,7 +395,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         qrow_unit = self.dataset.units[2]
         qcol_unit = self.dataset.units[3]
 
-        if qrow_unit in {"A", "Å"}:
+        if qrow_unit in {"A^-1", "Å^-1", "1/A", "1/Å"}:
             qrow_sampling_ang = self.dataset.sampling[2]
         elif qrow_unit == "mrad":
             wavelength = electron_wavelength_angstrom(self.dataset.metadata["energy"])
@@ -404,7 +404,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             qrow_sampling_ang = 1.0
             qrow_unit = "pixels"
 
-        if qcol_unit in {"A", "Å"}:
+        if qcol_unit in {"A^-1", "Å^-1", "1/A", "1/Å"}:
             qcol_sampling_ang = self.dataset.sampling[3]
         elif qcol_unit == "mrad":
             wavelength = electron_wavelength_angstrom(self.dataset.metadata["energy"])
@@ -1078,8 +1078,8 @@ class StrainMapAutocorrelation(AutoSerialize):
                         device=dev,
                     )
                     use_cache = True
-                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                    print(f"Out of memory, will read per-batch")
+                except (RuntimeError, torch.cuda.OutOfMemoryError):
+                    print("Out of memory, will read per-batch")
                     self._gpu_cache = None
                     use_cache = False
             else:
