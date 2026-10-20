@@ -195,6 +195,7 @@ class Dataset3d(Dataset):
         title_prefix: str | None = None,
         suptitle: str | None = None,
         returnfig: bool = False,
+        same_scale: bool = True,
         **kwargs,
     ) -> tuple[Figure, Axes] | None:
         """
@@ -222,6 +223,10 @@ class Dataset3d(Dataset):
             Figure super title displayed above all subplots.
         returnfig : bool, default False
             If True, returns (fig, axes).
+        same_scale : bool, default True
+            If True, all slices share one intensity range (the volume's global
+            min/max) so they are directly comparable.  Ignored when you pass
+            ``vmin``/``vmax``/``norm``.  Set False for per-slice auto-contrast.
         **kwargs : dict
             Keyword arguments for show_2d (cmap, cbar, vmin, vmax, norm, etc.).
 
@@ -330,6 +335,9 @@ class Dataset3d(Dataset):
             labels.extend([""] * pad_count)
         image_grid = [images[i : i + ncols] for i in range(0, len(images), ncols)]
         label_grid = [labels[i : i + ncols] for i in range(0, len(labels), ncols)]
+        if same_scale and not any(key in kwargs for key in ("vmin", "vmax", "norm")):
+            kwargs["vmin"] = float(np.nanmin(self.array))
+            kwargs["vmax"] = float(np.nanmax(self.array))
         fig, axes = show_2d(image_grid, scalebar=scalebar, title=label_grid, **kwargs)
         if pad_count > 0:
             for ax in np.array(axes).flat[-pad_count:]:
