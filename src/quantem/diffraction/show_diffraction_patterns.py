@@ -195,7 +195,7 @@ def show_diffraction_patterns(
         if disp_vmax <= disp_vmin:
             disp_vmax = disp_vmin + 1e-12
 
-        R_sample = Rotation.from_euler("zxz", [0.0, tilt, 0.0], degrees=True)
+        R_sample = Rotation.from_euler("ZXZ", [0.0, tilt, 0.0], degrees=True)
 
         fs = figsize if figsize is not None else ((11, 5.5) if show_3d else (5.5, 5.5))
         fig = plt.figure(figsize=fs, dpi=dpi)

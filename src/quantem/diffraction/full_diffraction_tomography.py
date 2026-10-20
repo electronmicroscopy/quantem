@@ -344,7 +344,7 @@ class DiffractionTomography(AutoSerialize):
         kx, ky, kz = cls._make_reciprocal_grids(shape, dk)
         k_grid = torch.stack(torch.broadcast_tensors(kx, ky, kz), axis=-1)
 
-        rot = Rotation.from_euler("zxz", zxz)
+        rot = Rotation.from_euler("ZXZ", zxz)
         k_source = rot.inv().apply(k_grid.reshape(-1, 3)).reshape(*volume.shape, 3)
         coords = torch.stack(
             [
@@ -1158,11 +1158,12 @@ class DiffractionTomography(AutoSerialize):
 
         `u_proj` is the fast-scan direction, `v_proj` the slow-scan direction,
         and `w_proj` the beam direction. The sample is rotated by the given
-        ZXZ Euler angles relative to the (lab, beam-down-z) frame; the lab
+        intrinsic Z-X-Z (Bunge) Euler angles, scipy "ZXZ", relative to
+        the (lab, beam-down-z) frame; the lab
         axes (1,0,0), (0,1,0), (0,0,1) are then expressed in the sample frame.
         """
         zxz_arr = self._resolve_zxz_deg(tilt_x_deg, zxz_deg)
-        rot = Rotation.from_euler("zxz", zxz_arr, degrees=True)
+        rot = Rotation.from_euler("ZXZ", zxz_arr, degrees=True)
         # Lab→sample mapping: apply the inverse rotation to lab basis vectors.
         u_proj = torch.tensor(rot.inv().apply([1.0, 0.0, 0.0]))
         v_proj = torch.tensor(rot.inv().apply([0.0, 1.0, 0.0]))

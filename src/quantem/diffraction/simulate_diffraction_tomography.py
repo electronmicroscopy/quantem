@@ -84,7 +84,7 @@ class SimDiffractionTomography(DiffractionTomography):
         amp_scale = 1j * phase_scale
 
         rot = (
-            Rotation.from_euler("zxz", torch.tensor(zxz_deg, dtype=torch.float32), degrees=True)
+            Rotation.from_euler("ZXZ", torch.tensor(zxz_deg, dtype=torch.float32), degrees=True)
             if zxz_deg is not None
             else None
         )
