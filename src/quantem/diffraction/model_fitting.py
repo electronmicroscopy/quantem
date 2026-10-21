@@ -19,6 +19,7 @@ from quantem.core.fitting.base import (
     RenderComponent,
     RenderContext,
     SqrtMSELoss,
+    WeightedMSELoss,
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
@@ -745,6 +746,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             pbar.close()
 
         self.individual_refined=True
+        self.g1_array = None
+        self.g2_array = None
         return self
 
     def fit_individual_diffraction_pattern_batched(
@@ -942,6 +945,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             is_sqrt = isinstance(loss_fn, SqrtMSELoss)
             is_log = isinstance(loss_fn, LogMSELoss)
             is_l1 = isinstance(loss_fn, torch.nn.L1Loss)
+            # signal-weighted MSE: per-pixel weights fixed from the targets for this chunk
+            w_pix = loss_fn.weights(targets) if isinstance(loss_fn, WeightedMSELoss) else None
             ew = float(edge_weight)
             if is_sqrt:
                 sqrt_gamma = float(loss_fn.gamma)
@@ -978,6 +983,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
                 diff_mod = pred_mod - tgt_mod
                 val = diff_mod.abs() if is_l1 else diff_mod * diff_mod
+                if w_pix is not None:
+                    val = val * w_pix
                 if fidelity_mask is not None:
                     per_sample_loss = (val * fidelity_mask).sum(dim=(1, 2)) / fidelity_valid_count
                 else:
@@ -1046,6 +1053,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         pbar.close()
         self.individual_refined = True
+        self.g1_array = None
+        self.g2_array = None
         return self
 
     def get_individual_uv_vectors(self) -> "ModelDiffraction":

@@ -820,6 +820,29 @@ class LogMSELoss(nn.Module):
     def forward(self, pred, target):
         return self.mse_fn(torch.log(1+pred), torch.log(1+target))
 
+class WeightedMSELoss(nn.Module):
+    """Signal-weighted MSE: residuals weighted by ``(target / mean target)**power + floor``.
+
+    Power-compressed data (``**0.25`` / sqrt preprocessing) inflates the noisy near-zero
+    pixels; weighting by the target intensity puts the emphasis back on the diffraction
+    disks, where the lattice-position information is. Weights are normalized to mean 1.
+    """
+
+    def __init__(self, power: float = 1.0, floor: float = 0.05):
+        super().__init__()
+        self.power = float(power)
+        self.floor = float(floor)
+
+    def weights(self, target: torch.Tensor) -> torch.Tensor:
+        dims = tuple(range(target.ndim - 2, target.ndim))
+        t = target.clamp(min=0)
+        w = (t / t.mean(dims, keepdim=True).clamp(min=1e-12)) ** self.power + self.floor
+        return w / w.mean(dims, keepdim=True)
+
+    def forward(self, pred, target):
+        return (self.weights(target) * (pred - target) ** 2).mean()
+
+
 class FitBase(OptimizerMixin):
 
     def __init__(self):
@@ -864,7 +887,7 @@ class FitBase(OptimizerMixin):
             raise RuntimeError("Call .define_model(...) first.")
         return self.model(self.ctx).detach().cpu().numpy()
     
-    def set_loss(self, loss_fn: str = "sqrtmse", gamma: float = 0.25):
+    def set_loss(self, loss_fn: str = "sqrtmse", gamma: float = 0.25, power: float = 1.0, floor: float = 0.05):
         mode_in = loss_fn.strip().lower()
         if mode_in in {"mse"}:
             self.loss_fn = torch.nn.MSELoss(reduction="mean")
@@ -874,9 +897,11 @@ class FitBase(OptimizerMixin):
             self.loss_fn = LogMSELoss()
         elif mode_in in {"l1"}:
             self.loss_fn = torch.nn.L1Loss(reduction="mean")
+        elif mode_in in {"wmse"}:
+            self.loss_fn = WeightedMSELoss(power=power, floor=floor)
         else:
             raise ValueError(
-                "loss function must be mse, sqrtmse, logmse or l1"
+                "loss function must be mse, sqrtmse, logmse, l1 or wmse"
             )
 
     def reset(
