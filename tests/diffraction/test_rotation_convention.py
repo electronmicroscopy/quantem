@@ -12,10 +12,10 @@ import torch
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
+from quantem.core.utils.rotations import quat_from_axis_angle
 from quantem.diffraction import calibration
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.orientation import OrientationMap
-from quantem.diffraction.rotations import quat_from_axis_angle
 
 
 @pytest.mark.parametrize(
@@ -58,7 +58,7 @@ def test_rotation_roundtrip(rot_scan_deg, transpose):
 
     # the recovered orientation must equal the scan-frame ground truth
     # (modulo crystal symmetry) -- independent of the detector rotation
-    from quantem.diffraction.rotations import misorientation_angle_deg
+    from quantem.core.utils.rotations import misorientation_angle_deg
 
     err = float(misorientation_angle_deg(q_true, om.quats[0, 0, 0], xtl.sym_quats))
     assert err < 1.0, f"misorientation {err:.2f} deg at rot {rot_scan_deg}"

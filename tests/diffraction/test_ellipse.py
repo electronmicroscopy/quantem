@@ -5,9 +5,9 @@ import torch
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
+from quantem.core.utils.rotations import qnormalize
 from quantem.diffraction import calibration
 from quantem.diffraction.crystal import Crystal
-from quantem.diffraction.rotations import qnormalize
 
 
 def test_ellipse_recovery():

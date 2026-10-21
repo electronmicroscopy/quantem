@@ -1,10 +1,10 @@
-"""Tests for quantem.diffraction.rotations."""
+"""Tests for quantem.core.utils.rotations and quantem.diffraction.crystal_rotations."""
 
 import numpy as np
 import pytest
 import torch
 
-from quantem.diffraction.rotations import (
+from quantem.core.utils.rotations import (
     misorientation_angle_deg,
     qconj,
     qmult,
@@ -13,9 +13,11 @@ from quantem.diffraction.rotations import (
     quat_from_axis_angle,
     quat_from_euler_zxz,
     quat_from_matrix,
-    quat_from_zone_axis,
     quat_to_euler_zxz,
     quat_to_matrix,
+)
+from quantem.diffraction.crystal_rotations import (
+    quat_from_zone_axis,
     sample_zone_axes,
     zone_axis_from_quat,
 )
@@ -117,7 +119,7 @@ def test_symmetry_reduced_zone_angles():
     from ase.build import bulk
 
     from quantem.diffraction.crystal import Crystal
-    from quantem.diffraction.rotations import symmetry_reduced_zone_angles
+    from quantem.diffraction.crystal_rotations import symmetry_reduced_zone_angles
 
     xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
     za = torch.tensor(
@@ -133,7 +135,7 @@ def test_symmetry_reduced_zone_angles():
 
 
 def test_misorientation_axis_angle():
-    from quantem.diffraction.rotations import misorientation_axis_angle
+    from quantem.core.utils.rotations import misorientation_axis_angle
 
     axis = torch.tensor([1.0, 2.0, 2.0], dtype=torch.float64) / 3
     qa = qnormalize(torch.tensor([0.9, 0.1, -0.3, 0.2], dtype=torch.float64))
@@ -163,7 +165,7 @@ def test_misorientation_axis_angle():
 def _cubic_sym_quats():
     import itertools
 
-    from quantem.diffraction.rotations import symmetry_quaternions
+    from quantem.diffraction.crystal_rotations import symmetry_quaternions
 
     # the 24 proper rotations of m-3m as signed permutation matrices
     mats = []
@@ -178,7 +180,7 @@ def _cubic_sym_quats():
 
 
 def test_symmetry_aligned():
-    from quantem.diffraction.rotations import symmetry_aligned
+    from quantem.core.utils.rotations import symmetry_aligned
 
     torch.manual_seed(3)
     sym = _cubic_sym_quats()
@@ -201,7 +203,7 @@ def test_symmetry_aligned():
 
 
 def test_sample_zone_axis_cap():
-    from quantem.diffraction.rotations import sample_zone_axis_cap
+    from quantem.diffraction.crystal_rotations import sample_zone_axis_cap
 
     axis = torch.tensor([1.0, -1.0, 2.0], dtype=torch.float64)
     unit = axis / torch.linalg.norm(axis)

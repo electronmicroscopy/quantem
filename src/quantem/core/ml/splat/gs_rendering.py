@@ -1,18 +1,14 @@
 import torch
 import torch.nn.functional as F
 
+from quantem.core.utils.rotations import quat_random_uniform, quat_to_matrix
+
 
 def random_quaternion(
     size: tuple, device: str | torch.device = "cpu", generator: torch.Generator | None = None
 ) -> torch.Tensor:
-    """Generate random unit quaternions for uniform random rotations using Shoemake's method."""
-    u = torch.rand((*size, 3), device=device, generator=generator)
-    u1, u2, u3 = u.unbind(-1)
-    s1, s2 = torch.sqrt(u1), torch.sqrt(1 - u1)
-    t2, t3 = 2 * torch.pi * u2, 2 * torch.pi * u3
-    return torch.stack(
-        [s2 * torch.sin(t2), s2 * torch.cos(t2), s1 * torch.sin(t3), s1 * torch.cos(t3)], dim=-1
-    )
+    """Uniform random rotations (Shoemake), scalar-first [w, x, y, z] unit quaternions."""
+    return quat_random_uniform(size, generator=generator, dtype=torch.float32, device=device)
 
 
 def quaternion_to_2d_angle(quaternion: torch.Tensor) -> torch.Tensor:
@@ -157,40 +153,10 @@ def quaternion_to_rotation_matrix_3d(quaternions: torch.Tensor) -> torch.Tensor:
     Convert quaternions to 3D rotation matrices.
 
     Args:
-        quaternions: (N, 4) tensor of [w, x, y, z] quaternions
+        quaternions: (N, 4) tensor of [w, x, y, z] quaternions, normalized here
 
     Returns:
-        torch.Tensor: (N, 3, 3) rotation matrices
+        torch.Tensor: (N, 3, 3) rotation matrices, see
+        :func:`quantem.core.utils.rotations.quat_to_matrix`
     """
-    # Normalize quaternions
-    q = F.normalize(quaternions, dim=-1)
-    w, x, y, z = q.unbind(-1)
-
-    # Compute rotation matrix elements
-    # R = [[1-2(y²+z²), 2(xy-wz), 2(xz+wy)],
-    #      [2(xy+wz), 1-2(x²+z²), 2(yz-wx)],
-    #      [2(xz-wy), 2(yz+wx), 1-2(x²+y²)]]
-
-    R00 = 1 - 2 * (y**2 + z**2)
-    R01 = 2 * (x * y - w * z)
-    R02 = 2 * (x * z + w * y)
-
-    R10 = 2 * (x * y + w * z)
-    R11 = 1 - 2 * (x**2 + z**2)
-    R12 = 2 * (y * z - w * x)
-
-    R20 = 2 * (x * z - w * y)
-    R21 = 2 * (y * z + w * x)
-    R22 = 1 - 2 * (x**2 + y**2)
-
-    # Stack into rotation matrices - (N, 3, 3)
-    R = torch.stack(
-        [
-            torch.stack([R00, R01, R02], dim=-1),
-            torch.stack([R10, R11, R12], dim=-1),
-            torch.stack([R20, R21, R22], dim=-1),
-        ],
-        dim=-2,
-    )
-
-    return R
+    return quat_to_matrix(F.normalize(quaternions, dim=-1))

@@ -6,9 +6,9 @@ import torch
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
+from quantem.core.utils.rotations import misorientation_angle_deg, qnormalize
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.orientation import OrientationMap
-from quantem.diffraction.rotations import misorientation_angle_deg, qnormalize
 
 
 def _make_peaks(xtl, q_true, sigma=0.02):
@@ -264,8 +264,8 @@ def test_metadata_inheritance():
 def test_precession_envelope_matches_quadrature():
     # the analytic ring-averaged envelope equals the positive quadrature of
     # the static envelope over the exact excitation errors on the ring
+    from quantem.core.utils.rotations import qrotate
     from quantem.diffraction.illumination import ring_disk_quadrature
-    from quantem.diffraction.rotations import qrotate
 
     xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
     xtl.calculate_structure_factors(k_max=1.5)
@@ -437,11 +437,8 @@ def test_in_plane_angle_auto_fold():
     random. Folding by the projected order makes the reported angle the same
     for both, which is what keeps an in-plane map continuous.
     """
-    from quantem.diffraction.rotations import (
-        qmult,
-        quat_from_axis_angle,
-        quat_from_zone_axis,
-    )
+    from quantem.core.utils.rotations import qmult, quat_from_axis_angle
+    from quantem.diffraction.crystal_rotations import quat_from_zone_axis
 
     torch.manual_seed(2)
     xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.26, cubic=True))
@@ -486,12 +483,9 @@ def test_in_plane_angle_auto_fold():
 
 def test_fold_in_plane_collapses_degenerate_variants():
     """Two orientations with the same zero-layer pattern get the same color."""
+    from quantem.core.utils.rotations import qmult, quat_from_axis_angle
+    from quantem.diffraction.crystal_rotations import quat_from_zone_axis
     from quantem.diffraction.orientation_visualization import fold_in_plane, ipf_color
-    from quantem.diffraction.rotations import (
-        qmult,
-        quat_from_axis_angle,
-        quat_from_zone_axis,
-    )
 
     xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.26, cubic=True), verbose=False)
     xtl.calculate_structure_factors(k_max=1.5)
@@ -524,7 +518,7 @@ def test_fold_in_plane_collapses_degenerate_variants():
 
 def test_smooth_orientations():
     """Bilateral smoothing averages noise inside a grain, not across variants."""
-    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
+    from quantem.core.utils.rotations import qmult, quat_from_axis_angle
 
     torch.manual_seed(6)
     xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True))
@@ -613,7 +607,8 @@ def test_display_smoothing_needs_both_widths():
 def test_rescue_breaks_friedel_ties_by_neighbours():
     """At a zone axis the pattern rotated 180 degrees about the beam is the
     same pattern, so a scattered twin can only be undone by its neighbours."""
-    from quantem.diffraction.rotations import qmult, quat_from_zone_axis
+    from quantem.core.utils.rotations import qmult
+    from quantem.diffraction.crystal_rotations import quat_from_zone_axis
 
     xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686))
     xtl.calculate_structure_factors(k_max=1.5)
@@ -728,7 +723,7 @@ def test_plot_matches_background_norm():
 
 
 def _quat_deg(axis, angle_deg):
-    from quantem.diffraction.rotations import quat_from_axis_angle
+    from quantem.core.utils.rotations import quat_from_axis_angle
 
     a = torch.tensor(axis, dtype=torch.float64)
     return quat_from_axis_angle(a / a.norm(), torch.tensor(np.deg2rad(angle_deg)))
@@ -750,7 +745,8 @@ def _two_grain_peaks(xtl, q1, q2, n=3):
 
 def test_second_match_indexes_second_grain():
     """With deflation, the second match fits the peaks the first leaves."""
-    from quantem.diffraction.rotations import qmult, quat_from_axis_angle, quat_from_zone_axis
+    from quantem.core.utils.rotations import qmult, quat_from_axis_angle
+    from quantem.diffraction.crystal_rotations import quat_from_zone_axis
 
     xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
     xtl.calculate_structure_factors(k_max=1.5)
