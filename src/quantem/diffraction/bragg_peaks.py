@@ -1505,12 +1505,14 @@ class BraggPeaksPolymer(AutoSerialize):
             fields=["y_pixels", "x_pixels", "y_invA", "x_invA"],
             name="peaks_vector",
             units=["Pixels", "Pixels", "1/Å", "1/Å"],
+            dtype=torch.float64,
         )
         intensities = Vector.from_shape(
             shape=(Ry, Rx),
             fields=["intensities", "intensities_sampled_from_dp"],
             name="intensities_vector",
             units=["Normalized", "Normalized"],
+            dtype=torch.float64,
         )
         
         # ============================================
@@ -1662,6 +1664,27 @@ class BraggPeaksPolymer(AutoSerialize):
         arr[()] = obj
         np.save(filepath, arr, allow_pickle=True)
 
+    @staticmethod
+    def _upgrade_legacy_vector(obj):
+        # Files saved before quantem's Vector moved to torch storage unpickle into a Vector
+        # whose _state still holds NumPy arrays, which fails on first use. Rebuild those
+        # through the public constructor, keeping the float64 precision they were saved at.
+        state = getattr(obj, "_state", None)
+        if not isinstance(obj, Vector) or not isinstance(state.get("data"), np.ndarray):
+            return obj
+        if getattr(obj, "_selection_indices", None) is not None:
+            raise ValueError("Cannot upgrade a saved Vector selection view; save the full Vector.")
+        cells = np.empty(len(state["cell_lengths"]), dtype=object)
+        for index, (start, length) in enumerate(zip(state["cell_starts"], state["cell_lengths"])):
+            cells[index] = state["data"][int(start) : int(start) + int(length)]
+        return Vector.from_data(
+            cells.reshape(state["shape"]).tolist(),
+            fields=state["fields"],
+            units=state["units"],
+            name=state["name"],
+            dtype=torch.float64,
+        )
+
     def save_cartesian_peaks(self, filepath):
         self._save_object(filepath, self.peak_coordinates_cartesian)
 
@@ -1669,7 +1692,7 @@ class BraggPeaksPolymer(AutoSerialize):
         peak_coordinates_cartesian = np.load(filepath, allow_pickle=True)
         if isinstance(peak_coordinates_cartesian, np.ndarray) and peak_coordinates_cartesian.dtype == object and peak_coordinates_cartesian.size == 1:
             peak_coordinates_cartesian = peak_coordinates_cartesian.item()
-        self.peak_coordinates_cartesian = peak_coordinates_cartesian
+        self.peak_coordinates_cartesian = self._upgrade_legacy_vector(peak_coordinates_cartesian)
     
     def save_polar_peaks(self, filepath):
         self._save_object(filepath, self.polar_peaks)
@@ -1681,7 +1704,7 @@ class BraggPeaksPolymer(AutoSerialize):
         polar_peaks = np.load(filepath, allow_pickle=True)
         if isinstance(polar_peaks, np.ndarray) and polar_peaks.dtype == object and polar_peaks.size == 1:
             polar_peaks = polar_peaks.item()
-        self.polar_peaks = polar_peaks
+        self.polar_peaks = self._upgrade_legacy_vector(polar_peaks)
 
     def load_polar_data(self, filepath):
         obj = np.load(filepath, allow_pickle=True)
@@ -1702,7 +1725,7 @@ class BraggPeaksPolymer(AutoSerialize):
         peak_intensities = np.load(filepath, allow_pickle=True)
         if isinstance(peak_intensities, np.ndarray) and peak_intensities.dtype == object and peak_intensities.size == 1:
             peak_intensities = peak_intensities.item()
-        self.peak_intensities = peak_intensities
+        self.peak_intensities = self._upgrade_legacy_vector(peak_intensities)
 
     def save_image_centers(self, filepath):
         np.save(filepath, self.image_centers)
@@ -1912,7 +1935,10 @@ class BraggPeaksPolymer(AutoSerialize):
             device=device if device is not None else self.device,
             batch_size=batch_size,
         )
-        polar_intensity_full = np.asarray(polar_full.numpy(), dtype=np.float32).transpose(0, 1, 3, 2)
+        # polar_transform returns a tensor-backed result owned only by this call; read it
+        # as a writable CPU array (numpy() would add a read-only copy of a multi-GB volume).
+        polar_values = polar_full.tensor.detach().cpu().numpy()
+        polar_intensity_full = np.asarray(polar_values, dtype=np.float32).transpose(0, 1, 3, 2)
         polar_intensity_full[~scan_mask] = 0.0
 
         # Pre-calculate coordinate arrays in both units using Karen's radial bins.

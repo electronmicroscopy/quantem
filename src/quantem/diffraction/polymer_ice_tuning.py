@@ -292,7 +292,7 @@ def ice_split_widget(bp, ice_result, params, *, view="removed", ice_hists=None,
         total = 0
         for iy in range(vector.shape[0]):
             for ix in range(vector.shape[1]):
-                rows = vector[iy, ix].array
+                rows = vector[iy, ix].numpy()
                 if rows is not None:
                     total += len(rows)
         return total
@@ -322,8 +322,8 @@ def probe_peaks(bp, params, ry, rx, *, n_show=4, q_band_only=True):
     r_axis = np.asarray(polar_data["r_invA"])[:, 0]
     theta_axis = np.asarray(polar_data["theta"])[0, :]
 
-    peaks = np.asarray(bp.polar_peaks[ry, rx].array)
-    intensities = np.asarray(bp.peak_intensities[ry, rx].array)
+    peaks = np.asarray(bp.polar_peaks[ry, rx].numpy())
+    intensities = np.asarray(bp.peak_intensities[ry, rx].numpy())
     q = peaks[:, bp.polar_peaks.fields.index("r_invA")]
     theta = peaks[:, bp.polar_peaks.fields.index("theta")]
     values = intensities[:, bp.peak_intensities.fields.index(params.intensity_field)]

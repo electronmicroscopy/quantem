@@ -433,7 +433,7 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
         if debug:
             print(f"Using x='{x_field}', y='{y_field}'")
         
-        vector_data = peak_coords.flatten()
+        vector_data = peak_coords.numpy()
         if len(vector_data) > 0:
             y_idx = peak_coords.fields.index(y_field)
             x_idx = peak_coords.fields.index(x_field)

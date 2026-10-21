@@ -13,9 +13,9 @@ __all__ = ["vector_field_cell", "vector_field_flat"]
 
 def vector_field_flat(vector, field):
     """Return one current-Vector field as a one-dimensional NumPy array."""
-    return vector.select_fields(field).flatten()[:, 0]
+    return vector.select_fields(field).numpy()[:, 0]
 
 
 def vector_field_cell(vector, field, row, col):
     """Return one current-Vector field from a scan cell as a 1D array."""
-    return vector.select_fields(field)[row, col].array[:, 0]
+    return vector.select_fields(field)[row, col].numpy()[:, 0]

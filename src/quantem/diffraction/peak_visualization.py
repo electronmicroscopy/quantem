@@ -631,7 +631,7 @@ def plot_peak_histogram_map(
     count_map = np.zeros((Ry, Rx))
     for i in range(Ry):
         for j in range(Rx):
-            cell_peaks = peaks[i, j].array
+            cell_peaks = peaks[i, j].numpy()
             if len(cell_peaks) == 0:
                 continue
 
@@ -1147,7 +1147,7 @@ def visualize_peak_detection(
         
         # Check if peaks exist for this pattern
         has_peaks = (peaks[ind_y, ind_x] is not None and
-                     len(peaks[ind_y, ind_x].array) > 0)
+                     len(peaks[ind_y, ind_x].numpy()) > 0)
         
         # 1. Polar Transform
         ax = axes[row, col_offset]
@@ -1163,10 +1163,10 @@ def visualize_peak_detection(
         ax = axes[row, col_offset + 1]
         ax.matshow(polar_data["intensity"][ind_y, ind_x], cmap='turbo', vmax=vmax_polar)
         if (has_peaks and polar_peaks[ind_y, ind_x] is not None
-                and len(polar_peaks[ind_y, ind_x].array) > 0):
+                and len(polar_peaks[ind_y, ind_x].numpy()) > 0):
             # Convert radial coordinates to bin indices
-            r_coords = polar_peaks[ind_y, ind_x].array[:, 0]
-            theta_coords = polar_peaks[ind_y, ind_x].array[:, 1]
+            r_coords = polar_peaks[ind_y, ind_x].numpy()[:, 0]
+            theta_coords = polar_peaks[ind_y, ind_x].numpy()[:, 1]
             
             # Convert theta from radians to angular bins (0 to num_annular_bins)
             theta_period = np.pi if two_fold_symmetry else 2 * np.pi
@@ -1187,8 +1187,8 @@ def visualize_peak_detection(
         ax = axes[row, col_offset + 2]
         ax.matshow(img, cmap="gray", vmin=vmin, vmax=vmax_cartesian)
         if has_peaks:
-            ax.scatter(peaks[ind_y, ind_x].array[:, 1],
-                      peaks[ind_y, ind_x].array[:, 0],
+            ax.scatter(peaks[ind_y, ind_x].numpy()[:, 1],
+                      peaks[ind_y, ind_x].numpy()[:, 0],
                       c='red', s=15, alpha=0.8, edgecolors='white', linewidths=0.5)
         ax.scatter(image_centers[1, ind_y, ind_x], 
                   image_centers[0, ind_y, ind_x], 

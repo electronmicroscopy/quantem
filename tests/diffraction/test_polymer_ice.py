@@ -26,7 +26,7 @@ def test_detect_ice_and_filter_does_not_mutate_source():
     intensity[0, 0] = np.array([[0.9], [0.8], [0.7]])
     polar[0, 1] = np.empty((0, 2))
     intensity[0, 1] = np.empty((0, 1))
-    original = polar[0, 0].array.copy()
+    original = polar[0, 0].numpy().copy()
 
     result = detect_ice(
         polar,
@@ -39,8 +39,8 @@ def test_detect_ice_and_filter_does_not_mutate_source():
     assert result.threshold == 0.5
     assert result.flagged_peaks_count_map.tolist() == [[2, 0]]
     filtered = result.filter(polar)
-    np.testing.assert_array_equal(polar[0, 0].array, original)
-    assert len(filtered[0, 0].array) == 1
+    np.testing.assert_array_equal(polar[0, 0].numpy(), original)
+    assert len(filtered[0, 0].numpy()) == 1
     assert (0, 1) in result.debug_records
 
 

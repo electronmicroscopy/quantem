@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
+import torch
 from matplotlib.colors import LogNorm
 from scipy.ndimage import gaussian_filter1d
 from matplotlib.patches import Rectangle
@@ -225,8 +226,8 @@ class IceDetectionResult:
         out = vector.copy()
         for iy in range(vector.shape[0]):
             for ix in range(vector.shape[1]):
-                source = vector[iy, ix].array
-                mask_cell = self.mask[iy, ix].array
+                source = vector[iy, ix].numpy()
+                mask_cell = self.mask[iy, ix].numpy()
                 if source is None or len(source) == 0 or mask_cell is None:
                     continue
                 flags = np.asarray(mask_cell)[:, 0].astype(bool, copy=False)
@@ -488,7 +489,7 @@ def _global_threshold(
     index = intensities.fields.index(field)
     values = []
     for iy, ix in np.argwhere(scan_mask):
-        cell = intensities[int(iy), int(ix)].array
+        cell = intensities[int(iy), int(ix)].numpy()
         if cell is not None and len(cell):
             finite = np.asarray(cell)[:, index]
             finite = finite[np.isfinite(finite)]
@@ -766,7 +767,9 @@ def detect_ice(
         r_axis = np.asarray(polar_data["r_invA"])[:, 0]
         theta_axis = np.asarray(polar_data["theta"])[0, :]
 
-    mask = Vector.from_shape(shape=shape, fields=["is_ice"], units=["bool"], name="ice_peak_mask")
+    mask = Vector.from_shape(
+        shape=shape, fields=["is_ice"], units=["bool"], name="ice_peak_mask", dtype=torch.float64
+    )
     flagged = np.zeros(shape, dtype=int)
     matched_bins = np.zeros(shape, dtype=int)
     records = {} if return_debug else None
@@ -787,8 +790,8 @@ def detect_ice(
     intensity_index = peak_intensities.fields.index(params.intensity_field)
     for iy, ix in np.argwhere(selected):
         iy, ix = int(iy), int(ix)
-        polar_cell = polar_peaks[iy, ix].array
-        intensity_cell = peak_intensities[iy, ix].array
+        polar_cell = polar_peaks[iy, ix].numpy()
+        intensity_cell = peak_intensities[iy, ix].numpy()
         if polar_cell is None or intensity_cell is None:
             continue
         if len(polar_cell) != len(intensity_cell):
@@ -851,8 +854,8 @@ def plot_q_intensity_density(
     qs, values = [], []
     for iy in range(polar_peaks.shape[0]):
         for ix in range(polar_peaks.shape[1]):
-            q_cell = polar_peaks[iy, ix].array
-            i_cell = peak_intensities[iy, ix].array
+            q_cell = polar_peaks[iy, ix].numpy()
+            i_cell = peak_intensities[iy, ix].numpy()
             if q_cell is None or i_cell is None:
                 continue
             if len(q_cell) != len(i_cell):
@@ -956,8 +959,8 @@ def collect_peak_widths(
                                  "width_r_invA", "width_theta_deg")}
     for iy, ix in np.argwhere(selected):
         iy, ix = int(iy), int(ix)
-        polar_cell = polar_peaks[iy, ix].array
-        intensity_cell = peak_intensities[iy, ix].array
+        polar_cell = polar_peaks[iy, ix].numpy()
+        intensity_cell = peak_intensities[iy, ix].numpy()
         if polar_cell is None or intensity_cell is None or not len(polar_cell):
             continue
         radius = np.asarray(polar_cell)[:, r_index]

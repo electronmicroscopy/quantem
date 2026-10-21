@@ -466,6 +466,7 @@ def polar_transform_peaks(
         fields=output_fields,
         units=output_units,
         name=cartesian_vector.name + name_suffix,
+        dtype=torch.float64,
     )
 
     theta_period = np.pi if two_fold_rotation_symmetry else 2.0 * np.pi
@@ -476,7 +477,7 @@ def polar_transform_peaks(
                 polar_vector[i, j] = np.zeros((0, len(output_fields)))
                 continue
 
-            cartesian_data = cartesian_vector[i, j].array
+            cartesian_data = cartesian_vector[i, j].numpy()
             if len(cartesian_data) == 0:
                 polar_vector[i, j] = np.zeros((0, len(output_fields)))
                 continue
