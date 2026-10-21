@@ -217,3 +217,42 @@ class TestDataset4dstemShow:
         # Check that the method returns a tuple of (fig, axs)
         assert isinstance(result, tuple)
         assert len(result) == 2
+
+
+class TestProbePositions:
+    """`probe_positions` hands the implicit raster grid to consumers that need it explicitly."""
+
+    @staticmethod
+    def _dataset(**kwargs):
+        return Dataset4dstem.from_array(
+            np.zeros((3, 4, 5, 5)),
+            name="scan",
+            **kwargs,
+        )
+
+    def test_origin_and_sampling_set_the_grid(self):
+        dataset = self._dataset(
+            sampling=(2.0, 3.0, 0.1, 0.1),
+            origin=(1.0, -4.0, 0.0, 0.0),
+            units=["A", "A", "A^-1", "A^-1"],
+        )
+        positions = dataset.probe_positions()
+
+        assert positions.shape == (12, 2)
+        assert list(positions.units) == ["A", "A"]
+        assert np.allclose(positions.array[0], [1.0, -4.0])
+        # row-major, so reshaping recovers the scan grid
+        assert np.allclose(positions.array.reshape(3, 4, 2)[2, 3], [1.0 + 2 * 2.0, -4.0 + 3 * 3.0])
+
+    def test_ordering_matches_a_reshape_of_the_patterns(self):
+        dataset = self._dataset(sampling=(2.0, 3.0, 0.1, 0.1), units=["A", "A", "A^-1", "A^-1"])
+        rows, cols = dataset.shape[:2]
+        expected = np.stack(
+            np.meshgrid(np.arange(rows) * 2.0, np.arange(cols) * 3.0, indexing="ij"), axis=-1
+        ).reshape(-1, 2)
+        assert np.allclose(dataset.probe_positions().array, expected)
+
+    def test_rejects_mismatched_scan_units(self):
+        dataset = self._dataset(sampling=(2.0, 3.0, 0.1, 0.1), units=["A", "nm", "A^-1", "A^-1"])
+        with pytest.raises(ValueError, match="must share a unit"):
+            dataset.probe_positions()

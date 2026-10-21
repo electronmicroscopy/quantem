@@ -10,7 +10,7 @@ import numpy as np
 from quantem.core import config
 
 if TYPE_CHECKING:
-    import cupy as cp
+    import cupy as cp  # type: ignore
     import torch
 else:
     if config.get("has_cupy"):
@@ -299,10 +299,10 @@ def fftshift(a: ArrayLike, axes: tuple[int, ...] | int | None = None) -> ArrayLi
 
 
 @overload
-def as_type(a: np.ndarray, dtype: "type|str|torch.dtype") -> np.ndarray: ...
+def as_type(a: np.ndarray, dtype: "type|str|torch.dtype|np.dtype") -> np.ndarray: ...
 @overload
-def as_type(a: "torch.Tensor", dtype: "type|str|torch.dtype") -> "torch.Tensor": ...
-def as_type(a: ArrayLike, dtype: "type|str|torch.dtype") -> ArrayLike:
+def as_type(a: "torch.Tensor", dtype: "type|str|torch.dtype|np.dtype") -> "torch.Tensor": ...
+def as_type(a: ArrayLike, dtype: "type|str|torch.dtype|np.dtype") -> ArrayLike:
     """Cast the array to a specified type."""
     if config.get("has_torch"):
         if isinstance(a, torch.Tensor):

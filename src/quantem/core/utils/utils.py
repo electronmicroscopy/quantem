@@ -215,3 +215,45 @@ def extract_patches(
     patches = array[y_indices, x_indices]
 
     return patches
+
+
+_REQUIRED = object()
+
+
+def inherit(value, key: str, *sources: dict | None, default=_REQUIRED):
+    """An explicit value, else the one an earlier stage recorded.
+
+    Lets a later stage of a chain (match, phase fit, refinement) leave a
+    parameter as None and reuse the value the earlier stage used.
+
+    Parameters
+    ----------
+    value : object
+        Explicit value; returned whenever it is not None.
+    key : str
+        Key looked up in each source.
+    *sources : dict | None
+        Metadata dicts of earlier stages, searched in order; None sources
+        and None entries are skipped.
+    default : object, optional
+        Returned when no source records `key`. Without it, a missing value
+        raises.
+
+    Returns
+    -------
+    object
+        The resolved value.
+
+    Raises
+    ------
+    ValueError
+        If `value` is None, no source records `key` and no default is given.
+    """
+    if value is not None:
+        return value
+    for src in sources:
+        if src is not None and src.get(key) is not None:
+            return src[key]
+    if default is _REQUIRED:
+        raise ValueError(f"{key} was not given and no earlier stage recorded it.")
+    return default

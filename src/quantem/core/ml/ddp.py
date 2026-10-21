@@ -5,11 +5,10 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, random_split
 
+from quantem.core.ml.dist_utils import worker_init_fn
 from quantem.tomography.dataset_models import DatasetModelType
 
-
-def worker_init_fn(worker_id):
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+__all__ = ["DDPMixin", "worker_init_fn"]
 
 
 class DDPMixin:

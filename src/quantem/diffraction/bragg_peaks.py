@@ -26,12 +26,13 @@ from quantem.diffraction.polymer_normalization import (
 )
 from quantem.core.datastructures import Vector
 from quantem.core.visualization import show_2d
-from quantem.diffraction.polar_transform import (
+from quantem.diffraction.polar_transform import polar_transform as karen_polar_transform
+from quantem.diffraction.polymer_polar import (
+    as_dataset4dstem,
     centered_dp_mean,
     find_central_beams_4d,
     fit_origin_roi,
     find_origin as find_origin_angular_uniformity,
-    polar_transform as karen_polar_transform,
     polar_transform_peaks as karen_polar_transform_peaks,
 )
 from quantem.diffraction.ellipse_fitting import fit_ellipse_from_ridge, fit_ellipse_from_ring
@@ -60,7 +61,7 @@ from quantem.diffraction.vector_fields import (
     vector_field_cell as _vector_field_cell,
     vector_field_flat as _vector_field_flat,
 )
-from quantem.diffraction.orientation import (
+from quantem.diffraction.polymer_orientation import (
     _get_intensity,
     _set_intensity,
     make_flowline_combined_image as _make_flowline_combined_image,
@@ -1769,7 +1770,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def find_central_beams_4d(self, **kwargs):
         """Locate the central beam at every scan position.
 
-        Thin wrapper over :func:`quantem.diffraction.polar_transform.find_central_beams_4d`,
+        Thin wrapper over :func:`quantem.diffraction.polymer_polar.find_central_beams_4d`,
         supplying this object's dataset, peaks and device. All keyword arguments are
         forwarded; see that function for the full set.
         """
@@ -1900,7 +1901,7 @@ class BraggPeaksPolymer(AutoSerialize):
         max_radius_invA = max_radius_pixels * self.pixels_to_inv_A()
         
         polar_full = karen_polar_transform(
-            data,
+            as_dataset4dstem(data),
             origin_array=centers_karen,
             ellipse_params=ellipse_params,
             num_annular_bins=num_theta,
@@ -1910,9 +1911,8 @@ class BraggPeaksPolymer(AutoSerialize):
             two_fold_rotation_symmetry=False,
             device=device if device is not None else self.device,
             batch_size=batch_size,
-            show_progress=use_tqdm,
         )
-        polar_intensity_full = np.asarray(polar_full.array, dtype=np.float32).transpose(0, 1, 3, 2)
+        polar_intensity_full = np.asarray(polar_full.numpy(), dtype=np.float32).transpose(0, 1, 3, 2)
         polar_intensity_full[~scan_mask] = 0.0
 
         # Pre-calculate coordinate arrays in both units using Karen's radial bins.
@@ -2013,7 +2013,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def make_orientation_histogram(self, *args, **kwargs):
         """Orientation histogram from this analysis's polar peaks.
 
-        Forwards to :func:`quantem.diffraction.orientation.make_orientation_histogram`.
+        Forwards to :func:`quantem.diffraction.polymer_orientation.make_orientation_histogram`.
         """
 
         return _make_orientation_histogram(self.polar_peaks, self.peak_intensities, *args, **kwargs)
@@ -3069,7 +3069,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def make_flowline_map(self, *args, **kwargs):
         """Trace flowlines through an orientation histogram.
 
-        Forwards to :func:`quantem.diffraction.orientation.make_flowline_map`.
+        Forwards to :func:`quantem.diffraction.polymer_orientation.make_flowline_map`.
         """
 
         return _make_flowline_map(*args, **kwargs)
@@ -3077,7 +3077,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def make_flowline_rainbow_image(self, *args, **kwargs):
         """Render flowlines as an orientation-coloured image.
 
-        Forwards to :func:`quantem.diffraction.orientation.make_flowline_rainbow_image`.
+        Forwards to :func:`quantem.diffraction.polymer_orientation.make_flowline_rainbow_image`.
         """
 
         return _make_flowline_rainbow_image(*args, **kwargs)
@@ -3085,7 +3085,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def make_flowline_rainbow_legend(self, *args, **kwargs):
         """Colour key for the rainbow flowline image.
 
-        Forwards to :func:`quantem.diffraction.orientation.make_flowline_rainbow_legend`.
+        Forwards to :func:`quantem.diffraction.polymer_orientation.make_flowline_rainbow_legend`.
         """
 
         return _make_flowline_rainbow_legend(*args, **kwargs)
@@ -3093,7 +3093,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def make_flowline_combined_image(self, *args, **kwargs):
         """Render flowlines with explicit per-bin colours.
 
-        Forwards to :func:`quantem.diffraction.orientation.make_flowline_combined_image`.
+        Forwards to :func:`quantem.diffraction.polymer_orientation.make_flowline_combined_image`.
         """
 
         return _make_flowline_combined_image(*args, **kwargs)
@@ -3101,7 +3101,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def get_intensity(self, *args, **kwargs):
         """Sample an orientation histogram with linear interpolation.
 
-        Forwards to :func:`quantem.diffraction.orientation._get_intensity`.
+        Forwards to :func:`quantem.diffraction.polymer_orientation._get_intensity`.
         """
 
         return _get_intensity(*args, **kwargs)
@@ -3109,7 +3109,7 @@ class BraggPeaksPolymer(AutoSerialize):
     def set_intensity(self, *args, **kwargs):
         """Deposit interpolated weight into an orientation histogram.
 
-        Forwards to :func:`quantem.diffraction.orientation._set_intensity`.
+        Forwards to :func:`quantem.diffraction.polymer_orientation._set_intensity`.
         """
 
         return _set_intensity(*args, **kwargs)

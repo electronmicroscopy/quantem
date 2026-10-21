@@ -300,3 +300,22 @@ def test_hybrid_module_roundtrip(tmp_path, store):
 
     for key in mod.state_dict():
         assert torch.allclose(mod.state_dict()[key], mod_reload.state_dict()[key])
+
+
+class WithSets(AutoSerialize):
+    def __init__(self):
+        self.names = {"C10", "C12", "rotation_angle"}
+        self.numbers = {1, 2, 3}
+        self.empty = set()
+
+
+@pytest.mark.parametrize("store", ["zip", "dir"])
+def test_set_roundtrip(tmp_path, store):
+    """Sets load back as sets, whether their items are strings or numbers."""
+    target = tmp_path / ("sets.zip" if store == "zip" else "sets_dir")
+    WithSets().save(str(target), mode="w", store=store)
+    loaded = load(str(target))
+
+    assert loaded.names == {"C10", "C12", "rotation_angle"}
+    assert loaded.numbers == {1, 2, 3}
+    assert loaded.empty == set()

@@ -23,10 +23,10 @@ from quantem.diffraction.peak_visualization import (
     _resolve_intensity_map,
 )
 from quantem.diffraction.polar_transform import (
-    find_origin,
     find_origin_angular_descent,
     find_origin_angular_grid,
 )
+from quantem.diffraction.polymer_polar import find_origin
 
 
 def _ring_pattern(ny, nx, cy, cx, radii=(10, 20, 30), beam_sigma=2.5):

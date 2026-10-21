@@ -20,6 +20,14 @@ from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 from quantem.tomography.tomography_context import ReconstructionContext
 
 
+def _tomography_autocast(device: torch.device | str, use_bfloat16: bool):
+    device = torch.device(device)
+    enabled = bool(
+        use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
+    )
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
+
+
 class ObjConstraintParams:
     """
     Namespace class for object reconstruction constraint dataclasses and parsing utilities.
@@ -687,6 +695,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         scheduler_params: dict | None = None,
         loss_fn: Callable | str = "l1",
         verbose: bool = True,
+        use_bfloat16: bool = True,
     ):
         """
         Pretrain the INR model to fit target volume.
@@ -717,6 +726,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
             num_iters=num_iters,
             loss_fn=loss_fn,
             verbose=verbose,
+            use_bfloat16=use_bfloat16,
         )
 
     def _pretrain(
@@ -724,6 +734,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         num_iters: int,
         loss_fn: Callable,
         verbose: bool,
+        use_bfloat16: bool,
     ):
         if self.optimizer is None:
             raise RuntimeError("Optimizer not set. Call set_optimizer() first.")
@@ -741,9 +752,7 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 coords = batch["coords"].to(self.device, non_blocking=True)
                 target = batch["target"].to(self.device, non_blocking=True)
 
-                with torch.autocast(
-                    device_type=self.device.type, dtype=torch.bfloat16, enabled=True
-                ):
+                with _tomography_autocast(self.device, use_bfloat16):
                     outputs = self.forward(coords)
                     loss = loss_fn(outputs, target)
 

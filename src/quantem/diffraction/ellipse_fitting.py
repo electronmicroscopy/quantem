@@ -35,7 +35,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import least_squares
 from scipy.signal import find_peaks
 
-from quantem.diffraction.polar_transform import polar_transform
+from quantem.diffraction.polymer_polar import polar_transform_pattern
 
 __all__ = ["EllipseFit", "fit_ellipse_from_ridge", "fit_ellipse_from_ring"]
 
@@ -142,26 +142,22 @@ def fit_ellipse_from_ring(
     -------
     (a, b, theta_deg, (radial_min, radial_max))
     """
-    from quantem.diffraction.polar_transform import polar_transform
-
     dp = np.asarray(dp, dtype=float)
     Qy, Qx = dp.shape
     origin = np.asarray(center, dtype=float)
 
     def _polar(image, ellipse_params, rmin, rmax):
-        # polar_transform returns (n_phi, n_r) when scan_pos is given.
+        # (n_phi, n_r) for the single pattern.
         return np.asarray(
-            polar_transform(
+            polar_transform_pattern(
                 image,
-                origin_array=origin,
+                origin,
                 ellipse_params=ellipse_params,
                 num_annular_bins=num_annular_bins,
                 radial_min=float(rmin),
                 radial_max=float(rmax),
                 radial_step=radial_step,
-                scan_pos=(0, 0),
                 device=device,
-                show_progress=False,
             ),
             dtype=float,
         )
@@ -504,7 +500,6 @@ def fit_ellipse_from_ridge(
     over an independently refined circle.
     """
     from scipy.optimize import least_squares
-    from quantem.diffraction.polar_transform import polar_transform
 
     dp = np.asarray(dp, dtype=float)
     origin = np.asarray(center, dtype=float)
@@ -517,17 +512,15 @@ def fit_ellipse_from_ridge(
 
     def polar_at(image, candidate_center, rmin, rmax):
         return np.asarray(
-            polar_transform(
+            polar_transform_pattern(
                 image,
-                origin_array=np.asarray(candidate_center, dtype=float),
+                np.asarray(candidate_center, dtype=float),
                 ellipse_params=(1.0, 1.0, 0.0),
                 num_annular_bins=num_annular_bins,
                 radial_min=float(rmin),
                 radial_max=float(rmax),
                 radial_step=radial_step,
-                scan_pos=(0, 0),
                 device=device,
-                show_progress=False,
             ),
             dtype=float,
         )
@@ -908,17 +901,15 @@ def fit_ellipse_from_ridge(
         axes[0].set_title("diffuse-ring ridge and robust ellipse")
         before = polar_at(dp, origin, selected["band"][0], selected["band"][1])
         after = np.asarray(
-            polar_transform(
+            polar_transform_pattern(
                 dp,
-                origin_array=np.asarray(refined_center),
+                np.asarray(refined_center),
                 ellipse_params=(a_axis, b_axis, theta_deg),
                 num_annular_bins=num_annular_bins,
                 radial_min=selected["band"][0],
                 radial_max=selected["band"][1],
                 radial_step=radial_step,
-                scan_pos=(0, 0),
                 device=device,
-                show_progress=False,
             )
         )
         axes[1].imshow(before, aspect="auto", cmap="magma")

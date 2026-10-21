@@ -1,3 +1,4 @@
+from os import PathLike
 from typing import Any, Self
 
 import matplotlib.pyplot as plt
@@ -8,9 +9,54 @@ from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
+from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
+from quantem.core.utils.diffractive_imaging_utils import (
+    fit_probe_circle as _fit_probe_circle,
+)
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
+
+
+def q_to_r_matrix(rotation_ccw_deg: float = 0.0, transpose: bool = False) -> np.ndarray:
+    """The 2x2 map from detector (q) to scan (r) coordinates, ``v_r = M @ v_q``.
+
+    The one convention shared by calibration, orientation and strain mapping
+    and ptychography, stored on a dataset as
+    ``metadata["q_to_r_rotation_ccw_deg"]`` and ``metadata["q_transpose"]``:
+    a detector vector (row, col) is first swapped to (col, row) if
+    `transpose`, then rotated counter-clockwise by `rotation_ccw_deg`,
+    ``row' = cos(t) row - sin(t) col``, ``col' = sin(t) row + cos(t) col``.
+    Ptychography stores the same rotation as ``com_rotation_rad`` and
+    ``com_transpose``.
+
+    Parameters
+    ----------
+    rotation_ccw_deg : float, default=0.0
+        Counter-clockwise rotation, degrees.
+    transpose : bool, default=False
+        Swap the detector row and column axes before the rotation.
+
+    Returns
+    -------
+    np.ndarray
+        (2, 2) matrix; its inverse maps scan vectors back onto the detector.
+    """
+    th = np.deg2rad(float(rotation_ccw_deg or 0.0))
+    M = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    return M[:, ::-1].copy() if transpose else M
+
+
+def scan_rotation_from_metadata(metadata) -> tuple[float | None, bool | None]:
+    """``(q_to_r_rotation_ccw_deg, q_transpose)`` recorded on a dataset, or None
+    for either that is not set. Reads the older ``r_to_q_rotation_cw_deg``
+    name too (the same number)."""
+    md = metadata or {}
+    rot = md.get("q_to_r_rotation_ccw_deg")
+    if rot is None:
+        rot = md.get("r_to_q_rotation_cw_deg")
+    tr = md.get("q_transpose")
+    return (None if rot is None else float(rot)), (None if tr is None else bool(tr))
 
 
 class Dataset4dstem(Dataset4d):
@@ -72,12 +118,30 @@ class Dataset4dstem(Dataset4d):
         signal_units : str, optional
             Units for the array values, by default "arb. units"
         metadata : dict
-            "r_to_q_rotation_cw_deg":  rotation r to q clockwise in degrees
-            "ellipticity": 3 parameters (a, b, theta (degrees))
+            Missing keys below are set to None.
+
+            "q_to_r_rotation_ccw_deg" : float
+                Rotation in degrees that maps detector (q) vectors onto the
+                scan (r) frame. A detector vector (dr, dc) is first swapped to
+                (dc, dr) if "q_transpose" is True, then rotated as
+                dr' = cos(t) dr - sin(t) dc, dc' = sin(t) dr + cos(t) dc.
+            "q_transpose" : bool
+                If True, swap the detector row and column axes before the
+                rotation.
+            "ellipticity" : tuple
+                3 parameters (a, b, theta in degrees).
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
-        mdata_keys_4dstem = ["r_to_q_rotation_cw_deg", "ellipticity"]
+        # The old name described the inverse transform. Its clockwise angle
+        # has the same numeric value as the new q-to-r counterclockwise angle.
+        if (
+            metadata.get("q_to_r_rotation_ccw_deg") is None
+            and metadata.get("r_to_q_rotation_cw_deg") is not None
+        ):
+            metadata["q_to_r_rotation_ccw_deg"] = metadata["r_to_q_rotation_cw_deg"]
+
+        mdata_keys_4dstem = ["q_to_r_rotation_ccw_deg", "q_transpose", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
                 metadata[k] = None
@@ -96,16 +160,26 @@ class Dataset4dstem(Dataset4d):
         self._virtual_images = {}
         self._virtual_detectors = {}  # Store detector information for regeneration
 
+    def _post_load(self) -> None:
+        """Migrate detector rotation metadata from older serialized datasets."""
+        metadata = getattr(self, "_metadata", None)
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("q_to_r_rotation_ccw_deg") is None
+            and metadata.get("r_to_q_rotation_cw_deg") is not None
+        ):
+            metadata["q_to_r_rotation_ccw_deg"] = metadata["r_to_q_rotation_cw_deg"]
+
     @classmethod
-    def from_file(cls, file_path: str, file_type: str) -> "Dataset4dstem":
+    def from_file(cls, file_path: str | PathLike, file_type: str | None = None) -> "Dataset4dstem":
         """
         Create a new Dataset4dstem from a file.
 
         Parameters
         ----------
-        file_path : str
+        file_path : str | PathLike
             Path to the data file
-        file_type : str
+        file_type : str | None
             The type of file reader needed. See rosettasciio for supported formats
             https://hyperspy.org/rosettasciio/supported_formats/index.html
 
@@ -204,6 +278,54 @@ class Dataset4dstem(Dataset4d):
             _token=cls._token,
         )
 
+    def probe_positions(self) -> Dataset2d:
+        """
+        The scan positions this dataset was acquired at, in calibrated units.
+
+        Reconstructions that do not assume a scan grid take the positions explicitly, as an
+        ``(N, 2)`` array ordered the same way the patterns are. A raster acquisition already
+        carries them implicitly in :attr:`origin` and :attr:`sampling`, so this builds them
+        rather than leaving every caller to rebuild the meshgrid and pick an axis order::
+
+            events = vector_from_frames(counts)          # (Rx, Ry) ragged cells
+            montage = DirectPtychographyMontage.from_vector(
+                events, dataset.probe_positions(), dataset.dp_mean, ...
+            )
+
+        Ordering is row-major over the two scan axes, matching a ``reshape(-1, ...)`` of the
+        patterns and the row-major flattening ``from_vector`` applies to a 2D ``Vector``.
+        Reshape to ``(Rx, Ry, 2)`` for the grid form.
+
+        Returns
+        -------
+        Dataset2d
+            ``(Rx * Ry, 2)`` positions carrying the scan units, so a consumer can check them.
+
+        Raises
+        ------
+        ValueError
+            If the two scan axes do not share one unit, which would leave the pair meaningless.
+        """
+        scan_units = [str(u) for u in self.units[:2]]
+        if scan_units[0] != scan_units[1]:
+            raise ValueError(
+                f"The scan axes must share a unit to form a position pair, got {scan_units}."
+            )
+
+        rows, cols = (int(n) for n in self.shape[:2])
+        origin = np.asarray(self.origin[:2], dtype=np.float64)
+        sampling = np.asarray(self.sampling[:2], dtype=np.float64)
+
+        ii, jj = np.meshgrid(np.arange(rows), np.arange(cols), indexing="ij")
+        positions = np.stack((ii, jj), axis=-1) * sampling + origin
+
+        return Dataset2d.from_array(
+            positions.reshape(-1, 2),
+            name=f"{self.name} probe positions",
+            units=[scan_units[0], scan_units[0]],
+            signal_units=scan_units[0],
+        )
+
     @property
     def virtual_images(self) -> dict[str, Dataset2d]:
         """
@@ -273,6 +395,39 @@ class Dataset4dstem(Dataset4d):
             self._dp_mean = dp_mean_dataset
 
         return dp_mean_dataset
+
+    def fit_probe_circle(
+        self,
+        array: NDArray | Dataset2d | None = None,
+        threshold: float | None = None,
+        show: bool = True,
+    ) -> tuple[float, float, float]:
+        """Fit a circle to the probe in a diffraction pattern.
+
+        Parameters
+        ----------
+        array : NDArray | Dataset2d | None, optional
+            2D diffraction pattern to fit, either as an array or a Dataset2d. If
+            None, uses this dataset's mean diffraction pattern, computing it if needed.
+        threshold : float | None, optional
+            Threshold for binarizing the diffraction pattern. If None, Otsu's method
+            is used.
+        show : bool, optional
+            Whether to display the fitted circle, by default True.
+
+        Returns
+        -------
+        tuple[float, float, float]
+            Probe center in diffraction-pattern row and column coordinates
+            (probe_qy0, probe_qx0), followed by the fitted radius.
+        """
+        if array is None:
+            dp_mean = (
+                self._dp_mean if hasattr(self, "_dp_mean") else self.get_dp_mean(attach=False)
+            )
+            array = dp_mean.array
+
+        return _fit_probe_circle(array, threshold=threshold, show=show)
 
     @property
     def dp_max(self) -> Dataset2d:
@@ -566,7 +721,15 @@ class Dataset4dstem(Dataset4d):
 
         return (distance >= r_inner) & (distance <= r_outer)
 
-    def show_virtual_images(self, figsize: tuple[int, int] | None = None, **kwargs) -> tuple:
+    def show_virtual_images(
+        self,
+        figsize: tuple[int, int] | None = None,
+        *,
+        positions: list[tuple[int, int]] | None = None,
+        position_color: str = "red",
+        position_size: float = 60.0,
+        **kwargs,
+    ) -> tuple:
         """
         Display all virtual images stored in the dataset using show_2d.
 
@@ -574,6 +737,13 @@ class Dataset4dstem(Dataset4d):
         ----------
         figsize : tuple[int, int] | None, optional
             Figure size in inches. If None, automatically calculated based on number of images
+        positions : list of tuple of int, optional
+            ``(row, col)`` scan positions to mark on every image, e.g. the
+            positions used to tune Bragg disk detection.
+        position_color : str, default="red"
+            Color of the position markers.
+        position_size : float, default=60.0
+            Area of the position markers in points squared.
         **kwargs
             Additional keyword arguments passed to show_2d (e.g., cmap, norm, cbar, etc.)
 
@@ -623,7 +793,119 @@ class Dataset4dstem(Dataset4d):
             kwargs.setdefault("scalebar", [scalebar] + [False] * (len(arrays) - 1))
         fig, axs = show_2d(arrays_organized, title=titles_organized, figsize=figsize, **kwargs)
 
+        if positions is not None and len(positions) > 0:
+            pos = np.asarray(positions, dtype=float).reshape(-1, 2)
+            for ax in np.atleast_1d(np.asarray(axs, dtype=object)).ravel():
+                ax.scatter(
+                    pos[:, 1],
+                    pos[:, 0],
+                    s=position_size,
+                    facecolors="none",
+                    edgecolors=position_color,
+                    linewidths=1.5,
+                )
+
         return fig, axs
+
+    def show_virtual_detectors(
+        self,
+        names: str | list[str] | None = None,
+        *,
+        colors: list[str] | None = None,
+        alpha: float = 0.2,
+        linewidth: float = 1.5,
+        legend: bool = True,
+        **kwargs,
+    ) -> tuple:
+        """Show the mean diffraction pattern with the virtual detectors drawn on it.
+
+        Every detector attached by :meth:`get_virtual_image` is drawn on a single
+        mean pattern, so their placement relative to the direct beam and the
+        diffracted rings can be checked at a glance.
+
+        Parameters
+        ----------
+        names : str or list of str, optional
+            Detector(s) to draw. ``None`` (default) draws all attached detectors.
+        colors : list of str, optional
+            One color per detector; defaults to the matplotlib color cycle.
+        alpha : float, default=0.2
+            Opacity of the filled detector area. Set to 0 for outlines only.
+        linewidth : float, default=1.5
+            Width of the detector outline.
+        legend : bool, default=True
+            If ``True``, label the detectors in a legend.
+        **kwargs
+            Passed to :func:`~quantem.core.visualization.show_2d`; ``norm``,
+            ``scalebar`` and ``title`` have diffraction-pattern defaults.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)`` from :func:`~quantem.core.visualization.show_2d`.
+        """
+        if not self._virtual_detectors:
+            raise ValueError("No virtual detectors attached. Create one with get_virtual_image().")
+        if names is None:
+            names = list(self._virtual_detectors)
+        elif isinstance(names, str):
+            names = [names]
+        missing = [n for n in names if n not in self._virtual_detectors]
+        if missing:
+            raise ValueError(
+                f"Virtual detector(s) {missing} not found. "
+                f"Available detectors: {list(self._virtual_detectors)}"
+            )
+
+        if colors is None:
+            cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["red"])
+            colors = [cycle[i % len(cycle)] for i in range(len(names))]
+
+        dp_mean = self.dp_mean
+        kwargs.setdefault("norm", {"power": 0.4, "upper_quantile": 0.999})
+        kwargs.setdefault("title", "mean DP with virtual detectors")
+        kwargs.setdefault(
+            "scalebar", ScalebarConfig(sampling=self.sampling[2], units=self.units[2])
+        )
+        fig, ax = show_2d(dp_mean.array, **kwargs)
+
+        for name, color in zip(names, colors):
+            det = self._virtual_detectors[name]
+            mode, geometry, mask = det["mode"], det["geometry"], det["mask"]
+            if mask is not None:
+                ax.contour(mask, levels=[0.5], colors=[color], linewidths=linewidth)
+                ax.plot([], [], color=color, linewidth=linewidth, label=name)
+                continue
+            (cy, cx) = geometry[0]
+            if mode == "circle":
+                radius = geometry[1]
+                ax.add_patch(
+                    Circle((cx, cy), radius, color=color, fill=True, alpha=alpha, label=name)
+                )
+                ax.add_patch(
+                    Circle((cx, cy), radius, color=color, fill=False, linewidth=linewidth)
+                )
+            elif mode == "annular":
+                r_inner, r_outer = geometry[1]
+                ax.add_patch(
+                    Wedge(
+                        (cx, cy),
+                        r_outer,
+                        0,
+                        360,
+                        width=r_outer - r_inner,
+                        color=color,
+                        fill=True,
+                        alpha=alpha,
+                        label=name,
+                    )
+                )
+                for r in (r_inner, r_outer):
+                    ax.add_patch(Circle((cx, cy), r, color=color, fill=False, linewidth=linewidth))
+
+        if legend:
+            ax.legend(loc="upper right", framealpha=0.8)
+        return fig, ax
 
     def regenerate_virtual_images(self) -> None:
         """
@@ -798,3 +1080,5 @@ class Dataset4dstem(Dataset4d):
             self.array[:, :, index_x, index_y] = np.median(
                 self.array[:, :, x_min:x_max, y_min:y_max], axis=(2, 3)
             )
+
+    polar_transform = dataset4dstem_polar_transform

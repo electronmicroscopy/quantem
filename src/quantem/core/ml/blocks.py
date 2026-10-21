@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Literal
 
 import numpy as np
 import torch
@@ -141,7 +141,17 @@ class Conv2dBlock(nn.Module):
 
 
 class Upsample2dBlock(nn.Module):
-    """Upsampling block using transposed convolution or interpolation followed by convolution."""
+    """Upsampling block using transposed convolution or interpolation followed by convolution.
+
+    Two upsampling methods are available:
+
+    - ``"transpose"`` (default): transposed convolution (for ``scale_factor==2``,
+      otherwise interpolation) followed by a 1x1 convolution. This is the
+      original behavior.
+    - ``"resize"``: interpolation followed by a 3x3 convolution. Decoupling the
+      upsampling from the learned weights avoids the uneven kernel overlap that
+      produces checkerboard artifacts with transposed convolutions.
+    """
 
     def __init__(
         self,
@@ -151,6 +161,7 @@ class Upsample2dBlock(nn.Module):
         dtype: "torch.dtype" = torch.float32,
         scale_factor: int = 2,
         mode: str = "bilinear",
+        method: Literal["transpose", "resize"] = "transpose",
     ):
         """Initialize Upsample2dBlock.
 
@@ -168,41 +179,74 @@ class Upsample2dBlock(nn.Module):
             Factor by which to scale the input, by default 2
         mode : str, optional
             Interpolation mode, either "bilinear" or "nearest", by default "bilinear"
+        method : str, optional
+            Upsampling method, either "transpose" (transposed convolution) or
+            "resize" (interpolation followed by convolution). The "resize"
+            method reduces checkerboard artifacts. By default "transpose".
         """
         super().__init__()
         assert mode in ["bilinear", "nearest"], "Mode must be 'bilinear' or 'nearest'."
+        assert method in ("transpose", "resize"), "method must be 'transpose' or 'resize'."
         self.scale_factor = scale_factor
         self.mode = mode
         self.use_batchnorm = use_batchnorm
         self.dtype = dtype
-        self.upsample2x = nn.ConvTranspose2d(
-            input_channels,
-            input_channels,
-            kernel_size=3,
-            stride=2,
-            padding=(1, 1),
-            output_padding=(1, 1),
-            dtype=self.dtype,
-        )
-        self.conv = nn.Conv2d(
-            input_channels,
-            output_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            dtype=self.dtype,
-            padding_mode="circular",
-        )
+        self.method = method
+
+        if method == "transpose":
+            self.upsample2x = nn.ConvTranspose2d(
+                input_channels,
+                input_channels,
+                kernel_size=3,
+                stride=2,
+                padding=(1, 1),
+                output_padding=(1, 1),
+                dtype=self.dtype,
+            )
+            self.conv = nn.Conv2d(
+                input_channels,
+                output_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                dtype=self.dtype,
+                padding_mode="circular",
+            )
+        else:
+            # Resize-conv: interpolate first, then a 3x3 conv smooths the result.
+            self.upsample2x = None
+            self.conv = nn.Conv2d(
+                input_channels,
+                output_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                dtype=self.dtype,
+                padding_mode="circular",
+            )
+
         if self.dtype.is_complex:
             self.bn = ComplexBatchNorm2D(output_channels)
         else:
             self.bn = nn.BatchNorm2d(output_channels)
 
+    def _interpolate(self, x: torch.Tensor) -> torch.Tensor:
+        # F.interpolate does not support complex tensors, so handle parts separately.
+        if x.is_complex():
+            real = F.interpolate(x.real, scale_factor=self.scale_factor, mode=self.mode)
+            imag = F.interpolate(x.imag, scale_factor=self.scale_factor, mode=self.mode)
+            return torch.complex(real, imag)
+        return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.scale_factor == 2:
-            x = self.upsample2x(x)
+        if getattr(self, "method", "transpose") == "transpose":
+            if self.scale_factor == 2:
+                assert self.upsample2x is not None
+                x = self.upsample2x(x)
+            else:
+                x = self._interpolate(x)
         else:
-            x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+            x = self._interpolate(x)
 
         x = self.conv(x)
         if self.use_batchnorm:
@@ -399,7 +443,17 @@ class Conv3dBlock(nn.Module):
 
 
 class Upsample3dBlock(nn.Module):
-    """3D upsampling block using transposed convolution followed by 1x1x1 convolution."""
+    """3D upsampling block.
+
+    Two upsampling methods are available:
+
+    - ``"transpose"`` (default): transposed convolution followed by a 1x1x1
+      convolution. This is the original behavior.
+    - ``"resize"``: nearest/trilinear interpolation followed by a 3x3x3
+      convolution. Decoupling the upsampling from the learned weights avoids
+      the uneven kernel overlap that produces checkerboard artifacts with
+      transposed convolutions.
+    """
 
     def __init__(
         self,
@@ -408,7 +462,8 @@ class Upsample3dBlock(nn.Module):
         use_batchnorm: bool = False,
         dtype: torch.dtype = torch.float32,
         scale_factor: int = 2,
-        mode: str = "trilinear",
+        mode: str = "nearest",
+        method: Literal["transpose", "resize"] = "transpose",
     ) -> None:
         """Initialize Upsample3dBlock.
 
@@ -425,29 +480,63 @@ class Upsample3dBlock(nn.Module):
         scale_factor : int, optional
             Factor by which to scale the input, by default 2
         mode : str, optional
-            Interpolation mode, by default "trilinear"
+            Interpolation mode used when ``method="resize"``, by default "trilinear"
+        method : str, optional
+            Upsampling method, either "transpose" (transposed convolution) or
+            "resize" (interpolation followed by convolution). The "resize"
+            method reduces checkerboard artifacts. By default "transpose".
         """
         super().__init__()
+        assert method in ("transpose", "resize"), "method must be 'transpose' or 'resize'."
         self.dtype = dtype
         self.use_batchnorm = use_batchnorm
-        self.upsample = nn.ConvTranspose3d(
-            input_channels,
-            input_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            output_padding=1,
-            dtype=dtype,
-        )
-        self.conv = nn.Conv3d(input_channels, output_channels, kernel_size=1, dtype=dtype)
+        self.method = method
+        self.scale_factor = scale_factor
+        self.mode = mode
+
+        if method == "transpose":
+            self.upsample = nn.ConvTranspose3d(
+                input_channels,
+                input_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=1,
+                dtype=dtype,
+            )
+            self.conv = nn.Conv3d(input_channels, output_channels, kernel_size=1, dtype=dtype)
+        else:
+            # Resize-conv: interpolate first, then a 3x3x3 conv smooths the result.
+            self.upsample = None
+            self.conv = nn.Conv3d(
+                input_channels,
+                output_channels,
+                kernel_size=3,
+                padding=1,
+                dtype=dtype,
+                padding_mode="circular",
+            )
+
         self.bn = (
             ComplexBatchNorm3D(output_channels)
             if dtype.is_complex
             else nn.BatchNorm3d(output_channels)
         )
 
+    def _interpolate(self, x: torch.Tensor) -> torch.Tensor:
+        # F.interpolate does not support complex tensors, so handle parts separately.
+        if x.is_complex():
+            real = F.interpolate(x.real, scale_factor=self.scale_factor, mode=self.mode)
+            imag = F.interpolate(x.imag, scale_factor=self.scale_factor, mode=self.mode)
+            return torch.complex(real, imag)
+        return F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.upsample(x)
+        if getattr(self, "method", "transpose") == "transpose":
+            assert self.upsample is not None
+            x = self.upsample(x)
+        else:
+            x = self._interpolate(x)
         x = self.conv(x)
         if self.use_batchnorm:
             x = self.bn(x)

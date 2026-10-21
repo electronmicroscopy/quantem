@@ -1,5 +1,6 @@
 import gzip
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -170,6 +171,42 @@ class AutoSerialize:
                 # If Path creation fails, keep as string
                 return val
         return val
+
+    @staticmethod
+    def _convert_string_to_device_if_needed(val: Any, group: zarr.Group, key: str) -> Any:
+        """Convert string back to torch.device if it was originally a device."""
+        if isinstance(val, str) and group.attrs.get(f"{key}.is_torch_device", False):
+            try:
+                return torch.device(val)
+            except (ValueError, RuntimeError):
+                return val
+        return val
+
+    @staticmethod
+    def _read_ase_atoms(group: zarr.Group) -> Any:
+        """Rebuild an ase.Atoms written by `_serialize_value`."""
+        from ase import Atoms
+
+        if "arrays" in group.group_keys():
+            arrays_group = AutoSerialize._get_group(group, "arrays")
+            arrays = {
+                k: AutoSerialize._read_array_np(arrays_group, k) for k in arrays_group.array_keys()
+            }
+            arrays.update(
+                {k: np.asarray(v) for k, v in dict(group.attrs.get("text_arrays", {})).items()}
+            )
+        else:  # files written before per-atom arrays were stored
+            arrays = {k: AutoSerialize._read_array_np(group, k) for k in ("numbers", "positions")}
+        atoms = Atoms(
+            numbers=arrays.pop("numbers"),
+            positions=arrays.pop("positions"),
+            cell=AutoSerialize._read_array_np(group, "cell"),
+            pbc=AutoSerialize._read_array_np(group, "pbc"),
+        )
+        for key, arr in arrays.items():
+            atoms.set_array(key, arr)
+        atoms.info.update(dict(group.attrs.get("info", {})))
+        return atoms
 
     @staticmethod
     def _is_autoserialize_instance(value: Any) -> bool:
@@ -406,6 +443,12 @@ class AutoSerialize:
             group.attrs[name] = str(value)
             group.attrs[f"{name}.is_path"] = True
 
+        elif isinstance(value, torch.device):
+            # A device belongs to the machine, not to the data: store the string
+            # so the object reloads on a host that does not have that device.
+            group.attrs[name] = str(value)
+            group.attrs[f"{name}.is_torch_device"] = True
+
         elif self._is_autoserialize_instance(value):
             # Nested AutoSerialize subtree
             subgroup = group.require_group(name)
@@ -417,12 +460,12 @@ class AutoSerialize:
             self._serialize_container(value, subgroup, skip_names, skip_types, compressors)
 
         elif isinstance(value, set):
-            # Convert set to list for serialization, store type info
+            # Serialize the items as a list, then mark the group as a set: the list writer
+            # records its own container type, which would otherwise load the set as a list
             subgroup = group.require_group(name)
-            subgroup.attrs["_container_type"] = "set"
-            # Convert set items to list and serialize
             list_value = list(value)
             self._serialize_container(list_value, subgroup, skip_names, skip_types, compressors)
+            subgroup.attrs["_container_type"] = "set"
 
         elif hasattr(value, "bit_generator"):
             # NumPy random generator - save state through bit_generator
@@ -444,6 +487,27 @@ class AutoSerialize:
             subgroup.attrs["_torch_rng_skipped"] = True
             subgroup.attrs["_rng_type"] = "torch.Generator"
             # Don't try to save the state - it's not essential for core functionality
+
+        elif type(value).__module__.startswith("ase.") and type(value).__name__ == "Atoms":
+            # Stored as plain arrays so the file stays readable without pickling
+            # an ase version in: cell, pbc, every per-atom array in atoms.arrays
+            # (numbers, positions, occupancy, tags, masses, ...) and the
+            # JSON-serializable entries of atoms.info. Constraints and attached
+            # calculators are not saved.
+            subgroup = group.require_group(name)
+            subgroup.attrs["_ase_atoms"] = True
+            self._write_ndarray(subgroup, "cell", np.asarray(value.get_cell()), compressors)
+            self._write_ndarray(subgroup, "pbc", np.asarray(value.get_pbc()), compressors)
+            arrays_group = subgroup.require_group("arrays")
+            text_arrays = {}
+            for key, arr in value.arrays.items():
+                arr = np.asarray(arr)
+                if arr.dtype.kind in "biufc":
+                    self._write_ndarray(arrays_group, key, arr, compressors)
+                else:
+                    text_arrays[key] = arr.tolist()
+            subgroup.attrs["text_arrays"] = _json_entries(text_arrays, f"{name}.arrays")
+            subgroup.attrs["info"] = _json_entries(dict(value.info), f"{name}.info")
 
         else:
             # Fallback: dill-serialize + gzip-compress
@@ -522,6 +586,7 @@ class AutoSerialize:
                 name == "_autoserialize"
                 or name.endswith(".torch_save")
                 or name.endswith(".is_path")
+                or name.endswith(".is_torch_device")
             ):
                 continue  # Skip metadata/flags
             if name in skip_names:
@@ -531,6 +596,7 @@ class AutoSerialize:
 
             # Convert string paths back to pathlib.Path objects if needed
             val = cls._convert_string_to_path_if_needed(val, group, name)
+            val = cls._convert_string_to_device_if_needed(val, group, name)
 
             setattr(obj, name, val)
             set_attrs.add(name)
@@ -558,8 +624,16 @@ class AutoSerialize:
                 continue
             subgrp = AutoSerialize._get_group(group, name)
 
+            # ase.Atoms group
+            if subgrp.attrs.get("_ase_atoms"):
+                atoms = AutoSerialize._read_ase_atoms(subgrp)
+                if type(atoms) in skip_types:
+                    continue
+                setattr(obj, name, atoms)
+                set_attrs.add(name)
+
             # torch tensor group
-            if subgrp.attrs.get("_torch_tensor"):
+            elif subgrp.attrs.get("_torch_tensor"):
                 data = AutoSerialize._read_array_np(subgrp, "tensor").tobytes()
                 buf = io.BytesIO(data)
                 tensor = torch.load(buf, map_location="cpu", weights_only=False)
@@ -740,6 +814,14 @@ class AutoSerialize:
         if hasattr(obj, "__attrs_post_init__"):
             obj.__attrs_post_init__()
 
+        # Give the class a chance to normalize its restored state. Loading
+        # bypasses __init__, so classes that store data in a form different from
+        # what they serialize (e.g. Vector, which writes NumPy but works in
+        # torch) use this hook to rehydrate.
+        post_load = getattr(obj, "_post_load", None)
+        if callable(post_load):
+            post_load()
+
         # Fix PyTorch module set attributes after all loading is complete
         if isinstance(obj, torch.nn.Module):
             cls._fix_torch_module_sets(obj)
@@ -789,7 +871,9 @@ class AutoSerialize:
 
         # Handle list/tuple containers
         if isinstance(value, (list, tuple)):
-            group.attrs["_container_type"] = type(value).__name__
+            # normalize subclasses (torch.Size, namedtuples, ...) to their base container,
+            # since _deserialize_container only knows how to rebuild list/tuple
+            group.attrs["_container_type"] = "tuple" if isinstance(value, tuple) else "list"
             # Fast-path: homogeneous numeric scalars → single ndarray
             try:
                 is_all_numeric = len(value) > 0 and all(
@@ -869,6 +953,7 @@ class AutoSerialize:
                         val = group.attrs[key]
                         # Convert string paths back to Path objects if needed
                         val = cls._convert_string_to_path_if_needed(val, group, key)
+                        val = cls._convert_string_to_device_if_needed(val, group, key)
                         items.append(val)
                     elif key in group.array_keys():
                         items.append(maybe_tensor(group, key))
@@ -965,6 +1050,11 @@ class AutoSerialize:
 
         elif ctype == "set":
             # Convert back from list to set
+            if (
+                group.attrs.get("_sequence_encoding") == "ndarray"
+                and "values" in group.array_keys()
+            ):
+                return set(AutoSerialize._read_array_np(group, "values").tolist())
             items = []
             for i in range(
                 max(
@@ -984,6 +1074,7 @@ class AutoSerialize:
                     val = group.attrs[key]
                     # Convert string paths back to Path objects if needed
                     val = cls._convert_string_to_path_if_needed(val, group, key)
+                    val = cls._convert_string_to_device_if_needed(val, group, key)
                     items.append(val)
                 elif key in group.array_keys():
                     items.append(maybe_tensor(group, key))
@@ -1073,11 +1164,13 @@ class AutoSerialize:
                     key == "_container_type"
                     or key.endswith(".torch_save")
                     or key.endswith(".is_path")
+                    or key.endswith(".is_torch_device")
                 ):
                     continue
                 val = group.attrs[key]
                 # Convert string paths back to Path objects if needed
                 val = cls._convert_string_to_path_if_needed(val, group, key)
+                val = cls._convert_string_to_device_if_needed(val, group, key)
                 result[key] = val
             # Restore arrays (including torch tensors)
             for key in group.array_keys():
@@ -1303,6 +1396,62 @@ class AutoSerialize:
         _recurse(self, prefix="", current_depth=0)
 
 
+def _is_saved_object(directory: str) -> bool:
+    """True if `directory` is the root of a saved AutoSerialize object."""
+    try:
+        with open(os.path.join(directory, "zarr.json")) as f:
+            return "_autoserialize" in json.load(f).get("attributes", {})
+    except (OSError, ValueError):
+        return False
+
+
+def _open_saved(path: str | Path) -> tuple[zarr.Group, Any]:
+    """Open a saved object read-only, from a directory or a .zip archive.
+
+    Copies of saved files often gain one extra folder level: a folder dragged
+    into a folder of the same name, or a zip made by the operating system,
+    which wraps its contents in a folder. If `path` holds no saved object but
+    exactly one subfolder that is one, that subfolder is opened.
+
+    Returns
+    -------
+    root : zarr.Group
+        The object's root group.
+    tempdir : tempfile.TemporaryDirectory | None
+        Holds the extracted zip; keep it alive while reading.
+    """
+    path = os.fspath(path)
+    tempdir = None
+    if os.path.isdir(path):
+        base = path
+    elif os.path.isfile(path):
+        tempdir = tempfile.TemporaryDirectory()
+        with ZipFile(path, "r") as zf:
+            zf.extractall(tempdir.name)
+        base = tempdir.name
+    else:
+        raise FileNotFoundError(f"No such file or directory: {path!r}")
+
+    if not _is_saved_object(base):
+        found = [
+            os.path.join(base, d)
+            for d in sorted(os.listdir(base))
+            if not d.startswith((".", "__MACOSX")) and _is_saved_object(os.path.join(base, d))
+        ]
+        if len(found) != 1:
+            hint = (
+                f"; it contains {len(found)} saved objects: "
+                + ", ".join(os.path.basename(f) for f in found)
+                if found
+                else ""
+            )
+            raise FileNotFoundError(f"No saved quantem object at {path!r}{hint}.")
+        base = found[0]
+    # read-only: loading never writes into the user's folders
+    root = zarr.open_group(store=LocalStore(base, read_only=True), mode="r")
+    return root, tempdir
+
+
 def load(
     path: str | Path,
     skip: Union[str, type, Sequence[Union[str, type]]] = (),
@@ -1330,17 +1479,7 @@ def load(
     user_skip_types = tuple(s for s in skip if isinstance(s, type))
 
     # Load Zarr store from directory or extracted zip
-    if os.path.isdir(path):
-        store = LocalStore(path)
-    else:
-        tempdir = tempfile.TemporaryDirectory()
-        with ZipFile(path, "r") as zf:
-            zf.extractall(tempdir.name)
-        store = LocalStore(tempdir.name)
-
-    root = zarr.group(store=store)
-    if "_autoserialize" not in root.attrs:
-        raise KeyError("Missing '_autoserialize' metadata in Zarr root attrs.")
+    root, tempdir = _open_saved(path)
     meta = cast(dict[str, Any], root.attrs["_autoserialize"])
     version = int(meta.get("version", 1))
     if version != 1:
@@ -1397,14 +1536,7 @@ def print_file(
         Show full class import path (module + class name) in output.
     """
     # Open the Zarr group from dir/zip
-    if os.path.isdir(path):
-        store = LocalStore(path)
-    else:
-        tempdir = tempfile.TemporaryDirectory()
-        with ZipFile(path, "r") as zf:
-            zf.extractall(tempdir.name)
-        store = LocalStore(tempdir.name)
-    root = zarr.group(store=store)
+    root, tempdir = _open_saved(path)
 
     def _recurse(obj: Any, prefix: str = "", current_depth: int = 0, is_last: bool = True) -> None:
         if isinstance(obj, zarr.Group):
@@ -1494,3 +1626,57 @@ def print_file(
                         )
 
     _recurse(root)
+
+
+def _json_entries(entries: dict, label: str) -> dict:
+    """Return the JSON-serializable entries of a dict, warning about the rest."""
+    kept, dropped = {}, []
+    for key, val in entries.items():
+        try:
+            json.dumps({str(key): val})
+        except (TypeError, ValueError):
+            dropped.append(str(key))
+        else:
+            kept[str(key)] = val
+    if dropped:
+        print(f"Not saving non-JSON-serializable entries of {label}: {dropped}")
+    return kept
+
+
+class Bundle(AutoSerialize):
+    """A named collection of serializable objects, saved as one file.
+
+    Groups any AutoSerialize objects (Datasets, Vectors, ...) plus plain
+    metadata values under attribute names::
+
+        bundle = Bundle(adf=dataset2d, peaks=vector, note="IM689")
+        bundle.save("data.zip")
+        b = load("data.zip"); b.adf, b.peaks
+
+    Parameters
+    ----------
+    **objects
+        Objects to store, keyed by attribute name. Names must not shadow an
+        existing attribute or method of the class (e.g. ``save``).
+
+    Raises
+    ------
+    ValueError
+        If a name shadows a class attribute or method.
+    """
+
+    def __init__(self, **objects):
+        reserved = sorted(name for name in objects if hasattr(type(self), name))
+        if reserved:
+            raise ValueError(
+                f"Bundle names {reserved} shadow Bundle/AutoSerialize attributes; "
+                "choose different names."
+            )
+        for name, obj in objects.items():
+            setattr(self, name, obj)
+
+    def __repr__(self) -> str:
+        items = ", ".join(
+            f"{k}: {type(v).__name__}" for k, v in vars(self).items() if not k.startswith("_")
+        )
+        return f"Bundle({items})"

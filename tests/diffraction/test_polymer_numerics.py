@@ -2,6 +2,7 @@ import numpy as np
 
 from quantem.diffraction.peak_detection import detect_blobs
 from quantem.diffraction.polar_transform import polar_transform
+from quantem.diffraction.polymer_polar import as_dataset4dstem
 from quantem.diffraction.polymer_utils import parse_reciprocal_units
 
 
@@ -22,8 +23,8 @@ def test_polar_transform_orientation_and_shape():
     data = np.zeros((1, 1, 15, 15), dtype=np.float32)
     data[0, 0, 7, 11] = 1.0
     polar = polar_transform(
-        data, origin_array=np.array([7.0, 7.0]), num_annular_bins=8,
-        radial_min=0, radial_max=7, radial_step=1, device="cpu", show_progress=False,
-    )
-    assert polar.array.shape == (1, 1, 8, 7)
-    assert np.unravel_index(np.argmax(polar.array[0, 0]), (8, 7)) == (0, 4)
+        as_dataset4dstem(data), origin_array=np.array([7.0, 7.0]), num_annular_bins=8,
+        radial_min=0, radial_max=7, radial_step=1, device="cpu",
+    ).numpy()
+    assert polar.shape == (1, 1, 8, 7)
+    assert np.unravel_index(np.argmax(polar[0, 0]), (8, 7)) == (0, 4)
