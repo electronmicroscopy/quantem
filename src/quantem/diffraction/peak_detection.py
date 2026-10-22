@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import find_peaks, peak_widths
 from scipy.ndimage import gaussian_filter1d
