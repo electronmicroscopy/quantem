@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
-import json
 import os
-from pathlib import Path
 import tempfile
+from dataclasses import dataclass
+from math import floor
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 from quantem.core import config
-from math import floor
-
 from quantem.core.ml.activation_functions import get_activation_function
 from quantem.core.ml.blocks import Conv2dBlock, Upsample2dBlock, complex_pool, passfunc
 

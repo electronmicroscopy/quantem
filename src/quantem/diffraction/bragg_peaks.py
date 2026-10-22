@@ -1,20 +1,71 @@
 # from collections.abc import Sequence
 import warnings
-import tempfile
+from pathlib import Path
 from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
-from numpy.typing import ArrayLike
-from scipy.ndimage import gaussian_filter, map_coordinates, label
-from tqdm import tqdm
 import torch
-from quantem.core.datastructures.dataset3d import Dataset3d
+from IPython.display import display
+from ipywidgets import HBox, IntSlider, VBox, interactive_output
+from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from numpy.typing import ArrayLike
+from scipy.ndimage import gaussian_filter
+from tqdm import tqdm
+
+from quantem.core.datastructures import Vector
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.diffraction.ellipse_fitting import fit_ellipse_from_ridge, fit_ellipse_from_ring
+from quantem.diffraction.orientation_correlation import (
+    calculate_orientation_correlation as _calculate_orientation_correlation,
+)
+from quantem.diffraction.orientation_correlation import (
+    plot_orientation_correlation as _plot_orientation_correlation,
+)
+from quantem.diffraction.peak_detection import (
+    estimate_peak_windows as _estimate_peak_windows,
+)
+from quantem.diffraction.peak_detection import (
+    peaks_from_model_output as _peaks_from_model_output,
+)
+from quantem.diffraction.peak_detection import (
+    resize_images_for_model as _resize_images_for_model,
+)
+from quantem.diffraction.peak_visualization import (
+    _intensity_display_limits,
+    _normalized_dp,
+    _resolve_intensity_map,
+)
+from quantem.diffraction.peak_visualization import (
+    peak_radial_count_plot as _peak_radial_count_plot,
+)
+from quantem.diffraction.peak_visualization import (
+    peak_radial_intensity_plot as _peak_radial_intensity_plot,
+)
+from quantem.diffraction.peak_visualization import (
+    plot_interactive_image_map as _plot_interactive_image_map,
+)
+from quantem.diffraction.peak_visualization import (
+    plot_peak_count_map as _plot_peak_count_map,
+)
+from quantem.diffraction.peak_visualization import (
+    plot_peak_histogram_map as _plot_peak_histogram_map,
+)
+from quantem.diffraction.peak_visualization import (
+    save_diffraction_figures as _save_diffraction_figures,
+)
+from quantem.diffraction.peak_visualization import (
+    visualize_peak_detection as _visualize_peak_detection,
+)
+from quantem.diffraction.peak_visualization import (
+    visualize_selected_patterns as _visualize_selected_patterns,
+)
+from quantem.diffraction.polar_transform import polar_transform as karen_polar_transform
 from quantem.diffraction.polymer_models import (
     PAPER_MODEL_ID,
-    PAPER_MODEL_VERSION,
     MultiChannelCNN2d,
     build_polymer_model,
     resolve_polymer_model,
@@ -24,72 +75,43 @@ from quantem.diffraction.polymer_normalization import (
     NormalizationStrategy,
     resolve_normalization_strategy,
 )
-from quantem.core.datastructures import Vector
-from quantem.core.visualization import show_2d
-from quantem.diffraction.polar_transform import polar_transform as karen_polar_transform
+from quantem.diffraction.polymer_orientation import (
+    _get_intensity,
+    _set_intensity,
+)
+from quantem.diffraction.polymer_orientation import (
+    make_flowline_combined_image as _make_flowline_combined_image,
+)
+from quantem.diffraction.polymer_orientation import (
+    make_flowline_map as _make_flowline_map,
+)
+from quantem.diffraction.polymer_orientation import (
+    make_flowline_rainbow_image as _make_flowline_rainbow_image,
+)
+from quantem.diffraction.polymer_orientation import (
+    make_flowline_rainbow_legend as _make_flowline_rainbow_legend,
+)
+from quantem.diffraction.polymer_orientation import (
+    make_orientation_histogram as _make_orientation_histogram,
+)
 from quantem.diffraction.polymer_polar import (
     as_dataset4dstem,
     centered_dp_mean,
     find_central_beams_4d,
     fit_origin_roi,
-    find_origin as find_origin_angular_uniformity,
+)
+from quantem.diffraction.polymer_polar import (
     polar_transform_peaks as karen_polar_transform_peaks,
 )
-from quantem.diffraction.ellipse_fitting import fit_ellipse_from_ridge, fit_ellipse_from_ring
-from quantem.diffraction.scan_mask_editor import ScanMaskEditor
-from quantem.diffraction.peak_detection import (
-    detect_blobs,
-    find_central_beam_from_peaks,
-    estimate_peak_windows as _estimate_peak_windows,
-    peaks_from_model_output as _peaks_from_model_output,
-    resize_images_for_model as _resize_images_for_model,
-)
-from quantem.diffraction.peak_visualization import (
-    _intensity_display_limits,
-    _normalized_dp,
-    _resolve_intensity_map,
-    peak_radial_count_plot as _peak_radial_count_plot,
-    peak_radial_intensity_plot as _peak_radial_intensity_plot,
-    plot_interactive_image_map as _plot_interactive_image_map,
-    plot_peak_count_map as _plot_peak_count_map,
-    plot_peak_histogram_map as _plot_peak_histogram_map,
-    save_diffraction_figures as _save_diffraction_figures,
-    visualize_peak_detection as _visualize_peak_detection,
-    visualize_selected_patterns as _visualize_selected_patterns,
-)
-from quantem.diffraction.vector_fields import (
-    vector_field_cell as _vector_field_cell,
-    vector_field_flat as _vector_field_flat,
-)
-from quantem.diffraction.polymer_orientation import (
-    _get_intensity,
-    _set_intensity,
-    make_flowline_combined_image as _make_flowline_combined_image,
-    make_flowline_map as _make_flowline_map,
-    make_flowline_rainbow_image as _make_flowline_rainbow_image,
-    make_flowline_rainbow_legend as _make_flowline_rainbow_legend,
-    make_orientation_histogram as _make_orientation_histogram,
-)
-from quantem.diffraction.orientation_correlation import (
-    calculate_orientation_correlation as _calculate_orientation_correlation,
-    plot_orientation_correlation as _plot_orientation_correlation,
-)
-from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.polymer_utils import (
     import_show_polymer_4dstem,
     parse_reciprocal_units,
     sample_average_from_image,
 )
-from emdfile import tqdmnd
-from scipy.ndimage import gaussian_filter1d
-from scipy.signal import find_peaks, peak_widths
-import ipywidgets as widgets
-from ipywidgets import IntSlider, Button, HBox, VBox, interactive_output
-from IPython.display import clear_output, display
-from pathlib import Path
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from matplotlib.patches import Ellipse, Rectangle
-from matplotlib.colors import BoundaryNorm, hsv_to_rgb, rgb_to_hsv
+from quantem.diffraction.scan_mask_editor import ScanMaskEditor
+from quantem.diffraction.vector_fields import (
+    vector_field_cell as _vector_field_cell,
+)
 
 
 def _apply_zoom_crop(data, zoom_factor, center=None):
@@ -1533,7 +1555,6 @@ class BraggPeaksPolymer(AutoSerialize):
             explicit warning is emitted. Ignored for reciprocal-length calibration.
         """
         Ry, Rx, Qy, Qx = self.dataset_cartesian.shape
-        total_positions = Ry * Rx
 
         # Resolve this once per run, both to avoid repeated unit parsing and to retain
         # the selected voltage for later polar-coordinate operations.
@@ -2423,7 +2444,7 @@ class BraggPeaksPolymer(AutoSerialize):
                 center,
             )
 
-            im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
+            ax2.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
             ax2.set_xticks([])
             ax2.set_yticks([])
                 
@@ -2450,8 +2471,7 @@ class BraggPeaksPolymer(AutoSerialize):
             
             # Polar transform
             if show_polar:
-                im3 = ax3.imshow(im_polar_data, 
-                                cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+                ax3.imshow(im_polar_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
                 # ax3.set_aspect('equal', adjustable='box')                
                 ax3.set_xlabel('Radius (bins)')
                 ax3.set_ylabel('Theta (bins)')
@@ -2654,7 +2674,7 @@ class BraggPeaksPolymer(AutoSerialize):
         # Save diffraction pattern with peaks
         if save_diffraction:
             fig_diff, ax = plt.subplots(figsize=figsize_individual)
-            im = ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
+            ax.imshow(dp_data, cmap=dp_cmap, vmax=vmax_cartesian, vmin=vmin_cartesian)
             ax.set_xticks([])
             ax.set_yticks([])
             if peaks_x is not None:
@@ -2669,7 +2689,7 @@ class BraggPeaksPolymer(AutoSerialize):
         # Save polar transform with peaks
         if show_polar:
             fig_polar, ax = plt.subplots(figsize=figsize_individual)
-            im = ax.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+            ax.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
             ax.set_title(f'Polar (Ry={ry}, Rx={rx})')
             ax.set_xlabel('Radius (bins)')
             ax.set_ylabel('Theta (bins)')

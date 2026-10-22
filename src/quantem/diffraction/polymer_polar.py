@@ -23,7 +23,6 @@ from quantem.diffraction.polar_transform import (
     polar_transform,
 )
 
-
 OriginMethod = Literal["descent", "grid"]
 
 __all__ = [

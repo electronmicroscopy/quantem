@@ -12,14 +12,12 @@ it is bound to the analysis whose mask it edits.
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
-from ipywidgets import Button, HBox, VBox
 from IPython.display import clear_output, display
 from matplotlib.patches import Ellipse, Rectangle
 

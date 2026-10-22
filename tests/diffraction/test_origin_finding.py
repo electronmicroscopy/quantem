@@ -1,14 +1,15 @@
+import ipywidgets
+import matplotlib
 import numpy as np
 import pytest
-import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from quantem.core.datastructures import Vector
-from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 import quantem.diffraction.bragg_peaks as bragg_peaks_module
 import quantem.diffraction.peak_visualization as peak_visualization_module
+from quantem.core.datastructures import Vector
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.diffraction.bragg_peaks import (
     BraggPeaksPolymer,
     _central_peak_index,
@@ -337,7 +338,7 @@ def test_bragg_plotting_and_save_smoke(monkeypatch, tmp_path):
 
     def fake_interactive_output(fn, controls):
         fn(**{name: widget.value for name, widget in controls.items()})
-        return bragg_peaks_module.widgets.Output()
+        return ipywidgets.Output()
 
     for module in (bragg_peaks_module, peak_visualization_module):
         monkeypatch.setattr(module, "interactive_output", fake_interactive_output, raising=False)

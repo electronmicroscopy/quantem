@@ -30,7 +30,6 @@ from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Ellipse
-from numpy.typing import NDArray
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import least_squares
 from scipy.signal import find_peaks
@@ -499,7 +498,6 @@ def fit_ellipse_from_ridge(
     least squares. Fits are accepted only when held-out azimuthal sectors improve
     over an independently refined circle.
     """
-    from scipy.optimize import least_squares
 
     dp = np.asarray(dp, dtype=float)
     origin = np.asarray(center, dtype=float)

@@ -6,8 +6,7 @@ import numpy as np
 import pytest
 
 from quantem.core.datastructures import Vector
-from quantem.diffraction import (IceFlaggerParams, detect_ice,
-                                 measure_peak_widths, sharpness_mask)
+from quantem.diffraction import IceFlaggerParams, detect_ice, measure_peak_widths, sharpness_mask
 
 FOLD = {"theta_period_deg": 180.0}
 

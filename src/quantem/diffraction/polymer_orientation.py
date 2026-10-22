@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
+from emdfile import tqdmnd
 from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
 from scipy.ndimage import gaussian_filter1d
-
-from emdfile import tqdmnd
 
 from quantem.diffraction.vector_fields import vector_field_cell
 
@@ -449,13 +448,6 @@ def make_flowline_map(
     # coordinates
     theta = np.linspace(0, np.pi, orient_hist.shape[3], endpoint=False)
     dtheta = theta[1] - theta[0]
-    size_3D = np.array(
-        [
-            orient_hist.shape[1],
-            orient_hist.shape[2],
-            orient_hist.shape[3],
-        ]
-    )
 
     # initialize weighting array
     vx = np.arange(-np.ceil(2 * sigma_x), np.ceil(2 * sigma_x) + 1)

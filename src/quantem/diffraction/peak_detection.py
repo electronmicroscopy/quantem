@@ -1,18 +1,21 @@
-import torch
-import torch.nn.functional as F
+
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+from scipy.ndimage import (
+    gaussian_filter,
+    gaussian_filter1d,
+    grey_dilation,
+    map_coordinates,
+    maximum_filter,
+)
 from scipy.signal import find_peaks, peak_widths
-from scipy.ndimage import gaussian_filter1d
+from scipy.spatial import cKDTree
+from tqdm import tqdm
 
+from quantem.core.datastructures import Vector
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.diffraction.vector_fields import vector_field_flat
-from scipy.ndimage import map_coordinates
-from tqdm import tqdm
-from typing import List, Tuple
-from scipy.spatial import cKDTree
-from scipy.ndimage import gaussian_filter, maximum_filter, grey_dilation, map_coordinates
-from quantem.core.datastructures import Vector
 
 
 def visualize_blobs(image: np.ndarray, blobs: np.ndarray):
@@ -490,7 +493,7 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
     
     if debug:
         print(f"\n{'='*60}")
-        print(f"DEBUG: Central Beam Detection")
+        print("DEBUG: Central Beam Detection")
         print(f"{'='*60}")
         print(f"Number of peaks detected: {len(peak_coords)}")
         print(f"Image shape: {image_shape}")
@@ -498,7 +501,7 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
         print(f"Intensity source: {intensity_source}")
         print(f"Intensity threshold: {intensity_threshold}")
         print(f"Distance weight: {distance_weight}")
-        print(f"\nAll peaks:")
+        print("\nAll peaks:")
         for i, (coord, intensity, intensity_norm) in enumerate(zip(peak_coords, intensities_to_use, intensities_norm)):
             print(f"  Peak {i}: coord=({coord[0]:.2f}, {coord[1]:.2f}), "
                   f"intensity={intensity:.4f}, normalized={intensity_norm:.4f}")
@@ -532,7 +535,7 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
     )
     
     if debug:
-        print(f"\nDistances from center:")
+        print("\nDistances from center:")
         for i, dist in enumerate(distances):
             print(f"  Peak {i}: {dist:.2f} pixels")
     
@@ -543,7 +546,7 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
         distances_norm = distances
     
     if debug:
-        print(f"\nNormalized values:")
+        print("\nNormalized values:")
         print(f"  Distance range: [{np.min(distances_norm):.3f}, {np.max(distances_norm):.3f}]")
         print(f"  Intensity range: [{np.min(filtered_intensities_norm):.3f}, {np.max(filtered_intensities_norm):.3f}]")
     
@@ -552,7 +555,7 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
     scores = (1 - filtered_intensities_norm) * (1 - distance_weight) + distances_norm * distance_weight
     
     if debug:
-        print(f"\nScores (lower is better):")
+        print("\nScores (lower is better):")
         print(f"  Formula: (1 - intensity_norm) * {1-distance_weight:.2f} + distance_norm * {distance_weight:.2f}")
         for i, score in enumerate(scores):
             print(f"  Peak {i}: score={score:.4f} "
@@ -569,7 +572,7 @@ def find_central_beam_from_peaks(peak_coords, peak_intensities, image_shape,
     
     if debug:
         print(f"\n{'='*60}")
-        print(f"SELECTED CENTRAL BEAM:")
+        print("SELECTED CENTRAL BEAM:")
         print(f"  Peak index (filtered): {best_idx}")
         print(f"  Peak index (original): {original_best_idx}")
         print(f"  Coordinates: ({central_beam_coords[0]:.2f}, {central_beam_coords[1]:.2f})")
@@ -868,7 +871,7 @@ def peaks_from_model_output(position_map, intensity_map, sigma=1.0, threshold=0.
 
         # Peak positions with color representing intensity
         fig, ax = plt.subplots(figsize=(10, 8))
-        im = ax.imshow(position_map, cmap='gray', alpha=0.8)
+        ax.imshow(position_map, cmap='gray', alpha=0.8)
         scatter = ax.scatter(
             peak_coords[:, 1],  # x coordinates
             peak_coords[:, 0],  # y coordinates
@@ -1047,7 +1050,10 @@ def estimate_peak_windows(
     
     # Print summary
     print(f"Detected {len(peak_centers)} peaks:")
-    _to_d = lambda q: (1.0 / q if q > 0 else float('inf'))  # d-spacing (Å) = 1 / q (1/Å)
+
+    def _to_d(q):  # d-spacing (Å) = 1 / q (1/Å)
+        return 1.0 / q if q > 0 else float('inf')
+
     for i, (center, window, height, prom, width) in enumerate(zip(
         peak_centers, peak_windows, peak_info['heights'],
         peak_info['prominences'], peak_info['widths_fwhm']

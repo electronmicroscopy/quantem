@@ -6,9 +6,9 @@ from collections.abc import Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
 import torch
 from scipy import fft as scipy_fft
+from scipy.ndimage import gaussian_filter1d
 from tqdm.auto import tqdm
 
 

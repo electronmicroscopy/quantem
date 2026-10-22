@@ -11,14 +11,11 @@ peak vectors they draw rather than an analysis object, so they work for any
 
 from __future__ import annotations
 
-import os
-
 import matplotlib.pyplot as plt
 import numpy as np
-from ipywidgets import HBox, IntSlider, VBox, interactive_output
 from IPython.display import clear_output, display
-from matplotlib.colors import BoundaryNorm, ListedColormap
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+from ipywidgets import HBox, IntSlider, VBox, interactive_output
+from matplotlib.colors import BoundaryNorm
 from scipy.ndimage import gaussian_filter
 
 from quantem.diffraction.vector_fields import vector_field_cell, vector_field_flat
@@ -753,14 +750,14 @@ def plot_interactive_image_map(
     ax_map.set_title(map_title)
     ax_map.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
     ax_map.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-    cbar_map = plt.colorbar(im_map, ax=ax_map)
+    plt.colorbar(im_map, ax=ax_map)
     
     # Diffraction pattern (initialize with zeros)
     im_diff = ax_diff.imshow(np.zeros((10, 10)), cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
     ax_diff.set_title('Diffraction Pattern')
     ax_diff.set_xticks([])
     ax_diff.set_yticks([])
-    cbar_diff = plt.colorbar(im_diff, ax=ax_diff)
+    plt.colorbar(im_diff, ax=ax_diff)
     
     # Polar transform
     if show_polar:
@@ -769,7 +766,7 @@ def plot_interactive_image_map(
         ax_polar.set_title('Polar Transform')
         ax_polar.set_xlabel('Radius (bins)')
         ax_polar.set_ylabel('Theta (bins)')
-        cbar_polar = plt.colorbar(im_polar, ax=ax_polar)
+        plt.colorbar(im_polar, ax=ax_polar)
     
     plt.tight_layout()
     plt.close(fig)
@@ -911,9 +908,9 @@ def save_diffraction_figures(
             figsize_individual = (6, 6)
         fig_map, ax = plt.subplots(figsize=figsize_individual)
         if vmin_intensity_map is None:
-            im = ax.imshow(intensity_map, cmap=map_cmap)
+            ax.imshow(intensity_map, cmap=map_cmap)
         else:
-            im = ax.imshow(intensity_map, cmap=map_cmap, 
+            ax.imshow(intensity_map, cmap=map_cmap, 
                           vmin=vmin_intensity_map, vmax=vmax_intensity_map)
         ax.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
         ax.set_title(map_title)
@@ -939,7 +936,7 @@ def save_diffraction_figures(
             if show_polar:
                 polar_im_data = gaussian_filter(polar_im_data, gaussian_filter_sigma)
         
-        im = ax.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+        ax.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
         ax.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
         ax.set_xticks([])
         ax.set_yticks([])
@@ -951,7 +948,7 @@ def save_diffraction_figures(
         # Save polar transform
         if show_polar:
             fig_polar, ax = plt.subplots(figsize=figsize_individual)
-            im = ax.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
+            ax.imshow(polar_im_data, cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
             # ax.set_aspect('equal', adjustable='box')
             ax.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
             ax.set_xlabel('Radius (bins)')
@@ -968,15 +965,15 @@ def save_diffraction_figures(
             fig_combined, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=figsize_combined)
         else:
             if figsize_combined is None:
-                figszie_combined = (12, 5)
+                figsize_combined = (12, 5)
             fig_combined, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize_combined)
             ax3 = None
         
         # Plot intensity map
         if vmin_intensity_map is None:
-            im1 = ax1.imshow(intensity_map, cmap=map_cmap)
+            ax1.imshow(intensity_map, cmap=map_cmap)
         else:
-            im1 = ax1.imshow(intensity_map, cmap=map_cmap, 
+            ax1.imshow(intensity_map, cmap=map_cmap, 
                             vmin=vmin_intensity_map, vmax=vmax_intensity_map)
         ax1.plot(marker_rx, marker_ry, color=crosshair_color, marker='+', markersize=crosshair_size, markeredgewidth=crosshair_width)
         ax1.set_title(map_title)
@@ -984,14 +981,14 @@ def save_diffraction_figures(
         ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
         
         # Plot diffraction pattern
-        im2 = ax2.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
+        ax2.imshow(dp_data, cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian)
         ax2.set_title(f'Diffraction Pattern (Ry={ry}, Rx={rx})')
         ax2.set_xticks([])
         ax2.set_yticks([])
         
         # Plot polar transform
         if show_polar:
-            im3 = ax3.imshow(polar_im_data, 
+            ax3.imshow(polar_im_data, 
                             cmap=dp_cmap, vmax=vmax_polar, aspect='auto')
             # ax3.set_aspect('equal', adjustable='box')
             ax3.set_title(f'Polar Transform (Ry={ry}, Rx={rx})')
