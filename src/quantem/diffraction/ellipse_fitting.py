@@ -185,45 +185,29 @@ def fit_ellipse_from_ring(
         i0 = int(r_exclude / radial_step)
         search_profile = radial_profile.copy()
         search_profile[:i0] = np.min(search_profile)
-        prominence_floor = max(
-            1e-9, 0.03 * float(np.ptp(search_profile[i0:]))
-        )
+        prominence_floor = max(1e-9, 0.03 * float(np.ptp(search_profile[i0:])))
         peak_indices, properties = find_peaks(
             search_profile,
             prominence=prominence_floor,
             distance=max(3, int(round(6.0 / radial_step))),
         )
-        valid = (
-            (peak_indices >= i0)
-            & (r_axis[peak_indices] <= 0.92 * r_hi)
-        )
+        valid = (peak_indices >= i0) & (r_axis[peak_indices] <= 0.92 * r_hi)
         peak_indices = peak_indices[valid]
         prominences = properties["prominences"][valid]
         if not peak_indices.size:
-            peak_indices = np.asarray(
-                [i0 + int(np.argmax(search_profile[i0:]))]
-            )
+            peak_indices = np.asarray([i0 + int(np.argmax(search_profile[i0:]))])
             prominences = np.asarray([1.0])
         order = np.argsort(prominences)[::-1][:max_ring_candidates]
         for index in peak_indices[order]:
             r0 = float(r_axis[index])
             half = max(6.0, 0.20 * r0)
-            band_min = (
-                max(r_exclude, r0 - half)
-                if radial_min is None
-                else float(radial_min)
-            )
-            band_max = (
-                min(r_hi, r0 + half)
-                if radial_max is None
-                else float(radial_max)
-            )
+            band_min = max(r_exclude, r0 - half) if radial_min is None else float(radial_min)
+            band_max = min(r_hi, r0 + half) if radial_max is None else float(radial_max)
             if band_max > band_min:
                 candidate_bands.append((band_min, band_max, r0))
     else:
         candidate_bands.append(
-            (float(radial_min), float(radial_max),
-             0.5 * (float(radial_min) + float(radial_max)))
+            (float(radial_min), float(radial_max), 0.5 * (float(radial_min) + float(radial_max)))
         )
 
     # Deduplicate overlapping candidates created by broad/shouldered peaks.
@@ -237,18 +221,14 @@ def fit_ellipse_from_ring(
     validation_angles = ~fit_angles
 
     def _robust_score(ellipse_params, band, angle_mask):
-        polar = _polar(
-            fit_dp, ellipse_params, band[0], band[1]
-        )[angle_mask]
+        polar = _polar(fit_dp, ellipse_params, band[0], band[1])[angle_mask]
         if not polar.size:
             return np.inf
         # Per-radius clipping removes angularly isolated hot pixels. Per-angle
         # normalisation then scores radial alignment rather than polymer texture.
         upper = np.percentile(polar, 90.0, axis=0, keepdims=True)
         polar = np.minimum(polar, upper)
-        polar = polar - np.percentile(
-            polar, 10.0, axis=1, keepdims=True
-        )
+        polar = polar - np.percentile(polar, 10.0, axis=1, keepdims=True)
         polar = np.clip(polar, 0.0, None)
         scale = np.percentile(polar, 90.0, axis=1, keepdims=True)
         valid_scale = scale[:, 0] > 1e-9
@@ -257,22 +237,16 @@ def fit_ellipse_from_ring(
         polar = polar[valid_scale] / (scale[valid_scale] + 1e-9)
         reference = np.median(polar, axis=0)
         return float(
-            np.median(np.abs(polar - reference), axis=0).sum()
-            / (np.abs(reference).sum() + 1e-9)
+            np.median(np.abs(polar - reference), axis=0).sum() / (np.abs(reference).sum() + 1e-9)
         )
 
     def _raw_score(ellipse_params, band):
         polar = _polar(dp, ellipse_params, band[0], band[1])
-        return float(
-            polar.std(axis=0).sum()
-            / (np.abs(polar.mean(axis=0)).sum() + 1e-6)
-        )
+        return float(polar.std(axis=0).sum() / (np.abs(polar.mean(axis=0)).sum() + 1e-6))
 
     def _angular_coverage(ellipse_params, band):
         polar = _polar(fit_dp, ellipse_params, band[0], band[1])
-        contrast = np.percentile(polar, 95.0, axis=1) - np.percentile(
-            polar, 20.0, axis=1
-        )
+        contrast = np.percentile(polar, 95.0, axis=1) - np.percentile(polar, 20.0, axis=1)
         reference = np.percentile(contrast, 90.0)
         if not np.isfinite(reference) or reference <= 1e-9:
             return 0.0
@@ -282,9 +256,7 @@ def fit_ellipse_from_ring(
         best = (np.inf, 1.0, 0.0)
         for th in thetas:
             for rat in ratios:
-                s = _robust_score(
-                    (1.0, float(rat), float(th)), band, fit_angles
-                )
+                s = _robust_score((1.0, float(rat), float(th)), band, fit_angles)
                 if s < best[0]:
                     best = (s, float(rat), float(th))
         return best
@@ -294,35 +266,26 @@ def fit_ellipse_from_ring(
     coarse_ratios = np.linspace(ratio_range[0], ratio_range[1], n_ratio)
     coarse_thetas = np.linspace(0.0, 180.0, n_theta, endpoint=False)
     diagnostics = []
-    ratio_step = (
-        (ratio_range[1] - ratio_range[0]) / max(n_ratio - 1, 1)
-    )
+    ratio_step = (ratio_range[1] - ratio_range[0]) / max(n_ratio - 1, 1)
     for band in candidate_bands:
         best = _search(coarse_ratios, coarse_thetas, band)
         if refine:
             _, rat0, th0 = best
             dth = 180.0 / n_theta
-            fine_ratios = np.unique(np.clip(
-                np.linspace(rat0 - ratio_step, rat0 + ratio_step, 11),
-                ratio_range[0],
-                ratio_range[1],
-            ))
-            fine_thetas = (
-                np.linspace(th0 - dth, th0 + dth, 11) % 180.0
+            fine_ratios = np.unique(
+                np.clip(
+                    np.linspace(rat0 - ratio_step, rat0 + ratio_step, 11),
+                    ratio_range[0],
+                    ratio_range[1],
+                )
             )
+            fine_thetas = np.linspace(th0 - dth, th0 + dth, 11) % 180.0
             fine = _search(fine_ratios, fine_thetas, band)
             best = min(best, fine, key=lambda item: item[0])
         fit_score, ratio, theta = best
-        circle_validation = _robust_score(
-            (1.0, 1.0, 0.0), band, validation_angles
-        )
-        ellipse_validation = _robust_score(
-            (1.0, ratio, theta), band, validation_angles
-        )
-        improvement = (
-            (circle_validation - ellipse_validation)
-            / max(abs(circle_validation), 1e-9)
-        )
+        circle_validation = _robust_score((1.0, 1.0, 0.0), band, validation_angles)
+        ellipse_validation = _robust_score((1.0, ratio, theta), band, validation_angles)
+        improvement = (circle_validation - ellipse_validation) / max(abs(circle_validation), 1e-9)
         raw_score = _raw_score((1.0, ratio, theta), band)
         coverage = _angular_coverage((1.0, ratio, theta), band)
         boundary_limited = (
@@ -336,18 +299,20 @@ def fit_ellipse_from_ring(
             and coverage >= min_angular_coverage
             and not boundary_limited
         )
-        diagnostics.append({
-            "band": (float(band[0]), float(band[1])),
-            "r0": float(band[2]),
-            "ratio_b_over_a": float(ratio),
-            "theta_deg": float(theta % 180.0),
-            "fit_score": float(fit_score),
-            "raw_score": float(raw_score),
-            "validation_improvement": float(improvement),
-            "angular_coverage": float(coverage),
-            "boundary_limited": bool(boundary_limited),
-            "accepted": bool(accepted),
-        })
+        diagnostics.append(
+            {
+                "band": (float(band[0]), float(band[1])),
+                "r0": float(band[2]),
+                "ratio_b_over_a": float(ratio),
+                "theta_deg": float(theta % 180.0),
+                "fit_score": float(fit_score),
+                "raw_score": float(raw_score),
+                "validation_improvement": float(improvement),
+                "angular_coverage": float(coverage),
+                "boundary_limited": bool(boundary_limited),
+                "accepted": bool(accepted),
+            }
+        )
 
     accepted_candidates = [item for item in diagnostics if item["accepted"]]
     if accepted_candidates:
@@ -407,25 +372,18 @@ def fit_ellipse_from_ring(
         if selected["boundary_limited"]:
             reasons.append("ratio search boundary")
         if selected["validation_improvement"] < min_fit_improvement:
-            reasons.append(
-                f"held-out improvement {selected['validation_improvement']:.3g}"
-            )
+            reasons.append(f"held-out improvement {selected['validation_improvement']:.3g}")
         if selected["raw_score"] > max_fit_score:
             reasons.append(f"raw score {selected['raw_score']:.3g}")
         if selected["angular_coverage"] < min_angular_coverage:
-            reasons.append(
-                f"angular coverage {selected['angular_coverage']:.1%}"
-            )
-        message = (
-            "Ellipse fit rejected; using a circular correction"
-            + (f" ({', '.join(reasons)})." if reasons else ".")
+            reasons.append(f"angular coverage {selected['angular_coverage']:.1%}")
+        message = "Ellipse fit rejected; using a circular correction" + (
+            f" ({', '.join(reasons)})." if reasons else "."
         )
         diagnostics["rejection_reasons"] = reasons
         warnings.warn(message, RuntimeWarning, stacklevel=2)
     if verbose:
-        bands_text = ", ".join(
-            f"{item['r0']:.1f}" for item in diagnostics
-        )
+        bands_text = ", ".join(f"{item['r0']:.1f}" for item in diagnostics)
         print(
             f"  ellipse ring candidates: r0=[{bands_text}] px; "
             f"selected band=[{radial_min:.1f}, {radial_max:.1f}] px"
@@ -442,9 +400,7 @@ def fit_ellipse_from_ring(
         import matplotlib.pyplot as plt
 
         circ = _polar(dp, (1.0, 1.0, 0.0), radial_min, radial_max)
-        corr = _polar(
-            dp, (a_axis, b_axis, theta_deg), radial_min, radial_max
-        )
+        corr = _polar(dp, (a_axis, b_axis, theta_deg), radial_min, radial_max)
         fig, axes = plt.subplots(1, 3, figsize=(13, 4))
         axes[0].imshow(dp, cmap="magma")
         axes[0].plot([origin[1]], [origin[0]], "c+", ms=10)
@@ -452,7 +408,9 @@ def fit_ellipse_from_ring(
         axes[1].imshow(circ, aspect="auto", cmap="magma")
         axes[1].set_title("polar: circular (before)")
         axes[2].imshow(corr, aspect="auto", cmap="magma")
-        axes[2].set_title(f"polar: ellipse-corrected\na/b={a_axis / b_axis:.4f}, θ={theta_deg:.1f}°")
+        axes[2].set_title(
+            f"polar: ellipse-corrected\na/b={a_axis / b_axis:.4f}, θ={theta_deg:.1f}°"
+        )
         for ax in axes[1:]:
             ax.set_xlabel("radius (band)")
             ax.set_ylabel("φ bin")
@@ -527,11 +485,13 @@ def fit_ellipse_from_ridge(
     # disappear in the median rather than becoming the selected calibration ring.
     explicit_band = radial_min is not None and radial_max is not None
     if explicit_band:
-        bands = [(
-            float(radial_min),
-            float(radial_max),
-            0.5 * (float(radial_min) + float(radial_max)),
-        )]
+        bands = [
+            (
+                float(radial_min),
+                float(radial_max),
+                0.5 * (float(radial_min) + float(radial_max)),
+            )
+        ]
     else:
         full = polar_at(fit_dp, origin, 0.0, r_hi)
         profile = gaussian_filter1d(np.median(full, axis=0), 2.0)
@@ -544,9 +504,7 @@ def fit_ellipse_from_ridge(
             prominence=prominence,
             distance=max(3, int(round(6.0 / radial_step))),
         )
-        valid_peaks = (
-            (indices >= start) & (r_axis[indices] <= 0.92 * r_hi)
-        )
+        valid_peaks = (indices >= start) & (r_axis[indices] <= 0.92 * r_hi)
         indices = indices[valid_peaks]
         prominences = properties["prominences"][valid_peaks]
         if not indices.size:
@@ -564,20 +522,20 @@ def fit_ellipse_from_ridge(
         if not bands:
             fallback_r0 = float(np.clip(r_axis[start], exclude, 0.92 * r_hi))
             fallback_half = max(6.0, 0.20 * fallback_r0)
-            bands = [(
-                max(exclude, fallback_r0 - fallback_half),
-                min(r_hi, fallback_r0 + fallback_half),
-                fallback_r0,
-            )]
+            bands = [
+                (
+                    max(exclude, fallback_r0 - fallback_half),
+                    min(r_hi, fallback_r0 + fallback_half),
+                    fallback_r0,
+                )
+            ]
 
     phi = np.linspace(0.0, 2.0 * np.pi, num_annular_bins, endpoint=False)
     block_fit = (np.arange(num_annular_bins) // 6) % 2 == 0
 
     def extract_ridge(band):
         polar = polar_at(fit_dp, origin, band[0], band[1])
-        polar = np.minimum(
-            polar, np.percentile(polar, 90.0, axis=0, keepdims=True)
-        )
+        polar = np.minimum(polar, np.percentile(polar, 90.0, axis=0, keepdims=True))
         smooth = gaussian_filter1d(polar, 1.25, axis=1, mode="nearest")
         baseline = np.percentile(smooth, 20.0, axis=1, keepdims=True)
         signal = np.clip(smooth - baseline, 0.0, None)
@@ -594,21 +552,20 @@ def fit_ellipse_from_ridge(
                 if weights.sum() > 1e-12
                 else float(peak_index[index])
             )
-            noise = (
-                1.4826 * np.median(np.abs(np.diff(smooth[index])))
-                + 1e-9
-            )
+            noise = 1.4826 * np.median(np.abs(np.diff(smooth[index]))) + 1e-9
             confidence[index] = signal[index, peak_index[index]] / noise
         ridge = band[0] + ridge * radial_step
         valid = np.isfinite(ridge) & (confidence >= 2.0)
         if np.count_nonzero(valid) >= 12:
-            design = np.column_stack([
-                np.ones(num_annular_bins),
-                np.cos(phi),
-                np.sin(phi),
-                np.cos(2 * phi),
-                np.sin(2 * phi),
-            ])
+            design = np.column_stack(
+                [
+                    np.ones(num_annular_bins),
+                    np.cos(phi),
+                    np.sin(phi),
+                    np.cos(2 * phi),
+                    np.sin(2 * phi),
+                ]
+            )
             weights = np.clip(confidence / 10.0, 0.05, 1.0)
             beta = np.zeros(5)
             for _ in range(5):
@@ -620,9 +577,7 @@ def fit_ellipse_from_ridge(
                     rcond=None,
                 )[0]
                 residual = ridge - design @ beta
-                scale = 1.4826 * np.median(
-                    np.abs(residual[use] - np.median(residual[use]))
-                ) + 1e-6
+                scale = 1.4826 * np.median(np.abs(residual[use] - np.median(residual[use]))) + 1e-6
                 robust = np.minimum(1.0, 1.5 * scale / (np.abs(residual) + 1e-9))
                 weights = np.clip(confidence / 10.0, 0.05, 1.0) * robust
             valid &= np.abs(ridge - design @ beta) <= max(3.0, 4.0 * scale)
@@ -638,32 +593,28 @@ def fit_ellipse_from_ridge(
         major = dx * cosine + dy * sine
         minor = -dx * sine + dy * cosine
         geometric = (
-            np.sqrt(
-                (major / axis_a) ** 2
-                + (minor / (axis_a * ratio)) ** 2
-            )
-            - 1.0
+            np.sqrt((major / axis_a) ** 2 + (minor / (axis_a * ratio)) ** 2) - 1.0
         ) * axis_a
         return geometric * np.sqrt(np.clip(weights, 1e-3, None))
 
     def circle_residual(parameters, x, y, weights):
         cy, cx, radius = parameters
-        return (
-            np.hypot(x - cx, y - cy) - radius
-        ) * np.sqrt(np.clip(weights, 1e-3, None))
+        return (np.hypot(x - cx, y - cy) - radius) * np.sqrt(np.clip(weights, 1e-3, None))
 
     evaluated = []
     for band in bands:
         ridge, confidence, valid, harmonic, weights = extract_ridge(band)
         coverage = float(np.mean(valid))
         if np.count_nonzero(valid) < 12:
-            evaluated.append({
-                "band": tuple(float(v) for v in band[:2]),
-                "r0": float(band[2]),
-                "accepted": False,
-                "angular_coverage": coverage,
-                "rejection_reasons": ["insufficient ridge points"],
-            })
+            evaluated.append(
+                {
+                    "band": tuple(float(v) for v in band[:2]),
+                    "r0": float(band[2]),
+                    "accepted": False,
+                    "angular_coverage": coverage,
+                    "rejection_reasons": ["insufficient ridge points"],
+                }
+            )
             continue
 
         x = origin[1] + ridge * np.cos(phi)
@@ -675,10 +626,12 @@ def fit_ellipse_from_ridge(
             validate = valid
 
         r0, c1, s1, c2, s2 = harmonic
-        center_initial = np.asarray([
-            origin[0] + np.clip(s1, -center_search_radius, center_search_radius),
-            origin[1] + np.clip(c1, -center_search_radius, center_search_radius),
-        ])
+        center_initial = np.asarray(
+            [
+                origin[0] + np.clip(s1, -center_search_radius, center_search_radius),
+                origin[1] + np.clip(c1, -center_search_radius, center_search_radius),
+            ]
+        )
         second = float(np.hypot(c2, s2))
         ratio_initial = np.clip(
             (max(r0, 1.0) - second) / (max(r0, 1.0) + second),
@@ -695,11 +648,10 @@ def fit_ellipse_from_ridge(
             circle_residual,
             [*center_initial, np.median(ridge[fit])],
             args=(x[fit], y[fit], weights[fit]),
-            bounds=([
-                center_low[0], center_low[1], axis_low
-            ], [
-                center_high[0], center_high[1], axis_high
-            ]),
+            bounds=(
+                [center_low[0], center_low[1], axis_low],
+                [center_high[0], center_high[1], axis_high],
+            ),
             loss="soft_l1",
             f_scale=1.0,
         )
@@ -712,33 +664,50 @@ def fit_ellipse_from_ridge(
                 theta_initial,
             ],
             args=(x[fit], y[fit], weights[fit]),
-            bounds=([
-                center_low[0], center_low[1], axis_low,
-                ratio_range[0], -np.pi,
-            ], [
-                center_high[0], center_high[1], axis_high,
-                ratio_range[1], np.pi,
-            ]),
+            bounds=(
+                [
+                    center_low[0],
+                    center_low[1],
+                    axis_low,
+                    ratio_range[0],
+                    -np.pi,
+                ],
+                [
+                    center_high[0],
+                    center_high[1],
+                    axis_high,
+                    ratio_range[1],
+                    np.pi,
+                ],
+            ),
             loss="soft_l1",
             f_scale=1.0,
         )
-        circle_validation = np.median(np.abs(circle_residual(
-            circle.x, x[validate], y[validate], np.ones(np.count_nonzero(validate))
-        )))
-        ellipse_validation = np.median(np.abs(ellipse_residual(
-            ellipse.x, x[validate], y[validate], np.ones(np.count_nonzero(validate))
-        )))
-        improvement = float(
-            (circle_validation - ellipse_validation)
-            / max(circle_validation, 1e-9)
+        circle_validation = np.median(
+            np.abs(
+                circle_residual(
+                    circle.x, x[validate], y[validate], np.ones(np.count_nonzero(validate))
+                )
+            )
         )
-        center_boundary = bool(np.any(
-            np.isclose(ellipse.x[:2], center_low, atol=0.05)
-            | np.isclose(ellipse.x[:2], center_high, atol=0.05)
-        ))
+        ellipse_validation = np.median(
+            np.abs(
+                ellipse_residual(
+                    ellipse.x, x[validate], y[validate], np.ones(np.count_nonzero(validate))
+                )
+            )
+        )
+        improvement = float(
+            (circle_validation - ellipse_validation) / max(circle_validation, 1e-9)
+        )
+        center_boundary = bool(
+            np.any(
+                np.isclose(ellipse.x[:2], center_low, atol=0.05)
+                | np.isclose(ellipse.x[:2], center_high, atol=0.05)
+            )
+        )
         ratio_boundary = bool(
-            ellipse.x[3] <= ratio_range[0] + 0.005
-            or ellipse.x[3] >= ratio_range[1] - 0.001
+            ellipse.x[3] <= ratio_range[0] + 0.005 or ellipse.x[3] >= ratio_range[1] - 0.001
         )
         reasons = []
         if coverage < min_angular_coverage:
@@ -746,9 +715,7 @@ def fit_ellipse_from_ridge(
         if improvement < min_validation_improvement:
             reasons.append(f"held-out improvement {improvement:.2%}")
         if ellipse_validation > max_validation_residual:
-            reasons.append(
-                f"held-out residual {ellipse_validation:.2f} px"
-            )
+            reasons.append(f"held-out residual {ellipse_validation:.2f} px")
         if center_boundary:
             reasons.append("center search boundary")
         if ratio_boundary:
@@ -758,51 +725,63 @@ def fit_ellipse_from_ridge(
                 ellipse_residual,
                 ellipse.x,
                 args=(x[valid], y[valid], weights[valid]),
-                bounds=([
-                    center_low[0], center_low[1], axis_low,
-                    ratio_range[0], -np.pi,
-                ], [
-                    center_high[0], center_high[1], axis_high,
-                    ratio_range[1], np.pi,
-                ]),
+                bounds=(
+                    [
+                        center_low[0],
+                        center_low[1],
+                        axis_low,
+                        ratio_range[0],
+                        -np.pi,
+                    ],
+                    [
+                        center_high[0],
+                        center_high[1],
+                        axis_high,
+                        ratio_range[1],
+                        np.pi,
+                    ],
+                ),
                 loss="soft_l1",
                 f_scale=1.0,
             )
-            center_boundary = bool(np.any(
-                np.isclose(ellipse.x[:2], center_low, atol=0.05)
-                | np.isclose(ellipse.x[:2], center_high, atol=0.05)
-            ))
+            center_boundary = bool(
+                np.any(
+                    np.isclose(ellipse.x[:2], center_low, atol=0.05)
+                    | np.isclose(ellipse.x[:2], center_high, atol=0.05)
+                )
+            )
             ratio_boundary = bool(
-                ellipse.x[3] <= ratio_range[0] + 0.005
-                or ellipse.x[3] >= ratio_range[1] - 0.001
+                ellipse.x[3] <= ratio_range[0] + 0.005 or ellipse.x[3] >= ratio_range[1] - 0.001
             )
             if center_boundary:
                 reasons.append("center search boundary after full refit")
             if ratio_boundary:
                 reasons.append("ratio search boundary after full refit")
-        evaluated.append({
-            "band": tuple(float(v) for v in band[:2]),
-            "r0": float(band[2]),
-            "accepted": not reasons,
-            "angular_coverage": coverage,
-            "center_initial": tuple(float(v) for v in center_initial),
-            "center_refined": tuple(float(v) for v in ellipse.x[:2]),
-            "a_pixels": float(ellipse.x[2]),
-            "b_pixels": float(ellipse.x[2] * ellipse.x[3]),
-            "ratio_b_over_a": float(ellipse.x[3]),
-            "theta_deg": float(np.rad2deg(ellipse.x[4]) % 180.0),
-            "circle_validation_residual": float(circle_validation),
-            "ellipse_validation_residual": float(ellipse_validation),
-            "validation_improvement": improvement,
-            "center_boundary": center_boundary,
-            "ratio_boundary": ratio_boundary,
-            "ridge_point_count": int(np.count_nonzero(valid)),
-            "rejection_reasons": reasons,
-            "_ridge": ridge,
-            "_valid": valid,
-            "_x": x,
-            "_y": y,
-        })
+        evaluated.append(
+            {
+                "band": tuple(float(v) for v in band[:2]),
+                "r0": float(band[2]),
+                "accepted": not reasons,
+                "angular_coverage": coverage,
+                "center_initial": tuple(float(v) for v in center_initial),
+                "center_refined": tuple(float(v) for v in ellipse.x[:2]),
+                "a_pixels": float(ellipse.x[2]),
+                "b_pixels": float(ellipse.x[2] * ellipse.x[3]),
+                "ratio_b_over_a": float(ellipse.x[3]),
+                "theta_deg": float(np.rad2deg(ellipse.x[4]) % 180.0),
+                "circle_validation_residual": float(circle_validation),
+                "ellipse_validation_residual": float(ellipse_validation),
+                "validation_improvement": improvement,
+                "center_boundary": center_boundary,
+                "ratio_boundary": ratio_boundary,
+                "ridge_point_count": int(np.count_nonzero(valid)),
+                "rejection_reasons": reasons,
+                "_ridge": ridge,
+                "_valid": valid,
+                "_x": x,
+                "_y": y,
+            }
+        )
 
     accepted = [item for item in evaluated if item["accepted"]]
     candidates_with_fit = [item for item in evaluated if "a_pixels" in item]
@@ -840,15 +819,12 @@ def fit_ellipse_from_ridge(
         refined_center = tuple(float(v) for v in origin)
         reasons = selected.get("rejection_reasons", ["no valid ridge fit"])
         warnings.warn(
-            "Ridge ellipse fit rejected; using a circular correction "
-            f"({', '.join(reasons)}).",
+            f"Ridge ellipse fit rejected; using a circular correction ({', '.join(reasons)}).",
             RuntimeWarning,
             stacklevel=2,
         )
 
-    selected_public = {
-        key: value for key, value in selected.items() if not key.startswith("_")
-    }
+    selected_public = {key: value for key, value in selected.items() if not key.startswith("_")}
     diagnostics = {
         "method": "ridge",
         "accepted": fit_accepted,
@@ -885,16 +861,18 @@ def fit_ellipse_from_ridge(
             alpha=0.7,
             label="ridge inliers",
         )
-        axes[0].add_patch(Ellipse(
-            (refined_center[1], refined_center[0]),
-            2 * a_axis,
-            2 * b_axis,
-            angle=theta_deg,
-            fill=False,
-            color="lime",
-            linewidth=1.5,
-            label="ridge fit",
-        ))
+        axes[0].add_patch(
+            Ellipse(
+                (refined_center[1], refined_center[0]),
+                2 * a_axis,
+                2 * b_axis,
+                angle=theta_deg,
+                fill=False,
+                color="lime",
+                linewidth=1.5,
+                label="ridge fit",
+            )
+        )
         axes[0].legend(fontsize=8)
         axes[0].set_title("diffuse-ring ridge and robust ellipse")
         before = polar_at(dp, origin, selected["band"][0], selected["band"][1])

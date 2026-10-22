@@ -22,21 +22,28 @@ from quantem.diffraction import peak_visualization as pv
 def bp():
     array = np.arange(2 * 2 * 8 * 8, dtype=np.float32).reshape(2, 2, 8, 8)
     dataset = Dataset4dstem.from_array(
-        array=array, name="viz_test", origin=(0, 0, 0, 0),
+        array=array,
+        name="viz_test",
+        origin=(0, 0, 0, 0),
         sampling=(1.0, 1.0, 1.0, 1.0),
-        units=["pixels"] * 4, signal_units="counts",
+        units=["pixels"] * 4,
+        signal_units="counts",
     )
     analysis = BraggPeaksPolymer.from_data(
-        dataset, device="cpu",
+        dataset,
+        device="cpu",
         compute_parameters=lambda x, **kwargs: (0.0, 1.0),
         normalize_data=lambda x, lo, hi: x,
     )
-    peaks = Vector.from_shape(shape=(2, 2), fields=["y_pixels", "x_pixels"],
-                             units=["pixels"] * 2, name="cartesian_peaks")
-    polar = Vector.from_shape(shape=(2, 2), fields=["r_invA", "theta"],
-                              units=["1/Å", "radians"], name="polar_peaks")
-    intensities = Vector.from_shape(shape=(2, 2), fields=["intensities"],
-                                    units=["counts"], name="peak_intensities")
+    peaks = Vector.from_shape(
+        shape=(2, 2), fields=["y_pixels", "x_pixels"], units=["pixels"] * 2, name="cartesian_peaks"
+    )
+    polar = Vector.from_shape(
+        shape=(2, 2), fields=["r_invA", "theta"], units=["1/Å", "radians"], name="polar_peaks"
+    )
+    intensities = Vector.from_shape(
+        shape=(2, 2), fields=["intensities"], units=["counts"], name="peak_intensities"
+    )
     for i in range(2):
         for j in range(2):
             peaks[i, j] = np.array([[4.0, 4.0], [2.0, 6.0], [6.0, 2.0]])
@@ -52,7 +59,8 @@ def bp():
 
 def test_peak_plots_agree_with_their_forwarding_methods(bp):
     direct = pv.peak_radial_intensity_plot(
-        bp.polar_peaks, bp.peak_intensities, num_bins=8, plot=False, return_data=True)
+        bp.polar_peaks, bp.peak_intensities, num_bins=8, plot=False, return_data=True
+    )
     through = bp.peak_radial_intensity_plot(num_bins=8, plot=False, return_data=True)
     np.testing.assert_allclose(np.asarray(direct[0]), np.asarray(through[0]))
 
@@ -66,13 +74,17 @@ def test_peak_plots_agree_with_their_forwarding_methods(bp):
     assert len(counts) == len(windows)
     assert all(np.asarray(c).shape == (2, 2) for c in counts)
     _, _, direct_counts = pv.plot_peak_count_map(
-        bp.peak_coordinates_cartesian, bp.polar_peaks, windows, return_values=True)
+        bp.peak_coordinates_cartesian, bp.polar_peaks, windows, return_values=True
+    )
     np.testing.assert_allclose(np.asarray(counts), np.asarray(direct_counts))
 
     bp.plot_peak_histogram_map(intensity_threshold=15.0, return_values=True)
     pv.plot_peak_histogram_map(
-        bp.peak_coordinates_cartesian, bp.peak_intensities,
-        intensity_threshold=15.0, return_values=True)
+        bp.peak_coordinates_cartesian,
+        bp.peak_intensities,
+        intensity_threshold=15.0,
+        return_values=True,
+    )
     bp.visualize_selected_patterns([(0, 0), (1, 1)])
     pv.visualize_selected_patterns(bp.dataset_cartesian, [(0, 0)])
 

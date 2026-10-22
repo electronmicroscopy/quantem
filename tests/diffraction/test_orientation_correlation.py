@@ -34,11 +34,7 @@ def _direct_correlation_reference(orient_hist, radius_max):
         s=(padded_x, padded_y, num_theta),
         axes=(1, 2, 3),
     )
-    pairs = [
-        (first, second)
-        for first in range(num_radii)
-        for second in range(first, num_radii)
-    ]
+    pairs = [(first, second) for first in range(num_radii) for second in range(first, num_radii)]
     output = []
     for first, second in pairs:
         spatial_angular = np.fft.ifftn(
@@ -62,20 +58,14 @@ def _direct_correlation_reference(orient_hist, radius_max):
             ]
         )
         denominator = radial.sum(axis=0) / num_theta
-        output.append(
-            radial[: num_theta // 2 + 1] / denominator[None, :]
-        )
+        output.append(radial[: num_theta // 2 + 1] / denominator[None, :])
     return np.stack(output), np.asarray(pairs)
 
 
 @pytest.mark.parametrize("backend", ["numpy", "torch"])
 def test_streamed_correlation_matches_full_volume_reference(backend):
-    histogram = np.random.default_rng(7).random(
-        (3, 7, 6, 12), dtype=np.float32
-    )
-    expected, expected_pairs = _direct_correlation_reference(
-        histogram, radius_max=4
-    )
+    histogram = np.random.default_rng(7).random((3, 7, 6, 12), dtype=np.float32)
+    expected, expected_pairs = _direct_correlation_reference(histogram, radius_max=4)
 
     actual, actual_pairs = calculate_orientation_correlation(
         histogram,
@@ -149,9 +139,9 @@ def test_correlation_plot_reports_half_probability_intercepts():
     """A linear 50% boundary of slope -0.5 deg/nm, above and below baseline."""
     distances = np.arange(11, dtype=float)
     angles = np.linspace(0, 90, 37)
-    shape = np.exp(-distances[None, :] / 4) * (
-        20 - 0.5 * distances[None, :] - angles[:, None]
-    ) / 20
+    shape = (
+        np.exp(-distances[None, :] / 4) * (20 - 0.5 * distances[None, :] - angles[:, None]) / 20
+    )
     results = {
         "above": _plot((1 + 9 * shape)[None], [[0, 0]]),
         "below": _plot((1 - 0.5 * shape)[None], [[0, 1]]),
@@ -178,9 +168,7 @@ def test_correlation_plot_reports_half_probability_intercepts():
 def test_correlation_slope_stops_before_connected_boundary_turns_back():
     distances = np.arange(101, dtype=float)
     angles = np.linspace(0, 90, 91)
-    boundary = np.where(
-        distances <= 30, 40 + 0.5 * distances, 55 - 0.8 * (distances - 30)
-    )
+    boundary = np.where(distances <= 30, 40 + 0.5 * distances, 55 - 0.8 * (distances - 30))
     panel = 1 + (boundary[None, :] - angles[:, None]) / 40
 
     _, _, metrics = _plot(panel[None], [[0, 0]], show_metrics=False)
@@ -214,8 +202,7 @@ def test_relative_angle_axis_spans_ninety_degrees():
     size, num_theta = 32, 180
     grid_y, grid_x = np.mgrid[0:size, 0:size]
     orientation = (
-        60 * np.sin(2 * np.pi * grid_x / size)
-        + 40 * np.cos(2 * np.pi * grid_y / size)
+        60 * np.sin(2 * np.pi * grid_x / size) + 40 * np.cos(2 * np.pi * grid_y / size)
     ) % 180
     bins = np.arange(num_theta)
 
@@ -259,23 +246,38 @@ def test_correlation_intercepts_follow_the_lobe():
     spike = _bimodal_panel()[::-1].copy()
     spike[45, :] += 6.0  # spurious spike above both ends
     cases = {
-        "orthogonal": (orthogonal, [[0, 1]], {}, {
-            "lobe_angle_degrees": pytest.approx(90.0),
-            "max_relative_angle_degrees": pytest.approx(90.0),
-            "half_probability": pytest.approx(2.5),
-            "radial_distance": radial,
-            "radial_distance_censored": False,
-            "annular_distance_degrees": annular,
-        }),
-        "aligned": (_bimodal_panel()[::-1], [[0, 0]], {}, {
-            "lobe_angle_degrees": pytest.approx(0.0),
-            "radial_distance": radial,
-            "annular_distance_degrees": annular,
-        }),
-        "spike": (spike, [[0, 1]], {"show_metrics": False}, {
-            "lobe_angle_degrees": pytest.approx(0.0),
-            "radial_distance": radial,
-        }),
+        "orthogonal": (
+            orthogonal,
+            [[0, 1]],
+            {},
+            {
+                "lobe_angle_degrees": pytest.approx(90.0),
+                "max_relative_angle_degrees": pytest.approx(90.0),
+                "half_probability": pytest.approx(2.5),
+                "radial_distance": radial,
+                "radial_distance_censored": False,
+                "annular_distance_degrees": annular,
+            },
+        ),
+        "aligned": (
+            _bimodal_panel()[::-1],
+            [[0, 0]],
+            {},
+            {
+                "lobe_angle_degrees": pytest.approx(0.0),
+                "radial_distance": radial,
+                "annular_distance_degrees": annular,
+            },
+        ),
+        "spike": (
+            spike,
+            [[0, 1]],
+            {"show_metrics": False},
+            {
+                "lobe_angle_degrees": pytest.approx(0.0),
+                "radial_distance": radial,
+            },
+        ),
     }
     # Preconditions: the orthogonal parallel cut cannot resolve a crossing,
     # and the spike really is the maximum.

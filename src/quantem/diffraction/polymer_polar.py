@@ -119,15 +119,15 @@ def find_central_beams_from_peaks_4d(
     """Previous central-beam heuristic based on detected peak locations."""
     scan_y, scan_x, det_y, det_x = dataset.shape
     centers = np.zeros((2, scan_y, scan_x))
-    
+
     # Handle scan_mask
     if scan_mask is None:
         scan_mask = np.ones((scan_y, scan_x), dtype=bool)
     else:
         scan_mask = np.asarray(scan_mask, dtype=bool)
-    
+
     iterator = tqdm(range(scan_y), disable=not use_tqdm, desc="Finding centers")
-    
+
     for i in iterator:
         for j in range(scan_x):
             if not scan_mask[i, j]:
@@ -142,7 +142,7 @@ def find_central_beams_from_peaks_4d(
                 distance_weight=distance_weight,
                 debug=debug,
                 image=dataset[i, j].array.squeeze(),
-                sampling_radius=sampling_radius
+                sampling_radius=sampling_radius,
             )
     return centers
 
@@ -172,14 +172,14 @@ def find_central_beams_4d(
 ):
     """
     Fast central beam finding for entire 4D dataset.
-    
+
     Parameters:
     -----------
     scan_mask : ArrayLike, optional
         Boolean mask (Ry, Rx) indicating which positions to process
     use_tqdm : bool
         Show progress bar
-    
+
     Returns:
     --------
     centers : ndarray, shape (2, scan_y, scan_x)
@@ -188,8 +188,8 @@ def find_central_beams_4d(
     center_method = center_method.lower()
     if center_method == "peaks":
         return find_central_beams_from_peaks_4d(
-                dataset,
-                peaks,
+            dataset,
+            peaks,
             scan_mask=scan_mask,
             intensity_threshold=intensity_threshold,
             distance_weight=distance_weight,
@@ -199,8 +199,7 @@ def find_central_beams_4d(
         )
     if center_method not in ("descent", "grid"):
         raise ValueError(
-            "center_method must be 'descent', 'grid', or 'peaks', "
-            f"got {center_method!r}."
+            f"center_method must be 'descent', 'grid', or 'peaks', got {center_method!r}."
         )
 
     scan_y, scan_x, _det_y, _det_x = dataset.shape
@@ -238,8 +237,8 @@ def find_central_beams_4d(
             stacklevel=2,
         )
         return find_central_beams_from_peaks_4d(
-                dataset,
-                peaks,
+            dataset,
+            peaks,
             scan_mask=scan_mask_arr,
             intensity_threshold=intensity_threshold,
             distance_weight=distance_weight,
@@ -343,18 +342,14 @@ def centered_dp_mean(dataset, image_centers, com_model=None):
             # (in-mask, non-zero) patterns are averaged.
             oy = torch.as_tensor(ic[0].ravel(), dtype=torch.float, device=dev)
             ox = torch.as_tensor(ic[1].ravel(), dtype=torch.float, device=dev)
-            keep = (
-                torch.as_tensor(valid.ravel(), device=dev)
-                .nonzero(as_tuple=False)
-                .squeeze(1)
-            )
+            keep = torch.as_tensor(valid.ravel(), device=dev).nonzero(as_tuple=False).squeeze(1)
             sy = center[0] - oy  # continuous shift -> detector center, (y, x)
             sx = center[1] - ox
             acc = torch.zeros((Qy, Qx), dtype=torch.float32, device=dev)
             batch = 256
             for bstart in range(0, int(keep.numel()), batch):
-                bidx = keep[bstart:bstart + batch]
-                chunk = flat[bidx].float()                 # (b, Qy, Qx), ROI patterns only
+                bidx = keep[bstart : bstart + batch]
+                chunk = flat[bidx].float()  # (b, Qy, Qx), ROI patterns only
                 fyb = torch.floor(sy[bidx])
                 fxb = torch.floor(sx[bidx])
                 gy = sy[bidx] - fyb
@@ -372,7 +367,7 @@ def centered_dp_mean(dataset, image_centers, com_model=None):
                 uniq, inv = torch.unique(floor_pairs, dim=0, return_inverse=True)
                 for k in range(int(uniq.shape[0])):
                     m = inv == k
-                    cg = chunk[m]                          # (g, Qy, Qx)
+                    cg = chunk[m]  # (g, Qy, Qx)
                     fy = int(uniq[k, 0])
                     fx = int(uniq[k, 1])
                     for (dy, dx), wt in corner_w.items():
@@ -441,15 +436,16 @@ def polar_transform_peaks(
     else:
         scan_mask = np.asarray(scan_mask, dtype=bool)
         if scan_mask.shape != (n_scan_y, n_scan_x):
-            raise ValueError(f"scan_mask shape {scan_mask.shape} must match {(n_scan_y, n_scan_x)}")
+            raise ValueError(
+                f"scan_mask shape {scan_mask.shape} must match {(n_scan_y, n_scan_x)}"
+            )
     if sampling_conversion_factor is None:
         sampling_conversion_factor = 1.0
 
     x_idx = cartesian_vector.fields.index(x_field_found)
     y_idx = cartesian_vector.fields.index(y_field_found)
     extra_indices = [
-        idx for idx in range(len(cartesian_vector.fields))
-        if idx not in (x_idx, y_idx)
+        idx for idx in range(len(cartesian_vector.fields)) if idx not in (x_idx, y_idx)
     ]
     # ``theta`` is folded when two_fold_rotation_symmetry is set, which maps each
     # Friedel pair onto one angle. ``theta_unfolded`` keeps the full 0-2pi angle so

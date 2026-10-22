@@ -104,9 +104,7 @@ class GlobalPercentileNormalization:
             raise ValueError("Percentiles must satisfy 0 <= lower < upper <= 100.")
 
     def fit(self, sample_batch: Any) -> tuple[float, float]:
-        return _percentiles(
-            sample_batch, self.lower_percentile, self.upper_percentile
-        )
+        return _percentiles(sample_batch, self.lower_percentile, self.upper_percentile)
 
     def transform(self, batch: Any, parameters: Any) -> Any:
         return _percentile_transform(batch, parameters)
@@ -125,9 +123,7 @@ class PerImageMinMaxPercentileNormalization:
 
     def fit(self, sample_batch: Any) -> tuple[float, float]:
         normalized = _per_image_minmax(sample_batch)
-        return _percentiles(
-            normalized, self.lower_percentile, self.upper_percentile
-        )
+        return _percentiles(normalized, self.lower_percentile, self.upper_percentile)
 
     def transform(self, batch: Any, parameters: Any) -> Any:
         return _percentile_transform(_per_image_minmax(batch), parameters)

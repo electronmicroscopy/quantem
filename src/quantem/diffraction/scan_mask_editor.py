@@ -70,11 +70,7 @@ class ScanMaskEditor:
         rows, columns = self.scan_shape
         center_row = rows // 2 if initial_y is None else int(initial_y)
         center_column = columns // 2 if initial_x is None else int(initial_x)
-        radius = (
-            max(1, min(rows, columns) // 3)
-            if initial_radius is None
-            else int(initial_radius)
-        )
+        radius = max(1, min(rows, columns) // 3) if initial_radius is None else int(initial_radius)
         geometry = str(initial_geometry).lower()
         size_x = radius if initial_size_x is None else int(initial_size_x)
         size_y = radius if initial_size_y is None else int(initial_size_y)
@@ -93,16 +89,12 @@ class ScanMaskEditor:
             self._loaded = True
             self._saved = True
 
-        self._validate_geometry(
-            center_row, center_column, geometry, size_x, size_y
-        )
+        self._validate_geometry(center_row, center_column, geometry, size_x, size_y)
         self.reference_image = self._resolve_reference_image(reference_image)
         self._preview_mask = (
             loaded_mask.copy()
             if loaded_mask is not None
-            else self._geometry_mask(
-                center_row, center_column, geometry, size_x, size_y, angle
-            )
+            else self._geometry_mask(center_row, center_column, geometry, size_x, size_y, angle)
         )
 
         maximum_radius = int(np.ceil(np.hypot(rows - 1, columns - 1))) + 1
@@ -325,15 +317,11 @@ class ScanMaskEditor:
         self.angle_input.observe(self._on_angle_input, names="value")
         self.apply_button.on_click(lambda _: self.apply())
         self.save_button.on_click(lambda _: self.save())
-        self.center_button.on_click(
-            lambda _: self.set_mask(x=columns // 2, y=rows // 2)
-        )
+        self.center_button.on_click(lambda _: self.set_mask(x=columns // 2, y=rows // 2))
         self.full_button.on_click(lambda _: self._set_full_scan())
         self.reset_button.on_click(lambda _: self._restore_initial())
 
-        self._initial_geometry = (
-            center_column, center_row, geometry, size_x, size_y, angle
-        )
+        self._initial_geometry = (center_column, center_row, geometry, size_x, size_y, angle)
         self._initial_mask = self._preview_mask.copy()
         # A loaded/default mask is immediately usable by Run All. Slider edits
         # remain previews until Apply, preventing repeated inference-cache invalidation.
@@ -361,9 +349,7 @@ class ScanMaskEditor:
         )
         plot_row = widgets.HBox(
             [self.y_slider, self.output],
-            layout=widgets.Layout(
-                align_items="center", width="500px", overflow="hidden"
-            ),
+            layout=widgets.Layout(align_items="center", width="500px", overflow="hidden"),
         )
         self.size_x_row = widgets.HBox(
             [
@@ -533,8 +519,7 @@ class ScanMaskEditor:
             )
         if geometry not in self.GEOMETRIES:
             raise ValueError(
-                f"Unknown mask geometry {geometry!r}; choose one of "
-                f"{', '.join(self.GEOMETRIES)}."
+                f"Unknown mask geometry {geometry!r}; choose one of {', '.join(self.GEOMETRIES)}."
             )
         if size_x < 1 or size_y < 1:
             raise ValueError("Mask half-sizes must be at least one scan pixel.")
@@ -762,9 +747,7 @@ class ScanMaskEditor:
     def _set_full_scan(self):
         rows, columns = self.scan_shape
         if self.geometry == "circle":
-            size_x = size_y = (
-                int(np.ceil(np.hypot(rows - 1, columns - 1))) + 1
-            )
+            size_x = size_y = int(np.ceil(np.hypot(rows - 1, columns - 1))) + 1
         elif self.geometry == "ellipse":
             size_x, size_y = columns, rows
         elif self.geometry == "square":
@@ -954,9 +937,7 @@ class ScanMaskEditor:
         self.circle_artist = artist
 
     def _render(self):
-        self.mask_artist.set_data(
-            np.ma.masked_where(~self._preview_mask, self._preview_mask)
-        )
+        self.mask_artist.set_data(np.ma.masked_where(~self._preview_mask, self._preview_mask))
         self._replace_boundary_artist()
         self.center_artist.set_data([self.x], [self.y])
         self.figure.canvas.draw_idle()
@@ -972,14 +953,10 @@ class ScanMaskEditor:
             row_sampling, column_sampling = (
                 float(v) for v in self.analysis.dataset_cartesian.sampling[:2]
             )
-            row_unit, column_unit = (
-                str(v) for v in self.analysis.dataset_cartesian.units[:2]
-            )
+            row_unit, column_unit = (str(v) for v in self.analysis.dataset_cartesian.units[:2])
             if np.isclose(row_sampling, column_sampling) and row_unit == column_unit:
                 if self.geometry == "circle":
-                    physical = (
-                        f" · radius ≈ {self.size_x * row_sampling:.4g} {row_unit}"
-                    )
+                    physical = f" · radius ≈ {self.size_x * row_sampling:.4g} {row_unit}"
                 else:
                     physical = (
                         f" · half-size ≈ "

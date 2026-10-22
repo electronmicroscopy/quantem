@@ -21,12 +21,16 @@ from quantem.diffraction.peak_detection import peaks_from_model_output
 @pytest.fixture
 def bp():
     dataset = Dataset4dstem.from_array(
-        array=np.zeros((1, 1, 8, 8), dtype=np.float32), name="ml_test",
-        origin=(0, 0, 0, 0), sampling=(1.0, 1.0, 1.0, 1.0),
-        units=["pixels"] * 4, signal_units="counts",
+        array=np.zeros((1, 1, 8, 8), dtype=np.float32),
+        name="ml_test",
+        origin=(0, 0, 0, 0),
+        sampling=(1.0, 1.0, 1.0, 1.0),
+        units=["pixels"] * 4,
+        signal_units="counts",
     )
     analysis = BraggPeaksPolymer.from_data(
-        dataset, device="cpu",
+        dataset,
+        device="cpu",
         compute_parameters=lambda x, **kwargs: (0.0, 1.0),
         normalize_data=lambda x, lo, hi: x,
     )
@@ -35,7 +39,7 @@ def bp():
 
 
 def _blob(shape=(32, 32), centres=((10.0, 12.0), (22.0, 20.0)), sigma=1.2):
-    y, x = np.mgrid[0:shape[0], 0:shape[1]]
+    y, x = np.mgrid[0 : shape[0], 0 : shape[1]]
     image = np.zeros(shape, dtype=float)
     for cy, cx in centres:
         image += np.exp(-((y - cy) ** 2 + (x - cx) ** 2) / (2 * sigma**2))
@@ -52,6 +56,7 @@ def test_resize_images_intensity_convention(bp):
     fragility only, since ``scale_factor`` depends on the detector size and would matter
     under a normalization with a fixed absolute divisor.
     """
+
     class Wrapped:  # resize_images also accepts anything with an ``array`` attribute
         array = np.stack([_blob((32, 32))])
 
@@ -65,15 +70,15 @@ def test_resize_images_intensity_convention(bp):
         originals = getattr(images, "array", images)
         assert resized.shape == (len(originals), 16, 16), name
         for original, small in zip(originals, resized):
-            assert small.sum() == pytest.approx(
-                original.sum() * scale_factor / 4, rel=0.05), name
+            assert small.sum() == pytest.approx(original.sum() * scale_factor / 4, rel=0.05), name
 
 
 def test_peaks_from_model_output_finds_blobs_and_samples_intensities(bp):
     # show=True used to raise NameError (matplotlib not imported) once a peak was found.
     for show in (False, True):
         coords, intensities = peaks_from_model_output(
-            _blob(), np.full((32, 32), 3.0), sigma=1.0, threshold=0.25, show=show)
+            _blob(), np.full((32, 32), 3.0), sigma=1.0, threshold=0.25, show=show
+        )
         plt.close("all")
 
         # Both injected centres should be recovered to within a pixel.

@@ -24,19 +24,23 @@ def _percentile_clip(array, lower_percentile, upper_percentile):
 def test_strategies_match_reference_for_numpy_and_torch():
     ramp = np.arange(48, dtype=np.float32).reshape(3, 4, 4)
     # The constant third image must map to zeros, not divide by zero.
-    images = np.array(
-        [[[1, 2], [3, 5]], [[10, 20], [30, 50]], [[7, 7], [7, 7]]], dtype=np.float32
+    images = np.array([[[1, 2], [3, 5]], [[10, 20], [30, 50]], [[7, 7], [7, 7]]], dtype=np.float32)
+    per_image = np.stack(
+        [
+            (image - image.min()) / (image.max() - image.min())
+            if image.max() > image.min()
+            else np.zeros_like(image)
+            for image in images
+        ]
     )
-    per_image = np.stack([
-        (image - image.min()) / (image.max() - image.min())
-        if image.max() > image.min() else np.zeros_like(image)
-        for image in images
-    ])
     cases = [
-        ("global", GlobalPercentileNormalization(10, 90), ramp,
-         _percentile_clip(ramp, 10, 90)),
-        ("per-image", PerImageMinMaxPercentileNormalization(5, 95), images,
-         _percentile_clip(per_image, 5, 95)),
+        ("global", GlobalPercentileNormalization(10, 90), ramp, _percentile_clip(ramp, 10, 90)),
+        (
+            "per-image",
+            PerImageMinMaxPercentileNormalization(5, 95),
+            images,
+            _percentile_clip(per_image, 5, 95),
+        ),
     ]
     for name, strategy, array, expected in cases:
         for backend, batch in (("numpy", array), ("torch", torch.from_numpy(array))):
@@ -62,15 +66,11 @@ def test_registered_resolution_and_legacy_adapter():
         return {"low": float(batch.min()), "high": float(batch.max())}
 
     def transform(batch, parameters):
-        return (batch - parameters["low"]) / (
-            parameters["high"] - parameters["low"]
-        )
+        return (batch - parameters["low"]) / (parameters["high"] - parameters["low"])
 
     adapter = LegacyNormalizationAdapter(compute, transform, 1, 99)
     batch = np.array([[1.0, 3.0]])
-    np.testing.assert_allclose(
-        adapter.transform(batch, adapter.fit(batch)), [[0.0, 1.0]]
-    )
+    np.testing.assert_allclose(adapter.transform(batch, adapter.fit(batch)), [[0.0, 1.0]])
 
 
 def test_strategy_and_model_changes_invalidate_inference_caches():
@@ -134,9 +134,7 @@ def test_named_model_selects_metadata_strategy_and_explicit_override_wins(
     detector._normalization_is_explicit = False
     detector._invalidate_inference_caches()
     detector.set_model_weights()
-    assert isinstance(
-        detector.normalization_strategy, PerImageMinMaxPercentileNormalization
-    )
+    assert isinstance(detector.normalization_strategy, PerImageMinMaxPercentileNormalization)
     assert detector.normalization_strategy.lower_percentile == 3
 
     override = GlobalPercentileNormalization(4, 96)

@@ -71,11 +71,17 @@ def _vector(shape, fields, units, name, values):
 def _bragg_for_plotting():
     bp = _bragg(np.arange(2 * 2 * 8 * 8, dtype=np.float32).reshape(2, 2, 8, 8))
     bp.peak_coordinates_cartesian = _vector(
-        (2, 2), ["y_pixels", "x_pixels"], ["pixels", "pixels"], "cartesian_peaks",
+        (2, 2),
+        ["y_pixels", "x_pixels"],
+        ["pixels", "pixels"],
+        "cartesian_peaks",
         [[4.0, 4.0], [2.0, 6.0], [6.0, 2.0]],
     )
     bp.polar_peaks = _vector(
-        (2, 2), ["r_invA", "theta"], ["1/Å", "radians"], "polar_peaks",
+        (2, 2),
+        ["r_invA", "theta"],
+        ["1/Å", "radians"],
+        "polar_peaks",
         [[0.1, 0.0], [0.4, np.pi / 2], [0.7, np.pi]],
     )
     bp.peak_intensities = _vector(
@@ -92,9 +98,9 @@ def _bragg_for_plotting():
 
 def test_origin_finders_recover_centers():
     descent_centers = [(47.3, 48.7), (48.4, 47.6), (46.8, 49.1), (49.0, 46.9)]
-    descent_arr = np.stack(
-        [_ring_pattern(96, 96, cy, cx) for cy, cx in descent_centers]
-    ).reshape(2, 2, 96, 96)
+    descent_arr = np.stack([_ring_pattern(96, 96, cy, cx) for cy, cx in descent_centers]).reshape(
+        2, 2, 96, 96
+    )
     cases = {
         # Subpixel centres that differ per scan position.
         "descent": (
@@ -107,7 +113,10 @@ def test_origin_finders_recover_centers():
         "grid": (
             lambda: find_origin_angular_grid(
                 _dataset(_ring_pattern(64, 64, 30.4, 31.6, radii=(8, 16, 24))[None, None]),
-                radial_min=3, radial_max=26, num_annular_bins=72, device="cpu",
+                radial_min=3,
+                radial_max=26,
+                num_annular_bins=72,
+                device="cpu",
             ),
             np.array([[[30.4, 31.6]]]),
             0.75,
@@ -116,7 +125,10 @@ def test_origin_finders_recover_centers():
         "dispatch_2d": (
             lambda: find_origin(
                 _ring_pattern(64, 64, 31.5, 31.5),
-                method="descent", radial_min=4, radial_max=26, device="cpu",
+                method="descent",
+                radial_min=4,
+                radial_max=26,
+                device="cpu",
             ),
             np.array([[[31.5, 31.5]]]),
             0.35,
@@ -159,8 +171,8 @@ def test_bragg_peak_polar_transform_conventions():
             peaks=[
                 [8.0, 11.0, 0.0, 0.0],  # +x axis -> theta 0
                 [12.0, 8.0, 0.0, 0.0],  # +y axis -> theta pi/2
-                [4.0, 8.0, 0.0, 0.0],   # -y axis -> theta 3pi/2, folded to pi/2
-                [8.0, 5.0, 0.0, 0.0],   # -x axis -> theta pi, folded to 0
+                [4.0, 8.0, 0.0, 0.0],  # -y axis -> theta 3pi/2, folded to pi/2
+                [8.0, 5.0, 0.0, 0.0],  # -x axis -> theta pi, folded to 0
             ],
             kwargs=dict(two_fold_symmetry=True),
             r=[3.0, 4.0, 4.0, 3.0],
@@ -181,8 +193,11 @@ def test_bragg_peak_polar_transform_conventions():
     for name, case in cases.items():
         bp = _bragg(np.zeros((1, 1, case["size"], case["size"]), dtype=np.float32))
         peaks = _vector(
-            (1, 1), case["fields"], ["pixels", "pixels", "1/Å", "1/Å"][: len(case["fields"])],
-            "peaks", case["peaks"],
+            (1, 1),
+            case["fields"],
+            ["pixels", "pixels", "1/Å", "1/Å"][: len(case["fields"])],
+            "peaks",
+            case["peaks"],
         )
         polar = bp.polar_transform_peaks(
             peaks, centers=np.array([[[8.0]], [[8.0]]]), use_tqdm=False, **case["kwargs"]
@@ -221,11 +236,17 @@ def _bragg_orientation_histogram(theta_values, normalize_stack=False):
     bp = _bragg(np.zeros((1, 1, 8, 8), dtype=np.float32))
     theta_values = np.asarray(theta_values, dtype=float)
     bp.polar_peaks = _vector(
-        (1, 1), ["r_invA", "theta"], ["1/Å", "radians"], "polar_peaks",
+        (1, 1),
+        ["r_invA", "theta"],
+        ["1/Å", "radians"],
+        "polar_peaks",
         np.column_stack([np.ones_like(theta_values), theta_values]),
     )
     bp.peak_intensities = _vector(
-        (1, 1), ["intensities"], ["counts"], "peak_intensities",
+        (1, 1),
+        ["intensities"],
+        ["counts"],
+        "peak_intensities",
         np.ones((theta_values.size, 1)),
     )
     return bp.make_orientation_histogram(
@@ -305,8 +326,13 @@ def test_bragg_private_helpers_characterize_shared_plotting_behavior():
         ),
         # The central peak falls outside the crop, so no central index survives.
         "central_cropped": (
-            (np.zeros((8, 8)), np.array([1.0, 4.0]), np.array([1.0, 4.0]),
-             np.array([0.1, 2.0]), (4.0, 4.0)),
+            (
+                np.zeros((8, 8)),
+                np.array([1.0, 4.0]),
+                np.array([1.0, 4.0]),
+                np.array([0.1, 2.0]),
+                (4.0, 4.0),
+            ),
             dict(shape=(4, 4), xy=2.0, r=2.0, i=20.0, central=None, center=(2.0, 2.0)),
         ),
     }
@@ -352,8 +378,10 @@ def test_bragg_plotting_and_save_smoke(monkeypatch, tmp_path):
 
     bp.save_diffraction_figures(0, 0, save_dir=tmp_path / "diff", show_polar=True)
     bp.save_peak_figures(0, 0, save_dir=tmp_path / "peaks", show_polar=True)
-    expected = [f"diff/diffraction_ry0_rx0_{s}.pdf"
-                for s in ("intensity_map", "diffraction", "polar", "combined")]
+    expected = [
+        f"diff/diffraction_ry0_rx0_{s}.pdf"
+        for s in ("intensity_map", "diffraction", "polar", "combined")
+    ]
     expected += [f"peaks/peaks_ry0_rx0_{s}.pdf" for s in ("intensity_map", "diffraction", "polar")]
     for path in expected:
         assert (tmp_path / path).exists(), path

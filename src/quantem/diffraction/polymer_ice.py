@@ -156,6 +156,7 @@ class IceFlaggerParams:
                 "intensity_cutoff_mode must be 'absolute' or 'percentile'; got "
                 f"{self.intensity_cutoff_mode!r}"
             )
+
     # Angular period of the peak thetas, in degrees. process_polar(two_fold_symmetry=True)
     # folds theta to [0, 180), collapsing every Friedel pair onto one angle, so only three
     # of the six lattice arms are distinguishable and min_matches cannot exceed 3. None lets
@@ -287,7 +288,7 @@ def _half_width_bins(
             for ahead in range(1, need):
                 probe = center + direction * (step + ahead)
                 if probe < 0 or probe >= n:
-                    break          # window edge: treat the run as sustained
+                    break  # window edge: treat the run as sustained
                 nxt = float(profile[probe])
                 if np.isfinite(nxt) and nxt > half:
                     run = False
@@ -372,7 +373,9 @@ def measure_peak_widths(
     n_r, n_theta = polar_intensity.shape
     # Window half-widths in bins; at least 2 so a FWHM is measurable at all.
     window_r = max(2, int(np.ceil(params.sharpness_window_r_invA / max(r_step, 1e-12))))
-    window_theta = max(2, int(np.ceil(params.sharpness_window_theta_deg / max(theta_step_deg, 1e-12))))
+    window_theta = max(
+        2, int(np.ceil(params.sharpness_window_theta_deg / max(theta_step_deg, 1e-12)))
+    )
     # The annular axis wraps, so a window wider than the circle would repeat bins and let
     # the outward walk run back into the peak it started from.
     window_theta = min(window_theta, max(1, (n_theta - 1) // 2))
@@ -384,11 +387,15 @@ def measure_peak_widths(
         r_bin = int(np.round((radius[index] - r_axis[0]) / r_step))
         if not 0 <= r_bin < n_r:
             continue
-        theta_bin = int(np.round(np.mod(theta[index], theta_period) / (theta_period / n_theta))) % n_theta
+        theta_bin = (
+            int(np.round(np.mod(theta[index], theta_period) / (theta_period / n_theta))) % n_theta
+        )
 
         # Annular cut first: it is periodic, so the window is always full length
         # and the refined bin it returns anchors the radial cut.
-        theta_indices = np.mod(np.arange(theta_bin - window_theta, theta_bin + window_theta + 1), n_theta)
+        theta_indices = np.mod(
+            np.arange(theta_bin - window_theta, theta_bin + window_theta + 1), n_theta
+        )
         annular = polar_intensity[r_bin, theta_indices]
         fwhm_theta, refined = _profile_fwhm(
             annular,
@@ -507,21 +514,15 @@ def compute_global_intensity_threshold(
     """Compute a scan-wide intensity percentile for ice candidate selection."""
 
     if intensity_field not in peak_intensities.fields:
-        raise KeyError(
-            f"Intensity field {intensity_field!r} is absent from peak_intensities."
-        )
+        raise KeyError(f"Intensity field {intensity_field!r} is absent from peak_intensities.")
     selected = (
         np.ones(peak_intensities.shape, dtype=bool)
         if scan_mask is None
         else np.asarray(scan_mask, dtype=bool)
     )
     if selected.shape != peak_intensities.shape:
-        raise ValueError(
-            f"scan_mask shape {selected.shape} must match {peak_intensities.shape}."
-        )
-    return _global_threshold(
-        peak_intensities, intensity_field, percentile, selected
-    )
+        raise ValueError(f"scan_mask shape {selected.shape} must match {peak_intensities.shape}.")
+    return _global_threshold(peak_intensities, intensity_field, percentile, selected)
 
 
 def flag_ice_peaks_in_pattern(
@@ -551,9 +552,7 @@ def flag_ice_peaks_in_pattern(
     if radius.shape != theta.shape or radius.shape != intensity.shape:
         raise ValueError("r_invA, theta_rad, and intensities must have the same shape.")
 
-    q_candidates = np.isfinite(radius) & (
-        np.abs(radius - params.q_target_invA) <= params.dq_invA
-    )
+    q_candidates = np.isfinite(radius) & (np.abs(radius - params.q_target_invA) <= params.dq_invA)
 
     # Sharpness gate. Applied to the q band before the six-fold search, so the
     # broad polymer peaks neither get flagged nor drag the phi estimate around.
@@ -576,9 +575,7 @@ def flag_ice_peaks_in_pattern(
     elif params.intensity_cutoff_mode == "percentile":
         finite = intensity[np.isfinite(intensity)]
         threshold = (
-            float(np.percentile(finite, params.intensity_cutoff))
-            if len(finite)
-            else float("inf")
+            float(np.percentile(finite, params.intensity_cutoff)) if len(finite) else float("inf")
         )
     else:
         raise ValueError("intensity_cutoff_mode must be 'absolute' or 'percentile'.")
@@ -605,7 +602,8 @@ def flag_ice_peaks_in_pattern(
     period = _resolve_theta_period(params, theta_period_deg)
     n_arms = max(1, int(round(period / 60.0)))
     unfolded_deg = (
-        None if theta_unfolded_rad is None
+        None
+        if theta_unfolded_rad is None
         else np.mod(np.rad2deg(np.asarray(theta_unfolded_rad, dtype=float)), 360.0)
     )
     remaining = candidate_indices
@@ -615,8 +613,7 @@ def flag_ice_peaks_in_pattern(
         angles = np.mod(np.rad2deg(theta[remaining]), period)
         modulo = np.mod(angles, 60.0)
         supports = [
-            _angle_distance(modulo, float(center)) <= params.dtheta_deg
-            for center in modulo
+            _angle_distance(modulo, float(center)) <= params.dtheta_deg for center in modulo
         ]
         inliers = supports[int(np.argmax([np.count_nonzero(x) for x in supports]))]
         radians = np.deg2rad(modulo[inliers])
@@ -629,9 +626,7 @@ def flag_ice_peaks_in_pattern(
             break
 
         expected = phi + 60.0 * np.arange(n_arms)
-        errors = np.stack(
-            [_angle_distance(angles, value, period) for value in expected], axis=1
-        )
+        errors = np.stack([_angle_distance(angles, value, period) for value in expected], axis=1)
         closest = np.argmin(errors, axis=1)
         aligned = errors[np.arange(len(angles)), closest] <= params.dtheta_deg
         # Keep only arms carrying enough peaks, then re-restrict the matched set to them.
@@ -649,7 +644,8 @@ def flag_ice_peaks_in_pattern(
                     "Re-run polar_transform_peaks (or process_polar) to record it."
                 )
             paired = [
-                arm for arm in good_arms
+                arm
+                for arm in good_arms
                 if _has_friedel_pair(
                     unfolded_deg[remaining[aligned & (closest == arm)]], params.dtheta_deg
                 )
@@ -806,13 +802,14 @@ def detect_ice(
             params=params,
             intensity_threshold_global=threshold,
             return_debug=return_debug,
-            polar_intensity=None if polar_intensity_stack is None else polar_intensity_stack[iy, ix],
+            polar_intensity=None
+            if polar_intensity_stack is None
+            else polar_intensity_stack[iy, ix],
             r_axis=r_axis,
             theta_axis=theta_axis,
             theta_period_deg=period,
             theta_unfolded_rad=(
-                None if unfolded_index is None
-                else np.asarray(polar_cell)[:, unfolded_index]
+                None if unfolded_index is None else np.asarray(polar_cell)[:, unfolded_index]
             ),
         )
         if len(flags):
@@ -954,9 +951,18 @@ def collect_peak_widths(
     theta_index = polar_peaks.fields.index("theta")
     intensity_index = peak_intensities.fields.index(params.intensity_field)
 
-    columns: dict[str, list] = {key: [] for key in
-                                ("iy", "ix", "q_invA", "theta_deg", "intensity",
-                                 "width_r_invA", "width_theta_deg")}
+    columns: dict[str, list] = {
+        key: []
+        for key in (
+            "iy",
+            "ix",
+            "q_invA",
+            "theta_deg",
+            "intensity",
+            "width_r_invA",
+            "width_theta_deg",
+        )
+    }
     for iy, ix in np.argwhere(selected):
         iy, ix = int(iy), int(ix)
         polar_cell = polar_peaks[iy, ix].numpy()

@@ -25,14 +25,8 @@ def _elliptical_ring(
     dx, dy = xx - cx, yy - cy
     major = dx * np.cos(theta) + dy * np.sin(theta)
     minor = -dx * np.sin(theta) + dy * np.cos(theta)
-    elliptical_radius = np.sqrt(
-        (major * ratio_b_over_a) ** 2 + minor**2
-    )
-    return (
-        2.0
-        * np.exp(-0.5 * ((elliptical_radius - radius) / sigma) ** 2)
-        + 0.02
-    )
+    elliptical_radius = np.sqrt((major * ratio_b_over_a) ** 2 + minor**2)
+    return 2.0 * np.exp(-0.5 * ((elliptical_radius - radius) / sigma) ** 2) + 0.02
 
 
 def _center(pattern):
@@ -61,8 +55,14 @@ def _fit_ridge(pattern, **kwargs):
 
 FITS = {"angular_variance": _fit, "ridge": _fit_ridge}
 DIAGNOSTIC_KEYS = {
-    "method", "accepted", "selected", "candidates", "explicit_band",
-    "center_initial", "center_refined", "rejection_reasons",
+    "method",
+    "accepted",
+    "selected",
+    "candidates",
+    "explicit_band",
+    "center_initial",
+    "center_refined",
+    "rejection_reasons",
 }
 
 

@@ -17,10 +17,7 @@ def _validate_and_shape_input(orient_hist):
     if orient_hist.ndim == 3:
         orient_hist = orient_hist[None]
     elif orient_hist.ndim != 4:
-        raise ValueError(
-            "orient_hist must have shape (x, y, theta) or "
-            "(radial_bin, x, y, theta)"
-        )
+        raise ValueError("orient_hist must have shape (x, y, theta) or (radial_bin, x, y, theta)")
 
     num_radii, size_x, size_y, num_theta = orient_hist.shape
     if min(num_radii, size_x, size_y) < 1 or num_theta < 2:
@@ -35,29 +32,20 @@ def _resolve_pairs(pairs, num_radii):
     if isinstance(pairs, str):
         if pairs == "all":
             pair_list = [
-                (first, second)
-                for first in range(num_radii)
-                for second in range(first, num_radii)
+                (first, second) for first in range(num_radii) for second in range(first, num_radii)
             ]
         elif pairs == "autocorrelation":
             pair_list = [(index, index) for index in range(num_radii)]
         else:
-            raise ValueError(
-                "pairs must be 'all', 'autocorrelation', or a sequence of pairs"
-            )
+            raise ValueError("pairs must be 'all', 'autocorrelation', or a sequence of pairs")
     else:
         pair_list = []
         for pair in pairs:
             if len(pair) != 2:
                 raise ValueError("each entry in pairs must contain two indices")
             first, second = int(pair[0]), int(pair[1])
-            if not (
-                0 <= first < num_radii and 0 <= second < num_radii
-            ):
-                raise ValueError(
-                    f"radial-bin pair {(first, second)} is outside "
-                    f"[0, {num_radii})"
-                )
+            if not (0 <= first < num_radii and 0 <= second < num_radii):
+                raise ValueError(f"radial-bin pair {(first, second)} is outside [0, {num_radii})")
             pair_list.append((first, second))
 
         if not pair_list:
@@ -107,22 +95,14 @@ def _normalize_correlation(
     if isinstance(radial_correlation, torch.Tensor):
         dtype = radial_correlation.dtype
         maximum = torch.max(torch.abs(denominator))
-        threshold = torch.finfo(dtype).eps * torch.clamp(
-            maximum, min=torch.finfo(dtype).tiny
-        )
+        threshold = torch.finfo(dtype).eps * torch.clamp(maximum, min=torch.finfo(dtype).tiny)
         valid = torch.abs(denominator) > threshold
         if zero_policy == "raise" and not bool(torch.all(valid).item()):
             raise ZeroDivisionError(
-                "orientation correlation has radial distances with zero "
-                "normalization signal"
+                "orientation correlation has radial distances with zero normalization signal"
             )
-        safe_denominator = torch.where(
-            valid, denominator, torch.ones_like(denominator)
-        )
-        output = (
-            radial_correlation[:, :num_modes, :]
-            / safe_denominator[:, None, :]
-        )
+        safe_denominator = torch.where(valid, denominator, torch.ones_like(denominator))
+        output = radial_correlation[:, :num_modes, :] / safe_denominator[:, None, :]
         fill_value = float("nan") if zero_policy == "nan" else 0.0
         return output.masked_fill(~valid[:, None, :], fill_value)
 
@@ -132,8 +112,7 @@ def _normalize_correlation(
     valid = np.abs(denominator) > threshold
     if zero_policy == "raise" and not np.all(valid):
         raise ZeroDivisionError(
-            "orientation correlation has radial distances with zero "
-            "normalization signal"
+            "orientation correlation has radial distances with zero normalization signal"
         )
     fill_value = np.nan if zero_policy == "nan" else 0.0
     output = np.full(
@@ -179,17 +158,12 @@ def _calculate_numpy(
         raise ValueError("mode_batch_size and pair_batch_size must be at least 1")
 
     theta_spectrum = scipy_fft.rfft(histogram, axis=-1, workers=workers)
-    correlation_spectrum = np.empty(
-        (num_pairs, num_modes, num_distances), dtype=complex_dtype
-    )
+    correlation_spectrum = np.empty((num_pairs, num_modes, num_distances), dtype=complex_dtype)
     point_indices = geometry["point_indices"]
     radial_bins = geometry["radial_bins"]
     radial_weights = geometry["radial_weights"]
 
-    total = (
-        int(np.ceil(num_modes / mode_batch_size))
-        * int(np.ceil(num_pairs / pair_batch_size))
-    )
+    total = int(np.ceil(num_modes / mode_batch_size)) * int(np.ceil(num_pairs / pair_batch_size))
     progress = tqdm(
         total=total,
         desc="Calculate orientation correlations (CPU)",
@@ -200,9 +174,7 @@ def _calculate_numpy(
         for mode_start in range(0, num_modes, mode_batch_size):
             mode_stop = min(mode_start + mode_batch_size, num_modes)
             spatial_spectrum = scipy_fft.fft2(
-                np.moveaxis(
-                    theta_spectrum[..., mode_start:mode_stop], -1, 1
-                ),
+                np.moveaxis(theta_spectrum[..., mode_start:mode_stop], -1, 1),
                 s=geometry["padded_shape"],
                 axes=(-2, -1),
                 workers=workers,
@@ -211,9 +183,8 @@ def _calculate_numpy(
             for pair_start in range(0, num_pairs, pair_batch_size):
                 pair_stop = min(pair_start + pair_batch_size, num_pairs)
                 pair_batch = pair_indices[pair_start:pair_stop]
-                cross_spectrum = (
-                    spatial_spectrum[pair_batch[:, 0]]
-                    * np.conj(spatial_spectrum[pair_batch[:, 1]])
+                cross_spectrum = spatial_spectrum[pair_batch[:, 0]] * np.conj(
+                    spatial_spectrum[pair_batch[:, 1]]
                 )
                 spatial_correlation = scipy_fft.ifft2(
                     cross_spectrum, axes=(-2, -1), workers=workers
@@ -235,12 +206,7 @@ def _calculate_numpy(
                         for points, bins, weights in zip(
                             point_indices, radial_bins, radial_weights
                         ):
-                            values = (
-                                spatial_correlation[
-                                    pair_index, mode_index, points
-                                ]
-                                * weights
-                            )
+                            values = spatial_correlation[pair_index, mode_index, points] * weights
                             output += np.bincount(
                                 bins,
                                 weights=values.real,
@@ -252,9 +218,9 @@ def _calculate_numpy(
                                 minlength=num_distances,
                             )
 
-                correlation_spectrum[
-                    pair_start:pair_stop, mode_start:mode_stop
-                ] = radial_correlation
+                correlation_spectrum[pair_start:pair_stop, mode_start:mode_stop] = (
+                    radial_correlation
+                )
                 progress.update()
     finally:
         progress.close()
@@ -288,22 +254,14 @@ def _calculate_torch(
     progress_bar,
 ):
     device = torch.device(
-        device
-        if device is not None
-        else ("cuda" if torch.cuda.is_available() else "cpu")
+        device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            f"CUDA device {device} was requested, but CUDA is not available"
-        )
+        raise RuntimeError(f"CUDA device {device} was requested, but CUDA is not available")
 
     real_dtype = torch.float32 if dtype == "float32" else torch.float64
-    complex_dtype = (
-        torch.complex64 if real_dtype == torch.float32 else torch.complex128
-    )
-    histogram = torch.as_tensor(
-        orient_hist, dtype=real_dtype, device=device
-    )
+    complex_dtype = torch.complex64 if real_dtype == torch.float32 else torch.complex128
+    histogram = torch.as_tensor(orient_hist, dtype=real_dtype, device=device)
     if not bool(torch.all(torch.isfinite(histogram)).item()):
         raise ValueError("orient_hist contains NaN or infinite values")
 
@@ -345,9 +303,8 @@ def _calculate_torch(
                     # are reusable, and after a failed run they can account for
                     # most of the cap. Counting them as spent wrongly reports a
                     # zero budget.
-                    remaining = (
-                        process_fraction * total_memory
-                        - torch.cuda.memory_allocated(device)
+                    remaining = process_fraction * total_memory - torch.cuda.memory_allocated(
+                        device
                     )
                     budget = min(budget, max(0, int(remaining)))
                 return max(0, budget - spectrum_bytes)
@@ -355,11 +312,7 @@ def _calculate_torch(
             memory_budget = int(available_bytes() * max_memory_fraction)
 
             def estimate_bytes_per_mode(batch_size):
-                return (
-                    padded_pixels
-                    * complex_bytes
-                    * (num_radii + 3 * batch_size)
-                )
+                return padded_pixels * complex_bytes * (num_radii + 3 * batch_size)
 
             bytes_per_mode = estimate_bytes_per_mode(pair_batch_size)
             if not pair_batch_was_requested:
@@ -418,9 +371,7 @@ def _calculate_torch(
         torch.as_tensor(values, dtype=real_dtype, device=device)
         for values in geometry["radial_weights"]
     ]
-    pair_indices = torch.as_tensor(
-        pair_indices, dtype=torch.long, device=device
-    )
+    pair_indices = torch.as_tensor(pair_indices, dtype=torch.long, device=device)
 
     theta_spectrum = torch.fft.rfft(histogram, dim=-1)
     correlation_spectrum = torch.empty(
@@ -428,10 +379,7 @@ def _calculate_torch(
         dtype=complex_dtype,
         device=device,
     )
-    total = (
-        int(np.ceil(num_modes / mode_batch_size))
-        * int(np.ceil(num_pairs / pair_batch_size))
-    )
+    total = int(np.ceil(num_modes / mode_batch_size)) * int(np.ceil(num_pairs / pair_batch_size))
     progress = tqdm(
         total=total,
         desc=f"Calculate orientation correlations ({device})",
@@ -450,15 +398,10 @@ def _calculate_torch(
             for pair_start in range(0, num_pairs, pair_batch_size):
                 pair_stop = min(pair_start + pair_batch_size, num_pairs)
                 pair_batch = pair_indices[pair_start:pair_stop]
-                cross_spectrum = (
-                    spatial_spectrum.index_select(0, pair_batch[:, 0])
-                    * torch.conj(
-                        spatial_spectrum.index_select(0, pair_batch[:, 1])
-                    )
+                cross_spectrum = spatial_spectrum.index_select(0, pair_batch[:, 0]) * torch.conj(
+                    spatial_spectrum.index_select(0, pair_batch[:, 1])
                 )
-                spatial_correlation = torch.fft.ifft2(
-                    cross_spectrum, dim=(-2, -1)
-                ).flatten(-2)
+                spatial_correlation = torch.fft.ifft2(cross_spectrum, dim=(-2, -1)).flatten(-2)
                 radial_correlation = torch.zeros(
                     (
                         len(pair_batch),
@@ -468,25 +411,21 @@ def _calculate_torch(
                     dtype=complex_dtype,
                     device=device,
                 )
-                for points, bins, weights in zip(
-                    point_indices, radial_bins, radial_weights
-                ):
+                for points, bins, weights in zip(point_indices, radial_bins, radial_weights):
                     radial_correlation.index_add_(
                         -1,
                         bins,
                         spatial_correlation.index_select(-1, points) * weights,
                     )
 
-                correlation_spectrum[
-                    pair_start:pair_stop, mode_start:mode_stop
-                ] = radial_correlation
+                correlation_spectrum[pair_start:pair_stop, mode_start:mode_stop] = (
+                    radial_correlation
+                )
                 progress.update()
     finally:
         progress.close()
 
-    radial_correlation = torch.fft.irfft(
-        correlation_spectrum, n=num_theta, dim=1
-    )
+    radial_correlation = torch.fft.irfft(correlation_spectrum, n=num_theta, dim=1)
     return _normalize_correlation(
         radial_correlation,
         correlation_spectrum,
@@ -550,18 +489,10 @@ def calculate_orientation_correlation(
     geometry = _radial_geometry(size_x, size_y, radius_max)
     if backend == "auto":
         wants_cuda = device is None or str(device).startswith("cuda")
-        backend = (
-            "torch"
-            if torch.cuda.is_available() and wants_cuda
-            else "numpy"
-        )
+        backend = "torch" if torch.cuda.is_available() and wants_cuda else "numpy"
 
     if backend == "numpy":
-        histogram = (
-            orient_hist.detach().cpu().numpy()
-            if is_torch_input
-            else orient_hist
-        )
+        histogram = orient_hist.detach().cpu().numpy() if is_torch_input else orient_hist
         output = _calculate_numpy(
             histogram,
             pair_indices,
@@ -711,22 +642,16 @@ def plot_orientation_correlation(
         )
     values = np.asarray(values)
     if values.ndim != 3:
-        raise ValueError(
-            "orient_corr must have shape (pair, relative_angle, distance)."
-        )
+        raise ValueError("orient_corr must have shape (pair, relative_angle, distance).")
     if values.shape[0] == 0:
         raise ValueError("orient_corr must contain at least one radial-bin pair.")
     if values.shape[1] < 2 or values.shape[2] < 2:
-        raise ValueError(
-            "orient_corr requires at least two angle and two distance samples."
-        )
+        raise ValueError("orient_corr requires at least two angle and two distance samples.")
     labels = orient_corr_pairs if pair_indices is None else pair_indices
     if labels is not None:
         labels = np.asarray(labels)
         if labels.shape != (values.shape[0], 2):
-            raise ValueError(
-                f"pair_indices must have shape ({values.shape[0]}, 2)."
-            )
+            raise ValueError(f"pair_indices must have shape ({values.shape[0]}, 2).")
 
     panel_count = values.shape[0]
     column_count = min(3, max(1, panel_count))
@@ -756,9 +681,7 @@ def plot_orientation_correlation(
         )
     distance_max = (values.shape[2] - 1) * float(pixel_size)
     distances = np.arange(values.shape[2], dtype=float) * float(pixel_size)
-    angles = np.linspace(
-        0.0, MAX_RELATIVE_ANGLE_DEGREES, values.shape[1]
-    )
+    angles = np.linspace(0.0, MAX_RELATIVE_ANGLE_DEGREES, values.shape[1])
     image = None
     metrics = []
     for index, ax in enumerate(axes.flat):
@@ -808,10 +731,7 @@ def plot_orientation_correlation(
         lobe_index = (
             zero_separation.size - 1
             if np.isfinite(last_probability)
-            and (
-                not np.isfinite(first_probability)
-                or last_probability > first_probability
-            )
+            and (not np.isfinite(first_probability) or last_probability > first_probability)
             else 0
         )
         lobe_angle = float(angles[lobe_index])
@@ -837,9 +757,7 @@ def plot_orientation_correlation(
         fit_distances = np.array([])
         fit_angles = np.array([])
         if np.isfinite(half_probability):
-            radial_distance = crossing(
-                distances, panel[lobe_index, :], half_probability
-            )
+            radial_distance = crossing(distances, panel[lobe_index, :], half_probability)
             # Walk outwards from the lobe along the zero-separation column in
             # both directions and keep the nearer crossing, so the annular
             # distance is an angular offset from the lobe for every pair and
@@ -855,9 +773,7 @@ def plot_orientation_correlation(
                 offsets = np.arange(branch.size, dtype=float) * angular_step
                 offset = crossing(offsets, branch, half_probability)
                 if np.isfinite(offset):
-                    annular_candidates.append(
-                        (offset, lobe_angle + direction * offset)
-                    )
+                    annular_candidates.append((offset, lobe_angle + direction * offset))
             if annular_candidates:
                 annular_distance, annular_angle = min(annular_candidates)
             # An intercept that does not exist inside the measured window is
@@ -892,10 +808,7 @@ def plot_orientation_correlation(
         # The slope belongs to the gray probability/random = 1 boundary, not
         # the half-maximum contour used for the two distance intercepts.
         baseline_boundary = np.array(
-            [
-                crossing(angles, panel[:, radius], 1.0)
-                for radius in range(panel.shape[1])
-            ]
+            [crossing(angles, panel[:, radius], 1.0) for radius in range(panel.shape[1])]
         )
         baseline_radial_intercept = crossing(distances, panel[0, :], 1.0)
         valid = np.isfinite(baseline_boundary)
@@ -907,16 +820,12 @@ def plot_orientation_correlation(
         valid_indices = np.flatnonzero(valid)
         primary_indices = np.array([], dtype=int)
         if valid_indices.size:
-            angular_jump = np.abs(
-                np.diff(baseline_boundary[valid_indices])
-            )
+            angular_jump = np.abs(np.diff(baseline_boundary[valid_indices]))
             maximum_step = max(15.0, 4.0 * (angles[1] - angles[0]))
-            split_points = np.flatnonzero(
-                (np.diff(valid_indices) > 1) | (angular_jump > maximum_step)
-            ) + 1
-            segments = np.split(
-                valid_indices, split_points
+            split_points = (
+                np.flatnonzero((np.diff(valid_indices) > 1) | (angular_jump > maximum_step)) + 1
             )
+            segments = np.split(valid_indices, split_points)
             primary_indices = next(
                 (segment for segment in segments if len(segment) >= 2),
                 np.array([], dtype=int),
@@ -935,9 +844,7 @@ def plot_orientation_correlation(
             )
             boundary_gradient = np.gradient(boundary_smooth)
             initial_count = min(20, max(3, len(boundary_run) // 10))
-            initial_trend = float(
-                np.median(boundary_gradient[:initial_count])
-            )
+            initial_trend = float(np.median(boundary_gradient[:initial_count]))
             if not np.isclose(initial_trend, 0.0):
                 reversal = boundary_gradient * np.sign(initial_trend) < 0
                 persistence = min(5, max(2, len(boundary_run) // 20))
@@ -948,9 +855,7 @@ def plot_orientation_correlation(
                 )
                 turning_points = np.flatnonzero(sustained == persistence)
                 if turning_points.size and turning_points[0] >= 2:
-                    primary_indices = primary_indices[
-                        : turning_points[0] + 1
-                    ]
+                    primary_indices = primary_indices[: turning_points[0] + 1]
         if primary_indices.size:
             fit_distances = distances[primary_indices]
             fit_values = baseline_boundary[primary_indices]
@@ -974,14 +879,11 @@ def plot_orientation_correlation(
                 fit_weights = np.ones_like(fit_distances)
                 weight_scale = np.inf
             else:
-                fit_weights = np.exp(
-                    -(fit_distances - fit_distances.min()) / weight_scale
-                )
+                fit_weights = np.exp(-(fit_distances - fit_distances.min()) / weight_scale)
 
             root_weights = np.sqrt(fit_weights)
             design = (
-                np.vstack([fit_distances, np.ones_like(fit_distances)]).T
-                * root_weights[:, None]
+                np.vstack([fit_distances, np.ones_like(fit_distances)]).T * root_weights[:, None]
             )
             fit_slope, fit_intercept = np.linalg.lstsq(
                 design, fit_values * root_weights, rcond=None
@@ -992,22 +894,12 @@ def plot_orientation_correlation(
             slope_fit_point_count = int(fit_distances.size)
             # Kish effective sample size: how many points the weighting really
             # uses, so a too-aggressive scale is visible rather than silent.
-            slope_fit_effective_count = float(
-                fit_weights.sum() ** 2 / np.sum(fit_weights**2)
-            )
-            weight_mean = float(
-                np.average(fit_values, weights=fit_weights)
-            )
-            residual_sum_squares = float(
-                np.sum(fit_weights * (fit_values - fit_angles) ** 2)
-            )
-            total_sum_squares = float(
-                np.sum(fit_weights * (fit_values - weight_mean) ** 2)
-            )
+            slope_fit_effective_count = float(fit_weights.sum() ** 2 / np.sum(fit_weights**2))
+            weight_mean = float(np.average(fit_values, weights=fit_weights))
+            residual_sum_squares = float(np.sum(fit_weights * (fit_values - fit_angles) ** 2))
+            total_sum_squares = float(np.sum(fit_weights * (fit_values - weight_mean) ** 2))
             slope_fit_r_squared = (
-                1.0 - residual_sum_squares / total_sum_squares
-                if total_sum_squares > 0
-                else np.nan
+                1.0 - residual_sum_squares / total_sum_squares if total_sum_squares > 0 else np.nan
             )
 
         if fit_distances.size:
@@ -1015,19 +907,13 @@ def plot_orientation_correlation(
             # ~3 decay lengths the boundary has saturated away from this
             # tangent, and extending the line there would misrepresent the fit.
             if np.isfinite(weight_scale):
-                drawn = fit_distances <= (
-                    fit_distances.min() + 3.0 * weight_scale
-                )
+                drawn = fit_distances <= (fit_distances.min() + 3.0 * weight_scale)
                 if drawn.sum() < 2:
                     drawn = np.zeros_like(fit_distances, dtype=bool)
                     drawn[: min(2, drawn.size)] = True
             else:
                 drawn = np.ones_like(fit_distances, dtype=bool)
-            visible_fit = (
-                drawn
-                & (fit_angles >= 0)
-                & (fit_angles <= MAX_RELATIVE_ANGLE_DEGREES)
-            )
+            visible_fit = drawn & (fit_angles >= 0) & (fit_angles <= MAX_RELATIVE_ANGLE_DEGREES)
             ax.plot(
                 fit_distances[visible_fit],
                 fit_angles[visible_fit],
@@ -1076,9 +962,7 @@ def plot_orientation_correlation(
             "lobe_angle_degrees": lobe_angle,
             "radial_distance": float(radial_distance),
             "radial_distance_censored": bool(radial_censored),
-            "radial_distance_lower_bound": (
-                float(distance_max) if radial_censored else np.nan
-            ),
+            "radial_distance_lower_bound": (float(distance_max) if radial_censored else np.nan),
             "annular_distance_degrees": float(annular_distance),
             "annular_distance_censored": bool(annular_censored),
             "annular_distance_lower_bound_degrees": (
@@ -1091,9 +975,7 @@ def plot_orientation_correlation(
             "slope_fit_r_squared": float(slope_fit_r_squared),
             "slope_fit_point_count": slope_fit_point_count,
             "slope_fit_intercept_degrees": float(slope_fit_intercept),
-            "slope_fit_effective_point_count": float(
-                slope_fit_effective_count
-            ),
+            "slope_fit_effective_point_count": float(slope_fit_effective_count),
             "slope_weight_scale": float(weight_scale),
             "slope_contour_probability": 1.0,
             "distance_units": pixel_units,
@@ -1115,9 +997,7 @@ def plot_orientation_correlation(
                 else "not resolved"
             )
             slope_text = (
-                f"{slope:.2f} degrees/{pixel_units}"
-                if np.isfinite(slope)
-                else "not resolved"
+                f"{slope:.2f} degrees/{pixel_units}" if np.isfinite(slope) else "not resolved"
             )
             ax.text(
                 0.98,

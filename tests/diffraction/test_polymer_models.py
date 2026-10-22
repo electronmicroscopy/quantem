@@ -29,12 +29,19 @@ def test_download_then_offline_cache_hit(tmp_path):
         return io.BytesIO(payload)
 
     first = resolve_polymer_model(
-        "test-model", version="v1", cache_dir=tmp_path, registry=_registry(payload), downloader=download
+        "test-model",
+        version="v1",
+        cache_dir=tmp_path,
+        registry=_registry(payload),
+        downloader=download,
     )
     assert first.weights_path.read_bytes() == payload
     assert first.weights_path.parent.name == first.checksum
     second = resolve_polymer_model(
-        "test-model", version="v1", cache_dir=tmp_path, registry=_registry(payload),
+        "test-model",
+        version="v1",
+        cache_dir=tmp_path,
+        registry=_registry(payload),
         downloader=lambda _: pytest.fail("offline cache hit attempted a download"),
     )
     assert second == first
@@ -64,8 +71,11 @@ def test_failed_download_leaves_no_partial_file(tmp_path):
     ]:
         with pytest.raises(PolymerModelError, match=match):
             resolve_polymer_model(
-                "test-model", version="v1", cache_dir=tmp_path / label,
-                registry=_registry(b"expected"), downloader=downloader,
+                "test-model",
+                version="v1",
+                cache_dir=tmp_path / label,
+                registry=_registry(b"expected"),
+                downloader=downloader,
             )
         assert not list(tmp_path.rglob("weights.pth")), label
         assert not list(tmp_path.rglob(".download-*")), label
@@ -74,8 +84,13 @@ def test_failed_download_leaves_no_partial_file(tmp_path):
 def test_incompatible_specification_is_rejected(tmp_path):
     with pytest.raises(PolymerModelError, match="incompatible"):
         resolve_polymer_model(
-            "test-model", version="v1", cache_dir=tmp_path,
-            registry=_registry(b"weights", architecture={"input_channels": 3, "output_channels": 2, "kernel_size": 3}),
+            "test-model",
+            version="v1",
+            cache_dir=tmp_path,
+            registry=_registry(
+                b"weights",
+                architecture={"input_channels": 3, "output_channels": 2, "kernel_size": 3},
+            ),
         )
 
 
@@ -84,9 +99,14 @@ def test_latest_is_explicit_and_exclusive(tmp_path):
     versions = _registry(payload)["test-model"]
     versions["v2"] = versions["v1"]
     result = resolve_polymer_model(
-        "test-model", latest=True, cache_dir=tmp_path, registry={"test-model": versions},
+        "test-model",
+        latest=True,
+        cache_dir=tmp_path,
+        registry={"test-model": versions},
         downloader=lambda _: io.BytesIO(payload),
     )
     assert result.version == "v2"
     with pytest.raises(ValueError, match="mutually exclusive"):
-        resolve_polymer_model("test-model", version="v1", latest=True, registry={"test-model": versions})
+        resolve_polymer_model(
+            "test-model", version="v1", latest=True, registry={"test-model": versions}
+        )

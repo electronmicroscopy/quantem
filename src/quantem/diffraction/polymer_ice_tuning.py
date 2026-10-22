@@ -50,8 +50,14 @@ def peak_widths(bp, params, *, use_cache=True):
     Cached on the q band and intensity field, which are the only inputs that
     change the measurement, so sweeping the ceilings costs nothing.
     """
-    key = (id(bp), params.q_target_invA, params.dq_invA, params.intensity_field,
-           params.sharpness_window_theta_deg, params.sharpness_smooth_sigma_bins)
+    key = (
+        id(bp),
+        params.q_target_invA,
+        params.dq_invA,
+        params.intensity_field,
+        params.sharpness_window_theta_deg,
+        params.sharpness_smooth_sigma_bins,
+    )
     if use_cache and key in _WIDTH_CACHE:
         return _WIDTH_CACHE[key]
     print("measuring peak widths over the q band (cached until the q band changes)...")
@@ -60,8 +66,9 @@ def peak_widths(bp, params, *, use_cache=True):
     return widths
 
 
-def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None,
-                  fig_path=None, use_cache=True):
+def selection_box(
+    bp, params, *, max_width_r_invA=None, max_width_theta_deg=None, fig_path=None, use_cache=True
+):
     """Preview the sharpness gate as a box in (width, intensity), and return the params.
 
     Assign the result back to your params object; nothing is mutated in place::
@@ -90,29 +97,39 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
     floor_label = "none" if not np.isfinite(floor) else f"{floor:.4g}"
     selected = sharpness_mask(width_r, width_theta, tuned) & (intensity >= floor)
     total = len(width_r)
-    print(f"box selects {selected.sum()} of {total} q-band peaks "
-          f"({100 * selected.sum() / max(total, 1):.1f}%)")
+    print(
+        f"box selects {selected.sum()} of {total} q-band peaks "
+        f"({100 * selected.sum() / max(total, 1):.1f}%)"
+    )
 
     # Where each population sits. If a width's two rows look alike, that axis does
     # not separate the populations and its ceiling buys nothing.
     bright, dim = intensity >= floor, intensity < floor
     quantiles = [0.05, 0.25, 0.5, 0.75, 0.95]
-    for label, values, digits in (("radial FWHM (1/Å)", width_r, 4),
-                                  ("annular FWHM (deg)", width_theta, 2)):
+    for label, values, digits in (
+        ("radial FWHM (1/Å)", width_r, 4),
+        ("annular FWHM (deg)", width_theta, 2),
+    ):
         print(f"{label} quantiles {quantiles}")
-        for group_label, group in ((f"intensity >= {floor_label}", bright),
-                                   (f"intensity <  {floor_label}", dim)):
+        for group_label, group in (
+            (f"intensity >= {floor_label}", bright),
+            (f"intensity <  {floor_label}", dim),
+        ):
             finite = group & np.isfinite(values)
-            print(f"  {group_label:<22} (n={finite.sum():>7}):",
-                  np.round(np.quantile(values[finite], quantiles), digits)
-                  if finite.any() else "none")
+            print(
+                f"  {group_label:<22} (n={finite.sum():>7}):",
+                np.round(np.quantile(values[finite], quantiles), digits)
+                if finite.any()
+                else "none",
+            )
 
     fig, ((ax_r, ax_t), (ax_rt, ax_map)) = plt.subplots(2, 2, figsize=(12.5, 9))
 
     def width_panel(ax, values, ceiling, xlabel):
         finite = np.isfinite(values)
-        hist = ax.hist2d(values[finite], intensity[finite], bins=(80, 80),
-                         norm=LogNorm(), cmap="magma")
+        hist = ax.hist2d(
+            values[finite], intensity[finite], bins=(80, 80), norm=LogNorm(), cmap="magma"
+        )
         fig.colorbar(hist[3], ax=ax, label="count (log)")
         x_lo, x_hi = ax.get_xlim()
         y_lo, y_hi = ax.get_ylim()
@@ -122,11 +139,21 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
         edge = x_hi if ceiling is None else ceiling
         if ceiling is not None:
             ax.axvline(ceiling, color="cyan", ls="--", lw=2)
-        ax.add_patch(plt.Rectangle((x_lo, bottom), edge - x_lo, y_hi - bottom,
-                                   facecolor="cyan", alpha=0.15, edgecolor="none"))
-        ax.set(xlabel=xlabel, ylabel=tuned.intensity_field,
-               title=f"{xlabel} vs intensity"
-                     + ("" if ceiling is not None else "  (no ceiling set)"))
+        ax.add_patch(
+            plt.Rectangle(
+                (x_lo, bottom),
+                edge - x_lo,
+                y_hi - bottom,
+                facecolor="cyan",
+                alpha=0.15,
+                edgecolor="none",
+            )
+        )
+        ax.set(
+            xlabel=xlabel,
+            ylabel=tuned.intensity_field,
+            title=f"{xlabel} vs intensity" + ("" if ceiling is not None else "  (no ceiling set)"),
+        )
 
     width_panel(ax_r, width_r, tuned.max_width_r_invA, "radial FWHM (1/Å)")
     width_panel(ax_t, width_theta, tuned.max_width_theta_deg, "annular FWHM (deg)")
@@ -134,8 +161,9 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
     # The plane the gate cuts in. Ceilings are ANDed, so the keep-region is the
     # corner under both; with no radial ceiling it is the band below the annular one.
     plane = np.isfinite(width_r) & np.isfinite(width_theta) & bright
-    hist = ax_rt.hist2d(width_r[plane], width_theta[plane], bins=(80, 80),
-                        norm=LogNorm(), cmap="magma")
+    hist = ax_rt.hist2d(
+        width_r[plane], width_theta[plane], bins=(80, 80), norm=LogNorm(), cmap="magma"
+    )
     fig.colorbar(hist[3], ax=ax_rt, label="count (log)")
     x_lo, x_hi = ax_rt.get_xlim()
     y_lo, y_hi = ax_rt.get_ylim()
@@ -145,10 +173,21 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
         ax_rt.axvline(tuned.max_width_r_invA, color="cyan", ls="--", lw=2)
     if tuned.max_width_theta_deg is not None:
         ax_rt.axhline(tuned.max_width_theta_deg, color="cyan", ls="--", lw=2)
-    ax_rt.add_patch(plt.Rectangle((x_lo, y_lo), r_edge - x_lo, t_edge - y_lo,
-                                  facecolor="cyan", alpha=0.15, edgecolor="none"))
-    ax_rt.set(xlabel="radial FWHM (1/Å)", ylabel="annular FWHM (deg)",
-              title=f"radial vs annular FWHM  (intensity >= {floor_label})")
+    ax_rt.add_patch(
+        plt.Rectangle(
+            (x_lo, y_lo),
+            r_edge - x_lo,
+            t_edge - y_lo,
+            facecolor="cyan",
+            alpha=0.15,
+            edgecolor="none",
+        )
+    )
+    ax_rt.set(
+        xlabel="radial FWHM (1/Å)",
+        ylabel="annular FWHM (deg)",
+        title=f"radial vs annular FWHM  (intensity >= {floor_label})",
+    )
 
     # Ice should be compact blobs on the scan, not sprinkled everywhere.
     selected_map = np.zeros(bp.polar_peaks.shape, dtype=int)
@@ -164,16 +203,21 @@ def selection_box(bp, params, *, max_width_r_invA=None, max_width_theta_deg=None
         fig.savefig(fig_path, format="pdf", bbox_inches="tight")
     plt.show()
 
-    print(f"\nreturned params: max_width_r_invA={tuned.max_width_r_invA}, "
-          f"max_width_theta_deg={tuned.max_width_theta_deg}, "
-          f"intensity_cutoff={tuned.intensity_cutoff}")
-    print(f"detect_ice can flag at most these {selected.sum()} peaks; the six-fold "
-          "alignment then drops those not sitting in an aligned pattern.")
+    print(
+        f"\nreturned params: max_width_r_invA={tuned.max_width_r_invA}, "
+        f"max_width_theta_deg={tuned.max_width_theta_deg}, "
+        f"intensity_cutoff={tuned.intensity_cutoff}"
+    )
+    print(
+        f"detect_ice can flag at most these {selected.sum()} peaks; the six-fold "
+        "alignment then drops those not sitting in an aligned pattern."
+    )
     return tuned
 
 
-def orientation_histograms(bp, ice_result, params, *, theta_step_deg=2.0,
-                           orientation_offset_degrees=0.0, fig_path=None):
+def orientation_histograms(
+    bp, ice_result, params, *, theta_step_deg=2.0, orientation_offset_degrees=0.0, fig_path=None
+):
     """Ice-band orientation histograms for all / kept / removed peaks.
 
     Run BEFORE the filter cell: the removed set needs the unfiltered peaks.
@@ -182,8 +226,7 @@ def orientation_histograms(bp, ice_result, params, *, theta_step_deg=2.0,
     three histograms as a dict, keyed 'all peaks' / 'kept (ice removed)' /
     'removed (ice)'.
     """
-    q_window = (params.q_target_invA - params.dq_invA,
-                params.q_target_invA + params.dq_invA)
+    q_window = (params.q_target_invA - params.dq_invA, params.q_target_invA + params.dq_invA)
 
     def histogram(polar_peaks, peak_intensities):
         # make_orientation_histogram reads bp.polar_peaks / bp.peak_intensities,
@@ -194,39 +237,53 @@ def orientation_histograms(bp, ice_result, params, *, theta_step_deg=2.0,
         try:
             return bp.make_orientation_histogram(
                 radial_ranges=np.array([q_window]),
-                upsample_factor=1, theta_step_deg=theta_step_deg,
-                sigma_x=0.0, sigma_y=0.0, sigma_theta=3.0,
+                upsample_factor=1,
+                theta_step_deg=theta_step_deg,
+                sigma_x=0.0,
+                sigma_y=0.0,
+                sigma_theta=3.0,
                 orientation_offset_degrees=orientation_offset_degrees,
-                normalize_intensity_image=False, normalize_intensity_stack=False,
-                progress_bar=False)[0]
+                normalize_intensity_image=False,
+                normalize_intensity_stack=False,
+                progress_bar=False,
+            )[0]
         finally:
             bp.polar_peaks, bp.peak_intensities = saved
 
     hists = {
         "all peaks": histogram(bp.polar_peaks, bp.peak_intensities),
-        "kept (ice removed)": histogram(ice_result.filter(bp.polar_peaks),
-                                        ice_result.filter(bp.peak_intensities)),
-        "removed (ice)": histogram(ice_result.filter(bp.polar_peaks, invert=True),
-                                   ice_result.filter(bp.peak_intensities, invert=True)),
+        "kept (ice removed)": histogram(
+            ice_result.filter(bp.polar_peaks), ice_result.filter(bp.peak_intensities)
+        ),
+        "removed (ice)": histogram(
+            ice_result.filter(bp.polar_peaks, invert=True),
+            ice_result.filter(bp.peak_intensities, invert=True),
+        ),
     }
 
     theta = np.arange(0, 180, theta_step_deg)
     vmax = max(float(h.max()) for h in hists.values()) or 1.0
     ymax = max(float(h.sum(axis=(0, 1)).max()) for h in hists.values()) or 1.0
-    fig, axes = plt.subplots(len(hists), 2, figsize=(9, 3.2 * len(hists)),
-                             gridspec_kw={"width_ratios": [1, 1.3]})
+    fig, axes = plt.subplots(
+        len(hists), 2, figsize=(9, 3.2 * len(hists)), gridspec_kw={"width_ratios": [1, 1.3]}
+    )
     for (label, hist), (ax_map, ax_hist) in zip(hists.items(), np.atleast_2d(axes)):
-        image = ax_map.imshow(hist.max(axis=2), cmap="inferno", vmin=0, vmax=vmax,
-                              interpolation="nearest")
+        image = ax_map.imshow(
+            hist.max(axis=2), cmap="inferno", vmin=0, vmax=vmax, interpolation="nearest"
+        )
         ax_map.set_title(f"{label} — max over theta", fontsize=9)
         ax_map.axis("off")
         fig.colorbar(image, ax=ax_map, fraction=0.046)
         ax_hist.plot(theta, hist.sum(axis=(0, 1)), lw=1.2)
-        ax_hist.set(xlim=(0, 180), ylim=(0, 1.05 * ymax), xlabel="theta (deg)",
-                    ylabel="summed intensity")
+        ax_hist.set(
+            xlim=(0, 180), ylim=(0, 1.05 * ymax), xlabel="theta (deg)", ylabel="summed intensity"
+        )
         ax_hist.set_title(f"{label} — angular histogram", fontsize=9)
-    fig.suptitle(f"Ice band q = {q_window[0]:.3f}–{q_window[1]:.3f} 1/Å "
-                 f"(d = {1 / q_window[1]:.2f}–{1 / q_window[0]:.2f} Å)", fontsize=10)
+    fig.suptitle(
+        f"Ice band q = {q_window[0]:.3f}–{q_window[1]:.3f} 1/Å "
+        f"(d = {1 / q_window[1]:.2f}–{1 / q_window[0]:.2f} Å)",
+        fontsize=10,
+    )
     fig.tight_layout()
     if fig_path is not None:
         fig.savefig(fig_path, format="pdf", bbox_inches="tight")
@@ -259,8 +316,9 @@ class IcePeakView:
         object.__setattr__(self, name, value)
 
 
-def ice_split_widget(bp, ice_result, params, *, view="removed", ice_hists=None,
-                     map_view="match", **widget_kwargs):
+def ice_split_widget(
+    bp, ice_result, params, *, view="removed", ice_hists=None, map_view="match", **widget_kwargs
+):
     """Open the interactive viewer on one side of the ice split. ``bp`` is untouched.
 
     ``view`` is 'removed' | 'kept' | 'all'. ``map_view`` follows ``view`` by
@@ -281,8 +339,7 @@ def ice_split_widget(bp, ice_result, params, *, view="removed", ice_hists=None,
     map_key = {"all": "all peaks", "kept": "kept (ice removed)", "removed": "removed (ice)"}
     resolved = view if map_view == "match" else map_view
     if resolved not in map_key:
-        raise ValueError(f"map_view must be 'match', 'removed', 'kept' or 'all'; "
-                         f"got {map_view!r}")
+        raise ValueError(f"map_view must be 'match', 'removed', 'kept' or 'all'; got {map_view!r}")
     if ice_hists is not None:
         context_map = ice_hists[map_key[resolved]].max(axis=2)
         map_label = f"{resolved} orientation"
@@ -299,8 +356,10 @@ def ice_split_widget(bp, ice_result, params, *, view="removed", ice_hists=None,
                     total += len(rows)
         return total
 
-    print(f"showing '{view}' peaks: {count(subset[0])} of {count(peaks[0])} total "
-          "(bp itself is untouched)")
+    print(
+        f"showing '{view}' peaks: {count(subset[0])} of {count(peaks[0])} total "
+        "(bp itself is untouched)"
+    )
     # Pass the view, not bp: bp.show_widget() would bind bp as self.
     return show_polymer_4DSTEM(
         IcePeakView(bp, *subset),
@@ -334,25 +393,32 @@ def probe_peaks(bp, params, ry, rx, *, n_show=4, q_band_only=True):
         keep = np.abs(q - params.q_target_invA) <= params.dq_invA
         q, theta, values = q[keep], theta[keep], values[keep]
     if not len(q):
-        raise ValueError(f"no peaks at ({ry},{rx})"
-                         + (" in the q band" if q_band_only else ""))
+        raise ValueError(f"no peaks at ({ry},{rx})" + (" in the q band" if q_band_only else ""))
 
-    width_r, width_theta = measure_peak_widths(q, theta, image, r_axis, theta_axis,
-                                               params=params)
+    width_r, width_theta = measure_peak_widths(q, theta, image, r_axis, theta_axis, params=params)
     gate_r, gate_t = params.max_width_r_invA, params.max_width_theta_deg
-    print(f"position ({ry}, {rx}) -- {len(q)} peaks"
-          f"{' in the q band' if q_band_only else ''}\n")
-    print(f"{'#':>3} {'q 1/Å':>8} {'d Å':>7} {'theta°':>8} {'intens':>8} "
-          f"{'radFWHM':>9} {'annFWHM':>9}  gate")
+    print(f"position ({ry}, {rx}) -- {len(q)} peaks{' in the q band' if q_band_only else ''}\n")
+    print(
+        f"{'#':>3} {'q 1/Å':>8} {'d Å':>7} {'theta°':>8} {'intens':>8} "
+        f"{'radFWHM':>9} {'annFWHM':>9}  gate"
+    )
     for k in np.argsort(-values):
         pass_r = gate_r is None or width_r[k] <= gate_r
         pass_t = gate_t is None or width_theta[k] <= gate_t
-        verdict = ("sharp" if (pass_r and pass_t) else
-                   "broad-r" if not pass_r and pass_t else
-                   "broad-t" if pass_r else "broad-rt")
-        print(f"{k:>3} {q[k]:>8.4f} {1 / max(q[k], 1e-9):>7.2f} "
-              f"{np.rad2deg(theta[k]):>8.1f} {values[k]:>8.4f} "
-              f"{width_r[k]:>9.4f} {width_theta[k]:>9.1f}  {verdict}")
+        verdict = (
+            "sharp"
+            if (pass_r and pass_t)
+            else "broad-r"
+            if not pass_r and pass_t
+            else "broad-t"
+            if pass_r
+            else "broad-rt"
+        )
+        print(
+            f"{k:>3} {q[k]:>8.4f} {1 / max(q[k], 1e-9):>7.2f} "
+            f"{np.rad2deg(theta[k]):>8.1f} {values[k]:>8.4f} "
+            f"{width_r[k]:>9.4f} {width_theta[k]:>9.1f}  {verdict}"
+        )
 
     order = np.argsort(-values)[:n_show]
     theta_step = float(np.rad2deg(theta_axis[1] - theta_axis[0]))
@@ -367,19 +433,32 @@ def probe_peaks(bp, params, ry, rx, *, n_show=4, q_band_only=True):
         ax.plot(r_axis, image[:, theta_bin], lw=1)
         ax.axvline(q[k], color="tab:red", ls=":")
         ax.axvspan(q[k] - width_r[k] / 2, q[k] + width_r[k] / 2, color="tab:red", alpha=0.15)
-        ax.set(xlim=(q[k] - 6 * max(width_r[k], r_step), q[k] + 6 * max(width_r[k], r_step)),
-               xlabel="q (1/Å)", ylabel="intensity",
-               title=f"peak {k}: radial cut, FWHM={width_r[k]:.4f} 1/Å")
+        ax.set(
+            xlim=(q[k] - 6 * max(width_r[k], r_step), q[k] + 6 * max(width_r[k], r_step)),
+            xlabel="q (1/Å)",
+            ylabel="intensity",
+            title=f"peak {k}: radial cut, FWHM={width_r[k]:.4f} 1/Å",
+        )
 
         ax = axes[row][1]
         center = np.mod(np.rad2deg(theta[k]), 180.0)
         ax.plot(np.rad2deg(theta_axis), image[r_bin, :], lw=1)
         ax.axvline(center, color="tab:red", ls=":")
-        ax.axvspan(center - width_theta[k] / 2, center + width_theta[k] / 2,
-                   color="tab:red", alpha=0.15)
-        ax.set(xlim=(0, 180), xlabel="theta (deg)", ylabel="intensity",
-               title=f"peak {k}: annular cut, FWHM={width_theta[k]:.1f}°")
+        ax.axvspan(
+            center - width_theta[k] / 2, center + width_theta[k] / 2, color="tab:red", alpha=0.15
+        )
+        ax.set(
+            xlim=(0, 180),
+            xlabel="theta (deg)",
+            ylabel="intensity",
+            title=f"peak {k}: annular cut, FWHM={width_theta[k]:.1f}°",
+        )
     fig.tight_layout()
     plt.show()
-    return {"q_invA": q, "theta_rad": theta, "intensity": values,
-            "width_r_invA": width_r, "width_theta_deg": width_theta}
+    return {
+        "q_invA": q,
+        "theta_rad": theta,
+        "intensity": values,
+        "width_r_invA": width_r,
+        "width_theta_deg": width_theta,
+    }

@@ -23,19 +23,25 @@ KWARGS = dict(num_bins=100, q_min=0.0, q_max=0.5, prominence_factor=0.05, smooth
 @pytest.fixture(scope="module")
 def bp():
     dataset = Dataset4dstem.from_array(
-        array=np.zeros((4, 4, 8, 8), dtype=np.float32), name="windows_test",
-        origin=(0, 0, 0, 0), sampling=(1.0, 1.0, 1.0, 1.0),
-        units=["pixels"] * 4, signal_units="counts",
+        array=np.zeros((4, 4, 8, 8), dtype=np.float32),
+        name="windows_test",
+        origin=(0, 0, 0, 0),
+        sampling=(1.0, 1.0, 1.0, 1.0),
+        units=["pixels"] * 4,
+        signal_units="counts",
     )
     analysis = BraggPeaksPolymer.from_data(
-        dataset, device="cpu",
+        dataset,
+        device="cpu",
         compute_parameters=lambda x, **kwargs: (0.0, 1.0),
         normalize_data=lambda x, lo, hi: x,
     )
-    polar = Vector.from_shape(shape=(4, 4), fields=["r_invA", "theta"],
-                             units=["1/A", "rad"], name="polar_peaks")
-    intensities = Vector.from_shape(shape=(4, 4), fields=["intensities"],
-                                    units=["counts"], name="peak_intensities")
+    polar = Vector.from_shape(
+        shape=(4, 4), fields=["r_invA", "theta"], units=["1/A", "rad"], name="polar_peaks"
+    )
+    intensities = Vector.from_shape(
+        shape=(4, 4), fields=["intensities"], units=["counts"], name="peak_intensities"
+    )
     rng = np.random.default_rng(0)
     for i in range(4):
         for j in range(4):
@@ -63,8 +69,16 @@ def test_recovers_the_injected_families_and_windows(bp):
     assert np.all((windows[:, 1] - windows[:, 0]) >= 0.05 - 1e-9)
 
     # `profile` and `intensity_profile` are the same array -- a back-compat alias.
-    assert set(info) == {"heights", "prominences", "widths_fwhm", "intensity_profile",
-                         "profile", "r_centers", "mode", "log_scale"}
+    assert set(info) == {
+        "heights",
+        "prominences",
+        "widths_fwhm",
+        "intensity_profile",
+        "profile",
+        "r_centers",
+        "mode",
+        "log_scale",
+    }
     np.testing.assert_array_equal(info["profile"], info["intensity_profile"])
     assert info["r_centers"].shape == info["profile"].shape == (100,)
     assert info["mode"] == "intensity" and info["log_scale"] is False
@@ -81,7 +95,8 @@ def test_recovers_the_injected_families_and_windows(bp):
 def test_no_peaks_and_bad_mode(bp):
     """A window containing no peaks must still return usable shapes."""
     centers, windows, info = bp.estimate_peak_windows(
-        num_bins=20, q_min=0.9, q_max=1.0, prominence_factor=0.5)
+        num_bins=20, q_min=0.9, q_max=1.0, prominence_factor=0.5
+    )
 
     assert len(centers) == 0
     assert windows.shape == (0, 2)

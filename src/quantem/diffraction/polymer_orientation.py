@@ -31,12 +31,7 @@ __all__ = [
 ]
 
 
-def _get_intensity(
-    orient, 
-    x, 
-    y, 
-    t
-):
+def _get_intensity(orient, x, y, t):
     # utility function to get histogram intensites
 
     x = np.clip(x, 0, orient.shape[0] - 2)
@@ -65,10 +60,7 @@ def _get_intensity(
     return int_vals
 
 
-def _set_intensity(
-    orient, 
-    xy_t_int
-):
+def _set_intensity(orient, xy_t_int):
     # utility function to set flowline intensites
 
     xF = np.floor(xy_t_int[:, 0]).astype("int")
@@ -78,54 +70,38 @@ def _set_intensity(
     dy = xy_t_int[:, 1] - yF
     dt = xy_t_int[:, 2] - tF
 
-    inds_1D = np.ravel_multi_index(
-        [xF, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
-        1 - dy
-    ) * (1 - dt)
-    inds_1D = np.ravel_multi_index(
-        [xF, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
-        1 - dy
-    ) * (dt)
-    inds_1D = np.ravel_multi_index(
-        [xF, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
-        dy
-    ) * (1 - dt)
-    inds_1D = np.ravel_multi_index(
-        [xF, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (
-        dy
-    ) * (dt)
-    inds_1D = np.ravel_multi_index(
-        [xF + 1, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (
-        1 - dy
-    ) * (1 - dt)
-    inds_1D = np.ravel_multi_index(
-        [xF + 1, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (
-        1 - dy
-    ) * (dt)
-    inds_1D = np.ravel_multi_index(
-        [xF + 1, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
-    )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (
+    inds_1D = np.ravel_multi_index([xF, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"])
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (1 - dy) * (
         1 - dt
     )
     inds_1D = np.ravel_multi_index(
+        [xF, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+    )
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (1 - dy) * (dt)
+    inds_1D = np.ravel_multi_index(
+        [xF, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+    )
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (dy) * (1 - dt)
+    inds_1D = np.ravel_multi_index(
+        [xF, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+    )
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (1 - dx) * (dy) * (dt)
+    inds_1D = np.ravel_multi_index(
+        [xF + 1, yF, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+    )
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (1 - dy) * (1 - dt)
+    inds_1D = np.ravel_multi_index(
+        [xF + 1, yF, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+    )
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (1 - dy) * (dt)
+    inds_1D = np.ravel_multi_index(
+        [xF + 1, yF + 1, tF], orient.shape[0:3], mode=["clip", "clip", "wrap"]
+    )
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (1 - dt)
+    inds_1D = np.ravel_multi_index(
         [xF + 1, yF + 1, tF + 1], orient.shape[0:3], mode=["clip", "clip", "wrap"]
     )
-    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (
-        dt
-    )
+    orient.ravel()[inds_1D] = orient.ravel()[inds_1D] + xy_t_int[:, 3] * (dx) * (dy) * (dt)
 
     return orient
 
@@ -200,7 +176,7 @@ def make_orientation_histogram(
     dtheta = theta[1] - theta[0]
     dtheta_deg = dtheta * 180 / np.pi
     num_theta_bins = np.size(theta)
-    
+
     # Setup for peak sigma spreading
     if use_peak_sigma:
         v_sigma = np.linspace(-2, 2, 2 * peak_sigma_samples + 1)
@@ -214,9 +190,7 @@ def make_orientation_histogram(
     num_radii = radial_ranges.shape[0]
     size_input = polar_peaks.shape
 
-    size_output = np.round(
-        np.array(size_input).astype("float") * upsample_factor
-    ).astype("int")
+    size_output = np.round(np.array(size_input).astype("float") * upsample_factor).astype("int")
 
     # Output init
     orient_hist = np.zeros([num_radii, size_output[0], size_output[1], num_theta_bins])
@@ -240,21 +214,16 @@ def make_orientation_histogram(
 
             p_r = vector_field_cell(polar_peaks, r_field, rx, ry)
             p_theta = vector_field_cell(polar_peaks, theta_field, rx, ry)
-                
+
             if p_r is not None and len(p_r) > 0:
                 r2 = p_r**2
-                sub = np.logical_and(
-                    r2 >= radial_ranges_2[a0, 0], 
-                    r2 < radial_ranges_2[a0, 1]
-                )
+                sub = np.logical_and(r2 >= radial_ranges_2[a0, 0], r2 < radial_ranges_2[a0, 1])
                 if np.any(sub):
-                    intensity_data = vector_field_cell(
-                        peak_intensities, intensity_field, rx, ry
-                    )
+                    intensity_data = vector_field_cell(peak_intensities, intensity_field, rx, ry)
                     if intensity_data is not None and len(intensity_data) > 0:
                         add_data = True
                         intensity = intensity_data[sub]
-                            
+
                         # Get theta values
                         theta_radians = p_theta[sub]
                         if orientation_flip_sign:
@@ -263,14 +232,15 @@ def make_orientation_histogram(
                         theta_radians += orientation_offset_degrees * np.pi / 180
                         theta_radians = np.mod(theta_radians, np.pi)
                         t = theta_radians / dtheta
-                            
+
                         # Spread signal using peak sigma if requested
                         if use_peak_sigma:
                             # Try to get sigma values if available
-                            if 'sigma_theta' in polar_peaks.fields:
-                                theta_std = vector_field_cell(
-                                    polar_peaks, "sigma_theta", rx, ry
-                                )[sub] / dtheta
+                            if "sigma_theta" in polar_peaks.fields:
+                                theta_std = (
+                                    vector_field_cell(polar_peaks, "sigma_theta", rx, ry)[sub]
+                                    / dtheta
+                                )
                                 t = (t[:, None] + theta_std[:, None] * v_sigma[None, :]).ravel()
                                 intensity = (intensity[:, None] * w_sigma[None, :]).ravel()
 
@@ -289,31 +259,23 @@ def make_orientation_histogram(
                     minlength=num_theta_bins,
                 )
 
-                orient_hist[a0, xF + 1, yF, :] = orient_hist[
-                    a0, xF + 1, yF, :
-                ] + np.bincount(
+                orient_hist[a0, xF + 1, yF, :] = orient_hist[a0, xF + 1, yF, :] + np.bincount(
                     np.mod(tF, num_theta_bins),
                     weights=(dx) * (1 - dy) * (1 - dt) * intensity,
                     minlength=num_theta_bins,
                 )
-                orient_hist[a0, xF + 1, yF, :] = orient_hist[
-                    a0, xF + 1, yF, :
-                ] + np.bincount(
+                orient_hist[a0, xF + 1, yF, :] = orient_hist[a0, xF + 1, yF, :] + np.bincount(
                     np.mod(tF + 1, num_theta_bins),
                     weights=(dx) * (1 - dy) * (dt) * intensity,
                     minlength=num_theta_bins,
                 )
 
-                orient_hist[a0, xF, yF + 1, :] = orient_hist[
-                    a0, xF, yF + 1, :
-                ] + np.bincount(
+                orient_hist[a0, xF, yF + 1, :] = orient_hist[a0, xF, yF + 1, :] + np.bincount(
                     np.mod(tF, num_theta_bins),
                     weights=(1 - dx) * (dy) * (1 - dt) * intensity,
                     minlength=num_theta_bins,
                 )
-                orient_hist[a0, xF, yF + 1, :] = orient_hist[
-                    a0, xF, yF + 1, :
-                ] + np.bincount(
+                orient_hist[a0, xF, yF + 1, :] = orient_hist[a0, xF, yF + 1, :] + np.bincount(
                     np.mod(tF + 1, num_theta_bins),
                     weights=(1 - dx) * (dy) * (dt) * intensity,
                     minlength=num_theta_bins,
@@ -522,18 +484,12 @@ def make_flowline_map(
             t0 = theta[t_inds[a1]]
 
             # init theta
-            inds_theta = np.mod(
-                np.round(t0 / dtheta).astype("int") + vt, orient.shape[2]
-            )
+            inds_theta = np.mod(np.round(t0 / dtheta).astype("int") + vt, orient.shape[2])
             orient_crop = (
                 k
                 * orient[
-                    np.clip(
-                        np.round(xy0[0]).astype("int") + vx, 0, orient.shape[0] - 1
-                    ),
-                    np.clip(
-                        np.round(xy0[1]).astype("int") + vy, 0, orient.shape[1] - 1
-                    ),
+                    np.clip(np.round(xy0[0]).astype("int") + vx, 0, orient.shape[0] - 1),
+                    np.clip(np.round(xy0[1]).astype("int") + vy, 0, orient.shape[1] - 1),
                     inds_theta,
                 ]
             )
@@ -579,9 +535,7 @@ def make_flowline_map(
                     grow = False
                 else:
                     # update direction
-                    inds_theta = np.mod(
-                        np.round(t / dtheta).astype("int") + vt, orient.shape[2]
-                    )
+                    inds_theta = np.mod(np.round(t / dtheta).astype("int") + vt, orient.shape[2])
                     orient_crop = (
                         k
                         * orient[
@@ -650,9 +604,7 @@ def make_flowline_map(
                     grow = False
                 else:
                     # update direction
-                    inds_theta = np.mod(
-                        np.round(t / dtheta).astype("int") + vt, orient.shape[2]
-                    )
+                    inds_theta = np.mod(np.round(t / dtheta).astype("int") + vt, orient.shape[2])
                     orient_crop = (
                         k
                         * orient[
@@ -786,10 +738,7 @@ def make_flowline_rainbow_image(
             # color projections
             b0 = np.maximum(
                 1
-                - np.abs(
-                    np.mod(theta_offset[a0] + theta_color + np.pi, 2 * np.pi) - np.pi
-                )
-                ** 2
+                - np.abs(np.mod(theta_offset[a0] + theta_color + np.pi, 2 * np.pi) - np.pi) ** 2
                 / (np.pi * 2 / 3) ** 2,
                 0,
             )
@@ -821,8 +770,7 @@ def make_flowline_rainbow_image(
             )
 
             sig = np.clip(
-                (orient_flowlines[a0, :, :, :] - int_range[0])
-                / (int_range[1] - int_range[0]),
+                (orient_flowlines[a0, :, :, :] - int_range[0]) / (int_range[1] - int_range[0]),
                 0,
                 1,
             )
@@ -831,10 +779,8 @@ def make_flowline_rainbow_image(
 
             im_flowline[a0, :, :, :] = (
                 np.sum(sig * b0[None, None, :], axis=2)[:, :, None] * c0[None, None, :]
-                + np.sum(sig * b1[None, None, :], axis=2)[:, :, None]
-                * c1[None, None, :]
-                + np.sum(sig * b2[None, None, :], axis=2)[:, :, None]
-                * c2[None, None, :]
+                + np.sum(sig * b1[None, None, :], axis=2)[:, :, None] * c1[None, None, :]
+                + np.sum(sig * b2[None, None, :], axis=2)[:, :, None] * c2[None, None, :]
             )
 
             # clip limits
@@ -927,7 +873,7 @@ def make_flowline_rainbow_legend(
     ta_sym = ta * sym_rotation_order
 
     # mask
-    mask = np.logical_and(ra2 > radial_range[0]**2, ra2 < radial_range[1]**2)
+    mask = np.logical_and(ra2 > radial_range[0] ** 2, ra2 < radial_range[1] ** 2)
     # mask = np.logical_and(ra > radial_range[0], ra < radial_range[1])
 
     # rgb image
@@ -1009,9 +955,7 @@ def make_flowline_combined_image(
             sig = sig**power_scaling
 
         if white_background:
-            im_flowline[a0, :, :, :] = 1 - sig[:, :, None] * (
-                1 - cvals[a0, :][None, None, :]
-            )
+            im_flowline[a0, :, :, :] = 1 - sig[:, :, None] * (1 - cvals[a0, :][None, None, :])
         else:
             im_flowline[a0, :, :, :] = sig[:, :, None] * cvals[a0, :][None, None, :]
 

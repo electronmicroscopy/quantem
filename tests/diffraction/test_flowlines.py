@@ -19,12 +19,16 @@ from quantem.diffraction import BraggPeaksPolymer
 @pytest.fixture(scope="module")
 def bp():
     dataset = Dataset4dstem.from_array(
-        array=np.zeros((1, 1, 4, 4), dtype=np.float32), name="flowline_test",
-        origin=(0, 0, 0, 0), sampling=(1.0, 1.0, 1.0, 1.0), units=["pixels"] * 4,
+        array=np.zeros((1, 1, 4, 4), dtype=np.float32),
+        name="flowline_test",
+        origin=(0, 0, 0, 0),
+        sampling=(1.0, 1.0, 1.0, 1.0),
+        units=["pixels"] * 4,
         signal_units="counts",
     )
     analysis = BraggPeaksPolymer.from_data(
-        dataset, device="cpu",
+        dataset,
+        device="cpu",
         compute_parameters=lambda x, **kwargs: (0.0, 1.0),
         normalize_data=lambda x, lo, hi: x,
     )
@@ -61,11 +65,14 @@ def test_make_flowline_map_traces_the_aligned_band(flowlines, orient_hist):
 def test_flowline_images_are_rgb_in_unit_range(bp, flowlines):
     images = {
         "rainbow": bp.make_flowline_rainbow_image(
-            flowlines, int_range=[0, 1], plot_images=False, sum_radial_bins=True),
+            flowlines, int_range=[0, 1], plot_images=False, sum_radial_bins=True
+        ),
         "combined": bp.make_flowline_combined_image(
-            flowlines, int_range=[0, 1], plot_images=False, sum_radial_bins=True),
+            flowlines, int_range=[0, 1], plot_images=False, sum_radial_bins=True
+        ),
         "legend": bp.make_flowline_rainbow_legend(
-            im_size=np.array([32, 32]), return_image=True, plot_legend=False),
+            im_size=np.array([32, 32]), return_image=True, plot_legend=False
+        ),
     }
     for name, image in images.items():
         assert image.ndim in (3, 4) and image.shape[-1] == 3, f"{name}: {image.shape}"
@@ -78,5 +85,6 @@ def test_intensity_helpers_round_trip(bp):
     written = bp.set_intensity(np.zeros((6, 6, 8)), np.array([[2.0, 3.0, 4.0, 1.0]]))
 
     assert written.sum() == pytest.approx(1.0)
-    assert bp.get_intensity(written, np.array([2.0]), np.array([3.0]),
-                            np.array([4.0]))[0] == pytest.approx(1.0)
+    assert bp.get_intensity(written, np.array([2.0]), np.array([3.0]), np.array([4.0]))[
+        0
+    ] == pytest.approx(1.0)

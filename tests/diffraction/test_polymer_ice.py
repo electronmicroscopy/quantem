@@ -54,7 +54,8 @@ def test_detect_ice_and_filter_does_not_mutate_source():
     original = polar[0, 0].numpy().copy()
 
     result = detect_ice(
-        polar, intensity,
+        polar,
+        intensity,
         params=IceFlaggerParams(intensity_cutoff=0.5, min_matches=2, dtheta_deg=6),
         return_debug=True,
     )
@@ -83,46 +84,105 @@ def test_flagging_counts():
     friedel = dict(arm2, require_friedel_pair=True)
     near_pair = ([5.0, 8.0], [5.0, 8.0])  # same side, 3 deg apart: same arm, not a pair
     cases = [
-        ("masked cell is not analyzed", _cell([0.0, 60.0]), dict(intensity_cutoff=0.0),
-         dict(scan_mask=np.zeros((1, 1), dtype=bool)), dict(flagged=0)),
+        (
+            "masked cell is not analyzed",
+            _cell([0.0, 60.0]),
+            dict(intensity_cutoff=0.0),
+            dict(scan_mask=np.zeros((1, 1), dtype=bool)),
+            dict(flagged=0),
+        ),
         # 12 peaks present, only the strongest lattice's 6 claimed.
         ("one crystallite by default", _lattices(3.0, 31.0), mm3, {}, dict(flagged=6, n_phi=1)),
-        ("max_crystallites claims both; bins accumulate", _lattices(3.0, 31.0),
-         dict(mm3, max_crystallites=3), {}, dict(flagged=12, matched=12, phi=[3.0, 31.0])),
+        (
+            "max_crystallites claims both; bins accumulate",
+            _lattices(3.0, 31.0),
+            dict(mm3, max_crystallites=3),
+            {},
+            dict(flagged=12, matched=12, phi=[3.0, 31.0]),
+        ),
         # A single lattice must not be re-found as a near-duplicate crystallite.
-        ("peel does not split one lattice", _lattices(5.0),
-         dict(mm3, max_crystallites=5), {}, dict(flagged=6, n_phi=1)),
+        (
+            "peel does not split one lattice",
+            _lattices(5.0),
+            dict(mm3, max_crystallites=5),
+            {},
+            dict(flagged=6, n_phi=1),
+        ),
         # 8 deg apart: separable at dtheta_deg=3, not with min_phi_separation_deg=15.
-        ("close lattices separable", _lattices(3.0, 11.0),
-         dict(mm3, dtheta_deg=3.0, max_crystallites=3), {}, dict(n_phi=2)),
-        ("min_phi_separation merges close lattices", _lattices(3.0, 11.0),
-         dict(mm3, dtheta_deg=3.0, max_crystallites=3, min_phi_separation_deg=15.0), {},
-         dict(n_phi=1)),
+        (
+            "close lattices separable",
+            _lattices(3.0, 11.0),
+            dict(mm3, dtheta_deg=3.0, max_crystallites=3),
+            {},
+            dict(n_phi=2),
+        ),
+        (
+            "min_phi_separation merges close lattices",
+            _lattices(3.0, 11.0),
+            dict(mm3, dtheta_deg=3.0, max_crystallites=3, min_phi_separation_deg=15.0),
+            {},
+            dict(n_phi=1),
+        ),
         # theta and theta+180 both fold to 5 deg; before the period was honoured the
         # pair counted as one bin and was rejected by min_matches=2.
         ("folded friedel pair", _cell([5.0, 5.0]), dict(min_matches=1), FOLD, dict(flagged=2)),
-        ("three arms reachable on 180 deg", _cell([5.0, 65.0, 125.0]), mm3, FOLD,
-         dict(flagged=3, n_bins=3)),
+        (
+            "three arms reachable on 180 deg",
+            _cell([5.0, 65.0, 125.0]),
+            mm3,
+            FOLD,
+            dict(flagged=3, n_bins=3),
+        ),
         # Params insist on the full circle, so min_matches=5 is reachable: no error.
-        ("params theta_period overrides caller", _cell([5.0, 5.0]),
-         dict(min_matches=5, theta_period_deg=360.0), FOLD, dict(flagged=0)),
-        ("lone peak, default min_peaks_per_arm", _cell([5.0]), dict(min_matches=1), FOLD,
-         dict(flagged=1)),
+        (
+            "params theta_period overrides caller",
+            _cell([5.0, 5.0]),
+            dict(min_matches=5, theta_period_deg=360.0),
+            FOLD,
+            dict(flagged=0),
+        ),
+        (
+            "lone peak, default min_peaks_per_arm",
+            _cell([5.0]),
+            dict(min_matches=1),
+            FOLD,
+            dict(flagged=1),
+        ),
         ("lone peak below min_peaks_per_arm", _cell([5.0]), arm2, FOLD, dict(flagged=0)),
         # Also: vectors predating theta_unfolded still work when it is not required.
         ("pair meets min_peaks_per_arm", _cell([5.0, 5.0]), arm2, FOLD, dict(flagged=2)),
         # An under-populated arm must not contribute its peaks to the flagged set.
-        ("under-populated arm dropped", _cell([5.0, 5.0, 65.0]), arm2, FOLD,
-         dict(flagged=2, bins=[0])),
-        ("two populated arms meet min_matches", _cell([5.0, 5.0, 65.0, 65.0]),
-         dict(arm2, min_matches=2), FOLD, dict(flagged=4)),
-        ("three populated arms required", _cell([5.0, 5.0, 65.0, 65.0]),
-         dict(arm2, min_matches=3), FOLD, dict(flagged=0)),
+        (
+            "under-populated arm dropped",
+            _cell([5.0, 5.0, 65.0]),
+            arm2,
+            FOLD,
+            dict(flagged=2, bins=[0]),
+        ),
+        (
+            "two populated arms meet min_matches",
+            _cell([5.0, 5.0, 65.0, 65.0]),
+            dict(arm2, min_matches=2),
+            FOLD,
+            dict(flagged=4),
+        ),
+        (
+            "three populated arms required",
+            _cell([5.0, 5.0, 65.0, 65.0]),
+            dict(arm2, min_matches=3),
+            FOLD,
+            dict(flagged=0),
+        ),
         # min_peaks_per_arm cannot tell a true pair from two near peaks; theta_unfolded can.
         ("true friedel pair", _cell([5.0, 5.0], [5.0, 185.0]), friedel, FOLD, dict(flagged=2)),
         ("near peaks are not a friedel pair", _cell(*near_pair), friedel, FOLD, dict(flagged=0)),
-        ("near peaks pass without require_friedel_pair", _cell(*near_pair), arm2, FOLD,
-         dict(flagged=2)),
+        (
+            "near peaks pass without require_friedel_pair",
+            _cell(*near_pair),
+            arm2,
+            FOLD,
+            dict(flagged=2),
+        ),
     ]
     for label, (polar, intensity), extra, kwargs, want in cases:
         params = IceFlaggerParams(**{"intensity_cutoff": 0.5, "dtheta_deg": 6.0, **extra})
@@ -137,16 +197,34 @@ def test_bad_inputs_fail_clearly():
     ragged[1][0, 0] = np.zeros((1, 1))
     cases = [
         ("ragged", ragged, dict(intensity_cutoff=0.0), {}, "Row count mismatch"),
-        ("ceiling without polar_data", _cell([0.0]),
-         dict(intensity_cutoff=0.5, max_width_r_invA=0.1), {}, "requires polar_data"),
-        ("unreachable min_matches when folded", _cell([5.0, 65.0]),
-         dict(intensity_cutoff=0.5, min_matches=5), FOLD, "can never be reached"),
-        ("friedel without theta_unfolded", _cell([5.0, 5.0]),
-         dict(intensity_cutoff=0.5, require_friedel_pair=True), FOLD, "theta_unfolded"),
+        (
+            "ceiling without polar_data",
+            _cell([0.0]),
+            dict(intensity_cutoff=0.5, max_width_r_invA=0.1),
+            {},
+            "requires polar_data",
+        ),
+        (
+            "unreachable min_matches when folded",
+            _cell([5.0, 65.0]),
+            dict(intensity_cutoff=0.5, min_matches=5),
+            FOLD,
+            "can never be reached",
+        ),
+        (
+            "friedel without theta_unfolded",
+            _cell([5.0, 5.0]),
+            dict(intensity_cutoff=0.5, require_friedel_pair=True),
+            FOLD,
+            "theta_unfolded",
+        ),
     ]
     for label, (polar, intensity), params, kwargs, match in cases:
-        _raises(label, match, lambda: detect_ice(
-            polar, intensity, params=IceFlaggerParams(**params), **kwargs))
+        _raises(
+            label,
+            match,
+            lambda: detect_ice(polar, intensity, params=IceFlaggerParams(**params), **kwargs),
+        )
 
 
 def test_invalid_params_are_rejected_at_construction():
@@ -166,9 +244,13 @@ def test_invalid_params_are_rejected_at_construction():
         _raises(str(kwargs), match, lambda: IceFlaggerParams(**kwargs))
     # Edge values are valid.
     IceFlaggerParams(
-        max_width_r_invA=None, max_width_theta_deg=None,
-        sharpness_baseline_quantile=0.0, sharpness_smooth_sigma_bins=0.0,
-        min_matches=1, min_peaks_per_arm=1, max_crystallites=1,
+        max_width_r_invA=None,
+        max_width_theta_deg=None,
+        sharpness_baseline_quantile=0.0,
+        sharpness_smooth_sigma_bins=0.0,
+        min_matches=1,
+        min_peaks_per_arm=1,
+        max_crystallites=1,
     )
 
 
@@ -189,8 +271,12 @@ def _polar_volume(peaks, *, shape=(1, 1), n_r=600, n_theta=180, r_max=3.0):
 
 def _widths(peak, polar_data, params):
     return measure_peak_widths(
-        [peak[0]], [np.deg2rad(peak[1])], polar_data["intensity"][0, 0],
-        polar_data["r_invA"][:, 0], polar_data["theta"][0, :], params=params,
+        [peak[0]],
+        [np.deg2rad(peak[1])],
+        polar_data["intensity"][0, 0],
+        polar_data["r_invA"][:, 0],
+        polar_data["theta"][0, :],
+        params=params,
     )
 
 
@@ -214,9 +300,11 @@ def test_sharpness_gate_keeps_sharp_ice_and_spares_broad_peaks():
     assert ungated.flagged_peaks_count_map[0, 0] == 2
     # With it only the sharp one is a candidate, below min_matches=2: nothing flagged.
     gated = detect_ice(
-        polar, intensity,
+        polar,
+        intensity,
         params=IceFlaggerParams(**base, max_width_r_invA=0.10, max_width_theta_deg=15.0),
-        polar_data=_polar_volume([sharp, broad]), return_debug=True,
+        polar_data=_polar_volume([sharp, broad]),
+        return_debug=True,
     )
     assert gated.debug_records[(0, 0)].n_candidates_sharp == 1
     assert gated.flagged_peaks_count_map[0, 0] == 0
@@ -246,15 +334,21 @@ def _annular_arc(fwhm_deg, *, amplitude=1.0, ring=0.0, n_r=300):
     fwhm_to_sigma = 1 / (2 * np.sqrt(2 * np.log(2)))
     delta = np.abs(grid_t - np.deg2rad(45.0))
     delta = np.minimum(delta, np.pi - delta)
-    image = amplitude * np.exp(-0.5 * (((grid_r - 0.27) / (0.02 * fwhm_to_sigma)) ** 2
-                                       + (delta / (np.deg2rad(fwhm_deg) * fwhm_to_sigma)) ** 2))
+    image = amplitude * np.exp(
+        -0.5
+        * (
+            ((grid_r - 0.27) / (0.02 * fwhm_to_sigma)) ** 2
+            + (delta / (np.deg2rad(fwhm_deg) * fwhm_to_sigma)) ** 2
+        )
+    )
     image += ring * np.exp(-0.5 * ((grid_r - 0.27) / (0.05 * fwhm_to_sigma)) ** 2)
     return image, r_axis, theta_axis
 
 
 def _theta_width(image, r_axis, theta_axis, params):
-    return measure_peak_widths([0.27], [np.deg2rad(45.0)], image, r_axis, theta_axis,
-                               params=params)[1][0]
+    return measure_peak_widths(
+        [0.27], [np.deg2rad(45.0)], image, r_axis, theta_axis, params=params
+    )[1][0]
 
 
 def test_annular_width_tracks_broad_arcs_and_clamps_window():
@@ -268,7 +362,9 @@ def test_annular_width_tracks_broad_arcs_and_clamps_window():
     for label, fwhm, params, rel in cases:
         image, r_axis, theta_axis = _annular_arc(fwhm, n_r=200)
         image += np.random.default_rng(0).normal(0, 0.02, image.shape)
-        assert _theta_width(image, r_axis, theta_axis, params) == pytest.approx(fwhm, rel=rel), label
+        assert _theta_width(image, r_axis, theta_axis, params) == pytest.approx(fwhm, rel=rel), (
+            label
+        )
 
 
 def test_annular_width_survives_noise():
@@ -285,8 +381,12 @@ def test_annular_width_survives_noise():
     ]:
         image, r_axis, theta_axis = _annular_arc(fwhm, amplitude=amplitude, ring=0.3)
         measured = [
-            _theta_width(image + np.random.default_rng(seed).normal(0, noise, image.shape),
-                         r_axis, theta_axis, IceFlaggerParams())
+            _theta_width(
+                image + np.random.default_rng(seed).normal(0, noise, image.shape),
+                r_axis,
+                theta_axis,
+                IceFlaggerParams(),
+            )
             for seed in range(8)
         ]
         assert np.median(measured) == pytest.approx(fwhm, rel=0.25), label
@@ -296,7 +396,11 @@ def test_smoothing_is_deconvolved_so_sharp_peaks_stay_unbiased():
     """The Gaussian kernel is removed in quadrature, exactly for Gaussian peaks."""
     image, r_axis, theta_axis = _annular_arc(6.0)
     smoothed = _theta_width(image, r_axis, theta_axis, IceFlaggerParams())
-    raw = _theta_width(image, r_axis, theta_axis, IceFlaggerParams(
-        sharpness_smooth_sigma_bins=0.0, sharpness_crossing_persistence=1))
+    raw = _theta_width(
+        image,
+        r_axis,
+        theta_axis,
+        IceFlaggerParams(sharpness_smooth_sigma_bins=0.0, sharpness_crossing_persistence=1),
+    )
     # Deconvolution keeps the smoothed estimate within a bin of the raw one.
     assert abs(smoothed - raw) < 2.0

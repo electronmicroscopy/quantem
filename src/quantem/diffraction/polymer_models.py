@@ -74,10 +74,14 @@ class CNN2d(nn.Module):
             self._final_activation = final_activation
         else:
             self._final_activation = get_activation_function(final_activation, self.dtype)
-        if conv_kernel_size <=0:
-            raise ValueError(f"Convolutional kernel size must be greater than 0. Got value {conv_kernel_size}")
+        if conv_kernel_size <= 0:
+            raise ValueError(
+                f"Convolutional kernel size must be greater than 0. Got value {conv_kernel_size}"
+            )
         if conv_kernel_size % 2 == 0:
-            raise ValueError(f"Convolutional kernel size must be an odd number. Got value {conv_kernel_size}")
+            raise ValueError(
+                f"Convolutional kernel size must be an odd number. Got value {conv_kernel_size}"
+            )
         self._conv_kernel_size = int(conv_kernel_size)
 
         self._build()
@@ -115,7 +119,7 @@ class CNN2d(nn.Module):
                     dtype=self.dtype,
                     activation=self.activation,
                     kernel_size=self.conv_kernel_size,
-                    padding=int(floor(self.conv_kernel_size/2)),
+                    padding=int(floor(self.conv_kernel_size / 2)),
                 )
             )
             in_channels = out_channels
@@ -130,7 +134,7 @@ class CNN2d(nn.Module):
             dtype=self.dtype,
             activation=self.activation,
             kernel_size=self.conv_kernel_size,
-            padding=int(floor(self.conv_kernel_size/2)),
+            padding=int(floor(self.conv_kernel_size / 2)),
         )
         in_channels = out_channels
 
@@ -156,7 +160,7 @@ class CNN2d(nn.Module):
                     dtype=self.dtype,
                     activation=self.activation,
                     kernel_size=self.conv_kernel_size,
-                    padding=int(floor(self.conv_kernel_size/2)),
+                    padding=int(floor(self.conv_kernel_size / 2)),
                 )
             )
 
@@ -213,16 +217,21 @@ class MultiChannelCNN2d(CNN2d):
         in_channels=1,
         out_channels: int = 2,
         final_activations: list | tuple | None = None,
-        **kwargs
+        **kwargs,
     ):
         # Always use identity activation in base CNN, handle activations here
-        super().__init__(in_channels=in_channels, out_channels=out_channels, final_activation="identity", **kwargs)
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            final_activation="identity",
+            **kwargs,
+        )
         self.final_activations = (
             ["sigmoid"] * out_channels if final_activations is None else final_activations
         )
 
     @property
-    def final_activations(self): 
+    def final_activations(self):
         return self._final_activations
 
     @final_activations.setter
@@ -232,11 +241,11 @@ class MultiChannelCNN2d(CNN2d):
         self._final_activations = [get_activation_function(act, self.dtype) for act in value]
 
     def forward(self, x):
-        out = super().forward(x) # B,C,H,W
+        out = super().forward(x)  # B,C,H,W
         # Apply per-channel activation
         outs = []
         for i, fn in enumerate(self.final_activations):
-            outs.append(fn(out[:, i:i+1]))
+            outs.append(fn(out[:, i : i + 1]))
         return torch.cat(outs, dim=1)
 
 
@@ -397,9 +406,7 @@ def resolve_polymer_model(
         version = PAPER_MODEL_VERSION if model_id == PAPER_MODEL_ID else sorted(versions)[0]
     entry = versions.get(version)
     if entry is None:
-        raise PolymerModelError(
-            f"Unknown version {version!r} for polymer model {model_id!r}."
-        )
+        raise PolymerModelError(f"Unknown version {version!r} for polymer model {model_id!r}.")
 
     specification = dict(entry["specification"])
     weights = specification.get("weights", {})
@@ -407,9 +414,7 @@ def resolve_polymer_model(
     filename = str(weights.get("filename", "best.pth"))
     if len(checksum) != 64:
         raise PolymerModelError(f"Model {model_id!r} version {version!r} has no valid SHA-256.")
-    _validate_specification(
-        specification, model_id=model_id, version=version, checksum=checksum
-    )
+    _validate_specification(specification, model_id=model_id, version=version, checksum=checksum)
 
     local_root_value = local_model_dir or os.environ.get("QUANTEM_POLYMER_MODEL_DIR")
     if local_root_value:
@@ -457,7 +462,9 @@ def resolve_polymer_model(
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".download-", delete=False) as out:
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent, prefix=".download-", delete=False
+        ) as out:
             temporary = Path(out.name)
             try:
                 response = downloader(str(weights_url))

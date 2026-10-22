@@ -12,9 +12,7 @@ def _analysis(scan_shape=(7, 9)):
     analysis = object.__new__(BraggPeaksPolymer)
     analysis.dataset_cartesian = SimpleNamespace(
         shape=(rows, columns, 3, 4),
-        array=np.arange(rows * columns * 12, dtype=float).reshape(
-            rows, columns, 3, 4
-        ),
+        array=np.arange(rows * columns * 12, dtype=float).reshape(rows, columns, 3, 4),
         sampling=(0.5, 0.5, 1.0, 1.0),
         units=("nm", "nm", "1/Å", "1/Å"),
         virtual_images={},
@@ -133,9 +131,7 @@ def test_version_one_circle_state_remains_loadable(tmp_path):
         center_column=np.asarray(4),
         radius=np.asarray(2),
     )
-    editor = _analysis().edit_scan_mask(
-        state_path=path, display_widget=False
-    )
+    editor = _analysis().edit_scan_mask(state_path=path, display_widget=False)
     try:
         assert (editor.geometry, editor.size_x, editor.size_y) == (
             "circle",
@@ -215,8 +211,9 @@ def test_rotation_moves_the_mask():
 
 
 def test_a_diagonal_ellipse_is_neither_axis_aligned():
-    editor = _editor(initial_geometry="ellipse", initial_size_x=14, initial_size_y=3,
-                     initial_angle=45)
+    editor = _editor(
+        initial_geometry="ellipse", initial_size_x=14, initial_size_y=3, initial_angle=45
+    )
     mask = np.asarray(editor.mask)
     editor.close()
 
@@ -243,13 +240,19 @@ def test_outline_matches_the_mask_at_every_angle():
     points = np.column_stack([xx.ravel(), yy.ravel()])
     for geometry, size_x, size_y in (("ellipse", 14, 3), ("rectangle", 12, 4), ("square", 9, 9)):
         for angle in (0, 30, 45, 120):
-            editor = _editor(initial_geometry=geometry, initial_size_x=size_x,
-                             initial_size_y=size_y, initial_angle=angle)
+            editor = _editor(
+                initial_geometry=geometry,
+                initial_size_x=size_x,
+                initial_size_y=size_y,
+                initial_angle=angle,
+            )
             mask = np.asarray(editor.mask)
             patch = editor.boundary_artist
-            inside = patch.get_path().contains_points(
-                points, transform=patch.get_patch_transform()
-            ).reshape(41, 41)
+            inside = (
+                patch.get_path()
+                .contains_points(points, transform=patch.get_patch_transform())
+                .reshape(41, 41)
+            )
             editor.close()
 
             bound = 0.99 if geometry == "ellipse" else 0.96
@@ -266,16 +269,22 @@ def test_angle_is_normalized_per_geometry():
     np.testing.assert_array_equal(np.asarray(editor.mask), before)
     editor.close()
 
-    editor = _editor(initial_geometry="rectangle", initial_size_x=10, initial_size_y=4,
-                     initial_angle=200)
+    editor = _editor(
+        initial_geometry="rectangle", initial_size_x=10, initial_size_y=4, initial_angle=200
+    )
     assert editor.angle == pytest.approx(20.0)
     editor.close()
 
 
 def test_angle_round_trips_through_a_saved_state(tmp_path):
     path = tmp_path / "mask_state.npz"
-    editor = _editor(initial_geometry="ellipse", initial_size_x=12, initial_size_y=4,
-                     initial_angle=30, state_path=path)
+    editor = _editor(
+        initial_geometry="ellipse",
+        initial_size_x=12,
+        initial_size_y=4,
+        initial_angle=30,
+        state_path=path,
+    )
     saved_mask = np.asarray(editor.mask).copy()
     editor.save()
     editor.close()
