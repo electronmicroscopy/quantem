@@ -1,4 +1,4 @@
-"""Small numerical helpers specific to polymer diffraction inference."""
+"""Small helpers specific to polymer diffraction inference."""
 
 from __future__ import annotations
 
@@ -76,4 +76,29 @@ def sample_average_from_image(
     return means[rows, cols]
 
 
-__all__ = ["parse_reciprocal_units", "sample_average_from_image"]
+POLYMER_WIDGET_INSTALL = (
+    "pip install 'quantem.widget @ "
+    "git+https://github.com/NJMarchese/quantem.widget.git@show-polymer-4dstem'"
+)
+
+
+def import_show_polymer_4dstem():
+    """Return ``quantem.widget.show_polymer_4DSTEM``, or raise an ImportError saying how to get it.
+
+    The interactive polymer viewer lives in the optional ``quantem.widget`` package, so
+    only the functions that open it import it; the rest of the polymer pipeline runs
+    without it.
+    """
+    try:
+        from quantem.widget import show_polymer_4DSTEM
+    except ImportError as exc:
+        raise ImportError(
+            "The interactive polymer viewer needs the optional quantem.widget package with "
+            "show_polymer_4DSTEM, which is not available in this environment "
+            f"({exc}). Install it with:\n    {POLYMER_WIDGET_INSTALL}\n"
+            "The rest of BraggPeaksPolymer does not need it."
+        ) from exc
+    return show_polymer_4DSTEM
+
+
+__all__ = ["import_show_polymer_4dstem", "parse_reciprocal_units", "sample_average_from_image"]

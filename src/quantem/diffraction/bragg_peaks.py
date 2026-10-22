@@ -75,7 +75,11 @@ from quantem.diffraction.orientation_correlation import (
     plot_orientation_correlation as _plot_orientation_correlation,
 )
 from quantem.core.utils.utils import electron_wavelength_angstrom
-from quantem.diffraction.polymer_utils import parse_reciprocal_units, sample_average_from_image
+from quantem.diffraction.polymer_utils import (
+    import_show_polymer_4dstem,
+    parse_reciprocal_units,
+    sample_average_from_image,
+)
 from emdfile import tqdmnd
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
@@ -2234,7 +2238,7 @@ class BraggPeaksPolymer(AutoSerialize):
         to the factory (e.g. ``intensity_map``, ``map_cmap``, ``dp_cmap``, ``show_polar``,
         ``title``).
         """
-        from quantem.widget import show_polymer_4DSTEM
+        show_polymer_4DSTEM = import_show_polymer_4dstem()
         return show_polymer_4DSTEM(self, **kwargs)
 
     def _polar_peak_bins_at(self, ry, rx, two_fold_symmetry):

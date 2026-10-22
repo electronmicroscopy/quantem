@@ -16,8 +16,9 @@ returns its results; none mutate ``bp``. They are free functions rather than mor
 methods on BraggPeaksPolymer, which is already large -- the algorithms live in
 ``polymer_ice``, and this module is only the interactive layer over them.
 
-``ice_split_widget`` needs the optional ``quantem.widget`` package; its import is
-deferred into the function so this module stays importable without it.
+``ice_split_widget`` needs the optional ``quantem.widget`` package; it imports it only
+when called (raising an ImportError that says how to install it), so this module and
+the other helpers work without it.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import numpy as np
 from matplotlib.colors import LogNorm
 
 from quantem.diffraction.polymer_ice import measure_peak_widths, sharpness_mask
+from quantem.diffraction.polymer_utils import import_show_polymer_4dstem
 
 __all__ = [
     "IcePeakView",
@@ -266,7 +268,7 @@ def ice_split_widget(bp, ice_result, params, *, view="removed", ice_hists=None,
     toggling the overlay. Pass ``ice_hists`` from :func:`orientation_histograms`
     to use the ice-band orientation image as the context map.
     """
-    from quantem.widget import show_polymer_4DSTEM
+    show_polymer_4DSTEM = import_show_polymer_4dstem()
 
     peaks = (bp.peak_coordinates_cartesian, bp.peak_intensities, bp.polar_peaks)
     if view == "all":
