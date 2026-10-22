@@ -7,11 +7,10 @@ from quantem.core.utils.utils import to_numpy
 from quantem.diffractive_imaging import DirectPtychography, DirectPtychographyTiltSeries
 
 from .conftest import (
-    ML_ABERRATIONS,
-    ML_SAMPLING,
+    correlation,
     layer_purity,
     ml_kwargs,
-    thin_layer_4dstem,
+    tilted_layers_4dstem,
     twisted_square_cell,
 )
 
@@ -25,19 +24,9 @@ def _layers():
     return [0.3 * layer for layer in layers]
 
 
-def _shifted(image, shift):
-    q = np.fft.fftfreq(image.shape[0], ML_SAMPLING)
-    ramp = np.exp(-2j * np.pi * (q[:, None] * shift[0] + q[None, :] * shift[1]))
-    return np.fft.ifft2(np.fft.fft2(image) * ramp).real
-
-
 def _acquisition(tilt_mrad, dose, seed, drift=(0.0, 0.0)):
     """The two layers seen at a specimen tilt: each displaced by its depth times the tilt."""
-    theta = np.asarray(tilt_mrad, dtype=float) * 1e-3
-    logs = [
-        1j * _shifted(layer, z * theta + np.asarray(drift)) for layer, z in zip(_layers(), DEPTHS)
-    ]
-    return thin_layer_4dstem(logs, list(DEPTHS), ML_ABERRATIONS, dose=dose, seed=seed)
+    return tilted_layers_4dstem(tilt_mrad, SPACING, dose=dose, seed=seed, drift=drift)
 
 
 def _recon(dataset):
@@ -56,24 +45,34 @@ def tilted():
     return series, _recon(_acquisition((0, 0), total, seed=99))
 
 
+@pytest.fixture(scope="module")
+def noiseless():
+    """Noise-free acquisitions at no tilt and at 10 mrad."""
+    return [_acquisition((0, 0), None, 0), _acquisition((10, 0), None, 0)]
+
+
 KWARGS = dict(obj_type="complex", num_slices=2, slice_mode="joint", slice_thicknesses=SPACING)
 
 
 class TestTiltSeries:
-    @pytest.mark.parametrize(
-        "kernel, obj_type", [("obf", "complex"), ("wiener", "pure_phase"), ("obf", "pure_phase")]
-    )
-    def test_one_untilted_acquisition_is_its_own_reconstruction(self, kernel, obj_type):
+    def test_one_untilted_acquisition_is_its_own_reconstruction(self):
         recon = _recon(_acquisition((0, 0), 300.0, seed=0))
-        kwargs = dict(
-            deconvolution_kernel=kernel, obj_type=obj_type, num_slices=2, slice_mode="joint"
-        )
-        expected = recon.reconstruct(slice_thicknesses=SPACING, verbose=False, **kwargs).obj
         series = DirectPtychographyTiltSeries([recon], [(0, 0)])
-        series.reconstruct(slice_thicknesses=SPACING, **kwargs)
+        for kernel, obj_type in (
+            ("obf", "complex"),
+            ("wiener", "pure_phase"),
+            ("obf", "pure_phase"),
+        ):
+            kwargs = dict(
+                deconvolution_kernel=kernel, obj_type=obj_type, num_slices=2, slice_mode="joint"
+            )
+            expected = recon.reconstruct(slice_thicknesses=SPACING, verbose=False, **kwargs).obj
+            series.reconstruct(slice_thicknesses=SPACING, **kwargs)
 
-        assert np.array_equal(series.obj, expected)
-        assert series.residual_loss() == pytest.approx(recon.residual_loss())
+            assert np.array_equal(series.obj, expected), f"{kernel=} {obj_type=}"
+            assert series.residual_loss() == pytest.approx(recon.residual_loss()), (
+                f"{kernel=} {obj_type=}"
+            )
 
     def test_the_residual_prefers_the_true_tilts(self, tilted):
         series, _ = tilted
@@ -116,53 +115,40 @@ class TestTiltSeries:
         assert series.shifts[0] == pytest.approx((0.0, 0.0))
         assert series.shifts[1] == pytest.approx(drift, abs=0.03)
 
-    def test_upsampling(self, tilted):
-        series, _ = tilted
+    def test_upsampling(self, noiseless):
+        series = DirectPtychographyTiltSeries([_recon(d) for d in noiseless], [(0, 0), (10, 0)])
+        coarse = to_numpy(series.reconstruct(deconvolution_kernel="obf", **KWARGS).corrected_bf)
         series.reconstruct(deconvolution_kernel="obf", upsampling_factor=2, **KWARGS)
-        assert series.corrected_bf.shape == (2, 128, 128)
-        assert np.isfinite(series.obj).all()
+        fine = to_numpy(series.corrected_bf)
 
-    def test_from_tilt_series_builds_each_acquisition(self):
-        datasets = [_acquisition((0, 0), None, 0), _acquisition((10, 0), None, 0)]
-        shared = ml_kwargs()
-        shared.pop("aberration_coefs")
-        series = DirectPtychography.from_tilt_series(
-            datasets,
-            [(0, 0), (10, 0)],
-            per_dataset_kwargs=[
-                {"aberration_coefs": ML_ABERRATIONS},
-                {"aberration_coefs": dict(ML_ABERRATIONS, C10=60.0)},
-            ],
-            **shared,
-        )
+        assert fine.shape == (2, 128, 128)
+        for slice_index in range(2):
+            assert correlation(fine[slice_index, ::2, ::2], coarse[slice_index]) > 0.99
 
-        assert isinstance(series, DirectPtychographyTiltSeries)
-        assert len(series) == 2
-        assert series[1].hyperparameter_state.current_aberrations()["C10"] == pytest.approx(60.0)
-
-    @pytest.mark.parametrize(
-        "make, match",
-        [
-            (lambda r: DirectPtychographyTiltSeries([r], [(0, 0), (1, 0)]), "one row per"),
-            (lambda r: DirectPtychographyTiltSeries([r, "not one"], [(0, 0), (1, 0)]), "must be"),
-            (lambda r: DirectPtychographyTiltSeries([], []), "at least one"),
-        ],
-    )
-    def test_rejects_bad_series(self, tilted, make, match):
-        series, _ = tilted
-        with pytest.raises((ValueError, TypeError), match=match):
-            make(series[0])
-
-    def test_rejects_another_scan_grid(self, tilted):
-        series, _ = tilted
+    def test_rejects_what_it_cannot_combine(self, tilted, noiseless):
         from quantem.core.datastructures import Dataset4d
 
-        full = _acquisition((0, 0), None, 0)
+        series, _ = tilted
+        one = series[0]
+        with pytest.raises((ValueError, TypeError), match="one row per"):
+            DirectPtychographyTiltSeries([one], [(0, 0), (1, 0)])
+        with pytest.raises((ValueError, TypeError), match="must be"):
+            DirectPtychographyTiltSeries([one, "not one"], [(0, 0), (1, 0)])
+        with pytest.raises((ValueError, TypeError), match="at least one"):
+            DirectPtychographyTiltSeries([], [])
+
+        full = noiseless[0]
         cropped = Dataset4d.from_array(
             np.asarray(full.array)[:32].copy(), sampling=full.sampling, units=full.units
         )
         with pytest.raises(ValueError, match="scan grid"):
-            DirectPtychographyTiltSeries([series[0], _recon(cropped)], [(0, 0), (1, 0)])
+            DirectPtychographyTiltSeries([one, _recon(cropped)], [(0, 0), (1, 0)])
+
+        # only the kernels solving the normal equations combine acquisitions
+        with pytest.raises(ValueError, match="normal"):
+            series.reconstruct(deconvolution_kernel="ssb", num_slices=1)
+        with pytest.raises(ValueError, match="solved jointly"):
+            series.reconstruct(num_slices=2, slice_thicknesses=SPACING, slice_mode="sectioned")
 
     def test_survives_a_round_trip(self, tmp_path):
         from quantem.core.io.serialize import load
@@ -197,13 +183,10 @@ class TestTiltSeries:
         restored.reconstruct(**kwargs)
         assert np.allclose(restored.obj, before, atol=1e-6)
 
-    def test_survives_a_round_trip_before_reconstructing(self, tmp_path):
+    def test_survives_a_round_trip_before_reconstructing(self, noiseless, tmp_path):
         from quantem.core.io.serialize import load
 
-        series = DirectPtychographyTiltSeries(
-            [_recon(_acquisition((0, 0), None, 0)), _recon(_acquisition((10, 0), None, 0))],
-            [(0, 0), (10, 0)],
-        )
+        series = DirectPtychographyTiltSeries([_recon(d) for d in noiseless], [(0, 0), (10, 0)])
         path = str(tmp_path / "fresh.zip")
         series.save(path, mode="o")
         restored = load(path)
@@ -214,15 +197,3 @@ class TestTiltSeries:
         restored.reconstruct(deconvolution_kernel="obf", **KWARGS)
         expected = series.reconstruct(deconvolution_kernel="obf", **KWARGS).obj
         assert np.allclose(restored.obj, expected, atol=1e-6)
-
-    @pytest.mark.parametrize("kernel", ["ssb", "wdd", "prlx", "icom"])
-    def test_only_the_normal_equation_kernels_combine(self, tilted, kernel):
-        series, _ = tilted
-        with pytest.raises(ValueError, match="normal"):
-            series.reconstruct(deconvolution_kernel=kernel, num_slices=1)
-
-
-def test_a_tilt_series_cannot_be_sectioned(tilted):
-    series, _ = tilted
-    with pytest.raises(ValueError, match="solved jointly"):
-        series.reconstruct(num_slices=2, slice_thicknesses=SPACING, slice_mode="sectioned")

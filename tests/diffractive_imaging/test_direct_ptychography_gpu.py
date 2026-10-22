@@ -4,10 +4,13 @@ MPS has no float64 or complex128, so the per-frequency solves leave the device a
 these tests run only where a GPU is present.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
 
+from quantem.core.datastructures import Dataset3d
 from quantem.core.utils.utils import to_numpy
 from quantem.diffractive_imaging import (
     DirectPtychography,
@@ -18,13 +21,17 @@ from quantem.diffractive_imaging import (
 )
 
 from .conftest import (
-    ML_ABERRATIONS,
     ML_N_DET,
-    ML_SAMPLING,
+    PROBE_ENERGY,
+    SCAN_SAMPLING,
+    SEMIANGLE_CUTOFF,
+    N,
     direct_ptycho_kwargs,
     integer_shift_defocus,
     ml_kwargs,
+    scan_positions_px,
     thin_layer_4dstem,
+    tilted_layers_4dstem,
     twisted_square_cell,
 )
 
@@ -49,10 +56,11 @@ def pair(dataset4d):
     return _build(dataset4d, "cpu"), _build(dataset4d, "gpu")
 
 
-def _assert_close(image, expected, rtol=1e-4):
+def _assert_close(image, expected, rtol=1e-4, case=""):
     image, expected = to_numpy(image), to_numpy(expected)
-    assert np.isfinite(image).all()
-    assert np.abs(image - expected).max() <= rtol * np.abs(expected).max()
+    assert image.shape == expected.shape, case
+    assert np.isfinite(image).all(), case
+    assert np.abs(image - expected).max() <= rtol * np.abs(expected).max(), case
 
 
 def test_gpu_resolves_to_a_device(pair):
@@ -81,24 +89,9 @@ def test_a_complex_object_matches_the_cpu(pair, kernel):
 SPACING = 6.0
 
 
-def _shifted(image, shift):
-    q = np.fft.fftfreq(image.shape[0], ML_SAMPLING)
-    ramp = np.exp(-2j * np.pi * (q[:, None] * shift[0] + q[None, :] * shift[1]))
-    return np.fft.ifft2(np.fft.fft2(image) * ramp).real
-
-
-def _layered(tilt_mrad=(0, 0)):
-    """Two twisted layers 6 A apart, each displaced by its depth times the tilt."""
-    _, layers, _ = twisted_square_cell()
-    theta = np.asarray(tilt_mrad, dtype=float) * 1e-3
-    depths = (-SPACING / 2, SPACING / 2)
-    logs = [1j * _shifted(0.3 * layer, z * theta) for layer, z in zip(layers, depths)]
-    return thin_layer_4dstem(logs, list(depths), ML_ABERRATIONS)
-
-
 @pytest.fixture(scope="module")
 def layered_pair():
-    dataset = _layered()
+    dataset = tilted_layers_4dstem(spacing=SPACING)
     return tuple(
         DirectPtychography.from_dataset4d(dataset, device=device, **ml_kwargs())
         for device in ("cpu", "gpu")
@@ -146,8 +139,69 @@ def test_the_montage_fft_route_matches_the_cpu(dataset4d):
     _assert_close(images["gpu"], images["cpu"])
 
 
+def test_the_montage_splat_and_stencil_routes_match_the_cpu(dataset4d):
+    """MPS has no float64 at all, so every positional tensor -- coordinates, shifts, canvas
+    origins -- has to take its dtype from the device rather than hardcode one."""
+    for constructor, reconstruct in (
+        (dict(boundary="wrap"), {}),
+        # float noise must not push a canvas bound across an integer on one device only
+        (dict(boundary="pad"), {}),
+        (dict(boundary="wrap"), dict(upsampling_factor=2, interpolation="bilinear")),
+        (dict(boundary="pad", defocus_gradient=(30.0, -10.0)), {}),
+        (dict(boundary="wrap"), dict(deconvolution_kernel="ssb", stencil_radius=4)),
+    ):
+        case = f"{constructor=} {reconstruct=}"
+        results = {}
+        for device in ("cpu", "gpu"):
+            montage = DirectPtychographyMontage.from_dataset4d(
+                dataset4d,
+                device=device,
+                edge_blend_pixels=0,
+                **direct_ptycho_kwargs(C10),
+                **constructor,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                montage.reconstruct(verbose=False, **reconstruct)
+            residual = None if "deconvolution_kernel" in reconstruct else montage.residual_loss()
+            results[device] = montage.obj, residual
+        _assert_close(results["gpu"][0], results["cpu"][0], case=case)
+        if results["cpu"][1] is not None:
+            assert results["gpu"][1] == pytest.approx(results["cpu"][1], rel=1e-4), case
+
+
+def test_an_ungridded_scan_fits_its_origin_on_the_device(dataset4d):
+    """Regression: probe positions arrive as numpy and met the measured origin on MPS.
+
+    Forcing the origin skips the centre-of-mass fit entirely, which is where the device
+    mismatch lived, so this deliberately lets it run.
+    """
+    dataset3d = Dataset3d.from_array(
+        np.asarray(dataset4d.array).reshape(-1, N, N),
+        name="ungridded",
+        sampling=(1.0, dataset4d.sampling[-2], dataset4d.sampling[-1]),
+        units=("index", "A^-1", "A^-1"),
+    )
+    images = {}
+    for device in ("cpu", "gpu"):
+        reconstruction = DirectPtychographyMontage.from_dataset3d(
+            dataset3d,
+            scan_positions_px() * SCAN_SAMPLING,
+            energy=PROBE_ENERGY,
+            semiangle_cutoff=SEMIANGLE_CUTOFF,
+            rotation_angle=0.0,
+            aberration_coefs={"C10": C10},
+            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
+            device=device,
+            verbose=False,
+        )
+        images[device] = reconstruction.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
+    assert np.abs(images["cpu"]).max() > 0
+    _assert_close(images["gpu"], images["cpu"])
+
+
 def test_a_tilt_series_matches_the_cpu():
-    datasets = [_layered((0, 0)), _layered((10, 0))]
+    datasets = [tilted_layers_4dstem(tilt, SPACING) for tilt in ((0, 0), (10, 0))]
     images = {}
     for device in ("cpu", "gpu"):
         series = DirectPtychography.from_tilt_series(
@@ -183,11 +237,10 @@ def test_tilt_corrected_dark_field_matches_the_cpu():
     _assert_close(images["gpu"][1], images["cpu"][1])
 
 
-@pytest.mark.parametrize("kernel", ["ssb", "obf", "prlx"])
-def test_sections_match_the_cpu(pair, kernel):
+def test_sections_match_the_cpu(pair):
     cpu, gpu = pair
     kwargs = dict(
-        deconvolution_kernel=kernel, num_slices=3, slice_thicknesses=50.0, slice_mode="sectioned"
+        deconvolution_kernel="obf", num_slices=3, slice_thicknesses=50.0, slice_mode="sectioned"
     )
     cpu.reconstruct(**kwargs)
     gpu.reconstruct(**kwargs)

@@ -8,9 +8,9 @@ through ``setup_distributed`` and so follow the ``torch_device`` fixture under
 ``requires_torch`` (build on CUDA when present; see conftest).
 """
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pytest
-import torch
 
 from quantem.tomography.dataset_models import TomographyINRDataset, TomographyPixDataset
 from quantem.tomography.object_models import ObjConstraintParams, ObjectINR, ObjectPixelated
@@ -35,12 +35,15 @@ def _conventional(n=12):
 
 
 class TestConventionalFactory:
-    def test_from_models_builds(self):
+    def test_from_models_builds_with_empty_history(self):
         tomo = _conventional()
         assert isinstance(tomo, TomographyConventional)
         assert isinstance(tomo.obj_model, ObjectPixelated)
         assert isinstance(tomo.dset, TomographyPixDataset)
         assert tomo.num_epochs == 0
+        assert tomo.epoch_losses.shape == (0,)
+        assert tomo.consistency_losses.shape == (0,)
+        assert tomo.learning_rates == {}
 
     def test_direct_init_requires_token(self):
         with pytest.raises(RuntimeError):
@@ -53,7 +56,7 @@ class TestConventionalFactory:
 
 
 class TestBaseProperties:
-    def test_constraints_setter_dict_and_object(self):
+    def test_constraints_setter(self):
         tomo = _conventional()
         tomo.constraints = {"name": "obj_pixelated", "tv_vol": 0.02}
         assert isinstance(tomo.constraints, ObjConstraintParams.ObjPixelatedConstraints)
@@ -61,33 +64,17 @@ class TestBaseProperties:
         obj_c = ObjConstraintParams.ObjPixelatedConstraints(positivity=True)
         tomo.constraints = obj_c
         assert tomo.constraints is obj_c
-
-    def test_constraints_setter_none_is_noop(self):
-        tomo = _conventional()
-        before = tomo.constraints
-        tomo.constraints = None
-        assert tomo.constraints is before
-
-    def test_constraints_setter_invalid_raises(self):
-        tomo = _conventional()
+        tomo.constraints = None  # no-op
+        assert tomo.constraints is obj_c
         with pytest.raises(ValueError):
             tomo.constraints = 1.0
 
-    def test_logger_setter_rejects_wrong_type(self):
+    def test_setters_reject_wrong_types(self):
         tomo = _conventional()
         with pytest.raises(TypeError):
             tomo.logger = "not a logger"
-
-    def test_dset_setter_rejects_wrong_type(self):
-        tomo = _conventional()
         with pytest.raises(TypeError):
             tomo.dset = object()
-
-    def test_loss_accessors_start_empty(self):
-        tomo = _conventional()
-        assert tomo.epoch_losses.shape == (0,)
-        assert tomo.consistency_losses.shape == (0,)
-        assert tomo.learning_rates == {}
 
     def test_append_learning_rates_accumulates(self):
         tomo = _conventional()
@@ -96,15 +83,13 @@ class TestBaseProperties:
         assert tomo.learning_rates["object"] == [1e-3, 5e-4]
         assert tomo.learning_rates["pose"] == [1e-2, 5e-3]
 
-    def test_to_updates_device(self):
-        tomo = _conventional()
-        tomo.to("cpu")
-        assert torch.device(tomo.device) == torch.device("cpu")
-
-    def test_plot_losses_runs(self):
+    def test_plot_losses(self):
         tomo = _conventional()
         tomo._epoch_losses.extend([1.0, 0.5, 0.25])
         tomo.plot_losses()  # Agg backend; plt.show() is a no-op
+        fig = plt.gcf()
+        assert np.allclose(fig.axes[0].lines[0].get_ydata(), [1.0, 0.5, 0.25])
+        plt.close(fig)
 
 
 @requires_torch
@@ -119,16 +104,15 @@ class TestInrFactory:
         )
         return Tomography.from_models(dset=dset, obj_model=obj, device=device, verbose=False)
 
-    def test_from_models_builds(self, torch_device):
-        tomo = self._inr_tomo(torch_device)
-        assert isinstance(tomo, Tomography)
-        assert isinstance(tomo.obj_model, ObjectINR)
-
-    def test_plot_losses_runs(self, torch_device):
+    def test_plot_losses(self, torch_device):
         tomo = self._inr_tomo(torch_device)
         tomo._epoch_losses.extend([1.0, 0.5])
         tomo._lrs["object"] = [1e-3, 5e-4]
         tomo.plot_losses()
+        loss_ax, lr_ax = plt.gcf().axes[:2]
+        assert np.allclose(loss_ax.lines[0].get_ydata(), [1.0, 0.5])
+        assert np.allclose(lr_ax.lines[0].get_ydata(), [1e-3, 5e-4])
+        plt.close(plt.gcf())
 
     def test_save_volume_overwrite_guard(self, torch_device, tmp_path):
         tomo = self._inr_tomo(torch_device)

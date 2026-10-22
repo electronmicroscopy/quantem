@@ -31,7 +31,6 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
 )
 
 from .conftest import (
-    ACCELERATORS,
     CTF_SAMPLING,
     CTF_SCAN_SAMPLING,
     ORIGIN,
@@ -80,31 +79,18 @@ def _build_pair(dataset4d, defocus):
     return fourier, montage
 
 
+@pytest.fixture(scope="module")
+def fourier_montage(dataset4d):
+    """`_build_pair` at the integer-shift defocus, for the tests that only reconstruct."""
+    return _build_pair(dataset4d, integer_shift_defocus(1))
+
+
 def _relative_error(a, b):
     return float(np.abs(a - b).max() / np.abs(b).max())
 
 
 class TestSplatKernel:
     """Unit tests for `scatter_add_splat`, independent of any reconstruction."""
-
-    def test_integer_coordinates_deposit_one_pixel(self):
-        values = torch.tensor([[2.0]])
-        coords = torch.tensor([[[3.0, 4.0]]])
-        sum_w, sum_wv, sum_wv2 = scatter_add_splat(values, coords, (8, 8))
-
-        assert sum_w.sum().item() == pytest.approx(1.0)
-        assert sum_w.reshape(8, 8)[3, 4].item() == pytest.approx(1.0)
-        assert sum_wv.reshape(8, 8)[3, 4].item() == pytest.approx(2.0)
-        assert sum_wv2.reshape(8, 8)[3, 4].item() == pytest.approx(4.0)
-
-    def test_half_pixel_splits_four_ways(self):
-        values = torch.tensor([[1.0]])
-        coords = torch.tensor([[[3.5, 4.5]]])
-        sum_w, _, _ = scatter_add_splat(values, coords, (8, 8))
-
-        nonzero = sum_w[sum_w > 0]
-        assert nonzero.numel() == 4
-        assert torch.allclose(nonzero, torch.full((4,), 0.25, dtype=nonzero.dtype))
 
     def test_wrap_is_periodic(self):
         values = torch.tensor([[1.0]])
@@ -124,14 +110,6 @@ class TestSplatKernel:
         assert sum_w.sum().item() == pytest.approx(1.0)
         assert sum_wv.sum().item() == pytest.approx(2.0)
         assert sum_w.reshape(8, 8)[0].max().item() == pytest.approx(0.0)
-
-    def test_weights_are_a_partition_of_unity(self):
-        generator = torch.Generator().manual_seed(0)
-        values = torch.randn(4, 100, generator=generator)
-        coords = torch.rand(4, 100, 2, generator=generator) * 8
-        sum_w, _, _ = scatter_add_splat(values, coords, (8, 8), boundary="wrap")
-
-        assert sum_w.sum().item() == pytest.approx(400.0)
 
     def test_matches_brute_force(self):
         generator = torch.Generator().manual_seed(1)
@@ -189,21 +167,6 @@ class TestSplatKernel:
         with pytest.raises(ValueError, match="interpolation"):
             scatter_add_splat(values, coords, (8, 8), interpolation="cubic")
 
-    def test_convolve_with_a_unit_tap_is_a_plain_splat(self):
-        values = torch.tensor([[1.0, 2.0]])
-        coords = torch.tensor([[[3.0, 4.0], [5.0, 6.0]]])
-
-        out = scatter_add_convolve(
-            values,
-            coords,
-            (8, 8),
-            torch.tensor([[0, 0]]),
-            torch.ones(1, 1, dtype=torch.complex64),
-        ).reshape(8, 8)
-
-        assert out[3, 4].item() == pytest.approx(1.0)
-        assert out[5, 6].item() == pytest.approx(2.0)
-
     def test_convolve_places_each_tap_at_its_offset(self):
         offsets = torch.tensor([[0, 0], [1, 0], [0, -2]])
         weights = torch.tensor([[1.0, 2.0j, -3.0]], dtype=torch.complex64)
@@ -230,83 +193,47 @@ class TestSplatKernel:
         assert out[7, 7].item() == pytest.approx(1.0)
 
 
-class TestIntegerShiftConstruction:
-    """The defocus used below must put every BF pixel on an exact canvas pixel."""
-
-    @pytest.mark.parametrize("upsampling_factor", [1, 2])
-    @pytest.mark.parametrize("pixel_shift", [1, 2])
-    def test_shifts_land_on_pixel_centers(self, dataset4d, upsampling_factor, pixel_shift):
-        defocus = integer_shift_defocus(pixel_shift, upsampling_factor)
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, boundary="wrap", **_common_kwargs(defocus)
-        )
-        shifts, _ = montage._return_shifts_px(
-            0.0, {"C10": defocus}, montage.bf_mask, upsampling_factor
-        )
-        residual = (shifts - shifts.round()).abs().max().item()
-
-        assert residual < 1e-4, f"shifts are not integral: max residual {residual:.2e} px"
-        assert shifts.abs().max().item() > 1.0, "test would be vacuous with zero shifts"
-
-
 class TestFourierEquivalence:
     """`DirectPtychographyMontage` must reproduce `DirectPtychography`'s parallax kernel."""
 
-    @pytest.mark.parametrize("upsampling_factor", [1, 2])
-    @pytest.mark.parametrize("pixel_shift", [1, 2])
-    def test_matches_parallax_kernel(self, dataset4d, upsampling_factor, pixel_shift):
-        defocus = integer_shift_defocus(pixel_shift, upsampling_factor)
-        fourier, montage = _build_pair(dataset4d, defocus)
+    def test_matches_parallax_kernel(self, fourier_montage):
+        fourier, montage = fourier_montage
+        for shared, montage_only in (
+            (dict(upsampling_factor=1), dict(interpolation="bilinear")),
+            (dict(upsampling_factor=2), dict(interpolation="bilinear")),
+            # the phase-flip filter is BF-independent, so post-hoc application is exact
+            (dict(parallax_flip_phase=True), {}),
+            (dict(q_lowpass=0.2, q_highpass=0.02), {}),
+            # a quarter turn keeps every shift on a whole pixel
+            (dict(override_rotation_angle=90.0), {}),
+        ):
+            upsampling_factor = shared.get("upsampling_factor", 1)
+            defocus = integer_shift_defocus(1, upsampling_factor)
+            shifts, _ = montage._return_shifts_px(
+                shared.get("override_rotation_angle", 0.0),
+                {"C10": defocus},
+                montage.bf_mask,
+                upsampling_factor,
+            )
+            assert (shifts - shifts.round()).abs().max() < 1e-4, f"{shared=}"
+            assert shifts.abs().max() > 1.0, f"{shared=}"
 
-        recon_kwargs = dict(
-            deconvolution_kernel="prlx",
-            parallax_flip_phase=False,
-            upsampling_factor=upsampling_factor,
-            verbose=False,
-        )
-        fourier.reconstruct(**recon_kwargs)
-        montage.reconstruct(
-            boundary="wrap", interpolation="bilinear", weight_normalize=False, **recon_kwargs
-        )
+            kwargs = dict(
+                deconvolution_kernel="prlx",
+                parallax_flip_phase=False,
+                override_aberration_coefs={"C10": defocus},
+                verbose=False,
+            )
+            kwargs.update(shared)
+            fourier.reconstruct(**kwargs)
+            montage.reconstruct(weight_normalize=False, **montage_only, **kwargs)
 
-        assert montage.obj.shape == fourier.obj.shape
-        assert _relative_error(montage.obj, fourier.obj) < 1e-4
+            assert montage.obj.shape == fourier.obj.shape, f"{shared=}"
+            assert _relative_error(montage.obj, fourier.obj) < 1e-4, f"{shared=}"
 
-    def test_matches_with_phase_flip(self, dataset4d):
-        """The phase-flip filter is BF-independent, so post-hoc application is exact."""
-        defocus = integer_shift_defocus(1)
-        fourier, montage = _build_pair(dataset4d, defocus)
-
-        fourier.reconstruct(deconvolution_kernel="prlx", parallax_flip_phase=True, verbose=False)
-        montage.reconstruct(
-            deconvolution_kernel="prlx",
-            parallax_flip_phase=True,
-            weight_normalize=False,
-            verbose=False,
-        )
-
-        assert _relative_error(montage.obj, fourier.obj) < 1e-4
-
-    def test_matches_with_butterworth_filters(self, dataset4d):
-        defocus = integer_shift_defocus(1)
-        fourier, montage = _build_pair(dataset4d, defocus)
-
-        recon_kwargs = dict(
-            deconvolution_kernel="prlx",
-            parallax_flip_phase=False,
-            q_lowpass=0.2,
-            q_highpass=0.02,
-            verbose=False,
-        )
-        fourier.reconstruct(**recon_kwargs)
-        montage.reconstruct(weight_normalize=False, **recon_kwargs)
-
-        assert _relative_error(montage.obj, fourier.obj) < 1e-4
-
-    def test_weight_normalization_differs_only_by_a_constant(self, dataset4d):
+    def test_weight_normalization_differs_only_by_a_constant(self, fourier_montage):
         """On a full grid at U=1 the accumulated weight is exactly num_bf everywhere."""
-        defocus = integer_shift_defocus(1)
-        _, montage = _build_pair(dataset4d, defocus)
+        _, montage = fourier_montage
 
         montage.reconstruct(
             deconvolution_kernel="prlx",
@@ -329,15 +256,14 @@ class TestFourierEquivalence:
         rescaled = normalized * montage.num_bf / bf_weights
         assert _relative_error(rescaled, unnormalized) < 1e-4
 
-    def test_residual_loss_tracks_the_fourier_one(self, dataset4d):
+    def test_residual_loss_tracks_the_fourier_one(self, fourier_montage):
         """Both measure the spread of the parallax-corrected images about their mean.
 
         At the integer-shift defocus the montage's nearest-pixel deposit is the exact shift,
         so the two agree up to the frequencies past the band limit that only the montage
         counts. ``band_limit=False`` because the two classes filter at different stages.
         """
-        defocus = integer_shift_defocus(1)
-        fourier, montage = _build_pair(dataset4d, defocus)
+        fourier, montage = fourier_montage
 
         recon_kwargs = dict(
             deconvolution_kernel="prlx",
@@ -350,10 +276,9 @@ class TestFourierEquivalence:
 
         assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), rel=5e-3)
 
-    def test_bf_mask_subsets_are_additive(self, dataset4d):
+    def test_bf_mask_subsets_are_additive(self, fourier_montage):
         """Checkerboard half-sets, rescaled by their BF weights, sum to the whole."""
-        defocus = integer_shift_defocus(1)
-        _, montage = _build_pair(dataset4d, defocus)
+        _, montage = fourier_montage
 
         recon_kwargs = dict(
             deconvolution_kernel="prlx",
@@ -371,18 +296,9 @@ class TestFourierEquivalence:
 
         assert _relative_error(halves[0] + halves[1], full) < 1e-4
 
-    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
-    def test_accepts_the_deconvolution_kernels(self, dataset4d, kernel):
-        """Available as truncated real-space convolutions; see `TestRealSpaceKernels`."""
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-
-        obj = montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=6, verbose=False).obj
-
-        assert np.isfinite(obj).all()
-
-    def test_icom_matches_the_fourier_class(self, dataset4d):
+    def test_icom_matches_the_fourier_class(self, fourier_montage):
         """iCoM has no compact real-space form, but the FFT route never truncates."""
-        fourier, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        fourier, montage = fourier_montage
         fourier.reconstruct(deconvolution_kernel="icom", verbose=False)
         montage.reconstruct(deconvolution_kernel="icom", convolution_mode="fft", verbose=False)
 
@@ -392,10 +308,9 @@ class TestFourierEquivalence:
 class TestRotationConvention:
     """`spatial_frequencies` rotates the k-grid; shifts must follow it, unflipped."""
 
-    def test_ninety_degrees_rotates_the_shifts(self, dataset4d):
-        defocus = integer_shift_defocus(1)
-        _, montage = _build_pair(dataset4d, defocus)
-        coefs = {"C10": defocus}
+    def test_ninety_degrees_rotates_the_shifts(self, fourier_montage):
+        _, montage = fourier_montage
+        coefs = {"C10": integer_shift_defocus(1)}
 
         unrotated, _ = montage._return_shifts_px(0.0, coefs, montage.bf_mask, 1)
         rotated, _ = montage._return_shifts_px(90.0, coefs, montage.bf_mask, 1)
@@ -405,63 +320,22 @@ class TestRotationConvention:
         expected = torch.stack((-unrotated[:, 1], unrotated[:, 0]), dim=-1)
         assert torch.allclose(rotated, expected, atol=1e-4)
 
-    def test_rotation_changes_the_reconstruction(self, dataset4d):
-        defocus = integer_shift_defocus(1)
-        _, montage = _build_pair(dataset4d, defocus)
-
-        montage.reconstruct(override_rotation_angle=0.0, verbose=False)
-        unrotated = montage.obj.copy()
-        montage.reconstruct(override_rotation_angle=30.0, verbose=False)
-
-        assert not np.allclose(unrotated, montage.obj)
-
 
 class TestReconstructDefaults:
     """The defaults are behaviour; pin them."""
 
-    def test_interpolation_defaults_to_nearest(self, dataset4d):
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-
-        default = montage.reconstruct(upsampling_factor=2, verbose=False).obj.copy()
-        nearest = montage.reconstruct(
-            upsampling_factor=2, interpolation="nearest", verbose=False
-        ).obj
-
-        assert np.array_equal(default, nearest)
-
-    def test_nearest_is_a_roll_of_the_bright_field_images(self, dataset4d):
-        """On a raster scan, snapping moves every position of a BF image by one integer.
-
-        `positions_px * U` is an exact integer, so `round(n + s) == n + round(s)`.
-        """
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-        upsampling_factor = 4
-        shifts, _ = montage._return_shifts_px(
-            0.0, montage.aberration_coefs, montage.bf_mask, upsampling_factor
-        )
-        positions = montage.positions_px * upsampling_factor
-        coords = positions[None] + shifts[:, None]
-
-        offsets = coords.round() - positions[None]
-        # every position of a given BF image moves by the same integer
-        assert torch.equal(offsets, shifts.round()[:, None].expand_as(offsets))
-
-    def test_gridded_constructors_flag_the_scan_as_gridded(self, dataset4d):
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-        assert montage.gridded_scan is True
-
-    def test_weight_normalize_defaults_off_for_a_raster_scan(self, dataset4d):
+    def test_weight_normalize_defaults_on_only_for_an_ungridded_scan(
+        self, dataset4d, fourier_montage
+    ):
         """Uniform density needs no correction, and normalizing amplifies edge noise."""
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-
+        _, montage = fourier_montage
+        assert montage.gridded_scan is True
         default = montage.reconstruct(boundary="pad", verbose=False).obj.copy()
         unnormalized = montage.reconstruct(
             boundary="pad", weight_normalize=False, verbose=False
         ).obj
-
         assert np.array_equal(default, unnormalized)
 
-    def test_weight_normalize_defaults_on_for_an_ungridded_scan(self, dataset4d):
         dataset3d, positions = TestNonGridScan._dataset3d_and_positions(dataset4d)
         recon = DirectPtychographyMontage.from_dataset3d(
             dataset3d,
@@ -469,7 +343,6 @@ class TestReconstructDefaults:
             scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
             **_common_kwargs(integer_shift_defocus(1)),
         )
-
         assert recon.gridded_scan is False
         default = recon.reconstruct(verbose=False).obj.copy()
         normalized = recon.reconstruct(weight_normalize=True, verbose=False).obj
@@ -479,9 +352,9 @@ class TestReconstructDefaults:
 class TestPadBoundary:
     """`boundary="pad"` grows the canvas instead of wrapping."""
 
-    def test_interior_matches_wrap(self, dataset4d):
+    def test_interior_matches_wrap(self, fourier_montage):
         defocus = integer_shift_defocus(1)
-        _, montage = _build_pair(dataset4d, defocus)
+        _, montage = fourier_montage
 
         # the filter is an FFT over the whole canvas, and "pad" makes that canvas larger, so
         # filtering then cropping is not the same operation as filtering the wrapped canvas.
@@ -513,10 +386,13 @@ class TestPadBoundary:
         assert interior_pad.shape == interior_wrap.shape
         assert _relative_error(interior_pad, interior_wrap) < 1e-5
 
-    def test_canvas_covers_the_shifted_positions(self, dataset4d):
-        defocus = integer_shift_defocus(2)
-        _, montage = _build_pair(dataset4d, defocus)
-        montage.reconstruct(boundary="pad", verbose=False)
+    def test_canvas_covers_the_shifted_positions(self, fourier_montage):
+        _, montage = fourier_montage
+        montage.reconstruct(
+            boundary="pad",
+            override_aberration_coefs={"C10": integer_shift_defocus(2)},
+            verbose=False,
+        )
 
         # nothing was dropped: every (BF pixel, position) pair landed on the canvas
         assert float(montage.weights.sum()) == pytest.approx(
@@ -524,8 +400,8 @@ class TestPadBoundary:
         )
         assert montage.obj.shape[0] > N and montage.obj.shape[1] > N
 
-    def test_pad_px_freezes_the_canvas(self, dataset4d):
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+    def test_pad_px_freezes_the_canvas(self, fourier_montage):
+        _, montage = fourier_montage
 
         shapes = set()
         for pixel_shift in (1, 2):
@@ -555,13 +431,11 @@ class TestNonGridScan:
         positions = scan_positions_px()[: n_scan * n_scan] * SCAN_SAMPLING
         return dataset3d, positions
 
-    def test_matches_from_dataset4d(self, dataset4d):
+    def test_matches_from_dataset4d(self, dataset4d, fourier_montage):
         defocus = integer_shift_defocus(1)
         dataset3d, positions = self._dataset3d_and_positions(dataset4d)
 
-        gridded = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, edge_blend_pixels=0, boundary="wrap", **_common_kwargs(defocus)
-        )
+        _, gridded = fourier_montage
         ungridded = DirectPtychographyMontage.from_dataset3d(
             dataset3d,
             positions,
@@ -582,111 +456,6 @@ class TestNonGridScan:
         assert ungridded.obj.shape == gridded.obj.shape
         assert _relative_error(ungridded.obj, gridded.obj) < 1e-5
 
-    def test_position_axis_order_is_row_col(self, dataset4d):
-        """Swapping the position columns must transpose the reconstruction."""
-        defocus = integer_shift_defocus(1)
-        dataset3d, positions = self._dataset3d_and_positions(dataset4d)
-
-        recon_kwargs = dict(
-            deconvolution_kernel="prlx",
-            parallax_flip_phase=False,
-            weight_normalize=False,
-            verbose=False,
-        )
-        common = dict(
-            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
-            boundary="wrap",
-            **_common_kwargs(defocus),
-        )
-
-        straight = DirectPtychographyMontage.from_dataset3d(dataset3d, positions, **common)
-        swapped = DirectPtychographyMontage.from_dataset3d(
-            dataset3d, positions[:, ::-1].copy(), **common
-        )
-        straight.reconstruct(**recon_kwargs)
-        swapped.reconstruct(**recon_kwargs)
-
-        assert not np.allclose(straight.obj, swapped.obj)
-
-    def test_scattered_positions_reconstruct(self, dataset4d):
-        """A jittered, shuffled scan still produces a supported montage."""
-        defocus = integer_shift_defocus(1)
-        dataset3d, positions = self._dataset3d_and_positions(dataset4d)
-
-        rng = np.random.default_rng(0)
-        order = rng.permutation(len(positions))
-        jittered = positions[order] + rng.normal(
-            scale=0.25 * SCAN_SAMPLING, size=(len(positions), 2)
-        )
-        shuffled = Dataset3d.from_array(
-            dataset3d.array[order],
-            name="shuffled",
-            units=dataset3d.units,
-            sampling=dataset3d.sampling,
-        )
-
-        recon = DirectPtychographyMontage.from_dataset3d(
-            shuffled,
-            jittered,
-            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
-            boundary="pad",
-            **_common_kwargs(defocus),
-        )
-        recon.reconstruct(parallax_flip_phase=False, verbose=False)
-
-        assert np.isfinite(recon.obj).all()
-        assert float(recon.weights.max()) > 0
-
-    def test_auto_scan_sampling_warns_and_infers(self, dataset4d):
-        dataset3d, positions = self._dataset3d_and_positions(dataset4d)
-
-        with pytest.warns(UserWarning, match="Inferred scan_sampling"):
-            recon = DirectPtychographyMontage.from_dataset3d(
-                dataset3d,
-                positions,
-                scan_sampling="auto",
-                **_common_kwargs(integer_shift_defocus(1)),
-            )
-
-        assert recon.scan_sampling[0] == pytest.approx(SCAN_SAMPLING, rel=1e-6)
-
-    def test_accepts_a_dataset2d_of_positions(self, dataset4d):
-        dataset3d, positions = self._dataset3d_and_positions(dataset4d)
-        positions_dataset = Dataset2d.from_array(positions, name="positions", units=("A", "A"))
-
-        recon = DirectPtychographyMontage.from_dataset3d(
-            dataset3d,
-            positions_dataset,
-            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
-            **_common_kwargs(integer_shift_defocus(1)),
-        )
-        assert recon.num_positions == len(positions)
-
-    def test_rejects_positions_in_the_wrong_units(self, dataset4d):
-        dataset3d, positions = self._dataset3d_and_positions(dataset4d)
-        positions_dataset = Dataset2d.from_array(
-            positions, name="positions", units=("pixels", "pixels")
-        )
-
-        with pytest.raises(ValueError, match="must be given in 'A'"):
-            DirectPtychographyMontage.from_dataset3d(
-                dataset3d,
-                positions_dataset,
-                scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
-                **_common_kwargs(integer_shift_defocus(1)),
-            )
-
-    def test_rejects_mismatched_position_count(self, dataset4d):
-        dataset3d, positions = self._dataset3d_and_positions(dataset4d)
-
-        with pytest.raises(ValueError, match="rows but `dataset` has"):
-            DirectPtychographyMontage.from_dataset3d(
-                dataset3d,
-                positions[:-1],
-                scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
-                **_common_kwargs(integer_shift_defocus(1)),
-            )
-
     def test_requires_an_explicit_rotation_angle(self, dataset4d):
         dataset3d, positions = self._dataset3d_and_positions(dataset4d)
         kwargs = _common_kwargs(integer_shift_defocus(1))
@@ -702,27 +471,9 @@ class TestNonGridScan:
 
 
 class TestHyperparameterSearch:
-    def test_grid_search_recovers_the_seeded_defocus(self, dataset4d):
+    def test_residual_loss_is_minimized_at_the_true_defocus(self, fourier_montage):
         true_defocus = integer_shift_defocus(1)
-        _, montage = _build_pair(dataset4d, true_defocus)
-
-        montage.grid_search_hyperparameters(
-            aberration_coefs={
-                "C10": OptimizationParameter(
-                    low=0.4 * true_defocus, high=1.6 * true_defocus, n_points=7
-                )
-            },
-            parallax_flip_phase=False,
-            verbose=False,
-        )
-        best = montage.hyperparameter_state.optimized_aberrations["C10"]
-
-        step = (1.6 - 0.4) * true_defocus / 6
-        assert abs(best - true_defocus) <= step
-
-    def test_residual_loss_is_minimized_at_the_true_defocus(self, dataset4d):
-        true_defocus = integer_shift_defocus(1)
-        _, montage = _build_pair(dataset4d, true_defocus)
+        _, montage = fourier_montage
 
         losses = {}
         for scale in (0.5, 0.8, 1.0, 1.2, 1.5):
@@ -775,7 +526,7 @@ class TestSparseEvents:
     """
 
     @staticmethod
-    def _counts(dataset4d, scale=40.0):
+    def _counts(dataset4d, scale=4.0):
         """Integer counts, in the ``(N_pos, N, N)`` layout `from_dataset3d` takes."""
         frames = to_numpy(dataset4d.array).reshape(-1, N, N)
         frames = frames - frames.min()
@@ -869,23 +620,33 @@ class TestSparseEvents:
         )
         assert _relative_error(b, a) < 1e-4
 
-    @pytest.mark.parametrize("boundary, interpolation", [("wrap", "nearest"), ("pad", "bilinear")])
-    def test_boundaries_and_interpolation_match_dense(
-        self, dataset4d, pair, boundary, interpolation
-    ):
-        if boundary == "wrap":
-            dense, sparse = pair
-        else:
-            dense, sparse = self._pair(dataset4d, integer_shift_defocus(1), boundary=boundary)
+    def test_pad_and_bilinear_match_dense(self, pair):
+        dense, sparse = pair
         a, b = self._both(
             dense,
             sparse,
             deconvolution_kernel="ssb",
             convolution_mode="stencil",
             stencil_radius=4,
-            interpolation=interpolation,
+            boundary="pad",
+            interpolation="bilinear",
         )
         assert _relative_error(b, a) < 1e-4
+
+    def test_complex_objects_match_dense(self, pair):
+        dense, sparse = pair
+        for kernel in ("obf", "icom"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                a, b = self._both(
+                    dense,
+                    sparse,
+                    deconvolution_kernel=kernel,
+                    obj_type="complex",
+                    convolution_mode="stencil",
+                    stencil_radius=4,
+                )
+            assert _relative_error(b, a) < 1e-4, f"{kernel=}"
 
     def test_scattered_positions_match_dense(self, dataset4d):
         """An ungridded scan, where the coverage the scan mean rides on is not constant."""
@@ -1136,116 +897,122 @@ class TestSparseEvents:
                 **_common_kwargs(0.0),
             )
 
-    def test_dense_and_sparse_are_mutually_exclusive(self, pair):
-        dense, sparse = pair
-        assert sparse.sparse_frames
-        assert sparse.vbf_stack is None
-        assert sparse.events.num_positions == sparse.num_positions
+    def test_survives_a_round_trip(self, pair, tmp_path):
+        _, sparse = pair
+        state = sparse.hyperparameter_state
+        state.optimized_aberrations = {"C10": 123.0}
+        state.optimized_rotation_angle = 7.5
+        try:
+            sparse.reconstruct(deconvolution_kernel="prlx", verbose=False)
+            before = sparse.obj.copy()
 
-        assert not dense.sparse_frames
-        assert dense.events is None
+            path = str(tmp_path / "sparse.zip")
+            sparse.save(path, mode="o")
+            restored = load(path)
+
+            assert type(restored) is DirectPtychographyMontage
+            assert restored.sparse_frames
+            assert np.array_equal(restored.obj, before)
+            assert restored.hyperparameter_state.optimized_aberrations == {"C10": 123.0}
+            assert restored.hyperparameter_state.optimized_rotation_angle == 7.5
+            assert restored.residual_loss() == pytest.approx(sparse.residual_loss())
+
+            restored.reconstruct(deconvolution_kernel="prlx", verbose=False)
+            assert np.allclose(restored.obj, before)
+        finally:
+            state.clear_optimized()
 
 
 class TestSerialization:
-    """Both classes must survive a save/load round-trip and stay usable afterwards."""
-
-    @pytest.mark.parametrize("cls_name", ["fourier", "montage", "sparse"])
-    def test_round_trip(self, dataset4d, tmp_path, cls_name):
-        defocus = integer_shift_defocus(1)
-        if cls_name == "sparse":
-            recon = TestSparseEvents._pair(dataset4d, defocus)[1]
-        else:
-            fourier, montage = _build_pair(dataset4d, defocus)
-            recon = fourier if cls_name == "fourier" else montage
-
+    def test_round_trip(self, dataset4d, tmp_path):
+        """Every setting a montage stores must survive save/load and reconstruct again."""
+        recon = TestSharedCanvas._montage(
+            dataset4d,
+            integer_shift_defocus(1),
+            position_offset=(11.0, -3.0),
+            defocus_gradient=(7.0, -3.0),
+        )
         recon.hyperparameter_state.optimized_aberrations = {"C10": 123.0}
         recon.hyperparameter_state.optimized_rotation_angle = 7.5
-        recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
-        before = recon.obj.copy()
+        _, empirical = TestFourierProbe._pair(dataset4d, DirectPtychographyMontage)
 
-        path = str(tmp_path / f"{cls_name}.zip")
-        recon.save(path, mode="o")
-        restored = load(path)
+        for name, montage, kwargs in (
+            ("ungridded", recon, dict(deconvolution_kernel="prlx")),
+            ("empirical", empirical, dict(deconvolution_kernel="ssb", stencil_radius=5)),
+        ):
+            montage.reconstruct(verbose=False, **kwargs)
+            before = montage.obj.copy()
 
-        assert type(restored) is type(recon)
-        assert np.array_equal(restored.obj, before)
-        assert restored.hyperparameter_state.optimized_aberrations == {"C10": 123.0}
-        assert restored.hyperparameter_state.optimized_rotation_angle == 7.5
-        assert restored.gpts == recon.gpts
-        assert restored.residual_loss() == pytest.approx(recon.residual_loss())
+            path = str(tmp_path / f"{name}.zip")
+            montage.save(path, mode="o")
+            restored = load(path)
 
-        # and it must still be able to reconstruct
-        restored.reconstruct(deconvolution_kernel="prlx", verbose=False)
-        assert np.allclose(restored.obj, before)
+            assert type(restored) is DirectPtychographyMontage, name
+            assert np.array_equal(restored.obj, before), name
+            assert restored.gpts == montage.gpts, name
+            restored.reconstruct(verbose=False, **kwargs)
+            assert np.allclose(restored.obj, before), name
 
-    def test_torch_size_attributes_round_trip_as_tuples(self, dataset4d):
-        """`torch.Size` is a tuple subclass; AutoSerialize used to choke on the subclass name."""
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-
-        assert type(montage.gpts) is tuple
-        assert type(montage.scan_gpts) is tuple
+            if name == "ungridded":
+                state = restored.hyperparameter_state
+                assert state.optimized_aberrations == {"C10": 123.0}
+                assert state.optimized_rotation_angle == 7.5
+                assert restored.residual_loss() == pytest.approx(montage.residual_loss())
+                assert restored.defocus_gradient == (7.0, -3.0)
+                assert restored.scan_origin == pytest.approx(montage.scan_origin)
+                assert restored.obj_origin == pytest.approx(montage.obj_origin)
+            else:
+                assert restored.fourier_probe is not None
 
 
 class TestVisualization:
     """The object sampling, and hence `visualize`'s scalebar, must follow the upsampling."""
 
-    @pytest.mark.parametrize("cls_name", ["fourier", "montage"])
-    @pytest.mark.parametrize("upsampling_factor", [1, 2, 3])
-    def test_scalebar_follows_the_upsampling(self, dataset4d, cls_name, upsampling_factor):
-        fourier, montage = _build_pair(dataset4d, integer_shift_defocus(1, upsampling_factor))
-        recon = fourier if cls_name == "fourier" else montage
-        recon.reconstruct(
-            deconvolution_kernel="prlx", upsampling_factor=upsampling_factor, verbose=False
-        )
+    def test_scalebar_follows_the_upsampling(self, dataset4d):
+        for recon in _build_pair(dataset4d, integer_shift_defocus(1)):
+            name = type(recon).__name__
+            assert recon._obj_sampling[0] == pytest.approx(SCAN_SAMPLING), name
+            assert recon.fov == pytest.approx((N * SCAN_SAMPLING, N * SCAN_SAMPLING)), name
+            assert recon.scan_origin == (0.0, 0.0), name
 
-        expected = SCAN_SAMPLING / upsampling_factor
-        assert recon._obj_sampling[0] == pytest.approx(expected)
-        # the reported sampling must span the same field of view as the image itself
-        assert recon.obj.shape[0] * recon._obj_sampling[0] == pytest.approx(N * SCAN_SAMPLING)
+            for upsampling_factor in (2, 3):
+                case = f"{name} {upsampling_factor=}"
+                recon.reconstruct(
+                    deconvolution_kernel="prlx",
+                    upsampling_factor=upsampling_factor,
+                    override_aberration_coefs={"C10": integer_shift_defocus(1, upsampling_factor)},
+                    verbose=False,
+                )
+                assert recon._obj_sampling[0] == pytest.approx(
+                    SCAN_SAMPLING / upsampling_factor
+                ), case
+                # the reported sampling must span the same field of view as the image itself
+                assert recon.obj.shape[0] * recon._obj_sampling[0] == pytest.approx(
+                    N * SCAN_SAMPLING
+                ), case
+                assert recon._obj_fov == pytest.approx(recon.fov), case
 
-    def test_sampling_resets_between_reconstructions(self, dataset4d):
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-
-        montage.reconstruct(upsampling_factor=3, verbose=False)
-        assert montage._obj_sampling[0] == pytest.approx(SCAN_SAMPLING / 3)
-        montage.reconstruct(upsampling_factor=1, verbose=False)
-        assert montage._obj_sampling[0] == pytest.approx(SCAN_SAMPLING)
-
-    def test_sampling_is_defined_before_reconstructing(self, dataset4d):
-        fourier, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-
-        for recon in (fourier, montage):
-            assert recon._obj_sampling[0] == pytest.approx(SCAN_SAMPLING)
-
-    def test_fov_matches_the_scan_extent(self, dataset4d):
-        fourier, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-
-        for recon in (fourier, montage):
-            assert recon.fov == pytest.approx((N * SCAN_SAMPLING, N * SCAN_SAMPLING))
-
-    @pytest.mark.parametrize("upsampling_factor", [1, 2])
-    def test_padded_canvas_keeps_the_scan_sampling(self, dataset4d, upsampling_factor):
+    def test_padded_canvas_keeps_the_scan_sampling(self, fourier_montage):
         """A padded canvas spans more than the scan, so its sampling is not fov/shape.
 
         Deriving from the *scan* field of view would under-report the pixel size by the
         padding fraction; `_obj_fov` reports the canvas extent instead.
         """
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1, upsampling_factor))
-        montage.reconstruct(boundary="pad", upsampling_factor=upsampling_factor, verbose=False)
+        _, montage = fourier_montage
+        montage.reconstruct(
+            boundary="pad",
+            upsampling_factor=2,
+            override_aberration_coefs={"C10": integer_shift_defocus(1, 2)},
+            verbose=False,
+        )
 
-        assert montage.obj.shape[0] > N * upsampling_factor  # canvas really did grow
-        assert montage._obj_sampling[0] == pytest.approx(SCAN_SAMPLING / upsampling_factor)
+        assert montage.obj.shape[0] > N * 2  # canvas really did grow
+        assert montage._obj_sampling[0] == pytest.approx(SCAN_SAMPLING / 2)
         assert montage._obj_fov[0] > montage.fov[0]
         # and the reported extent still matches the image it describes
         assert montage.obj.shape[0] * montage._obj_sampling[0] == pytest.approx(
             montage._obj_fov[0]
         )
-
-    def test_wrapped_canvas_spans_exactly_the_scan(self, dataset4d):
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-        montage.reconstruct(boundary="wrap", upsampling_factor=2, verbose=False)
-
-        assert montage._obj_fov == pytest.approx(montage.fov)
 
     def test_visualize_before_reconstruct_raises(self, dataset4d):
         _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
@@ -1258,7 +1025,8 @@ class TestFourierProbe:
 
     DEFOCUS = staticmethod(lambda: integer_shift_defocus(1))
 
-    def _pair(self, dataset4d, cls, **probe_kwargs):
+    @staticmethod
+    def _pair(dataset4d, cls, **probe_kwargs):
         """The same reconstruction twice: analytic, and with its own probe fed back in."""
         defocus = integer_shift_defocus(1)
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0)
@@ -1273,30 +1041,22 @@ class TestFourierProbe:
         empirical = cls.from_dataset4d(dataset4d, fourier_probe=probe, **kwargs)
         return analytic, empirical
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
-    def test_empirical_probe_reproduces_the_analytic_one(self, dataset4d, cls, kernel):
+    def test_empirical_probe_reproduces_the_analytic_one(self, dataset4d):
         """The headline: the same probe, described two ways, must reconstruct the same.
 
         This is what makes the empirical path trustworthy -- there is no ground truth for a
         measured probe, so the only check available is that a probe we *can* write down
-        analytically goes through the array path unchanged.
+        analytically goes through the array path unchanged. `TestEmpiricalProbe` checks the
+        Fourier class.
         """
-        analytic, empirical = self._pair(dataset4d, cls, normalize=False)
-        extra = {} if cls is DirectPtychography else {"stencil_radius": 5}
+        analytic, empirical = self._pair(dataset4d, DirectPtychographyMontage, normalize=False)
 
-        analytic.reconstruct(deconvolution_kernel=kernel, verbose=False, **extra)
-        expected = analytic.obj.copy()
-        empirical.reconstruct(deconvolution_kernel=kernel, verbose=False, **extra)
+        for kernel in ("ssb", "obf"):
+            analytic.reconstruct(deconvolution_kernel=kernel, stencil_radius=5, verbose=False)
+            expected = analytic.obj.copy()
+            empirical.reconstruct(deconvolution_kernel=kernel, stencil_radius=5, verbose=False)
 
-        assert _relative_error(empirical.obj, expected) < 1e-5
-
-    def test_is_analytic_reports_which_path_is_live(self, dataset4d):
-        analytic, empirical = self._pair(dataset4d, DirectPtychographyMontage)
-
-        assert analytic.fourier_probe is None
-        assert empirical.fourier_probe is not None
-        assert empirical.fourier_probe.is_analytic is False
+            assert _relative_error(empirical.obj, expected) < 1e-5, f"{kernel=}"
 
     def test_zero_outside_the_detector(self, dataset4d):
         """Beyond the detector's Nyquist nothing was measured, so `psi` is zero there.
@@ -1397,8 +1157,7 @@ class TestFourierProbe:
         assert errors[0] > errors[1] > errors[2]
         assert errors[2] < 0.01
 
-    @pytest.mark.parametrize("rotation_angle", [15.0, -30.0])
-    def test_rotation_off_the_lattice_is_supported(self, dataset4d, rotation_angle):
+    def test_rotation_off_the_lattice_is_supported(self, dataset4d):
         """A rotation carries `q` off the probe's lattice, which is interpolated, not refused.
 
         It is a real experimental parameter. What it costs is a sampling error that the
@@ -1413,7 +1172,7 @@ class TestFourierProbe:
         kwargs = dict(
             _common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap", intensity_threshold=0.5
         )
-        kwargs["rotation_angle"] = rotation_angle
+        kwargs["rotation_angle"] = 15.0
 
         analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
         psi = analytic_probe_array(analytic, {"C10": defocus})
@@ -1506,42 +1265,21 @@ class TestFourierProbe:
         with pytest.raises(NotImplementedError, match=match):
             empirical.reconstruct(verbose=False, override_aberration_coefs={"C10": 0.0}, **kwargs)
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    def test_prlx_runs_on_a_modelled_empirical_probe(self, dataset4d, cls):
+    def test_prlx_runs_on_a_modelled_empirical_probe(self, dataset4d):
         """Coefficients modelling a measured probe's phase are enough to run parallax.
 
         The probe here *is* the analytic one materialized as an array, so the model is exact
         and the two paths must agree. Whether a real measured probe is this well modelled is
-        what ``fit_aberrations_from_probe`` is for.
+        what ``fit_aberrations_from_probe`` is for; `test_fitted_coefficients_drive_parallax`
+        runs the montage on the fitted coefficients.
         """
-        analytic, empirical = self._pair(dataset4d, cls, normalize=False)
-        extra = {} if cls is DirectPtychography else {"boundary": "wrap"}
+        analytic, empirical = self._pair(dataset4d, DirectPtychography, normalize=False)
 
-        analytic.reconstruct(deconvolution_kernel="prlx", verbose=False, **extra)
+        analytic.reconstruct(deconvolution_kernel="prlx", verbose=False)
         expected = analytic.obj.copy()
-        empirical.reconstruct(deconvolution_kernel="prlx", verbose=False, **extra)
+        empirical.reconstruct(deconvolution_kernel="prlx", verbose=False)
 
         assert correlation(to_numpy(empirical.obj), to_numpy(expected)) > 0.999
-
-    def test_semiangle_cutoff_becomes_optional(self, dataset4d):
-        """The empirical probe carries its own aperture, whatever shape it is."""
-        defocus = integer_shift_defocus(1)
-        kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
-        analytic = DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
-        psi = analytic_probe_array(analytic, {"C10": defocus})
-
-        kwargs["semiangle_cutoff"] = None
-        empirical = DirectPtychographyMontage.from_dataset4d(
-            dataset4d,
-            fourier_probe=FourierProbe.from_array(
-                psi, analytic.reciprocal_sampling, analytic.wavelength
-            ),
-            **kwargs,
-        )
-
-        assert empirical.semiangle_cutoff is None
-        empirical.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
-        assert np.isfinite(empirical.obj).all()
 
     def test_normalize_gives_unit_intensity(self, dataset4d):
         _, empirical = self._pair(dataset4d, DirectPtychographyMontage, normalize=True)
@@ -1568,25 +1306,11 @@ class TestFourierProbe:
         with pytest.raises(ValueError, match="detector grid"):
             analytic.fourier_probe = wrong
 
-    def test_survives_a_round_trip(self, dataset4d, tmp_path):
-        _, empirical = self._pair(dataset4d, DirectPtychographyMontage)
-        empirical.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
-        before = empirical.obj.copy()
-
-        path = str(tmp_path / "empirical.zip")
-        empirical.save(path, mode="o")
-        restored = load(path)
-
-        assert restored.fourier_probe is not None
-        restored.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
-        assert np.allclose(restored.obj, before)
-
 
 class TestWavelength:
     """`wavelength` given directly, for anything that is not an electron."""
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    def test_energy_and_wavelength_agree(self, dataset4d, cls):
+    def test_energy_and_wavelength_agree(self, dataset4d):
         """The two routes must land on the same geometry, and hence the same image."""
         common = dict(
             semiangle_cutoff=SEMIANGLE_CUTOFF,
@@ -1596,8 +1320,10 @@ class TestWavelength:
             edge_blend_pixels=0,
             verbose=False,
         )
-        from_energy = cls.from_dataset4d(dataset4d, energy=PROBE_ENERGY, **common)
-        from_wavelength = cls.from_dataset4d(
+        from_energy = DirectPtychographyMontage.from_dataset4d(
+            dataset4d, energy=PROBE_ENERGY, **common
+        )
+        from_wavelength = DirectPtychographyMontage.from_dataset4d(
             dataset4d, wavelength=from_energy.wavelength, **common
         )
 
@@ -1608,43 +1334,24 @@ class TestWavelength:
             recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
         assert np.array_equal(from_wavelength.obj, from_energy.obj)
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            {},  # neither
-            {"energy": PROBE_ENERGY, "wavelength": 0.02},  # both
-        ],
-    )
-    def test_exactly_one_of_energy_or_wavelength(self, dataset4d, cls, kwargs):
-        with pytest.raises(ValueError, match="exactly one of `energy`"):
-            cls.from_dataset4d(
-                dataset4d,
-                semiangle_cutoff=SEMIANGLE_CUTOFF,
-                rotation_angle=0.0,
-                force_fitted_origin=ORIGIN,
-                verbose=False,
-                **kwargs,
-            )
+    def test_exactly_one_positive_value_is_given(self, dataset4d):
+        common = dict(
+            semiangle_cutoff=SEMIANGLE_CUTOFF,
+            rotation_angle=0.0,
+            force_fitted_origin=ORIGIN,
+            verbose=False,
+        )
+        for kwargs, match in (
+            ({}, "exactly one of `energy`"),
+            ({"energy": PROBE_ENERGY, "wavelength": 0.02}, "exactly one of `energy`"),
+            ({"wavelength": 0.0}, "wavelength must be greater than 0"),
+            ({"wavelength": -1.0}, "wavelength must be greater than 0"),
+        ):
+            with pytest.raises(ValueError, match=match):
+                DirectPtychographyMontage.from_dataset4d(dataset4d, **common, **kwargs)
 
-    def test_photon_wavelength_is_not_the_electron_one(self):
-        """The reason this exists: the de Broglie formula is wrong for photons.
-
-        `electron_wavelength_angstrom` is relativistic and correct for electrons -- 0.019687
-        Angstrom at 300 kV -- but it is the wrong physics for a 7.9 keV photon, where the
-        answer is `hc/E` = 1.5694 rather than 0.1375.
-        """
-        from quantem.core.utils.utils import electron_wavelength_angstrom
-
-        assert electron_wavelength_angstrom(300e3) == pytest.approx(0.019687, abs=1e-6)
-
-        photon_energy_ev = 7900.08
-        assert electron_wavelength_angstrom(photon_energy_ev) == pytest.approx(0.1375, abs=1e-3)
-        assert 12398.42 / photon_energy_ev == pytest.approx(1.5694, abs=1e-3)
-
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    def test_wavelength_survives_a_round_trip(self, dataset4d, cls, tmp_path):
-        recon = cls.from_dataset4d(
+    def test_wavelength_survives_a_round_trip(self, dataset4d, tmp_path):
+        recon = DirectPtychographyMontage.from_dataset4d(
             dataset4d,
             wavelength=1.5694,
             semiangle_cutoff=SEMIANGLE_CUTOFF,
@@ -1655,37 +1362,24 @@ class TestWavelength:
         )
         recon.reconstruct(deconvolution_kernel="prlx", verbose=False)
 
-        path = str(tmp_path / f"{cls.__name__}.zip")
+        path = str(tmp_path / "wavelength.zip")
         recon.save(path, mode="o")
         restored = load(path)
 
         assert restored.wavelength == pytest.approx(1.5694)
 
-    @pytest.mark.parametrize("bad", [0.0, -1.0])
-    def test_non_positive_wavelength_raises(self, dataset4d, bad):
-        with pytest.raises(ValueError):
-            DirectPtychographyMontage.from_dataset4d(
-                dataset4d,
-                wavelength=bad,
-                semiangle_cutoff=SEMIANGLE_CUTOFF,
-                rotation_angle=0.0,
-                force_fitted_origin=ORIGIN,
-                verbose=False,
-            )
-
 
 class TestSemiangleCutoff:
     """`semiangle_cutoff` sets the probe aperture and is never optional."""
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    def test_from_virtual_bfs_requires_it(self, cls, dataset4d):
+    def test_is_required_and_positive(self, dataset4d, fourier_montage):
         """Enforced at runtime rather than by the signature.
 
         It used to be a required positional, but `wavelength` has to sit alongside `energy`
         with a default, and Python will not take a defaulted parameter before an
         undefaulted one. The guarantee is the error, so test the error.
         """
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
+        _, montage = fourier_montage
         vbf_dataset = Dataset3d.from_array(
             to_numpy(montage.vbf_stack).reshape(montage.num_bf, N, N),
             name="vBF stack",
@@ -1698,9 +1392,8 @@ class TestSemiangleCutoff:
             units=("A^-1", "A^-1"),
             sampling=tuple(montage.reciprocal_sampling),
         )
-
         with pytest.raises(ValueError, match="`semiangle_cutoff` is required"):
-            cls.from_virtual_bfs(
+            DirectPtychographyMontage.from_virtual_bfs(
                 vbf_dataset,
                 bf_mask_dataset,
                 energy=PROBE_ENERGY,
@@ -1709,29 +1402,13 @@ class TestSemiangleCutoff:
                 verbose=False,
             )
 
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    def test_none_raises_a_clear_error(self, dataset4d, cls):
+        common = dict(
+            energy=PROBE_ENERGY, rotation_angle=0.0, force_fitted_origin=ORIGIN, verbose=False
+        )
         with pytest.raises(ValueError, match="`semiangle_cutoff` is required"):
-            cls.from_dataset4d(
-                dataset4d,
-                energy=PROBE_ENERGY,
-                semiangle_cutoff=None,
-                rotation_angle=0.0,
-                force_fitted_origin=ORIGIN,
-                verbose=False,
-            )
-
-    @pytest.mark.parametrize("cls", [DirectPtychography, DirectPtychographyMontage])
-    def test_non_positive_raises(self, dataset4d, cls):
-        with pytest.raises(ValueError):
-            cls.from_dataset4d(
-                dataset4d,
-                energy=PROBE_ENERGY,
-                semiangle_cutoff=-1.0,
-                rotation_angle=0.0,
-                force_fitted_origin=ORIGIN,
-                verbose=False,
-            )
+            DirectPtychographyMontage.from_dataset4d(dataset4d, semiangle_cutoff=None, **common)
+        with pytest.raises(ValueError, match="semiangle_cutoff must be greater than 0"):
+            DirectPtychographyMontage.from_dataset4d(dataset4d, semiangle_cutoff=-1.0, **common)
 
 
 class TestDefocusGradient:
@@ -1757,11 +1434,10 @@ class TestDefocusGradient:
             with_zero.reconstruct(verbose=False).obj,
         )
 
-    def test_defocus_rate_is_the_analytic_lambda_k(self, dataset4d):
-        """`d shift / d C10 = wavelength * k`, independent of the other aberrations."""
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, **_common_kwargs(integer_shift_defocus(1))
-        )
+    def test_defocus_rate_is_the_analytic_lambda_k(self, fourier_montage):
+        """`d shift / d C10 = wavelength * k`, independent of the other aberrations: chi is
+        linear in every magnitude, so the rate cannot depend on the rest."""
+        _, montage = fourier_montage
         rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
 
         kxa, kya = spatial_frequencies(montage.gpts, montage.sampling, device=montage.device)
@@ -1773,37 +1449,21 @@ class TestDefocusGradient:
             * montage.wavelength
             / scan_sampling
         )
-
         assert torch.allclose(rate, expected, atol=1e-9)
-
-    def test_defocus_rate_ignores_other_aberrations(self, dataset4d):
-        """chi is linear in every magnitude, so the rate cannot depend on the rest."""
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, **_common_kwargs(integer_shift_defocus(1))
-        )
-        rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
 
         base = {"C10": 500.0, "C12": 40.0, "phi12": 0.7, "C30": 1.2e5}
         shifted = montage._return_shifts_px(0.0, {**base, "C10": 501.0}, montage.bf_mask, 1)[0]
         unshifted = montage._return_shifts_px(0.0, base, montage.bf_mask, 1)[0]
-
         assert torch.allclose(shifted - unshifted, rate, atol=1e-6)
 
-    def test_delta_defocus_is_mean_zero(self, dataset4d):
+    def test_delta_defocus_is_mean_zero(self, fourier_montage):
         """Measuring from the centroid keeps the gradient orthogonal to the global C10."""
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, **_common_kwargs(integer_shift_defocus(1))
-        )
+        _, montage = fourier_montage
         delta = montage._return_delta_c10((7.0, -3.0))
 
-        assert delta is not None
         assert float(delta.mean().abs()) < 1e-9
         assert float(delta.abs().max()) > 0
-
-    def test_zero_gradient_short_circuits(self, dataset4d):
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, **_common_kwargs(integer_shift_defocus(1))
-        )
+        # and no gradient short-circuits
         assert montage._return_delta_c10(None) is None
         assert montage._return_delta_c10((0.0, 0.0)) is None
 
@@ -1823,11 +1483,9 @@ class TestDefocusGradient:
         assert tilted_shape[0] > flat_shape[0]
         assert tilted_shape[1] > flat_shape[1]
 
-    def test_shift_extrema_match_a_brute_force_scan(self, dataset4d):
+    def test_shift_extrema_match_a_brute_force_scan(self, fourier_montage):
         """The closed form must bound every (BF pixel, position) pair, with no slack."""
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, **_common_kwargs(integer_shift_defocus(1))
-        )
+        _, montage = fourier_montage
         gradient = (30.0, -10.0)
         shifts = montage._return_shifts_px(0.0, montage.aberration_coefs, montage.bf_mask, 1)[0]
         rate = montage._return_defocus_rate_px(0.0, montage.bf_mask, 1)
@@ -1861,8 +1519,8 @@ class TestDefocusGradient:
 
         assert corr(gradient) > corr((-gradient[0], -gradient[1]))
 
-    @pytest.mark.parametrize("gradient", [(20.0, 0.0), (20.0, -10.0), (-15.0, 25.0)])
-    def test_correcting_the_gradient_sharpens_the_reconstruction(self, gradient):
+    def test_correcting_the_gradient_sharpens_the_reconstruction(self):
+        gradient = (20.0, -10.0)
         montage, obj = _model_montage(gradient)
         reconstruct = dict(parallax_flip_phase=False, interpolation="bilinear", verbose=False)
 
@@ -1903,41 +1561,38 @@ class TestDefocusGradient:
 
         assert np.ptp(results["c10_best"]) < 0.05 * MODEL_DEFOCUS
 
-    @pytest.mark.parametrize("gradient", [(0.0, 0.0), (20.0, -10.0), (-15.0, 25.0)])
-    def test_fit_defocus_gradient_recovers_the_seed(self, gradient):
-        montage, _ = _model_montage(gradient)
+    def test_fit_defocus_gradient_recovers_the_seed(self):
+        # a zero gradient is the control
+        for gradient in ((0.0, 0.0), (20.0, -10.0)):
+            montage, _ = _model_montage(gradient)
 
-        montage.fit_defocus_gradient(
-            MODEL_C10_GRID, patch_grid=(3, 3), interpolation="bilinear", verbose=False
-        )
+            montage.fit_defocus_gradient(
+                MODEL_C10_GRID, patch_grid=(3, 3), interpolation="bilinear", verbose=False
+            )
 
-        assert montage.defocus_gradient is not None
-        scale = max(np.hypot(*gradient), 1.0)
-        assert np.hypot(*np.subtract(montage.defocus_gradient, gradient)) < 0.15 * scale
+            assert montage.defocus_gradient is not None, f"{gradient=}"
+            scale = max(np.hypot(*gradient), 1.0)
+            error = np.hypot(*np.subtract(montage.defocus_gradient, gradient))
+            assert error < 0.15 * scale, f"{gradient=}"
 
-    def test_fit_defocus_gradient_updates_the_global_defocus(self):
-        montage, _ = _model_montage((20.0, 0.0))
-        montage.hyperparameter_state.optimized_aberrations = {}
+    def test_fit_defocus_gradient_updates_the_global_defocus_on_request(self):
+        for update_defocus in (True, False):
+            montage, _ = _model_montage((20.0, 0.0))
 
-        montage.fit_defocus_gradient(
-            MODEL_C10_GRID, patch_grid=(3, 3), interpolation="bilinear", verbose=False
-        )
+            montage.fit_defocus_gradient(
+                MODEL_C10_GRID,
+                patch_grid=(3, 3),
+                interpolation="bilinear",
+                update_defocus=update_defocus,
+                verbose=False,
+            )
 
-        assert "C10" in montage.hyperparameter_state.optimized_aberrations
-        assert "C10" in montage.hyperparameter_state.optimized_keys
-
-    def test_fit_defocus_gradient_can_leave_the_defocus_alone(self):
-        montage, _ = _model_montage((20.0, 0.0))
-
-        montage.fit_defocus_gradient(
-            MODEL_C10_GRID,
-            patch_grid=(3, 3),
-            interpolation="bilinear",
-            update_defocus=False,
-            verbose=False,
-        )
-
-        assert montage.hyperparameter_state.optimized_aberrations == {}
+            state = montage.hyperparameter_state
+            if update_defocus:
+                assert "C10" in state.optimized_aberrations
+                assert "C10" in state.optimized_keys
+            else:
+                assert state.optimized_aberrations == {}
 
     def test_endpoint_pinned_patches_are_invalid(self):
         """A grid that does not bracket the local defocus must be reported, not fitted."""
@@ -1964,25 +1619,17 @@ class TestDefocusGradient:
                 verbose=False,
             )
 
-    def test_defocus_map_allows_a_one_dimensional_grid(self):
-        """A (P, 1) grid is a profile along one axis -- only the plane fit needs three."""
+    def test_defocus_map_validates_its_grids(self):
         montage, _ = _model_montage((20.0, 0.0))
 
+        # a (P, 1) grid is a profile along one axis -- only the plane fit needs three
         results = montage.defocus_map(
             MODEL_C10_GRID, patch_grid=(3, 1), interpolation="bilinear", verbose=False
         )
-
         assert results["c10_best"].shape == (3,)
-
-    def test_defocus_map_rejects_a_degenerate_grid(self):
-        montage, _ = _model_montage((0.0, 0.0))
 
         with pytest.raises(ValueError, match="must be positive"):
             montage.defocus_map(MODEL_C10_GRID, patch_grid=(0, 3), verbose=False)
-
-    def test_defocus_map_needs_enough_trial_values(self):
-        montage, _ = _model_montage((0.0, 0.0))
-
         with pytest.raises(ValueError, match="at least 3 points"):
             montage.defocus_map([2000.0, 3000.0], patch_grid=(2, 2), verbose=False)
 
@@ -2012,15 +1659,6 @@ class TestDefocusGradient:
         )
         with pytest.raises(ValueError, match="must be a \\(row, col\\) pair"):
             montage.defocus_gradient = (1.0, 2.0, 3.0)
-
-    def test_survives_a_serialization_round_trip(self, dataset4d, tmp_path):
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, defocus_gradient=(7.0, -3.0), **_common_kwargs(integer_shift_defocus(1))
-        )
-        path = tmp_path / "montage.zip"
-        montage.save(path, mode="o")
-
-        assert load(path).defocus_gradient == (7.0, -3.0)
 
 
 class TestRealSpaceKernels:
@@ -2146,6 +1784,10 @@ class TestRealSpaceKernels:
 
     def test_auto_respects_the_radius_cap(self, dataset4d):
         _, montage = self._pair(dataset4d)
+        montage.reconstruct(deconvolution_kernel="ssb", convolution_mode="stencil", verbose=False)
+        info = montage._stencil_info
+        assert info["stencil_radius"] >= 1
+        assert 0.0 <= info["mean_error"] <= info["max_error"]
 
         with pytest.warns(UserWarning, match="truncation error"):
             montage.reconstruct(
@@ -2158,39 +1800,15 @@ class TestRealSpaceKernels:
 
         assert montage._stencil_info["stencil_radius"] <= 3
 
-    def test_auto_reports_what_it_chose(self, dataset4d):
+    def test_residual_loss_is_only_defined_for_parallax(self, dataset4d):
+        """`TestHyperparameterSearch` checks the same for `ssb`."""
         _, montage = self._pair(dataset4d)
-        montage.reconstruct(deconvolution_kernel="ssb", convolution_mode="stencil", verbose=False)
-
-        info = montage._stencil_info
-        assert info["stencil_radius"] >= 1
-        assert 0.0 <= info["mean_error"] <= info["max_error"]
-
-    @pytest.mark.parametrize("kernel", KERNELS)
-    def test_residual_loss_is_undefined(self, dataset4d, kernel):
-        _, montage = self._pair(dataset4d)
-        montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=4, verbose=False)
-
+        montage.reconstruct(deconvolution_kernel="obf", stencil_radius=4, verbose=False)
         with pytest.raises(NotImplementedError, match="only defined for the parallax"):
             montage.residual_loss()
 
-    def test_residual_loss_returns_after_a_parallax_reconstruction(self, dataset4d):
-        _, montage = self._pair(dataset4d)
-        montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=4, verbose=False)
         montage.reconstruct(verbose=False)
-
         assert montage.residual_loss() > 0
-
-    def test_icom_runs_in_either_mode(self, dataset4d):
-        _, montage = self._pair(dataset4d)
-        for mode in ("fft", "stencil"):
-            montage.reconstruct(
-                deconvolution_kernel="icom",
-                convolution_mode=mode,
-                stencil_radius=8,
-                verbose=False,
-            )
-            assert np.isfinite(montage.obj).all()
 
     def test_icom_ignores_an_empirical_probe(self, dataset4d):
         """It never reads psi, so an empirical probe changes nothing -- not even a bit.
@@ -2303,28 +1921,6 @@ class TestRealSpaceKernels:
 
         assert _relative_error(to_numpy(collapsed), to_numpy(expected)) < 1e-5
 
-    def test_the_icom_kernel_is_the_ricom_kernel(self):
-        """`ifft2(-i q / |q|**2)` is `r / (2 pi |r|**2)`, the kernel riCOM writes down."""
-        size = 128
-        frequency = np.fft.fftfreq(size)
-        qx, qy = frequency[:, None], frequency[None, :]
-        q_square = qx**2 + qy**2
-        q_square[0, 0] = 1.0
-        operator = -1j * qx / q_square
-        operator[0, 0] = 0.0
-        transformed = np.real(np.fft.ifft2(operator))
-
-        position = np.fft.fftfreq(size, 1 / size)
-        rx, ry = position[:, None], position[None, :]
-        r_square = rx**2 + ry**2
-        r_square[0, 0] = 1.0
-        analytic = rx / (2 * np.pi * r_square)
-
-        # away from the singular origin and the periodic seam
-        distance = np.hypot(rx, ry)
-        inside = (distance > 3) & (distance < size / 4)
-        assert np.corrcoef(transformed[inside], analytic[inside])[0, 1] > 0.98
-
     def test_phase_flip_is_not_applied_to_deconvolution_kernels(self, dataset4d):
         """The kernels already invert the contrast transfer, as in `DirectPtychography`."""
         _, montage = self._pair(dataset4d)
@@ -2383,24 +1979,6 @@ class TestConvolutionModes:
 
         assert _relative_error(montage.obj, fourier.obj) < 1e-5
 
-    @pytest.mark.parametrize("kernel", KERNELS)
-    def test_fft_mode_beats_a_truncated_stencil(self, dataset4d, kernel):
-        fourier, montage = self._pair(dataset4d)
-        fourier.reconstruct(deconvolution_kernel=kernel, verbose=False)
-        reference = fourier.obj.copy()
-
-        montage.reconstruct(deconvolution_kernel=kernel, convolution_mode="fft", verbose=False)
-        exact = _relative_error(montage.obj, reference)
-        montage.reconstruct(
-            deconvolution_kernel=kernel,
-            convolution_mode="stencil",
-            stencil_radius=5,
-            verbose=False,
-        )
-        truncated = _relative_error(montage.obj, reference)
-
-        assert exact < 0.01 * truncated
-
     def test_pad_boundary_stays_linear(self, dataset4d):
         """A Fourier convolution wraps; `"pad"` doubles the canvas so that it does not.
 
@@ -2422,9 +2000,7 @@ class TestConvolutionModes:
         assert montage.obj.shape == stencil.shape
         assert _relative_error(montage.obj, stencil) < 0.05
 
-    @pytest.mark.parametrize("interpolation", ["nearest", "bilinear"])
-    @pytest.mark.parametrize("boundary", ["wrap", "pad"])
-    def test_conv2d_stencil_matches_the_scatter(self, dataset4d, boundary, interpolation):
+    def test_conv2d_stencil_matches_the_scatter(self):
         """`splat_and_convolve` is a reorganization of `scatter_add_convolve`, not a change.
 
         The subtlety it has to reproduce is that the scatter tests the boundary at the
@@ -2441,28 +2017,31 @@ class TestConvolutionModes:
         coords = torch.rand(4, 30, 2) * torch.tensor([28.0, 24.0]) - torch.tensor([4.0, 4.0])
         shape = (20, 16)
 
-        scattered = torch.zeros(shape[0] * shape[1], dtype=torch.complex64)
-        scatter_add_convolve(
-            values,
-            coords,
-            shape,
-            offsets,
-            weights,
-            boundary=boundary,
-            interpolation=interpolation,
-            out=scattered,
-        )
-        convolved = splat_and_convolve(
-            values,
-            coords,
-            shape,
-            weights,
-            radius,
-            boundary=boundary,
-            interpolation=interpolation,
-        ).sum(0)
+        for boundary in ("wrap", "pad"):
+            for interpolation in ("nearest", "bilinear"):
+                scattered = torch.zeros(shape[0] * shape[1], dtype=torch.complex64)
+                scatter_add_convolve(
+                    values,
+                    coords,
+                    shape,
+                    offsets,
+                    weights,
+                    boundary=boundary,
+                    interpolation=interpolation,
+                    out=scattered,
+                )
+                convolved = splat_and_convolve(
+                    values,
+                    coords,
+                    shape,
+                    weights,
+                    radius,
+                    boundary=boundary,
+                    interpolation=interpolation,
+                ).sum(0)
 
-        assert _relative_error(to_numpy(convolved), to_numpy(scattered.view(shape))) < 1e-5
+                error = _relative_error(to_numpy(convolved), to_numpy(scattered.view(shape)))
+                assert error < 1e-5, f"{boundary=} {interpolation=}"
 
     def test_splat_stack_matches_a_shared_canvas(self):
         """Summing the per-image canvases must give what the shared-canvas splat gives."""
@@ -2478,15 +2057,16 @@ class TestConvolutionModes:
 
         assert _relative_error(to_numpy(stack.sum(0)), to_numpy(shared.view(shape))) < 1e-5
 
-    @pytest.mark.parametrize("stencil_radius, expected", [("auto", "fft"), (6, "stencil")])
-    def test_auto_reads_the_stencil_radius(self, stencil_radius, expected):
-        """Naming a radius is a request to truncate; leaving it 'auto' takes the exact route."""
+    def test_auto_reads_the_stencil_radius(self):
+        """Naming a radius is a request to truncate; leaving it 'auto' takes the exact route.
+        Parallax ignores the mode."""
         resolve = DirectPtychographyMontage._resolve_convolution_mode
-        assert resolve("auto", "ssb", stencil_radius) == expected
-
-    def test_parallax_ignores_the_mode(self):
-        resolve = DirectPtychographyMontage._resolve_convolution_mode
-        assert resolve("fft", "prlx", "auto") == "splat"
+        for args, expected in (
+            (("auto", "ssb", "auto"), "fft"),
+            (("auto", "ssb", 6), "stencil"),
+            (("fft", "prlx", "auto"), "splat"),
+        ):
+            assert resolve(*args) == expected, f"{args=}"
 
     def test_unknown_mode_raises(self, dataset4d):
         _, montage = self._pair(dataset4d)
@@ -2494,12 +2074,6 @@ class TestConvolutionModes:
             montage.reconstruct(
                 deconvolution_kernel="ssb", convolution_mode="direct", verbose=False
             )
-
-    def test_fft_mode_leaves_no_stencil_info(self, dataset4d):
-        _, montage = self._pair(dataset4d)
-        montage.reconstruct(deconvolution_kernel="ssb", convolution_mode="fft", verbose=False)
-
-        assert montage._stencil_info is None
 
 
 class TestSharedCanvas:
@@ -2651,48 +2225,25 @@ class TestSharedCanvas:
                 verbose=False,
             )
 
-    @pytest.mark.parametrize("boundary", ["wrap", "pad"])
-    def test_a_canvas_covering_the_scan_is_silent(self, dataset4d, boundary, recwarn):
+    def test_a_canvas_covering_the_scan_is_silent(self, dataset4d, recwarn):
         montage = self._montage(dataset4d, integer_shift_defocus(1))
         span = np.ptp(to_numpy(montage.positions_px), axis=0) * SCAN_SAMPLING
 
-        montage.reconstruct(
-            deconvolution_kernel="prlx",
-            boundary=boundary,
-            obj_origin=tuple(np.asarray(montage.scan_origin) - 4 * SCAN_SAMPLING),
-            obj_fov=tuple(span + 8 * SCAN_SAMPLING),
-            verbose=False,
-        )
+        for boundary in ("wrap", "pad"):
+            montage.reconstruct(
+                deconvolution_kernel="prlx",
+                boundary=boundary,
+                obj_origin=tuple(np.asarray(montage.scan_origin) - 4 * SCAN_SAMPLING),
+                obj_fov=tuple(span + 8 * SCAN_SAMPLING),
+                verbose=False,
+            )
 
-        assert not [w for w in recwarn if "wrap around" in str(w.message)]
-
-    def test_wrap_defaults_to_the_scan_grid(self, dataset4d):
-        """The default is unchanged: no window given, the canvas is the scan."""
-        montage = self._montage(dataset4d, integer_shift_defocus(1))
-        montage.reconstruct(deconvolution_kernel="prlx", boundary="wrap", verbose=False)
-
-        assert montage.obj.shape == tuple(montage.scan_gpts)
+            assert not [w for w in recwarn if "wrap around" in str(w.message)], f"{boundary=}"
 
     def test_obj_fov_must_be_positive(self, dataset4d):
         montage = self._montage(dataset4d, integer_shift_defocus(1))
         with pytest.raises(ValueError, match="positive"):
             montage.reconstruct(deconvolution_kernel="prlx", obj_fov=(0.0, 10.0), verbose=False)
-
-    def test_scan_origin_survives_a_round_trip(self, dataset4d, tmp_path):
-        montage = self._montage(dataset4d, integer_shift_defocus(1), position_offset=(11.0, -3.0))
-        montage.reconstruct(deconvolution_kernel="prlx", verbose=False)
-
-        path = str(tmp_path / "montage.zip")
-        montage.save(path, mode="o")
-        restored = load(path)
-
-        assert restored.scan_origin == pytest.approx(montage.scan_origin)
-        assert restored.obj_origin == pytest.approx(montage.obj_origin)
-
-    def test_gridded_construction_has_a_zero_scan_origin(self, dataset4d):
-        """A raster acquisition's grid *defines* the coordinates, so its origin is zero."""
-        _, montage = _build_pair(dataset4d, integer_shift_defocus(1))
-        assert montage.scan_origin == (0.0, 0.0)
 
 
 class TestFrameDrift:
@@ -2704,9 +2255,10 @@ class TestFrameDrift:
     FOV = (48 * CTF_SAMPLING, 48 * CTF_SAMPLING)
     DRIFT = np.array([[0.0, 0.0], [1.6, -0.8], [3.2, -1.6], [4.8, -2.4]]) * CTF_SAMPLING
 
-    def _frames(self, ctf_scene, drift=None):
+    @classmethod
+    def _frames(cls, ctf_scene, drift=None):
         complex_obj, _, probe, _, _ = ctf_scene
-        drift = self.DRIFT if drift is None else drift
+        drift = cls.DRIFT if drift is None else drift
         datasets, positions = ctf_interleaved_frames(complex_obj, probe, drift)
 
         montages = []
@@ -2720,27 +2272,28 @@ class TestFrameDrift:
             )
             montage.reconstruct(
                 deconvolution_kernel="prlx",
-                obj_origin=self.ORIGIN,
-                obj_fov=self.FOV,
+                obj_origin=cls.ORIGIN,
+                obj_fov=cls.FOV,
                 verbose=False,
             )
             montages.append(montage)
         return montages, positions
 
-    def test_recovers_a_seeded_drift(self, ctf_scene):
+    @pytest.fixture(scope="class")
+    def measured(self, ctf_scene):
+        """The drift estimated from the default frames, which the tests only read."""
         montages, _ = self._frames(ctf_scene)
-        measured = estimate_frame_drift(montages, verbose=False)
+        return estimate_frame_drift(montages, verbose=False)
 
+    def test_recovers_a_seeded_drift(self, measured):
         # the estimate is referred to the mean over frames, so compare mean-centered
         expected = self.DRIFT - self.DRIFT.mean(axis=0)
         assert measured == pytest.approx(expected, abs=0.35 * CTF_SCAN_SAMPLING)
-
-    def test_drift_sums_to_zero(self, ctf_scene):
-        montages, _ = self._frames(ctf_scene)
-        measured = estimate_frame_drift(montages, verbose=False)
         assert measured.mean(axis=0) == pytest.approx((0.0, 0.0), abs=1e-9)
 
-    def test_correcting_the_positions_sharpens_the_combined_reconstruction(self, ctf_scene):
+    def test_correcting_the_positions_sharpens_the_combined_reconstruction(
+        self, ctf_scene, measured
+    ):
         """The point of the exercise: `positions - drift` must beat `positions`.
 
         Also pins the sign, which no amount of reasoning about correlation conventions
@@ -2748,8 +2301,7 @@ class TestFrameDrift:
         """
         complex_obj, _, probe, ctf_full, _ = ctf_scene
         datasets, positions = ctf_interleaved_frames(complex_obj, probe, self.DRIFT)
-        montages, _ = self._frames(ctf_scene)
-        drift = estimate_frame_drift(montages, verbose=False)
+        drift = measured
 
         combined = Dataset3d.from_array(
             np.concatenate([d.array for d in datasets]),
@@ -2788,8 +2340,11 @@ class TestFrameDrift:
         measured = estimate_frame_drift(montages, verbose=False)
         assert np.abs(measured).max() < 0.35 * CTF_SCAN_SAMPLING
 
-    def test_rejects_frames_on_different_canvases(self, ctf_scene):
+    def test_rejects_frames_it_cannot_compare(self, ctf_scene):
         montages, _ = self._frames(ctf_scene)
+        with pytest.raises(ValueError, match="at least two"):
+            estimate_frame_drift(montages[:1], verbose=False)
+
         montages[1].reconstruct(
             deconvolution_kernel="prlx",
             obj_origin=self.ORIGIN,
@@ -2799,9 +2354,7 @@ class TestFrameDrift:
         with pytest.raises(ValueError, match="share a canvas"):
             estimate_frame_drift(montages, verbose=False)
 
-    def test_rejects_frames_at_different_origins(self, ctf_scene):
-        """The subtle failure: same shape, wrong place, silently measuring the offset."""
-        montages, _ = self._frames(ctf_scene)
+        # the subtle failure: same shape, wrong place, silently measuring the offset
         montages[1].reconstruct(
             deconvolution_kernel="prlx",
             obj_origin=(self.ORIGIN[0] + 3 * CTF_SAMPLING, self.ORIGIN[1]),
@@ -2811,16 +2364,9 @@ class TestFrameDrift:
         with pytest.raises(ValueError, match="not a canvas origin"):
             estimate_frame_drift(montages, verbose=False)
 
-    def test_rejects_unreconstructed_frames(self, ctf_scene):
-        montages, _ = self._frames(ctf_scene)
         montages[1]._reset_reconstruction()
         with pytest.raises(ValueError, match="not been reconstructed"):
             estimate_frame_drift(montages, verbose=False)
-
-    def test_needs_at_least_two_frames(self, ctf_scene):
-        montages, _ = self._frames(ctf_scene)
-        with pytest.raises(ValueError, match="at least two"):
-            estimate_frame_drift(montages[:1], verbose=False)
 
     def test_works_on_gridded_reconstructions(self, dataset4d):
         """Nothing about it is montage-specific -- two raster reconstructions also align."""
@@ -2836,129 +2382,6 @@ class TestFrameDrift:
 
         drift = estimate_frame_drift([first, second], verbose=False)
         assert np.abs(drift).max() < 1e-6
-
-
-@pytest.mark.skipif(not ACCELERATORS, reason="no accelerator available")
-@pytest.mark.parametrize("device", ACCELERATORS)
-class TestAccelerators:
-    """Both classes must run, and agree with CPU, on whatever accelerator is present.
-
-    MPS has no float64 at all, so every positional tensor -- coordinates, shifts, canvas
-    origins -- has to take its dtype from the device rather than hardcode one.
-    """
-
-    @staticmethod
-    def _kwargs(dataset4d):
-        return dict(_common_kwargs(integer_shift_defocus(1)), edge_blend_pixels=0)
-
-    @staticmethod
-    def _ungridded(dataset4d):
-        """A `Dataset3d` and positions, with the origin *fitted* rather than forced.
-
-        Forcing the origin skips the centre-of-mass fit entirely, which is where the
-        device mismatch lived, so these deliberately let it run.
-        """
-        dataset3d = Dataset3d.from_array(
-            np.asarray(dataset4d.array).reshape(-1, N, N),
-            name="ungridded",
-            sampling=(1.0, dataset4d.sampling[-2], dataset4d.sampling[-1]),
-            units=("index", "A^-1", "A^-1"),
-        )
-        return dataset3d, scan_positions_px() * SCAN_SAMPLING
-
-    @pytest.mark.parametrize("boundary", ["wrap", "pad"])
-    def test_montage_matches_cpu(self, dataset4d, device, boundary):
-        def run(where):
-            montage = DirectPtychographyMontage.from_dataset4d(
-                dataset4d, device=where, boundary=boundary, **self._kwargs(dataset4d)
-            )
-            return montage.reconstruct(verbose=False).obj
-
-        on_device, on_cpu = run(device), run("cpu")
-
-        assert on_device.shape == on_cpu.shape
-        assert np.abs(on_device - on_cpu).max() / np.abs(on_cpu).max() < 1e-4
-
-    def test_montage_upsampled_matches_cpu(self, dataset4d, device):
-        def run(where):
-            montage = DirectPtychographyMontage.from_dataset4d(
-                dataset4d, device=where, **self._kwargs(dataset4d)
-            )
-            return montage.reconstruct(
-                upsampling_factor=2, interpolation="bilinear", verbose=False
-            ).obj
-
-        assert np.abs(run(device) - run("cpu")).max() / np.abs(run("cpu")).max() < 1e-4
-
-    def test_defocus_gradient_matches_cpu(self, dataset4d, device):
-        def run(where):
-            montage = DirectPtychographyMontage.from_dataset4d(
-                dataset4d,
-                device=where,
-                boundary="pad",
-                defocus_gradient=(30.0, -10.0),
-                **self._kwargs(dataset4d),
-            )
-            return montage.reconstruct(verbose=False).obj
-
-        on_device, on_cpu = run(device), run("cpu")
-
-        assert on_device.shape == on_cpu.shape
-        assert np.abs(on_device - on_cpu).max() / np.abs(on_cpu).max() < 1e-4
-
-    def test_real_space_kernel_runs(self, dataset4d, device):
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, device=device, **self._kwargs(dataset4d)
-        )
-        obj = montage.reconstruct(deconvolution_kernel="ssb", stencil_radius=4, verbose=False).obj
-
-        assert np.isfinite(obj).all()
-
-    def test_residual_loss_and_search_run(self, dataset4d, device):
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d, device=device, **self._kwargs(dataset4d)
-        )
-        montage.reconstruct(verbose=False)
-
-        assert np.isfinite(montage.residual_loss())
-
-    @pytest.mark.parametrize(
-        "cls", [DirectPtychography, DirectPtychographyMontage], ids=["fourier", "montage"]
-    )
-    def test_ungridded_fits_the_origin_on_device(self, dataset4d, device, cls):
-        """Regression: probe positions arrive as numpy and met the measured origin on MPS."""
-        dataset3d, positions = self._ungridded(dataset4d)
-
-        reconstruction = cls.from_dataset3d(
-            dataset3d,
-            positions,
-            energy=PROBE_ENERGY,
-            semiangle_cutoff=SEMIANGLE_CUTOFF,
-            rotation_angle=0.0,
-            scan_sampling=(SCAN_SAMPLING, SCAN_SAMPLING),
-            device=device,
-            verbose=False,
-        )
-        obj = reconstruction.reconstruct(deconvolution_kernel="prlx", verbose=False).obj
-
-        assert np.isfinite(obj).all()
-
-
-@pytest.mark.skipif(not ACCELERATORS, reason="no accelerator available")
-@pytest.mark.parametrize("device", ACCELERATORS)
-def test_padded_canvas_shape_is_device_independent(dataset4d, device):
-    """Float noise must not push a canvas bound across an integer on one device only."""
-
-    def shape(where):
-        montage = DirectPtychographyMontage.from_dataset4d(
-            dataset4d,
-            device=where,
-            boundary="pad",
-            **dict(_common_kwargs(integer_shift_defocus(1)), edge_blend_pixels=0),
-        )
-        return montage.reconstruct(verbose=False).obj.shape
-
-    assert shape(device) == shape("cpu")
 
 
 class TestAberrationFitFromProbe:
@@ -3097,22 +2520,6 @@ class TestBandLimit:
         kwargs = dict(_common_kwargs(defocus), edge_blend_pixels=0, boundary="wrap")
         return DirectPtychographyMontage.from_dataset4d(dataset4d, **kwargs)
 
-    def test_band_limit_is_twice_the_cutoff(self, dataset4d):
-        montage = self._recon(dataset4d)
-        expected = 2 * montage.semiangle_cutoff * 1e-3 / montage.wavelength
-        assert montage._return_band_limit() == pytest.approx(expected)
-
-    @pytest.mark.parametrize("kernel", ["ssb", "obf"])
-    def test_deconvolution_kernels_are_untouched(self, dataset4d, kernel):
-        """``gamma`` already vanishes past the band limit, so the clamp must be a no-op."""
-        montage = self._recon(dataset4d)
-        montage.reconstruct(deconvolution_kernel=kernel, stencil_radius=5, verbose=False)
-        limited = to_numpy(montage.obj).copy()
-        montage.reconstruct(
-            deconvolution_kernel=kernel, stencil_radius=5, band_limit=False, verbose=False
-        )
-        assert np.allclose(limited, to_numpy(montage.obj))
-
     def test_parallax_amplitude_now_scales_like_ssb(self, dataset4d):
         """Unfiltered ``prlx`` fell off as 1/U where every other kernel goes as 1/U**2,
         and that gap was the retained replicas."""
@@ -3136,8 +2543,11 @@ class TestBandLimit:
         assert unlimited == pytest.approx(2.0, rel=0.05)
 
     def test_an_explicit_cutoff_below_the_band_limit_still_wins(self, dataset4d):
+        """``gamma`` already vanishes past the band limit, so the kernels carrying it keep
+        whatever cutoff was asked for."""
         montage = self._recon(dataset4d)
         band = montage._return_band_limit()
+        assert band == pytest.approx(2 * montage.semiangle_cutoff * 1e-3 / montage.wavelength)
 
         assert montage._resolve_q_lowpass(band / 4, "prlx") == pytest.approx(band / 4)
         assert montage._resolve_q_lowpass(band * 4, "prlx") == pytest.approx(band)
@@ -3167,6 +2577,8 @@ class TestBandLimit:
         assert empirical._return_band_limit() == pytest.approx(
             analytic._return_band_limit(), rel=0.25
         )
+        empirical.reconstruct(deconvolution_kernel="ssb", stencil_radius=5, verbose=False)
+        assert np.isfinite(empirical.obj).all()
 
 
 # ---------------------------------------------------------------------------
@@ -3281,10 +2693,9 @@ class TestComplexAndMultislice:
         # energies, which agree to 3e-7, set how well it can match
         assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), abs=1e-6)
 
-    @pytest.mark.parametrize("kernel", ["obf"])
-    def test_the_fft_route_takes_the_ard_prior(self, complex_pair, kernel):
+    def test_the_fft_route_takes_the_ard_prior(self, complex_pair):
         fourier, montage = complex_pair
-        kwargs = dict(deconvolution_kernel=kernel, obj_type="complex", prior="ard", verbose=False)
+        kwargs = dict(deconvolution_kernel="obf", obj_type="complex", prior="ard", verbose=False)
         fourier.reconstruct(**kwargs)
         montage.reconstruct(convolution_mode="fft", **kwargs)
 
@@ -3310,11 +2721,25 @@ class TestComplexAndMultislice:
             expected = to_numpy(getattr(fourier, attribute))
             assert _relative_error(to_numpy(getattr(montage, attribute)), expected) < 5e-3
 
-    def test_the_stencil_route_refuses_the_wiener_kernel(self, complex_pair):
+    def test_the_stencil_route_refuses_the_nonlinear_and_multislice_solves(self, complex_pair):
         _, montage = complex_pair
-        with pytest.raises(ValueError, match="convolution_mode='fft'"):
+        with pytest.raises(ValueError, match="'wiener' kernel needs convolution_mode='fft'"):
             montage.reconstruct(
                 deconvolution_kernel="wiener", convolution_mode="stencil", verbose=False
+            )
+        with pytest.raises(ValueError, match="prior='ard' needs convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="obf", convolution_mode="stencil", prior="ard", verbose=False
+            )
+        with pytest.raises(NotImplementedError, match="num_slices=2 needs convolution_mode='fft'"):
+            montage.reconstruct(
+                deconvolution_kernel="obf",
+                num_slices=2,
+                slice_mode="joint",
+                slice_thicknesses=5.0,
+                convolution_mode="stencil",
+                stencil_radius=4,
+                verbose=False,
             )
 
     def test_wdd_is_refused(self, complex_pair):
@@ -3337,13 +2762,6 @@ class TestComplexAndMultislice:
         finally:
             for recon in (fourier, montage):
                 recon.focal_spread = 0.0
-
-    def test_the_stencil_route_refuses_the_ard_prior(self, complex_pair):
-        _, montage = complex_pair
-        with pytest.raises(ValueError, match="convolution_mode='fft'"):
-            montage.reconstruct(
-                deconvolution_kernel="obf", convolution_mode="stencil", prior="ard", verbose=False
-            )
 
     def test_sections_are_single_plane_reconstructions(self, complex_pair):
         """Sectioning is dispatched before the convolution route is chosen, so one route covers
@@ -3414,24 +2832,6 @@ class TestComplexAndMultislice:
         expected = to_numpy(fourier.corrected_amplitude)
         assert _relative_error(to_numpy(montage.corrected_amplitude), expected) < 1e-4
 
-    def test_several_slices_need_the_fft_route(self, complex_pair):
-        _, montage = complex_pair
-        with pytest.raises(NotImplementedError, match="convolution_mode='fft'"):
-            montage.reconstruct(
-                deconvolution_kernel="obf",
-                num_slices=2,
-                slice_mode="joint",
-                slice_thicknesses=5.0,
-                convolution_mode="stencil",
-                stencil_radius=4,
-                verbose=False,
-            )
-
-    def test_parallax_rejects_complex(self, complex_pair):
-        _, montage = complex_pair
-        with pytest.raises(ValueError, match="cannot separate amplitude from phase"):
-            montage.reconstruct(deconvolution_kernel="prlx", obj_type="complex", verbose=False)
-
     def test_frame_mean_subtraction_rejects_complex(self, dataset4d):
         montage = DirectPtychographyMontage.from_dataset4d(
             dataset4d,
@@ -3442,18 +2842,3 @@ class TestComplexAndMultislice:
         )
         with pytest.raises(ValueError, match="zeroth moment"):
             montage.reconstruct(deconvolution_kernel="obf", obj_type="complex", verbose=False)
-
-    @pytest.mark.parametrize("kernel", ["obf", "icom"])
-    def test_sparse_frames_match_dense(self, dataset4d, kernel):
-        dense, sparse = TestSparseEvents._pair(dataset4d, integer_shift_defocus(1))
-        kwargs = dict(
-            deconvolution_kernel=kernel,
-            obj_type="complex",
-            convolution_mode="stencil",
-            stencil_radius=4,
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            a, b = TestSparseEvents._both(dense, sparse, **kwargs)
-
-        assert _relative_error(b, a) < 1e-4

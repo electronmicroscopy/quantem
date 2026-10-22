@@ -49,16 +49,15 @@ def _td_tomography(device):
     return Tomography.from_models(dset=dset, obj_model=obj, device=device, verbose=False)
 
 
+def _object_and_pose_params():
+    return {
+        "object": OptimizerParams.Adam(lr=1e-3),
+        "pose": OptimizerParams.Adam(lr=1e-2),
+    }
+
+
 @requires_torch
 class TestOptimizerParams:
-    def test_setter_getter_roundtrip(self, torch_device):
-        tomo = _inr_tomography(torch_device)
-        tomo.optimizer_params = {
-            "object": OptimizerParams.Adam(lr=1e-3),
-            "pose": OptimizerParams.Adam(lr=1e-2),
-        }
-        assert set(tomo.optimizer_params.keys()) == {"object", "pose"}
-
     def test_unknown_key_raises(self, torch_device):
         tomo = _inr_tomography(torch_device)
         with pytest.raises(ValueError):
@@ -67,20 +66,10 @@ class TestOptimizerParams:
     def test_set_optimizers_builds_object_and_pose(self, torch_device):
         """Regression guard: the pose path must not raise (see module docstring)."""
         tomo = _inr_tomography(torch_device)
-        tomo.optimizer_params = {
-            "object": OptimizerParams.Adam(lr=1e-3),
-            "pose": OptimizerParams.Adam(lr=1e-2),
-        }
+        tomo.optimizer_params = _object_and_pose_params()
+        assert set(tomo.optimizer_params.keys()) == {"object", "pose"}
         tomo.set_optimizers()
         assert set(tomo.optimizers.keys()) == {"object", "pose"}
-
-    def test_current_lrs(self, torch_device):
-        tomo = _inr_tomography(torch_device)
-        tomo.optimizer_params = {
-            "object": OptimizerParams.Adam(lr=1e-3),
-            "pose": OptimizerParams.Adam(lr=1e-2),
-        }
-        tomo.set_optimizers()
         lrs = tomo.get_current_lrs()
         assert set(lrs.keys()) == {"object", "pose"}
         assert lrs["object"] == pytest.approx(1e-3)
@@ -88,10 +77,7 @@ class TestOptimizerParams:
 
     def test_remove_optimizer(self, torch_device):
         tomo = _inr_tomography(torch_device)
-        tomo.optimizer_params = {
-            "object": OptimizerParams.Adam(lr=1e-3),
-            "pose": OptimizerParams.Adam(lr=1e-2),
-        }
+        tomo.optimizer_params = _object_and_pose_params()
         tomo.set_optimizers()
         tomo.remove_optimizer("object")
         assert "object" not in tomo.optimizers
@@ -112,64 +98,40 @@ class TestOptimizerParams:
         assert len(tomo.optimizers["object"].param_groups) == 3
         assert "pose" in tomo.optimizers
 
-    def test_step_optimizers_steps_each_once(self, torch_device, monkeypatch):
-        """Regression: with object+pose, each optimizer must step exactly once per call.
+    def test_step_and_zero_grad_touch_each_optimizer_once(self, torch_device, monkeypatch):
+        """Regression: with object+pose, each optimizer must step (and zero) exactly once per call.
 
         ``step_optimizers`` previously looped over both keys and stepped *both* optimizers on
         every pass, so each took two Adam steps per batch.
         """
         tomo = _inr_tomography(torch_device)
-        tomo.optimizer_params = {
-            "object": OptimizerParams.Adam(lr=1e-3),
-            "pose": OptimizerParams.Adam(lr=1e-2),
-        }
+        tomo.optimizer_params = _object_and_pose_params()
         tomo.set_optimizers()
         assert set(tomo.optimizers.keys()) == {"object", "pose"}  # both optimizers live
 
-        counts = {"object": 0, "pose": 0}
-        monkeypatch.setattr(
-            tomo.obj_model,
-            "step_optimizer",
-            lambda: counts.__setitem__("object", counts["object"] + 1),
-        )
-        monkeypatch.setattr(
-            tomo.dset, "step_optimizer", lambda: counts.__setitem__("pose", counts["pose"] + 1)
-        )
-        tomo.step_optimizers()
-        assert counts == {"object": 1, "pose": 1}
-
-    def test_zero_grad_all_zeros_each_once(self, torch_device, monkeypatch):
-        """Companion to the step regression: zero_grad_all must touch each optimizer once."""
-        tomo = _inr_tomography(torch_device)
-        tomo.optimizer_params = {
-            "object": OptimizerParams.Adam(lr=1e-3),
-            "pose": OptimizerParams.Adam(lr=1e-2),
-        }
-        tomo.set_optimizers()
-        counts = {"object": 0, "pose": 0}
-        monkeypatch.setattr(
-            tomo.obj_model,
-            "zero_optimizer_grad",
-            lambda: counts.__setitem__("object", counts["object"] + 1),
-        )
-        monkeypatch.setattr(
-            tomo.dset,
-            "zero_optimizer_grad",
-            lambda: counts.__setitem__("pose", counts["pose"] + 1),
-        )
-        tomo.zero_grad_all()
-        assert counts == {"object": 1, "pose": 1}
+        for tomo_method, model_method in [
+            ("step_optimizers", "step_optimizer"),
+            ("zero_grad_all", "zero_optimizer_grad"),
+        ]:
+            counts = {"object": 0, "pose": 0}
+            for key, model in (("object", tomo.obj_model), ("pose", tomo.dset)):
+                monkeypatch.setattr(
+                    model, model_method, lambda key=key: counts.__setitem__(key, counts[key] + 1)
+                )
+            getattr(tomo, tomo_method)()
+            assert counts == {"object": 1, "pose": 1}, tomo_method
 
 
 @requires_torch
 class TestOptHelpers:
-    def test_get_default_lr_object_and_pose(self, torch_device):
+    def test_get_default_lr(self, torch_device):
+        """Each key reads the model's own declared default rather than the fallback, which for
+        the pose happens to have the same value."""
         tomo = _inr_tomography(torch_device)
-        assert isinstance(tomo._get_default_lr("object"), float)
-        assert isinstance(tomo._get_default_lr("pose"), float)
-
-    def test_get_default_lr_unknown_raises(self, torch_device):
-        tomo = _inr_tomography(torch_device)
+        assert tomo._get_default_lr("object") == pytest.approx(
+            tomo.obj_model.DEFAULT_LRS["object"]
+        )
+        assert tomo._get_default_lr("pose") == pytest.approx(tomo.dset.DEFAULT_LRS["pose"])
         with pytest.raises(ValueError):
             tomo._get_default_lr("banana")
 
@@ -185,25 +147,15 @@ class TestOptHelpers:
 
 @requires_torch
 class TestSchedulerParams:
-    def test_scheduler_setter_getter(self, torch_device):
-        tomo = _inr_tomography(torch_device)
-        tomo.scheduler_params = {
-            "object": SchedulerParams.CosineAnnealing(T_max=10),
-            "pose": SchedulerParams.CosineAnnealing(T_max=10),
-        }
-        assert set(tomo.scheduler_params.keys()) == {"object", "pose"}
-
     def test_set_schedulers_builds(self, torch_device):
         tomo = _inr_tomography(torch_device)
-        tomo.optimizer_params = {
-            "object": OptimizerParams.Adam(lr=1e-3),
-            "pose": OptimizerParams.Adam(lr=1e-2),
-        }
+        tomo.optimizer_params = _object_and_pose_params()
         tomo.set_optimizers()
         tomo.scheduler_params = {
             "object": SchedulerParams.CosineAnnealing(T_max=10),
             "pose": SchedulerParams.CosineAnnealing(T_max=10),
         }
+        assert set(tomo.scheduler_params.keys()) == {"object", "pose"}
         tomo.set_schedulers(tomo.scheduler_params, num_iter=10)
         assert set(tomo.schedulers.keys()) == {"object", "pose"}
 

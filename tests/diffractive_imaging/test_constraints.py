@@ -61,25 +61,15 @@ def ptycho():
 
 
 class TestParseDict:
-    def test_object_raster_by_name(self):
+    def test_parse_dict(self):
         c = PtychoObjConstraintParams.parse_dict({"name": "raster", "tv_weight_z": 5.0})
         assert isinstance(c, PtychoObjConstraintParams.Raster)
         assert c.tv_weight_z == 5.0
         assert c.positivity is True  # default preserved
 
-    def test_object_inr_by_type(self):
         c = PtychoObjConstraintParams.parse_dict({"type": "inr"})
         assert isinstance(c, PtychoObjConstraintParams.INR)
 
-    def test_object_unknown_raises(self):
-        with pytest.raises(ValueError, match="Unknown object constraint type"):
-            PtychoObjConstraintParams.parse_dict({"name": "nope"})
-
-    def test_object_missing_name_raises(self):
-        with pytest.raises(ValueError, match="Must provide either 'name' or 'type'"):
-            PtychoObjConstraintParams.parse_dict({"tv_weight_z": 5.0})
-
-    def test_probe_raster_with_fields(self):
         c = PtychoProbeConstraintParams.parse_dict(
             {"name": "raster", "center_probe": True, "tv_weight": 0.1}
         )
@@ -87,21 +77,24 @@ class TestParseDict:
         assert c.center_probe is True
         assert c.tv_weight == 0.1
 
-    def test_dataset_raster_default(self):
         c = PtychoDatasetConstraintParams.parse_dict({"name": "raster"})
         assert isinstance(c, PtychoDatasetConstraintParams.Raster)
         assert c.clip_scan_positions is True  # default preserved
+
+    def test_parse_dict_errors(self):
+        with pytest.raises(ValueError, match="Unknown object constraint type"):
+            PtychoObjConstraintParams.parse_dict({"name": "nope"})
+        with pytest.raises(ValueError, match="Must provide either 'name' or 'type'"):
+            PtychoObjConstraintParams.parse_dict({"tv_weight_z": 5.0})
 
 
 # --- Constraint typo catching -------------------------------------------------
 
 
 class TestTypoCatching:
-    def test_setting_unknown_field_via_dict_raises(self, ptycho):
+    def test_unknown_constraint_key_raises(self, ptycho):
         with pytest.raises(KeyError, match="Invalid constraint key"):
             ptycho.obj_model.constraints = {"not_a_real_field": True}
-
-    def test_add_constraint_unknown_key_raises(self, ptycho):
         with pytest.raises(KeyError, match="Invalid constraint key"):
             ptycho.obj_model.add_constraint("not_a_real_field", True)
 
@@ -110,22 +103,28 @@ class TestTypoCatching:
 
 
 class TestRoundtrip:
-    def test_obj_constraints_dataclass(self, ptycho):
-        obj_c = PtychoObjConstraintParams.Raster(tv_weight_z=2.5, identical_slices=True)
-        ptycho.constraints = {"object": obj_c}
-        assert ptycho.obj_model.constraints is obj_c
+    def test_constraint_dataclasses_are_stored(self, ptycho):
+        for key, constraints, model in [
+            (
+                "object",
+                PtychoObjConstraintParams.Raster(tv_weight_z=2.5, identical_slices=True),
+                lambda: ptycho.obj_model,
+            ),
+            (
+                "probe",
+                PtychoProbeConstraintParams.Raster(center_probe=True, tv_weight=0.05),
+                lambda: ptycho.probe_model,
+            ),
+            (
+                "dataset",
+                PtychoDatasetConstraintParams.Raster(descan_tv_weight=0.01),
+                lambda: ptycho.dset,
+            ),
+        ]:
+            ptycho.constraints = {key: constraints}
+            assert model().constraints is constraints, key
         assert ptycho.obj_model.constraints.tv_weight_z == 2.5
         assert ptycho.obj_model.constraints.identical_slices is True
-
-    def test_probe_constraints_dataclass(self, ptycho):
-        probe_c = PtychoProbeConstraintParams.Raster(center_probe=True, tv_weight=0.05)
-        ptycho.constraints = {"probe": probe_c}
-        assert ptycho.probe_model.constraints is probe_c
-
-    def test_dataset_constraints_dataclass(self, ptycho):
-        dset_c = PtychoDatasetConstraintParams.Raster(descan_tv_weight=0.01)
-        ptycho.constraints = {"dataset": dset_c}
-        assert ptycho.dset.constraints is dset_c
 
     def test_dict_form_still_works(self, ptycho):
         """Backward compatibility: nested-dict form sets individual fields."""
@@ -142,20 +141,6 @@ class TestRoundtrip:
 
 
 class TestReconstructKwargs:
-    def test_dataclass_leaf_applied(self, ptycho):
-        from quantem.core.ml import OptimizerParams
-
-        obj_c = PtychoObjConstraintParams.Raster(tv_weight_z=1.5)
-        ptycho.reconstruct(
-            num_iters=1,
-            reset=True,
-            optimizer_params={"object": OptimizerParams.Adam(lr=1e-2)},
-            constraints={"object": obj_c},
-            batch_size=4,
-            device="cpu",
-        )
-        assert ptycho.obj_model.constraints.tv_weight_z == 1.5
-
     def test_dict_leaf_partial_update(self, ptycho):
         from quantem.core.ml import OptimizerParams
 
@@ -179,63 +164,47 @@ class TestReconstructKwargs:
             reset=True,
             optimizer_params={"object": OptimizerParams.Adam(lr=1e-2)},
             constraints={
-                "object": PtychoObjConstraintParams.Raster(tv_weight_xy=0.4),
+                "object": PtychoObjConstraintParams.Raster(tv_weight_xy=0.4, tv_weight_z=1.5),
                 "probe": {"center_probe": True},
             },
             batch_size=4,
             device="cpu",
         )
         assert ptycho.obj_model.constraints.tv_weight_xy == 0.4
+        assert ptycho.obj_model.constraints.tv_weight_z == 1.5
         assert ptycho.probe_model.constraints.center_probe is True
 
 
 # --- Real-valued pure_phase representation -----------------------------------
 
 
+def _initialized_obj(obj_type) -> ObjectPixelated:
+    obj = ObjectPixelated.from_uniform(obj_type=obj_type, num_slices=1)
+    obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+    return obj
+
+
 class TestPurePhaseRealValued:
-    def test_pure_phase_pixelated_obj_is_real(self):
-        obj = ObjectPixelated.from_uniform(obj_type="pure_phase", num_slices=1)
-        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
-        assert not obj._obj.is_complex(), f"pure_phase _obj should be real, got {obj._obj.dtype}"
+    def test_storage_dtype_per_obj_type(self):
+        for obj_type, is_complex in [
+            ("pure_phase", False),
+            ("complex", True),
+            ("potential", False),
+        ]:
+            obj = _initialized_obj(obj_type)
+            assert obj._obj.is_complex() is is_complex, f"{obj_type}: got {obj._obj.dtype}"
+            if obj_type == "pure_phase":
+                assert not obj.apply_hard_constraints(obj._obj).is_complex()
 
-    def test_complex_pixelated_obj_is_complex(self):
-        obj = ObjectPixelated.from_uniform(obj_type="complex", num_slices=1)
-        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
-        assert obj._obj.is_complex()
-
-    def test_potential_pixelated_obj_is_real(self):
-        obj = ObjectPixelated.from_uniform(obj_type="potential", num_slices=1)
-        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
-        assert not obj._obj.is_complex()
-
-    def test_pure_phase_tv_emits_no_phase_warning(self):
-        obj = ObjectPixelated.from_uniform(obj_type="pure_phase", num_slices=1)
-        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
-        obj.constraints.tv_weight_xy = 0.1
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            obj.get_tv_loss(obj._obj)
-        phase_warnings = [w for w in caught if "phase wrapping" in str(w.message)]
-        assert not phase_warnings, (
-            f"pure_phase should not emit phase-wrap warning, got {phase_warnings}"
-        )
-
-    def test_complex_tv_still_emits_phase_warning(self):
-        obj = ObjectPixelated.from_uniform(obj_type="complex", num_slices=1)
-        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
-        obj.constraints.tv_weight_xy = 0.1
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            obj.get_tv_loss(obj._obj)
-        assert any("phase wrapping" in str(w.message) for w in caught), (
-            "complex obj_type should still emit phase-wrap warning"
-        )
-
-    def test_pure_phase_apply_hard_constraints_stays_real(self):
-        obj = ObjectPixelated.from_uniform(obj_type="pure_phase", num_slices=1)
-        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
-        out = obj.apply_hard_constraints(obj._obj)
-        assert not out.is_complex()
+    def test_tv_phase_warning_only_for_complex(self):
+        for obj_type, warns in [("pure_phase", False), ("complex", True)]:
+            obj = _initialized_obj(obj_type)
+            obj.constraints.tv_weight_xy = 0.1
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                obj.get_tv_loss(obj._obj)
+            phase_warnings = [w for w in caught if "phase wrapping" in str(w.message)]
+            assert bool(phase_warnings) is warns, f"{obj_type}: {phase_warnings}"
 
 
 # --- FOV-mask single application ---------------------------------------------
@@ -243,14 +212,17 @@ class TestPurePhaseRealValued:
 
 class TestFovMaskSingleApplication:
     def _make_obj(self, obj_type) -> ObjectPixelated:
-        obj = ObjectPixelated.from_uniform(obj_type=obj_type, num_slices=1)
-        obj._initialize_obj((1, 16, 16), sampling=(0.1, 0.1))
+        obj = _initialized_obj(obj_type)
         obj.constraints.apply_fov_mask = True
         # Force a non-trivial _obj so masking is observable
         if obj_type == "complex":
             obj._obj = torch.nn.Parameter(
                 torch.ones(1, 16, 16, dtype=torch.complex64) * (0.5 + 0.3j)
             )
+        elif obj_type == "pure_phase":
+            # zero-mean +-0.7 checkerboard: the phase recentering leaves it unchanged
+            yy, xx = torch.meshgrid(torch.arange(16), torch.arange(16), indexing="ij")
+            obj._obj = torch.nn.Parameter(0.7 * (1 - 2 * ((yy + xx) % 2)).float()[None])
         else:
             obj._obj = torch.nn.Parameter(torch.full((1, 16, 16), 0.7))
         return obj
@@ -270,8 +242,8 @@ class TestFovMaskSingleApplication:
         # of the unmasked value; once it scales by 0.5. We compare to the
         # per-obj-type expected post-constraint value.
         if obj_type == "pure_phase":
-            # phase recentered to zero mean, then *= 0.5 mask
-            expected_mag = 0.0  # phase=constant -> recenter to 0 -> *0.5 = 0
+            # zero-mean phase survives recentering, then *= 0.5 mask -> |phase| 0.35
+            expected_mag = 0.35
         elif obj_type == "potential":
             # positivity clamp keeps 0.7, * 0.5 -> 0.35 (one application)
             expected_mag = 0.35

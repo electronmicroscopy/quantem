@@ -31,5 +31,6 @@ jobs:
 
       # -n logical, not auto: auto counts physical cores, 2 on GitHub's 4-vCPU runners.
       # tests/conftest.py gives each worker cores // workers torch and BLAS threads.
+      # Tests marked slow run only on pull requests into main, that is once per release.
       - name: Run pytests
-        run: uv run pytest tests -n logical
+        run: uv run pytest tests -n logical --dist loadscope ${{ github.base_ref == 'main' && '--runslow' || '' }}

@@ -68,7 +68,7 @@ def test_bundle_round_trip(tmp_path):
     assert np.allclose(back.atoms.arrays["occupancy"], [0.4, 1.0, 0.6])
 
 
-@pytest.mark.parametrize("name", ["save", "print_tree", "_recursive_save"])
-def test_bundle_rejects_reserved_names(name):
-    with pytest.raises(ValueError, match="shadow"):
-        Bundle(**{name: 1})
+def test_bundle_rejects_reserved_names():
+    for name in ("save", "print_tree", "_recursive_save"):
+        with pytest.raises(ValueError, match="shadow"):
+            Bundle(**{name: 1})

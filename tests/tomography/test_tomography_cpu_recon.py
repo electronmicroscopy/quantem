@@ -8,8 +8,8 @@ exercised. This runs a tiny INR reconstruction on CPU with ``num_workers=0`` -- 
 
 It is skipped when CUDA is present: object models that go through ``setup_distributed`` must
 be built on CUDA when a CUDA device exists (the CPU path is only valid with no CUDA device),
-and on GPU machines the ``requires_gpu`` tests already cover this path. Marked ``slow`` so it
-runs under ``--runslow``.
+and on GPU machines the ``requires_gpu`` tests already cover this path. It takes under a
+second, so it is not marked ``slow``.
 """
 
 import numpy as np
@@ -19,7 +19,6 @@ import torch
 from quantem.tomography.tomography_lite import TomographyLiteINR
 
 pytestmark = [
-    pytest.mark.slow,
     pytest.mark.skipif(
         torch.cuda.is_available(),
         reason="CPU INR path is only valid without CUDA; GPU machines use the requires_gpu tests",

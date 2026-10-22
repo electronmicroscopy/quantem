@@ -583,17 +583,6 @@ def ctf_interleaved_frames(
     return datasets, positions_A
 
 
-#: every accelerator present, so the same assertions run on CPU, CUDA and MPS
-ACCELERATORS = [
-    device
-    for device, present in (
-        ("cuda", torch.cuda.is_available()),
-        ("mps", torch.backends.mps.is_available()),
-    )
-    if present
-]
-
-
 # ---------------------------------------------------------------------------
 # complex-valued and multislice objects
 #
@@ -784,26 +773,27 @@ def twisted_square_cell():
     return shape, layers, float(np.degrees(twist))
 
 
-def twisted_honeycomb_cell(a: float = 2.46):
-    """Two honeycombs twisted by 21.79 degrees, the (1, 2) commensurate cell.
+def periodic_shift(image: np.ndarray, shift, sampling: float = ML_SAMPLING) -> np.ndarray:
+    """``image`` translated by ``shift`` Angstrom, periodically, by the Fourier shift theorem."""
+    q = np.fft.fftfreq(image.shape[0], sampling)
+    ramp = np.exp(-2j * np.pi * (q[:, None] * shift[0] + q[None, :] * shift[1]))
+    return np.fft.ifft2(np.fft.fft2(image) * ramp).real
 
-    Both layers are periodic in the orthogonal cell of their ``sqrt(7) a`` coincidence lattice,
-    ``sqrt(21) a x sqrt(7) a``, snapped to whole pixels (a 0.1-0.2% strain).
+
+def tilted_layers_4dstem(
+    tilt_mrad=(0.0, 0.0), spacing: float = 6.0, dose=None, seed=0, drift=(0.0, 0.0)
+) -> Dataset4d:
+    """The twisted square layers, ``0.3`` rad strong and ``spacing`` apart about the C10 plane,
+    seen at a specimen tilt: each displaced by its depth times the tilt, and both by ``drift``.
     """
-    a1, a2 = np.array([a, 0.0]), np.array([a / 2, a * np.sqrt(3) / 2])
-    t, t_image = a1 + 2 * a2, 2 * a1 + a2
-    first = -np.arctan2(t[1], t[0])
-    second = first + np.arctan2(t[1], t[0]) - np.arctan2(t_image[1], t_image[0])
-    side = np.sqrt(7) * a
-    box_true = (side, np.sqrt(3) * side)  # built as (col, row), transposed below
-    shape = (int(round(box_true[1] / ML_SAMPLING)), int(round(box_true[0] / ML_SAMPLING)))
-    strain = np.asarray(shape[::-1]) * ML_SAMPLING / np.asarray(box_true)
-    motif = [(np.zeros(2), 1.0), ((a1 + a2) / 3, 1.0)]
-    layers = []
-    for angle in (first, second):
-        sites, weights = _lattice_in_box((a1, a2), motif, angle, box_true)
-        layers.append(periodic_gaussians((sites * strain)[:, ::-1], shape, weights=weights))
-    return shape, layers, float(np.degrees(np.arccos(13 / 14)))
+    _, layers, _ = twisted_square_cell()
+    theta = np.asarray(tilt_mrad, dtype=float) * 1e-3
+    depths = (-spacing / 2, spacing / 2)
+    logs = [
+        1j * periodic_shift(0.3 * layer, z * theta + np.asarray(drift))
+        for layer, z in zip(layers, depths)
+    ]
+    return thin_layer_4dstem(logs, list(depths), ML_ABERRATIONS, dose=dose, seed=seed)
 
 
 def layer_purity(slices, truths) -> tuple[float, float]:
@@ -820,3 +810,136 @@ def layer_purity(slices, truths) -> tuple[float, float]:
         purities.append(c[layer] ** 2 / (c**2).sum())
         owns.append(c[layer])
     return float(np.mean(purities)), float(np.mean(owns))
+
+
+# --- Implicit-object (ObjectINR / ObjectTensorDecomp) reconstruction data ---------------------
+# A smooth phase object larger than the scanned region, scanned in its interior with padding
+# >= roi // 2, so patches never reach the object boundary (the non-toroidal regime the
+# implicit models assume). Used by test_object_inr.py and test_object_tensor_decomp.py.
+
+INR_N = 40  # detector / roi size (px)
+INR_OGT = 64  # ground-truth object size (px); larger than the scanned region
+INR_PAD = 20  # obj padding (>= roi // 2 so interior patches never hit the boundary)
+INR_Q_MAX = 0.5  # inverse Angstroms
+INR_Q_PROBE = INR_Q_MAX / 2
+INR_ENERGY = 300e3  # eV
+INR_C10 = 50.0  # defocus (Angstrom)
+INR_STEP = 2  # scan step (px)
+INR_SCAN_START = 20  # first scan position (px); INR_SCAN_START - roi//2 >= 0
+INR_SCAN_STOP = 44  # exclusive; INR_SCAN_STOP - 1 + roi//2 - 1 < INR_OGT -> no wrap
+
+
+def inr_smooth_phase() -> np.ndarray:
+    """A smooth, band-limited phase object (friendly to a SIREN, unlike white noise)."""
+    yy, xx = np.meshgrid(np.arange(INR_OGT), np.arange(INR_OGT), indexing="ij")
+    phase = 0.7 * np.sin(2 * np.pi * xx / INR_OGT * 4) * np.cos(2 * np.pi * yy / INR_OGT * 3)
+    return phase.astype(np.float32)
+
+
+def inr_probe_array() -> np.ndarray:
+    sampling = 1 / INR_Q_MAX / 2
+    reciprocal_sampling = 2 * INR_Q_MAX / INR_N
+    qx = qy = np.fft.fftfreq(INR_N, sampling)
+    q = np.sqrt(qx[:, None] ** 2 + qy[None, :] ** 2)
+    aperture = np.sqrt(np.clip((INR_Q_PROBE - q) / reciprocal_sampling + 0.5, 0, 1))
+    chi = q**2 * electron_wavelength_angstrom(INR_ENERGY) * np.pi * INR_C10
+    probe_fourier = aperture * np.exp(-1j * chi)
+    probe_fourier /= np.sqrt(np.sum(np.abs(probe_fourier) ** 2))
+    return (np.fft.ifft2(probe_fourier) * INR_N).astype(np.complex64)
+
+
+def inr_semiangle_mrad() -> float:
+    return electron_wavelength_angstrom(INR_ENERGY) * INR_Q_PROBE * 1e3
+
+
+def inr_probe_params() -> dict:
+    return {"energy": INR_ENERGY, "C10": INR_C10, "semiangle_cutoff": inr_semiangle_mrad()}
+
+
+def inr_synthetic_dataset():
+    """Simulate the non-toroidal 4D-STEM dataset; return ``(dataset_model, gt_phase, probe)``."""
+    from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+    from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
+
+    phase = inr_smooth_phase()
+    complex_obj = np.exp(1j * phase)
+    probe = inr_probe_array()
+    reciprocal_sampling = 2 * INR_Q_MAX / INR_N
+
+    gpos = np.arange(INR_SCAN_START, INR_SCAN_STOP, INR_STEP)
+    xx, yy = np.meshgrid(gpos, gpos, indexing="ij")
+    positions = np.stack((xx.ravel(), yy.ravel()), axis=-1)
+    x0 = positions[:, 0].astype(int)
+    y0 = positions[:, 1].astype(int)
+    x_ind = np.fft.fftfreq(INR_N, d=1 / INR_N).astype(int)
+    y_ind = np.fft.fftfreq(INR_N, d=1 / INR_N).astype(int)
+    row = x0[:, None, None] + x_ind[None, :, None]  # no modulo: interior scan, no wrap
+    col = y0[:, None, None] + y_ind[None, None, :]
+    assert row.min() >= 0 and row.max() < INR_OGT and col.min() >= 0 and col.max() < INR_OGT
+    exit_waves = complex_obj[row, col] * probe
+    intensities = np.abs(np.fft.fft2(exit_waves)) ** 2
+
+    sxy = len(gpos)
+    dset = Dataset4dstem.from_array(
+        array=np.fft.fftshift(intensities * 100, axes=(-2, -1)).reshape((sxy, sxy, INR_N, INR_N)),
+        sampling=(INR_STEP, INR_STEP, reciprocal_sampling, reciprocal_sampling),
+        units=("A", "A", "A^-1", "A^-1"),
+    )
+    pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
+    pdset.learn_scan_positions = False
+    pdset.learn_descan = False
+    pdset.preprocess(
+        com_fit_function="constant",
+        plot_rotation=False,
+        plot_com=False,
+        probe_energy=INR_ENERGY,
+    )
+    return pdset, phase, probe
+
+
+def inr_ptychography(obj_model, pdset=None, probe_model=None):
+    """``Ptychography`` on the synthetic dataset; the exact simulation probe, frozen, by default."""
+    from quantem.diffractive_imaging.detector_models import DetectorPixelated
+    from quantem.diffractive_imaging.probe_models import ProbePixelated
+    from quantem.diffractive_imaging.ptychography import Ptychography
+
+    gt_phase = None
+    if pdset is None:
+        pdset, gt_phase, probe = inr_synthetic_dataset()
+        if probe_model is None:
+            probe_model = ProbePixelated.from_array(
+                num_probes=1, probe_params=inr_probe_params(), probe_array=probe.copy()
+            )
+    ptycho = Ptychography.from_models(
+        dset=pdset,
+        obj_model=obj_model,
+        probe_model=probe_model,
+        detector_model=DetectorPixelated(),
+        rng=0,
+        verbose=False,
+    )
+    ptycho.preprocess(obj_padding_px=(INR_PAD, INR_PAD))
+    return ptycho, gt_phase
+
+
+def _inr_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a = a - a.mean()
+    b = b - b.mean()
+    return float((a * b).sum() / np.sqrt((a**2).sum() * (b**2).sum() + 1e-12))
+
+
+def _inr_center_crop(a: np.ndarray, s: int) -> np.ndarray:
+    r0 = (a.shape[0] - s) // 2
+    c0 = (a.shape[1] - s) // 2
+    return a[r0 : r0 + s, c0 : c0 + s]
+
+
+def inr_best_corr(recon: np.ndarray, gt: np.ndarray, s: int = 32) -> float:
+    """Best |correlation| over small integer shifts (handles ~1px registration offset)."""
+    g = _inr_center_crop(gt, s)
+    best = -1.0
+    for dr in range(-3, 4):
+        for dc in range(-3, 4):
+            r = _inr_center_crop(np.roll(recon, (dr, dc), (0, 1)), s)
+            best = max(best, abs(_inr_corr(r, g)))
+    return best
