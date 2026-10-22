@@ -208,6 +208,61 @@ def _polar_peak_bins(
     return r_bins, theta_bins
 
 
+def _draw_scan_map_with_zoom(
+    ax,
+    intensity_map,
+    ry,
+    rx,
+    *,
+    cmap,
+    vmin,
+    vmax,
+    marker_color,
+    marker_size,
+    marker_width,
+    colorbar=False,
+    margin=4,
+):
+    """Draw a scan map with the selected position circled and a zoomed inset around it.
+
+    ``ry``, ``rx`` index ``intensity_map`` directly (upsampled pixels for an upsampled
+    map). The inset shows the ``2 * margin + 1`` square around the position, and that
+    square is outlined on the main map.
+    """
+    if vmin is None:
+        im = ax.imshow(intensity_map, cmap=cmap)
+    else:
+        im = ax.imshow(intensity_map, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.scatter(rx, ry, facecolor='none', edgecolor=marker_color, marker='o', s=marker_size, linewidth=marker_width)
+    if colorbar:
+        plt.colorbar(im, ax=ax)
+
+    axins = inset_axes(ax, width="30%", height="30%", loc='upper right', borderpad=1.5)
+    ry_min = max(0, ry - margin)
+    ry_max = min(intensity_map.shape[0], ry + margin + 1)
+    rx_min = max(0, rx - margin)
+    rx_max = min(intensity_map.shape[1], rx + margin + 1)
+    zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
+    if vmin is None:
+        axins.imshow(zoomed_region, cmap=cmap, extent=[rx_min, rx_max, ry_max, ry_min], interpolation='nearest')
+    else:
+        axins.imshow(zoomed_region, cmap=cmap, extent=[rx_min, rx_max, ry_max, ry_min],
+                     vmin=vmin, vmax=vmax, interpolation='nearest')
+    axins.add_patch(Rectangle((rx, ry), 1, 1, linewidth=2, edgecolor=marker_color,
+                              facecolor='none', zorder=10))
+    axins.set_xlim(rx_min, rx_max)
+    axins.set_ylim(ry_max, ry_min)
+    axins.set_xticks([])
+    axins.set_yticks([])
+    side = 2 * margin + 1
+    axins.set_title(f'{side}×{side} zoom', fontsize=8, pad=2)
+
+    ax.add_patch(Rectangle((rx_min, ry_min), rx_max - rx_min, ry_max - ry_min,
+                           linewidth=1.5, edgecolor=marker_color, facecolor='none',
+                           linestyle='--', alpha=0.7))
+    return im
+
+
 def _plot_bragg_peaks_on_ax(
     ax,
     peaks_x,
@@ -2183,6 +2238,28 @@ class BraggPeaksPolymer(AutoSerialize):
         from quantem.widget import show_polymer_4DSTEM
         return show_polymer_4DSTEM(self, **kwargs)
 
+    def _polar_peak_bins_at(self, ry, rx, two_fold_symmetry):
+        """Polar-panel bin coordinates of the peaks at one scan position.
+
+        Returns ``(r_bins, theta_bins, r_invA)``, or ``None`` when there are no polar
+        peaks at that position.
+        """
+        if getattr(self, 'polar_peaks', None) is None:
+            return None
+        polar_r = _vector_field_cell(self.polar_peaks, "r_invA", ry, rx)
+        if len(polar_r) == 0:
+            return None
+        polar_theta = _vector_field_cell(self.polar_peaks, "theta", ry, rx)
+        r_bins, theta_bins = _polar_peak_bins(
+            polar_r,
+            polar_theta,
+            self.max_radius_invA,
+            self.num_radial_bins,
+            self.num_annular_bins,
+            two_fold_symmetry,
+        )
+        return r_bins, theta_bins, polar_r
+
     def plot_interactive_peak_map(self, radial_range=None, intensity_map=None,
                                     ry=None, rx=None,
                                     vmax_cartesian=7, vmin_cartesian=0, show_all_peaks=True,
@@ -2212,23 +2289,15 @@ class BraggPeaksPolymer(AutoSerialize):
             show_polar = False
         
         # Setup intensity map
-        if intensity_map is not None:
-            intensity_map, upsample_factor = _resolve_intensity_map(
-                self.dataset_cartesian,
-                intensity_map,
-                (Ry, Rx),
-                validate=False,
-            )
-            map_title = f'Custom Map ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else 'Custom Map'
-        else:
-            intensity_map, upsample_factor = _resolve_intensity_map(
-                self.dataset_cartesian,
-                intensity_map,
-                (Ry, Rx),
-                validate=False,
-            )
-            map_title = f'Peak Map ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else 'Peak Map'
-        
+        map_kind = 'Custom Map' if intensity_map is not None else 'Peak Map'
+        intensity_map, upsample_factor = _resolve_intensity_map(
+            self.dataset_cartesian,
+            intensity_map,
+            (Ry, Rx),
+            validate=False,
+        )
+        map_title = f'{map_kind} ({radial_range[0]:.2f}-{radial_range[1]:.2f} 1/Å)' if radial_range else map_kind
+
         is_rgb_map, vmin_intensity_map, vmax_intensity_map = _intensity_display_limits(
             intensity_map
         )
@@ -2280,61 +2349,23 @@ class BraggPeaksPolymer(AutoSerialize):
             ax3 = axes[2] if show_polar else None
             
             # Intensity map
-            if vmin_intensity_map is None:
-                im1 = ax1.imshow(intensity_map, cmap=map_cmap)
-            else:
-                im1 = ax1.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-            ax1.scatter(rx_slider, ry_slider,  facecolor='none', edgecolor=crosshair_color, marker='o', s=crosshair_size, linewidth=crosshair_width)
+            _draw_scan_map_with_zoom(
+                ax1,
+                intensity_map,
+                ry_slider,
+                rx_slider,
+                cmap=map_cmap,
+                vmin=vmin_intensity_map,
+                vmax=vmax_intensity_map,
+                marker_color=crosshair_color,
+                marker_size=crosshair_size,
+                marker_width=crosshair_width,
+                colorbar=not is_rgb_map,
+            )
             ax1.set_title(map_title)
             ax1.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax1.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
-            if not is_rgb_map:
-                plt.colorbar(im1, ax=ax1)
-            
-            # Create inset axes for the zoomed view
-            axins = inset_axes(ax1, width="30%", height="30%", loc='upper right', 
-                               borderpad=1.5)
-            
-            # Calculate 9x9 region with selected pixel at center (4 pixels margin each side)
-            margin = 4
-            ry_min = max(0, ry_slider - margin)
-            ry_max = min(intensity_map.shape[0], ry_slider + margin + 1)
-            rx_min = max(0, rx_slider - margin)
-            rx_max = min(intensity_map.shape[1], rx_slider + margin + 1)
-            
-            # Extract and display the zoomed region
-            zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
-            
-            if vmin_intensity_map is None:
-                axins.imshow(zoomed_region, cmap=map_cmap, 
-                             extent=[rx_min, rx_max, ry_max, ry_min], 
-                             interpolation='nearest')
-            else:
-                axins.imshow(zoomed_region, cmap=map_cmap, 
-                             extent=[rx_min, rx_max, ry_max, ry_min],
-                             vmin=vmin_intensity_map, vmax=vmax_intensity_map,
-                             interpolation='nearest')
-            
-            # Draw border around the selected (central) pixel
-            pixel_border = Rectangle((rx_slider, ry_slider), 1, 1,
-                                     linewidth=2, edgecolor=crosshair_color, 
-                                     facecolor='none', zorder=10)
-            axins.add_patch(pixel_border)
-            
-            # Set limits and styling
-            axins.set_xlim(rx_min, rx_max)
-            axins.set_ylim(ry_max, ry_min)
-            axins.set_xticks([])
-            axins.set_yticks([])
-            axins.set_title('9×9 zoom', fontsize=8, pad=2)
-            
-            # Optional: Add a rectangle on main plot showing zoomed region
-            rect = Rectangle((rx_min, ry_min), rx_max-rx_min, ry_max-ry_min,
-                             linewidth=1.5, edgecolor=crosshair_color, 
-                             facecolor='none', linestyle='--', alpha=0.7)
-            ax1.add_patch(rect)
 
-            
             # Diffraction pattern
             dp_data = _normalized_dp(
                 self.dataset_cartesian,
@@ -2367,6 +2398,9 @@ class BraggPeaksPolymer(AutoSerialize):
                 peaks_x, peaks_y, peaks_r_invA, center,
                 max_dist=_central_beam_max_dist(dp_data.shape),
             )
+            # The polar panel shows every peak, so it keeps the unzoomed intensities and
+            # central index; zoom > 1 subsets them for the Cartesian panel only.
+            polar_peak_ints, polar_central_idx = peak_ints, central_idx
             (
                 dp_data,
                 peaks_x,
@@ -2419,24 +2453,14 @@ class BraggPeaksPolymer(AutoSerialize):
                 ax3.set_xlabel('Radius (bins)')
                 ax3.set_ylabel('Theta (bins)')
                 ax3.set_title(f'Polar (Ry={ry_data}, Rx={rx_data})')
-                
-                if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
-                    polar_r = _vector_field_cell(
-                        self.polar_peaks, "r_invA", ry_data, rx_data
+
+                polar_peaks = self._polar_peak_bins_at(ry_data, rx_data, two_fold_symmetry)
+                if polar_peaks is not None:
+                    r_bins, theta_bins, polar_r = polar_peaks
+                    plot_peaks_on_ax(
+                        ax3, r_bins, theta_bins, polar_r, polar_peak_ints, polar_central_idx,
+                        ry_data, rx_data,
                     )
-                    polar_theta = _vector_field_cell(
-                        self.polar_peaks, "theta", ry_data, rx_data
-                    )
-                    if polar_r is not None and len(polar_r) > 0:
-                        r_bins, theta_bins = _polar_peak_bins(
-                            polar_r,
-                            polar_theta,
-                            self.max_radius_invA,
-                            self.num_radial_bins,
-                            self.num_annular_bins,
-                            two_fold_symmetry,
-                        )
-                        plot_peaks_on_ax(ax3, r_bins, theta_bins, polar_r, peak_ints, central_idx, ry_data, rx_data)
             
             plt.tight_layout()
             plt.show()
@@ -2605,48 +2629,18 @@ class BraggPeaksPolymer(AutoSerialize):
             figsize_individual = (6, 6)
         if save_intensity_map:
             fig_map, ax = plt.subplots(figsize=figsize_individual)
-            if vmin_intensity_map is None:
-                im = ax.imshow(intensity_map, cmap=map_cmap)
-            else:
-                im = ax.imshow(intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map)
-
-            ry_slider = ry * upsample_factor
-            rx_slider = rx * upsample_factor
-
-            ax.scatter(rx_slider, ry_slider, facecolor='none', edgecolor=crosshair_color, marker='o', s=crosshair_size, linewidth=crosshair_width)
-
-            # Add inset
-            from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-            axins = inset_axes(ax, width="30%", height="30%", loc='upper right', borderpad=1.5)
-
-            margin = 4
-            ry_min = max(0, ry_slider - margin)
-            ry_max = min(intensity_map.shape[0], ry_slider + margin + 1)
-            rx_min = max(0, rx_slider - margin)
-            rx_max = min(intensity_map.shape[1], rx_slider + margin + 1)
-
-            zoomed_region = intensity_map[ry_min:ry_max, rx_min:rx_max]
-
-            if vmin_intensity_map is None:
-                axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min], interpolation='nearest')
-            else:
-                axins.imshow(zoomed_region, cmap=map_cmap, extent=[rx_min, rx_max, ry_max, ry_min],
-                             vmin=vmin_intensity_map, vmax=vmax_intensity_map, interpolation='nearest')
-
-            pixel_border = Rectangle((rx_slider, ry_slider), 1, 1, linewidth=2, edgecolor=crosshair_color,
-                                     facecolor='none', zorder=10)
-            axins.add_patch(pixel_border)
-
-            axins.set_xlim(rx_min, rx_max)
-            axins.set_ylim(ry_max, ry_min)
-            axins.set_xticks([])
-            axins.set_yticks([])
-            axins.set_title('9×9 zoom', fontsize=8, pad=2)
-
-            rect = Rectangle((rx_min, ry_min), rx_max-rx_min, ry_max-ry_min,
-                             linewidth=1.5, edgecolor=crosshair_color, facecolor='none', linestyle='--', alpha=0.7)
-            ax.add_patch(rect)
-
+            _draw_scan_map_with_zoom(
+                ax,
+                intensity_map,
+                ry * upsample_factor,
+                rx * upsample_factor,
+                cmap=map_cmap,
+                vmin=vmin_intensity_map,
+                vmax=vmax_intensity_map,
+                marker_color=crosshair_color,
+                marker_size=crosshair_size,
+                marker_width=crosshair_width,
+            )
             ax.set_title(map_title)
             ax.set_xlabel('Rx (upsampled)' if upsample_factor > 1 else 'Rx')
             ax.set_ylabel('Ry (upsampled)' if upsample_factor > 1 else 'Ry')
@@ -2676,30 +2670,19 @@ class BraggPeaksPolymer(AutoSerialize):
             ax.set_title(f'Polar (Ry={ry}, Rx={rx})')
             ax.set_xlabel('Radius (bins)')
             ax.set_ylabel('Theta (bins)')
-            
-            if hasattr(self, 'polar_peaks') and self.polar_peaks is not None:
-                polar_r = _vector_field_cell(self.polar_peaks, "r_invA", ry, rx)
-                polar_theta = _vector_field_cell(self.polar_peaks, "theta", ry, rx)
-                if polar_r is not None and len(polar_r) > 0:
-                    r_bins, theta_bins = _polar_peak_bins(
-                        polar_r,
-                        polar_theta,
-                        self.max_radius_invA,
-                        self.num_radial_bins,
-                        self.num_annular_bins,
-                        two_fold_symmetry,
-                    )
-                    
-                    # Find central beam for polar
-                    polar_central_idx = np.argmin(polar_r)
-                    # Use the full (unzoomed) intensities: polar_r / r_bins / theta_bins are read
-                    # from the full polar_peaks, whereas `peak_ints` may have been subset by
-                    # zoom > 1 for the Cartesian panel (length mismatch -> IndexError otherwise).
-                    polar_peak_ints = _vector_field_cell(
-                        self.peak_intensities, intensity_field, ry, rx
-                    )
-                    if polar_r is not None and len(polar_r) > 0:
-                        plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, polar_peak_ints, polar_central_idx)
+
+            polar_peaks = self._polar_peak_bins_at(ry, rx, two_fold_symmetry)
+            if polar_peaks is not None:
+                r_bins, theta_bins, polar_r = polar_peaks
+                # Find central beam for polar
+                polar_central_idx = np.argmin(polar_r)
+                # Use the full (unzoomed) intensities: polar_r / r_bins / theta_bins are read
+                # from the full polar_peaks, whereas `peak_ints` may have been subset by
+                # zoom > 1 for the Cartesian panel (length mismatch -> IndexError otherwise).
+                polar_peak_ints = _vector_field_cell(
+                    self.peak_intensities, intensity_field, ry, rx
+                )
+                plot_peaks_on_ax(ax, r_bins, theta_bins, polar_r, polar_peak_ints, polar_central_idx)
             fig_polar.savefig(save_path / f'{prefix}_ry{ry}_rx{rx}_polar.pdf', format='pdf', bbox_inches='tight', pad_inches=0, dpi=dpi)
             plt.close(fig_polar)
             print(f'✓ Saved: {prefix}_ry{ry}_rx{rx}_polar.pdf')

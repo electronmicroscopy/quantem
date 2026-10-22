@@ -445,6 +445,8 @@ def test_bragg_plotting_and_save_smoke(monkeypatch, tmp_path):
 
     bp.plot_interactive_image_map(ry=0, rx=0, show_polar=False)
     bp.plot_interactive_peak_map(ry=0, rx=0, show_polar=True)
+    # zoom crops peaks from the Cartesian panel only; the polar panel still shows all of them.
+    bp.plot_interactive_peak_map(ry=0, rx=0, show_polar=True, zoom=2)
 
     bp.save_diffraction_figures(0, 0, save_dir=tmp_path / "diff", show_polar=True)
     assert (tmp_path / "diff" / "diffraction_ry0_rx0_intensity_map.pdf").exists()
