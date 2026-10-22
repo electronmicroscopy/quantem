@@ -52,27 +52,23 @@ def test_local_override_uses_verified_weights(tmp_path):
     assert result.weights_path == (model_dir / "weights.pth").resolve()
 
 
-def test_checksum_failure_leaves_no_partial_file(tmp_path):
-    with pytest.raises(PolymerModelError, match="Checksum failure after downloading"):
-        resolve_polymer_model(
-            "test-model", version="v1", cache_dir=tmp_path, registry=_registry(b"expected"),
-            downloader=lambda _: io.BytesIO(b"corrupt"),
-        )
-    assert not list(tmp_path.rglob("weights.pth"))
-    assert not list(tmp_path.rglob(".download-*"))
+class _Interrupted(io.BytesIO):
+    def read(self, size=-1):
+        raise OSError("connection interrupted")
 
 
-def test_interrupted_download_leaves_no_partial_file(tmp_path):
-    class Interrupted(io.BytesIO):
-        def read(self, size=-1):
-            raise OSError("connection interrupted")
-
-    with pytest.raises(PolymerModelError, match="Could not download"):
-        resolve_polymer_model(
-            "test-model", version="v1", cache_dir=tmp_path, registry=_registry(b"expected"),
-            downloader=lambda _: Interrupted(b"partial"),
-        )
-    assert not list(tmp_path.rglob(".download-*"))
+def test_failed_download_leaves_no_partial_file(tmp_path):
+    for label, downloader, match in [
+        ("checksum", lambda _: io.BytesIO(b"corrupt"), "Checksum failure after downloading"),
+        ("interrupted", lambda _: _Interrupted(b"partial"), "Could not download"),
+    ]:
+        with pytest.raises(PolymerModelError, match=match):
+            resolve_polymer_model(
+                "test-model", version="v1", cache_dir=tmp_path / label,
+                registry=_registry(b"expected"), downloader=downloader,
+            )
+        assert not list(tmp_path.rglob("weights.pth")), label
+        assert not list(tmp_path.rglob(".download-*")), label
 
 
 def test_incompatible_specification_is_rejected(tmp_path):

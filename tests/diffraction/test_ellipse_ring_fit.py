@@ -59,111 +59,80 @@ def _fit_ridge(pattern, **kwargs):
     )
 
 
-def test_ring_fit_recovers_synthetic_ellipse():
-    fit = _fit(
-        _elliptical_ring(ratio_b_over_a=0.9, theta_deg=35.0)
-    )
+FITS = {"angular_variance": _fit, "ridge": _fit_ridge}
+DIAGNOSTIC_KEYS = {
+    "method", "accepted", "selected", "candidates", "explicit_band",
+    "center_initial", "center_refined", "rejection_reasons",
+}
 
-    assert fit.accepted is True
-    assert fit.ratio == pytest.approx(1 / 0.9, abs=0.025)
-    assert fit.theta_deg == pytest.approx(35.0, abs=3.0)
-    assert fit.ring_band[0] < 27 < fit.ring_band[1]
+
+def test_fit_recovers_synthetic_ellipse_and_exposes_diagnostics():
+    """Ridge fitting also refines the centre, so its pattern is offset.
+
+    ``params`` is the (a, b, theta_deg) triple the polar transforms consume, and
+    ``diagnostics`` is the flat mapping ``BraggPeaksPolymer`` publishes as
+    ``ellipse_fit_diagnostics``; ``preprocess`` and notebooks depend on both.
+    """
+    offset = (1.2, -0.8)
+    cases = {
+        "angular_variance": ((0.0, 0.0), 0.025, DIAGNOSTIC_KEYS | {"quality_thresholds"}),
+        "ridge": (offset, 0.03, DIAGNOSTIC_KEYS),
+    }
+    for method, (center_offset, ratio_tol, keys) in cases.items():
+        fit = FITS[method](
+            _elliptical_ring(ratio_b_over_a=0.9, theta_deg=35.0, center_offset=center_offset)
+        )
+
+        assert fit.accepted is True, method
+        assert fit.ratio == pytest.approx(1 / 0.9, abs=ratio_tol), method
+        assert fit.theta_deg == pytest.approx(35.0, abs=3.0), method
+        assert fit.ring_band[0] < 27 < fit.ring_band[1], method
+        assert fit.params == (fit.a, fit.b, fit.theta_deg), method
+        assert fit.ratio == pytest.approx(fit.a / fit.b), method
+        diagnostics = fit.diagnostics
+        assert set(diagnostics) == keys, method
+        assert diagnostics["method"] == method
+        assert diagnostics["accepted"] is fit.accepted, method
+        assert diagnostics["center_refined"] == fit.center_refined, method
+    assert fit.center_refined == pytest.approx(np.asarray((47.5, 47.5)) + offset, abs=0.25)
 
 
 def test_sparse_outer_bragg_spots_do_not_select_the_calibration_band():
-    pattern = _elliptical_ring(
-        radius=26.0, ratio_b_over_a=0.94, theta_deg=118.0
-    )
+    pattern = _elliptical_ring(radius=26.0, ratio_b_over_a=0.94, theta_deg=118.0)
     cy, cx = (np.asarray(pattern.shape) - 1) / 2
     for angle in np.deg2rad([5, 42, 91, 147, 221, 305]):
         row = int(round(cy + 39 * np.sin(angle)))
         column = int(round(cx + 39 * np.cos(angle)))
         pattern[row - 1 : row + 2, column - 1 : column + 2] += 50.0
 
-    fit = _fit(pattern)
-
-    assert fit.accepted is True
-    assert fit.details["selected"]["r0"] < 32
-    assert fit.ring_band[0] < 26 < fit.ring_band[1]
+    for method, fitter in FITS.items():
+        fit = fitter(pattern)
+        assert fit.accepted is True, method
+        assert fit.details["selected"]["r0"] < 32, method
+        assert fit.ring_band[0] < 26 < fit.ring_band[1], method
 
 
 def test_boundary_solution_is_rejected_and_refinement_is_clipped():
-    pattern = _elliptical_ring(ratio_b_over_a=0.7)
+    fits = {}
+    for method, fitter in FITS.items():
+        with pytest.warns(RuntimeWarning, match="ratio search boundary"):
+            fits[method] = fit = fitter(_elliptical_ring(ratio_b_over_a=0.7))
 
-    with pytest.warns(RuntimeWarning, match="ratio search boundary"):
-        fit = _fit(pattern)
-
-    selected = fit.details["selected"]
-    assert fit.accepted is False
+        assert fit.accepted is False, method
+        assert (fit.ratio, fit.theta_deg) == pytest.approx((1.0, 0.0)), method
+    selected = fits["angular_variance"].details["selected"]
     assert selected["boundary_limited"] is True
     assert 0.85 <= selected["ratio_b_over_a"] <= 1.18
-    assert (fit.ratio, fit.theta_deg) == pytest.approx((1.0, 0.0))
 
 
 def test_low_information_pattern_falls_back_to_circle():
-    with pytest.warns(RuntimeWarning, match="using a circular correction"):
-        fit = _fit(np.ones((96, 96)))
+    for method, fitter in FITS.items():
+        with pytest.warns(RuntimeWarning, match="using a circular correction"):
+            fit = fitter(np.ones((96, 96)))
 
-    assert fit.accepted is False
-    assert (fit.ratio, fit.theta_deg) == pytest.approx((1.0, 0.0))
-
-
-def test_ridge_fit_jointly_recovers_center_and_ellipse():
-    offset = (1.2, -0.8)
-    fit = _fit_ridge(
-        _elliptical_ring(
-            ratio_b_over_a=0.9,
-            theta_deg=35.0,
-            center_offset=offset,
-        )
-    )
-
-    expected_center = np.asarray((47.5, 47.5)) + offset
-    assert fit.accepted is True
-    assert fit.center_refined == pytest.approx(
-        expected_center, abs=0.25
-    )
-    assert fit.ratio == pytest.approx(1 / 0.9, abs=0.03)
-    assert fit.theta_deg == pytest.approx(35.0, abs=3.0)
-    assert fit.ring_band[0] < 27 < fit.ring_band[1]
-
-
-def test_ridge_fit_rejects_out_of_range_ellipse():
-    with pytest.warns(RuntimeWarning, match="ratio search boundary"):
-        fit = _fit_ridge(
-            _elliptical_ring(ratio_b_over_a=0.7)
-        )
-
-    assert fit.accepted is False
-    assert (fit.ratio, fit.theta_deg) == pytest.approx((1.0, 0.0))
-
-
-def test_ridge_fit_ignores_sparse_outer_bragg_spots():
-    pattern = _elliptical_ring(
-        radius=26.0, ratio_b_over_a=0.94, theta_deg=118.0
-    )
-    cy, cx = (np.asarray(pattern.shape) - 1) / 2
-    for angle in np.deg2rad([5, 42, 91, 147, 221, 305]):
-        row = int(round(cy + 39 * np.sin(angle)))
-        column = int(round(cx + 39 * np.cos(angle)))
-        pattern[row - 1 : row + 2, column - 1 : column + 2] += 50.0
-
-    fit = _fit_ridge(pattern)
-
-    assert fit.accepted is True
-    assert fit.details["selected"]["r0"] < 32
-    assert fit.ring_band[0] < 26 < fit.ring_band[1]
-
-
-def test_low_information_ridge_falls_back_to_circle():
-    with pytest.warns(RuntimeWarning, match="using a circular correction"):
-        fit = _fit_ridge(
-            np.ones((96, 96), dtype=float)
-        )
-
-    assert fit.method == "ridge"
-    assert fit.accepted is False
-    assert (fit.ratio, fit.theta_deg) == pytest.approx((1.0, 0.0))
+        assert fit.method == method
+        assert fit.accepted is False, method
+        assert (fit.ratio, fit.theta_deg) == pytest.approx((1.0, 0.0)), method
 
 
 def test_preprocess_rejects_unknown_ellipse_fit_method_before_data_access():
@@ -171,36 +140,3 @@ def test_preprocess_rejects_unknown_ellipse_fit_method_before_data_access():
 
     with pytest.raises(ValueError, match="ellipse_fit_method"):
         detector.preprocess(ellipse_fit_method="not-a-fit-method")
-
-
-def test_fit_exposes_the_params_triple_and_legacy_diagnostics_mapping():
-    """``preprocess`` and downstream notebooks depend on both of these shapes.
-
-    ``params`` is the (a, b, theta_deg) triple the polar transforms consume, and
-    ``diagnostics`` reproduces the flat mapping that ``BraggPeaksPolymer`` has
-    always published as ``ellipse_fit_diagnostics``.
-    """
-    fit = _fit(_elliptical_ring(ratio_b_over_a=0.9, theta_deg=35.0))
-
-    assert fit.params == (fit.a, fit.b, fit.theta_deg)
-    assert fit.ratio == pytest.approx(fit.a / fit.b)
-
-    diagnostics = fit.diagnostics
-    assert set(diagnostics) == {
-        "method", "accepted", "selected", "candidates", "explicit_band",
-        "center_initial", "center_refined", "rejection_reasons",
-        "quality_thresholds",
-    }
-    assert diagnostics["method"] == "angular_variance"
-    assert diagnostics["accepted"] is fit.accepted
-    assert diagnostics["center_refined"] == fit.center_refined
-
-
-def test_ridge_diagnostics_mapping_matches_the_ridge_method():
-    fit = _fit_ridge(_elliptical_ring(ratio_b_over_a=0.9, theta_deg=35.0))
-
-    assert set(fit.diagnostics) == {
-        "method", "accepted", "selected", "candidates", "explicit_band",
-        "center_initial", "center_refined", "rejection_reasons",
-    }
-    assert fit.diagnostics["method"] == "ridge"

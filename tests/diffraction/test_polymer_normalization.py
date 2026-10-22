@@ -16,48 +16,36 @@ from quantem.diffraction import (
 )
 
 
-@pytest.mark.parametrize("as_torch", [False, True])
-def test_global_percentile_matches_reference(as_torch):
-    array = np.arange(48, dtype=np.float32).reshape(3, 4, 4)
-    batch = torch.from_numpy(array) if as_torch else array
-    strategy = GlobalPercentileNormalization(10, 90)
-    parameters = strategy.fit(batch)
-    lower, upper = np.percentile(array, [10, 90])
-    expected = (np.clip(array, lower, upper) - lower) / (upper - lower + 1e-8)
-    actual = strategy.transform(batch, parameters)
-    if as_torch:
-        actual = actual.numpy()
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+def _percentile_clip(array, lower_percentile, upper_percentile):
+    lower, upper = np.percentile(array, [lower_percentile, upper_percentile])
+    return (np.clip(array, lower, upper) - lower) / (upper - lower + 1e-8)
 
 
-@pytest.mark.parametrize("as_torch", [False, True])
-def test_per_image_minmax_percentile_matches_reference(as_torch):
-    array = np.array(
-        [
-            [[1, 2], [3, 5]],
-            [[10, 20], [30, 50]],
-            [[7, 7], [7, 7]],
-        ],
-        dtype=np.float32,
+def test_strategies_match_reference_for_numpy_and_torch():
+    ramp = np.arange(48, dtype=np.float32).reshape(3, 4, 4)
+    # The constant third image must map to zeros, not divide by zero.
+    images = np.array(
+        [[[1, 2], [3, 5]], [[10, 20], [30, 50]], [[7, 7], [7, 7]]], dtype=np.float32
     )
-    batch = torch.from_numpy(array) if as_torch else array
-    per_image = np.stack(
-        [
-            (image - image.min()) / (image.max() - image.min())
-            if image.max() > image.min()
-            else np.zeros_like(image)
-            for image in array
-        ]
-    )
-    lower, upper = np.percentile(per_image, [5, 95])
-    expected = (
-        np.clip(per_image, lower, upper) - lower
-    ) / (upper - lower + 1e-8)
-    strategy = PerImageMinMaxPercentileNormalization(5, 95)
-    actual = strategy.transform(batch, strategy.fit(batch))
-    if as_torch:
-        actual = actual.numpy()
-    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+    per_image = np.stack([
+        (image - image.min()) / (image.max() - image.min())
+        if image.max() > image.min() else np.zeros_like(image)
+        for image in images
+    ])
+    cases = [
+        ("global", GlobalPercentileNormalization(10, 90), ramp,
+         _percentile_clip(ramp, 10, 90)),
+        ("per-image", PerImageMinMaxPercentileNormalization(5, 95), images,
+         _percentile_clip(per_image, 5, 95)),
+    ]
+    for name, strategy, array, expected in cases:
+        for backend, batch in (("numpy", array), ("torch", torch.from_numpy(array))):
+            actual = strategy.transform(batch, strategy.fit(batch))
+            if backend == "torch":
+                actual = actual.numpy()
+            np.testing.assert_allclose(
+                actual, expected, rtol=1e-6, atol=1e-7, err_msg=f"{name} {backend}"
+            )
 
 
 def test_registered_resolution_and_legacy_adapter():

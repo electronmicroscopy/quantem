@@ -11,9 +11,11 @@ import numpy as np
 import pytest
 
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.diffraction import BraggPeaksPolymer
+from quantem.diffraction.peak_detection import peaks_from_model_output
 
 
 @pytest.fixture
@@ -40,63 +42,46 @@ def _blob(shape=(32, 32), centres=((10.0, 12.0), (22.0, 20.0)), sigma=1.2):
     return image
 
 
-def test_resize_images_shape_and_intensity_convention(bp):
+def test_resize_images_intensity_convention(bp):
     """Pins the existing intensity convention, which is NOT count-conserving.
 
-    Bilinear interpolation to half the linear size already divides the sum by 4
-    (each output pixel is the mean of its neighbourhood). The code then multiplies
-    by ``scale_factor = (16*16)/(32*32) = 1/4`` as well, so the total comes out
-    16x smaller. Conserving counts would need the reciprocal, x4.
-
-    This has no effect on results, and not merely because training and inference
-    share the pipeline: the factor is *annihilated* downstream. Resizing happens
-    before normalization everywhere, and every normalization strategy here begins
-    with a per-image min-max -- ``(x - min) / (max - min)`` is invariant under any
-    positive uniform scaling, since min and max scale with it. Both reported
-    intensity fields are post-normalization too (one from the model's intensity
-    channel, one sampled from the already-normalized input), so no pre-normalization
-    absolute intensity reaches any output.
-
-    Worth keeping in mind only as latent fragility: ``scale_factor`` depends on the
-    input detector size, so it is not constant across datasets. Harmless under any
-    scale-equivariant normalization (per-image min-max and median/IQR both are), but
-    a normalization with a fixed absolute divisor would make it matter, and matter
-    differently per dataset.
+    Bilinear resizing to half the linear size already divides the sum by 4, and the
+    code then multiplies by ``scale_factor = (16*16)/(32*32) = 1/4`` too, so the total
+    is 16x smaller (conserving counts would need x4). Harmless today: resizing precedes
+    a per-image min-max normalization, which cancels any uniform scale. It is latent
+    fragility only, since ``scale_factor`` depends on the detector size and would matter
+    under a normalization with a fixed absolute divisor.
     """
-    images = np.stack([_blob((32, 32)), _blob((32, 32), centres=((5.0, 5.0),))])
-    resized = bp.resize_images(images, device="cpu", initial_chunk_size=2)
-
-    assert resized.shape == (2, 16, 16)
-    scale_factor = (16 * 16) / (32 * 32)
-    for original, small in zip(images, resized):
-        assert small.sum() == pytest.approx(original.sum() * scale_factor / 4, rel=0.05)
-
-
-def test_resize_images_accepts_a_dataset_with_an_array_attribute(bp):
-    class Wrapped:
+    class Wrapped:  # resize_images also accepts anything with an ``array`` attribute
         array = np.stack([_blob((32, 32))])
 
-    resized = bp.resize_images(Wrapped(), device="cpu")
-    assert resized.shape == (1, 16, 16)
+    cases = {
+        "ndarray": np.stack([_blob((32, 32)), _blob((32, 32), centres=((5.0, 5.0),))]),
+        "wrapped": Wrapped(),
+    }
+    scale_factor = (16 * 16) / (32 * 32)
+    for name, images in cases.items():
+        resized = bp.resize_images(images, device="cpu", initial_chunk_size=2)
+        originals = getattr(images, "array", images)
+        assert resized.shape == (len(originals), 16, 16), name
+        for original, small in zip(originals, resized):
+            assert small.sum() == pytest.approx(
+                original.sum() * scale_factor / 4, rel=0.05), name
 
 
-def test_postprocess_single_finds_blobs_and_samples_intensities(bp):
-    position_map = _blob()
-    intensity_map = np.full((32, 32), 3.0)
+def test_peaks_from_model_output_finds_blobs_and_samples_intensities(bp):
+    # show=True used to raise NameError (matplotlib not imported) once a peak was found.
+    for show in (False, True):
+        coords, intensities = peaks_from_model_output(
+            _blob(), np.full((32, 32), 3.0), sigma=1.0, threshold=0.25, show=show)
+        plt.close("all")
 
-    coords, intensities = bp._postprocess_single(position_map, intensity_map,
-                                                 sigma=1.0, threshold=0.25)
+        # Both injected centres should be recovered to within a pixel.
+        found = sorted(tuple(np.round(c, 0)) for c in coords)
+        assert found == [(10.0, 12.0), (22.0, 20.0)], f"show={show}"
+        # Intensities are sampled from the (uniform) intensity channel.
+        np.testing.assert_allclose(intensities, 3.0, rtol=1e-6, err_msg=f"show={show}")
 
-    assert len(coords) == 2
-    assert coords.shape[1] == 2
-    # Both injected centres should be recovered to within a pixel.
-    found = sorted(tuple(np.round(c, 0)) for c in coords)
-    assert found == [(10.0, 12.0), (22.0, 20.0)]
-    # Intensities are sampled from the (uniform) intensity channel.
-    np.testing.assert_allclose(intensities, 3.0, rtol=1e-6)
-
-
-def test_postprocess_single_returns_empty_when_nothing_is_above_threshold(bp):
+    # The method wrapper forwards, and nothing above threshold gives empty output.
     coords, intensities = bp._postprocess_single(np.zeros((32, 32)), np.zeros((32, 32)))
-
     assert len(coords) == 0 and len(intensities) == 0
