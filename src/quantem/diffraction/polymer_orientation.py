@@ -135,10 +135,6 @@ def make_orientation_histogram(
     polar_peaks,
     peak_intensities,
     radial_ranges: np.ndarray = None,
-    orientation_map=None,
-    orientation_ind: int = 0,
-    orientation_growth_angles: np.array = 0.0,
-    orientation_separate_bins: bool = False,
     orientation_flip_sign: bool = False,
     orientation_offset_degrees: float = 0.0,
     upsample_factor: float = 4.0,
@@ -157,24 +153,12 @@ def make_orientation_histogram(
     # intensity_field: str = "intensities_sampled_from_dp",
 ):
     """
-    Create a 3D or 4D orientation histogram from bragg peaks.
-    
-    Can generate histograms from either:
-    1. Polar peak data with radial ranges
-    2. Orientation map with Euler angles (for fiber textures)
+    Create a 4D orientation histogram from polar Bragg peaks, one histogram per radial range.
 
     Parameters
     ----------
     radial_ranges : np.ndarray, optional
         Size (N x 2) array for N radial bins, or (2,) for a single bin.
-    orientation_map : OrientationMap, optional
-        Class containing Euler angles to generate a flowline map.
-    orientation_ind : int
-        Index of the orientation map (default 0)
-    orientation_growth_angles : np.array
-        Angles to place into histogram, relative to orientation.
-    orientation_separate_bins : bool
-        Whether to place multiple angles into multiple radial bins.
     orientation_flip_sign : bool
         Flip the direction of theta
     orientation_offset_degrees : float
@@ -223,22 +207,13 @@ def make_orientation_histogram(
         v_sigma = np.linspace(-2, 2, 2 * peak_sigma_samples + 1)
         w_sigma = np.exp(-(v_sigma**2) / 2)
 
-    if orientation_map is None:
-        # Input bins
-        radial_ranges = np.array(radial_ranges)
-        if radial_ranges.ndim == 1:
-            radial_ranges = radial_ranges[None, :]
-        radial_ranges_2 = radial_ranges**2
-        num_radii = radial_ranges.shape[0]
-        size_input = polar_peaks.shape
-    else:
-        orientation_growth_angles = np.atleast_1d(orientation_growth_angles)
-        num_angles = orientation_growth_angles.shape[0]
-        size_input = [orientation_map.num_x, orientation_map.num_y]
-        if orientation_separate_bins is False:
-            num_radii = 1
-        else:
-            num_radii = num_angles
+    # Input bins
+    radial_ranges = np.array(radial_ranges)
+    if radial_ranges.ndim == 1:
+        radial_ranges = radial_ranges[None, :]
+    radial_ranges_2 = radial_ranges**2
+    num_radii = radial_ranges.shape[0]
+    size_input = polar_peaks.shape
 
     size_output = np.round(
         np.array(size_input).astype("float") * upsample_factor
@@ -264,125 +239,41 @@ def make_orientation_histogram(
 
             add_data = False
 
-            if orientation_map is None:
-                p_r = vector_field_cell(polar_peaks, r_field, rx, ry)
-                p_theta = vector_field_cell(polar_peaks, theta_field, rx, ry)
+            p_r = vector_field_cell(polar_peaks, r_field, rx, ry)
+            p_theta = vector_field_cell(polar_peaks, theta_field, rx, ry)
                 
-                if p_r is not None and len(p_r) > 0:
-                    r2 = p_r**2
-                    sub = np.logical_and(
-                        r2 >= radial_ranges_2[a0, 0], 
-                        r2 < radial_ranges_2[a0, 1]
+            if p_r is not None and len(p_r) > 0:
+                r2 = p_r**2
+                sub = np.logical_and(
+                    r2 >= radial_ranges_2[a0, 0], 
+                    r2 < radial_ranges_2[a0, 1]
+                )
+                if np.any(sub):
+                    intensity_data = vector_field_cell(
+                        peak_intensities, intensity_field, rx, ry
                     )
-                    if np.any(sub):
-                        intensity_data = vector_field_cell(
-                            peak_intensities, intensity_field, rx, ry
-                        )
-                        if intensity_data is not None and len(intensity_data) > 0:
-                            add_data = True
-                            intensity = intensity_data[sub]
-                            
-                            # Get theta values
-                            theta_radians = p_theta[sub]
-                            if orientation_flip_sign:
-                                theta_radians *= -1
-                            # Add offset
-                            theta_radians += orientation_offset_degrees * np.pi / 180
-                            theta_radians = np.mod(theta_radians, np.pi)
-                            t = theta_radians / dtheta
-                            
-                            # Spread signal using peak sigma if requested
-                            if use_peak_sigma:
-                                # Try to get sigma values if available
-                                if 'sigma_theta' in polar_peaks.fields:
-                                    theta_std = vector_field_cell(
-                                        polar_peaks, "sigma_theta", rx, ry
-                                    )[sub] / dtheta
-                                    t = (t[:, None] + theta_std[:, None] * v_sigma[None, :]).ravel()
-                                    intensity = (intensity[:, None] * w_sigma[None, :]).ravel()
-            else:
-                if orientation_map.corr[rx, ry, orientation_ind] > 0:
-                    if orientation_separate_bins is False:
-                        if orientation_flip_sign:
-                            t = (
-                                np.array(
-                                    [
-                                        (
-                                            -orientation_map.angles[
-                                                rx, ry, orientation_ind, 0
-                                            ]
-                                            - orientation_map.angles[
-                                                rx, ry, orientation_ind, 2
-                                            ]
-                                        )
-                                        / dtheta
-                                    ]
-                                )
-                                + orientation_growth_angles
-                            )
-                        else:
-                            t = (
-                                np.array(
-                                    [
-                                        (
-                                            orientation_map.angles[
-                                                rx, ry, orientation_ind, 0
-                                            ]
-                                            + orientation_map.angles[
-                                                rx, ry, orientation_ind, 2
-                                            ]
-                                        )
-                                        / dtheta
-                                    ]
-                                )
-                                + orientation_growth_angles
-                            )
-                        # Add offset
-                        t += orientation_offset_degrees / dtheta_deg
-                        intensity = (
-                            np.ones(num_angles)
-                            * orientation_map.corr[rx, ry, orientation_ind]
-                        )
+                    if intensity_data is not None and len(intensity_data) > 0:
                         add_data = True
-                    else:
+                        intensity = intensity_data[sub]
+                            
+                        # Get theta values
+                        theta_radians = p_theta[sub]
                         if orientation_flip_sign:
-                            t = (
-                                np.array(
-                                    [
-                                        (
-                                            -orientation_map.angles[
-                                                rx, ry, orientation_ind, 0
-                                            ]
-                                            - orientation_map.angles[
-                                                rx, ry, orientation_ind, 2
-                                            ]
-                                        )
-                                        / dtheta
-                                    ]
-                                )
-                                + orientation_growth_angles[a0]
-                            )
-                        else:
-                            t = (
-                                np.array(
-                                    [
-                                        (
-                                            orientation_map.angles[
-                                                rx, ry, orientation_ind, 0
-                                            ]
-                                            + orientation_map.angles[
-                                                rx, ry, orientation_ind, 2
-                                            ]
-                                        )
-                                        / dtheta
-                                    ]
-                                )
-                                + orientation_growth_angles[a0]
-                            )
+                            theta_radians *= -1
                         # Add offset
-                        t += orientation_offset_degrees / dtheta_deg
-                        intensity = orientation_map.corr[rx, ry, orientation_ind]
-                        add_data = True
+                        theta_radians += orientation_offset_degrees * np.pi / 180
+                        theta_radians = np.mod(theta_radians, np.pi)
+                        t = theta_radians / dtheta
+                            
+                        # Spread signal using peak sigma if requested
+                        if use_peak_sigma:
+                            # Try to get sigma values if available
+                            if 'sigma_theta' in polar_peaks.fields:
+                                theta_std = vector_field_cell(
+                                    polar_peaks, "sigma_theta", rx, ry
+                                )[sub] / dtheta
+                                t = (t[:, None] + theta_std[:, None] * v_sigma[None, :]).ravel()
+                                intensity = (intensity[:, None] * w_sigma[None, :]).ravel()
 
             if add_data:
                 tF = np.floor(t).astype("int")
