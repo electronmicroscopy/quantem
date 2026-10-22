@@ -1119,7 +1119,6 @@ class BraggPeaksPolymer(AutoSerialize):
         return results
 
     def resize_data(self, device:str = "cuda:0"):
-        print(device)
         Ry, Rx, Qy, Qx = self._dataset_cartesian.shape
         scale_factor = (self._final_shape[0] * self._final_shape[1]) / (Qy * Qx)
         resized_data = np.zeros((Ry, Rx, self._final_shape[0], self._final_shape[1]))
