@@ -1,4 +1,3 @@
-import ipywidgets
 import matplotlib
 import numpy as np
 import pytest
@@ -6,8 +5,6 @@ import pytest
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import quantem.diffraction.bragg_peaks as bragg_peaks_module
-import quantem.diffraction.peak_visualization as peak_visualization_module
 from quantem.core.datastructures import Vector
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.diffraction.bragg_peaks import (
@@ -359,22 +356,8 @@ def test_bragg_private_helpers_characterize_shared_plotting_behavior():
     assert np.allclose(theta_bins, [90.0, 180.0])
 
 
-def test_bragg_plotting_and_save_smoke(monkeypatch, tmp_path):
+def test_bragg_plotting_and_save_smoke(tmp_path):
     bp = _bragg_for_plotting()
-
-    def fake_interactive_output(fn, controls):
-        fn(**{name: widget.value for name, widget in controls.items()})
-        return ipywidgets.Output()
-
-    for module in (bragg_peaks_module, peak_visualization_module):
-        monkeypatch.setattr(module, "interactive_output", fake_interactive_output, raising=False)
-        monkeypatch.setattr(module, "display", lambda *args, **kwargs: None, raising=False)
-        monkeypatch.setattr(module, "clear_output", lambda *args, **kwargs: None, raising=False)
-
-    bp.plot_interactive_image_map(ry=0, rx=0, show_polar=False)
-    bp.plot_interactive_peak_map(ry=0, rx=0, show_polar=True)
-    # zoom crops peaks from the Cartesian panel only; the polar panel still shows all of them.
-    bp.plot_interactive_peak_map(ry=0, rx=0, show_polar=True, zoom=2)
 
     bp.save_diffraction_figures(0, 0, save_dir=tmp_path / "diff", show_polar=True)
     bp.save_peak_figures(0, 0, save_dir=tmp_path / "peaks", show_polar=True)

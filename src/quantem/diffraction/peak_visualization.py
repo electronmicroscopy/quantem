@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 import numpy as np
-from IPython.display import clear_output, display
-from ipywidgets import HBox, IntSlider, VBox, interactive_output
 from matplotlib.colors import BoundaryNorm
 from scipy.ndimage import gaussian_filter
 
@@ -23,7 +21,6 @@ from quantem.diffraction.vector_fields import vector_field_cell, vector_field_fl
 __all__ = [
     "peak_radial_count_plot",
     "peak_radial_intensity_plot",
-    "plot_interactive_image_map",
     "plot_peak_count_map",
     "plot_peak_histogram_map",
     "save_diffraction_figures",
@@ -714,186 +711,6 @@ def plot_peak_histogram_map(
 
     if return_values:
         return fig, ax, count_map
-
-
-def plot_interactive_image_map(
-    dataset,
-    polar_data=None,
-    ry=None,
-    rx=None,
-    intensity_map=None,
-    vmax_cartesian=None,
-    vmin_cartesian=None,
-    map_cmap="viridis",
-    map_title="Intensity Map",
-    dp_cmap="gray",
-    norm_upper_quantile=None,
-    norm_power=1.0,
-    show_polar=True,
-    vmax_polar=None,
-    crosshair_color="r",
-    figsize=None,
-    crosshair_width=2,
-    crosshair_size=15,
-    gaussian_filter_sigma=None,
-):
-    """
-    Interactive plot for browsing diffraction patterns with optional intensity map.
-
-    Parameters
-    ----------
-    intensity_map : array, optional
-        2D array to display as reference map. Can be upsampled relative to dataset.
-        If None, shows mean intensity at original resolution.
-        Upsample factor is automatically detected from array dimensions.
-    vmax_cartesian : float
-        Maximum value for diffraction pattern display
-    vmin_cartesian : float
-        Minimum value for diffraction pattern display
-    map_cmap : str
-        Colormap for the intensity map
-    map_title : str
-        Title for the intensity map panel
-    dp_cmap : str
-        Colormap for diffraction patterns
-    norm_upper_quantile : float, optional
-        Upper quantile for normalization (0-1). If None, not used.
-    norm_power : float
-        Power law normalization exponent
-    show_polar : bool
-        Whether to show the polar transformed data panel
-    vmax_polar : float, optional
-        Maximum value for polar pattern display. If None, uses vmax_cartesian.
-    """
-
-    Ry, Rx = dataset.shape[:2]
-
-    # Check polar data availability
-    if show_polar and not (polar_data is not None):
-        print(
-            "Warning: polar_data not found. Set show_polar=False or run polar_transform_4d first."
-        )
-        show_polar = False
-
-    intensity_map, upsample_factor = _resolve_intensity_map(
-        dataset,
-        intensity_map,
-        (Ry, Rx),
-        validate=True,
-        announce_upsample=intensity_map is not None,
-    )
-
-    # Compute intensity map display limits
-    _is_rgb_map, vmin_intensity_map, vmax_intensity_map = _intensity_display_limits(intensity_map)
-
-    vmax_polar = vmax_polar or vmax_cartesian
-    slider_Ry, slider_Rx = Ry * upsample_factor, Rx * upsample_factor
-
-    # ---- Create figure and axes once ----
-    if show_polar:
-        if figsize is None:
-            figsize = (15, 4)
-        fig, (ax_map, ax_diff, ax_polar) = plt.subplots(1, 3, figsize=figsize)
-    else:
-        if figsize is None:
-            figsize = (12, 5)
-        fig, (ax_map, ax_diff) = plt.subplots(1, 2, figsize=figsize)
-        ax_polar = None
-
-    # Initialize image objects
-    if vmin_intensity_map is None:
-        im_map = ax_map.imshow(intensity_map, cmap=map_cmap)
-    else:
-        im_map = ax_map.imshow(
-            intensity_map, cmap=map_cmap, vmin=vmin_intensity_map, vmax=vmax_intensity_map
-        )
-    (line_marker,) = ax_map.plot(
-        [],
-        [],
-        color=crosshair_color,
-        marker="+",
-        markersize=crosshair_size,
-        markeredgewidth=crosshair_width,
-    )
-    ax_map.set_title(map_title)
-    ax_map.set_xlabel("Rx (upsampled)" if upsample_factor > 1 else "Rx")
-    ax_map.set_ylabel("Ry (upsampled)" if upsample_factor > 1 else "Ry")
-    plt.colorbar(im_map, ax=ax_map)
-
-    # Diffraction pattern (initialize with zeros)
-    im_diff = ax_diff.imshow(
-        np.zeros((10, 10)), cmap=dp_cmap, vmin=vmin_cartesian, vmax=vmax_cartesian
-    )
-    ax_diff.set_title("Diffraction Pattern")
-    ax_diff.set_xticks([])
-    ax_diff.set_yticks([])
-    plt.colorbar(im_diff, ax=ax_diff)
-
-    # Polar transform
-    if show_polar:
-        # ax_polar.set_aspect('equal', adjustable='box')
-        im_polar = ax_polar.imshow(
-            np.zeros((10, 10)), cmap=dp_cmap, vmax=vmax_polar, aspect="auto"
-        )
-        ax_polar.set_title("Polar Transform")
-        ax_polar.set_xlabel("Radius (bins)")
-        ax_polar.set_ylabel("Theta (bins)")
-        plt.colorbar(im_polar, ax=ax_polar)
-
-    plt.tight_layout()
-    plt.close(fig)
-
-    # ---- Interactive display callback (updates only) ----
-    def show_pattern(ry_slider, rx_slider):
-        ry_data = ry_slider // upsample_factor
-        rx_data = rx_slider // upsample_factor
-
-        # Update marker
-        line_marker.set_data([rx_slider], [ry_slider])
-
-        # Update diffraction pattern
-        dp_data = _normalized_dp(
-            dataset,
-            ry_data,
-            rx_data,
-            norm_upper_quantile=norm_upper_quantile,
-            norm_power=norm_power,
-            copy_data=False,
-        )
-        im_polar_data = polar_data["intensity"][ry_data, rx_data].T if show_polar else None
-        if gaussian_filter_sigma is not None:
-            dp_data = gaussian_filter(dp_data, gaussian_filter_sigma)
-            if show_polar:
-                im_polar_data = gaussian_filter(im_polar_data, gaussian_filter_sigma)
-
-        im_diff.set_data(dp_data)
-        ax_diff.set_title(f"Diffraction Pattern (Ry={ry_data}, Rx={rx_data})")
-
-        # Update polar transform
-        if show_polar:
-            im_polar.set_data(im_polar_data)
-            ax_polar.set_title(f"Polar Transform (Ry={ry_data}, Rx={rx_data})")
-
-        clear_output(wait=True)
-        display(fig)
-
-    # Create widgets
-    if ry is None:
-        ry = slider_Ry // 2
-    if rx is None:
-        rx = slider_Rx // 2
-    ry_slider = IntSlider(
-        min=0, max=slider_Ry - 1, value=ry, description="Ry:", continuous_update=False
-    )
-    rx_slider = IntSlider(
-        min=0, max=slider_Rx - 1, value=rx, description="Rx:", continuous_update=False
-    )
-
-    controls = VBox([HBox([ry_slider, rx_slider])])
-    interactive_plot = interactive_output(
-        show_pattern, {"ry_slider": ry_slider, "rx_slider": rx_slider}
-    )
-    display(controls, interactive_plot)
 
 
 def save_diffraction_figures(
