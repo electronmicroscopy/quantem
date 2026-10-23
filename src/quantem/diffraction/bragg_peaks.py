@@ -104,7 +104,6 @@ from quantem.diffraction.polymer_polar import (
     polar_transform_peaks as karen_polar_transform_peaks,
 )
 from quantem.diffraction.polymer_utils import (
-    import_show_polymer_4dstem,
     parse_reciprocal_units,
     sample_average_from_image,
 )
@@ -2303,18 +2302,6 @@ class BraggPeaksPolymer(AutoSerialize):
         return _save_diffraction_figures(
             self.dataset_cartesian, getattr(self, "polar_data", None), *args, **kwargs
         )
-
-    def show_widget(self, **kwargs):
-        """Open the interactive polymer 4D-STEM viewer (``quantem.widget``).
-
-        Thin wrapper over ``quantem.widget.show_polymer_4DSTEM``: drag the map to update
-        the Current/Lamellar/Backbone/pi-pi DP panels and the polar view, with detected
-        peaks overlaid when ``find_peaks_model`` has run. All ``**kwargs`` are forwarded
-        to the factory (e.g. ``intensity_map``, ``map_cmap``, ``dp_cmap``, ``show_polar``,
-        ``title``).
-        """
-        show_polymer_4DSTEM = import_show_polymer_4dstem()
-        return show_polymer_4DSTEM(self, **kwargs)
 
     def _polar_peak_bins_at(self, ry, rx, two_fold_symmetry):
         """Polar-panel bin coordinates of the peaks at one scan position.

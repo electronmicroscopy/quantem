@@ -7,7 +7,6 @@ can import them without carrying a copy:
     from quantem.diffraction.polymer_ice_tuning import (
         selection_box,          # tune the sharpness ceilings, returns updated params
         orientation_histograms, # did the flagger take ice and leave your peaks?
-        ice_split_widget,       # inspect kept / removed peaks interactively
         probe_peaks,            # per-peak FWHM at one scan position, with the cuts
     )
 
@@ -16,9 +15,7 @@ returns its results; none mutate ``bp``. They are free functions rather than mor
 methods on BraggPeaksPolymer, which is already large -- the algorithms live in
 ``polymer_ice``, and this module is only the interactive layer over them.
 
-``ice_split_widget`` needs the optional ``quantem.widget`` package; it imports it only
-when called (raising an ImportError that says how to install it), so this module and
-the other helpers work without it.
+The interactive kept/removed viewer, ``ice_split_widget``, lives in ``quantem.widget``.
 """
 
 from __future__ import annotations
@@ -30,11 +27,8 @@ import numpy as np
 from matplotlib.colors import LogNorm
 
 from quantem.diffraction.polymer_ice import measure_peak_widths, sharpness_mask
-from quantem.diffraction.polymer_utils import import_show_polymer_4dstem
 
 __all__ = [
-    "IcePeakView",
-    "ice_split_widget",
     "orientation_histograms",
     "peak_widths",
     "probe_peaks",
@@ -289,86 +283,6 @@ def orientation_histograms(
         fig.savefig(fig_path, format="pdf", bbox_inches="tight")
     plt.show()
     return hists
-
-
-class IcePeakView:
-    """Stand-in for ``bp`` exposing one side of the ice split.
-
-    ``show_polymer_4DSTEM`` is duck-typed and reads the peak vectors live on every
-    cursor move, so the subset must stay visible for the widget's lifetime and
-    cannot be restored after construction. Delegating instead of assigning onto
-    ``bp`` keeps ``bp`` itself pristine.
-    """
-
-    def __init__(self, base, cartesian, intensities, polar):
-        object.__setattr__(self, "_base", base)
-        object.__setattr__(self, "peak_coordinates_cartesian", cartesian)
-        object.__setattr__(self, "peak_intensities", intensities)
-        object.__setattr__(self, "polar_peaks", polar)
-
-    def __getattr__(self, name):
-        # Reached only for attributes not set above, i.e. everything but the peaks.
-        return getattr(self._base, name)
-
-    def __setattr__(self, name, value):
-        # The widget's "Save settings" writes to its source object; keep those
-        # writes on the view so they never land on bp.
-        object.__setattr__(self, name, value)
-
-
-def ice_split_widget(
-    bp, ice_result, params, *, view="removed", ice_hists=None, map_view="match", **widget_kwargs
-):
-    """Open the interactive viewer on one side of the ice split. ``bp`` is untouched.
-
-    ``view`` is 'removed' | 'kept' | 'all'. ``map_view`` follows ``view`` by
-    default; pin it to one of the same names to hold a fixed backdrop while
-    toggling the overlay. Pass ``ice_hists`` from :func:`orientation_histograms`
-    to use the ice-band orientation image as the context map.
-    """
-    show_polymer_4DSTEM = import_show_polymer_4dstem()
-
-    peaks = (bp.peak_coordinates_cartesian, bp.peak_intensities, bp.polar_peaks)
-    if view == "all":
-        subset = peaks
-    elif view in ("kept", "removed"):
-        subset = tuple(ice_result.filter(v, invert=view == "removed") for v in peaks)
-    else:
-        raise ValueError(f"view must be 'removed', 'kept' or 'all'; got {view!r}")
-
-    map_key = {"all": "all peaks", "kept": "kept (ice removed)", "removed": "removed (ice)"}
-    resolved = view if map_view == "match" else map_view
-    if resolved not in map_key:
-        raise ValueError(f"map_view must be 'match', 'removed', 'kept' or 'all'; got {map_view!r}")
-    if ice_hists is not None:
-        context_map = ice_hists[map_key[resolved]].max(axis=2)
-        map_label = f"{resolved} orientation"
-    else:
-        context_map = ice_result.flagged_peaks_count_map.astype(float)
-        map_label = "flagged count — pass ice_hists for the orientation map"
-
-    def count(vector):
-        total = 0
-        for iy in range(vector.shape[0]):
-            for ix in range(vector.shape[1]):
-                rows = vector[iy, ix].numpy()
-                if rows is not None:
-                    total += len(rows)
-        return total
-
-    print(
-        f"showing '{view}' peaks: {count(subset[0])} of {count(peaks[0])} total "
-        "(bp itself is untouched)"
-    )
-    # Pass the view, not bp: bp.show_widget() would bind bp as self.
-    return show_polymer_4DSTEM(
-        IcePeakView(bp, *subset),
-        intensity_map=context_map,
-        title=f"ice split — {view} peaks (map: {map_label})",
-        show_inset=True,
-        sharpness_params=params,
-        **widget_kwargs,
-    )
 
 
 def probe_peaks(bp, params, ry, rx, *, n_show=4, q_band_only=True):

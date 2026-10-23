@@ -1,14 +1,9 @@
-import sys
-
 import numpy as np
-import pytest
 
 from quantem.diffraction.peak_detection import detect_blobs
 from quantem.diffraction.polar_transform import polar_transform
 from quantem.diffraction.polymer_polar import as_dataset4dstem
 from quantem.diffraction.polymer_utils import (
-    POLYMER_WIDGET_INSTALL,
-    import_show_polymer_4dstem,
     parse_reciprocal_units,
 )
 
@@ -40,10 +35,3 @@ def test_polar_transform_orientation_and_shape():
     ).numpy()
     assert polar.shape == (1, 1, 8, 7)
     assert np.unravel_index(np.argmax(polar[0, 0]), (8, 7)) == (0, 4)
-
-
-def test_missing_polymer_widget_says_how_to_install(monkeypatch):
-    monkeypatch.setitem(sys.modules, "quantem.widget", None)
-    with pytest.raises(ImportError) as info:
-        import_show_polymer_4dstem()
-    assert POLYMER_WIDGET_INSTALL in str(info.value)
