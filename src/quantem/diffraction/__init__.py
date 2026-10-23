@@ -14,7 +14,8 @@ from quantem.diffraction import rotations as rotations
 from quantem.diffraction import digital_dark_field as digital_dark_field
 from quantem.diffraction import illumination as illumination
 
-from quantem.diffraction.bragg_peaks import BraggPeaksPolymer, ScanMaskEditor
+from quantem.diffraction.bragg_peaks import BraggPeaksPolymer
+from quantem.diffraction.scan_mask import ScanMaskShape
 from quantem.diffraction.polymer_models import (
     PAPER_MODEL_ID,
     PAPER_MODEL_VERSION,
@@ -61,7 +62,7 @@ __all__ = [
     "illumination",
     "rotations",
     "BraggPeaksPolymer",
-    "ScanMaskEditor",
+    "ScanMaskShape",
     "GlobalPercentileNormalization",
     "GlobalPercentileStrategy",
     "IceDetectionResult",

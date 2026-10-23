@@ -34,6 +34,7 @@ from quantem.diffraction.peak_detection import (
 )
 from quantem.diffraction.peak_visualization import (
     _intensity_display_limits,
+    _mean_intensity_map,
     _normalized_dp,
     _resolve_intensity_map,
 )
@@ -102,7 +103,7 @@ from quantem.diffraction.polymer_utils import (
     parse_reciprocal_units,
     sample_average_from_image,
 )
-from quantem.diffraction.scan_mask_editor import ScanMaskEditor
+from quantem.diffraction.scan_mask import ScanMaskShape, load_scan_mask, save_scan_mask
 from quantem.diffraction.vector_fields import (
     vector_field_cell as _vector_field_cell,
 )
@@ -677,6 +678,9 @@ class BraggPeaksPolymer(AutoSerialize):
         # Scan mask (region of interest) remembered from find_peaks_model / process_polar,
         # so normalization + BN adaptation restrict to the sample ROI (see scan_mask).
         self._scan_mask = None
+        # The shape the mask was built from by set_scan_mask, kept when the mask is then
+        # edited pixel by pixel so a saved state records where it started.
+        self._scan_mask_shape = None
 
         if model is None:
             # Setup model
@@ -801,6 +805,8 @@ class BraggPeaksPolymer(AutoSerialize):
             )
         )
         self._scan_mask = new_mask
+        if new_mask is None:
+            self._scan_mask_shape = None
         if changed:
             self._invalidate_inference_caches()
 
@@ -2947,81 +2953,88 @@ class BraggPeaksPolymer(AutoSerialize):
             print(f"✓ Saved {len(frames)}-frame animation: {path.resolve()}")
         return path
 
-    def edit_scan_mask(
-        self,
-        *,
-        initial_x=None,
-        initial_y=None,
-        initial_radius=None,
-        initial_geometry="circle",
-        initial_size_x=None,
-        initial_size_y=None,
-        initial_angle=None,
-        reference_image=None,
-        state_path=None,
-        overlay_alpha=0.28,
-        crosshair_width=2,
-        crosshair_size=12,
-        autosave=False,
-        display_widget=True,
+    def set_scan_mask(
+        self, geometry="circle", *, x=None, y=None, size_x=None, size_y=None, angle=0.0
     ):
-        """Create an interactive scan-mask editor.
+        """Set :attr:`scan_mask` to a circle, ellipse, square or rectangle region.
 
-        X is the horizontal scan-column coordinate and Y is the vertical
-        scan-row coordinate. Circle, ellipse, square, and rectangle geometries
-        are available, and all but the circle can be rotated by ``initial_angle``
-        (degrees anticlockwise) or with the Angle slider. Sizes are radii for round geometries and half-sizes for
-        rectangular geometries. A saved ``state_path`` is loaded automatically.
+        x is the scan column (horizontal) and y the scan row (vertical); both default
+        to the scan center. Sizes are radii for round shapes and half-sizes for
+        rectangular ones; ``size_x`` defaults to a third of the shorter scan side and
+        ``size_y`` to ``size_x``. ``angle`` rotates all but the circle, in degrees
+        anticlockwise. To edit the mask pixel by pixel afterwards, assign the edited
+        array to :attr:`scan_mask`; the starting shape is kept for
+        :meth:`save_scan_mask`. Returns the mask.
         """
-        return ScanMaskEditor(
-            self,
-            initial_x=initial_x,
-            initial_y=initial_y,
-            initial_radius=initial_radius,
-            initial_geometry=initial_geometry,
-            initial_size_x=initial_size_x,
-            initial_size_y=initial_size_y,
-            initial_angle=initial_angle,
-            reference_image=reference_image,
-            state_path=state_path,
-            overlay_alpha=overlay_alpha,
-            crosshair_width=crosshair_width,
-            crosshair_size=crosshair_size,
-            autosave=autosave,
-            display_widget=display_widget,
+        rows, columns = (int(v) for v in self.dataset_cartesian.shape[:2])
+        if size_x is None:
+            size_x = max(1, min(rows, columns) // 3)
+        shape = ScanMaskShape(
+            x=columns // 2 if x is None else x,
+            y=rows // 2 if y is None else y,
+            geometry=geometry,
+            size_x=size_x,
+            size_y=size_y,
+            angle=angle,
+        )
+        self.scan_mask = shape.mask((rows, columns))
+        self._scan_mask_shape = shape
+        return self.scan_mask
+
+    @property
+    def scan_mask_shape(self):
+        """The :class:`ScanMaskShape` the current mask was built from, or None."""
+        return self._scan_mask_shape
+
+    def save_scan_mask(self, path):
+        """Write :attr:`scan_mask`, its starting shape and the scan sampling to ``path``.
+
+        The file records whether the mask was edited after it was built from the
+        shape. Returns the path.
+        """
+        if self.scan_mask is None:
+            raise ValueError("No scan_mask to save; call set_scan_mask or assign scan_mask.")
+        dataset = self.dataset_cartesian
+        return save_scan_mask(
+            path,
+            self.scan_mask,
+            shape=self._scan_mask_shape,
+            sampling=dataset.sampling[:2],
+            units=dataset.units[:2],
         )
 
-    def create_interactive_circular_mask(
-        self,
-        initial_x0=None,
-        initial_y0=None,
-        initial_r=None,
-        reference_image=None,
-        overlay_alpha=0.3,
-        crosshair_width=2,
-        crosshair_size=15,
-        state_path=None,
-        autosave=False,
-        display_widget=True,
-    ):
-        """Compatibility wrapper for :meth:`edit_scan_mask`.
+    def load_scan_mask(self, path):
+        """Set :attr:`scan_mask` (and its starting shape) from a saved state file.
 
-        Historically ``initial_x0`` represented the array row and
-        ``initial_y0`` represented the array column. New code should use
-        ``edit_scan_mask(initial_x=column, initial_y=row, ...)``.
+        Raises ValueError if the file was saved for a different scan shape.
+        Returns the mask.
         """
-        return self.edit_scan_mask(
-            initial_x=initial_y0,
-            initial_y=initial_x0,
-            initial_radius=initial_r,
-            reference_image=reference_image,
-            state_path=state_path,
-            overlay_alpha=overlay_alpha,
-            crosshair_width=crosshair_width,
-            crosshair_size=crosshair_size,
-            autosave=autosave,
-            display_widget=display_widget,
-        )
+        mask, shape = load_scan_mask(path, self.dataset_cartesian.shape[:2])
+        self.scan_mask = mask
+        self._scan_mask_shape = shape
+        return self.scan_mask
+
+    def plot_scan_mask(self, reference_image=None, *, ax=None, cmap="gray", alpha=0.3):
+        """Show :attr:`scan_mask` over a scan image, with the starting shape outlined.
+
+        ``reference_image`` defaults to the mean detector intensity per scan position.
+        Returns the axes.
+        """
+        if self.scan_mask is None:
+            raise ValueError("No scan_mask to plot; call set_scan_mask or assign scan_mask.")
+        if reference_image is None:
+            reference_image = _mean_intensity_map(
+                self.dataset_cartesian, self.dataset_cartesian.shape[:2]
+            )
+        if ax is None:
+            _, ax = plt.subplots()
+        ax.imshow(np.asarray(reference_image), cmap=cmap)
+        ax.imshow(np.ma.masked_where(~self.scan_mask, self.scan_mask), cmap="autumn", alpha=alpha)
+        if self._scan_mask_shape is not None:
+            outline = self._scan_mask_shape.outline()
+            ax.plot(outline[:, 0], outline[:, 1], color="tab:orange", lw=1, ls="--")
+        ax.set_title(f"scan mask: {int(self.scan_mask.sum())} of {self.scan_mask.size} positions")
+        return ax
 
     def plot_peak_histogram_map(self, *args, **kwargs):
         """Per-position peak-intensity histogram map.
