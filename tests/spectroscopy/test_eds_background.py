@@ -31,23 +31,18 @@ class TestXEDSBackground:
             background[[0, -1]], true_background[[0, -1]], rtol=0.3, atol=0.8
         )
 
-    @pytest.mark.parametrize(
-        "kwargs,exc_type,match",
-        [
+    def test_calculate_background_polynomial_validates_inputs(self, xeds_factory):
+        dataset = xeds_factory(np.zeros((1, 1, 64), dtype=np.float32))
+        spectrum = np.linspace(1.0, 2.0, 64, dtype=np.float32)
+
+        for kwargs, exc_type, match in [
             ({"degree": True}, TypeError, "degree"),
             ({"degree": -1}, ValueError, "degree"),
             ({"percentile": 120}, ValueError, "percentile"),
             ({"window_size": 0}, ValueError, "window_size"),
-        ],
-    )
-    def test_calculate_background_polynomial_validates_inputs(
-        self, xeds_factory, kwargs, exc_type, match
-    ):
-        dataset = xeds_factory(np.zeros((1, 1, 64), dtype=np.float32))
-        spectrum = np.linspace(1.0, 2.0, 64, dtype=np.float32)
-
-        with pytest.raises(exc_type, match=match):
-            dataset.calculate_background_polynomial(spectrum, **kwargs)
+        ]:
+            with pytest.raises(exc_type, match=match):
+                dataset.calculate_background_polynomial(spectrum, **kwargs)
 
     def test_calculate_background_powerlaw_is_alias(self, xeds_factory):
         dataset = xeds_factory(np.zeros((1, 1, 64), dtype=np.float32))

@@ -191,6 +191,6 @@ ipynb-playground/
 # cursor/CLI
 .cursor
 .claude
-CLAUDE.md
+CLAUDE.local.md
 AGENTS.md
 AGENT.md

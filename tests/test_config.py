@@ -7,35 +7,39 @@ from quantem.core import config
 
 
 def test_config_set_device():
-    config.set_device("cpu")
-    assert config.get_device() == "cpu"
-    if torch.cuda.is_available():
-        config.set_device("gpu")
-        assert config.get_device() == "cuda:0"
-        config.set_device("GPU")
-        assert config.get_device() == "cuda:0"
-        config.set_device(0)
-        assert config.get_device() == "cuda:0"
-        NUM_DEVICES = torch.cuda.device_count()
-        if NUM_DEVICES > 0:
-            config.set_device(NUM_DEVICES - 1)
-            assert config.get_device() == f"cuda:{NUM_DEVICES - 1}"
-        config.refresh()
+    start = config.get_device()
+    try:
+        config.set_device("cpu")
         assert config.get_device() == "cpu"
-    else:
-        with pytest.raises(RuntimeError):
-            config.set_device("cuda:0")
+        if torch.cuda.is_available():
+            config.set_device("gpu")
+            assert config.get_device() == "cuda:0"
+            config.set_device("GPU")
+            assert config.get_device() == "cuda:0"
+            config.set_device(0)
+            assert config.get_device() == "cuda:0"
+            NUM_DEVICES = torch.cuda.device_count()
+            if NUM_DEVICES > 0:
+                config.set_device(NUM_DEVICES - 1)
+                assert config.get_device() == f"cuda:{NUM_DEVICES - 1}"
+            config.refresh()
+            assert config.get_device() == "cpu"
+        else:
+            with pytest.raises(RuntimeError):
+                config.set_device("cuda:0")
 
-    if torch.mps.is_available():
-        config.set_device("mps")
-        assert config.get_device() == "mps"
-        config.set_device("gpu")
-        assert config.get_device() == "mps"
-        config.set_device("GPU")
-        assert config.get_device() == "mps"
-    else:
-        with pytest.raises(RuntimeError):
+        if torch.mps.is_available():
             config.set_device("mps")
+            assert config.get_device() == "mps"
+            config.set_device("gpu")
+            assert config.get_device() == "mps"
+            config.set_device("GPU")
+            assert config.get_device() == "mps"
+        else:
+            with pytest.raises(RuntimeError):
+                config.set_device("mps")
+    finally:
+        config.set_device(start)
 
 
 def test_config_update_defaults():
@@ -90,19 +94,13 @@ def test_collect_env_overrides_yaml(tmp_path):
     assert merged == {"verbose": 9, "viz": {"cmap": "viridis"}}
 
 
-def test_check_key_val_known_key_silent():
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        config.check_key_val("verbose", 1)
-    assert caught == []
-
-
-def test_check_key_val_nested_key_silent():
+def test_check_key_val_known_and_nested_keys_silent():
     """Only the top-level key is checked, a key under it is not."""
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        config.check_key_val("viz.not_a_real_key", 1)
-    assert caught == []
+    for key in ("verbose", "viz.not_a_real_key"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            config.check_key_val(key, 1)
+        assert caught == [], key
 
 
 def test_check_key_val_unknown_key_warns_and_still_sets():

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from matplotlib import pyplot as plt
 
@@ -134,14 +135,18 @@ class TestXEDSFitting:
 
 
 class TestXEDSFitHelpers:
-    def test_loss_and_tv_helpers_are_finite(self):
+    def test_loss_and_tv_helper_values(self):
         predicted = torch.tensor([1.0, 2.0, 3.0])
         target = torch.tensor([0.0, 2.0, 4.0])
         maps = torch.tensor([[[1.0, 2.0], [3.0, 5.0]]])
 
-        assert torch.isfinite(xeds_data_loss(predicted, target, loss="mse"))
-        assert torch.isfinite(xeds_data_loss(predicted, target, loss="poisson"))
-        assert torch.isfinite(total_variation_in_plane(maps))
+        assert float(xeds_data_loss(predicted, target, loss="mse")) == pytest.approx(2 / 3)
+        poisson = (6 - 2 * np.log(2) - 4 * np.log(3)) / 3  # mean(pred - target * log(pred))
+        assert float(xeds_data_loss(predicted, target, loss="poisson")) == pytest.approx(poisson)
+        # mean |dy| = (2 + 3) / 2 plus mean |dx| = (1 + 2) / 2
+        assert float(total_variation_in_plane(maps)) == pytest.approx(4.0)
+        with pytest.raises(ValueError, match="loss must be"):
+            xeds_data_loss(predicted, target, loss="l1")
 
     def test_plot_loss_history_shifts_negative_values_for_log_plot(self):
         fig, ax = plt.subplots(1, 1)

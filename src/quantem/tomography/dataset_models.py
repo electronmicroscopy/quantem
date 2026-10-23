@@ -160,7 +160,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     _token = object()
 
     DEFAULT_LRS = {
-        "pose_lr": 5e-2,
+        "pose": 5e-2,
     }
 
     def __init__(

@@ -136,70 +136,41 @@ class TestSingleGPUDevicePersistence:
         assert p.device == DEVICE_0
 
 
-class TestMultiGPUDeviceRestoration:
-    """device=[…] is stored and restored across spawn boundaries."""
+class TestMultiGPULifecycle:
+    """device=[…], _iter_losses, iter_lrs and Adam state across spawn boundaries."""
 
-    def test_gpu_list_persists(self):
+    def test_device_losses_lrs_and_optimizer_state(self):
         p = _make_ptycho()
         p.reconstruct(
             num_iters=N_ITERS, reset=True, optimizer_params=_opt(), batch_size=16, device=GPU_IDS
         )
         assert p.device == GPU_IDS
         assert p.obj_model._obj.device.type == "cuda"
-
-        p.reconstruct(num_iters=N_ITERS, batch_size=16)
-        assert p.device == GPU_IDS
-
-
-class TestMultiGPULossTracking:
-    """_iter_losses extends correctly across spawn(reset=False)/reset=True."""
-
-    def test_losses_length_lifecycle(self):
-        p = _make_ptycho()
-        p.reconstruct(
-            num_iters=N_ITERS, reset=True, optimizer_params=_opt(), batch_size=16, device=GPU_IDS
-        )
         assert len(p._iter_losses) == N_ITERS
-
-        p.reconstruct(num_iters=N_ITERS, reset=False, batch_size=16, device=GPU_IDS)
-        assert len(p._iter_losses) == 2 * N_ITERS, "continuation must not double-count"
-
-        p.reconstruct(num_iters=N_ITERS, reset=True, batch_size=16, device=GPU_IDS)
-        assert len(p._iter_losses) == N_ITERS
-
-
-class TestMultiGPULRTracking:
-    """iter_lrs extends correctly across spawn boundaries."""
-
-    def test_iter_lrs_lifecycle(self):
-        p = _make_ptycho()
-        p.reconstruct(
-            num_iters=N_ITERS, reset=True, optimizer_params=_opt(), batch_size=16, device=GPU_IDS
-        )
         assert "object" in p.iter_lrs
         assert len(p.iter_lrs["object"]) == N_ITERS
 
-        p.reconstruct(num_iters=N_ITERS, reset=False, batch_size=16, device=GPU_IDS)
-        assert len(p.iter_lrs["object"]) == 2 * N_ITERS
-
-        p.reconstruct(num_iters=N_ITERS, reset=True, batch_size=16, device=GPU_IDS)
-        assert len(p.iter_lrs["object"]) == N_ITERS
-
-
-class TestMultiGPUOptimizerState:
-    """Adam state survives the save/restore around the spawn worker."""
-
-    def test_adam_state_restored_on_device(self):
-        p = _make_ptycho()
-        p.reconstruct(
-            num_iters=N_ITERS, reset=True, optimizer_params=_opt(), batch_size=16, device=GPU_IDS
-        )
+        # Adam state survives the save/restore around the spawn worker
         obj_opt = p.optimizers.get("object")
         assert obj_opt is not None
         assert len(obj_opt.state) > 0
         first = next(iter(obj_opt.state.values()))
         assert "exp_avg" in first, "Adam moments missing"
         assert first["exp_avg"].device.type == "cuda"
+
+        # follow-up call without device= keeps the GPU list
+        p.reconstruct(num_iters=N_ITERS, batch_size=16)
+        assert p.device == GPU_IDS
+        assert len(p._iter_losses) == 2 * N_ITERS, "continuation must not double-count"
+        assert len(p.iter_lrs["object"]) == 2 * N_ITERS
+
+        p.reconstruct(num_iters=N_ITERS, reset=False, batch_size=16, device=GPU_IDS)
+        assert len(p._iter_losses) == 3 * N_ITERS, "continuation must not double-count"
+        assert len(p.iter_lrs["object"]) == 3 * N_ITERS
+
+        p.reconstruct(num_iters=N_ITERS, reset=True, batch_size=16, device=GPU_IDS)
+        assert len(p._iter_losses) == N_ITERS
+        assert len(p.iter_lrs["object"]) == N_ITERS
 
 
 class TestDIPMultiGPU:

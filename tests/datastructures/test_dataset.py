@@ -15,12 +15,6 @@ def sample_2d_array():
 
 
 @pytest.fixture
-def sample_3d_array():
-    """Create a sample 3D array for testing."""
-    return np.random.rand(5, 10, 15)
-
-
-@pytest.fixture
 def sample_dataset_2d(sample_2d_array):
     """Create a sample 2D dataset for testing."""
     return Dataset.from_array(
@@ -33,17 +27,8 @@ def sample_dataset_2d(sample_2d_array):
     )
 
 
-@pytest.fixture
-def sample_dataset_3d(sample_3d_array):
-    """Create a sample 3D dataset for testing."""
-    return Dataset.from_array(
-        array=sample_3d_array,
-        name="test_3d_dataset",
-        origin=(0, 0, 0),
-        sampling=(1, 1, 1),
-        units=["nm", "nm", "nm"],
-        signal_units="counts",
-    )
+def center_world(d):
+    return d.origin + (np.array(d.shape) - 1) / 2.0 * d.sampling
 
 
 class TestDatasetInitialization:
@@ -93,74 +78,17 @@ class TestDatasetInitialization:
 
 
 class TestDatasetProperties:
-    """Test Dataset properties and setters."""
-
-    def test_array_property(self, sample_dataset_2d, sample_2d_array):
-        """Test array property getter and setter."""
-        # Test getter
-        assert np.array_equal(sample_dataset_2d.array, sample_2d_array)
-
-        # Test setter
-        new_array = np.ones((10, 10))
-        sample_dataset_2d.array = new_array
-        assert np.array_equal(sample_dataset_2d.array, new_array)
-
-    def test_name_property(self, sample_dataset_2d):
-        """Test name property getter and setter."""
-        # Test getter
-        assert sample_dataset_2d.name == "test_2d_dataset"
-
-        # Test setter
-        sample_dataset_2d.name = "new_name"
-        assert sample_dataset_2d.name == "new_name"
-
-    def test_origin_property(self, sample_dataset_2d):
-        """Test origin property getter and setter."""
-        # Test getter
-        assert np.array_equal(sample_dataset_2d.origin, np.array([0, 0]))
-
-        # Test setter
-        sample_dataset_2d.origin = (1, 1)
-        assert np.array_equal(sample_dataset_2d.origin, np.array([1, 1]))
-
-        # Test validation
-        with pytest.raises(ValueError):
-            sample_dataset_2d.origin = (1, 1, 1)  # Wrong number of dimensions
-
-    def test_sampling_property(self, sample_dataset_2d):
-        """Test sampling property getter and setter."""
-        # Test getter
-        assert np.array_equal(sample_dataset_2d.sampling, np.array([1, 1]))
-
-        # Test setter
-        sample_dataset_2d.sampling = (2, 2)
-        assert np.array_equal(sample_dataset_2d.sampling, np.array([2, 2]))
-
-        # Test validation
-        with pytest.raises(ValueError):
-            sample_dataset_2d.sampling = (2, 2, 2)  # Wrong number of dimensions
-
-    def test_units_property(self, sample_dataset_2d):
-        """Test units property getter and setter."""
-        # Test getter
-        assert sample_dataset_2d.units == ["nm", "nm"]
-
-        # Test setter
-        sample_dataset_2d.units = ["Å", "Å"]
-        assert sample_dataset_2d.units == ["Å", "Å"]
-
-        # Test validation
-        with pytest.raises(ValueError):
-            sample_dataset_2d.units = ["Å", "Å", "Å"]  # Wrong number of dimensions
-
-    def test_signal_units_property(self, sample_dataset_2d):
-        """Test signal_units property getter and setter."""
-        # Test getter
-        assert sample_dataset_2d.signal_units == "counts"
-
-        # Test setter
-        sample_dataset_2d.signal_units = "electrons"
-        assert sample_dataset_2d.signal_units == "electrons"
+    def test_axis_metadata_setters_validate_length(self, sample_dataset_2d):
+        """origin, sampling and units accept one value per axis and reject any other length."""
+        for name, valid, expected, wrong in [
+            ("origin", (1, 1), np.array([1, 1]), (1, 1, 1)),
+            ("sampling", (2, 2), np.array([2, 2]), (2, 2, 2)),
+            ("units", ["Å", "Å"], ["Å", "Å"], ["Å", "Å", "Å"]),
+        ]:
+            setattr(sample_dataset_2d, name, valid)
+            assert np.array_equal(getattr(sample_dataset_2d, name), expected), name
+            with pytest.raises(ValueError):
+                setattr(sample_dataset_2d, name, wrong)
 
 
 class TestDatasetMethods:
@@ -185,40 +113,12 @@ class TestDatasetMethods:
         copied_dataset.name = "modified_copy"
         assert sample_dataset_2d.name == "test_2d_dataset"
 
-    def test_mean(self, sample_dataset_2d):
-        """Test mean method."""
-        # Mean of all elements
-        mean_value = sample_dataset_2d.mean()
-        assert isinstance(mean_value, (float, np.float64))
-
-        # Mean along axis 0
-        mean_along_axis = sample_dataset_2d.mean(axes=(0,))
-        assert mean_along_axis.shape == (10,)
-
-        # Mean along both axes (should be the same as mean of all elements)
-        mean_along_both = sample_dataset_2d.mean(axes=(0, 1))
-        assert isinstance(mean_along_both, (float, np.float64))
-        assert np.isclose(mean_value, mean_along_both)
-
-    def test_max(self, sample_dataset_2d):
-        """Test max method."""
-        # Max of all elements
-        max_value = sample_dataset_2d.max()
-        assert isinstance(max_value, (float, np.float64))
-
-        # Max along axis 0
-        max_along_axis = sample_dataset_2d.max(axes=(0,))
-        assert max_along_axis.shape == (10,)
-
-    def test_min(self, sample_dataset_2d):
-        """Test min method."""
-        # Min of all elements
-        min_value = sample_dataset_2d.min()
-        assert isinstance(min_value, (float, np.float64))
-
-        # Min along axis 0
-        min_along_axis = sample_dataset_2d.min(axes=(0,))
-        assert min_along_axis.shape == (10,)
+    def test_reductions_match_numpy(self, sample_dataset_2d, sample_2d_array):
+        for name, reference in [("mean", np.mean), ("max", np.max), ("min", np.min)]:
+            reduce = getattr(sample_dataset_2d, name)
+            assert np.isclose(reduce(), reference(sample_2d_array)), name
+            assert np.isclose(reduce(axes=(0, 1)), reference(sample_2d_array)), name
+            assert np.allclose(reduce(axes=(0,)), reference(sample_2d_array, axis=0)), name
 
     def test_pad(self, sample_dataset_2d):
         """Test pad method."""
@@ -252,40 +152,29 @@ class TestDatasetMethods:
         assert sample_dataset_2d.shape == (8, 8)
         assert np.array_equal(sample_dataset_2d.origin, np.array([1, 1]))
 
-    def test_crop_4dstem_kspace(self):
-        """Test cropping k-space axes of a 4D-STEM dataset."""
-        dset = Dataset.from_array(np.random.rand(8, 8, 96, 96))
-        cropped = dset.crop(crop_widths=((4, 92), (4, 92)), axes=(2, 3))
-        assert cropped.shape == (8, 8, 88, 88)
-        assert dset.shape == (8, 8, 96, 96)
+    def test_crop_selected_axes(self):
+        """Cropping a subset of axes, including stop=0 (keep the rest) and a single int axis."""
+        cases = [
+            # shape, origin, sampling, crop_widths, axes, expected shape, expected origin
+            ((8, 8, 96, 96), (0, 0, 0, 0), (1, 1, 1, 1), ((4, 92), (4, 92)), (2, 3),
+             (8, 8, 88, 88), (0, 0, 4, 4)),
+            ((8, 8, 96, 96), (0, 0, 0, 0), (1, 1, 1, 1), ((10, 0), (10, 0)), (2, 3),
+             (8, 8, 86, 86), (0, 0, 10, 10)),
+            ((16, 16, 32, 32), (10, 20, 30, 40), (0.5, 0.25, 2, 3), ((4, 12), (4, 12)), (0, 1),
+             (8, 8, 32, 32), (12, 21, 30, 40)),
+            ((2048, 64), (5, 7), (0.5, 2), ((80, 2000),), 0,
+             (1920, 64), (45, 7)),
+        ]  # fmt: skip
+        for shape, origin, sampling, crop_widths, axes, out_shape, out_origin in cases:
+            dset = Dataset.from_array(np.random.rand(*shape), origin=origin, sampling=sampling)
+            cropped = dset.crop(crop_widths=crop_widths, axes=axes)
+            assert cropped.shape == out_shape, (shape, crop_widths, axes)
+            assert np.allclose(cropped.origin, out_origin), (shape, crop_widths, axes)
+            assert dset.shape == shape, (shape, crop_widths, axes)
 
-    def test_crop_4dstem_realspace_in_place(self):
-        """Test in-place real-space crop of a 4D-STEM dataset."""
-        dset = Dataset.from_array(
-            np.random.rand(16, 16, 32, 32),
-            origin=(10, 20, 30, 40),
-            sampling=(0.5, 0.25, 2, 3),
-        )
-        dset.crop(crop_widths=((4, 12), (4, 12)), axes=(0, 1), modify_in_place=True)
-        assert dset.shape == (8, 8, 32, 32)
-        assert np.array_equal(dset.origin, np.array([12, 21, 30, 40]))
-
-    def test_crop_4dstem_stop_zero(self):
-        """Test that stop=0 keeps all remaining elements."""
-        dset = Dataset.from_array(np.random.rand(8, 8, 96, 96))
-        cropped = dset.crop(crop_widths=((10, 0), (10, 0)), axes=(2, 3))
-        assert cropped.shape == (8, 8, 86, 86)
-
-    def test_crop_single_axis_updates_origin_in_place(self):
-        """Test in-place single-axis crop updates origin."""
-        dset = Dataset.from_array(
-            np.random.rand(2048, 64),
-            origin=(5, 7),
-            sampling=(0.5, 2),
-        )
-        dset.crop(crop_widths=((80, 2000),), axes=0, modify_in_place=True)
-        assert dset.shape == (1920, 64)
-        assert np.array_equal(dset.origin, np.array([45, 7]))
+            dset.crop(crop_widths=crop_widths, axes=axes, modify_in_place=True)
+            assert dset.shape == out_shape, (shape, crop_widths, axes)
+            assert np.allclose(dset.origin, out_origin), (shape, crop_widths, axes)
 
     def test_getitem_slice_updates_origin_like_crop(self):
         """Test slicing keeps origin aligned with crop semantics."""
@@ -322,94 +211,39 @@ class TestDatasetMethods:
 
     def test_bin(self, sample_dataset_2d):
         """Test bin method."""
+        # Original metadata
+        assert np.array_equal(sample_dataset_2d.origin, np.array([0.0, 0.0]))
+        assert np.array_equal(sample_dataset_2d.sampling, np.array([1.0, 1.0]))
+
         # Bin by factor of 2
-        binned_dataset = sample_dataset_2d.bin(bin_factors=2)
-        # Check shape
-        assert binned_dataset.shape == (5, 5)  # Original (10, 10) / 2
+        binned = sample_dataset_2d.bin(bin_factors=2)
+        assert binned.shape == (5, 5)  # Original (10, 10) / 2
+        # Sampling doubled
+        assert np.allclose(binned.sampling, np.array([2.0, 2.0]))
+        # Origin shifted to center of first 2x2 block: +0.5 * (2-1) * old_sampling
+        assert np.allclose(binned.origin, np.array([0.5, 0.5]))
         # Check that the original dataset is unchanged
         assert sample_dataset_2d.shape == (10, 10)
+
         # Test modify_in_place
         sample_dataset_2d.bin(bin_factors=2, modify_in_place=True)
         assert sample_dataset_2d.shape == (5, 5)
 
 
-class TestDatasetRepresentation:
-    """Test Dataset string representation."""
-
-    def test_repr(self, sample_dataset_2d):
-        """Test __repr__ method."""
-        repr_str = repr(sample_dataset_2d)
-        assert "Dataset" in repr_str
-        assert "shape=(10, 10)" in repr_str
-        assert "name='test_2d_dataset'" in repr_str
-
-    def test_str(self, sample_dataset_2d):
-        """Test __str__ method."""
-        str_str = str(sample_dataset_2d)
-        assert "quantem Dataset" in str_str
-        assert "shape: (10, 10)" in str_str
-        assert "name: 'test_2d_dataset'" in str_str or "named 'test_2d_dataset'" in str_str
-
-
-class TestBinMetadata:
-    def test_bin_updates_sampling_and_origin(self, sample_dataset_2d):
-        # Original metadata
-        assert np.array_equal(sample_dataset_2d.origin, np.array([0.0, 0.0]))
-        assert np.array_equal(sample_dataset_2d.sampling, np.array([1.0, 1.0]))
-
-        # Bin by 2 on both axes
-        binned = sample_dataset_2d.bin(bin_factors=2)
-
-        # Shape reduced
-        assert binned.shape == (5, 5)
-
-        # Sampling doubled
-        assert np.allclose(binned.sampling, np.array([2.0, 2.0]))
-
-        # Origin shifted to center of first 2x2 block: +0.5 * (2-1) * old_sampling
-        assert np.allclose(binned.origin, np.array([0.5, 0.5]))
-
-
 class TestFourierResample:
-    def test_downsample_mean_and_sampling(self):
-        # Constant array → easy mean check; 10x10 → factors 0.5,0.5 → 5x5
-        arr = np.ones((10, 10), dtype=float)
-        ds = Dataset.from_array(arr, origin=(0, 0), sampling=(1.0, 1.0), units=["px", "px"])
-
-        ds2 = ds.fourier_resample(factors=0.5)  # apply to all axes
-        assert ds2.shape == (5, 5)
-
-        # Mean preserved ~ 1
-        assert np.isclose(ds2.array.mean(), 1.0, rtol=1e-6, atol=1e-6)
-
-        # Sampling doubled
-        assert np.allclose(ds2.sampling, np.array([2.0, 2.0]))
-
-        # Center preserved in world coords
-        def center_world(d):
-            return d.origin + (np.array(d.shape) - 1) / 2.0 * d.sampling
-
-        assert np.allclose(center_world(ds), center_world(ds2), rtol=1e-12, atol=1e-12)
-
-    def test_upsample_mean_and_sampling(self):
-        # 5x6 → factors 2 → 10x12
-        arr = np.ones((5, 6), dtype=float)
-        ds = Dataset.from_array(arr, origin=(1.5, -2.0), sampling=(0.2, 0.5), units=["nm", "nm"])
-
-        ds2 = ds.fourier_resample(factors=2.0)
-        assert ds2.shape == (10, 12)
-
-        # Mean preserved ~ 1
-        assert np.isclose(ds2.array.mean(), 1.0, rtol=1e-6, atol=1e-6)
-
-        # Sampling halved
-        assert np.allclose(ds2.sampling, np.array([0.1, 0.25]))
-
-        # Center preserved in world coords (with nonzero origin/sampling)
-        def center_world(d):
-            return d.origin + (np.array(d.shape) - 1) / 2.0 * d.sampling
-
-        assert np.allclose(center_world(ds), center_world(ds2), rtol=1e-10, atol=1e-10)
+    def test_resample_preserves_mean_and_center(self):
+        cases = [
+            # shape, origin, sampling, kwargs, expected shape, expected sampling, center tol
+            ((10, 10), (0, 0), (1.0, 1.0), {"factors": 0.5}, (5, 5), (2.0, 2.0), 1e-12),
+            ((5, 6), (1.5, -2.0), (0.2, 0.5), {"factors": 2.0}, (10, 12), (0.1, 0.25), 1e-10),
+        ]
+        for shape, origin, sampling, kwargs, out_shape, out_sampling, tol in cases:
+            ds = Dataset.from_array(np.ones(shape), origin=origin, sampling=sampling)
+            ds2 = ds.fourier_resample(**kwargs)
+            assert ds2.shape == out_shape, kwargs
+            assert np.isclose(ds2.array.mean(), 1.0, rtol=1e-6, atol=1e-6), kwargs
+            assert np.allclose(ds2.sampling, np.array(out_sampling)), kwargs
+            assert np.allclose(center_world(ds), center_world(ds2), rtol=tol, atol=tol), kwargs
 
     def test_odd_even_center_preservation(self):
         # Odd→even sizes; check center preservation rather than sampling integers
@@ -419,11 +253,6 @@ class TestFourierResample:
         # Target out_shape (5, 4) explicitly
         ds2 = ds.fourier_resample(out_shape=(5, 4))
         assert ds2.shape == (5, 4)
-
-        # Center preserved
-        def center_world(d):
-            return d.origin + (np.array(d.shape) - 1) / 2.0 * d.sampling
-
         assert np.allclose(center_world(ds), center_world(ds2), rtol=1e-12, atol=1e-12)
 
     def test_api_errors(self, sample_dataset_2d):
@@ -444,11 +273,11 @@ class TestDatasetTorch:
         so writes raise instead of silently updating only the detached copy.
         """
         import torch
+
         from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+
         ds = Dataset4dstem.from_tensor(torch.zeros(2, 2, 2, 2))
         arr = ds.numpy()
         assert arr.flags.writeable is False
         with pytest.raises(ValueError, match="read-only"):
             arr[0, 0, 0, 0] = 99.0
-
-

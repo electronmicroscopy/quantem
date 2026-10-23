@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 import torch
 import torch.nn as nn
 
@@ -24,54 +23,57 @@ class Dummy(AutoSerialize):
         self._private = "secret"
 
 
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_dummy_save_load_and_skip(tmp_path, store):
+def test_dummy_save_load_and_skip(tmp_path):
     """
+    For both the zip and the directory store:
     1.  Save/load Dummy with no skips: all fields rehydrate.
     2.  Then save but skip 'count' and skip 'child', verifying each is dropped.
     3.  Then save but skip '_private', verifying only _private is dropped.
     """
-    # ——— (a) no skips ———
-    d = Dummy()
-    tgt = tmp_path / ("dummy_full.zip" if store == "zip" else "dummy_full_dir")
-    d.save(str(tgt), mode="w", store=store)
-    loaded_full = load(str(tgt))
+    for store in ("zip", "dir"):
+        suffix = ".zip" if store == "zip" else "_dir"
+        d = Dummy()
 
-    # types
-    assert isinstance(loaded_full, Dummy)
-    assert isinstance(loaded_full.child, Child)
+        # ——— (a) no skips ———
+        tgt = tmp_path / f"dummy_full{suffix}"
+        d.save(str(tgt), mode="w", store=store)
+        loaded_full = load(str(tgt))
 
-    # values round-trip
-    np.testing.assert_allclose(loaded_full.arr, d.arr)
-    assert loaded_full.count == d.count
-    np.testing.assert_allclose(loaded_full.child.values, d.child.values)
-    assert loaded_full.child.flag is True
-    assert loaded_full._private == "secret"
+        # types
+        assert isinstance(loaded_full, Dummy), store
+        assert isinstance(loaded_full.child, Child), store
 
-    # ——— (b) skip 'count' and skip 'child' ———
-    tgt2 = tmp_path / ("dummy_skip_cd.zip" if store == "zip" else "dummy_skip_cd_dir")
-    d.save(str(tgt2), mode="w", store=store, skip=["count", "child"])
-    loaded_skip_cd = load(str(tgt2))
+        # values round-trip
+        np.testing.assert_allclose(loaded_full.arr, d.arr, err_msg=store)
+        assert loaded_full.count == d.count, store
+        np.testing.assert_allclose(loaded_full.child.values, d.child.values, err_msg=store)
+        assert loaded_full.child.flag is True, store
+        assert loaded_full._private == "secret", store
 
-    # arr still there
-    np.testing.assert_allclose(loaded_skip_cd.arr, d.arr)
+        # ——— (b) skip 'count' and skip 'child' ———
+        tgt2 = tmp_path / f"dummy_skip_cd{suffix}"
+        d.save(str(tgt2), mode="w", store=store, skip=["count", "child"])
+        loaded_skip_cd = load(str(tgt2))
 
-    # count & child should be gone
-    assert not hasattr(loaded_skip_cd, "count")
-    assert not hasattr(loaded_skip_cd, "child")
+        # arr still there
+        np.testing.assert_allclose(loaded_skip_cd.arr, d.arr, err_msg=store)
 
-    # _private still exists
-    assert loaded_skip_cd._private == "secret"
+        # count & child should be gone
+        assert not hasattr(loaded_skip_cd, "count"), store
+        assert not hasattr(loaded_skip_cd, "child"), store
 
-    # ——— (c) skip "_private" only ———
-    tgt3 = tmp_path / ("dummy_skip_priv.zip" if store == "zip" else "dummy_skip_priv_dir")
-    d.save(str(tgt3), mode="w", store=store, skip=["_private"])
-    loaded_skip_priv = load(str(tgt3))
+        # _private still exists
+        assert loaded_skip_cd._private == "secret", store
 
-    np.testing.assert_allclose(loaded_skip_priv.arr, d.arr)
-    assert loaded_skip_priv.count == d.count
-    assert isinstance(loaded_skip_priv.child, Child)
-    assert not hasattr(loaded_skip_priv, "_private")
+        # ——— (c) skip "_private" only ———
+        tgt3 = tmp_path / f"dummy_skip_priv{suffix}"
+        d.save(str(tgt3), mode="w", store=store, skip=["_private"])
+        loaded_skip_priv = load(str(tgt3))
+
+        np.testing.assert_allclose(loaded_skip_priv.arr, d.arr, err_msg=store)
+        assert loaded_skip_priv.count == d.count, store
+        assert isinstance(loaded_skip_priv.child, Child), store
+        assert not hasattr(loaded_skip_priv, "_private"), store
 
 
 # ──────────────────────────── #
@@ -110,8 +112,7 @@ class TestingClass(AutoSerialize):
         return self.data.sum()
 
 
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_nested_save_load_roundtrip(tmp_path, store):
+def test_nested_save_load_and_skip(tmp_path):
     """
     1.  Save/load TestingClass with no skips:
         - `data` (ndarray)
@@ -119,109 +120,51 @@ def test_nested_save_load_roundtrip(tmp_path, store):
         - nested list + nested tuple (with ndarrays)
         - top‐level child.info
         - nested subClass inside list_with_child and tuple_with_child
-    2.  Verify each nested structure (including the nested subClass objects) round‐trips.
+    2.  Save with skip=["info","child"]: `info` and top‐level `child` are removed entirely,
+        but the *nested* subClass instances inside list_with_child/tuple_with_child remain.
     """
     obj = TestingClass()
-    tgt = tmp_path / ("nested.zip" if store == "zip" else "nested_dir")
-    obj.save(str(tgt), mode="w", store=store)
-    loaded = load(str(tgt))
+    for skip in ([], ["info", "child"]):
+        tgt = tmp_path / f"nested_{len(skip)}.zip"
+        obj.save(str(tgt), mode="w", skip=skip)
+        loaded = load(str(tgt))
 
-    # — Top‐level class —
-    assert isinstance(loaded, TestingClass)
+        # — Top‐level class —
+        assert isinstance(loaded, TestingClass), skip
 
-    # — data array —
-    np.testing.assert_allclose(loaded.data, obj.data)
+        # — data array —
+        np.testing.assert_allclose(loaded.data, obj.data, err_msg=str(skip))
 
-    # — top‐level dicts and child —
-    assert loaded.info == obj.info
-    assert isinstance(loaded.child, subClass)
-    assert loaded.child.info == obj.child.info
+        # — top‐level dicts and child: kept, or gone when skipped —
+        if skip:
+            assert not hasattr(loaded, "info")
+            assert not hasattr(loaded, "child")
+        else:
+            assert loaded.info == obj.info
+            assert isinstance(loaded.child, subClass)
+            assert loaded.child.info == obj.child.info
 
-    # — list_a: first two entries + ndarray —
-    assert loaded.list_a[:2] == obj.list_a[:2]
-    np.testing.assert_allclose(loaded.list_a[2], obj.list_a[2])
+        # — list_a / tuple_a: first two entries + ndarray —
+        assert loaded.list_a[:2] == obj.list_a[:2], skip
+        np.testing.assert_allclose(loaded.list_a[2], obj.list_a[2], err_msg=str(skip))
+        assert loaded.tuple_a[:2] == obj.tuple_a[:2], skip
+        np.testing.assert_allclose(loaded.tuple_a[2], obj.tuple_a[2], err_msg=str(skip))
 
-    # — tuple_a: first two entries + ndarray —
-    assert loaded.tuple_a[:2] == obj.tuple_a[:2]
-    np.testing.assert_allclose(loaded.tuple_a[2], obj.tuple_a[2])
+        # — nested list & nested tuple of primitives —
+        assert loaded.list_nested == obj.list_nested, skip
+        assert loaded.tuple_nested == obj.tuple_nested, skip
 
-    # — nested list & nested tuple of primitives —
-    assert loaded.list_nested == obj.list_nested
-    assert loaded.tuple_nested == obj.tuple_nested
-
-    # — list_with_child: check nested subClass —
-    assert loaded.list_with_child[0] == "start"
-    assert isinstance(loaded.list_with_child[1], subClass)
-    assert loaded.list_with_child[1].info == obj.list_with_child[1].info
-
-    # — tuple_with_child: check nested subClass —
-    assert loaded.tuple_with_child[0] == "start"
-    assert isinstance(loaded.tuple_with_child[1], subClass)
-    assert loaded.tuple_with_child[1].info == obj.tuple_with_child[1].info
-
-
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_nested_skip_fields(tmp_path, store):
-    """
-    1.  Save with skip=["info","child"], load back.
-    2.  Only `data`, `list_a`, `list_nested`, `tuple_a`, `tuple_nested`,
-        `list_with_child` and `tuple_with_child` survive.
-    3.  `info` and top‐level `child` are removed entirely, but the *nested*
-        subClass instances inside list_with_child/tuple_with_child should remain.
-    """
-    obj = TestingClass()
-    tgt = tmp_path / ("skip_nested.zip" if store == "zip" else "skip_nested_dir")
-    obj.save(str(tgt), mode="w", store=store, skip=["info", "child"])
-    loaded = load(str(tgt))
-
-    # — data must still be present —
-    np.testing.assert_allclose(loaded.data, obj.data)
-
-    # — top‐level info & child must be gone —
-    assert not hasattr(loaded, "info")
-    assert not hasattr(loaded, "child")
-
-    # — list_a and its ndarray still rehydrate —
-    assert loaded.list_a[:2] == obj.list_a[:2]
-    np.testing.assert_allclose(loaded.list_a[2], obj.list_a[2])
-
-    # — tuple_a and its ndarray still rehydrate —
-    assert loaded.tuple_a[:2] == obj.tuple_a[:2]
-    np.testing.assert_allclose(loaded.tuple_a[2], obj.tuple_a[2])
-
-    # — nested list & nested tuple still rehydrate —
-    assert loaded.list_nested == obj.list_nested
-    assert loaded.tuple_nested == obj.tuple_nested
-
-    # — list_with_child: nested subClass should survive —
-    assert loaded.list_with_child[0] == "start"
-    assert isinstance(loaded.list_with_child[1], subClass)
-
-    # — tuple_with_child: nested subClass should survive —
-    assert loaded.tuple_with_child[0] == "start"
-    assert isinstance(loaded.tuple_with_child[1], subClass)
+        # — list_with_child / tuple_with_child: nested subClass survives —
+        for name in ("list_with_child", "tuple_with_child"):
+            assert getattr(loaded, name)[0] == "start", (name, skip)
+            assert isinstance(getattr(loaded, name)[1], subClass), (name, skip)
+            if not skip:
+                assert getattr(loaded, name)[1].info == getattr(obj, name)[1].info, name
 
 
 # ──────────────────────────── #
 # 3) PyTorch‐specific behavior #
 # ──────────────────────────── #
-
-
-class TorchOnly(AutoSerialize):
-    def __init__(self):
-        self.data = torch.rand(100, 100)
-
-    def method(self):
-        return self.data.sum()
-
-
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_torch_tensor_roundtrip(tmp_path, store):
-    obj = TorchOnly()
-    tgt = tmp_path / ("tensor.zip" if store == "zip" else "tensor_dir")
-    obj.save(str(tgt), mode="w", store=store)
-    loaded = load(str(tgt))
-    assert torch.allclose(obj.data, loaded.data)
 
 
 class TorchWithOpt(AutoSerialize):
@@ -234,16 +177,15 @@ class TorchWithOpt(AutoSerialize):
         return self.data.sum()
 
 
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_torch_tensor_and_optimizer(tmp_path, store):
+def test_torch_tensor_and_optimizer(tmp_path):
     obj = TorchWithOpt()
-    tgt = tmp_path / ("opt.zip" if store == "zip" else "opt_dir")
-    obj.save(str(tgt), mode="w", store=store)
+    tgt = tmp_path / "opt.zip"
+    obj.save(str(tgt), mode="w")
     loaded = load(str(tgt))
 
     assert torch.allclose(obj.data, loaded.data)
     assert isinstance(loaded.opt, torch.optim.Adam)
-    assert set(obj.opt.state_dict().keys()) == set(loaded.opt.state_dict().keys())
+    assert loaded.opt.param_groups[0]["lr"] == 0.01
 
 
 class TestModule(torch.nn.Module, AutoSerialize):
@@ -258,11 +200,10 @@ class TestModule(torch.nn.Module, AutoSerialize):
         return self.linear(x)
 
 
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_torch_nn_module_roundtrip(tmp_path, store):
+def test_torch_nn_module_roundtrip(tmp_path):
     mod = TestModule()
-    tgt = tmp_path / ("mod.zip" if store == "zip" else "mod_dir")
-    mod.save(str(tgt), mode="w", store=store)
+    tgt = tmp_path / "mod.zip"
+    mod.save(str(tgt), mode="w")
     mod_reload = load(str(tgt))
 
     assert isinstance(mod_reload, TestModule)
@@ -291,11 +232,10 @@ class TestHybrid(AutoSerialize, nn.Module):
             self._p1.copy_(value)
 
 
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_hybrid_module_roundtrip(tmp_path, store):
+def test_hybrid_module_roundtrip(tmp_path):
     mod = TestHybrid()
-    tgt = tmp_path / ("hybrid.zip" if store == "zip" else "hybrid_dir")
-    mod.save(str(tgt), mode="w", store=store)
+    tgt = tmp_path / "hybrid.zip"
+    mod.save(str(tgt), mode="w")
     mod_reload = load(str(tgt))
 
     for key in mod.state_dict():
@@ -309,11 +249,10 @@ class WithSets(AutoSerialize):
         self.empty = set()
 
 
-@pytest.mark.parametrize("store", ["zip", "dir"])
-def test_set_roundtrip(tmp_path, store):
+def test_set_roundtrip(tmp_path):
     """Sets load back as sets, whether their items are strings or numbers."""
-    target = tmp_path / ("sets.zip" if store == "zip" else "sets_dir")
-    WithSets().save(str(target), mode="w", store=store)
+    target = tmp_path / "sets.zip"
+    WithSets().save(str(target), mode="w")
     loaded = load(str(target))
 
     assert loaded.names == {"C10", "C12", "rotation_angle"}

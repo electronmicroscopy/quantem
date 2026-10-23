@@ -20,43 +20,24 @@ def _disk(n: int, cy: int, cx: int, r: int) -> torch.Tensor:
 
 
 class TestRadonShapes:
-    def test_2d_input_returns_angles_by_pixels(self):
-        img = _disk(64, 32, 32, 10)
+    def test_radon_shapes(self):
         theta = torch.linspace(0, 180, 30)
-        sino = radon_torch(img, theta=theta)
-        assert sino.shape == (30, 64)
-
-    def test_batched_input_returns_batch_angles_pixels(self):
+        assert radon_torch(_disk(64, 32, 32, 10), theta=theta).shape == (30, 64)
         imgs = torch.stack([_disk(48, 24, 20, 8), _disk(48, 24, 28, 8)])
-        theta = torch.linspace(0, 180, 20)
-        sino = radon_torch(imgs, theta=theta)
-        assert sino.shape == (2, 20, 48)
-
-    def test_default_theta_is_180_angles(self):
-        sino = radon_torch(_disk(32, 16, 16, 6))
-        assert sino.shape == (180, 32)
+        assert radon_torch(imgs, theta=theta).shape == (2, 30, 48)
+        assert radon_torch(_disk(32, 16, 16, 6)).shape == (180, 32)  # default theta
 
     def test_iradon_shapes(self):
-        sino = radon_torch(_disk(40, 20, 20, 8), theta=torch.linspace(0, 180, 25))
-        rec = iradon_torch(sino, theta=torch.linspace(0, 180, 25))
-        assert rec.shape == (40, 40)
-
-    def test_iradon_output_size_override(self):
-        sino = radon_torch(_disk(40, 20, 20, 8), theta=torch.linspace(0, 180, 25))
-        rec = iradon_torch(sino, theta=torch.linspace(0, 180, 25), output_size=32)
-        assert rec.shape == (32, 32)
+        theta = torch.linspace(0, 180, 25)
+        sino = radon_torch(_disk(40, 20, 20, 8), theta=theta)
+        assert iradon_torch(sino, theta=theta).shape == (40, 40)
+        assert iradon_torch(sino, theta=theta, output_size=32).shape == (32, 32)
 
 
 class TestFourierFilter:
-    def test_even_size_ok(self):
-        f = get_fourier_filter_torch(64, "ramp")
-        assert f.shape == (1, 64)
-
-    def test_odd_size_raises(self):
+    def test_bad_arguments_raise(self):
         with pytest.raises(ValueError):
             get_fourier_filter_torch(63, "ramp")
-
-    def test_unknown_filter_raises(self):
         with pytest.raises(ValueError):
             get_fourier_filter_torch(64, "not-a-filter")
 
@@ -64,11 +45,15 @@ class TestFourierFilter:
         f = get_fourier_filter_torch(64, None)
         assert torch.allclose(f, torch.ones_like(f))
 
-    @pytest.mark.parametrize("name", ["ramp", "shepp-logan", "cosine", "hamming", "hann"])
-    def test_named_filters_run(self, name):
-        f = get_fourier_filter_torch(64, name)
-        assert f.shape == (1, 64)
-        assert torch.isfinite(f).all()
+    def test_named_filters_window_the_ramp(self):
+        ramp = get_fourier_filter_torch(64, "ramp")
+        assert ramp.shape == (1, 64)
+        assert int(torch.argmax(ramp)) == 32  # the ramp peaks at Nyquist
+        for name in ["shepp-logan", "cosine", "hamming", "hann"]:
+            f = get_fourier_filter_torch(64, name)
+            assert f.shape == (1, 64), name
+            assert torch.all(f >= -1e-6) and torch.all(f <= ramp + 1e-6), name
+            assert f[0, 32] < ramp[0, 32], name  # attenuated at Nyquist
 
 
 class TestRadonBehaviour:
@@ -89,22 +74,18 @@ class TestRadonBehaviour:
         assert torch.allclose(rec[outside], torch.zeros(int(outside.sum())))
 
     def test_roundtrip_recovers_structure(self):
-        disk = _disk(64, 32, 24, 9)
-        theta = torch.linspace(0, 180, 60)
-        rec = iradon_torch(radon_torch(disk, theta=theta), theta=theta, filter_name="ramp")
-        corr = np.corrcoef(disk.numpy().ravel(), rec.numpy().ravel())[0, 1]
-        assert corr > 0.9
-
-    def test_default_theta_roundtrip_is_consistent(self):
-        """radon and iradon must share an angle convention when ``theta`` is defaulted.
-
-        iradon's default previously included the 180-degree endpoint while radon's did not,
-        so a default-theta round-trip sampled mismatched angles.
+        """Also with ``theta`` defaulted on both sides: radon and iradon must share an angle
+        convention. iradon's default previously included the 180-degree endpoint while radon's
+        did not, so a default-theta round-trip sampled mismatched angles.
         """
-        disk = _disk(64, 32, 28, 10)
-        rec = iradon_torch(radon_torch(disk), filter_name="ramp")  # both default theta
-        corr = np.corrcoef(disk.numpy().ravel(), rec.numpy().ravel())[0, 1]
-        assert corr > 0.9
+        theta = torch.linspace(0, 180, 60)
+        for disk, kwargs in [
+            (_disk(64, 32, 24, 9), {"theta": theta}),
+            (_disk(64, 32, 28, 10), {}),
+        ]:
+            rec = iradon_torch(radon_torch(disk, **kwargs), filter_name="ramp", **kwargs)
+            corr = np.corrcoef(disk.numpy().ravel(), rec.numpy().ravel())[0, 1]
+            assert corr > 0.9, kwargs
 
 
 class TestRadonVsSkimage:

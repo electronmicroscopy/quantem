@@ -3,15 +3,16 @@
 ``LoggerTomography`` is a thin tensorboard wrapper that the reconstruction loop only drives
 when a ``log_dir`` is passed, so the end-to-end recon tests never exercise it. These CPU,
 always-on tests construct a logger against a ``tmp_path`` and drive each method with small
-stubs that expose only the attributes the logger reads, asserting the calls run and write
-event files. Matplotlib backend is ``Agg`` (set in the root conftest), so figure logging is
+stubs that expose only the attributes the logger reads, then read the event files back. Matplotlib backend is ``Agg`` (set in the root conftest), so figure logging is
 headless.
 """
 
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from quantem.tomography.logger_tomography import LoggerTomography
 
@@ -34,23 +35,19 @@ def test_init_creates_log_dir(tmp_path):
         logger.close()
 
 
-def test_log_epoch_writes_events(tmp_path):
+def _read_events(logger) -> EventAccumulator:
+    logger.flush()
+    events = EventAccumulator(str(logger.log_dir))
+    events.Reload()
+    return events
+
+
+def test_log_epoch_and_iter_write_scalars(tmp_path):
     logger = _make_logger(tmp_path)
     try:
         logger.log_epoch(epoch=0, loss=1.0, tilt_series_loss=0.8, soft_loss=0.2)
-        logger.flush()
-        events = list(logger.log_dir.glob("events.out.tfevents.*"))
-        assert events, "log_epoch should have written a tensorboard event file"
-    finally:
-        logger.close()
-
-
-def test_log_iter_unpacks_learning_rates(tmp_path):
-    logger = _make_logger(tmp_path)
-    obj_model = SimpleNamespace(_soft_constraint_losses=[0.3])
-    try:
         logger.log_iter(
-            object_model=obj_model,
+            object_model=SimpleNamespace(_soft_constraint_losses=[0.3]),
             iter=2,
             consistency_loss=0.5,
             total_loss=0.7,
@@ -58,26 +55,27 @@ def test_log_iter_unpacks_learning_rates(tmp_path):
             num_samples_per_ray=16,
             val_loss=0.4,
         )
-        logger.flush()
-        assert list(logger.log_dir.glob("events.out.tfevents.*"))
-    finally:
-        logger.close()
-
-
-def test_log_iter_without_val_loss(tmp_path):
-    logger = _make_logger(tmp_path)
-    obj_model = SimpleNamespace(_soft_constraint_losses=[0.1])
-    try:
         # val_loss defaults to None -> the val branch must be skipped without error.
         logger.log_iter(
-            object_model=obj_model,
-            iter=0,
+            object_model=SimpleNamespace(_soft_constraint_losses=[0.1]),
+            iter=3,
             consistency_loss=0.5,
             total_loss=0.6,
             learning_rates={},
             num_samples_per_ray=8,
         )
-        logger.flush()
+        events = _read_events(logger)
+
+        def scalars(tag):
+            return {e.step: e.value for e in events.Scalars(tag)}
+
+        assert scalars("loss/total") == pytest.approx({0: 1.0, 2: 0.7, 3: 0.6})
+        assert scalars("loss/tilt_series") == pytest.approx({0: 0.8})
+        assert scalars("loss/soft") == pytest.approx({0: 0.2, 2: 0.3, 3: 0.1})
+        assert scalars("learning_rate/object") == pytest.approx({2: 1e-3})
+        assert scalars("learning_rate/pose") == pytest.approx({2: 1e-2})
+        assert scalars("num_samples_per_ray") == pytest.approx({2: 16, 3: 8})
+        assert scalars("loss/val") == pytest.approx({2: 0.4})
     finally:
         logger.close()
 
@@ -97,7 +95,8 @@ def test_log_iter_images(tmp_path):
             dataset_model=dataset_model,
             iter=1,
         )
-        logger.flush()
-        assert list(logger.log_dir.glob("events.out.tfevents.*"))
+        images = set(_read_events(logger).Tags()["images"])
+        expected = {f"volume/sum_{axis}_{c}" for axis in "zyx" for c in range(2)}
+        assert images == expected | {"z1_z3_angles", "shifts"}
     finally:
         logger.close()
