@@ -9,9 +9,9 @@ from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import load
+from quantem.core.utils.rotations import qnormalize
 from quantem.diffraction import calibration
 from quantem.diffraction.crystal import Crystal
-from quantem.diffraction.rotations import qnormalize
 
 PIXEL_SIZE = 0.0123
 E_TRUE = np.array([0.012, -0.008])
@@ -108,7 +108,7 @@ def test_calibrate_dominant_low_ring(fe):
 @pytest.fixture(scope="module")
 def fe_zone(fe):
     """One [001] grain over the whole scan, small in-plane wobble."""
-    from quantem.diffraction.rotations import quat_from_axis_angle
+    from quantem.core.utils.rotations import quat_from_axis_angle
 
     torch.manual_seed(2)
     rng = np.random.default_rng(2)

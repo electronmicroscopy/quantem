@@ -7,7 +7,7 @@ from ase import Atoms
 from ase.build import bulk
 
 from quantem.diffraction.crystal import Crystal
-from quantem.diffraction.rotations import quat_from_zone_axis
+from quantem.diffraction.crystal_rotations import quat_from_zone_axis
 
 
 @pytest.fixture
@@ -73,7 +73,7 @@ def test_generate_pattern(ti_beta):
 
 def _images_in_wedge(xtl, n=3000, tol=1e-9):
     """Count, per random direction, its symmetry images inside the wedge."""
-    from quantem.diffraction.rotations import quat_to_matrix
+    from quantem.core.utils.rotations import quat_to_matrix
 
     rng = np.random.default_rng(0)
     d = rng.normal(size=(n, 3))
@@ -316,12 +316,8 @@ def test_projected_rotation_order():
 
 def test_projected_order_matches_pattern_degeneracy():
     """The reported order is the rotation that leaves the pattern unchanged."""
-    from quantem.diffraction.rotations import (
-        qmult,
-        qnormalize,
-        quat_from_axis_angle,
-        quat_from_zone_axis,
-    )
+    from quantem.core.utils.rotations import qmult, qnormalize, quat_from_axis_angle
+    from quantem.diffraction.crystal_rotations import quat_from_zone_axis
 
     bcc = Crystal.from_ase(
         bulk("Ti", "bcc", a=3.26, cubic=True), verbose=False
@@ -550,8 +546,8 @@ def test_generate_pattern_validates_excitation_model(ti_beta):
 
 
 def test_generate_pattern_foil_normal():
+    from quantem.core.utils.rotations import qrotate
     from quantem.diffraction.illumination import excitation_coefficients
-    from quantem.diffraction.rotations import qrotate
 
     xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False)
     xtl.calculate_structure_factors(k_max=1.5)

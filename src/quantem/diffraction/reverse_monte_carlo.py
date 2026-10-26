@@ -549,7 +549,7 @@ class ReverseMonteCarlo(AutoSerialize):
 
         The zone axis is turned toward ``(tilt_x, tilt_y, 1)``, which puts the Bloch excitation
         errors on the same Laue circle as the diffuse model's Ewald sphere."""
-        from quantem.diffraction.rotations import quat_from_matrix
+        from quantem.core.utils.rotations import quat_from_matrix
 
         n = np.array([tilt[0], tilt[1], 1.0])
         n /= np.linalg.norm(n)

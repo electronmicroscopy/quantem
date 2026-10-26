@@ -11,9 +11,9 @@ from quantem.core.datastructures.vector import Vector
 from quantem.diffraction import bloch
 from quantem.diffraction.bloch import dynamical_pattern, refine_thickness
 from quantem.diffraction.crystal import Crystal
+from quantem.diffraction.crystal_rotations import quat_from_zone_axis
 from quantem.diffraction.orientation import OrientationMap
 from quantem.diffraction.phase import PhaseMap
-from quantem.diffraction.rotations import quat_from_zone_axis
 
 
 @pytest.fixture(scope="module")
@@ -280,7 +280,7 @@ REF_STEP_MRAD = 3.0
 
 
 def _tilted_110():
-    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
+    from quantem.core.utils.rotations import qmult, quat_from_axis_angle
 
     tilt = quat_from_axis_angle(
         torch.tensor([1.0, 0.3, 0.0], dtype=torch.float64) / np.hypot(1, 0.3),
@@ -420,7 +420,7 @@ def test_kossel_lines_render_matches_direct(si_lines):
 
 
 def test_kossel_line_segments_on_cones(si_lines):
-    from quantem.diffraction.rotations import quat_to_matrix
+    from quantem.core.utils.rotations import quat_to_matrix
 
     lines = si_lines
     q = _tilted_110()
@@ -508,14 +508,14 @@ def test_refine_dynamical_recovery():
     """Bragg-vector dynamical refinement: thickness, tilt, in-plane strain and
     rotation recovered from noise-free patterns of a strained, tilted cell."""
     from quantem.core.datastructures.vector import Vector
-    from quantem.diffraction.orientation import OrientationMap
-    from quantem.diffraction.phase import PhaseMap
-    from quantem.diffraction.rotations import (
+    from quantem.core.utils.rotations import (
         misorientation_angle_deg,
         qmult,
         qnormalize,
         quat_from_axis_angle,
     )
+    from quantem.diffraction.orientation import OrientationMap
+    from quantem.diffraction.phase import PhaseMap
 
     energy_ev = 200e3
     xtl = _si(absorptive=True)
@@ -600,9 +600,9 @@ def test_image_refinement_round_trip():
     from types import SimpleNamespace
 
     from quantem.core.datastructures.vector import Vector
+    from quantem.core.utils.rotations import qnormalize
     from quantem.diffraction.orientation import OrientationMap
     from quantem.diffraction.phase import PhaseMap
-    from quantem.diffraction.rotations import qnormalize
 
     energy_ev = 200e3
     xtl = _si(absorptive=True)
@@ -801,9 +801,9 @@ def test_fourier_ring_matches_quadrature():
 def test_refine_dynamical_reported_cost_reproducible():
     """The stored cost and thickness belong to the stored orientation."""
     from quantem.core.datastructures.vector import Vector
+    from quantem.core.utils.rotations import qnormalize
     from quantem.diffraction.orientation import OrientationMap
     from quantem.diffraction.phase import PhaseMap
-    from quantem.diffraction.rotations import qnormalize
 
     energy_ev = 200e3
     xtl = _si(absorptive=True)
@@ -898,14 +898,14 @@ def test_refine_dynamical_with_precession_and_convergence():
     the ground truth is integrated with denser illumination nodes than
     the model uses."""
     from quantem.core.datastructures.vector import Vector
-    from quantem.diffraction.orientation import OrientationMap
-    from quantem.diffraction.phase import PhaseMap
-    from quantem.diffraction.rotations import (
+    from quantem.core.utils.rotations import (
         misorientation_angle_deg,
         qmult,
         qnormalize,
         quat_from_axis_angle,
     )
+    from quantem.diffraction.orientation import OrientationMap
+    from quantem.diffraction.phase import PhaseMap
 
     energy_ev = 200e3
     xtl = _si(absorptive=True)
@@ -990,9 +990,9 @@ def _smooth_map_setup(n, tilt_start_deg, corrupt=None):
     apart, thickness varying slowly, strained cell; starts tilted by
     tilt_start_deg (and one position by `corrupt` degrees)."""
     from quantem.core.datastructures.vector import Vector
+    from quantem.core.utils.rotations import qmult, quat_from_axis_angle
     from quantem.diffraction.orientation import OrientationMap
     from quantem.diffraction.phase import PhaseMap
-    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
 
     energy_ev = 200e3
     xtl = _si(absorptive=True)
@@ -1064,7 +1064,7 @@ def _smooth_map_setup(n, tilt_start_deg, corrupt=None):
 
 
 def test_refine_dynamical_warm_start_matches_cold():
-    from quantem.diffraction.rotations import (
+    from quantem.core.utils.rotations import (
         misorientation_angle_deg,
         qconj,
         qmult,
@@ -1131,7 +1131,7 @@ def test_refine_dynamical_warm_start_matches_cold():
 
 
 def test_refine_dynamical_neighbor_rescue():
-    from quantem.diffraction.rotations import misorientation_angle_deg
+    from quantem.core.utils.rotations import misorientation_angle_deg
 
     n = 5
     # position 2 starts 0.45 degrees off: outside the coarse stage's reach,
@@ -1163,7 +1163,7 @@ def test_refine_dynamical_neighbor_rescue():
 
 
 def test_refine_dynamical_threads_match_one_worker():
-    from quantem.diffraction.rotations import misorientation_angle_deg
+    from quantem.core.utils.rotations import misorientation_angle_deg
 
     # 32 positions: two blocks of 16 on two threads, one warm-start chain
     # broken at the block boundary. Both runs start from the same matched
@@ -1199,7 +1199,7 @@ def _fake_dynamical_result():
     was not refined."""
     from types import SimpleNamespace
 
-    from quantem.diffraction.rotations import quat_from_axis_angle
+    from quantem.core.utils.rotations import quat_from_axis_angle
 
     R, C, F = 2, 2, 1
     q = quat_from_axis_angle(

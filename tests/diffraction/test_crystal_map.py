@@ -11,10 +11,10 @@ import torch
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
+from quantem.core.utils.rotations import misorientation_angle_deg, quat_from_axis_angle
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.crystal_map import CrystalMap
 from quantem.diffraction.orientation import OrientationMap
-from quantem.diffraction.rotations import misorientation_angle_deg, quat_from_axis_angle
 
 Q_ALPHA = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
 Q_BETA = quat_from_axis_angle(

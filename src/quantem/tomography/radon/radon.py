@@ -1,8 +1,15 @@
 """
-scikit-image's radon and iradon functions fully implemented in Torch.
+Radon transform and filtered back-projection in Torch, after scikit-image's radon and iradon.
 
 Reference: van der Walt, S., et al. (2014). scikit-image: image processing in Python. PeerJ, 2, e453.
+
+Angles follow quantem's tomography convention (see `quantem.tomography.utils`): theta is the
+tilt in degrees with the sign of the INR rays, and slices rotate about the array centre
+(N - 1) / 2. scikit-image's theta is minus this tilt, and it rotates about N // 2, so for even N
+the two differ by half a pixel.
 """
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +25,7 @@ def radon_torch(images, theta=None, device=None):
 
     shape_min = min(H, W)
     radius = shape_min // 2
-    center_h, center_w = H // 2, W // 2
+    center_h, center_w = (H - 1) / 2, (W - 1) / 2
 
     Y, X = torch.meshgrid(
         torch.arange(H, device=device),
@@ -37,7 +44,7 @@ def radon_torch(images, theta=None, device=None):
     )
     images = images[:, slices[0], slices[1]]  # [B, N, N]
     N = images.shape[-1]
-    center = N // 2
+    center = (N - 1) / 2
 
     # Build all rotation matrices at once: [A, 2, 2]
     angles_rad = torch.deg2rad(theta.float())
@@ -46,7 +53,7 @@ def radon_torch(images, theta=None, device=None):
     rot = torch.stack(
         [
             torch.stack([cos_a, -sin_a], dim=1),
-            torch.stack([-sin_a, -cos_a], dim=1),
+            torch.stack([sin_a, cos_a], dim=1),
         ],
         dim=1,
     )  # [A, 2, 2]
@@ -59,11 +66,8 @@ def radon_torch(images, theta=None, device=None):
     )
     coords = torch.stack((grid_x - center, grid_y - center), dim=-1).view(-1, 2)  # [N*N, 2]
 
-    # Rotate all angles at once: [A, N*N, 2]
-    coords_rot = (coords @ rot.transpose(1, 2)) + center  # [A, N*N, 2]
-
-    # Normalize to [-1, 1] for grid_sample
-    grid = (2 * coords_rot / (N - 1) - 1).view(A, N, N, 2)  # [A, N, N, 2]
+    # Rotate all angles at once and normalize to [-1, 1] for grid_sample: [A, N, N, 2]
+    grid = (coords @ rot.transpose(1, 2) / center).view(A, N, N, 2)
 
     # Expand images: [B, 1, N, N] -> sample with [B*A, 1, N, N] style
     # Tile images over angles, tile grid over batch
@@ -97,49 +101,56 @@ def iradon_torch(
     if output_size is None:
         output_size = N if circle else int((N**2 / 2) ** 0.5)
 
+    # Pad the detector to the diagonal of the reconstruction circle, as scikit-image does, so
+    # pixels near the circle edge read filtered values instead of extrapolating past the
+    # detector.
+    D = math.ceil(math.sqrt(2) * N) if circle else N
+    pad = D // 2 - N // 2
+    sinograms = F.pad(sinograms, (pad, D - N - pad))
+
     # Filter
-    padded_size = max(64, int(2 ** torch.ceil(torch.log2(torch.tensor(2.0 * N)))))
-    pad_y = padded_size - N
-    sinograms_padded = F.pad(sinograms, (0, pad_y))
+    padded_size = max(64, int(2 ** math.ceil(math.log2(2 * D))))
+    sinograms_padded = F.pad(sinograms, (0, padded_size - D))
     f_filter = get_fourier_filter_torch(padded_size, filter_name, device=device)
     filtered = torch.real(
         torch.fft.ifft(torch.fft.fft(sinograms_padded, dim=2) * f_filter, dim=2)
-    )[:, :, :N]  # [B, A, N]
+    )[:, :, :D]  # [B, A, D]
 
-    radius = output_size // 2
+    center = (output_size - 1) / 2
     y, x = torch.meshgrid(
-        torch.arange(output_size, device=device) - radius,
-        torch.arange(output_size, device=device) - radius,
+        torch.arange(output_size, device=device) - center,
+        torch.arange(output_size, device=device) - center,
         indexing="ij",
     )
     x = x.float().flatten()  # [H*W]
     y = y.float().flatten()
 
-    # Compute t for all angles at once: [A, H*W]
+    # Detector coordinate of every pixel for all angles at once: [A, H*W]
     angles_rad = torch.deg2rad(theta.float())
-    t = x.unsqueeze(0) * torch.cos(angles_rad).unsqueeze(1) - y.unsqueeze(0) * torch.sin(
+    t = x.unsqueeze(0) * torch.cos(angles_rad).unsqueeze(1) + y.unsqueeze(0) * torch.sin(
         angles_rad
     ).unsqueeze(1)  # [A, H*W]
-    t_idx = t + (N // 2)  # [A, H*W]
+    t_idx = t + (N - 1) / 2 + pad  # [A, H*W]
 
-    t0 = t_idx.long().clamp(0, N - 2)  # [A, H*W]
+    t0 = t_idx.floor().long().clamp(0, D - 2)  # [A, H*W]
     t1 = t0 + 1
     w = t_idx - t0.float()  # [A, H*W]
+    inside = (t_idx >= 0) & (t_idx <= D - 1)  # zero outside the detector
 
-    # Gather from filtered: [B, A, N] -> gather at [A, H*W] indices
+    # Gather from filtered: [B, A, D] -> gather at [A, H*W] indices
     # Expand: [B, A, H*W]
-    # HW = output_size * output_size
     t0_exp = t0.unsqueeze(0).expand(B, -1, -1)  # [B, A, H*W]
     t1_exp = t1.unsqueeze(0).expand(B, -1, -1)
     w_exp = w.unsqueeze(0).expand(B, -1, -1)
 
     val0 = torch.gather(filtered, 2, t0_exp)  # [B, A, H*W]
     val1 = torch.gather(filtered, 2, t1_exp)
-    proj = ((1 - w_exp) * val0 + w_exp * val1).sum(dim=1)  # [B, H*W]
+    proj = (((1 - w_exp) * val0 + w_exp * val1) * inside).sum(dim=1)  # [B, H*W]
 
     recon = proj.view(B, output_size, output_size)
 
     if circle:
+        radius = output_size // 2
         mask = (
             x.view(output_size, output_size) ** 2 + y.view(output_size, output_size) ** 2
             > radius**2

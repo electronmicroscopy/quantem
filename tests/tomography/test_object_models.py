@@ -216,6 +216,19 @@ class TestObjectINRBehaviour:
         pred = torch.tensor([-1.0, 0.5, 2.0], device=torch_device)
         assert torch.all(obj.apply_hard_constraints(pred) >= 0.0)
 
+    def test_create_volume_keeps_channels_apart(self, torch_device):
+        """The (N^3, C) model outputs land as [C, X, Y, Z] for C > 1."""
+
+        class TwoChannels(torch.nn.Module):
+            def forward(self, coords):
+                return torch.stack((coords[:, 0] + 2, coords[:, 1] + 4), dim=-1)
+
+        n = 6
+        obj = ObjectINR.from_model(TwoChannels(), shape=(n, n, n), device=torch_device)
+        vol = obj.create_volume(return_vol=True)
+        x, y, _ = torch.meshgrid(*(torch.linspace(-1, 1, n),) * 3, indexing="ij")
+        assert torch.allclose(vol, torch.stack((x + 2, y + 4)), atol=1e-6)
+
     def test_get_tv_loss_scalar(self, torch_device):
         obj = self._obj(torch_device)
         obj.constraints.tv_vol = 1.0
