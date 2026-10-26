@@ -1483,9 +1483,22 @@ def _opt_spec_for_component(
         d = dict(optimizer_params[class_name])
     else:
         return OptimizerParams.Adam(lr=component.DEFAULT_LR)
+    d.pop("param_lr", None)  # batched-fit per-parameter LR overrides, read by _BatchedPlan
     d.setdefault("type", "adam")
     d.setdefault("lr", component.DEFAULT_LR)
     return OptimizerParams.parse_dict(d)
+
+
+def _param_lr_for_component(
+    component: RenderComponent,
+    component_idx: int,
+    optimizer_params: dict[str, Any],
+    model: AdditiveRenderModel,
+) -> dict[str, float]:
+    """Per-parameter LR overrides, e.g. ``{"lat0": {"lr": 2e-2, "param_lr": {"i0_raw": 0.1}}}``."""
+    name = model._component_constraint_name(component, component_idx)
+    spec = optimizer_params.get(name, optimizer_params.get(component.__class__.__name__, {}))
+    return {str(k): float(v) for k, v in dict(spec.get("param_lr", {}) or {}).items()}
 
 
 def _masked(t: torch.Tensor, mask_expanded: torch.Tensor | None) -> torch.Tensor:
@@ -1739,6 +1752,7 @@ class _BatchedPlan:
             first_lr = None
             for lat, lat_idx in zip(self.lats, self.lat_idxs):
                 lr = _lr_for_component(lat, lat_idx, optimizer_params, model)
+                param_lr = _param_lr_for_component(lat, lat_idx, optimizer_params, model)
                 if first_lr is None:
                     first_lr = lr
                 canonical_name = model._component_constraint_name(lat, lat_idx)
@@ -1762,7 +1776,7 @@ class _BatchedPlan:
                         is_trainable = param.requires_grad if isinstance(param, torch.nn.Parameter) else False
                         self._trainable_flags[full_key] = is_trainable
                         if is_trainable:
-                            self.lrs[full_key] = lr
+                            self.lrs[full_key] = param_lr.get(k, lr)
                             lat_keys.append(full_key)
 
                 self.component_keys[canonical_name] = lat_keys
