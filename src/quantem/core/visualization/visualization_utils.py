@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -400,8 +401,11 @@ def add_scalebar_to_ax(
 
     if length_units % 1 == 0.0:
         label = f"{length_units:.0f} {units}"
-    else:
+    elif math.isclose(round(length_units, 2), length_units, rel_tol=1e-9):
         label = f"{length_units:.2f} {units}"
+    else:
+        # two decimals would round a length below a hundredth to zero
+        label = f"{length_units:g} {units}"
 
     if isinstance(loc, int):
         loc_codes = legend.Legend.codes

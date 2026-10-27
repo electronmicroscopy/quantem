@@ -98,19 +98,22 @@ class TestScalebar:
 
     def test_add_scalebar_to_ax(self, mock_fig_ax):
         fig, ax = mock_fig_ax
-        add_scalebar_to_ax(
-            ax,
-            array_size=100,
-            sampling=1.0,
-            length_units=10.0,
-            units="nm",
-            width_px=1,
-            pad_px=0.5,
-            color="white",
-            loc="lower right",
-        )
-        # Check if scalebar was added (this is a bit tricky to test directly)
-        assert len(ax.artists) > 0
+        # a unit outside the conversion maps is labelled as given, and a length below a
+        # hundredth, an X-ray detector's in 1/A, must not be rounded to zero
+        cases = {"10 nm": (10.0, "nm"), "0.50 mrad": (0.5, "mrad"), "0.001 Å⁻¹": (1e-3, "Å⁻¹")}
+        for expected, (length, units) in cases.items():
+            add_scalebar_to_ax(
+                ax,
+                array_size=100,
+                sampling=length / 20,
+                length_units=length,
+                units=units,
+                width_px=1,
+                pad_px=0.5,
+                color="white",
+                loc="lower right",
+            )
+            assert ax.artists[-1].txt_label.get_text() == expected, expected
 
 
 class TestColorbars:
