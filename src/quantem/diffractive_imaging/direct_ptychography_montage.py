@@ -16,6 +16,8 @@ from quantem.core.utils.validators import (
 )
 from quantem.diffractive_imaging.complex_probe import (
     FourierProbe,
+    LatticeOverlap,
+    _passively_rotate_grid,
     aberration_surface,
     aberration_surface_cartesian_gradients,
     gamma_factor,
@@ -49,7 +51,9 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
     preferred_float_dtype,
     scatter_add_convolve,
     scatter_add_splat,
+    signed_index,
     slice_depths,
+    smooth_fft_size,
     splat_and_convolve,
     splat_stack,
     unit_overlap,
@@ -60,6 +64,110 @@ from quantem.diffractive_imaging.direct_ptychography_base import DirectPtychogra
 
 # target number of (BF pixel, scan position) points per splat batch
 _DEFAULT_POINTS_PER_BATCH = 4_194_304
+#: (bright-field pixel, frequency) pairs per batch in the per-pixel pass of the correlation
+#: route's Gram, measured fastest at four million on CPU and MPS (one pixel per batch is three to
+#: four times slower)
+_GRAM_POINTS_PER_BATCH = 4_194_304
+#: canvas sub-lattices, fields of view along rows times along columns, up to which the
+#: correlation route places each frame on the whole canvas in Fourier space, exactly. Beyond
+#: it a frame's patch is cheaper: on a defocused electron probe at 16 the two cost about the same
+_CORRELATION_LATTICE_SUBLATTICES = 16
+#: probe fields of view per axis spanned by a correlation patch, centred on its position
+_CORRELATION_PATCH_FIELDS = 2
+_CORRELATION_PATCH_FLOOR = 1e-6
+
+
+def _reflect(x: torch.Tensor) -> torch.Tensor:
+    """``x(-n)`` on a periodic grid, over the last two axes."""
+    return torch.roll(torch.flip(x, dims=(-2, -1)), shifts=(1, 1), dims=(-2, -1))
+
+
+def _probe_support(modes):
+    """Where the summed mode power exceeds round-off, ``OVERLAP_FLOOR**2`` of its peak.
+
+    A probe refined by zero-padding returns its given values to round-off only, so the zeros
+    outside an aperture come back as 1e-14 of the peak rather than zero, and a test against
+    zero takes the whole detector: 2.5 times the frequencies an X-ray ring needs.
+    """
+    power = modes.abs().square().sum(0)
+    return power > OVERLAP_FLOOR**2 * power.max()
+
+
+def _read_onto_canvas(image, origin, step, rotation, canvas_shape, sampling, refine=2):
+    """``image`` read at the pixels of a canvas turned by ``rotation``, through a cubic spline.
+
+    ``image`` is sampled every ``step`` Angstrom per axis from ``origin``, in a frame where the
+    pixel ``(i, j)`` of the requested canvas, ``(i, j) * sampling`` from that canvas's corner,
+    sits at ``((i, j) * sampling) @ rotation``. Its spectrum is first cut to the requested
+    canvas's Nyquist box, turned into this frame, so that reading it at coarser pixels does not
+    alias. It is then refined ``refine`` times by zero-padding and divided by the transform of
+    the sampled cubic B-spline, so that the spline through the refined samples interpolates
+    them, and the spline is read at each requested pixel.
+    """
+    device, real = image.device, image.dtype
+    complex_dtype = torch.complex128 if real == torch.float64 else torch.complex64
+    n_rows, n_cols = image.shape
+    spectrum = torch.fft.fft2(image.to(complex_dtype))
+    q_rows = torch.as_tensor(np.fft.fftfreq(n_rows, step[0]), device=device, dtype=real)[:, None]
+    q_cols = torch.as_tensor(np.fft.fftfreq(n_cols, step[1]), device=device, dtype=real)[None, :]
+    # the canvas frequency of each, R q'
+    along_rows = q_rows * float(rotation[0, 0]) + q_cols * float(rotation[0, 1])
+    along_cols = q_rows * float(rotation[1, 0]) + q_cols * float(rotation[1, 1])
+    keep = (along_rows.abs() <= 0.5 / sampling[0] * (1 + 1e-9)) & (
+        along_cols.abs() <= 0.5 / sampling[1] * (1 + 1e-9)
+    )
+    spectrum = spectrum * keep
+    # an even size's Nyquist bin has no partner on the finer grid; the band stops short of it
+    if n_rows % 2 == 0:
+        spectrum[n_rows // 2] = 0
+    if n_cols % 2 == 0:
+        spectrum[:, n_cols // 2] = 0
+
+    fine = (refine * n_rows, refine * n_cols)
+    rows = torch.as_tensor(signed_index(n_rows) % fine[0], device=device)
+    cols = torch.as_tensor(signed_index(n_cols) % fine[1], device=device)
+    refined = torch.zeros(fine, device=device, dtype=complex_dtype)
+    refined[rows[:, None], cols[None, :]] = spectrum
+    spline = [
+        (
+            2
+            + torch.cos(
+                2 * math.pi * torch.as_tensor(np.fft.fftfreq(n), device=device, dtype=real)
+            )
+        )
+        / 3
+        for n in fine
+    ]
+    coefficients = torch.fft.ifft2(refined / (spline[0][:, None] * spline[1][None, :])).real
+    coefficients = coefficients * (refine * refine)
+
+    # each requested pixel, in refined pixels of this frame from its origin
+    i = np.arange(canvas_shape[0], dtype=np.float64)[:, None] * sampling[0]
+    j = np.arange(canvas_shape[1], dtype=np.float64)[None, :] * sampling[1]
+    u = (i * rotation[0, 0] + j * rotation[1, 0] - origin[0]) / (step[0] / refine)
+    v = (i * rotation[0, 1] + j * rotation[1, 1] - origin[1]) / (step[1] / refine)
+
+    taps = []
+    for coordinate, n in ((u, fine[0]), (v, fine[1])):
+        base = np.floor(coordinate)
+        t = torch.as_tensor(coordinate - base, device=device, dtype=real)
+        weights = (
+            (1 - t) ** 3 / 6,
+            (3 * t**3 - 6 * t**2 + 4) / 6,
+            (-3 * t**3 + 3 * t**2 + 3 * t + 1) / 6,
+            t**3 / 6,
+        )
+        index = [
+            torch.as_tensor((base.astype(np.int64) + offset) % n, device=device)
+            for offset in (-1, 0, 1, 2)
+        ]
+        taps.append((weights, index))
+    (row_weights, row_index), (col_weights, col_index) = taps
+    out = torch.zeros(u.shape, device=device, dtype=real)
+    for a in range(4):
+        for b in range(4):
+            out += row_weights[a] * col_weights[b] * coefficients[row_index[a], col_index[b]]
+    return out
 
 
 def _snap_to_integer(values: torch.Tensor, tolerance: float = 1e-4) -> torch.Tensor:
@@ -950,6 +1058,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         self._stencil_info = None
         self._corrected_amplitude = None
         self._residual = None
+        self._residual_unavailable = None
         self._noise_variance = None
 
     # ------------------------------------------------------------------
@@ -1172,10 +1281,18 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         """
         if kernel == "prlx":
             return "splat"
-        if convolution_mode not in ("auto", "fft", "stencil"):
+        if convolution_mode not in ("auto", "fft", "stencil", "correlation"):
             raise ValueError(
-                f"`convolution_mode` must be 'auto', 'fft' or 'stencil', got {convolution_mode!r}"
+                "`convolution_mode` must be 'auto', 'fft', 'stencil' or 'correlation', got "
+                f"{convolution_mode!r}"
             )
+        if convolution_mode == "correlation":
+            if sparse:
+                raise NotImplementedError(
+                    "`convolution_mode='correlation'` reads dense frames; build the montage "
+                    "with `from_dataset3d` or `from_dataset4d`."
+                )
+            return convolution_mode
         if sparse:
             if convolution_mode == "fft":
                 raise ValueError(
@@ -1968,12 +2085,16 @@ class DirectPtychographyMontage(DirectPtychographyBase):
 
             Neither applies to ``boundary="wrap"``, whose canvas is the scan grid.
         compute_variance : bool
-            Accumulate the sum of squares needed by :meth:`residual_loss`.
+            Accumulate what :meth:`residual_loss` needs: the sum of squares for ``prlx``, and
+            the residual's sums on the Fourier route of the weak-object kernels. Turning it off
+            skips them. ``ssb`` then accumulates only its own kernel, which saves about a
+            quarter of its time. ``obf`` still needs its normal equations, and ``wiener`` and
+            ``prior="ard"`` estimate the noise from the residual, so they keep it regardless.
         suppress_nyquist : bool
             Zero the Nyquist row and column of the phase-flip filter. Off by default, to
             match ``DirectPtychography``; turn it on for odd-order aberrations, where
             ``sign(sin(chi))`` is not symmetric and leaves a checkerboard artifact.
-        convolution_mode : {"auto", "fft", "stencil"}
+        convolution_mode : {"auto", "fft", "stencil", "correlation"}
             How the ``ssb`` / ``obf`` convolutions are evaluated.
 
             ``"fft"`` splats each bright-field image onto the canvas and multiplies by the
@@ -1999,6 +2120,17 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             With ``boundary="pad"`` the FFT route doubles the canvas and crops back, since a
             Fourier convolution is otherwise circular. That costs four times the transform
             area; ``boundary="wrap"`` wants the circular one anyway and pays nothing.
+
+            ``"correlation"`` sums OBF's numerator over scan positions rather than over
+            bright-field pixels: each frame is correlated with the probe on the detector and
+            enters the canvas at its exact position. Its cost follows the number of positions,
+            and the Gram, which depends only on the probe and the canvas, is cached between
+            calls, or built ahead of them by :meth:`precompute_gram`. It carries single-slice, pure-phase OBF only, and no residual. It pays when
+            bright-field pixels far outnumber positions, as in X-ray ptychography, 25 to 130
+            times faster than ``"fft"`` on two cSAXS scans, and on a scan refined well past its
+            step, 5 to 6 times faster on two sub-sampled electron scans at the full band. It is
+            exact when the detector is unrotated and the canvas spans at most 16 probe fields of
+            view; see :meth:`_reconstruct_correlation` for the other cases.
         probe_oversample : int
             How finely an empirical ``fourier_probe`` is refined before being sampled off its
             own reciprocal lattice, which a ``rotation_angle`` that is not a multiple of 90
@@ -2103,52 +2235,40 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         if num_slices > 1:
             slice_thicknesses = state.current_slice_thicknesses(slice_thicknesses)
         depths = slice_depths(num_slices, slice_thicknesses, device=self.device)
-        if upsampling_factor is None:
-            upsampling_factor = 1
-        upsampling_factor = math.ceil(upsampling_factor)
-
-        if bf_mask is None:
-            bf_mask = self.bf_mask
-        bf = self._return_bf_context(bf_mask)
-
-        if boundary is None:
-            boundary = self.boundary
-        if defocus_gradient is None:
-            defocus_gradient = self.defocus_gradient
-        if verbose and defocus_gradient is not None:
-            print(f"  defocus_gradient={tuple(defocus_gradient)!r} A/A,")
+        geometry = self._reconstruction_geometry(
+            bf_mask=bf_mask,
+            aberration_coefs=aberration_coefs,
+            rotation_angle=rotation_angle,
+            upsampling_factor=upsampling_factor,
+            boundary=boundary,
+            defocus_gradient=defocus_gradient,
+            pad_px=pad_px,
+            obj_origin=obj_origin,
+            obj_fov=obj_fov,
+        )
+        bf, upsampling_factor, boundary = (
+            geometry["bf"],
+            geometry["upsampling_factor"],
+            geometry["boundary"],
+        )
+        shifts_px, bf_weights = geometry["shifts_px"], geometry["bf_weights"]
+        delta_c10, defocus_rate_px = geometry["delta_c10"], geometry["defocus_rate_px"]
+        canvas_shape, canvas_origin, canvas_fov = (
+            geometry["canvas_shape"],
+            geometry["canvas_origin"],
+            geometry["canvas_fov"],
+        )
+        coords_base = geometry["coords_base"]
+        if verbose and geometry["defocus_gradient"] is not None:
+            print(f"  defocus_gradient={tuple(geometry['defocus_gradient'])!r} A/A,")
         if weight_normalize is None:
             # density correction matters for an ungridded scan; on a raster it would only
             # amplify noise at the low-weight edges of a padded canvas
             weight_normalize = not self.gridded_scan
 
-        shifts_px, bf_weights = self._return_shifts_px(
-            rotation_angle, aberration_coefs, bf.bf_mask, upsampling_factor
-        )
-
-        delta_c10 = self._return_delta_c10(defocus_gradient, aberration_coefs)
-        if delta_c10 is None:
-            defocus_rate_px = None
-        else:
-            defocus_rate_px = self._return_defocus_rate_px(
-                rotation_angle, bf.bf_mask, upsampling_factor, aberration_coefs
-            )
-
-        canvas_shape, canvas_origin, canvas_fov = self._return_canvas(
-            shifts_px,
-            upsampling_factor,
-            boundary,
-            pad_px,
-            defocus_rate_px,
-            delta_c10,
-            obj_origin=obj_origin,
-            obj_fov=obj_fov,
-        )
-
         if max_batch_size is None:
             max_batch_size = max(1, _DEFAULT_POINTS_PER_BATCH // max(self.num_positions, 1))
 
-        coords_base = self._positions_px * upsampling_factor - canvas_origin
         self._reset_reconstruction()
         self._kernel = kernel
 
@@ -2166,6 +2286,48 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             stencil_radius,
             sparse=self.sparse_frames and not collapse_icom,
         )
+        if mode == "correlation":
+            obj, bf_weights = self._reconstruct_correlation(
+                bf,
+                kernel=kernel,
+                obj_type=obj_type,
+                num_slices=num_slices,
+                prior=prior,
+                delta_c10=delta_c10,
+                rotation_angle=rotation_angle,
+                aberration_coefs=aberration_coefs,
+                canvas_shape=canvas_shape,
+                upsampling_factor=upsampling_factor,
+                coords_base=coords_base,
+                ridge=ridge,
+                probe_oversample=probe_oversample,
+            )
+            self._canvas_shape = canvas_shape
+            self._canvas_origin_px = canvas_origin
+            self._canvas_fov = canvas_fov
+            self._bf_weights = bf_weights
+            self._residual_unavailable = (
+                "convolution_mode='correlation' does not accumulate the residual's sums, which "
+                "are quadratic in the data at every detector pixel. Reconstruct with "
+                "convolution_mode='fft' to read it."
+            )
+            return self._finish_reconstruction(
+                obj,
+                None,
+                kernel=kernel,
+                aberration_coefs=aberration_coefs,
+                upsampling_factor=upsampling_factor,
+                q_lowpass=q_lowpass,
+                q_highpass=q_highpass,
+                butterworth_order=butterworth_order,
+                band_limit=band_limit,
+                parallax_flip_phase=parallax_flip_phase,
+                suppress_nyquist=suppress_nyquist,
+                obj_type=obj_type,
+                num_slices=num_slices,
+                depths=depths,
+            )
+
         stencil_offsets = stencil_weights = kernel_args = norm = None
         fft_shape = canvas_shape
 
@@ -2274,22 +2436,40 @@ class DirectPtychographyMontage(DirectPtychographyBase):
                 complex_dtype = (
                     torch.complex128 if real_dtype == torch.float64 else torch.complex64
                 )
-                sums = {
-                    "energy": torch.zeros(fft_shape, device=self.device, dtype=real_dtype),
-                    "gram": torch.zeros(
+                # only the sums something reads: SSB's own without the residual, the normal
+                # equations for the solved kernels, and the residual's when it is asked for or
+                # a noise estimate needs it
+                if compute_variance or kernel == "wiener" or prior is not None:
+                    accumulate = "residual"
+                else:
+                    accumulate = "kernel" if kernel == "ssb" else "normal"
+                sums = {}
+                if accumulate != "kernel":
+                    sums["gram"] = torch.zeros(
                         (*fft_shape, num_columns, num_columns),
                         device=self.device,
                         dtype=complex_dtype,
-                    ),
-                    "numerator": torch.zeros(
+                    )
+                    sums["numerator"] = torch.zeros(
                         (*fft_shape, num_columns), device=self.device, dtype=complex_dtype
-                    ),
-                    "weighted_energy": torch.zeros(
+                    )
+                if accumulate == "residual":
+                    sums["weighted_energy"] = torch.zeros(
                         fft_shape, device=self.device, dtype=real_dtype
-                    ),
-                }
-                if num_columns == 1:
-                    sums["residual_gram"] = torch.zeros_like(sums["gram"])
+                    )
+                    if num_columns == 1:
+                        sums["residual_gram"] = torch.zeros_like(sums["gram"])
+                # an array probe refined onto the canvas lattice is read by integer offsets
+                # found once, rather than by FourierProbe.at per batch and per mode
+                lattice = None
+                if gram_probe.array is not None and gram_probe.interpolation == "exact":
+                    lattice = LatticeOverlap(
+                        gram_probe,
+                        gram_kxa[bf.bf_inds_i, bf.bf_inds_j],
+                        gram_kya[bf.bf_inds_i, bf.bf_inds_j],
+                        gram_qxa,
+                        gram_qya,
+                    )
                 if kernel == "ssb":
                     sums["phase"] = torch.zeros(fft_shape, device=self.device, dtype=complex_dtype)
                     if complex_obj:
@@ -2421,8 +2601,13 @@ class DirectPtychographyMontage(DirectPtychographyBase):
                         complex_obj,
                         aperture_floor,
                         peak_amplitude**2,
+                        overlap=(
+                            None
+                            if lattice is None
+                            else lattice(batch_idx, magnitudes=kernel == "ssb" and complex_obj)
+                        ),
+                        accumulate=accumulate,
                     )
-                    terms["energy"] = spectra.abs().square().sum(0)
                     for key, term in terms.items():
                         sums[key] = sums[key] + term
                 elif two_channel_fft:
@@ -2562,7 +2747,13 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             obj = torch.fft.ifft2(phase_q).real[crop]
             if amplitude_q is not None:
                 amplitude = torch.fft.ifft2(amplitude_q).real[crop]
-            self._residual = float(self._residual_from_sums(channel_ctx, sums))
+            if accumulate == "residual":
+                self._residual = float(self._residual_from_sums(channel_ctx, sums))
+            else:
+                self._residual_unavailable = (
+                    "This reconstruction ran with compute_variance=False, which skips the sums "
+                    "the residual needs. Reconstruct with compute_variance=True to read it."
+                )
         elif kernel != "prlx":
             if mode == "fft":
                 accumulator = torch.fft.ifft2(accumulator)
@@ -2594,6 +2785,42 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             else:
                 obj = self._sum_wv.reshape(canvas_shape) / bf_weights
 
+        return self._finish_reconstruction(
+            obj,
+            amplitude,
+            kernel=kernel,
+            aberration_coefs=aberration_coefs,
+            upsampling_factor=upsampling_factor,
+            q_lowpass=q_lowpass,
+            q_highpass=q_highpass,
+            butterworth_order=butterworth_order,
+            band_limit=band_limit,
+            parallax_flip_phase=parallax_flip_phase,
+            suppress_nyquist=suppress_nyquist,
+            obj_type=obj_type,
+            num_slices=num_slices,
+            depths=depths,
+        )
+
+    def _finish_reconstruction(
+        self,
+        obj,
+        amplitude,
+        *,
+        kernel,
+        aberration_coefs,
+        upsampling_factor,
+        q_lowpass,
+        q_highpass,
+        butterworth_order,
+        band_limit,
+        parallax_flip_phase,
+        suppress_nyquist,
+        obj_type,
+        num_slices,
+        depths,
+    ):
+        """The post-hoc Fourier filters and the stored state, shared by every route."""
         obj = self._apply_fourier_filters(
             obj,
             aberration_coefs=aberration_coefs,
@@ -2636,6 +2863,733 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         gc.collect()
 
         return self
+
+    def _reconstruction_geometry(
+        self,
+        *,
+        bf_mask,
+        aberration_coefs,
+        rotation_angle,
+        upsampling_factor,
+        boundary,
+        defocus_gradient,
+        pad_px,
+        obj_origin,
+        obj_fov,
+    ):
+        """Where the frames land, as ``reconstruct`` and ``precompute_gram`` resolve it.
+
+        A dict of the bright-field context ``bf``, the integer ``upsampling_factor``, the
+        ``boundary`` and ``defocus_gradient`` in effect, the parallax ``shifts_px`` with their
+        ``bf_weights``, the per-position defocus terms ``delta_c10`` and ``defocus_rate_px``,
+        the canvas, and the positions on it, ``coords_base``.
+        """
+        upsampling_factor = math.ceil(1 if upsampling_factor is None else upsampling_factor)
+        bf = self._return_bf_context(self.bf_mask if bf_mask is None else bf_mask)
+        boundary = self.boundary if boundary is None else boundary
+        if defocus_gradient is None:
+            defocus_gradient = self.defocus_gradient
+
+        shifts_px, bf_weights = self._return_shifts_px(
+            rotation_angle, aberration_coefs, bf.bf_mask, upsampling_factor
+        )
+        delta_c10 = self._return_delta_c10(defocus_gradient, aberration_coefs)
+        if delta_c10 is None:
+            defocus_rate_px = None
+        else:
+            defocus_rate_px = self._return_defocus_rate_px(
+                rotation_angle, bf.bf_mask, upsampling_factor, aberration_coefs
+            )
+        canvas_shape, canvas_origin, canvas_fov = self._return_canvas(
+            shifts_px,
+            upsampling_factor,
+            boundary,
+            pad_px,
+            defocus_rate_px,
+            delta_c10,
+            obj_origin=obj_origin,
+            obj_fov=obj_fov,
+        )
+        return dict(
+            bf=bf,
+            upsampling_factor=upsampling_factor,
+            boundary=boundary,
+            defocus_gradient=defocus_gradient,
+            shifts_px=shifts_px,
+            bf_weights=bf_weights,
+            delta_c10=delta_c10,
+            defocus_rate_px=defocus_rate_px,
+            canvas_shape=canvas_shape,
+            canvas_origin=canvas_origin,
+            canvas_fov=canvas_fov,
+            coords_base=self._positions_px * upsampling_factor - canvas_origin,
+        )
+
+    def precompute_gram(
+        self,
+        upsampling_factor=None,
+        obj_origin=None,
+        obj_fov=None,
+        bf_mask=None,
+        override_aberration_coefs=None,
+        override_rotation_angle=None,
+        boundary=None,
+        pad_px=None,
+        probe_oversample=8,
+    ):
+        """Build the Gram ``reconstruct(convolution_mode="correlation")`` needs, and cache it.
+
+        OBF divides each spatial frequency by the Gram ``sum_k |c_k(q)|^2``, which depends on
+        the probe, the bright-field mask, the detector rotation and the canvas, and not on the
+        diffraction data. It is most of the cost of a first reconstruction on a fine canvas, so
+        building it here, before the data are reconstructed, leaves every later call with the
+        same arguments only the per-position work. Pass the arguments ``reconstruct`` will get;
+        a call whose probe, mask, rotation or canvas differs builds a new Gram, and only one is
+        cached at a time.
+
+        Parameters
+        ----------
+        upsampling_factor, obj_origin, obj_fov, bf_mask, override_aberration_coefs, override_rotation_angle, boundary, pad_px, probe_oversample
+            As for :meth:`reconstruct`.
+
+        Returns
+        -------
+        self
+        """
+        state = self.hyperparameter_state
+        aberration_coefs = state.current_aberrations(override_aberration_coefs)
+        rotation_angle = state.current_rotation_angle(override_rotation_angle)
+        geometry = self._reconstruction_geometry(
+            bf_mask=bf_mask,
+            aberration_coefs=aberration_coefs,
+            rotation_angle=rotation_angle,
+            upsampling_factor=upsampling_factor,
+            boundary=boundary,
+            defocus_gradient=None,
+            pad_px=pad_px,
+            obj_origin=obj_origin,
+            obj_fov=obj_fov,
+        )
+        self._correlation_setup(
+            geometry["bf"],
+            delta_c10=geometry["delta_c10"],
+            rotation_angle=rotation_angle,
+            aberration_coefs=aberration_coefs,
+            canvas_shape=geometry["canvas_shape"],
+            upsampling_factor=geometry["upsampling_factor"],
+            coords_base=geometry["coords_base"],
+            probe_oversample=probe_oversample,
+        )
+        return self
+
+    # ------------------------------------------------------------------
+    # correlation route
+    # ------------------------------------------------------------------
+
+    def _reconstruct_correlation(
+        self,
+        bf,
+        *,
+        kernel,
+        obj_type,
+        num_slices,
+        prior,
+        delta_c10,
+        rotation_angle,
+        aberration_coefs,
+        canvas_shape,
+        upsampling_factor,
+        coords_base,
+        ridge,
+        probe_oversample,
+    ):
+        """``(obj, bf_weights)`` for OBF, summed over scan positions rather than detector pixels.
+
+        The OBF numerator ``b(q) = sum_k c_k*(q) G_k(q)`` is a double sum, over detector pixels
+        and over scan positions. The FFT route transforms each bright-field image over the scan
+        and contracts over ``k`` afterwards, one canvas FFT per pixel. Here the contraction comes
+        first, frame by frame. ``c_k*(q)`` is a product of the probe at ``k`` and at ``k -/+ q``,
+        so ``sum_k c_k*(q) V_R(k)`` is a cross-correlation over the detector, which one padded
+        detector FFT per mode gives on the detector's own lattice of ``q``. A lattice ``m`` times
+        finer per axis takes ``m^2`` sub-lattices, each a correlation against the probe shifted
+        by ``s / m`` of a pixel, which the probe refined by zero-padding in real space supplies
+        exactly, as it does for the FFT route.
+
+        The frames land on a canvas aligned with the detector, ``m`` probe fields of view wide
+        per axis, so that its lattice is the detector's refined ``m`` times. That is the
+        requested canvas itself when the detector is not rotated and the canvas already spans a
+        whole number of fields of view. Otherwise it covers the requested canvas, turned into
+        the detector frame, with a margin, and the image is read onto the requested canvas at
+        the end through a cubic spline, after refining it twice by zero-padding. The Gram is
+        evaluated on that canvas's lattice exactly; see :meth:`_correlation_gram`.
+
+        Each frame then reaches the canvas in one of two ways. With ``m_r m_c`` at most 16, on
+        the lattice: every sub-lattice is correlated and the frame enters through its exact
+        plane wave ``exp(-2 pi i q . r_R)``, at ``2M + m^2`` padded detector FFTs per frame for
+        ``M`` modes. Nothing is approximated but the final reading. This is the X-ray case,
+        where a few fields of view span the scan. With more, as a patch: in real space a frame
+        contributes the probe times its own back-transformed wave, which the probe confines
+        mostly to a window of two fields of view about the position. It is evaluated there from
+        two sub-lattices per axis, shifted by the sub-pixel part of the position in Fourier
+        space, and added onto the canvas, which costs one FFT at the end. A frame then costs the
+        same at any canvas size or upsampling. What the probe leaves outside the window, the
+        diffraction tails of a sharp aperture, is the patch's error: about 1% of the numerator
+        on a defocused electron probe, rising towards the band's edge. Where the Gram falls
+        below a millionth of its peak, past the aperture's edge, that error is all the
+        numerator would hold, so it is set to zero there.
+
+        Away from the requested canvas itself, the detector-aligned canvas is not periodic in
+        the scan, so near the edges of a ``boundary="wrap"`` canvas the image lacks what the FFT
+        route wraps around from the opposite edge.
+        """
+        if kernel != "obf":
+            raise ValueError(
+                f"convolution_mode='correlation' carries the 'obf' kernel only, got {kernel!r}. "
+                "Its contraction over the detector is a correlation because OBF's kernel is a "
+                "product of probe values; SSB divides each (k, q) by |Gamma|, which is not."
+            )
+        if obj_type != "pure_phase" or int(num_slices) != 1 or prior is not None:
+            raise NotImplementedError(
+                "convolution_mode='correlation' solves single-slice, pure-phase OBF without a "
+                "prior. Use convolution_mode='fft' for complex objects, slices or prior='ard'."
+            )
+        setup = self._correlation_setup(
+            bf,
+            delta_c10=delta_c10,
+            rotation_angle=rotation_angle,
+            aberration_coefs=aberration_coefs,
+            canvas_shape=canvas_shape,
+            upsampling_factor=upsampling_factor,
+            coords_base=coords_base,
+            probe_oversample=probe_oversample,
+        )
+        refined_modes = setup.pop("refined_modes")
+        real_dtype, complex_dtype = setup["real_dtype"], setup["complex_dtype"]
+        upsampled, fields, reach = setup["upsampled"], setup["fields"], setup["reach"]
+        layout, gram, canvas_lags = setup["layout"], setup["gram"], setup["canvas_lags"]
+        multiples, inner_shape, grid_step = layout["multiples"], layout["shape"], layout["step"]
+        on_lattice = layout["placement"] == "lattice"
+
+        if on_lattice:
+            sub, grid_shape, lags = multiples, inner_shape, canvas_lags
+        else:
+            per_fov = layout["per_fov"]
+            sub, grid_shape = fields, tuple(int(v) for v in fields * per_fov)  # the patch
+            # a correlation vanishes beyond 2 * reach lags, and a sub-lattice adds under one
+            lags = tuple(int(v) for v in np.minimum(per_fov // 2 + 1, 2 * reach + 2))
+        _, modes = refined_modes(sub)
+        del refined_modes  # and with it every refined probe but the one in use
+        operands = self._lattice_operands(modes, sub, grid_shape, lags)
+        sublattices, padded, to_grid = (
+            operands["sublattices"],
+            operands["padded"],
+            operands["to_grid"],
+        )
+        shifted, psi = operands["shifted"], operands["psi"]
+        signed_rows = torch.as_tensor(signed_index(int(self.gpts[0])), device=self.device)
+        signed_cols = torch.as_tensor(signed_index(int(self.gpts[1])), device=self.device)
+        bf_rows = signed_rows[bf.bf_inds_i] % padded[0]
+        bf_cols = signed_cols[bf.bf_inds_j] % padded[1]
+        bf_weights = psi.abs().square().sum(0)[bf_rows, bf_cols].sum()
+
+        conj_a_hat = {s: torch.fft.fft2(shifted[-1][s]).conj() for s in sublattices}
+        b_hat = {s: torch.fft.fft2(shifted[1][s]) for s in sublattices}
+        values = self._vbf_stack[bf.vbf_index_mapping]
+        num_frames = int(values.shape[1])
+
+        def contractions(lo, hi):
+            """``sum_k c_k*(q) V_R(k)`` on the grid, for the frames ``lo:hi``."""
+            frames = torch.zeros((hi - lo, *padded), device=self.device, dtype=complex_dtype)
+            frames[:, bf_rows, bf_cols] = values[:, lo:hi].T.to(complex_dtype)
+            spectra = {s: 0 for s in sublattices}
+            for mode in range(modes.shape[0]):
+                f_hat = torch.fft.fft2(frames * psi[mode])
+                # B(q) = sum_k psi(k + q) psi*(k) V(k) reads the spectrum at -nu
+                g_hat = _reflect(torch.fft.fft2(frames * psi[mode].conj()))
+                for s in sublattices:
+                    spectra[s] = spectra[s] + conj_a_hat[s][mode] * f_hat - b_hat[s][mode] * g_hat
+            return to_grid({s: torch.fft.ifft2(spectra[s]) for s in sublattices})
+
+        def ramps(frequencies, offsets):
+            return torch.exp(-2j * math.pi * frequencies[None, :] * offsets[:, None]).to(
+                complex_dtype
+            )
+
+        q_rows, q_cols = (
+            torch.as_tensor(np.fft.fftfreq(n, d), device=self.device, dtype=real_dtype)
+            for n, d in zip(grid_shape, grid_step)
+        )
+        sublattice_points = len(sublattices) * padded[0] * padded[1]
+        grid_points = grid_shape[0] * grid_shape[1]
+        if on_lattice:
+            positions = torch.as_tensor(
+                layout["positions"] * grid_step, device=self.device, dtype=real_dtype
+            )
+            numerator = torch.zeros(grid_shape, device=self.device, dtype=complex_dtype)
+            batch = max(
+                1,
+                min(
+                    _DEFAULT_POINTS_PER_BATCH * 4 // sublattice_points,
+                    _DEFAULT_POINTS_PER_BATCH * 8 // grid_points,
+                ),
+            )
+            for lo in range(0, num_frames, batch):
+                hi = min(lo + batch, num_frames)
+                placed = contractions(lo, hi) * ramps(q_rows, positions[lo:hi, 0])[:, :, None]
+                numerator += (placed * ramps(q_cols, positions[lo:hi, 1])[:, None, :]).sum(0)
+        else:
+            base = np.round(layout["positions"])
+            fraction = torch.as_tensor(
+                (layout["positions"] - base) * grid_step, device=self.device, dtype=real_dtype
+            )
+            base = torch.as_tensor(base.astype(np.int64), device=self.device)
+            offset_rows = torch.as_tensor(signed_index(grid_shape[0]), device=self.device)
+            offset_cols = torch.as_tensor(signed_index(grid_shape[1]), device=self.device)
+            # real and imaginary parts side by side, which index_add_ takes on every device
+            canvas = torch.zeros(
+                (inner_shape[0] * inner_shape[1], 2), device=self.device, dtype=real_dtype
+            )
+            batch = max(
+                1,
+                min(
+                    _DEFAULT_POINTS_PER_BATCH * 4 // sublattice_points,
+                    _DEFAULT_POINTS_PER_BATCH * 2 // grid_points,
+                ),
+            )
+            for lo in range(0, num_frames, batch):
+                hi = min(lo + batch, num_frames)
+                # the sub-pixel part of each position, as a phase on the patch's own lattice
+                patch = contractions(lo, hi) * ramps(q_rows, fraction[lo:hi, 0])[:, :, None]
+                patch = torch.fft.ifft2(patch * ramps(q_cols, fraction[lo:hi, 1])[:, None, :])
+                rows = (base[lo:hi, 0:1] + offset_rows[None, :]) % inner_shape[0]
+                cols = (base[lo:hi, 1:2] + offset_cols[None, :]) % inner_shape[1]
+                flat = rows[:, :, None] * inner_shape[1] + cols[:, None, :]
+                canvas.index_add_(0, flat.reshape(-1), torch.view_as_real(patch).reshape(-1, 2))
+            numerator = torch.fft.fft2(torch.view_as_complex(canvas.view(*inner_shape, 2)))
+            del canvas
+            numerator = torch.where(gram > _CORRELATION_PATCH_FLOOR * gram.max(), numerator, 0)
+
+        sums = {"gram": gram.to(complex_dtype)[..., None, None], "numerator": numerator[..., None]}
+        channel_ctx = {"kernel": kernel, "bf": bf, "bf_weights": bf_weights}
+        phase_q, _ = self._fourier_channels(channel_ctx, sums, 1, obj_type, ridge, None, None)
+        obj = torch.fft.ifft2(phase_q).real
+        if layout["rotation"] is not None:
+            obj = _read_onto_canvas(
+                obj[0], layout["origin"], grid_step, layout["rotation"], canvas_shape, upsampled
+            )[None]
+            # the inverse transform divides by the pixel count, so the same coefficients give an
+            # image proportional to the pixel area; and the requested canvas holds only part of
+            # the inner one, whose mean is zero, so its own mean is set to zero as the solve
+            # sets every other route's
+            obj = obj * float(np.prod(upsampled) / np.prod(grid_step))
+            obj = obj - obj.mean()
+        return obj, bf_weights
+
+    def _correlation_setup(
+        self,
+        bf,
+        *,
+        delta_c10,
+        rotation_angle,
+        aberration_coefs,
+        canvas_shape,
+        upsampling_factor,
+        coords_base,
+        probe_oversample,
+    ):
+        """The probe, the canvas layout and the Gram the correlation route works with.
+
+        The Gram comes from the cache when the probe, mask, rotation and canvas match, and is
+        built and cached otherwise. ``refined_modes(factor)`` gives the probe refined ``factor``
+        times, and holds on to every refinement it has made until it is dropped.
+        """
+        if delta_c10 is not None:
+            raise NotImplementedError(
+                "convolution_mode='correlation' does not take a `defocus_gradient`, which "
+                "gives every position its own kernel; use convolution_mode='fft'."
+            )
+        probe = self._return_probe(aberration_coefs)
+        if probe.is_partially_coherent:
+            raise NotImplementedError(
+                "convolution_mode='correlation' does not take `focal_spread` or "
+                "`source_size`; describe the incoherence with probe modes instead."
+            )
+
+        real_dtype = preferred_float_dtype(self.device)
+        # the device's own precision throughout: the numerator's A and B are full correlations
+        # whose difference is the weak signal, so complex64 loses digits to the cancellation the
+        # FFT route, subtracting per (k, q), does not suffer (1e-4 against 2e-5 on a weak object)
+        complex_dtype = torch.complex128 if real_dtype == torch.float64 else torch.complex64
+        upsampled = np.asarray(self.scan_sampling, dtype=np.float64) / upsampling_factor
+        detector_step = 1 / (np.asarray(self.gpts) * np.asarray(self.sampling, dtype=np.float64))
+        fov = 1 / detector_step
+        fields = np.full(2, _CORRELATION_PATCH_FIELDS)
+
+        refined_cache = {}
+
+        def refined_modes(factor):
+            key = tuple(int(v) for v in factor)
+            if key not in refined_cache:
+                refined = self._correlation_probe(
+                    probe, detector_step, np.asarray(key), rotation_angle, probe_oversample
+                )
+                modes = refined.modes if refined.modes is not None else refined.array[None]
+                refined_cache[key] = (refined, modes.to(self.device, complex_dtype))
+            return refined_cache[key]
+
+        _, patch_modes = refined_modes(fields)
+        reach = self._correlation_reach(bf, patch_modes, fields)
+        layout = self._correlation_layout(
+            canvas_shape, upsampled, fov, reach, fields, rotation_angle, coords_base
+        )
+        multiples, inner_shape, grid_step = layout["multiples"], layout["shape"], layout["step"]
+
+        # the Gram on the canvas's own lattice, exactly
+        key = self._correlation_gram_key(
+            aberration_coefs, rotation_angle, inner_shape, grid_step, probe_oversample
+        )
+        gram = self._cached_correlation_gram(key, bf)
+        canvas_lags = tuple(int(n) // 2 // int(m) + 1 for n, m in zip(inner_shape, multiples))
+        if gram is None:
+            gram_refined, gram_modes = refined_modes(multiples)
+            operands = self._lattice_operands(gram_modes, multiples, inner_shape, canvas_lags)
+            gram = self._correlation_gram(
+                bf, gram_refined, operands, inner_shape, grid_step, real_dtype
+            )
+            self._correlation_gram_cache = {
+                "key": key,
+                "mapping": bf.vbf_index_mapping.clone(),
+                "gram": gram,
+            }
+            del operands
+
+        return dict(
+            real_dtype=real_dtype,
+            complex_dtype=complex_dtype,
+            upsampled=upsampled,
+            fields=fields,
+            refined_modes=refined_modes,
+            reach=reach,
+            layout=layout,
+            gram=gram,
+            canvas_lags=canvas_lags,
+        )
+
+    def _correlation_reach(self, bf, modes, sub):
+        """``(2,)`` detector pixels from ``k = 0`` to the edge of the probe or bright field, per axis."""
+        support = _probe_support(modes)
+        reach = []
+        for axis, bf_index in ((0, bf.bf_inds_i), (1, bf.bf_inds_j)):
+            n = int(self.gpts[axis])
+            refined_index = torch.as_tensor(signed_index(n * int(sub[axis])), device=self.device)
+            line = support.any(dim=1 - axis)
+            probe_reach = float(refined_index[line].abs().max()) / sub[axis]
+            signed = torch.as_tensor(signed_index(n), device=self.device)
+            reach.append(max(math.ceil(probe_reach), int(signed[bf_index].abs().max())))
+        return np.asarray(reach)
+
+    def _correlation_layout(
+        self, canvas_shape, sampling, fov, reach, fields, rotation_angle, coords_base
+    ):
+        """Where the correlation route works, as a dict.
+
+        ``multiples`` probe fields of view per axis span the canvas the frames land on, of
+        ``shape`` pixels ``step`` wide, ``per_fov`` to a field of view, with the positions in
+        its pixels. ``placement`` is ``"lattice"`` for at most
+        ``_CORRELATION_LATTICE_SUBLATTICES`` sub-lattices, else ``"patch"``. When that canvas
+        is the requested one, unrotated, ``rotation`` is ``None`` and it is periodic in the scan
+        as the FFT route's is. Otherwise it covers the requested canvas turned into the detector
+        frame, centred, with room per side for half a probe field of view, or half a patch's
+        ``fields``, so that nothing wraps back onto it, and ``origin`` is its corner there, in
+        Angstrom.
+        """
+        positions = to_numpy(coords_base).astype(np.float64)
+        # pixels per field of view that hold the whole band, which a patch needs
+        band = 4 * reach + 1
+        native = fov / sampling
+        turns = float(rotation_angle) / 360.0
+        if abs(turns - round(turns)) < 1e-9 and np.allclose(native, np.round(native), rtol=1e-6):
+            per_fov = np.round(native).astype(int)
+            if all(int(n) % int(p) == 0 for n, p in zip(canvas_shape, per_fov)):
+                multiples = np.asarray(canvas_shape) // per_fov
+                lattice = int(np.prod(multiples)) <= _CORRELATION_LATTICE_SUBLATTICES
+                if lattice or bool(np.all(per_fov >= band)):
+                    return dict(
+                        placement="lattice" if lattice else "patch",
+                        multiples=multiples,
+                        per_fov=per_fov,
+                        shape=tuple(int(n) for n in canvas_shape),
+                        step=fov / per_fov,
+                        origin=np.zeros(2),
+                        rotation=None,
+                        positions=positions,
+                    )
+
+        # a pixel's scan-frame frequency is R times its detector-frame one, so a position p
+        # sits at R^T p in the detector frame, which for row vectors is p @ R
+        theta = math.radians(float(rotation_angle))
+        rotation = np.array(
+            [[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]]
+        )
+        extent = np.asarray(canvas_shape, dtype=np.float64) * sampling
+        corners = np.array([[0, 0], [extent[0], 0], [0, extent[1]], extent]) @ rotation
+        span = corners.max(0) - corners.min(0)
+        multiples = np.ceil(span / fov + 1 - 1e-9).astype(int)
+        lattice = int(np.prod(multiples)) <= _CORRELATION_LATTICE_SUBLATTICES
+        if not lattice:
+            multiples = np.ceil(span / fov + fields - 1e-9).astype(int)
+        # pixels no coarser than the requested ones, and fine enough for the requested canvas's
+        # Nyquist box turned into this frame, though never beyond the band
+        turned = fov * (
+            np.abs(rotation[0, :]) / sampling[0] + np.abs(rotation[1, :]) / sampling[1]
+        )
+        per_fov = np.maximum(np.ceil(native - 1e-6), np.minimum(np.ceil(turned - 1e-6), band))
+        if not lattice:
+            per_fov = np.maximum(per_fov, band)
+        per_fov = per_fov.astype(int)
+        step = fov / per_fov
+        # centred to a whole pixel, so that an unrotated canvas with the same pixels is read
+        # at whole pixels, which the spline reproduces exactly
+        origin = corners.min(0) - np.round((multiples * fov - span) / 2 / step) * step
+        return dict(
+            placement="lattice" if lattice else "patch",
+            multiples=multiples,
+            per_fov=per_fov,
+            shape=tuple(int(v) for v in multiples * per_fov),
+            step=step,
+            origin=origin,
+            rotation=rotation,
+            positions=(positions * sampling @ rotation - origin) / step,
+        )
+
+    def _lattice_operands(self, modes, sub, grid_shape, lags):
+        """What a correlation onto a grid whose lattice is ``sub`` times the detector's needs.
+
+        ``padded`` is the detector grid, padded so that no lag up to ``lags`` wraps;
+        ``shifted[sign][s]`` holds ``psi_m(k + sign * s dk / sub)`` on it, ``psi`` the unshifted
+        modes; and ``to_grid`` maps per-sub-lattice correlations onto the grid, zero beyond
+        ``lags``, where nothing reaches.
+        """
+        gpts = np.asarray(self.gpts)
+        padded = (
+            smooth_fft_size(int(gpts[0]) + lags[0] + 1),
+            smooth_fft_size(int(gpts[1]) + lags[1] + 1),
+        )
+        sublattices = [(a, b) for a in range(int(sub[0])) for b in range(int(sub[1]))]
+        shifted = {
+            sign: {
+                s: self._sublattice_probe(modes, gpts, sub, s, sign, padded) for s in sublattices
+            }
+            for sign in (-1, 1)
+        }
+
+        # the grid's lattice index -> (sub-lattice, detector lag) per axis
+        def lookup(n, factor, size, protected):
+            index = signed_index(n)
+            lag = index // factor
+            flat = (index % factor) * size + lag % size
+            return (
+                torch.as_tensor(flat, device=self.device),
+                torch.as_tensor(np.abs(lag) <= protected, device=self.device),
+            )
+
+        row_lookup, row_kept = lookup(grid_shape[0], int(sub[0]), padded[0], lags[0])
+        col_lookup, col_kept = lookup(grid_shape[1], int(sub[1]), padded[1], lags[1])
+        kept = row_kept[:, None] & col_kept[None, :]
+        everything_kept = bool(kept.all())
+
+        def to_grid(per_sublattice):
+            stack = torch.stack([per_sublattice[s] for s in sublattices], 0)
+            lead = stack.shape[1:-2]
+            stack = stack.view(int(sub[0]), int(sub[1]), *lead, *padded)
+            stack = stack.movedim((0, 1), (-4, -2))
+            stack = stack.reshape(*lead, int(sub[0]) * padded[0], int(sub[1]) * padded[1])
+            out = stack.index_select(-2, row_lookup).index_select(-1, col_lookup)
+            return out if everything_kept else out * kept
+
+        return {
+            "padded": padded,
+            "sublattices": sublattices,
+            "shifted": shifted,
+            "psi": shifted[-1][(0, 0)],
+            "to_grid": to_grid,
+        }
+
+    def _correlation_probe(self, probe, detector_step, m, rotation_angle=0.0, oversample=8):
+        """The probe in the detector frame, on a lattice ``m`` times finer than the detector's.
+
+        The other routes read the probe at the scan-frame frequency of each detector pixel,
+        ``R k`` for a detector turned by ``R``. An analytic probe is evaluated there. An array
+        probe is refined by zero-padding in real space, which is exact, and read there: exactly
+        when the rotation maps its lattice onto itself, and otherwise bilinearly from a further
+        ``oversample`` refinement, as the FFT route reads it.
+        """
+        target = detector_step / m
+        turns = float(rotation_angle) / 360.0
+        unrotated = abs(turns - round(turns)) < 1e-9
+        if probe.array is not None and unrotated:
+            return probe.resampled_to(tuple(float(v) for v in target))
+
+        shape = tuple(int(n * f) for n, f in zip(self.gpts, m))
+        kx = torch.as_tensor(signed_index(shape[0]) * target[0], dtype=torch.float32)
+        ky = torch.as_tensor(signed_index(shape[1]) * target[1], dtype=torch.float32)
+        kxa, kya = torch.meshgrid(kx.to(self.device), ky.to(self.device), indexing="ij")
+        if not unrotated:
+            kxa, kya = _passively_rotate_grid(
+                kxa, kya, _rotation_degrees_to_radians(rotation_angle)
+            )
+        sampling = tuple(float(v) for v in target)
+        if probe.array is None:
+            return FourierProbe(
+                self.wavelength, array=probe.at(kxa, kya), reciprocal_sampling=sampling
+            )
+
+        exact = self._probe_rotation_is_exact(rotation_angle)
+        refinement = 1 if exact else max(1, int(oversample))
+        if not exact and refinement < 8:
+            warnings.warn(
+                f"rotation_angle={rotation_angle} takes the detector off the probe's reciprocal "
+                f"lattice, so psi is read bilinearly; at probe_oversample={refinement} that "
+                "costs a few percent on a speckled probe.",
+                stacklevel=4,
+            )
+        source = probe if exact else probe.with_interpolation("bilinear")
+        source = source.resampled_to(tuple(v / refinement for v in sampling))
+        values = torch.stack(
+            [mode.to(self.device).at(kxa, kya) for mode in source.coherent_modes()]
+        )
+        if probe.modes is None:
+            return FourierProbe(self.wavelength, array=values[0], reciprocal_sampling=sampling)
+        return FourierProbe(self.wavelength, modes=values, reciprocal_sampling=sampling)
+
+    def _sublattice_probe(self, modes, gpts, m, sublattice, sign, padded):
+        """``psi_m(k + sign * s dk / m)`` at every detector lattice point, on the padded grid.
+
+        Read from the refined modes; zero where the shifted point leaves the refined grid, as
+        :class:`~quantem.diffractive_imaging.complex_probe.LatticeOverlap` reads it.
+        """
+        picks = []
+        for axis in (0, 1):
+            n, factor = int(gpts[axis]), int(m[axis])
+            index = factor * signed_index(n) + sign * sublattice[axis]
+            valid = (index >= -(n * factor // 2)) & (index < (n * factor + 1) // 2)
+            picks.append((torch.as_tensor(index % (n * factor)), torch.as_tensor(valid)))
+        (row_index, row_valid), (col_index, col_valid) = picks
+        values = modes[:, row_index.to(modes.device)[:, None], col_index.to(modes.device)[None, :]]
+        mask = (row_valid[:, None] & col_valid[None, :]).to(modes.device)
+        out = torch.zeros((modes.shape[0], *padded), dtype=modes.dtype, device=modes.device)
+        rows = torch.as_tensor(signed_index(int(gpts[0])) % padded[0], device=modes.device)
+        cols = torch.as_tensor(signed_index(int(gpts[1])) % padded[1], device=modes.device)
+        out[:, rows[:, None], cols[None, :]] = values * mask
+        return out
+
+    def _correlation_gram_key(
+        self, aberration_coefs, rotation_angle, grid_shape, grid_step, probe_oversample
+    ):
+        return (
+            self.fourier_probe,
+            tuple(sorted((k, float(v)) for k, v in aberration_coefs.items()))
+            if self.fourier_probe is None
+            else None,
+            float(rotation_angle),
+            tuple(int(n) for n in grid_shape),
+            tuple(float(v) for v in grid_step),
+            # an array probe read off its lattice is refined this many times first
+            int(probe_oversample),
+            str(self.device),
+        )
+
+    def _cached_correlation_gram(self, key, bf):
+        """The Gram cached under ``key`` for this bright-field mask, or ``None``."""
+        cached = getattr(self, "_correlation_gram_cache", None)
+        if (
+            cached is not None
+            and len(cached["key"]) == len(key)
+            # the probe is compared by identity, the rest by value
+            and all(
+                a is b if i == 0 else a == b for i, (a, b) in enumerate(zip(cached["key"], key))
+            )
+            and torch.equal(cached["mapping"], bf.vbf_index_mapping)
+        ):
+            return cached["gram"]
+        return None
+
+    def _correlation_gram(self, bf, refined, operands, grid_shape, grid_step, dtype):
+        """``sum_k |c_k(q)|^2`` on a grid whose lattice the sub-lattices of ``operands`` cover.
+
+        ``|c|^2 = |t-|^2 + |t+|^2 - 2 Re(t- t+*)``. The first two terms summed over ``k`` are
+        autocorrelations of ``psi_m psi_n*``, one FFT pair each. The cross term
+        ``sum_k psi(k - q) psi(k + q) psi*(k)^2`` has no FFT form and is not negligible: on a
+        defocused zone plate dropping it leaves a 16% median error. It is evaluated per
+        detector pixel instead, and only where it can be nonzero. It needs ``k``, ``k - q`` and
+        ``k + q`` all inside the probe's support, so it vanishes beyond the support radius, and
+        ``|c_k(-q)| = |c_k(q)|`` halves the rest.
+
+        The Gram has to be exact on the grid it is used on. It falls steeply to zero at the
+        band's edge, where OBF divides by its square root, so reading it between lattices, by
+        zero-padding its transform, leaves ripple there that the division turns into errors
+        larger than the image (70% rms on a defocused electron probe).
+
+        Only the support of the probe as given is used. The refined probe's sub-lattice values
+        between the given ones are sinc interpolants, which do not vanish outside it, so with
+        ``m > 1`` the cross term beyond the radius is the product of two such tails and is dropped.
+        """
+        shifted, psi, to_grid = operands["shifted"], operands["psi"], operands["to_grid"]
+        sublattices = operands["sublattices"]
+        # the direct terms, as autocorrelations summed over mode pairs in the Fourier domain
+        num_modes = psi.shape[0]
+        minus = {s: 0 for s in sublattices}
+        plus = {s: 0 for s in sublattices}
+        for a in range(num_modes):
+            for b in range(num_modes):
+                u0 = torch.fft.fft2((psi[a] * psi[b].conj()).conj())
+                v0 = torch.fft.fft2(psi[a] * psi[b].conj())
+                for s in sublattices:
+                    us = shifted[-1][s][a] * shifted[-1][s][b].conj()
+                    ws = shifted[1][s][a] * shifted[1][s][b].conj()
+                    # sum_j us(j - n) conj(u0(j)), and sum_j conj(ws(j + n)) u0(j)
+                    minus[s] = minus[s] + torch.fft.fft2(us.conj()).conj() * u0
+                    plus[s] = plus[s] + torch.fft.fft2(ws).conj() * v0
+        direct = to_grid({s: torch.fft.ifft2(minus[s]) for s in sublattices}) + to_grid(
+            {s: _reflect(torch.fft.ifft2(plus[s])) for s in sublattices}
+        )
+        gram = direct.real.to(dtype)
+
+        # the cross term, per detector pixel, where it can live
+        kxa, kya, _, _ = self._return_k_grid(0.0)
+        support = _probe_support(psi)
+        signed_rows = torch.as_tensor(signed_index(self.gpts[0]), device=self.device)
+        signed_cols = torch.as_tensor(signed_index(self.gpts[1]), device=self.device)
+        padded = psi.shape[-2:]
+        on_detector = support[signed_rows[:, None] % padded[0], signed_cols[None, :] % padded[1]]
+        radius = float(torch.hypot(kxa, kya)[on_detector].max())
+        rows = torch.as_tensor(signed_index(grid_shape[0]), device=self.device)[:, None]
+        cols = torch.as_tensor(signed_index(grid_shape[1]), device=self.device)[None, :]
+        rows, cols = rows.expand(*grid_shape), cols.expand(*grid_shape)
+        qx = rows.to(dtype) / (grid_shape[0] * float(grid_step[0]))
+        qy = cols.to(dtype) / (grid_shape[1] * float(grid_step[1]))
+        inside = torch.hypot(qx, qy) <= radius * (1 + 1e-6)
+        upper = (rows >= 0) | (rows == -(grid_shape[0] // 2)) | (cols == -(grid_shape[1] // 2))
+        computed = inside & upper
+        if bool(computed.any()):
+            lattice = LatticeOverlap(
+                refined.to(self.device),
+                kxa[bf.bf_inds_i, bf.bf_inds_j],
+                kya[bf.bf_inds_i, bf.bf_inds_j],
+                qx[computed],
+                qy[computed],
+            )
+            exact = torch.zeros(int(computed.sum()), device=self.device, dtype=dtype)
+            batch = max(1, _GRAM_POINTS_PER_BATCH // int(computed.sum()))
+            for lo in range(0, bf.num_bf, batch):
+                # indices made on the device: copying them over each batch costs 7% on MPS
+                batch_idx = torch.arange(lo, min(lo + batch, bf.num_bf), device=self.device)
+                t_minus, t_plus, _, _ = lattice(batch_idx, magnitudes=False)
+                exact += (t_minus - t_plus).abs().square().sum(0).to(dtype)
+            gram[computed] = exact
+            mirror = inside & ~upper
+            gram[mirror] = gram[(-rows[mirror]) % grid_shape[0], (-cols[mirror]) % grid_shape[1]]
+        return gram
 
     def _apply_fourier_filters(
         self,
@@ -2754,6 +3708,8 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             return None
         if self._kernel != "prlx" and self._residual is not None:
             return self._residual
+        if self._residual_unavailable is not None:
+            raise ValueError(self._residual_unavailable)
         if self._kernel != "prlx":
             raise NotImplementedError(
                 f"residual_loss is only defined for the parallax kernel, not {self._kernel!r}, "

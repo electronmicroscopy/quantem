@@ -821,6 +821,100 @@ def overlap_terms(
     return t_minus, t_plus, psi_minus, psi_plus
 
 
+def _lattice_index(values: torch.Tensor, step: float) -> torch.Tensor:
+    """``values / step`` as integers, refusing frequencies that miss the lattice."""
+    index = values / step
+    rounded = torch.round(index)
+    # the same tolerance as `FourierProbe.at`
+    if float((index - rounded).abs().max()) > 1e-3:
+        raise ValueError(
+            "LatticeOverlap needs every frequency on the probe's reciprocal lattice; refine the "
+            "probe with `resampled_to` so that it divides the canvas's, or use `overlap_terms`."
+        )
+    return rounded.long()
+
+
+class LatticeOverlap:
+    """:func:`overlap_terms` for an array probe whose ``k`` and ``q`` share its reciprocal lattice.
+
+    The montage reads ``psi(k -/+ q)`` at every canvas frequency for every bright-field pixel, a
+    batch at a time. :meth:`FourierProbe.at` finds each lattice index again on every call,
+    validates it with a host synchronization, and gathers one mode at a time. Here the indices
+    are found and validated once. The modes are stacked into one zero-padded flat array, wide
+    enough that every ``k -/+ q`` lands inside it, so a batch costs one integer add and one
+    gather for all modes. Measured with 61 bright-field pixels on a 256x256 canvas, it takes
+    2.3 ms per batch against 20 ms for one mode, and 11 ms against 104 ms for five.
+
+    The padding stands for frequencies the detector did not record, which
+    :meth:`FourierProbe._gather` also returns as zero. Partial coherence is left to the caller,
+    as with ``overlap_terms(..., partial_coherence=False)``.
+
+    Parameters
+    ----------
+    probe : FourierProbe
+        An array probe, coherent or mixed, already on the lattice of ``qx, qy``.
+    kx, ky : torch.Tensor
+        ``(N,)`` bright-field frequencies, indexed by :meth:`__call__`'s ``batch_idx``.
+    qx, qy : torch.Tensor
+        Canvas frequencies, usually ``(H, W)``; any shape is kept in the output.
+    """
+
+    def __init__(self, probe: FourierProbe, kx, ky, qx, qy):
+        if probe.array is None:
+            raise ValueError("LatticeOverlap reads an array probe; evaluate an analytic one.")
+        modes = probe.modes if probe.modes is not None else probe.array[None]
+        n_rows, n_cols = modes.shape[-2:]
+        dq_row, dq_col = probe.reciprocal_sampling  # ty:ignore[not-iterable]
+        q_row, q_col = _lattice_index(qx, dq_row), _lattice_index(qy, dq_col)
+        k_row, k_col = _lattice_index(kx, dq_row), _lattice_index(ky, dq_col)
+
+        reach_row = int(q_row.abs().max()) + 1
+        reach_col = int(q_col.abs().max()) + 1
+        width = n_cols + 2 * reach_col
+        padded = torch.zeros(
+            (modes.shape[0], n_rows + 2 * reach_row, width), dtype=modes.dtype, device=modes.device
+        )
+        # signed index i sits at i + n // 2 once shifted, so k = 0 lands at (centre_row, centre_col)
+        padded[:, reach_row : reach_row + n_rows, reach_col : reach_col + n_cols] = (
+            torch.fft.fftshift(modes, dim=(-2, -1))
+        )
+        centre_row, centre_col = reach_row + n_rows // 2, reach_col + n_cols // 2
+
+        self._flat = padded.reshape(modes.shape[0], -1)
+        self._k_base = (k_row + centre_row) * width + (k_col + centre_col)
+        self._q_offset = q_row * width + q_col
+        self._coherent = probe.modes is None
+
+    def __call__(self, batch_idx, magnitudes: bool = True):
+        """``(t_minus, t_plus, psi_minus, psi_plus)`` for the bright-field pixels ``batch_idx``.
+
+        For a mixed state ``psi_minus`` and ``psi_plus`` are mode sums as costly as the overlap
+        itself, and only the double-overlap mask of complex SSB reads them, so
+        ``magnitudes=False`` returns ``None`` in their place.
+        """
+        ones = (1,) * self._q_offset.ndim
+        base = self._k_base[batch_idx].view(-1, *ones)
+        shape = (self._flat.shape[0], base.shape[0], *self._q_offset.shape)
+        psi_k = self._flat[:, base.reshape(-1)].view(shape[0], -1, *ones)
+        minus = self._flat[:, (base - self._q_offset).reshape(-1)].view(shape)
+        plus = self._flat[:, (base + self._q_offset).reshape(-1)].view(shape)
+        if self._coherent:
+            # indexed rather than summed: on MPS a reduction over the size-one mode axis costs
+            # about 30 ms per batch, a hundred times the gather (torch 2.14)
+            minus, plus, psi_k = minus[0], plus[0], psi_k[0]
+            return minus * psi_k.conj(), plus.conj() * psi_k, minus, plus
+        t_minus = (minus * psi_k.conj()).sum(0)
+        t_plus = (plus.conj() * psi_k).sum(0)
+        if not magnitudes:
+            return t_minus, t_plus, None, None
+        return (
+            t_minus,
+            t_plus,
+            minus.abs().square().sum(0).sqrt(),
+            plus.abs().square().sum(0).sqrt(),
+        )
+
+
 def gamma_factor(
     probe: FourierProbe,
     cmplx_probe_at_k: torch.Tensor,

@@ -2070,7 +2070,7 @@ class TestConvolutionModes:
 
     def test_unknown_mode_raises(self, dataset4d):
         _, montage = self._pair(dataset4d)
-        with pytest.raises(ValueError, match="must be 'auto', 'fft' or 'stencil'"):
+        with pytest.raises(ValueError, match="must be 'auto', 'fft', 'stencil' or 'correlation'"):
             montage.reconstruct(
                 deconvolution_kernel="ssb", convolution_mode="direct", verbose=False
             )
@@ -2674,6 +2674,60 @@ class TestMixedStateMontage:
         assert correlation(to_numpy(montage.corrected_bf), expected) > 0.99
 
 
+class TestCorrelation:
+    """The OBF numerator summed over scan positions first, by detector-plane correlations."""
+
+    def test_matches_the_fft_route(self, mixed_pair, complex_pair):
+        """Both canvases span the probe's own field of view, and the support radius sits inside
+        the canvas Nyquist, so the Gram's per-pixel and FFT-only regions are both exercised."""
+        cases = {"two-mode array probe": mixed_pair[1], "analytic probe": complex_pair[1]}
+        for name, montage in cases.items():
+            kwargs = dict(deconvolution_kernel="obf", compute_variance=False, verbose=False)
+            expected = to_numpy(montage.reconstruct(convolution_mode="fft", **kwargs).obj)
+            correlated = montage.reconstruct(convolution_mode="correlation", **kwargs)
+            obj = to_numpy(correlated.obj)
+            # the FFT route's spectra are complex64, which on this fixture's weak object
+            # leaves 2e-5, as in `TestComplexAndMultislice`; a wrong sub-lattice or sign is O(1)
+            assert _relative_error(obj, expected) < 1e-4, name
+            # a Gram built ahead by precompute_gram is the one the next call reads, rather than
+            # one rebuilt for a canvas or key that precompute_gram resolved differently
+            montage._correlation_gram_cache = None
+            gram = montage.precompute_gram()._correlation_gram_cache["gram"]
+            again = to_numpy(montage.reconstruct(convolution_mode="correlation", **kwargs).obj)
+            assert montage._correlation_gram_cache["gram"] is gram, name
+            np.testing.assert_array_equal(again, obj, err_msg=name)
+
+    def test_a_rotated_detector(self, complex_pair):
+        """The canvas leaves a probe field of view empty around the scan, so that neither
+        route's boundary reaches the scanned region. Turned by 90 degrees the detector-aligned
+        canvas needs 16 sub-lattices and frames are placed on it exactly; by 30 degrees it needs
+        36, and frames are placed as patches."""
+        montage = complex_pair[1]
+        fov = 16.0  # the fixture's probe field of view, which its scan also spans, in Angstrom
+        kwargs = dict(
+            deconvolution_kernel="obf",
+            compute_variance=False,
+            obj_fov=(3 * fov, 3 * fov),
+            obj_origin=(-fov, -fov),
+            verbose=False,
+        )
+        scanned = slice(64, 128)  # 0.25 A pixels
+        for angle in (90.0, 30.0):
+            expected = montage.reconstruct(
+                convolution_mode="fft", override_rotation_angle=angle, **kwargs
+            )
+            expected = to_numpy(expected.obj)[scanned, scanned]
+            obj = montage.reconstruct(
+                convolution_mode="correlation", override_rotation_angle=angle, **kwargs
+            )
+            obj = to_numpy(obj.obj)[scanned, scanned]
+            # the detector-aligned canvas is a different periodic domain from the FFT route's,
+            # which OBF's long-ranged kernel feels at a few 1e-3 here, and the patch's window
+            # costs as much again; a rotation taken the wrong way round is O(1)
+            error = np.sqrt(np.mean((obj - expected) ** 2) / np.mean(expected**2))
+            assert error < 1e-2, angle
+
+
 class TestComplexAndMultislice:
     """The montage reaches the same solves, by FFT exactly and by stencil approximately."""
 
@@ -2692,6 +2746,17 @@ class TestComplexAndMultislice:
         # the data are noiseless and weak, so the residual is about 1e-5 and the float32
         # energies, which agree to 3e-7, set how well it can match
         assert montage.residual_loss() == pytest.approx(fourier.residual_loss(), abs=1e-6)
+
+        # skipping the residual's sums leaves SSB its own and OBF its normal equations, which
+        # must give the same images
+        images = {
+            a: to_numpy(getattr(montage, a)) for a in ("corrected_bf", "corrected_amplitude")
+        }
+        montage.reconstruct(convolution_mode="fft", compute_variance=False, **kwargs)
+        for attribute, expected in images.items():
+            np.testing.assert_array_equal(to_numpy(getattr(montage, attribute)), expected)
+        with pytest.raises(ValueError, match="compute_variance=False"):
+            montage.residual_loss()
 
     def test_the_fft_route_takes_the_ard_prior(self, complex_pair):
         fourier, montage = complex_pair

@@ -2822,6 +2822,27 @@ def explained_energy(gram, numerator, mask=None, eigenvalue_floor: float = EIGEN
     return energy.sum()
 
 
+def smooth_fft_size(n: int) -> int:
+    """The smallest ``2^a 3^b 5^c`` at least ``n``, a size every FFT backend handles quickly."""
+    best = None
+    power2 = 1
+    while power2 < 2 * n:
+        power3 = power2
+        while power3 < 2 * n:
+            size = power3
+            while size < n:
+                size *= 5
+            best = size if best is None else min(best, size)
+            power3 *= 3
+        power2 *= 2
+    return int(best)
+
+
+def signed_index(n: int) -> np.ndarray:
+    """The signed lattice index of each corner-centred position, ``fftfreq(n) * n``."""
+    return np.round(np.fft.fftfreq(n, 1 / n)).astype(np.int64)
+
+
 def woa_kernel_terms(
     kernel: str,
     vbf_fourier,
@@ -2838,6 +2859,8 @@ def woa_kernel_terms(
     peak_intensity: float = 1.0,
     alias_factor: int = 1,
     slice_phases=None,
+    overlap=None,
+    accumulate: str = "residual",
 ) -> dict:
     """One batch's contribution to the sums of the weak-object kernels: ``ssb``, ``obf``,
     ``wiener`` and ``wdd``.
@@ -2870,10 +2893,22 @@ def woa_kernel_terms(
     ``slice_phases``, ``(N, H, W)``, multiplies every column of slice ``n`` by a phase that
     depends on ``q`` alone: a lateral displacement of that slice, such as a specimen tilt gives
     each depth in a tilt series.
+
+    ``overlap`` is this batch's ``overlap_terms(..., partial_coherence=False)``, when the
+    caller already has it from a :class:`~quantem.diffractive_imaging.complex_probe.LatticeOverlap`.
+
+    ``accumulate`` says which sums the caller reads. ``"residual"`` returns all of them,
+    ``"normal"`` leaves out the residual's own (``residual_gram`` and ``weighted_energy``), and
+    ``"kernel"`` returns only SSB's ``phase`` and ``amplitude``. Each level contains the one
+    after it.
     """
-    t_minus, t_plus, psi_minus, psi_plus = overlap_terms(
-        probe, cmplx_probe_at_k, kx, ky, qxa, qya, partial_coherence=False
-    )
+    if accumulate not in ("residual", "normal", "kernel"):
+        raise ValueError(
+            f"`accumulate` must be 'residual', 'normal' or 'kernel', got {accumulate!r}"
+        )
+    if overlap is None:
+        overlap = overlap_terms(probe, cmplx_probe_at_k, kx, ky, qxa, qya, partial_coherence=False)
+    t_minus, t_plus, psi_minus, psi_plus = overlap
     coherent = (t_minus, t_plus)
     if probe.is_partially_coherent:
         env_minus, env_plus = partial_coherence_envelope(
@@ -2881,27 +2916,31 @@ def woa_kernel_terms(
         )
         t_minus = t_minus * env_minus.to(t_minus.real.dtype)
         t_plus = t_plus * env_plus.to(t_plus.real.dtype)
-    factors = depth_phase_factors(qxa, qya, kx, ky, wavelength, depths)
-    columns = woa_columns(t_minus, t_plus, factors, complex_obj)
-    if slice_phases is not None:
-        # the columns are the slices' phase columns, then their amplitude columns
-        repeat = columns.shape[-1] // slice_phases.shape[0]
-        columns = columns * slice_phases.repeat(repeat, 1, 1).permute(1, 2, 0).to(columns.dtype)
-    data = vbf_fourier
-    if alias_factor > 1:
-        columns = alias_tiles(columns, alias_factor)
-        data = vbf_fourier[:, : columns.shape[1], : columns.shape[2]]
-    # one column only rescales each frequency, so the single-plane phase keeps the unweighted
-    # Gram it has always had; several columns need the exact weights
-    intensity = cmplx_probe_at_k.abs().square() / peak_intensity
-    several = columns.shape[-1] > 1
     terms = {}
-    terms["gram"], terms["numerator"] = accumulate_normal_equations(
-        columns, data, intensity if several else None
-    )
-    if not several:
-        terms["residual_gram"] = weighted_gram(columns, intensity)
-    terms["weighted_energy"] = (intensity * data.abs().square()).sum(0)
+    if accumulate != "kernel":
+        factors = depth_phase_factors(qxa, qya, kx, ky, wavelength, depths)
+        columns = woa_columns(t_minus, t_plus, factors, complex_obj)
+        if slice_phases is not None:
+            # the columns are the slices' phase columns, then their amplitude columns
+            repeat = columns.shape[-1] // slice_phases.shape[0]
+            columns = columns * slice_phases.repeat(repeat, 1, 1).permute(1, 2, 0).to(
+                columns.dtype
+            )
+        data = vbf_fourier
+        if alias_factor > 1:
+            columns = alias_tiles(columns, alias_factor)
+            data = vbf_fourier[:, : columns.shape[1], : columns.shape[2]]
+        # one column only rescales each frequency, so the single-plane phase keeps the
+        # unweighted Gram it has always had; several columns need the exact weights
+        intensity = cmplx_probe_at_k.abs().square() / peak_intensity
+        several = columns.shape[-1] > 1
+        terms["gram"], terms["numerator"] = accumulate_normal_equations(
+            columns, data, intensity if several else None
+        )
+        if accumulate == "residual":
+            if not several:
+                terms["residual_gram"] = weighted_gram(columns, intensity)
+            terms["weighted_energy"] = (intensity * data.abs().square()).sum(0)
 
     if kernel == "ssb":
         # unit-modulus weights from the coherent overlap: the partial-coherence envelope would
