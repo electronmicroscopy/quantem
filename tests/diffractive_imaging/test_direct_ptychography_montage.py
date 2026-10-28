@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from quantem.core.datastructures import Dataset2d, Dataset3d
+from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4dstem
 from quantem.core.io.serialize import load
 from quantem.core.utils.utils import to_numpy
 from quantem.diffractive_imaging import (
@@ -2605,6 +2605,21 @@ def complex_pair():
 
 
 @pytest.fixture(scope="module")
+def coarse_montage():
+    """The weak object of ``complex_pair`` scanned at every fourth position, a 1 A step."""
+    from .conftest import ml_kwargs, thin_layer_4dstem, white_noise_object_2D
+
+    noise = 0.02 * white_noise_object_2D(n=64, phi0=1.0)
+    dataset = thin_layer_4dstem([noise + 0.5j * noise[::-1]], [0.0])
+    coarse = Dataset4dstem.from_array(
+        np.ascontiguousarray(np.asarray(dataset.array)[::4, ::4]),
+        sampling=(1.0, 1.0, *dataset.sampling[2:]),
+        units=list(dataset.units),
+    )
+    return DirectPtychographyMontage.from_dataset4d(coarse, boundary="wrap", **ml_kwargs())
+
+
+@pytest.fixture(scope="module")
 def mixed_pair():
     """Both classes over a weak object imaged with a two-mode probe, and that probe."""
     from quantem.core.utils.utils import electron_wavelength_angstrom
@@ -2726,6 +2741,47 @@ class TestCorrelation:
             # costs as much again; a rotation taken the wrong way round is O(1)
             error = np.sqrt(np.mean((obj - expected) ** 2) / np.mean(expected**2))
             assert error < 1e-2, angle
+
+    def test_a_patch_holds_the_canvas_band(self, coarse_montage):
+        """On a scan four times coarser than the fixture's, a patch holds only the band the
+        canvas shows. Turned by 30 degrees its 16 pixels per probe field of view need 22, and the
+        margin of 4 rounds up to 27, where OBF's whole band needs 65. The Gram and the canvas
+        shrink with it, and the image moves by about 1e-3."""
+        fov = 16.0
+        kwargs = dict(
+            deconvolution_kernel="obf",
+            convolution_mode="correlation",
+            compute_variance=False,
+            obj_fov=(3 * fov, 3 * fov),
+            obj_origin=(-fov, -fov),
+            override_rotation_angle=30.0,
+            verbose=False,
+        )
+        scanned = slice(16, 32)  # 1 A pixels
+
+        def rms_error(obj, expected):
+            obj, expected = obj[scanned, scanned], expected[scanned, scanned]
+            return np.sqrt(np.mean((obj - expected) ** 2) / np.mean(expected**2))
+
+        coarse_montage.precompute_gram(
+            obj_fov=kwargs["obj_fov"],
+            obj_origin=kwargs["obj_origin"],
+            override_rotation_angle=30.0,
+            patch_margin=None,
+        )
+        gram = coarse_montage._correlation_gram_cache["gram"]
+        whole = to_numpy(coarse_montage.reconstruct(patch_margin=None, **kwargs).obj)
+        assert coarse_montage._correlation_gram_cache["gram"] is gram
+        assert tuple(gram.shape) == (7 * 65, 7 * 65)
+
+        banded = to_numpy(coarse_montage.reconstruct(**kwargs).obj)
+        assert tuple(coarse_montage._correlation_gram_cache["gram"].shape) == (7 * 27, 7 * 27)
+        assert rms_error(banded, whole) < 5e-3
+
+        # the FFT route is off by its own periodic domain, as in `test_a_rotated_detector`, and
+        # holding less of the band does not take the correlation route further from it
+        expected = to_numpy(coarse_montage.reconstruct(**dict(kwargs, convolution_mode="fft")).obj)
+        assert rms_error(banded, expected) < 1.05 * rms_error(whole, expected)
 
 
 class TestComplexAndMultislice:

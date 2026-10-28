@@ -75,6 +75,9 @@ _CORRELATION_LATTICE_SUBLATTICES = 16
 #: probe fields of view per axis spanned by a correlation patch, centred on its position
 _CORRELATION_PATCH_FIELDS = 2
 _CORRELATION_PATCH_FLOOR = 1e-6
+#: pixels per probe field of view a correlation patch holds beyond the canvas's Nyquist box,
+#: rounded up to an FFT size, rather than OBF's whole band; see `reconstruct`'s `patch_margin`
+_CORRELATION_PATCH_MARGIN = 4
 
 
 def _reflect(x: torch.Tensor) -> torch.Tensor:
@@ -1968,6 +1971,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         suppress_nyquist=False,
         convolution_mode="auto",
         probe_oversample=8,
+        patch_margin=_CORRELATION_PATCH_MARGIN,
         stencil_radius="auto",
         truncation_tolerance=0.1,
         max_stencil_radius=32,
@@ -2139,6 +2143,16 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             7.5% at 2, 1.7% at 4, 0.52% at 8, 0.064% at 16. Ignored for an analytic probe,
             which is evaluated rather than sampled, and for a rotation that maps the lattice
             onto itself.
+        patch_margin : int or None
+            Pixels per probe field of view that a patch of ``convolution_mode="correlation"``
+            holds beyond the canvas's Nyquist box, turned into the detector frame and rounded up
+            to an FFT size. A patch then holds only the band the canvas shows, rather than OBF's
+            whole band, which on a canvas coarser than the band makes each frame cheaper. On the
+            four electron scans of tutorials 10 and 12, each at the upsampling its own tutorial
+            uses, the default of 4 is about 3 to 5 times faster than the whole band on the CPU
+            and 1.3 to 3.5 times on MPS. The image moves by 0.06% to 0.3% of its RMS. ``None``
+            holds the whole band. It changes nothing once the canvas reaches the band, nor when
+            frames are placed on the lattice, as in X-ray ptychography.
         stencil_radius : int or "auto"
             Half-width of the box stencil used by the ``ssb`` / ``obf`` / ``icom``
             kernels, in canvas pixels. ``"auto"`` grows it until the estimated truncation
@@ -2301,6 +2315,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
                 coords_base=coords_base,
                 ridge=ridge,
                 probe_oversample=probe_oversample,
+                patch_margin=patch_margin,
             )
             self._canvas_shape = canvas_shape
             self._canvas_origin_px = canvas_origin
@@ -2936,6 +2951,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         boundary=None,
         pad_px=None,
         probe_oversample=8,
+        patch_margin=_CORRELATION_PATCH_MARGIN,
     ):
         """Build the Gram ``reconstruct(convolution_mode="correlation")`` needs, and cache it.
 
@@ -2949,7 +2965,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
 
         Parameters
         ----------
-        upsampling_factor, obj_origin, obj_fov, bf_mask, override_aberration_coefs, override_rotation_angle, boundary, pad_px, probe_oversample
+        upsampling_factor, obj_origin, obj_fov, bf_mask, override_aberration_coefs, override_rotation_angle, boundary, pad_px, probe_oversample, patch_margin
             As for :meth:`reconstruct`.
 
         Returns
@@ -2979,6 +2995,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             upsampling_factor=geometry["upsampling_factor"],
             coords_base=geometry["coords_base"],
             probe_oversample=probe_oversample,
+            patch_margin=patch_margin,
         )
         return self
 
@@ -3002,6 +3019,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         coords_base,
         ridge,
         probe_oversample,
+        patch_margin=_CORRELATION_PATCH_MARGIN,
     ):
         """``(obj, bf_weights)`` for OBF, summed over scan positions rather than detector pixels.
 
@@ -3032,11 +3050,19 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         mostly to a window of two fields of view about the position. It is evaluated there from
         two sub-lattices per axis, shifted by the sub-pixel part of the position in Fourier
         space, and added onto the canvas, which costs one FFT at the end. A frame then costs the
-        same at any canvas size or upsampling. What the probe leaves outside the window, the
-        diffraction tails of a sharp aperture, is the patch's error: about 1% of the numerator
-        on a defocused electron probe, rising towards the band's edge. Where the Gram falls
-        below a millionth of its peak, past the aperture's edge, that error is all the
-        numerator would hold, so it is set to zero there.
+        same at any canvas size. What the probe leaves outside the window, the diffraction tails
+        of a sharp aperture, is the patch's error, about 1% of the numerator on a defocused
+        electron probe and rising towards the band's edge. Where the Gram falls below a
+        millionth of its peak, past the aperture's edge, that error is all the numerator would
+        hold, so it is set to zero there.
+
+        A patch holds only the band the requested canvas shows, its Nyquist box turned into the
+        detector frame, and ``patch_margin`` pixels per field of view beyond it, rather than
+        OBF's whole band. The patches, the detector-side correlations, the canvas and the Gram
+        all shrink with it, so a frame costs less on a coarse canvas and grows towards the whole
+        band's cost as the canvas is refined. Cutting each patch's spectrum at its edge is all
+        the difference, 0.06% to 0.3% of the image's RMS on the electron tutorials' scans.
+        With ``patch_margin=None`` a patch holds the whole band.
 
         Away from the requested canvas itself, the detector-aligned canvas is not periodic in
         the scan, so near the edges of a ``boundary="wrap"`` canvas the image lacks what the FFT
@@ -3062,6 +3088,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             upsampling_factor=upsampling_factor,
             coords_base=coords_base,
             probe_oversample=probe_oversample,
+            patch_margin=patch_margin,
         )
         refined_modes = setup.pop("refined_modes")
         real_dtype, complex_dtype = setup["real_dtype"], setup["complex_dtype"]
@@ -3196,6 +3223,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         upsampling_factor,
         coords_base,
         probe_oversample,
+        patch_margin=_CORRELATION_PATCH_MARGIN,
     ):
         """The probe, the canvas layout and the Gram the correlation route works with.
 
@@ -3240,7 +3268,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         _, patch_modes = refined_modes(fields)
         reach = self._correlation_reach(bf, patch_modes, fields)
         layout = self._correlation_layout(
-            canvas_shape, upsampled, fov, reach, fields, rotation_angle, coords_base
+            canvas_shape, upsampled, fov, reach, fields, rotation_angle, coords_base, patch_margin
         )
         multiples, inner_shape, grid_step = layout["multiples"], layout["shape"], layout["step"]
 
@@ -3289,7 +3317,15 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         return np.asarray(reach)
 
     def _correlation_layout(
-        self, canvas_shape, sampling, fov, reach, fields, rotation_angle, coords_base
+        self,
+        canvas_shape,
+        sampling,
+        fov,
+        reach,
+        fields,
+        rotation_angle,
+        coords_base,
+        patch_margin=_CORRELATION_PATCH_MARGIN,
     ):
         """Where the correlation route works, as a dict.
 
@@ -3302,10 +3338,22 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         frame, centred, with room per side for half a probe field of view, or half a patch's
         ``fields``, so that nothing wraps back onto it, and ``origin`` is its corner there, in
         Angstrom.
+
+        A patch holds the requested canvas's Nyquist box turned into the detector frame and
+        ``patch_margin`` pixels per field of view beyond it, or with ``patch_margin=None`` OBF's
+        whole band, but never fewer pixels than the requested canvas has.
         """
         positions = to_numpy(coords_base).astype(np.float64)
-        # pixels per field of view that hold the whole band, which a patch needs
+        # pixels per field of view that hold the whole band
         band = 4 * reach + 1
+
+        def patch_per_fov(per_fov):
+            if patch_margin is None:
+                return np.maximum(per_fov, band)
+            margin = int(patch_margin)
+            held = np.minimum([smooth_fft_size(int(v) + margin) for v in per_fov], band)
+            return np.maximum(per_fov, held)
+
         native = fov / sampling
         turns = float(rotation_angle) / 360.0
         if abs(turns - round(turns)) < 1e-9 and np.allclose(native, np.round(native), rtol=1e-6):
@@ -3313,7 +3361,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             if all(int(n) % int(p) == 0 for n, p in zip(canvas_shape, per_fov)):
                 multiples = np.asarray(canvas_shape) // per_fov
                 lattice = int(np.prod(multiples)) <= _CORRELATION_LATTICE_SUBLATTICES
-                if lattice or bool(np.all(per_fov >= band)):
+                if lattice or bool(np.all(per_fov >= patch_per_fov(per_fov))):
                     return dict(
                         placement="lattice" if lattice else "patch",
                         multiples=multiples,
@@ -3345,7 +3393,7 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         )
         per_fov = np.maximum(np.ceil(native - 1e-6), np.minimum(np.ceil(turned - 1e-6), band))
         if not lattice:
-            per_fov = np.maximum(per_fov, band)
+            per_fov = patch_per_fov(per_fov.astype(int))
         per_fov = per_fov.astype(int)
         step = fov / per_fov
         # centred to a whole pixel, so that an unrotated canvas with the same pixels is read
