@@ -315,29 +315,38 @@ class TestBackgroundFitting:
         # Check that background is positive
         assert (bg >= 0).all()
 
-    def test_fit_bg_recovers_known_background(self, synthetic_4dstem_dataset):
-        """The torch fit recovers a known smooth background under a structure
-        modulation, on a realistic high-dynamic-range I(k) / calibrated axis."""
+    @pytest.mark.parametrize("bg_model", ["power", "gaussian"])
+    def test_fit_bg_recovers_known_background(self, synthetic_4dstem_dataset, bg_model):
+        """Each background model recovers a known smooth background of its own
+        form under a structure modulation, on a realistic high-dynamic-range
+        I(k) / calibrated axis."""
         pdf = PairDistributionFunction.from_data(synthetic_4dstem_dataset, find_origin=False)
         nb = len(np.asarray(pdf.qq))
         pdf.polar.sampling[3] = 2.3 / (nb - 1)  # realistic 1/A q-axis
         k = np.asarray(pdf.qq)
         rng = np.random.RandomState(0)
-        bg_true = (
-            0.5 + 900.0 * np.exp(-(k**2) / (2 * 0.09**2)) + 6.0 * np.exp(-(k**4) / (2 * 0.8**4))
-        )
+        if bg_model == "gaussian":
+            bg_true = 0.5 + 900.0 * np.exp(-(k**2) / (2 * 0.09**2)) + 6.0 * np.exp(-(k**4) / (2 * 0.8**4))
+        else:
+            bg_true = 0.5 + 900.0 * (1 + k**2 / 0.15**2) ** -1.8
         # add 35% amplitude ripple to the true bg to simulate scattering
         modulation = 1.0 + 0.35 * np.sin(2 * np.pi * k / 0.42 + 0.5) * np.exp(-k / 1.2)
         Ik = np.clip(bg_true * modulation + np.abs(0.5 * rng.randn(k.size)), 1e-6, None).astype(
             np.float32
         )
         # try fitting to this simulated Ik
-        bg, _ = pdf.fit_bg(Ik.copy())
-        bg = bg.cpu().numpy()
-        assert (bg >= 0).all()
+        weight = "py4dstem" if bg_model == "gaussian" else "k/I"
+        bg, f = pdf.fit_bg(Ik.copy(), bg_model=bg_model, bg_weight=weight)
+        bg, f = bg.cpu().numpy(), f.cpu().numpy()
+        assert (bg >= 0).all() and (f > 0).all()
+        assert (np.diff(f) <= 0).all(), "single scattering f(k) must decrease monotonically"
         # The fit tracks the modulated data, so pointwise error reflects the
         # ~35% structure modulation
         # the recovered shape of the smooth background should still correlate strongly with the truth.
+        # The power model is weighted toward the whole dynamic range (k / I), so
+        # compare it in log space; the Gaussian model keeps the linear comparison.
+        if bg_model == "power":
+            bg, bg_true = np.log(bg), np.log(bg_true)
         corr = float(np.corrcoef(bg, bg_true)[0, 1])
         assert corr > 0.99, f"bg shape far from truth: corr {corr:.4g}"
 
@@ -681,7 +690,7 @@ class TestKnownAnswer:
         pdf.Ik = torch.tensor(S - 1, dtype=torch.float32)
         pdf.bg = torch.zeros(len(k))
         pdf.f = torch.ones(len(k))
-        pdf.fit_bg = lambda Ik, kmin=None, kmax=None: (pdf.bg, pdf.f)
+        pdf.fit_bg = lambda Ik, kmin=None, kmax=None, **kwargs: (pdf.bg, pdf.f)
         return pdf, k, S
 
     def test_G_matches_windowed_transform_of_true_S(self):

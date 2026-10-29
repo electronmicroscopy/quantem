@@ -669,3 +669,172 @@ def show_2d(
         axs_out = axs
 
     return fig, axs_out
+
+
+def show_1d(
+    arrays: ArrayLike | Sequence[ArrayLike] | Sequence[Sequence[ArrayLike]],
+    *,
+    x: ArrayLike | Sequence[ArrayLike] | None = None,
+    labels: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
+    title: str | Sequence[str] | None = None,
+    xlabel: str | Sequence[str] | None = None,
+    ylabel: str | Sequence[str] | None = None,
+    log_y: bool | Sequence[bool] = False,
+    xlim: tuple[float, float] | None = None,
+    xticks: ArrayLike | None = None,
+    colors: Sequence[str] | None = None,
+    figax: tuple[Any, Any] | None = None,
+    axsize: tuple[float, float] = (5, 3),
+    save: os.PathLike | str | None = None,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
+    """Plot one or more 1D arrays as line profiles.
+
+    A single array or a flat sequence of arrays is drawn in one panel, so that the curves can
+    be compared directly. A nested sequence draws one panel per inner sequence, in one row.
+    ``title``, ``xlabel``, ``ylabel``, and ``log_y`` may be scalars or one value per panel.
+
+    Parameters
+    ----------
+    arrays : ndarray or sequence of ndarray or sequence of sequences of ndarray
+        The 1D arrays to plot.
+    x : ndarray or sequence of ndarray, optional
+        Horizontal coordinates, either one array shared by all curves or one array per panel.
+        Defaults to the array indices.
+    labels : str or sequence of str or sequence of sequences of str, optional
+        Legend labels, one per curve. A legend is drawn in each panel that has labels.
+    title : str or sequence of str, optional
+        Panel titles.
+    xlabel, ylabel : str or sequence of str, optional
+        Axis labels.
+    log_y : bool or sequence of bool, default=False
+        Whether to use a logarithmic vertical axis.
+    xlim : tuple, optional
+        Horizontal axis limits, shared by all panels.
+    xticks : array-like, optional
+        Horizontal tick positions, shared by all panels.
+    colors : sequence of str, optional
+        Line colors, cycled over the curves of each panel. Defaults to ``viz.colors.set``.
+    figax : tuple, optional
+        (fig, axs) tuple to plot on. If None, a new figure and axes are created.
+    axsize : tuple, default=(5, 3)
+        Size of each panel in inches.
+    save : os.PathLike or str, optional
+        Path to save the figure to.
+    **kwargs : dict
+        Additional keyword arguments passed to ``matplotlib.axes.Axes.plot``, for example
+        ``marker``, ``linestyle``, or ``linewidth`` (default 2).
+
+    Returns
+    -------
+    fig : Figure
+        The matplotlib figure object.
+    axs : Axes | ndarray of Axes
+        A single Axes for one panel, otherwise a 1D ndarray of Axes.
+
+    Examples
+    --------
+    >>> depth = np.arange(9) * 17.5
+    >>> fig, ax = show_1d(
+    ...     [mean_potential, std_potential],
+    ...     x=depth,
+    ...     labels=["mean", "std"],
+    ...     xlabel="depth (Å)",
+    ...     ylabel="potential (rad)",
+    ...     marker="o",
+    ... )
+    """
+
+    def as_numpy(value: Any) -> Any:
+        if isinstance(value, (list, tuple)) and len(value) > 0 and np.isscalar(value[0]):
+            return np.asarray(value)  # a plain list of numbers is one curve
+        return to_cpu(value)
+
+    dpi = kwargs.pop("dpi", 300)
+    arrays = as_numpy(arrays)
+    if isinstance(arrays, np.ndarray):
+        arrays = [arrays]
+    panels = (
+        [[as_numpy(a) for a in p] for p in arrays]
+        if not isinstance(arrays[0], np.ndarray)
+        else [list(arrays)]
+    )
+    panels = [[np.asarray(a).ravel() for a in panel] for panel in panels]
+    num_panels = len(panels)
+
+    def per_panel(value: Any, name: str) -> list[Any]:
+        if value is None or isinstance(value, (str, bool)):
+            return [value] * num_panels
+        value = list(value)
+        if len(value) != num_panels:
+            raise ValueError(f"{name} has {len(value)} entries for {num_panels} panels")
+        return value
+
+    if x is None:
+        xs = [None] * num_panels
+    else:
+        x = as_numpy(x)
+        if isinstance(x, np.ndarray) and x.ndim == 1:
+            xs = [x] * num_panels
+        else:
+            xs = [np.asarray(v).ravel() for v in per_panel(x, "x")]
+
+    if labels is None or isinstance(labels, str):
+        panel_labels = [[labels] for _ in range(num_panels)]
+    elif num_panels == 1 and all(isinstance(lab, str) for lab in labels):
+        panel_labels = [list(labels)]
+    else:
+        panel_labels = [
+            [lab] if isinstance(lab, str) else list(lab) for lab in per_panel(labels, "labels")
+        ]
+
+    titles = per_panel(title, "title")
+    xlabels = per_panel(xlabel, "xlabel")
+    ylabels = per_panel(ylabel, "ylabel")
+    log_ys = per_panel(log_y, "log_y")
+    colors = list(config.get("viz.colors.set")) if colors is None else list(colors)
+    kwargs.setdefault("linewidth", 2)
+
+    if figax is not None:
+        fig, axs = figax
+        axs = np.atleast_1d(axs).ravel()
+        if len(axs) != num_panels:
+            raise ValueError(f"figax has {len(axs)} axes for {num_panels} panels")
+    else:
+        fig, axs = plt.subplots(
+            1, num_panels, figsize=(axsize[0] * num_panels, axsize[1]), squeeze=False
+        )
+        axs = axs.ravel()
+
+    for ax, panel, xv, labs, ttl, xl, yl, logy in zip(
+        axs, panels, xs, panel_labels, titles, xlabels, ylabels, log_ys
+    ):
+        for k, y in enumerate(panel):
+            coords = np.arange(len(y)) if xv is None else xv
+            if len(coords) != len(y):
+                raise ValueError(f"x has length {len(coords)} but the curve has length {len(y)}")
+            label = labs[k] if k < len(labs) else None
+            ax.plot(coords, y, color=colors[k % len(colors)], label=label, **kwargs)
+        if logy:
+            ax.set_yscale("log")
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if xticks is not None:
+            ax.set_xticks(xticks)
+        if ttl is not None:
+            ax.set_title(ttl)
+        if xl is not None:
+            ax.set_xlabel(xl)
+        if yl is not None:
+            ax.set_ylabel(yl)
+        if any(lab is not None for lab in labs):
+            ax.legend()
+
+    if figax is None:
+        fig.tight_layout()
+
+    if save is not None:
+        print(f"Saving figure to {save}")
+        fig.savefig(save, bbox_inches="tight", dpi=dpi)
+
+    return fig, (axs[0] if num_panels == 1 else axs)
