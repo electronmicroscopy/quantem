@@ -154,7 +154,7 @@ class ScalebarConfig:
     color: str = "white"
     loc: str | int = "lower right"
     fontsize: int = 12
-    bold: bool = False
+    bold: bool = True
 
 
 SCALEBAR_KWARGS = [
