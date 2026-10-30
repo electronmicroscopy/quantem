@@ -151,6 +151,7 @@ def plot_strain_panels(
 
     if figsize is None:
         figsize = (8, 3) if is_horizontal else (6, 6)
+    figsize = (max(figsize[0], 4.0), max(figsize[1], 3.0 if is_horizontal else 0.9 * ncols))
 
     if is_horizontal:
         fig, ax = plt.subplots(1, ncols, figsize=figsize)
@@ -301,6 +302,58 @@ def plot_strain_panels(
     cb_pad = 0.03
     cb_min_len = 0.16
 
+    def _fit_cbar_ticks(cbar, norm):
+        """Keep ticks and their labels inside the bar.
+
+        The locator emits "nice" values that can fall outside [vmin, vmax] for any
+        range it does not land on exactly -- every range but the shipped defaults.
+        Matplotlib then draws those by extrapolation past the bar ends, where they
+        run off the figure on one side and collide with the neighbouring colorbar
+        on the other. Clip them, then pull the end labels inward so they stop
+        overhanging the bar.
+        """
+        ticks = [
+            float(t) for t in cbar.get_ticks() if norm.vmin - 1e-9 <= t <= norm.vmax + 1e-9
+        ]
+        if ticks:
+            cbar.set_ticks(ticks)
+        if cb_orientation == "horizontal":
+            labels = [lab for lab in cbar.ax.get_xticklabels() if lab.get_text()]
+            if len(labels) > 1:
+                labels[0].set_horizontalalignment("left")
+                labels[-1].set_horizontalalignment("right")
+        else:
+            labels = [lab for lab in cbar.ax.get_yticklabels() if lab.get_text()]
+            if len(labels) > 1:
+                labels[0].set_verticalalignment("bottom")
+                labels[-1].set_verticalalignment("top")
+
+    def _fit_panel_gap(margin=1.15):
+        """Widen ``hspace`` until the inter-panel gap clears the tallest title.
+
+        Stacked panels put each title in the gap above its own panel, so that gap
+        must be at least as tall as the rendered title. A fixed ``hspace`` cannot do
+        it: the title height varies with ``figsize`` and ``rotate_title`` (0.028-0.082
+        of the figure in practice), needing anywhere from 0.17 to 0.65. Solve
+        ``n*h + (n-1)*g*h = top - bottom`` for the ``g`` that makes ``g*h >= need``.
+        """
+        renderer = fig.canvas.get_renderer()
+        heights = [
+            a.title.get_window_extent(renderer=renderer)
+            .transformed(fig.transFigure.inverted())
+            .height
+            for a in ax
+            if a.title.get_text()
+        ]
+        if not heights:
+            return
+        need = max(heights) * margin
+        n = len(ax)
+        sp = fig.subplotpars
+        denom = (sp.top - sp.bottom) - need * (n - 1)
+        if denom > 0:
+            fig.subplots_adjust(hspace=min(max(need * n / denom, 0.0), 1.2))
+        
     def _finalize_layout():
         # set_aspect("equal") only resizes/recenters each panel at draw time, so
         # get_position() before a draw returns stale boxes -- placing the colorbars
@@ -345,14 +398,16 @@ def plot_strain_panels(
 
     else:
         # Top band for the panel titles, right band for the vertical colorbars + labels.
-        right = 0.55 if need_side_panel else 0.80
+        title_gap = 0.15 if arrow_style == "title" else cb_pad
+        right = (0.55 if need_side_panel else 0.80) - title_gap
         fig.subplots_adjust(left=0.04, right=right, top=0.92, bottom=0.06, hspace=0.15)
+        _finalize_layout()
+        _fit_panel_gap()
         _finalize_layout()
 
         cb_orientation = "vertical"
         b0 = ax[0].get_position()
         b2 = ax[n_strain - 1].get_position()
-        title_gap = 0.15 if arrow_style == "title" else cb_pad
         cb_x0 = b0.x1 + title_gap
         strain_cb_pos = [cb_x0, b2.y0, cb_size, b0.y1 - b2.y0]
 
@@ -374,6 +429,7 @@ def plot_strain_panels(
     cbar1.formatter = FuncFormatter(lambda v, _pos: f"{v:g}%")
     cbar1.update_ticks()
     cbar1.ax.tick_params(labelsize=tick_fs)
+    _fit_cbar_ticks(cbar1, norm_strain)
 
     if plot_rotation and rot_cb_pos is not None:
         cax2 = fig.add_axes(rot_cb_pos)
@@ -384,6 +440,7 @@ def plot_strain_panels(
         cbar2.locator = MaxNLocator(nbins=2)
         cbar2.update_ticks()
         cbar2.ax.tick_params(labelsize=tick_fs)
+        _fit_cbar_ticks(cbar2, norm_rot)
 
     def _add_title_arrow(ax, angle_deg, gap_pt=4.0, color="black", fontsize=None):
         fs = fontsize if fontsize is not None else title_fs

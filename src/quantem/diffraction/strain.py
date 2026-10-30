@@ -487,7 +487,6 @@ class StrainMap(AutoSerialize):
         """
         if arrow_style not in ("title", "legend"):
             raise ValueError("arrow_style must be 'title' or 'legend'")
-
         e_rr = self.e_rr.array
         e_cc = self.e_cc.array
         e_rc = self.e_rc.array
@@ -771,6 +770,11 @@ class StrainMap(AutoSerialize):
         if returnfig:
             return fig, ax
         return result
+    
+    @property
+    def mask_weight(self) -> np.ndarray | None:
+        """Per-position fit weight (alias of :attr:`mask`, matching BraggVectors/StrainMapAutocorrelation)."""
+        return self.mask
 
 
 # ---- module-level fitting functions ----
@@ -1026,7 +1030,6 @@ def _rotate_strain_tensor(
         Row-column (shear) strain component.
     rotation_angle : float
         Frame rotation angle, in degrees.
-
     Returns
     -------
     tuple of np.ndarray
