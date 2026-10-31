@@ -450,6 +450,9 @@ class Crystal(AutoSerialize):
 
         atoms = read(file_path)
         assert isinstance(atoms, Atoms)
+        # the reader adds an ase Spacegroup object; Crystal finds the space
+        # group itself (Crystal.spacegroup), so we keep only native data
+        atoms.info.pop("spacegroup", None)
         return cls(_expand_partial_occupancy(atoms), name=name, **kwargs)
 
     @property

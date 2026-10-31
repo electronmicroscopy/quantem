@@ -392,6 +392,7 @@ def test_from_cif_keeps_partial_occupancy(tmp_path):
     assert content["Li"] == pytest.approx(8.444, abs=1e-6)
     assert content["O"] == pytest.approx(12.0, abs=1e-6)
     assert xtl.spacegroup.startswith("C2/m")
+    assert "spacegroup" not in xtl.atoms.info  # no ase objects inside Crystal
 
 
 def test_pseudo_symmetry_names_the_breaking_reflection(tmp_path):
