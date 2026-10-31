@@ -2742,6 +2742,38 @@ class TestCorrelation:
             error = np.sqrt(np.mean((obj - expected) ** 2) / np.mean(expected**2))
             assert error < 1e-2, angle
 
+    def test_the_patch_products_are_the_fft_contraction(
+        self, mixed_pair, complex_pair, monkeypatch
+    ):
+        """Turned by 30 degrees the frames are placed as patches, whose contraction runs as two
+        matrix products (`_correlation_products`). Without them it runs as the spectra and inverse
+        FFTs over the padded detector grid, and the two agree to rounding, with one probe mode
+        and with two."""
+        fov = 16.0
+        kwargs = dict(
+            deconvolution_kernel="obf",
+            convolution_mode="correlation",
+            compute_variance=False,
+            obj_fov=(3 * fov, 3 * fov),
+            obj_origin=(-fov, -fov),
+            override_rotation_angle=30.0,
+            verbose=False,
+        )
+        cases = {"two-mode array probe": mixed_pair[1], "analytic probe": complex_pair[1]}
+        for name, montage in cases.items():
+            montage._correlation_gram_cache = None
+            products = to_numpy(montage.reconstruct(**kwargs).obj)
+            assert montage._correlation_gram_cache["products"] is not None, name
+            with monkeypatch.context() as patched:
+                patched.setattr(
+                    DirectPtychographyMontage, "_correlation_products", lambda *a: None
+                )
+                montage._correlation_gram_cache.pop("products")
+                spectra = to_numpy(montage.reconstruct(**kwargs).obj)
+            # the products run in float32 on weights built in float64 (`_correlation_products`),
+            # which leaves 3e-6 on this weak object; a wrong sub-lattice, sign or lag is O(1)
+            assert _relative_error(products, spectra) < 1e-5, name
+
     def test_a_patch_holds_the_canvas_band(self, coarse_montage):
         """On a scan four times coarser than the fixture's, a patch holds only the band the
         canvas shows. Turned by 30 degrees its 16 pixels per probe field of view need 22, and the

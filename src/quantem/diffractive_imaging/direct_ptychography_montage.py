@@ -3123,16 +3123,28 @@ class DirectPtychographyMontage(DirectPtychographyBase):
         b_hat = {s: torch.fft.fft2(shifted[1][s]) for s in sublattices}
         values = self._vbf_stack[bf.vbf_index_mapping]
         num_frames = int(values.shape[1])
+        products = None
+        if not on_lattice:
+            cache = self._correlation_gram_cache
+            products = cache.get("products")
+            if products is None:
+                products = self._correlation_products(
+                    operands, conj_a_hat, b_hat, sub, grid_shape, lags, bf_rows, bf_cols
+                )
+                cache["products"] = products
 
         def contractions(lo, hi):
             """``sum_k c_k*(q) V_R(k)`` on the grid, for the frames ``lo:hi``."""
+            if products is not None:
+                return products(values[:, lo:hi].T)
             frames = torch.zeros((hi - lo, *padded), device=self.device, dtype=complex_dtype)
             frames[:, bf_rows, bf_cols] = values[:, lo:hi].T.to(complex_dtype)
             spectra = {s: 0 for s in sublattices}
             for mode in range(modes.shape[0]):
                 f_hat = torch.fft.fft2(frames * psi[mode])
-                # B(q) = sum_k psi(k + q) psi*(k) V(k) reads the spectrum at -nu
-                g_hat = _reflect(torch.fft.fft2(frames * psi[mode].conj()))
+                # B(q) = sum_k psi(k + q) psi*(k) V(k) reads the spectrum of V psi* at -nu,
+                # which for real V is the conjugate of V psi's at nu
+                g_hat = f_hat.conj()
                 for s in sublattices:
                     spectra[s] = spectra[s] + conj_a_hat[s][mode] * f_hat - b_hat[s][mode] * g_hat
             return to_grid({s: torch.fft.ifft2(spectra[s]) for s in sublattices})
@@ -3462,6 +3474,110 @@ class DirectPtychographyMontage(DirectPtychographyBase):
             "psi": shifted[-1][(0, 0)],
             "to_grid": to_grid,
         }
+
+    def _correlation_products(
+        self, operands, conj_a_hat, b_hat, sub, grid_shape, lags, bf_rows, bf_cols
+    ):
+        """The contraction onto a patch as two matrix products: ``contract(values)`` gives what
+        the FFT route's spectra, inverse transforms and ``to_grid`` give, for values ``(B, N_bf)``.
+
+        Per sub-lattice the FFT route forms ``Z_s = A_s* F - B_s conj(F)`` over the padded
+        detector grid, transforms it back in full and keeps only the lags the patch holds, a few
+        tens of the padded grid's points per axis. Those lags are a partial inverse DFT,
+        ``E0 Z_s E1^T``, and the elementwise products fold into its first factor:
+        ``T_s[m, v] = sum_u (KA - KB)[m, u, v] Re F[u, v] + i (KA + KB)[m, u, v] Im F[u, v]``,
+        with ``KA = E0[m, u] A_s*[u, v]`` and ``KB = E0[m, u] B_s[u, v]``, summed over the modes.
+        A frame then costs one detector FFT per mode, one real matrix product per mode batched
+        over ``v``, and one complex product, and ``Z_s`` is never formed. The frames are laid out
+        transposed, so that the FFT's output feeds the first product without a copy.
+
+        The products run in float32 on every device, unlike the rest of the route, whose
+        correlations ``A`` and ``B`` are subtracted after they are formed and so need the device's
+        own precision (see :meth:`_correlation_setup`). Here the difference is taken once, in
+        ``KA - KB`` and ``KA + KB``, while the weights are built in the montage's precision, so
+        float32 products of the frames with them keep the weak signal: they stay within 3e-6 of
+        the float64 contraction on the two-mode weak-object test fixture. On GPUs without full
+        float64 units, such as the A40 and the RTX cards, float64 matrix products run at 1/64 of
+        float32's rate.
+        """
+        padded, sublattices = operands["padded"], operands["sublattices"]
+        p0, p1 = padded
+        s0, s1 = int(sub[0]), int(sub[1])
+        g0, g1 = int(grid_shape[0]), int(grid_shape[1])
+        n0, n1 = g0 // s0, g1 // s1
+        psi = operands["psi"]
+        precise = psi.dtype  # the montage's: the weights are built in it
+        complex_dtype, real_dtype = torch.complex64, torch.float32  # the products run in it
+
+        # the grid's lattice index -> (sub-lattice, detector lag, kept), as `to_grid` reads it
+        def lookup(n, factor, size, protected):
+            index = signed_index(n)
+            lag = index // factor
+            return index % factor, lag % size, np.abs(lag) <= protected
+
+        a_row, r_row, row_kept = lookup(g0, s0, p0, lags[0])
+        a_col, c_col, col_kept = lookup(g1, s1, p1, lags[1])
+        m_row, n_col = np.empty(g0, np.int64), np.empty(g1, np.int64)
+        e0 = np.zeros((s0, n0, p0), np.complex128)
+        e1 = np.zeros((s1, n1, p1), np.complex128)
+        for a in range(s0):
+            rows = np.flatnonzero(a_row == a)
+            m_row[rows] = np.arange(n0)
+            # torch's inverse transform divides by the size of each axis
+            e0[a] = (
+                np.exp(2j * np.pi * np.outer(r_row[rows], np.arange(p0)) / p0)
+                / p0
+                * row_kept[rows][:, None]
+            )
+        for a in range(s1):
+            cols = np.flatnonzero(a_col == a)
+            n_col[cols] = np.arange(n1)
+            e1[a] = (
+                np.exp(2j * np.pi * np.outer(c_col[cols], np.arange(p1)) / p1)
+                / p1
+                * col_kept[cols][:, None]
+            )
+        # cast on the host: MPS takes no float64
+        e0 = torch.as_tensor(e0).to(precise).to(self.device)
+        e0_s = e0[torch.as_tensor([a for a, _ in sublattices], device=self.device)]
+        a_hat = torch.stack([conj_a_hat[s] for s in sublattices], 1).resolve_conj()  # (M, S, ...)
+        b_stack = torch.stack([b_hat[s] for s in sublattices], 1)
+        weights = []
+        for mode in range(a_hat.shape[0]):
+            ka = torch.einsum("smu,suv->vusm", e0_s, a_hat[mode])
+            kb = torch.einsum("smu,suv->vusm", e0_s, b_stack[mode])
+            parts = torch.stack(
+                (torch.view_as_real(ka - kb), torch.view_as_real(1j * (ka + kb))), 2
+            )
+            # (v, u, Re/Im F, S = (a, a'), m, Re/Im) -> columns grouped by a' and then a
+            parts = parts.view(p1, p0, 2, s0, s1, n0, 2).permute(0, 1, 2, 4, 3, 5, 6)
+            weights.append(parts.reshape(p1, 2 * p0, s1 * s0 * n0 * 2).contiguous().to(real_dtype))
+        e1 = torch.as_tensor(e1).to(complex_dtype).to(self.device)
+        flat = (
+            (a_col[None, :] * n1 + n_col[None, :]) * (s0 * n0)
+            + a_row[:, None] * n0
+            + m_row[:, None]
+        )
+        flat = torch.as_tensor(flat.reshape(-1), device=self.device)
+        transposed = (bf_cols * p0 + bf_rows).to(self.device)
+        psi_bf = psi[:, bf_rows, bf_cols].to(complex_dtype)  # (M, N_bf)
+
+        def contract(values):
+            batch = values.shape[0]
+            values = values.to(complex_dtype)
+            t = None
+            for mode, weight in enumerate(weights):
+                frames = torch.zeros((batch, p1 * p0), device=self.device, dtype=complex_dtype)
+                frames[:, transposed] = values * psi_bf[mode]
+                spectrum = torch.fft.fft2(frames.view(batch, p1, p0))  # (B, v, u)
+                parts = torch.view_as_real(spectrum).reshape(batch, p1, 2 * p0).transpose(0, 1)
+                term = torch.bmm(parts, weight)
+                t = term if t is None else t + term
+            t = torch.view_as_complex(t.view(p1, batch, s1, s0 * n0, 2))
+            y = torch.matmul(e1, t.permute(1, 2, 0, 3))  # (B, a', n1, (a, m))
+            return y.reshape(batch, -1)[:, flat].view(batch, g0, g1).to(precise)
+
+        return contract
 
     def _correlation_probe(self, probe, detector_step, m, rotation_angle=0.0, oversample=8):
         """The probe in the detector frame, on a lattice ``m`` times finer than the detector's.
