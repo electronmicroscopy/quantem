@@ -4,7 +4,7 @@ from typing import Literal
 
 from quantem.core.utils.validators import validate_gt, validate_lt
 from quantem.core.visualization.custom_normalizations import NormalizationConfig
-from quantem.core.visualization.visualization_utils import ScalebarConfig
+from quantem.core.visualization.visualization_utils import ScalebarConfig, _parse_length_units
 
 
 class ShowParams:
@@ -234,8 +234,13 @@ class ShowParams:
             Unit label displayed on the scale bar (e.g. ``"Å"``, ``"nm"``,
             ``"1/Å"``). Default ``"pixels"``.
         length : float or None
-            Fixed scale bar length in physical units. ``None`` auto-estimates
-            a "nice" length.
+            Fixed scale bar length in physical units (in ``display_units`` if
+            given). ``None`` auto-estimates a "nice" length.
+        display_units : str or None
+            Units to show the scale bar in, converting from ``units``: e.g.
+            ``"nm"`` for data calibrated in ``"μm"``, or ``"1/Å"`` for data in
+            ``"1/nm"``. Supports pm, Å, nm, μm, mm, cm, m and their reciprocals.
+            ``None`` picks units automatically from the bar length.
         width_px : float
             Thickness of the bar in image pixels. Default 1.
         pad_px : float
@@ -265,11 +270,13 @@ class ShowParams:
         >>> ShowParams.Scalebar(sampling=0.5, units="Å")
         >>> ShowParams.Scalebar(sampling=0.02, units="1/Å", color="black", fontsize=16)
         >>> ShowParams.Scalebar(sampling=0.5, units="Å", outline_color="black")
+        >>> ShowParams.Scalebar(sampling=0.002, units="μm", display_units="nm")
         """
 
         sampling: float = 1.0
         units: str = "pixels"
         length: float | None = None
+        display_units: str | None = None
         width_px: float = 1
         pad_px: float = 0.5
         color: str = "white"
@@ -289,6 +296,11 @@ class ShowParams:
             validate_gt(self.width_px, 0, "width_px")
             validate_gt(self.fontsize, 0, "fontsize")
             validate_gt(self.outline_width, 0, "outline_width")
+            if self.display_units is not None and _parse_length_units(self.display_units) is None:
+                raise ValueError(
+                    f"Unknown display_units {self.display_units!r}; use pm, Å, nm, μm, mm, cm, "
+                    "m or a reciprocal such as '1/nm'."
+                )
             if not 0 <= self.box_alpha <= 1:
                 raise ValueError(f"box_alpha must be between 0 and 1, got {self.box_alpha}")
 

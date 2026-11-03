@@ -23,6 +23,7 @@ from quantem.core.visualization.custom_normalizations import (
 from quantem.core.visualization.show_params import ShowParams
 from quantem.core.visualization.visualization_utils import (
     ScalebarConfig,
+    _fill_scalebar_calibration,
     _resolve_scalebar,
     add_arg_cbar_to_ax,
     add_cbar_to_ax,
@@ -185,6 +186,7 @@ def _show_2d_array(
             box_alpha=scalebar_config.box_alpha,
             outline_color=scalebar_config.outline_color,
             outline_width=scalebar_config.outline_width,
+            display_units=scalebar_config.display_units,
         )
 
     for spine in ax.spines.values():  # fixes asymmetry of bbox for some reason
@@ -307,9 +309,30 @@ def _show_2d_combined(
             box_alpha=scalebar_config.box_alpha,
             outline_color=scalebar_config.outline_color,
             outline_width=scalebar_config.outline_width,
+            display_units=scalebar_config.display_units,
         )
 
     return fig, ax
+
+
+def _dataset_calibration_grid(arrays: Any) -> list[list[tuple[float, str] | None]]:
+    """Return (sampling, units) for each Dataset2d in the input grid, None for plain arrays.
+
+    Mirrors the grid layout of ``_normalize_show_input_to_grid`` so entries line up
+    with the panels, and must be called before ``to_cpu`` strips the datasets.
+    """
+    from quantem.core.datastructures import Dataset2d
+
+    def calib(obj: Any) -> tuple[float, str] | None:
+        if isinstance(obj, Dataset2d):
+            return float(obj.sampling[-1]), str(obj.units[-1])
+        return None
+
+    if not isinstance(arrays, (list, tuple)) or len(arrays) == 0:
+        return [[calib(arrays)]]
+    if not isinstance(arrays[0], (list, tuple)):
+        return [[calib(a) for a in arrays]]
+    return [[calib(a) for a in row] for row in arrays]
 
 
 def _normalize_show_input_to_grid(
@@ -577,6 +600,7 @@ def show_2d(
     >>> labels = [["BF", "ADF", "ABF"], ["HAADF", "DPC", "SSB"]]
     >>> fig, axs = show_2d(rows, title=labels, cmap="gray", scalebar={"sampling": 0.5, "units": "Å"})
     """
+    calibrations = _dataset_calibration_grid(arrays)
     arrays = to_cpu(arrays)
     grid = _normalize_show_input_to_grid(arrays)
     nrows = len(grid)
@@ -589,6 +613,8 @@ def show_2d(
             norm = norm[0] if not isinstance(norm[0], Sequence) else norm[0][0]
         if isinstance(scalebar, Sequence):  # flatten scalebar
             scalebar = scalebar[0] if not isinstance(scalebar[0], Sequence) else scalebar[0][0]
+        if calibrations[0][0] is not None:
+            scalebar = _fill_scalebar_calibration(scalebar, *calibrations[0][0])
         if isinstance(title, Sequence) and not isinstance(title, str):  # flatten title
             title = title[0] if isinstance(title[0], str) else title[0][0]
 
@@ -628,6 +654,15 @@ def show_2d(
         for i, row in enumerate(grid):
             for j, array in enumerate(row):
                 figax_local = (fig, axs[i][j])
+                calibration = (
+                    calibrations[i][j]
+                    if i < len(calibrations) and j < len(calibrations[i])
+                    else None
+                )
+                if calibration is not None:
+                    normalized_args[i][j]["scalebar"] = _fill_scalebar_calibration(
+                        normalized_args[i][j]["scalebar"], *calibration
+                    )
                 _show_2d_array(
                     array,
                     figax=figax_local,
