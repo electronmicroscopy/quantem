@@ -11,10 +11,8 @@ from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerParams
 from quantem.spectroscopy.spectroscopy_models import (
     CubeSpectrumModel,
     MeanSpectrumModel,
-    energy_dependent_line_widths,
     total_variation_in_plane,
     xeds_data_loss,
-    build_element_peak_basis
 )
 
 
@@ -415,8 +413,7 @@ def _fit_mean_model_pytorch(
     width_params = model.peak_width_params()
     if width_params is not None:
         width_values = [
-            float(torch.nn.functional.softplus(p).detach().cpu().item())
-            for p in width_params
+            float(torch.nn.functional.softplus(p).detach().cpu().item()) for p in width_params
         ]
     else:
         # widths are fixed: report the stored constants ([a, b] for energy_dependent, scalar otherwise)
@@ -475,8 +472,8 @@ def fit_spectrum_mean_pytorch(
 
     width_model="constant" fits one shared Gaussian FWHM (peak_width);
     width_model="energy_dependent" fits width(E) = a + b * sqrt(E) per X-ray line, with a
-    initialized from peak_width and b from peak_width_b. Set
-    freeze_peak_width_global=True to keep the widths fixed at their init values.
+    initialized from peak_width and b from peak_width_b (defaults to peak_width when None).
+    Set freeze_peak_width_global=True to keep the widths fixed at their init values.
     """
     optimizer_name = _normalize_choice(optimizer, "optimizer", {"adam", "lbfgs"})
     loss_name = _normalize_choice(loss, "loss", {"mse", "poisson"})
@@ -583,16 +580,15 @@ def fit_spectrum_pytorch(
     constrain_background=0.1,
     width_model="constant",
     peak_width_b=None,
-    freeze_peak_width_global=None,
+    freeze_peak_width_global=False,
 ):
     """Fit XEDS with a mean-first then full-cube workflow.
 
     width_model="constant" fits one shared Gaussian FWHM (peak_width);
     width_model="energy_dependent" fits width(E) = a + b * sqrt(E) per X-ray line, with a
-    initialized from peak_width and b from peak_width_b (e.g. a=0.02 keV,
-    b=0.043 for a typical Fano-limited detector). freeze_peak_width freezes the
-    cube-stage widths; freeze_peak_width_global also freezes the mean-stage
-    widths (defaults to freeze_peak_width when not set).
+    initialized from peak_width and b from peak_width_b (defaults to peak_width when None;
+    e.g. a=0.02 keV, b=0.043 for a typical Fano-limited detector). freeze_peak_width freezes
+    the cube-stage widths; freeze_peak_width_global freezes the mean-stage widths.
     """
     effective_optimizer_global = _normalize_choice(
         optimizer_global, "optimizer_global", {"adam", "lbfgs"}
@@ -600,11 +596,10 @@ def fit_spectrum_pytorch(
     effective_optimizer_local = _normalize_choice(
         optimizer_local, "optimizer_local", {"adam", "lbfgs"}
     )
-    effective_width_model = _normalize_choice(width_model, "width_model", {"constant", "energy_dependent"})
-    # freeze_peak_width_global defaults to freeze_peak_width so one flag freezes both stages
-    effective_freeze_global = (
-        bool(freeze_peak_width) if freeze_peak_width_global is None else bool(freeze_peak_width_global)
+    effective_width_model = _normalize_choice(
+        width_model, "width_model", {"constant", "energy_dependent"}
     )
+    effective_freeze_global = bool(freeze_peak_width_global)
     effective_loss_global = (
         _normalize_choice(loss_global, "loss_global", {"poisson", "mse"})
         if loss_global is not None
@@ -757,6 +752,11 @@ def fit_spectrum_pytorch(
         else:
             # widths are fixed: report the stored constants ([a, b] for energy_dependent, scalar otherwise)
             cube_width_values = cube_model._peak_width_fixed.detach().cpu().reshape(-1).tolist()
+        if effective_width_model == "energy_dependent":
+            cube_width_a, cube_width_b = cube_width_values
+        else:
+            (cube_width_a,) = cube_width_values
+            cube_width_b = None
         peak_widths = np.asarray(cube_width_values, dtype=np.float32)
         mean_input_spectrum = spectra[valid_pixel_mask].mean(dim=0).detach().cpu().numpy()
         mean_fitted_spectrum = predicted[valid_pixel_mask].mean(dim=0).detach().cpu().numpy()
@@ -798,6 +798,9 @@ def fit_spectrum_pytorch(
         "abundance_maps": abundance_maps,
         "element_names": list(global_fit["element_names"]),
         "peak_widths": peak_widths,
+        "peak_width": float(cube_width_a),
+        "peak_width_a": cube_width_a,
+        "peak_width_b": cube_width_b,
         "width_model": effective_width_model,
         "loss_history": local_loss_history,
         "global_loss_history": global_loss_history,
