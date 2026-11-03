@@ -8,25 +8,25 @@ from scipy.optimize import curve_fit
 
 from quantem.core.visualization import show_2d
 from quantem.spectroscopy.dataset3dspectroscopy import Dataset3dspectroscopy
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     interpret_thickness_quality as _visualize_thickness_quality,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_absolute_thickness as _visualize_absolute_thickness,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_absolute_zlp_shift as _visualize_absolute_zlp_shift,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_dual_eels_picker as _visualize_dual_eels_picker,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_quantem_diagnostic as _visualize_quantem_diagnostic,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     plot_zlp_drift_diagnostics as _visualize_zlp_drift_diagnostics,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     visualize_thickness_windows as _visualize_thickness_windows,
 )
 
