@@ -5,7 +5,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 from colorspacious import cspace_convert
-from matplotlib import cm, colors, legend, ticker
+from matplotlib import cm, colors, legend, patheffects, ticker
 from matplotlib.axes import Axes
 from matplotlib.colorbar import Colorbar
 from matplotlib.figure import Figure
@@ -144,6 +144,18 @@ class ScalebarConfig:
         Font size of the scale bar label in points.
     bold : bool, default=True
         Whether to render the scale bar label in bold.
+    box : bool, default=False
+        Draw a translucent box behind the bar and label.
+    box_color : str, default="black"
+        Fill color of the box.
+    box_alpha : float, default=0.5
+        Opacity of the box.
+    outline_color : str, optional
+        Color of an outline drawn around the bar and label (via matplotlib
+        path effects) so the scale bar stays readable on any background.
+        If None, no outline is drawn.
+    outline_width : float, default=2.0
+        Width of the outline in points.
     """
 
     sampling: float = 1.0
@@ -155,6 +167,11 @@ class ScalebarConfig:
     loc: str | int = "lower right"
     fontsize: int = 12
     bold: bool = True
+    box: bool = False
+    box_color: str = "black"
+    box_alpha: float = 0.5
+    outline_color: str | None = None
+    outline_width: float = 2.0
 
 
 SCALEBAR_KWARGS = [
@@ -350,6 +367,8 @@ def add_scalebar_to_ax(
     box: bool = False,
     box_color: str = "black",
     box_alpha: float = 0.5,
+    outline_color: str | None = None,
+    outline_width: float = 2.0,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -381,13 +400,16 @@ def add_scalebar_to_ax(
     box : bool, default=False
         Draw a translucent box behind the bar and label so it stays
         readable on any image (e.g. white bar on a black box, or black bar
-        on a white box). Padding follows ``pad_px``. ``box``, ``box_color``
-        and ``box_alpha`` are only available when calling this function
-        directly; ScalebarConfig and show_2d do not pass them.
+        on a white box). Padding follows ``pad_px``.
     box_color : str, default="black"
         Fill color of the box.
     box_alpha : float, default=0.5
         Opacity of the box.
+    outline_color : str, optional
+        Color of an outline drawn around the bar and label using
+        matplotlib path effects. If None, no outline is drawn.
+    outline_width : float, default=2.0
+        Width of the outline in points.
     """
     from matplotlib.font_manager import FontProperties
 
@@ -426,6 +448,14 @@ def add_scalebar_to_ax(
     )
     if box:
         bar.patch.set(facecolor=box_color, edgecolor="none", alpha=box_alpha)
+    if outline_color is not None:
+        effects = [
+            patheffects.withStroke(linewidth=outline_width, foreground=outline_color)
+        ]
+        for artist in bar.size_bar.get_children():
+            artist.set_path_effects(effects)
+        for artist in bar.txt_label.get_children():
+            artist.set_path_effects(effects)
     ax.add_artist(bar)
 
 
