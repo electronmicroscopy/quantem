@@ -180,6 +180,11 @@ def _show_2d_array(
             scalebar_config.loc,
             scalebar_config.fontsize,
             scalebar_config.bold,
+            box=scalebar_config.box,
+            box_color=scalebar_config.box_color,
+            box_alpha=scalebar_config.box_alpha,
+            outline_color=scalebar_config.outline_color,
+            outline_width=scalebar_config.outline_width,
         )
 
     for spine in ax.spines.values():  # fixes asymmetry of bbox for some reason
@@ -297,6 +302,11 @@ def _show_2d_combined(
             scalebar_config.loc,
             scalebar_config.fontsize,
             scalebar_config.bold,
+            box=scalebar_config.box,
+            box_color=scalebar_config.box_color,
+            box_alpha=scalebar_config.box_alpha,
+            outline_color=scalebar_config.outline_color,
+            outline_width=scalebar_config.outline_width,
         )
 
     return fig, ax
