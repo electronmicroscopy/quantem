@@ -5,6 +5,7 @@ from matplotlib import pyplot as plt
 
 from quantem.spectroscopy.spectroscopy_models import (
     build_element_peak_basis,
+    energy_dependent_line_widths,
     total_variation_in_plane,
     xeds_data_loss,
 )
@@ -133,8 +134,109 @@ class TestXEDSFitting:
         assert np.corrcoef(result["abundance_maps"][1].ravel(), cu_map.ravel())[0, 1] > 0.5
         assert result["spectrum_images_pytorch"]
 
+    def test_energy_dependent_width_model_mean_and_cube_fit(self, xeds_factory):
+        dataset = xeds_factory(np.zeros((2, 2, 384), dtype=np.float32))
+        energy_axis = torch.tensor(dataset.energy_axis, dtype=torch.float32)
+        basis_data = _collect_element_basis_data(dataset, energy_axis, ["Si", "Fe"])
+        line_widths = energy_dependent_line_widths(
+            basis_data["line_energies"],
+            torch.tensor(0.02, dtype=torch.float32),
+            torch.tensor(0.04, dtype=torch.float32),
+        )
+        basis = (
+            build_element_peak_basis(
+                energy_axis=energy_axis,
+                line_energies=basis_data["line_energies"],
+                line_weights=basis_data["line_weights"],
+                line_element_indices=basis_data["line_element_indices"],
+                n_elements=len(basis_data["element_names"]),
+                peak_width=line_widths,
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        background = 1.5 + 1.0 * np.linspace(0.0, 1.0, 384, dtype=np.float32)
+        amplitudes = np.array([450.0, 180.0], dtype=np.float32)
+        mean_spectrum = amplitudes @ basis + background
+        cube = np.broadcast_to(mean_spectrum, (2, 2, 384)).copy()
+        dataset = xeds_factory(cube)
+
+        mean_frozen = dataset.fit_spectrum_mean_pytorch(
+            elements_to_fit=["Si", "Fe"],
+            peak_width=0.02,
+            peak_width_b=0.04,
+            width_model="energy_dependent",
+            freeze_peak_width_global=True,
+            num_iters=15,
+            optimizer="lbfgs",
+            device="cpu",
+            show_plot=False,
+            verbose=False,
+        )
+        assert mean_frozen["width_model"] == "energy_dependent"
+        assert mean_frozen["peak_widths"].shape == (2,)
+        assert mean_frozen["peak_width_a"] == pytest.approx(0.02)
+        assert mean_frozen["peak_width_b"] == pytest.approx(0.04)
+
+        cube_result = dataset.fit_spectrum_pytorch(
+            elements_to_fit=["Si", "Fe"],
+            peak_width=0.025,
+            peak_width_b=0.045,
+            width_model="energy_dependent",
+            freeze_peak_width_global=False,
+            freeze_peak_width=True,
+            num_iters_global=15,
+            num_iters=15,
+            optimizer_global="adam",
+            optimizer_local="adam",
+            loss_local="mse",
+            device="cpu",
+            show_plot=False,
+            verbose=False,
+        )
+        assert cube_result["width_model"] == "energy_dependent"
+        assert cube_result["peak_widths"].shape == (2,)
+        assert cube_result["peak_width"] == pytest.approx(cube_result["peak_width_a"])
+        assert cube_result["peak_width_b"] is not None
+        assert np.isfinite(cube_result["abundance_maps"]).all()
+
 
 class TestXEDSFitHelpers:
+    def test_energy_dependent_line_widths_and_per_line_basis(self):
+        energy_axis = torch.linspace(0.0, 10.0, 200)
+        line_energies = torch.tensor([1.0, 4.0, 9.0])
+        line_weights = torch.tensor([1.0, 0.6, 0.4])
+        line_element_indices = torch.tensor([0, 1, 1], dtype=torch.long)
+
+        widths = energy_dependent_line_widths(
+            line_energies,
+            torch.tensor(0.02),
+            torch.tensor(0.04),
+        )
+        assert torch.allclose(widths, torch.tensor([0.06, 0.10, 0.14]))
+
+        basis = build_element_peak_basis(
+            energy_axis=energy_axis,
+            line_energies=line_energies,
+            line_weights=line_weights,
+            line_element_indices=line_element_indices,
+            n_elements=2,
+            peak_width=widths,
+        )
+        assert basis.shape == (2, 200)
+
+        with pytest.raises(ValueError, match="peak_width must have one entry per X-ray line"):
+            build_element_peak_basis(
+                energy_axis=energy_axis,
+                line_energies=line_energies,
+                line_weights=line_weights,
+                line_element_indices=line_element_indices,
+                n_elements=2,
+                peak_width=torch.tensor([0.05, 0.08]),
+            )
+
     def test_loss_and_tv_helper_values(self):
         predicted = torch.tensor([1.0, 2.0, 3.0])
         target = torch.tensor([0.0, 2.0, 4.0])
