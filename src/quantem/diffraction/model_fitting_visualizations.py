@@ -77,9 +77,9 @@ class ModelDiffractionVisualizations:
             ax.plot(disk_centers_rc[:, 1], disk_centers_rc[:, 0], **kw_disks)
 
     def plot_losses(
-        self, 
-        figax: tuple[Any, Any] | None = None, 
-        plot_lrs: bool = True, 
+        self,
+        figax: tuple[Any, Any] | None = None,
+        plot_lrs: bool = True,
         plot_individual: bool = False,
         individual_row: int = 0,
         individual_col: int = 0,
@@ -164,8 +164,8 @@ class ModelDiffractionVisualizations:
         overlay_on: Literal["model", "both"] = "model",
         origin_marker_kwargs: dict[str, Any] | None = None,
         disk_marker_kwargs: dict[str, Any] | None = None,
-        figsize: tuple[int, int] = (12,7),
-        **kwargs
+        figsize: tuple[int, int] = (12, 7),
+        **kwargs,
     ) -> tuple[Any, Any]:
         """
         Visualize fit losses with reference/model image panels.
@@ -215,7 +215,13 @@ class ModelDiffractionVisualizations:
         fig = plt.figure(figsize=figsize)
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
         ax_top = fig.add_subplot(gs[0])
-        md.plot_losses(figax=(fig, ax_top), plot_lrs=True, plot_individual=individual_loss,individual_row=pattern_row,individual_col=pattern_col)
+        md.plot_losses(
+            figax=(fig, ax_top),
+            plot_lrs=True,
+            plot_individual=individual_loss,
+            individual_row=pattern_row,
+            individual_col=pattern_col,
+        )
 
         if individual_loss:
             pred = md.render_individual_pattern(row=pattern_row, col=pattern_col)
@@ -223,7 +229,7 @@ class ModelDiffractionVisualizations:
         else:
             ref = np.asarray(md.image_ref, dtype=np.float32)
             pred = md.render_current
-        
+
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
         kwargs.setdefault("vmin", float(min(refp.min(), predp.min())))
@@ -241,7 +247,7 @@ class ModelDiffractionVisualizations:
             title=["image_ref", "model"],
             returnfig=False,
             axsize=axsize,
-            **kwargs
+            **kwargs,
         )
 
         if overlay:
@@ -278,7 +284,7 @@ class ModelDiffractionVisualizations:
         plot_mean_model: bool = False,
         plot_individual_model: bool = False,
         pattern_row: int = 0,
-        pattern_col: int= 0,
+        pattern_col: int = 0,
         power: float = 0.25,
         returnfig: bool = False,
         axsize: tuple[int, int] = (6, 6),
@@ -347,8 +353,6 @@ class ModelDiffractionVisualizations:
 
         refp = ref if power == 1.0 else np.maximum(ref, 0.0) ** float(power)
         predp = pred if power == 1.0 else np.maximum(pred, 0.0) ** float(power)
-        # kwargs.setdefault("vmin", float(min(refp.min(), predp.min())))
-        # kwargs.setdefault("vmax", float(max(refp.max(), predp.max())))
 
         norm = kwargs.get("norm", None)
         if norm is None:
@@ -382,7 +386,6 @@ class ModelDiffractionVisualizations:
                 "asinh_linear_range": cfg.asinh_linear_range,
             }
 
-
         t1 = kwargs.pop("title", "")
         fig, ax = show_2d(
             [refp, predp],
@@ -391,7 +394,7 @@ class ModelDiffractionVisualizations:
             cbar=True,
             returnfig=True,
             axsize=axsize,
-            **kwargs, 
+            **kwargs,
         )
         if overlay:
             if overlay_on not in ("model", "both"):
