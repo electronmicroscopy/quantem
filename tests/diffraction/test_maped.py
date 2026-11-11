@@ -100,7 +100,7 @@ def test_float_merge_saves_exactly_and_releases_input_memory(tmp_path):
     reference_t = reference.read()
     assert all(not tilt.data.is_released for tilt in tilts)
     saved = maped.merge(
-        save_to=tmp_path / "merged_master.h5", crop=True,
+        path=tmp_path / "merged_master.h5", crop=True,
         release_tilts=True, show=False, verbose=False,
     )
     assert equal(saved.read(), reference_t)

@@ -193,7 +193,7 @@ class MAPED(AutoSerialize):
         precision: float = 0.01,
         crop: bool = True,
         dtype: str | None = None,
-        save_to: str | Path | None = None,
+        path: str | Path | None = None,
         release_tilts: bool = False,
         show: bool = True,
         verbose: bool = True,
@@ -210,7 +210,7 @@ class MAPED(AutoSerialize):
             Images for :meth:`align_images`. Omit to use the default images.
         blur, border_taper, iterations, hann_window, max_shift, edge_blur, precision
             Alignment settings, with the same meaning as on each stage.
-        dtype, crop, save_to
+        dtype, crop, path
             Settings of :meth:`merge`. Omitted ``dtype`` preserves float32.
         release_tilts : bool
             Free each tilt's scan rows as the merge passes them, then close the
@@ -249,7 +249,7 @@ class MAPED(AutoSerialize):
         if verbose:
             print(report.aligned(self, iterations, started))
         return self.merge(
-            crop=crop, dtype=dtype, save_to=save_to, release_tilts=release_tilts,
+            crop=crop, dtype=dtype, path=path, release_tilts=release_tilts,
             show=show, verbose=verbose,
         )
 
@@ -394,7 +394,7 @@ class MAPED(AutoSerialize):
         self,
         scan_region: tuple[int, int, int, int] | None = None,
         crop: bool = False,
-        save_to: str | Path | None = None,
+        path: str | Path | None = None,
         release_tilts: bool = False,
         show: bool = True,
         verbose: bool = True,
@@ -413,11 +413,11 @@ class MAPED(AutoSerialize):
         ----------
         scan_region : (row_start, row_stop, col_start, col_stop), optional
             Inspect this part of the aligned scan, with exclusive stops.
-            Omit for the complete merge. Only available without ``save_to``.
+            Omit for the complete merge. Only available without ``path``.
         crop : bool
             Keep only the scan positions every tilt covers. The box is saved
             in ``metadata["maped_merge"]["scan_box"]``.
-        save_to : str or Path, optional
+        path : str or Path, optional
             Write the complete GPU merge to HDF5 in bounded regions, then reopen
             it as ANS. The encoded result must fit in memory. For a small CPU
             merge, call ``merged.save("merged.zip")`` afterwards instead.
@@ -434,7 +434,7 @@ class MAPED(AutoSerialize):
             same Torch calculation without compilation; CPU defaults to False.
         dtype : str or torch.dtype, optional
             Omitted or ``"float32"`` preserves the computed values. Dense
-            results are limited to 4 GiB; use ``save_to`` for larger results.
+            results are limited to 4 GiB; use ``path`` for larger results.
             Explicit ``"scaled_uint16"`` stores calibrated ANS regions with
             measured rounding error in ``metadata["precision"]``. CPU results
             stay float32 and use QuantEM's ordinary dataset serialization.
@@ -451,7 +451,7 @@ class MAPED(AutoSerialize):
         --------
         >>> merged = maped.merge(crop=True)
         >>> patch = maped.merge(scan_region=(252, 260, 252, 260), show=False)
-        >>> merged = maped.merge(save_to="merged_master.h5", release_tilts=True)
+        >>> merged = maped.merge(path="merged_master.h5", release_tilts=True)
         >>> merged = maped.merge(dtype="scaled_uint16", crop=True)
         """
         if self.real_space_shifts is None or self.diffraction_shifts is None:
@@ -459,10 +459,10 @@ class MAPED(AutoSerialize):
         if dtype not in (None, "float32", torch.float32, "scaled_uint16"):
             raise ValueError("dtype must be 'float32' or 'scaled_uint16'.")
         native = isinstance(self.tilts[0], Dataset4dstem)
-        if self.device.type == "cpu" and (save_to is not None or dtype == "scaled_uint16"):
+        if self.device.type == "cpu" and (path is not None or dtype == "scaled_uint16"):
             raise ValueError("Use merge() for native CPU float32, then merged.save('merged.zip').")
         storage_dtype = "scaled_uint16" if dtype == "scaled_uint16" else "float32"
-        in_memory = save_to is None and storage_dtype == "float32"
+        in_memory = path is None and storage_dtype == "float32"
         if scan_region is not None and not in_memory:
             raise ValueError(
                 "scan_region selects float32 inspection; omit it for a complete save."
@@ -472,7 +472,7 @@ class MAPED(AutoSerialize):
             self.tilts, self.real_space_shifts, self.diffraction_shifts,
             release_tilts=release_tilts and not in_memory,
             compile_merge=compile_merge,
-            max_region_frames=2048 if save_to else None,
+            max_region_frames=2048 if path else None,
             crop=crop,
         )
         if crop and scan_region is None and verbose:
@@ -492,7 +492,7 @@ class MAPED(AutoSerialize):
             if prod(shape) * 4 > 4 * 1024**3:
                 raise ValueError(
                     f"This float32 merge needs {prod(shape) * 4 / 1024**3:.2f} GiB. "
-                    "Use a smaller scan_region, save_to for a bounded float32 archive, "
+                    "Use a smaller scan_region, path= to save a bounded float32 HDF5, "
                     "or dtype='scaled_uint16' to explicitly accept calibrated rounding."
                 )
             values_t = torch.empty(shape, dtype=torch.float32, device=self.device)
@@ -525,7 +525,7 @@ class MAPED(AutoSerialize):
             self.dp_mean_merged = values_t.mean(dim=(0, 1))
         else:
             merged = type(self.tilts[0]).from_blocks(
-                regions, dtype=storage_dtype, device=self.device, save_to=save_to,
+                regions, dtype=storage_dtype, device=self.device, path=path,
             )
             if release_tilts:
                 self.tilts = []
