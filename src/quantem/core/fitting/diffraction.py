@@ -48,9 +48,7 @@ def _splat_patch(
     put(r0i + 1, c0i + 1, w11)
 
 
-def _gaussian_tap_weights(
-    frac: torch.Tensor, taps: torch.Tensor, sigma: float
-) -> torch.Tensor:
+def _gaussian_tap_weights(frac: torch.Tensor, taps: torch.Tensor, sigma: float) -> torch.Tensor:
     """
     Normalized 1D Gaussian weights from fractional positions to integer taps.
 
@@ -75,9 +73,7 @@ def _gaussian_tap_weights(
     return w / w.sum(dim=-1, keepdim=True)
 
 
-def _smooth_tap_weights(
-    frac: torch.Tensor, taps: torch.Tensor, width: float
-) -> torch.Tensor:
+def _smooth_tap_weights(frac: torch.Tensor, taps: torch.Tensor, width: float) -> torch.Tensor:
     """
     Normalized finite-support smoothstep splat weights.
 
@@ -142,9 +138,7 @@ def _splat_patch_gaussian(
             keep = r_ok & (cc >= 0) & (cc < w)
             if torch.any(keep):
                 ww = wr[:, i] * wc[:, j]
-                out.index_put_(
-                    (rr[keep], cc[keep]), v[keep] * ww[keep], accumulate=True
-                )
+                out.index_put_((rr[keep], cc[keep]), v[keep] * ww[keep], accumulate=True)
 
 
 def _splat_patch_batched_gaussian(
@@ -232,7 +226,7 @@ class DiskTemplate(RenderComponent):
     DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
         "force_center": False,
         "force_positive": True,
-        "force_norm": True, # force range [0,1]
+        "force_norm": True,  # force range [0,1]
         "force_shrinkage": False,
         "force_cutoff": False,
         "force_circular_mask": True,
@@ -340,13 +334,20 @@ class DiskTemplate(RenderComponent):
         self.constraint_config = self.DEFAULT_CONSTRAINT_CONFIG.copy()
         if constraint_config is not None:
             self.constraint_config.update(constraint_config)
-        
+
         if constraint_params is not None:
             self.apply_constraint_params(constraint_params, strict=True)
         if bool(self.hard_constraints.get("force_positive", False)):
             self._enforce_positivity()
-        if bool(self.hard_constraints.get("force_shrinkage", False)) and bool(self.hard_constraints.get("force_positive", True)):
-            raise RuntimeWarning("Setting shrinkage true and positivity false might cause negative values in disk template")
+        if bool(self.hard_constraints.get("force_shrinkage", False)) and not bool(
+            self.hard_constraints.get("force_positive", True)
+        ):
+            import warnings
+
+            warnings.warn(
+                "Setting shrinkage true and positivity false might cause negative values in disk template",
+                RuntimeWarning,
+            )
 
     @classmethod
     def from_array(
@@ -363,7 +364,6 @@ class DiskTemplate(RenderComponent):
         render_kernel: str = "gaussian",
         constraint_params: dict[str, Any] | None = None,
         constraint_config: dict[str, Any] | None = None,
-
     ) -> "DiskTemplate":
         return cls(
             name=name,
@@ -377,7 +377,6 @@ class DiskTemplate(RenderComponent):
             render_kernel=render_kernel,
             constraint_params=constraint_params,
             constraint_config=constraint_config,
-
         )
 
     def set_origin(self, origin: OriginND) -> None:
@@ -402,7 +401,13 @@ class DiskTemplate(RenderComponent):
         dc = cast(torch.Tensor, self.dc).to(device=out.device, dtype=out.dtype)
         if self.render_sigma is not None:
             _splat_patch_gaussian(
-                out, r0=r0, c0=c0, patch_vals=vals, dr=dr, dc=dc, scale=scale,
+                out,
+                r0=r0,
+                c0=c0,
+                patch_vals=vals,
+                dr=dr,
+                dc=dc,
+                scale=scale,
                 sigma=self.render_sigma,
                 kernel=self.render_kernel,
             )
@@ -448,8 +453,14 @@ class DiskTemplate(RenderComponent):
         vals = template_raw_b.reshape(B, N) * intensity_raw_b.view(B, 1)
         if self.render_sigma is not None:
             return _splat_patch_batched_gaussian(
-                ctx.shape, r0=r0, c0=c0, vals=vals, device=ctx.device,
-                dtype=ctx.dtype, sigma=self.render_sigma, kernel=self.render_kernel,
+                ctx.shape,
+                r0=r0,
+                c0=c0,
+                vals=vals,
+                device=ctx.device,
+                dtype=ctx.dtype,
+                sigma=self.render_sigma,
+                kernel=self.render_kernel,
             )
         return _splat_patch_batched(
             ctx.shape, r0=r0, c0=c0, vals=vals, device=ctx.device, dtype=ctx.dtype
@@ -495,52 +506,68 @@ class DiskTemplate(RenderComponent):
         with torch.no_grad():
             self.template_raw.clamp_(min=0.0)
             self.intensity_raw.clamp_(min=0.0)
-    
-    def _enforce_norm(self) -> None: # pick value and cut off 5 percent of mean, or every iteration shrinkage, every iteration just subtract a valye of 0.01
+
+    def _enforce_norm(
+        self,
+    ) -> None:  # pick value and cut off 5 percent of mean, or every iteration shrinkage, every iteration just subtract a valye of 0.01
         with torch.no_grad():
             self.template_raw -= self.template_raw.min()
-            self.template_raw /= self.template_raw.max()
-    
+            self.template_raw /= self.template_raw.max().clamp(min=1e-12)
+
     def _enforce_shrinkage(self) -> None:
         with torch.no_grad():
             self.template_raw -= self.constraint_config["shrinkage_amount"]
-    
+
     def _enforce_cutoff(self) -> None:
         with torch.no_grad():
-            mean_val = torch.max(self.template_raw) * self.constraint_config["hard_cutoff_threshold"]
+            mean_val = (
+                torch.max(self.template_raw) * self.constraint_config["hard_cutoff_threshold"]
+            )
             self.template_raw[self.template_raw <= mean_val] = 0
-    
+
     def _enforce_circular_mask(self) -> None:
         with torch.no_grad():
             h, w = self.template_raw.shape
             radius = (min(h, w) / 2.0) * self.constraint_config["circular_mask_radius_fraction"]
-            
-            r = torch.arange(-h/2, h/2, device=self.template_raw.device, dtype=self.template_raw.dtype)
-            c = torch.arange(-w/2, w/2, device=self.template_raw.device, dtype=self.template_raw.dtype)
-            rr, cc = torch.meshgrid(r, c, indexing='ij')
+
+            r = torch.arange(
+                -h / 2, h / 2, device=self.template_raw.device, dtype=self.template_raw.dtype
+            )
+            c = torch.arange(
+                -w / 2, w / 2, device=self.template_raw.device, dtype=self.template_raw.dtype
+            )
+            rr, cc = torch.meshgrid(r, c, indexing="ij")
             circle_matrix = torch.sqrt(rr**2 + cc**2)
-            
+
             if self.constraint_config["soft_circular_mask"]:
-                mask = torch.sigmoid(self.constraint_config["circular_mask_sharpness"]*(radius-circle_matrix))
+                mask = torch.sigmoid(
+                    self.constraint_config["circular_mask_sharpness"] * (radius - circle_matrix)
+                )
             else:
                 mask = circle_matrix <= radius
             self.template_raw *= mask
 
-
     def enforce_hard_constraints(self, ctx: RenderContext) -> None:
-        if bool(self.hard_constraints.get("force_center", False)):
-            self._center_disk()
-        if bool(self.hard_constraints.get("force_cutoff", False)):
-            self._enforce_cutoff()
-        if bool(self.hard_constraints.get("force_circular_mask", False)):
-            self._enforce_circular_mask()
-        if bool(self.hard_constraints.get("force_shrinkage", False)):
-            self._enforce_shrinkage()
-        if bool(self.hard_constraints.get("force_positive", False)):
-            self._enforce_positivity()
-        if bool(self.hard_constraints.get("force_norm", False)): # could be put in positivity
-            self._enforce_norm()
-        
+        if self.template_raw.requires_grad:
+            if bool(self.hard_constraints.get("force_center", False)):
+                self._center_disk()
+            if bool(self.hard_constraints.get("force_cutoff", False)):
+                self._enforce_cutoff()
+            if bool(self.hard_constraints.get("force_circular_mask", False)):
+                self._enforce_circular_mask()
+            if bool(self.hard_constraints.get("force_shrinkage", False)):
+                self._enforce_shrinkage()
+            if bool(self.hard_constraints.get("force_positive", False)):
+                with torch.no_grad():
+                    self.template_raw.clamp_(min=0.0)
+            if bool(self.hard_constraints.get("force_norm", False)):
+                self._enforce_norm()
+        if self.intensity_raw.requires_grad and bool(
+            self.hard_constraints.get("force_positive", False)
+        ):
+            with torch.no_grad():
+                self.intensity_raw.clamp_(min=0.0)
+
         super().enforce_hard_constraints(ctx)
 
     def constraint_loss(
@@ -550,7 +577,7 @@ class DiskTemplate(RenderComponent):
         tv_weight = float(cfg.get("tv_weight", 0.0))
         cutoff_weight = float(cfg.get("cutoff_weight", 0.0))
         circular_weight = float(cfg.get("circular_weight", 0.0))
-        
+
         if tv_weight <= 0.0:
             tv_weight = 0.0
         if cutoff_weight <= 0.0:
@@ -574,25 +601,35 @@ class DiskTemplate(RenderComponent):
 
         # Cutoff loss calculation
         num_px = torch.prod(torch.tensor(template.shape))
-        px_under_threshold = torch.sum(template <= torch.mean(template)*self.constraint_config["soft_cutoff_threshold"])/num_px
-        cutoff_loss = torch.as_tensor(cutoff_weight, device=ctx.device, dtype=ctx.dtype) * torch.maximum(
-            px_under_threshold-self.constraint_config["soft_cutoff_target_ratio"], torch.as_tensor(0.0, device=ctx.device, dtype=ctx.dtype))
-        
+        px_under_threshold = (
+            torch.sum(
+                template <= torch.mean(template) * self.constraint_config["soft_cutoff_threshold"]
+            )
+            / num_px
+        )
+        cutoff_loss = torch.as_tensor(
+            cutoff_weight, device=ctx.device, dtype=ctx.dtype
+        ) * torch.maximum(
+            px_under_threshold - self.constraint_config["soft_cutoff_target_ratio"],
+            torch.as_tensor(0.0, device=ctx.device, dtype=ctx.dtype),
+        )
+
         # circular loss calculation
         h, w = template.shape
         radius = (min(h, w) / 2.0) * self.constraint_config["circular_mask_radius_fraction"]
 
         r = torch.arange(h, device=ctx.device, dtype=ctx.dtype) - h / 2.0
         c = torch.arange(w, device=ctx.device, dtype=ctx.dtype) - w / 2.0
-        rr, cc = torch.meshgrid(r, c, indexing='ij')
-        
+        rr, cc = torch.meshgrid(r, c, indexing="ij")
+
         circle_mask = torch.sqrt(rr**2 + cc**2)
 
-        dist_from_radius = torch.abs(circle_mask - radius)
-        dist_from_radius = torch.relu(dist_from_radius)
+        dist_from_radius = torch.relu(circle_mask - radius)
         circular_err = torch.mean(dist_from_radius * template)
-        
-        circular_loss = torch.as_tensor(circular_weight, device=ctx.device, dtype=ctx.dtype) * circular_err
+
+        circular_loss = (
+            torch.as_tensor(circular_weight, device=ctx.device, dtype=ctx.dtype) * circular_err
+        )
 
         return cutoff_loss + tv_loss + circular_loss
 
@@ -649,7 +686,7 @@ class DiskTemplate(RenderComponent):
         c = torch.arange(w, device=ctx.device, dtype=ctx.dtype) - w / 2.0
         rr, cc = torch.meshgrid(r, c, indexing="ij")
         circle_mask = torch.sqrt(rr * rr + cc * cc)
-        dist_from_radius = torch.relu(torch.abs(circle_mask - radius))  # (H, W)
+        dist_from_radius = torch.relu(circle_mask - radius)  # (H, W)
         circular_err = (dist_from_radius.unsqueeze(0) * template).mean(dim=(1, 2))
         circular_loss = circular_weight * circular_err
 
@@ -658,13 +695,11 @@ class DiskTemplate(RenderComponent):
     def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
         params = []
         for name, param in self.named_parameters(recurse=True):
-            if not name.startswith('origin.') and param.requires_grad:
+            if not name.startswith("origin.") and param.requires_grad:
                 params.append(param)
         if not params:
             return {}
-        return {'default': params}
-
-        
+        return {"default": params}
 
 
 class SyntheticDiskLattice(RenderComponent):
@@ -672,9 +707,9 @@ class SyntheticDiskLattice(RenderComponent):
         "force_positive_intensity": True,
     }
     DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {
-            "consistency_weight": 0.0,
-            "consistency_window": 1,
-        }
+        "consistency_weight": 0.0,
+        "consistency_window": 1,
+    }
 
     def __init__(
         self,
@@ -952,11 +987,7 @@ class SyntheticDiskLattice(RenderComponent):
         """
         with torch.no_grad():
             self.i0_raw.clamp_(min=0.0)
-            if (
-                self.max_slope_ratio is not None
-                and self.ir is not None
-                and self.ic is not None
-            ):
+            if self.max_slope_ratio is not None and self.ir is not None and self.ic is not None:
                 radius = self._slope_support_radius()
                 if radius > 0.0:
                     slope = torch.sqrt(self.ir * self.ir + self.ic * self.ic)
@@ -981,7 +1012,6 @@ class SyntheticDiskLattice(RenderComponent):
         if self.own_template:
             self.disk.enforce_hard_constraints(ctx)
         super().enforce_hard_constraints(ctx)
-
 
     def _mask_keep(
         self, ctx: RenderContext, centers_r: torch.Tensor, centers_c: torch.Tensor
@@ -1024,7 +1054,7 @@ class SyntheticDiskLattice(RenderComponent):
         if self.intensity_softplus_beta is not None:
             beta = self.intensity_softplus_beta
             return F.softplus(beta * inten) / beta
-        return (inten)
+        return torch.clamp(inten, min=0.0)
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
@@ -1050,7 +1080,7 @@ class SyntheticDiskLattice(RenderComponent):
             keep = keep & mk
         if not torch.any(keep):
             return out
-        
+
         centers_r = centers_r[keep]
         centers_c = centers_c[keep]
         keep_idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
@@ -1071,27 +1101,41 @@ class SyntheticDiskLattice(RenderComponent):
         if self.per_disk_intensity:
             i0 = self.i0_raw[keep_idx][:, None]
             inten = i0.expand(-1, num_pixels)
-            
+
             if active_order >= 1 and self.ir is not None:
                 ir = self.ir[keep_idx][:, None]
                 ic = self.ic[keep_idx][:, None]
                 inten = inten + ir * dr[None, :] + ic * dc[None, :]
-            
+
             if active_order >= 2 and self.irr is not None:
                 irr = self.irr[keep_idx][:, None]
                 icc = self.icc[keep_idx][:, None]
                 irc = self.irc[keep_idx][:, None]
-                inten = inten + irr * (dr*dr)[None, :] + icc * (dc*dc)[None, :] + irc * (dr*dc)[None, :]
+                inten = (
+                    inten
+                    + irr * (dr * dr)[None, :]
+                    + icc * (dc * dc)[None, :]
+                    + irc * (dr * dc)[None, :]
+                )
         else:
             inten = self.i0_raw if isinstance(self.i0_raw, torch.Tensor) else self.i0_raw
             if active_order >= 1:
                 inten = inten + self.ir * centers_r + self.ic * centers_c
             if active_order >= 2:
-                inten = inten + self.irr * centers_r**2 + self.icc * centers_c**2 + self.irc * centers_r * centers_c
-        
+                inten = (
+                    inten
+                    + self.irr * centers_r**2
+                    + self.icc * centers_c**2
+                    + self.irc * centers_r * centers_c
+                )
+
         # Positivity: hard clip, or smooth softplus if a beta is configured.
         inten = self._apply_positivity(inten)
-        inten = inten[:, None].expand(-1, num_pixels) if inten.ndim == 1 else inten.expand(num_disks, num_pixels)
+        inten = (
+            inten[:, None].expand(-1, num_pixels)
+            if inten.ndim == 1
+            else inten.expand(num_disks, num_pixels)
+        )
         total_pixels = num_disks * num_pixels
         r0_all = centers_r[:, None].expand(-1, num_pixels).reshape(total_pixels)
         c0_all = centers_c[:, None].expand(-1, num_pixels).reshape(total_pixels)
@@ -1100,8 +1144,13 @@ class SyntheticDiskLattice(RenderComponent):
         vals_all = (patch_vals[None, :] * inten).reshape(total_pixels)
         if self.disk.render_sigma is not None:
             _splat_patch_gaussian(
-                out, r0=r0_all, c0=c0_all, patch_vals=vals_all,
-                dr=dr_all, dc=dc_all, scale=torch.ones_like(vals_all),
+                out,
+                r0=r0_all,
+                c0=c0_all,
+                patch_vals=vals_all,
+                dr=dr_all,
+                dc=dc_all,
+                scale=torch.ones_like(vals_all),
                 sigma=self.disk.render_sigma,
                 kernel=self.disk.render_kernel,
             )
@@ -1113,7 +1162,7 @@ class SyntheticDiskLattice(RenderComponent):
                 patch_vals=vals_all,
                 dr=dr_all,
                 dc=dc_all,
-                scale=torch.ones_like(vals_all)
+                scale=torch.ones_like(vals_all),
             )
         return out
 
@@ -1180,7 +1229,11 @@ class SyntheticDiskLattice(RenderComponent):
         if self.per_disk_intensity:
             inten = i0_raw_b.unsqueeze(2).expand(B, K, N_pix)
             if active_order >= 1 and ir_b is not None and ic_b is not None:
-                inten = inten + ir_b.unsqueeze(2) * dr.view(1, 1, N_pix) + ic_b.unsqueeze(2) * dc.view(1, 1, N_pix)
+                inten = (
+                    inten
+                    + ir_b.unsqueeze(2) * dr.view(1, 1, N_pix)
+                    + ic_b.unsqueeze(2) * dc.view(1, 1, N_pix)
+                )
             if active_order >= 2 and irr_b is not None and icc_b is not None and irc_b is not None:
                 inten = (
                     inten
@@ -1191,7 +1244,11 @@ class SyntheticDiskLattice(RenderComponent):
         else:
             inten = i0_raw_b.view(B, 1, 1).expand(B, K, N_pix).clone()
             if active_order >= 1 and ir_b is not None and ic_b is not None:
-                inten = inten + ir_b.view(B, 1, 1) * r0_kb.unsqueeze(2) + ic_b.view(B, 1, 1) * c0_kb.unsqueeze(2)
+                inten = (
+                    inten
+                    + ir_b.view(B, 1, 1) * r0_kb.unsqueeze(2)
+                    + ic_b.view(B, 1, 1) * c0_kb.unsqueeze(2)
+                )
             if active_order >= 2 and irr_b is not None and icc_b is not None and irc_b is not None:
                 inten = (
                     inten
@@ -1211,32 +1268,42 @@ class SyntheticDiskLattice(RenderComponent):
 
         if self.disk.render_sigma is not None:
             return _splat_patch_batched_gaussian(
-                ctx.shape, r0=r0_full, c0=c0_full, vals=vals_full,
-                device=ctx.device, dtype=ctx.dtype, sigma=self.disk.render_sigma, kernel=self.disk.render_kernel,
+                ctx.shape,
+                r0=r0_full,
+                c0=c0_full,
+                vals=vals_full,
+                device=ctx.device,
+                dtype=ctx.dtype,
+                sigma=self.disk.render_sigma,
+                kernel=self.disk.render_kernel,
             )
         return _splat_patch_batched(
-            ctx.shape, r0=r0_full, c0=c0_full, vals=vals_full,
-            device=ctx.device, dtype=ctx.dtype,
+            ctx.shape,
+            r0=r0_full,
+            c0=c0_full,
+            vals=vals_full,
+            device=ctx.device,
+            dtype=ctx.dtype,
         )
 
     def get_optimization_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
         params = []
         for name, param in self.named_parameters(recurse=True):
-            if name.startswith('disk.'):
+            if name.startswith("disk."):
                 # The lattice's own template is trained here; other disk params
                 # (intensity, its origin) are not owned by the lattice.
-                if self.own_template and name == 'disk.template_raw' and param.requires_grad:
+                if self.own_template and name == "disk.template_raw" and param.requires_grad:
                     params.append(param)
                 continue
             if param.requires_grad:
                 params.append(param)
         if not params:
             return {}
-        return {'default': params}
+        return {"default": params}
 
     def constraint_loss(
-        self, 
-        ctx: RenderContext, 
+        self,
+        ctx: RenderContext,
         params: dict[str, object] | None = None,
         neighbor_target: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -1246,12 +1313,17 @@ class SyntheticDiskLattice(RenderComponent):
             ir = self.ir.to(device=ctx.device, dtype=ctx.dtype)
             ic = self.ic.to(device=ctx.device, dtype=ctx.dtype)
             l2_loss = self.slope_l2_weight * torch.mean(ir * ir + ic * ic)
-        
+
         cfg = self.effective_soft_constraints(cast(dict[str, object] | None, params))
         consistency_weight = max(float(cfg.get("consistency_weight", 0.0)), 0.0)
         consistency_loss = torch.zeros((), device=ctx.device, dtype=ctx.dtype)
         if consistency_weight > 0.0 and neighbor_target is not None:
-            for attr, key in (("u_row", "u_row"), ("u_col", "u_col"), ("v_row", "v_row"), ("v_col", "v_col")):
+            for attr, key in (
+                ("u_row", "u_row"),
+                ("u_col", "u_col"),
+                ("v_row", "v_row"),
+                ("v_col", "v_col"),
+            ):
                 tgt = neighbor_target.get(key)
                 if tgt is None or tgt != tgt:  # NaN check without importing math
                     continue
@@ -1285,13 +1357,14 @@ class SyntheticDiskLattice(RenderComponent):
         consistency_weight = max(float(cfg.get("consistency_weight", 0.0)), 0.0)
 
         if consistency_weight > 0.0 and neighbor_target is not None:
+
             def penalty(x, tgt):
                 if x is None or tgt is None:
                     return torch.zeros(B, device=ctx.device, dtype=ctx.dtype)
                 valid = ~torch.isnan(tgt)
                 safe_tgt = torch.where(valid, tgt, x.detach())
                 return torch.where(valid, (x - safe_tgt) ** 2, torch.zeros_like(x))
-            
+
             out = out + consistency_weight * (
                 penalty(u_row_b, neighbor_target.get("u_row"))
                 + penalty(u_col_b, neighbor_target.get("u_col"))

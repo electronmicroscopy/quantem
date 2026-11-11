@@ -253,7 +253,12 @@ class ModelDiffractionVisualizations:
         if overlay:
             if overlay_on not in ("model", "both"):
                 raise ValueError("overlay_on must be 'model' or 'both'.")
-            origin_rc, disk_centers_rc = md.get_overlay_coordinates()
+            overlay_state = (
+                md.state_individual_refined[pattern_row, pattern_col]
+                if (individual_loss and md.state_individual_refined is not None)
+                else None
+            )
+            origin_rc, disk_centers_rc = md.get_overlay_coordinates(state=overlay_state)
             axes = [axs[1]] if overlay_on == "model" else [axs[0], axs[1]]
             for ax in axes:
                 self._plot_overlays(
@@ -268,7 +273,7 @@ class ModelDiffractionVisualizations:
 
         mean_hist = md.fit_history.get("mean")
         if individual_loss:
-            mean_hist = md.fit_history.get(f"individual_{pattern_row}_{pattern_row}")
+            mean_hist = md.fit_history.get(f"individual_{pattern_row}_{pattern_col}")
         if mean_hist is not None and len(mean_hist.losses) > 0:
             fig.suptitle(
                 f"Final loss: {mean_hist.losses[-1]:.3e} | Iters: {len(mean_hist.losses)}",
@@ -399,7 +404,13 @@ class ModelDiffractionVisualizations:
         if overlay:
             if overlay_on not in ("model", "both"):
                 raise ValueError("overlay_on must be 'model' or 'both'.")
-            origin_rc, disk_centers_rc = md.get_overlay_coordinates()
+            if plot_individual_model and md.state_individual_refined is not None:
+                overlay_state = md.state_individual_refined[pattern_row, pattern_col]
+            elif plot_mean_model:
+                overlay_state = md.state_mean_refined
+            else:
+                overlay_state = None
+            origin_rc, disk_centers_rc = md.get_overlay_coordinates(state=overlay_state)
             axs_arr = np.asarray(ax, dtype=object).reshape(-1)
             axes = [axs_arr[1]] if overlay_on == "model" else [axs_arr[0], axs_arr[1]]
             for a in axes:

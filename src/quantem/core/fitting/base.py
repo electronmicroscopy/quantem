@@ -785,7 +785,7 @@ class BCEMSELoss(nn.Module):
         )
 
         # Combined loss
-        total_loss = mse_loss + self.gamma**bce_loss
+        total_loss = mse_loss + self.gamma * bce_loss
 
         return total_loss
 

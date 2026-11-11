@@ -52,6 +52,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         # Dataset/input references
         self.dataset = dataset
+        self._raw_array: np.ndarray | None = None
         self.image_ref: np.ndarray | None = None
         self.preprocess_shifts: np.ndarray | None = None
         self.index_shape: tuple[int, ...] | None = None
@@ -253,13 +254,18 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             "soft": dict(component.soft_constraints),
         }
 
-    def get_overlay_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+    def get_overlay_coordinates(
+        self, state: dict[str, torch.Tensor] | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Return origin and lattice disk-center coordinates for overlay plotting.
 
         Parameters
         ----------
-        None
+        state : dict[str, torch.Tensor] | None, optional
+            Optional model state dict to evaluate coordinates from without
+            mutating the live model state. If ``None``, uses the current live
+            model parameters.
 
         Returns
         -------
@@ -275,50 +281,57 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         Notes
         -----
-        Coordinates are computed from current model parameters without mutating state.
+        Coordinates are computed from model parameters without mutating state.
         Boundary filtering matches ``SyntheticDiskLattice.forward`` behavior.
         """
         if self.model is None or self.ctx is None:
             raise RuntimeError("Call .define_model(...) first.")
 
-        with torch.no_grad():
-            origin = cast(OriginND, self.model.origin)
-            origin_rc = origin.coords[:2].detach().cpu().numpy().astype(np.float32, copy=False)
+        live = self._get_model_state_dict_copy() if state is not None else None
+        try:
+            if state is not None:
+                self._load_model_state_dict_copy(state)
+            with torch.no_grad():
+                origin = cast(OriginND, self.model.origin)
+                origin_rc = origin.coords[:2].detach().cpu().numpy().astype(np.float32, copy=False)
 
-            centers: list[np.ndarray] = []
-            for module in self.model.components:
-                component = cast(RenderComponent, module)
-                if not isinstance(component, SyntheticDiskLattice):
-                    continue
-                if component.origin is None:
-                    continue
-                uv_indices = cast(torch.Tensor, component.uv_indices)
-                if torch.numel(uv_indices) == 0:
-                    continue
+                centers: list[np.ndarray] = []
+                for module in self.model.components:
+                    component = cast(RenderComponent, module)
+                    if not isinstance(component, SyntheticDiskLattice):
+                        continue
+                    if component.origin is None:
+                        continue
+                    uv_indices = cast(torch.Tensor, component.uv_indices)
+                    if torch.numel(uv_indices) == 0:
+                        continue
 
-                uv = torch.as_tensor(uv_indices, device=self.ctx.device)
-                u = uv[:, 0].to(dtype=self.ctx.dtype)
-                v = uv[:, 1].to(dtype=self.ctx.dtype)
-                r0, c0 = component.origin.coords[0], component.origin.coords[1]
-                centers_r = r0 + u * component.u_row + v * component.v_row
-                centers_c = c0 + u * component.u_col + v * component.v_col
+                    uv = torch.as_tensor(uv_indices, device=self.ctx.device)
+                    u = uv[:, 0].to(dtype=self.ctx.dtype)
+                    v = uv[:, 1].to(dtype=self.ctx.dtype)
+                    r0, c0 = component.origin.coords[0], component.origin.coords[1]
+                    centers_r = r0 + u * component.u_row + v * component.v_row
+                    centers_c = c0 + u * component.u_col + v * component.v_col
 
-                b = torch.as_tensor(
-                    component.boundary_px, device=self.ctx.device, dtype=self.ctx.dtype
-                )
-                keep = (centers_r >= b) & (centers_r <= (self.ctx.shape[0] - 1) - b)
-                keep = keep & (centers_c >= b) & (centers_c <= (self.ctx.shape[1] - 1) - b)
-                mk = component._mask_keep(self.ctx, centers_r, centers_c)
-                if mk is not None:
-                    keep = keep & mk
-                if torch.any(keep):
-                    rc = torch.stack((centers_r[keep], centers_c[keep]), dim=1)
-                    centers.append(rc.detach().cpu().numpy().astype(np.float32, copy=False))
+                    b = torch.as_tensor(
+                        component.boundary_px, device=self.ctx.device, dtype=self.ctx.dtype
+                    )
+                    keep = (centers_r >= b) & (centers_r <= (self.ctx.shape[0] - 1) - b)
+                    keep = keep & (centers_c >= b) & (centers_c <= (self.ctx.shape[1] - 1) - b)
+                    mk = component._mask_keep(self.ctx, centers_r, centers_c)
+                    if mk is not None:
+                        keep = keep & mk
+                    if torch.any(keep):
+                        rc = torch.stack((centers_r[keep], centers_c[keep]), dim=1)
+                        centers.append(rc.detach().cpu().numpy().astype(np.float32, copy=False))
 
-            if centers:
-                disk_centers_rc = np.concatenate(centers, axis=0)
-            else:
-                disk_centers_rc = np.zeros((0, 2), dtype=np.float32)
+                if centers:
+                    disk_centers_rc = np.concatenate(centers, axis=0)
+                else:
+                    disk_centers_rc = np.zeros((0, 2), dtype=np.float32)
+        finally:
+            if live is not None:
+                self._load_model_state_dict_copy(live)
 
         return origin_rc, disk_centers_rc
 
@@ -336,7 +349,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         rows=None,
         cols=None,
     ) -> "ModelDiffraction":
-        arr = np.asarray(self.dataset.array)
+        if self._raw_array is None:
+            self._raw_array = np.asarray(self.dataset.array).copy()
+        arr = self._raw_array
         self.mask = np.ones(arr.shape[:2])
 
         if arr.ndim < 2:
@@ -653,7 +668,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         rows=None,
         cols=None,
         n_steps: int = 200,
-        reset: bool | Literal["initialized", "mean_refined"],
+        reset: bool | Literal["initialized", "mean_refined"] = "mean_refined",
         optimizer_params: dict | None = None,
         scheduler_params: dict | None = None,
         constraint_weight: float = 1.0,
@@ -727,33 +742,62 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         if progress:
             pbar = tqdm(total=rows.shape[0] * cols.shape[0], desc="Fit individual")
 
-        for r in rows:
-            for c in cols:
-                self.reset(
-                    reset_to=cast(Literal["initialized", "mean_refined"], reset),
-                    reset_history=False,
-                )
-                nt_single = _neighbor_uv_target_single(self.state_individual_refined, r, c)
-                self.fit_render(
-                    target=torch.as_tensor(
-                        self.dataset.array[r, c], device=self.ctx.device, dtype=self.ctx.dtype
-                    ),
-                    n_steps=int(n_steps),
-                    constraint_weight=float(constraint_weight),
-                    constraint_params=constraint_params,
-                    optimizer_params=optimizer_params,
-                    scheduler_params=scheduler_params,
-                    progress=False,
-                    run_key=f"individual_{r}_{c}",
-                    neighbor_target=nt_single,
-                )
+        saved_requires_grad: list[tuple[torch.nn.Parameter, bool]] = []
+        if frozen_components is not None:
+            frozen_names = (
+                [frozen_components]
+                if isinstance(frozen_components, str)
+                else list(frozen_components)
+            )
+            for target_name in frozen_names:
+                matched = False
+                for idx, module in enumerate(self.model.components):
+                    comp = cast(RenderComponent, module)
+                    cname = self.model._component_constraint_name(comp, idx)
+                    if cname == target_name or comp.__class__.__name__ == target_name:
+                        matched = True
+                        for _, param in comp.named_parameters(recurse=False):
+                            saved_requires_grad.append((param, bool(param.requires_grad)))
+                            param.requires_grad_(False)
+                if not matched:
+                    known = self.model.get_component_names()
+                    raise KeyError(
+                        f"Unknown component name '{target_name}' in frozen_components. "
+                        f"Known: {known}"
+                    )
 
-                s_fit = self._get_model_state_dict_copy()
-                self.state_individual_refined[r, c] = self._clone_state_dict(s_fit)
-                if progress:
-                    pbar.update(1)
-        if progress:
-            pbar.close()
+        try:
+            for r in rows:
+                for c in cols:
+                    self.reset(
+                        reset_to=cast(Literal["initialized", "mean_refined"], reset),
+                        reset_history=False,
+                    )
+                    nt_single = _neighbor_uv_target_single(self.state_individual_refined, r, c)
+                    self.fit_render(
+                        target=torch.as_tensor(
+                            self.dataset.array[r, c], device=self.ctx.device, dtype=self.ctx.dtype
+                        ),
+                        n_steps=int(n_steps),
+                        constraint_weight=float(constraint_weight),
+                        constraint_params=constraint_params,
+                        constraint_config_params=constraint_config_params,
+                        optimizer_params=optimizer_params,
+                        scheduler_params=scheduler_params,
+                        progress=False,
+                        run_key=f"individual_{r}_{c}",
+                        neighbor_target=nt_single,
+                    )
+
+                    s_fit = self._get_model_state_dict_copy()
+                    self.state_individual_refined[r, c] = self._clone_state_dict(s_fit)
+                    if progress:
+                        pbar.update(1)
+        finally:
+            for param, req_grad in reversed(saved_requires_grad):
+                param.requires_grad_(req_grad)
+            if progress:
+                pbar.close()
 
         self.individual_refined = True
         self.g1_array = None
@@ -1190,7 +1234,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self.i0_sum_array = np.zeros(shape=(scan_r, scan_c))
 
         if use_radial_method:
-            center_y, center_x = np.array(self.dataset.shape[:-2]) / 2
+            center_y, center_x = np.array(self.dataset.shape[-2:]) / 2.0
             y, x = np.ogrid[: self.dataset.shape[-2], : self.dataset.shape[-1]]
             radius_map = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
             exclusion_radius = exclusion_radius_fraction * self.dataset.shape[-1]
@@ -1216,7 +1260,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
                     if i0_raw is None or uv_indices is None:
                         continue
                     is_not_center = ~((uv_indices[:, 0] == 0) & (uv_indices[:, 1] == 0))
-                    self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
+                    if i0_raw.ndim == 0:
+                        self.i0_sum_array[r, c] = float(i0_raw) * int(np.sum(is_not_center))
+                    else:
+                        self.i0_sum_array[r, c] = np.sum(i0_raw[is_not_center])
 
         # Min-max normalization to [0, 1], no contrast windowing (set mask_range at
         # display). Subtracting the floor -- rather than only dividing by the max -- keeps
@@ -2133,7 +2180,23 @@ class _BatchedPlan:
 
         if self.lats is not None:
             for lat_name, lat in zip(self.lat_names, self.lats):
+                for pname, (lo, hi) in lat.parameter_bounds.items():
+                    key = f"{lat_name}.{pname}"
+                    if key in stacked and key not in skip_keys:
+                        self._clamp_bounds_inplace(stacked[key], lo, hi)
+
                 i0_key = f"{lat_name}.i0_raw"
+                if (
+                    lat._center_i0_bounds is not None
+                    and lat._center_i0_index is not None
+                    and i0_key in stacked
+                    and i0_key not in skip_keys
+                ):
+                    i0 = stacked[i0_key]
+                    if i0.ndim >= 2:
+                        lo_c, hi_c = lat._center_i0_bounds
+                        self._clamp_bounds_inplace(i0[:, lat._center_i0_index], lo_c, hi_c)
+
                 if i0_key not in skip_keys and bool(
                     lat.hard_constraints.get("force_positive_intensity", False)
                 ):
@@ -2171,7 +2234,7 @@ class _BatchedPlan:
             intensity = stacked.get("disk.intensity_raw")
             cfg = self.disk.constraint_config
             force_positive = bool(self.disk.hard_constraints.get("force_positive", False))
-            if not disk_template_frozen and template is not None and intensity is not None:
+            if not disk_template_frozen and template is not None:
                 if bool(self.disk.hard_constraints.get("force_center", False)):
                     self._batched_center_disk(template)
                 if bool(self.disk.hard_constraints.get("force_cutoff", False)):
@@ -2182,21 +2245,10 @@ class _BatchedPlan:
                     template.sub_(float(cfg.get("shrinkage_amount", 0.25)))
                 if force_positive:
                     template.clamp_(min=0.0)
-                    if not disk_intensity_frozen and intensity is not None:
-                        intensity.clamp_(min=0.0)
                 if bool(self.disk.hard_constraints.get("force_norm", False)):
                     self._batched_enforce_norm(template)
             if force_positive and not disk_intensity_frozen and intensity is not None:
                 intensity.clamp_(min=0.0)
-
-        for lat_name, lat in zip(self.lat_names, self.lats):
-            key = f"{lat_name}.i0_raw"
-            if key not in skip_keys and bool(
-                lat.hard_constraints.get("force_positive_intensity", False)
-            ):
-                i0 = stacked.get(key)
-                if i0 is not None:
-                    i0.clamp_(min=0.0)
 
     @staticmethod
     def _clamp_bounds_inplace(t: torch.Tensor, lo: float | None, hi: float | None) -> None:

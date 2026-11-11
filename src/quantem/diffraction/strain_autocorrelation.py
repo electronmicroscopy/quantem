@@ -521,7 +521,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 self.metadata["q_to_r_rotation_ccw_deg"],
                 clockwise=False,
             ),
-            origin=(im.shape[0] // 2, im.shape[1] // 2),
+            origin=(im_plot.shape[0] // 2, im_plot.shape[1] // 2),
             sampling=(1.0, 1.0),
             units=(self.metadata["real_units"], self.metadata["real_units"]),
             signal_units="intensity",
@@ -1021,7 +1021,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 im = np.fft.fftshift(np.abs(np.fft.fft2(dp_proc * self.fft_window)))
                 tr_np = dp_proc * self.fft_window
 
-                g1_fit_abs, g2_fit_abs, _, _ = _refine_lattice_vectors(
+                g1_fit_abs, g2_fit_abs, _, _, _ = _refine_lattice_vectors(
                     im,
                     g1_rc=g1_0,
                     g2_rc=g2_0,
@@ -1029,8 +1029,8 @@ class StrainMapAutocorrelation(AutoSerialize):
                     refine_gaussian=refine_gaussian,
                     refine_dft=refine_dft,
                     refine_all_peaks=refine_all_peaks,
-                    peaks=self.mean_img_peaks,
-                    weights=self.mean_img_weights,
+                    peaks=self.mean_img_peaks if refine_all_peaks else None,
+                    weights=self.mean_img_weights if refine_all_peaks else None,
                     upsample=upsample,
                     maxfev=gaussian_maxfev,
                     tr=tr_np,
@@ -2139,7 +2139,7 @@ def _refine_lattice_vectors(
 
         return np.array((r_fit - r_center, c_fit - c_center, amp, sig, bg), dtype=float)
 
-    def _find_initial_peaks_weights(initial_peaks: NDArray) -> tuple[NDArray, NDArray, NDArray]:
+    def _find_initial_peaks_weights(initial_peaks: NDArray | None) -> tuple[NDArray, NDArray]:
         if initial_peaks is None:
             threshold = np.percentile(im, threshold_percentile * 100)
             p = np.logical_and.reduce(
