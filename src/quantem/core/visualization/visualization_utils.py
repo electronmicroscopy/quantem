@@ -127,10 +127,15 @@ class ScalebarConfig:
     sampling : float, default=1.0
         Physical units per pixel.
     units : str, default="pixels"
-        Units to display on the scale bar.
+        Units of ``sampling`` (e.g. "nm", "Å", "1/nm").
     length : float, optional
-        Length of the scale bar in physical units. If None, an appropriate length
-        will be estimated.
+        Length of the scale bar in physical units (in ``display_units`` if
+        given). If None, an appropriate length will be estimated.
+    display_units : str, optional
+        Units to show the scale bar in, e.g. "nm" for data calibrated in μm.
+        Converts between pm, Å, nm, μm, mm, cm and m, or between their
+        reciprocals (e.g. "1/nm" to "1/Å"). If None, units are chosen
+        automatically from the bar length.
     width_px : float, default=1
         Width of the scale bar in pixels.
     pad_px : float, default=0.5
@@ -161,6 +166,7 @@ class ScalebarConfig:
     sampling: float = 1.0
     units: str = "pixels"
     length: float | None = None
+    display_units: str | None = None
     width_px: float = 1
     pad_px: float = 0.5
     color: str = "white"
@@ -222,6 +228,34 @@ def _resolve_scalebar(cfg: Any, **kwargs) -> ScalebarConfig | None:
         )
 
 
+def _fill_scalebar_calibration(cfg: Any, sampling: float, units: str) -> Any:
+    """Fill in a scale bar's sampling and units from a dataset's calibration.
+
+    Used when a dataset (e.g. ``Dataset2d``) is shown, so the scale bar picks up
+    the dataset's calibration unless the user set it explicitly.
+
+    - ``True`` becomes a ``ScalebarConfig`` with the dataset's sampling and units.
+    - A dict gets ``sampling`` and ``units`` added if they are missing.
+    - A ``ScalebarConfig`` or ``ShowParams.Scalebar`` still on the defaults
+      (``sampling=1.0`` and ``units="pixels"``) gets the dataset's values.
+    - ``None`` and ``False`` (no scale bar) are returned unchanged.
+    """
+    from dataclasses import replace
+
+    if cfg is None or cfg is False:
+        return cfg
+    if cfg is True:
+        return ScalebarConfig(sampling=sampling, units=units)
+    if isinstance(cfg, dict):
+        if "sampling" in cfg or "units" in cfg:
+            return cfg
+        return {**cfg, "sampling": sampling, "units": units}
+    resolved = _resolve_scalebar(cfg)
+    if resolved is not None and resolved.sampling == 1.0 and resolved.units == "pixels":
+        return replace(resolved, sampling=sampling, units=units)
+    return resolved
+
+
 def estimate_scalebar_length(length: float, sampling: float) -> tuple[float, float]:
     """Estimate an appropriate scale bar length based on data dimensions.
 
@@ -262,94 +296,142 @@ def estimate_scalebar_length(length: float, sampling: float) -> tuple[float, flo
     return spacing, spacing / sampling
 
 
+# Length units the scale bar knows how to convert, as multiples of 1 Å.
+_LENGTH_UNITS_IN_ANGSTROM = {
+    "pm": 1e-2,
+    "Å": 1.0,
+    "nm": 1e1,
+    "μm": 1e4,
+    "mm": 1e7,
+    "cm": 1e8,
+    "m": 1e10,
+}
+
+# Accepted spellings (compared in lower case) for each unit above.
+_LENGTH_UNIT_ALIASES = {
+    **dict.fromkeys(["pm", "picometer", "picometre", "picometers", "picometres"], "pm"),
+    **dict.fromkeys(
+        ["a", "å", "Å", "ang", "angstrom", "angstroms", "ångström", "ångströms"], "Å"
+    ),
+    **dict.fromkeys(["nm", "nanometer", "nanometre", "nanometers", "nanometres"], "nm"),
+    **dict.fromkeys(
+        [
+            "um",
+            "μm",  # Greek mu
+            "µm",  # micro sign
+            "micrometer",
+            "micrometre",
+            "micrometers",
+            "micrometres",
+            "micron",
+            "microns",
+        ],
+        "μm",
+    ),
+    **dict.fromkeys(["mm", "millimeter", "millimetre", "millimeters", "millimetres"], "mm"),
+    **dict.fromkeys(["cm", "centimeter", "centimetre", "centimeters", "centimetres"], "cm"),
+    **dict.fromkeys(["m", "meter", "metre", "meters", "metres"], "m"),
+}
+
+_RECIPROCAL_SUFFIXES = ("^-1", "**-1", "⁻¹", "-1")
+
+
+def _parse_length_units(units: Any) -> tuple[str, int] | None:
+    """Parse a length unit string into (canonical unit, power).
+
+    Power is 1 for real-space lengths (e.g. ``"nm"``) and -1 for reciprocal
+    lengths (e.g. ``"1/nm"``, ``"nm^-1"``, ``"nm⁻¹"``, ``"$\\mathrm{nm}^{-1}$"``).
+    Returns None if the units are not a recognised length (e.g. ``"pixels"``).
+    """
+    if not isinstance(units, str):
+        return None
+    u = units.strip().replace("$", "").replace("\\mathrm", "").replace(" ", "")
+    u = u.replace("{", "").replace("}", "")
+    power = 1
+    if u.startswith("1/"):
+        u, power = u[2:], -1
+    else:
+        for suffix in _RECIPROCAL_SUFFIXES:
+            if u.endswith(suffix):
+                u, power = u[: -len(suffix)], -1
+                break
+    base = _LENGTH_UNIT_ALIASES.get(u.lower())
+    return (base, power) if base is not None else None
+
+
+def _length_unit_label(base: str, power: int) -> str:
+    """Display label for a parsed unit, e.g. ("nm", -1) -> nm⁻¹ in mathtext."""
+    return base if power == 1 else f"$\\mathrm{{{base}}}^{{-1}}$"
+
+
+def _length_unit_factor(from_units: str, to_units: str) -> float:
+    """Factor that converts a value in ``from_units`` to ``to_units``.
+
+    Works for real-space lengths (pm, Å, nm, μm, mm, cm, m) and their
+    reciprocals; e.g. ``_length_unit_factor("μm", "nm") == 1000`` and
+    ``_length_unit_factor("1/nm", "1/Å") == 0.1``.
+
+    Raises
+    ------
+    ValueError
+        If either unit is not a recognised length, or one is a real-space
+        length and the other a reciprocal length.
+    """
+    src = _parse_length_units(from_units)
+    dst = _parse_length_units(to_units)
+    known = ", ".join(_LENGTH_UNITS_IN_ANGSTROM)
+    if dst is None:
+        raise ValueError(
+            f"Unknown display units {to_units!r}. Use one of {known}, or a reciprocal "
+            "such as '1/nm' or 'Å^-1'."
+        )
+    if src is None:
+        raise ValueError(
+            f"Cannot convert scale bar units {from_units!r} to {to_units!r}: "
+            f"{from_units!r} is not a recognised length unit ({known})."
+        )
+    if src[1] != dst[1]:
+        kinds = {1: "a real-space length", -1: "a reciprocal length"}
+        raise ValueError(
+            f"Cannot convert {from_units!r} ({kinds[src[1]]}) to {to_units!r} "
+            f"({kinds[dst[1]]})."
+        )
+    ratio = _LENGTH_UNITS_IN_ANGSTROM[src[0]] / _LENGTH_UNITS_IN_ANGSTROM[dst[0]]
+    return ratio if src[1] == 1 else 1 / ratio
+
+
 def _normalize_length_units(length_units: float, units: str) -> tuple[float, str]:
     """
     Pick intelligent units for the scalebar length. Handles both direct and inverse units.
     """
-    inverse_unit_map = {
-        "1/A": "$\\mathrm{Å}^{-1}$",
-        "1/Å": "$\\mathrm{Å}^{-1}$",
-        "A^-1": "$\\mathrm{Å}^{-1}$",
-        "1/angstrom": "$\\mathrm{Å}^{-1}$",
-        "1/Angstrom": "$\\mathrm{Å}^{-1}$",
-        "1/nm": "$\\mathrm{nm}^{-1}$",
-        "1/nanometer": "$\\mathrm{nm}^{-1}$",
-        "1/nanometre": "$\\mathrm{nm}^{-1}$",
-    }
-    direct_unit_map = {
-        "A": "Å",
-        "Å": "Å",
-        "angstrom": "Å",
-        "Angstrom": "Å",
-        "nm": "nm",
-        "nanometer": "nm",
-        "nanometre": "nm",
-        "um": "μm",
-        "μm": "μm",
-        "micrometer": "μm",
-        "micrometre": "μm",
-        "micron": "μm",
-        "mm": "mm",
-        "millimeter": "mm",
-        "millimetre": "mm",
-        "cm": "cm",
-        "centimeter": "cm",
-        "centimetre": "cm",
-        "m": "m",
-        "meter": "m",
-        "metre": "m",
-    }
+    parsed = _parse_length_units(units)
+    if parsed is None:
+        # unknown unit (e.g. "pixels"): return as is
+        return length_units, units
+    base, power = parsed
 
-    # Handle inverse units first
-    if units in inverse_unit_map:
-        # Convert everything to 1/Å then scale
-        units = inverse_unit_map[units]
-        if units == "$\\mathrm{Å}^{-1}$":
-            length_invA = length_units
-        else:  # units == "$\\mathrm{nm}^{-1}$":
-            length_invA = length_units / 10
-
+    if power == -1:
+        length_invA = length_units / _LENGTH_UNITS_IN_ANGSTROM[base]
         if length_invA < 0.1:
-            return length_invA * 10, "$\\mathrm{nm}^{-1}$"
+            return length_invA * 10, _length_unit_label("nm", -1)
         elif length_invA < 100:
-            return length_invA, "$\\mathrm{Å}^{-1}$"
-        else:  # length_invA >= 10:
-            return length_invA / 100, "$\\mathrm{pm}^{-1}$"
-
-    # Handle direct metric units (distance)
-    if units in direct_unit_map:
-        # Everything to Å
-        if units in ["A", "Å", "angstrom", "Angstrom"]:
-            length_A = length_units
-        elif units in ["nm", "nanometer", "nanometre"]:
-            length_A = length_units * 10
-        elif units in ["um", "μm", "micrometer", "micrometre", "micron"]:
-            length_A = length_units * 1e4
-        elif units in ["mm", "millimeter", "millimetre"]:
-            length_A = length_units * 1e7
-        elif units in ["cm", "centimeter", "centimetre"]:
-            length_A = length_units * 1e8
-        elif units in ["m", "meter", "metre"]:
-            length_A = length_units * 1e10
+            return length_invA, _length_unit_label("Å", -1)
         else:
-            # fallback, should not happen due to keys in direct_unit_map
-            return length_units, units
+            return length_invA / 100, _length_unit_label("pm", -1)
 
-        if length_A <= 0.1:
-            return length_A * 100, "pm"
-        elif length_A < 10:
-            return length_A, "Å"
-        elif length_A < 1e4:
-            return length_A / 10, "nm"
-        elif length_A < 1e7:
-            return length_A / 1e4, "μm"
-        elif length_A < 1e10:
-            return length_A / 1e7, "mm"
-        else:
-            return length_A / 1e10, "m"
-
-    # fallback: unknown unit, return as is
-    return length_units, units
+    length_A = length_units * _LENGTH_UNITS_IN_ANGSTROM[base]
+    if length_A <= 0.1:
+        return length_A * 100, "pm"
+    elif length_A < 10:
+        return length_A, "Å"
+    elif length_A < 1e4:
+        return length_A / 10, "nm"
+    elif length_A < 1e7:
+        return length_A / 1e4, "μm"
+    elif length_A < 1e10:
+        return length_A / 1e7, "mm"
+    else:
+        return length_A / 1e10, "m"
 
 
 def add_scalebar_to_ax(
@@ -369,6 +451,7 @@ def add_scalebar_to_ax(
     box_alpha: float = 0.5,
     outline_color: str | None = None,
     outline_width: float = 2.0,
+    display_units: str | None = None,
 ) -> None:
     """Add a scale bar to a matplotlib axis.
 
@@ -410,20 +493,34 @@ def add_scalebar_to_ax(
         matplotlib path effects. If None, no outline is drawn.
     outline_width : float, default=2.0
         Width of the outline in points.
+    display_units : str, optional
+        Units to show the scale bar in (e.g. "nm" when ``units`` is "μm", or
+        "1/Å" when ``units`` is "1/nm"). ``sampling`` is converted to these
+        units and ``length_units``, if given, is taken to be in them. If None,
+        units are chosen automatically from the bar length.
     """
     from matplotlib.font_manager import FontProperties
+
+    if display_units is not None:
+        if isinstance(sampling, (tuple, list)):
+            sampling = np.asarray(sampling, dtype=float)
+        sampling = sampling * _length_unit_factor(units, display_units)
+        units = _length_unit_label(*cast(tuple, _parse_length_units(display_units)))
 
     if length_units is None:
         length_units, length_px = estimate_scalebar_length(array_size, sampling)
     else:
         length_px = length_units / sampling
 
-    length_units, units = _normalize_length_units(length_units, units)
+    if display_units is None:
+        length_units, units = _normalize_length_units(length_units, units)
 
     if length_units % 1 == 0.0:
         label = f"{length_units:.0f} {units}"
-    else:
+    elif length_units >= 0.1:
         label = f"{length_units:.2f} {units}"
+    else:  # e.g. 0.005 would round to "0.01" with .2f
+        label = f"{length_units:g} {units}"
 
     if isinstance(loc, int):
         loc_codes = legend.Legend.codes
