@@ -1,8 +1,14 @@
+import gzip
+
+import dill
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
+import zarr
 
-from quantem.core.io.serialize import AutoSerialize, load
+import quantem
+from quantem.core.io.serialize import AutoSerialize, load, print_file
 
 # ─────────────────────────────────────────────── #
 # 1) Simple “Dummy” with arr/count/child/_private #
@@ -18,12 +24,13 @@ class Child(AutoSerialize):
 class Dummy(AutoSerialize):
     def __init__(self):
         self.arr = np.linspace(0, 1, 5)
+        self.scalar_array = np.array(2.5)
         self.count = 123
         self.child = Child()
         self._private = "secret"
 
 
-def test_dummy_save_load_and_skip(tmp_path):
+def test_dummy_save_load_and_skip(tmp_path, capsys):
     """
     For both the zip and the directory store:
     1.  Save/load Dummy with no skips: all fields rehydrate.
@@ -45,10 +52,16 @@ def test_dummy_save_load_and_skip(tmp_path):
 
         # values round-trip
         np.testing.assert_allclose(loaded_full.arr, d.arr, err_msg=store)
+        np.testing.assert_array_equal(loaded_full.scalar_array, 2.5, err_msg=store)
         assert loaded_full.count == d.count, store
         np.testing.assert_allclose(loaded_full.child.values, d.child.values, err_msg=store)
         assert loaded_full.child.flag is True, store
         assert loaded_full._private == "secret", store
+        assert not hasattr(loaded_full, "_autoserialize_skip_names"), store
+
+        # the file records the quantem version that wrote it
+        print_file(tgt)
+        assert f"(quantem {quantem.__version__})" in capsys.readouterr().out, store
 
         # ——— (b) skip 'count' and skip 'child' ———
         tgt2 = tmp_path / f"dummy_skip_cd{suffix}"
@@ -167,25 +180,69 @@ def test_nested_save_load_and_skip(tmp_path):
 # ──────────────────────────── #
 
 
+_unpickled = []
+
+
+def _record(tag):
+    _unpickled.append(tag)
+    return tag
+
+
+class _Payload:
+    """Unpickles to a call of _record, which shows whether loading ran code from the file."""
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __reduce__(self):
+        return (_record, (self.tag,))
+
+
 class TorchWithOpt(AutoSerialize):
     def __init__(self):
         self.data = torch.rand(100, 100)
         self.param = self.data.clone().detach().requires_grad_(True)
         self.opt = torch.optim.Adam([self.data.detach().clone()], lr=0.01)
+        self.payloads = [_Payload("new")]
 
     def method(self):
         return self.data.sum()
 
 
-def test_torch_tensor_and_optimizer(tmp_path):
+def test_pickled_values_load_only_with_allow_pickle(tmp_path):
+    """Optimizers and dill fallbacks, in a list or in the older bare-array layout,
+    load only with allow_pickle=True; without it, nothing stored in them runs."""
+    _unpickled.clear()
     obj = TorchWithOpt()
-    tgt = tmp_path / "opt.zip"
-    obj.save(str(tgt), mode="w")
-    loaded = load(str(tgt))
+    tgt = tmp_path / "opt"
+    obj.save(tgt)
+    # older files stored dill fallbacks as gzip-compressed bytes in a bare uint8 array
+    legacy = np.frombuffer(gzip.compress(dill.dumps(_Payload("legacy"))), dtype=np.uint8)
+    root = zarr.open_group(tgt, mode="r+")
+    root.create_array("legacy", shape=legacy.shape, dtype=legacy.dtype)[...] = legacy
 
+    with pytest.raises(ValueError, match="allow_pickle=True") as error:
+        load(tgt)
+    for entry in ("opt (torch optimizer)", "payloads/0 (dill pickle)", "legacy (dill pickle)"):
+        assert entry in str(error.value), entry
+    assert _unpickled == []
+
+    loaded = load(tgt, allow_pickle=True)
     assert torch.allclose(obj.data, loaded.data)
+    assert loaded.param.requires_grad
     assert isinstance(loaded.opt, torch.optim.Adam)
     assert loaded.opt.param_groups[0]["lr"] == 0.01
+    assert loaded.payloads == ["new"]
+    assert loaded.legacy == "legacy"
+    assert sorted(_unpickled) == ["legacy", "new"]
+
+    # the class named in the file must be an AutoSerialize class
+    meta = dict(root.attrs["_autoserialize"])
+    root.attrs["_autoserialize"] = {**meta, "class_module": "subprocess", "class_name": "Popen"}
+    with pytest.raises(
+        ValueError, match="subprocess.Popen is not an importable AutoSerialize class"
+    ):
+        load(tgt, allow_pickle=True)
 
 
 class TestModule(torch.nn.Module, AutoSerialize):
@@ -204,7 +261,7 @@ def test_torch_nn_module_roundtrip(tmp_path):
     mod = TestModule()
     tgt = tmp_path / "mod.zip"
     mod.save(str(tgt), mode="w")
-    mod_reload = load(str(tgt))
+    mod_reload = load(str(tgt), allow_pickle=True)  # nn.Linear is pickled
 
     assert isinstance(mod_reload, TestModule)
     out = mod_reload.forward(torch.randn(1, 10))

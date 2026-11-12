@@ -998,10 +998,10 @@ class Vector(AutoSerialize):
         written by that object's ``save()``, and its buffers are stored
         uncompressed.
         """
-        # Nested Vectors go through AutoSerialize._recursive_save, not this
-        # method. Storing plain non-grad tensors as Zarr arrays in
-        # AutoSerialize._serialize_value would fix that, and reduce this
-        # override to compact().
+        # Nested Vectors are written by the parent's save(), not this method.
+        # Storing plain non-grad tensors as Zarr arrays in
+        # serialize._Writer.value would fix that, and reduce this override to
+        # compact().
         self.compact()
         buffer_keys = ("data", "cell_starts", "cell_lengths")
         saved_state = {key: self._state[key] for key in buffer_keys}
@@ -1026,7 +1026,7 @@ class Vector(AutoSerialize):
     def _post_load(self) -> None:
         """Rehydrate NumPy-backed state into CPU tensors after deserialization.
 
-        Called by ``AutoSerialize._recursive_load``. This handles both files
+        Called by :func:`~quantem.core.io.serialize.load`. This handles both files
         written by :meth:`save` and older files written when Vector was
         NumPy-backed; in both cases the stored dtype is preserved rather than
         being coerced to the current default.

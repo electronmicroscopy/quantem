@@ -383,16 +383,23 @@ class Tomography(TomographyOpt, TomographyBase):
 
     # Loading and Saving
     @classmethod
-    def _recursive_load_from_path(cls, path: str):
-        return autoserialize_load(path)
+    def _recursive_load_from_path(cls, path: str, allow_pickle: bool = False):
+        return autoserialize_load(path, allow_pickle=allow_pickle)
 
     @classmethod
     def from_file(
         cls,
         path: str,
         device: str = "cpu",
+        allow_pickle: bool = False,
     ) -> Self:
-        tomography = cls._recursive_load_from_path(path)
+        """Load a saved tomography reconstruction.
+
+        Its models are stored pickled, so it loads only with ``allow_pickle=True``.
+        Unpickling can run code stored in the file: set it only for files from a
+        source you trust.
+        """
+        tomography = cls._recursive_load_from_path(path, allow_pickle=allow_pickle)
         tomography.to(device)
         tomography._rebuild_dataloader(
             batch_size=tomography.batch_size,

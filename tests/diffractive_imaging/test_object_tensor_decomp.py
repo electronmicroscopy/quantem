@@ -397,7 +397,7 @@ class TestObjectTensorDecompReconstruction:
         obj_before = ptycho.obj.copy()
         path = tmp_path / "kplanes_ptycho.zip"
         ptycho.save(path, mode="o", save_raw_data=True)  # persist dset so loaded.dset works
-        loaded = autoserialize_load(path)
+        loaded = autoserialize_load(path, allow_pickle=True)
         assert loaded.obj_model.is_implicit is True
         assert loaded.dset.implicit_object is True
         assert loaded.obj_model.name == "ObjectTensorDecomp"
