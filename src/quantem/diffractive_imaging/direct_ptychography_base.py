@@ -1055,9 +1055,7 @@ class DirectPtychographyBase(RNGMixin, AutoSerialize):
         ``exp(a + i phi)`` for ``obj_type="complex"``, with ``a`` the log-amplitude. Shaped
         ``(Ny, Nx)`` for one slice and ``(num_slices, Ny, Nx)`` for several.
 
-        Mirrors ``corrected_bf`` rather than raising: ``AutoSerialize._recursive_load``
-        walks ``dir(obj)`` and evaluates every property, so a ``to_numpy(None)`` here made
-        save/load fail for a instance that had not been reconstructed yet.
+        Mirrors ``corrected_bf`` rather than raising.
         """
         corrected_bf = self.corrected_bf
         if corrected_bf is None:

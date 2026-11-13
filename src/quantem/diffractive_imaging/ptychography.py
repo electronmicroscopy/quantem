@@ -923,6 +923,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         device: str | int | None = None,
         verbose: int | bool | None = None,
         auto_reload_dataset: bool = True,
+        allow_pickle: bool = False,
     ):
         """
         Load a ptychography object from a saved file.
@@ -939,6 +940,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             Verbosity level
         auto_reload_dataset : bool
             Whether to automatically reload and preprocess the dataset from saved metadata
+        allow_pickle : bool
+            Also load values that can run code; see `quantem.core.io.load`.
+            Needed only for files written by older quantem versions, which
+            pickled the models, or for models defined outside quantem and torch.
 
         Returns
         -------
@@ -946,7 +951,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             Loaded ptychography object
         """
         # Load the base object without the dataset
-        ptycho = cls._recursive_load_from_path(path)
+        ptycho = cls._recursive_load_from_path(path, allow_pickle=allow_pickle)
 
         if not isinstance(ptycho, Ptychography):
             raise ValueError("Loaded object is not a Ptychography object")
@@ -1027,9 +1032,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         return ptycho
 
     @classmethod
-    def _recursive_load_from_path(cls, path: str | Path):
+    def _recursive_load_from_path(cls, path: str | Path, allow_pickle: bool = False):
         """Helper method to load an object from a path using AutoSerialize."""
-        return autoserialize_load(path)
+        return autoserialize_load(path, allow_pickle=allow_pickle)
 
     def clone(self, device: str | int = "cpu") -> Self:  # TODO make this faster
         """

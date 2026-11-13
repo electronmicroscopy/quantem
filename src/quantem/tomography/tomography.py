@@ -18,6 +18,7 @@ from quantem.tomography.dataset_models import (
     DatasetConstraintsType,
     DatasetModelType,
     TomographyINRDataset,
+    TomographyINRPretrainDataset,
     TomographyPixDataset,
 )
 from quantem.tomography.logger_tomography import LoggerTomography
@@ -383,16 +384,24 @@ class Tomography(TomographyOpt, TomographyBase):
 
     # Loading and Saving
     @classmethod
-    def _recursive_load_from_path(cls, path: str):
-        return autoserialize_load(path)
+    def _recursive_load_from_path(cls, path: str, allow_pickle: bool = False):
+        return autoserialize_load(path, allow_pickle=allow_pickle)
 
     @classmethod
     def from_file(
         cls,
         path: str,
         device: str = "cpu",
+        allow_pickle: bool = False,
     ) -> Self:
-        tomography = cls._recursive_load_from_path(path)
+        """Load a saved tomography reconstruction.
+
+        ``allow_pickle=True`` also loads values that can run code; see
+        `quantem.core.io.load`. It is needed only for files written by older
+        quantem versions, which pickled the models, or for models defined
+        outside quantem and torch.
+        """
+        tomography = cls._recursive_load_from_path(path, allow_pickle=allow_pickle)
         tomography.to(device)
         tomography._rebuild_dataloader(
             batch_size=tomography.batch_size,
@@ -419,9 +428,20 @@ class Tomography(TomographyOpt, TomographyBase):
         path: str | Path,
         mode: Literal["w", "o"] = "w",
         store: Literal["auto", "zip", "dir"] = "auto",
-        skip: str | type | Sequence[str | type] = ["dataloader"],
+        skip: str | type | Sequence[str | type] = (),
         compression_level: int | None = 4,
     ) -> None:
+        """Save the reconstruction; see `AutoSerialize.save`.
+
+        Data loaders and samplers, which `from_file` rebuilds, and the pretraining
+        data are not saved.
+        """
+        skip = [skip] if isinstance(skip, (str, type)) else list(skip)
+        skip += [
+            torch.utils.data.DataLoader,
+            torch.utils.data.Sampler,
+            TomographyINRPretrainDataset,
+        ]
         super(Tomography, self).save(
             path=path,
             mode=mode,

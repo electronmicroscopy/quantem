@@ -129,7 +129,8 @@ class LoggerBase(AutoSerialize):
                     mode="o",
                     store="zip",
                 )
-                cloned = cast(Self, load(tmp_path))
+                # written just above by this process, so its pickles are trusted
+                cloned = cast(Self, load(tmp_path, allow_pickle=True))
             finally:
                 with contextlib.suppress(Exception):
                     tmp_path.unlink()

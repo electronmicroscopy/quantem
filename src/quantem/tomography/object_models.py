@@ -701,6 +701,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         Pretrain the INR model to fit target volume.
         """
 
+        if pretrain_dataset is None and not hasattr(self, "pretraining_dataloader"):
+            raise ValueError(
+                "pretrain_dataset is required: saved reconstructions do not keep the pretraining data"
+            )
         if (
             pretrain_dataset is not None
         ):  # Need to make a check if there's already a pretrain dataset to not go through with the setup again.

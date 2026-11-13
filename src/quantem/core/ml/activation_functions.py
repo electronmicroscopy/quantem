@@ -100,6 +100,17 @@ class Complex_Phase_ReLU(nn.Module):
         return f.type(torch.complex64)
 
 
+class CallableWrapper(nn.Module):
+    """Module that applies a function, such as ``torch.tanh``."""
+
+    def __init__(self, func: Callable) -> None:
+        super().__init__()
+        self.func = func
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.func(x)
+
+
 def get_activation_function(
     activation_type: str | Callable,
     dtype: "torch.dtype",
@@ -134,17 +145,7 @@ def get_activation_function(
     if callable(activation_type):
         if isinstance(activation_type, nn.Module):
             return activation_type
-        else:
-            # Wrap callable in a lambda module
-            class CallableWrapper(nn.Module):
-                def __init__(self, func: Callable) -> None:
-                    super().__init__()
-                    self.func = func
-
-                def forward(self, x: torch.Tensor) -> torch.Tensor:
-                    return self.func(x)
-
-            return CallableWrapper(activation_type)
+        return CallableWrapper(activation_type)
 
     activation_type = activation_type.lower()
 

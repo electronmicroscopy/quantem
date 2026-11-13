@@ -46,12 +46,18 @@ def test_ase_atoms_round_trip_keeps_occupancy(tmp_path):
     assert back.info == {"spacegroup_number": 229}
 
 
-def test_torch_device_round_trip(tmp_path):
+def test_torch_device_dtype_and_generator_round_trip(tmp_path):
+    generator = torch.Generator().manual_seed(7)
+    torch.rand(3, generator=generator)  # move the state past the seed
+    holder = _Holder(device=torch.device("cpu"), dtype=torch.float64, generator=generator)
+    holder.name = "x"
     path = tmp_path / "device.zip"
-    _Holder(device=torch.device("cpu"), name="x").save(path, mode="o")
-    back = load(path)
+    holder.save(path, mode="o")
+    back = load(path)  # stored as strings and arrays, so no pickle is needed
+    assert torch.equal(torch.rand(3, generator=back.generator), torch.rand(3, generator=generator))
     assert isinstance(back.device, torch.device)
     assert back.device == torch.device("cpu")
+    assert back.dtype is torch.float64
     assert back.name == "x"
 
 
@@ -69,6 +75,6 @@ def test_bundle_round_trip(tmp_path):
 
 
 def test_bundle_rejects_reserved_names():
-    for name in ("save", "print_tree", "_recursive_save"):
+    for name in ("save", "print_tree"):
         with pytest.raises(ValueError, match="shadow"):
             Bundle(**{name: 1})

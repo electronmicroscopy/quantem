@@ -258,6 +258,7 @@ class PtychoLite(Ptychography):
         device: str | int | None = None,
         verbose: int | bool | None = None,
         auto_reload_dataset: bool = True,
+        allow_pickle: bool = False,
     ) -> Self:
         """
         Load a saved reconstruction and ensure the returned instance is PtychoLite.
@@ -272,6 +273,7 @@ class PtychoLite(Ptychography):
             device=device,
             verbose=verbose,
             auto_reload_dataset=auto_reload_dataset,
+            allow_pickle=allow_pickle,
         )
 
         if not isinstance(base, cls):
@@ -280,7 +282,7 @@ class PtychoLite(Ptychography):
                 base.__class__ = cls  # type: ignore[assignment]
             except Exception:
                 # Fallback: rely on the serialized class if available
-                upgraded = cls._recursive_load_from_path(path)
+                upgraded = cls._recursive_load_from_path(path, allow_pickle=allow_pickle)
                 return upgraded  # type: ignore[return-value]
 
         return base  # pyright: ignore[reportReturnType]
