@@ -48,9 +48,9 @@ class StrainMapAutocorrelation(AutoSerialize):
        (``q_to_r_rotation_ccw_deg`` + ``q_transpose``) is read from the parent dataset
        metadata, the single source of truth shared with the DPC/CoM and Bragg
        workflows.
-    3. :meth:`choose_lattice_vector` -- refine a hand-picked initial ``(g1, g2)`` basis
+    3. :meth:`choose_basis_vectors` -- refine a hand-picked initial ``(g1, g2)`` basis
        against the mean transform, optionally auto-detecting and re-fitting all peaks.
-    4. :meth:`fit_lattice_vectors` -- the heavy step: transform and fit the lattice
+    4. :meth:`fit_lattice` -- the heavy step: transform and fit the lattice
        vectors at every scan position into ``g1_array``/``g2_array`` of shape
        ``(scan_row, scan_col, 2)``. The sub-pixel peak refinement is chosen with ``method``: ``"gaussian"``
        (isotropic Gaussian fit, optionally followed by DFT upsampling) or ``"cft"``
@@ -124,8 +124,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.mask_diffraction = np.ones(self.dataset.array.shape[2:])
         self.mask_diffraction_inv = np.zeros(self.dataset.array.shape[2:])
 
-        # initial basis from choose_lattice_vector(); per-position fits from
-        # fit_lattice_vectors(); per-position weight from create_mask().
+        # initial basis from choose_basis_vectors(); per-position fits from
+        # fit_lattice(); per-position weight from create_mask().
         self.g1: np.ndarray | None = None
         self.g2: np.ndarray | None = None
         self.g1_peak_fit: Dataset3d | None = None
@@ -192,7 +192,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         threshold=None,
         threshold_percentile=50.0,
         edge_blend=64.0,
-        plot_mask=True,
+        plot=True,
         figsize=(8, 4),
     ):
         """Build a soft detector mask that removes dim detector regions.
@@ -203,10 +203,10 @@ class StrainMapAutocorrelation(AutoSerialize):
         transform) into :attr:`mask_diffraction` (multiplicative, in ``[0, 1]``), and a
         complementary fill :attr:`mask_diffraction_inv` replaces the masked region with a
         flat edge intensity. Both are applied to every pattern in :meth:`preprocess` and
-        :meth:`fit_lattice_vectors` so the transform is not dominated by the dim, noisy parts of the detector. The
+        :meth:`fit_lattice` so the transform is not dominated by the dim, noisy parts of the detector. The
         central beam is bright and is therefore *kept*. Because the mask is thresholded on
         the raw mean pattern, it can follow the disk lattice (disks kept, gaps masked);
-        check it with ``plot_mask=True``, since a lattice-shaped mask imprints the mean
+        check it with ``plot=True``, since a lattice-shaped mask imprints the mean
         lattice on every pattern's transform.
 
         Parameters
@@ -223,7 +223,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         edge_blend : float, default=64.0
             Feather width in pixels of the raised-cosine taper between kept and masked
             regions; larger values give a softer transition.
-        plot_mask : bool, default=True
+        plot : bool, default=True
             If ``True``, show the raw mean pattern beside the masked/filled pattern (log
             scaled) so the mask can be checked.
         figsize : tuple of float, default=(8, 4)
@@ -278,7 +278,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         int_edge = np.min(dp_mean[self.mask_diffraction > 0.99])
         self.mask_diffraction_inv = (1 - self.mask_diffraction) * int_edge
 
-        if plot_mask:
+        if plot:
             fig, ax = plt.subplots(1, 2, figsize=figsize)
             ax[0].imshow(
                 np.log(np.maximum(dp_mean, np.min(dp_mean[dp_mean > 0]))),
@@ -299,7 +299,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         q_to_r_rotation_ccw_deg: float | None = None,
         q_transpose: bool | None = None,
         skip=None,
-        plot_transform: bool = True,
+        plot: bool = True,
         cropping_factor: float = 0.25,
         gamma: float = 0.5,
         hann_window: bool = False,
@@ -342,11 +342,11 @@ class StrainMapAutocorrelation(AutoSerialize):
         skip : int, optional
             If given, subsample the scan by this stride (``array[::skip, ::skip]``) when
             building the mean transform -- a fast preview over fewer patterns.
-        plot_transform : bool, default=True
+        plot : bool, default=True
             If ``True``, show the original and rotated mean transforms via
             :meth:`plot_transform`.
         cropping_factor : float, default=0.25
-            Fraction of the transform width/height shown when ``plot_transform`` is
+            Fraction of the transform width/height shown when ``plot`` is
             ``True`` (the lattice peaks sit near the center).
         gamma : float, default=0.5
             Exponent for ``mode="gamma"`` (ignored otherwise).
@@ -527,7 +527,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             signal_units="intensity",
         )
 
-        if plot_transform:
+        if plot:
             self.plot_transform(cropping_factor=cropping_factor, **plot_kwargs)
 
         return self
@@ -616,7 +616,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         Recomputes the transform for the pattern at ``(row, col)`` using the current
         ``mode``, and overlays the per-position fitted ``g1``/``g2`` vectors (from
-        :meth:`fit_lattice_vectors`) plus any detected peaks. Useful for inspecting the
+        :meth:`fit_lattice`) plus any detected peaks. Useful for inspecting the
         fit quality at a specific position.
 
         Parameters
@@ -640,7 +640,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         if self.transform is None or self.transform_rotated is None:
             raise ValueError("Run preprocess() first to compute transform images.")
         if self.g1_peak_fit is None or self.g2_peak_fit is None:
-            raise ValueError("Run fit_lattice_vectors() first.")
+            raise ValueError("Run fit_lattice() first.")
 
         sampling = np.mean(self.metadata["sampling_real"])
         units = self.metadata.get("real_units", r"$\mathrm{\AA}$")
@@ -721,18 +721,18 @@ class StrainMapAutocorrelation(AutoSerialize):
         for a in _flatten_axes(ax):
             _apply_center_crop_limits(a, self.transform.shape, cropping_factor)
 
-    def choose_lattice_vector(
+    def choose_basis_vectors(
         self,
         *,
         g1: tuple[float, float] | NDArray,
         g2: tuple[float, float] | NDArray,
-        define_in_rotated: bool = False,
+        define_in_rotated_frame: bool = False,
         refine_gaussian: bool = True,
         refine_all_peaks: bool = False,
         refine_radius_px: float = 2.0,
         gaussian_maxfev: int = 1000,
         threshold_percentile: float = 0.9975,
-        min_peak_spacing: float = 0,
+        min_spacing: float = 0,
         plot: bool = True,
         cropping_factor: float = 0.25,
         **plot_kwargs: Any,
@@ -742,7 +742,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         Takes an approximate basis ``(g1, g2)`` -- read off the transform plot by eye --
         and refines each vector to the nearest transform peak, storing the result in
         :attr:`g1` and :attr:`g2`. These seed the per-position fit in
-        :meth:`fit_lattice_vectors`. Vectors are ``(row, col)`` offsets from the
+        :meth:`fit_lattice`. Vectors are ``(row, col)`` offsets from the
         transform center, in transform pixels.
 
         Parameters
@@ -751,7 +751,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             Initial first lattice vector ``(d_row, d_col)`` relative to the center.
         g2 : tuple of float or np.ndarray
             Initial second lattice vector ``(d_row, d_col)`` relative to the center.
-        define_in_rotated : bool, default=False
+        define_in_rotated_frame : bool, default=False
             If ``True``, ``g1``/``g2`` are given in the rotated (display) frame and are
             converted back to the raw detector frame before fitting.
         refine_gaussian : bool, default=True
@@ -768,7 +768,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         threshold_percentile : float, default=0.9975
             Intensity percentile (0--1) above which local maxima are kept as peaks when
             ``refine_all_peaks=True``.
-        min_peak_spacing : float, default=0
+        min_spacing : float, default=0
             Minimum spacing in pixels between accepted peaks when
             ``refine_all_peaks=True`` (0 disables the spacing filter).
         plot : bool, default=True
@@ -793,7 +793,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         rot_ccw = self.metadata["q_to_r_rotation_ccw_deg"]
         q_transpose = self.metadata["q_transpose"]
 
-        if define_in_rotated:
+        if define_in_rotated_frame:
             g1_rc = _display_vec_to_raw(g1_rc, rotation_ccw_deg=rot_ccw, transpose=q_transpose)
             g2_rc = _display_vec_to_raw(g2_rc, rotation_ccw_deg=rot_ccw, transpose=q_transpose)
 
@@ -809,7 +809,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             weights=None,
             maxfev=gaussian_maxfev,
             threshold_percentile=threshold_percentile,
-            min_peak_spacing=min_peak_spacing,
+            min_spacing=min_spacing,
             warn_on_bound=True,
         )
 
@@ -821,7 +821,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             self.mean_img_weights = weights
             self.mean_img_ab = peaks_ab
 
-        self.metadata["choose_define_in_rotated"] = define_in_rotated
+        self.metadata["choose_define_in_rotated_frame"] = define_in_rotated_frame
         self.metadata["choose_refine_gaussian"] = refine_gaussian
         self.metadata["choose_refine_all_peaks"] = refine_all_peaks
         self.metadata["choose_refine_radius_px"] = refine_radius_px
@@ -843,7 +843,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         return self
 
-    def fit_lattice_vectors(
+    def fit_lattice(
         self,
         refine_gaussian: bool = True,
         refine_dft: bool = False,
@@ -862,7 +862,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         For each scan position the masked/filled pattern is transformed (same ``mode``
         as :meth:`preprocess`) and the lattice basis is refined from the
-        :meth:`choose_lattice_vector` seed ``(self.g1, self.g2)``. The fitted vectors are
+        :meth:`choose_basis_vectors` seed ``(self.g1, self.g2)``. The fitted vectors are
         written to :attr:`g1_array`/:attr:`g2_array` (shape ``(scan_row, scan_col, 2)``,
         row/col components) for :meth:`calculate_strain_map`; the full fit records
         (position, amplitude, width, background) are kept in :attr:`g1_peak_fit`/
@@ -918,12 +918,12 @@ class StrainMapAutocorrelation(AutoSerialize):
         """
         if self.g1 is None or self.g2 is None:
             raise ValueError(
-                "Run choose_lattice_vector() first to set initial lattice vectors (self.g1, self.g2)."
+                "Run choose_basis_vectors() first to set initial lattice vectors (self.g1, self.g2)."
             )
         if refine_all_peaks:
             if self.mean_img_peaks is None or self.mean_img_weights is None:
                 raise ValueError(
-                    "Run choose_lattice_vector() with refine_all_peaks=True to determine which peaks to fit"
+                    "Run choose_basis_vectors() with refine_all_peaks=True to determine which peaks to fit"
                 )
         if method not in ("gaussian", "cft"):
             raise ValueError("method must be 'gaussian' or 'cft'.")
@@ -972,7 +972,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         if batch_fit:
             # Fast path: batch the transforms
-            self._fit_lattice_vectors_batched(
+            self._fit_lattice_batched(
                 g1_0=g1_0,
                 g2_0=g2_0,
                 refine_gaussian=refine_gaussian,
@@ -998,7 +998,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 try:
                     from tqdm.auto import tqdm  # type: ignore
 
-                    it = tqdm(it, total=scan_r * scan_c, desc="fit_lattice_vectors", leave=True)
+                    it = tqdm(it, total=scan_r * scan_c, desc="fit_lattice", leave=True)
                 except Exception:
                     pass
 
@@ -1061,7 +1061,7 @@ class StrainMapAutocorrelation(AutoSerialize):
 
         return self
 
-    def _fit_lattice_vectors_batched(
+    def _fit_lattice_batched(
         self,
         *,
         g1_0: NDArray,
@@ -1079,7 +1079,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         method: str = "gaussian",
         save_to_gpu: bool = True,
     ) -> None:
-        """Batched torch implementation of :meth:`fit_lattice_vectors` (``batch_fit=True``).
+        """Batched torch implementation of :meth:`fit_lattice` (``batch_fit=True``).
 
         The transform (mask/fill -> ``mode`` -> window -> ``|FFT|`` -> fftshift) and the
         peak refinement are evaluated for a stack of scan positions at once on
@@ -1089,11 +1089,11 @@ class StrainMapAutocorrelation(AutoSerialize):
         Levenberg-Marquardt fit when ``refine_gaussian``), optionally followed by
         :func:`_refine_peaks_dft_batched` when ``refine_dft``. Results are written into
         :attr:`g1_array`/:attr:`g2_array` and :attr:`g1_peak_fit`/:attr:`g2_peak_fit`,
-        and match the per-position path (see :meth:`fit_lattice_vectors`).
+        and match the per-position path (see :meth:`fit_lattice`).
 
         With ``refine_all_peaks=False`` only the two seed vectors ``g1_0``/``g2_0`` are
         refined per position. With ``refine_all_peaks=True`` every peak in ``peaks`` (the
-        basis detected by :meth:`choose_lattice_vector`, weighted by ``weights``) is
+        basis detected by :meth:`choose_basis_vectors`, weighted by ``weights``) is
         batch-refined across the stack and the basis is recovered per position by the
         same intensity-weighted least-squares fit as the per-position all-peaks branch --
         so that path is batched too rather than looping ``scipy.optimize.curve_fit`` over
@@ -1156,7 +1156,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             try:
                 from tqdm.auto import tqdm  # type: ignore
 
-                bar = tqdm(total=n_pos, desc="fit_lattice_vectors", leave=True)
+                bar = tqdm(total=n_pos, desc="fit_lattice", leave=True)
             except Exception:
                 bar = None
         else:
@@ -1286,7 +1286,7 @@ class StrainMapAutocorrelation(AutoSerialize):
     ):
         """(Re)compute the per-position weight :attr:`mask_weight` from lattice signal.
 
-        Usually **optional**: :meth:`fit_lattice_vectors` already populates
+        Usually **optional**: :meth:`fit_lattice` already populates
         :attr:`mask_weight` from the fitted peak amplitudes (mirroring the correlation
         pipeline, where ``BraggVectors.fit_lattice`` emits ``mask_weight``). Call this
         only to plot the weight map, to recompute it, or to switch to the radial
@@ -1315,8 +1315,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             disks are kept: a large exclusion keeps only the far-corner diffuse scatter,
             which is *anti*-correlated with crystallinity and inverts the contrast. If
             ``False`` (default, recommended), weight by the mean fitted peak amplitude
-            from :meth:`fit_lattice_vectors` (requires it to have been run), identical to
-            the weight ``fit_lattice_vectors`` stores automatically.
+            from :meth:`fit_lattice` (requires it to have been run), identical to
+            the weight ``fit_lattice`` stores automatically.
         exclusion_radius_fraction : float, default=0.1
             Central-disk radius (fraction of detector width) excluded by the radial
             method.
@@ -1359,7 +1359,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 self.mask_weight = np.ones((scan_r, scan_c))
         else:
             if self.g1_peak_fit is None or self.g2_peak_fit is None:
-                raise RuntimeError("For intensity-based masking, run fit_lattice_vectors() first.")
+                raise RuntimeError("For intensity-based masking, run fit_lattice() first.")
             self.mask_weight = self._amplitude_mask_weight()
 
         if plot:
@@ -1409,7 +1409,7 @@ class StrainMapAutocorrelation(AutoSerialize):
             A strain map initialized from the fitted lattice vectors.
         """
         if self.g1_array is None or self.g2_array is None:
-            raise ValueError("Run fit_lattice_vectors() before calculate_strain_map().")
+            raise ValueError("Run fit_lattice() before calculate_strain_map().")
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
 
@@ -1448,7 +1448,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         Shows ``g1_row``, ``g1_col``, ``g2_row``, ``g2_col`` from :attr:`g1_array`/
         :attr:`g2_array` as four panels (optionally with the mean subtracted), on a
         shared symmetric color range. Positions whose vectors deviate from the
-        :meth:`choose_lattice_vector` seed by more than ``max_shift`` are masked out, so
+        :meth:`choose_basis_vectors` seed by more than ``max_shift`` are masked out, so
         bad fits do not blow up the color scale. A quick diagnostic of fit smoothness
         before computing strain.
 
@@ -1475,9 +1475,9 @@ class StrainMapAutocorrelation(AutoSerialize):
             ``(fig, ax)`` with the four-panel figure.
         """
         if self.g1_array is None or self.g2_array is None:
-            raise ValueError("Run fit_lattice_vectors() first to compute g1_array and g2_array.")
+            raise ValueError("Run fit_lattice() first to compute g1_array and g2_array.")
         if self.g1 is None or self.g2 is None:
-            raise ValueError("Run choose_lattice_vector() first to set self.g1 and self.g2.")
+            raise ValueError("Run choose_basis_vectors() first to set self.g1 and self.g2.")
 
         im0 = self.g1_array[:, :, 0]
         im1 = self.g1_array[:, :, 1]
@@ -1751,7 +1751,7 @@ def _parabolic_peak_rc_amp(
     guess, refines row and column independently by a parabolic vertex, and returns
     ``(r_sub, c_sub, amp)`` -- the sub-pixel peak position and the image value at the
     rounded vertex. Shared by the per-position :func:`_refine_lattice_vectors` and the
-    batched :meth:`StrainMapAutocorrelation._fit_lattice_vectors_batched` so they agree
+    batched :meth:`StrainMapAutocorrelation._fit_lattice_batched` so they agree
     exactly.
     """
     H, W = im.shape
@@ -1941,7 +1941,7 @@ def _refine_lattice_vectors(
     upsample: int = 16,
     maxfev: int = 1000,
     threshold_percentile: float = 0.9975,
-    min_peak_spacing: float = 0,
+    min_spacing: float = 0,
     tr: NDArray | None = None,
     method: str = "gaussian",
     warn_on_bound: bool = False,
@@ -1989,7 +1989,7 @@ def _refine_lattice_vectors(
     threshold_percentile : float, optional
         Fractional intensity percentile (0-1) used as the peak-detection
         threshold when auto-detecting peaks. Default 0.9975.
-    min_peak_spacing : float, optional
+    min_spacing : float, optional
         Minimum allowed spacing (in pixels) between detected peaks; ``0`` (default)
         disables the spacing filter.
     warn_on_bound : bool, default=False.
@@ -2158,7 +2158,7 @@ def _refine_lattice_vectors(
             initial_peaks = np.argwhere(p)
             r0 = (r_center, c_center)
             initial_peaks = initial_peaks - r0
-            if min_peak_spacing > 0:
+            if min_spacing > 0:
                 intensities = im[initial_peaks[:, 0] + r_center, initial_peaks[:, 1] + c_center]
                 sorted_indices = np.argsort(intensities)[::-1]
                 initial_peaks_sorted = initial_peaks[sorted_indices]
@@ -2169,7 +2169,7 @@ def _refine_lattice_vectors(
                         accepted_peaks.append(peak)
                     else:
                         distances = np.sqrt(np.sum((np.array(accepted_peaks) - peak) ** 2, axis=1))
-                        if np.all(distances >= min_peak_spacing):
+                        if np.all(distances >= min_spacing):
                             accepted_peaks.append(peak)
 
                 initial_peaks = np.array(accepted_peaks)
@@ -2451,7 +2451,7 @@ def _refine_peaks_cft_batched(
 
     # local background = median of the border of the (2*rad+1)^2 pixel window,
     # so mask_weight keeps using a background-subtracted height (see the
-    # pedestal comment in _fit_lattice_vectors_batched)
+    # pedestal comment in _fit_lattice_batched)
     rad = int(max(1, np.ceil(radius_px)))
     off = torch.arange(-rad, rad + 1, device=dev)
     ri = (q_r0 + rc).long()[:, None, None] + off[None, :, None]

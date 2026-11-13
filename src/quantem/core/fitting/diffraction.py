@@ -704,7 +704,15 @@ class DiskTemplate(RenderComponent):
 
 class SyntheticDiskLattice(RenderComponent):
     DEFAULT_HARD_CONSTRAINTS: dict[str, bool] = {
+        # clamp the i0 parameters to >= 0 after each step
         "force_positive_intensity": True,
+        # clip each disk's rendered intensity at zero, max(f, 0), so no disk renders
+        # negative. The clip has zero gradient where it acts, so slopes that push a
+        # disk edge below zero are never pulled back, which can bias the fitted
+        # lattice vectors; set False for the most accurate fit. Unclipped, a disk can
+        # dip slightly negative at its edge, but the summed pattern with the
+        # backgrounds stays non-negative.
+        "force_positive_render": True,
     }
     DEFAULT_SOFT_CONSTRAINTS: dict[str, float] = {
         "consistency_weight": 0.0,
@@ -815,8 +823,9 @@ class SyntheticDiskLattice(RenderComponent):
         # is trained via this lattice and shaped by the disk's constraints. When
         # False (default) the lattice shares the center disk's template.
         self.own_template = bool(own_template)
-        # None -> hard clamp max(f, 0); float -> softplus(beta*f)/beta (smooth,
-        # gradient-alive positivity that approaches zero without crossing it).
+        # float -> softplus(beta*f)/beta (smooth, gradient-alive positivity that
+        # approaches zero without crossing it); takes precedence over the
+        # force_positive_render hard constraint.
         self.intensity_softplus_beta = (
             None if intensity_softplus_beta is None else float(intensity_softplus_beta)
         )
@@ -1044,17 +1053,20 @@ class SyntheticDiskLattice(RenderComponent):
         return (frac >= self.min_frac_inside_mask).reshape(centers_r.shape)
 
     def _apply_positivity(self, inten: torch.Tensor) -> torch.Tensor:
-        """Map the per-pixel intensity polynomial to nonnegative values.
+        """Apply the optional positivity mapping to the per-pixel intensity polynomial.
 
-        Hard ``max(f, 0)`` clips part of a tilted disk dark but leaves a dead
-        gradient in the clipped region; softplus (``intensity_softplus_beta``
-        set) is smooth and keeps the slope gradient alive everywhere while still
-        approaching zero without crossing it.
+        Softplus (``intensity_softplus_beta`` set) is smooth and keeps the slope
+        gradient alive everywhere while approaching zero without crossing it.
+        The ``force_positive_render`` hard constraint clips with ``max(f, 0)``,
+        which leaves a dead gradient in the clipped region. Otherwise the
+        intensity is unchanged.
         """
         if self.intensity_softplus_beta is not None:
             beta = self.intensity_softplus_beta
             return F.softplus(beta * inten) / beta
-        return torch.clamp(inten, min=0.0)
+        if bool(self.hard_constraints.get("force_positive_render", False)):
+            return torch.clamp(inten, min=0.0)
+        return inten
 
     def forward(self, ctx: RenderContext) -> torch.Tensor:
         if self.origin is None:
@@ -1129,7 +1141,7 @@ class SyntheticDiskLattice(RenderComponent):
                     + self.irc * centers_r * centers_c
                 )
 
-        # Positivity: hard clip, or smooth softplus if a beta is configured.
+        # Positivity: softplus if a beta is configured, hard clip if force_positive_render.
         inten = self._apply_positivity(inten)
         inten = (
             inten[:, None].expand(-1, num_pixels)
@@ -1257,7 +1269,7 @@ class SyntheticDiskLattice(RenderComponent):
                     + irc_b.view(B, 1, 1) * (r0_kb * c0_kb).unsqueeze(2)
                 )
 
-        # Positivity: hard clip, or smooth softplus if a beta is configured.
+        # Positivity: softplus if a beta is configured, hard clip if force_positive_render.
         inten = self._apply_positivity(inten)
         inten = inten * keep_f.unsqueeze(2)
         vals = patch_vals.unsqueeze(1) * inten

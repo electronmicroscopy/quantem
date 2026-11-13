@@ -352,7 +352,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         if self._raw_array is None:
             self._raw_array = np.asarray(self.dataset.array).copy()
         arr = self._raw_array
-        self.mask = np.ones(arr.shape[:2])
+        self.mask_weight = np.ones(arr.shape[:2])
 
         if arr.ndim < 2:
             raise ValueError("dataset.array must have at least 2 dimensions.")
@@ -1186,7 +1186,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         plot: bool = True,
         figsize: tuple[float, float] = (5, 4),
     ):
-        """Compute the per-position weight :attr:`mask` from the fitted lattice signal.
+        """Compute the per-position weight :attr:`mask_weight` from the fitted lattice signal.
 
         Builds a ``(scan_row, scan_col)`` weight in ``[0, 1]`` measuring the lattice
         signal at each position -- the model-fitting analogue of
@@ -1224,7 +1224,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         Returns
         -------
         ModelDiffraction
-            ``self``, with :attr:`mask` set.
+            ``self``, with :attr:`mask_weight` set.
         """
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
@@ -1273,16 +1273,16 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         lo = np.nanmin(self.i0_sum_array)
         hi = np.nanmax(self.i0_sum_array)
         if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
-            self.mask = (self.i0_sum_array - lo) / (hi - lo)
+            self.mask_weight = (self.i0_sum_array - lo) / (hi - lo)
         else:
-            self.mask = np.ones_like(self.i0_sum_array)
+            self.mask_weight = np.ones_like(self.i0_sum_array)
 
         if plot:
             import matplotlib.pyplot as plt
 
             fig, ax = plt.subplots(1, 1, figsize=figsize)
-            handle = ax.imshow(self.mask, cmap="gray", vmin=0.0, vmax=1.0)
-            ax.set_title("Per-position lattice weight (mask)")
+            handle = ax.imshow(self.mask_weight, cmap="gray", vmin=0.0, vmax=1.0)
+            ax.set_title("Per-position lattice weight (mask_weight)")
             ax.set_xlabel("scan column")
             ax.set_ylabel("scan row")
             fig.colorbar(handle, ax=ax, fraction=0.046, pad=0.04)
@@ -1316,7 +1316,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             the scan inside :class:`StrainMap`.
         mask : np.ndarray, optional
             ``(scan_row, scan_col)`` per-position weighting used when computing the
-            reference lattice. Defaults to :attr:`mask` from :meth:`create_mask` (the
+            reference lattice. Defaults to :attr:`mask_weight` from :meth:`create_mask` (the
             lattice signal strength), so strong, well-fit positions dominate the
             reference.
         calculation_metric : {"median", "mean"}, default="median"
@@ -1335,7 +1335,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
 
         if mask is None:
-            mask = self.mask
+            mask = self.mask_weight
 
         default_units = None
         default_sampling = None
