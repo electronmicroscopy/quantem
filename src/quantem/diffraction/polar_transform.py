@@ -21,6 +21,45 @@ RADIAL_MAX_PERCENTILE = 0.1
 # but is noted where the call occures
 
 
+def as_dataset4dstem(data) -> Dataset4dstem:
+    """
+    Normalize a dataset to 4D-STEM form so the polar/PADF pipeline can treat
+    all inputs uniformly:
+
+    - 2D (single diffraction pattern)  -> (1, 1, H, W)
+    - 3D (stack of patterns)           -> (N, 1, H, W)
+    - 4D                               -> unchanged
+
+    The detector calibration (last two dims) is preserved; wrapped scan dims
+    get sampling 1 pixel.
+    """
+    if data.ndim == 4:
+        return data
+    arr = data.array if data.array is not None else to_numpy(data.tensor)
+    sampling = np.asarray(data.sampling, dtype=float)
+    origin = np.asarray(data.origin, dtype=float)
+    units = list(data.units)
+    if data.ndim == 2:
+        arr4 = arr[None, None]
+        scan_sampling = [1.0, 1.0]
+    elif data.ndim == 3:
+        arr4 = arr[:, None]
+        scan_sampling = [float(sampling[0]), 1.0]
+    else:
+        raise ValueError(
+            f"Got array with shape {data.shape}. "
+            "Expected a 2D pattern, 3D stack of patterns, or 4D-STEM dataset."
+        )
+    return Dataset4dstem.from_array(
+        arr4,
+        name=data.name,
+        origin=np.concatenate([np.zeros(2), origin[-2:]]),
+        sampling=np.concatenate([scan_sampling, sampling[-2:]]),
+        units=["pixels", "pixels"] + units[-2:],
+        signal_units=data.signal_units,
+    )
+
+
 def find_origin_angular_grid(
     data: Dataset4dstem,
     *,
@@ -82,16 +121,8 @@ def find_origin_angular_grid(
         Array of shape (scan_row, scan_col, 2) containing (row, col) origin
         estimates in pixels.
     """
-    if data.ndim == 2:
-        n_row, n_col = data.shape
-        scan_row, scan_col = 1, 1
-    elif data.ndim == 4:
-        scan_row, scan_col, n_row, n_col = data.shape
-    else:
-        raise ValueError(
-            f" Got array with shape {data.shape}."
-            "To use find_origin_angular_grid, pass a 2D or 4DSTEM dataset."
-        )
+    data = as_dataset4dstem(data)
+    scan_row, scan_col, n_row, n_col = data.shape
 
     # Move the full dataset to the chosen device once
     dps = (
@@ -396,11 +427,7 @@ def polar_transform(
     device: str = "cpu",
     batch_size: int = 128,
 ) -> Polar4dstem | torch.Tensor:
-    if data.ndim != 4:
-        raise ValueError(
-            f"Found array with shape: {data.shape}. "
-            "polar_transform requires a 4D-STEM dataset (ndim=4)."
-        )
+    data = as_dataset4dstem(data)
     scan_row, scan_col, n_row, n_col = data.shape
 
     # Standardize origin_array input
