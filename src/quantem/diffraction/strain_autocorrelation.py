@@ -193,6 +193,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         threshold_percentile=50.0,
         edge_blend=64.0,
         plot=True,
+        returnfig=False,
         figsize=(8, 4),
     ):
         """Build a soft detector mask that removes dim detector regions.
@@ -226,13 +227,16 @@ class StrainMapAutocorrelation(AutoSerialize):
         plot : bool, default=True
             If ``True``, show the raw mean pattern beside the masked/filled pattern (log
             scaled) so the mask can be checked.
+        returnfig : bool, default=False
+            If ``True``, return ``(fig, ax)`` instead of ``self`` (implies ``plot``).
         figsize : tuple of float, default=(8, 4)
             Figure size in inches for the diagnostic plot.
 
         Returns
         -------
         StrainMapAutocorrelation
-            ``self``, with :attr:`mask_diffraction` and :attr:`mask_diffraction_inv` set.
+            ``self``, with :attr:`mask_diffraction` and :attr:`mask_diffraction_inv` set;
+            or ``(fig, ax)`` when ``returnfig=True``.
         """
         dp_mean = np.mean(self.dataset.array, axis=(0, 1))
         if threshold is None:
@@ -278,7 +282,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         int_edge = np.min(dp_mean[self.mask_diffraction > 0.99])
         self.mask_diffraction_inv = (1 - self.mask_diffraction) * int_edge
 
-        if plot:
+        if plot or returnfig:
             fig, ax = plt.subplots(1, 2, figsize=figsize)
             ax[0].imshow(
                 np.log(np.maximum(dp_mean, np.min(dp_mean[dp_mean > 0]))),
@@ -290,6 +294,8 @@ class StrainMapAutocorrelation(AutoSerialize):
                 ),
                 cmap="gray",
             )
+            if returnfig:
+                return fig, ax
 
         return self
 
@@ -300,6 +306,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         q_transpose: bool | None = None,
         skip=None,
         plot: bool = True,
+        returnfig: bool = False,
         cropping_factor: float = 0.25,
         gamma: float = 0.5,
         hann_window: bool = False,
@@ -345,6 +352,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         plot : bool, default=True
             If ``True``, show the original and rotated mean transforms via
             :meth:`plot_transform`.
+        returnfig : bool, default=False
+            If ``True``, return ``(fig, ax)`` instead of ``self`` (implies ``plot``).
         cropping_factor : float, default=0.25
             Fraction of the transform width/height shown when ``plot`` is
             ``True`` (the lattice peaks sit near the center).
@@ -371,7 +380,8 @@ class StrainMapAutocorrelation(AutoSerialize):
         Returns
         -------
         StrainMapAutocorrelation
-            ``self``, with :attr:`transform` and :attr:`transform_rotated` set.
+            ``self``, with :attr:`transform` and :attr:`transform_rotated` set; or
+            ``(fig, ax)`` when ``returnfig=True``.
         """
         mode_in = mode.strip().lower()
         if mode_in in {"linear", "patterson", "paterson", "acf", "autocorrelation"}:
@@ -527,8 +537,10 @@ class StrainMapAutocorrelation(AutoSerialize):
             signal_units="intensity",
         )
 
-        if plot:
-            self.plot_transform(cropping_factor=cropping_factor, **plot_kwargs)
+        if plot or returnfig:
+            fig, ax = self.plot_transform(cropping_factor=cropping_factor, **plot_kwargs)
+            if returnfig:
+                return fig, ax
 
         return self
 
@@ -734,6 +746,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         threshold_percentile: float = 0.9975,
         min_spacing: float = 0,
         plot: bool = True,
+        returnfig: bool = False,
         cropping_factor: float = 0.25,
         **plot_kwargs: Any,
     ) -> "StrainMapAutocorrelation":
@@ -773,6 +786,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             ``refine_all_peaks=True`` (0 disables the spacing filter).
         plot : bool, default=True
             If ``True``, show the transform with the refined ``g1``/``g2`` overlaid.
+        returnfig : bool, default=False
+            If ``True``, return ``(fig, ax)`` instead of ``self`` (implies ``plot``).
         cropping_factor : float, default=0.25
             Fraction of the transform shown about the center when ``plot=True``.
         **plot_kwargs
@@ -782,7 +797,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         -------
         StrainMapAutocorrelation
             ``self``, with :attr:`g1` and :attr:`g2` set (and the detected peaks/weights
-            when ``refine_all_peaks=True``).
+            when ``refine_all_peaks=True``); or ``(fig, ax)`` when ``returnfig=True``.
         """
         if self.transform is None or self.transform_rotated is None:
             raise ValueError("Run preprocess() first to compute transform images.")
@@ -828,7 +843,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         self.metadata["choose_gaussian_maxfev"] = gaussian_maxfev
         self.metadata["choose_threshold_percentile"] = threshold_percentile
 
-        if plot:
+        if plot or returnfig:
             fig, ax = self.plot_transform(cropping_factor=cropping_factor, **plot_kwargs)
             _overlay_lattice_vectors(
                 ax=ax,
@@ -839,7 +854,8 @@ class StrainMapAutocorrelation(AutoSerialize):
                 q_transpose=q_transpose,
                 peaks_plot=self.mean_img_peaks,
             )
-            return self
+            if returnfig:
+                return fig, ax
 
         return self
 
@@ -1282,6 +1298,7 @@ class StrainMapAutocorrelation(AutoSerialize):
         use_radial_method: bool = False,
         exclusion_radius_fraction: float = 0.1,
         plot: bool = True,
+        returnfig: bool = False,
         figsize: tuple[float, float] = (5, 4),
     ):
         """(Re)compute the per-position weight :attr:`mask_weight` from lattice signal.
@@ -1323,13 +1340,16 @@ class StrainMapAutocorrelation(AutoSerialize):
         plot : bool, default=True
             If ``True``, show the resulting per-position weight map (the analogue of the
             correlation pipeline's :meth:`BraggVectors.fit_lattice` plot).
+        returnfig : bool, default=False
+            If ``True``, return ``(fig, ax)`` instead of ``self`` (implies ``plot``).
         figsize : tuple of float, default=(5, 4)
             Figure size in inches for the weight-map plot.
 
         Returns
         -------
         StrainMapAutocorrelation
-            ``self``, with :attr:`mask_weight` set.
+            ``self``, with :attr:`mask_weight` set; or ``(fig, ax)`` when
+            ``returnfig=True``.
         """
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
@@ -1362,7 +1382,7 @@ class StrainMapAutocorrelation(AutoSerialize):
                 raise RuntimeError("For intensity-based masking, run fit_lattice() first.")
             self.mask_weight = self._amplitude_mask_weight()
 
-        if plot:
+        if plot or returnfig:
             fig, ax = plt.subplots(1, 1, figsize=figsize)
             handle = ax.imshow(self.mask_weight, cmap="gray", vmin=0.0, vmax=1.0)
             ax.set_title("Per-position lattice weight (mask_weight)")
@@ -1370,6 +1390,8 @@ class StrainMapAutocorrelation(AutoSerialize):
             ax.set_ylabel("scan row")
             fig.colorbar(handle, ax=ax, fraction=0.046, pad=0.04)
             fig.tight_layout()
+            if returnfig:
+                return fig, ax
 
         return self
 

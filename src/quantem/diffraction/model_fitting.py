@@ -1184,6 +1184,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         use_radial_method: bool = False,
         exclusion_radius_fraction: float = 0.1,
         plot: bool = True,
+        returnfig: bool = False,
         figsize: tuple[float, float] = (5, 4),
     ):
         """Compute the per-position weight :attr:`mask_weight` from the fitted lattice signal.
@@ -1218,13 +1219,16 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         plot : bool, default=True
             If ``True``, show the resulting per-position weight map (so a separate
             ``plt.imshow(mask)`` cell is unnecessary).
+        returnfig : bool, default=False
+            If ``True``, return ``(fig, ax)`` instead of ``self`` (implies ``plot``).
         figsize : tuple of float, default=(5, 4)
             Figure size in inches for the weight-map plot.
 
         Returns
         -------
         ModelDiffraction
-            ``self``, with :attr:`mask_weight` set.
+            ``self``, with :attr:`mask_weight` set; or ``(fig, ax)`` when
+            ``returnfig=True``.
         """
         if not isinstance(self.dataset, (Dataset4d, Dataset4dstem)):
             raise ValueError("Dataset must be Dataset4d or Dataset4dstem.")
@@ -1277,7 +1281,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         else:
             self.mask_weight = np.ones_like(self.i0_sum_array)
 
-        if plot:
+        if plot or returnfig:
             import matplotlib.pyplot as plt
 
             fig, ax = plt.subplots(1, 1, figsize=figsize)
@@ -1287,6 +1291,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             ax.set_ylabel("scan row")
             fig.colorbar(handle, ax=ax, fraction=0.046, pad=0.04)
             fig.tight_layout()
+            if returnfig:
+                return fig, ax
 
         return self
 
