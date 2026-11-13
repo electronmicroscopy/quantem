@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from quantem.core import config
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.vector import Vector
@@ -85,14 +86,16 @@ class BraggVectors(AutoSerialize):
     def __init__(
         self,
         dataset: Dataset4dstem,
-        device: str = "cpu",
+        device: str | None = None,
         _token: object | None = None,
     ):
         if _token is not self._token:
             raise RuntimeError("Use BraggVectors.from_dataset() to instantiate this class.")
         super(BraggVectors, self).__init__()
         self.dataset = dataset
-        self.device = device
+        self.device = config.validate_device(
+            config.get("device") if device is None else device
+        )[0]
 
         self.peaks: Vector | None = None
         self.calibration = None
@@ -109,6 +112,7 @@ class BraggVectors(AutoSerialize):
         self.reference_ab: np.ndarray | None = None
         self.reference_qpos: np.ndarray | None = None
         self.reference_intensity: np.ndarray | None = None
+        self.max_peak_shift: float | None = None
 
         self.g1_array: np.ndarray | None = None
         self.g2_array: np.ndarray | None = None
@@ -124,7 +128,7 @@ class BraggVectors(AutoSerialize):
 
     @classmethod
     def from_dataset(
-        cls, dataset: Dataset4dstem, *, device: str = "cpu", name: str | None = None
+        cls, dataset: Dataset4dstem, *, device: str | None = None, name: str | None = None
     ) -> "BraggVectors":
         """Create a BraggVectors workflow bound to a 4D-STEM dataset.
 
@@ -132,8 +136,9 @@ class BraggVectors(AutoSerialize):
         ----------
         dataset : Dataset4dstem
             The 4D-STEM dataset to analyze.
-        device : str, default="cpu"
+        device : str, optional
             Torch device used for detection (e.g. ``"cpu"`` or ``"cuda"``).
+            Defaults to ``config.get("device")``.
         name : str, optional
             If given, sets ``dataset.name``.
 
@@ -327,7 +332,7 @@ class BraggVectors(AutoSerialize):
 
     def make_template_from_probe(
         self,
-        probe: NDArray | torch.Tensor,
+        probe: NDArray | torch.Tensor | Dataset2d,
         center: tuple[float, float] | None = None,
         subtract_mean: bool = False,
     ) -> "BraggVectors":
@@ -335,7 +340,7 @@ class BraggVectors(AutoSerialize):
 
         Parameters
         ----------
-        probe : np.ndarray or torch.Tensor
+        probe : np.ndarray or torch.Tensor or Dataset2d
             Probe image; must match the diffraction-pattern shape.
         center : tuple of float, optional
             ``(row, col)`` probe center rolled to the origin; defaults to the
@@ -350,6 +355,8 @@ class BraggVectors(AutoSerialize):
         BraggVectors
             ``self``, for method chaining.
         """
+        if isinstance(probe, Dataset2d):
+            probe = probe.array
         probe_t = torch.as_tensor(probe, dtype=torch.float, device=self.device)
         if center is None and tuple(probe_t.shape) == tuple(self.dataset.shape[-2:]):
             center = probe_centroid(probe_t)
@@ -559,10 +566,10 @@ class BraggVectors(AutoSerialize):
 
     def correct_peak_origins(
         self,
-        origins: NDArray,
+        origins: NDArray | None = None,
         origin_ref: NDArray | tuple[float, float] | None = None,
         *,
-        inplace: bool = False,
+        modify_in_place: bool = False,
     ) -> "BraggVectors":
         """Shift the detected peak coordinates so all positions share one origin.
 
@@ -580,24 +587,30 @@ class BraggVectors(AutoSerialize):
 
         Parameters
         ----------
-        origins : np.ndarray
+        origins : np.ndarray, optional
             ``(scan_row, scan_col, 2)`` per-position diffraction origins in
-            detector pixels (row, col).
+            detector pixels (row, col). Defaults to :meth:`measure_origins` with
+            its own defaults. Measure them yourself and pass the result when you
+            need a non-default ``search_radius`` or ``center`` -- e.g. a beam that
+            is not centred on the detector -- or want to check the plane fit with
+            :meth:`plot_origin_fit` first.
         origin_ref : array-like of float, optional
             ``(row, col)`` common origin the corrected peaks are referred to.
             Defaults to the scan-mean of ``origins``.
-        inplace : bool, default=False
+        modify_in_place : bool, default=False
             If ``True``, correct ``self`` instead of returning a corrected copy.
 
         Returns
         -------
         BraggVectors
             The workflow holding the corrected peaks (a new instance unless
-            ``inplace=True``); its :attr:`bvm` is recomputed.
+            ``modify_in_place=True``); its :attr:`bvm` is recomputed.
         """
         if self.peaks is None:
             raise ValueError("Run detect_disks() before correct_peak_origins().")
         scan_shape = tuple(int(v) for v in self.dataset.shape[:2])
+        if origins is None:
+            origins = self.measure_origins()
         origins = np.asarray(origins, dtype=float)
         if origins.shape != scan_shape + (2,):
             raise ValueError(f"origins must have shape {scan_shape + (2,)}, got {origins.shape}.")
@@ -605,7 +618,7 @@ class BraggVectors(AutoSerialize):
             origin_ref = origins.mean(axis=(0, 1))
         origin_ref = np.asarray(origin_ref, dtype=float).reshape(2)
 
-        if inplace:
+        if modify_in_place:
             bv = self
         else:
             bv = type(self)(dataset=self.dataset, device=self.device, _token=type(self)._token)
@@ -827,6 +840,10 @@ class BraggVectors(AutoSerialize):
         self.origin = np.asarray(origin_rc, dtype=float).reshape(2)
         self.g1 = np.asarray(g1_rc, dtype=float).reshape(2)
         self.g2 = np.asarray(g2_rc, dtype=float).reshape(2)
+        self.reference_ab = None
+        self.reference_qpos = None
+        self.reference_intensity = None
+        self.max_peak_shift = None
 
         if plot or returnfig:
             fig, ax = plot_basis_vectors(
@@ -845,6 +862,7 @@ class BraggVectors(AutoSerialize):
     def index_peaks(
         self,
         *,
+        max_peak_shift: float | None = None,
         plot: bool = True,
         returnfig: bool = False,
         **show_kwargs,
@@ -864,11 +882,18 @@ class BraggVectors(AutoSerialize):
         With ``plot=True`` (default) the reference lattice is drawn over the Bragg
         vector map, each site ringed and labelled with its ``(a, b)`` index. The ring
         color encodes how far the picked candidate sits from its ideal lattice site
-        ``origin + a*g1 + b*g2``, so a mis-picked or duplicate candidate (which rings
-        far from zero offset) is easy to spot.
+        ``origin + a*g1 + b*g2``, scaled to ``max_peak_shift`` -- the radius
+        :meth:`fit_lattice` matches within -- so a mis-picked or duplicate candidate
+        rings far from zero offset, and one that would later be rejected reads at
+        full scale here.
 
         Parameters
         ----------
+        max_peak_shift : float, optional
+            Inclusion radius in pixels that :meth:`fit_lattice` matches within,
+            stored on :attr:`max_peak_shift`. The plot's ring colors are scaled to
+            it, so the figure shows the tolerance that will actually be applied.
+            Defaults to ``0.5 * min(|g1|, |g2|)`` -- half the shorter lattice spacing.
         plot : bool, default=True
             If ``True``, show the reference lattice via
             :func:`~quantem.diffraction.bragg_vectors_visualization.plot_reference_lattice`.
@@ -905,6 +930,11 @@ class BraggVectors(AutoSerialize):
         self.reference_ab = ab[keep]
         self.reference_qpos = cand_rc[keep]
         self.reference_intensity = cand_int[keep]
+        if max_peak_shift is None:
+            max_peak_shift = 0.5 * float(
+                min(np.linalg.norm(self.g1), np.linalg.norm(self.g2))
+            )
+        self.max_peak_shift = float(max_peak_shift)
 
         if not (plot or returnfig):
             return self
@@ -916,6 +946,7 @@ class BraggVectors(AutoSerialize):
             self.origin,
             self.g1,
             self.g2,
+            max_peak_shift=self.max_peak_shift,
             **show_kwargs,
         )
         if returnfig:
@@ -966,8 +997,11 @@ class BraggVectors(AutoSerialize):
             Inclusion radius in pixels: a detected peak is kept only if it lands
             within this distance of its nearest *ideal* lattice site
             (``origin + a*g1 + b*g2``), excluding peaks that stray too far from where
-            the best-fit lattice predicts. Defaults to ``0.5 * min(|g1|, |g2|)`` —
-            half the shorter lattice spacing.
+            the best-fit lattice predicts. Defaults to the value :meth:`index_peaks`
+            stored (itself ``0.5 * min(|g1|, |g2|)`` -- half the shorter lattice
+            spacing -- unless given there). Passing a different value here warns,
+            because the reference-lattice plot's ring colors are scaled to the
+            stored one.
         progressbar : bool, default=True
             If ``True``, show a tqdm progress bar over the scan positions.
         plot : bool, default=True
@@ -997,6 +1031,8 @@ class BraggVectors(AutoSerialize):
         g2 = np.asarray(self.g2, dtype=float).reshape(2)
         ideal_qpos = o[None, :] + ref_ab[:, 0:1] * g1[None, :] + ref_ab[:, 1:2] * g2[None, :]
 
+        if max_peak_shift is None:
+            max_peak_shift = self.max_peak_shift
         if max_peak_shift is None:
             max_peak_shift = 0.5 * float(min(np.linalg.norm(g1), np.linalg.norm(g2)))
 
@@ -1261,6 +1297,9 @@ class BraggVectors(AutoSerialize):
             if radius is None:
                 radius = radius_est
             crop = (float(center[0]), float(center[1]), float(crop_factor) * float(radius))
+            dr = float(center[0]) - dp_mean.shape[0] / 2.0
+            dc = float(center[1]) - dp_mean.shape[1] / 2.0
+            print(f"mean diffraction (beam {dr:+.1f}, {dc:+.1f} px from detector center)")
 
         fig, ax = plot_template(
             dp_mean,
@@ -1494,6 +1533,9 @@ class BraggVectors(AutoSerialize):
         **kwargs
             Extra keyword arguments forwarded to
             :func:`~quantem.diffraction.bragg_vectors_visualization.plot_bvm`.
+        **counts_kwargs : dict, optional
+            Keyword arguments for the peak-count panel (e.g. ``cmap``, ``norm``,
+            ``cbar``), forwarded to ``plot_bvm``.
 
         Returns
         -------
