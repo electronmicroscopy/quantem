@@ -357,6 +357,22 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
         raise NotImplementedError("This method should be implemented in subclasses.")
 
+    def _pose_to(self, device: torch.device | str):
+        """Move the pose parameters to `device`, creating them on the first call.
+
+        Later calls move them in place, so they keep their learned values and
+        the optimizer keeps its state for them.
+        """
+        if "_z1_params" not in self._parameters:
+            self._z1_params = nn.Parameter(self._z1_angles)
+            self._z3_params = nn.Parameter(self._z3_angles)
+            self._shifts_params = nn.Parameter(self._shifts)
+        for param in (self._z1_params, self._z3_params, self._shifts_params):
+            param.data = param.data.to(device)
+        self._z1_ref = self._z1_ref.to(device)
+        self._z3_ref = self._z3_ref.to(device)
+        self._shifts_ref = self._shifts_ref.to(device)
+
 
 class TomographyDatasetConstraints(BaseConstraints, TomographyDatasetBase):
     DEFAULT_CONSTRAINTS = DatasetConstraintParams.BaseTomographyDatasetConstraints()
@@ -436,15 +452,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         """
         self.tilt_stack = self.tilt_stack.to(device)
         self.tilt_angles = self.tilt_angles.to(device)
-
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
-
-        self._z1_ref = self._z1_ref.to(device)
-        self._z3_ref = self._z3_ref.to(device)
-        self._shifts_ref = self._shifts_ref.to(device)
-
+        self._pose_to(device)
         self.device = device
 
 
@@ -657,14 +665,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         return self.tilt_stack.shape[0] * N * N
 
     def to(self, device: torch.device | str):
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
-
-        self._z1_ref = self._z1_ref.to(device)
-        self._z3_ref = self._z3_ref.to(device)
-        self._shifts_ref = self._shifts_ref.to(device)
-
+        self._pose_to(device)
         self.device = device
         self.reconnect_optimizer_to_parameters()
 

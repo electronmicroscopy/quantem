@@ -1,4 +1,5 @@
 import gzip
+import json
 
 import dill
 import numpy as np
@@ -9,6 +10,7 @@ import zarr
 
 import quantem
 from quantem.core.io.serialize import AutoSerialize, load, print_file
+from quantem.core.ml.activation_functions import get_activation_function
 
 # ─────────────────────────────────────────────── #
 # 1) Simple “Dummy” with arr/count/child/_private #
@@ -206,16 +208,25 @@ class _Net(nn.Module):
         self.scale = nn.Parameter(torch.full((2,), 3.0))
 
 
+def _local_module() -> nn.Module:
+    class Local(nn.Module):  # cannot be imported by name, so it is pickled
+        pass
+
+    return Local()
+
+
 class Untrusted(AutoSerialize):
     def __init__(self):
         self.net = _Net()
         self.payloads = [_Payload("new")]
+        self.encode = json.dumps
+        self.local = _local_module()
 
 
 def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path):
-    """Dill fallbacks, in a list or in the older bare-array layout, and modules from
-    outside quantem and torch load only with allow_pickle=True; without it, nothing
-    stored in them runs."""
+    """Dill fallbacks, in a list or in the older bare-array layout, and modules and
+    functions from outside quantem and torch load only with allow_pickle=True;
+    without it, nothing stored in them runs."""
     _unpickled.clear()
     tgt = tmp_path / "untrusted"
     Untrusted().save(tgt)
@@ -230,6 +241,8 @@ def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path):
         f"net ({_Net.__module__}._Net, from outside quantem and torch)",
         "payloads/0 (dill pickle)",
         "legacy (dill pickle)",
+        "encode (json.dumps, from outside quantem and torch)",
+        "local (dill pickle)",
     ):
         assert entry in str(error.value), entry
     assert _unpickled == []
@@ -238,6 +251,8 @@ def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path):
     assert torch.equal(loaded.net.scale, torch.full((2,), 3.0))
     assert loaded.payloads == ["new"]
     assert loaded.legacy == "legacy"
+    assert loaded.encode is json.dumps
+    assert type(loaded.local).__name__ == "Local"
     assert sorted(_unpickled) == ["legacy", "new"]
 
     # the file can only name classes that are stored by their attributes
@@ -254,22 +269,26 @@ class TestModule(torch.nn.Module, AutoSerialize):
         super().__init__()
         # more than ten layers, so loading them out of order changes the output
         self.layers = nn.Sequential(*(nn.Linear(3, 3) for _ in range(11)))
+        # a module that holds a function, as CNN2d holds torch.cat
+        self.activation = get_activation_function(torch.tanh, torch.float32)
         self.opt = torch.optim.Adam(self.parameters(), lr=0.01)
         self.sched = torch.optim.lr_scheduler.ExponentialLR(self.opt, gamma=0.5)
+        self.rng = np.random.default_rng(0)
 
     def forward(self, x):
-        return self.layers(x)
+        return self.activation(self.layers(x))
 
     def train_step(self):
         self.opt.zero_grad()
-        self(torch.ones(1, 3)).sum().backward()
+        self(torch.from_numpy(self.rng.random((1, 3), dtype=np.float32))).sum().backward()
         self.opt.step()
         self.sched.step()
 
 
 def test_torch_nn_module_roundtrip(tmp_path):
-    """A model with its optimizer and scheduler loads without pickle and trains on
-    as the original does, so the optimizer holds the loaded model's parameters."""
+    """A model with its optimizer, scheduler and random generator loads without
+    pickle and trains on as the original does, so the optimizer holds the loaded
+    model's parameters."""
     mod = TestModule()
     mod.train_step()
     tgt = tmp_path / "mod.zip"

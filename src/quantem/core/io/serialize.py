@@ -3,14 +3,15 @@
 Arrays, tensors, scalars, strings, paths, containers and ase.Atoms are stored as
 Zarr arrays and JSON attributes. AutoSerialize objects, dataclasses, torch
 modules and schedulers are stored by their attributes, and torch optimizers by
-their state_dict, and are rebuilt without unpickling. A value held in several
+their state_dict, and are rebuilt without unpickling. Classes and functions,
+such as a layer type a model keeps, are stored by name. A value held in several
 places, such as a parameter of a model and its optimizer, is stored once and
 stays shared.
 
 Values without such a form are pickled. Unpickling can run code stored in the
 file, so `load` reads them only with ``allow_pickle=True``. The same holds for
-modules, optimizers, schedulers and dataclasses defined outside quantem and
-torch, whose code was not written to take attributes from a file.
+modules, optimizers, schedulers, dataclasses, classes and functions defined
+outside quantem and torch, whose code was not written to take values from a file.
 """
 
 import dataclasses
@@ -23,6 +24,7 @@ import logging
 import os
 import shutil
 import tempfile
+import types
 import zlib
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -50,7 +52,14 @@ _METADATA_KEYS = frozenset(
     }
 )
 # Attributes "<name><suffix>" that say how to rebuild the attribute "<name>"
-_FLAG_SUFFIXES = (".is_path", ".is_ref", ".is_torch_device", ".is_torch_dtype", ".torch_save")
+_FLAG_SUFFIXES = (
+    ".is_global",
+    ".is_path",
+    ".is_ref",
+    ".is_torch_device",
+    ".is_torch_dtype",
+    ".torch_save",
+)
 # Torch classes stored as groups of their state, like AutoSerialize objects
 _TORCH_STATEFUL = (
     torch.nn.Module,
@@ -79,10 +88,10 @@ class AutoSerialize:
 
     Arrays and tensors are stored as Zarr arrays, scalars and strings as JSON
     attributes, and lists, tuples, sets, dicts, dataclasses, torch modules,
-    optimizers and schedulers and nested AutoSerialize objects as Zarr groups.
-    Values of any other type are pickled with dill; see `load`. Torch
-    generators keep their state; loggers and NumPy generators are recreated
-    without it.
+    optimizers and schedulers and nested AutoSerialize objects as Zarr groups,
+    and classes and functions by name. Values of any other type are pickled
+    with dill; see `load`. Torch and NumPy generators keep their state;
+    loggers are recreated without it.
 
     Loading does not call ``__init__``. A class whose stored state differs from
     its working state defines ``_post_load(self)`` to convert it after loading.
@@ -354,6 +363,9 @@ class _Writer:
         elif isinstance(value, torch.dtype):
             group.attrs[name] = str(value)  # "torch.float32"
             group.attrs[f"{name}.is_torch_dtype"] = True
+        elif (global_name := _global_name(value)) is not None:
+            group.attrs[name] = global_name  # "torch.nn.modules.batchnorm:BatchNorm2d"
+            group.attrs[f"{name}.is_global"] = True
         elif isinstance(value, torch.Tensor):
             if self._is_ref(value, group, name):
                 return
@@ -380,7 +392,11 @@ class _Writer:
                 }
             )
             _write_bytes(subgroup, "state", value.get_state().numpy().tobytes())
-        elif _is_object_class(type(value)) and hasattr(value, "__dict__"):
+        elif (
+            _is_object_class(type(value))
+            and hasattr(value, "__dict__")
+            and _importable_name(type(value)) is not None  # not a class defined in a function
+        ):
             if not self._is_ref(value, group, name):
                 self.object(value, group.require_group(name))
         elif isinstance(value, (list, tuple, set, dict)):
@@ -389,6 +405,7 @@ class _Writer:
             subgroup = group.require_group(name)
             subgroup.attrs["_numpy_rng"] = True
             subgroup.attrs["_bit_generator_type"] = type(value.bit_generator).__name__
+            subgroup.attrs["_rng_state"] = _json_state(value.bit_generator.state)
         elif type(value).__module__.startswith("ase.") and type(value).__name__ == "Atoms":
             _write_atoms(group.require_group(name), name, value, self.compressors)
         elif hasattr(value, "add_scalar") and hasattr(value, "add_image"):
@@ -526,6 +543,8 @@ class _Reader:
                 if path in self.loaded:
                     return self.loaded[path]
                 return self._group(cast(zarr.Group, self.root[path]))
+            if group.attrs.get(f"{key}.is_global"):
+                return self._global(_join(group.path, key), cast(str, value))
             if group.attrs.get(f"{key}.is_path"):
                 return Path(cast(str, value))
             if group.attrs.get(f"{key}.is_torch_device"):
@@ -575,7 +594,10 @@ class _Reader:
             return _read_atoms(group)
         if attrs.get("_numpy_rng"):
             bit_generator = _BIT_GENERATORS.get(cast(str, attrs.get("_bit_generator_type")))
-            return np.random.Generator((bit_generator or np.random.PCG64)())
+            bit_generator = (bit_generator or np.random.PCG64)()
+            if "_rng_state" in attrs:
+                bit_generator.state = attrs["_rng_state"]
+            return np.random.Generator(bit_generator)
         if attrs.get("_torch_generator"):
             generator = torch.Generator()
             if attrs.get("device") == "cpu":
@@ -613,6 +635,17 @@ class _Reader:
         return self._refuse(
             group.path, f"{cls.__module__}.{cls.__qualname__}, from outside quantem and torch"
         )
+
+    def _global(self, path: str, name: str) -> Any:
+        """The class or function stored by `name`, or _SKIP if it is refused."""
+        module_name, _, qualname = name.partition(":")
+        # checked before importing, since importing a module runs its code
+        if not self.allow_pickle and module_name.partition(".")[0] not in _TRUSTED_PACKAGES:
+            return self._refuse(path, f"{module_name}.{qualname}, from outside quantem and torch")
+        value = _import_global(module_name, qualname)
+        if value is None:
+            raise ValueError(f"{module_name}.{qualname} at {path} is not a class or function")
+        return value
 
     def _refuse(self, path: str, description: str) -> Any:
         self.refused.append(f"{path} ({description})")
@@ -692,12 +725,55 @@ def _import_class(metadata: Any) -> type:
     if int(metadata.get("version", 1)) != _FORMAT_VERSION:
         raise ValueError(f"Unsupported AutoSerialize version: {metadata.get('version')}")
     module_name, class_name = metadata["class_module"], metadata["class_name"]
-    cls: Any = importlib.import_module(module_name)
-    for part in class_name.split("."):  # a qualified name, for nested classes
-        cls = getattr(cls, part, None)
+    cls = _import_global(module_name, class_name)
     if not isinstance(cls, type):
         raise ValueError(f"{module_name}.{class_name} is not an importable class")
     return cls
+
+
+def _global_name(value: Any) -> str | None:
+    """The "module:qualname" stored for `value`, if it is a class or function."""
+    if not isinstance(value, (type, types.FunctionType, types.BuiltinFunctionType)):
+        return None
+    if value.__module__ == "__main__":
+        return None  # dill stores what a script or notebook defines by value
+    return _importable_name(value)
+
+
+def _importable_name(value: Any) -> str | None:
+    """The "module:qualname" that imports the class or function `value`, else None."""
+    module_name = getattr(value, "__module__", None)
+    if not module_name:
+        return None
+    # torch's C functions have qualnames such as "_VariableFunctionsClass.cat"
+    for name in dict.fromkeys((value.__qualname__, value.__name__)):
+        try:
+            found = _import_global(module_name, name)
+        except ImportError:
+            return None
+        # the same object, or the one an autoreload replaced it with
+        if found is value or (found is not None and found.__qualname__ == value.__qualname__):
+            return f"{module_name}:{name}"
+    return None  # a lambda, or a class or function defined inside a function
+
+
+def _import_global(module_name: str, qualname: str) -> Any:
+    """The class or function `module_name.qualname`, else None."""
+    value: Any = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        value = getattr(value, part, None)
+    if isinstance(value, (type, types.FunctionType, types.BuiltinFunctionType)):
+        return value
+    return None
+
+
+def _json_state(value: Any) -> Any:
+    """A NumPy bit generator's state, with its arrays as lists, for JSON."""
+    if isinstance(value, dict):
+        return {key: _json_state(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value.item() if isinstance(value, np.generic) else value
 
 
 def _stored_class(group: zarr.Group) -> type:

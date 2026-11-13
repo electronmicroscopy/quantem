@@ -12,6 +12,8 @@ paths it inherits (off-object masking, z coordinates, autograd-only backward, th
 flag) are tested once, in ``test_object_inr.py``.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -175,14 +177,20 @@ class TestObjectTensorDecompUnit:
         assert obj.optimizer is None
 
     def test_from_model_warns_on_lambda_activation(self):
-        # a lambda activation cannot be pickled by AutoSerialize -> from_model must warn
+        # a lambda activation is pickled, so the saved file needs allow_pickle -> warn
         model = KPlanes(
             M_features=4,
             resolution=(8, 8, 8),
             multiscale_res_multipliers=[1.0],
-            use_hybrid_mlp=False,  # default density_activation is a lambda
+            use_hybrid_mlp=False,
+            density_activation=lambda x: x,
         )
         with pytest.warns(UserWarning, match="density_activation"):
+            ObjectTensorDecomp.from_model(model, num_slices=1, obj_type="pure_phase")
+        # the default activation is a module-level function, saved by name
+        model.density_activation = KPlanes(M_features=4, resolution=(8, 8, 8)).density_activation
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             ObjectTensorDecomp.from_model(model, num_slices=1, obj_type="pure_phase")
 
     def test_from_model_rejects_non_kplanes(self):
