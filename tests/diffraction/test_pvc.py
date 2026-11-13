@@ -141,7 +141,8 @@ def test_self_term_removal(triangular):
     on r = r', which Theta_self holds, in both rotation models, and the fitted
     amplitude peaks at the bond length. The projected pair distribution of the mean
     pattern, which holds that two-body information instead, matches the atom
-    positions (one projection has no 3D pair distribution)."""
+    positions (one projection has no 3D pair distribution), and its first
+    neighbor shell holds the bond length and stops short of the next shell."""
     intensity, positions = triangular
     pvc = _pvc(intensity, (N_PX // 2, N_PX // 2))
     for model in ("beam", "sphere"):
@@ -156,3 +157,5 @@ def test_self_term_removal(triangular):
             g2_model = pvc.model_pair_distribution([np.c_[positions, np.zeros(len(positions))]])
             inside = pvc.r > 1.0
             assert np.corrcoef(g2[inside], g2_model[inside])[0, 1] > 0.98
+            lo, hi = pvc.neighbor_shell(g2=g2)
+            assert lo < BOND < hi < 0.5 * (1 + np.sqrt(3)) * BOND, (lo, hi)

@@ -523,6 +523,33 @@ class PairVectorCorrelation:
         """
         return self._radial_transform(self.mean_harmonics[0].real - 1.0)
 
+    def neighbor_shell(self, n: int = 1, g2=None, min_fraction: float = 0.3):
+        """
+        (r_lo, r_hi) of the n-th neighbor shell (A): around the n-th peak of the
+        pair distribution weighted by r^2 (sphere) or r (beam), out to where it
+        falls to the mean pair density or to a minimum, whichever comes first.
+        Peaks count where the unweighted pair distribution is above
+        min_fraction of its largest value beyond 1 A.
+
+        g2 : pair distribution on the r grid; by default pair_distribution().
+        """
+        g2 = self.pair_distribution() if g2 is None else np.asarray(g2, dtype=np.float64)
+        y = g2 * self.r ** (1.0 if self.model == "beam" else 2.0)
+        floor = min_fraction * g2[self.r > 1.0].max()
+        peaks = [
+            k
+            for k in range(1, y.size - 1)
+            if self.r[k] > 1.0 and g2[k] > floor and y[k] > y[k - 1] and y[k] >= y[k + 1]
+        ]
+        if len(peaks) < n:
+            raise ValueError(f"the pair distribution has {len(peaks)} shells, fewer than {n}")
+        lo = hi = peaks[n - 1]
+        while lo > 0 and y[lo] > 0 and y[lo - 1] < y[lo]:
+            lo -= 1
+        while hi < y.size - 1 and y[hi] > 0 and y[hi + 1] < y[hi]:
+            hi += 1
+        return float(self.r[lo]), float(self.r[hi])
+
     def model_pair_distribution(self, clusters):
         """
         pair_distribution of atomic models: the mean intensity of all their
@@ -565,6 +592,7 @@ class PairVectorCorrelation:
         self,
         Theta=None,
         r_fixed=None,
+        r_shell=None,
         marks=None,
         title=None,
         r_display_power: float | None = None,
@@ -578,20 +606,24 @@ class PairVectorCorrelation:
     ):
         """
         Maps of Theta against angle (y-axis) and r (x-axis), one panel per volume
-        in a single row: the r = r' diagonal, or Theta(r_fixed, r', theta) when
-        r_fixed is given (one value or one per panel). The display is weighted by
-        (r r')^r_display_power (default 1 for the sphere model, 0.5 for beam).
+        in a single row: the r = r' diagonal; Theta(r_fixed, r', theta) when
+        r_fixed is given; or Theta integrated over r in a shell when r_shell is
+        given, such as the first-neighbor shell from neighbor_shell(). The
+        display is weighted by (r r')^p, or by r^(2p) dr over the shell and r'^p,
+        with p = r_display_power (default 1 for the sphere model, 0.5 for beam).
         subtract_median (default on for beam) subtracts the median over the
-        interior angles at each r: the self-correlation bands at 0 and 180 deg
-        otherwise offset every interior angle. Color limits use 15-165 deg and
+        interior angles at each r. Color limits use 15-165 deg and
         r <= r_max_display.
 
         Theta : (Nr, Nr, Ntheta) array, a list of them, or None for self.Theta.
+        r_fixed : r (A), shared or one per panel.
+        r_shell : (r_lo, r_hi) (A), shared, or a list with one per panel.
         marks : (r', angle) points (A, deg) circled with dashed lines, such as
             the output of pair_vector_marks, shared or one list per panel.
-        g2 : (Nr,) pair distribution drawn above each map on the same r axis,
-            weighted like the map and scaled to 1, such as pair_distribution()
-            or model_pair_distribution(); shared or one per panel.
+        g2 : (Nr,) pair distribution drawn below each map on the same r axis,
+            weighted by r^(2p) and scaled to 1, with the shell or r_fixed
+            highlighted, such as pair_distribution() or
+            model_pair_distribution(); shared or one per panel.
         self_term : self term added to the maps for display, each pair vector
             correlated with itself and its reverse: True for Theta_self when
             Theta is None, or Theta_self and the second output of
@@ -609,6 +641,11 @@ class PairVectorCorrelation:
         subtract = beam if subtract_median is None else subtract_median
         titles = _per_panel(title, n)
         r_fixeds = list(r_fixed) if isinstance(r_fixed, (list, tuple)) else [r_fixed] * n
+        shells = (
+            list(r_shell)
+            if isinstance(r_shell, list)
+            else [None if r_shell is None else tuple(r_shell)] * n
+        )
         markss = _per_panel(marks, n, nested=True, depth=2)
         g2s = _per_panel(g2, n, nested=True, depth=1)
         if self_term is True:
@@ -617,31 +654,39 @@ class PairVectorCorrelation:
             selfs = list(self_term) if isinstance(self_term, (list, tuple)) else [self_term] * n
             vols = [np.asarray(v) + np.asarray(t) for v, t in zip(vols, selfs)]
         r, theta = self.r, self.theta_deg
+        dr = r[1] - r[0]
         rs = r <= (r[-1] if r_max_display is None else r_max_display)
         interior = (theta % 180 > 15) & (theta % 180 < 165)
         theta_max = theta[-1]
 
-        rows = 1 if g2 is None else 2
         fig, axs = plt.subplots(
-            rows,
+            1 if g2 is None else 2,
             n,
             figsize=(axsize[0] * n, axsize[1] * (1 if g2 is None else 1.4)),
             squeeze=False,
             sharex="col",
-            height_ratios=[1] if g2 is None else [1, 2.5],
+            height_ratios=[1] if g2 is None else [2.5, 1],
             constrained_layout=True,
         )
-        for k, (ax, vol, t, r0, panel_marks) in enumerate(
-            zip(axs[-1], vols, titles, r_fixeds, markss)
+        for k, (ax, vol, t, r0, shell, panel_marks) in enumerate(
+            zip(axs[0], vols, titles, r_fixeds, shells, markss)
         ):
             vol = vol.numpy() if isinstance(vol, torch.Tensor) else np.asarray(vol)
-            if r0 is None:
-                m = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * power))[:, None]
-                xlabel = "r = r' (Å)"
-            else:
+            if shell is not None:
+                inside = (r >= shell[0]) & (r <= shell[1])
+                w = r[inside] ** (2 * power) * dr
+                m = np.tensordot(w, vol[inside], axes=(0, 0))[rs] * (r[rs] ** power)[:, None]
+                xlabel = f"r' (Å), r from {shell[0]:.2f} to {shell[1]:.2f} Å"
+                label = rf"$\int \Theta \, r^{{{2 * power:g}}} dr \cdot r'^{{{power:g}}}$"
+            elif r0 is not None:
                 i0 = int(np.argmin(np.abs(r - r0)))
                 m = vol[i0][rs] * ((r[i0] * r[rs]) ** power)[:, None]
                 xlabel = f"r' (Å), r = {r[i0]:.2f} Å"
+                label = rf"$\Theta \cdot (r r')^{{{power:g}}}$"
+            else:
+                m = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * power))[:, None]
+                xlabel = "r = r' (Å)"
+                label = rf"$\Theta \cdot (r r')^{{{power:g}}}$"
             if subtract:
                 m = m - np.median(m[:, interior], axis=1, keepdims=True)
             vmax = np.abs(m[:, interior]).max()
@@ -661,23 +706,27 @@ class PairVectorCorrelation:
                     )
                 )
             ax.set_xlim(r[rs][0], r[rs][-1])
-            ax.set_xlabel(xlabel)
             ax.set_ylabel(r"$\Delta\phi$ (deg)" if beam else r"$\theta$ (deg)")
             ax.set_ylim(0, theta_max)
             ax.set_yticks(np.arange(0, theta_max + 1, 30 if theta_max <= 180 else 60))
-            fig.colorbar(im, ax=ax, label=rf"$\Theta \cdot (r r')^{{{power:g}}}$")
-            top = ax
-            if g2 is not None:
-                top = axs[0, k]
-                y = np.asarray(g2s[k], dtype=np.float64)[rs] * r[rs] ** (2 * power)
-                top.plot(r[rs], y / np.abs(y).max(), color="k", lw=1.5)
-                top.axhline(0, color="0.6", lw=0.8)
-                top.set_ylabel(rf"$g_2 \cdot r^{{{2 * power:g}}}$")
-                fig.colorbar(im, ax=top).ax.set_visible(False)  # keeps the r axes aligned
+            fig.colorbar(im, ax=ax, label=label)
             if t is not None:
-                top.set_title(t)
+                ax.set_title(t)
+            bottom = ax
+            if g2 is not None:
+                bottom = axs[1, k]
+                y = np.asarray(g2s[k], dtype=np.float64)[rs] * r[rs] ** (2 * power)
+                if shell is not None:
+                    bottom.axvspan(*shell, color="tab:orange", alpha=0.3, lw=0)
+                elif r0 is not None:
+                    bottom.axvline(r[int(np.argmin(np.abs(r - r0)))], color="tab:orange", lw=2)
+                bottom.plot(r[rs], y / np.abs(y).max(), color="k", lw=1.5)
+                bottom.axhline(0, color="0.6", lw=0.8)
+                bottom.set_ylabel(rf"$g_2 \cdot r^{{{2 * power:g}}}$")
+                fig.colorbar(im, ax=bottom).ax.set_visible(False)  # keeps the r axes aligned
+            bottom.set_xlabel(xlabel)
         if returnfig:
-            return fig, axs[-1]
+            return fig, axs[0]
         plt.show()
 
 
