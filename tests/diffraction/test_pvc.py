@@ -1,10 +1,23 @@
 import numpy as np
 import pytest
+from ase.build import bulk
 
 from quantem.core.datastructures.dataset2d import Dataset2d
-from quantem.diffraction.lattices import gaussian_form_factor, make_images
+from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.diffraction.lattices import (
+    gaussian_form_factor,
+    make_images,
+    polycrystal,
+    probe_patterns,
+)
 from quantem.diffraction.multislice import circular_window
-from quantem.diffraction.pvc import PairVectorCorrelation, _solve_sphere, _ylm_azimuth_zero
+from quantem.diffraction.pvc import (
+    PairVectorCorrelation,
+    _solve_sphere,
+    _ylm_azimuth_zero,
+    pair_vector_marks,
+)
 
 N_PX, PIXEL, SIGMA, BOND = 128, 0.2, 0.4, 2.5
 
@@ -54,7 +67,8 @@ def test_sphere_solve_recovers_invariants_on_curved_ewald_sphere():
 
 def test_beam_correlation_and_patterson_of_lattice(triangular, recwarn):
     """One triangular-lattice pattern: the beam correlation matches the model of the
-    atom positions with peaks at 60 and 120 deg, and the Patterson peaks at the bond vector."""
+    atom positions and peaks at the angles pair_vector_marks expects, and the
+    Patterson peaks at the bond vector."""
     intensity, positions = triangular
     pvc = _pvc(intensity, (N_PX // 2, N_PX // 2))
     assert not any("n = 1 harmonic" in str(w.message) for w in recwarn), (
@@ -65,11 +79,11 @@ def test_beam_correlation_and_patterson_of_lattice(triangular, recwarn):
     i = int(np.argmin(np.abs(pvc.r - BOND)))
     interior = slice(15, 166)
     assert np.corrcoef(T[i, i, interior], M[i, i, interior])[0, 1] > 0.98
-    t = T[i, i, :181]
-    assert (
-        abs(theta[30 + np.argmax(t[30:90])] - 60) <= 2
-        and abs(theta[90 + np.argmax(t[90:150])] - 120) <= 2
-    )
+    angles = [a for _, a in pair_vector_marks(positions, BOND, 3.0, model="beam")]
+    assert angles == [60.0, 120.0, 240.0, 300.0], angles
+    for a in angles:
+        near = np.abs(theta - a) <= 20
+        assert abs(theta[near][np.argmax(T[i, i, near])] - a) <= 2, f"peak near {a} deg"
 
     image, px = pvc.patterson(r_max=4.0)
     c = image.shape[0] // 2
@@ -92,3 +106,53 @@ def test_miscentered_pattern_warns(triangular):
     intensity, _ = triangular
     with pytest.warns(UserWarning, match="n = 1 harmonic"):
         _pvc(intensity, (N_PX // 2 + 2, N_PX // 2))
+
+
+def test_bright_field_radius_of_probe_patterns():
+    """The bright-field disk of multislice patterns of a nanocrystalline film is
+    measured at its radius alpha / lambda."""
+    film = polycrystal(bulk("Si", "diamond", a=5.431, cubic=True), 8.0, 24.0, 8.0, seed=0)
+    ds = probe_patterns(film, 4, 10.0, q_max=1.0)
+    pvc = PairVectorCorrelation(ds, energy=200e3)
+    expected = 10e-3 / electron_wavelength_angstrom(200e3)
+    assert abs(pvc.bright_field_radius - expected) < 0.5 * ds.sampling[-1]
+
+
+def test_split_counts_removes_shot_noise_bias():
+    """Poisson noise on a flat pattern biases the second moment at k = k'; the
+    cross moment of two random halves of the counts does not."""
+    counts = np.random.default_rng(0).poisson(20.0, size=(200, 1, 48, 48)).astype(np.float32)
+    ds = Dataset4dstem.from_array(
+        counts, origin=(0, 0, -24, -24), sampling=(1, 1, 1, 1), units=["pixels"] * 4
+    )
+    bias = [
+        np.diagonal(
+            PairVectorCorrelation(ds, k_min=4, k_max=20, split_counts=split).second_moment[1:],
+            axis1=1,
+            axis2=2,
+        ).real.mean()
+        for split in (False, True)
+    ]
+    assert bias[0] > 0 and abs(bias[1]) < 0.1 * bias[0], bias
+
+
+def test_self_term_removal(triangular):
+    """Theta leaves out the correlation of each pair vector with itself at 0 deg
+    on r = r', which Theta_self holds, in both rotation models, and the fitted
+    amplitude peaks at the bond length. The projected pair distribution of the mean
+    pattern, which holds that two-body information instead, matches the atom
+    positions (one projection has no 3D pair distribution)."""
+    intensity, positions = triangular
+    pvc = _pvc(intensity, (N_PX // 2, N_PX // 2))
+    for model in ("beam", "sphere"):
+        _, T = pvc.correlation(model, r_max=4.0)
+        i = int(np.argmin(np.abs(pvc.r - BOND)))
+        spike = [abs(V[i, i, 0]) / np.abs(V[i, i, 30:150]).max() for V in (T + pvc.Theta_self, T)]
+        assert spike[0] > 0.9 and spike[1] < 0.3, (model, spike)
+        u, h = pvc.self_amplitude
+        assert abs(u[np.argmax(h.sum(0))] - BOND) <= 0.1, model
+        if model == "beam":
+            g2 = pvc.pair_distribution()
+            g2_model = pvc.model_pair_distribution([np.c_[positions, np.zeros(len(positions))]])
+            inside = pvc.r > 1.0
+            assert np.corrcoef(g2[inside], g2_model[inside])[0, 1] > 0.98

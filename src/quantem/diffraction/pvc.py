@@ -28,8 +28,19 @@ about it. Anything identical in every pattern (the bright-field disk and its
 pixelation, ellipticity or miscentering, a static detector pattern) sits in the
 mean part, so the fluctuation part removes it exactly. For randomly oriented
 samples the mean pattern is isotropic and both parts carry the same structure,
-which is why the sphere model uses the fluctuation part by default. The moments add over patterns and every solve is linear, so averaging
-the outputs of subsets of patterns equals solving their summed moments.
+which is why the sphere model uses the fluctuation part by default. The
+moments add over patterns and every solve is linear, so averaging the outputs
+of subsets of patterns equals solving their summed moments.
+
+Every pair vector also correlates with itself and with its reverse, a spike at
+theta = 0 and 180 deg on r = r' whose size follows the pair distribution. It
+adds the same radial function to every order, times 2l + 1 (sphere) or 1 and
+(-1)^n (beam), so it is fitted and removed from Theta, which leaves the
+correlation of distinct pair vectors. The fitted term is kept in Theta_self,
+with its l = 0 part, which the solve cannot measure, restored, and
+plot_correlation can add it back. The mean pattern holds the same two-body
+information (pair_distribution). A Gaussian damping of the radial weight keeps
+the ringing of sharp features below 1%.
 
 The radial detector coordinate is |q| (1/A, no 2 pi). On the Ewald sphere the
 scattering vector makes the polar angle beta = 90 deg + asin(lambda |q| / 2)
@@ -53,6 +64,8 @@ import warnings
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from matplotlib.patches import Circle
+from matplotlib.transforms import ScaledTranslation
 from scipy.special import jv, spherical_jn
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
@@ -88,19 +101,34 @@ class PairVectorCorrelation:
     fq : callable, array or None
         Mean atomic scattering factor f(q), or a function of |q| (1/A). Patterns
         are divided by f(q)^2.
-    k_min, k_max : float
-        Radial range (1/A). Set k_min just outside the bright-field disk.
+    k_min, k_max : float or None
+        Radial range (1/A). By default k_min is two radial bins outside the
+        bright-field disk, whose radius is measured from the mean pattern
+        (bright_field_radius), and k_max is the largest radius.
     taper : (float, float)
         Widths (1/A) of the cosine ramps of the radial window at k_min and k_max.
         The window applies in the real-space transforms only; each radius pair is
         solved on its own, so the window never mixes radii.
+    damping : float or None
+        Width of a Gaussian damping exp(-(q / (damping k_max))^2) of the radial
+        weight, as a fraction of k_max, which keeps sidelobes below 1% for a
+        resolution in r of about 0.5 / (damping k_max). None turns it off.
     batch_size : int
         Patterns per chunk when accumulating the moments.
+    split_counts : bool
+        The patterns are electron counts: split the electrons of each pattern
+        at random into two halves, whose shot noise is independent, and
+        estimate the second moment from their cross products. This removes the
+        shot-noise bias of the second moment exactly.
+    seed : int
+        Random seed for split_counts.
 
     The moments are normalized by the mean intensity where the radial window is 1.
-    A mean pattern with a strong n = 1 harmonic near k_min warns: kinematic
-    patterns are centrosymmetric, so it points to a miscentered pattern or a
-    bright-field disk edge leaking into the window.
+    Inside the bright-field disk the scattered wave interferes with the
+    unscattered beam, so a k_min inside the disk warns. A mean pattern with a
+    strong n = 1 harmonic near k_min warns: kinematic patterns are
+    centrosymmetric, so it points to a miscentered pattern or a bright-field
+    disk edge leaking into the window.
     """
 
     def __init__(
@@ -111,10 +139,13 @@ class PairVectorCorrelation:
         ellipse_params=None,
         n_phi: int = 180,
         fq=None,
-        k_min: float = 0.0,
+        k_min: float | None = None,
         k_max: float | None = None,
         taper: tuple[float, float] = (0.1, 0.25),
+        damping: float | None = 0.6,
         batch_size: int = 512,
+        split_counts: bool = False,
+        seed: int = 0,
     ):
         self.energy = energy
         self.wavelength = electron_wavelength_angstrom(energy) if energy else 0.0
@@ -122,25 +153,53 @@ class PairVectorCorrelation:
         if isinstance(data, (Dataset4dstem, Polar4dstem)) or hasattr(data, "array"):
             items = [data]
 
+        gen = torch.Generator().manual_seed(seed)
         sum_M = sum_S = None
         self.n_patterns = 0
         for item in items:
-            polar = self._to_polar(item, origin, ellipse_params, n_phi)
+            if split_counts:
+                *halves, item_origin = _split_counts(item, origin, gen)
+            else:
+                halves, item_origin = [item], origin
+            polars = [self._to_polar(h, item_origin, ellipse_params, n_phi) for h in halves]
             if sum_M is None:
-                self._set_geometry(polar, fq, k_min, k_max, taper)
-            elif polar.shape[-1] != self.q.size:
+                self._set_geometry(polars[0], fq)
+            elif polars[0].shape[-1] != self.q.size:
                 raise ValueError("all datasets need the same radial axis")
-            patterns = polar.tensor.reshape(-1, polar.shape[-2], polar.shape[-1]).to(torch.float64)
-            for start in range(0, patterns.shape[0], batch_size):
-                F = self._harmonics(patterns[start : start + batch_size])
-                M = F.sum(dim=0)
-                S = torch.einsum("bnk,bnj->nkj", F.conj(), F)
+            stacks = [
+                p.tensor.reshape(-1, p.shape[-2], p.shape[-1]).to(torch.float64) for p in polars
+            ]
+            for start in range(0, stacks[0].shape[0], batch_size):
+                F = [self._harmonics(x[start : start + batch_size]) for x in stacks]
+                if split_counts:  # each half carries half the intensity and independent noise
+                    M = (F[0] + F[1]).sum(dim=0)
+                    S = 2 * torch.einsum("bnk,bnj->nkj", F[0].conj(), F[1])
+                    S = S + S.conj().transpose(1, 2)
+                else:
+                    M = F[0].sum(dim=0)
+                    S = torch.einsum("bnk,bnj->nkj", F[0].conj(), F[0])
                 sum_M = M if sum_M is None else sum_M + M
                 sum_S = S if sum_S is None else sum_S + S
-                self.n_patterns += F.shape[0]
+                self.n_patterns += F[0].shape[0]
 
         M = sum_M / self.n_patterns
         S = sum_S / self.n_patterns
+        self.mean_intensity = (M[0].real * self._f2).numpy()  # azimuthal mean of the patterns
+        self.bright_field_radius = _bright_field_radius(self.q, self.mean_intensity)
+        if k_min is None:
+            k_min = self.bright_field_radius + 2 * (self.q[1] - self.q[0])
+        elif k_min < self.bright_field_radius:
+            warnings.warn(
+                f"k_min = {k_min:.3f} 1/A is inside the bright-field disk "
+                f"(radius {self.bright_field_radius:.3f} 1/A), where the scattered wave "
+                "interferes with the unscattered beam."
+            )
+        self.k_min, self.k_max = k_min, self.q[-1] if k_max is None else k_max
+        self.window = _radial_window(self.q, self.k_min, self.k_max, taper)
+        self.damping = damping
+        self.weight = self.window * (
+            np.exp(-((self.q / (damping * self.k_max)) ** 2)) if damping else 1.0
+        )  # radial weight of the real-space transforms
         scale = float(
             M[0].real[self.window == 1].mean()
         )  # flat part of the window, clear of the bright-field edge
@@ -155,15 +214,14 @@ class PairVectorCorrelation:
         if isinstance(item, Polar4dstem):
             return item
         ds = as_dataset4dstem(item)
-        if origin is None:
-            offset = np.asarray(ds.origin, dtype=float)[-2:]
-            sampling = np.asarray(ds.sampling, dtype=float)[-2:]
-            origin = -offset / sampling if np.any(offset != 0) else find_origin_angular_grid(ds)
         return polar_transform(
-            ds, origin_array=origin, ellipse_params=ellipse_params, num_annular_bins=n_phi
+            ds,
+            origin_array=_pattern_origin(ds, origin),
+            ellipse_params=ellipse_params,
+            num_annular_bins=n_phi,
         )
 
-    def _set_geometry(self, polar, fq, k_min, k_max, taper):
+    def _set_geometry(self, polar, fq):
         n_q = polar.shape[-1]
         self.n_phi = polar.shape[-2]
         self.n_max = self.n_phi // 2 - 1
@@ -175,8 +233,6 @@ class PairVectorCorrelation:
         self.q_perp = self.q * np.cos(half_angle)  # component of q perpendicular to the beam
         self.dq = np.gradient(self.q)
         self.dq_perp = np.gradient(self.q_perp)
-        k_max = self.q[-1] if k_max is None else k_max
-        self.window = _radial_window(self.q, k_min, k_max, taper)
         fq = fq(self.q) if callable(fq) else fq
         f2 = (
             np.ones(n_q)
@@ -234,7 +290,7 @@ class PairVectorCorrelation:
         self,
         model: str = "sphere",
         part: str | None = None,
-        l_max: int = 40,
+        l_max: int = 60,
         n_max: int | None = None,
         r_max: float = 8.0,
         r_step: float = 0.05,
@@ -254,9 +310,14 @@ class PairVectorCorrelation:
         order_taper : weight the orders by a cos^2 taper to zero just past the
             largest order, which suppresses ringing in theta.
 
-        Returns theta_deg (Ntheta,) and Theta (Nr, Nr, Ntheta); also stored on
-        the object (r, theta_deg, Theta, and the order coefficients G of the
-        orders l_values or n_values) with the settings for model_correlation.
+        Returns theta_deg (Ntheta,) and Theta (Nr, Nr, Ntheta), the correlation
+        of distinct pair vectors; also stored on the object (r, theta_deg,
+        Theta, and the order coefficients G of the orders l_values or n_values)
+        with the settings for model_correlation. The self term, each pair
+        vector correlated with itself and its reverse, is stored in Theta_self
+        (orders G_self, and G0_self for l = 0 or n = 0), and its radial
+        amplitude, which follows the pair distribution, in self_amplitude as
+        (u, h).
         """
         part = ("fluctuation" if model == "sphere" else "total") if part is None else part
         self.r = np.arange(0, r_max + 0.5 * r_step, r_step)
@@ -266,29 +327,91 @@ class PairVectorCorrelation:
             self.l_values = np.arange(2, l_max + 1, 2)
             self.B = _solve_sphere(S.real, self.beta, self.l_values)
             G = self._real_space_sphere(self.B)
-            self.G = G.numpy()
-            self.theta_deg = np.arange(0, 181, 1.0)
-            self.Theta = _legendre_sum(G, self.l_values, self.theta_deg, order_taper)
         elif model == "beam":
             self.n_values = np.arange(1, (self.n_max if n_max is None else n_max) + 1)
             G = self._real_space_beam(S[self.n_values])
-            self.G = G.numpy()
-            self.theta_deg = np.arange(0, 361, 1.0)
-            self.Theta = _harmonic_sum(G, self.n_values, self.theta_deg, order_taper)
         else:
             raise ValueError(f"model must be 'sphere' or 'beam', got {model!r}")
+        G_self, G0_self, u, h = self._self_term(G)
+        G = G - G_self
+        self.G, self.G_self, self.G0_self = G.numpy(), G_self.numpy(), G0_self.numpy()
+        self.self_amplitude = (u, h)
+        self.theta_deg, self.Theta = self._angular_sum(G)
+        self.Theta_self = self._angular_sum(G_self, self.G0_self)[1]
         return self.theta_deg, self.Theta
 
+    def _angular_sum(self, G, G0=None):
+        """Theta from the order coefficients G and an optional order-0 part G0 (Nr, Nr)."""
+        if self.model == "sphere":
+            theta = np.arange(0, 181, 1.0)
+            out = _legendre_sum(G, self.l_values, theta, self.order_taper)
+        else:
+            theta = np.arange(0, 361, 1.0)
+            out = _harmonic_sum(G, self.n_values, theta, self.order_taper)
+        return theta, out if G0 is None else out + G0[:, :, None]
+
+    def _length_image(self, order, u):
+        """(Nr, Nu) band-limited image in r of pair vectors of each length u, for one order."""
+        du = u[1] - u[0]
+        if self.model == "sphere":
+            Kr = spherical_jn(order, 2 * np.pi * np.outer(self.q, u)) * (u**2 * du)[None, :]
+            return self._kernel_sphere(order) @ torch.from_numpy(Kr)
+        Kr = jv(order, 2 * np.pi * np.outer(self.q_perp, u)) * (u * du)[None, :]
+        return self._kernel_beam(order) @ torch.from_numpy(Kr)
+
+    def _self_term(self, G, band: float = 0.5, u_step: float = 0.1, ridge: float = 1e-2):
+        """
+        Fit the self term of the order coefficients G. A pair vector of length u
+        adds c_k A_k(r, u) A_k(r', u) to order k, with A_k the band-limited image
+        of the length u and c_k = 2l + 1 (sphere, where both directions add
+        alike) or 1 and (-1)^n (beam, one amplitude per direction). The
+        amplitudes h(u) are fitted to G where |r - r'| <= band (A), by least
+        squares with a ridge of `ridge` times the mean diagonal.
+
+        Returns G_self (like G), its order-0 part G0_self (Nr, Nr), u (Nu,) and
+        h (directions, Nu).
+        """
+        u = np.arange(0.5 * u_step, self.r[-1] + 1.0, u_step)
+        ir, jr = (
+            torch.as_tensor(x)
+            for x in np.nonzero(np.abs(np.subtract.outer(self.r, self.r)) <= band)
+        )
+        orders = self.l_values if self.model == "sphere" else self.n_values
+        signs = (
+            [2.0 * orders + 1]
+            if self.model == "sphere"
+            else [np.ones(orders.size), (-1.0) ** orders]
+        )
+        images = [self._length_image(int(o), u) for o in orders]
+        n_h = len(signs) * u.size
+        AtA = torch.zeros((n_h, n_h), dtype=torch.float64)
+        Atb = torch.zeros(n_h, dtype=torch.float64)
+        for k, A in enumerate(images):
+            rows = torch.cat([float(c[k]) * A[ir] * A[jr] for c in signs], dim=1)
+            AtA += rows.T @ rows
+            Atb += rows.T @ G[k].real[ir, jr]
+        damp = ridge * torch.trace(AtA) / n_h * torch.eye(n_h, dtype=torch.float64)
+        h = torch.linalg.solve(AtA + damp, Atb).reshape(len(signs), u.size)
+        G_self = torch.stack(
+            [
+                sum(float(c[k]) * (A * hc) @ A.T for c, hc in zip(signs, h))
+                for k, A in enumerate(images)
+            ]
+        )
+        A0 = self._length_image(0, u)
+        G0_self = sum((A0 * hc) @ A0.T for hc in h)  # every direction adds 1 at order 0
+        return G_self.to(G.dtype), G0_self, u, h.numpy()
+
     def _kernel_sphere(self, ell, r=None):
-        """(Nr, Nk) spherical Bessel transform q -> r with the radial window."""
+        """(Nr, Nk) spherical Bessel transform q -> r with the radial weight."""
         r = self.r if r is None else r
-        w = self.q**2 * self.dq * self.window
+        w = self.q**2 * self.dq * self.weight
         return torch.from_numpy(spherical_jn(ell, 2 * np.pi * np.outer(r, self.q)) * w[None, :])
 
     def _kernel_beam(self, n, r=None):
-        """(Nr, Nk) Hankel transform of order n, q_perp -> r, with the radial window."""
+        """(Nr, Nk) Hankel transform of order n, q_perp -> r, with the radial weight."""
         r = self.r if r is None else r
-        w = self.q_perp * self.dq_perp * self.window
+        w = self.q_perp * self.dq_perp * self.weight
         return torch.from_numpy(jv(n, 2 * np.pi * np.outer(r, self.q_perp)) * w[None, :])
 
     def _real_space_sphere(self, B):
@@ -343,16 +466,17 @@ class PairVectorCorrelation:
 
     # ------------------------------------------------------------------ model
 
-    def model_correlation(self, clusters):
+    def model_correlation(self, clusters, return_self: bool = False):
         """
         Pair vector correlation of atomic models, processed like the last
-        correlation() call: same model, grid, q range, radial window and order
-        taper. The correlation of all interatomic vectors within each cluster is
+        correlation() call: same model, grid, q range, radial weight, order
+        taper and self-term removal. The correlation of all interatomic vectors within each cluster is
         summed over clusters, so it holds two-, three- and four-body terms, as
         the diffraction correlation does. For the beam model the positions are
         projected along the beam (the last coordinate).
 
         clusters : iterable of (N, 3) arrays of positions (A), (row, col, beam).
+        return_self : also return the self term of the model, like Theta_self.
         Returns Theta on the stored (r, theta_deg) grid.
         """
         r_model = np.arange(0, self.r[-1] + 2.0, self.r[1] - self.r[0])
@@ -368,7 +492,7 @@ class PairVectorCorrelation:
                 B = 4 * np.pi * Kr @ H[k] @ Kr.T  # band-limited to the measured q
                 K = self._kernel_sphere(int(ell))
                 G[k] = 2 * np.pi * (4 * np.pi) ** 3 * K @ B @ K.T
-            return _legendre_sum(G, self.l_values, self.theta_deg, self.order_taper)
+            return self._model_output(G, return_self)
         H = _cluster_power_beam(clusters, r_model, self.n_values)
         G = torch.zeros((len(self.n_values), self.r.size, self.r.size), dtype=torch.complex128)
         dr = r_model[1] - r_model[0]
@@ -380,7 +504,60 @@ class PairVectorCorrelation:
             S = (2 * np.pi) ** 2 * Kr @ H[k] @ Kr.T
             K = self._kernel_beam(int(n)).to(torch.complex128)
             G[k] = (2 * np.pi) ** 2 * K @ S @ K.T
-        return _harmonic_sum(G, self.n_values, self.theta_deg, self.order_taper)
+        return self._model_output(G, return_self)
+
+    def _model_output(self, G, return_self):
+        G_self, G0_self, _, _ = self._self_term(G)
+        Theta = self._angular_sum(G - G_self)[1]
+        if return_self:
+            return Theta, self._angular_sum(G_self, G0_self.numpy())[1]
+        return Theta
+
+    def pair_distribution(self):
+        """
+        Pair distribution of the mean pattern (the first moment) on the r grid of
+        the last correlation() call, with the same rotation model and radial
+        weight: the density of pair vectors at each length relative to its
+        mean, rho (g(r) - 1) up to a scale, in 3D (sphere) or projected (beam).
+        This is the two-body information the self term would repeat in Theta.
+        """
+        return self._radial_transform(self.mean_harmonics[0].real - 1.0)
+
+    def model_pair_distribution(self, clusters):
+        """
+        pair_distribution of atomic models: the mean intensity of all their
+        interatomic distances (Debye sum; projected along the beam for the
+        beam model), band-limited like the data.
+
+        clusters : iterable of (N, 3) arrays of positions (A), (row, col, beam).
+        """
+        bin_width = 0.01
+        counts = torch.zeros(0, dtype=torch.float64)
+        for pos in clusters:
+            pos = torch.as_tensor(np.asarray(pos), dtype=torch.float64)
+            pos = pos[:, :2] if self.model == "beam" else pos
+            i, j = torch.triu_indices(pos.shape[0], pos.shape[0], offset=1)
+            index = torch.round(torch.linalg.norm(pos[i] - pos[j], dim=1) / bin_width).long()
+            if index.max() >= counts.numel():
+                counts = torch.cat(
+                    [
+                        counts,
+                        torch.zeros(int(index.max()) + 1 - counts.numel(), dtype=torch.float64),
+                    ]
+                )
+            counts.index_add_(0, index, torch.ones_like(index, dtype=torch.float64))
+        u = np.arange(counts.numel()) * bin_width
+        if self.model == "sphere":
+            pairs = np.sinc(2 * np.outer(self.q, u))  # j0(2 pi q u)
+        else:
+            pairs = jv(0, 2 * np.pi * np.outer(self.q_perp, u))
+        return self._radial_transform(pairs @ counts.numpy())
+
+    def _radial_transform(self, intensity):
+        """Isotropic (order 0) transform of a radial intensity to the r grid."""
+        if self.model == "sphere":
+            return 4 * np.pi * self._kernel_sphere(0).numpy() @ intensity
+        return 2 * np.pi * self._kernel_beam(0).numpy() @ intensity
 
     # ------------------------------------------------------------------ plotting
 
@@ -388,12 +565,14 @@ class PairVectorCorrelation:
         self,
         Theta=None,
         r_fixed=None,
-        theta_marks=None,
-        r_marks=None,
+        marks=None,
         title=None,
         r_display_power: float | None = None,
         r_max_display: float | None = None,
         subtract_median: bool | None = None,
+        g2=None,
+        self_term=None,
+        mark_radius: float = 0.15,
         axsize: tuple[float, float] = (4.5, 3.5),
         returnfig: bool = False,
     ):
@@ -408,8 +587,16 @@ class PairVectorCorrelation:
         r <= r_max_display.
 
         Theta : (Nr, Nr, Ntheta) array, a list of them, or None for self.Theta.
-        theta_marks, r_marks : angles (deg) and radii (A) marked with dotted
-            lines, shared or one list per panel.
+        marks : (r', angle) points (A, deg) circled with dashed lines, such as
+            the output of pair_vector_marks, shared or one list per panel.
+        g2 : (Nr,) pair distribution drawn above each map on the same r axis,
+            weighted like the map and scaled to 1, such as pair_distribution()
+            or model_pair_distribution(); shared or one per panel.
+        self_term : self term added to the maps for display, each pair vector
+            correlated with itself and its reverse: True for Theta_self when
+            Theta is None, or Theta_self and the second output of
+            model_correlation(..., return_self=True), one per panel.
+        mark_radius : radius of the circles (inches).
         """
         vols = (
             [self.Theta]
@@ -422,18 +609,30 @@ class PairVectorCorrelation:
         subtract = beam if subtract_median is None else subtract_median
         titles = _per_panel(title, n)
         r_fixeds = list(r_fixed) if isinstance(r_fixed, (list, tuple)) else [r_fixed] * n
-        theta_markss = _per_panel(theta_marks, n, nested=True)
-        r_markss = _per_panel(r_marks, n, nested=True)
+        markss = _per_panel(marks, n, nested=True, depth=2)
+        g2s = _per_panel(g2, n, nested=True, depth=1)
+        if self_term is True:
+            self_term = self.Theta_self
+        if self_term is not None and self_term is not False:
+            selfs = list(self_term) if isinstance(self_term, (list, tuple)) else [self_term] * n
+            vols = [np.asarray(v) + np.asarray(t) for v, t in zip(vols, selfs)]
         r, theta = self.r, self.theta_deg
         rs = r <= (r[-1] if r_max_display is None else r_max_display)
         interior = (theta % 180 > 15) & (theta % 180 < 165)
         theta_max = theta[-1]
 
+        rows = 1 if g2 is None else 2
         fig, axs = plt.subplots(
-            1, n, figsize=(axsize[0] * n, axsize[1]), squeeze=False, constrained_layout=True
+            rows,
+            n,
+            figsize=(axsize[0] * n, axsize[1] * (1 if g2 is None else 1.4)),
+            squeeze=False,
+            sharex="col",
+            height_ratios=[1] if g2 is None else [1, 2.5],
+            constrained_layout=True,
         )
-        for ax, vol, t, r0, t_marks, rm_marks in zip(
-            axs[0], vols, titles, r_fixeds, theta_markss, r_markss
+        for k, (ax, vol, t, r0, panel_marks) in enumerate(
+            zip(axs[-1], vols, titles, r_fixeds, markss)
         ):
             vol = vol.numpy() if isinstance(vol, torch.Tensor) else np.asarray(vol)
             if r0 is None:
@@ -449,23 +648,169 @@ class PairVectorCorrelation:
             im = ax.pcolormesh(
                 r[rs], theta, m.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto"
             )
-            for th in t_marks or []:
-                ax.axhline(th, color="k", ls=":", lw=1)
-            for rm in rm_marks or []:
-                ax.axvline(rm, color="k", ls=":", lw=1)
+            for rm, th in panel_marks if panel_marks is not None else []:
+                ax.add_patch(  # fixed size on screen, centered on the data point
+                    Circle(
+                        (0, 0),
+                        mark_radius,
+                        transform=fig.dpi_scale_trans + ScaledTranslation(rm, th, ax.transData),
+                        fill=False,
+                        ec="k",
+                        ls="--",
+                        lw=1,
+                    )
+                )
+            ax.set_xlim(r[rs][0], r[rs][-1])
             ax.set_xlabel(xlabel)
             ax.set_ylabel(r"$\Delta\phi$ (deg)" if beam else r"$\theta$ (deg)")
             ax.set_ylim(0, theta_max)
             ax.set_yticks(np.arange(0, theta_max + 1, 30 if theta_max <= 180 else 60))
             fig.colorbar(im, ax=ax, label=rf"$\Theta \cdot (r r')^{{{power:g}}}$")
+            top = ax
+            if g2 is not None:
+                top = axs[0, k]
+                y = np.asarray(g2s[k], dtype=np.float64)[rs] * r[rs] ** (2 * power)
+                top.plot(r[rs], y / np.abs(y).max(), color="k", lw=1.5)
+                top.axhline(0, color="0.6", lw=0.8)
+                top.set_ylabel(rf"$g_2 \cdot r^{{{2 * power:g}}}$")
+                fig.colorbar(im, ax=top).ax.set_visible(False)  # keeps the r axes aligned
             if t is not None:
-                ax.set_title(t)
+                top.set_title(t)
         if returnfig:
-            return fig, axs[0]
+            return fig, axs[-1]
         plt.show()
 
 
+def pair_vector_marks(
+    positions,
+    r_fixed: float,
+    r_max: float,
+    model: str = "sphere",
+    tol: float = 0.05,
+    min_fraction: float = 0.45,
+    n_shells: int | None = None,
+    n_centers: int = 64,
+):
+    """
+    Expected peaks (r', angle) of the pair vector correlation of an ordered
+    structure with one vector of length r_fixed: the angles between its pair
+    vectors of length r_fixed and its pair vectors of each length up to r_max,
+    for the marks of plot_correlation.
+
+    positions : (N, 2) or (N, 3) atom positions (A) of a patch that extends
+        more than r_max beyond the atoms near its center.
+    model : "sphere" (3D angles, 0 to 180 deg) or "beam" (positions projected
+        along the last axis, angles from 0 to 360 deg).
+    tol : distance tolerance (A) of a shell.
+    min_fraction : shells and angles rarer than this fraction of the
+        nearest-neighbor shell, or of the most frequent angle in their shell,
+        are left out.
+    n_shells : keep only this many shells, starting from the shortest.
+
+    Angles within 5 deg of the axis limits, and the 180 deg between a vector and
+    its reverse at r' = r_fixed, are left out. Returns a list of (r', angle).
+    """
+    pos = np.asarray(positions, dtype=np.float64)
+    pos = pos[:, :2] if model == "beam" else pos
+    theta_max = 360.0 if model == "beam" else 180.0
+    d_center = np.linalg.norm(pos - pos.mean(0), axis=1)
+    inner = np.flatnonzero(d_center < 0.5 * np.ptp(pos, axis=0).min() - r_max - tol)
+    if inner.size == 0:
+        raise ValueError("positions must extend more than r_max around their center")
+    centers = inner[np.argsort(d_center[inner])[:n_centers]]
+    vec = (pos[None, :, :] - pos[centers][:, None, :]).reshape(-1, pos.shape[1])
+    length = np.linalg.norm(vec, axis=1)
+    keep = (length > tol) & (length < r_max + tol)
+    vec, length = vec[keep], length[keep]
+    # distinct vectors (to 0.01 tol) and how often they occur
+    _, first, count = np.unique(
+        np.round(vec / (0.01 * tol)), axis=0, return_index=True, return_counts=True
+    )
+    vec, length = vec[first], length[first]
+    order = np.argsort(length)
+    vec, count, length = vec[order], count[order], length[order]
+    shell_id = np.concatenate([[0], np.cumsum(np.diff(length) > tol)])
+    shell_r = np.array([length[shell_id == s].mean() for s in range(shell_id[-1] + 1)])
+    shell_n = np.array([count[shell_id == s].sum() for s in range(shell_id[-1] + 1)])
+    fixed = int(np.argmin(np.abs(shell_r - r_fixed)))
+    a, wa = vec[shell_id == fixed], count[shell_id == fixed]
+
+    marks = []
+    for s in np.flatnonzero(shell_n >= min_fraction * shell_n[fixed])[:n_shells]:
+        b, wb = vec[shell_id == s], count[shell_id == s]
+        if model == "beam":
+            ang = (
+                np.degrees(
+                    np.arctan2(b[None, :, 1], b[None, :, 0])
+                    - np.arctan2(a[:, None, 1], a[:, None, 0])
+                )
+                % 360
+            )
+        else:
+            cos = (a @ b.T) / np.outer(np.linalg.norm(a, axis=1), np.linalg.norm(b, axis=1))
+            ang = np.degrees(np.arccos(np.clip(cos, -1, 1)))
+        ang, w = ang.ravel(), np.outer(wa, wb).ravel()
+        bins = np.round(ang).astype(int)
+        hist = np.bincount(bins, weights=w, minlength=int(theta_max) + 1)
+        strong = np.flatnonzero(hist >= min_fraction * hist.max())
+        for run in np.split(
+            strong, np.flatnonzero(np.diff(strong) > 1) + 1
+        ):  # merge adjacent degrees
+            inside = np.isin(bins, run)
+            deg = round(float(np.average(ang[inside], weights=w[inside])), 1)
+            same_shell_reverse = s == fixed and abs(deg - 180) < 5
+            if 5 <= deg <= theta_max - 5 and not same_shell_reverse:
+                marks.append((round(float(shell_r[s]), 2), float(deg)))
+    return marks
+
+
 # ---------------------------------------------------------------------- helpers
+
+
+def _split_counts(item, origin, gen):
+    """Two random halves of the electron counts of every pattern (binomial
+    thinning), and the pattern origin, found once from the full counts."""
+    if isinstance(item, Polar4dstem):
+        raise ValueError("split_counts needs the detector counts, not polar data")
+    ds = as_dataset4dstem(item)
+    counts = torch.as_tensor(np.asarray(ds.array), dtype=torch.float64)
+    if counts.min() < 0 or not torch.equal(counts, torch.round(counts)):
+        raise ValueError("split_counts needs non-negative integer counts")
+    half = torch.binomial(counts, torch.full_like(counts, 0.5), generator=gen)
+    a, b = (
+        Dataset4dstem.from_array(x.numpy(), origin=ds.origin, sampling=ds.sampling, units=ds.units)
+        for x in (half, counts - half)
+    )
+    return a, b, _pattern_origin(ds, origin)
+
+
+def _pattern_origin(ds, origin):
+    """Pixel of q = 0: origin if given, else from the calibration, else found
+    with find_origin_angular_grid when the calibration has no offset."""
+    if origin is not None:
+        return origin
+    offset = np.asarray(ds.origin, dtype=float)[-2:]
+    sampling = np.asarray(ds.sampling, dtype=float)[-2:]
+    return -offset / sampling if np.any(offset != 0) else find_origin_angular_grid(ds)
+
+
+def _bright_field_radius(q, intensity):
+    """
+    Radius of the bright-field disk: where the azimuthal mean intensity first
+    falls halfway from its level inside the disk to the level just outside.
+    With no disk, only the central beam, it is within a bin of q = 0.
+    """
+    below = np.flatnonzero(intensity < 0.5 * intensity[0])
+    if below.size == 0:
+        return 0.0
+    j = int(below[0])
+    level_in = np.median(intensity[: max(1, int(0.7 * j))])
+    level_out = np.median(intensity[j + 1 : j + 2 + max(1, j // 3)])
+    k = int(np.flatnonzero(intensity < 0.5 * (level_in + level_out))[0])
+    if k == 0:
+        return 0.0
+    frac = (intensity[k - 1] - 0.5 * (level_in + level_out)) / (intensity[k - 1] - intensity[k])
+    return float(q[k - 1] + frac * (q[k] - q[k - 1]))
 
 
 def _radial_window(q, k_min, k_max, taper):
@@ -637,11 +982,18 @@ def _cluster_power_beam(clusters, r, n_values):
     return H
 
 
-def _per_panel(value, n, nested=False):
+def _per_panel(value, n, nested=False, depth=1):
     """One entry per panel: a list with one item per panel is used as is, anything
-    else is repeated. With nested=True only a list of lists (or Nones) counts as
-    per panel, so a flat list of marks is shared."""
+    else is repeated. With nested=True only a list whose items are nested depth
+    levels deep (or None) counts as per panel, so a shared list of marks is not
+    split across panels."""
+
+    def deep(v, d):
+        return d == 0 or (
+            isinstance(v, (list, tuple, np.ndarray)) and all(deep(u, d - 1) for u in v)
+        )
+
     if isinstance(value, (list, tuple)) and len(value) == n:
-        if not nested or all(v is None or isinstance(v, (list, tuple, np.ndarray)) for v in value):
+        if not nested or all(v is None or deep(v, depth) for v in value):
             return list(value)
     return [value] * n

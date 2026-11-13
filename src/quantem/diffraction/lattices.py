@@ -18,8 +18,8 @@ pixel_size_ang. The cluster functions work in Angstroms.
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.ndimage import gaussian_filter
 import torch
+from scipy.ndimage import gaussian_filter
 
 GOLDEN = (1 + np.sqrt(5)) / 2
 
@@ -580,3 +580,220 @@ def random_clusters(atoms, n_clusters, r_cluster=None, seed=0, random_orientatio
         keep = torch.linalg.norm(d, dim=1) <= r_cluster
         pos = d[keep] @ rot.T if random_orientation else d[keep]
         yield pos.numpy(), atoms.numbers[keep.numpy()]
+
+
+def _random_rotation(rng):
+    """Uniform random 3D rotation matrix from a normalized Gaussian quaternion."""
+    w, x, y, z = (q := rng.normal(size=4)) / np.linalg.norm(q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def polycrystal(atoms, grain_size, width, thickness, seed=0, gap=None):
+    """
+    Film of randomly oriented grains of a crystal, periodic in the plane.
+
+    Grain centers are random in the (width, width, thickness) box, one per
+    sphere of diameter grain_size on average. Each grain is the Voronoi cell
+    of its center (periodic in x and y), filled with the crystal in a random
+    orientation and position. Where atoms of two grains are closer than gap
+    (default 0.8 times the nearest-neighbor distance of the crystal), the atom
+    of the grain with the higher index is removed.
+
+    atoms : ase.Atoms, a periodic cell of the crystal.
+    Returns ase.Atoms with the cell (width, width, thickness), periodic in x and
+    y, and the grain of each atom in arrays["grain"]. The beam is along z.
+    """
+    from ase import Atoms
+
+    rng = np.random.default_rng(seed)
+    box = torch.tensor([width, width, thickness], dtype=torch.float64)
+    cell = torch.as_tensor(np.asarray(atoms.cell), dtype=torch.float64)
+    basis = torch.as_tensor(atoms.get_scaled_positions(wrap=True), dtype=torch.float64)
+    if gap is None:
+        n = torch.stack(torch.meshgrid(*[torch.arange(-1, 2)] * 3, indexing="ij"), -1).reshape(-1, 3)
+        images = ((n[:, None, :] + basis[None, :, :]).reshape(-1, 3) @ cell)
+        d = torch.cdist(basis @ cell, images)
+        gap = 0.8 * float(d[d > 1e-6].min())
+    n_grains = max(1, int(round(float(box.prod()) * 6 / (np.pi * grain_size**3))))
+    centers = torch.as_tensor(rng.random((n_grains, 3))) * box
+
+    def offsets(p):
+        """Minimum-image displacements (Np, Ngrains, 3) from every center to p, periodic in x and y."""
+        d = p[:, None, :] - centers[None, :, :]
+        d[..., :2] -= width * torch.round(d[..., :2] / width)
+        return d
+
+    # extent of each grain, from its points on a 1 A grid
+    axes = [torch.arange(0.5, float(s), 1.0, dtype=torch.float64) for s in box]
+    grid = torch.stack(torch.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+    extent = torch.zeros(n_grains, dtype=torch.float64)
+    for chunk in grid.split(20000):
+        dist = torch.linalg.norm(offsets(chunk), dim=-1)
+        nearest = dist.argmin(1)
+        extent = extent.scatter_reduce(0, nearest, dist.gather(1, nearest[:, None])[:, 0], "amax")
+    extent = extent + 2.0
+    if float(extent.max()) >= 0.5 * width:
+        raise ValueError("grains are too large for the film width; increase width or reduce grain_size")
+
+    heights = torch.abs(torch.det(cell)) / torch.linalg.norm(
+        torch.cross(cell[[1, 2, 0]], cell[[2, 0, 1]], dim=1), dim=1
+    )
+    positions, numbers, grains, near_boundary = [], [], [], []
+    for g in range(n_grains):
+        n_max = (extent[g] / heights).ceil().long() + 1
+        n = torch.stack(
+            torch.meshgrid(*[torch.arange(-int(m), int(m) + 1) for m in n_max], indexing="ij"), -1
+        ).reshape(-1, 3)
+        frac = (n[:, None, :] + basis[None, :, :] + torch.as_tensor(rng.random(3))).reshape(-1, 3)
+        local = frac @ cell
+        inside = torch.linalg.norm(local, dim=1) <= extent[g]
+        rot = torch.as_tensor(_random_rotation(rng))
+        p = local[inside] @ rot.T + centers[g]
+        z_ok = (p[:, 2] >= 0) & (p[:, 2] < thickness)
+        p, species = p[z_ok], np.tile(atoms.numbers, n.shape[0])[inside.numpy()][z_ok.numpy()]
+        d = offsets(p)
+        d2 = (d**2).sum(-1)
+        sep = torch.linalg.norm(d[:, g : g + 1, :] - d, dim=-1)  # distance between the two centers
+        # distance from p to the bisector of center g and each other center
+        to_boundary = (d2 - d2[:, g : g + 1]) / (2 * sep.clamp(min=1e-9))
+        to_boundary[:, g] = np.inf
+        boundary = to_boundary.min(1).values
+        keep = boundary >= 0  # inside the Voronoi cell of grain g
+        p = p[keep]
+        p[:, :2] = torch.remainder(p[:, :2], width)
+        positions.append(p)
+        numbers.append(species[keep.numpy()])
+        grains.append(torch.full((int(keep.sum()),), g))
+        near_boundary.append(boundary[keep] < gap)
+    pos, grain, near = torch.cat(positions), torch.cat(grains), torch.cat(near_boundary)
+
+    # only atoms within gap of a boundary can be too close to another grain
+    index = torch.nonzero(near)[:, 0]
+    keep = torch.ones(pos.shape[0], dtype=torch.bool)
+    for chunk in index.split(512):
+        d = pos[chunk, None, :] - pos[None, index, :]
+        d[..., :2] -= width * torch.round(d[..., :2] / width)
+        clash = ((d**2).sum(-1) < gap**2) & (grain[None, index] < grain[chunk, None])
+        keep[chunk[clash.any(1)]] = False
+    film = Atoms(
+        numbers=np.concatenate(numbers)[keep.numpy()],
+        positions=pos[keep].numpy(),
+        cell=[width, width, thickness],
+        pbc=(True, True, False),
+    )
+    film.arrays["grain"] = grain[keep].numpy()
+    return film
+
+
+def probe_patterns(
+    film,
+    n_patterns,
+    semiangle,
+    energy=200e3,
+    q_max=2.0,
+    slice_thickness=2.0,
+    dose=None,
+    thermal_sigma=None,
+    seed=0,
+    batch_size=16,
+    device="cpu",
+):
+    """
+    Nanobeam diffraction patterns of a film from a focused probe at random
+    positions, by multislice.
+
+    The aberration-free probe, with convergence semiangle `semiangle` (mrad)
+    and focused on the entrance surface, is transmitted through slices of the
+    projected potential and Fresnel-propagated between them, which includes
+    multiple scattering and the curvature of the Ewald sphere. The projected
+    potentials are exact sums over atoms with the absorptive Weickenmeier-Kohl
+    scattering factors and an optional Debye-Waller factor (thermal_sigma, A),
+    with no thermal diffuse scattering.
+
+    film : ase.Atoms with an orthorhombic cell, square and periodic in x and y,
+        such as the output of polycrystal. The beam is along z.
+    q_max : largest scattering vector (1/A). The real-space pixel is
+        1 / (3 q_max), so q_max is the usual 2/3 band limit.
+    dose : electrons per pattern for Poisson noise. None gives noise-free
+        intensities, as fractions of the incident electrons.
+
+    Returns
+    -------
+    Dataset4dstem of shape (n_patterns, 1, n_px, n_px), calibrated in 1/A with
+    sampling 1 / width, with q = 0 at pixel (n_px // 2, n_px // 2).
+    """
+    from quantem.core.datastructures import Dataset4dstem
+    from quantem.core.utils.utils import electron_wavelength_angstrom
+    from quantem.diffraction.wk_scattering_factors import compute_WK_factor
+    from quantem.diffractive_imaging.complex_probe import fourier_space_probe
+
+    lengths = np.asarray(film.cell.lengths())
+    if not np.allclose(np.asarray(film.cell), np.diag(lengths)) or abs(lengths[0] - lengths[1]) > 1e-6:
+        raise ValueError("the film needs an orthorhombic cell, square in x and y")
+    width, thickness = float(lengths[0]), float(lengths[2])
+    wavelength = electron_wavelength_angstrom(energy)
+    n = int(np.ceil(3 * q_max * width))
+    n += n % 2
+    pixel = width / n
+    k = torch.fft.fftfreq(n, pixel, dtype=torch.float64)
+    k2 = k[:, None] ** 2 + k[None, :] ** 2
+    band = k2 <= q_max**2
+
+    # transmission functions of the slices: the phase of each atom is
+    # wavelength * f(k) in Fourier space, with f in A (compute_WK_factor returns f / pi)
+    n_slices = max(1, int(round(thickness / slice_thickness)))
+    dz = thickness / n_slices
+    pos = torch.as_tensor(film.positions, dtype=torch.float64)
+    which = torch.clamp((pos[:, 2] / dz).long(), 0, n_slices - 1)
+    f = {
+        int(z): torch.as_tensor(
+            np.pi * compute_WK_factor(np.sqrt(k2.numpy()).ravel(), int(z), energy, thermal_sigma)
+        ).reshape(n, n)
+        for z in np.unique(film.numbers)
+    }
+    numbers = torch.as_tensor(film.numbers)
+    transmission = torch.empty((n_slices, n, n), dtype=torch.complex64)
+    for s in range(n_slices):
+        phase_k = torch.zeros((n, n), dtype=torch.complex128)
+        for z, fz in f.items():
+            p = pos[(which == s) & (numbers == z)]
+            ex = torch.exp(-2j * np.pi * p[:, 0, None] * k[None, :])
+            ey = torch.exp(-2j * np.pi * p[:, 1, None] * k[None, :])
+            phase_k += wavelength * fz * (ex.T @ ey)
+        t = torch.exp(1j * torch.fft.ifft2(phase_k) / pixel**2)
+        transmission[s] = torch.fft.ifft2(torch.fft.fft2(t) * band).to(torch.complex64)
+    transmission = transmission.to(device)
+    propagator = (torch.exp(-1j * np.pi * wavelength * dz * k2) * band).to(torch.complex64).to(device)
+    probe = fourier_space_probe((n, n), (pixel, pixel), energy, semiangle, device="cpu")
+    probe = probe.to(torch.complex64).to(device)
+
+    n_px = min(2 * int(np.ceil(q_max * width)), n)
+    crop = slice(n // 2 - n_px // 2, n // 2 - n_px // 2 + n_px)
+    rng = np.random.default_rng(seed)
+    shifts = torch.as_tensor(rng.random((n_patterns, 2)) * width, dtype=torch.float32)
+    k32 = k.to(torch.float32)
+    gen = torch.Generator().manual_seed(seed)
+    patterns = torch.empty((n_patterns, n_px, n_px), dtype=torch.float32)
+    for start in range(0, n_patterns, batch_size):
+        r = shifts[start : start + batch_size]
+        ramp = torch.exp(-2j * np.pi * (r[:, 0, None, None] * k32[None, :, None] + r[:, 1, None, None] * k32[None, None, :]))
+        psi = torch.fft.ifft2(probe[None] * ramp.to(device))
+        for s in range(n_slices - 1):
+            psi = torch.fft.ifft2(torch.fft.fft2(psi * transmission[s]) * propagator)
+        intensity = torch.abs(torch.fft.fft2(psi * transmission[-1])) ** 2
+        intensity = torch.fft.fftshift(intensity, dim=(-2, -1))[:, crop, crop].cpu()
+        if dose is not None:
+            intensity = torch.poisson(dose * intensity.to(torch.float64), generator=gen)
+        patterns[start : start + batch_size] = intensity.to(torch.float32)
+    dq = 1.0 / width
+    return Dataset4dstem.from_array(
+        patterns.numpy()[:, None],
+        origin=(0, 0, -(n_px // 2) * dq, -(n_px // 2) * dq),
+        sampling=(1, 1, dq, dq),
+        units=["pixels", "pixels", "A^-1", "A^-1"],
+        signal_units="counts" if dose is not None else "intensity",
+    )
