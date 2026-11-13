@@ -70,6 +70,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         self.g1_array: np.ndarray | None = None
         self.g2_array: np.ndarray | None = None
+        self.mask_weight: np.ndarray | None = None
 
         self.real_space = False
 
