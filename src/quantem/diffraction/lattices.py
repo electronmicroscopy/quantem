@@ -621,20 +621,34 @@ def polycrystal(atoms, grain_size, width, thickness, seed=0, gap=None):
     n_grains = max(1, int(round(float(box.prod()) * 6 / (np.pi * grain_size**3))))
     centers = torch.as_tensor(rng.random((n_grains, 3))) * box
 
-    def offsets(p):
-        """Minimum-image displacements (Np, Ngrains, 3) from every center to p, periodic in x and y."""
-        d = p[:, None, :] - centers[None, :, :]
+    def offsets(p, c=centers):
+        """Minimum-image displacements (Np, Nc, 3) from the centers c to p, periodic in x and y."""
+        d = p[:, None, :] - c[None, :, :]
         d[..., :2] -= width * torch.round(d[..., :2] / width)
         return d
 
-    # extent of each grain, from its points on a 1 A grid
+    def nearest_center(p, c_index):
+        """Distance to and index of the nearest of the centers c_index for each point p."""
+        if c_index.numel() == 0:
+            return torch.full((p.shape[0],), np.inf, dtype=torch.float64), torch.zeros(
+                p.shape[0], dtype=torch.long
+            )
+        dist = torch.linalg.norm(offsets(p, centers[c_index]), dim=-1).min(1)
+        return dist.values, c_index[dist.indices]
+
+    # extent of each grain, from its points on a 1 A grid, one plane at a time: the
+    # centers within grain_size in z hold the nearest center of every point closer than that
     axes = [torch.arange(0.5, float(s), 1.0, dtype=torch.float64) for s in box]
-    grid = torch.stack(torch.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+    plane = torch.stack(torch.meshgrid(axes[0], axes[1], indexing="ij"), -1).reshape(-1, 2)
     extent = torch.zeros(n_grains, dtype=torch.float64)
-    for chunk in grid.split(20000):
-        dist = torch.linalg.norm(offsets(chunk), dim=-1)
-        nearest = dist.argmin(1)
-        extent = extent.scatter_reduce(0, nearest, dist.gather(1, nearest[:, None])[:, 0], "amax")
+    every = torch.arange(n_grains)
+    for z in axes[2]:
+        pts = torch.cat([plane, torch.full((plane.shape[0], 1), float(z), dtype=torch.float64)], 1)
+        dist, nearest = nearest_center(pts, every[torch.abs(centers[:, 2] - z) < grain_size])
+        far = dist >= grain_size
+        if far.any():
+            dist[far], nearest[far] = nearest_center(pts[far], every)
+        extent = extent.scatter_reduce(0, nearest, dist, "amax")
     extent = extent + 2.0
     if float(extent.max()) >= 0.5 * width:
         raise ValueError("grains are too large for the film width; increase width or reduce grain_size")
@@ -655,12 +669,17 @@ def polycrystal(atoms, grain_size, width, thickness, seed=0, gap=None):
         p = local[inside] @ rot.T + centers[g]
         z_ok = (p[:, 2] >= 0) & (p[:, 2] < thickness)
         p, species = p[z_ok], np.tile(atoms.numbers, n.shape[0])[inside.numpy()][z_ok.numpy()]
-        d = offsets(p)
+        # centers farther than 2 (extent + gap) from center g are farther than gap from its cell
+        others = torch.nonzero(
+            torch.linalg.norm(offsets(centers[g : g + 1])[0], dim=-1) < 2 * (extent[g] + gap)
+        )[:, 0]
+        j = int(torch.nonzero(others == g)[0, 0])
+        d = offsets(p, centers[others])
         d2 = (d**2).sum(-1)
-        sep = torch.linalg.norm(d[:, g : g + 1, :] - d, dim=-1)  # distance between the two centers
+        sep = torch.linalg.norm(d[:, j : j + 1, :] - d, dim=-1)  # distance between the two centers
         # distance from p to the bisector of center g and each other center
-        to_boundary = (d2 - d2[:, g : g + 1]) / (2 * sep.clamp(min=1e-9))
-        to_boundary[:, g] = np.inf
+        to_boundary = (d2 - d2[:, j : j + 1]) / (2 * sep.clamp(min=1e-9))
+        to_boundary[:, j] = np.inf
         boundary = to_boundary.min(1).values
         keep = boundary >= 0  # inside the Voronoi cell of grain g
         p = p[keep]
@@ -671,14 +690,20 @@ def polycrystal(atoms, grain_size, width, thickness, seed=0, gap=None):
         near_boundary.append(boundary[keep] < gap)
     pos, grain, near = torch.cat(positions), torch.cat(grains), torch.cat(near_boundary)
 
-    # only atoms within gap of a boundary can be too close to another grain
+    # only atoms within gap of a boundary can be too close to another grain;
+    # sorted by z, each chunk is compared with the atoms within gap of it in z
     index = torch.nonzero(near)[:, 0]
+    index = index[torch.argsort(pos[index, 2])]
+    z = pos[index, 2].contiguous()
     keep = torch.ones(pos.shape[0], dtype=torch.bool)
-    for chunk in index.split(512):
-        d = pos[chunk, None, :] - pos[None, index, :]
+    for chunk in torch.arange(index.numel()).split(512):
+        lo = int(torch.searchsorted(z, z[chunk[0]] - gap))
+        hi = int(torch.searchsorted(z, z[chunk[-1]] + gap, right=True))
+        a, b = index[chunk], index[lo:hi]
+        d = pos[a, None, :] - pos[None, b, :]
         d[..., :2] -= width * torch.round(d[..., :2] / width)
-        clash = ((d**2).sum(-1) < gap**2) & (grain[None, index] < grain[chunk, None])
-        keep[chunk[clash.any(1)]] = False
+        clash = ((d**2).sum(-1) < gap**2) & (grain[None, b] < grain[a, None])
+        keep[a[clash.any(1)]] = False
     film = Atoms(
         numbers=np.concatenate(numbers)[keep.numpy()],
         positions=pos[keep].numpy(),
@@ -698,6 +723,7 @@ def probe_patterns(
     slice_thickness=2.0,
     dose=None,
     thermal_sigma=None,
+    kinematic=False,
     seed=0,
     batch_size=16,
     device="cpu",
@@ -720,6 +746,10 @@ def probe_patterns(
         1 / (3 q_max), so q_max is the usual 2/3 band limit.
     dose : electrons per pattern for Poisson noise. None gives noise-free
         intensities, as fractions of the incident electrons.
+    kinematic : single scattering (first Born approximation): each slice
+        scatters the unscattered probe, and the scattered waves propagate to
+        the exit surface without scattering again. The mean potential is left
+        out, since in multislice it only shifts the phase of the whole wave.
 
     Returns
     -------
@@ -756,6 +786,7 @@ def probe_patterns(
         for z in np.unique(film.numbers)
     }
     numbers = torch.as_tensor(film.numbers)
+    # transmission function of each slice, or i times its phase for single scattering
     transmission = torch.empty((n_slices, n, n), dtype=torch.complex64)
     for s in range(n_slices):
         phase_k = torch.zeros((n, n), dtype=torch.complex128)
@@ -764,7 +795,10 @@ def probe_patterns(
             ex = torch.exp(-2j * np.pi * p[:, 0, None] * k[None, :])
             ey = torch.exp(-2j * np.pi * p[:, 1, None] * k[None, :])
             phase_k += wavelength * fz * (ex.T @ ey)
-        t = torch.exp(1j * torch.fft.ifft2(phase_k) / pixel**2)
+        if kinematic:
+            phase_k[0, 0] = 0.0  # the mean potential only shifts the phase of the whole wave
+        phase = 1j * torch.fft.ifft2(phase_k) / pixel**2
+        t = phase if kinematic else torch.exp(phase)
         transmission[s] = torch.fft.ifft2(torch.fft.fft2(t) * band).to(torch.complex64)
     transmission = transmission.to(device)
     propagator = (torch.exp(-1j * np.pi * wavelength * dz * k2) * band).to(torch.complex64).to(device)
@@ -782,9 +816,19 @@ def probe_patterns(
         r = shifts[start : start + batch_size]
         ramp = torch.exp(-2j * np.pi * (r[:, 0, None, None] * k32[None, :, None] + r[:, 1, None, None] * k32[None, None, :]))
         psi = torch.fft.ifft2(probe[None] * ramp.to(device))
-        for s in range(n_slices - 1):
-            psi = torch.fft.ifft2(torch.fft.fft2(psi * transmission[s]) * propagator)
-        intensity = torch.abs(torch.fft.fft2(psi * transmission[-1])) ** 2
+        if kinematic:
+            scattered = torch.zeros_like(psi)
+            for s in range(n_slices):
+                scattered = scattered + psi * transmission[s]
+                if s < n_slices - 1:
+                    psi = torch.fft.ifft2(torch.fft.fft2(psi) * propagator)
+                    scattered = torch.fft.ifft2(torch.fft.fft2(scattered) * propagator)
+            exit_wave = psi + scattered
+        else:
+            for s in range(n_slices - 1):
+                psi = torch.fft.ifft2(torch.fft.fft2(psi * transmission[s]) * propagator)
+            exit_wave = psi * transmission[-1]
+        intensity = torch.abs(torch.fft.fft2(exit_wave)) ** 2
         intensity = torch.fft.fftshift(intensity, dim=(-2, -1))[:, crop, crop].cpu()
         if dose is not None:
             intensity = torch.poisson(dose * intensity.to(torch.float64), generator=gen)

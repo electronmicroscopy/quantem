@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from ase.build import bulk
+from scipy.special import eval_legendre
 
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
@@ -14,6 +15,7 @@ from quantem.diffraction.lattices import (
 from quantem.diffraction.multislice import circular_window
 from quantem.diffraction.pvc import (
     PairVectorCorrelation,
+    _cluster_power_sphere,
     _solve_sphere,
     _ylm_azimuth_zero,
     pair_vector_marks,
@@ -65,6 +67,33 @@ def test_sphere_solve_recovers_invariants_on_curved_ewald_sphere():
     assert np.abs(_solve_sphere(S, beta, ls) - B).max() < 1e-10
 
 
+def test_cluster_power_sphere_matches_addition_theorem():
+    """The cluster power, which counts each pair once and evaluates repeated pair
+    vectors of a lattice once, equals the double sum over all pair vectors of their
+    radial bin weights times (2l + 1) / (4 pi) P_l(cos of the angle between them)."""
+    rng = np.random.default_rng(0)
+    rotation = np.linalg.qr(rng.normal(size=(3, 3)))[0]
+    grid = np.stack(np.meshgrid(*[np.arange(3.0)] * 3, indexing="ij"), -1).reshape(-1, 3)
+    clusters = [1.7 * grid @ rotation.T, rng.uniform(-3, 3, size=(20, 3))]
+    r, ls = np.arange(0, 5.0, 0.1), np.arange(2, 13, 2)
+    shell = np.maximum(r, 0.05) ** 2 * 0.1
+    expected = np.zeros((ls.size, r.size, r.size))
+    for pos in clusters:
+        d = (pos[None, :, :] - pos[:, None, :]).reshape(-1, 3)
+        dist = np.linalg.norm(d, axis=1)
+        d, dist = d[(dist > 0) & (dist < r[-1])], dist[(dist > 0) & (dist < r[-1])]
+        i0 = np.floor(dist / 0.1).astype(int)
+        f = dist / 0.1 - i0
+        W = np.zeros((r.size, dist.size))
+        W[i0, np.arange(dist.size)] = (1 - f) / shell[i0]
+        W[i0 + 1, np.arange(dist.size)] += f / shell[i0 + 1]
+        cos = (d / dist[:, None]) @ (d / dist[:, None]).T
+        for k, ell in enumerate(ls):
+            expected[k] += (2 * ell + 1) / (4 * np.pi) * W @ eval_legendre(ell, cos) @ W.T
+    H = _cluster_power_sphere(clusters, r, ls, memory=0, block=16).numpy()
+    assert np.abs(H - expected).max() < 1e-10 * np.abs(expected).max()
+
+
 def test_beam_correlation_and_patterson_of_lattice(triangular, recwarn):
     """One triangular-lattice pattern: the beam correlation matches the model of the
     atom positions and peaks at the angles pair_vector_marks expects, and the
@@ -108,14 +137,23 @@ def test_miscentered_pattern_warns(triangular):
         _pvc(intensity, (N_PX // 2 + 2, N_PX // 2))
 
 
-def test_bright_field_radius_of_probe_patterns():
+def test_probe_patterns_bright_field_and_kinematic_limit():
     """The bright-field disk of multislice patterns of a nanocrystalline film is
-    measured at its radius alpha / lambda."""
+    measured at its radius alpha / lambda, and single scattering by this thin
+    film matches multislice outside the disk."""
     film = polycrystal(bulk("Si", "diamond", a=5.431, cubic=True), 8.0, 24.0, 8.0, seed=0)
     ds = probe_patterns(film, 4, 10.0, q_max=1.0)
     pvc = PairVectorCorrelation(ds, energy=200e3)
     expected = 10e-3 / electron_wavelength_angstrom(200e3)
-    assert abs(pvc.bright_field_radius - expected) < 0.5 * ds.sampling[-1]
+    dq, n = ds.sampling[-1], ds.shape[-1]
+    assert abs(pvc.bright_field_radius - expected) < 0.5 * dq
+
+    kinematic = probe_patterns(film, 4, 10.0, q_max=1.0, kinematic=True).array
+    q = np.hypot(*np.meshgrid(np.arange(n) - n // 2, np.arange(n) - n // 2, indexing="ij")) * dq
+    outside = q > expected + 2 * dq
+    dynamic = ds.array[..., outside]
+    error = np.linalg.norm(kinematic[..., outside] - dynamic) / np.linalg.norm(dynamic)
+    assert error < 0.06, error
 
 
 def test_split_counts_removes_shot_noise_bias():

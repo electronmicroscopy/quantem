@@ -960,48 +960,131 @@ def _bin_vectors(dist, r):
     return torch.cat([i0, i0 + 1]), torch.cat([1 - f, f])
 
 
-def _cluster_power_sphere(clusters, r, l_values):
-    """sum_m conj(P_lm(r)) P_lm(r') summed over clusters, P_lm per unit volume, as an (Nl, Nr, Nr) tensor."""
+def _pair_vectors(pos, r_cut, block=1024):
+    """Pair vectors pos_j - pos_i with i < j and 0 < |d| < r_cut, (Npairs, 3)."""
+    n = pos.shape[0]
+    parts = [torch.zeros((0, 3), dtype=pos.dtype)]
+    for start in range(0, n, block):
+        rows = torch.arange(start, min(start + block, n))
+        d = pos[None, :, :] - pos[rows, None, :]
+        dist2 = (d**2).sum(-1)
+        keep = (torch.arange(n)[None, :] > rows[:, None]) & (dist2 > 0) & (dist2 < r_cut**2)
+        parts.append(d[keep])
+    return torch.cat(parts)
+
+
+def _unique_vectors(d, r_cut):
+    """Merge pair vectors that repeat, as in a crystal: (mean, count) of each group."""
+    quantum = r_cut / 2**19  # |d| < r_cut, so each quantized coordinate fits in 21 bits
+    q = torch.round(d / quantum).long() + 2**20
+    key = (q[:, 0] << 42) | (q[:, 1] << 21) | q[:, 2]
+    key, inverse, count = torch.unique(key, return_inverse=True, return_counts=True)
+    mean = torch.zeros((key.numel(), 3), dtype=d.dtype).index_add_(0, inverse, d)
+    return mean / count[:, None], count.to(d.dtype)
+
+
+def _cluster_power_sphere(clusters, r, l_values, memory=2**28, block=2048):
+    """
+    sum_m conj(P_lm(r)) P_lm(r') summed over clusters, P_lm per unit volume, as an
+    (Nl, Nr, Nr) tensor, for even l. Since Y_lm(-v) = Y_lm(v) for even l, each pair
+    adds one vector with twice the weight, and vectors that repeat within a
+    cluster, as in a crystal, are evaluated once and weighted by their count.
+    """
+    l_values = np.asarray(l_values)
+    if np.any(l_values % 2):
+        raise ValueError("the cluster power is computed for even l only")
     r_t = torch.as_tensor(r, dtype=torch.float64)
+    n_r, r0, r_cut = r.size, float(r_t[0]), float(r_t[-1])
     dr = float(r_t[1] - r_t[0])
     shell = torch.clamp(r_t, min=0.5 * dr) ** 2 * dr
     shell = torch.cat([shell, shell[-1:]])
     l_max = int(l_values[-1])
-    row = {int(ell): k for k, ell in enumerate(l_values)}
-    H = torch.zeros((len(l_values), r.size, r.size), dtype=torch.float64)
+
+    # P_lm = a_lm (x P_l-1,m - b_lm P_l-2,m) for m <= l - 2, P_l,l-1 = sqrt(2l + 1) x P_l-1,l-1,
+    # and P_mm = diag_m sin(beta) P_m-1,m-1
+    ell = torch.arange(l_max + 1, dtype=torch.float64)[:, None]
+    m = torch.arange(l_max + 1, dtype=torch.float64)
+    low = m[None, :] <= ell - 2
+    a = torch.where(low, (4 * ell**2 - 1) / torch.where(low, ell**2 - m**2, 1.0), 0.0).sqrt()
+    b = (
+        torch.where(low, ((ell - 1) ** 2 - m**2) / (4 * (ell - 1) ** 2 - 1), 0.0)
+        .clamp(min=0)
+        .sqrt()
+    )
+    a, b = a[:, :, None].contiguous(), b[:, :, None].contiguous()
+    diag = -torch.sqrt((2 * m[1:] + 1) / (2 * m[1:]))
+    sub = torch.sqrt(2 * m + 1)
+    bounds = np.concatenate([[0], np.cumsum(l_values + 1)])
+    column = {int(e): (int(bounds[k]), int(bounds[k + 1])) for k, e in enumerate(l_values)}
+    m_weight = torch.cat([torch.ones(1), torch.full((l_max,), 2.0)]).to(torch.float64).sqrt()
+    chunk = max(block, memory // (80 * (l_max + 1)))
+
+    H = torch.zeros((len(l_values), n_r, n_r), dtype=torch.float64)
     for pos in clusters:
-        pos = torch.as_tensor(np.asarray(pos), dtype=torch.float64)
-        d = (pos[None, :, :] - pos[:, None, :]).reshape(-1, 3)
+        d = _pair_vectors(torch.as_tensor(np.asarray(pos), dtype=torch.float64), r_cut)
+        d = d[torch.linalg.norm(d, dim=1) >= r0]
+        if d.shape[0] == 0:
+            continue
+        d, count = _unique_vectors(d, r_cut)
         dist = torch.linalg.norm(d, dim=1)
-        keep = (dist > 0) & (dist >= float(r_t[0])) & (dist < float(r_t[-1]))
-        d, dist = d[keep], dist[keep]
-        index, weight = _bin_vectors(dist, r)
-        weight = weight / shell[index]
-        cos_t = torch.cat(
-            [torch.clamp(d[:, 2] / dist, -1, 1)] * 2
-        )  # polar angle from the beam axis
+        order = torch.argsort(dist)  # so that each block of vectors covers a short range of r
+        d, count, dist = d[order], count[order], dist[order]
+        x = (dist - r0) / dr
+        i0 = torch.floor(x).long()
+        f = x - i0
+        w0, w1 = 2 * count * (1 - f) / shell[i0], 2 * count * f / shell[i0 + 1]
+        cos_t = torch.clamp(d[:, 2] / dist, -1, 1)  # polar angle from the beam axis
         sin_t = torch.sqrt(1 - cos_t**2)
-        phi = torch.cat([torch.atan2(d[:, 0], d[:, 1])] * 2)
-        p_mm = torch.full_like(cos_t, (1 / (4 * np.pi)) ** 0.5)
-        for m in range(l_max + 1):
-            if m > 0:
-                p_mm = -(((2 * m + 1) / (2 * m)) ** 0.5) * sin_t * p_mm
-            e = torch.polar(torch.ones_like(phi), m * phi) * weight
-            p_prev, p_l = None, p_mm
-            for ell in range(m, l_max + 1):
-                if ell == m + 1:
-                    p_prev, p_l = p_l, (2 * m + 3) ** 0.5 * cos_t * p_l
-                elif ell > m + 1:
-                    a = ((4 * ell * ell - 1) / (ell * ell - m * m)) ** 0.5
-                    b = (((ell - 1) ** 2 - m * m) / (4 * (ell - 1) ** 2 - 1)) ** 0.5
-                    p_prev, p_l = p_l, a * (cos_t * p_l - b * p_prev)
-                if ell in row:
-                    A = torch.zeros(r.size + 1, dtype=torch.complex128).index_add_(
-                        0, index, p_l * e
-                    )[: r.size]
-                    H[row[ell]] += (1.0 if m == 0 else 2.0) * torch.real(
-                        A.conj()[:, None] * A[None, :]
-                    )
+        phi = torch.atan2(d[:, 0], d[:, 1])
+        A = torch.zeros((2, int(bounds[-1]), n_r + 1), dtype=torch.float64)
+        for s in range(0, dist.numel(), chunk):
+            c = slice(s, s + chunk)
+            n_c = dist[c].numel()
+            # linear binning in r of each block of vectors, as a (vectors, bins) matrix
+            bins = []
+            for t in range(0, n_c, block):
+                i = i0[c][t : t + block]
+                lo = int(i[0])
+                W = torch.zeros((i.numel(), int(i[-1]) + 2 - lo), dtype=torch.float64)
+                rows = torch.arange(i.numel())
+                W[rows, i - lo] = w0[c][t : t + block]
+                W[rows, i + 1 - lo] += w1[c][t : t + block]
+                bins.append((t, lo, W))
+            x_c = cos_t[None, c]
+            p_mm = torch.cumprod(
+                torch.cat(
+                    [
+                        torch.full((1, n_c), (1 / (4 * np.pi)) ** 0.5, dtype=torch.float64),
+                        diag[:, None] * sin_t[None, c],
+                    ]
+                ),
+                0,
+            )  # (M, n)
+            mphi = m[:, None] * phi[None, c]
+            trig = torch.stack([torch.cos(mphi), torch.sin(mphi)])  # (2, M, n)
+            prev2 = prev1 = None
+            for e in range(l_max + 1):
+                cur = torch.empty((e + 1, n_c), dtype=torch.float64)
+                if e >= 2:
+                    body = cur[: e - 1]
+                    torch.mul(prev1[: e - 1], x_c, out=body)
+                    body.addcmul_(prev2, b[e, : e - 1], value=-1.0)
+                    body.mul_(a[e, : e - 1])
+                if e >= 1:
+                    torch.mul(p_mm[e - 1], x_c[0], out=cur[e - 1]).mul_(sub[e])
+                cur[e] = p_mm[e]
+                if e in column:
+                    lo_col, hi_col = column[e]
+                    Y = (cur[None] * trig[:, : e + 1]).reshape(-1, n_c)  # real and imaginary parts
+                    for t, lo, W in bins:
+                        A[:, lo_col:hi_col, lo : lo + W.shape[1]] += (
+                            Y[:, t : t + W.shape[0]] @ W
+                        ).reshape(2, e + 1, -1)
+                prev2, prev1 = prev1, cur
+        for k, e in enumerate(l_values):
+            lo, hi = column[int(e)]
+            Ak = (A[:, lo:hi, :n_r] * m_weight[: e + 1, None]).reshape(-1, n_r)
+            H[k] += Ak.T @ Ak
     return H
 
 
