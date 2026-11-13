@@ -395,9 +395,10 @@ class Tomography(TomographyOpt, TomographyBase):
     ) -> Self:
         """Load a saved tomography reconstruction.
 
-        Its models are stored pickled, so it loads only with ``allow_pickle=True``.
-        Unpickling can run code stored in the file: set it only for files from a
-        source you trust.
+        ``allow_pickle=True`` also loads values that can run code; see
+        `quantem.core.io.load`. It is needed only for files written by older
+        quantem versions, which pickled the models, or for models defined
+        outside quantem and torch.
         """
         tomography = cls._recursive_load_from_path(path, allow_pickle=allow_pickle)
         tomography.to(device)

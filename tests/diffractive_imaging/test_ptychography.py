@@ -215,8 +215,7 @@ class TestTargetResidency:
         small_ptycho_dataset.target_residency = "cpu"
         path = tmp_path / "pdset.zip"
         small_ptycho_dataset.save(str(path))
-        # optimizer and constraint settings are pickled
-        reloaded = autoserialize_load(str(path), allow_pickle=True)
+        reloaded = autoserialize_load(str(path))
         assert reloaded.target_residency == "cpu"
 
 
@@ -324,7 +323,7 @@ class TestPtychographySaveLoadRoundtrip:
         )
         path = tmp_path / "ptycho.zip"
         ptycho.save(str(path), save_raw_data=True)
-        reloaded = autoserialize_load(str(path), allow_pickle=True)
+        reloaded = autoserialize_load(str(path))
 
         np.testing.assert_array_equal(reloaded._iter_losses, ptycho._iter_losses)
         np.testing.assert_allclose(

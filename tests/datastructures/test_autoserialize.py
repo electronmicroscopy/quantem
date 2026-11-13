@@ -198,24 +198,27 @@ class _Payload:
         return (_record, (self.tag,))
 
 
-class TorchWithOpt(AutoSerialize):
+class _Net(nn.Module):
+    """A module from outside quantem and torch, whose methods have not been checked."""
+
     def __init__(self):
-        self.data = torch.rand(100, 100)
-        self.param = self.data.clone().detach().requires_grad_(True)
-        self.opt = torch.optim.Adam([self.data.detach().clone()], lr=0.01)
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((2,), 3.0))
+
+
+class Untrusted(AutoSerialize):
+    def __init__(self):
+        self.net = _Net()
         self.payloads = [_Payload("new")]
 
-    def method(self):
-        return self.data.sum()
 
-
-def test_pickled_values_load_only_with_allow_pickle(tmp_path):
-    """Optimizers and dill fallbacks, in a list or in the older bare-array layout,
-    load only with allow_pickle=True; without it, nothing stored in them runs."""
+def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path):
+    """Dill fallbacks, in a list or in the older bare-array layout, and modules from
+    outside quantem and torch load only with allow_pickle=True; without it, nothing
+    stored in them runs."""
     _unpickled.clear()
-    obj = TorchWithOpt()
-    tgt = tmp_path / "opt"
-    obj.save(tgt)
+    tgt = tmp_path / "untrusted"
+    Untrusted().save(tgt)
     # older files stored dill fallbacks as gzip-compressed bytes in a bare uint8 array
     legacy = np.frombuffer(gzip.compress(dill.dumps(_Payload("legacy"))), dtype=np.uint8)
     root = zarr.open_group(tgt, mode="r+")
@@ -223,25 +226,24 @@ def test_pickled_values_load_only_with_allow_pickle(tmp_path):
 
     with pytest.raises(ValueError, match="allow_pickle=True") as error:
         load(tgt)
-    for entry in ("opt (torch optimizer)", "payloads/0 (dill pickle)", "legacy (dill pickle)"):
+    for entry in (
+        f"net ({_Net.__module__}._Net, from outside quantem and torch)",
+        "payloads/0 (dill pickle)",
+        "legacy (dill pickle)",
+    ):
         assert entry in str(error.value), entry
     assert _unpickled == []
 
     loaded = load(tgt, allow_pickle=True)
-    assert torch.allclose(obj.data, loaded.data)
-    assert loaded.param.requires_grad
-    assert isinstance(loaded.opt, torch.optim.Adam)
-    assert loaded.opt.param_groups[0]["lr"] == 0.01
+    assert torch.equal(loaded.net.scale, torch.full((2,), 3.0))
     assert loaded.payloads == ["new"]
     assert loaded.legacy == "legacy"
     assert sorted(_unpickled) == ["legacy", "new"]
 
-    # the class named in the file must be an AutoSerialize class
+    # the file can only name classes that are stored by their attributes
     meta = dict(root.attrs["_autoserialize"])
     root.attrs["_autoserialize"] = {**meta, "class_module": "subprocess", "class_name": "Popen"}
-    with pytest.raises(
-        ValueError, match="subprocess.Popen is not an importable AutoSerialize class"
-    ):
+    with pytest.raises(ValueError, match="subprocess.Popen is not an AutoSerialize class"):
         load(tgt, allow_pickle=True)
 
 
@@ -250,53 +252,39 @@ class TestModule(torch.nn.Module, AutoSerialize):
 
     def __init__(self):
         super().__init__()
-        self.linear = torch.nn.Linear(10, 5)
-        self.param = torch.nn.Parameter(torch.randn(3, requires_grad=True))
+        # more than ten layers, so loading them out of order changes the output
+        self.layers = nn.Sequential(*(nn.Linear(3, 3) for _ in range(11)))
+        self.opt = torch.optim.Adam(self.parameters(), lr=0.01)
+        self.sched = torch.optim.lr_scheduler.ExponentialLR(self.opt, gamma=0.5)
 
     def forward(self, x):
-        return self.linear(x)
+        return self.layers(x)
+
+    def train_step(self):
+        self.opt.zero_grad()
+        self(torch.ones(1, 3)).sum().backward()
+        self.opt.step()
+        self.sched.step()
 
 
 def test_torch_nn_module_roundtrip(tmp_path):
+    """A model with its optimizer and scheduler loads without pickle and trains on
+    as the original does, so the optimizer holds the loaded model's parameters."""
     mod = TestModule()
+    mod.train_step()
     tgt = tmp_path / "mod.zip"
     mod.save(str(tgt), mode="w")
-    mod_reload = load(str(tgt), allow_pickle=True)  # nn.Linear is pickled
+    loaded = load(str(tgt))
 
-    assert isinstance(mod_reload, TestModule)
-    out = mod_reload.forward(torch.randn(1, 10))
-    assert out.shape[-1] == 5
+    x = torch.randn(2, 3)
+    assert torch.equal(loaded(x), mod(x))
+    assert loaded.sched.optimizer is loaded.opt
 
-    for key in mod.state_dict():
-        assert torch.allclose(mod.state_dict()[key], mod_reload.state_dict()[key])
-
-
-class TestHybrid(AutoSerialize, nn.Module):
-    __test__ = False
-
-    def __init__(self):
-        nn.Module.__init__(self)
-        super().__init__()
-        self._p1 = nn.Parameter(torch.randn(3, 3))
-
-    @property
-    def p1(self):
-        return self._p1
-
-    @p1.setter
-    def p1(self, value):
-        with torch.no_grad():
-            self._p1.copy_(value)
-
-
-def test_hybrid_module_roundtrip(tmp_path):
-    mod = TestHybrid()
-    tgt = tmp_path / "hybrid.zip"
-    mod.save(str(tgt), mode="w")
-    mod_reload = load(str(tgt))
-
-    for key in mod.state_dict():
-        assert torch.allclose(mod.state_dict()[key], mod_reload.state_dict()[key])
+    mod.train_step()
+    loaded.train_step()
+    for (name, before), after in zip(mod.named_parameters(), loaded.parameters()):
+        assert torch.equal(before, after), name
+    assert loaded.sched.get_last_lr() == mod.sched.get_last_lr()
 
 
 class WithSets(AutoSerialize):

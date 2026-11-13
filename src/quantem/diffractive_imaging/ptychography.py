@@ -941,9 +941,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         auto_reload_dataset : bool
             Whether to automatically reload and preprocess the dataset from saved metadata
         allow_pickle : bool
-            A saved reconstruction stores its models, optimizers and schedulers
-            pickled, so it loads only with True. Unpickling can run code stored in
-            the file: set it only for files from a source you trust.
+            Also load values that can run code; see `quantem.core.io.load`.
+            Needed only for files written by older quantem versions, which
+            pickled the models, or for models defined outside quantem and torch.
 
         Returns
         -------

@@ -1,14 +1,22 @@
 """Save quantem objects as Zarr trees, in a directory or a .zip file, and load them back.
 
-Arrays, tensors, scalars, strings, paths, containers, ase.Atoms and nested
-AutoSerialize objects are stored as Zarr arrays and JSON attributes. Torch
-modules, optimizers and schedulers, and any other value without such a form,
-are pickled. Unpickling can run code stored in the file, so `load` reads them
-only with ``allow_pickle=True``.
+Arrays, tensors, scalars, strings, paths, containers and ase.Atoms are stored as
+Zarr arrays and JSON attributes. AutoSerialize objects, dataclasses, torch
+modules and schedulers are stored by their attributes, and torch optimizers by
+their state_dict, and are rebuilt without unpickling. A value held in several
+places, such as a parameter of a model and its optimizer, is stored once and
+stays shared.
+
+Values without such a form are pickled. Unpickling can run code stored in the
+file, so `load` reads them only with ``allow_pickle=True``. The same holds for
+modules, optimizers, schedulers and dataclasses defined outside quantem and
+torch, whose code was not written to take attributes from a file.
 """
 
+import dataclasses
 import gzip
 import importlib
+import inspect
 import io
 import json
 import logging
@@ -37,12 +45,23 @@ _METADATA_KEYS = frozenset(
         "_autoserialize_skip_names",
         "_autoserialize_skip_types",
         "_container_type",
+        "_dict_keys",
         "_sequence_encoding",
     }
 )
 # Attributes "<name><suffix>" that say how to rebuild the attribute "<name>"
-_FLAG_SUFFIXES = (".is_path", ".is_torch_device", ".is_torch_dtype", ".torch_save")
-# Group marker -> (array holding the pickle, description for error messages)
+_FLAG_SUFFIXES = (".is_path", ".is_ref", ".is_torch_device", ".is_torch_dtype", ".torch_save")
+# Torch classes stored as groups of their state, like AutoSerialize objects
+_TORCH_STATEFUL = (
+    torch.nn.Module,
+    torch.optim.Optimizer,
+    torch.optim.lr_scheduler.LRScheduler,
+)
+# Packages whose torch classes and dataclasses load without allow_pickle
+_TRUSTED_PACKAGES = ("quantem", "torch")
+# Group marker -> (array holding the pickle, description for error messages);
+# files written before modules, optimizers and schedulers were stored by
+# their attributes hold them pickled
 _PICKLED = {
     "_torch_whole_module": ("module", "torch module"),
     "_torch_optimizer": ("optimizer", "torch optimizer"),
@@ -59,10 +78,11 @@ class AutoSerialize:
     """Mixin that saves every instance attribute of an object and loads it back.
 
     Arrays and tensors are stored as Zarr arrays, scalars and strings as JSON
-    attributes, and lists, tuples, sets, dicts and nested AutoSerialize objects
-    as Zarr groups. Torch modules, optimizers and schedulers, and values of any
-    other type (through dill), are pickled; see `load`. Torch generators keep
-    their state; loggers and NumPy generators are recreated without it.
+    attributes, and lists, tuples, sets, dicts, dataclasses, torch modules,
+    optimizers and schedulers and nested AutoSerialize objects as Zarr groups.
+    Values of any other type are pickled with dill; see `load`. Torch
+    generators keep their state; loggers and NumPy generators are recreated
+    without it.
 
     Loading does not call ``__init__``. A class whose stored state differs from
     its working state defines ``_post_load(self)`` to convert it after loading.
@@ -289,8 +309,11 @@ class _Writer:
         self.skip_names = skip_names
         self.skip_types = skip_types
         self.compressors = compressors
+        self.paths: dict[int, str] = {}  # id of each tensor and object written -> its path
+        self.written: list[Any] = []  # keeps those ids from being reused during the save
 
     def root(self, obj: Any, group: zarr.Group) -> None:
+        self.paths[id(obj)] = group.path
         self.object(obj, group, quantem_version=package_version("quantem"))
         group.attrs["_autoserialize_skip_names"] = sorted(self.skip_names)
         group.attrs["_autoserialize_skip_types"] = [
@@ -304,7 +327,9 @@ class _Writer:
             "class_name": type(obj).__qualname__,
             **metadata,
         }
-        for name, value in vars(obj).items():
+        # optimizers after models and schedulers after optimizers, so that the
+        # values they share are stored with the model and referenced from them
+        for name, value in sorted(_get_state(obj).items(), key=lambda kv: _write_order(kv[1])):
             if name in self.skip_names or isinstance(value, self.skip_types):
                 continue
             self.value(value, group, name)
@@ -330,6 +355,8 @@ class _Writer:
             group.attrs[name] = str(value)  # "torch.float32"
             group.attrs[f"{name}.is_torch_dtype"] = True
         elif isinstance(value, torch.Tensor):
+            if self._is_ref(value, group, name):
+                return
             # torch.save keeps the dtype, requires_grad and Parameter type
             subgroup = group.require_group(name)
             subgroup.attrs.update(
@@ -353,15 +380,9 @@ class _Writer:
                 }
             )
             _write_bytes(subgroup, "state", value.get_state().numpy().tobytes())
-        elif isinstance(value, torch.optim.Optimizer):
-            self._pickle(group, name, "_torch_optimizer", _torch_bytes(value))
-        elif isinstance(value, torch.optim.lr_scheduler.LRScheduler):
-            self._pickle(group, name, "_torch_scheduler", _torch_bytes(value))
-        elif isinstance(value, torch.nn.Module):
-            # Includes AutoSerialize modules nested in another object
-            self._pickle(group, name, "_torch_whole_module", _torch_bytes(value))
-        elif _is_autoserialize(value):
-            self.object(value, group.require_group(name))
+        elif _is_object_class(type(value)) and hasattr(value, "__dict__"):
+            if not self._is_ref(value, group, name):
+                self.object(value, group.require_group(name))
         elif isinstance(value, (list, tuple, set, dict)):
             self.container(value, group.require_group(name))
         elif isinstance(value, np.random.Generator):
@@ -394,18 +415,35 @@ class _Writer:
     def container(self, value: list | tuple | set | dict, group: zarr.Group) -> None:
         if isinstance(value, dict):
             group.attrs["_container_type"] = "dict"
+            # the order, and str and int keys as they are; other keys become strings
+            group.attrs["_dict_keys"] = [k if type(k) in (str, int) else str(k) for k in value]
             for key, item in value.items():
                 self.value(item, group, str(key))
             return
         kind = "set" if isinstance(value, set) else "tuple" if isinstance(value, tuple) else "list"
         group.attrs["_container_type"] = kind
         items = list(value)
-        if items and all(isinstance(v, (int, float, np.number, np.bool_)) for v in items):
+        if (
+            items
+            and isinstance(items[0], (int, float, np.number, np.bool_))
+            and len({type(v) for v in items}) == 1  # mixed types would come back as one
+        ):
             group.attrs["_sequence_encoding"] = "ndarray"
             _write_array(group, "values", np.asarray(items), self.compressors)
         else:
             for index, item in enumerate(items):
                 self.value(item, group, str(index))
+
+    def _is_ref(self, value: Any, group: zarr.Group, name: str) -> bool:
+        """Store a reference to `value` if it was written before, else note its path."""
+        path = self.paths.get(id(value))
+        if path is not None:
+            group.attrs[name] = path
+            group.attrs[f"{name}.is_ref"] = True
+            return True
+        self.paths[id(value)] = _join(group.path, name)
+        self.written.append(value)
+        return False
 
     def _pickle(self, group: zarr.Group, name: str, marker: str, payload: bytes) -> None:
         subgroup = group.require_group(name)
@@ -416,19 +454,32 @@ class _Writer:
 class _Reader:
     """Rebuild the values in a Zarr tree written by `_Writer`.
 
-    Without `allow_pickle`, pickled values are not loaded: their paths are
-    collected in `refused` so the caller can report them all at once.
+    Without `allow_pickle`, pickled values and classes from outside quantem and
+    torch are not loaded: their paths are collected in `refused` so the caller
+    can report them all at once.
     """
 
-    def __init__(self, skip_names: set[str], skip_types: tuple[type, ...], allow_pickle: bool):
+    def __init__(
+        self,
+        root: zarr.Group,
+        skip_names: set[str],
+        skip_types: tuple[type, ...],
+        allow_pickle: bool,
+    ):
+        self.root = root
         self.skip_names = skip_names
         self.skip_types = skip_types
         self.allow_pickle = allow_pickle
         self.refused: list[str] = []
+        self.loaded: dict[str, Any] = {}  # path -> value read from it, for references
 
     def object(self, group: zarr.Group) -> Any:
-        cls = _resolve_class(group.attrs["_autoserialize"])
+        cls = self._class(group)
+        if cls is _SKIP:
+            return _SKIP
         obj = cls.__new__(cls)
+        self.loaded[group.path] = obj  # before its values, which may refer back to it
+        state = {}
         for key, kind in _entries(group):
             if key in self.skip_names or (
                 kind == "group"
@@ -439,24 +490,23 @@ class _Reader:
             value = self._entry(group, key, kind)
             if value is _SKIP or isinstance(value, self.skip_types):
                 continue
-            # Attributes are set in the order JSON values, arrays, groups, as
-            # nn.Module.__setattr__ needs plain state before submodules.
-            setattr(obj, key, value)
-        if not self.refused:  # hooks only run on complete objects
-            if isinstance(obj, torch.nn.Module):
-                # files written before sets were stored as sets hold this as a list
-                obj._non_persistent_buffers_set = set(
-                    getattr(obj, "_non_persistent_buffers_set", ())
-                )
-            post_load = getattr(obj, "_post_load", None)
-            if callable(post_load):
-                post_load()
+            state[key] = value
+        if self.refused:  # the load fails, so leave the object as read
+            obj.__dict__.update(state)
+            return obj
+        _set_state(obj, state)
+        post_load = getattr(obj, "_post_load", None)
+        if callable(post_load):
+            post_load()
         return obj
 
     def container(self, group: zarr.Group) -> Any:
         kind = group.attrs["_container_type"]
         if kind == "dict":
-            values = {key: self._entry(group, key, k) for key, k in _entries(group)}
+            kinds = dict(_entries(group))
+            # older files did not store the keys, which come back as strings
+            keys = cast(list, group.attrs.get("_dict_keys", list(kinds)))
+            values = {key: self._entry(group, str(key), kinds[str(key)]) for key in keys}
             return {key: value for key, value in values.items() if value is not _SKIP}
         if kind not in ("list", "tuple", "set"):
             raise ValueError(f"Unknown container type {kind!r} at {group.path}")
@@ -471,6 +521,11 @@ class _Reader:
     def _entry(self, group: zarr.Group, key: str, kind: str) -> Any:
         if kind == "attr":
             value = group.attrs[key]
+            if group.attrs.get(f"{key}.is_ref"):
+                path = cast(str, value)
+                if path in self.loaded:
+                    return self.loaded[path]
+                return self._group(cast(zarr.Group, self.root[path]))
             if group.attrs.get(f"{key}.is_path"):
                 return Path(cast(str, value))
             if group.attrs.get(f"{key}.is_torch_device"):
@@ -494,6 +549,12 @@ class _Reader:
         return self._group(cast(zarr.Group, group[key]))
 
     def _group(self, group: zarr.Group) -> Any:
+        # a referenced group may have been read before the traversal reaches it
+        if group.path not in self.loaded:
+            self.loaded[group.path] = self._read_group(group)
+        return self.loaded[group.path]
+
+    def _read_group(self, group: zarr.Group) -> Any:
         attrs = group.attrs
         if "_autoserialize" in attrs:
             return self.object(group)
@@ -535,9 +596,83 @@ class _Reader:
             return logger
         raise ValueError(f"Unknown subgroup structure: {group.path}")
 
+    def _class(self, group: zarr.Group) -> Any:
+        """The class of the object stored in `group`, or _SKIP if it is refused."""
+        cls = _import_class(group.attrs["_autoserialize"])
+        if not _is_object_class(cls):
+            raise ValueError(
+                f"{cls.__module__}.{cls.__qualname__} is not an AutoSerialize class, "
+                "dataclass, or torch module, optimizer or scheduler"
+            )
+        if (
+            self.allow_pickle
+            or _is_autoserialize_class(cls)  # written to be saved and loaded
+            or cls.__module__.partition(".")[0] in _TRUSTED_PACKAGES
+        ):
+            return cls
+        return self._refuse(
+            group.path, f"{cls.__module__}.{cls.__qualname__}, from outside quantem and torch"
+        )
+
     def _refuse(self, path: str, description: str) -> Any:
         self.refused.append(f"{path} ({description})")
         return _SKIP
+
+
+def _get_state(obj: Any) -> dict[str, Any]:
+    """The values stored for `obj`, from which `_set_state` rebuilds it."""
+    if isinstance(obj, torch.optim.Optimizer):
+        # state_dict() names the parameters by position; `params` holds them, so
+        # they are written once and shared with the model that holds them
+        return {
+            "defaults": obj.defaults,
+            "state_dict": obj.state_dict(),
+            "params": [p for group in obj.param_groups for p in group["params"]],
+        }
+    if isinstance(obj, torch.optim.lr_scheduler.LRScheduler):
+        return {**obj.state_dict(), "optimizer": obj.optimizer}
+    if isinstance(obj, torch.nn.Module):
+        # internals left at their defaults, such as empty hook dicts, are not stored
+        default = vars(torch.nn.Module())
+        return {
+            key: value
+            for key, value in obj.__getstate__().items()
+            if not (key in default and type(value) is type(default[key]) and value == default[key])
+        }
+    return vars(obj)
+
+
+def _set_state(obj: Any, state: dict[str, Any]) -> None:
+    """Restore the attributes from `_get_state` onto `obj`, made with ``__new__``."""
+    if isinstance(obj, torch.optim.Optimizer):
+        # as torch documents: construct over the parameters, then load the state.
+        # The defaults can hold settings the constructor fixes itself (AdamW's
+        # decoupled_weight_decay); load_state_dict restores each group's settings.
+        params, state_dict = state["params"], state["state_dict"]
+        groups = [
+            {**group, "params": [params[i] for i in group["params"]]}
+            for group in state_dict["param_groups"]
+        ]
+        accepted = inspect.signature(type(obj).__init__).parameters
+        obj.__init__(groups, **{k: v for k, v in state["defaults"].items() if k in accepted})
+        obj.load_state_dict(state_dict)
+    elif isinstance(obj, torch.optim.lr_scheduler.LRScheduler):
+        obj.optimizer = state.pop("optimizer")
+        # load_state_dict of some schedulers reads attributes that __init__ sets
+        obj.__dict__.update(state)
+        obj.load_state_dict(dict(state))
+    elif isinstance(obj, torch.nn.Module):
+        obj.__setstate__({**vars(torch.nn.Module()), **state})
+        # files written before sets were stored as sets hold this as a list
+        obj._non_persistent_buffers_set = set(obj._non_persistent_buffers_set)
+    else:
+        obj.__dict__.update(state)
+
+
+def _write_order(value: Any) -> int:
+    if isinstance(value, torch.optim.lr_scheduler.LRScheduler):
+        return 2
+    return int(isinstance(value, torch.optim.Optimizer))
 
 
 def _entries(group: zarr.Group) -> list[tuple[str, str]]:
@@ -552,21 +687,32 @@ def _entries(group: zarr.Group) -> list[tuple[str, str]]:
     return attrs + arrays + groups
 
 
-def _resolve_class(metadata: Any) -> type:
+def _import_class(metadata: Any) -> type:
     """Import the class named in a group's ``_autoserialize`` metadata."""
     if int(metadata.get("version", 1)) != _FORMAT_VERSION:
         raise ValueError(f"Unsupported AutoSerialize version: {metadata.get('version')}")
     module_name, class_name = metadata["class_module"], metadata["class_name"]
-    cls = getattr(importlib.import_module(module_name), class_name, None)
-    if not (isinstance(cls, type) and _is_autoserialize_class(cls)):
-        raise ValueError(f"{module_name}.{class_name} is not an importable AutoSerialize class")
+    cls: Any = importlib.import_module(module_name)
+    for part in class_name.split("."):  # a qualified name, for nested classes
+        cls = getattr(cls, part, None)
+    if not isinstance(cls, type):
+        raise ValueError(f"{module_name}.{class_name} is not an importable class")
     return cls
 
 
 def _stored_class(group: zarr.Group) -> type:
-    """Class of the AutoSerialize object stored in `group`, else `object`."""
+    """Class of the object stored in `group`, else `object`."""
     metadata = group.attrs.get("_autoserialize")
-    return _resolve_class(metadata) if metadata is not None else object
+    return _import_class(metadata) if metadata is not None else object
+
+
+def _is_object_class(cls: type) -> bool:
+    """True for the classes stored as a group of their state, rebuilt by `_set_state`."""
+    return (
+        _is_autoserialize_class(cls)
+        or issubclass(cls, _TORCH_STATEFUL)
+        or dataclasses.is_dataclass(cls)
+    )
 
 
 def _is_autoserialize_class(cls: type) -> bool:
@@ -777,10 +923,11 @@ def load(path: str | Path, skip: SkipSpec = (), *, allow_pickle: bool = False) -
     skip : str, type, or list of (str or type)
         Attribute names, at any depth, and types not to load.
     allow_pickle : bool
-        Also load pickled values: torch modules (including every ptychography
-        and tomography model), optimizers, schedulers and dill fallbacks.
-        Unpickling can run code stored in the file, so only allow it for files
-        from a source you trust.
+        Also load pickled values (dill fallbacks, and torch modules, optimizers
+        and schedulers in files written before quantem stored them without
+        pickle), and torch modules, optimizers, schedulers and dataclasses
+        defined outside quantem and torch. These can run code stored in the
+        file, so only allow them for files from a source you trust.
 
     Returns
     -------
@@ -790,11 +937,11 @@ def load(path: str | Path, skip: SkipSpec = (), *, allow_pickle: bool = False) -
     Raises
     ------
     ValueError
-        If the file holds pickled values and `allow_pickle` is False. The
-        message lists them; nothing from them has been run.
+        If the file holds such values and `allow_pickle` is False. The message
+        lists them; nothing from them has been run.
     """
     root, tempdir = _open_saved(path)
-    reader = _Reader(*_split_skip(skip), allow_pickle=allow_pickle)
+    reader = _Reader(root, *_split_skip(skip), allow_pickle=allow_pickle)
     try:
         obj = reader.object(root)
     finally:
@@ -803,7 +950,7 @@ def load(path: str | Path, skip: SkipSpec = (), *, allow_pickle: bool = False) -
     if reader.refused:
         listing = "\n".join(f"  {entry}" for entry in reader.refused)
         raise ValueError(
-            f"{os.fspath(path)!r} holds pickled values, which can run code when loaded:\n"
+            f"{os.fspath(path)!r} holds values that can run code when loaded:\n"
             f"{listing}\n"
             "Load it with allow_pickle=True if you trust where the file came from."
         )
@@ -859,13 +1006,9 @@ def print_file(
             # Optionally filter out internal autoserialize fields for cleaner output
             printable_keys = []
             for key in keys:
-                if not show_autoserialize_types and key in {
-                    "_container_type",
-                    "_autoserialize",
-                    "_class_def",
-                }:
-                    continue
-                if not show_autoserialize_types and key.endswith(".torch_save"):
+                if not show_autoserialize_types and (
+                    key in _METADATA_KEYS or key == "_class_def" or key.endswith(_FLAG_SUFFIXES)
+                ):
                     continue
                 printable_keys.append(key)
 
