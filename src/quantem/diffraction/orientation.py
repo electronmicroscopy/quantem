@@ -114,6 +114,62 @@ def scan_scalebar(metadata: dict) -> dict | None:
     return {"sampling": step, "units": units}
 
 
+def with_scan_calibration(scalebar, calibration: dict | None):
+    """Fill a requested scale bar's sampling and units from the scan.
+
+    Parameters
+    ----------
+    scalebar : bool | "auto" | dict | ScalebarConfig | None
+        The scale bar asked for. True and "auto" mean the scan calibration
+        as it stands; a dict or ScalebarConfig that does not set its own
+        sampling and units takes them from `calibration`. None or False
+        draws no bar.
+    calibration : dict | None
+        :func:`scan_scalebar` of the scan, or None when it was never
+        calibrated.
+
+    Returns
+    -------
+    bool | dict | ScalebarConfig | None
+        A scale bar any quantem plot accepts, or None for no bar.
+
+    Raises
+    ------
+    ValueError
+        If `scalebar` is an unknown string, or asks for `display_units`
+        while neither it nor the scan has a length calibration.
+    """
+    from quantem.core.visualization.visualization_utils import (
+        _fill_scalebar_calibration,
+        _parse_length_units,
+        _resolve_scalebar,
+    )
+
+    if isinstance(scalebar, str):
+        if scalebar != "auto":
+            raise ValueError(
+                f"scalebar must be 'auto', True, a dict or a ScalebarConfig, got {scalebar!r}"
+            )
+        scalebar = True
+    if calibration is not None:
+        return _fill_scalebar_calibration(scalebar, calibration["sampling"], calibration["units"])
+    if scalebar is True:
+        return None
+    cfg = _resolve_scalebar(scalebar)
+    if (
+        cfg is not None
+        and cfg.display_units is not None
+        and _parse_length_units(cfg.units) is None
+    ):
+        raise ValueError(
+            f"display_units={cfg.display_units!r} needs a length calibration, but this "
+            "scan has none (its scale is in pixels). Set dataset.sampling and "
+            "dataset.units before detecting the Bragg disks, or give 'sampling' and "
+            "'units' in the scale bar."
+        )
+    return scalebar
+
+
 def smooth_quaternions(
     quats: torch.Tensor,
     active: torch.Tensor,
@@ -2735,15 +2791,10 @@ class OrientationMap(AutoSerialize):
         """Fill a requested scale bar's sampling and units from the scan.
 
         A dict, ScalebarConfig or True that does not set its own sampling
-        and units takes them from :attr:`scan_scalebar`. The default (True)
-        draws no bar when the scan was never calibrated, as before.
+        and units takes them from :attr:`scan_scalebar`; see
+        :func:`with_scan_calibration`.
         """
-        from quantem.core.visualization.visualization_utils import _fill_scalebar_calibration
-
-        cal = self.scan_scalebar
-        if cal is None:
-            return None if scalebar is True else scalebar
-        return _fill_scalebar_calibration(scalebar, cal["sampling"], cal["units"])
+        return with_scan_calibration(scalebar, self.scan_scalebar)
 
     def plot_orientation(self, direction: str = "z", match: int = 0, **kwargs):
         """IPF-colored orientation map with the color wedge beside it.

@@ -365,7 +365,6 @@ def wedge_legend(
     ax.axis("off")
 
 
-
 def _draw_map_scalebar(ax, scalebar, shape) -> None:
     """Draw a scale bar on a scan map from any form `scalebar` may take.
 
