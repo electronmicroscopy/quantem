@@ -1,3 +1,6 @@
+import os
+import sys
+import warnings
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -256,6 +259,64 @@ def _fill_scalebar_calibration(cfg: Any, sampling: float, units: str) -> Any:
     return resolved
 
 
+_QUANTEM_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _warn_from_caller(message: str) -> None:
+    """Issue a UserWarning attributed to the first frame outside quantem.
+
+    Python shows a warning once per source line, so a warning raised inside
+    quantem would appear only the first time. Attributing it to the caller's
+    line shows it for every call site in a script or notebook.
+    """
+    if sys.version_info >= (3, 12):
+        warnings.warn(message, UserWarning, skip_file_prefixes=(_QUANTEM_ROOT + os.sep,))
+    else:
+        # stacklevel counts from this function; step past every quantem frame
+        level, frame = 2, sys._getframe(1)
+        while frame is not None and frame.f_code.co_filename.startswith(_QUANTEM_ROOT + os.sep):
+            frame, level = frame.f_back, level + 1
+        warnings.warn(message, UserWarning, stacklevel=level)
+
+
+def _is_pixel_units(units: Any) -> bool:
+    """True for the uncalibrated scale bar units ("pixels", "pixel", "px")."""
+    return isinstance(units, str) and units.strip().lower() in ("pixels", "pixel", "px")
+
+
+def _scalebar_lacks_calibration(cfg: Any) -> bool:
+    """Whether a requested scale bar carries no sampling and units of its own.
+
+    Parameters
+    ----------
+    cfg : None, bool, dict, ScalebarConfig or ShowParams.Scalebar
+        The scale bar as passed by the user.
+
+    Returns
+    -------
+    bool
+        False when no bar is requested. For a dict, True unless it gives both
+        "sampling" and "units". For anything else, True when its units are
+        still pixels.
+    """
+    if cfg is None or cfg is False:
+        return False
+    if isinstance(cfg, dict):
+        return not ("sampling" in cfg and "units" in cfg)
+    resolved = _resolve_scalebar(cfg)
+    return resolved is not None and _is_pixel_units(resolved.units)
+
+
+def _scalebar_display_units(cfg: Any) -> str | None:
+    """The display_units a scale bar asks for, or None."""
+    if cfg is None or cfg is False or cfg is True:
+        return None
+    if isinstance(cfg, dict):
+        return cfg.get("display_units")
+    resolved = _resolve_scalebar(cfg)
+    return None if resolved is None else resolved.display_units
+
+
 def estimate_scalebar_length(length: float, sampling: float) -> tuple[float, float]:
     """Estimate an appropriate scale bar length based on data dimensions.
 
@@ -310,9 +371,7 @@ _LENGTH_UNITS_IN_ANGSTROM = {
 # Accepted spellings (compared in lower case) for each unit above.
 _LENGTH_UNIT_ALIASES = {
     **dict.fromkeys(["pm", "picometer", "picometre", "picometers", "picometres"], "pm"),
-    **dict.fromkeys(
-        ["a", "å", "Å", "ang", "angstrom", "angstroms", "ångström", "ångströms"], "Å"
-    ),
+    **dict.fromkeys(["a", "å", "Å", "ang", "angstrom", "angstroms", "ångström", "ångströms"], "Å"),
     **dict.fromkeys(["nm", "nanometer", "nanometre", "nanometers", "nanometres"], "nm"),
     **dict.fromkeys(
         [
@@ -393,8 +452,7 @@ def _length_unit_factor(from_units: str, to_units: str) -> float:
     if src[1] != dst[1]:
         kinds = {1: "a real-space length", -1: "a reciprocal length"}
         raise ValueError(
-            f"Cannot convert {from_units!r} ({kinds[src[1]]}) to {to_units!r} "
-            f"({kinds[dst[1]]})."
+            f"Cannot convert {from_units!r} ({kinds[src[1]]}) to {to_units!r} ({kinds[dst[1]]})."
         )
     ratio = _LENGTH_UNITS_IN_ANGSTROM[src[0]] / _LENGTH_UNITS_IN_ANGSTROM[dst[0]]
     return ratio if src[1] == 1 else 1 / ratio
@@ -501,6 +559,14 @@ def add_scalebar_to_ax(
     """
     from matplotlib.font_manager import FontProperties
 
+    if display_units is not None and _parse_length_units(units) is None:
+        _warn_from_caller(
+            f"display_units={display_units!r} ignored: the scale bar is in {units!r}, "
+            "which is not a calibrated length, so it is drawn without conversion. Pass a "
+            "calibrated dataset rather than its array, or give 'sampling' and 'units' in "
+            "the scale bar."
+        )
+        display_units = None
     if display_units is not None:
         if isinstance(sampling, (tuple, list)):
             sampling = np.asarray(sampling, dtype=float)
@@ -546,9 +612,7 @@ def add_scalebar_to_ax(
     if box:
         bar.patch.set(facecolor=box_color, edgecolor="none", alpha=box_alpha)
     if outline_color is not None:
-        effects = [
-            patheffects.withStroke(linewidth=outline_width, foreground=outline_color)
-        ]
+        effects = [patheffects.withStroke(linewidth=outline_width, foreground=outline_color)]
         for artist in bar.size_bar.get_children():
             artist.set_path_effects(effects)
         for artist in bar.txt_label.get_children():

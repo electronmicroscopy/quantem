@@ -136,13 +136,23 @@ def with_scan_calibration(scalebar, calibration: dict | None):
     Raises
     ------
     ValueError
-        If `scalebar` is an unknown string, or asks for `display_units`
-        while neither it nor the scan has a length calibration.
+        If `scalebar` is an unknown string.
+
+    Warns
+    -----
+    UserWarning
+        When a scale bar is asked for on an uncalibrated scan without its own
+        sampling and units: it is drawn in pixels, and any `display_units`
+        is dropped.
     """
+    from dataclasses import replace
+
     from quantem.core.visualization.visualization_utils import (
         _fill_scalebar_calibration,
-        _parse_length_units,
         _resolve_scalebar,
+        _scalebar_display_units,
+        _scalebar_lacks_calibration,
+        _warn_from_caller,
     )
 
     if isinstance(scalebar, str):
@@ -155,18 +165,16 @@ def with_scan_calibration(scalebar, calibration: dict | None):
         return _fill_scalebar_calibration(scalebar, calibration["sampling"], calibration["units"])
     if scalebar is True:
         return None
-    cfg = _resolve_scalebar(scalebar)
-    if (
-        cfg is not None
-        and cfg.display_units is not None
-        and _parse_length_units(cfg.units) is None
-    ):
-        raise ValueError(
-            f"display_units={cfg.display_units!r} needs a length calibration, but this "
-            "scan has none (its scale is in pixels). Set dataset.sampling and "
-            "dataset.units before detecting the Bragg disks, or give 'sampling' and "
-            "'units' in the scale bar."
+    if _scalebar_lacks_calibration(scalebar):
+        display_units = _scalebar_display_units(scalebar)
+        dropped = f"; display_units={display_units!r} is ignored" if display_units else ""
+        _warn_from_caller(
+            f"This scan has no length calibration, so the scale bar is drawn in pixels"
+            f"{dropped}. Set dataset.sampling and dataset.units before detecting the "
+            "Bragg disks, or give 'sampling' and 'units' in the scale bar."
         )
+        if display_units:
+            scalebar = replace(_resolve_scalebar(scalebar), display_units=None)
     return scalebar
 
 

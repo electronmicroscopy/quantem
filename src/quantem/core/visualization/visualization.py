@@ -25,6 +25,9 @@ from quantem.core.visualization.visualization_utils import (
     ScalebarConfig,
     _fill_scalebar_calibration,
     _resolve_scalebar,
+    _scalebar_display_units,
+    _scalebar_lacks_calibration,
+    _warn_from_caller,
     add_arg_cbar_to_ax,
     add_cbar_to_ax,
     add_scalebar_to_ax,
@@ -335,6 +338,26 @@ def _dataset_calibration_grid(arrays: Any) -> list[list[tuple[float, str] | None
     return [[calib(a) for a in row] for row in arrays]
 
 
+_UNCALIBRATED_SCALEBAR_WARNING = (
+    "A scale bar was requested for a plain array, which carries no calibration, so it "
+    "is drawn in pixels. Pass the calibrated dataset (e.g. a Dataset2d) rather than its "
+    "array, or give 'sampling' and 'units' in the scale bar."
+)
+
+
+def _check_uncalibrated_scalebar(scalebar: Any, calibration: Any) -> bool:
+    """Whether a panel's scale bar falls back to pixels with no warning of its own.
+
+    A bar asking for display_units is left to :func:`add_scalebar_to_ax`,
+    which warns that the conversion was skipped.
+    """
+    return (
+        calibration is None
+        and _scalebar_lacks_calibration(scalebar)
+        and _scalebar_display_units(scalebar) is None
+    )
+
+
 def _normalize_show_input_to_grid(
     arrays: Any,  # NDArray | Sequence[NDArray] | Sequence[Sequence[NDArray]]
 ) -> list[list[NDArray]]:
@@ -615,6 +638,8 @@ def show_2d(
             scalebar = scalebar[0] if not isinstance(scalebar[0], Sequence) else scalebar[0][0]
         if calibrations[0][0] is not None:
             scalebar = _fill_scalebar_calibration(scalebar, *calibrations[0][0])
+        elif _check_uncalibrated_scalebar(scalebar, None):
+            _warn_from_caller(_UNCALIBRATED_SCALEBAR_WARNING)
         if isinstance(title, Sequence) and not isinstance(title, str):  # flatten title
             title = title[0] if isinstance(title[0], str) else title[0][0]
 
@@ -650,6 +675,16 @@ def show_2d(
         else:
             figsize = kwargs.pop("figsize", (axsize[0] * ncols, axsize[1] * nrows))
             fig, axs = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+
+        if any(
+            _check_uncalibrated_scalebar(
+                normalized_args[i][j]["scalebar"],
+                calibrations[i][j] if i < len(calibrations) and j < len(calibrations[i]) else None,
+            )
+            for i, row in enumerate(grid)
+            for j in range(len(row))
+        ):
+            _warn_from_caller(_UNCALIBRATED_SCALEBAR_WARNING)
 
         for i, row in enumerate(grid):
             for j, array in enumerate(row):
