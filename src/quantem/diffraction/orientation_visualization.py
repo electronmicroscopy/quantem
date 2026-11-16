@@ -1031,6 +1031,28 @@ def _pole_scatter_xy(quats: torch.Tensor, crystal: Crystal, pole) -> np.ndarray:
     return np.stack((x, y), axis=1)
 
 
+def _draw_scan_axes_glyph(ax) -> None:
+    """Scan-axes arrows in the top-left corner of a pole figure.
+
+    Pole figures are drawn in the scan (image) frame of the orientation maps:
+    c (column) rightward and r (row) downward, so the y axis is inverted.
+    """
+    gx, gy = -1.06, -1.06
+    for dx, dy, lbl, ha, va in (
+        (0.22, 0.0, "c", "left", "center"),
+        (0.0, 0.22, "r", "center", "top"),
+    ):
+        ax.annotate(
+            "",
+            xy=(gx + dx, gy + dy),
+            xytext=(gx, gy),
+            arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.2),
+            annotation_clip=False,
+        )
+        ax.text(gx + dx * 1.25, gy + dy * 1.25, lbl, fontsize=9, ha=ha, va=va, color="0.3")
+    ax.text(gx - 0.03, gy - 0.06, "scan axes", fontsize=7, ha="left", va="bottom", color="0.45")
+
+
 def plot_cluster_pole_figure(
     om,
     clusters: dict,
@@ -1041,6 +1063,10 @@ def plot_cluster_pole_figure(
     figax=None,
 ):
     """Pole figure of the cluster mean orientations, one color per cluster.
+
+    Drawn in the scan frame, the same as :func:`plot_pole_figure`: the scan
+    column axis c to the right and the row axis r downward, so the two
+    figures can be compared or overlaid directly.
 
     Also available as :meth:`OrientationMap.plot_cluster_pole_figure`.
 
@@ -1091,9 +1117,10 @@ def plot_cluster_pole_figure(
     K = clusters["mean_quats"].shape[0]
     for k in range(K):
         xy = _pole_scatter_xy(clusters["mean_quats"][k], om.crystal, pole)
+        # scan frame, as in plot_pole_figure: c (lab y) across, r (lab x) down
         ax.scatter(
-            xy[:, 0],
             xy[:, 1],
+            xy[:, 0],
             s=60,
             marker="h",
             color=colors[k % len(colors)],
@@ -1104,8 +1131,8 @@ def plot_cluster_pole_figure(
     if overlay is not None:
         xy = _pole_scatter_xy(overlay["quats"], overlay["crystal"], overlay["pole"])
         ax.scatter(
-            xy[:, 0],
             xy[:, 1],
+            xy[:, 0],
             s=70,
             marker="D",
             facecolors="none",
@@ -1113,8 +1140,9 @@ def plot_cluster_pole_figure(
             lw=1.0,
             label=overlay.get("label", "overlay"),
         )
+    _draw_scan_axes_glyph(ax)
     ax.set_xlim(-1.15, 1.15)
-    ax.set_ylim(-1.15, 1.15)
+    ax.set_ylim(1.2, -1.15)
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
@@ -1285,38 +1313,7 @@ def plot_pole_figure(
         for az in range(0, 180, 30):
             ca, sa = np.cos(np.deg2rad(az)), np.sin(np.deg2rad(az))
             ax.plot([-ca, ca], [-sa, sa], color="0.85", lw=0.4)
-        # compact scan-axes glyph, top-left corner: the pole figure is in
-        # the scan (image) frame -- c rightward, r downward
-        gx, gy = -1.06, -1.06
-        for dx, dy, lbl, ha, va in (
-            (0.22, 0.0, "c", "left", "center"),
-            (0.0, 0.22, "r", "center", "top"),
-        ):
-            ax.annotate(
-                "",
-                xy=(gx + dx, gy + dy),
-                xytext=(gx, gy),
-                arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.2),
-                annotation_clip=False,
-            )
-            ax.text(
-                gx + dx * 1.25,
-                gy + dy * 1.25,
-                lbl,
-                fontsize=9,
-                ha=ha,
-                va=va,
-                color="0.3",
-            )
-        ax.text(
-            gx - 0.03,
-            gy - 0.06,
-            "scan axes",
-            fontsize=7,
-            ha="left",
-            va="bottom",
-            color="0.45",
-        )
+        _draw_scan_axes_glyph(ax)
     if overlay is not None:
         if "om" in overlay:
             # raw-histogram contour of another map's pole family
