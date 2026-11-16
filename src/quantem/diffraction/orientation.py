@@ -2731,6 +2731,20 @@ class OrientationMap(AutoSerialize):
         md = self.metadata.get("peaks", {}) or {}
         return scan_scalebar(md)
 
+    def _scalebar_with_calibration(self, scalebar):
+        """Fill a requested scale bar's sampling and units from the scan.
+
+        A dict, ScalebarConfig or True that does not set its own sampling
+        and units takes them from :attr:`scan_scalebar`. The default (True)
+        draws no bar when the scan was never calibrated, as before.
+        """
+        from quantem.core.visualization.visualization_utils import _fill_scalebar_calibration
+
+        cal = self.scan_scalebar
+        if cal is None:
+            return None if scalebar is True else scalebar
+        return _fill_scalebar_calibration(scalebar, cal["sampling"], cal["units"])
+
     def plot_orientation(self, direction: str = "z", match: int = 0, **kwargs):
         """IPF-colored orientation map with the color wedge beside it.
 
@@ -2755,7 +2769,7 @@ class OrientationMap(AutoSerialize):
         """
         from quantem.diffraction.orientation_visualization import plot_orientation_map
 
-        kwargs.setdefault("scalebar", self.scan_scalebar)
+        kwargs["scalebar"] = self._scalebar_with_calibration(kwargs.get("scalebar", True))
         return plot_orientation_map(
             self, direction=direction, match=match, **self._default_mask(kwargs)
         )
@@ -2803,7 +2817,7 @@ class OrientationMap(AutoSerialize):
         """
         from quantem.diffraction.orientation_visualization import plot_cluster_map
 
-        kwargs.setdefault("scalebar", self.scan_scalebar)
+        kwargs["scalebar"] = self._scalebar_with_calibration(kwargs.get("scalebar", True))
         return plot_cluster_map(self, clusters, **kwargs)
 
     def plot_cluster_pole_figure(self, clusters: dict, pole=(0, 0, 1), **kwargs):

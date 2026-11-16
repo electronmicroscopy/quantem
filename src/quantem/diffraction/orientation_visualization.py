@@ -6,7 +6,11 @@ import numpy as np
 import torch
 
 from quantem.core.utils.rotations import quat_to_matrix
-from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
+from quantem.core.visualization.visualization_utils import (
+    ScalebarConfig,
+    _resolve_scalebar,
+    add_scalebar_to_ax,
+)
 from quantem.diffraction.crystal import Crystal
 
 # one color per candidate phase, used consistently across every plot; index
@@ -361,12 +365,48 @@ def wedge_legend(
     ax.axis("off")
 
 
+
+def _draw_map_scalebar(ax, scalebar, shape) -> None:
+    """Draw a scale bar on a scan map from any form `scalebar` may take.
+
+    Accepts None/False (no bar), True, a dict of :class:`ScalebarConfig`
+    fields, a ScalebarConfig or a ``ShowParams.Scalebar``. Every field is
+    honored. A bar width and padding left at the ScalebarConfig defaults are
+    scaled to the map size instead, since one pixel is invisible on a scan.
+    """
+    cfg = _resolve_scalebar(scalebar)
+    if cfg is None:
+        return
+    defaults = ScalebarConfig()
+    width_px = shape[0] / 40 if cfg.width_px == defaults.width_px else cfg.width_px
+    pad_px = shape[0] / 80 if cfg.pad_px == defaults.pad_px else cfg.pad_px
+    add_scalebar_to_ax(
+        ax,
+        array_size=shape[1],
+        sampling=cfg.sampling,
+        length_units=cfg.length,
+        units=cfg.units,
+        width_px=width_px,
+        pad_px=pad_px,
+        color=cfg.color,
+        loc=cfg.loc,
+        fontsize=cfg.fontsize,
+        bold=cfg.bold,
+        box=cfg.box,
+        box_color=cfg.box_color,
+        box_alpha=cfg.box_alpha,
+        outline_color=cfg.outline_color,
+        outline_width=cfg.outline_width,
+        display_units=cfg.display_units,
+    )
+
+
 def plot_orientation_map(
     om,
     direction: str = "z",
     match: int = 0,
     mask: np.ndarray | None = None,
-    scalebar: dict | None = None,
+    scalebar=None,
     figax=None,
     legend: bool = True,
     axsize: tuple[float, float] = (9.0, 4.5),
@@ -427,8 +467,9 @@ def plot_orientation_map(
         Colorfulness relative to the corner colors: 1 keeps them exact, lower
         washes the map toward white.
         The legend is drawn with the same values.
-    scalebar : dict | None
-        Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
+    scalebar : bool | dict | ScalebarConfig | None
+        Real-space scale bar: True, a ScalebarConfig, or a dict of its
+        fields, e.g. {"sampling": 30, "units": "A", "loc": "lower left"}.
     crop : (r0, r1, c0, c1) | None
         Show only this window of the map (rows r0:r1, columns c0:c1).
     title : str | None
@@ -501,18 +542,7 @@ def plot_orientation_map(
             ax.set_title(f"{om.crystal.name}  in-plane orientation  ({direction:g}\u00b0)")
         else:
             ax.set_title(f"{om.crystal.name}  in-plane orientation")
-    if scalebar is not None:
-        add_scalebar_to_ax(
-            ax,
-            array_size=rgb.shape[1],
-            sampling=scalebar.get("sampling", 1.0),
-            length_units=scalebar.get("length", None),
-            units=scalebar.get("units", "pixels"),
-            width_px=rgb.shape[0] / 40,
-            pad_px=rgb.shape[0] / 80,
-            color=scalebar.get("color", "white"),
-            loc="lower right",
-        )
+    _draw_map_scalebar(ax, scalebar, rgb.shape)
     if legend and ax_leg is not None:
         wedge_legend(
             om.crystal,
@@ -855,7 +885,7 @@ def plot_cluster_map(
     om,
     clusters: dict,
     colors: np.ndarray | None = None,
-    scalebar: dict | None = None,
+    scalebar=None,
     figax=None,
 ):
     """Map of orientation clusters (variants), one color per cluster.
@@ -870,8 +900,9 @@ def plot_cluster_map(
         Output of :meth:`OrientationMap.cluster_orientations`.
     colors : sequence | None
         One color per cluster, cycled; defaults to `CLUSTER_COLORS`.
-    scalebar : dict | None
-        Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
+    scalebar : bool | dict | ScalebarConfig | None
+        Real-space scale bar: True, a ScalebarConfig, or a dict of its
+        fields, e.g. {"sampling": 30, "units": "A", "loc": "lower left"}.
     figax : (fig, ax) | None
         Existing axes to draw into.
 
@@ -910,18 +941,7 @@ def plot_cluster_map(
         for k in range(K)
     ]
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
-    if scalebar is not None:
-        add_scalebar_to_ax(
-            ax,
-            array_size=rgb.shape[1],
-            sampling=scalebar.get("sampling", 1.0),
-            length_units=scalebar.get("length", None),
-            units=scalebar.get("units", "pixels"),
-            width_px=rgb.shape[0] / 40,
-            pad_px=rgb.shape[0] / 80,
-            color=scalebar.get("color", "white"),
-            loc="lower right",
-        )
+    _draw_map_scalebar(ax, scalebar, rgb.shape)
     return fig, ax
 
 
