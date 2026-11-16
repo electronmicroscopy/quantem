@@ -345,7 +345,7 @@ class TestLatticeAtoms:
             contrast_min=0.2,
             annulus_radii=(5, 10),
         ).refine_atoms(
-            fit_radius=15.0,
+            fit_radius=12.0,
             max_nfev=250,
             max_move_px=5.0,
         )
@@ -372,7 +372,7 @@ class TestLatticeAtoms:
             contrast_min=0.2,
             annulus_radii=(5, 10),
             refine_atoms=True,
-            fit_radius=15.0,
+            fit_radius=12.0,
             max_nfev=250,
             max_move_px=5.0,
         )
@@ -501,7 +501,7 @@ class TestLatticeAtomsSynGT:
             intensity_radius=3.0,
             edge_min_dist_px=margin,
         )
-        lattice.refine_atoms(fit_radius=5.0, max_move_px=margin)
+        lattice.refine_atoms(fit_radius=5.0)
 
         errors = []
         n_matched = 0

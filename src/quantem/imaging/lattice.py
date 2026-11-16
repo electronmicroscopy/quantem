@@ -585,7 +585,7 @@ class Lattice(AutoSerialize):
 
         def _resolve_radius(value: float) -> float:
             """Convert a user-supplied radius value to pixels given radius_units."""
-            if not value > 1.0:
+            if not value >= 1.0 and radius_units == "px":
                 raise ValueError("Radius must be atleast 1 px.")
             return float(value) * auto_r if radius_units == "auto" else float(value)
 
@@ -604,13 +604,13 @@ class Lattice(AutoSerialize):
 
         # Sanity checks for radii
         if not rin < rout:
-            if rin - rout < 1:  # Floating point equality check for pixel values
+            if rin - rout < 1e-6:  # Floating point equality check for pixel values
                 raise ValueError("annulus_radii cannot be equal.")
             # Swap
             temp = rin
             rin = rout
             rout = temp
-        if not r_px <= rin and r_px < rout:
+        if r_px > rin:
             raise ValueError("intensity_radius must be smaller than or equal to annulus_radii.")
         # Range check
         if r_px / auto_r > 1.0:
@@ -636,7 +636,7 @@ class Lattice(AutoSerialize):
 
         # PREPARE MASK AND DISTANCE TRANSFORM (if provided)
 
-        DT: None = None  # Distance transform of the mask (computed if mask is provided)
+        DT: NDArray | None = None  # Distance transform of the mask (computed if mask is provided)
         if mask is not None:
             m = np.asarray(mask).astype(bool)
 
@@ -1007,11 +1007,17 @@ class Lattice(AutoSerialize):
         # SETUP FITTING PARAMETERS
 
         # Fitting radius: auto-estimate or user-provided
-        r_fit = (
-            float(fit_radius)
-            if fit_radius is not None and fit_radius <= _auto_radius_px() and fit_radius > 1.0
-            else _auto_radius_px()
-        )
+        if fit_radius is None:
+            r_fit = _auto_radius_px()
+        elif fit_radius <= _auto_radius_px() and fit_radius > 1.0:
+            r_fit = float(fit_radius)
+        else:
+            import warnings
+
+            warnings.warn(
+                f"fit_radius value for this dataset must be between 1.0 and {_auto_radius_px():.2f}. \n Reverting to default = {_auto_radius_px():.2f} px."
+            )
+            r_fit = _auto_radius_px()
 
         # Integer pixel range for patch extraction (used in neighborhood lookups)
         R = int(np.ceil(r_fit))
@@ -1118,7 +1124,7 @@ class Lattice(AutoSerialize):
                 # Amplitude: maximum pixel value minus background, i.e. max - median; (with safety floor)
                 amp0 = max(float(np.max(patch[mask]) - bg0), 1e-6)
 
-                # Gaussian width: one-fourth the fitting radius (with safety floor)
+                # Gaussian width: half the fitting radius (with safety floor)
                 sig0 = max(r_fit * 0.5, 0.5)
 
                 # Extract coordinates of pixels in the mask
@@ -1168,7 +1174,9 @@ class Lattice(AutoSerialize):
                     x_ub,
                     y_ub,
                     pmax + (pmax - pmin),
-                    max(1.1 * r_fit if fit_radius is None else 1.5 * r_fit, 1.0),
+                    max(
+                        1.1 * r_fit if abs(r_fit - _auto_radius_px()) < 1e-6 else 1.5 * r_fit, 1.0
+                    ),
                     pmax + (pmax - pmin),
                 ]
 
