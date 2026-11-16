@@ -176,52 +176,8 @@ def drift_field(self, idx: int) -> torch.Tensor:
     )
 
 
-def probe_positions(
-    self,
-    image_index: int = 0,
-    *,
-    corrected: bool = True,
-    strip_padding: bool = True,
-    plot: bool = True,
-    stride: int = 16,
-) -> np.ndarray:
-    """Return nominal or drift-updated probe positions for one scan image.
-
-    Positions retain the raw diffraction-pattern indexing and use ``(row,
-    col)`` coordinates in the shared corrected frame. This lets iterative
-    ptychography consume corrected positions without interpolating detector
-    data.
-
-    Parameters
-    ----------
-    image_index : int, default 0
-        Scan image or 4D-STEM acquisition to describe.
-    corrected : bool, default True
-        Return fitted positions instead of the nominal scan grid.
-    strip_padding : bool, default True
-        Express positions in the original image-0 frame instead of the padded
-        solver canvas.
-    plot : bool, default True
-        Draw the nominal and corrected positions for inspection.
-    stride : int, default 16
-        Subsampling used only by the plot.
-
-    Returns
-    -------
-    numpy.ndarray
-        Position array with shape ``(scan_rows, scan_columns, 2)``.
-
-    Examples
-    --------
-    >>> positions = drift.probe_positions(image_index=0, plot=False)
-    """
-    if not hasattr(self, "_initial_knots"):
-        raise RuntimeError(
-            "probe_positions() requires preprocess() first. Run "
-            "dc.preprocess() before exporting nominal or corrected "
-            "probe positions."
-        )
-    index = image_index % len(self.imgs)
+def _canvas_positions(self, index, corrected, strip_padding):
+    """Return dense positions in solver pixels for image-space operations."""
     knots = (
         self.knots[index]
         if corrected
@@ -239,13 +195,111 @@ def probe_positions(
             device=positions.device,
             dtype=positions.dtype,
         )
-    result = to_numpy(positions, dtype=np.float32)
-    if plot:
-        self.plot_probe_positions(
-            image_index=index,
-            strip_padding=strip_padding,
-            stride=stride,
+    return to_numpy(positions, dtype=np.float32)
+
+
+def probe_positions(
+    self,
+    image_index: int | None = None,
+    *,
+    corrected: bool = True,
+    strip_padding: bool = True,
+    show: bool = False,
+    stride: int = 16,
+) -> np.ndarray:
+    """Return nominal or drift-updated probe positions in the shared scan frame.
+
+    Positions retain the raw diffraction-pattern indexing and use ``(row,
+    col)`` coordinates in the shared corrected frame. This lets iterative
+    ptychography consume corrected positions without interpolating detector
+    data.
+
+    Parameters
+    ----------
+    image_index : int, optional
+        Select a single scan. By default, stack all scans in acquisition order.
+    corrected : bool, default True
+        Return fitted positions instead of the nominal scan grid.
+    strip_padding : bool, default True
+        Express positions in the original image-0 frame instead of the padded
+        solver canvas.
+    show : bool, default False
+        Draw the nominal and corrected positions for inspection.
+    stride : int, default 16
+        Subsampling used only by the plot.
+
+    Returns
+    -------
+    numpy.ndarray
+        Coordinates in ångströms on the native acquisition raster, with shape
+        (scans, acquired rows, acquired columns, 2).
+        Selecting one scan removes the leading scan axis.
+
+    Examples
+    --------
+    >>> positions_A = drift.probe_positions(show=True)
+    """
+    if not hasattr(self, "_initial_knots"):
+        raise RuntimeError(
+            "probe_positions() requires preprocess() first. Run "
+            "dc.preprocess() before exporting nominal or corrected "
+            "probe positions."
         )
+    if image_index is None:
+        indices = tuple(range(len(self.imgs)))
+        result = np.stack([
+            self.probe_positions(i, corrected=corrected, strip_padding=strip_padding)
+            for i in indices
+        ])
+        selection = indices if len(indices) > 1 else indices[0]
+    else:
+        index = image_index % len(self.imgs)
+        image = self.imgs[index]
+        factor = image.metadata.get("upsample", 1)
+        downsample = getattr(self, "downsample", 1)
+        raw_shape = image.metadata.get("downsample_original_shape", image.shape)[:2]
+        if not isinstance(factor, (int, np.integer)) or factor < 1 or any(n % factor for n in raw_shape):
+            raise ValueError("Supply a positive integer upsample dividing both phase dimensions.")
+        reference = self.imgs[0]
+        scales = {"nm": 10., "angstrom": 1., "ångström": 1., "å": 1., "a": 1.,
+                  "pm": 0.01, "µm": 1e4, "μm": 1e4, "um": 1e4, "m": 1e10}
+        try:
+            sampling_A = np.array([scales[str(u).strip().lower()] * v for u, v in
+                                   zip(reference.units[:2], reference.sampling[:2], strict=True)])
+        except KeyError as exc:
+            raise ValueError("Set physical scan sampling and length units before exporting positions.") from exc
+        if not np.all(np.isfinite(sampling_A) & (sampling_A > 0)):
+            raise ValueError("Set finite positive physical scan sampling before exporting positions.")
+        canvas = _canvas_positions(self, index, corrected, False)
+        if downsample == 1:
+            sites = canvas[::factor, ::factor].astype(np.float64)
+        else:
+            # Average-binned pixels are located at block centres. Interpolate the
+            # displacement only, retaining the nominal raster up to its outer edges.
+            from scipy.ndimage import map_coordinates
+
+            r, c = np.indices(tuple(n // factor for n in raw_shape), dtype=float)
+            rc = (np.stack((r, c)) * factor - (downsample - 1) / 2) / downsample
+            nominal = _canvas_positions(self, index, False, False)
+            delta = canvas - nominal
+            sites = (nominal[0, 0] + rc[0, ..., None] * self.scan_slow[index]
+                     + rc[1, ..., None] * self.scan_fast[index])
+            for axis in range(2):
+                sites[..., axis] += map_coordinates(delta[..., axis], rc, order=1, mode="nearest")
+        # Express every acquisition in the nominal row and column axes of scan 0.
+        basis = np.stack((self.scan_slow[0], self.scan_fast[0]))
+        origin = self._initial_knots[0][:, 0, 0].detach().cpu().numpy()
+        result = (sites - origin) @ basis.T
+        result += (downsample - 1) / (2 * downsample)
+        if not strip_padding:
+            result += padding_offset(self.shape[1:], reference.shape[:2])
+        result *= sampling_A
+        selection = index
+    if show:
+        from matplotlib import pyplot as plt
+
+        self.plot_probe_positions(image_index=selection, strip_padding=strip_padding, stride=stride)
+        plt.show()
     return result
 
 
@@ -518,12 +572,7 @@ def regional_diffraction_patterns(
     for stage_index, stage in enumerate(requested_stages):
         corrected = stage == "corrected"
         for scan_index, dataset in enumerate(source_datasets):
-            positions = self.probe_positions(
-                scan_index,
-                corrected=corrected,
-                strip_padding=True,
-                plot=False,
-            )
+            positions = _canvas_positions(self, scan_index, corrected, True)
             for region_index, (name, center) in enumerate(
                 zip(region_names, region_centers, strict=True)
             ):

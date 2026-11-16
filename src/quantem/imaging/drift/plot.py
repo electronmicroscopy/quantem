@@ -128,7 +128,8 @@ def overlay_pair(
 def plot_probe_positions(
     self,
     *,
-    image_index: int = 0,
+    image_index: int | tuple[int, ...] = 0,
+    zoom: float = 1.0,
     stride: int = 16,
     strip_padding: bool = True,
     axsize: tuple[float, float] = (5.0, 4.8),
@@ -144,10 +145,15 @@ def plot_probe_positions(
 
     Parameters
     ----------
-    image_index : int, default 0
-        Scan whose probe positions are shown.
+    image_index : int or tuple of int, default 0
+        One scan shows its position overlay and displacement vectors. Two indices
+        compare nominal and fitted rasters side by side. Arrows in the nominal
+        panel indicate the direction of increasing acquisition column.
+    zoom : float, default 1
+        Magnification about the field center. Displacements remain to scale.
     stride : int, default 16
-        Plot every nth position along each scan axis.
+        Plot every nth site along each scan axis. The paired view counts native
+        probe sites when the phase images record their upsampling.
     strip_padding : bool, default True
         Express positions in the original image frame.
     axsize : tuple of float, default (5.0, 4.8)
@@ -166,19 +172,63 @@ def plot_probe_positions(
     --------
     >>> figure, axes = drift.plot_probe_positions(image_index=1, stride=8)
     """
+    from quantem.imaging.drift.fourdstem import _canvas_positions
+
     if stride < 1:
         raise ValueError("stride must be >= 1")
-    nominal = self.probe_positions(
-        image_index=image_index,
+    if not np.isfinite(zoom) or zoom <= 0:
+        raise ValueError("Choose a positive finite zoom.")
+    rows, cols = self.imgs[0].shape[:2]
+    center_row, center_col = (np.asarray(self.shape[1:] if not strip_padding else (rows, cols)) - 1) / 2
+    xlim = center_col + np.array([-0.5, 0.5]) * cols / zoom
+    ylim = center_row + np.array([0.5, -0.5]) * rows / zoom
+    if isinstance(image_index, tuple):
+        if len(image_index) < 2 or len(set(image_index)) != len(image_index) or any(
+            i < 0 or i >= len(self.imgs) for i in image_index
+        ):
+            raise ValueError("Choose distinct scan indices for the paired view.")
+        fig, axes = plt.subplots(1, 2, sharex=True, sharey=True, figsize=(2 * axsize[0], axsize[1]))
+        before, after = axes
+        for slot, i in enumerate(image_index):
+            marker = ("o", "x", "+", "s")[slot % 4]
+            color = f"C{slot % 10}"
+            step = stride * self.imgs[i].metadata.get("upsample", 1)
+            label = f"Scan {i}: {self.scan_direction_degrees[i]:g}°"
+            for ax, corrected in ((before, False), (after, True)):
+                sites = _canvas_positions(self, i, corrected, strip_padding)
+                points = sites[::step, ::step]
+                ax.plot(points[..., 1].ravel(), points[..., 0].ravel(), linestyle="none",
+                        marker=marker, markerfacecolor="none", color=color, label=label, markersize=5)
+                if not corrected:
+                    # Draw a direction key in axes coordinates; row increases downward.
+                    row, col = sites[0, -1] - sites[0, 0]
+                    direction = np.array([col, -row])
+                    length = np.linalg.norm(direction)
+                    if length:
+                        start = np.array([(slot + 0.3) / len(image_index), 0.85])
+                        before.annotate("", xy=start + 0.13 * direction / length, xytext=start,
+                                        xycoords="axes fraction",
+                                        arrowprops=dict(arrowstyle="-|>", color=color, lw=2.5))
+        before.set(title="Nominal positions · fast-scan arrows", ylabel="Row (px)")
+        if zoom != 1:
+            before.set(xlim=xlim, ylim=ylim)
+        else:
+            before.invert_yaxis()
+        after.set_title("Fitted positions")
+        for ax in axes:
+            ax.set(xlabel="Column (px)", aspect="equal")
+        fig.legend(*before.get_legend_handles_labels(), loc="upper center", ncol=2)
+        fig.tight_layout(rect=(0, 0, 1, 0.91))
+        return fig, axes
+    nominal = _canvas_positions(
+        self, image_index,
         corrected=False,
         strip_padding=strip_padding,
-        plot=False,
     )
-    corrected = self.probe_positions(
-        image_index=image_index,
+    corrected = _canvas_positions(
+        self, image_index,
         corrected=True,
         strip_padding=strip_padding,
-        plot=False,
     )
     disp = corrected - nominal
     mag = np.linalg.norm(disp, axis=-1)
@@ -232,6 +282,8 @@ def plot_probe_positions(
     for ax in axes:
         ax.set_aspect("equal")
         ax.invert_yaxis()
+        if zoom != 1:
+            ax.set(xlim=xlim, ylim=ylim)
         ax.grid(alpha=0.2, linewidth=0.5)
     fig.tight_layout()
     return fig, axes

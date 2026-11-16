@@ -159,12 +159,8 @@ def test_regional_patterns_average_native_detector_samples():
     assert comparison["patterns"].shape == (2, 1, 2, 4, 5)
     for stage_index, corrected in enumerate((False, True)):
         for scan_index, cube in enumerate((cube_0, cube_1)):
-            positions = drift.probe_positions(
-                scan_index,
-                corrected=corrected,
-                strip_padding=True,
-                plot=False,
-            )
+            from quantem.imaging.drift.fourdstem import _canvas_positions
+            positions = _canvas_positions(drift, scan_index, corrected, True)
             mask = (
                 (positions[..., 0] - 8.0) ** 2
                 + (positions[..., 1] - 8.0) ** 2

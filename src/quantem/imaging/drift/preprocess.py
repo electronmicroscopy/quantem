@@ -133,7 +133,7 @@ def prepare_inputs(
                 from quantem.imaging.drift.fourdstem import integrate_virtual_detector
 
                 moving = integrate_virtual_detector(second)
-            prepare_image_collection(correction, [first, moving], angles)
+            prepare_image_collection(correction, [first, moving], angles, datasets)
             correction._reference_mode = True
             correction._datasets = [None, second]
             correction._built_from_datasets = True

@@ -199,3 +199,53 @@ def test_nonrigid_diagnostic_defines_fast_roughness():
     doc = DriftCorrection.diagnose_nonrigid.__doc__ or ""
     assert "root-mean-square difference between neighboring knot" in doc
     assert "does not measure image noise" in doc
+
+
+def test_paired_position_plot_uses_native_sites_and_measured_scan_directions():
+    first, second = _orthogonal_pair()
+    for scan in (first, second):
+        scan.metadata["upsample"] = 2
+    drift = DriftCorrection.from_images(first, second, device="cpu")
+    drift.preprocess(show_combined=False, show_knots=False, verbose=False)
+    fig, (before, after) = drift.plot_probe_positions(image_index=(0, 1), stride=4, zoom=4)
+    try:
+        for i, arrow in enumerate(before.texts):
+            sites = drift.probe_positions(i, corrected=False)
+            row, col = sites[0, -1] - sites[0, 0]
+            expected = np.array([col, -row])
+            np.testing.assert_allclose(np.subtract(arrow.xy, arrow.xyann), 0.13 * expected / np.linalg.norm(expected), atol=1e-6)
+            np.testing.assert_allclose(before.lines[i].get_xdata(), sites[::4, ::4, 1].ravel() / 0.8, atol=1e-5)
+        assert len(before.texts) == 2 and not after.texts
+        assert np.isclose(np.diff(before.get_xlim()).item(), first.shape[1] / 4)
+        assert before.get_ylim() == after.get_ylim() and before.yaxis_inverted()
+    finally:
+        plt.close(fig)
+
+
+def test_probe_positions_returns_the_same_full_arrays_with_or_without_show(monkeypatch):
+    first, second = _orthogonal_pair()
+    drift = DriftCorrection.from_images(first, second, device="cpu")
+    drift.preprocess(show_combined=False, show_knots=False, verbose=False)
+    figures = []
+    monkeypatch.setattr(plt, "show", lambda: figures.append(plt.gcf()))
+    expected = np.stack([drift.probe_positions(0), drift.probe_positions(1)])
+    np.testing.assert_array_equal(drift.probe_positions(), expected)
+    assert not figures
+    np.testing.assert_array_equal(drift.probe_positions(show=True), expected)
+    assert len(figures) == 1
+    plt.close(figures[0])
+
+
+@pytest.mark.parametrize("downsample", [1, 2])
+def test_probe_positions_native_angstrom_raster(downsample):
+    """Recover each measured site, including edges, in the first scan's axes."""
+    scans = _orthogonal_pair()
+    for scan, angle in zip(scans, [25, 115], strict=True):
+        scan.metadata.update(upsample=2, scan_rotation_deg=angle)
+    drift = DriftCorrection.from_images(*scans, device="cpu")
+    drift.preprocess(downsample=downsample, verbose=False, show_knots=False)
+    positions = drift.probe_positions(corrected=False)
+    assert positions.shape == (2, 32, 32, 2)
+    row, col = np.indices((32, 32))
+    np.testing.assert_allclose(positions[0], np.stack((row, col), axis=-1) * 1.6, atol=2e-5)
+    np.testing.assert_allclose(positions[1, 1] - positions[1, 0], np.tile([0, -1.6], (32, 1)), atol=2e-5)
