@@ -241,8 +241,10 @@ class ShowParams:
             ``"nm"`` for data calibrated in ``"μm"``, or ``"1/Å"`` for data in
             ``"1/nm"``. Supports pm, Å, nm, μm, mm, cm, m and their reciprocals.
             ``None`` picks units automatically from the bar length.
-        width_px : float
-            Thickness of the bar in image pixels. Default 1.
+        width_px : float | None
+            Thickness of the bar in image pixels; fractions are kept. Default
+            None: 1 pixel on an image, scaled to the map size on orientation
+            and phase maps.
         pad_px : float | None
             Padding between bar and plot edge in image pixels. Default None,
             matplotlib's spacing, which scales with the font size.
@@ -278,7 +280,7 @@ class ShowParams:
         units: str = "pixels"
         length: float | None = None
         display_units: str | None = None
-        width_px: float = 1
+        width_px: float | None = None
         pad_px: float | None = None
         color: str = "white"
         loc: Literal["lower right", "lower left", "upper right", "upper left"] = "lower right"
@@ -294,7 +296,8 @@ class ShowParams:
             validate_gt(self.sampling, 0, "sampling")
             if self.length is not None:
                 validate_gt(self.length, 0, "length")
-            validate_gt(self.width_px, 0, "width_px")
+            if self.width_px is not None:
+                validate_gt(self.width_px, 0, "width_px")
             validate_gt(self.fontsize, 0, "fontsize")
             validate_gt(self.outline_width, 0, "outline_width")
             if self.display_units is not None and _parse_length_units(self.display_units) is None:

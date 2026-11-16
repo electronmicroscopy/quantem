@@ -139,8 +139,10 @@ class ScalebarConfig:
         Converts between pm, Å, nm, μm, mm, cm and m, or between their
         reciprocals (e.g. "1/nm" to "1/Å"). If None, units are chosen
         automatically from the bar length.
-    width_px : float, default=1
-        Width of the scale bar in pixels.
+    width_px : float, optional
+        Thickness of the scale bar in image pixels; fractions are kept. If
+        None, the plot chooses: 1 pixel for an image, or a fraction of the
+        map size for orientation and phase maps.
     pad_px : float, optional
         Gap between the scale bar (or its box) and the edge of the plot, in
         image pixels. If None, matplotlib's default spacing is used, which
@@ -172,7 +174,7 @@ class ScalebarConfig:
     units: str = "pixels"
     length: float | None = None
     display_units: str | None = None
-    width_px: float = 1
+    width_px: float | None = None
     pad_px: float | None = None
     color: str = "white"
     loc: str | int = "lower right"
@@ -524,7 +526,7 @@ def add_scalebar_to_ax(
     sampling: float,
     length_units: float | None,
     units: str,
-    width_px: float,
+    width_px: float | None,
     pad_px: float | None,
     color: str,
     loc: str | int,
@@ -552,8 +554,8 @@ def add_scalebar_to_ax(
         will be estimated.
     units : str
         Units to display on the scale bar.
-    width_px : float
-        Width of the scale bar in pixels.
+    width_px : float or None
+        Thickness of the scale bar in image pixels. None means 1 pixel.
     pad_px : float or None
         Gap between the scale bar (or its box) and the edge of the plot, in
         image pixels. None uses matplotlib's default spacing.
@@ -627,7 +629,7 @@ def add_scalebar_to_ax(
         color=color,
         frameon=box,
         label_top=label_top,
-        size_vertical=float(width_px),
+        size_vertical=1.0 if width_px is None else float(width_px),
         fontproperties=fontprops,
         sep=2 if label_top else int(round(0.3 * fontsize)),
     )

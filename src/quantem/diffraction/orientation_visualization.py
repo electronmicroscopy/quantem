@@ -7,7 +7,6 @@ import torch
 
 from quantem.core.utils.rotations import quat_to_matrix
 from quantem.core.visualization.visualization_utils import (
-    ScalebarConfig,
     _resolve_scalebar,
     add_scalebar_to_ax,
 )
@@ -370,14 +369,14 @@ def _draw_map_scalebar(ax, scalebar, shape) -> None:
 
     Accepts None/False (no bar), True, a dict of :class:`ScalebarConfig`
     fields, a ScalebarConfig or a ``ShowParams.Scalebar``. Every field is
-    honored. A bar width left at the ScalebarConfig default is scaled to the
-    map size instead, since a one-pixel bar is invisible on a scan.
+    honored. With no width_px set, the bar is 1/40 of the map height thick,
+    since a one-pixel bar is invisible on a scan; any width_px given,
+    including 1, is used as it is.
     """
     cfg = _resolve_scalebar(scalebar)
     if cfg is None:
         return
-    defaults = ScalebarConfig()
-    width_px = shape[0] / 40 if cfg.width_px == defaults.width_px else cfg.width_px
+    width_px = shape[0] / 40 if cfg.width_px is None else cfg.width_px
     add_scalebar_to_ax(
         ax,
         array_size=shape[1],
