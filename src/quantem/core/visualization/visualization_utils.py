@@ -141,8 +141,10 @@ class ScalebarConfig:
         automatically from the bar length.
     width_px : float, default=1
         Width of the scale bar in pixels.
-    pad_px : float, default=0.5
-        Padding around the scale bar in pixels.
+    pad_px : float, optional
+        Gap between the scale bar (or its box) and the edge of the plot, in
+        image pixels. If None, matplotlib's default spacing is used, which
+        scales with the label font size rather than the image.
     color : str, default="white"
         Color of the scale bar.
     loc : str or int, default="lower right"
@@ -171,7 +173,7 @@ class ScalebarConfig:
     length: float | None = None
     display_units: str | None = None
     width_px: float = 1
-    pad_px: float = 0.5
+    pad_px: float | None = None
     color: str = "white"
     loc: str | int = "lower right"
     fontsize: int = 12
@@ -492,6 +494,30 @@ def _normalize_length_units(length_units: float, units: str) -> tuple[float, str
         return length_A / 1e10, "m"
 
 
+class _PixelPaddedSizeBar(AnchoredSizeBar):
+    """AnchoredSizeBar held `pad_px` image pixels from the edge of the axes.
+
+    matplotlib measures `borderpad` in multiples of the label font size, so
+    a gap in image pixels has to be converted with the current data-to-screen
+    scale. That is redone every time the bar is placed, so the gap follows
+    any later change of figure size or layout (e.g. ``tight_layout``).
+    """
+
+    def __init__(self, transform, *args, pad_px: float, **kwargs):
+        super().__init__(transform, *args, borderpad=0.0, **kwargs)
+        self._pad_px = float(pad_px)
+        self._pad_transform = transform
+
+    def get_offset(self, *args, **kwargs):
+        renderer = kwargs.get("renderer", args[-1] if args else None)
+        if renderer is not None:
+            (x0, y0), (x1, y1) = self._pad_transform.transform([(0, 0), (1, 1)])
+            screen_px_per_image_px = 0.5 * (abs(x1 - x0) + abs(y1 - y0))
+            fontsize = renderer.points_to_pixels(self.prop.get_size_in_points())
+            self.borderpad = self._pad_px * screen_px_per_image_px / fontsize
+        return super().get_offset(*args, **kwargs)
+
+
 def add_scalebar_to_ax(
     ax: Axes,
     array_size: float,
@@ -499,7 +525,7 @@ def add_scalebar_to_ax(
     length_units: float | None,
     units: str,
     width_px: float,
-    pad_px: float,
+    pad_px: float | None,
     color: str,
     loc: str | int,
     fontsize: int = 12,
@@ -528,8 +554,9 @@ def add_scalebar_to_ax(
         Units to display on the scale bar.
     width_px : float
         Width of the scale bar in pixels.
-    pad_px : float
-        Padding around the scale bar in pixels.
+    pad_px : float or None
+        Gap between the scale bar (or its box) and the edge of the plot, in
+        image pixels. None uses matplotlib's default spacing.
     color : str
         Color of the scale bar.
     loc : str or int
@@ -596,19 +623,27 @@ def add_scalebar_to_ax(
     fontprops = FontProperties(size=fontsize, weight="bold" if bold else "normal")
 
     label_top = loc[:3] == "low"
-    bar = AnchoredSizeBar(
-        ax.transData,
-        length_px,
-        label,
-        loc,
-        pad=pad_px,
+    bar_kwargs = dict(
         color=color,
         frameon=box,
         label_top=label_top,
-        size_vertical=int(width_px),
+        size_vertical=float(width_px),
         fontproperties=fontprops,
         sep=2 if label_top else int(round(0.3 * fontsize)),
     )
+    if pad_px is None:
+        # matplotlib's own spacing, in multiples of the label font size
+        bar = AnchoredSizeBar(ax.transData, length_px, label, loc, pad=0.5, **bar_kwargs)
+    else:
+        bar = _PixelPaddedSizeBar(
+            ax.transData,
+            length_px,
+            label,
+            loc,
+            pad=0.3 if box else 0.0,
+            pad_px=pad_px,
+            **bar_kwargs,
+        )
     if box:
         bar.patch.set(facecolor=box_color, edgecolor="none", alpha=box_alpha)
     if outline_color is not None:

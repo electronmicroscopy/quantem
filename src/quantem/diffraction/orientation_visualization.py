@@ -370,15 +370,14 @@ def _draw_map_scalebar(ax, scalebar, shape) -> None:
 
     Accepts None/False (no bar), True, a dict of :class:`ScalebarConfig`
     fields, a ScalebarConfig or a ``ShowParams.Scalebar``. Every field is
-    honored. A bar width and padding left at the ScalebarConfig defaults are
-    scaled to the map size instead, since one pixel is invisible on a scan.
+    honored. A bar width left at the ScalebarConfig default is scaled to the
+    map size instead, since a one-pixel bar is invisible on a scan.
     """
     cfg = _resolve_scalebar(scalebar)
     if cfg is None:
         return
     defaults = ScalebarConfig()
     width_px = shape[0] / 40 if cfg.width_px == defaults.width_px else cfg.width_px
-    pad_px = shape[0] / 80 if cfg.pad_px == defaults.pad_px else cfg.pad_px
     add_scalebar_to_ax(
         ax,
         array_size=shape[1],
@@ -386,7 +385,7 @@ def _draw_map_scalebar(ax, scalebar, shape) -> None:
         length_units=cfg.length,
         units=cfg.units,
         width_px=width_px,
-        pad_px=pad_px,
+        pad_px=cfg.pad_px,
         color=cfg.color,
         loc=cfg.loc,
         fontsize=cfg.fontsize,

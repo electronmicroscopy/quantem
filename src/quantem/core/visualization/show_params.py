@@ -243,8 +243,9 @@ class ShowParams:
             ``None`` picks units automatically from the bar length.
         width_px : float
             Thickness of the bar in image pixels. Default 1.
-        pad_px : float
-            Padding between bar and plot edge in image pixels. Default 0.5.
+        pad_px : float | None
+            Padding between bar and plot edge in image pixels. Default None,
+            matplotlib's spacing, which scales with the font size.
         color : str
             Bar and label colour. Default ``"white"``.
         loc : ``"lower right"`` | ``"lower left"`` | ``"upper right"`` | ``"upper left"``
@@ -278,7 +279,7 @@ class ShowParams:
         length: float | None = None
         display_units: str | None = None
         width_px: float = 1
-        pad_px: float = 0.5
+        pad_px: float | None = None
         color: str = "white"
         loc: Literal["lower right", "lower left", "upper right", "upper left"] = "lower right"
         fontsize: int = 12
