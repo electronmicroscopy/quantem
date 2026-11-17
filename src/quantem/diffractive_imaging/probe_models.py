@@ -2,7 +2,6 @@ from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Self, Union, cast
-from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -1158,8 +1157,6 @@ class ProbeDIP(ProbeConstraints):
         self.register_buffer("_pretrain_target", torch.tensor([]))
 
         self._model = model.to(self._device)
-        if roi_shape is not None:
-            self._check_roi_shape()
         self.set_pretrained_weights(self._model)
 
         self._optimizer = None
@@ -1358,7 +1355,6 @@ class ProbeDIP(ProbeConstraints):
         super().set_initial_probe(
             roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
         )
-        self._check_roi_shape()
 
         # could check if num_probes corresponds to out_channels of model
 
@@ -1546,22 +1542,6 @@ class ProbeDIP(ProbeConstraints):
         raise NotImplementedError(
             f"Analytical gradients are not implemented for {self.name}, use autograd=True"
         )
-
-    def _check_roi_shape(self):
-        num_layers = getattr(self.model, "num_layers", None)
-        if num_layers is not None:
-            if not np.all(np.array(self.roi_shape) % 2**num_layers == 0):
-                raise ValueError(
-                    f"Model has {num_layers} layers, but ROI shape {self.roi_shape} is not "
-                    f"divisible by 2^{num_layers} for all dimensions.\nPlease crop or pad the "
-                    "dataset in reciprocal space to fix this error."
-                )
-        else:
-            warn(
-                "Model has no num_layers attribute, so cannot check if the ROI shape is "
-                "compatible with the model.\nIf using a ConvNet, ensure that the ROI shape is "
-                "divisble by 2^num_layers for all dimensions."
-            )
 
 
 ProbeModelType = ProbePixelated | ProbeDIP

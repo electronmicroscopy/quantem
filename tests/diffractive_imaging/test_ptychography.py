@@ -7,16 +7,18 @@ Gradient equivalence between autograd and the analytic path lives in
 
 import numpy as np
 import pytest
+import torch
 
 from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml import OptimizerParams
+from quantem.core.ml.cnn import CNN2d
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.object_models import ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbePixelated
+from quantem.diffractive_imaging.probe_models import ProbeDIP, ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 
 if config.NUM_DEVICES > 0:
@@ -266,6 +268,16 @@ def _build_aspect_ratio_ptycho(complex_obj, probe_array, gpts, com_rotation, tra
     )
     ptycho.preprocess(obj_padding_px=(0, 0))
     return ptycho
+
+
+def test_probe_dip_detector_not_divisible_by_pooling():
+    probe_model = ProbeDIP.from_model(
+        model=CNN2d(in_channels=1, dtype=torch.complex64, num_layers=3, start_filters=4),
+        roi_shape=(20, 20),
+        num_probes=1,
+        probe_params={"energy": PROBE_ENERGY, "C10": C10, "semiangle_cutoff": 20},
+    )
+    assert probe_model.probe.shape == (1, 20, 20)
 
 
 class TestAspectRatioRotatedFOV:

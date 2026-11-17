@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.io.serialize import load
 
 
 @pytest.fixture
@@ -63,6 +64,14 @@ class TestDataset4dstemInitialization:
             "pixels",
         ]  # Default units
         assert dataset.signal_units == "arb. units"  # Default signal units
+
+
+def test_load_file_saved_before_metadata_existed(sample_dataset4dstem, tmp_path):
+    del sample_dataset4dstem._metadata
+    sample_dataset4dstem.save(tmp_path / "old.zip", mode="o")
+    loaded = load(tmp_path / "old.zip")
+    loaded.metadata["q_to_r_rotation_ccw_deg"] = 12.0
+    assert loaded.metadata == {"q_to_r_rotation_ccw_deg": 12.0}
 
 
 class TestDataset4dstemGetItem:

@@ -116,7 +116,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # initializing default attributes
         self._multi_gpu_devices: list[int] | None = None
         self._preprocessed: bool = False
-        self._obj_padding_force_power2_level: int = 3
         self._store_snapshots: bool = False
         self._store_snapshot_every: int = 1
         self._iter_losses: list[float] = []
@@ -363,7 +362,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @obj_padding_px.setter
     def obj_padding_px(self, pad: np.ndarray | tuple[int, int]):
-        p2 = self._to_numpy(
+        self._obj_padding_px = self._to_numpy(
             validate_array(
                 validate_np_len(pad, 2, name="obj_padding_px"),
                 dtype="int16",
@@ -371,13 +370,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 name="obj_padding_px",
             )
         )
-        if self._obj_padding_force_power2_level > 0:
-            p2 = adjust_padding_power2(
-                p2,
-                self.dset._obj_shape_full_2d((0, 0)),
-                self._obj_padding_force_power2_level,
-            )
-        self._obj_padding_px = p2
         self.obj_model._initialize_obj(shape=self.obj_shape_full, sampling=self.sampling)
         self.dset._set_initial_scan_positions_px(self.obj_padding_px)
         self.dset._set_patch_indices(self.obj_padding_px)
@@ -1179,20 +1171,3 @@ def remove_global_phase(obj: np.ndarray) -> np.ndarray:
     if np.abs(m) == 0:
         return obj
     return obj * (np.conj(m) / np.abs(m))
-
-
-def adjust_padding_power2(pad, shape, power2_level):
-    """
-    Adjusts pad so that (shape + 2*pad) is divisible by 2**power2_level.
-    """
-    div = 2**power2_level
-    rem0 = (shape[-2] + 2 * pad[-2]) % div
-    rem1 = (shape[-1] + 2 * pad[-1]) % div
-    if rem0 != 0:
-        pad[-2] += (div - rem0) // 2
-    if rem1 != 0:
-        pad[-1] += (div - rem1) // 2
-
-    if ((shape[-2] + 2 * pad[-2]) % div != 0) or ((shape[-1] + 2 * pad[-1]) % div != 0):
-        raise ValueError(f"Adjustment failed to achieve divisibility by {div}")
-    return pad
