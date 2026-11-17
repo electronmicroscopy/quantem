@@ -162,10 +162,10 @@ class Dataset4dstem(Dataset4d):
 
     def _post_load(self) -> None:
         """Migrate detector rotation metadata from older serialized datasets."""
-        metadata = getattr(self, "_metadata", None)
+        super()._post_load()
+        metadata = self._metadata
         if (
-            isinstance(metadata, dict)
-            and metadata.get("q_to_r_rotation_ccw_deg") is None
+            metadata.get("q_to_r_rotation_ccw_deg") is None
             and metadata.get("r_to_q_rotation_cw_deg") is not None
         ):
             metadata["q_to_r_rotation_ccw_deg"] = metadata["r_to_q_rotation_cw_deg"]

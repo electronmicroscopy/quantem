@@ -163,6 +163,11 @@ class Dataset(AutoSerialize):
             )
         return tensor
 
+    def _post_load(self) -> None:
+        # files saved before the metadata dict existed have no _metadata
+        if not hasattr(self, "_metadata"):
+            self._metadata = {}
+
     @property
     def metadata(self) -> dict:
         return self._metadata
