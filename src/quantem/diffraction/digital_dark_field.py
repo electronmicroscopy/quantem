@@ -57,6 +57,7 @@ from matplotlib.collections import EllipseCollection
 from matplotlib.colors import hsv_to_rgb
 
 from quantem.core.utils.clustering import cluster_vector, dbscan  # noqa: F401
+from quantem.core.visualization.visualization_utils import color_wheel  # noqa: F401
 
 
 def _scan_cells(vector) -> np.ndarray:
@@ -922,29 +923,6 @@ def composite_ddf(
     scaled = (images / norm[:, None, None]) ** gamma
     rgb = np.einsum("krc,kj->rcj", scaled, colors)
     return np.clip(rgb, 0, 1)
-
-
-def color_wheel(n: int = 256, saturation: float = 1.0) -> np.ndarray:
-    """Hue wheel for labeling composite images.
-
-    Parameters
-    ----------
-    n : int, default=256
-        Size of the output image in pixels.
-    saturation : float, default=1.0
-        Saturation of the hues, from 0 (gray) to 1 (full color).
-
-    Returns
-    -------
-    np.ndarray
-        (n, n, 4) RGBA image in [0, 1], transparent outside the wheel.
-    """
-    y, x = np.mgrid[-1 : 1 : n * 1j, -1 : 1 : n * 1j]
-    r = np.hypot(x, y)
-    hue = (np.arctan2(y, x) / (2 * np.pi)) % 1.0
-    hsv = np.stack([hue, np.full_like(hue, saturation), np.clip(r, 0, 1)], axis=-1)
-    rgba = np.concatenate([hsv_to_rgb(hsv), (r <= 1.0)[..., None].astype(float)], axis=-1)
-    return rgba
 
 
 def plot_cluster_scatter(
