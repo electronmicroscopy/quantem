@@ -18,6 +18,11 @@ K-planes utility functions
 """
 
 
+def shifted_softplus(x: torch.Tensor) -> torch.Tensor:
+    """softplus(x - 1), the default density activation."""
+    return F.softplus(x - 1)
+
+
 def grid_sample_wrapper(
     grid: torch.Tensor, coords: torch.Tensor, align_corners: bool = True
 ) -> torch.Tensor:
@@ -179,9 +184,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Sequence[float] | None = None,
         concat_features: bool = True,
-        density_activation: Callable = lambda x: F.softplus(
-            x - 1
-        ),  # Keep playing around with this and trunc_exp
+        density_activation: Callable = shifted_softplus,  # also try trunc_exp
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -408,7 +411,7 @@ class KPlanesTILTED(KPlanes):
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Sequence[float] | None = None,
-        density_activation: Callable = lambda x: F.softplus(x - 1),
+        density_activation: Callable = shifted_softplus,
         # TILTED parameters
         T: int = 4,
         tau_init: Literal["random", "identity"] = "random",
@@ -678,7 +681,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         multiscale_res_multipliers: Sequence[float] | None = None,
         T: int = 4,
         tau_init: Literal["random", "identity"] = "random",
-        density_activation: Callable = lambda x: F.softplus(x - 1),
+        density_activation: Callable = shifted_softplus,
         so3_param_type: str = "r9svd",
     ):
         super().__init__()

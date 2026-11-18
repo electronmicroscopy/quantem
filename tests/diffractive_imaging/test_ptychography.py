@@ -7,17 +7,20 @@ Gradient equivalence between autograd and the analytic path lives in
 
 import numpy as np
 import pytest
+import torch
 
 from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import load as autoserialize_load
-from quantem.core.ml import OptimizerParams
+from quantem.core.ml import OptimizerParams, SchedulerParams
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.object_models import ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
+
+from .conftest import inr_probe_params, inr_ptychography, inr_synthetic_dataset
 
 if config.NUM_DEVICES > 0:
     config.set_device("gpu")
@@ -360,3 +363,39 @@ class TestPtychographySaveLoadRoundtrip:
         assert reloaded._iter_losses[-1] <= loss_after_reload, (
             "loss must not regress after reload — optimizer state likely lost"
         )
+
+
+def test_default_save_keeps_learned_positions(tmp_path):
+    """A save without the raw data reloads it from its file and keeps the learned scan
+    positions, with the optimizer and scheduler learning them."""
+    pdset, _, probe = inr_synthetic_dataset(raw_path=tmp_path / "raw.zip")
+    pdset.learn_scan_positions = True
+    ptycho, _ = inr_ptychography(
+        ObjectPixelated.from_uniform(num_slices=1, obj_type="complex", slice_thicknesses=1),
+        pdset=pdset,
+        probe_model=ProbePixelated.from_array(
+            num_probes=1, probe_params=inr_probe_params(), probe_array=probe.copy()
+        ),
+    )
+    initial = ptycho.dset.scan_positions_px.detach().cpu().clone()
+    ptycho.reconstruct(
+        num_iters=2,
+        reset=True,
+        optimizer_params={
+            "object": OptimizerParams.Adam(lr=1e-2),
+            "dataset": OptimizerParams.Adam(lr=1e-2),
+        },
+        scheduler_params={"dataset": SchedulerParams.Exponential(gamma=0.9)},
+        batch_size=48,
+    )
+    ptycho.save(str(tmp_path / "ptycho.zip"))
+    loaded = Ptychography.from_file(tmp_path / "ptycho.zip", verbose=False)
+
+    positions = ptycho.dset.scan_positions_px.detach().cpu()
+    assert not torch.equal(positions, initial), "the positions were not learned"
+    assert torch.equal(loaded.dset.scan_positions_px.detach().cpu(), positions)
+    saved = ptycho.optimizers["dataset"].state_dict()["state"]
+    restored = loaded.optimizers["dataset"].state_dict()["state"]
+    for i in saved:
+        assert torch.equal(restored[i]["exp_avg_sq"].cpu(), saved[i]["exp_avg_sq"].cpu()), i
+    assert loaded.schedulers["dataset"].last_epoch == ptycho.schedulers["dataset"].last_epoch

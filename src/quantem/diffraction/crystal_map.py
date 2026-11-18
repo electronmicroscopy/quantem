@@ -114,7 +114,7 @@ class CrystalMap(AutoSerialize):
         self.metadata: dict = {}
         self.k_max = _common_k_max([om.crystal for om in orientation_maps], k_max)
 
-    def __attrs_post_init__(self):
+    def _post_load(self):
         """After loading: the phase map shares this map's orientation maps.
 
         A saved file holds the phase map's copies of the orientation maps
