@@ -1,5 +1,6 @@
 import gzip
 import json
+import shutil
 import sys
 
 import dill
@@ -8,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 import zarr
+from torch.utils.tensorboard import SummaryWriter
 
 import quantem
 from quantem.core.io.serialize import AutoSerialize, load, print_file
@@ -39,6 +41,7 @@ def test_dummy_save_load_and_skip(tmp_path, capsys):
     1.  Save/load Dummy with no skips: all fields rehydrate.
     2.  Then save but skip 'count' and skip 'child', verifying each is dropped.
     3.  Then save but skip '_private', verifying only _private is dropped.
+    4.  Overwrite the save, then fail to overwrite it, verifying the save is kept.
     """
     for store in ("zip", "dir"):
         suffix = ".zip" if store == "zip" else "_dir"
@@ -90,6 +93,16 @@ def test_dummy_save_load_and_skip(tmp_path, capsys):
         assert loaded_skip_priv.count == d.count, store
         assert isinstance(loaded_skip_priv.child, Child), store
         assert not hasattr(loaded_skip_priv, "_private"), store
+
+        # ——— (d) overwriting replaces the save; an overwrite that fails keeps it ———
+        d.count = 7
+        d.save(str(tgt), mode="o", store=store)
+        d.unsaveable = (i for i in range(3))  # a generator cannot be pickled
+        with pytest.raises(TypeError):
+            d.save(str(tgt), mode="o", store=store)
+        assert load(str(tgt)).count == 7, store
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".quantem-save")]
+        assert leftovers == [], store
 
 
 # ──────────────────────────── #
@@ -338,3 +351,19 @@ def test_set_roundtrip(tmp_path):
     assert loaded.names == {"C10", "C12", "rotation_angle"}
     assert loaded.numbers == {1, 2, 3}
     assert loaded.empty == set()
+
+
+def test_tensorboard_writer_creates_its_folder_when_it_logs(tmp_path):
+    """Loading a SummaryWriter writes nothing, so a file saved on another computer
+    loads where the log folder cannot be made; the writer creates it when it logs."""
+    holder = Child()
+    holder.writer = SummaryWriter(str(tmp_path / "runs"))
+    holder.writer.close()
+    holder.save(str(tmp_path / "holder.zip"))
+    shutil.rmtree(tmp_path / "runs")
+
+    loaded = load(str(tmp_path / "holder.zip"))
+    assert not (tmp_path / "runs").exists()
+    loaded.writer.add_scalar("loss", 1.0, 0)
+    loaded.writer.close()
+    assert len(list((tmp_path / "runs").glob("events.out.tfevents.*"))) == 1

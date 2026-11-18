@@ -22,7 +22,6 @@ import io
 import json
 import logging
 import os
-import shutil
 import sys
 import tempfile
 import types
@@ -116,7 +115,8 @@ class AutoSerialize:
         path : str or Path
             Target path. A '.zip' extension writes one zip file, anything else a directory.
         mode : {'w', 'o'}
-            'w' refuses to replace an existing path, 'o' overwrites it.
+            'w' refuses to replace an existing path. 'o' replaces it once the new
+            file is complete, so a save that fails keeps the old one.
         store : {'auto', 'zip', 'dir'}
             Storage format. 'auto' infers it from the extension.
         skip : str, type, or list of (str or type)
@@ -143,28 +143,29 @@ class AutoSerialize:
         elif store not in ("zip", "dir"):
             raise ValueError(f"Unknown store type: {store}")
 
-        if os.path.exists(path):
-            if mode != "o":
-                raise FileExistsError(f"File '{path}' already exists. Use mode='o' to overwrite.")
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                os.remove(path)
+        if os.path.exists(path) and mode != "o":
+            raise FileExistsError(f"File '{path}' already exists. Use mode='o' to overwrite.")
 
         writer = _Writer(*_split_skip(skip), compressors)
-        if store == "dir":
-            os.makedirs(path)
-            writer.root(self, zarr.group(store=LocalStore(path), overwrite=True))
-        else:
-            # Every attribute update rewrites zarr.json, which a zip cannot do in
-            # place, so write a directory and zip it.
-            with tempfile.TemporaryDirectory() as tmpdir:
-                writer.root(self, zarr.group(store=LocalStore(tmpdir), overwrite=True))
-                with ZipFile(path, mode="w") as zf:
-                    for dirpath, _, filenames in os.walk(tmpdir):
+        # Written next to `path` and moved there once complete, so a save that
+        # fails leaves the file it would have replaced as it was.
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent, prefix=".quantem-save-") as tmpdir:
+            tree = os.path.join(tmpdir, "tree")
+            writer.root(self, zarr.group(store=LocalStore(tree), overwrite=True))
+            if store == "dir":
+                written = tree
+            else:
+                # Every attribute update rewrites zarr.json, which a zip cannot do in
+                # place, so write a directory and zip it.
+                written = os.path.join(tmpdir, "saved.zip")
+                with ZipFile(written, mode="w") as zf:
+                    for dirpath, _, filenames in os.walk(tree):
                         for filename in filenames:
                             full_path = os.path.join(dirpath, filename)
-                            zf.write(full_path, arcname=os.path.relpath(full_path, tmpdir))
+                            zf.write(full_path, arcname=os.path.relpath(full_path, tree))
+            _move_into_place(written, path, tmpdir)
 
     def print_tree(
         self,
@@ -626,8 +627,8 @@ class _Reader:
         if not self._may_import(module_name):
             return self._refuse(
                 group.path,
-                f"{module_name}.{cast(dict, metadata)['class_name']}, "
-                "from a module outside quantem and torch that is not imported",
+                f"{module_name}.{cast(dict, metadata)['class_name']}, from a module outside "
+                "quantem and torch that is not imported; import it first if you trust it",
             )
         cls = _import_class(metadata)
         if not _is_object_class(cls):
@@ -948,13 +949,39 @@ def _read_summary_writer(group: zarr.Group) -> Any:
         return _SKIP
     from torch.utils.tensorboard import SummaryWriter
 
-    return SummaryWriter(
+    # Restored closed, as close() leaves it: it creates its folder and event file
+    # when it next logs, so loading writes nothing, and a file saved on another
+    # computer loads where that folder cannot be made.
+    writer = SummaryWriter.__new__(SummaryWriter)
+    setattr(writer, "_get_file_writer", lambda: None)  # what __init__ calls to create them
+    writer.__init__(
         log_dir=cast(str | None, attrs.get("log_dir")),
         comment=str(attrs.get("comment", "")),
         max_queue=int(cast(int, attrs.get("max_queue", 10))),
         flush_secs=int(cast(int, attrs.get("flush_secs", 120))),
         filename_suffix=str(attrs.get("filename_suffix", "")),
     )
+    delattr(writer, "_get_file_writer")
+    return writer
+
+
+def _move_into_place(written: str, path: str, tmpdir: str) -> None:
+    """Move the file or directory `written` to `path`, replacing what is there.
+
+    A file replaces a file in one step. Otherwise what is at `path` is first
+    moved into `tmpdir`, which is deleted afterwards, and moved back if the
+    second move fails.
+    """
+    if not os.path.exists(path) or (os.path.isfile(path) and os.path.isfile(written)):
+        os.replace(written, path)
+        return
+    replaced = os.path.join(tmpdir, "replaced")
+    os.replace(path, replaced)
+    try:
+        os.replace(written, path)
+    except BaseException:
+        os.replace(replaced, path)
+        raise
 
 
 def _is_saved_object(directory: str) -> bool:
