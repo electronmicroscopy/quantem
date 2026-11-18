@@ -11,7 +11,9 @@ through ``setup_distributed`` and so follow the ``torch_device`` fixture under
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
+import torch
 
+from quantem.core.ml import OptimizerParams
 from quantem.tomography.dataset_models import TomographyINRDataset, TomographyPixDataset
 from quantem.tomography.object_models import ObjConstraintParams, ObjectINR, ObjectPixelated
 from quantem.tomography.tomography import Tomography, TomographyConventional
@@ -113,6 +115,31 @@ class TestInrFactory:
         assert np.allclose(loss_ax.lines[0].get_ydata(), [1.0, 0.5])
         assert np.allclose(lr_ax.lines[0].get_ydata(), [1e-3, 5e-4])
         plt.close(plt.gcf())
+
+    def test_save_load_keeps_pose_and_optimizer_state(self, torch_device, tmp_path):
+        """A reconstruction with a validation split loads without pickle, with its learned
+        pose and the optimizer state for it."""
+        tomo = self._inr_tomo(torch_device)
+        tomo.reconstruct(
+            num_iter=1,
+            batch_size=256,
+            num_workers=0,
+            val_fraction=0.2,
+            optimizer_params={
+                "object": OptimizerParams.Adam(lr=1e-3),
+                "pose": OptimizerParams.Adam(lr=1e-2),
+            },
+        )
+        path = tmp_path / "tomo.zip"
+        tomo.save(path)
+        loaded = Tomography.from_file(str(path), device=torch_device)
+
+        assert torch.equal(loaded.dset.shifts_params.cpu(), tomo.dset.shifts_params.cpu())
+        before = tomo.dset.optimizer.state_dict()["state"]
+        after = loaded.dset.optimizer.state_dict()["state"]
+        assert before and after.keys() == before.keys()
+        for index, state in before.items():
+            assert torch.equal(after[index]["exp_avg"].cpu(), state["exp_avg"].cpu()), index
 
     def test_save_volume_overwrite_guard(self, torch_device, tmp_path):
         tomo = self._inr_tomo(torch_device)

@@ -11,7 +11,7 @@ from quantem.spectroscopy import Dataset3dspectroscopy
 from quantem.spectroscopy.dataset3dxeds_fitting import (
     peak_autoid as _peak_autoid,
 )
-from quantem.spectroscopy.spectroscopy_visualzitions import (
+from quantem.spectroscopy.spectroscopy_visualizations import (
     show_spectrum_images as _visualize_spectrum_images,
 )
 from quantem.spectroscopy.xeds_fitting import (

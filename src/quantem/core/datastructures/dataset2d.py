@@ -4,7 +4,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
-from quantem.core.utils.utils import to_numpy
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -159,21 +158,17 @@ class Dataset2d(Dataset):
 
         Parameters
         ----------
-        scalebar: ScalebarConfig or bool
-            If True, displays scalebar
+        scalebar: ScalebarConfig, ShowParams.Scalebar, dict or bool
+            If True, displays a scalebar. Sampling and units are taken from the
+            dataset unless set explicitly, so e.g. ``{"outline_color": "black"}``
+            still gives a calibrated scalebar.
         title: str
             Title of Dataset
         **kwargs: dict
             Keyword arguments for show_2d
         """
 
-        if scalebar is True:
-            scalebar = ScalebarConfig(
-                sampling=self.sampling[-1],
-                units=self.units[-1],
-            )
-
         if title is None:
             title = self.name
 
-        return show_2d(to_numpy(self.array), scalebar=scalebar, title=title, **kwargs)
+        return show_2d(self, scalebar=scalebar, title=title, **kwargs)

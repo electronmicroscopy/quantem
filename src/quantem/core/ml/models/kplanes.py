@@ -3,7 +3,7 @@ Tensor Decomposition Methods for INR-based reconstructions
 """
 
 import itertools
-from typing import Callable, Literal, Sequence, cast
+from typing import Callable, Literal, Sequence
 
 # import tinycudann as tcnn
 import torch
@@ -16,6 +16,11 @@ from .so3params import SO3ParamQuat, SO3ParamR9SVD
 """
 K-planes utility functions
 """
+
+
+def shifted_softplus(x: torch.Tensor) -> torch.Tensor:
+    """softplus(x - 1), the default density activation."""
+    return F.softplus(x - 1)
 
 
 def grid_sample_wrapper(
@@ -179,9 +184,7 @@ class KPlanes(PPLR, TensorDecompositionModel):
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Sequence[float] | None = None,
         concat_features: bool = True,
-        density_activation: Callable = lambda x: F.softplus(
-            x - 1
-        ),  # Keep playing around with this and trunc_exp
+        density_activation: Callable = shifted_softplus,  # also try trunc_exp
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -408,7 +411,7 @@ class KPlanesTILTED(KPlanes):
         M_features: int = 32,
         resolution: Sequence[int] = (200, 200, 200),
         multiscale_res_multipliers: Sequence[float] | None = None,
-        density_activation: Callable = lambda x: F.softplus(x - 1),
+        density_activation: Callable = shifted_softplus,
         # TILTED parameters
         T: int = 4,
         tau_init: Literal["random", "identity"] = "random",
@@ -536,14 +539,15 @@ class KPlanesTILTED(KPlanes):
 
     def extract_tau_state(self) -> torch.Tensor:
         """
-        Returns the current raw R^9 matrices (detached copy) so they can be
-        used to initialise a phase-2 model via `load_tau_state`.
+        Returns the current rotations (detached copy) so they can be used to
+        initialize a phase-2 model via `load_tau_state`: the raw R^9 matrices
+        for "r9svd", the rotation matrices for "quat".
 
         Returns
         -------
         torch.Tensor of shape (T, 3, 3)
         """
-        return cast(torch.Tensor, self.so3.M).detach().cpu().clone()
+        return self.so3.rotation_state().cpu()
 
     def load_tau_state(self, M: torch.Tensor) -> None:
         """
@@ -557,14 +561,13 @@ class KPlanesTILTED(KPlanes):
         M : torch.Tensor of shape (T, 3, 3)
             Raw unconstrained matrices from `extract_tau_state()`.
         """
-        if M.shape != self.so3.M.shape:
+        expected = (self.T, 3, 3)
+        if tuple(M.shape) != expected:
             raise ValueError(
-                f"Shape mismatch: got {M.shape}, expected {self.so3.M.shape}. "
+                f"Shape mismatch: got {tuple(M.shape)}, expected {expected}. "
                 f"Make sure T matches between phase 1 and phase 2."
             )
-        with torch.no_grad():
-            so3_M = cast(torch.Tensor, self.so3.M)
-            so3_M.copy_(M.to(so3_M.device))
+        self.so3.load_rotation_state(M)
 
     # ------------------------------------------------------------------
     # Pretty print
@@ -678,7 +681,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         multiscale_res_multipliers: Sequence[float] | None = None,
         T: int = 4,
         tau_init: Literal["random", "identity"] = "random",
-        density_activation: Callable = lambda x: F.softplus(x - 1),
+        density_activation: Callable = shifted_softplus,
         so3_param_type: str = "r9svd",
     ):
         super().__init__()
@@ -733,7 +736,7 @@ class CPTilted(PPLR, TensorDecompositionModel):
         return ["grids", "sigma_net", "so3"]
 
     def extract_tau_state(self) -> torch.Tensor:
-        return cast(torch.Tensor, self.so3.M).detach().clone()
+        return self.so3.rotation_state()
 
     @property
     def tilted(self) -> bool:

@@ -291,7 +291,11 @@ class StrategyBase:
                         if len(inds) == 1:
                             merged_quats.append(p[inds[0]])
                         else:
-                            avg_quat = torch.mean(p[inds], dim=0)
+                            # q and -q are the same rotation: align the signs
+                            # to the first before averaging, or they cancel
+                            qs = p[inds]
+                            qs = qs * torch.where((qs @ qs[0]) < 0, -1.0, 1.0)[:, None]
+                            avg_quat = torch.mean(qs, dim=0)
                             merged_quats.append(avg_quat / torch.norm(avg_quat))
                     p[keeps] = torch.stack(merged_quats)
 

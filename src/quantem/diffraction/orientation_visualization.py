@@ -5,9 +5,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from quantem.core.utils.rotations import quat_to_matrix
 from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
 from quantem.diffraction.crystal import Crystal
-from quantem.diffraction.rotations import quat_to_matrix
 
 # one color per candidate phase, used consistently across every plot; index
 # with phase_color_cycle() so more crystals than colors cycle through them
@@ -226,7 +226,7 @@ def fold_in_plane(quats: torch.Tensor, crystal: Crystal, strict: bool = False) -
     returned unchanged, unless `strict`, which folds by the projected order
     everywhere.
     """
-    from quantem.diffraction.rotations import (
+    from quantem.core.utils.rotations import (
         qmult,
         qnormalize,
         quat_from_axis_angle,
@@ -265,7 +265,7 @@ def fold_in_plane(quats: torch.Tensor, crystal: Crystal, strict: bool = False) -
 
 def _crystal_rotation_order(axes: torch.Tensor, crystal: Crystal) -> torch.Tensor:
     """Order of the crystal's own rotation axis along each direction, (N,)."""
-    from quantem.diffraction.rotations import quat_to_matrix
+    from quantem.core.utils.rotations import quat_to_matrix
 
     Rs = quat_to_matrix(crystal.sym_quats)  # (S, 3, 3)
     u = axes / torch.linalg.norm(axes, dim=1, keepdim=True).clamp_min(1e-12)

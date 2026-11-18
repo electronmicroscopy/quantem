@@ -12,5 +12,7 @@ from quantem import imaging as imaging
 from quantem import diffraction as diffraction
 from quantem import spectroscopy as spectroscopy
 from quantem import diffractive_imaging as diffractive_imaging
+from quantem import tomography as tomography
+from quantem import atoms as atoms
 
 __version__ = version("quantem")

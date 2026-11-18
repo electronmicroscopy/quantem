@@ -1764,8 +1764,8 @@ def calibrate_2d(
     """
     import torch
 
+    from quantem.core.utils.rotations import qmult, quat_from_matrix
     from quantem.diffraction.orientation import OrientationMap
-    from quantem.diffraction.rotations import qmult, quat_from_matrix
 
     crystals = [crystal] if isinstance(crystal, Crystal) else list(crystal)
     for xtl in crystals:

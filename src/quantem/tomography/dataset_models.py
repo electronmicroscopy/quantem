@@ -357,6 +357,22 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
 
         raise NotImplementedError("This method should be implemented in subclasses.")
 
+    def _pose_to(self, device: torch.device | str):
+        """Move the pose parameters to `device`, creating them on the first call.
+
+        Later calls move them in place, so they keep their learned values and
+        the optimizer keeps its state for them.
+        """
+        if "_z1_params" not in self._parameters:
+            self._z1_params = nn.Parameter(self._z1_angles)
+            self._z3_params = nn.Parameter(self._z3_angles)
+            self._shifts_params = nn.Parameter(self._shifts)
+        for param in (self._z1_params, self._z3_params, self._shifts_params):
+            param.data = param.data.to(device)
+        self._z1_ref = self._z1_ref.to(device)
+        self._z3_ref = self._z3_ref.to(device)
+        self._shifts_ref = self._shifts_ref.to(device)
+
 
 class TomographyDatasetConstraints(BaseConstraints, TomographyDatasetBase):
     DEFAULT_CONSTRAINTS = DatasetConstraintParams.BaseTomographyDatasetConstraints()
@@ -408,7 +424,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
     ):
         super().__init__(
             tilt_stack=tilt_stack,
-            tilt_angles=-tilt_angles,  # TODO: Flip the tilt angles to be negative to match the convention of INR.
+            tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
             norm_quantile=norm_quantile,
@@ -436,15 +452,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
         """
         self.tilt_stack = self.tilt_stack.to(device)
         self.tilt_angles = self.tilt_angles.to(device)
-
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
-
-        self._z1_ref = self._z1_ref.to(device)
-        self._z3_ref = self._z3_ref.to(device)
-        self._shifts_ref = self._shifts_ref.to(device)
-
+        self._pose_to(device)
         self.device = device
 
 
@@ -657,14 +665,7 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         return self.tilt_stack.shape[0] * N * N
 
     def to(self, device: torch.device | str):
-        self._z1_params = nn.Parameter(self._z1_angles.to(device))
-        self._z3_params = nn.Parameter(self._z3_angles.to(device))
-        self._shifts_params = nn.Parameter(self._shifts.to(device))
-
-        self._z1_ref = self._z1_ref.to(device)
-        self._z3_ref = self._z3_ref.to(device)
-        self._shifts_ref = self._shifts_ref.to(device)
-
+        self._pose_to(device)
         self.device = device
         self.reconnect_optimizer_to_parameters()
 
@@ -698,6 +699,10 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 class TomographyINRPretrainDataset(Dataset):
     """
     Dataset class for pretraining INR models.
+
+    `pretrain_target` must be in the reconstruction (`obj_view`, SIRT / FBP) layout
+    [C, X, Z, Y]. A [C, Z, Y, X] volume, such as a phantom, is misoriented unless it is
+    permuted first, ``vol.permute(0, 3, 1, 2)``.
     """
 
     def __init__(
@@ -717,8 +722,8 @@ class TomographyINRPretrainDataset(Dataset):
             data_quantile = torch.quantile(data, 0.95)
 
         data = data / data_quantile
-        data = torch.permute(data, (0, 3, 2, 1))
-        # data = torch.flip(data, dims=(2,))
+        # pretrain_target is in the obj_view layout [C, X, Z, Y]; the coordinates are (x, y, z).
+        data = torch.permute(data, (0, 1, 3, 2))
 
         self.volume = data.cpu()
         self.N = pretrain_target.shape[1]  # Assumes cubic volume.
@@ -727,7 +732,8 @@ class TomographyINRPretrainDataset(Dataset):
         coords_1d = torch.linspace(-1, 1, self.N)
         x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
         self.coords = torch.stack([x, y, z], dim=-1).reshape(-1, 3).cpu()
-        self.targets = self.volume.reshape(-1).cpu()
+        # (N^3,) for one channel, (N^3, C) otherwise
+        self.targets = self.volume.reshape(self.volume.shape[0], -1).T.squeeze(-1).cpu()
 
     def __len__(self):
         return self.total_samples

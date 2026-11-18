@@ -701,6 +701,10 @@ class ObjectINR(ObjectConstraints, DDPMixin):
         Pretrain the INR model to fit target volume.
         """
 
+        if pretrain_dataset is None and not hasattr(self, "pretraining_dataloader"):
+            raise ValueError(
+                "pretrain_dataset is required: saved reconstructions do not keep the pretraining data"
+            )
         if (
             pretrain_dataset is not None
         ):  # Need to make a check if there's already a pretrain dataset to not go through with the setup again.
@@ -854,9 +858,9 @@ class ObjectINR(ObjectConstraints, DDPMixin):
                 for rank, size in enumerate(all_sizes):
                     trimmed_outputs.append(gathered_outputs[rank][: size.item(), :])
 
-                pred_full = torch.cat(trimmed_outputs, dim=0).reshape(C, N, N, N).float()
+                pred_full = torch.cat(trimmed_outputs, dim=0).T.reshape(C, N, N, N).float()
             else:
-                pred_full = outputs.reshape(C, N, N, N).float()
+                pred_full = outputs.T.reshape(C, N, N, N).float()
 
             if return_vol:
                 return pred_full.detach().cpu()

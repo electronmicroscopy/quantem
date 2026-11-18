@@ -1,3 +1,4 @@
+from dataclasses import fields
 from typing import Self
 
 import numpy as np
@@ -8,7 +9,11 @@ from numpy.typing import NDArray
 from quantem.core.datastructures.dataset import Dataset
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
+from quantem.core.visualization.custom_normalizations import NormalizationConfig
 from quantem.core.visualization.visualization_utils import ScalebarConfig
+
+# show_2d keywords that set the normalization; same_scale leaves them alone
+_NORM_KEYS = ("norm", *(f.name for f in fields(NormalizationConfig)))
 
 
 @Dataset.register_dimension(3)
@@ -195,6 +200,7 @@ class Dataset3d(Dataset):
         title_prefix: str | None = None,
         suptitle: str | None = None,
         returnfig: bool = False,
+        same_scale: bool = False,
         **kwargs,
     ) -> tuple[Figure, Axes] | None:
         """
@@ -222,6 +228,11 @@ class Dataset3d(Dataset):
             Figure super title displayed above all subplots.
         returnfig : bool, default False
             If True, returns (fig, axes).
+        same_scale : bool, default False
+            If True, all shown slices share one intensity range (the 2% and 98%
+            quantiles over those slices) so they are directly comparable.
+            Ignored for complex data and when any normalization keyword
+            (``norm``, ``vmin``, ``lower_quantile``, ``power`` ...) is passed.
         **kwargs : dict
             Keyword arguments for show_2d (cmap, cbar, vmin, vmax, norm, etc.).
 
@@ -330,6 +341,13 @@ class Dataset3d(Dataset):
             labels.extend([""] * pad_count)
         image_grid = [images[i : i + ncols] for i in range(0, len(images), ncols)]
         label_grid = [labels[i : i + ncols] for i in range(0, len(labels), ncols)]
+        if (
+            same_scale
+            and not np.iscomplexobj(self.array)
+            and not any(key in kwargs for key in _NORM_KEYS)
+        ):
+            vmin, vmax = np.nanquantile(np.stack(images[:n_frames]), [0.02, 0.98])
+            kwargs["vmin"], kwargs["vmax"] = float(vmin), float(vmax)
         fig, axes = show_2d(image_grid, scalebar=scalebar, title=label_grid, **kwargs)
         if pad_count > 0:
             for ax in np.array(axes).flat[-pad_count:]:

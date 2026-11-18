@@ -856,8 +856,11 @@ def inr_probe_params() -> dict:
     return {"energy": INR_ENERGY, "C10": INR_C10, "semiangle_cutoff": inr_semiangle_mrad()}
 
 
-def inr_synthetic_dataset():
-    """Simulate the non-toroidal 4D-STEM dataset; return ``(dataset_model, gt_phase, probe)``."""
+def inr_synthetic_dataset(raw_path=None):
+    """Simulate the non-toroidal 4D-STEM dataset; return ``(dataset_model, gt_phase, probe)``.
+
+    With `raw_path`, the 4D dataset is saved there first, as data read from a file.
+    """
     from quantem.core.datastructures.dataset4dstem import Dataset4dstem
     from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 
@@ -885,6 +888,9 @@ def inr_synthetic_dataset():
         sampling=(INR_STEP, INR_STEP, reciprocal_sampling, reciprocal_sampling),
         units=("A", "A", "A^-1", "A^-1"),
     )
+    if raw_path is not None:
+        dset.save(str(raw_path))
+        dset.file_path = str(raw_path)
     pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
     pdset.learn_scan_positions = False
     pdset.learn_descan = False

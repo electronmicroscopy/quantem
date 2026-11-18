@@ -564,15 +564,13 @@ def plot_bvm(
         ``(fig, ax)`` with ``ax`` a length-2 array of axes.
     """
     from quantem.core.visualization import show_2d
-
     fig, ax = plt.subplots(1, 2, figsize=figsize)
-
+    plotting_kwargs.setdefault("title", "Bragg vector map")
     show_2d(
         np.asarray(bvm),
         figax=(fig, ax[0]),
         cmap=cmap,
         norm=norm,
-        title="Bragg vector map",
         **plotting_kwargs,
     )
     counts_plot_kwargs = {
@@ -593,6 +591,7 @@ def plot_reference_lattice(
     origin: np.ndarray,
     g1: np.ndarray,
     g2: np.ndarray,
+    max_peak_shift: float | None = None,
     *,
     cmap: str = "gray",
     norm: str | dict = "log_auto",
@@ -605,9 +604,9 @@ def plot_reference_lattice(
     Each indexed reference site is a ring labelled with its ``(a, b)`` Miller index;
     the chosen origin is a green marker and ``g1`` (red) / ``g2`` (blue) are arrows
     from it. The ring color encodes how far the picked candidate sits from its *ideal*
-    lattice site ``origin + a*g1 + b*g2`` (the colorbar reads pixels), scaled to half
-    the shorter lattice spacing — the default :meth:`fit_lattice` match radius. A
-    mis-picked or duplicate candidate stands out as a ring far from zero offset (bright
+    lattice site ``origin + a*g1 + b*g2`` (the colorbar reads pixels), scaled to
+    ``max_peak_shift`` -- the radius :meth:`BraggVectors.fit_lattice` matches
+    within. A mis-picked or duplicate candidate stands out as a ring far from zero offset (bright
     color), sitting off the regular grid, or carrying an index that breaks the pattern.
 
     Parameters
@@ -626,6 +625,10 @@ def plot_reference_lattice(
         First lattice vector as a ``(row, col)`` offset from ``origin``.
     g2 : np.ndarray
         Second lattice vector as a ``(row, col)`` offset from ``origin``.
+    max_peak_shift : float, optional
+        Radius in pixels the ring colors are scaled to -- the match radius
+        :meth:`BraggVectors.fit_lattice` will use. Defaults to
+        ``0.5 * min(|g1|, |g2|)``.
     cmap : str, default="gray"
         Colormap for the Bragg vector map; gray keeps the colored overlays legible.
     norm : str or dict, default="log_auto"
@@ -674,7 +677,11 @@ def plot_reference_lattice(
     # color the rings by that offset, scaled to half the shorter lattice spacing (the
     # default fit_lattice match radius) so the colorbar previews which candidates sit
     # near the inclusion tolerance.
-    radius = 0.5 * float(min(np.hypot(*g1), np.hypot(*g2)))
+    radius = (
+        0.5 * float(min(np.hypot(*g1), np.hypot(*g2)))
+        if max_peak_shift is None
+        else float(max_peak_shift)
+    )
     cmap_offset = plt.get_cmap("plasma")
     norm_offset = Normalize(vmin=0.0, vmax=radius if radius > 0 else 1.0)
 

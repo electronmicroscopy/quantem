@@ -6,12 +6,14 @@ All CPU, deterministic. Cross-checked against scikit-image where a ground truth 
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from quantem.tomography.radon.radon import (
     get_fourier_filter_torch,
     iradon_torch,
     radon_torch,
 )
+from quantem.tomography.utils import rot_ZXZ
 
 
 def _disk(n: int, cy: int, cx: int, r: int) -> torch.Tensor:
@@ -70,7 +72,8 @@ class TestRadonBehaviour:
         rec = iradon_torch(sino, theta=torch.linspace(0, 180, 30), circle=True)
         n = rec.shape[0]
         yy, xx = np.mgrid[0:n, 0:n]
-        outside = ((yy - n // 2) ** 2 + (xx - n // 2) ** 2) > (n // 2) ** 2
+        c = (n - 1) / 2
+        outside = ((yy - c) ** 2 + (xx - c) ** 2) > (n // 2) ** 2
         assert torch.allclose(rec[outside], torch.zeros(int(outside.sum())))
 
     def test_roundtrip_recovers_structure(self):
@@ -87,17 +90,38 @@ class TestRadonBehaviour:
             corr = np.corrcoef(disk.numpy().ravel(), rec.numpy().ravel())[0, 1]
             assert corr > 0.9, kwargs
 
+    def test_iradon_circle_edge_reads_filtered_detector(self):
+        """Padding the sinogram with zeros must not change the reconstruction: pixels at the
+        circle edge read the filtered detector instead of extrapolating past its last bin."""
+        theta = torch.linspace(-70, 70, 29)
+        sino = radon_torch(_disk(48, 20, 27, 9), theta=theta)
+        rec = iradon_torch(sino, theta=theta)
+        rec_padded = iradon_torch(F.pad(sino, (6, 6)), theta=theta, output_size=48)
+        assert torch.allclose(rec, rec_padded, atol=1e-5)
+
+    def test_matches_rot_zxz_tilt_series(self):
+        """A [X, Z, Y] object projected by radon_torch gives the tilt series of the same
+        [Z, Y, X] volume under rot_ZXZ, so SIRT / FBP and the INR share one tilt convention."""
+        vol = torch.zeros(32, 32, 32)  # [Z, Y, X], even N
+        vol[8:16, 6:16, 10:22] = 1.0
+        vol[16:24, 16:26, 5:11] = 0.6
+        theta = torch.tensor([-60.0, -25.0, 0.0, 35.0])
+        sino = radon_torch(vol.permute(2, 0, 1), theta=theta)  # [X, A, Y]
+        series = rot_ZXZ(vol[None], 0.0, theta, 0.0)[:, 0].sum(1)  # [A, Y, X]
+        assert torch.allclose(sino.permute(1, 2, 0), series, atol=1e-4)
+
 
 class TestRadonVsSkimage:
-    """Loose cross-check against scikit-image's reference implementation."""
+    """scikit-image's theta is minus quantem's tilt; for odd N the rotation centres agree."""
 
-    def test_forward_matches_skimage(self):
+    def test_matches_skimage_with_negated_theta(self):
         sk = pytest.importorskip("skimage.transform")
-        n = 64
-        disk = _disk(n, n // 2, n // 2, 12)
-        theta = np.linspace(0.0, 180.0, 45, endpoint=False).astype(np.float32)
+        n = 63
+        disk = _disk(n, 28, 36, 12)
+        theta = np.linspace(-70.0, 70.0, 29)
         ours = radon_torch(disk, theta=torch.from_numpy(theta)).numpy()  # (A, N)
-        ref = sk.radon(disk.numpy(), theta=theta, circle=True).T  # skimage: (N, A) -> (A, N)
-        # Different interpolation conventions; require strong agreement, not equality.
-        corr = np.corrcoef(ours.ravel(), ref.ravel())[0, 1]
-        assert corr > 0.95
+        ref = sk.radon(disk.numpy().astype(np.float64), theta=-theta, circle=True)  # (N, A)
+        np.testing.assert_allclose(ours, ref.T, atol=1e-4)
+        rec = iradon_torch(torch.from_numpy(ref.T).float(), theta=torch.from_numpy(theta))
+        ref_rec = sk.iradon(ref, theta=-theta, circle=True, filter_name="ramp")
+        np.testing.assert_allclose(rec.numpy(), ref_rec, atol=1e-5)

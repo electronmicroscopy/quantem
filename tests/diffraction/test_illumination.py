@@ -82,7 +82,7 @@ def test_slab_pattern_is_thin_bloch_limit():
     xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
     xtl.calculate_structure_factors(k_max=2.0)  # elastic Lobato factors only
     torch.manual_seed(1)
-    from quantem.diffraction.rotations import qnormalize
+    from quantem.core.utils.rotations import qnormalize
 
     q = qnormalize(torch.randn(4, dtype=torch.float64))
     z = 6.0
@@ -116,8 +116,8 @@ def test_slab_pattern_is_thin_bloch_limit():
 
 def test_refine_batched_matches_loop():
     from quantem.core.datastructures.vector import Vector
+    from quantem.core.utils.rotations import misorientation_angle_deg, qnormalize
     from quantem.diffraction.orientation import OrientationMap
-    from quantem.diffraction.rotations import misorientation_angle_deg, qnormalize
 
     xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False)
     xtl.calculate_structure_factors(k_max=1.5)

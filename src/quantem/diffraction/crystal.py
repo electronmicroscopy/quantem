@@ -30,7 +30,8 @@ from ase import Atoms
 from ase.data import chemical_symbols
 
 from quantem.core.io.serialize import AutoSerialize
-from quantem.diffraction.rotations import qrotate, symmetry_quaternions
+from quantem.core.utils.rotations import qrotate
+from quantem.diffraction.crystal_rotations import symmetry_quaternions
 
 # unicode combining overline, applies to the preceding character
 _B = "\u0305"
@@ -709,7 +710,7 @@ class Crystal(AutoSerialize):
         Returns the accepted quaternions and the worst mismatch among the
         operations that were tested.
         """
-        from quantem.diffraction.rotations import quat_to_matrix
+        from quantem.core.utils.rotations import quat_to_matrix
 
         hkl, inten = self._quick_intensities()
         lut = {tuple(h): i for i, h in enumerate(hkl.tolist())}
@@ -900,7 +901,7 @@ class Crystal(AutoSerialize):
         has no 3-corner wedge and libraries sample the full hemisphere.
         """
         if isinstance(self._wedge_cache, str):
-            from quantem.diffraction.rotations import fundamental_zone_axis_wedge
+            from quantem.diffraction.crystal_rotations import fundamental_zone_axis_wedge
 
             self._wedge_cache = fundamental_zone_axis_wedge(self.sym_quats_matching)
         return self._wedge_cache

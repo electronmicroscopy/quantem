@@ -1,8 +1,19 @@
+import gzip
+import json
+import shutil
+import sys
+
+import dill
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
+import zarr
+from torch.utils.tensorboard import SummaryWriter
 
-from quantem.core.io.serialize import AutoSerialize, load
+import quantem
+from quantem.core.io.serialize import AutoSerialize, load, print_file
+from quantem.core.ml.activation_functions import get_activation_function
 
 # ─────────────────────────────────────────────── #
 # 1) Simple “Dummy” with arr/count/child/_private #
@@ -18,17 +29,19 @@ class Child(AutoSerialize):
 class Dummy(AutoSerialize):
     def __init__(self):
         self.arr = np.linspace(0, 1, 5)
+        self.scalar_array = np.array(2.5)
         self.count = 123
         self.child = Child()
         self._private = "secret"
 
 
-def test_dummy_save_load_and_skip(tmp_path):
+def test_dummy_save_load_and_skip(tmp_path, capsys):
     """
     For both the zip and the directory store:
     1.  Save/load Dummy with no skips: all fields rehydrate.
     2.  Then save but skip 'count' and skip 'child', verifying each is dropped.
     3.  Then save but skip '_private', verifying only _private is dropped.
+    4.  Overwrite the save, then fail to overwrite it, verifying the save is kept.
     """
     for store in ("zip", "dir"):
         suffix = ".zip" if store == "zip" else "_dir"
@@ -45,10 +58,16 @@ def test_dummy_save_load_and_skip(tmp_path):
 
         # values round-trip
         np.testing.assert_allclose(loaded_full.arr, d.arr, err_msg=store)
+        np.testing.assert_array_equal(loaded_full.scalar_array, 2.5, err_msg=store)
         assert loaded_full.count == d.count, store
         np.testing.assert_allclose(loaded_full.child.values, d.child.values, err_msg=store)
         assert loaded_full.child.flag is True, store
         assert loaded_full._private == "secret", store
+        assert not hasattr(loaded_full, "_autoserialize_skip_names"), store
+
+        # the file records the quantem version that wrote it
+        print_file(tgt)
+        assert f"(quantem {quantem.__version__})" in capsys.readouterr().out, store
 
         # ——— (b) skip 'count' and skip 'child' ———
         tgt2 = tmp_path / f"dummy_skip_cd{suffix}"
@@ -74,6 +93,16 @@ def test_dummy_save_load_and_skip(tmp_path):
         assert loaded_skip_priv.count == d.count, store
         assert isinstance(loaded_skip_priv.child, Child), store
         assert not hasattr(loaded_skip_priv, "_private"), store
+
+        # ——— (d) overwriting replaces the save; an overwrite that fails keeps it ———
+        d.count = 7
+        d.save(str(tgt), mode="o", store=store)
+        d.unsaveable = (i for i in range(3))  # a generator cannot be pickled
+        with pytest.raises(TypeError):
+            d.save(str(tgt), mode="o", store=store)
+        assert load(str(tgt)).count == 7, store
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".quantem-save")]
+        assert leftovers == [], store
 
 
 # ──────────────────────────── #
@@ -167,25 +196,99 @@ def test_nested_save_load_and_skip(tmp_path):
 # ──────────────────────────── #
 
 
-class TorchWithOpt(AutoSerialize):
+_unpickled = []
+
+
+def _record(tag):
+    _unpickled.append(tag)
+    return tag
+
+
+class _Payload:
+    """Unpickles to a call of _record, which shows whether loading ran code from the file."""
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __reduce__(self):
+        return (_record, (self.tag,))
+
+
+class _Net(nn.Module):
+    """A module from outside quantem and torch, whose methods have not been checked."""
+
     def __init__(self):
-        self.data = torch.rand(100, 100)
-        self.param = self.data.clone().detach().requires_grad_(True)
-        self.opt = torch.optim.Adam([self.data.detach().clone()], lr=0.01)
-
-    def method(self):
-        return self.data.sum()
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((2,), 3.0))
 
 
-def test_torch_tensor_and_optimizer(tmp_path):
-    obj = TorchWithOpt()
-    tgt = tmp_path / "opt.zip"
-    obj.save(str(tgt), mode="w")
-    loaded = load(str(tgt))
+def _local_module() -> nn.Module:
+    class Local(nn.Module):  # cannot be imported by name, so it is pickled
+        pass
 
-    assert torch.allclose(obj.data, loaded.data)
-    assert isinstance(loaded.opt, torch.optim.Adam)
-    assert loaded.opt.param_groups[0]["lr"] == 0.01
+    return Local()
+
+
+class Untrusted(AutoSerialize):
+    def __init__(self):
+        self.net = _Net()
+        self.payloads = [_Payload("new")]
+        self.encode = json.dumps
+        self.local = _local_module()
+
+
+def test_values_that_can_run_code_load_only_with_allow_pickle(tmp_path, monkeypatch):
+    """Dill fallbacks, in a list or in the older bare-array layout, and modules and
+    functions from outside quantem and torch load only with allow_pickle=True;
+    without it, nothing stored in them runs, and no module outside quantem and
+    torch is imported."""
+    _unpickled.clear()
+    tgt = tmp_path / "untrusted"
+    Untrusted().save(tgt)
+    # older files stored dill fallbacks as gzip-compressed bytes in a bare uint8 array
+    legacy = np.frombuffer(gzip.compress(dill.dumps(_Payload("legacy"))), dtype=np.uint8)
+    root = zarr.open_group(tgt, mode="r+")
+    root.create_array("legacy", shape=legacy.shape, dtype=legacy.dtype)[...] = legacy
+
+    with pytest.raises(ValueError, match="allow_pickle=True") as error:
+        load(tgt)
+    for entry in (
+        f"net ({_Net.__module__}._Net, from outside quantem and torch)",
+        "payloads/0 (dill pickle)",
+        "legacy (dill pickle)",
+        "encode (json.dumps, from outside quantem and torch)",
+        "local (dill pickle)",
+    ):
+        assert entry in str(error.value), entry
+    assert _unpickled == []
+
+    loaded = load(tgt, allow_pickle=True)
+    assert torch.equal(loaded.net.scale, torch.full((2,), 3.0))
+    assert loaded.payloads == ["new"]
+    assert loaded.legacy == "legacy"
+    assert loaded.encode is json.dumps
+    assert type(loaded.local).__name__ == "Local"
+    assert sorted(_unpickled) == ["legacy", "new"]
+
+    # a class from a module that is not imported is refused without importing it,
+    # also where the skip check reads the class
+    (tmp_path / "_autoserialize_unimported.py").write_text("class Thing:\n    pass\n")
+    monkeypatch.syspath_prepend(tmp_path)
+    net_meta = dict(root["net"].attrs["_autoserialize"])
+    root["net"].attrs["_autoserialize"] = {
+        **net_meta,
+        "class_module": "_autoserialize_unimported",
+        "class_name": "Thing",
+    }
+    with pytest.raises(ValueError, match="_autoserialize_unimported.Thing, from a module outside"):
+        load(tgt, skip=[torch.optim.Optimizer])
+    assert "_autoserialize_unimported" not in sys.modules
+
+    # the file can only name classes that are stored by their attributes
+    meta = dict(root.attrs["_autoserialize"])
+    root.attrs["_autoserialize"] = {**meta, "class_module": "subprocess", "class_name": "Popen"}
+    with pytest.raises(ValueError, match="subprocess.Popen is not an AutoSerialize class"):
+        load(tgt, allow_pickle=True)
 
 
 class TestModule(torch.nn.Module, AutoSerialize):
@@ -193,53 +296,43 @@ class TestModule(torch.nn.Module, AutoSerialize):
 
     def __init__(self):
         super().__init__()
-        self.linear = torch.nn.Linear(10, 5)
-        self.param = torch.nn.Parameter(torch.randn(3, requires_grad=True))
+        # more than ten layers, so loading them out of order changes the output
+        self.layers = nn.Sequential(*(nn.Linear(3, 3) for _ in range(11)))
+        # a module that holds a function, as CNN2d holds torch.cat
+        self.activation = get_activation_function(torch.tanh, torch.float32)
+        self.opt = torch.optim.Adam(self.parameters(), lr=0.01)
+        self.sched = torch.optim.lr_scheduler.ExponentialLR(self.opt, gamma=0.5)
+        self.rng = np.random.default_rng(0)
 
     def forward(self, x):
-        return self.linear(x)
+        return self.activation(self.layers(x))
+
+    def train_step(self):
+        self.opt.zero_grad()
+        self(torch.from_numpy(self.rng.random((1, 3), dtype=np.float32))).sum().backward()
+        self.opt.step()
+        self.sched.step()
 
 
 def test_torch_nn_module_roundtrip(tmp_path):
+    """A model with its optimizer, scheduler and random generator loads without
+    pickle and trains on as the original does, so the optimizer holds the loaded
+    model's parameters."""
     mod = TestModule()
+    mod.train_step()
     tgt = tmp_path / "mod.zip"
     mod.save(str(tgt), mode="w")
-    mod_reload = load(str(tgt))
+    loaded = load(str(tgt))
 
-    assert isinstance(mod_reload, TestModule)
-    out = mod_reload.forward(torch.randn(1, 10))
-    assert out.shape[-1] == 5
+    x = torch.randn(2, 3)
+    assert torch.equal(loaded(x), mod(x))
+    assert loaded.sched.optimizer is loaded.opt
 
-    for key in mod.state_dict():
-        assert torch.allclose(mod.state_dict()[key], mod_reload.state_dict()[key])
-
-
-class TestHybrid(AutoSerialize, nn.Module):
-    __test__ = False
-
-    def __init__(self):
-        nn.Module.__init__(self)
-        super().__init__()
-        self._p1 = nn.Parameter(torch.randn(3, 3))
-
-    @property
-    def p1(self):
-        return self._p1
-
-    @p1.setter
-    def p1(self, value):
-        with torch.no_grad():
-            self._p1.copy_(value)
-
-
-def test_hybrid_module_roundtrip(tmp_path):
-    mod = TestHybrid()
-    tgt = tmp_path / "hybrid.zip"
-    mod.save(str(tgt), mode="w")
-    mod_reload = load(str(tgt))
-
-    for key in mod.state_dict():
-        assert torch.allclose(mod.state_dict()[key], mod_reload.state_dict()[key])
+    mod.train_step()
+    loaded.train_step()
+    for (name, before), after in zip(mod.named_parameters(), loaded.parameters()):
+        assert torch.equal(before, after), name
+    assert loaded.sched.get_last_lr() == mod.sched.get_last_lr()
 
 
 class WithSets(AutoSerialize):
@@ -258,3 +351,19 @@ def test_set_roundtrip(tmp_path):
     assert loaded.names == {"C10", "C12", "rotation_angle"}
     assert loaded.numbers == {1, 2, 3}
     assert loaded.empty == set()
+
+
+def test_tensorboard_writer_creates_its_folder_when_it_logs(tmp_path):
+    """Loading a SummaryWriter writes nothing, so a file saved on another computer
+    loads where the log folder cannot be made; the writer creates it when it logs."""
+    holder = Child()
+    holder.writer = SummaryWriter(str(tmp_path / "runs"))
+    holder.writer.close()
+    holder.save(str(tmp_path / "holder.zip"))
+    shutil.rmtree(tmp_path / "runs")
+
+    loaded = load(str(tmp_path / "holder.zip"))
+    assert not (tmp_path / "runs").exists()
+    loaded.writer.add_scalar("loss", 1.0, 0)
+    loaded.writer.close()
+    assert len(list((tmp_path / "runs").glob("events.out.tfevents.*"))) == 1

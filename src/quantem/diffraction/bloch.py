@@ -44,9 +44,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from quantem.core.utils.rotations import qrotate
 from quantem.core.utils.utils import electron_wavelength_angstrom, inherit
 from quantem.diffraction.crystal import Crystal
-from quantem.diffraction.rotations import qrotate, sample_zone_axes
+from quantem.diffraction.crystal_rotations import sample_zone_axes
 
 
 def relativistic_gamma(energy_ev: float) -> float:
@@ -1155,7 +1156,7 @@ def _lambert_raster(
     splat them bilinearly onto a Lambert equal-area grid of the upper
     hemisphere. values is (N, T); returns (T, n, n) with NaN where unhit
     (raster holes inside the disk are filled from their neighbors)."""
-    from quantem.diffraction.rotations import quat_to_matrix
+    from quantem.core.utils.rotations import quat_to_matrix
 
     T = values.shape[1]
     Rs = quat_to_matrix(crystal.sym_quats_matching)
@@ -1540,8 +1541,8 @@ def plot_kossel_reference(
     import matplotlib.pyplot as plt
     from matplotlib import patheffects
 
+    from quantem.core.utils.rotations import quat_to_matrix
     from quantem.diffraction.crystal import miller_to_miller_bravais
-    from quantem.diffraction.rotations import quat_to_matrix
 
     L = reference["lambert"][thickness_index]
     step = reference["step"]
@@ -1922,7 +1923,7 @@ def _detector_directions(
     """Crystal-frame anti-propagation directions of a Cartesian or polar
     detector grid, plus the grid axes. Polar grids follow the quantem
     convention: rows are azimuth, columns radius."""
-    from quantem.diffraction.rotations import quat_to_matrix
+    from quantem.core.utils.rotations import quat_to_matrix
 
     k0 = 1.0 / lam
     alpha_k = semiconv_mrad * 1e-3 / lam
@@ -2111,7 +2112,7 @@ def kossel_line_segments(
     'depth' (K,) the deficit fraction and 'width_mrad' (K,) the equivalent
     width at the chosen thickness.
     """
-    from quantem.diffraction.rotations import quat_to_matrix
+    from quantem.core.utils.rotations import quat_to_matrix
 
     alpha = semiconv_mrad * 1e-3
     R = (
@@ -2579,7 +2580,7 @@ def _closest_symmetry_variant(q: torch.Tensor, ref: torch.Tensor, sym_quats) -> 
     """The symmetry equivalent q * s of orientation q closest to ref."""
     if sym_quats is None:
         return q
-    from quantem.diffraction.rotations import qmult
+    from quantem.core.utils.rotations import qmult
 
     variants = qmult(q[None], torch.as_tensor(sym_quats, dtype=q.dtype))  # (S, 4)
     return variants[int((variants @ ref).abs().argmax())]
@@ -2591,7 +2592,7 @@ def _tilt_twist(dq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     Returns the tilt as its rotation vector (wx, wy) in radians, and the
     twist quaternion."""
-    from quantem.diffraction.rotations import qconj, qmult
+    from quantem.core.utils.rotations import qconj, qmult
 
     dq = dq / torch.linalg.norm(dq)
     n = float(torch.hypot(dq[0], dq[3]))
@@ -2815,7 +2816,7 @@ def refine_dynamical(
         was refined), and 'metadata', the resolved parameters. Values are
         NaN where a candidate was not refined.
     """
-    from quantem.diffraction.rotations import (
+    from quantem.core.utils.rotations import (
         misorientation_angle_deg,
         qconj,
         qmult,
@@ -3533,7 +3534,7 @@ def strain_crystal_frame(deformation: torch.Tensor, quats: torch.Tensor) -> dict
     dict of (...) tensors 'aa', 'bb', 'cc', 'ab', 'ac', 'bc' (strain
     components) and 'eps_crystal' (..., 3, 3).
     """
-    from quantem.diffraction.rotations import quat_to_matrix
+    from quantem.core.utils.rotations import quat_to_matrix
 
     A = deformation.to(torch.float64)
     Fp = torch.linalg.inv(A).transpose(-1, -2)  # real-space in-plane deformation
@@ -4138,7 +4139,7 @@ def refine_dynamical_image(
         the Bragg-vector result, 'quats' (R, C, 4), 'cost' (R, C) the
         normalized image residual (NaN where not refined), and 'metadata'.
     """
-    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
+    from quantem.core.utils.rotations import qmult, quat_from_axis_angle
 
     oms = phase_map.orientation_maps
     cands = phase_map.candidates

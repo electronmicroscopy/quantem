@@ -10,14 +10,10 @@ import torch
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
+from quantem.core.utils.rotations import misorientation_angle_deg, qmult, quat_from_axis_angle
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.orientation import OrientationMap
 from quantem.diffraction.phase import PhaseMap
-from quantem.diffraction.rotations import (
-    misorientation_angle_deg,
-    qmult,
-    quat_from_axis_angle,
-)
 
 
 def _pattern(xtl, q, rng):

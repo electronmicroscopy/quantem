@@ -1,72 +1,68 @@
+"""
+Tomography geometry conventions.
+
+Frame: x along the detector columns, y along the rows, z along the beam travel. This is the
+lab frame of `quantem.core.utils.rotations` (row, col, z toward the source) rotated by 180
+degrees about the row + col diagonal.
+
+Pose: each projection has angles (z1, x, z3) in degrees, x being the tilt. Lab ray coordinates
+map into the specimen as ``p_specimen = Rz(-z1) @ Rx(x) @ Rz(-z3) @ p_lab``, rotating about the
+array centre (n - 1) / 2. `quat_from_tomography_angles` gives the same pose as a core
+orientation. The INR rays (`TomographyINRDataset.transform_batch_rays`), `rot_ZXZ` and
+`radon_torch` / `iradon_torch` all follow it.
+
+Volumes: `rot_ZXZ` takes [C, Z, Y, X]. Reconstructions (`obj_view`, SIRT / FBP objects) are
+[C, X, Z, Y].
+"""
+
 import torch
 import torch.nn.functional as F
+
+from quantem.core.utils.rotations import quat_from_tomography_angles, quat_to_matrix
+
+# Tomography axes (x = col, y = row, z = beam travel) in the core lab frame (row, col, z).
+_TOMO_TO_LAB = torch.tensor(
+    [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]], dtype=torch.float64
+)
 
 # --- Projection Operator Utils ---
 
 
-def rot_ZXZ(mags, z1, x, z3, device, mode="bilinear"):
-    if not isinstance(x, torch.Tensor) or not isinstance(z1, torch.Tensor):
-        z1 = torch.tensor(z1, dtype=torch.float32, device=device)
-        x = torch.tensor(x, dtype=torch.float32, device=device)
-        z3 = torch.tensor(z3, dtype=torch.float32, device=device)
-    curr_mags = mags
+def rot_ZXZ(mags, z1, x, z3, device=None, mode="bilinear"):
+    """Rotate a [C, Z, Y, X] volume into the lab frame of a tomography (z1, x, z3) pose.
 
-    curr_mags = differentiable_rotz_vectorized(curr_mags, z1, mode)
-    curr_mags = differentiable_rotx_vectorized(curr_mags, x, mode)
+    Uses the same pose as the INR rays, so ``rot_ZXZ(vol, z1, x, z3).sum(-3)`` is the
+    projection they see. The rotation is rigid in voxel units about the array centre, also
+    for non-cubic volumes. Nothing in the reconstructions calls it; it makes tilt series of
+    phantoms (the tests and the ``tomography_00_generate_phantom`` notebook).
 
-    curr_mags = differentiable_rotz_vectorized(curr_mags, z3, mode)
+    Args:
+        mags: Volume of shape [C, Z, Y, X].
+        z1, x, z3: Pose angles in degrees, scalars or tensors of shape (T,).
+        device: Unused, kept for compatibility. The volume's device is used.
+        mode: Interpolation mode of `grid_sample`.
 
-    return curr_mags
+    Returns:
+        [C, Z, Y, X] for a single pose, [T, C, Z, Y, X] for T poses.
+    """
+    z1, x, z3 = (torch.as_tensor(a, device=mags.device) for a in (z1, x, z3))
+    R = quat_to_matrix(quat_from_tomography_angles(z1, x, z3)).reshape(-1, 3, 3)
+    P = _TOMO_TO_LAB.to(mags.device)
+    # p_specimen = M @ p_lab, in tomography axes
+    M = (P.T @ R.transpose(-1, -2) @ P).to(mags.dtype)
 
-
-def differentiable_rotz_vectorized(mags, theta, mode="bilinear"):
-    _, dimz, dimy, dimx = mags.shape
-
-    if theta.dim() == 0:
-        theta = theta.unsqueeze(0)
-
-    theta_rad = torch.deg2rad(theta)
-
-    cos_t, sin_t = torch.cos(theta_rad), torch.sin(theta_rad)
-    affine_matrix = torch.stack(
-        [cos_t, -sin_t, torch.zeros_like(theta), sin_t, cos_t, torch.zeros_like(theta)], dim=-1
-    ).view(-1, 2, 3)
-
-    mags = mags.permute(1, 0, 2, 3)
-
-    def transform_slice(mag_slice):
-        grid = F.affine_grid(affine_matrix, mag_slice.unsqueeze(0).shape, align_corners=False)
-        return F.grid_sample(mag_slice.unsqueeze(0), grid, mode=mode, align_corners=False).squeeze(
-            0
-        )
-
-    rotated_mags = torch.vmap(transform_slice)(mags)
-    return rotated_mags.permute(1, 0, 2, 3)
-
-
-def differentiable_rotx_vectorized(mags, theta, mode="bilinear"):
-    _, dimz, dimy, dimx = mags.shape
-
-    if theta.dim() == 0:
-        theta = theta.unsqueeze(0)
-
-    theta_rad = torch.deg2rad(theta)
-
-    cos_t, sin_t = torch.cos(theta_rad), torch.sin(theta_rad)
-    affine_matrix = torch.stack(
-        [cos_t, -sin_t, torch.zeros_like(theta), sin_t, cos_t, torch.zeros_like(theta)], dim=-1
-    ).view(-1, 2, 3)
-
-    mags = mags.permute(3, 0, 1, 2)
-
-    def transform_slice(mag_slice):
-        grid = F.affine_grid(affine_matrix, mag_slice.unsqueeze(0).shape, align_corners=False)
-        return F.grid_sample(mag_slice.unsqueeze(0), grid, mode=mode, align_corners=False).squeeze(
-            0
-        )
-
-    rotated_mags = torch.vmap(transform_slice)(mags)
-    return rotated_mags.permute(1, 2, 3, 0)
+    C, D, H, W = mags.shape
+    half = torch.tensor(
+        [(W - 1) / 2, (H - 1) / 2, (D - 1) / 2], device=mags.device, dtype=mags.dtype
+    )
+    zz, yy, xx = torch.meshgrid(
+        *(torch.arange(n, device=mags.device, dtype=mags.dtype) for n in (D, H, W)),
+        indexing="ij",
+    )
+    p_lab = torch.stack((xx, yy, zz), dim=-1) - half  # voxel units, (x, y, z)
+    grid = torch.einsum("tij,dhwj->tdhwi", M, p_lab) / half
+    out = F.grid_sample(mags.expand(len(M), -1, -1, -1, -1), grid, mode=mode, align_corners=True)
+    return out[0] if len(M) == 1 else out
 
 
 def tv_loss_1d(x: torch.Tensor, reduction: str = "mean") -> torch.Tensor:

@@ -17,7 +17,7 @@ The method:
    (conjugate FFT) tests inversion-related orientations at no library cost.
 4. Optionally refine the best zone axes on a finer local grid.
 
-Orientations are unit quaternions; see quantem.diffraction.rotations.
+Orientations are unit quaternions; see quantem.core.utils.rotations.
 """
 
 from __future__ import annotations
@@ -30,18 +30,17 @@ from tqdm import tqdm
 
 from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.utils.utils import electron_wavelength_angstrom, inherit
-from quantem.diffraction.crystal import Crystal
-from quantem.diffraction.rotations import (
+from quantem.core.utils.rotations import (
     misorientation_angle_deg,
     qconj,
     qmult,
     qnormalize,
     qrotate,
     quat_from_axis_angle,
-    quat_from_zone_axis,
-    sample_zone_axes,
 )
+from quantem.core.utils.utils import electron_wavelength_angstrom, inherit
+from quantem.diffraction.crystal import Crystal
+from quantem.diffraction.crystal_rotations import quat_from_zone_axis, sample_zone_axes
 
 
 def position_mask(positions, shape: tuple[int, int]) -> torch.Tensor:
@@ -542,7 +541,7 @@ class OrientationMap(AutoSerialize):
         # side, and a one-sided correlation centroid would drag it inward;
         # the symmetry images of the grid across the boundary restore the
         # missing side.
-        from quantem.diffraction.rotations import quat_to_matrix
+        from quantem.core.utils.rotations import quat_to_matrix
 
         Rs = quat_to_matrix(crystal.sym_quats_matching)
         images = torch.einsum("sij,zj->szi", Rs, za)
@@ -689,7 +688,7 @@ class OrientationMap(AutoSerialize):
         step_deg: float,
     ) -> torch.Tensor:
         """Zone-axis sampling requested by build_plan, (Z, 3) Cartesian."""
-        from quantem.diffraction.rotations import sample_zone_axis_cap
+        from quantem.diffraction.crystal_rotations import sample_zone_axis_cap
 
         crystal = self.crystal
 
@@ -2079,7 +2078,7 @@ class OrientationMap(AutoSerialize):
         power_env: float = 0.25,
     ) -> None:
         """Chunk-vectorized in-plane + envelope refinement of the active positions."""
-        from quantem.diffraction.rotations import quat_to_matrix
+        from quantem.core.utils.rotations import quat_to_matrix
 
         peaks = self.peaks
         R, C, M = self.quats.shape[:3]
@@ -2691,7 +2690,7 @@ class OrientationMap(AutoSerialize):
         between two variants no zero-layer pattern can separate. A float
         wraps everywhere by that value, and None returns the full range.
         """
-        from quantem.diffraction.rotations import quat_to_matrix
+        from quantem.core.utils.rotations import quat_to_matrix
 
         assert self.quats is not None
         R = quat_to_matrix(self.quats[..., match, :])
